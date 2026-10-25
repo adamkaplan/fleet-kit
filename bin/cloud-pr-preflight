@@ -63,10 +63,14 @@ def kill_children():
     del CHILD[:]
 
 
+QUICK_TOTAL = int(os.environ.get("CLOUD_PREFLIGHT_QUICK_TOTAL", "300"))  # seconds for the whole quick run
+
+
 def run_one(root, rel, timeout, selector=None):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     try:
-        p = subprocess.Popen([sys.executable, rel] + ([selector] if selector else []), cwd=root, env=env, stdout=subprocess.DEVNULL,
+        cmd = [sys.executable, rel] if rel.endswith(".py") else ["sh", rel]
+        p = subprocess.Popen(cmd + ([selector] if selector else []), cwd=root, env=env, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
         return 127
@@ -189,8 +193,13 @@ def main():
             names = sorted(set(tests_in(root)) | base_tests)
         print("%-52s %-9s %-9s %s" % ("file", "branch", "default", "verdict"))
         verdicts = []
+        t_start = time.monotonic()
         for rel in names:
             path, sel = sel_of.get(rel, (rel, None))
+            if quick and time.monotonic() - t_start > QUICK_TOTAL:
+                print("NOT RUN: quick run exceeded %d s (stopped before %s)" % (QUICK_TOTAL, rel))
+                failed = True
+                break
             if quick and path in cloud_quick.HEAVY:
                 print("%-52s %-9s %-9s %s" % (rel, "-", "-", "skipped: memory-heavy " + path))
                 verdicts.append((rel, "-", "-", "skipped")); failed = True
