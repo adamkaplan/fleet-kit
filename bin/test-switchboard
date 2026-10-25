@@ -15041,6 +15041,9 @@ class TestClearMarker(Base):
         self.assertFalse(sb.pr_marker_state([], sb.marker_edit("MERGE: captain\n")[0], now=0)["captain"])
 
 
+REAL_INTENT_ISSUE, REAL_INTENT_PARENT = sb.IntentReader.issue, sb.IntentReader.parent   # before any rig patches them
+
+
 class CharterRig:
     """The shared setUp and helpers of the charter classes (a mixin, so a class that only needs the rig does not re-run another class's tests)."""
 
@@ -15060,7 +15063,7 @@ class CharterRig:
         self.cmd_parents = {1: None, 3: None, 4: None, 9: None, 5: 4, 6: 3, 7: None}   # 5 and 6 are asks; 7 is a root issue with no label
         self.cmd_labels = {1: True, 3: True, 4: True, 9: True, 5: False, 6: False, 7: False}
         self.cmd_reads = []
-        def cmd_parent(reader, number, repo=None):
+        def cmd_parent(reader, number, repo=None, **kw):
             self.cmd_reads.append(("parent", number))
             return self.cmd_parents[number]
         def cmd_issue(reader, number, repo=None):
@@ -15495,7 +15498,7 @@ class TestCharterSetGuard(CharterRig, Base):
     def retire(self, name):
         self.registry._mutate(self.world.state, lambda doc: (doc["retired"].__setitem__(name, {"at": "2026-01-01T00:00:00Z"}) or True, [], None))
 
-    def unreadable(self, reader, number, repo=None):
+    def unreadable(self, reader, number, repo=None, **kw):
         raise RuntimeError("HTTP 502")
 
     def test_an_unreadable_parent_is_refused_unverified_and_nothing_is_written(self):
@@ -15557,6 +15560,141 @@ class TestCharterSetGuard(CharterRig, Base):
         with mock.patch.object(sb.IntentReader, "parent", self.unreadable), self.without("unverified"):
             code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertEqual(self.row("orch-b")["charter"], 3)   # the write the real guard refuses: test_an_unreadable_parent... fails for this mutant
+
+    OTHER = "other-org/other-repo"
+
+    def per_repo_fakes(self):
+        """Fakes that answer a different shape per repository: the intent repository gets the charter shape, any other (or none) the shape of an ask that is no charter."""
+        seen = []
+        def parent(reader, number, repo=None, **kw):
+            seen.append(("parent", repo))
+            return None if repo == self.REPO else 1
+        def issue(reader, number, repo=None):
+            seen.append(("issue", repo))
+            return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if repo == self.REPO else ["other"])
+        return seen, parent, issue
+
+    def test_both_reads_receive_the_intent_repository(self):
+        self.orchestrator("orch-b", registry=None)
+        seen, parent, issue = self.per_repo_fakes()
+        with mock.patch.object(sb.IntentReader, "parent", parent), mock.patch.object(sb.IntentReader, "issue", issue):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen, [("parent", self.REPO), ("issue", self.REPO)])
+        self.assertEqual(self.row("orch-b")["charter"], 3)
+
+    def test_a_row_whose_repository_changed_between_the_read_and_the_lock_is_refused(self):
+        self.orchestrator("orch-b", registry=None)
+        seen, parent, issue = self.per_repo_fakes()
+        def moving_parent(reader, number, repo=None, **kw):
+            found = parent(reader, number, repo)
+            self.registry.upsert(self.world.state, "orch-b", dict(self.row("orch-b"), repo=self.OTHER))
+            return found
+        with mock.patch.object(sb.IntentReader, "parent", moving_parent), mock.patch.object(sb.IntentReader, "issue", issue):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 2, err)
+        self.assertIn("the repository changed", err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+
+    def test_the_label_read_is_never_served_from_the_cache(self):
+        self.orchestrator("orch-b", registry=None)
+        labels, reads = [sb.orchestrator_label()], []
+        def api(reader, path, repo=None):
+            reads.append(path)
+            if path.endswith("/parent"):
+                raise sb.IntentError("not_found", "HTTP 404 no parent")
+            return {"number": 3, "labels": [{"name": n} for n in labels]}
+        with mock.patch.object(sb.IntentReader, "issue", REAL_INTENT_ISSUE), mock.patch.object(sb.IntentReader, "parent", REAL_INTENT_PARENT), mock.patch.object(sb.IntentReader, "_api", api):
+            shared = {("issue", self.REPO, 3): (float("inf"), types.SimpleNamespace(number=3, labels=list(labels)), None)}   # a cached answer that never expires, from before the label was removed
+            real_init = sb.IntentReader.__init__
+            def init(reader, *args, **kwargs):
+                real_init(reader, *args, **kwargs)
+                reader._cache = shared
+            labels[:] = []   # the label is removed since
+            reads.clear()
+            with mock.patch.object(sb.IntentReader, "__init__", init):
+                code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(len([r for r in reads if not r.endswith("/parent")]), 1)
+        self.assertEqual(code, 2, err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+
+    def test_a_labelled_root_issue_with_no_parent_is_accepted(self):
+        self.orchestrator("orch-b", registry=None)
+        self.add_root(10)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "10")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.row("orch-b")["charter"], 10)
+
+    def add_root(self, number):
+        self.cmd_parents[number], self.cmd_labels[number] = None, True
+
+    NOPARENT = sb.IntentError("not_found", "HTTP 404 no parent")
+
+    def real_set(self, parent, issue, repo_row=None):
+        """One `charter set orch-b 3` through the REAL IntentReader methods and a fake _api. `parent` / `issue`: a dict (the JSON), an exception to raise, or a str (non-JSON)."""
+        self.orchestrator("orch-b", registry=None)
+        paths = []
+        def api(reader, path, repo=None):
+            paths.append((path, repo))
+            answer = parent if path.endswith("/parent") else issue
+            if isinstance(answer, Exception):
+                raise answer
+            if isinstance(answer, str):
+                raise sb.IntentError("gh", "gh returned non-JSON: " + answer)
+            return answer
+        with mock.patch.object(sb.IntentReader, "issue", REAL_INTENT_ISSUE), mock.patch.object(sb.IntentReader, "parent", REAL_INTENT_PARENT), mock.patch.object(sb.IntentReader, "_api", api):
+            result = self.run_as("cos", "charter", "set", "orch-b", "3")
+        return result, paths
+
+    def test_the_real_reads_carry_the_intent_repository_in_the_request_path(self):
+        label = {"number": 3, "labels": [{"name": sb.orchestrator_label()}]}
+        (code, out, err), paths = self.real_set(self.NOPARENT, label)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(paths, [("repos/%s/issues/3/parent" % self.REPO, self.REPO), ("repos/%s/issues/3" % self.REPO, self.REPO)])
+
+    SHAPES = {   # every shape the guard can receive: name -> (parent read, issue record, refusal text or None)
+        "root, labelled, 404 no parent": (NOPARENT, {"number": 3, "labels": [{"name": "LABEL"}]}, None),
+        "root, labelled, closed": (NOPARENT, {"number": 3, "state": "closed", "labels": [{"name": "LABEL"}]}, None),
+        "has a parent": ({"number": 1}, {"number": 3, "labels": [{"name": "LABEL"}]}, "is an ask, not a charter"),
+        "pull request with the label": (NOPARENT, {"number": 3, "pull_request": {"url": "x"}, "labels": [{"name": "LABEL"}]}, "is a pull request, not a charter"),
+        "no label": (NOPARENT, {"number": 3, "labels": [{"name": "bug"}]}, "is not a charter"),
+        "label look-alike": (NOPARENT, {"number": 3, "labels": [{"name": "other:orchestrator"}]}, "is not a charter"),
+        "404 that is not no-parent": (sb.IntentError("not_found", "HTTP 404 repository moved or renamed"), {"number": 3, "labels": [{"name": "LABEL"}]}, "cannot read #3's parent"),
+        "parent read error": (sb.IntentError("gh", "HTTP 502"), {"number": 3, "labels": [{"name": "LABEL"}]}, "cannot read #3's parent"),
+        "parent read non-JSON": ("<html>", {"number": 3, "labels": [{"name": "LABEL"}]}, "cannot read #3's parent"),
+        "issue unreadable": (NOPARENT, sb.IntentError("gh", "HTTP 502"), "cannot read #3's parent"),
+        "issue 404 (foreign repository)": (NOPARENT, sb.IntentError("not_found", "HTTP 404"), "cannot read #3's parent"),
+    }
+
+    def test_every_shape_of_the_two_reads_through_the_real_methods(self):
+        label = sb.orchestrator_label()
+        for name, (parent, issue, refusal) in self.SHAPES.items():
+            with self.subTest(name):
+                if isinstance(issue, dict):
+                    issue = json.loads(json.dumps(issue).replace("LABEL", label))
+                if isinstance(parent, dict):
+                    parent = dict(parent)
+                (code, out, err), paths = self.real_set(parent, issue)
+                if refusal is None:
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(self.row("orch-b")["charter"], 3)
+                else:
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(refusal, err)
+                    self.assertIsNone(self.row("orch-b")["charter"])
+                self.registry.upsert(self.world.state, "orch-b", dict(self.row("orch-b"), charter=None))
+
+    def test_label_look_alikes_are_refused(self):
+        self.orchestrator("orch-b", registry=None)
+        real = sb.orchestrator_label()
+        for look in ("other:orchestrator", "orchestrator", real.upper()):
+            def issue(reader, number, repo=None, look=look):
+                return types.SimpleNamespace(number=number, labels=[look])
+            with mock.patch.object(sb.IntentReader, "issue", issue):
+                code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+            self.assertEqual(code, 2, (look, err))
+            self.assertIn("is not a charter", err)
+        self.assertIsNone(self.row("orch-b")["charter"])
 
     def test_a_retired_holder_does_not_hold_the_issue(self):
         self.orchestrator("orch-a", registry=3)
@@ -15746,7 +15884,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
     def test_the_parents_are_read_before_the_lock_and_never_inside_it(self):
         self.orchestrator("orch-b", registry=None)
         seen = []
-        real_parent = lambda reader, number, repo=None: (seen.append(("parent", number)), self.cmd_parents[number])[1]
+        real_parent = lambda reader, number, repo=None, **kw: (seen.append(("parent", number)), self.cmd_parents[number])[1]
         real = self.registry.set_charter
 
         def spy(state_dir, name, charter, by, now=None, check=None):
@@ -88824,6 +88962,259 @@ class TestPaneExitBoundaries(TestPaneExit):
         self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
 
 
+class TestCloudWatchTick(unittest.TestCase):
+    """#1073: one cloud_watch_tick per pass in finish_pass, under try/except, with bounded reads."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.tmp})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.dir = sb.state_dir_path() / "cloud"
+        self.audit = []
+        audit = types.SimpleNamespace(append=lambda *a: self.audit.append(a))
+        self.engine = types.SimpleNamespace(audit=audit, actor="daemon", now=time.time)
+        self.engine._failed = lambda subject, step, err, report: self.audit.append(("error", step, str(err)))
+
+    def records(self, n):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            (self.dir / ("w%d.json" % i)).write_text(json.dumps({"worker": "w%d" % i}))
+
+    def finish(self, tick=None):
+        calls = {"tick": 0, "health": 0}
+        real = sb.cloud_watch_tick
+        def counted(engine, discovery):
+            calls["tick"] += 1
+            return (tick or real)(engine, discovery)
+        def health(*a):
+            calls["health"] += 1
+        quiet = lambda *a, **k: None
+        with mock.patch.multiple(sb, cloud_watch_tick=counted, health_write=health, prune_delivered_reminders=quiet, friction_tick=quiet,
+                                 load_tick=quiet, prune_report_riders=quiet, publish_decisions=quiet, write_catching_up=quiet, schedule_judge_warm=quiet):
+            sb.finish_pass(self.engine, None, {"errors": []})
+        return calls
+
+    def test_S2_runs_once_and_reads_both_records(self):
+        self.records(2)
+        calls = self.finish()
+        self.assertEqual(calls["tick"], 1)
+        self.assertEqual(len(self.engine.cloud_watch["records"]), 2)
+
+    def test_S3_a_raising_tick_is_audited_and_later_ticks_run(self):
+        def boom(engine, discovery):
+            raise RuntimeError("boom")
+        calls = self.finish(boom)
+        self.assertIn("cloud-watch", [a[1] for a in self.audit if a[0] == "error"])
+        self.assertEqual(calls["health"], 1)
+
+    def test_S4_reads_at_most_the_cap_skips_bad_files_and_audits_once(self):
+        cloud = sb.load_module("cloud_worker")
+        self.records(cloud.WATCH_MAX_RECORDS + 5)
+        (self.dir / "big.json").write_text("{\"x\": \"" + "a" * (cloud.WATCH_MAX_BYTES + 10) + "\"}")
+        (self.dir / "bad.json").write_text("{not json")
+        sb.cloud_watch_tick(self.engine, None)
+        sb.cloud_watch_tick(self.engine, None)
+        self.assertEqual(len(self.engine.cloud_watch["records"]), cloud.WATCH_MAX_RECORDS)
+        self.assertEqual(len([a for a in self.audit if a[1] == "cloud-watch.capped"]), 1)
+
+    def test_S4_bad_files_are_skipped_and_counted(self):
+        self.records(1)
+        (self.dir / "big.json").write_text("x" * 70000)
+        (self.dir / "bad.json").write_text("{not json")
+        sb.cloud_watch_tick(self.engine, None)
+        self.assertEqual(len(self.engine.cloud_watch["records"]), 1)
+        self.assertEqual(self.engine.cloud_watch["skipped"], 2)
+
+    def test_U2_no_directory_no_error_no_directory_created(self):
+        calls = self.finish()
+        self.assertEqual(calls["tick"], 1)
+        self.assertEqual(self.audit, [])
+        self.assertFalse(self.dir.exists())
+
+
+class TestCloudWatchBounds(unittest.TestCase):
+    """#1073 review: every entry kind and every bound of the cloud watch read has a test and a mutant (table in docs/switchboard.md, Cloud watch)."""
+    SRC = (REPO / "bin" / "cloud_worker.py")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.dir = self.tmp / "cloud"
+        self.dir.mkdir()
+        self.cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
+
+    def module(self, old=None, new=None):
+        text = self.SRC.read_text()
+        if old is not None:
+            self.assertIn(old, text)
+            text = text.replace(old, new)
+        mod = types.ModuleType("cloud_mutant")
+        mod.__file__ = str(self.SRC)
+        sys.modules["cloud_mutant"] = mod
+        self.addCleanup(sys.modules.pop, "cloud_mutant", None)
+        exec(compile(text, str(self.SRC), "exec"), mod.__dict__)
+        return mod.bind(sb.__dict__)
+
+    def guarded(self, fn, seconds=2):
+        import signal
+        def hung(*a):
+            raise AssertionError("the read hung")
+        old = signal.signal(signal.SIGALRM, hung)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        try:
+            return fn()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+
+    def read(self, mod=None, **kw):
+        mod = mod or self.cloud
+        return self.guarded(lambda: mod.read_records_bounded(self.tmp, **kw))
+
+    def put(self, name, data=None):
+        (self.dir / name).write_bytes(json.dumps({"w": 1}).encode() if data is None else data)
+
+    # each kind: (check on the real module, mutant text change that must make the check fail)
+    def kind_cases(self):
+        outside = self.tmp / "outside.json"
+        outside.write_text("{}")
+        def fifo():
+            os.mkfifo(str(self.dir / "x.json"))
+        def sym():
+            os.symlink(str(outside), str(self.dir / "x.json"))
+        def adir():
+            (self.dir / "x.json").mkdir()
+        return {
+            "bad_name": (lambda: self.put("bad name!.json"), None, None),
+            "directory": (adir, None, None),
+            "not_regular": (fifo, "if not stat.S_ISREG(os.fstat(fd).st_mode):", "if False:"),
+            "fifo": (fifo, "os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW", "os.O_RDONLY | os.O_NOFOLLOW"),
+            "symlink": (sym, "os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW", "os.O_RDONLY | os.O_NONBLOCK"),
+            "too_large": (lambda: self.put("x.json", b"{\"a\": \"" + b"a" * 70000 + b"\"}"), "if len(raw) > max_bytes:", "if False:"),
+            "not_utf8": (lambda: self.put("x.json", b"\xff\xfe{}"), "except UnicodeDecodeError:", "except ZeroDivisionError:"),
+            "not_json": (lambda: self.put("x.json", b"{nope"), "except ValueError:\n        return None, \"not_json\"", "except ValueError:\n        return None, \"too_deep\""),
+            "wrong_shape": (lambda: self.put("x.json", b"[1]"), "if not isinstance(record, dict):", "if False:"),
+            "too_deep": (lambda: self.put("x.json", b"[" * 30000 + b"]" * 30000), "except RecursionError:", "except ZeroDivisionError:"),
+        }
+
+    def test_each_kind_is_skipped_and_counted_under_its_own_name(self):
+        for kind, (setup, _old, _new) in self.kind_cases().items():
+            with self.subTest(kind=kind):
+                for f in list(self.dir.iterdir()):
+                    shutil.rmtree(str(f)) if f.is_dir() and not f.is_symlink() else f.unlink()
+                setup()
+                got = self.read()
+                want = {"fifo": "not_regular", "directory": "not_regular"}.get(kind, kind)
+                self.assertEqual(got["records"], [])
+                self.assertEqual(got["skips"][want], 1, got)
+                self.assertEqual(got["skipped"], 1)
+
+    def test_each_kind_has_a_mutant_that_fails_its_check(self):
+        for kind, (setup, old, new) in self.kind_cases().items():
+            if old is None:
+                continue
+            with self.subTest(kind=kind):
+                for f in list(self.dir.iterdir()):
+                    shutil.rmtree(str(f)) if f.is_dir() and not f.is_symlink() else f.unlink()
+                setup()
+                want = {"fifo": "not_regular", "directory": "not_regular"}.get(kind, kind)
+                try:
+                    got = self.read(self.module(old, new))
+                except (AssertionError, Exception):
+                    continue   # the mutant hung or raised: caught
+                self.assertNotEqual((got["records"], got["skips"][want]), ([], 1), "the mutant of %s survived" % kind)
+
+    def test_mutant_plain_open_hangs_on_a_fifo(self):
+        os.mkfifo(str(self.dir / "x.json"))
+        plain = self.module("fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)", "fd = os.open(path, os.O_RDONLY)")
+        with self.assertRaises(AssertionError):
+            self.read(plain)
+        self.assertEqual(self.read()["skips"]["not_regular"], 1)
+
+    def test_files_examined_bound_with_more_bad_files_than_the_bound(self):
+        for i in range(self.cloud.WATCH_MAX_FILES + 30):
+            self.put("b%04d.json" % i, b"{nope")
+        got = self.read()
+        self.assertEqual(got["skipped"], self.cloud.WATCH_MAX_FILES)
+        self.assertEqual(got["bound"], "files")
+        mutant = self.module("elif examined >= max_files:", "elif False:")
+        self.assertGreater(self.read(mutant)["skipped"], self.cloud.WATCH_MAX_FILES)
+
+    def test_record_bound_names_records(self):
+        for i in range(self.cloud.WATCH_MAX_RECORDS + 3):
+            self.put("w%03d.json" % i)
+        got = self.read()
+        self.assertEqual((len(got["records"]), got["bound"]), (self.cloud.WATCH_MAX_RECORDS, "records"))
+        mutant = self.module("if len(out[\"records\"]) >= max_records:", "if False:")
+        self.assertGreater(len(self.read(mutant)["records"]), self.cloud.WATCH_MAX_RECORDS)
+
+    def test_time_bound_stops_and_says_so(self):
+        for i in range(10):
+            self.put("w%d.json" % i)
+        ticks = iter(range(0, 1000))
+        got = self.read(clock=lambda: next(ticks) * 0.5, seconds=1.0)
+        self.assertEqual(got["bound"], "time")
+        self.assertLess(len(got["records"]), 10)
+        mutant = self.module("elif clock() > deadline:", "elif False:")
+        ticks = iter(range(0, 1000))
+        self.assertEqual(len(self.read(mutant, clock=lambda: next(ticks) * 0.5, seconds=1.0)["records"]), 10)
+
+    def test_rotation_gives_every_record_a_turn(self):
+        for i in range(8):
+            self.put("w%d.json" % i)
+        seen, cursor = set(), None
+        for _ in range(4):
+            got = self.read(max_records=2, cursor=cursor)
+            cursor = got["cursor"]
+            seen |= {r["w"] for r in got["records"]}
+            self.assertEqual(len(got["records"]), 2)
+        names = set()
+        cursor = None
+        for _ in range(4):
+            got = self.read(max_records=2, cursor=cursor)
+            cursor = got["cursor"]
+            names.add(cursor)
+        self.assertEqual(len(names), 4)
+        mutant = self.module("after = [n for n in names if n > cursor]", "after = []")
+        cursor, last = None, set()
+        for _ in range(4):
+            got = self.read(mutant, max_records=2, cursor=cursor)
+            cursor = got["cursor"]
+            last.add(cursor)
+        self.assertEqual(len(last), 1)
+
+    def test_tick_makes_no_write_process_network_or_remove_call_and_audits_the_bound(self):
+        for i in range(self.cloud.WATCH_MAX_FILES + 2):
+            self.put("b%04d.json" % i, b"{nope")
+        audit = []
+        engine = types.SimpleNamespace(audit=types.SimpleNamespace(append=lambda *a: audit.append(a)), actor="daemon")
+        def boom(*a, **k):
+            raise AssertionError("the tick made a forbidden call")
+        import socket
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.tmp / "st")}):
+            (sb.state_dir_path() / "cloud").mkdir(parents=True)
+            for f in self.dir.iterdir():
+                shutil.copy(str(f), str(sb.state_dir_path() / "cloud" / f.name))
+            with mock.patch.object(subprocess, "run", boom), mock.patch.object(subprocess, "Popen", boom), mock.patch.object(os, "remove", boom), \
+                    mock.patch.object(os, "unlink", boom), mock.patch.object(os, "rename", boom), mock.patch.object(os, "write", boom), \
+                    mock.patch.object(socket, "socket", boom), mock.patch("builtins.open", boom):
+                sb.cloud_watch_tick(engine, None)
+                sb.cloud_watch_tick(engine, None)
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(audit[0][1], "cloud-watch.capped")
+        self.assertEqual(audit[0][3]["bound"], "files")
+        self.assertEqual(audit[0][3]["skipped"], {"not_json": self.cloud.WATCH_MAX_FILES})
+
+    def test_mutants_write_call_and_no_audit_are_caught(self):
+        # a tick that writes or never audits fails the recording test above: prove the audit one by a source mutant
+        src = (REPO / "bin" / "fleet-switchboard").read_text()
+        self.assertIn('engine.audit.append(engine.actor, "cloud-watch.capped"', src)
+        self.assertNotIn("os.unlink", src[src.index("def cloud_watch_tick"):src.index("def finish_pass")])
+        self.assertNotIn("subprocess", src[src.index("def cloud_watch_tick"):src.index("def finish_pass")])
+
+
 class TestArchitectureSafetyNet(unittest.TestCase):
     """The tools that prove a move of switchboard code is text only (plan #1092, slice S0)."""
     TOOLS = REPO / "tools"
@@ -89090,7 +89481,7 @@ class TestAssembler(unittest.TestCase):
         self.assertEqual(lines[0], "fleet-switchboard")
 
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py", "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py", "part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -89139,7 +89530,7 @@ class TestAssembler(unittest.TestCase):
         self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py"])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py"])
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
 
@@ -89842,6 +90233,345 @@ class TestProofCarry(LedgerBase):
         section = text[start:text.index("\n## ", start + 5)]
         for item in ("touches none of the files", "merge of the default branch", "CI is green", "`carried`"):
             self.assertIn(item, section)
+
+
+class TestCiRecordCarry(LedgerBase):
+    """#1217: the CI-verdict recording step (`gates ci-record`, and the daemon pass through the same `ci_record_core`) carries the proofs the #1213 rule allows, one `carried` line each.
+    Fakes only: GitHub's compare, commit and default-branch reads are served here."""
+
+    NEW = LEDGER_NEW_HEAD
+    API = "repos/acme/app"
+
+    def setUp(self):
+        super().setUp()
+        self.changed = ["bin/other.py"]
+        self.status = "ahead"
+        self.parents = ["p" * 40, "q" * 40]
+        self.reads = []
+        self.pr["headRefOid"] = LEDGER_HEAD
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "api" and argv[2].startswith(self.API) and not argv[2].endswith("/issues/7") and "/comments" not in argv[2]:
+            path = argv[2]
+            self.reads.append(path)
+            if "/compare/%s...%s" % ("a" * 40, self.NEW) in path:
+                body = {"status": self.status, "files": [{"filename": f} for f in self.changed]}
+            elif path.endswith("/commits/%s" % self.NEW):
+                body = {"parents": [{"sha": x} for x in self.parents]}
+            elif path.endswith("/check-runs"):
+                body = {"check_runs": [{"status": "completed", "conclusion": "success"}]}
+            elif path == self.API:
+                body = {"default_branch": "main"}
+            elif "/compare/main..." in path:
+                body = {"status": "behind"}
+            else:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        return super().route(argv, **kwargs)
+
+    def proofs(self, files=("src/widget.py",)):
+        more = [x for f in files for x in ("--file", f)]
+        self.assertEqual(self.prove("coder", "S2", *more)[0], 0)
+        self.assertEqual(self.prove("coder", "S3", *more)[0], 0)
+        self.assertEqual(self.verdict("tst", "S2", "tester", "pass", *more)[0], 0)
+
+    def step(self, green=True):
+        self.pr["headRefOid"] = self.NEW
+        self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS" if green else "FAILURE", "status": "COMPLETED"}]
+        return self.run_as(None, "gates", "ci-record", self.PR)
+
+    def carried(self):
+        return [e for e in self.ledger() if e["kind"] == "carried"]
+
+    def ledger_bytes(self):
+        return (self.world.state / "plan-ledger.jsonl").read_text()
+
+    def test_S1_a_merge_of_main_carries_one_line_per_proof_through_the_real_step(self):
+        self.proofs()
+        code, out, err = self.step()
+        self.assertEqual(code, 0, err)
+        lines = self.carried()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual({(c["old_head"], c["new_head"]) for c in lines}, {(LEDGER_HEAD, self.NEW)})
+        self.assertEqual(sorted(c["scenario"] for c in lines), ["S2", "S2", "S3"])
+        self.assertEqual(out.count("carried proof #"), 3)
+
+    def test_S2_a_tests_and_documentation_only_head_carries(self):
+        self.proofs(files=("src/widget.py",))
+        self.parents = ["p" * 40]
+        self.changed = ["docs/a.md", "bin/test-widget"]
+        self.assertEqual(self.step()[0], 0)
+        self.assertEqual(len(self.carried()), 3)
+        self.assertEqual({c["facts"]["difference"] for c in self.carried()}, {"tests and documentation only"})
+
+    def refused_case(self, name):
+        if name == "touched":
+            self.proofs()
+            self.changed = ["src/widget.py"]
+        elif name == "ci":
+            self.proofs()
+        elif name == "code":
+            self.proofs()
+            self.parents = ["p" * 40]
+        else:
+            self.proofs(files=())
+        return self.step(green=(name != "ci"))
+
+    def test_S3_each_refusal_carries_nothing_and_prints_one_reason_line_per_proof(self):
+        for name, reason in (("touched", "touches a file the proof names"), ("ci", "CI is not green"), ("code", "code outside a merge"), ("nofile", "names no file")):
+            with self.subTest(case=name):
+                self.tearDown()
+                self.setUp()
+                code, out, err = self.refused_case(name)
+                self.assertEqual(self.carried(), [])
+                text = out + err
+                self.assertEqual([l for l in text.splitlines() if l.startswith("not carried")].count(None), 0)
+                reasons = [l for l in text.splitlines() if l.startswith("not carried") and reason in l]
+                self.assertEqual(len(reasons), 3, text)
+
+    def test_S4_and_U2_a_second_run_writes_nothing_and_the_ledger_bytes_are_unchanged(self):
+        self.proofs()
+        self.step()
+        first = self.ledger_bytes()
+        self.assertEqual(len(self.carried()), 3)
+        self.assertEqual(self.step()[0], 0)
+        self.assertEqual(self.ledger_bytes(), first)
+        self.assertEqual(len(self.carried()), 3)
+
+    def test_S5_original_proof_rows_and_ci_verdicts_equal_the_baseline_apart_from_carried_lines(self):
+        self.proofs()
+        before = [l for l in self.ledger_bytes().splitlines()]
+        self.step()
+        rest = [json.loads(l) for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l]
+        self.assertEqual([l for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l][:len(before)], before)
+        ci = [(e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
+        self.assertEqual(sorted(ci), [("S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
+
+    def test_U1_the_step_decides_as_the_rule_does_on_six_combinations(self):
+        combos = [(["src/widget.py"], True, True), (["bin/o.py"], False, True), (["bin/o.py"], True, False),
+                  (["bin/o.py"], True, True), (["docs/a.md"], False, True), (["docs/a.md"], False, False)]
+        for files, merge, ci in combos:
+            with self.subTest(files=files, merge=merge, ci=ci):
+                self.tearDown()
+                self.setUp()
+                self.proofs()
+                self.changed = files
+                self.parents = ["p" * 40, "q" * 40] if merge else ["p" * 40]
+                self.step(green=ci)
+                row = {"files": ["src/widget.py"]}
+                wanted = sb.plan_ledger.carry_decision(row, "tester", files, merge, ci)[0] == "carry"
+                self.assertEqual(len(self.carried()), 3 if wanted else 0)
+
+    def test_the_carry_line_of_another_plan_hash_is_no_evidence(self):
+        self.proofs()
+        self.step()
+        entries, _ = sb.plan_ledger.read_ledger(self.world.state)
+        self.assertEqual(len(sb.plan_ledger.carried_seqs(entries, self.PR, self.NEW, sb.plan_check.plan_hash(LEDGER_PLAN))), 3)
+        self.assertEqual(sb.plan_ledger.carried_seqs(entries, self.PR, self.NEW, "sha256:" + "0" * 64), {})
+        code, report, err = self.gates()
+        s2 = next(s for s in report["scenarios"] if s["id"] == "S2")
+        self.assertTrue(s2["carried"])
+
+    def test_mutant_that_drops_the_plan_hash_check_of_a_carried_row_fails(self):
+        self.proofs()
+        self.step()
+        real = sb.plan_ledger.carried_seqs
+        with mock.patch.object(sb.plan_ledger, "carried_seqs", lambda e, pr, head, plan_hash=None: real(e, pr, head)):
+            with self.assertRaises(AssertionError):
+                self.test_the_carry_line_of_another_plan_hash_is_no_evidence()
+
+    def no_state_core(self, quiet=True):
+        import types
+        facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]})
+        ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": [], "plan_hash": "h"}, plan_problem=None, engine=None, pr=1, config={}, repo="o/r")
+        return sb.ci_record_core(ctx, lambda: 0, quiet=quiet)
+
+    def test_1217_ci_record_core_with_a_ctx_lacking_state_does_not_raise_and_carries_nothing(self):
+        got = self.no_state_core()
+        self.assertEqual([d["reason"] for d in got["carry"]], ["no ledger state: nothing to carry"])
+        self.assertTrue(all(d["proof"] is None for d in got["carry"]))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), mock.patch.object(sb, "_gates_audit", lambda *a, **k: None):
+            self.no_state_core(quiet=False)
+        self.assertIn("no ledger state: nothing to carry", buf.getvalue())
+        audits = []
+        ns = __import__('types').SimpleNamespace(facts={}, plan={}, pr=1, engine=object())
+        with mock.patch.object(sb, "_gates_audit", lambda *a, **k: audits.append(a)):
+            self.assertEqual(sb.carry_at_green(ns, lambda: 0)[0]["reason"], "no ledger state: nothing to carry")
+        self.assertEqual(len(audits), 1)
+
+    def test_1217_mutant_the_no_state_guard_removed_fails_the_no_state_test(self):
+        real = sb.carry_at_green
+        src = inspect.getsource(real).replace('getattr(ctx, "state", None) is None', "False")
+        ns = dict(vars(sb))
+        exec(src, ns)
+        with mock.patch.object(sb, "carry_at_green", ns["carry_at_green"]):
+            with self.assertRaises((AssertionError, AttributeError)):
+                self.test_1217_ci_record_core_with_a_ctx_lacking_state_does_not_raise_and_carries_nothing()
+
+    def test_1217_mutant_the_silent_empty_guard_fails_the_no_state_test(self):
+        real = sb.carry_at_green
+        src = inspect.getsource(real).replace("return [{\"proof\": None, \"scenario\": None, \"verdict\": \"refuse\", \"reason\": NO_STATE_REASON, \"noted\": True}]", "return []")
+        self.assertNotEqual(src, inspect.getsource(real))
+        ns = dict(vars(sb))
+        exec(src, ns)
+        with mock.patch.object(sb, "carry_at_green", ns["carry_at_green"]):
+            with self.assertRaises((AssertionError, KeyError)):
+                self.test_1217_ci_record_core_with_a_ctx_lacking_state_does_not_raise_and_carries_nothing()
+
+    def test_S6_mutant_that_skips_the_ci_check_fails_a_test(self):
+        real = sb.plan_ledger.carry_decision
+        with mock.patch.object(sb.plan_ledger, "carry_decision", lambda row, ev, files, merge, ci: real(row, ev, files, merge, True)):
+            with self.assertRaises(AssertionError):
+                self.refused_case("ci")
+                self.assertEqual(self.carried(), [])
+
+    def test_S6_mutant_that_carries_twice_fails_a_test(self):
+        real = sb.plan_ledger.append_checked
+
+        def twice(state, now, build):   # the carry is now written through append_checked (#1217 M1)
+            first = real(state, now, build)
+            if first.get("kind") == "carried":
+                real(state, now, lambda have, seq: dict(first))
+            return first
+        with mock.patch.object(sb.plan_ledger, "append_checked", twice):
+            with self.assertRaises(AssertionError):
+                self.test_S4_and_U2_a_second_run_writes_nothing_and_the_ledger_bytes_are_unchanged()
+
+    def test_M1_two_writers_racing_between_the_read_and_the_append_leave_one_carried_line(self):
+        self.proofs()
+        real = sb.plan_ledger.append_checked
+        state = {"raced": False}
+
+        def racing(st, now, build):   # a second writer gets in first, once, as it could between a read and an append
+            if not state["raced"]:
+                state["raced"] = True
+                self.step()
+            return real(st, now, build)
+        with mock.patch.object(sb.plan_ledger, "append_checked", racing):
+            self.step()
+        self.assertEqual(len(self.carried()), 3)
+        self.assertEqual(len({(c["proof"], c["old_head"], c["new_head"]) for c in self.carried()}), 3)
+
+    def test_M1_mutant_that_appends_outside_the_lock_fails(self):
+        real_checked, real_entry = sb.plan_ledger.append_checked, sb.plan_ledger.append_entry
+
+        def outside(st, now, build):   # the decision is not re-made under the lock
+            return real_entry(st, build([], 0), now)
+        with mock.patch.object(sb.plan_ledger, "append_checked", outside):
+            with self.assertRaises(AssertionError):
+                self.test_M1_two_writers_racing_between_the_read_and_the_append_leave_one_carried_line()
+
+    def no_ci_scenario(self):
+        plan = LEDGER_PLAN
+        return plan
+
+    def test_M2_a_plan_with_proofs_and_no_ci_scenario_carries_at_a_green_head(self):
+        self.proofs()
+        real = sb.ci_record_core
+
+        def no_ci(ctx, now, quiet=False):
+            ctx.plan = dict(ctx.plan, scenarios_parsed=[x for x in ctx.plan["scenarios_parsed"] if x.get("evaluator") != "ci"])
+            return real(ctx, now, quiet)
+        with mock.patch.object(sb, "ci_record_core", no_ci):
+            code, out, err = self.step()
+        self.assertEqual(code, 0, err)
+        self.assertIn("no per-PR scenario that names `ci`", out)
+        self.assertEqual(len(self.carried()), 3)
+        self.assertEqual(out.count("carried proof #"), 3)
+
+    def test_M2_mutant_that_carries_after_the_early_return_fails(self):
+        real = sb.carry_at_green
+
+        def late(ctx, now, get=None, green=True):
+            if not [x for x in ctx.plan["scenarios_parsed"] if x.get("evaluator") == "ci"]:
+                return []
+            return real(ctx, now, get, green)
+        with mock.patch.object(sb, "carry_at_green", late):
+            with self.assertRaises(AssertionError):
+                self.test_M2_a_plan_with_proofs_and_no_ci_scenario_carries_at_a_green_head()
+
+    def refusal_text(self, out, err):
+        return [l for l in (out + err).splitlines() if l.startswith("not carried")]
+
+    def test_M3_a_compare_of_300_files_is_refused_as_too_large(self):
+        self.proofs()
+        self.changed = ["f%d.py" % n for n in range(300)]
+        code, out, err = self.step()
+        self.assertEqual(self.carried(), [])
+        self.assertIn(sb.CARRY_TOO_LARGE, "\n".join(self.refusal_text(out, err)))
+
+    def test_M3_a_compare_flagged_truncated_is_refused_too(self):
+        self.proofs()
+        with self.assertRaises(sb.CarryRefused):
+            sb.carry_head_facts(lambda path: {"status": "ahead", "files": [], "truncated": True}, "acme/app", "a" * 40, self.NEW)
+
+    def not_a_descendant(self, status):
+        self.proofs()
+        self.status = status
+        code, out, err = self.step()
+        self.assertEqual(self.carried(), [])
+        self.assertIn(sb.CARRY_NOT_DESCENDANT % status, "\n".join(self.refusal_text(out, err)))
+
+    def test_M3_a_head_that_is_not_a_descendant_is_refused(self):
+        for status in ("diverged", "behind"):
+            with self.subTest(status=status):
+                self.tearDown()
+                self.setUp()
+                self.not_a_descendant(status)
+
+    def test_M3_ahead_with_few_files_carries_and_identical_too(self):
+        for status in ("ahead", "identical"):
+            self.tearDown()
+            self.setUp()
+            self.proofs()
+            self.status = status
+            self.assertEqual(self.step()[0], 0)
+            self.assertEqual(len(self.carried()), 3)
+
+    def test_M3_mutant_without_the_cap_guard_fails(self):
+        real = sb.CARRY_COMPARE_FILE_CAP
+        with mock.patch.object(sb, "CARRY_COMPARE_FILE_CAP", 10 ** 9):
+            with self.assertRaises(AssertionError):
+                self.test_M3_a_compare_of_300_files_is_refused_as_too_large()
+        self.assertEqual(sb.CARRY_COMPARE_FILE_CAP, real)
+
+    def test_M3_mutant_without_the_descendant_guard_fails(self):
+        real = sb.carry_head_facts
+
+        def lax(get, repo, old, new):
+            return real(lambda path: dict(get(path), status="ahead") if "/compare/%s...%s" % (old, new) in path else get(path), repo, old, new)
+        with mock.patch.object(sb, "carry_head_facts", lax):
+            with self.assertRaises(AssertionError):
+                self.not_a_descendant("diverged")
+
+    def test_M4_a_failed_read_writes_an_audit_line_naming_the_heads_and_the_read(self):
+        self.proofs()
+        self.parents = None
+        calls = []
+        real = sb._gates_audit
+        with mock.patch.object(sb, "_gates_audit", lambda eng, ev, subj, det: (calls.append((ev, subj, det)), real(eng, ev, subj, det))[1]):
+            orig = self.route
+            self.route = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "gh: boom") if argv[2:3] and "/commits/" in argv[2] else orig(argv, **kw)
+            code, out, err = self.step()
+        self.assertEqual(self.carried(), [])
+        got = [c for c in calls if c[0] == "gate.ci_record_carry"]
+        self.assertEqual(len(got), 1, calls)
+        self.assertEqual((got[0][1], got[0][2]["old_head"], got[0][2]["new_head"]), (self.PR, LEDGER_HEAD, self.NEW))
+        self.assertIn("commits", got[0][2]["read"])
+
+    def test_the_daemon_recording_and_the_command_share_the_one_call(self):
+        text = SWITCHBOARD.read_text(encoding="utf-8")
+        self.assertEqual(text.count("carry_at_green(ctx, now)"), 1)
+        self.assertEqual(text.count("got = ci_record_core("), 2)   # the command and the daemon pass: the only two writers of the `ci` verdicts at a head
+
+    def test_S7_the_documentation_names_the_step_and_the_line(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("## A proof carries to a new head")
+        section = text[start:text.index("\n## ", start + 5)]
+        self.assertEqual(section.count("`gates ci-record`"), 1)
+        self.assertIn("one line each", section)
+        self.assertIn("`carried`", section)
 
 
 class TestAskIssueSubject(unittest.TestCase):

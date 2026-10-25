@@ -1029,1066 +1029,6 @@ def derive_message_id(recipient, keys):
     return "msg_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:26]
 
 
-# ----------------------------------------------------------------- the audit
-
-SENSITIVE = ("token", "key", "password", "secret", "authorization")
-REDACTED = "[redacted]"
-
-
-def _sensitive(name):
-    lowered = str(name).lower()
-    # `keys` is the list of fact names a message covers (docs/switchboard.md
-    # §Data), such as `worker.idle:<session>:<time>`. It is the one thing the
-    # audit must show about a delivery, and it never holds a credential.
-    if lowered == "keys":
-        return False
-    return any(word in lowered for word in SENSITIVE)
-
-
-def redact(value):
-    """A copy of `value` with every credential-like key's value replaced."""
-    if isinstance(value, dict):
-        return {k: (REDACTED if _sensitive(k) else redact(v)) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [redact(v) for v in value]
-    return value
-
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-AUDIT_ROTATE_BYTES = 20 << 20    # the active audit file is rotated when an append finds it larger than this
-AUDIT_KEEP_SECONDS = 86400       # ... keeping the last day in the active file (and never more than three quarters of AUDIT_ROTATE_BYTES)
-AUDIT_ARCHIVE_DAYS = 14          # archives (audit-<UTC date>.jsonl.gz) older than this are deleted
-AUDIT_SYNC_SECONDS = 1.0         # fsync of a non-intent append at most this often (an `intent` is always synced: it must be on disk before the write it announces)
-_AUDIT_TS = re.compile(rb'"ts": "([^"]+)"')
-
-
-class AuditLog:
-    """Append-only JSON lines. Never read by a decision; written before and after.
-
-    Appenders open the file per write (O_APPEND) under a shared lock; a rotation archives the old part to
-    `audit-<UTC date>.jsonl.gz` (0600, written to a temp file and renamed), then takes the lock exclusively for the swap only, carries what was
-    appended meanwhile into the new active file and replaces the old one: no appended line is lost. An `intent` entry is fsynced before the write it announces; the
-    others at most once a second (a process crash loses nothing either way: the data is in the OS by `write`)."""
-
-    _synced = {}   # path -> monotonic time of the last fsync, shared by every AuditLog of the process
-    _failed = {}   # path -> (error text, monotonic time) of the last rotation failure said
-
-    def __init__(self, path):
-        self.path = Path(path)
-
-    def append(self, actor, event, subject=None, detail=None, **extra):
-        entry = {"ts": utc_now(), "actor": actor, "event": event,
-                 "subject": subject, "detail": redact(detail)}
-        entry.update(redact(extra))
-        line = json.dumps(entry, sort_keys=True, default=str) + "\n"
-        size = 0
-        with self._append_lock(fcntl.LOCK_SH):   # a rotation holds this exclusively for its swap only: no line is written to a file that is being replaced
-            fd = os.open(str(self.path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-            with os.fdopen(fd, "a") as handle:
-                handle.write(line)
-                handle.flush()
-                size = os.fstat(handle.fileno()).st_size
-                key, clock = str(self.path), time.monotonic()
-                if extra.get("phase") == "intent" or clock - AuditLog._synced.get(key, -1e9) >= AUDIT_SYNC_SECONDS:
-                    os.fsync(handle.fileno())
-                    AuditLog._synced[key] = clock
-        if size > AUDIT_ROTATE_BYTES:
-            try:
-                self.rotate()
-            except Exception as err:   # a rotation that fails is tried again at a later append and never fails this one; said once per change of error
-                self._say_rotation_failed(err)
-        return entry
-
-    @contextmanager
-    def _append_lock(self, mode):
-        """A flock on `audit.jsonl.append.lock` (shared for an append, exclusive for the swap). If the lock file cannot be had the write goes ahead without it."""
-        try:
-            fd = os.open(str(self.path.with_name(self.path.name + ".append.lock")), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        except OSError:
-            yield
-            return
-        with os.fdopen(fd, "w") as guard:
-            try:
-                fcntl.flock(guard, mode)
-            except OSError:
-                pass
-            yield
-
-    def _say_rotation_failed(self, err):
-        text = "%s: %s" % (type(err).__name__, _one_line(str(err), 120))
-        key, clock = str(self.path), time.monotonic()
-        said = AuditLog._failed.get(key)
-        if said is not None and said[0] == text and clock - said[1] < 3600:
-            return
-        AuditLog._failed[key] = (text, clock)
-        sys.stderr.write("%s: the audit log could not be rotated (%s); it keeps growing until it can\n" % (PROG, text))
-        try:
-            self.append(PROG, "audit.rotate_failed", None, {"error": text})
-        except Exception:
-            pass
-
-    def rotate(self, now=None):
-        """Archive the old part of the active file and keep the recent part. One rotator at a time (a lock file); another process that finds it
-        held skips. Returns the archive path, or None when there was nothing to do."""
-        now = time.time() if now is None else now
-        lock_path = self.path.with_name(self.path.name + ".rotate.lock")
-        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as guard:
-            try:
-                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                return None
-            archive = self._rotate_locked(now)
-            pruned = self._prune_archives(now)
-            if archive is not None or pruned:
-                self.append(PROG, "audit.rotated", None, {"archive": archive.name if archive else None, "pruned": pruned})
-            return archive
-
-    def _rotate_locked(self, now):
-        cutoff = datetime.fromtimestamp(now - AUDIT_KEEP_SECONDS, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-        try:
-            seen = self.path.stat().st_size
-        except OSError:
-            return None
-        if seen <= AUDIT_ROTATE_BYTES:
-            return None   # another process rotated first
-        floor = max(0, seen - AUDIT_ROTATE_BYTES * 3 // 4)   # never keep more than three quarters of the threshold (room to grow before the next rotation), whatever the clock says
-        stamp = datetime.fromtimestamp(now, timezone.utc)
-        archive = self.path.with_name("audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%d"))
-        if archive.exists():
-            archive = self.path.with_name("audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%dT%H%M%S"))
-        keep_temp = self.path.with_name("%s.%d.keep.tmp" % (self.path.name, os.getpid()))
-        placed = False
-        gz_temp = archive.with_name("%s.%d.tmp" % (archive.name, os.getpid()))
-        try:
-            offset, archived = 0, 0
-            with open(str(self.path), "rb") as source:
-                with os.fdopen(os.open(str(gz_temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "wb") as raw, \
-                        gzip.GzipFile(fileobj=raw, mode="wb", filename="") as packed, \
-                        os.fdopen(os.open(str(keep_temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "wb") as kept:
-                    keeping = False
-                    for line in source:
-                        if offset >= seen:
-                            break
-                        if not keeping:
-                            found = _AUDIT_TS.search(line)
-                            stamp_text = found.group(1).decode("ascii", "replace")[:19] if found else ""
-                            keeping = offset >= floor and (stamp_text >= cutoff or not found)
-                        offset += len(line)
-                        if keeping:
-                            kept.write(line)
-                        else:
-                            packed.write(line)
-                            archived += 1
-                    raw.flush()
-                    os.fsync(raw.fileno())
-                    kept.flush()
-                    os.fsync(kept.fileno())
-            if not archived:
-                os.unlink(str(gz_temp))
-                os.unlink(str(keep_temp))
-                return None
-            os.rename(str(gz_temp), str(archive))
-            placed = True
-            self._swap(keep_temp, offset)
-            return archive
-        except BaseException:
-            for temp in (gz_temp, keep_temp, archive if placed else None):   # a swap that failed leaves the log whole: its archive would be a duplicate of it
-                try:
-                    if temp is not None:
-                        os.unlink(str(temp))
-                except OSError:
-                    pass
-            raise
-
-    def _swap(self, keep_temp, offset):
-        """Carry what was appended after `offset` into the kept part, then put it in place of the active file."""
-        with self._append_lock(fcntl.LOCK_EX):   # no appender is mid-write while the tail is copied and the file replaced
-            with open(str(self.path), "rb") as source, open(str(keep_temp), "ab") as kept:
-                source.seek(offset)
-                while True:
-                    chunk = source.read(1 << 20)
-                    if not chunk:
-                        break
-                    kept.write(chunk)
-                kept.flush()
-                os.fsync(kept.fileno())
-            os.replace(str(keep_temp), str(self.path))
-
-    def _prune_archives(self, now):
-        """Delete the archives older than AUDIT_ARCHIVE_DAYS; the names of the ones deleted."""
-        horizon = now - AUDIT_ARCHIVE_DAYS * 86400
-        gone = []
-        for path in sorted(self.path.parent.glob("audit-*.jsonl.gz")):
-            try:
-                if path.stat().st_mtime < horizon:
-                    path.unlink()
-                    gone.append(path.name)
-            except OSError:
-                pass
-        return gone
-
-    @contextmanager
-    def external(self, actor, event, subject=None, detail=None):
-        """Audit one write to another system: `intent` before, `result` after.
-
-        Yields a dict the caller may fill with what came back; it becomes the
-        result entry's detail. An exception is recorded, then re-raised. A
-        SimulatedCrash is re-raised with nothing recorded, as a real crash.
-        """
-        call = uuid.uuid4().hex[:12]
-        self.append(actor, event, subject, detail, phase="intent", call=call)
-        outcome = {}
-        try:
-            yield outcome
-        except SimulatedCrash:
-            raise
-        except BaseException as err:
-            self.append(actor, event, subject, outcome or None, phase="result", call=call,
-                        ok=False, error="%s: %s" % (type(err).__name__, err))
-            raise
-        self.append(actor, event, subject, outcome or None, phase="result", call=call, ok=True)
-
-
-# ------------------------------------------------------------- OpenCode v2
-
-class V2Error(Exception):
-    """A v2 call that did not return usable JSON.
-
-    reason: "http" (v2 answered with an HTTP error), "exit" (non-zero exit, no
-    HTTP status), "timeout", "bad_json", "unavailable" (could not run), "too_large" (a reply over the cap), "refused" (a real run under the test suite) or "backoff" (an optional
-    read skipped while the service is slow).
-    """
-
-    def __init__(self, reason, status=None, detail=None):
-        self.reason = reason
-        self.status = status
-        self.detail = detail
-        text = reason if status is None else "%s %s" % (reason, status)
-        super().__init__("%s: %s" % (text, detail) if detail else text)
-
-
-def _one_line(text, limit=300):
-    return decision_core.one_line(text, limit)
-
-
-STATE_HEARTBEAT_SECONDS = 60   # a status file whose own timestamp is its liveness signal is rewritten at least this often, changed or not (`status` calls v2-calls stale past 120 s: a pass of 30 s fits twice)
-HEARTBEAT_HEALTH = STATE_HEARTBEAT_SECONDS * 8   # pane-health.json: 8 minutes (nothing reads its times as liveness)
-HEARTBEAT_SWEEP = STATE_HEARTBEAT_SECONDS * 4    # sweep.json and triage.json: 4 minutes (their `at` is shown as an absolute "as of")
-HEARTBEAT_PR_STATE = 300                         # pr-state.json: 5 minutes
-_STATE_LAST = {}               # path -> (stable text, monotonic time written): what this process last wrote
-
-
-def state_write(path, text, stable=None, heartbeat=None, fsync=False, nofollow=False):
-    """Write `text` to `path` (a private file: a temp file, mode 0600, renamed into place) ONLY WHEN IT CHANGED. Returns True when it wrote.
-
-    `stable` is the text to compare: the content without its volatile fields (a timestamp that moves every pass), default `text` itself.
-    The comparison is with what is on the DISK: the file's size and modification time are checked against what this process wrote (one stat), and
-    a file that changed meanwhile (an outside writer, `retire --undo`) is read and compared with what was written, so an external rewrite is
-    repaired at the next call, not at the heartbeat; a mere touch is not. A file that is missing is written. `heartbeat` (seconds) keeps a status
-    whose own timestamp is read as liveness fresh: it is rewritten when its last write is older than that. A write nobody needs costs the disk
-    a write, an fsync and a rename that every file watcher sees: about twenty files used to be rewritten every pass."""
-    path = Path(path)
-    key, clock = str(path), time.monotonic()
-    stable = text if stable is None else stable
-    last = _STATE_LAST.get(key)
-    try:
-        info = path.stat()
-        if last is not None and last[0] == stable and (heartbeat is None or clock - last[1] < heartbeat):
-            if (info.st_mtime_ns, info.st_size) == (last[3], last[4]):
-                return False
-            if path.read_text() == last[2]:   # touched, not rewritten: the content is what this process wrote
-                _STATE_LAST[key] = (last[0], last[1], last[2], info.st_mtime_ns, info.st_size)
-                return False
-            # the file is not what was written: an outside writer changed it; fall through and write it again
-        if last is None and heartbeat is None and info.st_size == len(text.encode("utf-8")) and path.read_text() == text:   # a file of another size is not even read
-            _STATE_LAST[key] = (stable, clock, text, info.st_mtime_ns, info.st_size)
-            return False
-    except OSError:
-        pass
-    temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
-    try:
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | (os.O_NOFOLLOW if nofollow else 0), 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(text)
-            if fsync:
-                handle.flush()
-                os.fsync(handle.fileno())
-        os.replace(str(temp), str(path))
-    except BaseException:
-        try:
-            os.unlink(str(temp))
-        except OSError:
-            pass
-        raise
-    try:
-        info = path.stat()
-        _STATE_LAST[key] = (stable, clock, text, info.st_mtime_ns, info.st_size)
-    except OSError:
-        _STATE_LAST.pop(key, None)
-    return True
-
-
-def _without(body, *names):
-    """`body` (a dict) as sorted JSON without the top-level `names`: the stable part of a status."""
-    return json.dumps({k: v for k, v in body.items() if k not in names}, sort_keys=True)
-
-
-CURSOR_LIMIT = 2000  # characters of one v2 cursor token we will pass back on an argv
-MAX_READ_PAGES = 12   # pages of SYNTHETIC_PAGE messages `delivered_keys` reads before it holds (600 messages, newest first, stopping at the first old enough)
-SYNTHETIC_PAGE = 50   # messages of one such read: a long history never answers a big page
-DESCRIPTION_MAX = 200  # characters of the one line v2's TUI shows for a synthetic message (PR 13)
-
-
-def valid_description(text):
-    return isinstance(text, str) and bool(text.strip()) and len(text) <= DESCRIPTION_MAX \
-        and "\n" not in text and "\r" not in text
-
-
-V2_CALLS_KEEP_SECONDS = 600   # how long a call is remembered, for the calls-per-minute figures
-V2_CALLS_KEEP_MAX = 50000     # and how many at most (a runaway cannot grow the list without bound)
-UNDER_TEST_ENV = "FLEET_SWITCHBOARD_UNDER_TEST"   # set by the test suite: the real opencode is then never run
-ALLOW_REAL_V2_ENV = "FLEET_SWITCHBOARD_ALLOW_REAL_V2"   # =1: a test that really means to talk to a service says so
-
-
-def refuse_real_opencode_under_test(runner, binary):
-    """Under the test suite, a call that would really run `opencode` (the real `subprocess.run`) is refused: a test that reached the live
-    service once helped take it down (tens of thousands of spawns). A fake runner is unaffected, and so is a test that says
-    FLEET_SWITCHBOARD_ALLOW_REAL_V2=1."""
-    if os.environ.get(UNDER_TEST_ENV) == "1" and os.environ.get(ALLOW_REAL_V2_ENV) != "1" and runner is subprocess.run:
-        raise V2Error("refused", None, "refusing to run the real %s under the test suite (set %s=1 to allow it in a test that means to)"
-                      % (binary, ALLOW_REAL_V2_ENV))
-
-
-# ---------------------------------------------------------------- the v2 transport: HTTP to the background service, and backpressure
-#
-# `opencode api <op>` starts a whole process per call (0.13 to 1.5 s measured, against 5 to 17 ms for the same call over HTTP, with identical
-# JSON). The background service writes its address and password to `<state>/opencode/service.json` (mode 0600); the daemon talks to it directly
-# over loopback, keeps one connection alive for reads, and falls back to the CLI on ANY trouble with the HTTP route (the CLI also starts a
-# stopped service, so the fallback is also the recovery). Writes use a fresh connection and are never replayed after they may have been
-# received. The password is sent only to a loopback address and is never logged, audited, printed or put in an error.
-# The operation table was read from the service's own /openapi.json (OpenCode 2.0.24); an operation not in it, or a path parameter it does not
-# know, goes through the CLI. FLEET_SWITCHBOARD_V2_CLI=1 turns the HTTP route off.
-#
-# Backpressure: V2Breaker watches the latency of every call. When calls are slow (p95 over V2_SLOW_SECONDS) or time out in a row it opens for an
-# exponentially growing time (V2_BACKOFF_BASE .. V2_BACKOFF_MAX): OPTIONAL reads are skipped (V2Error "backoff": the callers already hold on a
-# V2Error) while writes and the reads a delivery or a blocked worker needs go on; it resumes gradually (one probe at a time, V2_RECOVER_OK good
-# probes to close). Fail mode: OPEN for essential calls on purpose (a wake must not be lost to a slow service), closed for optional reads.
-
-V2_HTTP_OPERATIONS = {   # operation -> (method, path template, path parameters, query parameters)
-    "server.info": ("GET", "/api/info", (), ()),
-    "session.active": ("GET", "/api/session/active", (), ()),
-    "session.create": ("POST", "/api/session", (), ()),
-    "session.get": ("GET", "/api/session/{sessionID}", ("sessionID",), ()),
-    "session.remove": ("DELETE", "/api/session/{sessionID}", ("sessionID",), ()),
-    "session.list": ("GET", "/api/session", (), ("limit", "order", "search", "parentID", "directory", "project", "subpath", "cursor")),
-    "session.message.list": ("GET", "/api/session/{sessionID}/message", ("sessionID",), ("limit", "order", "cursor", "type")),
-    "session.inbox.list": ("GET", "/api/session/{sessionID}/inbox", ("sessionID",), ()),
-    "session.inbox.update": ("PATCH", "/api/session/{sessionID}/inbox/{inboxID}", ("sessionID", "inboxID"), ()),
-    "session.interrupt": ("POST", "/api/session/{sessionID}/interrupt", ("sessionID",), ("resume",)),
-    "session.permission.list": ("GET", "/api/session/{sessionID}/permission", ("sessionID",), ()),
-    "session.permission.reply": ("POST", "/api/session/{sessionID}/permission/{requestID}/reply", ("sessionID", "requestID"), ()),
-    "session.form.list": ("GET", "/api/session/{sessionID}/form", ("sessionID",), ()),
-    "session.form.reply": ("POST", "/api/session/{sessionID}/form/{formID}/reply", ("sessionID", "formID"), ()),
-    "session.prompt": ("POST", "/api/session/{sessionID}/prompt", ("sessionID",), ()),
-    "session.synthetic": ("POST", "/api/session/{sessionID}/synthetic", ("sessionID",), ()),
-    "experimental.session.import": ("POST", "/api/experimental/session/import", (), ()),
-}
-V2_ESSENTIAL_READS = ("session.get", "session.inbox.list", "session.permission.list", "session.form.list")   # discovery and the re-check before a write (session.get), a delivery and a blocked worker need these
-V2_SERVICE_FILE_MAX = 4096        # bytes of service.json read
-V2_HTTP_MAX_BODY = 16 * 1024 * 1024   # a reply larger than this is refused, not buffered (a transcript is read in bounded pages anyway)
-V2_READ_LIMIT_MAX = 500           # messages per page, whatever a caller asks
-V2_STREAM_LINE_MAX = 1024 * 1024  # one event line of the stream; a larger one is refused
-V2_STREAM_IDLE_SECONDS = 1800     # a stream that said nothing for this long is dropped and opened again (the service sends no keep-alive); that reopen is NOT a gap
-STREAM_OPENED = object()          # what stream_lines yields once the service answered
-STREAM_IDLE = object()            # what it yields when it ends because the stream was quiet for the whole idle time (the next open is not a gap)
-V2_SLOW_SECONDS = 8.0             # p95 of the recent calls above this opens the breaker
-V2_SLOW_MIN_SAMPLES = 8
-V2_SLOW_WINDOW = 20
-V2_TIMEOUT_STREAK = 3             # timeouts in a row that open it
-V2_BACKOFF_BASE = 10.0
-V2_BACKOFF_MAX = 300.0
-V2_RECOVER_OK = 3                 # good probes in a row that close it
-V2_LINK_STATUS_FILE = "v2-link.json"
-V2_LINK_WRITE_SECONDS = 60
-
-
-class V2Unreachable(Exception):
-    """The HTTP route cannot serve this call (no service file, a stale one, refused, a bad password twice): the caller uses the CLI."""
-
-
-def v2_service_file(env):
-    base = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local", "state")
-    return Path(base) / "opencode" / "service.json"
-
-
-class V2Http:
-    """One keep-alive connection for reads to the OpenCode service; see the section comment."""
-
-    def __init__(self, service_file, timeout, alive=None, connect=None):
-        self.file = Path(service_file)
-        self.timeout = timeout
-        self.alive = alive or self._pid_alive
-        self.connect = connect or http.client.HTTPConnection   # (host, port, timeout=) -> a connection; a test passes an in-memory one
-        self._info = None        # (host, port, authorization) once read; never logged
-        self._conn = None
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def _pid_alive(pid):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            return True   # not ours to signal, so it exists
-        return True
-
-    def base_url(self):
-        """`http://host:port` of the service (never the password), or None when the service file cannot be read."""
-        with self._lock:
-            try:
-                if self._info is None:
-                    self._load()
-                host, port, _ = self._info
-                return "http://%s:%d" % (host if ":" not in host else "[%s]" % host, port)
-            except Exception:
-                return None
-
-    def _read_file(self):
-        """(host, port, password, pid) of the service file, read with every safety check. Raises V2Unreachable."""
-        try:
-            parent = os.lstat(str(self.file.parent))
-            if parent.st_uid != os.getuid() or parent.st_mode & 0o022 or stat.S_ISLNK(parent.st_mode):
-                raise ValueError("the directory is not the user's own and closed to others")   # whoever can write the directory can swap the file
-            fd = os.open(str(self.file), os.O_RDONLY | os.O_NOFOLLOW)   # a symlink is refused, not followed
-            with os.fdopen(fd, "rb") as handle:
-                found = os.fstat(handle.fileno())
-                if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
-                    raise ValueError("not private to this user")   # the password in it is only trusted from a file only this user could write
-                raw = handle.read(V2_SERVICE_FILE_MAX + 1)
-            if len(raw) > V2_SERVICE_FILE_MAX:
-                raise ValueError("too large")
-            found = json.loads(raw.decode("utf-8"))
-            url = urllib.parse.urlsplit(found["url"])
-            password, pid = found["password"], found.get("pid")
-            if url.scheme != "http" or url.hostname not in ("127.0.0.1", "::1") or not url.port:
-                raise ValueError("not a loopback http address")   # the password goes nowhere else
-            if not isinstance(password, str) or not 0 < len(password) <= 512 or re.search(r"[\x00-\x1f\x7f]", password):
-                raise ValueError("no usable password")
-            host, port = url.hostname, url.port
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            raise V2Unreachable("no usable service file") from None
-        return host, port, password, pid
-
-    def service_identity(self):
-        """The service's process id from a FRESH read of its private service file (a restart changes it), or None when the file cannot be read or names a
-        process that is gone. Nothing is cached and the password is never returned."""
-        try:
-            pid = self._read_file()[3]
-        except V2Unreachable:
-            return None
-        return pid if isinstance(pid, int) and not isinstance(pid, bool) and self.alive(pid) else None
-
-    def _load(self):
-        host, port, password, pid = self._read_file()
-        if isinstance(pid, int) and not self.alive(pid):
-            raise V2Unreachable("the service file names a process that is gone")
-        token = base64.b64encode(("opencode:" + password).encode("utf-8")).decode("ascii")
-        self._info = (host, port, "Basic " + token)
-
-    def stream_lines(self, path, idle_seconds=V2_STREAM_IDLE_SECONDS):
-        """STREAM_OPENED once the service answered 200, then the lines of one SSE response (decoded, newline stripped), read on its OWN connection (never
-        under the request lock). A quiet stretch of `idle_seconds` (the service sends no keep-alive) ends the generator like a closed stream. Raises V2Unreachable
-        (no service, a refused connection, a password refused: use the old reads) or V2Error (any other status)."""
-        with self._lock:
-            if self._info is None:
-                self._load()
-            host, port, auth = self._info
-        conn = self.connect(host if ":" not in host else "[%s]" % host, port, timeout=idle_seconds)
-        try:
-            try:
-                conn.connect()
-                conn.request("GET", path, headers={"Authorization": auth, "Accept": "text/event-stream"})
-                response = conn.getresponse()
-            except (OSError, http.client.HTTPException):
-                with self._lock:
-                    self._info = None   # it may have moved (a restart on a new port): read the file again at the next connect, as `request` does
-                raise V2Unreachable("the service does not answer") from None
-            if response.status == 401:
-                with self._lock:
-                    self._info = None   # the password changed: read the file again at the next connect
-                raise V2Unreachable("the service refused the password")
-            if response.status != 200:
-                raise V2Error("http", response.status, "the event stream answered HTTP %d" % response.status)
-            yield STREAM_OPENED   # the service answered 200: only now is this a connection
-            while True:
-                try:
-                    raw = response.readline(V2_STREAM_LINE_MAX + 1)
-                except socket.timeout:
-                    yield STREAM_IDLE   # quiet for the whole idle time: ours to end, not the service's; the caller may reopen without marking a gap
-                    return
-                except (OSError, http.client.HTTPException):
-                    return   # a read timeout included: a response is not read on after a timeout (the socket refuses), so it ends and the caller reconnects
-                if not raw:
-                    return
-                if len(raw) > V2_STREAM_LINE_MAX:
-                    raise V2Error("too_large", None, "an event line over %d bytes was refused" % V2_STREAM_LINE_MAX)
-                yield raw.decode("utf-8", "replace").rstrip("\r\n")
-        finally:
-            try:
-                conn.close()
-            except OSError:
-                pass
-
-    def close(self):
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            try:
-                conn.close()
-            except OSError:
-                pass
-
-    def request(self, method, target, body=None):
-        """(status, text). Raises V2Unreachable (use the CLI) or V2Error (timeout, too large, or a write whose fate is unknown)."""
-        with self._lock:
-            for attempt in (0, 1):
-                if self._info is None:
-                    self._load()
-                try:
-                    return self._once(method, target, body)
-                except _V2Unauthorized:
-                    self._info = None   # the service restarted with a new password: read the file again, once
-                    self.close()
-                    if attempt:
-                        raise V2Unreachable("the service refused the password twice") from None
-                except V2Error:
-                    raise
-                except (OSError, http.client.HTTPException) as err:
-                    self.close()
-                    if isinstance(err, socket.timeout):
-                        raise V2Error("timeout", None, "no answer within %ss" % self.timeout) from None
-                    if method != "GET" and getattr(err, "sent", True):
-                        raise V2Error("unavailable", None, "the service dropped a %s (it may or may not have been received)" % method) from None
-                    self._info = None   # it may have moved: read the file again, once
-                    if attempt:
-                        raise V2Unreachable("the service does not answer") from None
-        raise V2Unreachable("the service does not answer")
-
-    @staticmethod
-    def _budget(conn, deadline):
-        """Give the socket only the time the call has left (connect, send, status line, headers and body all share ONE deadline); none left is a timeout."""
-        left = deadline - time.monotonic()
-        if left <= 0:
-            raise socket.timeout("the call did not finish within its total time")
-        sock = getattr(conn, "sock", None)
-        if sock is not None and hasattr(sock, "settimeout"):
-            sock.settimeout(left)
-
-    @staticmethod
-    def _read_body(response, conn, deadline):
-        """The whole reply body, at most V2_HTTP_MAX_BODY + 1 bytes, within a TOTAL deadline: each socket operation has its own timeout, so a service
-        that answers a byte at a time could otherwise hold the one client far longer than `timeout`."""
-        chunks, size = [], 0
-        while size <= V2_HTTP_MAX_BODY:
-            V2Http._budget(conn, deadline)
-            chunk = response.read(min(65536, V2_HTTP_MAX_BODY + 1 - size))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-        return b"".join(chunks)
-
-    def _once(self, method, target, body):
-        deadline = time.monotonic() + self.timeout
-        host, port, auth = self._info
-        reuse = method == "GET" and self._conn is not None
-        conn = self._conn if reuse else self.connect(host if ":" not in host else "[%s]" % host, port, timeout=self.timeout)
-        headers = {"Authorization": auth, "Accept": "application/json"}
-        data = None
-        if body is not None:
-            data = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        sent = False
-        try:
-            if conn.sock is None:
-                conn.connect()
-            sent = True   # from here on a write may have reached the service
-            self._budget(conn, deadline)
-            conn.request(method, target, body=data, headers=headers)
-            self._budget(conn, deadline)
-            response = conn.getresponse()
-            raw = self._read_body(response, conn, deadline)
-        except (OSError, http.client.HTTPException) as err:
-            try:
-                conn.close()
-            except OSError:
-                pass
-            if conn is self._conn:
-                self._conn = None
-            err.sent = sent
-            raise
-        if len(raw) > V2_HTTP_MAX_BODY:
-            conn.close()
-            self._conn = None
-            raise V2Error("too_large", None, "a reply over %d bytes was refused" % V2_HTTP_MAX_BODY)
-        if response.status == 401:
-            conn.close()
-            self._conn = None
-            raise _V2Unauthorized()
-        if method == "GET" and not response.will_close:
-            self._conn = conn
-        else:
-            conn.close()
-            if conn is self._conn:
-                self._conn = None
-        return response.status, raw.decode("utf-8", "replace")
-
-
-class _V2Unauthorized(Exception):
-    pass
-
-
-class V2Breaker:
-    """Latency-driven backoff for the calls to the service (see the section comment). `allows(essential)` returns False (skip the call), True, or
-    "probe" (go, and tell `record` or `abandon` it was the probe); `record(seconds, timed_out, probe)` returns an event or None:
-    {"event": "v2.backoff", "episode", "reason", "seconds"} when it opens, {"event": "v2.resume", "episode"} when it closes. One lock guards all
-    of it: the daemon has threads and one client."""
-
-    def __init__(self, clock=time.monotonic):
-        self.clock = clock
-        self.lock = threading.Lock()
-        self.samples = []
-        self.timeouts = 0
-        self.state = "closed"      # closed | open (waiting) | probing
-        self.until = 0.0
-        self.level = 0
-        self.good = 0
-        self.episode = 0
-        self.skipped = 0
-        self.probe_out = False
-
-    def p95(self):
-        with self.lock:
-            return self._p95()
-
-    def _p95(self):
-        if not self.samples:
-            return None
-        ordered = sorted(self.samples)
-        return ordered[min(len(ordered) - 1, int(math.ceil(0.95 * len(ordered))) - 1)]
-
-    def allows(self, essential):
-        """Whether this call may go now. Essential calls always may; an optional one waits out the backoff, then one probe at a time."""
-        with self.lock:
-            if self.state == "closed":
-                return True
-            if essential:
-                return True
-            if self.state == "open" and self.clock() >= self.until and not self.probe_out:
-                self.state, self.probe_out = "probing", True
-                return "probe"
-            if self.state == "probing" and not self.probe_out:
-                self.probe_out = True
-                return "probe"
-            self.skipped += 1
-            return False
-
-    def abandon(self):
-        """The probe call ended in something that is not an answer or a timeout (a bug, an interrupt): free the probe slot, learn nothing."""
-        with self.lock:
-            self.probe_out = False
-
-    def record(self, seconds, timed_out, probe=False):
-        with self.lock:
-            return self._record(seconds, timed_out, probe)
-
-    def _record(self, seconds, timed_out, probe):
-        slow = timed_out or seconds > V2_SLOW_SECONDS
-        if probe and self.state == "probing":
-            self.probe_out = False
-            if slow:
-                self.level += 1
-                self.state, self.good, self.until = "open", 0, self.clock() + self._wait()
-                return {"event": "v2.backoff", "episode": self.episode, "reason": "a probe was slow or timed out", "seconds": int(self._wait())}
-            self.good += 1
-            if self.good >= V2_RECOVER_OK:
-                self.state, self.level, self.good, self.samples, self.timeouts = "closed", 0, 0, [], 0
-                return {"event": "v2.resume", "episode": self.episode}
-            return None
-        self.samples = (self.samples + [seconds])[-V2_SLOW_WINDOW:]
-        self.timeouts = self.timeouts + 1 if timed_out else 0
-        if self.state != "closed":
-            return None   # an essential call during a backoff: it is recorded, it changes nothing (and is never mistaken for the probe)
-        reason = None
-        if self.timeouts >= V2_TIMEOUT_STREAK:
-            reason = "%d calls in a row timed out" % self.timeouts
-        elif len(self.samples) >= V2_SLOW_MIN_SAMPLES and self._p95() > V2_SLOW_SECONDS:
-            reason = "p95 latency %.1f s is over %g s" % (self._p95(), V2_SLOW_SECONDS)
-        if reason is None:
-            return None
-        self.episode += 1
-        self.level, self.good, self.state = 0, 0, "open"
-        self.until = self.clock() + self._wait()
-        return {"event": "v2.backoff", "episode": self.episode, "reason": reason, "seconds": int(self._wait())}
-
-    def _wait(self):
-        return min(V2_BACKOFF_MAX, V2_BACKOFF_BASE * (2 ** self.level))
-
-
-class V2Client:
-    """The one client for OpenCode v2. A call goes over HTTP to the background service when it can (see the transport section above), else
-    through `<binary> api <operation>`; every call is counted (one record, with its transport) and timed by the breaker."""
-
-    DELIVERIES = ("queue", "steer")
-    ORDERS = ("desc", "asc")
-
-    def __init__(self, binary, env=None, runner=subprocess.run, timeout=20, clock=time.time, http=None, monotonic=time.monotonic, transport="auto"):
-        self.binary = binary
-        self.env = dict(env or {})
-        self.runner = runner
-        self.timeout = timeout
-        self.clock = clock
-        self.monotonic = monotonic   # durations of calls, for the breaker: never the wall clock
-        self.breaker = V2Breaker(monotonic)
-        self.on_event = None      # callable(name, detail): the engine's audit of `v2.backoff` and `v2.resume`
-        self.state_dir = None     # set for the daemon: where `v2-link.json` (what `status` shows) is written
-        self.calls = collections.deque(maxlen=V2_CALLS_KEEP_MAX)   # (time, operation, transport) of the last V2_CALLS_KEEP_SECONDS (and at most V2_CALLS_KEEP_MAX): the calls-per-minute figures
-        self.calls_lock = threading.Lock()   # the daemon has threads (the judge socket, the forwarders): one list, one lock
-        self.count_errors = 0   # accounting that failed; a call never fails for it
-        self._link_written = 0.0
-        self._link_lock = threading.Lock()
-        if http is None and transport == "auto" and runner is subprocess.run and os.environ.get("FLEET_SWITCHBOARD_V2_CLI") != "1" and os.access(str(binary), os.X_OK):
-            merged = dict(os.environ)
-            merged.update(self.env)
-            http = V2Http(v2_service_file(merged), timeout)   # a real run only: a fake runner stands for the CLI
-        self.http = http
-
-    def count_call(self, operation, transport="cli"):
-        """Remember one call and the way it travelled ("http", "cli", or "cli-fallback": the CLI after the HTTP route could not serve it).
-        NEVER raises: accounting is evidence, a v2 call must not fail because of it."""
-        try:
-            now = self.clock()
-            with self.calls_lock:
-                self.calls.append((now, operation, transport))
-                while self.calls and self.calls[0][0] < now - V2_CALLS_KEEP_SECONDS:
-                    self.calls.popleft()
-        except Exception:
-            self.count_errors += 1
-
-    def _recent(self, window, now):
-        now = self.clock() if now is None else now
-        with self.calls_lock:
-            remembered = list(self.calls)
-        return [call for call in remembered if call[0] >= now - window]
-
-    def calls_by_operation(self, window=60.0, now=None):
-        """{operation: calls} over the last `window` seconds (this process's own calls, whatever the transport)."""
-        return dict(collections.Counter(call[1] for call in self._recent(window, now)))
-
-    def calls_by_transport(self, window=60.0, now=None):
-        """{transport: calls} over the last `window` seconds: how many went over HTTP, through the CLI, or through the CLI after a fallback."""
-        return dict(collections.Counter(call[2] for call in self._recent(window, now)))
-
-    def _call(self, operation, params=None, data=None, envelope=False):
-        refuse_real_opencode_under_test(self.runner, self.binary)
-        ticket = self.breaker.allows(self._is_essential(operation, params))
-        if not ticket:
-            raise V2Error("backoff", None, "%s skipped: the service is slow, optional reads wait (v2.backoff)" % operation)
-        started = self.monotonic()
-        try:
-            text = self._transport(operation, params, data)
-        except V2Error as err:
-            self._record(self.monotonic() - started, err.reason == "timeout", ticket == "probe")
-            raise
-        except BaseException:
-            if ticket == "probe":
-                self.breaker.abandon()   # not an answer: free the probe slot, or optional reads would wait for ever
-            raise
-        self._record(self.monotonic() - started, False, ticket == "probe")
-        return self._decode(operation, text, envelope)
-
-    def _is_essential(self, operation, params=None):
-        spec = V2_HTTP_OPERATIONS.get(operation)
-        if spec is None or spec[0] != "GET" or operation in V2_ESSENTIAL_READS:
-            return True
-        return operation == "session.message.list" and (params or {}).get("type") in ("synthetic", "user")   # the delivery rule's key read, and the person-is-typing read every observation (so every re-check before a write) makes
-
-    def _record(self, seconds, timed_out, probe=False):
-        event = self.breaker.record(seconds, timed_out, probe)
-        if event is not None and self.on_event is not None:
-            try:
-                self.on_event(event["event"], {k: v for k, v in event.items() if k != "event"})
-            except Exception:   # an audit trouble never fails a call, but it is counted
-                self.count_errors += 1
-        self._write_link(event is not None)
-
-    def _write_link(self, forced=False):
-        """What `status` shows of the link, written by the daemon only, at most once a minute unless the breaker changed."""
-        if self.state_dir is None:
-            return
-        with self._link_lock:   # the daemon has threads: one writer at a time, and the once-a-minute check is part of it
-            self._write_link_locked(forced)
-
-    def _write_link_locked(self, forced):
-        moment = self.clock()
-        if not forced and moment - self._link_written < V2_LINK_WRITE_SECONDS:
-            return
-        self._link_written = moment
-        by = self.calls_by_transport(V2_CALLS_KEEP_SECONDS)
-        body = {"at": int(moment), "transport": "http" if self.http is not None else "cli",
-                "fallbacks": by.get("cli-fallback", 0), "skipped": self.breaker.skipped,
-                "breaker": self.breaker.state, "episodes": self.breaker.episode,
-                "p95_ms": None if self.breaker.p95() is None else int(self.breaker.p95() * 1000)}
-        try:
-            state_write(Path(self.state_dir) / V2_LINK_STATUS_FILE, json.dumps(body, sort_keys=True), _without(body, "at"), STATE_HEARTBEAT_SECONDS)
-        except OSError:
-            self.count_errors += 1   # a status line is best effort; the failure is counted, and the line shows its own age
-
-    def _transport(self, operation, params, data):
-        """The reply text of one call: over HTTP when the service answers, else through the CLI (which also starts a stopped service)."""
-        spec = V2_HTTP_OPERATIONS.get(operation)
-        if self.http is not None and spec is not None:
-            target = self._target(spec, params)
-            if target is not None:
-                try:
-                    status, text = self.http.request(spec[0], target, data)
-                except V2Unreachable:
-                    self.count_call(operation, "cli-fallback")   # the HTTP route reached nothing: the CLI call is the one that counts
-                    return self._cli(operation, params, data)
-                except V2Error:
-                    self.count_call(operation, "http")           # it reached the service (a timeout, a refused size, a dropped write)
-                    raise
-                self.count_call(operation, "http")
-                if status >= 400:
-                    raise V2Error("http", status, _one_line(text) or "HTTP %d" % status)
-                return text
-        self.count_call(operation, "cli")
-        return self._cli(operation, params, data)
-
-    @staticmethod
-    def _target(spec, params):
-        """The request path and query of one call, or None when a parameter is one the table does not know (then the CLI decides)."""
-        method, template, path_names, query_names = spec
-        given = {name: value for name, value in (params or {}).items() if value is not None}
-        if set(given) - set(path_names) - set(query_names) or any(name not in given for name in path_names):
-            return None
-        path = template
-        for name in path_names:
-            path = path.replace("{%s}" % name, urllib.parse.quote(str(given[name]), safe=""))
-        query = [(name, str(given[name])) for name in query_names if name in given]
-        return path + ("?" + urllib.parse.urlencode(query) if query else "")
-
-    def _cli(self, operation, params, data):
-        argv = [self.binary, "api", operation]
-        for name, value in (params or {}).items():
-            if value is not None:
-                argv += ["--param", "%s=%s" % (name, value)]
-        if data is not None:
-            argv += ["-d", json.dumps(data, separators=(",", ":"), sort_keys=True)]
-        env = dict(os.environ)
-        env.update(self.env)
-        env.update(NO_CREDENTIAL_DIALOG_ENV)   # #1050: the service and a headless worker's tools never open a credential dialog
-        # OpenCode v2's `api` command loses the end of a large reply when it writes to a pipe and exits
-        # (a real 500 KB transcript arrived cut at 293 KB, inside a string, and every read failed with
-        # bad_json). Into a file the reply is whole, so the reply goes to a file and is read back.
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as sink:
-            try:
-                result = self.runner(argv, stdout=sink, stderr=subprocess.PIPE, text=True, timeout=self.timeout,
-                                     env=env, stdin=subprocess.DEVNULL)
-            except subprocess.TimeoutExpired:
-                raise V2Error("timeout", None, "%s did not answer within %ss" % (operation, self.timeout)) from None
-            except OSError as err:
-                raise V2Error("unavailable", None, "cannot run %s: %s" % (self.binary, err.strerror or err)) from None
-            stdout = result.stdout
-            if stdout is None:  # a real run wrote to the file
-                sink.seek(0)
-                stdout = sink.read()
-        stdout = stdout or ""
-        stderr = result.stderr or ""
-        if result.returncode != 0:
-            match = re.search(r"\bHTTP (\d{3})\b", stderr)
-            if match:
-                # v2 put the error body on stdout and `HTTP <code> <reason>` on stderr.
-                raise V2Error("http", int(match.group(1)), _one_line(stdout) or _one_line(stderr))
-            raise V2Error("exit", None, _one_line(stderr) or _one_line(stdout) or "exit %d" % result.returncode)
-        return stdout
-
-    @staticmethod
-    def _decode(operation, stdout, envelope):
-        if not (stdout or "").strip():
-            return None
-        try:
-            body = json.loads(stdout)
-        except ValueError:
-            raise V2Error("bad_json", None, "%s returned non-JSON: %s" % (operation, _one_line(stdout, 120))) from None
-        if isinstance(body, dict) and "data" in body:
-            return body if envelope else body["data"]  # PR 8: paging needs the cursor beside the data
-        return body
-
-    @staticmethod
-    def _limit(limit):
-        """A page of a transcript is never larger than V2_READ_LIMIT_MAX messages, whatever a caller asks."""
-        return min(limit, V2_READ_LIMIT_MAX) if isinstance(limit, int) and not isinstance(limit, bool) else limit
-
-    def service_identity(self):
-        """The service's process id (changes when it restarts), or None (the CLI transport, no readable service file, or the process is gone)."""
-        return self.http.service_identity() if self.http is not None and hasattr(self.http, "service_identity") else None
-
-    def service_url(self):
-        """Where the service is, `http://127.0.0.1:<port>`, or None (the CLI transport, or no readable service file)."""
-        return self.http.base_url() if self.http is not None and hasattr(self.http, "base_url") else None
-
-    def server_info(self):
-        return self._call("server.info")
-
-    def session_create(self, agent, title, directory, metadata, permissions=None):
-        if not os.path.isabs(directory):
-            raise ValueError("directory must be absolute: %r" % directory)
-        data = {"agent": agent, "title": title, "location": {"directory": directory},
-                "metadata": metadata}
-        if permissions is not None:
-            data["permissions"] = permissions
-        return self._call("session.create", data=data)
-
-    def session_get(self, session_id):
-        return self._call("session.get", {"sessionID": session_id})
-
-    def session_active(self):
-        return self._call("session.active")
-
-    def session_remove(self, session_id):
-        """`session.remove`: delete a session (DELETE /api/session/{sessionID}, an empty answer; 404 SessionNotFoundError when it is gone).
-        Used only to undo a launch that failed after it created its session."""
-        return self._call("session.remove", {"sessionID": session_id})
-
-    def message_list(self, session_id, limit=None, order=None, type=None, cursor=None):
-        if order is not None and order not in self.ORDERS:
-            raise ValueError("order must be one of %s" % ", ".join(self.ORDERS))
-        return self._call("session.message.list", {
-            "sessionID": session_id, "limit": self._limit(limit), "order": order, "type": type, "cursor": cursor})
-
-    def message_page(self, session_id, limit=None, type=None, cursor=None):
-        """PR 8: one page of `session.message.list` with its cursor: (messages, cursor).
-
-        `cursor` is v2's `{"previous": .., "next": ..}` object, or None when the
-        answer carries none. A cursor argument is v2's opaque token and fixes the
-        order, so no `order` is taken here (v2: do not combine them).
-        """
-        if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > CURSOR_LIMIT):
-            raise ValueError("cursor must be v2's opaque token (a non-empty string), got %r" % (cursor,))
-        body = self._call("session.message.list", {
-            "sessionID": session_id, "limit": self._limit(limit), "type": type, "cursor": cursor}, envelope=True)
-        if isinstance(body, dict):
-            found = body.get("cursor")
-            return (body["data"] if isinstance(body.get("data"), list) else []), \
-                (found if isinstance(found, dict) else None)
-        return (body if isinstance(body, list) else []), None
-
-    def message_pages(self, session_id, limit, type=None, max_pages=1):
-        """PR 8: the pages of one listing, newest first, following `cursor.next`.
-
-        UNVERIFIED: that `next` moves to older messages in a newest-first
-        listing; the Lab's paging spike must show it. Yields (messages, more):
-        `more` is True while v2 names a next cursor, False when it says there is
-        none, None when the answer carries no cursor at all. The walk ends after
-        a False or None, or after `max_pages`. A continuation that is empty or
-        repeats a message already seen means the cursor does not walk the
-        listing as assumed: that raises, and the caller holds.
-        """
-        cursor, seen = None, set()
-        for number in range(max_pages):
-            page, found = self.message_page(session_id, limit, type, cursor)
-            ids = [m.get("id") for m in page if isinstance(m, dict)]
-            if number and not page:
-                # v2 names a `next` cursor even when the page it just gave held the whole listing (measured:
-                # 104 messages at limit 200); following it answers an empty page. That is the end, not a
-                # cursor that fails to walk older.
-                yield [], False
-                return
-            if number and any(i in seen for i in ids):
-                raise V2Error("bad_json", None, "session.message.list: the next page repeated "
-                                                "a message; the cursor does not walk older as assumed")
-            seen.update(ids)
-            cursor = found.get("next") if found else None
-            more = None if found is None else bool(cursor)
-            yield page, more
-            if not more:
-                return
-
-    def synthetic(self, session_id, text, metadata, resume, delivery, message_id, description=None):
-        """`description` is the one human line the TUI shows for this message (`session.synthetic` takes it,
-        measured in PR 13): at most DESCRIPTION_MAX characters, one line. Every message the switchboard writes
-        carries one."""
-        if description is not None and not valid_description(description):
-            raise ValueError("description must be one non-empty line of at most %d characters: %r"
-                             % (DESCRIPTION_MAX, description))
-        if not isinstance(resume, bool):
-            raise ValueError("resume must be true or false")
-        if delivery not in self.DELIVERIES:
-            raise ValueError("delivery must be one of %s" % ", ".join(self.DELIVERIES))
-        if not isinstance(message_id, str) or not message_id.startswith("msg_"):
-            raise ValueError("message id must start with msg_: %r" % message_id)
-        body = {"id": message_id, "text": text, "metadata": metadata, "resume": resume, "delivery": delivery}
-        if description is not None:
-            body["description"] = description
-        return self._call("session.synthetic", {"sessionID": session_id}, body)
-
-    def interrupt(self, session_id, resume=False):
-        """`session.interrupt`: abort the active execution (the Escape key). VERIFIED in a throwaway v2 2.0.24:
-        the in-flight tool call is cut (state error, aborted), the answer is {"interrupted": true} (false when
-        idle), and with `resume` false nothing runs after it: a steering input waiting stays in the inbox."""
-        return self._call("session.interrupt", {"sessionID": session_id, "resume": "true" if resume else "false"})
-
-    def prompt(self, session_id, text, metadata=None, delivery=None, resume=None):
-        if delivery is not None and delivery not in self.DELIVERIES:
-            raise ValueError("delivery must be one of %s" % ", ".join(self.DELIVERIES))
-        data = {"text": text}
-        for name, value in (("metadata", metadata), ("delivery", delivery), ("resume", resume)):
-            if value is not None:
-                data[name] = value
-        return self._call("session.prompt", {"sessionID": session_id}, data)
-
-    def inbox_list(self, session_id):
-        return self._call("session.inbox.list", {"sessionID": session_id})
-
-    def permission_list(self, session_id):
-        """The session's pending permission requests (S2: `session.permission.list`
-        works with the session id alone; `permission.request.list` needs a location)."""
-        return self._call("session.permission.list", {"sessionID": session_id})
-
-    def form_list(self, session_id):
-        """The session's pending forms (questions): `session.form.list`, an array of {id, sessionID, title,
-        fields: [{key, type, title, ...}]} (VERIFIED in a throwaway v2 2.0.24, PR 18)."""
-        return self._call("session.form.list", {"sessionID": session_id})
-
-    def permission_reply(self, session_id, request_id, decision, message=None):
-        """PR 18: answer a pending permission request: `decision` is `once`, `always` or `reject`, `message` a
-        reason (VERIFIED in a throwaway v2 2.0.24: POST /api/session/{sessionID}/permission/{requestID}/reply,
-        body {"decision", "message"}; an empty answer; 404 PermissionNotFoundError once answered)."""
-        if decision not in ("once", "always", "reject"):
-            raise ValueError("decision must be once, always or reject")
-        data = {"decision": decision}
-        if message:
-            data["message"] = message
-        return self._call("session.permission.reply", {"sessionID": session_id, "requestID": request_id}, data)
-
-    def form_reply(self, session_id, form_id, answer):
-        """PR 18: answer a pending form (a question): `answer` maps each field's key to its value (VERIFIED in a
-        throwaway v2 2.0.24: POST /api/session/{sessionID}/form/{formID}/reply, body {"answer": {key: value}};
-        an empty answer; the form then reads `state.status` answered)."""
-        return self._call("session.form.reply", {"sessionID": session_id, "formID": form_id}, {"answer": dict(answer)})
-
-    def inbox_update(self, session_id, inbox_id, delivery):
-        if delivery not in self.DELIVERIES:
-            raise ValueError("delivery must be one of %s" % ", ".join(self.DELIVERIES))
-        return self._call("session.inbox.update", {"sessionID": session_id, "inboxID": inbox_id},
-                          {"delivery": delivery})
-
-
 # ------------------------------------------------------------------- herdr
 
 class HerdrError(Exception):
@@ -2303,411 +1243,6 @@ class HerdrClient:
         if not isinstance(pane, str) or not isinstance(tab, str):
             raise HerdrError("bad_shape", "expected layout.tab_id and layout.root.pane_id in herdr's reply")
         return {"tab_id": tab, "pane_id": pane}
-
-
-# ------------------------------------------------------------------ the facts
-
-class FactError(ValueError):
-    """A fact that cannot be used: a missing field, or a value of the wrong type."""
-
-
-DISK_GUARD_DEFAULTS = {"min_free_gb": 50, "hard_free_gb": 10}
-DISK_REARM_PERCENT = 110                # an episode ends when the free space is back at the threshold plus 10% (integer arithmetic: 50 * 1.1 is 55.00000000000001)
-DISK_GUARD_FILE = "disk-guard.json"     # {"low": bool, "episode": <epoch the episode began>, "hard": bool}: so a restart does not start a second episode
-
-
-def validate_disk_guard(raw, source):
-    """`disk_guard`: absent or null = the defaults; false = off; else {"min_free_gb", "hard_free_gb"} (numbers, hard at most min)."""
-    if raw is None or raw is False:
-        return
-    if not isinstance(raw, dict):
-        raise ConfigError("%s: 'disk_guard' must be false, null or an object, got %r" % (source, raw))
-    unknown = sorted(set(raw) - set(DISK_GUARD_DEFAULTS))
-    if unknown:
-        raise ConfigError("%s: 'disk_guard' has unknown key(s) %s (it takes %s)" % (source, ", ".join(unknown), ", ".join(DISK_GUARD_DEFAULTS)))
-    for key, value in raw.items():
-        if not _is_number(value) or value < 0:
-            raise ConfigError("%s: 'disk_guard.%s' must be a number of gigabytes of at least 0, got %r" % (source, key, value))
-    merged = dict(DISK_GUARD_DEFAULTS, **raw)
-    if merged["hard_free_gb"] > merged["min_free_gb"]:
-        raise ConfigError("%s: 'disk_guard.hard_free_gb' (%r) must not be more than 'min_free_gb' (%r)" % (source, merged["hard_free_gb"], merged["min_free_gb"]))
-
-
-def disk_guard_settings(config):
-    """{"min_free_gb", "hard_free_gb"}, or None when the guard is off."""
-    raw = config.get("disk_guard")
-    if raw is False:
-        return None
-    return dict(DISK_GUARD_DEFAULTS, **(raw or {}))
-
-
-def disk_free(path):
-    """(free bytes, total bytes) of the volume holding `path`: ONE stat, no walk; None when it cannot be read."""
-    try:
-        usage = shutil.disk_usage(str(path))
-    except OSError:
-        return None
-    return usage.free, usage.total
-
-
-def disk_status_line(config, state_dir):
-    """`238 GB free (24%)`, with LOW and the thresholds when below the guard; None when the volume cannot be read."""
-    found = disk_free(state_dir)
-    if found is None:
-        return None
-    free, total = found
-    gb = free / 1e9
-    line = "%d GB free (%d%%)" % (gb, round(100.0 * free / total)) if total else "%d GB free" % gb
-    guard = disk_guard_settings(config)
-    if guard is not None and gb < guard["min_free_gb"]:
-        line += ": %s (below %g GB; hard line %g GB)" % ("VERY LOW" if gb < guard["hard_free_gb"] else "LOW", guard["min_free_gb"], guard["hard_free_gb"])
-    return line
-
-
-class DiskFacts:
-    """The disk guard: ONE `disk_usage` of the state directory's volume per pass. Below `disk_guard.min_free_gb` the Chief of Staff is told ONCE for
-    the episode (`disk.low:<episode>`, the fact stays pending until delivered and the key is stable, so it is not told again), `disk.low` is
-    audited, and the episode ends (`disk.recovered`) when the free space is back above the threshold plus 10%. The episode is kept in `disk-guard.json`
-    so a restart does not begin a second one. Reads nothing else: no `du`, no walk."""
-
-    __name__ = "disk_facts"
-
-    def __init__(self):
-        self.engine = None
-        self.episode = None   # (episode epoch, hard flag) while low, from the file or this process
-
-    def bind(self, engine):
-        self.engine = engine
-
-    def _load(self, state_dir):
-        try:
-            with open(str(Path(state_dir) / DISK_GUARD_FILE)) as handle:
-                raw = json.loads(handle.read(4096))   # a few bytes are all it ever holds
-            if raw.get("low") and _is_number(raw.get("episode")):
-                return float(raw["episode"]), bool(raw.get("hard"))
-        except (OSError, ValueError, AttributeError, TypeError):
-            pass
-        return None
-
-    def _save(self, engine, low, episode, hard):
-        try:
-            path = Path(engine.state_dir) / DISK_GUARD_FILE   # written only on a change of episode: a handful of times a year
-            temp = path.with_name("%s.%d.tmp" % (DISK_GUARD_FILE, os.getpid()))
-            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "w") as handle:
-                handle.write(json.dumps({"low": bool(low), "episode": episode, "hard": bool(hard)}, sort_keys=True))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(str(temp), str(path))
-        except OSError as err:
-            try:
-                temp.unlink()
-            except (OSError, UnboundLocalError):
-                pass
-            engine._note("disk.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})   # said once per change: after a restart a second episode could begin
-
-    def __call__(self):
-        engine = self.engine
-        guard = disk_guard_settings(engine.config) if engine is not None else None
-        if guard is None or engine.state_dir is None:
-            return []
-        found = disk_free(engine.state_dir)
-        if found is None:   # FAIL OPEN, on purpose: a guard that cannot read the volume says so once (audit) and wakes nobody: a false alarm helps no one
-            engine._note("disk.unreadable", None, {"path": str(engine.state_dir)})
-            return []
-        free_gb, now = found[0] / 1e9, engine.now()
-        if self.episode is None:
-            self.episode = self._load(engine.state_dir)
-        if self.episode is not None and free_gb >= guard["min_free_gb"] * DISK_REARM_PERCENT / 100:
-            if engine.audit is not None:   # appended, not `_note`d: a second episode that recovers at the same figure is still news
-                engine.audit.append(engine.actor, "disk.recovered", None, {"free_gb": int(free_gb), "min_free_gb": guard["min_free_gb"], "episode": int(self.episode[0])})
-            self.episode = None
-            self._save(engine, False, None, False)
-        discovery = getattr(engine, "discovery", None)
-        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
-        if self.episode is None and free_gb < guard["min_free_gb"] and chiefs:   # an episode begins when there is someone to tell: with no Chief of Staff running, the next pass tries again
-            self.episode = (now, free_gb < guard["hard_free_gb"])
-            if engine.audit is not None:
-                engine.audit.append(engine.actor, "disk.low", None, {"free_gb": int(free_gb), "min_free_gb": guard["min_free_gb"],
-                                                                      "hard_free_gb": guard["hard_free_gb"], "hard": self.episode[1]})
-            self._save(engine, True, now, self.episode[1])
-        if self.episode is None:
-            return []
-        episode, hard = self.episode
-        if free_gb < guard["hard_free_gb"] and not hard:   # it got worse inside the episode: said in the status line and the audit, not a second wake
-            self.episode = (episode, True)
-            if engine.audit is not None:
-                engine.audit.append(engine.actor, "disk.hard", None, {"free_gb": int(free_gb), "hard_free_gb": guard["hard_free_gb"], "episode": int(episode)})
-            self._save(engine, True, episode, True)
-        if not chiefs:
-            return []
-        text = "disk low: %d GB free on the volume holding the state directory (the guard is %g GB, hard line %g GB). `%s disk prune --dry-run` shows what would be " \
-               "pruned (docker build cache and images older than a week, never volumes; it measures the state directory's volume, so check where docker keeps its data)" % (free_gb, guard["min_free_gb"], guard["hard_free_gb"], PROG)
-        return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
-
-
-class SpotlightFacts:
-    """The Spotlight guard's fact source (bin/spotlight_guard.py, ask #438). Once an hour a BACKGROUND thread asks `mdfind` (5 s per folder) whether the index holds
-    anything under each guarded folder; a pass only collects what the thread has finished, so it starts no process and a slow tool never delays it. A folder
-    indexed on two checks in a row begins an episode: ONE wake to the Chief of Staff (`spotlight.lost:<folder>:<episode>`, audited `spotlight.lost`); a zero count
-    ends it (`spotlight.recovered`). Writes only `spotlight-guard.json`, and only when an answer changed. Changes no setting."""
-
-    __name__ = "spotlight_facts"
-
-    def __init__(self):
-        self.engine = None
-        self.tracker = None
-        self.thread = None
-        self.done = None             # results the thread has finished, not yet stepped
-        self.lock = threading.Lock()  # the hand-off of `done`: a result stored while the pass takes the last one is never lost
-        self.started = None          # the engine's clock when the last check began
-        self.saved = None            # the stable content the file holds
-        self.counts = {}             # the last count seen per folder (the wake text names it)
-
-    def bind(self, engine):
-        self.engine = engine
-
-    def _start(self, engine, sg, cfg):
-        runner = getattr(engine, "spotlight_runner", None)
-        folders = list(cfg["folders"])
-        self.started = engine.now()
-
-        def work():
-            results = sg.check_all(folders, runner)
-            with self.lock:
-                if self.thread is threading.current_thread():
-                    self.done = results
-        self.thread = threading.Thread(target=work, name="spotlight-check", daemon=True)
-        self.thread.start()
-
-    def _chiefs(self, engine):
-        discovery = getattr(engine, "discovery", None)
-        return sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
-
-    def __call__(self):
-        engine = self.engine
-        if engine is None or engine.state_dir is None:
-            return []
-        sg = load_module("spotlight_guard")
-        cfg = sg.settings(engine.config.get("spotlight_guard"))
-        if cfg is None:
-            return []
-        if self.tracker is None:
-            saved = sg.load(engine.state_dir)
-            self.tracker = sg.Tracker((saved or {}).get("folders"))
-            self.saved = sg.stable(saved) if saved else None
-            self.counts = {f: sg.clean_count(e.get("count")) for f, e in ((saved or {}).get("folders") or {}).items() if isinstance(e, dict)}
-        with self.lock:
-            results, self.done = self.done, None
-        if results:
-            self._apply(engine, sg, results)
-        facts = self._open(engine, sg, cfg["folders"])   # EVERY pass while an episode is open: the delivery layer batches (a fact must still be pending when the batch is ripe) and dedups by the stable key
-        alive = self.thread is not None and self.thread.is_alive()
-        if not alive and (self.started is None or engine.now() - self.started >= sg.CHECK_SECONDS):
-            self._start(engine, sg, cfg)
-        return facts
-
-    def _open(self, engine, sg, folders):
-        """The wake of each open episode, one fact per Chief of Staff, the same key and `created` on every pass."""
-        chiefs = self._chiefs(engine)
-        facts = []
-        for folder, episode in sorted(self.tracker.episode.items()):
-            if episode is None or not chiefs or folder not in folders:   # a folder no longer guarded wakes nobody
-                continue
-            text = sg.wake_text(folder, self.counts.get(folder), PROG)
-            key = "spotlight.lost:%s:%d" % (hashlib.sha256(folder.encode()).hexdigest()[:10], int(episode))
-            facts.extend(Fact(key, name, "spotlight", " ".join(text.split()), episode, sender="switchboard") for name in chiefs)
-        return facts
-
-    def _apply(self, engine, sg, results):
-        now = engine.now()
-        for folder, (state, count) in sorted(results.items()):
-            event = self.tracker.step(folder, state, now)
-            if count is not None:
-                self.counts[folder] = count
-            if event == "begin" and engine.audit is not None:
-                engine.audit.append(engine.actor, "spotlight.lost", None, {"folder": folder, "count": count})
-            elif event == "end" and engine.audit is not None:
-                engine.audit.append(engine.actor, "spotlight.recovered", None, {"folder": folder})
-        content = sg.body(results, self.tracker, now)
-        if self.saved != sg.stable(content):
-            try:
-                sg.save(engine.state_dir, content)
-                self.saved = sg.stable(content)
-            except OSError as err:
-                engine._note("spotlight.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
-
-
-class CpuFacts:
-    """The CPU and memory guard's fact source (bin/cpu_guard.py): ONE `os.getloadavg()` and the kernel's memory counters per pass, no process. When the load over
-    the cores stays above the guard for the configured minutes the Chief of Staff is told ONCE for the episode (`cpu.high:<episode>`: the key is stable, so it is
-    delivered once), `cpu.high` is audited, and the wake NAMES THE TOP CONSUMERS by program and by lane (the agent or worktree the process runs in), from ONE
-    bounded `ps` and ONE bounded `lsof` run on a thread when the episode begins (never on another pass). The wake is held until they answer or `WAKE_GRACE_SECONDS`
-    pass; an answer that comes after the wake went out is sent as ONE follow-up note (`cpu.top:<episode>`), and a `ps` that never answers is said once in the
-    wake. The episode ends (`cpu.recovered`) below two thirds of the guard and is kept in `cpu-guard.json`, so a restart does not begin a second one. The same
-    pattern guards memory: swap above `swap_percent` for `swap_minutes` wakes once per episode (`mem.high:<episode>`, `mem-guard.json`)."""
-
-    __name__ = "cpu_facts"
-
-    def __init__(self):
-        self.engine = None
-        self.tracker = None
-        self.mem_tracker = None
-        self.detail = ""
-        self.thread = None
-        self.begin_at = None          # the engine's clock when this process began the episode (None: it was loaded from the file)
-        self.waked_without = False    # the wake went out while the consumers were still being read
-        self.saved_episode = None     # the episode the file holds (None: closed)
-        self.saved_mem = None
-
-    def bind(self, engine):
-        self.engine = engine
-
-    def _registry(self, engine):
-        try:
-            return {path: entry.get("agent") for path, entry in read_worktrees(engine.state_dir).items() if isinstance(entry, dict)}
-        except Exception:
-            return {}
-
-    def _start_ps(self, engine, cg):
-        """ONE bounded `ps`, then ONE bounded `lsof` of the top ten processes for their lanes, on a thread: a starved machine must never hang the daemon's pass.
-        The result lands in `self.detail` when it is done, and only while this is still the current thread (a slow one of an earlier episode writes nothing)."""
-        runner = getattr(engine, "cpu_ps_runner", None) or subprocess.run
-        registry = self._registry(engine)
-
-        def work():
-            text = ""
-            try:
-                done = runner(cg.PS_ARGV, capture_output=True, text=True, timeout=cg.PS_SECONDS, stdin=subprocess.DEVNULL)
-                if done.returncode == 0:
-                    lanes = {}
-                    pids = cg.top_pids(cg.process_rows(done.stdout))
-                    if pids:
-                        try:
-                            looked = runner(cg.lsof_argv(pids), capture_output=True, text=True, timeout=cg.LSOF_SECONDS, stdin=subprocess.DEVNULL)
-                            if looked.returncode in (0, 1):
-                                lanes = {pid: cg.lane_of(cwd, registry) for pid, cwd in cg.parse_lsof(looked.stdout).items()}
-                        except Exception:
-                            lanes = {}
-                    text = cg.detail(cg.consumers(done.stdout, lanes))
-            except Exception:
-                text = ""
-            if self.thread is threading.current_thread():
-                self.detail = text
-        self.thread = threading.Thread(target=work, name="cpu-ps", daemon=True)
-        self.thread.start()
-
-    def _chiefs(self, engine):
-        discovery = getattr(engine, "discovery", None)
-        return sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
-
-    def __call__(self):
-        engine = self.engine
-        if engine is None or engine.state_dir is None:
-            return []
-        cg = load_cpu_guard()
-        raw = engine.config.get("cpu_guard")
-        cfg = cg.settings(raw)
-        if cfg is None:
-            return []
-        chiefs = self._chiefs(engine)
-        facts = self._cpu(engine, cg, cfg, chiefs)
-        facts.extend(self._mem(engine, cg, cg.mem_settings(raw), chiefs))
-        return facts
-
-    def _cpu(self, engine, cg, cfg, chiefs):
-        read = cg.reading()
-        if not read.ratio_known:   # FAIL OPEN: a load or a core count that cannot be read tells nobody (the status line says so), and never counts as one core
-            return []
-        if self.tracker is None:
-            self.tracker = cg.Episode(cg.load_episode(engine.state_dir))
-            self.saved_episode = self.tracker.episode
-        load1, load5, cores = read.load1, read.load5, read.cores
-        ratio = load5 / cores   # the five-minute average decides: a one-minute spike never wakes the Chief of Staff
-        now = engine.now()
-        event = self.tracker.step(ratio, now, cfg, can_begin=bool(chiefs))
-        if event == "begin":
-            self.detail, self.begin_at, self.waked_without = "", now, False
-            self._start_ps(engine, cg)
-            if engine.audit is not None:
-                engine.audit.append(engine.actor, "cpu.high", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2),
-                                                                      "high_ratio": cfg["high_ratio"], "minutes": cfg["minutes"]})
-            self._save(engine, cg, self.tracker.episode)
-        elif event == "end":
-            if engine.audit is not None:
-                engine.audit.append(engine.actor, "cpu.recovered", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2)})
-            self.detail, self.thread, self.begin_at = "", None, None
-            self._save(engine, cg, None)
-        episode = self.tracker.episode
-        if self.saved_episode != episode:   # a save that failed is tried again on the next pass
-            self._save(engine, cg, episode)
-        if episode is None or not chiefs:
-            return []
-        alive = self.thread is not None and self.thread.is_alive()
-        if alive and self.begin_at is not None and now - self.begin_at < cg.WAKE_GRACE_SECONDS:
-            return []   # the consumers are being read: the wake waits a few seconds for them
-        if self.detail:
-            consumers = self.detail + "."
-        elif alive:
-            consumers = "Consumers not read within %d s (ps is slow; one follow-up note carries them if it answers)." % cg.WAKE_GRACE_SECONDS
-        elif self.begin_at is not None:
-            consumers = "Consumers could not be read."
-        else:
-            consumers = ""
-        if alive and not self.detail:
-            self.waked_without = True
-        text = "cpu high: load %d on %d cores (%.1fx over five minutes; the guard is %gx for %g minutes). %s `%s status` shows the line; heavy work should wait for a slot." % (
-            round(load5), cores, ratio, cfg["high_ratio"], cfg["minutes"], consumers, PROG)
-        facts = [Fact("cpu.high:%d" % int(episode), name, "cpu", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
-        if self.waked_without and self.detail:   # the answer came after the wake: ONE follow-up note (the same key on every pass, so it is delivered once)
-            note = "cpu consumers (the answer came after the cpu high note): %s." % self.detail
-            facts.extend(Fact("cpu.top:%d" % int(episode), name, "cpu-top", note, episode, sender="switchboard") for name in chiefs)
-        return facts
-
-    def _mem(self, engine, cg, mem_cfg, chiefs):
-        """Swap above the guard for the minutes: ONE wake per episode with the biggest holders (the kernel's counters, no process)."""
-        mem = cg.memory_reading()
-        percent = mem.swap_percent
-        if percent is None:   # FAIL OPEN: unreadable memory tells nobody (the status line says so)
-            return []
-        if self.mem_tracker is None:
-            self.mem_tracker = cg.Episode(cg.load_episode(engine.state_dir, cg.MEM_STATE_FILE))
-            self.saved_mem = self.mem_tracker.episode
-        event = self.mem_tracker.step(percent, engine.now(), mem_cfg, can_begin=bool(chiefs))
-        holders = []
-        if event == "begin":
-            holders = cg.biggest_holders(cg.process_table())
-            self.mem_holders = holders
-            if engine.audit is not None:
-                engine.audit.append(engine.actor, "mem.high", None, {"swap_percent": round(percent, 1), "swap_used_mb": int(mem.swap_used / 1e6), "swap_total_mb": int(mem.swap_total / 1e6),
-                                                                      "high_percent": mem_cfg["high_ratio"], "minutes": mem_cfg["minutes"]})
-            self._save_mem(engine, cg, self.mem_tracker.episode)
-        elif event == "end":
-            self.mem_holders = []
-            if engine.audit is not None:
-                engine.audit.append(engine.actor, "mem.recovered", None, {"swap_percent": round(percent, 1)})
-            self._save_mem(engine, cg, None)
-        episode = self.mem_tracker.episode
-        if self.saved_mem != episode:
-            self._save_mem(engine, cg, episode)
-        if episode is None or not chiefs:
-            return []
-        text = cg.mem_wake_text(mem, getattr(self, "mem_holders", []), mem_cfg, PROG)
-        return [Fact("mem.high:%d" % int(episode), name, "mem", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
-
-    def _save(self, engine, cg, episode):
-        try:
-            cg.save_episode(engine.state_dir, episode)
-            self.saved_episode = episode
-        except OSError as err:
-            engine._note("cpu.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
-
-    def _save_mem(self, engine, cg, episode):
-        try:
-            cg.save_episode(engine.state_dir, episode, cg.MEM_STATE_FILE)
-            self.saved_mem = episode
-        except OSError as err:
-            engine._note("mem.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
 
 
 # ---------------------------------------------------------------- the docker reaper (ask #321)
@@ -3457,470 +1992,6 @@ class Discovery:
         if self.problems:
             return "%s not found; %s" % (name, "; ".join(self.problems))
         return "%s not found: no herdr pane shows a v2 session named %s" % (name, name)
-
-
-# ------------------------------------------------------------ the decision
-
-class MessageTooLong(Exception):
-    """A message that would be cut at the delivery cap: refused to the sender, nothing delivered."""
-
-
-class InterruptRefused(Exception):
-    """`send --interrupt` from anyone but the recipient's boss."""
-
-
-class Plan:
-    """What the delivery rule says for one recipient now.
-
-    action: "wait" (batching), "hold" (reason says why), "note" or "wake".
-    """
-
-    def __init__(self, recipient, action, reason, pending, observation=None, ready_at=None):
-        self.recipient, self.action, self.reason = recipient, action, reason
-        self.pending, self.observation, self.ready_at = pending, observation, ready_at
-        self.folded = False   # #352: a report folded into the sender's earlier send: a note, never a second wake
-
-    def to_json(self):
-        return {"recipient": self.recipient, "action": self.action, "reason": self.reason,
-                "ready_at": iso(self.ready_at), "pending": [fact.to_json() for fact in self.pending]}
-
-
-def hold_reason(observation, missing=None):
-    """Why nothing may be written to this agent now, or None."""
-    if observation is None:
-        return missing or "not found"
-    if observation.conflict:
-        return "%s is claimed by more than one session (%s); fix the fleet metadata" % (
-            observation.name, ", ".join([observation.session_id] + observation.conflict))
-    if observation.problem:
-        return observation.problem
-    if observation.status == "blocked":
-        return "%s is blocked on a permission request or a question" % observation.name
-    if observation.status not in ("idle", "working"):
-        return "%s has status %s in herdr" % (observation.name, observation.status)
-    return None
-
-
-def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds, missing=None):
-    """The delivery rule for one recipient's pending facts. Reads nothing; writes nothing.
-
-    Batch: wait until the oldest pending fact is `batch_seconds` old, unless a
-    pending fact skips batching (`send`), or under `no-batch`. Then hold if
-    the agent is gone, blocked, unknown or unreadable; else a note if you are
-    engaged with it, else a wake.
-    """
-    pending = sorted(pending, key=lambda fact: (fact.created, fact.key))
-    # PR 17: standing orders go first and alone, at once, as a note (a wake only under `orders-wake`)
-    standing = [fact for fact in pending if fact.orders]
-    if standing:
-        reason = hold_reason(observation, missing)
-        if not reason:
-            return Plan(recipient, "wake" if fault("orders-wake") else "note",
-                        "standing orders are noted at once, and never wake anyone", standing, observation)
-        pending = [fact for fact in pending if not fact.orders]
-        if not pending:
-            return Plan(recipient, "hold", reason, standing, observation)
-    # PR 13: riders are carried, never the reason for a message. Only the others choose the action
-    # and start the batch clock; when there is any other, every rider goes with it.
-    chosen = pending if fault("no-rider") else [fact for fact in pending if not fact.rider]
-    if not chosen:
-        return None
-    if not fault("no-batch") and all(fact.batch for fact in chosen):
-        ready_at = chosen[0].created + batch_seconds
-        if now < ready_at:
-            return Plan(recipient, "wait", "batching until %s" % iso(ready_at), pending, observation, ready_at)
-    reason = hold_reason(observation, missing)
-    if reason:
-        return Plan(recipient, "hold", reason, pending, observation)
-    if observation.engaged(now, engaged_seconds):
-        return Plan(recipient, "note", "you prompted %s at %s" % (recipient, iso(observation.last_human_prompt)),
-                    pending, observation)
-    return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
-
-
-def steers_into_turn(config, observation, carried, discovery=None):
-    """A wake to an agent that is working goes in as `steer` (with `resume`, so one that outlives its turn starts
-    the next at once): the running turn takes it at its next safe point instead of after the turn. Only a
-    message that carries a `send` from the agent's own boss; `send_to_working` "queue" turns it off. Measured in
-    a throwaway v2 2.0.24: a steer lands after the in-flight tool call, before the next model request."""
-    return (config.get("send_to_working", "steer") == "steer" and observation.status == "working"
-            and any(fact.kind == "send" and fact.sender and fact.sender == boss_name(discovery, observation) for fact in carried))
-
-
-def clock_utc(epoch):
-    """HH:MMZ (UTC) of an epoch: the time a message was sent or delivered, as the header shows it."""
-    try:
-        return time.strftime("%H:%MZ", time.gmtime(epoch))
-    except (OverflowError, ValueError, OSError, TypeError):
-        return "??:??Z"   # a time that is not a time never stops a message
-
-
-def superseded_by(facts):
-    """{key of an older undelivered `send`: the newer `send` that replaces it}: the same sender, about the same issue (repo and number), to the same
-    recipient. Never across senders or issues, and a send with no issue is never superseded. The older text is KEPT (the caller marks it, never drops it)."""
-    newest = {}
-    for fact in facts:
-        if fact.kind == "send" and fact.sender and fact.issue:
-            group = (fact.recipient, fact.sender, fact.repo, fact.issue)
-            if group not in newest or (fact.created, fact.key) > (newest[group].created, newest[group].key):
-                newest[group] = fact
-    found = {}
-    for fact in facts:
-        if fact.kind == "send" and fact.sender and fact.issue:
-            top = newest[(fact.recipient, fact.sender, fact.repo, fact.issue)]
-            if top is not fact:
-                found[fact.key] = top
-    return found
-
-
-def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
-    """One message for `facts`, oldest first. Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
-    message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
-    same issue replaces (`superseded_by`) stays in the message, marked, so no key is left out of what is acknowledged.
-
-    The first line names the count and the first item; each item follows in
-    full. Items that do not fit under `cap` stay pending: the message ends with
-    how many, and they go in the next message. A single item longer than the
-    cap is cut, and says so. With `section` (PR 6, see sectioned_lines) every
-    item that names an issue sits under its ask's Intent lines.
-    """
-    facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
-    if not facts:
-        raise ValueError("nothing to compose")
-    if facts[0].orders:  # PR 17: the orders note, whole: every order
-        return orders_note(recipient, facts[0], repos), facts[:1]
-
-    replaced = {}
-
-    def item(fact):
-        where = " (issue %s)" % issue_tag(fact.repo, fact.issue, repos) if fact.issue else ""
-        body = fact.summary.strip().replace("\n", "\n  ")
-        mark = ""
-        if fact.key in replaced:
-            mark = " [superseded by the newer message from %s sent %s]" % (fact.sender, clock_utc(replaced[fact.key].created))
-        return "- %s from %s%s%s: %s" % (fact.kind, fact.sender or "the fleet", where, mark, body)
-
-    def render(count):
-        lead = next((fact for fact in facts if not fact.rider), facts[0])
-        taken = facts[:count]
-        replaced.clear()
-        replaced.update(superseded_by(taken))
-        when = ""
-        if delivered is not None:
-            first, last = clock_utc(min(f.created for f in taken)), clock_utc(max(f.created for f in taken))
-            when = " (sent %s, delivered %s)" % (first if first == last else "%s-%s" % (first, last), clock_utc(delivered))
-        waiting = sorted({t for f in taken for t in f.supersedes})
-        if waiting:   # the earlier messages stay where they are, unchanged: this says only that the newer one replaces them
-            names = sorted({f.sender for f in taken if f.supersedes and f.sender})
-            when = (when[:-1] + "; " if when else " (") + "supersedes %d earlier message%s from %s on this issue, still waiting: sent %s)" % (
-                len(waiting), "" if len(waiting) == 1 else "s", ", ".join(names) or "the same sender", ", ".join(clock_utc(t) for t in waiting[:5]))
-        head = "[switchboard] %d for %s%s: %s" % (count, recipient, when, _one_line(lead.summary, 200))
-        idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider and getattr(fact, "clean", False)]
-        shown = [fact for fact in taken if fact not in idle] if len(idle) < len(taken) else taken
-        if shown is taken:
-            idle = []  # nothing but idle riders: there is no news to fold them under
-        lines = [head] + (sectioned_lines(shown, section, item) if section else [item(fact) for fact in shown])
-        if idle:  # no-change worker lines are ONE quiet line next to real news (the keys are still carried)
-            names = sorted({fact.sender or "a worker" for fact in idle})
-            lines.append("- quiet: %d worker finish%s with no change (%s)" % (
-                len(idle), "" if len(idle) == 1 else "es", ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")))
-        rest = len(facts) - count
-        if rest:
-            lines.append("\u2026 and %d more: run fleet-switchboard pending %s" % (rest, recipient))
-        return "\n".join(lines)
-
-    for count in range(len(facts), 0, -1):
-        text = render(count)
-        if len(text) <= cap:
-            return text, facts[:count]
-    marker = "\n[cut at %d characters]" % cap
-    return text[:cap - len(marker)] + marker, facts[:1]
-
-
-ORDERS_CLOSING = ("These are the owner's standing instructions for this charter. Act on them without asking "
-                  "again, within their words. They cover nothing they do not name.")
-COS_ORDERS_CLOSING = ("These are the owner's standing orders to you. Answer for the owner only within their words; "
-                      "anything they do not name goes to the owner.")
-
-
-def orders_note(recipient, fact, repos=None):
-    """The standing-orders note: each order on its own line, then the closing line. Never cut. PR 18: the Chief of
-    Staff's own orders (key `orders:cos:...`) are the file's text as the owner wrote it."""
-    if fact.key.startswith("%s:cos:" % ORDERS_KIND):
-        return "\n".join(["[switchboard] standing orders for %s (the owner's, to you):" % recipient,
-                          fact.summary.strip(), COS_ORDERS_CLOSING])
-    lines = ["[switchboard] standing orders for %s (charter %s):" % (recipient, issue_tag(fact.repo, fact.issue, repos))]
-    lines.extend("- %s" % order for order in fact.summary.splitlines() if order.strip())
-    lines.append(ORDERS_CLOSING)
-    return "\n".join(lines)
-
-
-def is_withdrawal(summary):
-    """A `withdrawn` report rider never ages out: only a message carrying it (or its worker going) drops it."""
-    return (summary or "").startswith("withdrawn: ")
-
-
-def collapse_riders(facts, now, max_age):
-    """PR 13: riders cut to what is still worth carrying. A rider older than `max_age` seconds is
-    dropped, and only the newest `worker.idle` of each sender stays. Facts that are not riders pass."""
-    newest = {}
-    for fact in facts:
-        if fact.rider and fact.kind == WORKER_IDLE:
-            known = newest.get(fact.sender)
-            if known is None or (fact.created, fact.key) > (known.created, known.key):
-                newest[fact.sender] = fact
-    kept = []
-    for fact in facts:
-        if not fact.rider:
-            kept.append(fact)
-        elif now - fact.created > max_age and not is_withdrawal(fact.summary):
-            continue
-        elif fact.kind == WORKER_IDLE and newest.get(fact.sender) is not fact:
-            continue
-        else:
-            kept.append(fact)
-    return kept
-
-
-DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished", "worker.stopped": "stopped",
-                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "plan": "plan posted", "alert": "alert issue", "disk": "disk guard", "janitor": "janitor preview"}
-
-
-def _line_of(text, limit):
-    """`text` as one line of at most `limit` characters, with anything shaped like a bearer
-    credential or a provider key taken out."""
-    return decision_core.line_of(text, limit)
-
-
-def describe_items(recipient, facts, repos=None):
-    """The one human line v2's TUI shows for a message (PR 13): `switchboard: <sender> <what> on #<issue>:
-    <first 100 characters>` for one item, `switchboard: <n> items for <recipient>: <first item, 80 characters>`
-    for several. At most DESCRIPTION_MAX characters, never a newline."""
-    facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
-    if all(fact.orders for fact in facts):
-        return "switchboard: standing orders for %s" % recipient
-    lead = next((fact for fact in facts if not fact.rider), facts[0])
-    if len(facts) == 1:
-        where = " on %s" % issue_tag(lead.repo, lead.issue, repos) if lead.issue else ""
-        line = "switchboard: %s %s%s: %s" % (lead.sender or "the fleet", DESCRIBED_AS.get(lead.kind, lead.kind),
-                                             where, _line_of(lead.summary, 100))
-    else:
-        line = "switchboard: %d items for %s: %s" % (len(facts), recipient, _line_of(lead.summary, 80))
-    return _one_line(line, DESCRIPTION_MAX)
-
-
-# ---------------------------------------------------------------- the engine
-
-class LockError(Exception):
-    """Another `run` holds the single-instance lock."""
-
-
-@contextmanager
-def single_instance(state_dir):
-    """Hold $STATE/run.lock for the life of the block, or raise LockError at once."""
-    path = Path(state_dir) / "run.lock"
-    fd = adopt_inherited_lock(path)
-    if fd is None:
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
-    _HELD_LOCK["fd"] = fd
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            holder = os.read(fd, 32).decode("ascii", "replace").strip() or "unknown"
-            raise LockError("another %s run holds %s (pid %s)" % (PROG, path, holder)) from None
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)  # an adopted descriptor is not at the start
-        os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
-        yield path
-    finally:
-        _HELD_LOCK["fd"] = None
-        os.close(fd)  # closing the descriptor releases the lock
-
-
-LOCK_FD_ENV = "FLEET_SWITCHBOARD_LOCK_FD"  # set across a re-exec: the descriptor that still holds run.lock
-_HELD_LOCK = {"fd": None}
-
-
-def adopt_inherited_lock(path):
-    """The descriptor a daemon passed across `exec` to itself, when it is the lock file of `path`; else None.
-    The flock belongs to the open file description, so it was never released: there was no gap."""
-    raw = os.environ.pop(LOCK_FD_ENV, None)
-    try:
-        fd = int(raw) if raw else None
-        if fd is None:
-            return None
-        held, here = os.fstat(fd), os.stat(str(path))
-        if (held.st_dev, held.st_ino) != (here.st_dev, here.st_ino):
-            os.close(fd)
-            return None
-        os.set_inheritable(fd, False)
-        return fd
-    except (OSError, ValueError):
-        return None
-
-
-V2_LIGHT_OFF = ("the person's last prompt as a background read (the read before a write is still made)", "compactions (orders after one)", "inbox unread badge and lapsed-note conversion",
-                "stopped/finished summary and stop classification", "landed-checks that page messages (a sent-key ledger answers instead)",
-                "report-answered checks", "brief scan")
-SENT_KEYS_FILE = "sent-keys.json"
-SENT_PER_SESSION, SENT_SESSIONS = 400, 200   # the ledger's bounds
-SENT_FILE_MAX = 4 * 1024 * 1024   # a ledger of that many keys is under 2 MB; a bigger file is not one
-
-
-class SentLedger:
-    """v2_light: the keys the daemon itself delivered, per session, kept in `sent-keys.json` (0600, renamed into place, bounded) so a restart
-    keeps them. Two writers (the daemon and a CLI `send`) share it: every change is a locked read-modify-write (flock), every read
-    sees the file as it is now.
-
-    At most once: a send is `reserve`d BEFORE the write and `confirm`ed after it. A crash between the two leaves the key
-    UNKNOWN (`unknown` in the file): it counts as delivered, is never sent again by itself, and `status` says how many there are. A
-    send that FAILED (a V2Error) is `release`d: nothing was admitted, or v2 refuses a repeat (the message id is derived from the keys)."""
-
-    def __init__(self, state_dir):
-        self.path = Path(state_dir) / SENT_KEYS_FILE if state_dir is not None else None
-        self.lock = self.path.with_name(SENT_KEYS_FILE + ".lock") if self.path is not None else None
-
-    def load(self):
-        """(sent, unknown). A MISSING file is an empty ledger; a file that is there and cannot be read or parsed is not: the ledger
-        fails CLOSED (a V2Error, so the callers hold the send and say why), never forgetting what was delivered."""
-        if self.path is None:
-            return {}, {}
-        try:
-            with open(str(self.path)) as handle:
-                text = handle.read(SENT_FILE_MAX + 1)   # never more than the cap: the file can grow between a stat and a read
-            if len(text) > SENT_FILE_MAX:
-                raise V2Error("ledger_corrupt", None, "sent-keys.json is larger than any ledger the daemon writes: nothing is sent until it is moved aside")
-        except FileNotFoundError:
-            return {}, {}
-        except OSError as err:
-            raise V2Error("ledger_unreadable", None, "sent-keys.json cannot be read (%s): nothing is sent until it can be" % err)
-        try:
-            body = json.loads(text)
-            tables = []
-            for name in ("sessions", "unknown"):
-                table = {}
-                for sid, entries in (body.get(name) or {}).items():
-                    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in entries.values()):
-                        raise ValueError("a key without a time")
-                    table[sid] = {str(k): v for k, v in entries.items()}
-                tables.append(table)
-            sessions, unknown = tables
-        except (ValueError, AttributeError, TypeError):
-            raise V2Error("ledger_corrupt", None, "sent-keys.json is not a ledger: nothing is sent until it is moved aside (it is never read as empty)")
-        return sessions, unknown
-
-    @property
-    def keys(self):
-        return self.load()[0]
-
-    def update(self, change):
-        """Apply `change(sessions, unknown)` under the lock to what is on disk now, then write it back atomically. A ledger that cannot be
-        locked, read or written raises (V2Error): the caller does not send. With no state directory there is nowhere to keep it: that fails closed too."""
-        if self.path is None:
-            raise V2Error("ledger_unwritable", None, "v2_light needs a state directory for sent-keys.json: nothing is sent without one")
-        try:
-            fd = os.open(str(self.lock), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "a") as guard:
-                fcntl.flock(guard, fcntl.LOCK_EX)
-                sessions, unknown = self.load()
-                change(sessions, unknown)
-                # Only `sessions` is trimmed: an unknown-fate reservation is what says "do not send again", so it stays (bounded by SENT_FILE_MAX)
-                for mine in sessions.values():
-                    if len(mine) > SENT_PER_SESSION:
-                        for key, _ in sorted(mine.items(), key=lambda kv: kv[1])[:len(mine) - SENT_PER_SESSION]:
-                            del mine[key]
-                for sid in [sid for sid, mine in sessions.items() if not mine]:
-                    del sessions[sid]
-                if len(sessions) > SENT_SESSIONS:
-                    keep = sorted(sessions.items(), key=lambda kv: max(kv[1].values() or [0]), reverse=True)[:SENT_SESSIONS]
-                    sessions.clear()
-                    sessions.update(keep)
-                self.save(sessions, unknown)
-        except OSError as err:
-            raise V2Error("ledger_unwritable", None, "sent-keys.json cannot be written (%s): nothing is sent until it can be" % err)
-
-    def reserve(self, session_id, keys, created):
-        """Reserve `keys` unless one is already in the ledger (sent or of unknown fate): True when reserved, False when another sender
-        (the daemon, a CLI `send`) already has it. One locked step, so two senders never both write the same key."""
-        taken = []
-
-        def change(sessions, unknown):
-            have = set(sessions.get(session_id, {})) | set(unknown.get(session_id, {}))
-            if have & set(keys):
-                taken.append(True)
-                return
-            unknown.setdefault(session_id, {}).update({key: created for key in keys})
-        self.update(change)
-        return not taken
-
-    def confirm(self, session_id, keys, created):
-        def change(sessions, unknown):
-            sessions.setdefault(session_id, {}).update({key: created for key in keys})
-            for key in keys:
-                unknown.get(session_id, {}).pop(key, None)
-        self.update(change)
-
-    def release(self, session_id, keys):
-        def change(sessions, unknown):
-            for key in keys:
-                unknown.get(session_id, {}).pop(key, None)
-        self.update(change)
-
-    def known(self, session_id, since):
-        sessions, unknown = self.load()
-        found = KeyTimes()
-        for table in (sessions, unknown):   # an unknown-fate send counts as delivered: at most once
-            for key, created in table.get(session_id, {}).items():
-                if created >= since:
-                    found.add_all([key], created)
-        return found
-
-    def unknown_count(self):
-        return sum(len(mine) for mine in self.load()[1].values())
-
-    def save(self, sessions, unknown):
-        temp = None
-        try:
-            temp = self.path.with_name("%s.%d.tmp" % (self.path.name, os.getpid()))
-            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "w") as handle:
-                handle.write(json.dumps({"sessions": sessions, "unknown": unknown}, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.rename(str(temp), str(self.path))
-            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)   # the rename itself must survive a power loss
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except Exception as err:
-            if temp is not None:
-                try:
-                    temp.unlink()
-                except OSError:
-                    pass
-            raise OSError("sent-keys.json could not be written: %s" % err)
-
-
-class KeyTimes(set):
-    """The keys `delivered_keys` found, a plain set, with `at[key]`: when the message that carries it was
-    created (the oldest, when several do; None when v2 gave no time). PR 13 reads when a report arrived."""
-
-    def __init__(self):
-        super().__init__()
-        self.at = {}
-
-    def add_all(self, keys, created):
-        for key in keys:
-            self.add(key)
-            known = self.at.get(key)
-            if key not in self.at or (created is not None and (known is None or created < known)):
-                self.at[key] = created
-
-
-STATUS_REREAD_GAP = 5   # seconds: an agent whose state flaps is read again at most this often
-COMPACTION_TTL_MAX = 30   # seconds a compaction list is remembered (an orders fact for a compacted agent waits at most this long)
 
 
 # ---------------------------------------------------------------- the event feed (#290 slice 2)
@@ -5304,454 +3375,6 @@ class Switchboard:
                 "missing": None if observation else discovery.missing(name),
                 "plan": plan.to_json() if plan else None, "source_problems": problems,
                 "riders": [fact.to_json() for fact in riders]}
-
-
-# ============================================================================
-# PR 7: the decision model, the classifier and the policy judge's questions
-#
-# One section, so the stack rebases cleanly. docs/switchboard.md, "Classify: a
-# decision model" and "The judge". Registered in four places: the config check
-# (`validate_jev_config`), `Switchboard.__init__` (`build_jev`), `run_pass`
-# (`run_shadow_classifier`) and the unknown-key list (`PR7_CONFIG_KEYS`).
-# ============================================================================
-import socket
-import urllib.error
-import urllib.request
-
-JEV_MODEL = "typesafe/jev-1.13"
-JEV_URL = "https://openrouter.ai/api/v1/systemone"
-JEV_KEY_ENV = "OPENROUTER_API_KEY"
-JEV_DEFAULTS = {
-    "model": JEV_MODEL,
-    "url": JEV_URL,
-    "key_env": JEV_KEY_ENV,       # the NAME of the variable that holds the key, never the key
-    "key_file": None,             # PR 16: a private file that holds the key; None means jev.key beside config.json
-    "timeout_seconds": 20,
-    "min_confidence": 0.7,        # the classifier's threshold; SF2 will choose the real one
-    "record_file": None,          # append every real call here as a request/response pair
-    "replay": None,               # answer from this file instead of calling Jev
-}
-PR7_CONFIG_KEYS = ("jev", "shadow_judges")
-JEV_HTTP_REASONS = {400: "invalid", 401: "unauthorized", 402: "no_credit", 403: "unauthorized",
-                    413: "too_large", 422: "invalid", 429: "rate_limited"}
-JEV_REASONS = ("invalid", "unauthorized", "no_credit", "too_large", "rate_limited",
-               "timeout", "unreachable", "bad_response")
-JEV_TEXT_LIMIT = 1000   # characters of any one message or intent sent to Jev
-JEV_DETAIL_LIMIT = 160  # characters of a provider's text kept in an error
-
-
-def validate_jev_config(config, raw, source="config"):
-    """Check and complete `jev` and `shadow_judges`. Silent when `raw` has neither."""
-    if not any(name in raw for name in PR7_CONFIG_KEYS):
-        return
-    jev = raw.get("jev")
-    if jev is not None:
-        config["jev"] = _checked_jev_settings(jev, source)
-    shadow = raw.get("shadow_judges")
-    if shadow is not None and not isinstance(shadow, bool):
-        raise ConfigError("%s: 'shadow_judges' must be true or false, got %r" % (source, shadow))
-    if shadow and jev is None:
-        raise ConfigError("%s: 'shadow_judges' needs a 'jev' object: there is no decision model to ask" % source)
-    config["shadow_judges"] = (jev is not None) if shadow is None else shadow
-
-
-def _checked_jev_settings(jev, source):
-    if not isinstance(jev, dict):
-        raise ConfigError("%s: 'jev' must be an object, got %r" % (source, type(jev).__name__))
-    unknown = sorted(set(jev) - set(JEV_DEFAULTS))
-    if unknown:
-        warn_unknown_config("%s: 'jev' contains key(s) this tool does not read: %s (known: %s)"
-                          % (source, ", ".join(unknown), ", ".join(JEV_DEFAULTS)), 'jev', unknown, list(JEV_DEFAULTS))
-    settings = dict(JEV_DEFAULTS, **jev)
-    for name in ("model", "url", "key_env"):
-        if not isinstance(settings[name], str) or not settings[name].strip():
-            raise ConfigError("%s: 'jev.%s' must be a non-empty string, got %r" % (source, name, settings[name]))
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", settings["key_env"]):
-        raise ConfigError("%s: 'jev.key_env' is the NAME of an environment variable, got %r "
-                          "(never put the key itself in this file)" % (source, settings["key_env"]))
-    if not re.match(r"^(https://|http://(localhost|127\.0\.0\.1)[:/])", settings["url"]):
-        raise ConfigError("%s: 'jev.url' must be https (the key travels with it), got %r" % (source, settings["url"]))
-    if not _is_number(settings["timeout_seconds"]) or settings["timeout_seconds"] <= 0:
-        raise ConfigError("%s: 'jev.timeout_seconds' must be a positive number, got %r"
-                          % (source, settings["timeout_seconds"]))
-    if not _is_number(settings["min_confidence"]) or not 0 < settings["min_confidence"] <= 1:
-        raise ConfigError("%s: 'jev.min_confidence' must be a number above 0 and at most 1, got %r"
-                          % (source, settings["min_confidence"]))
-    for name in ("record_file", "replay", "key_file"):
-        value = settings[name]
-        if value is not None and (not isinstance(value, str) or not os.path.isabs(value)):
-            raise ConfigError("%s: 'jev.%s' must be an absolute path, got %r" % (source, name, value))
-    if settings["record_file"] and settings["replay"]:
-        raise ConfigError("%s: 'jev' cannot both record real calls and replay recorded ones" % source)
-    return settings
-
-
-# ------------------------------------------------------------------ the client
-
-class JevError(Exception):
-    """A Jev call with no usable answer. `reason` is one of JEV_REASONS."""
-
-    def __init__(self, reason, detail=None, latency_ms=None):
-        self.reason, self.detail, self.latency_ms = reason, detail, latency_ms
-        super().__init__("%s: %s" % (reason, detail) if detail else reason)
-
-
-def _canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-
-def _scrub_provider_text(text, key=None):
-    """One short line of a provider's text with the key (and any bearer value) removed."""
-    text = str(text if text is not None else "")
-    if key:
-        text = text.replace(key, "[key]")
-    text = re.sub(r"(?i)bearer\s+\S+", "Bearer [key]", text)
-    return _one_line(text, JEV_DETAIL_LIMIT)
-
-
-def _is_probability(value):
-    return _is_number(value) and 0 <= value <= 1
-
-
-def check_answers(questions, answers):
-    """`answers` (a dict by question id, or a list in question order) as a dict, or JevError.
-
-    A missing answer, an out-of-range probability or an option nobody offered
-    is a bad answer, never a reading.
-    """
-    if isinstance(answers, list):
-        if len(answers) != len(questions):
-            raise JevError("bad_response", "%d answer(s) for %d question(s)" % (len(answers), len(questions)))
-        answers = dict(zip(questions, answers))
-    if not isinstance(answers, dict):
-        raise JevError("bad_response", "no answers")
-    for name, question in questions.items():
-        answer = answers.get(name)
-        if not isinstance(answer, dict):
-            raise JevError("bad_response", "question %s is not answered" % name)
-        if question.get("type") == "noul":
-            if not _is_probability(answer.get("noul")):
-                raise JevError("bad_response", "question %s: noul is not a probability" % name)
-            continue
-        if answer.get("choice") not in question.get("criteria", {}):
-            raise JevError("bad_response", "question %s: choice is not one of the options" % name)
-        probabilities = answer.get("probabilities")
-        if probabilities is not None:
-            values = list(probabilities.values()) if isinstance(probabilities, dict) else [None]
-            if not all(_is_probability(v) for v in values) or abs(sum(values) - 1) > 0.01:
-                raise JevError("bad_response", "question %s: probabilities do not sum to 1" % name)
-            if set(probabilities) - set(question["criteria"]):
-                raise JevError("bad_response", "question %s: probabilities name an option nobody offered" % name)
-    return answers
-
-
-class KeyFileError(Exception):
-    """The key file exists and may not be used. Names the path and the rule, never the key."""
-
-
-def jev_key_file(settings):
-    """Where the decision-model key file is: `jev.key_file`, else jev.key beside config.json."""
-    given = (settings or {}).get("key_file")
-    return Path(given) if given else config_path().parent / "jev.key"
-
-
-def locate_jev_key(settings, environ=None):
-    """(key, source): the key and where it came from, `environment`, `file`, or (None, `none`).
-
-    The variable named by `key_env` wins. Otherwise the key file, which must be a regular file (not a
-    link) that you own and nobody else can read or write, and must not be empty: a file the group or
-    the world can read is refused with the reason, and the key is never part of that reason.
-    Raises KeyFileError.
-    """
-    environ = os.environ if environ is None else environ
-    name = (settings or {}).get("key_env") or JEV_KEY_ENV
-    value = environ.get(name)
-    if value:
-        return value, "environment"
-    path = jev_key_file(settings)
-    try:
-        info = os.lstat(str(path))
-    except FileNotFoundError:
-        return None, "none"
-    except OSError as err:
-        raise KeyFileError("cannot read the key file %s: %s" % (path, err.strerror or err)) from None
-    if not stat.S_ISREG(info.st_mode):
-        raise KeyFileError("the key file %s must be a regular file, not a link or a directory" % path)
-    if info.st_uid != os.getuid():
-        raise KeyFileError("the key file %s must be owned by you" % path)
-    if info.st_mode & 0o077:
-        raise KeyFileError("the key file %s can be read by others: run `chmod 0600 %s`, or save the key again "
-                           "with `%s key set` (mode 0600, owned by you)" % (path, path, PROG))
-    try:
-        text = path.read_text().strip()
-    except OSError as err:
-        raise KeyFileError("cannot read the key file %s: %s" % (path, err.strerror or err)) from None
-    if not text:
-        raise KeyFileError("the key file %s is empty" % path)
-    return text, "file"
-
-
-def jev_secrets(config, environ=None):
-    """The decision-model key as a list (empty when there is none or the file is refused): what redaction hides."""
-    if not config.get("jev"):
-        return []
-    try:
-        key, _ = locate_jev_key(config["jev"], environ)
-    except KeyFileError:
-        return []
-    return [key] if key else []
-
-
-def _usage_of(usage):
-    """The numbers of a usage block under names the audit does not redact."""
-    usage = usage if isinstance(usage, dict) else {}
-    pairs = (("in", "input_tokens"), ("out", "output_tokens"), ("cost", "cost"))
-    return {short: usage[name] for short, name in pairs if _is_number(usage.get(name))}
-
-
-class JevClient:
-    """The decision model over HTTPS (OpenRouter's System One endpoint).
-
-    The key is read from the environment variable named in the config at the
-    moment of each call. It is never stored on the client, written to a file,
-    put in an argument list, or kept in an error. `opener` has urlopen's shape
-    so tests inject a fake and never reach a network.
-    """
-
-    def __init__(self, settings, environ=None, opener=None, clock=time.monotonic):
-        self.settings = settings
-        self.environ = os.environ if environ is None else environ
-        self.opener = opener or urllib.request.urlopen
-        self.clock = clock
-
-    def decide(self, state, questions):
-        """{"model", "answers", "usage", "latency_ms"}. Raises JevError, with the latency."""
-        started = self.clock()
-        try:
-            try:
-                key, _ = locate_jev_key(self.settings, self.environ)
-            except KeyFileError as err:
-                raise JevError("unauthorized", str(err)) from None
-            if not key:
-                raise JevError("unauthorized", "no key in $%s or the key file" % self.settings["key_env"])
-            body = {"model": self.settings["model"], "state": state, "questions": questions}
-            out = self._post(body, key)
-            answers = check_answers(questions, out.get("answers"))
-        except JevError as err:
-            err.latency_ms = int((self.clock() - started) * 1000)
-            raise
-        result = {"model": _scrub_provider_text(out.get("model") or self.settings["model"], key), "answers": answers,
-                  "usage": _usage_of(out.get("usage")), "latency_ms": int((self.clock() - started) * 1000)}
-        self._record(body, out)
-        return result
-
-    def _post(self, body, key):
-        request = urllib.request.Request(
-            self.settings["url"], data=json.dumps(body).encode("utf-8"), method="POST",
-            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
-                     "Accept": "application/json"})
-        response = None
-        try:
-            response = self.opener(request, timeout=self.settings["timeout_seconds"])
-            raw = response.read()
-        except urllib.error.HTTPError as err:
-            reason = JEV_HTTP_REASONS.get(err.code, "unreachable")
-            raise JevError(reason, "HTTP %s %s" % (err.code, _scrub_provider_text(self._body_of(err), key)))
-        except (socket.timeout, TimeoutError):
-            raise JevError("timeout", "no answer in %ss" % self.settings["timeout_seconds"])
-        except urllib.error.URLError as err:
-            if isinstance(err.reason, (socket.timeout, TimeoutError)):
-                raise JevError("timeout", "no answer in %ss" % self.settings["timeout_seconds"])
-            raise JevError("unreachable", _scrub_provider_text(err.reason, key))
-        except OSError as err:
-            raise JevError("unreachable", _scrub_provider_text(err, key))
-        finally:
-            if response is not None and hasattr(response, "close"):
-                response.close()
-        try:
-            out = json.loads(raw)
-        except (TypeError, ValueError):
-            raise JevError("bad_response", "the answer is not JSON")
-        if not isinstance(out, dict):
-            raise JevError("bad_response", "the answer is not an object")
-        return out
-
-    @staticmethod
-    def _body_of(err):
-        try:
-            return err.read().decode("utf-8", "replace")
-        except Exception:
-            return ""
-
-    def _record(self, body, out):
-        path = self.settings.get("record_file")
-        if not path:
-            return
-        line = json.dumps({"request": body, "response": out}, sort_keys=True) + "\n"
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a") as handle:
-            handle.write(line)
-
-
-class ReplayJev:
-    """Answers from a hand-written or recorded file, never from the network.
-
-    The file is a JSON object {"pairs": [...], "rules": [...]} or JSON lines of
-    pairs (what `jev.record_file` writes). A pair is {"request": {state,
-    questions[, model]}, "response": {answers[, model, usage]}} and matches an
-    identical request. A rule is {"contains": text, "choice": {option: p},
-    "noul": {question: p}, "error": reason} and matches a request whose
-    "message" contains the text (a rule without "contains" matches anything);
-    the first match wins. A question nobody answered is an error, loudly.
-    """
-
-    def __init__(self, path, model=JEV_MODEL):
-        self.path, self.model = path, model
-        self._pairs = self._rules = None
-
-    def _load(self):
-        if self._pairs is not None:
-            return
-        try:
-            text = Path(self.path).read_text()
-            try:
-                data = json.loads(text)
-            except ValueError:
-                data = {"pairs": [json.loads(line) for line in text.splitlines() if line.strip()]}
-            if "request" in data:  # a record file holding exactly one line parses as that pair
-                data = {"pairs": [data]}
-            pairs, rules = list(data.get("pairs") or []), list(data.get("rules") or [])
-        except (OSError, ValueError, AttributeError) as err:
-            raise JevError("bad_response", "cannot read the replay file: %s" % _scrub_provider_text(err))
-        self._pairs = {_canonical({"model": p["request"].get("model", self.model),
-                                   "state": p["request"].get("state"),
-                                   "questions": p["request"].get("questions")}): p["response"] for p in pairs}
-        self._rules = rules
-
-    def decide(self, state, questions):
-        self._load()
-        response = self._pairs.get(_canonical({"model": self.model, "state": state, "questions": questions}))
-        if response is None:
-            response = self._by_rule(state, questions)
-        answers = check_answers(questions, response.get("answers"))
-        return {"model": str(response.get("model") or self.model), "answers": answers,
-                "usage": _usage_of(response.get("usage")), "latency_ms": int(response.get("latency_ms") or 0)}
-
-    def _by_rule(self, state, questions):
-        message = state.get("message") if isinstance(state, dict) else None
-        subject = message if isinstance(message, str) else _canonical(state)
-        for rule in self._rules:
-            if rule.get("contains", "") in subject:
-                if rule.get("error") in JEV_REASONS:
-                    raise JevError(rule["error"], "replayed")
-                return {"answers": self._answers_of(rule, questions), "model": rule.get("model")}
-        raise JevError("bad_response", "nothing recorded for this question")
-
-    @staticmethod
-    def _answers_of(rule, questions):
-        answers = {}
-        for name, question in questions.items():
-            if question.get("type") == "noul":
-                answers[name] = {"type": "noul", "noul": (rule.get("noul") or {}).get(name, 0.0)}
-                continue
-            options = list(question.get("criteria", {}))
-            given = rule.get("choice") or {}
-            probabilities = {option: given.get(option, 0.0) for option in options}
-            total = sum(p for p in probabilities.values() if _is_number(p))
-            if total > 0:  # a rule may name options this question lacks: scale what is left to 1
-                probabilities = {option: p / total for option, p in probabilities.items()}
-            top = max(options, key=lambda option: (probabilities[option], option == "current"))
-            answers[name] = {"type": "choice", "choice": top, "probabilities": probabilities}
-        return answers
-
-
-def build_jev(config):
-    """The decision model the config asks for, or None when `jev` is not configured."""
-    settings = config.get("jev")
-    if not settings:
-        return None
-    if settings.get("replay"):
-        return ReplayJev(settings["replay"], settings["model"])
-    return JevClient(settings)
-
-
-# ----------------------------------------------------------------- the classifier
-
-CLASSIFY_ID = "about"
-CLASSIFY_INSTRUCTIONS = (
-    "The Chief of Staff is an AI assistant working for one person, who has just sent a new message. "
-    "Which of the following is the new message about: the work in progress, an ask somebody else is "
-    "already working on, or something new?")
-
-
-def _clip(text, limit=JEV_TEXT_LIMIT):
-    text = "" if text is None else str(text)
-    return text if len(text) <= limit else text[:limit - 1] + "\u2026"
-
-
-def _ask_line(ask):
-    ask = ask or {}
-    line = _clip(ask.get("intent") or "no stated intent", 300)
-    if ask.get("done_when"):
-        line += " (done when: %s)" % _clip(ask["done_when"], 200)
-    return line
-
-
-def classify_options(current_ask, open_asks):
-    """Option name -> its criterion: `current`, one per open ask by issue number, `new`."""
-    options = {"current": "The message is about the work in progress now: %s." % _ask_line(current_ask)}
-    own = str((current_ask or {}).get("issue"))
-    for ask in open_asks or []:
-        name = str(ask["issue"])
-        if name == own:
-            continue  # the current ask is `current`, not a second option
-        options[name] = "The message is about ask %s (%s), which %s already owns." % (
-            name, _clip(ask.get("intent") or "no stated intent", 300), ask.get("owner") or "someone")
-    options["new"] = "The message is about something else: new work unrelated to the work in progress and to every open ask."
-    return options
-
-
-def classify_request(message, previous_message, current_ask, open_asks):
-    """(state, questions) for one classification."""
-    state = {"message": _clip(message), "previous_message": _clip(previous_message) if previous_message else None,
-             "current_ask": {"issue": (current_ask or {}).get("issue"), "intent": _ask_line(current_ask)},
-             "open_asks": [{"issue": str(a["issue"]), "intent": _clip(a.get("intent") or "", 300),
-                            "owner": a.get("owner")} for a in open_asks or []]}
-    question = {"type": "choice", "instructions": CLASSIFY_INSTRUCTIONS,
-                "criteria": classify_options(current_ask, open_asks)}
-    return state, {CLASSIFY_ID: question}
-
-
-def _default_current(reason, extra=None):
-    out = {"choice": "current", "probabilities": None, "confident": False, "reason": reason,
-           "jev_choice": None, "model": None, "usage": {}, "latency_ms": None}
-    out.update(extra or {})
-    return out
-
-
-def classify(jev, message, previous_message, current_ask, open_asks, min_confidence=0.7):
-    """One Jev call: {choice, probabilities, confident, reason, ...}. Never raises on Jev's account.
-
-    `confident` is true when the top probability reaches `min_confidence`. When
-    Jev is unreachable, errs, or is unsure, the choice is `current`: the safe
-    default changes nothing. `jev_choice` keeps what Jev said, for the audit.
-    """
-    state, questions = classify_request(message, previous_message, current_ask, open_asks)
-    try:
-        result = jev.decide(state, questions)
-    except JevError as err:
-        return _default_current("jev %s" % err.reason, {"latency_ms": err.latency_ms})
-    answer = result["answers"][CLASSIFY_ID]
-    probabilities = answer.get("probabilities")
-    out = {"probabilities": probabilities, "jev_choice": answer["choice"], "model": result["model"],
-           "usage": result["usage"], "latency_ms": result["latency_ms"]}
-    if not probabilities:
-        return dict(_default_current("jev gave no probabilities"), **out, choice="current")
-    top = probabilities.get(answer["choice"], 0.0)
-    if top < min_confidence:
-        return dict(out, choice="current", confident=False,
-                    reason="unsure: %s at %.2f is below %.2f" % (answer["choice"], top, min_confidence))
-    return dict(out, choice=answer["choice"], confident=True, reason="confident: %s at %.2f" % (answer["choice"], top))
 
 
 # ---------------------------------------------------------- the policy judge's questions
@@ -7965,7 +5588,7 @@ BOSS_READ_SITES = {
     "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
-    "bin/cloud_worker.py:cmd_retire": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
+    "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
 }
 
 
@@ -9215,8 +6838,23 @@ def add_read_parsers(sub):
     read.add_argument("--limit", type=int, default=20, help="How many messages (default 20, at most 200)")
 
 
+def add_cloud_clear_parsers(sub):
+    """`cloud-clear`: the cloud worker records whose pod is gone and whose hard deadline has passed are removed, each one named. The operator, the
+    Chief of Staff or the worker's own boss may run it; a record with a pod is never touched; it refuses when the cluster could not be read."""
+    clear = sub.add_parser("cloud-clear", help="Remove the cloud worker records whose pod is gone and whose hard deadline has passed "
+                                               "(the operator, the Chief of Staff or the worker's own boss); `--dry-run` removes nothing")
+    clear.add_argument("--dry-run", action="store_true", help="Say what would be cleared; remove nothing")
+
+
 def cmd_read(args, runner, now):
     return run_cloud("cmd_read", args, runner, now)
+
+
+def cmd_cloud_clear(args, runner, now):
+    """`cloud-clear [--dry-run]`: every cloud worker record whose pod is gone AND whose hard deadline has passed is removed (the record and its
+    password file), and every one it removes is named. A record with a pod, or one not past its deadline, is never touched, and it refuses when
+    the cluster could not be read: it never removes a record it cannot prove is gone. The caller rule is `retire`'s."""
+    return run_cloud("cmd_cloud_clear", args, runner, now)
 
 
 def watch_problem(engine, state, name, discovery):
@@ -11222,6 +8860,24 @@ def catching_up_lines(state_dir, now):
         return []
 
 
+def cloud_watch_tick(engine, discovery):
+    """#1073: cloud workers are outside discovery (no pane, no local session), so this one per-pass tick reads their records, bounded.
+    Read-only; the result is kept on `engine.cloud_watch` for the report relay (#1020). No directory means nothing to do."""
+    cloud = load_module("cloud_worker").bind(globals())
+    result = cloud.read_records_bounded(state_dir_path(), cursor=getattr(engine, "_cloud_cursor", None))
+    engine._cloud_cursor = result["cursor"]
+    engine.cloud_watch = result
+    if result["capped"] and not getattr(engine, "_cloud_cap_audited", False):
+        engine._cloud_cap_audited = True
+        if engine.audit is not None:
+            skips = {k: v for k, v in result["skips"].items() if v}
+            engine.audit.append(engine.actor, "cloud-watch.capped", "cloud-watch",
+                                {"bound": result["bound"], "records": len(result["records"]), "skipped": skips})
+    elif not result["capped"]:
+        engine._cloud_cap_audited = False
+    return result
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -11241,6 +8897,10 @@ def finish_pass(engine, discovery, report):
         prune_report_riders(engine, discovery)
     except Exception as err:
         engine._failed("report-riders", "report-riders", err, report)
+    try:
+        cloud_watch_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("cloud-watch", "cloud-watch", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:
@@ -16681,6 +14341,7 @@ class IssueIntent:
         found = cls(number, data.get("state"), data.get("title") or "", intent, done_when,
                     data.get("updated_at"), bool(_CHARTER_BLOCK.search(body)))
         found.workspace = charter_workspace(body)
+        found.pull_request = bool(data.get("pull_request"))   # #1249: a pull request is never a charter
         found.labels = [l.get("name") if isinstance(l, dict) else l for l in (data.get("labels") or []) if isinstance(l.get("name") if isinstance(l, dict) else l, str)]   # #432: the load feed's waiting and parked asks
         found.parked_until = parked_until(body, found.labels)   # the switchboard's own parser: the load module never copies it
         return found
@@ -16832,8 +14493,10 @@ class IntentReader:
         repo = repo or self.repo
         return self._cached(("orders", repo, number), lambda: fetch_orders(self, number, repo))
 
-    def parent(self, number, repo=None):
-        """The parent issue's number, or None when the issue has no parent."""
+    NO_PARENT_SHAPE = re.compile(r"(not_found: )?(gh: )?(not found|http 404 no parent)( \(http 404\))?", re.I)
+
+    def parent(self, number, repo=None, strict=False):
+        """The parent issue's number, or None when the issue has no parent. `strict` (#1249, charter set): a 404 whose body is not the exact "no parent" shape raises."""
         repo = repo or self.repo
 
         def fetch():
@@ -16841,6 +14504,8 @@ class IntentReader:
                 found = self._api("repos/%s/issues/%d/parent" % (repo, number), repo)
             except IntentError as err:
                 if err.reason == "not_found":
+                    if strict and not self.NO_PARENT_SHAPE.fullmatch(str(err).strip()):
+                        raise IntentError("gh", "404 that is not the no-parent answer: %s" % _one_line(str(err), 60)) from None
                     return None
                 raise
             return IssueIntent.from_api(found).number
@@ -19655,11 +17320,28 @@ def cmd_gates_stats(args, runner, now):
     return EXIT_OK
 
 
+CARRY_COMPARE_FILE_CAP = 300   # GitHub lists at most 300 files of a compare: a named file beyond the cap would read as untouched
+CARRY_TOO_LARGE = "the diff is too large to judge (GitHub lists at most 300 files of a compare, so a file may be missing): nothing carried"
+CARRY_NOT_DESCENDANT = "the new head is not a descendant of the old head (compare status %s: a force-push or rewind; the compare does not show changes only in the old head): nothing carried"
+
+
+class CarryRefused(Exception):
+    """A carry the facts of the diff cannot support; its text is the printed reason."""
+
+
+class _CarryDone(Exception):
+    pass
+
+
 def carry_head_facts(get, repo, old_head, new_head):
     """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
     "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
     files = [f["filename"] for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+    if len(files) >= CARRY_COMPARE_FILE_CAP or compared.get("truncated") or (compared.get("total_files") or 0) >= CARRY_COMPARE_FILE_CAP:
+        raise CarryRefused(CARRY_TOO_LARGE)
+    if compared.get("status") not in ("ahead", "identical"):
+        raise CarryRefused(CARRY_NOT_DESCENDANT % compared.get("status"))
     commit = get("repos/%s/commits/%s" % (repo, new_head))
     parents = [p.get("sha") for p in (commit.get("parents") or []) if isinstance(p, dict)]
     merge = False
@@ -19680,8 +17362,8 @@ def carry_proofs(state, pr, plan, old_head, new_head, facts, now):
     if problem:
         raise LedgerCommandError("the ledger is not trustworthy, nothing was carried: %s" % problem)
     evaluators = {x["id"]: plan_ledger.evaluator_of(x) for x in plan["scenarios_parsed"]}
-    holding = plan_ledger.carried_seqs(entries, pr, old_head)
-    done = plan_ledger.carried_seqs(entries, pr, new_head)
+    holding = plan_ledger.carried_seqs(entries, pr, old_head, plan["plan_hash"])
+    done = plan_ledger.carried_seqs(entries, pr, new_head, plan["plan_hash"])
     out = []
     for row in entries:
         if row.get("pr") != pr or row.get("kind") not in ("proof", "verdict") or row.get("result") != "pass" or row.get("plan_hash") != plan["plan_hash"]:
@@ -19693,7 +17375,16 @@ def carry_proofs(state, pr, plan, old_head, new_head, facts, now):
             continue
         verdict, reason = plan_ledger.carry_decision(row, evaluators.get(sid), facts["files"], facts["merge_of_default"], facts["ci_green"])
         if verdict == "carry":
-            plan_ledger.append_entry(state, plan_ledger.carry_line(row, sid, old_head, new_head, facts["merge_of_default"], pr), now)
+            line = plan_ledger.carry_line(row, sid, old_head, new_head, facts["merge_of_default"], pr)
+
+            def build(have, seq, row=row, line=line):   # the check is made under the ledger lock: two passes cannot both write the line
+                if row["seq"] in plan_ledger.carried_seqs(have, pr, new_head, plan["plan_hash"]):
+                    raise _CarryDone()
+                return line
+            try:
+                plan_ledger.append_checked(state, now, build)
+            except _CarryDone:
+                continue
         out.append({"proof": row["seq"], "scenario": sid, "verdict": verdict, "reason": reason})
     return out
 
@@ -20233,6 +17924,10 @@ def ci_record_core(ctx, now, quiet=False):
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
         named = "; ".join("%s run %s is %s" % (w or "status", r, st) for w, r, st in load_module("ci_runs").not_green_runs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
         return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)%s" % (ci, head[:8], " [%s]" % named if named else ""))
+    out["carry"] = carry_at_green(ctx, now)   # the carry does not depend on whether any ci verdict is wanted
+    for d in out["carry"]:
+        if d.get("noted") and not quiet:   # #1217: a real run always has ledger state, so a missing one is SAID (here, once), not skipped silently
+            print(d["reason"])
     if not wanted:
         if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))
@@ -20254,19 +17949,105 @@ def ci_record_core(ctx, now, quiet=False):
     return dict(out, status="recorded")
 
 
+def previous_head_of(entries, pr, head, plan_hash):
+    """#1217: the head the newest proof, verdict or carried line of `pr` (for this plan) was held at, other than `head`; None when there is none."""
+    best, found = -1, None
+    for e in entries:
+        if e.get("pr") != pr or e.get("plan_hash") != plan_hash or not isinstance(e.get("seq"), int):
+            continue
+        at = e.get("new_head") if e.get("kind") == "carried" else e.get("head") if e.get("kind") in ("proof", "verdict") else None
+        if isinstance(at, str) and at and at != head and e["seq"] > best:
+            best, found = e["seq"], at
+    return found
+
+
+def carry_get(engine, repo):
+    """#1217: a GET of one GitHub path (a repo's own account, counted and bounded as every read), decoded; raises GitHubUnavailable on any failure."""
+    accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or subprocess.run, engine.now)
+
+    def get(path):
+        try:
+            refuse_excluded(engine.config, repo)
+            done = accounts.read(engine.gh_runner or subprocess.run, path, repo, engine.config["call_timeout_seconds"], paginate=False)
+        except (AccountError, GhRateLimited, OSError, subprocess.SubprocessError) as err:
+            raise GitHubUnavailable("gh api %s: %s" % (path.split("?")[0], _one_line(str(err), 100))) from None
+        if done.returncode != 0:
+            raise GitHubUnavailable("gh api %s failed: %s" % (path.split("?")[0], _one_line(done.stderr or "", 100)))
+        try:
+            got = decode_json_stream(done.stdout or "")
+        except ValueError:
+            raise GitHubUnavailable("gh api %s answered something that is not JSON" % path.split("?")[0]) from None
+        return got[0] if isinstance(got, list) and len(got) == 1 else got
+    return get
+
+
+NO_STATE_REASON = "no ledger state: nothing to carry"
+
+
+def carry_at_green(ctx, now, get=None, green=True):
+    """#1217: the ONE call of the carry from the CI-verdict recording step (the command and the daemon pass both come through `ci_record_core`). Carries each proof of the
+    previous head the rule allows (`carry_proofs`) and returns [{"proof", "scenario", "verdict", "reason"}] (refusals included); a read that fails is one refused line. Writes no
+    line for anything the rule refuses. `get(path)` reads GitHub (default: the engine's `gh_api`)."""
+    if getattr(ctx, "state", None) is None:   # a real run always has ledger state: a missing one is a problem to SAY (named reason, printed by ci_record_core when not quiet, audited when a sink exists), never a silent skip
+        if getattr(ctx, "engine", None) is not None:
+            try:
+                _gates_audit(ctx.engine, "gate.ci_record_carry", ctx.pr, {"ok": False, "read": NO_STATE_REASON})
+            except Exception:
+                pass
+        return [{"proof": None, "scenario": None, "verdict": "refuse", "reason": NO_STATE_REASON, "noted": True}]
+    head = (ctx.facts or {}).get("head")
+    entries, problem = plan_ledger.read_ledger(ctx.state)
+    old = None if problem else previous_head_of(entries, ctx.pr, head, ctx.plan["plan_hash"])
+    if not old:
+        return []
+    try:
+        facts = carry_head_facts(get or carry_get(ctx.engine, ctx.repo), ctx.repo, old, head)
+        facts["ci_green"] = green and (ctx.facts or {}).get("ci") == "green"
+        ci_ids = {x["id"] for x in ctx.plan["scenarios_parsed"] if plan_ledger.evaluator_of(x) == "ci"}   # re-recorded at each green head, never carried: not a refusal to print
+        return [d for d in carry_proofs(ctx.state, ctx.pr, ctx.plan, old, head, facts, now()) if d["scenario"] not in ci_ids]
+    except CarryRefused as err:
+        return [{"proof": None, "scenario": None, "verdict": "refuse", "reason": str(err)}]
+    except (GitHubUnavailable, LedgerCommandError, AttributeError, KeyError, TypeError, ValueError) as err:
+        try:
+            _gates_audit(ctx.engine, "gate.ci_record_carry", ctx.pr, {"ok": False, "old_head": old, "new_head": head, "read": _one_line(str(err), 160)})
+        except Exception:
+            pass
+        return [{"proof": None, "scenario": None, "verdict": "refuse", "reason": "the facts of the head could not be read: %s" % _one_line(str(err), 160)}]
+
+
+def carry_lines(decisions):
+    """#1217: one line per proof decided: `carried #<seq> (<scenario>)` or `not carried #<seq> (<scenario>): <why>`."""
+    out = []
+    for d in decisions:
+        if d.get("noted"):   # already said by ci_record_core
+            continue
+        if d["verdict"] == "carry":
+            out.append("carried proof #%s (%s) from the previous head" % (d["proof"], d["scenario"]))
+        else:
+            out.append("not carried%s: %s" % (" proof #%s (%s)" % (d["proof"], d["scenario"]) if d["proof"] is not None else "", d["reason"]))
+    return out
+
+
 def cmd_gates_ci_record(args, runner, now):
     """`gates ci-record <repo#N>`: the switchboard itself records the `ci` verdict (see ci_record_core). Any caller may run it: the
     verdict says only what GitHub's checks say, whoever asked. The daemon runs the same logic for open PRs (ci_record_pass)."""
     ns = types.SimpleNamespace(pr=args.pr, plan=getattr(args, "plan", None), ask=getattr(args, "ask", None), head=None)
     ctx = _ledger_context(ns, runner, now, True)
     got = ci_record_core(ctx, now)
+    if got["status"] == "not-green" and ctx.plan is not None and ctx.plan["result"] == "pass" and got["head"]:
+        for line in carry_lines(carry_at_green(ctx, now, green=False)):   # #1217: a proof the rule refuses stays void, and the step says why
+            print(line)
     if got["status"] in ("unreadable", "no-plan", "no-head", "not-green"):
         raise LedgerCommandError("%s: nothing was recorded" % got["why"])
     if got["status"] == "nothing":
         print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % got["head"][:8])
+        for line in carry_lines(got.get("carry") or []):
+            print(line)
         return EXIT_OK
     print("CI is green at %s: recorded %s%s" % (got["head"][:8], ", ".join(got["recorded"]) or "nothing new",
                                                " (already recorded: %s)" % ", ".join(got["already"]) if got["already"] else ""))
+    for line in carry_lines(got.get("carry") or []):
+        print(line)
     return EXIT_OK
 
 
@@ -24035,11 +21816,15 @@ def cmd_charter(args, runner, now):
     if value is not None and isinstance(row0, dict):   # #1143: the GitHub reads happen BEFORE the registry lock, bound to the issue number and the repo; the lock only re-checks registry facts
         repo0 = row0.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
         try:
-            parent = engine.intents.parent(value, repo0)   # None only for the "no parent" answer; any other failure raises
+            parent = engine.intents.parent(value, repo0, strict=True)   # None only for the "no parent" answer; any other failure raises
             labelled = None
+            is_pr = False
             if parent is None:   # a charter has no parent: the one extra read is its label
-                labelled = orchestrator_label(engine.config) in (engine.intents.issue(value, repo0).labels or [])
-            pre = {"key": (value, repo0), "parent": parent, "labelled": labelled}
+                engine.intents.invalidate(value, repo0)   # #1249: the label read is never a cached answer
+                record = engine.intents.issue(value, repo0)
+                labelled = orchestrator_label(engine.config) in (record.labels or [])
+                is_pr = bool(getattr(record, "pull_request", False))
+            pre = {"key": (value, repo0), "parent": parent, "labelled": labelled, "pr": parent is None and is_pr}
         except Exception as err:
             pre = {"key": (value, repo0), "error": safe(_one_line(str(err), 80))}
 
@@ -24060,6 +21845,8 @@ def cmd_charter(args, runner, now):
                 return ("unverified", "cannot read #%d's parent (%s)" % (value, pre["error"]))
             if pre["parent"] is not None:
                 return ("is an ask", "#%d is an ask, not a charter (it has a parent, #%s)" % (value, pre["parent"]))
+            if pre.get("pr"):
+                return ("not a charter", "#%d is a pull request, not a charter" % value)
             if not pre["labelled"]:
                 return ("not a charter", "#%d is not a charter (no parent, but it lacks the %s label)" % (value, orchestrator_label(engine.config)))
         return None

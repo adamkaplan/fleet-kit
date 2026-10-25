@@ -544,6 +544,7 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard orders remove --charter <n or owner/repo#n> <number>` | Chief of Staff only (PR 17) | Removes the order with that number in `orders list`; the last one takes the section with it. The legacy `Standing authority:` line is numbered but lies outside the section, so it is refused (edit it on GitHub) |
 | `fleet-switchboard orders copy --source <charter> --charter <charter>` | Chief of Staff only (#347); anyone else is refused, audited | Copies every order bullet of the source charter's `## Standing orders` section to the target, word for word with its original `(ordered by ..., date)` (nothing re-dated), one order at a time through the same writer, with the same read-back. Orders the target already holds are skipped, so a second run copies only what is missing. It ALWAYS prints a result: one line per order, one line per failure and one summary line; a failed order is named, the rest are still copied, and any failure exits 1. The 20-order limit applies (the overflow is reported as failures). The legacy `Standing authority:` line is not a bullet and is not copied (the output says so). Each copied order gets the owner's heads-up as an added one does, and one comment on the target charter. The source is never changed. Code: `bin/orders_copy.py` |
 | `fleet-switchboard pending <name>` | Anyone | What is pending for an agent, and why anything is held |
+| `fleet-switchboard cloud-clear [--dry-run]` | The operator, the Chief of Staff, or the worker's own boss (the same rule as `retire`); anyone else is refused and the refusal audited | Removes every cloud worker record whose pod is gone AND whose hard deadline has passed, and names each one it removes (`cleared <name> (pod gone, deadline <time>)`). It never touches a record whose pod still stands, nor one that is not past its deadline, and it refuses (exit 1) when the cluster could not be read: it never removes a record it cannot prove is gone. `--dry-run` lists what it would clear (`would clear <name>`) and removes nothing. It makes no `stop` call: there is no pod. Code: `bin/cloud_worker.py` |
 
 Each agent definition gains one paragraph: what a `[switchboard]` message is,
 that agents message each other with `send` and never by typing into a pane,
@@ -559,6 +560,72 @@ Agents the switchboard manages do not use `heartbeat-ack`.
 | `fleet-switchboard status` | Every fleet agent: session, pane, status, pending and held items with reasons; GitHub watches |
 | `fleet-switchboard audit` | The decision history for one agent or one issue |
 | `fleet-switchboard intents` | Every open ask, one line each with its Done-when (PR 6) |
+
+#### The cloud workers in `status` (#1056)
+
+`status` reads the cluster ONCE per run and prints ONE summary line under the
+cloud section, whatever the number of cloud workers:
+
+```
+cloud: nodes 3 (pool pool-a 2 x size-1, oldest 5d3h; pool pool-b 1 x size-2, oldest 40m); pods 7 (Running 5, Pending 1, Failed 1)
+```
+
+The nodes are by pool (the node's pool label) and size (its instance-type
+label), with the age of the oldest node of the pool; a label that is not there
+reads `unknown`. The pods are every pod of the workers' namespace, by phase.
+The read is bounded: the whole summary, the login included, is given 30 s; the
+launcher run is killed as a group at that bound. The line is never omitted and
+the command never hangs: when the cluster could not be read, the summary is
+replaced by the reason
+
+```
+cloud: cluster not read (<one line of reason>) after <n> s; nodes and pods unknown
+```
+
+**When the login may not list the nodes.** The narrow `cw-operator` role of
+today is namespaced: it reads pods, logs, exec, port-forward and secrets in
+the workers' namespace, and nothing cluster-wide, so it cannot list the nodes.
+Reading the nodes needs ONE more rule, cluster-wide: `list` on `nodes` (the
+core API group), and a `ClusterRoleBinding` of it to the `cw-operator` service
+account; a namespaced Role cannot grant it. That is a **separate owner step**
+(the manifest is a held pull request of its own), so the code works with or
+without it. Until it is applied, the node count comes from the **pod
+placement** (the distinct node names of the pods) and the line says so:
+
+```
+cloud: nodes at least 2 carry workers (from pod placement; pool, size and age need list on nodes; idle nodes are not visible); pods 7 (Running 5, Pending 1, Failed 1)
+```
+
+That count cannot see the idle nodes, and the line says that too.
+
+**A record whose pod is gone.** A cloud worker record (the local endpoint
+record) is written at launch and removed in exactly two places: the launch's
+own failure paths and `retire`. When a pod ends by itself (the reaper at its
+hard deadline, or idle), nothing removed the record, so the records piled up.
+`status` judged a record past its hard deadline by the clock alone: it read no
+cluster for it and printed `past its hard deadline <time> (not queried)`, so
+it could not say whether a pod still stood, and the person asking had to read
+the cluster by hand to count the machines. Now the ONE read answers it:
+
+- the hard deadline has passed and no pod of the read matches the record (by
+  the record's pod name and by the worker annotation): the record is **ended**,
+  and the line says `cloud <name>: <pod>, ended at <hard deadline> (no pod)`.
+  The JSON row carries `launcher_status: ended` and `ended_at`. The deadline is
+  the time it ended: the pod's real stop time is in the launcher's audit, not
+  in the record.
+- the hard deadline has passed and the pod still stands: the line says
+  `pod still present past its hard deadline <time> (phase <p>)`.
+- the cluster could not be read: the record is **never** called ended. It is
+  printed as before, `not queried`.
+
+**`cloud-clear`.** One command removes every record whose pod is gone and whose
+deadline has passed: its own boss, the Chief of Staff or the operator may run
+it (the same rule as `retire`, factored once). It reads the cluster once,
+refuses (exit 1, with the reason) when the cluster could not be read, never
+touches a record with a pod, names every record it removes, writes the audit
+line and the registry note that `retire` writes, and makes no `stop` call
+(there is no pod). `retire` of such a record ends it cleanly, as it always
+did.
 
 ### Intent lines (PR 6)
 
@@ -4453,6 +4520,12 @@ A proof is bound to the head it was recorded at. A tester's, live check's or rev
 
 A carry is ONE ledger line of its own, kind `carried`, with the fields `proof` (the sequence number of the row), `scenario`, `old_head`, `new_head` and `facts` (`named_files_untouched`, `difference`, `ci`). The original proof row is never changed. `gates` shows the proof as carried, with the head it was recorded at. A proof that names no file is never carried; a proof whose named file is touched is void as before; proofs proven by CI are re-recorded by the daemon at each green head and are never carried. A carry never turns a proof into one for a head that fails any condition. The decision is `plan_ledger.carry_decision`; `fleet-switchboard`'s `carry_proofs` writes the lines from `carry_head_facts`. Reverting leaves the lines readable and ignored.
 
+The step that carries is `gates ci-record` (and the daemon's own recording of the `ci` verdicts, the same code): at a green head it carries, from the previous head, each proof the rule allows, one `carried` line each and never two for the same proof, old head and new head. A proof the rule refuses stays void and the step prints why, one line each (`not carried ...`). `gates <pr>` shows the carried line (`carried: row #N recorded at <head>, held here by carried line #M`), and the line itself is in the plan ledger. A `carried` line counts as evidence only for the plan hash it names.
+
+Two passes cannot write the same carry twice: the check "already carried" is made again under the ledger lock. The step runs whether or not the plan has a `ci` scenario. The facts of the diff are refused when they cannot be trusted: a compare of 300 files or more (GitHub's cap, a named file may be missing) reads "the diff is too large to judge", and a new head that is not a descendant of the old head (compare status other than `ahead` or `identical`: a force-push or rewind) is refused with that status named. A read that fails prints one line and writes an audit line `gate.ci_record_carry` (the pull request, both heads, the read); there is no retry in the step, the next pass retries by itself.
+
+Limits, stated: the carry line has no actor (it is derived from GitHub facts only). `previous_head_of` takes the newest row's head, so a proof at A with a newer row at B is not carried to C (conservative). The refusal branch for "CI not green" costs a few reads per pass (bounded).
+
 ## The merge gate and the merge lock: the fleet's own merge queue (#962)
 
 **It is the fleet's own merge queue.** Two pull requests that were each green against an older default branch can merge minutes apart and fail together (the
@@ -4784,7 +4857,7 @@ The merge gate reads a pull request as held from its merge label, and, with no m
 
 Every owner clear wakes the Chief of Staff with ONE line, and the orchestrator whose lane merges the pull request gets the same line: `owner cleared <repo#N> at <head8>: "<his reason>"; <lane> merges it`. A clear that CARRIES to a new head (#510) sends `owner's clear carried <repo#N> from <head8> to <head8>; <lane> merges it`. One function, `notify_clear`, is called once from the shared clear step (`impact_clear_core`: his command and his words in the chat both end there) and once from the carry decision, AFTER the clear (or the carry) is recorded and outside the impact-state lock; a refused clear sends nothing.
 
-- **Where an orchestrator's charter lives (#969).** In ONE place: the `charter` field of its row in the agent registry (`registry.json`). The lane lookup, `move`'s lookup of a charter's orchestrator, the adoption heir, the plan wake route, the asks an agent is accountable for (`intents`), the tester-registration lane check and the load figures read that field and nothing else. The live session's metadata (`fleet.charter`, `fleet.issue`) is written once, when the session is launched, and the service cannot update it, so it is never a second owner: an orchestrator launched with another orchestrator's issue number is not counted for that charter. The observation pass keeps a registry row's charter as it is and fills it from the session only for an agent with no row yet (the launch value); when a session's metadata disagrees with its row the pass says so ONCE per value (audit `charter.disagree`) and goes on with the row. A relaunch under an existing name is a new launch: `launch --charter` writes the launch value into the row, replacing a corrected one. To change an orchestrator's charter, the Chief of Staff or the operator runs `fleet-switchboard charter set <orchestrator> <issue number | none>` (audited with who, the old and the new value; an agent cannot set one). The Chief of Staff may run only `charter set *` (one allowed line in `agents/opencode/chief-of-staff.md`; the copilot definition lists tools, not commands, so its host grants shell as a whole and no line is added there). The owner grants the permission by applying that diff; the pull request does not. The command refuses a lane that is not an orchestrator, an issue that is not a charter (for this command a charter is an issue with no parent that carries the orchestrator label `<user>:orchestrator`; an issue with a parent is refused as "is an ask, not a charter", an issue with no parent and no label as not a charter, and one whose parent or label cannot be read as unverified; a closed charter with the shape is accepted) or is held by another orchestrator, and a change of a set charter without `--replace` (a flag, no value); every use or refusal is one audit line (caller, lane, old, new) and the output reads the registry row back. `fleet-switchboard agents charters` (read-only) shows each orchestrator's registry charter beside its session's metadata and prints a charter two orchestrators record. A charter number recorded by two orchestrators of one repository in the registry is a sweep finding, `S10`, on the charter's issue, naming both, and the lane of a pull request under it reads `lane unknown: charter #N has 2 orchestrators: a, b`.
+- **Where an orchestrator's charter lives (#969).** In ONE place: the `charter` field of its row in the agent registry (`registry.json`). The lane lookup, `move`'s lookup of a charter's orchestrator, the adoption heir, the plan wake route, the asks an agent is accountable for (`intents`), the tester-registration lane check and the load figures read that field and nothing else. The live session's metadata (`fleet.charter`, `fleet.issue`) is written once, when the session is launched, and the service cannot update it, so it is never a second owner: an orchestrator launched with another orchestrator's issue number is not counted for that charter. The observation pass keeps a registry row's charter as it is and fills it from the session only for an agent with no row yet (the launch value); when a session's metadata disagrees with its row the pass says so ONCE per value (audit `charter.disagree`) and goes on with the row. A relaunch under an existing name is a new launch: `launch --charter` writes the launch value into the row, replacing a corrected one. To change an orchestrator's charter, the Chief of Staff or the operator runs `fleet-switchboard charter set <orchestrator> <issue number | none>` (audited with who, the old and the new value; an agent cannot set one). The Chief of Staff may run only `charter set *` (one allowed line in `agents/opencode/chief-of-staff.md`; the copilot definition lists tools, not commands, so its host grants shell as a whole and no line is added there). The owner grants the permission by applying that diff; the pull request does not. The command refuses a lane that is not an orchestrator, an issue that is not a charter (for this command a charter is an issue with no parent that carries the orchestrator label `<user>:orchestrator`; an issue with a parent is refused as "is an ask, not a charter", an issue with no parent and no label as not a charter, and one whose parent or label cannot be read as unverified; a closed charter with the shape is accepted) (the label read is invalidated before it is made, so a set never judges a cached label; the parent read can still be served from the cache for up to the intent ttl; #1249 also made a small product change here: an issue record that is a pull request is refused as "is a pull request, not a charter", and a 404 on the parent read whose body is not the exact "no parent" answer is unverified and refused. Shapes the guard can receive: issue record = pull request, no label, look-alike label, closed, unreadable, foreign repository; parent read = parent, none, 404 no-parent, 404 other, error, non-JSON; the table test in `TestCharterSetGuard` has one row each) or is held by another orchestrator, and a change of a set charter without `--replace` (a flag, no value); every use or refusal is one audit line (caller, lane, old, new) and the output reads the registry row back. `fleet-switchboard agents charters` (read-only) shows each orchestrator's registry charter beside its session's metadata and prints a charter two orchestrators record. A charter number recorded by two orchestrators of one repository in the registry is a sweep finding, `S10`, on the charter's issue, naming both, and the lane of a pull request under it reads `lane unknown: charter #N has 2 orchestrators: a, b`.
 - **The lane** (#597). Two sources, each used only when it resolves: the pull request's PLAN, taken through `authoritative_plan` (the function the gates use: the body's PLAN line, else the first ledger entry's plan) and only while it PASSES the plan check, up to the charter that holds it AS IT IS NOW (each parent is read fresh, so a moved ask counts under its current charter) and that charter's one running orchestrator; and the agent that recorded the pull request's `notice pr` (its boss when it is a worker). When both resolve and AGREE that lane is told; when they DISAGREE the line says `lane unclear: plan lane A, notice by B` and only the Chief of Staff is told (neither lane is told to merge; audit `lane_unclear`); when one resolves it is used; none is `lane unknown`. A charter with TWO OR MORE running orchestrators is never picked between (`lane unknown: charter #N has 2 orchestrators: a, b`); a charter nobody runs counts as no plan lane. Only a running orchestrator counts.
 - **The reason** is one line of at most 300 characters, control characters out and token-shaped text replaced, like the audit line.
 - **Once** per pull request, head and kind (`clear-notified.json`, private), written when every recipient has the line (#827; it used to be written before the send, which made a failed notice final).
@@ -5585,6 +5658,31 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - **D3**: batch size against the review checkout's limits. Recommendation: cap a batch at what the checkout accepts, and split a larger one.
 - **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration` (and a `push` run of CI on `integration`; pull requests into it already run CI, as the workflow has no branch filter); a report of merges into `integration` while a batch is ready.
 
+## Cloud watch
+
+Cloud workers are outside discovery: `Engine.discover` builds observations only from the multiplexer's agent entries, and a cloud worker has no pane and no local session. Its records live in the cloud record directory, which only `status` and the reaper read. One `cloud_watch_tick` in `finish_pass` (the daemon's existing per-pass step, no new process or thread) reads those records each pass, under try/except like its sibling ticks (a failure is audited with step `cloud-watch`).
+
+Reads are bounded and never block. Every file is opened with `O_RDONLY|O_NONBLOCK|O_NOFOLLOW` and read only when `fstat` says it is a regular file (a FIFO named `x.json` cannot hang the pass). The tick is read-only (no write, process, network or remove call) and leaves its result on `engine.cloud_watch`. Reading starts after the last name examined in the previous pass (a cursor, wrapping round), so every record gets a turn. When a bound stops a pass, one audit line `cloud-watch.capped` names the bound and the skipped counts, once per episode (not an error). Relaying a cloud worker's report to its lane (#1020) shares this tick instead of adding a second read.
+
+Bounds: 50 valid records, 200 files examined, 64 KiB per file, 1 s monotonic per tick (`bound` is `records`, `files` or `time`). The result also holds `skips`, a count per kind. Tests are in `TestCloudWatchBounds` (one test and one mutant each; the mutant is the source with the named change, and the test fails on it).
+
+| Entry kind or bound | Skip kind / bound | Test | Mutant |
+|---|---|---|---|
+| name rejected by `valid_name` | `bad_name` | each_kind_is_skipped_and_counted | (counted before any open) |
+| directory | `not_regular` | each_kind_is_skipped_and_counted | (read fails, same kind) |
+| FIFO, no writer | `not_regular` | mutant_plain_open_hangs_on_a_fifo, each_kind | plain `open` without `O_NONBLOCK`; no `S_ISREG` check |
+| symlink | `symlink` | each_kind_is_skipped_and_counted | no `O_NOFOLLOW` |
+| over 64 KiB | `too_large` | each_kind_is_skipped_and_counted | no size check |
+| not UTF-8 | `not_utf8` | each_kind_is_skipped_and_counted | decode error not caught |
+| not JSON | `not_json` | each_kind_is_skipped_and_counted | kind mislabelled |
+| JSON that is not an object | `wrong_shape` | each_kind_is_skipped_and_counted | no shape check |
+| nested too deep | `too_deep` | each_kind_is_skipped_and_counted | recursion error not caught |
+| 50 valid records | `records` | record_bound_names_records | no record cap |
+| 200 files examined | `files` | files_examined_bound_with_more_bad_files_than_the_bound | no file cap |
+| 1 s monotonic | `time` | time_bound_stops_and_says_so | no deadline |
+| start rotates | cursor | rotation_gives_every_record_a_turn | no cursor |
+| no write/process/network/remove; audit once | - | tick_makes_no_write_process_network_or_remove_call | a recorded forbidden call fails the test |
+
 ## The assembler (#1092, slice S1)
 
 `bin/fleet-switchboard` builds the daemon's one module namespace from the manifest `bin/fleet-switchboard.parts`: one part path per line, relative to the entry's real path (symlinks resolved), `#` for comments.
@@ -5598,6 +5696,7 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - Slice S3 moved the v1 import converter (the `import-v1` section: the converter, the v2 shape checker and the command) to `switchboard/import_v1.py`, text unchanged, listed after the entry. Statements of that section stay in the entry, in place: `V1_MOVE_DEFAULTS` with the `DEFAULTS.update(V1_MOVE_DEFAULTS)` line (import time reads it, and the key order of `DEFAULTS` is as it was), `V1_LIST_PAGE`, `validate_v1_move_config`, `_v2_session_import` and `_v2_session_list_page` (the clear's closure reads them; they move with the clear batch, S13). No statement outside the section reads a moved name at import time (an ast check, run when the part was cut).
 - Slice S4 moved the decisions code (the escalated-request, PR-notice, order-notice and external-decision sections) to `switchboard/decisions_a.py` and `switchboard/decisions_b.py`, text unchanged, listed after the entry. 44 statements of those sections stay in the entry, in place, because the clear's closure reads them (`resolve_boss`, `boss_name`, `parse_pr_ref`, `read_pr_notices`, `read_pr_facts`, `read_pr_json`, `pr_marker`, `pr_hold_reasons`, `read_decisions_file`, `validate_order_burst` and what they read); they move with the clear batch (S13). The registry inventory (`docs/agent-registry.md`) names the part files for the readers that moved.
 - Slice S5 moved three whole sections no open pull request touched, each one job, to `switchboard/reminders.py` (the reminders file, `remind`, checkpoint reminders), `switchboard/plan_review.py` (`plan review`, slice R2) and `switchboard/pr_explain.py` (`pr-explain` and the held-body checks), text unchanged, listed after the entry. The waiting-on-the-person sweep and the triage code stay in the entry until the pull requests that edit them have merged. `tools/arch-part-cut` makes the cut and `tools/arch-split-check` proves it.
+- Slice S6 moved the daemon's core sections no open pull request touched and no test reads from the entry, one job each, to `switchboard/audit.py` (the audit log), `switchboard/v2_transport.py` (the OpenCode v2 client and its HTTP transport), `switchboard/facts.py` (the fact sources), `switchboard/decision.py` (the delivery decision), `switchboard/engine.py` (the engine) and `switchboard/jev.py` (the Jev client and the classifier), text unchanged. `v2_transport.py` and `facts.py` are listed right after the entry because earlier parts read their classes when they load. The event feed, the policy judge's questions and shadow mode, the heavy-reader budget block and the blocked-agent report stay in the entry.
 
 ## Running with no terminal multiplexer (#1072)
 
