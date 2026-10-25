@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -107,9 +108,46 @@ class PreflightStep(unittest.TestCase):
         p = run(repo, preflight=PASS, base="--version")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
 
+    SLOW = "import time\ntime.sleep(30)\n"
+
+    def test_slow_preflight_ends_at_its_own_bound(self):
+        repo = make_repo(self.tmp, TESTS)
+        t = time.monotonic()
+        p = run(repo, preflight=self.SLOW, env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "2", "CLOUD_PREPUSH_TIMEOUT": "20"})
+        self.assertLess(time.monotonic() - t, 2 + 8)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("could not run the preflight: timed out after 2s", p.stdout)
+        self.assertIn("preflight running (0 s of 2)", p.stderr)
+        self.assertNotIn("run 1,", p.stdout)
+
+    def test_total_shortens_the_preflight_bound(self):
+        repo = make_repo(self.tmp, TESTS)
+        p = run(repo, preflight=self.SLOW, env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "20", "CLOUD_PREPUSH_TOTAL": "2"})
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertRegex(p.stdout, r"timed out after [12]s")
+
+    def test_invalid_preflight_bound_is_refused(self):
+        repo = make_repo(self.tmp, TESTS)
+        for v in ("0", "-3", "abc", "1.5"):
+            p = run(repo, preflight=PASS, env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": v})
+            self.assertEqual(p.returncode, 2, (v, p.stdout + p.stderr))
+            self.assertIn("CLOUD_PREPUSH_PREFLIGHT_TIMEOUT", p.stderr)
+
+    def test_mutant_preflight_with_per_test_bound_fails_first_test(self):
+        repo = make_repo(self.tmp, TESTS)
+        text = open(SCRIPT).read()
+        mut = text.replace("min(PF_S, int(TOTAL_S - (time.monotonic() - started)))", "TIMEOUT_S")
+        self.assertNotEqual(mut, text)
+        t = time.monotonic()
+        p = run(repo, preflight=self.SLOW, script_text=mut,
+                env={"CLOUD_PREPUSH_PREFLIGHT_TIMEOUT": "2", "CLOUD_PREPUSH_TIMEOUT": "6"})
+        # the mutant ends at the per-test bound, not at the preflight bound: the first test's assertions fail
+        self.assertGreaterEqual(time.monotonic() - t, 5)
+        self.assertNotIn("timed out after 2s", p.stdout)
+
     def test_mutant_skipping_preflight_fails(self):
         s = open(SCRIPT).read()
-        old = "    ok, plines = preflight(root, base, scratch, max(1, TOTAL_S))\n"
+        old = "    ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))\n"
         self.assertIn(old, s)
         mutated = s.replace(old, "    ok, plines = True, []\n", 1)
         self.assertNotEqual(mutated, s, "mutation applied")

@@ -27,6 +27,9 @@ SCAN_TESTS = ["bin/test-switchboard"]
 # The two sides run one after the other, one test at a time (a pod has a hard memory limit): no parallelism.
 TIMEOUT = 120
 TOTAL = 1500
+# The preflight step has its own bound, CLOUD_PREPUSH_PREFLIGHT_TIMEOUT (default 900 s), counted inside the total; the
+# per-test bound does not apply to it. It runs serially and prints a progress line at start and every 60 s.
+PREFLIGHT_TIMEOUT = 900
 PREFLIGHT = "cloud-pr-preflight"  # found next to this file by path, never through PATH
 
 
@@ -119,14 +122,27 @@ def preflight(root, base, scratch, limit):
         return False, ["could not run the preflight: " + path + " is missing"]
     env = child_env(scratch)
     env["CLOUD_PREFLIGHT_BASE"] = base  # the preflight takes its base from this variable, never from an option
-    try:
-        p = subprocess.run([sys.executable, path], cwd=root, capture_output=True, text=True, timeout=limit, env=env,
-                           errors="replace")
-    except subprocess.TimeoutExpired:
-        return False, ["could not run the preflight: timed out after %ds" % limit]
-    except OSError as e:
-        return False, ["could not run the preflight: %s" % e]
-    lines = (p.stdout + p.stderr).splitlines()
+    t0 = time.monotonic()
+    with tempfile.TemporaryFile("w+", errors="replace") as outf:
+        try:
+            proc = subprocess.Popen([sys.executable, path], cwd=root, stdout=outf, stderr=subprocess.STDOUT, env=env)
+        except OSError as e:
+            return False, ["could not run the preflight: %s" % e]
+        nxt = 0
+        while proc.poll() is None:
+            el = time.monotonic() - t0
+            if el >= limit:
+                proc.kill()
+                proc.wait()
+                return False, ["could not run the preflight: timed out after %ds" % limit]
+            if el >= nxt:
+                print("preflight running (%d s of %d)" % (el, limit), file=sys.stderr, flush=True)
+                nxt += 60
+            time.sleep(min(0.2, max(0.01, limit - el)))
+        outf.seek(0)
+        lines = outf.read().splitlines()
+    class p:
+        returncode = proc.returncode
     if p.returncode != 0:
         return False, lines or ["the preflight exited %d with no output" % p.returncode]
     return True, lines
@@ -155,6 +171,7 @@ def main(argv):
     try:
         TIMEOUT_S = positive("CLOUD_PREPUSH_TIMEOUT", TIMEOUT)
         TOTAL_S = positive("CLOUD_PREPUSH_TOTAL", TOTAL)
+        PF_S = positive("CLOUD_PREPUSH_PREFLIGHT_TIMEOUT", PREFLIGHT_TIMEOUT)
     except ValueError as e:
         return refuse("%s must be a whole number of seconds (1 or more)" % e)
     started = time.monotonic()
@@ -178,14 +195,14 @@ def main(argv):
     scratch = os.path.join(tmp, "t")
     os.mkdir(scratch)
     try:
-        return stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started)
+        return stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started):
+def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S):
     # Step 1: the preflight of the pod, before any test.
-    ok, plines = preflight(root, base, scratch, max(1, TOTAL_S))
+    ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
     if not ok:
         for l in plines:
             print(l)
