@@ -278,6 +278,11 @@ def health_write(engine, state, now):
         _health_fault(engine, "write", err)
 
 
+def whole_lines(text):
+    """The lines of a sent message, stripped: a merged member is acknowledged only when its whole line is one of them (never a substring)."""
+    return {line.strip() for line in text.splitlines()}
+
+
 class _LazyImpactFloor:
     def __getattr__(self, name):
         return getattr(load_impact_floor(), name)
@@ -462,7 +467,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -707,6 +712,8 @@ def validate_config(raw, source="config"):
     validate_sweep_config(config, source)  # #117
     validate_triage_config(config, source)  # #130
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
+    validate_red_ci_required(config, source)  # #1141
+    validate_default_branches(config, source)
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
     validate_hold_labels_config(config, source)  # #376
@@ -794,6 +801,30 @@ def validate_plan_gates_config(config, source):
 
 
 PLAN_EVALUATOR_KINDS = ("ci", "tester", "reviewer", "owner")
+
+
+def validate_red_ci_required(config, source):
+    """`red_ci_required`: repository -> list of WORKFLOW names ("*" = every workflow). Absent: {} (and a repository not listed counts every workflow)."""
+    raw = config.get("red_ci_required")
+    if raw is None:
+        config.pop("red_ci_required", None)
+        return
+    if not isinstance(raw, dict) or not all(isinstance(r, str) and isinstance(v, list) and v and all(isinstance(n, str) and n for n in v) for r, v in raw.items()):
+        raise ConfigError("%s: 'red_ci_required' must be an object of repository -> non-empty list of workflow names (\"*\" for every workflow)" % source)
+    for repo, names in raw.items():
+        for n in names:
+            if re.search(r" \(.*\)$", n):   # 'test (ubuntu-latest)' is a matrix JOB name: the pass reads workflow runs and never matches it
+                warn_unknown_config("red_ci_required: %r for %s looks like a matrix JOB name; only WORKFLOW names are matched, so it will never fire" % (n, repo))
+
+
+def validate_default_branches(config, source):
+    """`default_branches`: repository -> branch name (at most 20). Absent: "main"."""
+    raw = config.get("default_branches")
+    if raw is None:
+        config.pop("default_branches", None)
+        return
+    if not isinstance(raw, dict) or len(raw) > 20 or not all(isinstance(r, str) and r and isinstance(b, str) and b for r, b in raw.items()):
+        raise ConfigError("%s: 'default_branches' must be an object of at most 20 repository -> non-empty branch name" % source)
 
 
 def validate_plan_evaluators(config, source):
@@ -1803,7 +1834,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -2925,18 +2956,34 @@ class Switchboard:
                 return {"sent": False, "action": again.action, "reason": again.reason}
             observation = fresh
         repos = self.repos_in_play()
-        text, carried = compose(plan.recipient, plan.pending, section=section_resolver(self, observation),
+        if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
+            self.intents.discard_told()
+        pending = merge_wake_facts(plan.recipient, plan.pending)   # #1275: the sweep, triage and load-alert items of one wake are ONE message
+        text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
                                 repos=repos, delivered=self.now())
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
-            whole, _ = compose(plan.recipient, plan.pending[:1], cap=10 ** 9, section=section_resolver(self, observation),
+            # Measure THE message delivered: the carried send alone (compose may cut a newer send, not pending[:1], the oldest fact).
+            whole, _ = compose(plan.recipient, [sent], cap=10 ** 9, section=section_resolver(self, observation),
                                repos=repos, delivered=self.now())
+            if len(pending) > 1:   # the carried send goes alone, with the line that says the others wait (compose's own rest line)
+                whole += "\n\u2026 and %d more: run fleet-switchboard pending %s" % (len(pending) - 1, plan.recipient)
             allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
             raise MessageTooLong("message is %d characters and would be cut at the delivery cap of %d once its header and "
                                  "ask sections are added; the allowed text for this message is %d characters: nothing was "
                                  "sent. Write it to a file in the opencode temp dir and send the path"
                                  % (len(sent.summary), MESSAGE_CAP, allowed))
-        keys = [fact.key for fact in carried]
+        if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
+            # #1275: only the asks of the CARRIED facts are told (compose rendered every fact's header)
+            self.intents.discard_told()
+            compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now())
+        keys = []
+        sent_lines = whole_lines(text)
+        for fact in carried:
+            lines = getattr(fact, "member_lines", None)
+            for key in (getattr(fact, "members", None) or [fact.key]):
+                if lines is None or lines.get(key, "") in sent_lines:   # a merged member counts only if its line is in the message
+                    keys.append(key)
         # The id lives in v2's namespace, so it is derived from the session the
         # recipient runs now: a relaunched agent is a new recipient for v2.
         message_id = derive_message_id(observation.session_id, keys)
@@ -2985,6 +3032,8 @@ class Switchboard:
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
         self._acknowledge(keys)
+        if getattr(self, "intents", None) is not None and hasattr(self.intents, "commit_told"):
+            self.intents.commit_told()
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
 
@@ -4462,10 +4511,8 @@ def release_stale_binding(engine, name, taken, session_id, replace=False):
 
 
 def _read_small(state_dir, name):
-    try:
-        with open(str(Path(state_dir) / name), "rb") as handle:
-            raw = json.loads(handle.read(1000001).decode("utf-8"))
-    except (OSError, ValueError, UnicodeError):
+    raw = read_record_file(Path(state_dir) / name)   # #1275: the ONE safe reader (no FIFO hang, no symlink, a size cap)
+    if raw is None:
         return {}
     return {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
 
@@ -7725,7 +7772,8 @@ def batch_body(name, rows):
 
 
 def decisions_from_github(engine, now):
-    """(items, problems): the open issues with your label, from the hub's picture. No `gh` call is made here."""
+    """(items, problems): the open issues with your label, from the hub's picture. The listing makes no `gh` call; each issue's plan kind
+    (#1094) is one cached read of its comments, at most PLAN_KIND_READS_PER_REFRESH new reads per call (the rest read "unknown" until the next refresh)."""
     if not decision_repos(engine):
         return [], []
     hub = engine.hub
@@ -7735,6 +7783,8 @@ def decisions_from_github(engine, now):
     records, problems = hub.awaiting_listing()
     agents = engine.discovery.agents if engine.discovery is not None else {}
     items = []
+    budget = [PLAN_KIND_READS_PER_REFRESH]
+    kinds = GitHubHub.plan_kinds(hub, records, budget)
     for record in records:
         numbers = [record["number"]] + ([record["parent"]] if record.get("parent") else [])
         items.append({"kind": "issue", "title": record["title"] or "issue #%d" % record["number"],
@@ -7743,7 +7793,8 @@ def decisions_from_github(engine, now):
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
                       "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
                       "parent": record.get("parent"), "closed": bool(record.get("closed")),
-                      "waits_for": record.get("waits_for") or []})
+                      "waits_for": record.get("waits_for") or [],
+                      "plan_kind": kinds[(record["repo"], record["number"])]})
     return items, problems
 
 
@@ -7801,8 +7852,19 @@ def synthetic_lines(engine, session_id, since, waiting=False):
         if not isinstance(item, dict) or item.get("type") != "synthetic" or item.get("id") in have \
                 or created is None or created < since or not isinstance(payload.get("text"), str):
             continue
-        waiting.extend((created, item.get("id"), number, line) for number, line in enumerate(payload["text"].splitlines()))
+        waiting.extend((created, item.get("id"), number, line) for number, line in numbered_lines(payload["text"], item))
     return sorted(waiting, key=lambda line: -line[0]) + found
+
+
+def numbered_lines(text, message=None):
+    """[(number, line)] of a message; the number grows with time, so a message composed newest first (#1275) is numbered from its last line.
+    Which messages are newest first is read from the STRUCTURE (the daemon's own fleet metadata: from the switchboard, with keys, and its header line), never from the text alone: an agent's
+    reply that ends its first line with the same words is numbered as written."""
+    lines = text.splitlines()
+    meta = _fleet_meta(message) if isinstance(message, dict) else None
+    if lines and isinstance(meta, dict) and meta.get("from") == "switchboard" and _fleet_keys(message) and lines[0].startswith("[switchboard] ") and lines[0].endswith(NEWEST_FIRST_MARK):
+        return [(len(lines) - 1 - n, line) for n, line in enumerate(lines)]
+    return list(enumerate(lines))
 
 
 def transcript_lines(engine, session_id, since):
@@ -7823,7 +7885,7 @@ def transcript_lines(engine, session_id, since):
             if created < since:
                 complete = True
                 break
-            for number, line in enumerate(reply_text(message).splitlines()):
+            for number, line in numbered_lines(reply_text(message), message):
                 found.append((created, message.get("id"), number, line))
         if complete or not more:
             break
@@ -9125,6 +9187,7 @@ class SweepState:
         self.s5 = {}             # decision id -> (head, ready time, who clears) for each held pull request that has waited past the threshold
         self.not_checked_since = {}   # "repo#n" -> when it was first not checked (unreadable or skipped), until it is read
         self.s5_oldest = 0       # seconds the longest not-checked held pull request has gone unread
+        self.s5_skipped = {"draft": 0, "parked": 0}
         self.s5_unchecked = 0    # held pull requests whose gates could not be read this pass: never raised (#986)
         self.details = {}        # (kind, ref) -> the finding's own sentence
 
@@ -9185,6 +9248,9 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
                          "author": (pr_login(record.get("user")) or "").lower(),
                          "created": parse_iso(record.get("created_at")), "updated": parse_iso(record.get("updated_at")),
                          "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
+                         "draft": _is_pr(record) and record.get("draft") is True,   # S5: a draft is a paused change
+                         "parked_until": parked_until(body, names),   # S5: the one reader of the parked date
+                         "closes": [r for r in pr_body_refs(body) if r[0] in (None, repo)] if _is_pr(record) else [],
                          "body_waits": sweep_says_waiting(regex, body), "comments": [], "comment_ids": [],
                          "latest_strong": False, "latest_refs": [], "latest_source": None}
     closed_holds = {}   # S9: the most recent closed (or merged) PRs that still carry a merge or hold label
@@ -9375,6 +9441,7 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
     moment, the wait does not restart), so a finding can be late, never early. The pass draws at most half of the call budget left
     (at least one reading when the budget allows two), the rest is for verifying the findings. The read order is in memory only. A clock that goes backwards makes now - start negative: nothing is raised until it catches up."""
     state.s5, state.s5_unchecked, state.s5_oldest = {}, 0, 0
+    state.s5_skipped = {"draft": 0, "parked": 0}   # the ONE counter of a sweep: reset here (this pass runs first), added to by sweep_findings
     if engine.state_dir is not None and not state.ready_loaded:
         state.ready_loaded = True
         for key, row in list(_read_small(engine.state_dir, SWEEP_READY_FILE).items())[:2000]:
@@ -9397,6 +9464,13 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
         todo.append((state.ready_read.get("%s#%d" % held, 0), "%s#%d" % held, held, d))
     todo.sort(key=lambda t: (t[0], t[1]))   # the least recently read first
     for _, key, held, d in todo:
+        skip = sweep_s5_skip(state, held, d, now)   # a draft, or a pull request of a parked ask: not read, not unchecked, the clock restarts when it is ready and neither
+        if skip:
+            state.s5_skipped[skip] += 1
+            state.ready.pop(key, None)
+            state.ready_read.pop(key, None)
+            state.not_checked_since.pop(key, None)
+            continue
         if reads >= SWEEP_READY_READS or (budget is not None and budget[0] < SWEEP_READY_READ_COST) \
                 or engine.now() - state.started >= SWEEP_PASS_SECONDS:
             state.not_checked_since.setdefault(key, now)
@@ -9504,6 +9578,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
     for d in decisions:   # everything the owner's tier already holds, however its ref is spelled
         if d.get("tier", "human") == "human" and d.get("kind") != "notice":
             human_keys |= sweep_ref_keys(d, home, repos_known)
+    skipped = state.__dict__.setdefault("s5_skipped", {"draft": 0, "parked": 0})   # shared with sweep_ready_pass, reset once per sweep there
     for d in decisions:
         ref = sweep_ref_of(d, home)
         # a report is about the refs its sentence names, never assumed to be about its own ask
@@ -9527,6 +9602,10 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
         if (decisions_whole and d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
+            skip = sweep_s5_skip(state, ref, d, now)
+            if skip:
+                skipped[skip] += 1
+                continue
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
     for repo, picture in state.repos.items():   # S9: a merge or hold label left on a closed, unmerged PR (read-only: nothing is removed; a merged one is the daemon's to clean, #559)
         for number in sorted(picture.get("closed_holds") or {}):
@@ -9552,6 +9631,21 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
         pass   # an unreadable registry raises nothing: the lookup itself says "unknown"
     state.unattributed = unattributed
     return sorted(found)
+
+
+def sweep_s5_skip(state, ref, decision, now):
+    """"draft" or "parked" when the decision's pull request is a draft, or closes or belongs to an ask parked now (the one reader
+    `parked_until`, judged by `triage_parked_now`); else None. Reads only the picture the sweep holds: an item not in it leaves S5 raised."""
+    picture = (state.repos.get(ref[0]) or {}).get("items", {}) if ref and ref[0] else {}
+    item = picture.get(ref[1]) if ref else None
+    if item is None or not item.get("pr"):
+        return None
+    if item.get("draft"):
+        return "draft"
+    asks = [item] + [picture.get(n) for _, n in item.get("closes", [])]
+    if isinstance(decision.get("ask"), int) and not isinstance(decision.get("ask"), bool):
+        asks.append(picture.get(decision["ask"]))
+    return "parked" if any(a and triage_parked_now(a, now) for a in asks) else None
 
 
 def _issue_pr_merged(record):
@@ -9763,7 +9857,8 @@ def sweep_decisions(engine, decisions, now, errors=()):
                      "truncated": sorted(r for r, p in state.repos.items() if p.get("truncated")),
                      "unreadable": sorted(r for r, p in state.repos.items() if p.get("error")), "at": iso(now),
                      "deferred": deferred, "unchecked": unchecked, "not_checked": state.s5_unchecked, "not_checked_oldest_seconds": int(max(state.s5_oldest, 0)),
-                     "unattributed": getattr(state, "unattributed", 0)}
+                     "unattributed": getattr(state, "unattributed", 0), "s5_skipped": dict(getattr(state, "s5_skipped", {}))}
+
     sweep_write(engine, state)
     return kept if cfg["enabled"] else decisions
 
@@ -10390,7 +10485,7 @@ def blocked_tick(engine, discovery, held):
     refused = blocked_update(engine.state_dir, BLOCKED_HELD_SENDS, forget)
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
 
-    def tell(observation, text, event, detail):
+    def tell(observation, text, event, detail, why=(None, None)):   # why: (blocked kind, the held reason): part of the repeat state
         boss = boss_name(discovery, observation)
         boss_seen = discovery.agents.get(boss) if boss else None
         recipients = []
@@ -10399,8 +10494,10 @@ def blocked_tick(engine, discovery, held):
         if cos and cos not in recipients:
             recipients.append(cos)
         recipients = [r for r in recipients if r != observation.name]
-        for who in recipients:
-            add_reminder(engine.state_dir, who, now, now, "Blocked agent: " + text)
+        for who in recipients:   # #1275: only a REPEAT of the same state is held (6 hours); the first report and the end line always pass
+            state_key = "%s|%s|%s|%s|%s" % (event, detail.get("held"), detail.get("refused"), why[0], why[1])
+            add_repeat_reminder(engine.state_dir, who, now, now, "Blocked agent: " + text, "blocked-agent", observation.name, state_key,
+                                first=event != "blocked.repeat", answered_at=last_send_at(engine.state_dir, who, observation.name))
         if engine.audit is not None:
             engine.audit.append(engine.actor, event, observation.name, dict(detail, told=recipients, text=_one_line(text, 400)))
 
@@ -10427,7 +10524,8 @@ def blocked_tick(engine, discovery, held):
             continue
         kind = blocked_kind(engine, seen, resume_first_recovery(engine, discovery, seen, last))
         tell(seen, blocked_line(engine, seen, entry["since"], now, messages, refusals, kind),
-             event, {"since": iso(entry["since"]), "held": len(messages), "refused": len(refusals)})
+             event, {"since": iso(entry["since"]), "held": len(messages), "refused": len(refusals)},
+             (str(kind), _one_line(str(plan.reason), 120) if plan is not None else None))
         entry["reported"] = now
         blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)   # after each one: a crash repeats at most one
         done.append((name, event.split(".")[1]))
@@ -10540,6 +10638,8 @@ GITHUB_CONFLICT_RETRY = 1800   # seconds between attempts, and catch-up reads, w
 GITHUB_CATCHUP_DELAY = 10      # seconds after a start: the forwarder has connected, so no gap remains
 GITHUB_LOOKUP_TTL = 600
 GITHUB_LOOKUP_RETRY = 60
+PLAN_KIND_READS_PER_REFRESH = 10   # #1094: new plan-kind reads of one decisions refresh
+PLAN_KIND_CACHE_MAX = 512          # #1094: plan-kind entries kept (expired first, then the oldest)
 GITHUB_BODY_LIMIT = 5 * 1024 * 1024
 GITHUB_QUEUE_LIMIT = 2000
 GITHUB_ROUTE_SECONDS = 5       # per pass: the time routing may spend on `gh api` lookups; the rest waits a pass
@@ -11749,6 +11849,53 @@ class GitHubHub:
             self._cache[key] = (now + GITHUB_LOOKUP_TTL, data)
         return data
 
+    def plan_kinds(self, records, budget):
+        """{(repo, number): kind} for the records, spending `budget` on never-read issues FIRST and on retries (an expired entry, e.g. a
+        persistent failure) last, so retries cannot starve rows that were never read (#1094)."""
+        def seen(r):
+            with self.lock:
+                return ("plan-kind", plan_ledger.normal_repo(r["repo"]), r["number"]) in self._cache
+        out = {}
+        for r in sorted(records, key=seen):
+            out[(r["repo"], r["number"])] = self.plan_kind(r["repo"], r["number"], budget)
+        return out
+
+    def plan_kind(self, repo, number, budget=None):
+        """"plan", "noplan" or "unknown" for an issue: whether a comment of it is the plan comment (the reading `plan check` uses,
+        plan_check.select_plan_text; it does not check the author, the latest heading comment counts whoever wrote it; a plan in the
+        issue BODY reads "noplan": the ask says a plan COMMENT). One read of the first 100 comments, cached for GITHUB_LOOKUP_TTL; a failed
+        read is remembered for GITHUB_LOOKUP_RETRY and says "unknown". A full page (100) with no plan found reads "unknown" (the plan may
+        be past it), and a plan found on a full page reads "unknown" too (a later revised plan may supersede it). `budget` is a one-item
+        list, the new reads left of this refresh: spent, a miss reads "unknown" with no read and no cache entry."""
+        key = ("plan-kind", plan_ledger.normal_repo(repo), number)
+        now = self.now()
+        with self.lock:
+            cached = self._cache.get(key)
+            if cached and now < cached[0]:
+                return cached[1]
+        if budget is not None:
+            if budget[0] <= 0:
+                return "unknown"
+            budget[0] -= 1
+        kind = "unknown"
+        ttl = GITHUB_LOOKUP_RETRY
+        try:
+            pages = self.gh_api("repos/%s/issues/%d/comments?per_page=100" % (repo, number), paginate=False,
+                                timeout=min(self.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT))
+            comments = pages[0] if pages and isinstance(pages[0], list) else None
+            if comments is not None and len(comments) < 100:
+                kind = "plan" if plan_check.select_plan_text("", comments)[1] != "issue body" else "noplan"
+                ttl = GITHUB_LOOKUP_TTL
+        except Exception:
+            pass
+        with self.lock:
+            self._cache[key] = (now + ttl, kind)
+            mine = [k for k in self._cache if k[0] == "plan-kind"]
+            if len(mine) > PLAN_KIND_CACHE_MAX:
+                for k in sorted(mine, key=lambda k: self._cache[k][0])[:len(mine) - PLAN_KIND_CACHE_MAX]:
+                    del self._cache[k]
+        return kind
+
     def open_issues_count(self, repo):
         """The repository's own count of open issues and pull requests (`open_issues_count` of `repos/<repo>`), one read; None when it cannot be told. Raises GitHubUnavailable."""
         pages = self.gh_api("repos/%s" % repo, paginate=False, timeout=min(self.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT))
@@ -12076,9 +12223,11 @@ class GitHubHub:
                 if fresh(suite):
                     items.append(_check_item(repo, dict(suite, pull_requests=suite.get("pull_requests") or [
                         {"number": number}]), now, "", "check suite"))
-        for run in read("runs", "workflow runs", base + "actions/runs?per_page=%d" % GITHUB_PAGE_SIZE, "workflow_runs") or []:
+        found_runs = read("runs", "workflow runs", base + "actions/runs?per_page=%d" % GITHUB_PAGE_SIZE, "workflow_runs")
+        for run in found_runs or []:
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
+        red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now)   # #1141: the same runs, no new read
         self.last_failed_primary = bool(failed)
         self.last_incomplete = bool(stopped or failed)   # #494: a step is still to do: the caller keeps the cursor and the marker where they are
         items = [item for item in items if item is not None]
@@ -12657,6 +12806,9 @@ def sweep_status_lines(sweep):
     if sweep.get("unattributed"):
         lines.append("      sweep      %d comment(s) say it waits but name only refs outside the watched repos: not "
                      "attributed to their own item" % sweep["unattributed"])
+    skipped = sweep.get("s5_skipped") or {}
+    if skipped.get("draft") or skipped.get("parked"):
+        lines.append("      sweep      S5 skipped: %d draft, %d parked" % (skipped.get("draft", 0), skipped.get("parked", 0)))
     if sweep.get("unchecked"):
         lines.append("      sweep      %d finding(s) not checked this pass (call budget or a failed read): neither "
                      "raised nor audited" % sweep["unchecked"])
@@ -14251,6 +14403,7 @@ DEFAULTS.update(INTENT_DEFAULTS)
 NO_INTENT = "no intent recorded"
 INTENT_TTL = 300        # seconds a cached issue is trusted; a webhook invalidates it sooner
 INTENT_TTL_LIVE = 1800  # ... while the repo's webhook forwarder is live (the same one that cached it): the webhook is what invalidates
+ASK_BRIEF = 160  # characters of an ask's header after its first delivery of the day
 INTENT_LINE_LIMIT = 240  # characters per header line
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -14534,10 +14687,22 @@ class IntentReader:
         ask_issue = self.issue(ask, repo)
         if ask_issue.charter:
             return None
+        lines = ask_lines(ask_issue, issue_tag(repo, ask, repos))
+        day, told = int(self.now() // 86400), self.__dict__.setdefault("_told_day", {})
+        if told.get((repo, ask)) == day:   # #1275: the full Intent and Done-when only on the first delivery per ask per day
+            lines = [_one_line(" ".join(lines), ASK_BRIEF)]
+        self.__dict__.setdefault("_told_pending", {})[(repo, ask)] = day   # recorded by `commit_told` when the message was DELIVERED, never at compose
         if work is None:
-            return ask, ask_lines(ask_issue, issue_tag(repo, ask, repos)), None, []
-        return (ask, ask_lines(ask_issue, issue_tag(repo, ask, repos)), work,
+            return ask, lines, None, []
+        return (ask, lines, work,
                 work_lines(self.issue(work, repo), issue_tag(repo, work, repos)))
+
+    def commit_told(self):
+        """The asks whose header went out in a delivered message: their full text is not repeated today."""
+        self.__dict__.setdefault("_told_day", {}).update(self.__dict__.pop("_told_pending", {}))
+
+    def discard_told(self):
+        self.__dict__.pop("_told_pending", None)
 
     def missing_intent(self, number, repo=None):
         """The issues in this one's ask chain (ask, work item) with no Intent line. Charters are exempt."""
@@ -21606,7 +21771,10 @@ def load_tick(engine, discovery):
         return int(found.group(2)) if found and found.group(1).lower() == str(repo).lower() else None
 
     def wake(text):
-        add_reminder(engine.state_dir, cos, now, now, text)
+        alert = getattr(context, "alert", None) or {}   # #1275: keyed by the DATA (the lane and its severity and reasons), never by the prose
+        if add_repeat_reminder(engine.state_dir, cos, now, now, text, "load-alert", str(alert.get("agent") or "unknown"), str(alert.get("state") or "unknown"),
+                               wake_class=WAKE_LOAD) is None:
+            return
         if engine.audit is not None:
             engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})
 
