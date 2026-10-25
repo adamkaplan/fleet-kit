@@ -50,7 +50,7 @@ ALLOWED_COPY = {"cloud/worker/plan_check.py"}
 
 
 def files():
-    for top in ("cloud", "bin/test-cloud-launcher", "docs/cloud-worker-interface.md"):
+    for top in ("cloud", "bin/test-cloud-launcher", "bin/test-cloud-launcher.chain", "docs/cloud-worker-interface.md"):
         full = os.path.join(ROOT, top)
         if os.path.isfile(full):
             yield top, full
