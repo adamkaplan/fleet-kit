@@ -90973,6 +90973,182 @@ class TestProofCarry(LedgerBase):
             self.assertIn(item, section)
 
 
+class TestCiRecordCarry(LedgerBase):
+    """#1217: the CI-verdict recording step (`gates ci-record`, and the daemon pass through the same `ci_record_core`) carries the proofs the #1213 rule allows, one `carried` line each.
+    Fakes only: GitHub's compare, commit and default-branch reads are served here."""
+
+    NEW = LEDGER_NEW_HEAD
+    API = "repos/acme/app"
+
+    def setUp(self):
+        super().setUp()
+        self.changed = ["bin/other.py"]
+        self.parents = ["p" * 40, "q" * 40]
+        self.reads = []
+        self.pr["headRefOid"] = LEDGER_HEAD
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "api" and argv[2].startswith(self.API) and not argv[2].endswith("/issues/7") and "/comments" not in argv[2]:
+            path = argv[2]
+            self.reads.append(path)
+            if "/compare/%s...%s" % ("a" * 40, self.NEW) in path:
+                body = {"files": [{"filename": f} for f in self.changed]}
+            elif path.endswith("/commits/%s" % self.NEW):
+                body = {"parents": [{"sha": x} for x in self.parents]}
+            elif path.endswith("/check-runs"):
+                body = {"check_runs": [{"status": "completed", "conclusion": "success"}]}
+            elif path == self.API:
+                body = {"default_branch": "main"}
+            elif "/compare/main..." in path:
+                body = {"status": "behind"}
+            else:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        return super().route(argv, **kwargs)
+
+    def proofs(self, files=("src/widget.py",)):
+        more = [x for f in files for x in ("--file", f)]
+        self.assertEqual(self.prove("coder", "S2", *more)[0], 0)
+        self.assertEqual(self.prove("coder", "S3", *more)[0], 0)
+        self.assertEqual(self.verdict("tst", "S2", "tester", "pass", *more)[0], 0)
+
+    def step(self, green=True):
+        self.pr["headRefOid"] = self.NEW
+        self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS" if green else "FAILURE", "status": "COMPLETED"}]
+        return self.run_as(None, "gates", "ci-record", self.PR)
+
+    def carried(self):
+        return [e for e in self.ledger() if e["kind"] == "carried"]
+
+    def ledger_bytes(self):
+        return (self.world.state / "plan-ledger.jsonl").read_text()
+
+    def test_S1_a_merge_of_main_carries_one_line_per_proof_through_the_real_step(self):
+        self.proofs()
+        code, out, err = self.step()
+        self.assertEqual(code, 0, err)
+        lines = self.carried()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual({(c["old_head"], c["new_head"]) for c in lines}, {(LEDGER_HEAD, self.NEW)})
+        self.assertEqual(sorted(c["scenario"] for c in lines), ["S2", "S2", "S3"])
+        self.assertEqual(out.count("carried proof #"), 3)
+
+    def test_S2_a_tests_and_documentation_only_head_carries(self):
+        self.proofs(files=("src/widget.py",))
+        self.parents = ["p" * 40]
+        self.changed = ["docs/a.md", "bin/test-widget"]
+        self.assertEqual(self.step()[0], 0)
+        self.assertEqual(len(self.carried()), 3)
+        self.assertEqual({c["facts"]["difference"] for c in self.carried()}, {"tests and documentation only"})
+
+    def refused_case(self, name):
+        if name == "touched":
+            self.proofs()
+            self.changed = ["src/widget.py"]
+        elif name == "ci":
+            self.proofs()
+        elif name == "code":
+            self.proofs()
+            self.parents = ["p" * 40]
+        else:
+            self.proofs(files=())
+        return self.step(green=(name != "ci"))
+
+    def test_S3_each_refusal_carries_nothing_and_prints_one_reason_line_per_proof(self):
+        for name, reason in (("touched", "touches a file the proof names"), ("ci", "CI is not green"), ("code", "code outside a merge"), ("nofile", "names no file")):
+            with self.subTest(case=name):
+                self.tearDown()
+                self.setUp()
+                code, out, err = self.refused_case(name)
+                self.assertEqual(self.carried(), [])
+                text = out + err
+                self.assertEqual([l for l in text.splitlines() if l.startswith("not carried")].count(None), 0)
+                reasons = [l for l in text.splitlines() if l.startswith("not carried") and reason in l]
+                self.assertEqual(len(reasons), 3, text)
+
+    def test_S4_and_U2_a_second_run_writes_nothing_and_the_ledger_bytes_are_unchanged(self):
+        self.proofs()
+        self.step()
+        first = self.ledger_bytes()
+        self.assertEqual(len(self.carried()), 3)
+        self.assertEqual(self.step()[0], 0)
+        self.assertEqual(self.ledger_bytes(), first)
+        self.assertEqual(len(self.carried()), 3)
+
+    def test_S5_original_proof_rows_and_ci_verdicts_equal_the_baseline_apart_from_carried_lines(self):
+        self.proofs()
+        before = [l for l in self.ledger_bytes().splitlines()]
+        self.step()
+        rest = [json.loads(l) for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l]
+        self.assertEqual([l for l in self.ledger_bytes().splitlines() if '"kind": "carried"' not in l][:len(before)], before)
+        ci = [(e["scenario"], e["head"], e["by"]) for e in rest[len(before):]]
+        self.assertEqual(sorted(ci), [("S1", self.NEW, sb.plan_ledger.CI_RECORDER), ("U1", self.NEW, sb.plan_ledger.CI_RECORDER)])
+
+    def test_U1_the_step_decides_as_the_rule_does_on_six_combinations(self):
+        combos = [(["src/widget.py"], True, True), (["bin/o.py"], False, True), (["bin/o.py"], True, False),
+                  (["bin/o.py"], True, True), (["docs/a.md"], False, True), (["docs/a.md"], False, False)]
+        for files, merge, ci in combos:
+            with self.subTest(files=files, merge=merge, ci=ci):
+                self.tearDown()
+                self.setUp()
+                self.proofs()
+                self.changed = files
+                self.parents = ["p" * 40, "q" * 40] if merge else ["p" * 40]
+                self.step(green=ci)
+                row = {"files": ["src/widget.py"]}
+                wanted = sb.plan_ledger.carry_decision(row, "tester", files, merge, ci)[0] == "carry"
+                self.assertEqual(len(self.carried()), 3 if wanted else 0)
+
+    def test_the_carry_line_of_another_plan_hash_is_no_evidence(self):
+        self.proofs()
+        self.step()
+        entries, _ = sb.plan_ledger.read_ledger(self.world.state)
+        self.assertEqual(len(sb.plan_ledger.carried_seqs(entries, self.PR, self.NEW, sb.plan_check.plan_hash(LEDGER_PLAN))), 3)
+        self.assertEqual(sb.plan_ledger.carried_seqs(entries, self.PR, self.NEW, "sha256:" + "0" * 64), {})
+        code, report, err = self.gates()
+        s2 = next(s for s in report["scenarios"] if s["id"] == "S2")
+        self.assertTrue(s2["carried"])
+
+    def test_mutant_that_drops_the_plan_hash_check_of_a_carried_row_fails(self):
+        self.proofs()
+        self.step()
+        real = sb.plan_ledger.carried_seqs
+        with mock.patch.object(sb.plan_ledger, "carried_seqs", lambda e, pr, head, plan_hash=None: real(e, pr, head)):
+            with self.assertRaises(AssertionError):
+                self.test_the_carry_line_of_another_plan_hash_is_no_evidence()
+
+    def test_S6_mutant_that_skips_the_ci_check_fails_a_test(self):
+        real = sb.plan_ledger.carry_decision
+        with mock.patch.object(sb.plan_ledger, "carry_decision", lambda row, ev, files, merge, ci: real(row, ev, files, merge, True)):
+            with self.assertRaises(AssertionError):
+                self.refused_case("ci")
+                self.assertEqual(self.carried(), [])
+
+    def test_S6_mutant_that_carries_twice_fails_a_test(self):
+        real = sb.plan_ledger.append_entry
+
+        def twice(state, entry, now):
+            real(state, entry, now)
+            if entry.get("kind") == "carried":
+                real(state, entry, now)
+        with mock.patch.object(sb.plan_ledger, "append_entry", twice):
+            with self.assertRaises(AssertionError):
+                self.test_S4_and_U2_a_second_run_writes_nothing_and_the_ledger_bytes_are_unchanged()
+
+    def test_the_daemon_recording_and_the_command_share_the_one_call(self):
+        text = SWITCHBOARD.read_text(encoding="utf-8")
+        self.assertEqual(text.count("carry_at_green(ctx, now)"), 1)
+        self.assertEqual(text.count("got = ci_record_core("), 2)   # the command and the daemon pass: the only two writers of the `ci` verdicts at a head
+
+    def test_S7_the_documentation_names_the_step_and_the_line(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("## A proof carries to a new head")
+        section = text[start:text.index("\n## ", start + 5)]
+        self.assertEqual(section.count("`gates ci-record`"), 1)
+        self.assertIn("one line each", section)
+        self.assertIn("`carried`", section)
+
+
 class TestAskIssueSubject(unittest.TestCase):
     """#1130: `prove`, `verdict` and `gates` accept an ASK ISSUE as the subject, bound to the hash of the plan comment on it. Fakes only."""
 

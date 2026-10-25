@@ -4414,6 +4414,8 @@ A proof is bound to the head it was recorded at. A tester's, live check's or rev
 
 A carry is ONE ledger line of its own, kind `carried`, with the fields `proof` (the sequence number of the row), `scenario`, `old_head`, `new_head` and `facts` (`named_files_untouched`, `difference`, `ci`). The original proof row is never changed. `gates` shows the proof as carried, with the head it was recorded at. A proof that names no file is never carried; a proof whose named file is touched is void as before; proofs proven by CI are re-recorded by the daemon at each green head and are never carried. A carry never turns a proof into one for a head that fails any condition. The decision is `plan_ledger.carry_decision`; `fleet-switchboard`'s `carry_proofs` writes the lines from `carry_head_facts`. Reverting leaves the lines readable and ignored.
 
+The step that carries is `gates ci-record` (and the daemon's own recording of the `ci` verdicts, the same code): at a green head it carries, from the previous head, each proof the rule allows, one `carried` line each and never two for the same proof, old head and new head. A proof the rule refuses stays void and the step prints why, one line each (`not carried ...`). `gates <pr>` shows the carried line (`carried: row #N recorded at <head>, held here by carried line #M`), and the line itself is in the plan ledger. A `carried` line counts as evidence only for the plan hash it names.
+
 ## The merge gate and the merge lock: the fleet's own merge queue (#962)
 
 **It is the fleet's own merge queue.** Two pull requests that were each green against an older default branch can merge minutes apart and fail together (the
