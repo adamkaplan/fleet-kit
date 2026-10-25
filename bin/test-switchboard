@@ -75705,10 +75705,25 @@ class TestSupportRebinding(unittest.TestCase):
         tree = ast.parse(source)
         lines = source.split("\n")
         parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
-        roots = ("sys.modules[__name__]", "sys.modules['__main__']", "globals()", "__main__")
-        aliases = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign) and ast.unparse(n.value) in roots for t in n.targets if isinstance(t, ast.Name)}
+        roots = ("sys.modules[__name__]", "sys.modules['__main__']", "globals()", "__main__", "vars()")
+        aliases = set()   # every name the module is bound to: an assignment, an annotated assignment, a walrus, a tuple of them, `import __main__ as m`
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and ast.unparse(n.value) in roots:
+                        aliases.add(t.id)
+                    elif isinstance(t, (ast.Tuple, ast.List)) and isinstance(n.value, (ast.Tuple, ast.List)) and len(t.elts) == len(n.value.elts):
+                        aliases |= {a.id for a, v in zip(t.elts, n.value.elts) if isinstance(a, ast.Name) and ast.unparse(v) in roots}
+            elif isinstance(n, ast.AnnAssign) and n.value is not None and isinstance(n.target, ast.Name) and ast.unparse(n.value) in roots:
+                aliases.add(n.target.id)
+            elif isinstance(n, ast.NamedExpr) and ast.unparse(n.value) in roots:
+                aliases.add(n.target.id)
+            elif isinstance(n, ast.Import):
+                aliases |= {a.asname for a in n.names if a.name == "__main__" and a.asname}
 
         def is_module(e):
+            if isinstance(e, ast.NamedExpr):
+                return is_module(e.value)
             text = ast.unparse(e)
             if text in roots or (isinstance(e, ast.Name) and e.id in aliases):
                 return True
@@ -75895,6 +75910,13 @@ class TestSupportRebinding(unittest.TestCase):
         "the marker on a module write": "globals()['sb'] = 1  # support import\n",
         "the marker with another value": "sb = _support_loader.sc  # support import\n",
         "the marker with a call": "sb = _support_loader.sb()  # support import\n",
+        "an alias made by import __main__ as m": "import __main__ as m\n\ndef f():\n    m.sb = 1\n",
+        "setattr through an import alias": "import __main__ as m\n\ndef f():\n    setattr(m, 'sb', 1)\n",
+        "an annotated alias": "def f():\n    m: object = sys.modules[__name__]\n    m.sb = 1\n",
+        "a walrus alias": "def f():\n    (m := globals())['sb'] = 1\n",
+        "a walrus alias, then a store": "def f():\n    (m := globals())\n    m['sb'] = 1\n",
+        "an alias in a tuple": "def f():\n    a, m = 1, sys.modules[__name__]\n    m.sb = 1\n",
+        "the module dict through a zero-argument vars()": "vars()['sb'] = 1\n",
         "a paired rebound for another name": "def f():\n    with mock.patch.dict(globals(), {'sb': 1}), rebound('sc', 1):\n        pass\n",
     }
 
