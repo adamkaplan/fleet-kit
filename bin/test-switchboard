@@ -90839,11 +90839,11 @@ class TestReadCheckRuns1237(unittest.TestCase):
         m = self.src_module("total < len(runs):", "False:")
         (runs, why), _ = self.run_pages([self.page(100, 50)], m)
         self.assertEqual(len(runs), 100)
-        m = self.src_module("return (1, _when(entry), _attempt(entry), run)", "return (0, run, _attempt(entry))")
+        m = self.src_module("key=lambda k: (cur[k], k[1], k[0])", "key=lambda k: (k[0], k[1], cur[k])")
         kept = self.latest_of([self.lrun(900, "2026-01-01T00:00:00Z"), self.lrun(500, "2026-02-01T00:00:00Z")], m)
         self.assertTrue(kept[0]["detailsUrl"].endswith("/900"))
         # the mutant that sorts a missing time first drops the queued newer run
-        m = self.src_module("untimed[ident] = untimed.get(ident, False) or _when(entry) is None", "untimed[ident] = False")
+        m = self.src_module("untimed.add(ident)", "pass")
         m._when = lambda e, _w=m._when: _w(e) or m.__dict__.setdefault("_MIN", __import__("datetime").datetime(1, 1, 1, tzinfo=__import__("datetime").timezone.utc))
         kept = self.latest_of(self.mixed(), m)
         self.assertEqual([e["detailsUrl"].rsplit("/", 1)[1] for e in kept], ["500"])
@@ -90877,9 +90877,83 @@ class TestReadCheckRuns1237(unittest.TestCase):
         self.assertEqual(self.ids(k), ["500"])
 
     def test_1281_comparison_table_in_docs_is_complete(self):
-        doc = (ROOT / "docs" / "switchboard.md").read_text() if "ROOT" in globals() else open("docs/switchboard.md").read()
-        for row in ("latest_runs group order", "newest per-check order", "latest_check_runs", "Field per reader"):
+        doc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "switchboard.md")).read()
+        ci = load_ci_runs()
+        labels = ["%s group order" % "latest_runs", "newest per-check order", "latest_check_runs", "Field per reader"]
+        for fn in ("latest_runs", "latest_check_runs", "newest"):
+            self.assertTrue(callable(getattr(ci, fn)), fn)
+        for row in labels:
             self.assertIn(row, doc)
+        self.assertIn("status contexts", doc.lower())
+
+    def job(self, run, name, state, started, attempt=None):
+        url = "https://github.com/o/r/actions/runs/%d" % run + ("/attempts/%d" % attempt if attempt else "")
+        done = state in ("SUCCESS", "FAILURE")
+        return {"name": name, "workflowName": "w", "detailsUrl": url, "startedAt": started,
+                "status": "COMPLETED" if done else state, "conclusion": state if done else ""}
+
+    def not_green(self, entries, mod=None):
+        mod = mod or load_ci_runs()
+        old = mod.READER
+        mod.READER = lambda repo, run: (1, "push")
+        mod._CACHE.clear()
+        try:
+            return mod.not_green_runs(entries)
+        finally:
+            mod.READER = old
+            mod._CACHE.clear()
+
+    def test_1281_jobs_of_one_run_are_all_kept_red_early_or_late(self):
+        red = self.job(900, "lint", "FAILURE", "2026-01-01T10:00:00Z")
+        green = self.job(900, "test", "SUCCESS", "2026-01-01T10:05:00Z")
+        for order in ([red, green], [green, red]):
+            self.assertEqual(sorted(e["name"] for e in self.latest_of(order)), ["lint", "test"])
+            self.assertEqual([b[0:1] for b in self.not_green(order)], [('"w"',)])
+        red_late = self.job(900, "lint", "FAILURE", "2026-01-01T10:05:00Z")
+        green_early = self.job(900, "test", "SUCCESS", "2026-01-01T10:00:00Z")
+        for order in ([red_late, green_early], [green_early, red_late]):
+            self.assertEqual(len(self.latest_of(order)), 2)
+            self.assertEqual(len(self.not_green(order)), 1)
+
+    def test_1281_in_progress_early_job_and_older_run_with_later_job(self):
+        early = self.job(900, "lint", "IN_PROGRESS", "2026-01-01T10:00:00Z")
+        late = self.job(900, "test", "SUCCESS", "2026-01-01T10:05:00Z")
+        older = self.job(500, "test", "SUCCESS", "2026-01-01T10:03:00Z")
+        for order in ([early, late, older], [older, late, early]):
+            kept = self.latest_of(order)
+            self.assertEqual(sorted(self.ids(kept)), ["900", "900"])
+            self.assertEqual(len(self.not_green(order)), 1)
+        # an older run whose job started LATER than the early job of the latest run must not win
+        older_mid = self.job(500, "x", "SUCCESS", "2026-01-01T10:03:00Z")
+        self.assertEqual(self.ids(self.latest_of([early, late, older_mid])), ["900", "900"])
+
+    def test_1281_check_runs_rest_started_at_keeps_both_jobs(self):
+        mod = load_ci_runs()
+        old = mod.READER
+        mod.READER = lambda repo, run: (1, "push")
+        mod._CACHE.clear()
+        try:
+            runs = [{"name": "lint", "status": "completed", "conclusion": "failure", "started_at": "2026-01-01T10:00:00Z", "details_url": "https://github.com/o/r/actions/runs/900/job/1"},
+                    {"name": "test", "status": "completed", "conclusion": "success", "started_at": "2026-01-01T10:05:00Z", "details_url": "https://github.com/o/r/actions/runs/900/job/2"}]
+            for order in (runs, runs[::-1]):
+                self.assertEqual(sorted(r["name"] for r in mod.latest_check_runs(order, "o/r")), ["lint", "test"])
+        finally:
+            mod.READER = old
+            mod._CACHE.clear()
+
+    def test_1281_top_entry_only_mutant_fails(self):
+        m = self.src_module("elif (run, _attempt(entry)) == top[ident]:", "elif _when(entry) == max(_when(e) for e in rollup if isinstance(e, dict) and _when(e)):")
+        red = self.job(900, "lint", "FAILURE", "2026-01-01T10:00:00Z")
+        green = self.job(900, "test", "SUCCESS", "2026-01-01T10:05:00Z")
+        self.assertEqual(len(self.latest_of([red, green], m)), 1)
+        self.assertEqual(self.not_green([red, green], m), [])
+        self.assertEqual(len(self.latest_of([red, green])), 2)
+
+    def test_1281_naive_and_date_only_times_are_unparsable(self):
+        ci = load_ci_runs()
+        for bad in ("2026-01-01T10:00:00", "2026-01-01"):
+            self.assertIsNone(ci._when({"created_at": bad}))
+        self.assertIsNotNone(ci._when({"created_at": "2026-01-01T10:00:00Z"}))
 
     def test_1281_error_text_names_ids_or_paths(self):
         with self.assertRaises(ValueError) as cm:

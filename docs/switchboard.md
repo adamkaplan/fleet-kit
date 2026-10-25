@@ -2385,7 +2385,7 @@ for one repo shows that repo's notices; the Chief of Staff's and yours show all.
 - unreadable identity
 <!-- ci-shapes:end -->
 
-**Readers of check runs (#1237).** Every reader of the check-runs or the rollup, by source file (a test derives them by grep and fails on a reader missing here):
+**Readers of check runs (#1237).** Status contexts (no workflow) are grouped by their context name. A run's time for "latest" is the MAX start time over its jobs (a run is as new as its latest job), then attempt, then run id, and ALL jobs of the winning run are kept; any missing, naive or date-only time in a group falls back to run id, then attempt. Residual: a newer run id that started EARLIER than an older green run is hidden when every time is valid (the intended reading). Every reader of the check-runs or the rollup, by source file (a test derives them by grep and fails on a reader missing here):
 
 | Reader (file: function) | Pages and cap | At the cap | Test and mutant | Branches and tests (`TestReadCheckRuns1237`) |
 |---|---|---|---|---|

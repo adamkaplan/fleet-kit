@@ -176,16 +176,39 @@ def _when(entry):
                 d = datetime.fromisoformat(t.strip().replace("Z", "+00:00").replace("z", "+00:00"))
             except ValueError:
                 return None
-            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+            if not d.tzinfo or "T" not in t.upper():
+                return None  # naive or date-only: unparsable, the group falls to the old rule
+            return d
     return None
 
 
-def _order(entry, run, timed=True):
-    """Order of runs of one workflow. With a usable time on EVERY entry of the group: (time, attempt, run id). If any entry lacks a usable
-    time the whole group uses the old rule (run id, then attempt), so a queued newer run is never dropped."""
-    if timed:
-        return (1, _when(entry), _attempt(entry), run)
-    return (0, run, _attempt(entry))
+def _winners(rollup, known):
+    """{identity: (run id, attempt)} of the winning run of each group. A run's time is the MAX start time over its jobs (fail-closed: the
+    jobs of one run start at different times, and a run is as new as its latest job; with MIN a run with an early job would lose to an older
+    run whose job started between, and its checks would be dropped). Winner: time, then attempt,
+    then run id. ANY missing or unparsable time in the group: the old rule (run id, then attempt). The residual: a newer run id with an
+    EARLIER start than an older green run is hidden when every time is valid (the intended reading of clause 3)."""
+    runs = {}
+    untimed = set()
+    for entry, (run, ident) in zip(rollup, known):
+        if ident is None:
+            continue
+        t = _when(entry)
+        if t is None:
+            untimed.add(ident)
+        cur = runs.setdefault(ident, {})
+        k = (run, _attempt(entry))
+        if t is not None and (cur.get(k) is None or t > cur[k]):
+            cur[k] = t
+        else:
+            cur.setdefault(k, t)
+    out = {}
+    for ident, cur in runs.items():
+        if ident in untimed:
+            out[ident] = max(cur, key=lambda k: (k[0], k[1]))
+        else:
+            out[ident] = max(cur, key=lambda k: (cur[k], k[1], k[0]))
+    return out
 
 
 def latest_runs(rollup, repo=None):
@@ -199,8 +222,6 @@ def latest_runs(rollup, repo=None):
     repo = own_repo(rollup, repo)
     budget = [READ_CAP]
     known = []
-    top = {}
-    untimed = {}
     capped = set()
     for entry in rollup:
         run = _run_id(entry) if isinstance(entry, dict) else None
@@ -208,19 +229,14 @@ def latest_runs(rollup, repo=None):
         if run is not None and ident is None and budget[0] <= 0 and (repo, run) not in _FAILED and _details_repo(entry) == repo:
             capped.add((repo, run))
         known.append((run, ident))
-        if ident is not None:
-            untimed[ident] = untimed.get(ident, False) or _when(entry) is None
-    for entry, (run, ident) in zip(rollup, known):
-        if ident is not None:
-            o = _order(entry, run, not untimed[ident])
-            top[ident] = max(top.get(ident, o), o)
+    top = _winners(rollup, known)
     out = []
     for entry, (run, ident) in zip(rollup, known):
         if run is None:
             out.append(entry)
         elif ident is None:
             out.append(dict(entry, status=CAP_STATUS if (repo, run) in capped else UNREADABLE, conclusion=""))
-        elif _order(entry, run, not untimed[ident]) >= top[ident]:
+        elif (run, _attempt(entry)) == top[ident]:
             out.append(entry)
     return out
 
