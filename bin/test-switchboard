@@ -3018,7 +3018,7 @@ class TestDeliver(Base):
         self.assertEqual((admitted["resume"], admitted["delivery"]), (True, "queue"))
         self.assertEqual(admitted["id"], sb.derive_message_id(sid, ["lab.fact:1", "lab.fact:2"]))
         self.assertEqual(admitted["from"], "switchboard")
-        self.assertRegex(admitted["text"].splitlines()[0], r"^\[switchboard\] 2 for platform \(sent \d\d:\d\dZ(-\d\d:\d\dZ)?, delivered \d\d:\d\dZ\): First")
+        self.assertRegex(admitted["text"].splitlines()[0], r"^\[switchboard\] 2 for platform \(sent \d\d:\d\dZ(-\d\d:\d\dZ)?, delivered \d\d:\d\dZ\): Second")
         intent, result = [e for e in self.world.audit() if e["event"] == "v2.synthetic"]
         self.assertEqual((intent["phase"], result["phase"], result["ok"]), ("intent", "result", True))
         self.assertEqual(intent["detail"]["message_id"], admitted["id"])
