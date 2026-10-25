@@ -2760,7 +2760,13 @@ own gets `--until-closed` for that issue by default, so a reminder about finishe
 
 **A reminder about an issue is dropped when it closes (#1132).** A reminder is dropped when its issue closes or its pull
 request merges, unless it was set with `--keep-if-closed`. `remind --issue N` says so at creation ("dropped if it closes")
-and names `--keep-if-closed`. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
+and names `--keep-if-closed`.
+
+`remind --key <text>` names the purpose: arming again with the same key replaces your pending reminder of that key (one pending per
+owner and key; another owner's or another key's reminder is never touched), and `remind --list` shows the key. A fired, undelivered
+reminder is dropped when a newer one of the same owner and key is due and will be delivered (one `reminder.drop_superseded` audit line names both ids). A
+delivery 5 minutes or more after its due time says "late by N min". Arming a text over 4000 characters (the delivery cap) prints a
+warning with the number of characters over. A newer reminder still in the future does NOT drop an older fired one: the older is delivered (with its late note) and the newer fires as usual, so a lane never gets nothing. A keyed reminder needs a known sender (an unidentified caller is refused). The key is cut at 80 characters, so two longer keys with the same first 80 characters are one key. The match is the owner and the key, not the recipient `to`. A cut body ends with an ellipsis before the note. The late note is added before the 4000 cap and kept: the body is cut, not the note. Without `--key` nothing changes. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
 reason (the issue closed, the pull request merged), audited as `reminder.drop_notice`; the notice is sent only by the sweep
 that removes the reminder, so it is never repeated. An issue already closed at creation is refused (exit 2, "already
 closed") unless `--keep-if-closed` is given, which keeps the reminder and fires it. A reminder without `--issue`, or whose
@@ -5875,3 +5881,17 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 - **Sender derivation follows ONE wrapper level** (a call through a wrapper of the base calls is found; a wrapper of a wrapper is not).
 - **The load key's subject is the agent only.**
 - Every place agent text reaches a daemon message (header lead, item summary via `_clean_line`/`one_line`, keys by data) and every place numbering or order is decided (`compose`, `numbered_lines`) has a hostile-text test.
+
+### Where a reminder is dropped, replaced, delayed or rewritten
+
+| Place | What happens | Loss case probed by |
+| --- | --- | --- |
+| `reminders_lock` in `add_reminder` | a keyed arming replaces the pending item of the same owner and key | other owner/key, fired item, sender-less |
+| `reminder.drop_superseded` / `drop_superseded_item` | a fired older item is dropped for a newer due one that will be delivered, re-checked in one locked read-modify-write | newer in the future, gated (verdict not `deliver`), unresolved (None), cancelled or pruned between read and drop: the older is delivered or kept; mutants: restore the old rule, drop outside the lock |
+| `superseded` / `verdict` / `until_closed` | match is owner+key (not the recipient `to`) | gated newer keeps the older |
+| mutant results (run by hand) | restore the old drop rule: killed; drop without re-checking the kept item in the lock: killed | `TestReminders` |
+| `remove_reminders` / `prune_delivered_reminders` | cancel, condition drop, prune of delivered items | `--cancel` and condition tests |
+| `reminder.drop` / `reminder.drop_notice` | the issue closed or the pull request merged | `--keep-if-closed` |
+| `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
+| `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
+| `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
