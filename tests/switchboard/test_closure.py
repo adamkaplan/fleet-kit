@@ -7,27 +7,44 @@ moving a definition without regenerating fails, and the floor of the assembled c
 """
 import ast
 import difflib
+import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 TOOL = REPO / "tools" / "derive-closure"
 MATRIX = "docs/review-laws/impact-matrix.json"
 PARTS = "bin/switchboard/"
-FLOOR = 395   # definitions reachable from closure_roots over the entry and the parts at the batch-6 head: it only grows
+FLOOR = 395   # definitions reachable from closure_roots over the entry and the parts at the batch-6 head: it only grows (raised only in its own commit, with the owner's sign-off)
+FLOOR_BINDINGS = 335   # the module-level bindings (and imports) those definitions read, over the entry and the parts: the same rule
 ENTRY_ONLY = 246   # the entry's own closure from closure_roots at the batch-6 head, as before the parts were counted
 
 
 def run(*args):
     done = subprocess.run([sys.executable, str(TOOL)] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
     return done.returncode, done.stdout
+
+
+def tool_module():
+    loader = importlib.machinery.SourceFileLoader("derive_closure_t", str(TOOL))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("derive_closure_t", loader))
+    loader.exec_module(module)
+    return module
+
+
+def counts(out):
+    """(entry definitions, assembled definitions, entry bindings, assembled bindings) from closure_roots alone, as the tool prints them."""
+    found = re.search(r"definitions (\d+) over the entry, (\d+) over the entry and the parts; bindings (\d+) over the entry, (\d+) over", out)
+    return tuple(int(x) for x in found.groups())
 
 
 def clear():
@@ -71,11 +88,15 @@ def function_lines(source, name):
 
 class TestDerivedClosure(unittest.TestCase):
     def test_the_matrix_is_what_the_code_derives_and_the_closure_is_over_the_floor(self):
-        code, out = run("--check", "--floor", str(FLOOR))
+        code, out = run("--check", "--floor", str(FLOOR), "--floor-bindings", str(FLOOR_BINDINGS))
         self.assertEqual(code, 0, out)
-        counts = [int(w) for w in out.split("from closure_roots alone: ")[1].split("\n")[0].replace(",", " ").split() if w.isdigit()]
-        self.assertEqual(counts[0], ENTRY_ONLY, "the entry's own closure is as before")
-        self.assertGreaterEqual(counts[1], FLOOR)
+        found = counts(out)
+        self.assertEqual(found[0], ENTRY_ONLY, "the entry's own closure is as before")
+        self.assertGreaterEqual(found[1], FLOOR)
+        self.assertGreaterEqual(found[3], FLOOR_BINDINGS)
+        code, out = run("--check", "--floor-bindings", str(found[3] + 1))
+        self.assertEqual(code, 1)
+        self.assertIn("below the floor of %d" % (found[3] + 1), out)
 
     def test_a_missing_name_is_named_with_its_part(self):
         root = fixture()
@@ -115,6 +136,90 @@ class TestDerivedClosure(unittest.TestCase):
         self.assertEqual(run("--check", "--root", str(root))[0], 0)
 
 
+    def test_a_part_that_holds_only_a_binding_the_closure_reads_is_listed(self):
+        part = PARTS + "import_v1.py"
+        rule = rule_of()
+        self.assertIn(part, rule["closure_files"])
+        self.assertEqual(rule["module_roots"][part], [], "no closure definition, so no root: the part is listed and any top-level statement of it is refused")
+        root = fixture()
+        self.addCleanup(shutil.rmtree, str(root))
+        def change(r):
+            r["closure_files"].remove(part)
+            del r["module_roots"][part]
+        matrix_edit(root, change)
+        code, out = run("--check", "--root", str(root))
+        self.assertEqual(code, 1)
+        self.assertIn("%s: missing from closure_files" % part, out)
+
+    def manifest_case(self, edit):
+        root = fixture()
+        self.addCleanup(shutil.rmtree, str(root))
+        path = root / "bin" / "fleet-switchboard.parts"
+        path.write_text(edit(path.read_text()))
+        before = (root / MATRIX).read_bytes()
+        return root, before
+
+    def test_a_manifest_that_is_not_the_assembly_fails_closed_naming_the_entry_and_writes_nothing(self):
+        cases = {
+            "an entry that is not a file": (lambda t: t + "switchboard/nope.py\n", "switchboard/nope.py: listed in bin/fleet-switchboard.parts but not a file"),
+            "a path with ..": (lambda t: t + "switchboard/../fleet-switchboard\n", "not the entry and not switchboard/<name>.py"),
+            "an absolute path": (lambda t: t + "/etc/hosts\n", "/etc/hosts: not the entry"),
+            "a directory": (lambda t: t + "switchboard/\n", "switchboard/: not the entry"),
+            "a duplicate": (lambda t: t + "switchboard/audit.py\n", "switchboard/audit.py: listed twice"),
+            "a part file the manifest does not list": (lambda t: t.replace("switchboard/audit.py\n", ""), "switchboard/audit.py: a part file that bin/fleet-switchboard.parts does not list"),
+            "no entry": (lambda t: t.replace("fleet-switchboard\n", "", 1), "fleet-switchboard: the entry is not listed"),
+        }
+        for label, (edit, words) in cases.items():
+            with self.subTest(case=label):
+                root, before = self.manifest_case(edit)
+                for mode in ("--check", "--write"):
+                    code, out = run(mode, "--root", str(root))
+                    self.assertEqual(code, 1, out)
+                    self.assertIn(words, out)
+                    self.assertEqual((root / MATRIX).read_bytes(), before, "nothing is written from a derivation that failed")
+
+    def test_a_closure_definition_defined_in_two_files_is_reported(self):
+        root = fixture()
+        self.addCleanup(shutil.rmtree, str(root))
+        text = (root / PARTS / "audit.py").read_text()
+        node = function_lines(text, "redact")
+        copy = "\n".join(text.splitlines()[node.lineno - 1:node.end_lineno])
+        other = root / PARTS / "decision.py"
+        other.write_text(other.read_text() + "\n\n" + copy + "\n")
+        before = (root / MATRIX).read_bytes()
+        for mode in ("--check", "--write"):
+            code, out = run(mode, "--root", str(root))
+            self.assertEqual(code, 1, out)
+            self.assertIn("redact: a closure definition defined in more than one file", out)
+            self.assertEqual((root / MATRIX).read_bytes(), before)
+
+    def test_a_write_is_atomic_and_a_failed_derivation_or_layout_leaves_the_matrix_as_it_was(self):
+        module = tool_module()
+        root = fixture()
+        self.addCleanup(shutil.rmtree, str(root))
+        part = PARTS + "audit.py"
+        matrix_edit(root, lambda r: r["module_roots"][part].remove("redact"))
+        path = root / MATRIX
+        before = path.read_bytes()
+        with unittest.mock.patch.object(module.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                module.main(["--write", "--root", str(root)])
+        self.assertEqual(path.read_bytes(), before, "a failed rename leaves the matrix whole")
+        self.assertEqual([f for f in os.listdir(str(path.parent)) if f.startswith(".derive-closure-")], [], "and no temp file")
+        self.assertEqual(module.main(["--write", "--root", str(root)]), 0)
+        self.assertEqual(run("--check", "--root", str(root))[0], 0)
+        self.assertEqual([f for f in os.listdir(str(path.parent)) if f.startswith(".derive-closure-")], [])
+        (root / PARTS / "audit.py").write_text("def broken(:\n")   # a part that does not parse: the tool cannot run (exit 2), the matrix is not touched
+        before = path.read_bytes()
+        self.assertEqual(run("--write", "--root", str(root))[0], 2)
+        self.assertEqual(path.read_bytes(), before)
+        shutil.copy(str(REPO / PARTS / "audit.py"), str(root / PARTS / "audit.py"))
+        path.write_text(path.read_text().replace('"module_roots": {', '"module_roots":{'))   # a layout the splice does not know
+        before = path.read_bytes()
+        self.assertEqual(run("--write", "--root", str(root))[0], 2)
+        self.assertEqual(path.read_bytes(), before)
+
+
 class TestRefusalInAPart(unittest.TestCase):
     def refusals(self, part, name, roots, in_function=True):
         module = clear()
@@ -146,6 +251,16 @@ class TestRefusalInAPart(unittest.TestCase):
         self.assertTrue(outside, "a listed part has a function outside the closure")
         self.assertEqual(self.refusals(part, outside[0], rule["module_roots"][part]), [])
 
+    def test_a_change_to_an_import_a_closure_definition_reads_in_a_part_is_refused(self):
+        module = clear()
+        part = PARTS + "import_v1.py"
+        base = (REPO / part).read_text()
+        self.assertIn("import base64", base)
+        head = base.replace("import base64", "import base64 as b64", 1)
+        reasons = module.closure_refusals(base, head, patch_of(base, head), rule_of()["module_roots"][part], set(), True)
+        self.assertTrue(reasons, "the binding is refused because the part is listed")
+        self.assertEqual(module.closure_refusals(base, head, patch_of(base, head), [], set(), False), [], "and was not seen before (a part outside closure_files is not looked at)")
+
     def test_a_top_level_statement_edit_in_a_listed_part_is_refused(self):
         module = clear()
         part = PARTS + "audit.py"
@@ -173,7 +288,7 @@ class TestMovingADefinition(unittest.TestCase):
         self.assertEqual(run("--check", "--root", str(root))[0], 0)
         after = rule_of(root)
         self.assertIn(PARTS + "decisions_b.py", after["module_roots"])
-        self.assertNotIn(PARTS + "decisions_a.py", after["module_roots"])
+        self.assertEqual(after["module_roots"][PARTS + "decisions_a.py"], [], "decisions_a.py still holds a binding the closure reads (_BARE_PR): listed, with no definition left")
         strip = lambda r: {k: ([f for f in v if not f.startswith(PARTS)] if k == "closure_files" else {f: x for f, x in v.items() if not f.startswith(PARTS)} if k == "module_roots" else v) for k, v in r.items()}
         self.assertEqual(strip(after), strip(before))
         self.assertEqual(list(after), list(before), "the key order is kept")

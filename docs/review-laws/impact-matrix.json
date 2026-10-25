@@ -394,6 +394,7 @@
         "bin/work_sync.py",
         "bin/switchboard/v2_transport.py",
         "bin/switchboard/facts.py",
+        "bin/switchboard/import_v1.py",
         "bin/switchboard/decisions_a.py",
         "bin/switchboard/reminders.py",
         "bin/switchboard/plan_review.py",
@@ -481,6 +482,8 @@
           "disk_free",
           "disk_guard_settings",
           "validate_disk_guard"
+        ],
+        "bin/switchboard/import_v1.py": [
         ],
         "bin/switchboard/decisions_a.py": [
           "parse_bare_pr_ref"
