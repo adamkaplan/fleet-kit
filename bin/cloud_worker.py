@@ -776,8 +776,7 @@ def cluster_token(env=None, now=None, recovery=None):
 
 
 def _cluster_token_bounded(env, now, recovery, timeout):
-    """The same mint as `cluster_token`. `timeout` bounds each command of it: a number of seconds (the launch entry passes the default), or a callable
-    that returns the seconds left of a whole-run deadline, read before each command (the status summary's one deadline)."""
+    """The same mint as `cluster_token`, with `timeout` bounding each command of it (the status summary's bound; the launch entry passes the default)."""
     env = dict(os.environ if env is None else env)
     try:
         def capture(argv, env=None, feed=None):
