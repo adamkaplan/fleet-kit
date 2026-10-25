@@ -14,12 +14,15 @@ replay. A report replay with a different pr or different args under the same cal
 
 The PR-to-issue link comes from the PR body's closing keywords (and the plan's issue). It is NOT a security boundary: anyone who can edit
 the PR body can set it. The boundaries are the prove holder check (`relay_holders`) and the verdict evaluator registry (`plan_evaluators`).
+
+Pod evidence text (prove/verdict args) is stored in the ledger UNSCRUBBED: the ledger is not secret-safe, so pods must never put secrets in it.
 """
 import contextlib
 import hashlib
 import fcntl
 import json
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -38,6 +41,7 @@ TOKEN_CAP = 4096                # bytes of the token file
 REASON_FIXED = "relay failed"
 REASON_MAX = 1900               # the hub refuses a reason over 2000 characters; every answer is clipped below that
 INDEX_READ_CAP = 8 * 1024 * 1024   # bytes of relay_calls.json read; the file is written only by this daemon (INDEX_MAX entries), a larger one is treated as damaged
+RID_RE = re.compile(r"[0-9a-f]{32}")
 PR_RE, CALL_ID_RE, SHA_RE = cloud_relay.PR, cloud_relay.CALL_ID, cloud_relay.HEAD
 
 
@@ -267,7 +271,7 @@ def pass_once(executor, fetch, post):
     done = 0
     for req in (pending.get("requests") or [])[:10]:
         rid = req.get("id")
-        if not isinstance(rid, str) or not rid:
+        if not isinstance(rid, str) or not RID_RE.fullmatch(rid):   # the id goes into a URL path: only what the hub generates
             continue
         try:
             status, reason, record = executor.handle(req)

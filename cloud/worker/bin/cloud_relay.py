@@ -32,6 +32,8 @@ WAIT = 30.0
 BATCH = 10
 MAX_PENDING = 200
 MAX_PER_POD = 20
+MAX_WAIT_PER_POD = 4   # held POST /relay waits per pod (each holds a hub handler slot for up to WAIT seconds)
+MAX_WAIT_TOTAL = 16    # held waits overall: at most MAX_HANDLERS/2, so the daemon's pending/result calls always find a slot
 PENDING_TTL = 120.0   # seconds an unanswered entry may wait for the daemon before it is dropped
 MAX_ARGS = 16
 MAX_ARG_KEY = 64
@@ -67,6 +69,8 @@ class Relay:
         self.deny = set()   # names that are not pods (the daemon credential): refused 403 once the pod is known to the map
         self.ttl, self.max_pending, self.max_per_pod, self.clock = ttl, max_pending, max_per_pod, clock
         self.lock = threading.Lock()
+        self.waiting = {}   # pod -> waits held right now
+        self.max_wait_pod, self.max_wait_total = MAX_WAIT_PER_POD, MAX_WAIT_TOTAL
         self.pending = collections.OrderedDict()   # id -> Entry, unanswered
         self.by_call = {}                          # (pod, call_id) -> Entry (unanswered or recently answered)
         self.finished = collections.OrderedDict()  # (pod, call_id) -> Entry, answered, bounded
@@ -124,6 +128,11 @@ class Relay:
             entry = self.by_call.get(key)
             if entry is not None and entry.fingerprint != fingerprint(call):
                 return 409, {"status": 409, "error": "call_id reused for a different call"}
+            if not (entry is not None and entry.done.is_set()):
+                if self.waiting.get(pod, 0) >= self.max_wait_pod:
+                    raise Refusal(429, "in-flight wait cap reached: at most %d held calls per pod" % self.max_wait_pod)
+                if sum(self.waiting.values()) >= self.max_wait_total:
+                    raise Refusal(503, "in-flight wait cap reached: at most %d held calls on the hub" % self.max_wait_total)
             if entry is None:
                 if sum(1 for e in self.pending.values() if e.pod == pod) >= self.max_per_pod:
                     raise Refusal(503, "per-pod cap reached: %d unanswered calls from this pod" % self.max_per_pod)
@@ -133,9 +142,18 @@ class Relay:
                 entry.born = self.clock()
                 self.pending[entry.id] = entry
                 self.by_call[key] = entry
-        if not entry.done.wait(self.wait):
-            return 504, {"status": 504, "error": "daemon did not answer in time; replay with the same call_id"}
-        return entry.answer
+            if entry.done.is_set():
+                return entry.answer
+            self.waiting[pod] = self.waiting.get(pod, 0) + 1
+        try:
+            if not entry.done.wait(self.wait):
+                return 504, {"status": 504, "error": "daemon did not answer in time; replay with the same call_id"}
+            return entry.answer
+        finally:
+            with self.lock:
+                self.waiting[pod] -= 1
+                if not self.waiting[pod]:
+                    del self.waiting[pod]
 
     def _expire(self):
         """Drop unanswered entries older than the TTL (caller holds the lock); their waiters are answered 504."""

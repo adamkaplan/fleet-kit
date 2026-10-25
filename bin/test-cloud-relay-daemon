@@ -76,7 +76,7 @@ class FakeHub:
         call = {"call_id": cid or "c%d" % self.n, "command": command, "pr": pr, "args": args}
         if head:
             call["head"] = head
-        rid = "r%d" % self.n
+        rid = "%032x" % self.n
         self.queue.append({"id": rid, "pod": pod, "repo": repo, "issue": issue, "call": call})
         return rid
 
@@ -312,6 +312,13 @@ class Case(Fixture):
         self.assertEqual(len(self.hub.results), 9)
         self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 3)
         self.assertEqual(set(self.hub.results), set(ids))
+
+    def test_pass_once_refuses_ids_that_are_not_hub_ids(self):
+        for bad in ("../x", "a?b", "r1", "A" * 32, "0" * 31, "0" * 32 + "/"):
+            self.hub.queue.append({"id": bad, "pod": CODER, "repo": REPO, "issue": 1, "call": {}})
+        posted = []
+        self.assertEqual(relay.pass_once(self.ex, lambda: {"requests": list(self.hub.queue)}, lambda r, b: posted.append(r)), 0)
+        self.assertEqual(posted, [])
 
     def test_pass_if_configured_never_raises(self):
         notes = []

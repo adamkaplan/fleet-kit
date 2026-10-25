@@ -271,6 +271,35 @@ class TestClient(unittest.TestCase):
         self.assertEqual(urls, ["http://hub.svc:8080/relay"])
 
 class TestBoundsAndCaps(unittest.TestCase):
+    def test_held_wait_caps_keep_daemon_routes_alive(self):
+        # per pod 4, global 6; both pods saturate, a refused call queues nothing, the daemon still gets through
+        with Hub(wait=2.0, max_per_pod=20, max_pending=200, agents=None) as hub:
+            hub.relay.max_wait_total = 6
+            results, threads = [], []
+            def go(who, pr, i):
+                results.append((who, i, hub.relay_call(who=who, call_id="%s-%d" % (who, i), pr=pr)))
+            for who, pr, n in (("pod-a", "acme-org/widget-service#12", 4), ("pod-b", "acme-org/widget-api#3", 2)):
+                for i in range(n):
+                    t = threading.Thread(target=go, args=(who, pr, i)); t.start(); threads.append(t)
+            for _ in range(100):
+                if sum(hub.relay.waiting.values()) == 6:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(sum(hub.relay.waiting.values()), 6)
+            status, body = hub.relay_call(who="pod-a", call_id="extra")
+            self.assertEqual(status, 429); self.assertIn("4 held calls per pod", body["error"])
+            status, body = hub.relay_call(who="pod-b", call_id="extra2", pr="acme-org/widget-api#3")
+            self.assertEqual(status, 503); self.assertIn("6 held calls on the hub", body["error"])
+            self.assertEqual(len(hub.relay.pending), 6)   # refused calls wrote nothing
+            status, got = hub.call("GET", "/relay/pending", who="daemon")
+            self.assertEqual((status, len(got["requests"])), (200, 6))
+            for req in got["requests"]:
+                self.assertEqual(hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")[0], 200)
+            for t in threads:
+                t.join()
+            self.assertEqual([r[2][0] for r in results], [200] * 6)
+            self.assertEqual(hub.relay.waiting, {})
+
     def test_per_pod_cap_names_itself_and_other_pods_still_served(self):
         with Hub(wait=0.01, max_per_pod=2, max_pending=50) as hub:
             for i in range(2):
