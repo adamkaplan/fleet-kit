@@ -400,3 +400,15 @@ Over one day a cloud pull request took nine pushes and others two to four, becau
 ### A rule for every cloud coder brief
 
 Before any push, run bin/cloud-pr-preflight at the repository root and paste its three sections in the pull request comment; a branch-only failure, a not-run file or an unchained test file must be fixed first, and every existing test file it lists as edited must be justified there.
+
+## Pre-push preflight modes
+
+<!-- preflight-modes:begin -->
+### The preflight has two modes (ask #1299)
+
+Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-preflight`) runs the repository's whole check on both the branch and the clean base, and it did not finish within 300 seconds, so the one pre-push command ended with "could not run the preflight".
+
+- full mode (the default of `bin/cloud-pr-preflight`): every test file of `cloud/launcher/tests` and `cloud/worker/tests`, on the branch and the clean base. Time measured in a pod: did not finish within 300 seconds.
+- quick mode (`bin/cloud-pr-preflight --quick`, and the default of `bin/cloud-prepush`): only the test files that read a changed file plus the named scans of `bin/cloud_quick.py` (each a file and one selector, run through the same test code CI runs). Same three sections and exit codes. Time measured on a six-file change: 194 seconds for both sides; a one-file change reads fewer files and takes less. A quick run that selects nothing for a non-empty change fails, never clean.
+- `CLOUD_PREPUSH_PREFLIGHT=full` asks `bin/cloud-prepush` for the full mode; `quick` (the default) is printed as `preflight mode: quick`; any other value is refused with exit 2. Continuous integration stays the full check.
+<!-- preflight-modes:end -->

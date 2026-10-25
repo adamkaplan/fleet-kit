@@ -239,6 +239,16 @@ It is the last step before every push, and the only command a worker names for i
 - Memory-heavy tests: the literal tuple `HEAVY` in the script (now `cloud/worker/tests/test_root_scanner.py`) names tests that need a lot of memory (a pod has a hard memory limit). A selected test on that list is NOT run: it is printed as `skipped: memory-heavy <path>`, counts as "could not run" (exit 1, never clean), and the last line gives the count. Continuous integration runs those tests.
 - The base worktree is removed without git's force flag; if git refuses the plain removal, the script deletes only its own temporary tree and runs `git worktree prune`. A SIGTERM or SIGKILL leaves the temporary directory and the `.git/worktrees` metadata; `git worktree prune` cleans the metadata later.
 
+<!-- preflight-modes:begin -->
+### The preflight has two modes (ask #1299)
+
+Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-preflight`) runs the repository's whole check on both the branch and the clean base, and it did not finish within 300 seconds, so the one pre-push command ended with "could not run the preflight".
+
+- full mode (the default of `bin/cloud-pr-preflight`): every test file of `cloud/launcher/tests` and `cloud/worker/tests`, on the branch and the clean base. Time measured in a pod: did not finish within 300 seconds.
+- quick mode (`bin/cloud-pr-preflight --quick`, and the default of `bin/cloud-prepush`): only the test files that read a changed file plus the named scans of `bin/cloud_quick.py` (each a file and one selector, run through the same test code CI runs). Same three sections and exit codes. Time measured on a six-file change: 194 seconds for both sides; a one-file change reads fewer files and takes less. A quick run that selects nothing for a non-empty change fails, never clean.
+- `CLOUD_PREPUSH_PREFLIGHT=full` asks `bin/cloud-prepush` for the full mode; `quick` (the default) is printed as `preflight mode: quick`; any other value is refused with exit 2. Continuous integration stays the full check.
+<!-- preflight-modes:end -->
+
 It needs git and python3 only, makes no network call and writes nothing outside its temporary directory. It is advice, never the gate: continuous integration stays the gate and its result is the only evidence. Tests: `cloud/worker/tests/test_cloud_prepush.py` and `cloud/worker/tests/test_cloud_prepush_preflight.py`.
 
 ## Tests (no cluster, no Azure)
