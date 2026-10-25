@@ -73889,6 +73889,10 @@ class TestReviewCheckout(LedgerBase):
                 table = {self.BASE: self.base_tree, self.OLD_TIP: self.tip_tree, LEDGER_HEAD: self.head_tree}[sha]
                 body = {"tree": self.entries(table) + (self.extra_entries if sha == LEDGER_HEAD else []), "truncated": sha == LEDGER_HEAD and self.truncated}
                 return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+            files = re.search(r"/pulls/\d+/files\?per_page=100&page=(\d+)", path)
+            if files and getattr(self, "pr_files", None) is not None:   # #1309: the pull request's file list, 100 a page
+                page = int(files.group(1))
+                return subprocess.CompletedProcess(argv, 0, json.dumps(self.pr_files[(page - 1) * 100:page * 100]), "")
             blob = re.search(r"/git/blobs/([0-9a-f]+)", path)
             if blob:
                 text = self.blobs[blob.group(1)]
@@ -74283,6 +74287,227 @@ class TestReviewCheckout(LedgerBase):
         sentence = "tell each reviewer to read the directory it prints"
         text = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
         self.assertEqual(text.count(sentence), 1)
+
+    # ---- #1309: `review checkout --sparse` (a fake archive of 6,000 files; the real code path through the command)
+
+    def sparse_setup(self, neighbours=4, bulk=5995, changed=("pkg/changed.txt",), deleted=()):
+        """head: pkg/ (the changed file and `neighbours` others) and `bulk` files elsewhere = 6,000 files in all; base differs in the changed file (and has the deleted ones)."""
+        common = {"pkg/n%d.txt" % i: "n%d\n" % i for i in range(neighbours)}
+        common.update({"bulk/f%d.txt" % i: "f%d\n" % i for i in range(bulk)})
+        self.base_tree = dict(common, **{"pkg/changed.txt": "old\n"}, **{d: "gone\n" for d in deleted})
+        self.head_tree = dict(common, **{"pkg/changed.txt": "new\n"})
+        self.pr_files = [{"filename": c, "status": "modified"} for c in changed] + [{"filename": d, "status": "removed"} for d in deleted]
+
+    def sparse_run(self):
+        return self.checkout("--sparse")
+
+    def test_1309_s5_the_whole_checkout_of_6000_files_is_refused_and_names_sparse(self):
+        self.sparse_setup()
+        self.assertEqual(len(self.head_tree), 6000)
+        code, out, err = self.checkout()
+        self.assertEqual(code, 2, err)
+        self.assertIn("--sparse", err)
+        self.assertIn("limit of 5000 files", err)
+        self.made_nothing()
+
+    def test_1309_s2_sparse_writes_the_changed_file_and_its_directory_neighbours_and_nothing_else(self):
+        self.sparse_setup()
+        code, out, err = self.sparse_run()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip().splitlines()[0])
+        self.assertEqual(self.files(root / "head"), ["pkg/changed.txt"] + ["pkg/n%d.txt" % i for i in range(4)])
+        self.assertEqual(self.files(root / "base"), ["pkg/changed.txt"])
+        self.assertEqual((root / "base" / "pkg" / "changed.txt").read_text(), "old\n")
+        self.assertEqual(self.files(root / "diffs"), ["pkg/changed.txt.diff"])
+
+    def test_1309_s4_the_result_the_marker_pr_diff_and_sparse_txt_say_sparse_with_the_counts(self):
+        self.sparse_setup()
+        code, out, err = self.sparse_run()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip().splitlines()[0])
+        self.assertIn("sparse checkout: 5 files written, 5995 files of the head tree not written", out)
+        marker = json.loads((root / self.rc.MARKER).read_text())
+        self.assertEqual((marker["sparse"], marker["sparse_written"], marker["sparse_not_written"]), (True, 5, 5995))
+        self.assertTrue((root / "pr.diff").read_text().splitlines()[0].startswith("sparse checkout: 5 files written, 5995 files of the head tree not written"))
+        listed = [l for l in (root / "sparse.txt").read_text().splitlines() if l.startswith("written ")]
+        self.assertEqual(listed, ["written head/pkg/changed.txt"] + ["written head/pkg/n%d.txt" % i for i in range(4)])
+
+    def test_1309_without_sparse_nothing_says_sparse_and_no_sparse_file_is_written(self):
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertNotIn("sparse", out.lower() + (root / "pr.diff").read_text().lower() + (root / self.rc.MARKER).read_text().lower())
+        self.assertFalse((root / "sparse.txt").exists())
+
+    def test_1309_s3_a_directory_of_250_files_is_cut_at_200_and_listed(self):
+        self.sparse_setup(neighbours=249)
+        code, out, err = self.sparse_run()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip().splitlines()[0])
+        self.assertEqual(len(self.files(root / "head")), 200)
+        self.assertIn("pkg/changed.txt", self.files(root / "head"), "the changed file is first, never the one cut")
+        self.assertEqual([l for l in (root / "sparse.txt").read_text().splitlines() if l.startswith("cut at")], ["cut at 200 files, others not included: pkg"])
+
+    def test_1309_a_deep_changed_file_and_a_deleted_file_are_right(self):
+        self.sparse_setup(changed=("a/b/c/d/deep.txt",), deleted=("old/dir/gone.txt",))
+        self.base_tree["a/b/c/d/deep.txt"] = "before\n"
+        self.head_tree["a/b/c/d/deep.txt"] = "after\n"
+        self.head_tree["a/b/c/d/side.txt"] = "side\n"
+        self.head_tree["a/b/c/other.txt"] = "not in the directory\n"
+        self.head_tree["old/dir/stays.txt"] = "stays\n"
+        self.base_tree["old/dir/stays.txt"] = "stays\n"
+        self.pr_files = [{"filename": "a/b/c/d/deep.txt", "status": "modified"}, {"filename": "old/dir/gone.txt", "status": "removed"}]
+        code, out, err = self.sparse_run()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip().splitlines()[0])
+        self.assertEqual(self.files(root / "head"), ["a/b/c/d/deep.txt", "a/b/c/d/side.txt", "old/dir/stays.txt"])
+        self.assertEqual(self.files(root / "base"), ["a/b/c/d/deep.txt", "old/dir/gone.txt"], "a deleted file has its base copy only")
+        self.assertIn("-gone", (root / "diffs" / "old" / "dir" / "gone.txt.diff").read_text())
+
+    def test_1309_every_page_of_the_file_list_is_read(self):
+        self.sparse_setup(bulk=300)
+        self.pr_files = [{"filename": "bulk/f%d.txt" % i, "status": "modified"} for i in range(150)] + [{"filename": "pkg/changed.txt", "status": "modified"}]
+        code, out, err = self.sparse_run()
+        self.assertEqual(code, 0, err)
+        written = self.files(Path(out.strip().splitlines()[0]) / "head")
+        self.assertIn("pkg/changed.txt", written, "the changed file on page 2 is written")
+        self.assertEqual(sum(1 for p in self.fetched if "/pulls/9/files" in p), 2)
+
+    def test_1309_a_cut_file_list_is_refused(self):
+        self.sparse_setup(bulk=3100)
+        self.pr_files = [{"filename": "bulk/f%d.txt" % i, "status": "modified"} for i in range(3000)]
+        code, out, err = self.sparse_run()
+        self.assertEqual(code, 1, err)
+        self.assertIn("caps its file list", err)
+        self.made_nothing()
+
+    def test_1309_s6_a_link_outside_the_selection_is_skipped_and_never_followed(self):
+        self.sparse_setup()
+        self.extra_members = [self.member("bulk/link", tarfile.SYMTYPE, linkname=str(self.outside))]
+        code, out, err = self.sparse_run()
+        self.assertEqual(code, 0, err)
+        self.assertIn("skipped 'bulk/link': a symlink", err)
+        self.assertEqual(os.listdir(self.outside), [])
+
+    def test_1309_s6_a_bad_member_name_is_refused_even_outside_the_selection_and_a_selected_duplicate_is_refused(self):
+        self.sparse_setup()
+        for label, member in (("a name with .. outside the selection", self.member("bulk/../escape.txt")),
+                              ("a .git member outside the selection", self.member("bulk/.git/config")),
+                              ("a duplicate of a selected member", self.member("pkg/n1.txt"))):
+            with self.subTest(label):
+                self.extra_members = [member]
+                code, out, err = self.sparse_run()
+                self.assertEqual(code, 1, err)
+                self.assertEqual(os.listdir(self.outside), [])
+                self.made_nothing()
+
+    def test_1309_a_member_the_git_tree_does_not_list_is_refused_selected_or_not(self):
+        self.sparse_setup()
+        self.extra_members = [self.member("bulk/unlisted.txt")]
+        code, out, err = self.sparse_run()
+        self.assertEqual(code, 1, err)
+        self.assertIn("does not list", err)
+        self.made_nothing()
+
+    def test_1309_s5_the_bounds_count_the_files_written_and_still_refuse(self):
+        self.sparse_setup()
+        for name, value, snippet in (("MAX_FILES", 4, "limit of 4 files"), ("MAX_FILE_BYTES", 3, "limit of 3 bytes"), ("MAX_TOTAL_BYTES", 10, "in total")):
+            with self.subTest(bound=name), mock.patch.object(self.rc, name, value):
+                code, out, err = self.sparse_run()
+                self.assertEqual(code, 2, err)
+                self.assertIn(snippet, err)
+                self.made_nothing()
+
+    def test_1309_a_member_not_selected_is_never_read(self):
+        self.sparse_setup()
+        reads = []
+        real = tarfile.TarFile.extractfile
+
+        def spy(tar, member):
+            reads.append(member.name)
+            return real(tar, member)
+        with mock.patch.object(tarfile.TarFile, "extractfile", spy):
+            self.assertEqual(self.sparse_run()[0], 0)
+        self.assertEqual(len(reads), 5)
+        self.assertFalse([n for n in reads if "/bulk/" in n])
+
+    def test_1309_s7_the_three_mutants_each_fail_a_test(self):
+        """Each mutant is applied (asserted) and must change what the tests above check."""
+        self.sparse_setup()
+        applied = []
+        original = self.rc.select_sparse
+        original_check = self.rc.check_bounds
+
+        def every_file(tree_files, changed, per_dir=None):
+            applied.append("every")
+            return set(tree_files), []
+
+        def leaves_out(tree_files, changed, per_dir=None):
+            applied.append("leaves out")
+            selected, cut = original(tree_files, changed, per_dir)
+            return selected - {sorted(changed)[0]}, cut
+
+        def whole_tree(files, limits, what, sparse=False):
+            applied.append("whole tree")
+            return original_check(self.head_tree_entries(), limits, what, sparse)
+        with mock.patch.object(self.rc, "select_sparse", every_file):
+            code, out, err = self.sparse_run()
+        self.assertEqual(applied, ["every"])
+        self.assertEqual(code, 2, "the select-every-file mutant fails the count bound: " + err)
+        applied.clear()
+        with mock.patch.object(self.rc, "select_sparse", leaves_out):
+            code, out, err = self.sparse_run()
+        self.assertEqual(applied, ["leaves out"])
+        self.assertTrue(code != 0 or "pkg/changed.txt" not in self.files(Path(out.strip().splitlines()[0]) / "head"), "the leave-out mutant is caught by the written list")
+        self.run_as("coder", "review", "checkout", "--remove", out.strip().splitlines()[0])
+        applied.clear()
+        with mock.patch.object(self.rc, "check_bounds", whole_tree):
+            code, out, err = self.sparse_run()
+        self.assertIn("whole tree", applied, err)
+        self.assertEqual(code, 2, "the whole-tree bound mutant refuses a sparse checkout the real code accepts: " + err)
+
+    def head_tree_entries(self):
+        """the whole head tree as `check_bounds` takes it"""
+        return {p: (hashlib.sha1(b"x").hexdigest(), len(t), False) for p, t in self.head_tree.items()}
+
+    # the completeness guard (#1309): its CLOSED rule is stated here, with its known limits.
+    # RULE: every call of `api(...)` or `archive(...)` in bin/review_checkout.py (found with the syntax tree: the enclosing function and the callee)
+    #       has a row `| <function>: <callee> | ... |` in the table "Review checkout inputs and outside calls (#1309)" of docs/switchboard.md, and every test named in
+    #       a row exists as a method of this class.
+    # KNOWN LIMITS: it does not run the named tests or mutants; it does not see a call made through another name (an alias of api), a call in another file, or an
+    #       input that is not an outside call (those rows are listed by hand: the --sparse option, the member names); a row's text is not judged.
+
+    def test_1309_the_docs_table_has_a_row_for_every_outside_call_and_names_existing_tests(self):
+        tree = ast.parse((BIN / "review_checkout.py").read_text())
+        calls = set()
+        for func in ast.walk(tree):
+            if isinstance(func, ast.FunctionDef):
+                for node in ast.walk(func):
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("api", "archive"):
+                        calls.add("%s: %s" % (func.name, node.func.id))
+        self.assertTrue(calls, "the walk found no outside call")
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        table = text[text.index("Review checkout inputs and outside calls (#1309)"):]
+        table = table[:table.index("\n\n", table.index("|"))]
+        rows = {l.split("|")[1].strip(): l for l in table.splitlines() if l.startswith("| ") and not l.startswith("| Input")}
+        for call in sorted(calls):
+            self.assertIn(call, rows, "no row for the outside call " + call)
+        methods = {n.name for c in ast.walk(ast.parse((BIN / "test-switchboard").read_text()))
+                   if isinstance(c, ast.ClassDef) and c.name == "TestReviewCheckout" for n in c.body if isinstance(n, ast.FunctionDef)}
+        for key, row in rows.items():
+            for name in re.findall(r"`(test_[a-z0-9_]+)`", row):
+                self.assertIn(name, methods, "row %s names a test that does not exist: %s" % (key, name))
+
+    def test_1309_s8_the_docs_and_the_skill_say_what_sparse_writes_and_that_no_limit_changed(self):
+        text = " ".join((REPO / "docs" / "switchboard.md").read_text().split())
+        for sentence in ("`review checkout --sparse` writes only the files the pull request changes",
+                         "a reader of a sparse checkout states which files it did not read",
+                         "No limit changed",
+                         "at most 200 files for one directory"):
+            self.assertIn(sentence, text)
+        skill = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
+        self.assertIn("review checkout --sparse", skill)
+        self.assertIn("over the 5,000-file limit", skill)
 
 
 class TestPlanReviewCore(unittest.TestCase):
