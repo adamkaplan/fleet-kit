@@ -27,6 +27,14 @@ MARK = "uniq-label-marker-%d" % rnd.randrange(10**9)
 NOISE = bytes(rnd.randrange(1, 256) for _ in range(5000))
 
 
+BOUND_KIB = 80 * 1024
+
+
+def kib(value, platform=sys.platform):
+    """ru_maxrss is bytes on macOS and KiB on Linux; return KiB."""
+    return value // 1024 if platform == "darwin" else value
+
+
 def run(args, lst=None, scanner=SCANNER, env_unset=False):
     env = dict(os.environ)
     env.pop("CW_ROOT_LIST", None)
@@ -149,8 +157,7 @@ class Scanner(unittest.TestCase):
         rc, _ = run([self.split_binary(5000)], self.list, scanner=self.w("nov.py", m.encode()))
         self.assertNotEqual(rc, 1)
 
-    def test_large_sparse_file_bounded_memory(self):
-        import resource
+    def sparse(self):
         p = os.path.join(self.d.name, "sparse.bin")
         try:
             with open(p, "wb") as f:
@@ -159,9 +166,55 @@ class Scanner(unittest.TestCase):
         except OSError as e:
             print("LOUD: SKIPPED the 120 MB sparse test: %s" % e)
             self.skipTest("disk cannot hold the file")
-        rc, out = run([p], self.list)
+        return p
+
+    def peak(self, scanner, args):
+        """(returncode, own peak KiB) of a child that runs scanner (or 'pass') under runpy."""
+        code = (
+            "import runpy, sys, resource\n"
+            "rc = 0\n"
+            "try:\n"
+            "    if sys.argv[1] != '-':\n"
+            "        sys.argv = sys.argv[1:]\n"
+            "        runpy.run_path(sys.argv[0], run_name='__main__')\n"
+            "except SystemExit as e:\n"
+            "    rc = e.code if isinstance(e.code, int) else 1\n"
+            "sys.stdout.flush()\n"
+            "print('PEAK', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)\n"
+            "sys.exit(rc)\n"
+        )
+        env = dict(os.environ, CW_ROOT_LIST=self.list)
+        argv = [scanner] + args if scanner else ["-"]
+        p = subprocess.run([sys.executable, "-c", code] + argv, env=env, capture_output=True, text=True)
+        last = p.stdout.strip().splitlines()[-1].split()
+        self.assertEqual(last[0], "PEAK", p.stderr)
+        return p.returncode, kib(int(last[1]))
+
+    def own_over_baseline(self, scanner):
+        p = self.sparse()
+        _, base = self.peak(None, [])
+        rc, own = self.peak(scanner, [p])
+        print("peak KiB: own=%d baseline=%d delta=%d" % (own, base, own - base))
+        return rc, own - base
+
+    def test_kib_normalises_platform(self):
+        self.assertEqual(kib(52346880, "darwin"), 51120)
+        self.assertEqual(kib(51120, "linux"), 51120)
+
+    def test_large_sparse_file_bounded_memory(self):
+        rc, delta = self.own_over_baseline(SCANNER)
         self.assertEqual(rc, 1)
-        self.assertLess(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss, 150 * 1024)  # KiB
+        self.assertLess(delta, BOUND_KIB)
+
+    def test_mutant_big_chunk_fails_bound(self):
+        sc = self.mutated("CHUNK = 8 * 1024 * 1024", "CHUNK = 200 * 1024 * 1024")
+        _, delta = self.own_over_baseline(sc)
+        self.assertGreaterEqual(delta, BOUND_KIB)
+
+    def test_mutant_whole_file_read_fails_bound(self):
+        sc = self.mutated("f.read(CHUNK)", "f.read()")
+        _, delta = self.own_over_baseline(sc)
+        self.assertGreaterEqual(delta, BOUND_KIB)
 
     def test_mutant_zero_guard_removed_fails(self):
         sc = self.mutated("if len(hits) == 0:", "if False:")
