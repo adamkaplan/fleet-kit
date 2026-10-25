@@ -1,5 +1,5 @@
 """Every named quick scan must RESOLVE and RUN (exit 0) on a clean tree; a mutant that runs a shell script with python fails."""
-import importlib.machinery, importlib.util, os, subprocess, sys, tempfile, unittest
+import shutil, importlib.machinery, importlib.util, os, subprocess, sys, tempfile, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -25,7 +25,7 @@ class TestScansRun(unittest.TestCase):
         subprocess.run(["git", "worktree", "remove", "--force", cls.wt], cwd=ROOT,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "worktree", "prune"], cwd=ROOT)
-        os.rmdir(cls.tmp)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_every_scan_entry_runs_clean(self):
         pre = load(os.path.join(ROOT, "bin", "cloud-pr-preflight"), "pre_ok")
@@ -34,12 +34,13 @@ class TestScansRun(unittest.TestCase):
                 self.assertEqual(pre.run_one(self.wt, rel, 140, sel), 0)
 
     def test_mutant_running_shell_with_python_fails(self):
-        src = open(os.path.join(ROOT, "bin", "cloud-pr-preflight")).read()
-        old = '["sh", rel]'
+        with open(os.path.join(ROOT, "bin", "cloud-pr-preflight")) as fh:
+            src = fh.read()
+        old = 'cmd = ["sh", rel]'
         self.assertIn(old, src)
         mut = os.path.join(self.tmp, "mutant.py")
         with open(mut, "w") as f:
-            f.write(src.replace(old, "[sys.executable, rel]"))
+            f.write(src.replace(old, "cmd = [sys.executable, rel]"))
         m = load(mut, "pre_mut")
         m.cloud_quick  # the helper must still import
         self.assertNotEqual(m.run_one(self.wt, "bin/test-cloud-neutral-names", 60, None), 0)
@@ -51,7 +52,7 @@ class TestScansRun(unittest.TestCase):
         env = dict(os.environ, CLOUD_PREFLIGHT_QUICK_TOTAL="0", CLOUD_PREFLIGHT_BASE="HEAD", PYTHONDONTWRITEBYTECODE="1")
         r = subprocess.run([sys.executable, os.path.join(self.wt, "bin", "cloud-pr-preflight"), "--quick"], cwd=self.wt,
                            env=env, capture_output=True, text=True, timeout=140)
-        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.returncode, 1, r.stderr[-500:])
         self.assertIn("NOT RUN: quick run exceeded 0 s", r.stdout)
         self.assertNotIn("RESULT: PASS", r.stdout)
 

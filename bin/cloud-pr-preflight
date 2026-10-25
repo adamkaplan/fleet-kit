@@ -69,7 +69,14 @@ QUICK_TOTAL = int(os.environ.get("CLOUD_PREFLIGHT_QUICK_TOTAL", "300"))  # secon
 def run_one(root, rel, timeout, selector=None):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     try:
-        cmd = [sys.executable, rel] if rel.endswith(".py") else ["sh", rel]
+        cmd = [sys.executable, rel]
+        try:
+            with open(os.path.join(root, rel), "rb") as fh:
+                first = fh.readline()
+            if first.startswith(b"#!") and b"python" not in first:
+                cmd = ["sh", rel]  # a shell script (a shebang that is not python) is run by sh
+        except OSError:
+            pass
         p = subprocess.Popen(cmd + ([selector] if selector else []), cwd=root, env=env, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
