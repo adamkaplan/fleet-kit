@@ -19676,11 +19676,28 @@ def cmd_gates_stats(args, runner, now):
     return EXIT_OK
 
 
+CARRY_COMPARE_FILE_CAP = 300   # GitHub lists at most 300 files of a compare: a named file beyond the cap would read as untouched
+CARRY_TOO_LARGE = "the diff is too large to judge (GitHub lists at most 300 files of a compare, so a file may be missing): nothing carried"
+CARRY_NOT_DESCENDANT = "the new head is not a descendant of the old head (compare status %s: a force-push or rewind; the compare does not show changes only in the old head): nothing carried"
+
+
+class CarryRefused(Exception):
+    """A carry the facts of the diff cannot support; its text is the printed reason."""
+
+
+class _CarryDone(Exception):
+    pass
+
+
 def carry_head_facts(get, repo, old_head, new_head):
     """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
     "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
     files = [f["filename"] for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+    if len(files) >= CARRY_COMPARE_FILE_CAP or compared.get("truncated") or (compared.get("total_files") or 0) >= CARRY_COMPARE_FILE_CAP:
+        raise CarryRefused(CARRY_TOO_LARGE)
+    if compared.get("status") not in ("ahead", "identical"):
+        raise CarryRefused(CARRY_NOT_DESCENDANT % compared.get("status"))
     commit = get("repos/%s/commits/%s" % (repo, new_head))
     parents = [p.get("sha") for p in (commit.get("parents") or []) if isinstance(p, dict)]
     merge = False
@@ -19701,8 +19718,8 @@ def carry_proofs(state, pr, plan, old_head, new_head, facts, now):
     if problem:
         raise LedgerCommandError("the ledger is not trustworthy, nothing was carried: %s" % problem)
     evaluators = {x["id"]: plan_ledger.evaluator_of(x) for x in plan["scenarios_parsed"]}
-    holding = plan_ledger.carried_seqs(entries, pr, old_head)
-    done = plan_ledger.carried_seqs(entries, pr, new_head)
+    holding = plan_ledger.carried_seqs(entries, pr, old_head, plan["plan_hash"])
+    done = plan_ledger.carried_seqs(entries, pr, new_head, plan["plan_hash"])
     out = []
     for row in entries:
         if row.get("pr") != pr or row.get("kind") not in ("proof", "verdict") or row.get("result") != "pass" or row.get("plan_hash") != plan["plan_hash"]:
@@ -19714,7 +19731,16 @@ def carry_proofs(state, pr, plan, old_head, new_head, facts, now):
             continue
         verdict, reason = plan_ledger.carry_decision(row, evaluators.get(sid), facts["files"], facts["merge_of_default"], facts["ci_green"])
         if verdict == "carry":
-            plan_ledger.append_entry(state, plan_ledger.carry_line(row, sid, old_head, new_head, facts["merge_of_default"], pr), now)
+            line = plan_ledger.carry_line(row, sid, old_head, new_head, facts["merge_of_default"], pr)
+
+            def build(have, seq, row=row, line=line):   # the check is made under the ledger lock: two passes cannot both write the line
+                if row["seq"] in plan_ledger.carried_seqs(have, pr, new_head, plan["plan_hash"]):
+                    raise _CarryDone()
+                return line
+            try:
+                plan_ledger.append_checked(state, now, build)
+            except _CarryDone:
+                continue
         out.append({"proof": row["seq"], "scenario": sid, "verdict": verdict, "reason": reason})
     return out
 
@@ -20254,6 +20280,10 @@ def ci_record_core(ctx, now, quiet=False):
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
         named = "; ".join("%s run %s is %s" % (w or "status", r, st) for w, r, st in load_module("ci_runs").not_green_runs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
         return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)%s" % (ci, head[:8], " [%s]" % named if named else ""))
+    out["carry"] = carry_at_green(ctx, now)   # the carry does not depend on whether any ci verdict is wanted
+    for d in out["carry"]:
+        if d.get("noted") and not quiet:   # #1217: a real run always has ledger state, so a missing one is SAID (here, once), not skipped silently
+            print(d["reason"])
     if not wanted:
         if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))
@@ -20275,19 +20305,105 @@ def ci_record_core(ctx, now, quiet=False):
     return dict(out, status="recorded")
 
 
+def previous_head_of(entries, pr, head, plan_hash):
+    """#1217: the head the newest proof, verdict or carried line of `pr` (for this plan) was held at, other than `head`; None when there is none."""
+    best, found = -1, None
+    for e in entries:
+        if e.get("pr") != pr or e.get("plan_hash") != plan_hash or not isinstance(e.get("seq"), int):
+            continue
+        at = e.get("new_head") if e.get("kind") == "carried" else e.get("head") if e.get("kind") in ("proof", "verdict") else None
+        if isinstance(at, str) and at and at != head and e["seq"] > best:
+            best, found = e["seq"], at
+    return found
+
+
+def carry_get(engine, repo):
+    """#1217: a GET of one GitHub path (a repo's own account, counted and bounded as every read), decoded; raises GitHubUnavailable on any failure."""
+    accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or subprocess.run, engine.now)
+
+    def get(path):
+        try:
+            refuse_excluded(engine.config, repo)
+            done = accounts.read(engine.gh_runner or subprocess.run, path, repo, engine.config["call_timeout_seconds"], paginate=False)
+        except (AccountError, GhRateLimited, OSError, subprocess.SubprocessError) as err:
+            raise GitHubUnavailable("gh api %s: %s" % (path.split("?")[0], _one_line(str(err), 100))) from None
+        if done.returncode != 0:
+            raise GitHubUnavailable("gh api %s failed: %s" % (path.split("?")[0], _one_line(done.stderr or "", 100)))
+        try:
+            got = decode_json_stream(done.stdout or "")
+        except ValueError:
+            raise GitHubUnavailable("gh api %s answered something that is not JSON" % path.split("?")[0]) from None
+        return got[0] if isinstance(got, list) and len(got) == 1 else got
+    return get
+
+
+NO_STATE_REASON = "no ledger state: nothing to carry"
+
+
+def carry_at_green(ctx, now, get=None, green=True):
+    """#1217: the ONE call of the carry from the CI-verdict recording step (the command and the daemon pass both come through `ci_record_core`). Carries each proof of the
+    previous head the rule allows (`carry_proofs`) and returns [{"proof", "scenario", "verdict", "reason"}] (refusals included); a read that fails is one refused line. Writes no
+    line for anything the rule refuses. `get(path)` reads GitHub (default: the engine's `gh_api`)."""
+    if getattr(ctx, "state", None) is None:   # a real run always has ledger state: a missing one is a problem to SAY (named reason, printed by ci_record_core when not quiet, audited when a sink exists), never a silent skip
+        if getattr(ctx, "engine", None) is not None:
+            try:
+                _gates_audit(ctx.engine, "gate.ci_record_carry", ctx.pr, {"ok": False, "read": NO_STATE_REASON})
+            except Exception:
+                pass
+        return [{"proof": None, "scenario": None, "verdict": "refuse", "reason": NO_STATE_REASON, "noted": True}]
+    head = (ctx.facts or {}).get("head")
+    entries, problem = plan_ledger.read_ledger(ctx.state)
+    old = None if problem else previous_head_of(entries, ctx.pr, head, ctx.plan["plan_hash"])
+    if not old:
+        return []
+    try:
+        facts = carry_head_facts(get or carry_get(ctx.engine, ctx.repo), ctx.repo, old, head)
+        facts["ci_green"] = green and (ctx.facts or {}).get("ci") == "green"
+        ci_ids = {x["id"] for x in ctx.plan["scenarios_parsed"] if plan_ledger.evaluator_of(x) == "ci"}   # re-recorded at each green head, never carried: not a refusal to print
+        return [d for d in carry_proofs(ctx.state, ctx.pr, ctx.plan, old, head, facts, now()) if d["scenario"] not in ci_ids]
+    except CarryRefused as err:
+        return [{"proof": None, "scenario": None, "verdict": "refuse", "reason": str(err)}]
+    except (GitHubUnavailable, LedgerCommandError, AttributeError, KeyError, TypeError, ValueError) as err:
+        try:
+            _gates_audit(ctx.engine, "gate.ci_record_carry", ctx.pr, {"ok": False, "old_head": old, "new_head": head, "read": _one_line(str(err), 160)})
+        except Exception:
+            pass
+        return [{"proof": None, "scenario": None, "verdict": "refuse", "reason": "the facts of the head could not be read: %s" % _one_line(str(err), 160)}]
+
+
+def carry_lines(decisions):
+    """#1217: one line per proof decided: `carried #<seq> (<scenario>)` or `not carried #<seq> (<scenario>): <why>`."""
+    out = []
+    for d in decisions:
+        if d.get("noted"):   # already said by ci_record_core
+            continue
+        if d["verdict"] == "carry":
+            out.append("carried proof #%s (%s) from the previous head" % (d["proof"], d["scenario"]))
+        else:
+            out.append("not carried%s: %s" % (" proof #%s (%s)" % (d["proof"], d["scenario"]) if d["proof"] is not None else "", d["reason"]))
+    return out
+
+
 def cmd_gates_ci_record(args, runner, now):
     """`gates ci-record <repo#N>`: the switchboard itself records the `ci` verdict (see ci_record_core). Any caller may run it: the
     verdict says only what GitHub's checks say, whoever asked. The daemon runs the same logic for open PRs (ci_record_pass)."""
     ns = types.SimpleNamespace(pr=args.pr, plan=getattr(args, "plan", None), ask=getattr(args, "ask", None), head=None)
     ctx = _ledger_context(ns, runner, now, True)
     got = ci_record_core(ctx, now)
+    if got["status"] == "not-green" and ctx.plan is not None and ctx.plan["result"] == "pass" and got["head"]:
+        for line in carry_lines(carry_at_green(ctx, now, green=False)):   # #1217: a proof the rule refuses stays void, and the step says why
+            print(line)
     if got["status"] in ("unreadable", "no-plan", "no-head", "not-green"):
         raise LedgerCommandError("%s: nothing was recorded" % got["why"])
     if got["status"] == "nothing":
         print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % got["head"][:8])
+        for line in carry_lines(got.get("carry") or []):
+            print(line)
         return EXIT_OK
     print("CI is green at %s: recorded %s%s" % (got["head"][:8], ", ".join(got["recorded"]) or "nothing new",
                                                " (already recorded: %s)" % ", ".join(got["already"]) if got["already"] else ""))
+    for line in carry_lines(got.get("carry") or []):
+        print(line)
     return EXIT_OK
 
 
