@@ -189,13 +189,13 @@ def main():
             names = sorted(names)
             print("\n== 2. quick mode: %s, plus the named scans (timeout %ds each) =="
                   % (cloud_quick.mode_line(len(reads), len(changed_files)), timeout))
-            if changed_files and not reads:
-                print("NOT RUN: no check reads " + ", ".join(sorted(changed_files)))
-                print("\nRESULT: FAIL")
-                return 1  # decided from the reader picks alone: no scan is started
             if changed_files and not names:
                 print("NOT RUN: quick mode selected no check for a non-empty change; this is not a clean result")
-                failed = True
+            elif changed_files and not reads:
+                print("NOT RUN: no check reads " + ", ".join(sorted(changed_files)))
+            if changed_files and not reads:
+                print("\nRESULT: FAIL")
+                return 1  # decided from the reader picks alone: no scan is started
         else:
             print("\n== 2. every test file, one at a time (timeout %ds each) ==" % timeout)
             names = sorted(set(tests_in(root)) | base_tests)
