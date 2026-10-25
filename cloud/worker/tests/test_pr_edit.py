@@ -63,7 +63,7 @@ class T(unittest.TestCase):
         cls.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
         cls.base = "http://127.0.0.1:%d" % cls.srv.server_port
-        cls.tmp = tempfile.TemporaryDirectory()
+        cls.tmp = tempfile.TemporaryDirectory(dir=os.path.realpath("/tmp"))
         cls.addClassCleanup(cls.tmp.cleanup)
         cls.work = os.path.join(cls.tmp.name, "work")
         os.mkdir(cls.work)
