@@ -11,6 +11,10 @@ keeps, for each check, only the run that decides; every reader of the rollup goe
 - Among COMPLETED runs, the newest STARTED decides (the completion time stands in for a run with no start time): an older attempt that
   finishes late, even red, does not override a newer run that started after it. Runs that tie on start are ordered by completion (the one
   completing later); runs that still tie are ALL kept, so any failing one fails.
+- Which RUN of a workflow counts (`latest_runs`, also behind `newest` and `latest_check_runs`): a run is dropped only when another run of the
+  same workflow identity is BOTH at least as late AND has a higher-or-equal run id/attempt. Where the two orders disagree, BOTH runs are
+  read, so a red in either is seen. A missing, unparsable, naive or date-only time in the group falls back to the old rule (run id, then
+  attempt). A stale red of an older, late-starting run stays red until a run dominates it: it can cost a manual re-run.
 - An entry with no time at all is older than one with a time. An entry that names no check is its own check. Nothing is ever read greener
   by guessing.
 """
