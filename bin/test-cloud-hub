@@ -5,6 +5,7 @@ Fakes: the TokenReview call (injected http) and an agent API on 127.0.0.1. Mutan
 
     bin/test-cloud-hub
 """
+import hashlib
 import http.client
 import io
 import json
@@ -87,7 +88,7 @@ class Hub:
         self.calls, self.lines = [], []
         reviewer = module.make_reviewer(kube or fake_kube(self.calls), audience=audience, sa_dir=str(t / "sa"))
         self.inbox = module.Inbox(str(self.agents), timeout=2)
-        self.server = module.make_hub(("127.0.0.1", 0), reviewer, self.inbox, self.lines.append, str(self.decisions))
+        self.server = module.make_hub(("127.0.0.1", 0), reviewer, self.inbox, self.lines.append, str(self.decisions), namespace="fleet-agents")
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def __enter__(self):
@@ -196,16 +197,16 @@ class TestHub(unittest.TestCase):
         module.make_hub = lambda *a, **k: types.SimpleNamespace(serve_forever=lambda: started.append(1))
         for name in sorted(module.RESERVED):
             with self.assertRaises(ValueError):
-                module.serve({"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:8080", "FLEET_CLOUD_HUB_DAEMON": " %s " % name}, reviewer=object(), inbox=object(), audit=print)
+                module.serve({"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:8080", "FLEET_CLOUD_AGENT_NAMESPACE": "fleet-agents", "FLEET_CLOUD_HUB_DAEMON": " %s " % name}, reviewer=object(), inbox=object(), audit=print)
             with self.assertRaises(ValueError):   # make_hub itself refuses too
-                load().make_hub(("127.0.0.1", 0), object(), object(), print, relay=module.cloud_relay.Relay(lambda: {}), daemon=name)
+                load().make_hub(("127.0.0.1", 0), object(), object(), print, relay=module.cloud_relay.Relay(lambda: {}), daemon=name, namespace="fleet-agents")
         self.assertEqual(started, [])
 
     def test_starts_with_a_valid_listen_value(self):
         module = load()
         started = []
         module.make_hub = lambda *a, **k: types.SimpleNamespace(serve_forever=lambda: started.append(a[0]))
-        self.assertTrue(module.serve({"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:8080"}, reviewer=object(), inbox=object(), audit=print))
+        self.assertTrue(module.serve({"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:8080", "FLEET_CLOUD_AGENT_NAMESPACE": "fleet-agents"}, reviewer=object(), inbox=object(), audit=print))
         self.assertEqual(started, [("127.0.0.1", 8080)])
 
     def test_frame_names_sender_issue_and_marks_untrusted(self):
@@ -313,8 +314,8 @@ class SecretsHub(Hub):
             self.secrets.write_text(table if isinstance(table, str) else json.dumps(table))
         self.server.shutdown()
         self.server.server_close()
-        self.server = module.make_hub(("127.0.0.1", 0), module.make_secrets_reviewer(str(self.secrets)), self.inbox,
-                                      self.lines.append, str(self.decisions))
+        self.server = module.make_hub(("127.0.0.1", 0), module.make_secrets_reviewer(str(self.secrets), "fleet-agents"), self.inbox,
+                                      self.lines.append, str(self.decisions), namespace="fleet-agents")
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
 
@@ -355,10 +356,10 @@ class TestSecretsMode(unittest.TestCase):
     def test_mode_choice(self):
         module = load()
         used = []
-        module.make_secrets_reviewer = lambda path: used.append(("secrets", path)) or (lambda *a: {})
+        module.make_secrets_reviewer = lambda path, namespace: used.append(("secrets", path)) or (lambda *a: {})
         module.make_reviewer = lambda **k: used.append(("kube",)) or (lambda *a: {})
         module.make_hub = lambda *a, **k: types.SimpleNamespace(serve_forever=lambda: None)
-        env = {"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:8080"}
+        env = {"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:8080", "FLEET_CLOUD_AGENT_NAMESPACE": "fleet-agents"}
         module.serve(dict(env, FLEET_CLOUD_HUB_SECRETS="/s"), inbox=object(), audit=print)
         module.serve(env, inbox=object(), audit=print)
         self.assertEqual(used, [("secrets", "/s"), ("kube",)])
@@ -369,7 +370,7 @@ class TestSecretsMode(unittest.TestCase):
         module.hmac = types.SimpleNamespace(compare_digest=lambda a, b: count.append(1) or a == b)
         path = Path(tempfile.mkdtemp()) / "s.json"
         path.write_text(json.dumps({n: hashlib.sha256(v.encode()).hexdigest() for n, v in (("agent-a", SECRET_A), ("agent-b", SECRET_B))}))
-        module.make_secrets_reviewer(str(path))(SECRET_A, "fleet-switchboard")   # matches the FIRST entry
+        module.make_secrets_reviewer(str(path), "fleet-agents")(SECRET_A, "fleet-switchboard")   # matches the FIRST entry
         return len(count)
 
     def test_compares_with_compare_digest_against_every_entry(self):
@@ -382,7 +383,7 @@ class TestSecretsMode(unittest.TestCase):
     def reviewer_for(self, table, module):
         path = Path(tempfile.mkdtemp()) / "s.json"
         path.write_text(json.dumps(table))
-        return module.make_secrets_reviewer(str(path))
+        return module.make_secrets_reviewer(str(path), "fleet-agents")
 
     def digest_a(self):
         import hashlib
@@ -412,7 +413,7 @@ class TestSecretsMode(unittest.TestCase):
                 hub.server.server_close()
                 reviewer = lambda t, a, n=name: {"authenticated": True, "audiences": [a],
                                                  "user": {"username": "system:serviceaccount:fleet-agents:" + n}}
-                hub.server = load().make_hub(("127.0.0.1", 0), reviewer, hub.inbox, hub.lines.append, str(hub.decisions))
+                hub.server = load().make_hub(("127.0.0.1", 0), reviewer, hub.inbox, hub.lines.append, str(hub.decisions), namespace="fleet-agents")
                 threading.Thread(target=hub.server.serve_forever, daemon=True).start()
                 self.assertEqual(hub.send(sender=name)[0], 401)
                 self.assertEqual(hub.api.got, [])
@@ -424,7 +425,7 @@ class TestSecretsMode(unittest.TestCase):
             hub.server.server_close()
             reviewer = lambda t, a: {"authenticated": True, "audiences": [a],
                                      "user": {"username": "system:serviceaccount:fleet-agents:captain"}}
-            hub.server = module.make_hub(("127.0.0.1", 0), reviewer, hub.inbox, hub.lines.append, str(hub.decisions))
+            hub.server = module.make_hub(("127.0.0.1", 0), reviewer, hub.inbox, hub.lines.append, str(hub.decisions), namespace="fleet-agents")
             threading.Thread(target=hub.server.serve_forever, daemon=True).start()
             self.assertNotEqual(hub.send(sender="captain")[0], 401)   # only the hub guard answers 401 here
 
@@ -483,7 +484,7 @@ class TestMutants(unittest.TestCase):
                         "    address = address or ('127.0.0.1', 0)\n    if False:\n        return False")
         started = []
         module.make_hub = lambda *a, **k: types.SimpleNamespace(serve_forever=lambda: started.append(1))
-        module.serve({}, reviewer=object(), inbox=object(), audit=print)
+        module.serve({"FLEET_CLOUD_AGENT_NAMESPACE": "fleet-agents"}, reviewer=object(), inbox=object(), audit=print)
         self.assertEqual(started, [1])     # the mutant starts with nothing set; the real one does not (TestHub)
 
     def test_mutant_no_framing(self):
@@ -695,7 +696,7 @@ class TestDecisions(HardCheck):
             path = Path(tmp) / "secrets.json"
             import hashlib
             path.write_text(json.dumps({"captain": hashlib.sha256(b"pod-secret").hexdigest()}))
-            reviewer = module.make_secrets_reviewer(str(path))
+            reviewer = module.make_secrets_reviewer(str(path), "fleet-agents")
             with self.assertRaises(ValueError):
                 reviewer("pod-secret", "aud")
 
@@ -703,7 +704,7 @@ class TestDecisions(HardCheck):
         self.pod_cannot_be_captain_check(load())
 
     def test_mutant_send_allows_the_captain_name(self):
-        self.killed(mutant('        if cloud_channel.agent_of(user, cloud_channel.NAMESPACE) in RESERVED:\n            return {"authenticated": False}\n        return status',
+        self.killed(mutant('        if cloud_channel.agent_of(user, namespace) in RESERVED:\n            return {"authenticated": False}\n        return status',
                            '        return status'), self.pod_cannot_be_captain_check)
 
     def test_mutant_secrets_file_may_name_the_captain(self):
@@ -789,6 +790,149 @@ class TestDedupe(HardCheck):
             self.assertTrue(hub.send(key="same", token="tok-a", sender="agent-a")[1]["delivered"])
             self.assertTrue(hub.send(key="same", token="tok-b", sender="agent-b")[1]["delivered"])
             self.assertEqual(len(hub.api.got), 2)
+
+
+def kube_users(users):
+    """A fake TokenReview: token -> full username (any namespace)."""
+    def http_call(url, headers, data, timeout):
+        body = json.loads(data)
+        name = users.get(body["spec"]["token"])
+        if name is None:
+            return {"status": {"authenticated": False}}
+        return {"status": {"authenticated": True, "audiences": body["spec"]["audiences"], "user": {"username": name}}}
+    return http_call
+
+
+class NsHub(Hub):
+    """A hub started with the namespace setting `namespace` (default cw) instead of the helper's fixed one."""
+    def __init__(self, module, users, namespace="cw"):
+        super().__init__(module, kube=kube_users(users))
+        self.server.shutdown()
+        self.server.server_close()
+        reviewer = module.make_reviewer(kube_users(users), audience="aud-x", sa_dir=str(Path(self.tmp.name) / "sa"))
+        self.server = module.make_hub(("127.0.0.1", 0), reviewer, self.inbox, self.lines.append, str(self.decisions), namespace=namespace)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+
+SA = "system:serviceaccount:"
+USERS_NS = {"tok-cw": SA + "cw:agent-a", "tok-old": SA + "fleet-agents:agent-a", "tok-cap": SA + "cw:captain",
+            "tok-sw": SA + "cw:switchboard", "tok-oldcap": SA + "fleet-agents:captain",
+            "tok-evil": SA + "cw-evil:agent-a", "tok-ecw": SA + "ecw:agent-a"}
+BAD_NAMESPACES = ("", "Cw", "c.w", "c:w", "cw\n", "a" * 64, "a/b", "cw/evil")
+
+
+class TestNamespaceSetting(unittest.TestCase):
+    def killed(self, module, check):
+        try:
+            check(module)
+        except (AssertionError, TypeError, KeyError):
+            return
+        self.fail("mutant survived")
+
+    def token_check(self, module):
+        with NsHub(module, USERS_NS) as hub:
+            self.assertEqual(hub.send(recipient="agent-b", token="tok-cw")[0], 200)
+            self.assertEqual(hub.send(recipient="agent-b", key="k2", token="tok-old")[0], 401)
+
+    def test_lookalike_namespaces_are_refused(self):
+        with NsHub(load(), USERS_NS) as hub:
+            self.assertEqual(hub.send(recipient="agent-b", token="tok-cw")[0], 200)
+            self.assertEqual(hub.send(recipient="agent-b", key="k3", token="tok-evil")[0], 401)
+            self.assertEqual(hub.send(recipient="agent-b", key="k4", token="tok-ecw")[0], 401)
+
+    def test_token_review_accepts_the_setting_namespace_only(self):
+        self.token_check(load())
+
+    def test_mutant_handle_reads_the_old_name(self):
+        self.killed(mutant("max_handlers, namespace=namespace)", 'max_handlers, namespace="fleet-" + "agents")'), self.token_check)
+
+    def reserved_check(self, module):
+        with NsHub(module, USERS_NS) as hub:
+            self.assertEqual(hub.call("GET", "/decisions", token="tok-sw")[0], 401)       # cw switchboard: reserved
+            self.assertEqual(hub.call("GET", "/decisions", token="tok-oldcap")[0], 401)   # foreign namespace: refused
+            self.assertEqual(hub.call("POST", "/message", {"sender": "switchboard", "recipient": "agent-b", "key": "k", "text": "x"}, "tok-sw")[0], 401)
+
+    def captain_check(self, module):
+        with NsHub(module, USERS_NS) as hub:
+            hub.decisions.write_text(json.dumps({"decisions": [{"id": 1, "agent": "agent-a"}, {"id": 2}], "errors": []}))
+            status, body = hub.call("GET", "/decisions", token="tok-cap")
+            self.assertEqual((status, len(body["decisions"])), (200, 2))                   # the cw captain sees the whole file
+
+    def scope_check(self, module):
+        with NsHub(module, USERS_NS) as hub:
+            hub.decisions.write_text(json.dumps({"decisions": [{"id": 1, "agent": "agent-a"}, {"id": 2, "agent": "agent-b"}], "errors": []}))
+            self.assertEqual(hub.call("GET", "/decisions", token="tok-cw")[1], {"decisions": [{"id": 1, "agent": "agent-a"}], "errors": []})
+
+    def test_reserved_captain_and_scope_use_the_setting(self):
+        for check in (self.reserved_check, self.captain_check, self.scope_check):
+            check(load())
+
+    def test_mutant_reserved_check_reads_the_old_name(self):
+        self.killed(mutant("agent_of(user, namespace) in RESERVED", 'agent_of(user, "fleet-" + "agents") in RESERVED'), self.reserved_check)
+
+    def test_mutant_captain_check_reads_the_old_name(self):
+        self.killed(mutant("agent_of(user, namespace) == CAPTAIN", 'agent_of(user, "fleet-" + "agents") == CAPTAIN'), self.captain_check)
+
+    def test_mutant_decisions_scope_reads_the_old_name(self):
+        self.killed(mutant('.get("user"), namespace))', '.get("user"), "fleet-" + "agents"))'), self.scope_check)
+
+    def reviewer_check(self, module):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secrets.json"
+            path.write_text(json.dumps({"agent-a": hashlib.sha256(b"tok-x").hexdigest()}))
+            status = module.make_secrets_reviewer(str(path), "cw")("tok-x", "fleet-switchboard")
+            self.assertEqual(status["user"]["username"], SA + "cw:agent-a")
+
+    def test_secrets_reviewer_builds_names_from_the_setting(self):
+        self.reviewer_check(load())
+
+    def test_mutant_secrets_reviewer_reads_the_old_name(self):
+        self.killed(mutant("(cloud_channel.SERVICE_ACCOUNT_PREFIX, namespace, found)", '(cloud_channel.SERVICE_ACCOUNT_PREFIX, "fleet-" + "agents", found)'), self.reviewer_check)
+
+    def serve_with(self, module, value, **extra):
+        started = []
+        module.make_hub = lambda *a, **k: types.SimpleNamespace(serve_forever=lambda: started.append(k.get("namespace")))
+        env = {"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:8080"}
+        if value is not None:
+            env["FLEET_CLOUD_AGENT_NAMESPACE"] = value
+        try:
+            module.serve(env, reviewer=object(), inbox=object(), audit=print)
+        except SystemExit as exc:
+            return str(exc), started
+        return None, started
+
+    def refusal_check(self, module):
+        for value in (None,) + BAD_NAMESPACES:
+            line, started = self.serve_with(module, value)
+            self.assertEqual(line, "cloud-hub: FLEET_CLOUD_AGENT_NAMESPACE missing or not a namespace name", repr(value))
+            self.assertEqual(started, [])
+        self.assertEqual(self.serve_with(module, "cw"), (None, ["cw"]))
+
+    def test_start_refuses_a_missing_or_malformed_setting(self):
+        self.refusal_check(load())
+
+    def test_mutant_fallback_to_the_old_name(self):
+        self.killed(mutant("namespace = environ.get(NAMESPACE_ENV)", 'namespace = environ.get(NAMESPACE_ENV) or "fleet-" + "agents"'), self.refusal_check)
+
+    def test_old_name_is_nowhere_in_the_hub_source(self):
+        old = "fleet-" + "agents"
+        for name in ("cloud_hub.py", "cloud_channel.py", "cloud_channel_server.py"):
+            for base in (BIN, BIN.parent / "cloud" / "worker" / "bin"):
+                self.assertNotIn(old, (base / name).read_text(), name)
+        self.assertEqual(SOURCE.count("environ.get(NAMESPACE_ENV)"), 1)
+        self.assertNotIn("environ.get(\"FLEET_CLOUD_AGENT_NAMESPACE", SOURCE)
+
+    def test_docs_state_namespace_cause(self):
+        doc = (BIN.parent / "docs" / "cloud-channel.md").read_text()
+        quick = (BIN.parent / "docs" / "cloud-operator-quickstart.md").read_text()
+        self.assertIn("Cause of the namespace setting", doc)
+        self.assertIn("the prefix is only a label in secrets mode", doc)
+        self.assertRegex(doc, r"FLEET_CLOUD_AGENT_NAMESPACE.{0,40}`cw`")
+        self.assertRegex(quick, r"FLEET_CLOUD_AGENT_NAMESPACE.{0,10}\(value `cw`")
+
+    def test_worker_copies_match_bin(self):
+        for name in ("cloud_hub.py", "cloud_channel.py", "cloud_channel_server.py"):
+            self.assertEqual((BIN / name).read_text(), (BIN.parent / "cloud" / "worker" / "bin" / name).read_text(), name)
 
 
 if __name__ == "__main__":

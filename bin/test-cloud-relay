@@ -281,7 +281,7 @@ class Harness:
 
     def start_hub(self):
         """The one place that builds the real hub. Keeps the port across a restart (state lives in the daemon, not the hub)."""
-        reviewer = cloud_hub.make_secrets_reviewer(str(self.t / "secrets.json"))
+        reviewer = cloud_hub.make_secrets_reviewer(str(self.t / "secrets.json"), "fleet-agents")
         inbox = cloud_hub.Inbox(str(self.t / "agents.json"), timeout=2)
         agents_path = str(self.t / "agents.json")
         relay = cloud_relay.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=20)
@@ -289,7 +289,7 @@ class Harness:
             real_submit = relay.submit
             relay.submit = lambda pod, body: real_submit(body.get("by") if isinstance(body, dict) and isinstance(body.get("by"), str) else pod, body)
         self.server = cloud_hub.make_hub(("127.0.0.1", self.port), reviewer, inbox, self.hub_lines.append, str(self.t / "decisions.json"),
-                                         relay=relay, daemon=DAEMON)
+                                         relay=relay, daemon=DAEMON, namespace="fleet-agents")
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 

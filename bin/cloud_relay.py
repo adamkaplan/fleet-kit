@@ -231,7 +231,7 @@ class Relay:
         entry.done.set()
 
 
-def pod_of(reviewer, token):
+def pod_of(reviewer, token, namespace):
     """Agent name proved by the token, or None."""
     try:
         review = reviewer(token, cloud_channel.AUDIENCE)
@@ -242,4 +242,4 @@ def pod_of(reviewer, token):
     audiences = review.get("audiences")
     if not isinstance(audiences, list) or cloud_channel.AUDIENCE not in audiences:
         return None
-    return cloud_channel.agent_of(review.get("user"), cloud_channel.NAMESPACE)
+    return cloud_channel.agent_of(review.get("user"), namespace)

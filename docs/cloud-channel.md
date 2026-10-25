@@ -48,6 +48,7 @@ Start it with `python3 bin/cloud_hub.py` (from `bin/`'s directory or with it imp
 | `FLEET_CLOUD_HUB_AGENTS` | Path to the `agents.json` file (below). Read at each message. |
 | `FLEET_CLOUD_HUB_SECRETS` | Path to the `secrets.json` file (below). When set, secrets mode is used instead of the cluster TokenReview. |
 | `FLEET_CLOUD_HUB_DECISIONS` | Path to the JSON file served at `GET /decisions`. |
+| `FLEET_CLOUD_AGENT_NAMESPACE` | Required when listening: the namespace agent accounts belong to (a namespace name; the manifest sets `cw`). Read once at start; missing or malformed stops the hub with `cloud-hub: FLEET_CLOUD_AGENT_NAMESPACE missing or not a namespace name`. |
 | `FLEET_CLOUD_CHANNEL_AUDIENCE` | Optional (TokenReview mode only): the audience the token must be issued for. |
 
 Audit lines go to stdout as JSON lines `{"ts", "line"}`; no token is logged.
@@ -56,18 +57,22 @@ Audit lines go to stdout as JSON lines `{"ts", "line"}`; no token is logged.
 
 Default (no `FLEET_CLOUD_HUB_SECRETS`): the hub posts the bearer token to the in-cluster TokenReview API
 (`https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews`) using its own service account token and CA from
-`/var/run/secrets/kubernetes.io/serviceaccount`. The token must be authenticated and belong to a ServiceAccount in the namespace `fleet-agents`; the ServiceAccount name is the agent name
+`/var/run/secrets/kubernetes.io/serviceaccount`. The token must be authenticated and belong to a ServiceAccount in the namespace named by `FLEET_CLOUD_AGENT_NAMESPACE` (value `cw` in the manifest); the ServiceAccount name is the agent name
 (lowercase letters, digits, `-`, at most 63 characters). The token must carry the channel audience. By default that is `fleet-switchboard`. If `FLEET_CLOUD_CHANNEL_AUDIENCE` is set, the hub asks the cluster for that audience instead. If the cluster cannot be asked the answer is 503: nothing is let through.
 
 Reserved names (`captain`, `switchboard`, `fleet-switchboard`, `hub`, `admin`) are refused as sender or recipient (403), and a
 token that proves a reserved name is refused. Service accounts in the agents' namespace are trusted as agents, so keep reserved
 names out of that namespace.
 
+### Cause of the namespace setting (ask #1273)
+
+The code once pinned a constant named `fleet-agents` as the namespace a token must come from, while the hub runs in, and the launcher makes agent accounts for, the namespace `cw`. The constant is gone: the namespace is the one setting `FLEET_CLOUD_AGENT_NAMESPACE`. Nothing was broken: the prefix is only a label in secrets mode (the live hub's mode); in TokenReview mode an account of `cw` would have been refused and one of the old name accepted. Registries written by the launcher hold no namespace; one written by hand that names the old namespace must be rewritten before TokenReview mode is turned on.
+
 ### Secrets mode
 
 When `FLEET_CLOUD_HUB_SECRETS` is set, the hub hashes the bearer token with SHA-256 and compares it
 (`hmac.compare_digest`, against every entry) with the digests in `secrets.json`. A match yields the agent whose entry matched, in
-namespace `fleet-agents`. The file is read at each request (at most 8 MiB).
+the namespace named by `FLEET_CLOUD_AGENT_NAMESPACE` (the prefix is only a label in secrets mode). The file is read at each request (at most 8 MiB).
 
 It refuses every request (401 or 503) if the file is missing, empty or malformed, is not an object, holds a duplicate digest, or
 names a reserved agent.
@@ -179,7 +184,7 @@ namespace, with a NetworkPolicy admitting only agent pods to the hub port. The c
 token and message text cross that network unencrypted. The hub does not check the source of a request beyond the token.
 
 What the code does accept as an agent (`bin/cloud_channel.py`): a token whose username is `system:serviceaccount:<namespace>:<name>`
-(prefix `system:serviceaccount:`) with the namespace exactly `fleet-agents` (the `NAMESPACE` constant) and a name that is a valid
+(prefix `system:serviceaccount:`) with the namespace exactly the one named by `FLEET_CLOUD_AGENT_NAMESPACE` (value `cw` in the manifest; read once at start) and a name that is a valid
 agent name. Any ServiceAccount in that namespace is accepted, wherever the request comes from; any other namespace is refused.
 
 ## Take down

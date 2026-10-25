@@ -232,7 +232,7 @@ class Entrypoint(unittest.TestCase):
         share, run, tmpdir = (os.path.join(d, x) for x in ("share", "run", "tmp"))
         for p in (share, run, tmpdir):
             os.mkdir(p)
-        for name, text in (("worker.md", "worker agent\n"), ("orchestrator.md", "orchestrator agent\n"), ("opencode-worker.json", "{\n}\n")):
+        for name, text in (("worker.md", "worker agent\n"), ("orchestrator.md", "---\npermission:\n  question: allow\n---\norchestrator agent\n"), ("opencode-worker.json", "{\n}\n")):
             open(os.path.join(share, name), "w").write(text)
         with open(os.path.join(run, "channel-secret"), "w") as f:
             f.write("c" * 64)

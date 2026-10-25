@@ -98,7 +98,7 @@ def make_reviewer(http=kube_http, audience=None, sa_dir=SA_DIR, api=API, timeout
 RESERVED = frozenset({"captain", "switchboard"}) | frozenset(getattr(cloud_channel, "RESERVED", ())) | frozenset(getattr(cloud_channel_server, "RESERVED", ()))
 
 
-def make_secrets_reviewer(secrets_path, namespace=cloud_channel.NAMESPACE):
+def make_secrets_reviewer(secrets_path, namespace):
     """reviewer(token, audience) judging the bearer token against the sha256 digests in the secrets file."""
     def reviewer(token, handle_audience):
         table = _read_json(secrets_path, {})
@@ -261,7 +261,7 @@ def json_audit(stream=None):
     return audit
 
 
-def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=None, relay=None, daemon=None):
+def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=None, relay=None, daemon=None, *, namespace):
     """The channel server with the hub's two additions: GET /decisions and 404 for an agent not in the map."""
     if relay is not None and not daemon:
         raise ValueError("the relay needs the daemon's agent name (FLEET_CLOUD_HUB_DAEMON), set explicitly")
@@ -274,17 +274,17 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
     def unreserved(token, audience):
         status = reviewer(token, audience)
         user = status.get("user") if isinstance(status, dict) else None
-        if cloud_channel.agent_of(user, cloud_channel.NAMESPACE) in RESERVED:
+        if cloud_channel.agent_of(user, namespace) in RESERVED:
             return {"authenticated": False}
         return status
     def decisions_reviewer(token, audience):
         """As unreserved, except the captain's own identity may read (and only read) the decisions."""
         status = reviewer(token, audience)
         user = status.get("user") if isinstance(status, dict) else None
-        if cloud_channel.agent_of(user, cloud_channel.NAMESPACE) == CAPTAIN:
+        if cloud_channel.agent_of(user, namespace) == CAPTAIN:
             return status
         return unreserved(token, audience)
-    server = cloud_channel_server.make_server(address, unreserved, inbox, audit, max_handlers)
+    server = cloud_channel_server.make_server(address, unreserved, inbox, audit, max_handlers, namespace=namespace)
     if relay is not None:
         relay.configure(server.max_handlers)   # caps derive from the real handler count (ValueError when < 2)
     base = server.RequestHandlerClass
@@ -305,7 +305,7 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
                 self._deny(401, "no token")
                 return None
             try:
-                name = cloud_relay.pod_of(reviewer, header[len(cloud_channel.BEARER):].strip())
+                name = cloud_relay.pod_of(reviewer, header[len(cloud_channel.BEARER):].strip(), namespace)
             except cloud_relay.Refusal as err:
                 self._deny(err.status, err.reason)
                 return None
@@ -419,7 +419,7 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
             def remembering(token, audience):
                 review["status"] = decisions_reviewer(token, audience)
                 return review["status"]
-            probe = cloud_channel.handle({"authorization": header, "body": {}}, remembering, inbox, seen.append)
+            probe = cloud_channel.handle({"authorization": header, "body": {}}, remembering, inbox, seen.append, namespace=namespace)
             if probe["status"] != 403:   # 403 (sender mismatch on the empty body) is what an authenticated caller gets
                 for line in seen:
                     audit(line)
@@ -428,7 +428,7 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
                 body = _read_json(decisions_path, {"decisions": [], "errors": []}) if decisions_path else {"decisions": [], "errors": []}
                 if not isinstance(body, dict):
                     raise ValueError("not an object")
-                body = _scoped(body, cloud_channel.agent_of((review.get("status") or {}).get("user"), cloud_channel.NAMESPACE))
+                body = _scoped(body, cloud_channel.agent_of((review.get("status") or {}).get("user"), namespace))
             except (OSError, ValueError):
                 audit("refused status=503 reason=decisions unreadable")
                 return self._send(503, {"status": 503, "error": "decisions unreadable"})
@@ -449,14 +449,23 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
     return server
 
 
+NAMESPACE_ENV = "FLEET_CLOUD_AGENT_NAMESPACE"
+NAMESPACE_NAME = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
+NAMESPACE_REFUSAL = "cloud-hub: FLEET_CLOUD_AGENT_NAMESPACE missing or not a namespace name"
+
+
 def serve(environ, reviewer=None, inbox=None, audit=None):
-    """Start only when FLEET_CLOUD_CHANNEL_LISTEN is set (blocks); False, binding nothing, when it is not."""
+    """Start only when FLEET_CLOUD_CHANNEL_LISTEN is set (blocks); False, binding nothing, when it is not. The namespace the
+    agents' ServiceAccounts belong to is read here, once, from FLEET_CLOUD_AGENT_NAMESPACE; missing or malformed stops the hub."""
     address = cloud_channel_server.listen_address(environ)
     if address is None:
         return False
+    namespace = environ.get(NAMESPACE_ENV)
+    if not isinstance(namespace, str) or not NAMESPACE_NAME.fullmatch(namespace):
+        raise SystemExit(NAMESPACE_REFUSAL)
     if reviewer is None:
         if environ.get(SECRETS_ENV):
-            reviewer = make_secrets_reviewer(environ[SECRETS_ENV])
+            reviewer = make_secrets_reviewer(environ[SECRETS_ENV], namespace)
         else:
             reviewer = make_reviewer(audience=environ.get(AUDIENCE_ENV) or None)
     inbox = inbox or Inbox(environ.get(AGENTS_ENV))
@@ -466,7 +475,7 @@ def serve(environ, reviewer=None, inbox=None, audit=None):
     relay = None
     if daemon:   # the relay is on only when the daemon's agent name is set explicitly: no default name a pod could register as
         relay = cloud_relay.Relay(lambda: _read_json(environ[AGENTS_ENV], {}) if environ.get(AGENTS_ENV) else {})
-    make_hub(address, reviewer, inbox, audit or json_audit(), environ.get(DECISIONS_ENV), relay=relay, daemon=daemon or None).serve_forever()
+    make_hub(address, reviewer, inbox, audit or json_audit(), environ.get(DECISIONS_ENV), relay=relay, daemon=daemon or None, namespace=namespace).serve_forever()
     return True
 
 

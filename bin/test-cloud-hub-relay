@@ -44,8 +44,8 @@ class Hub:
         self.lines = []
         agents_path = str(t / "agents.json")
         self.relay = cloud_relay.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=wait, **relay_kw)
-        self.server = cloud_hub.make_hub(("127.0.0.1", 0), cloud_hub.make_secrets_reviewer(str(t / "secrets.json")),
-                                         cloud_hub.Inbox(agents_path), self.lines.append, relay=self.relay, daemon="daemon", max_handlers=max_handlers)
+        self.server = cloud_hub.make_hub(("127.0.0.1", 0), cloud_hub.make_secrets_reviewer(str(t / "secrets.json"), "fleet-agents"),
+                                         cloud_hub.Inbox(agents_path), self.lines.append, relay=self.relay, daemon="daemon", max_handlers=max_handlers, namespace="fleet-agents")
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.port = self.server.server_address[1]
 
@@ -433,7 +433,7 @@ class TestBoundsAndCaps(unittest.TestCase):
             status, body = hub.call("POST", "/relay", {"call_id": "c", "command": "gates", "pr": "acme-org/widget-service#1"}, "daemon")
             self.assertEqual((status, "cannot relay as a pod" in body["error"]), (403, True))   # even registered in the map
         with self.assertRaises(ValueError):   # no default daemon name: the relay needs it set explicitly
-            cloud_hub.make_hub(("127.0.0.1", 0), lambda t, a: {}, None, print, relay=cloud_relay.Relay(lambda: {}))
+            cloud_hub.make_hub(("127.0.0.1", 0), lambda t, a: {}, None, print, relay=cloud_relay.Relay(lambda: {}), namespace="fleet-agents")
 
     def test_serve_without_a_daemon_name_leaves_the_relay_off(self):
         seen = {}
@@ -449,7 +449,7 @@ class TestBoundsAndCaps(unittest.TestCase):
         try:
             for env, expect in (({}, None), ({"FLEET_CLOUD_HUB_DAEMON": "d1"}, "d1")):
                 with self.assertRaises(Stop):
-                    cloud_hub.serve(dict(env, FLEET_CLOUD_CHANNEL_LISTEN="127.0.0.1:18765"), reviewer=lambda t, a: {}, inbox=object(), audit=print)
+                    cloud_hub.serve(dict(env, FLEET_CLOUD_AGENT_NAMESPACE="fleet-agents", FLEET_CLOUD_CHANNEL_LISTEN="127.0.0.1:18765"), reviewer=lambda t, a: {}, inbox=object(), audit=print)
                 self.assertEqual(seen["daemon"], expect)
                 self.assertEqual(seen["relay"] is None, expect is None)
         finally:
