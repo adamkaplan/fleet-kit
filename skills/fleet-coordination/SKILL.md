@@ -46,6 +46,7 @@ The mistakes that cost the most review rounds and the most lost work. Meet them 
 - (d) The body of a held pull request is in the owner format from the first push.
 - (e) A cloud builder opens its pull request as a draft at its first push, then updates it: the pod's git token expires after about an hour and a late open fails.
 - (f) A merger pod pushes the merge commit the minute it exists and runs the test classes after it, so a finished merge is never left unpushed when the pod ends.
+- (g) A guard or scan test states its closed rule and its known-limits list in its first version, and fails closed: anything not proven harmless is a site. Reviewers judge the rule and the limits: a spelling inside the stated limits is a Low, a spelling that escapes a rule claimed closed is a High.
 
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
 
