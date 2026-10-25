@@ -244,8 +244,18 @@ It is the last step before every push, and the only command a worker names for i
 
 Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-preflight`) runs the repository's whole check on both the branch and the clean base, and it did not finish within 300 seconds, so the one pre-push command ended with "could not run the preflight".
 
-- full mode (the default of `bin/cloud-pr-preflight`): every test file of `cloud/launcher/tests` and `cloud/worker/tests`, on the branch and the clean base. Time measured in a pod: did not finish within 300 seconds.
-- quick mode (`bin/cloud-pr-preflight --quick`, and the default of `bin/cloud-prepush`): only the test files that read a changed file plus the named scans of `bin/cloud_quick.py` (each a file and one selector, run through the same test code CI runs). Same three sections and exit codes. Time measured on a six-file change: 194 seconds for both sides; a one-file change reads fewer files and takes less. A quick run that selects nothing for a non-empty change fails, never clean.
+- full mode (the default of `bin/cloud-pr-preflight`): every test file of `cloud/launcher/tests` and `cloud/worker/tests`, on the branch and the clean base. Time measured (a builder's measurement in a pod, not a CI figure): did not finish within 300 seconds.
+- quick mode (`bin/cloud-pr-preflight --quick`, and the default of `bin/cloud-prepush`): only the test files that read a changed file plus the named scans of `bin/cloud_quick.py` (each a file and one selector, run through the same test code CI runs). The match is on the file's basename, so a doc change can select many files; the mode line says "N checks that read the K files (basename match)". Same three sections and exit codes. A non-empty change that no check reads exits 1 with `NOT RUN: no check reads <files>` (the scans alone never make it clean). A memory-heavy test (the one list `HEAVY` of `bin/cloud_quick.py`) is reported `skipped: memory-heavy <path>` and counts as could not run (exit 1). Time measured (a builder's measurement in a pod, not a CI figure): a six-file change took 194 seconds for both sides; the full mode did not finish in 300 seconds; the TestEverySite scan alone took about 17 seconds and bin/test-cloud-neutral-names about 4 seconds.
+
+<!-- scan-table:begin -->
+| scan | in quick | why |
+| --- | --- | --- |
+| `bin/test-switchboard::TestGitShim.test_s7_u1_no_file_of_this_change_writes_the_global_git_configuration` | yes | the added-lines scan of the whole diff; one method, seconds |
+| `cloud/launcher/tests/test_stub_cleanup.py::TestScanFindsTheShape` | yes | the shape finder of the string-of-code scan |
+| `cloud/launcher/tests/test_stub_cleanup.py::TestEverySite` | yes | the repository-wide string-of-code and stub-cleanup scan; measured about 17 s in a pod, so a pod can run it |
+| `bin/test-cloud-neutral-names` | yes | the neutral-names scan; about 4 s. The full check reaches it from CI's workflow (it is not under the test directories) |
+| `bin/test-switchboard` | no | every other method: a pod cannot finish it; CI runs it |
+<!-- scan-table:end -->
 - `CLOUD_PREPUSH_PREFLIGHT=full` asks `bin/cloud-prepush` for the full mode; `quick` (the default) is printed as `preflight mode: quick`; any other value is refused with exit 2. Continuous integration stays the full check.
 <!-- preflight-modes:end -->
 

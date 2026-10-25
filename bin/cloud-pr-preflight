@@ -18,7 +18,7 @@ import glob, os, shutil, signal, subprocess, sys, tarfile, tempfile, io
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 try:
     import cloud_quick  # noqa: E402  (the shared quick-mode selection, bin/cloud_quick.py)
-except ImportError:  # a copy of this script placed alone: only the full mode works
+except ImportError:  # a lone copy: the full mode works; quick mode fails loudly (never degrades silently)
     cloud_quick = None
 
 TEST_DIRS = ("cloud/launcher/tests", "cloud/worker/tests")
@@ -88,13 +88,15 @@ def main():
     for sg in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sg, _on_signal)
     expect = []
-    quick = os.environ.get("CLOUD_PREFLIGHT_MODE") == "quick" and cloud_quick is not None
+    quick = os.environ.get("CLOUD_PREFLIGHT_MODE") == "quick"
     args = sys.argv[1:]
+    if cloud_quick is None and (quick or "--quick" in args):
+        print("cloud_quick helper missing", file=sys.stderr); return 2
     while args:
         a = args.pop(0)
         if a == "--expect" and args:
             expect.append(args.pop(0))
-        elif a == "--quick" and cloud_quick is not None:
+        elif a == "--quick":
             quick = True
         elif a.startswith("--expect="):
             expect.append(a.split("=", 1)[1])
@@ -166,17 +168,19 @@ def main():
             changed_files |= {x for x in out.splitlines() if x}
             tracked = git("ls-files", cwd=root)[1].split("\n")
             allowed = lambda r: r in set(tests_in(root))
-            picks = [(r, None) for r in cloud_quick.readers(root, tracked, changed_files, allowed)]
-            have = {r for r, _ in picks}
-            picks += [(r, s) for r, s in cloud_quick.select_quick(root, tracked, set(), cloud_quick.SCAN_TESTS) if r not in have]
+            reads = cloud_quick.readers(root, tracked, changed_files, allowed)
+            picks = cloud_quick.add_scans(root, [(r, None) for r in reads], cloud_quick.SCAN_TESTS)
             names = []
             for r, s in picks:
                 key = r if s is None else r + "::" + s
                 sel_of[key] = (r, s)
                 names.append(key)
             names = sorted(names)
-            print("\n== 2. quick mode: %d check(s) that read the %d changed file(s), plus the named scans (timeout %ds each) =="
-                  % (len(names), len(changed_files), timeout))
+            print("\n== 2. quick mode: %s, plus the named scans (timeout %ds each) =="
+                  % (cloud_quick.mode_line(len(reads), len(changed_files)), timeout))
+            if changed_files and not reads:
+                print("NOT RUN: no check reads " + ", ".join(sorted(changed_files)))
+                failed = True
             if changed_files and not names:
                 print("NOT RUN: quick mode selected no check for a non-empty change; this is not a clean result")
                 failed = True
@@ -187,6 +191,10 @@ def main():
         verdicts = []
         for rel in names:
             path, sel = sel_of.get(rel, (rel, None))
+            if quick and path in cloud_quick.HEAVY:
+                print("%-52s %-9s %-9s %s" % (rel, "-", "-", "skipped: memory-heavy " + path))
+                verdicts.append((rel, "-", "-", "skipped")); failed = True
+                continue
             b = run_one(root, path, timeout, sel) if os.path.exists(os.path.join(root, path)) else "absent"
             d = run_one(basedir, path, timeout, sel) if os.path.exists(os.path.join(basedir, path)) else "absent"
             n = os.path.basename(path)

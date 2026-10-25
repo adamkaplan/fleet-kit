@@ -11,7 +11,12 @@ import re
 SCAN_TESTS = [
     ("bin/test-switchboard", "TestGitShim.test_s7_u1_no_file_of_this_change_writes_the_global_git_configuration"),
     ("cloud/launcher/tests/test_stub_cleanup.py", "TestScanFindsTheShape"),
+    ("cloud/launcher/tests/test_stub_cleanup.py", "TestEverySite"),
+    ("bin/test-cloud-neutral-names", None),
 ]
+# Memory-heavy tests: never run by a quick run (a pod has a hard memory limit); reported "skipped: memory-heavy <path>"
+# and counted as could not run (exit 1). Continuous integration runs them. The one list of both commands.
+HEAVY = ("cloud/worker/tests/test_root_scanner.py",)
 TEST_DIRS = ("cloud/launcher/tests", "cloud/worker/tests")
 
 
@@ -40,9 +45,16 @@ def readers(root, tracked, changed, test_ok=is_test):
     return sorted(out)
 
 
+def mode_line(n_readers, n_changed):
+    """The mode line: the match is on the basename, so a doc change can select many files."""
+    return "%d checks that read the %d files (basename match)" % (n_readers, n_changed)
+
+
 def selector_resolves(root, pair):
     """True when the file exists and holds the class (and method, if named) of the selector."""
     rel, sel = pair
+    if sel is None:  # a whole script with no class (bin/test-cloud-neutral-names)
+        return os.path.isfile(os.path.join(root, rel))
     try:
         with open(os.path.join(root, rel), errors="replace") as f:
             text = f.read()
@@ -58,7 +70,12 @@ def select_quick(root, tracked, changed, scans=None):
     """List of (file, selector or None): readers of the change first, then the scans not already picked whole."""
     scans = SCAN_TESTS if scans is None else scans
     picked = [(r, None) for r in readers(root, tracked, changed)]
+    return add_scans(root, picked, scans)
+
+
+def add_scans(root, picked, scans):
     have = {r for r, _ in picked}
+    picked = list(picked)
     for rel, sel in scans:
         if os.path.isfile(os.path.join(root, rel)) and rel not in have:
             picked.append((rel, sel))

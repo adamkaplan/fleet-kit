@@ -136,7 +136,8 @@ class QuickMode(unittest.TestCase):
         for pair in q.SCAN_TESTS:
             self.assertEqual(len(pair), 2)
             self.assertNotEqual(pair[0], "bin/test-switchboard" if not pair[1] else None)
-            self.assertTrue(pair[1])
+            if not pair[1]:  # only a whole script that takes no selector may omit it
+                self.assertFalse(pair[0].endswith(".py"), pair)
             self.assertTrue(q.selector_resolves(ROOT, pair), pair)
         self.assertFalse(q.selector_resolves(ROOT, (q.SCAN_TESTS[0][0], "TestNoSuchClassAnywhere")))
         # the preflight imports the same module, not a copy of the list

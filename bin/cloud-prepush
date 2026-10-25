@@ -27,6 +27,7 @@ try:
     import cloud_quick  # noqa: E402  (the shared list and selection, bin/cloud_quick.py)
     SCAN_TESTS = cloud_quick.SCAN_TESTS  # (file, selector) pairs; one list for both commands
 except ImportError:  # a copy of this script placed alone (an offline test): the whole-file scan of before
+    cloud_quick = None
     SCAN_TESTS = [("bin/test-switchboard", None)]
 PREFLIGHT_MODE = ["quick"]  # set from CLOUD_PREPUSH_PREFLIGHT (quick by default, or full)
 SCAN_SELECTOR = {}  # file -> selector, set by select() for a scan picked only as a scan
@@ -42,7 +43,9 @@ PREFLIGHT_TIMEOUT = 900
 MAX_SECONDS = 86400
 # Memory-heavy tests: never run here (a pod has a hard memory limit); reported as "skipped: memory-heavy" and counted as
 # "could not run" (exit 1). Continuous integration runs them. Repository-relative paths, one literal tuple.
-HEAVY = ("cloud/worker/tests/test_root_scanner.py",)
+HEAVY = ("cloud/worker/tests/test_root_scanner.py",)  # fallback of a lone copy; with the helper, cloud_quick.HEAVY rules
+if cloud_quick is not None:
+    HEAVY = cloud_quick.HEAVY
 PREFLIGHT = "cloud-pr-preflight"  # found next to this file by path, never through PATH
 
 
@@ -119,33 +122,43 @@ def git(args, cwd, check=False):
     return p
 
 
-def is_test(rel):
+READERS = [0]  # number of reader tests of the last select()
+
+
+def _is_test(rel):  # used only by a lone copy without the helper
     base = os.path.basename(rel)
-    parts = rel.split("/")
-    if rel.startswith("bin/test-"):
-        return True
-    return base.startswith("test_") and base.endswith(".py") and "tests" in parts[:-1]
+    return rel.startswith("bin/test-") or (base.startswith("test_") and base.endswith(".py") and "tests" in rel.split("/")[:-1])
 
 
 def select(root, changed):
     tracked = git(["ls-files"], root).stdout.split("\n")
-    names = {os.path.basename(c) for c in changed}
-    picked = []
-    for rel in tracked:
-        if not rel or not is_test(rel) or not os.path.isfile(os.path.join(root, rel)):
-            continue
-        try:
-            text = open(os.path.join(root, rel), errors="replace").read()
-        except OSError:
-            continue
-        if rel in changed or any(n in text for n in names):
-            picked.append(rel)
+    if cloud_quick is not None:
+        reads = cloud_quick.readers(root, tracked, set(changed))
+    else:
+        reads = cloud_quick_lone_readers(root, tracked, changed)
+    READERS[0] = len(reads)
+    picked = list(reads)
     SCAN_SELECTOR.clear()
     for rel, sel in SCAN_TESTS:
         if os.path.isfile(os.path.join(root, rel)) and rel not in picked:
             picked.append(rel)
             SCAN_SELECTOR[rel] = sel
     return sorted(picked)
+
+
+def cloud_quick_lone_readers(root, tracked, changed):
+    names = {os.path.basename(c) for c in changed}
+    out = []
+    for rel in tracked:
+        if not rel or not _is_test(rel) or not os.path.isfile(os.path.join(root, rel)):
+            continue
+        try:
+            text = open(os.path.join(root, rel), errors="replace").read()
+        except OSError:
+            continue
+        if rel in changed or any(n in text for n in names):
+            out.append(rel)
+    return out
 
 
 def run_one(root, rel, tmp, limit):
@@ -266,7 +279,11 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
         return 1
     print("cloud-prepush: preflight passed", file=sys.stderr)
     picked = select(root, changed)
-    if not picked:
+    if changed and not READERS[0]:
+        print("NOT RUN: no check reads " + ", ".join(sorted(changed)))
+    if cloud_quick is not None:
+        print("cloud-prepush: %s" % cloud_quick.mode_line(READERS[0], len(changed)), file=sys.stderr)
+    if not picked or (changed and not READERS[0]):
         print("cloud-prepush: %d changed file(s) but NO test was selected; this is not a clean result (advice only)" % len(changed))
         return 1
     wt = os.path.join(tmp, "base")
