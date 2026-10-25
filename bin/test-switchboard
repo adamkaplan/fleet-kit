@@ -42183,7 +42183,7 @@ class TestImpactHold(LedgerBase):
         profiled = {f[len("bin/"):-3] for f, _ in seen if f.endswith(".py")}
         named = lambda m: matches("bin/%s.py" % m, rule["clear_code_paths"])
         judged = {m for m in (reached | at_load | with_reader | profiled) if m in names and not named(m)}
-        listed = {f[len("bin/"):-3] for f in rule["closure_files"] if f.endswith(".py")}
+        listed = {f[len("bin/"):-3] for f in rule["closure_files"] if f.endswith(".py") and not f.startswith("bin/switchboard/")}   # a part of the daemon is judged by tools/derive-closure (tests/switchboard/test_closure.py), not by this list of flat modules
         self.assertEqual(sorted(judged ^ listed), [], "closure_files is the set of modules the clear loads or runs, derived (a module in one and not the other)")
         every_loaded = {m for m in (set(helper.values()) | set().union(*loaders.values()) | set().union(*[direct(f) for f in clear_functions])) if m in names and not named(m)}
         exempt = {"bin/%s.py" % m for m in every_loaded - judged}
@@ -78216,6 +78216,9 @@ def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2
 sys.path.insert(0, str(REPO / "tests" / "switchboard"))
 _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
+# The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
+_closure = importlib.import_module("test_closure")
+TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -78234,6 +78237,18 @@ class TestTheArchitectureTestIsRun(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 4, "the hook that loads tests/switchboard/test_architecture.py is gone")
         self.assertEqual(os.path.realpath(_architecture.__file__), os.path.realpath(str(REPO / "tests" / "switchboard" / "test_architecture.py")))
+
+    def test_the_suite_holds_every_test_of_the_closure_test(self):
+        def flat(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from flat(item)
+                else:
+                    yield item
+        ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
+        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld"):
+            with self.subTest(case=name):
+                self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 2, "the hook that loads tests/switchboard/test_closure.py is gone")
 
 
 class TestSupportRebinding(unittest.TestCase):
