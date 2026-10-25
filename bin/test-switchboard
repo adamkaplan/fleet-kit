@@ -82039,7 +82039,8 @@ class TestAdoption(LanesCase):
         return self.scan({rel: (REPO / rel).read_text() for rel in names})
 
     def test_every_reader_of_a_workers_boss_is_in_the_table_and_the_table_has_no_stale_member(self):   # S15
-        self.assertEqual(self.sites(), set(sb.BOSS_READ_SITES), "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
+        moved = {"bin/fleet-switchboard:live_cloud_by_lane": "bin/switchboard/heavy_budget.py:live_cloud_by_lane"}   # S9: the daemon's table still names the entry for this one; the function moved, the table's text is not edited in a move
+        self.assertEqual(self.sites(), {moved.get(k, k) for k in sb.BOSS_READ_SITES}, "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
 
     def test_the_scan_finds_a_raw_reader_when_one_is_planted(self):   # S15 mutant: the real scan, fed a planted source, reports it
         planted = {"bin/planted.py": "def load_row(o):\n    return o.fleet.get('reports_to') == 'x'\n\ndef other(o):\n    return o.fleet['reports_to']\n\ndef safe(o):\n    return boss_name(o)\n"}
