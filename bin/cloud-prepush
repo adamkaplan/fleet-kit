@@ -8,12 +8,13 @@ replaces the hand-written rule of which tests to pick.
 It lists the files changed since the merge base with <base>, selects every test file whose text names a changed file
 (basename match) plus the scan tests of SCAN_TESTS, runs each on the branch and on a clean worktree of the base (under the
 temporary directory, removed at the end, never forced), and prints only the differences.
-Exit: 0 no difference; 1 a difference, a test that could not run, or no test selected for a non-empty change; 2 refused input.
+An EMPTY change exits 0 before the preflight runs. Exit: 0 no difference; 1 a difference, a test that could not run, or no test selected for a non-empty change; 2 refused input.
 Continuous integration stays the gate; its result is the only evidence. Uses git and python3 only, local.
 """
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,11 @@ TOTAL = 1500
 # The preflight step has its own bound, CLOUD_PREPUSH_PREFLIGHT_TIMEOUT (default 900 s), counted inside the total; the
 # per-test bound does not apply to it. It runs serially and prints a progress line at start and every 60 s.
 PREFLIGHT_TIMEOUT = 900
+# Upper bound of every CLOUD_PREPUSH_* number, in seconds (one day); above it: exit 2.
+MAX_SECONDS = 86400
+# Memory-heavy tests: never run here (a pod has a hard memory limit); reported as "skipped: memory-heavy" and counted as
+# "could not run" (exit 1). Continuous integration runs them. Repository-relative paths, one literal tuple.
+HEAVY = ("cloud/worker/tests/test_root_scanner.py",)
 PREFLIGHT = "cloud-pr-preflight"  # found next to this file by path, never through PATH
 
 
@@ -37,7 +43,7 @@ def positive(name, default):
     raw = os.environ.get(name)
     if raw is None:
         return default
-    if not re.fullmatch(r"[0-9]+", raw.strip()) or int(raw) < 1:
+    if not re.fullmatch(r"[0-9]+", raw) or not 1 <= int(raw) <= MAX_SECONDS:
         raise ValueError(name)
     return int(raw)
 
@@ -60,6 +66,43 @@ def child_env(tmp):
     env["TMPDIR"] = tmp
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
+
+
+def _term(signum, frame):
+    raise KeyboardInterrupt
+
+
+def kill_group(proc):
+    """Kill the whole process group of a child started with start_new_session, then wait."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait()
+    except Exception:
+        pass
+
+
+def run_group(cmd, cwd, env, limit, tick=None):
+    """Run cmd in its own session; returns (returncode, output, timed_out). The whole group is killed at the end."""
+    t0 = time.monotonic()
+    with tempfile.TemporaryFile("w+", errors="replace") as outf:
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=outf, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        timed_out = False
+        try:
+            while proc.poll() is None:
+                el = time.monotonic() - t0
+                if el >= limit:
+                    timed_out = True
+                    break
+                if tick:
+                    tick(el)
+                time.sleep(min(0.1, max(0.01, limit - el)))
+        finally:
+            kill_group(proc)
+        outf.seek(0)
+        return proc.returncode, outf.read(), timed_out
 
 
 def git(args, cwd, check=False):
@@ -103,16 +146,16 @@ def run_one(root, rel, tmp, limit):
     cmd = [sys.executable, path] if rel.endswith(".py") else [path]
     env = child_env(tmp)
     try:
-        p = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=limit, env=env, errors="replace")
-    except subprocess.TimeoutExpired:
-        return ("noRun", "timed out after %ds" % limit)
+        rc, text, timed_out = run_group(cmd, root, env, limit)
     except OSError as e:
         return ("noRun", str(e))
-    if p.returncode in (126, 127):
-        return ("noRun", "exit %d" % p.returncode)
-    out = (p.stdout + p.stderr).replace(root, "<root>")
+    if timed_out:
+        return ("noRun", "timed out after %ds" % limit)
+    if rc in (126, 127):
+        return ("noRun", "exit %d" % rc)
+    out = text.replace(root, "<root>")
     out = re.sub(r"/tmp/\S+|\b\d+\.\d+s\b|0x[0-9a-f]+", "<x>", out)
-    return ("ran", (p.returncode, out[-4000:]))
+    return ("ran", (rc, out[-4000:]))
 
 
 def preflight(root, base, scratch, limit):
@@ -122,29 +165,22 @@ def preflight(root, base, scratch, limit):
         return False, ["could not run the preflight: " + path + " is missing"]
     env = child_env(scratch)
     env["CLOUD_PREFLIGHT_BASE"] = base  # the preflight takes its base from this variable, never from an option
-    t0 = time.monotonic()
-    with tempfile.TemporaryFile("w+", errors="replace") as outf:
-        try:
-            proc = subprocess.Popen([sys.executable, path], cwd=root, stdout=outf, stderr=subprocess.STDOUT, env=env)
-        except OSError as e:
-            return False, ["could not run the preflight: %s" % e]
-        nxt = 0
-        while proc.poll() is None:
-            el = time.monotonic() - t0
-            if el >= limit:
-                proc.kill()
-                proc.wait()
-                return False, ["could not run the preflight: timed out after %ds" % limit]
-            if el >= nxt:
-                print("preflight running (%d s of %d)" % (el, limit), file=sys.stderr, flush=True)
-                nxt += 60
-            time.sleep(min(0.2, max(0.01, limit - el)))
-        outf.seek(0)
-        lines = outf.read().splitlines()
-    class p:
-        returncode = proc.returncode
-    if p.returncode != 0:
-        return False, lines or ["the preflight exited %d with no output" % p.returncode]
+    state = {"next": 0}
+
+    def tick(el):
+        if el >= state["next"]:
+            print("preflight running (%d s of %d)" % (el, limit), file=sys.stderr, flush=True)
+            state["next"] += 60
+
+    try:
+        rc, text, timed_out = run_group([sys.executable, path], root, env, limit, tick)
+    except OSError as e:
+        return False, ["could not run the preflight: %s" % e]
+    if timed_out:
+        return False, ["could not run the preflight: timed out after %ds" % limit]
+    lines = text.splitlines()
+    if rc != 0:
+        return False, lines or ["the preflight exited %d with no output" % rc]
     return True, lines
 
 
@@ -192,8 +228,10 @@ def main(argv):
         print("cloud-prepush: no changed files since the merge base; nothing to run (advice only)")
         return 0
     tmp = tempfile.mkdtemp(prefix="cloud-prepush-")
-    scratch = os.path.join(tmp, "t")
+    scratch = os.path.join(tmp, "t")  # branch side; the base side has its own, tmp/tb
     os.mkdir(scratch)
+    os.mkdir(os.path.join(tmp, "tb"))
+    signal.signal(signal.SIGTERM, _term)
     try:
         return stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S)
     finally:
@@ -221,6 +259,10 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
     diffs = []
     try:
         for i, rel in enumerate(picked, 1):
+            if rel in HEAVY:
+                noRun += 1
+                diffs.append("skipped: memory-heavy " + rel)
+                continue
             left = TOTAL_S - (time.monotonic() - started)
             if left <= 0:
                 noRun += 1
@@ -230,7 +272,7 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
             b = run_one(root, rel, scratch, min(TIMEOUT_S, max(1, int(left))))
             print("[%d/%d] %s base" % (i, len(picked), rel), file=sys.stderr, flush=True)
             left = TOTAL_S - (time.monotonic() - started)
-            a = run_one(wt, rel, scratch, min(TIMEOUT_S, max(1, int(left)))) if left > 0 else ("noRun", "the overall deadline expired")
+            a = run_one(wt, rel, os.path.join(tmp, "tb"), min(TIMEOUT_S, max(1, int(left)))) if left > 0 else ("noRun", "the overall deadline expired")
             if b[0] == "noRun" or a[0] == "noRun":
                 noRun += 1
                 diffs.append("COULD NOT RUN %s: %s" % (rel, b[1] if b[0] == "noRun" else a[1]))
