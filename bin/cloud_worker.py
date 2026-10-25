@@ -1126,7 +1126,7 @@ def _launch(args, runner, now, reserve):
             options += [CREATE_OPTION[key], str(value)]
     if args.agent == "orchestrator":   # only on request: a worker launch hands the launcher exactly what it always did
         options += [CREATE_OPTION["agent"], args.agent, CREATE_OPTION["boss"], args.reports_to]
-    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip())   # the hub setting
+    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip() or args.agent == "orchestrator")   # the hub setting, or an orchestrator (the launcher registers its entry always: it needs the session)
     if hub and args.agent != "orchestrator":   # a worker joins the hub too: the launcher reads the setting itself, it only needs the boss
         options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
