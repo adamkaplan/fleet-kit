@@ -130,6 +130,164 @@ class AlertWakeFacts:
                 for key, (text, created, name, repo, number) in sorted(wake.facts.items())]
 
 
+# ---- #1141: a required check that failed at an open head of a worker-owned pull request, and a default branch that turned red or green again, reach the
+# people who must act. Reads nothing new: the runs the catch-up already reads. The messages are ordinary facts (the delivery rule holds them while blocked).
+
+RED_CI_FILE = "red-ci.json"   # {"told": {key: at}, "branch": {repo: "red"|"green"}, "lines": {key: {name: text}}} (private; survives a restart)
+RED_CI_PER_HOUR = 20          # a bound per hour on new messages; the rest is not told (and not remembered, so a later pass tells it)
+RED_CI_KEEP = 2 * 86400
+
+
+class RedCiState:
+    def __init__(self, state_dir, now):
+        self.told, self.branch, self.facts, self.recent = {}, {}, {}, []
+        try:
+            with open(str(Path(state_dir) / RED_CI_FILE), "rb") as handle:
+                raw = json.loads(handle.read(1000001).decode("utf-8"))
+            if isinstance(raw, dict):
+                self.told = {k: v for k, v in (raw.get("told") or {}).items() if isinstance(k, str) and _is_number(v)}
+                self.branch = {k: v for k, v in (raw.get("branch") or {}).items() if isinstance(k, str) and v in ("red", "green")}
+                for key, lines in (raw.get("lines") or {}).items():
+                    at = self.told.get(key)
+                    if at is not None and now - at < RED_CI_KEEP and isinstance(lines, dict):
+                        for name, text in lines.items():
+                            if isinstance(text, str) and isinstance(name, str):
+                                self.facts["red-ci:%s:%s" % (key, name)] = (text, at, name, key.split(":")[1].split("#")[0])
+        except (OSError, ValueError, UnicodeError):
+            pass
+        self.lines = {}
+
+
+def red_ci_state(engine):
+    state = getattr(engine, "red_ci", None)
+    if state is None:
+        state = engine.red_ci = RedCiState(engine.state_dir, engine.now()) if engine.state_dir is not None else RedCiState("/nonexistent-red-ci", engine.now())
+    return state
+
+
+def red_ci_receivers(engine, repo, with_chief):
+    discovery = getattr(engine, "discovery", None)
+    if discovery is None:
+        return []
+    names = {n for n, a in discovery.agents.items() if _is_orchestrator(a) and _fleet_repo(a.fleet or {}, engine.config) == repo}
+    if with_chief:
+        names |= {n for n, a in discovery.agents.items() if (a.fleet or {}).get("role") == "chief-of-staff"}
+    return sorted(names)
+
+
+def red_ci_tell(engine, state, key, repo, text, names, now):
+    """ONE message per key, to each receiver; nobody to tell, or over the hourly bound: nothing is remembered, so a later pass tells it."""
+    if key in state.told or not names:
+        return False
+    state.recent = [t for t in state.recent if now - t < 3600]
+    if len(state.recent) >= RED_CI_PER_HOUR:
+        return False
+    state.recent.append(now)
+    state.told[key] = now
+    state.lines[key] = {n: text for n in names}
+    for name in names:
+        state.facts["red-ci:%s:%s" % (key, name)] = (text, now, name, repo)
+    engine._note("red_ci.sent", repo, {"key": key, "to": names})
+    return True
+
+
+def red_ci_save(engine, state, now):
+    keep = {k: at for k, at in sorted(state.told.items(), key=lambda kv: kv[1])[-ALERT_MEMORY_MAX:]}
+    lines = {k: {n: v[0] for n, v in [(f.rsplit(":", 1)[1], state.facts[f]) for f in state.facts if f.startswith("red-ci:%s:" % k)]} for k in keep if now - keep[k] < RED_CI_KEEP}
+    try:
+        _write_small(engine.state_dir, RED_CI_FILE, {"told": keep, "branch": state.branch, "lines": lines})
+    except OSError as err:
+        engine._note("red_ci.error", "", {"error": _one_line(type(err).__name__, 40)})
+
+
+def red_ci_latest(repo, runs):
+    """The runs that count: the shared reader (bin/ci_runs.py `latest_runs`) keeps only the latest run of each workflow by identity (workflow id, event), never by name.
+    The workflow id is already in each run record, so it is seeded into the reader's cache: no read is added."""
+    ci = load_module("ci_runs")
+    low, entries = repo.lower(), []
+    for run in runs:
+        if isinstance(run, dict) and isinstance(run.get("id"), int):   # a record with no workflow id is its own group (superseded by nothing, never read by name)
+            wid = run["workflow_id"] if type(run.get("workflow_id")) is int else -run["id"]
+            ci._put(ci._CACHE, (low, run["id"]), (wid, str(run.get("event") or "")))
+        if isinstance(run, dict) and isinstance(run.get("id"), int):
+            entries.append(dict(run, detailsUrl="https://github.com/%s/actions/runs/%d" % (repo, run["id"]), name=run.get("name") or "run"))
+    kept = {e["id"] for e in ci.latest_runs(entries, low) if e.get("status") not in (ci.UNREADABLE, ci.CAP_STATUS)}
+    return [r for r in runs if not (isinstance(r, dict) and isinstance(r.get("id"), int)) or r["id"] in kept]
+
+
+def red_ci_runs(engine, repo, runs, now):
+    """Judge the workflow runs the catch-up read of `repo`. Never raises."""
+    try:
+        if engine is None or engine.state_dir is None:
+            return
+        module, state, changed = load_module("red_ci"), red_ci_state(engine), False
+        cfg = engine.config or {}
+        required = (cfg.get("red_ci_required") or {}).get(repo) or []
+        default = (cfg.get("default_branches") or {}).get(repo) or "main"
+        discovery = getattr(engine, "discovery", None)
+        agents = discovery.agents if discovery else {}
+        newest = None
+        runs = red_ci_latest(repo, runs)
+        for run in runs:
+            if not isinstance(run, dict) or not isinstance(run.get("id"), int):
+                continue
+            word, head, url, name = module.colour(run), run.get("head_sha"), run.get("html_url") or "", str(run.get("name") or "run")
+            if word == "none" or not isinstance(head, str):
+                continue
+            prs = [p.get("number") for p in run.get("pull_requests") or [] if isinstance(p, dict) and isinstance(p.get("number"), int)]
+            if prs:
+                if word != "red" or not module.is_required(required, name):
+                    continue
+                for number in prs:
+                    owner = pick_owner(agents, [number], repo)
+                    if owner is None or _is_orchestrator(agents[owner]):
+                        continue   # no worker of the lane owns it
+                    changed |= red_ci_tell(engine, state, module.pr_key(repo, number, head, name), repo,
+                                           module.pr_line(repo, number, name, url, head), red_ci_receivers(engine, repo, False), now)
+            elif run.get("head_branch") == default and run.get("event") != "pull_request":
+                if newest is None or str(run.get("created_at") or "") > str(newest.get("created_at") or ""):
+                    newest = run
+        if newest is not None:
+            word, rid = module.colour(newest), newest["id"]
+            head, url, name = newest.get("head_sha"), newest.get("html_url") or "", str(newest.get("name") or "run")
+            if word == "red" and module.branch_key("red", repo, head) not in state.told:
+                job = newest.get("failing_job") or name
+                ok = red_ci_tell(engine, state, module.branch_key("red", repo, head), repo, module.branch_line("red", repo, default, name, url, head, job),
+                                 red_ci_receivers(engine, repo, True), now)
+                if ok:
+                    state.branch[repo], changed = "red", True
+            elif word == "green" and state.branch.get(repo) == "red":
+                ok = red_ci_tell(engine, state, module.branch_key("green", repo, rid), repo, module.branch_line("green", repo, default, name, url, head),
+                                 red_ci_receivers(engine, repo, True), now)
+                if ok:
+                    state.branch[repo], changed = "green", True
+                    for old in [k for k in state.told if k.startswith("branch-red:%s:" % repo)]:
+                        del state.told[old]   # a later red at the same head is a new change
+        if changed:
+            red_ci_save(engine, state, now)
+    except Exception as err:
+        engine._note("red_ci.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+
+
+class RedCiFacts:
+    """The red-CI lines, as ordinary facts: the usual rule holds them while the receiver is blocked, and a key in the inbox is never delivered again."""
+
+    __name__ = "red_ci_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        state = getattr(self.engine, "red_ci", None) if self.engine else None
+        if not state or not state.facts:
+            return []
+        return [Fact(key, name, "alert", text, created, sender="switchboard", repo=repo)
+                for key, (text, created, name, repo) in sorted(state.facts.items())]
+
+
 def testers_status(config, agents, fleets, state):
     """The `status` lines of the resolved testers per repo with their source (#372); [] when there are none or the picture is unreadable."""
     try:
