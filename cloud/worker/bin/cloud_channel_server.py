@@ -79,7 +79,7 @@ def listen_address(environ):
     return match.group(1), int(match.group(2))
 
 
-def make_server(address, reviewer, inbox, audit, max_handlers=None, namespace=None):
+def make_server(address, reviewer, inbox, audit, max_handlers=None, *, namespace):
     """A server bound to address (not started). Raises ValueError when address is None: not configured, no listener."""
     if address is None:
         raise ValueError("cloud channel listener is not configured (%s)" % LISTEN_ENV)
@@ -178,7 +178,7 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None, namespace=No
     return _Server(address, Handler, max_handlers or MAX_HANDLERS, audit)
 
 
-def serve(environ, reviewer, inbox, audit, namespace=None):
+def serve(environ, reviewer, inbox, audit, *, namespace):
     """Start listening when configured (blocks); returns False without binding anything when it is not."""
     address = listen_address(environ)
     if address is None:

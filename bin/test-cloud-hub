@@ -805,8 +805,9 @@ class NsHub(Hub):
 
 SA = "system:serviceaccount:"
 USERS_NS = {"tok-cw": SA + "cw:agent-a", "tok-old": SA + "fleet-agents:agent-a", "tok-cap": SA + "cw:captain",
-            "tok-sw": SA + "cw:switchboard", "tok-oldcap": SA + "fleet-agents:captain"}
-BAD_NAMESPACES = ("", "Cw", "c.w", "c:w", "cw\n", "a" * 64)
+            "tok-sw": SA + "cw:switchboard", "tok-oldcap": SA + "fleet-agents:captain",
+            "tok-evil": SA + "cw-evil:agent-a", "tok-ecw": SA + "ecw:agent-a"}
+BAD_NAMESPACES = ("", "Cw", "c.w", "c:w", "cw\n", "a" * 64, "a/b", "cw/evil")
 
 
 class TestNamespaceSetting(unittest.TestCase):
@@ -821,6 +822,12 @@ class TestNamespaceSetting(unittest.TestCase):
         with NsHub(module, USERS_NS) as hub:
             self.assertEqual(hub.send(recipient="agent-b", token="tok-cw")[0], 200)
             self.assertEqual(hub.send(recipient="agent-b", key="k2", token="tok-old")[0], 401)
+
+    def test_lookalike_namespaces_are_refused(self):
+        with NsHub(load(), USERS_NS) as hub:
+            self.assertEqual(hub.send(recipient="agent-b", token="tok-cw")[0], 200)
+            self.assertEqual(hub.send(recipient="agent-b", key="k3", token="tok-evil")[0], 401)
+            self.assertEqual(hub.send(recipient="agent-b", key="k4", token="tok-ecw")[0], 401)
 
     def test_token_review_accepts_the_setting_namespace_only(self):
         self.token_check(load())

@@ -327,13 +327,20 @@ def check_bind(module, test):
     test.assertEqual(module.listen_address({module.LISTEN_ENV: "10.1.2.3:8443"}), ("10.1.2.3", 8443))
 
 
+def check_namespace_required(module, test):
+    for call in (lambda: module.make_server(("127.0.0.1", 0), reviewer, FakeInbox(), print),
+                 lambda: module.serve({}, reviewer, FakeInbox(), print)):
+        with test.assertRaises(TypeError):
+            call()
+
+
 def check_configured_only(module, test):
     test.assertIsNone(module.listen_address({}))
     test.assertIsNone(module.listen_address({module.LISTEN_ENV: "nonsense"}))
     test.assertIsNone(module.listen_address({module.LISTEN_ENV: "0.0.0.0:99999"}))
     test.assertEqual(module.listen_address({module.LISTEN_ENV: "127.0.0.1:8443"}), ("127.0.0.1", 8443))
     try:
-        module.make_server(None, reviewer, FakeInbox(), print)
+        module.make_server(None, reviewer, FakeInbox(), print, namespace="fleet-agents")
     except ValueError:
         pass
     except Exception as exc:
@@ -346,8 +353,8 @@ def check_configured_only(module, test):
         calls.append(args)
         raise test.failureException("make_server must not be called when not configured")
     module.make_server = fake_make_server
-    test.assertIs(module.serve({}, reviewer, FakeInbox(), print), False)
-    test.assertIs(module.serve({module.LISTEN_ENV: "junk"}, reviewer, FakeInbox(), print), False)
+    test.assertIs(module.serve({}, reviewer, FakeInbox(), print, namespace="fleet-agents"), False)
+    test.assertIs(module.serve({module.LISTEN_ENV: "junk"}, reviewer, FakeInbox(), print, namespace="fleet-agents"), False)
     test.assertEqual(calls, [])
 
 
@@ -386,6 +393,8 @@ CHECKS = [
     ("bind", check_bind, "_Server(address, Handler,", "_Server((\"0.0.0.0\", address[1]), Handler,"),
     ("configured_only", check_configured_only, "if address is None:\n        raise", "if False:\n        raise"),
     ("configured_only_serve", check_configured_only, "    if address is None:\n        return False", "    if False:\n        return False"),
+    ("namespace_required", check_namespace_required, "max_handlers=None, *, namespace):", "max_handlers=None, namespace=None):"),
+    ("namespace_required_serve", check_namespace_required, "audit, *, namespace):", "audit, namespace=None):"),
     ("bearer_reused", check_bearer_reused, "BEARER = cloud_channel.BEARER", "BEARER = \"Bearer  \""),
 ]
 
