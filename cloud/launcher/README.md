@@ -186,6 +186,12 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
 
+## How a member adds a test to the chain
+
+Cause of the old merge rounds: the whole chain of `bin/test-cloud-launcher` was ONE shell line of more than forty commands joined by `&&`, and every member that added a test appended to that same line, so every pair of concurrent members conflicted on it.
+
+The chain is now `bin/test-cloud-launcher.chain`, one path per line, sorted alphabetically, followed by one fixed last line (`cloud/worker/tests/test_cloud_prepush_preflight.py`) that no member edits. To add a test, add one line to bin/test-cloud-launcher.chain at its alphabetical place, above the fixed last line. Two members adding different tests at different places merge without a conflict. The script runs each entry once (passing its own arguments), stops at the first red with `RESULT: FAIL`, and prints `RESULT: PASS` otherwise. Its completeness check agrees both ways: every `test_*.py` is listed or named in `EXCEPTIONS` with a reason, and every listed entry must be an existing file.
+
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
 a cluster Secret scoped to the pod and mounted at `/run/cw/server-password` (0600); Basic auth, as the local v2

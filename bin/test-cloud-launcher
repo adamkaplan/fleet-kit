@@ -9,12 +9,14 @@ LIST=bin/test-cloud-launcher.chain
 EXCEPTIONS="test_cloud_pod_deadline.py:slow(26s),not-yet-chained test_cloud_stop_nonce.py:slow(57s),not-yet-chained test_reaper_record_family.py:did-not-finish-in-120s,not-yet-chained"
 [ -f "$LIST" ] || { echo "NOT RUN: $LIST is missing"; echo "RESULT: FAIL"; exit 1; }
 for f in cloud/launcher/tests/test_*.py; do
+  [ -e "$f" ] || continue
   n=$(basename "$f")
   grep -q "tests/$n\$" "$LIST" && continue
   case " $EXCEPTIONS " in *" $n:"*) continue ;; esac
   echo "NOT RUN: $n is neither chained nor in EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
 done
 for f in bin/test-cloud-cost-*; do
+  [ -e "$f" ] || continue
   n=$(basename "$f")
   grep -q "bin/$n\$" "$LIST" && continue
   echo "NOT RUN: bin/$n is not chained"; echo "RESULT: FAIL"; exit 1

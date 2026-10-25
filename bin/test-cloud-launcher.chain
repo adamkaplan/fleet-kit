@@ -1,5 +1,6 @@
 bin/test-cloud-cost-report
 cloud/launcher/tests/test_app_token.py
+cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_cloud_allowlist.py
 cloud/launcher/tests/test_cloud_docs_wording.py
 cloud/launcher/tests/test_cloud_hub_manifest.py
