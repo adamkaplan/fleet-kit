@@ -291,6 +291,17 @@ Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_
 - First install: `kubectl create -f cloud/k8s/cloud-hub.yaml`. Create refuses to overwrite an existing object: a second run fails with AlreadyExists on the Secrets, so it cannot reset the registry.
 - Verify: `kubectl -n cw get deployment,service,secret -l app.kubernetes.io/part-of=cloud-hub` shows the five objects.
 - Changing the hub later: applying the whole file again resets the registry Secret to empty objects and deregisters every live agent until the launcher registers them again. So never re-apply the whole file; patch in place. For the image: `kubectl -n cw set image deployment/cloud-hub hub=<registry>/<repository>@sha256:<digest>` (the container is named `hub`). For other fields: `kubectl -n cw patch deployment cloud-hub ...`. To apply the Deployment and Services only, apply a copy of the file with the two documents of kind Secret removed.
+- Rolling out the hub namespace setting: the hub refuses to start without `FLEET_CLOUD_AGENT_NAMESPACE`, and the old hub image ignores that variable, so set the variable FIRST, then change the image. Both are in-place patches, never a manifest re-apply (a re-apply resets the registry Secret and deregisters live agents). The operator of the hub (the cloud-hub lane) runs them, together with the image rebuild:
+
+  ```sh
+  kubectl -n cw get deployment cloud-hub -o jsonpath='{.spec.template.spec.containers[?(@.name=="hub")].image}'   # record the previous image
+  kubectl -n cw set env deployment/cloud-hub FLEET_CLOUD_AGENT_NAMESPACE=cw   # equals the namespace the hub runs in
+  kubectl -n cw rollout status deployment/cloud-hub
+  kubectl -n cw set image deployment/cloud-hub hub=<registry>/cw/worker@sha256:<digest>
+  kubectl -n cw rollout status deployment/cloud-hub
+  ```
+
+  Check: the hub pod is Ready, a token review of a real account in the hub's namespace is accepted, and an account of another namespace is refused (how the review works: `docs/cloud-channel.md`, the TokenReview mode and the namespace setting). Rollback: `kubectl -n cw set image deployment/cloud-hub hub=<previous image>`; the environment entry may stay (the old image ignores it).
 - The empty `cloud-hub-pw` Secret: a later apply may leave the launcher-added keys alone but does not guarantee it: do not re-apply.
 - Delay: kubelet refreshes mounted Secret contents within about a minute, so a newly launched agent can need up to ~60 s before it can message through the hub.
 - Smoke check: the hub has no unauthenticated health path (`GET /decisions` needs a token), so readiness is a TCP check on 8443. From a pod in `cw`, `nc -z cloud-hub 8443` must succeed.
