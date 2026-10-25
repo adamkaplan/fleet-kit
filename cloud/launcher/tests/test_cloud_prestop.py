@@ -868,7 +868,10 @@ class AutoGc(Base):
             f.write(self.plain_cfg)
         if os.path.exists(self.marker):
             os.remove(self.marker)
-        for k, v in (("gc.auto", "1"), ("gc.autoDetach", "false"), ("gc.pruneExpire", "now"), ("gc.recentObjectsHook", script)):
+        # git 2.55+ runs `maintenance run --auto` after a commit and, by default, that picks the geometric-repack task, not the gc
+        # task, so the recent-objects hook never fires; maintenance.strategy=gc restores the gc task (a no-op on older git, where
+        # the gc task is already the default). Verified on git 2.43.0 (ubuntu 24.04) and 2.56.0 (alpine edge).
+        for k, v in (("maintenance.strategy", "gc"), ("gc.auto", "1"), ("gc.autoDetach", "false"), ("gc.pruneExpire", "now"), ("gc.recentObjectsHook", script)):
             sh("git", "-C", self.work, "config", "--" + "add", k, v)
 
     def test_gc_keys_in_the_repository_are_refused_and_the_script_never_runs(self):
@@ -919,7 +922,7 @@ class AutoGc(Base):
         self.head = sh("git", "-C", self.work, "rev-parse", "HEAD")
         self.assertFalse(self.variant(s + "\n", "original"), "the real hook ran the gc script")
         self.assertTrue(self.refused)
-        wild = s.replace(check, "if key not in ALLOWED_KEYS and not BRANCH_RE.match(key) and not re.match(r'^(gc|pack)[.][^.]+$', key):")
+        wild = s.replace(check, "if key not in ALLOWED_KEYS and not BRANCH_RE.match(key) and not re.match(r'^(gc|pack|maintenance)[.][^.]+$', key):")
         self.assertFalse(self.variant(wild, "wildcard"), "the pins stop the script even then")
         self.assertFalse(self.refused, "a restored wildcard still refuses gc.recentObjectsHook: the refusal test would not catch it")
         # the allow-list bypassed ALONE: the pins still stop the gc; with the gc.auto pin removed too the script runs
