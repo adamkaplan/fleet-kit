@@ -70,7 +70,11 @@ def write_reminders(state_dir, items):
         raise
 
 
-def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, wake_class=None):
+LATE_NOTE_SECONDS = 300
+TEXT_CAP = 4000  # mirrors MESSAGE_CAP in bin/fleet-switchboard
+
+
+def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, key=None, wake_class=None):
     if not isinstance(to, str) or not to.strip():
         raise ReminderError("a reminder needs the name of the agent it is for")
     if not text.strip():
@@ -83,8 +87,13 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
         item["wake_class"] = wake_class  # #1275: folded with the sweep and triage items of the same wake
     if condition:
         item["condition"] = dict(condition)  # checked when it is due: {"unless_report_from", "since"} or {"while_running"}
+    if key:
+        item["key"] = key
     with reminders_lock(state_dir):
-        write_reminders(state_dir, read_reminders(state_dir) + [item])
+        items = read_reminders(state_dir)
+        if key and isinstance(sender, str) and sender.strip():   # one pending per owner and key; another owner or key, a fired one and a sender-less one are never touched
+            items = [i for i in items if not (i.get("key") == key and i.get("from") == sender and i.get("at", 0) > created)]
+        write_reminders(state_dir, items + [item])
     return item
 
 
@@ -266,6 +275,21 @@ def remove_reminders(state_dir, ids):
     return gone
 
 
+DROP_HOOK = None  # test hook: called between the snapshot read and the locked drop
+
+
+def drop_superseded_item(state_dir, item_id, kept_id):
+    """Remove item_id only if kept_id is STILL in the file: one read-modify-write under the lock."""
+    if DROP_HOOK is not None:
+        DROP_HOOK()
+    with reminders_lock(state_dir):
+        items = read_reminders(state_dir)
+        if not any(i["id"] == kept_id for i in items) or not any(i["id"] == item_id for i in items):
+            return False
+        write_reminders(state_dir, [i for i in items if i["id"] != item_id])
+    return True
+
+
 def found_reason(why):
     return "merged" if why.endswith(" is merged") else "closed"
 
@@ -381,9 +405,29 @@ class ReminderFacts:
         if self.engine.audit is not None:
             self.engine.audit.append(self.engine.actor, "reminder.drop_notice", sender, {"id": item["id"], "why": found_reason(why)})
 
+    def superseded(self, item, items):
+        """The newer item of the same owner and key that is DUE or fired, if any (only keyed items with a string sender).
+        A newer item still in the future never supersedes: the older one is delivered (late note) so the lane is not left with nothing."""
+        sender = item.get("from")
+        if not item.get("key") or not isinstance(sender, str) or not sender.strip():
+            return None
+        now = self.engine.now() if self.engine else time.time()
+        newer = [i for i in items if i["id"] != item["id"] and i.get("key") == item["key"] and i.get("from") == item.get("from")
+                 and i["at"] <= now and (i.get("created", 0), i["at"]) > (item.get("created", 0), item["at"])]
+        return max(newer, key=lambda i: (i.get("created", 0), i["at"])) if newer else None
+
     def __call__(self):
         facts = []
+        everything = read_reminders(self.state_dir)
         for item in self.due():
+            kept = self.superseded(item, everything)
+            if kept is not None and kept.get("condition") and self.verdict(kept) != "deliver":
+                kept = None   # the newer one is gated or unresolved: it may not be delivered, so deliver the older
+            if kept is not None:
+                if drop_superseded_item(self.state_dir, item["id"], kept["id"]) and self.engine is not None and self.engine.audit is not None:
+                    self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", item["to"],
+                                             {"dropped": item["id"], "kept": kept["id"], "key": _one_line(item["key"], 60)})
+                continue
             if item.get("condition"):
                 found = self.verdict(item)
                 if found is None:
@@ -397,6 +441,11 @@ class ReminderFacts:
                         self.notify_drop(item, found)
                     continue
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
+            late = (self.engine.now() if self.engine else time.time()) - item["at"]
+            if late >= LATE_NOTE_SECONDS:
+                note = " (late by %d min)" % int(late // 60)
+                cut = len(text) + len(note) > TEXT_CAP
+                text = text[:max(0, TEXT_CAP - len(note) - (1 if cut else 0))] + ("\u2026" if cut else "") + note   # the note is applied before the cap and kept: the body is cut, not the note
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
             if isinstance(item.get("wake_class"), str):
@@ -568,7 +617,7 @@ def remind_manage(args, engine, state, sender, moment):
     if args.list_mine:
         mine.sort(key=lambda item: item["at"])
         for item in mine[:REMIND_LIST_MAX]:
-            print("%s  %s  to=%s  issue=%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item["text"], 120)))
+            print("%s  %s  to=%s  issue=%s  key=%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item.get("key") or "-", 80), _one_line(item["text"], 120)))
         if len(mine) > REMIND_LIST_MAX:
             print("(%d more not shown)" % (len(mine) - REMIND_LIST_MAX))
         if not mine:
@@ -606,6 +655,9 @@ def cmd_remind(args, runner, now):
     except IssueRefError as err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
+    if args.key and not (isinstance(sender, str) and sender.strip()):
+        sys.stderr.write("%s: --key needs a known sender (an unidentified caller would replace other callers' reminders); nothing armed\n" % PROG)
+        return EXIT_USAGE
     condition = {}
     for flag, key in ((args.until_closed, "until_closed"), (args.until_merged, "until_merged")):
         if flag:
@@ -628,7 +680,10 @@ def cmd_remind(args, runner, now):
         warning = ("%s: reminder is dropped if it closes (%s#%d closes or its pull request merges), with one notice to you; "
                    "use --keep-if-closed to keep it\n" % (PROG, repo, number))
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
-                        " ".join(args.text).strip(), number, sender, repo, condition=condition or None)
+                        " ".join(args.text).strip(), number, sender, repo, condition=condition or None,
+                        key=_one_line(args.key, 80) if args.key else None)
+    if len(item["text"]) > TEXT_CAP:
+        sys.stderr.write("%s: warning: text is cut at %d characters: %d characters over\n" % (PROG, TEXT_CAP, len(item["text"]) - TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
                                                           "from": sender, "issue": number, "repo": repo})
     print(item["id"])
