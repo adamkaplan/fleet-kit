@@ -14433,8 +14433,9 @@ def red_ci_latest(repo, runs):
     ci = load_module("ci_runs")
     low, entries = repo.lower(), []
     for run in runs:
-        if isinstance(run, dict) and isinstance(run.get("id"), int) and type(run.get("workflow_id")) is int and isinstance(run.get("event"), str):
-            ci._put(ci._CACHE, (low, run["id"]), (run["workflow_id"], run["event"]))
+        if isinstance(run, dict) and isinstance(run.get("id"), int):   # a record with no workflow id is its own group (superseded by nothing, never read by name)
+            wid = run["workflow_id"] if type(run.get("workflow_id")) is int else -run["id"]
+            ci._put(ci._CACHE, (low, run["id"]), (wid, str(run.get("event") or "")))
         if isinstance(run, dict) and isinstance(run.get("id"), int):
             entries.append(dict(run, detailsUrl="https://github.com/%s/actions/runs/%d" % (repo, run["id"]), name=run.get("name") or "run"))
     kept = {e["id"] for e in ci.latest_runs(entries, low) if e.get("status") not in (ci.UNREADABLE, ci.CAP_STATUS)}
