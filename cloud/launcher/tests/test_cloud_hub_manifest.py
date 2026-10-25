@@ -272,7 +272,7 @@ class NamespaceSetting(unittest.TestCase):
                     if change == "set":
                         for e in c["env"]:
                             if e["name"] == "FLEET_CLOUD_AGENT_NAMESPACE":
-                                e["value"] = "fleet-" + "agents"
+                                e["value"] = "other-" + "agents"
                     else:
                         c["env"] = [e for e in c["env"] if e["name"] != "FLEET_CLOUD_AGENT_NAMESPACE"]
             self.assertEqual(namespace_setting_problems(docs, self.channel, self.quick), ["manifest"], change)
