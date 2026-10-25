@@ -97,7 +97,8 @@ def valid_worker(worker):
 
 
 def norm_repo(url):
-    """owner/name of a github.com URL (https or scp form), lower case, without .git; None if it is not one."""
+    """owner/name of a github.com URL (https or scp form), lower case, without .git; None if it is not one. Userinfo in an https URL
+    is stripped before the comparison; this is harmless because the push goes to the URL built from CW_REPO whatever the remote says."""
     m = re.match(r"^(?:https?://(?:[^/@]+@)?github\.com/|(?:ssh://)?git@github\.com[:/])([^/]+/[^/]+?)(?:\.git)?/?$", url.strip(), re.I)
     return m.group(1).lower() if m else None
 
@@ -202,8 +203,9 @@ def unpushed_names(workdir, ctx, trusted):
 
 
 def report(workdir, reason, ctx=None, trusted=False, names=True):
-    """THE durable trace: exactly one line with a stable prefix, on stdout AND stderr (cw-prestop keeps the last line in the container's
-    output, which the pod's log collector keeps; the launcher itself does not collect the hook's output). It says plainly that the work
+    """Exactly one line with a stable prefix, on stdout AND stderr (cw-prestop keeps the last line in the container's output). The line
+    is the only trace of a refused run: it lives in the pod's log and ends with the pod unless the cluster ships logs elsewhere (nothing
+    in the repository keeps it); the launcher does not collect the hook's output. It says plainly that the work
     is LOST when the pod ends, and lists the unpushed file names (at most MAX_NAMES) so a person can ask for them while the pod exists."""
     own = None
     listed = []
