@@ -97,6 +97,8 @@ class Table(unittest.TestCase):
 
     def test_u2_the_guard_and_the_client_agree_on_every_row(self):
         for r in rows():
+            if r["id"].startswith("pr-edit-"):
+                continue   # ask 1200: these rows write; tests/test_pr_edit.py runs them through both
             with self.subTest(row=r["id"]):
                 denied = r["kind"] == "denied"
                 self.assertEqual(guard_denies(r["example"]), denied, "guard: " + r["id"])
@@ -154,6 +156,77 @@ class Table(unittest.TestCase):
         open(path, "w").write(src.replace(old, "        return True", 1))
         self.assertEqual(self.client("api repos/acme-org/widget-service/issues/7", script=path).returncode, 0)   # the mutant answers where the table says no
         self.assertEqual(self.client("api repos/acme-org/widget-service/issues/7").returncode, 2)
+
+    def test_m1_the_client_refuses_a_path_that_is_not_normal_and_makes_no_request(self):
+        for bad in ("repos/acme-org/widget-service/./issues/1", "repos/acme-org/widget-service//issues/1", "repositories/1/issues/1",
+                    "repos/acme-org/widget-service/issues/1/../1", "repos/acme-org/widget-service/%2e/issues/1",
+                    "repos/acme-org/widget-service/issues%2F1", "repos/acme-org/widget-service/%2E%2E/issues/1",
+                    "repos/acme-org/widget-service/issues/1/comments//", "user"):
+            with self.subTest(path=bad):
+                p = self.client("api " + bad)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertEqual(Rec.seen, [])
+
+    def test_m1_a_mutant_without_the_normalisation_lets_those_paths_through(self):
+        src = open(CW_GH).read()
+        old = "    if not api_path_clean(path):   # normalisation check BEFORE the allow check\n        return False\n"
+        self.assertIn(old, src)
+        path = os.path.join(self.tmp.name, "cw-gh-nonorm")
+        open(path, "w").write(src.replace(old, "", 1))
+        for bad in ("repos/acme-org/widget-service/./issues/1", "repos/acme-org/widget-service//issues/1", "repositories/1/issues/1"):
+            p = self.client("api " + bad, script=path)
+            self.assertEqual(p.returncode, 0, bad)   # the mutant sends the GET: the test above would fail on it
+            self.assertEqual(len(Rec.seen), 1)
+
+    FLAG_PATTERNS = {"-f": "gh api* -f*", "-F": "gh api* -F*", "--input": "gh api*--input*", "graphql": "gh api*graphql*"}
+
+    def table_deny_patterns(self):
+        """The permission patterns that the table's denied rows need in opencode-worker.json (the method rows and the flag rows)."""
+        out = set()
+        for r in rows():
+            if r["kind"] != "denied":
+                continue
+            if r["method"] in ("POST", "PATCH", "PUT", "DELETE"):
+                out.add("gh api*%s*" % r["method"])
+            if r["path"] in self.FLAG_PATTERNS:
+                out.add(self.FLAG_PATTERNS[r["path"]])
+        return out
+
+    def missing_deny_rows(self, conf):
+        """Table deny rows absent from either bash block, and method deny rows of the file that the table does not list."""
+        want = self.table_deny_patterns()
+        blocks = (conf["permission"]["bash"], conf["agent"]["worker"]["permission"]["bash"])
+        missing = [(i, w) for i, b in enumerate(blocks) for w in sorted(want) if b.get(w) != "deny"]
+        extra = [k for k, v in blocks[0].items() if v == "deny" and re.fullmatch(r"gh api\*(POST|PATCH|PUT|DELETE)\*", k) and k not in want]
+        return missing, extra
+
+    def test_m2_every_deny_row_of_the_table_is_in_the_permission_file_and_back(self):
+        self.assertEqual(self.missing_deny_rows(load_conf()), ([], []))
+        self.assertEqual(len(self.table_deny_patterns()), 8)
+
+    def test_m2_a_mutant_that_drops_a_deny_row_is_seen(self):
+        for drop in ("gh api*POST*", "gh api*graphql*"):
+            conf = json.loads(json.dumps(load_conf()))
+            del conf["permission"]["bash"][drop]
+            del conf["agent"]["worker"]["permission"]["bash"][drop]
+            missing, _ = self.missing_deny_rows(conf)
+            self.assertEqual(sorted(w for _, w in missing), [drop, drop], drop)
+
+    def test_low_lower_and_capitalised_method_words_are_denied_in_the_shell_layer_and_by_the_client(self):
+        for m in ("post", "Post", "patch", "Patch", "put", "Put", "delete", "Delete"):
+            for fl in ("-X", "--method"):
+                ex = "api %s %s repos/acme-org/widget-service/pulls/7/comments" % (fl, m)
+                with self.subTest(ex=ex):
+                    self.assertEqual(conf_decision(load_conf(), "gh " + ex), "deny")
+                    self.assertEqual(self.client(ex).returncode, 2)
+                    self.assertEqual(Rec.seen, [])
+        self.assertEqual(conf_decision(load_conf(), "gh api -X GET repos/acme-org/widget-service/pulls/7/comments"), "allow")
+
+    def test_low_an_unsupported_jq_expression_is_refused_before_any_request(self):
+        for expr in (".[]|.body", "map(.id)", ".a|length", "$ENV", ".[0].body?"):
+            p = self.client("api repos/acme-org/widget-service/issues/7/comments --jq " + expr)
+            self.assertEqual(p.returncode, 2, expr)
+            self.assertEqual(Rec.seen, [], expr)
 
 
 if __name__ == "__main__":

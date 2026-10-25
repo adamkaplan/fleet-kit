@@ -145,6 +145,20 @@ class PlanCheckInPod(unittest.TestCase):
         self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "guard.sh")))
         self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "opencode-worker.json")))
 
+    def test_m3_the_moved_deny_rows_come_after_every_added_allow_row(self):
+        for keys in bash_key_lists(open(os.path.join(WORKER, "opencode-worker.json")).read()):
+            self.assertEqual(len(keys), len(set(keys)), "a duplicate key")
+            self.assertEqual(order_problems(keys), [])
+            self.assertEqual([k for k in keys if k in MOVED_DENY_ORDER], MOVED_DENY_ORDER)
+
+    def test_m3_a_mutant_that_moves_put_before_the_allows_is_seen(self):
+        text = open(os.path.join(WORKER, "opencode-worker.json")).read()
+        line = '      "gh api*PUT*": "deny",\n'
+        self.assertIn(line, text)
+        moved = text.replace(line, "", 1).replace('      "gh api*/issues/*/comments": "allow",\n', line + '      "gh api*/issues/*/comments": "allow",\n', 1)
+        self.assertNotEqual(moved, text)
+        self.assertNotEqual(order_problems(bash_key_lists(moved)[0]), [])
+
     def test_s11_docs_and_readme(self):
         for rel in ("cloud/README.md", "docs/cloud-worker-interface.md"):
             t = read(os.path.join(ROOT, rel)).decode()
@@ -243,9 +257,28 @@ def intent_differs():
     return "## Intent\n\nMake it work.\nDone when: something else\n\n" + plan()
 
 
-PINNED = {'guard.sh': '6a0b465561524c5b28cbfe8d79e9b682a53b04346db3bad8dd2e852c8024e184'}
+def bash_key_lists(text):
+    """The keys of both bash blocks IN FILE ORDER, duplicates kept (object_pairs_hook)."""
+    import json
+    found = []
+    def hook(pairs):
+        if any(k == "gh pr merge*" for k, _ in pairs):
+            found.append([k for k, _ in pairs])
+        return dict(pairs)
+    json.loads(text, object_pairs_hook=hook)
+    return found
+
+
+def order_problems(keys):
+    """opencode: the last matching rule wins, so each moved deny row must come AFTER every added allow row."""
+    last_allow = max(i for i, k in enumerate(keys) if k in ADDED_ALLOWS)
+    return [k for k in MOVED_DENY_ORDER if keys.index(k) < last_allow]
+
+
+PINNED = {'guard.sh': '2ff90a6117ef9e3c647262a1b274c77e452bea673af96d2339f09fc026cbaff4'}
 PINNED_JSON_WITHOUT_ADDED_ROWS = "98b3723a02edf83a5f74c177e3f8769267f9606026ed4ac461bd3688d504a5ad"
 # Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
+# Lower and capitalised method words after -X or --method are denied too (the glob is case sensitive; a mixed form such as pOsT is not covered here, the client refuses it).
 # asks 1166 and 1200 add their rows to THIS list.
 ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull request read paths, GET only; write methods and flags stay denied)
     ('gh api*/issues/*/comments', 'allow'),
@@ -258,6 +291,22 @@ ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull req
     ('gh api*/pulls/*/comments *', 'allow'),
     ('gh api*/pulls/*/comments?*', 'allow'),
     ('gh api*POST*', 'deny'),
+    ('gh api*-X post*', 'deny'),
+    ('gh api*--method post*', 'deny'),
+    ('gh api*-X Post*', 'deny'),
+    ('gh api*--method Post*', 'deny'),
+    ('gh api*-X patch*', 'deny'),
+    ('gh api*--method patch*', 'deny'),
+    ('gh api*-X Patch*', 'deny'),
+    ('gh api*--method Patch*', 'deny'),
+    ('gh api*-X put*', 'deny'),
+    ('gh api*--method put*', 'deny'),
+    ('gh api*-X Put*', 'deny'),
+    ('gh api*--method Put*', 'deny'),
+    ('gh api*-X delete*', 'deny'),
+    ('gh api*--method delete*', 'deny'),
+    ('gh api*-X Delete*', 'deny'),
+    ('gh api*--method Delete*', 'deny'),
     ('gh api* -f*', 'deny'),
     ('gh api* -F*', 'deny'),
     ('gh api*--field*', 'deny'),
@@ -265,12 +314,22 @@ ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull req
     ('gh api*--input*', 'deny'),
     ('gh api*graphql*', 'deny'),
     ('gh api*mutation*', 'deny'),
+    # ask 1200: DW-2, DW-3 (a worker edits the body of its own pull request: `pr edit N --body-file F` only; every other pr-edit form stays denied)
+    ('gh pr edit*', 'deny'),
+    ('gh pr edit * --body-file *', 'allow'),
+    ('gh pr edit*--body-file* --*', 'deny'),
+    ('gh pr edit*--* --body-file*', 'deny'),
+    ('gh pr edit*://*', 'deny'),
+    ('gh pr edit*--repo*', 'deny'),
     # ask 1166 (DW-3): the comment alone: `issue comment` (create) and a POST of a comment to issues/N/comments; every other issue write stays denied above
     ('gh issue comment*', 'allow'),
     ('gh * issue comment*', 'allow'),
     ('gh api -X POST repos/*/issues/*/comments', 'allow'),
     ('gh api --method POST repos/*/issues/*/comments', 'allow'),
 ]
+ADDED_ALLOWS = [k for k, v in ADDED_ROWS if v == 'allow']
+# The three deny rows that exist before ask 1083 and were moved: their order, and they come after every added allow row above.
+MOVED_DENY_ORDER = ['gh api*PATCH*', 'gh api*PUT*', 'gh api*DELETE*']
 
 if __name__ == "__main__":
     unittest.main()

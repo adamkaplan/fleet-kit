@@ -14,11 +14,13 @@ Everything else exits 2 with one line. The token is read from GH_TOKEN (set by t
 printed. Output differs from the real gh: `--json` prints the raw REST object, `--template` is not supported; `issue view --comments` prints the comments (at most 50 and 20000 bytes), and `api --jq`/`-q` is a small client-side path filter.
 Exit 0 ok, 1 failed (an HTTP error names its status), 2 not available or bad usage, 8 `pr checks` with checks pending.
 """
+import fnmatch
 import http.client
 import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -236,6 +238,148 @@ def pr_create(args):
     payload = {"title": opts["title"], "body": body, "head": head, "base": base, "draft": bool(opts.get("draft"))}
     out = parse_json(request("POST", "/repos/%s/pulls" % repo, payload))
     print(out.get("html_url", ""))
+    record_pr(out.get("number"))
+
+
+def record_pr(n):
+    """The pod's own record of pull requests it created (the file named by CW_PR_RECORD, one number a line); best effort."""
+    path = os.environ.get("CW_PR_RECORD")
+    if path and isinstance(n, int):
+        try:
+            with open(path, "a") as f:
+                f.write("%d\n" % n)
+        except OSError:
+            pass
+
+
+def recorded(n):
+    path = os.environ.get("CW_PR_RECORD")
+    try:
+        return bool(path) and str(n) in open(path).read().split()
+    except OSError:
+        return False
+
+
+HOLD = "MERGE: captain"
+BODY_MAX = 1 << 20
+REFUSE_TAIL = "the repository's rules are the guard; this wrapper is only a convenience"
+
+
+def refused(row):
+    return Fail("refused: %s: %s" % (row, REFUSE_TAIL), 3)
+
+
+LINE_SEPARATORS = ("\u2028", "\u2029", "\u0085", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e")
+
+
+def lines_of(text):
+    """Lines as a reader that splits on \\n only sees them (a trailing \\r is part of the line). Never str.splitlines(): it splits on more."""
+    return text.split("\n")
+
+
+def has_other_separator(text):
+    """True when the text holds a line separator other than \\n (a lone \\r, U+2028, U+2029, U+0085, \\x0b, \\x0c, \\x1c-\\x1e)."""
+    return any(c in text for c in LINE_SEPARATORS) or "\r" in text.replace("\r\n", "")
+
+
+GIT_PARTS = (".git", ".git" + "config")
+SENSITIVE_PARTS = (".netrc", ".ssh", ".config")
+# the secret-shaped names cloud/launcher/end_hook.py leaves out of its commit (SECRET_GLOBS there; keep the two lists equal)
+SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "*credentials*",
+                "*secret*", "*.kubeconfig", "kubeconfig", ".netrc", ".npmrc"]
+
+
+def check_body_path(path, real):
+    """Refuse a path (as given, and with symlinks resolved) with a .git, a git configuration file, .netrc, .ssh or .config component or a secret-shaped file name."""
+    for p in (path, real):
+        parts = [c for c in p.split("/") if c]
+        if any(c in GIT_PARTS for c in parts):
+            raise refused("pr-edit-body-file-git")
+        if any(c in SENSITIVE_PARTS for c in parts) or any(fnmatch.fnmatch(parts[-1].lower(), g) for g in SECRET_GLOBS if parts):
+            raise refused("pr-edit-body-file-sensitive")
+
+
+def real_body_file(path):
+    """The regular file a body may be read from: its real path (symlinks resolved) is inside the worktree or under /tmp."""
+    real = os.path.realpath(path)
+    roots = [os.path.realpath("/tmp")]
+    top = git("rev-parse", "--show-toplevel")
+    roots.append(os.path.realpath(top or os.getcwd()))
+    if not any(real == r or real.startswith(r.rstrip("/") + "/") for r in roots):
+        raise refused("pr-edit-body-file-outside")
+    check_body_path(path, real)
+    try:
+        st = os.stat(real)
+    except OSError:
+        raise Fail("the body file could not be read", 2)
+    if not stat.S_ISREG(st.st_mode):
+        raise refused("pr-edit-body-file-not-regular")
+    # only a file the worker itself made: owned by the current user and not writable by group or others (0644 is fine)
+    if st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise refused("pr-edit-body-file-not-owned")
+    if st.st_nlink > 1:   # a hardlink may be the same file as a credential file under a plain name
+        raise refused("pr-edit-body-file-linked")
+    if st.st_size > BODY_MAX:
+        raise refused("pr-edit-body-file-too-large")
+    return real
+
+
+def read_body_file(path):
+    real = real_body_file(path)
+    try:
+        with open(real, "rb") as f:
+            raw = f.read(BODY_MAX + 1)
+    except OSError:
+        raise Fail("the body file could not be read", 2)
+    if len(raw) > BODY_MAX:
+        raise refused("pr-edit-body-file-too-large")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Fail("the body file is not text (not UTF-8)", 2)
+
+
+def pr_edit(args):
+    """ask 1200: exactly `pr edit N --body-file F`, for the pod's own pull request only (guard-table.tsv: the pr-edit rows)."""
+    for a in args:
+        if a in ("--body", "-b") or a.startswith(("--body=", "-b")):
+            raise refused("pr-edit-inline-body")
+        if "://" in a or a in ("-R", "--repo") or a.startswith(("--repo=", "-R")):
+            raise refused("pr-edit-url-other-repo")
+    if len(args) != 3 or args[1] != "--body-file" or not args[0].isdigit():
+        raise refused("pr-edit-other-option")
+    n = int(args[0])
+    rec = os.environ.get("CW_PR_RECORD")
+    if rec and os.path.exists(rec) and os.path.getsize(rec) > 0 and not recorded(n):
+        raise refused("pr-edit-other-number")
+    repo = repo_of({})
+    try:
+        pr = get_json("/repos/%s/pulls/%d" % (repo, n))
+        head = pr["head"]["ref"]
+        head_repo = pr["head"]["repo"]["full_name"]
+        base_repo = pr["base"]["repo"]["full_name"]
+        cur = pr.get("body") or ""
+        if not isinstance(head, str) or not isinstance(head_repo, str) or not isinstance(base_repo, str) or not isinstance(cur, str):
+            raise ValueError
+    except (Fail, KeyError, TypeError, ValueError):
+        raise refused("pr-edit-read-failed")
+    mine = os.environ.get("CW_BRANCH") or git("symbolic-ref", "--quiet", "--short", "HEAD")
+    if base_repo.lower() != repo.lower() or not ((mine and head == mine) or recorded(n)):
+        raise refused("pr-edit-other-number")
+    if head_repo.lower() != repo.lower():   # a fork's pull request with the same branch name is not the pod's own
+        raise refused("pr-edit-other-number")
+    new = read_body_file(args[2])
+    if "\0" in new:
+        raise refused("pr-edit-body-nul")
+    if has_other_separator(new):
+        raise refused("pr-edit-body-separator")
+    # a hold line is the whole line, exactly ('MERGE: captain\r' is not one); the new body keeps the same number of them
+    # (the CURRENT body may come from the web page with CRLF: its hold line then ends in \r and still counts)
+    cur_holds = [l for l in lines_of(cur) if l in (HOLD, HOLD + "\r")]
+    if cur_holds and lines_of(new).count(HOLD) != len(cur_holds):
+        raise refused("pr-edit-no-hold-line")
+    out = parse_json(request("PATCH", "/repos/%s/pulls/%d" % (repo, n), {"body": new}))
+    print(out.get("html_url", ""))
 
 
 def pr_view(args):
@@ -393,10 +537,14 @@ def print_comments(rows):
         print(CUT_NOTE)
 
 
-def jq_apply(expr, data):
-    """A small client-side subset of jq: `.`, `.key`, `[N]`, `[]`, chained (`.[0].body`, `.[].user.login`). Anything else is refused."""
+def jq_check(expr):
     if not re.fullmatch(r"\.(?:(?:\.?[A-Za-z_][A-Za-z0-9_]*)|\[\d*\])*", expr):
         raise Fail("--jq supports only paths such as .[0].body or .[].user.login", 2)
+
+
+def jq_apply(expr, data):
+    """A small client-side subset of jq: `.`, `.key`, `[N]`, `[]`, chained (`.[0].body`, `.[].user.login`). Anything else is refused."""
+    jq_check(expr)
     vals = [data]
     for m in re.finditer(r"\.?([A-Za-z_][A-Za-z0-9_]*)|\[(\d*)\]", expr):
         out = []
@@ -523,7 +671,18 @@ API_ISSUE = re.compile(r"repos/[^/]+/[^/]+/issues(/.*)?", re.I)
 API_ISSUE_COMMENTS = re.compile(r"repos/[^/]+/[^/]+/issues/\d+/comments", re.I)
 
 
+def api_path_clean(path):
+    """Fail closed: only repos/<segment>/... with no empty, `.` or `..` segment, no percent-encoding and no backslash."""
+    p = path.split("?")[0]
+    if not p.startswith("/") or "%" in p or "\\" in p:
+        return False
+    segs = (p[1:-1] if p.endswith("/") else p[1:]).split("/")
+    return segs[0] == "repos" and len(segs) >= 3 and all(s not in ("", ".", "..") for s in segs)
+
+
 def api_path_allowed(path):
+    if not api_path_clean(path):   # normalisation check BEFORE the allow check
+        return False
     p = path.split("?")[0].strip("/")
     if API_ISSUE.fullmatch(p):
         return bool(API_ISSUE_COMMENTS.fullmatch(p))
@@ -550,6 +709,8 @@ def api_get(args):
         raise Fail("GraphQL is not available in this pod", 2)
     if not api_path_allowed(path):
         raise Fail("this api path is not in the pod's table (cloud/worker/guard-table.tsv)", 2)
+    if "jq" in opts:
+        jq_check(opts["jq"])   # an unsupported expression is refused BEFORE the request
     raw = request("GET", path).decode("utf-8", "replace")
     if "jq" in opts:   # a client-side filter of the GET answer: no further request
         for v in jq_apply(opts["jq"], parse_json(raw)):
@@ -585,6 +746,8 @@ def main(argv):
         args = pre + args
     sys.stdout, sys.stderr = Clean(sys.stdout), Clean(sys.stderr)
     fn = VERBS.get((group, verb))
+    if (group, verb) == ("pr", "edit") and "--body-file" in args:   # ask 1200: outside the verb table, which stays as pinned; any other pr edit is not available
+        fn = pr_edit
     if fn is None:
         listing = ", ".join("%s %s" % (g, v) if v else g for g, v in sorted(VERBS))
         print("cw-gh: '%s' is not available in this pod (the client covers: %s)" % (" ".join(x for x in (group, verb) if x)[:60], listing),

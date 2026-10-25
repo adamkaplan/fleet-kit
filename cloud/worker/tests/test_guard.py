@@ -152,7 +152,6 @@ EXTRA_ALLOWED = [
     ["gh", "pr", "create", "--title", "t"],
     ["gh", "pr", "view", "5"],
     ["gh", "pr", "comment", "5", "--body", "x"],
-    ["gh", "pr", "edit", "5", "--title", "t"],
     ["gh", "api", "graphql", "-f", "query={ viewer { login } }"],
     ["gh", "api", "graphql", "-f", "query=query($o:String!){ repository(owner:$o,name:\"x\"){ id } }", "-F", "o=acme-org"],
     ["gh", "api", U + "/pulls/5"],
