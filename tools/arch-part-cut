@@ -9,7 +9,8 @@ last statement or after it). Every cut must sit on statement boundaries: a top-l
 else the tool stops. The text is copied unchanged (trailing blank lines trimmed, one blank line left between the neighbours), the part is
 appended to the manifest after the last listed part, and the lines leave the entry. A name is lower-case letters, digits and underscores (no path); a part
 that already exists, listed or not, is never overwritten. Every name, range, boundary, existing file and the manifest are checked before the first write: a
-refusal leaves nothing written. Without --write it only reports sizes.
+refusal leaves nothing written. The parts are written first, then the entry, then the manifest; a crash in between (a full disk) can leave new parts that no
+manifest lists, and a rerun then refuses their names: delete them by hand and cut again. Without --write it only reports sizes.
 """
 import argparse
 import ast
@@ -35,10 +36,13 @@ def main(argv=None):
     ap.add_argument("--write", action="store_true")
     args = ap.parse_args(argv)
     # Everything is read and checked first (names, ranges, boundaries, existing files, the manifest): a refusal leaves nothing written.
-    text = open(args.entry, encoding="utf-8").read()
-    lines = text.split("\n")
-    tree = ast.parse(text)
-    manifest_text = open(args.manifest, encoding="utf-8").read()
+    try:
+        text = open(args.entry, encoding="utf-8").read()
+        lines = text.split("\n")
+        tree = ast.parse(text)
+        manifest_text = open(args.manifest, encoding="utf-8").read()
+    except (OSError, SyntaxError, UnicodeDecodeError) as err:
+        refuse("cannot read the entry %s or the manifest %s: %s" % (args.entry, args.manifest, err))
     parts_dir = os.path.realpath(args.parts_dir)
     if not os.path.isdir(parts_dir):
         refuse("the parts directory %s does not exist" % args.parts_dir)
@@ -50,7 +54,7 @@ def main(argv=None):
         if len(fields) != 3:
             refuse("%r is not NAME:FIRST:LAST" % spec)
         name = fields[0]
-        if not NAME_RE.match(name):
+        if not NAME_RE.fullmatch(name):   # fullmatch: `$` would let a trailing newline through
             refuse("part name %r: a name is lower-case letters, digits and underscores only (no path)" % name)
         if name in seen:
             refuse("a part name is given twice: %s" % name)
@@ -73,10 +77,11 @@ def main(argv=None):
             refuse("%s: lines %d-%d overlap another cut" % (name, first, last))
         claimed |= set(range(first, last + 1))
         for node in tree.body:
-            inside = first <= node.lineno and node.end_lineno <= last
-            outside = node.end_lineno < first or node.lineno > last
+            top = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])   # a decorator is part of the statement
+            inside = first <= top and node.end_lineno <= last
+            outside = node.end_lineno < first or top > last
             if not (inside or outside):
-                refuse("%s: statement at line %d-%d is cut by %d-%d" % (name, node.lineno, node.end_lineno, first, last))
+                refuse("%s: statement at line %d-%d is cut by %d-%d" % (name, top, node.end_lineno, first, last))
         cuts.append((name, first, last, target, entry_name))
         print("%-14s lines %d-%d (%d lines)" % (name, first, last, last - first + 1))
     if not args.write:

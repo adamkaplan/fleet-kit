@@ -90769,6 +90769,8 @@ class TestArchTools(unittest.TestCase):
             ("an absolute name", ["/tmp/escape:1:2"], "lower-case letters"),
             ("a name with a directory", ["sub/x:1:2"], "lower-case letters"),
             ("a capital", ["Part:1:2"], "lower-case letters"),
+            ("a name that ends in a newline", ["fresh\n:1:2"], "lower-case letters"),
+            ("a name that is only a newline", ["\n:1:2"], "lower-case letters"),
             ("an existing file that is not listed", ["exists:1:2"], "already exists"),
             ("a listed part", ["taken:1:2"], "already exists"),
             ("a range outside the entry", ["fresh:1:99"], "not inside the entry"),
@@ -90787,6 +90789,36 @@ class TestArchTools(unittest.TestCase):
                 self.assertIn(word, done.stderr)
                 self.assertNotIn("Traceback", done.stderr)
                 self.assertEqual(self.snapshot(root), before, "no file changed, no file appeared: the entry, the manifest, the parts and the directory outside")
+
+    def test_a_cut_that_would_leave_a_decorator_behind_is_refused_and_one_that_takes_it_is_not(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "switchboard").mkdir()
+        entry = "import functools\n\n\n@functools.lru_cache(None)\ndef cached():\n    return 1\n\n\ndef plain():\n    return 2\n"
+        (root / "entry").write_text(entry)
+        (root / "entry.parts").write_text("entry\n")
+        common = ["--entry", root / "entry", "--manifest", root / "entry.parts", "--parts-dir", root / "switchboard", "--write"]
+        before = self.snapshot(root)
+        done = self.tool("arch-part-cut", *common, "fresh:5:6")   # from the def line: the decorator on line 4 stays behind
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("cut by", done.stderr)
+        self.assertEqual(self.snapshot(root), before)
+        done = self.tool("arch-part-cut", *common, "fresh:4:6")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((root / "switchboard" / "fresh.py").read_text(), "@functools.lru_cache(None)\ndef cached():\n    return 1\n")
+
+    def test_a_part_that_does_not_parse_is_a_named_failure_in_the_statement_comparison(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "good.py").write_text("A = 1\n")
+        (root / "bad.py").write_text("def broken(:\n")
+        done = self.split_check([root / "good.py"], [root / "bad.py"], "--no-surface")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("bad.py does not parse", done.stderr)
+        missing = self.split_check([root / "good.py"], [root / "absent.py"], "--no-surface")
+        self.assertNotIn("Traceback", missing.stdout + missing.stderr)
+        self.assertIn("cannot read", missing.stderr)
 
     def test_a_cut_writes_only_inside_the_parts_directory_and_lists_the_part_relative_to_the_manifest(self):
         root, common = self.cut_tree()
@@ -90838,7 +90870,6 @@ class TestArchTools(unittest.TestCase):
         self.assertIn("NameError", done.stdout)
 
     def test_an_entry_with_no_manifest_beside_it_is_a_named_failure_that_says_how_to_lay_it_out(self):
-        root = self.entry_tree(with_manifest=False)
         lone = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(lone), True)
         shutil.copy(str(SWITCHBOARD), str(lone / "fleet-switchboard"))   # the entry alone, as `git show REV:bin/fleet-switchboard > tmp` leaves it

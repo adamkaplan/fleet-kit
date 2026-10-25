@@ -40,9 +40,15 @@ def statements(paths):
     counts = collections.Counter()
     labels = {}
     for path in paths:
-        with open(path, encoding="utf-8") as handle:
-            source = handle.read()
-        tree = ast.parse(source, filename=path)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                source = handle.read()
+        except (OSError, UnicodeDecodeError) as err:
+            sys.exit("arch-split-check: cannot read %s: %s" % (path, err))
+        try:
+            tree = ast.parse(source, filename=path)
+        except SyntaxError as err:
+            sys.exit("arch-split-check: %s does not parse: %s (line %s)" % (path, err.msg, err.lineno))
         for node in tree.body:
             dump = ast.dump(node, include_attributes=False)
             counts[dump] += 1
