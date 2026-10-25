@@ -1494,12 +1494,22 @@ def ann(pod, key, default=None):
     return pod["metadata"].get("annotations", {}).get("cw/" + key, default)
 
 
+SAFE_VALUE = re.compile(r"[A-Za-z0-9._-]{1,63}", re.ASCII)
+
+
+def safe_value(value):
+    """A value the cluster supplies (a node's pool or size label, a pod phase) that is printed to a person: ONE rule. It is kept whole when it is
+    1 to 63 ASCII letters, digits, `-`, `_` or `.` (what a Kubernetes label value or a phase may hold); anything else (an escape, a bell, a newline,
+    another control or non-ASCII character, an over-long value) becomes the fixed token `?`. Nothing is stripped: a partly clean value is not trusted."""
+    return value if isinstance(value, str) and SAFE_VALUE.fullmatch(value) else "?"
+
+
 def _node_label(labels, keys):
-    """The first of `keys` the node carries, or "unknown" (never a guess, never a value of another label)."""
+    """The first of `keys` the node carries, or "unknown" (never a guess, never a value of another label). The value is `safe_value`."""
     for key in keys:
         value = (labels or {}).get(key)
         if isinstance(value, str) and value:
-            return value
+            return safe_value(value)
     return "unknown"
 
 
@@ -2288,7 +2298,8 @@ class Launcher:
         pods = []
         for pod in self.kube.list_pods_all():
             meta = pod.get("metadata") or {}
-            pods.append({"name": meta.get("name"), "worker": ann(pod, "worker"), "phase": (pod.get("status") or {}).get("phase"),
+            pods.append({"name": meta.get("name"), "worker": ann(pod, "worker"),
+                         "phase": safe_value((pod.get("status") or {}).get("phase")) if (pod.get("status") or {}).get("phase") else None,
                          "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline")})
         nodes, nodes_read, nodes_error = [], True, None
         try:
