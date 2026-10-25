@@ -257,7 +257,7 @@ class Pins(unittest.TestCase):
         for _, run, _ in only_suites(got) + commands(self.jobs()["test-cloud"]):
             self.assertIn("grep -qx 'RESULT: PASS'", run)
 
-    def test_s6_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step(self):
+    def test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step(self):
         steps = self.jobs()["test-cloud"]["steps"]
         for name, _ in ADDED:
             hits = [x for x in steps if re.search(r"(^|[\s/])%s(\s|$)" % re.escape(name), x.get("run", ""))]
@@ -361,7 +361,18 @@ class Mutants(unittest.TestCase):
     def test_s7_one_of_the_seven_steps_removed(self):
         step = "      - name: bin/test-cloud-way-back\n        if: ${{ !cancelled() }}\n        run: |\n          bin/test-cloud-way-back 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
         self.assertIn(step, WORKFLOW.read_text())
-        self.fails("\n" + step, "", "test_s6_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+        self.fails("\n" + step, "", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+
+    def test_s9_a_suite_whose_name_is_a_prefix_of_another_is_not_counted_by_it(self):
+        channel = "          bin/test-cloud-channel 2>&1 | tee"
+        self.assertIn(channel, WORKFLOW.read_text())
+        # channel-server twice and channel zero fails the exactly-one check
+        self.fails(channel, "          bin/test-cloud-channel-server 2>&1 | tee", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+
+    def test_s9_the_channel_step_removed_alone_fails_the_exactly_one_check(self):
+        step = "      - name: bin/test-cloud-channel\n        if: ${{ !cancelled() }}\n        run: |\n          bin/test-cloud-channel 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+        self.assertIn(step, WORKFLOW.read_text())
+        self.fails("\n" + step, "", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
 
     def test_u1_a_command_edited(self):
         self.fails("bin/test-heartbeat 2>&1", "bin/test-heartbeat -q 2>&1", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
