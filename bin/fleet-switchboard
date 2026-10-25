@@ -9515,7 +9515,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
     for d in decisions:   # everything the owner's tier already holds, however its ref is spelled
         if d.get("tier", "human") == "human" and d.get("kind") != "notice":
             human_keys |= sweep_ref_keys(d, home, repos_known)
-    skipped = state.s5_skipped   # shared with sweep_ready_pass, reset once per sweep there
+    skipped = state.__dict__.setdefault("s5_skipped", {"draft": 0, "parked": 0})   # shared with sweep_ready_pass, reset once per sweep there
     for d in decisions:
         ref = sweep_ref_of(d, home)
         # a report is about the refs its sentence names, never assumed to be about its own ask

@@ -10063,7 +10063,7 @@ class TestReminders(PR4Base):
         self.assertEqual(self.world.engine.run_pass()["sent"], [])
         self.assertEqual(len(self.world.admissions("platform")), 1)
         self.assertEqual(sb.read_reminders(self.world.state), [], "the reminder is the loss")
-        self.world.tick(86400)
+        self.world.tick(3600)
         self.assertEqual(self.world.engine.run_pass()["sent"], [])
 
 
@@ -25984,7 +25984,7 @@ class TestLegitimateWaiting(WaitingInputs, ReportBase):
             "ci queued": (lambda: self.set_lists(checks=["queued"]), lambda: self.set_lists(checks=["success"])),
             "review requested": (lambda: self.set_lists(pr_extra={"requested_reviewers": [{"login": "reviewer-one"}]}), lambda: self.set_lists(pr_extra={})),
             "review requested of a team": (lambda: self.set_lists(pr_extra={"requested_teams": [{"slug": "maintainers"}]}), lambda: self.set_lists(pr_extra={})),
-            "younger than the review window": (lambda: self.set_lists(pr_extra={"created_at": sb.iso(now() - 600)}), lambda: self.world.tick(86400)),
+            "younger than the review window": (lambda: self.set_lists(pr_extra={"created_at": sb.iso(now() - 600)}), lambda: self.world.tick(3600)),
             "reminder due later": (reminder, drop_reminders),
             "issue awaiting label": (lambda: self.set_lists(issue_labels=[sb.awaiting_cos_label(cfg)]), lambda: self.set_lists(issue_labels=[])),
             "pull request awaiting label": (lambda: self.set_lists(pr_labels=[sb.awaiting_label(cfg)]), lambda: self.set_lists(pr_labels=[])),
@@ -27183,7 +27183,7 @@ class TestSweep(Base):
         self.sweep_real([])
         self.assertEqual(len(pending()), 1)                                          # raised once
         self.engine.sweep = None                                                     # the daemon restarts: memory only is gone
-        self.world.tick(86400)
+        self.world.tick(3600)
         self.sweep_real([])
         self.assertEqual(pending(), [])                                              # inside the window: not raised again
         self.engine.sweep = None
@@ -27227,7 +27227,7 @@ class TestSweep(Base):
                     self.sweep_real([])
                     self.assertEqual(len(self.lines(ref)), 1)
                     self.engine.sweep, self.engine._last = None, {}                   # the daemon restarts: memory only is gone, the audit's repeat filter too
-                    self.world.tick(86400)
+                    self.world.tick(3600)
                     self.sweep_real([])
                     self.assertEqual(len(self.lines(ref)), 1)                         # not logged again
                     self.assertEqual(self.engine.sweep.facts, {})                     # not woken
@@ -27670,7 +27670,7 @@ class TestSweep(Base):
             self.assertEqual(self.s5_run(reading, decisions, mutant), [])
         reading["value"] = self.ready()
         self.assertEqual(self.s5_run(reading, decisions, mutant), [])   # ready now, held for 10 hours: under the threshold counted from ready
-        self.world.tick(86400)
+        self.world.tick(3600)
         self.assertEqual(self.s5_run(reading, decisions, mutant), [])
         self.world.tick(3600 + 60)
         lines = self.s5_run(reading, decisions, mutant)
@@ -27681,7 +27681,7 @@ class TestSweep(Base):
         self.assertRegex(text, r"head [0-9a-f]{12}\b")
         self.assertIn("ready at", text)
         self.assertIn("Who can clear", text)
-        self.world.tick(86400)
+        self.world.tick(3600)
         reading["value"] = (["G0a", "G6"], self.HEAD_A, None, None)   # a gate opens again
         self.sweep_with(reading, decisions)
         self.assertEqual(sb.sweep_state(self.engine).s5, {})
@@ -29480,7 +29480,7 @@ class TestTriage(Base):
                     self.world.tick(120)
                     self.pass_now()
                     self.assertEqual([d["woken"] for d in self.tlines(ref)], [True, False])   # due and held: logged, not woken
-                    self.world.tick(86400)
+                    self.world.tick(3600)
                     self.pass_now()
                     self.assertEqual([d["woken"] for d in self.tlines(ref)], [True, False, True])   # the wake goes: logged once more
 
@@ -31683,7 +31683,7 @@ class TestTriageDigest(Base):
     def test_s3_a_changed_item_surfaces_at_once_and_its_backoff_restarts(self):
         self.add(140, created=3, updated=0.2, labels=["kind"])
         self.passes(1)                                             # shown on day 0 and day 1: next step is 3 days
-        self.world.tick(86400)
+        self.world.tick(3600)
         self.add(140, created=3, updated=0.01, labels=["kind"])     # a new comment: it was updated just now
         self.engine.triage.units.clear()
         self.assertEqual(len(self.passes(0)), 1)                   # surfaced at once
@@ -53901,7 +53901,7 @@ class TestRequestTiers(TierWorld):
     def test_an_agent_blocked_forever_is_never_hidden_from_you(self):
         self.block_(timed=True)
         for _ in range(3):
-            self.world.tick(86400)
+            self.world.tick(3600)
         self.assertEqual([d["tier"] for d in self.listed()], ["human"])
 
     def test_an_escalated_request_is_yours_at_once_and_the_marker_is_disposable(self):
