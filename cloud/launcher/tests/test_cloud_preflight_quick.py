@@ -295,6 +295,16 @@ class OneReaderDecision(unittest.TestCase):
         (rc1, out1), (rc2, out2) = run_both(repo, script, prepush, self.tmp)
         self.assertNotEqual(not_run_lines(out1), not_run_lines(out2))
 
+    def test_m1_a_scan_with_a_selector_is_never_run_whole_as_a_reader(self):
+        spec = importlib.util.spec_from_file_location("cloud_quick_y", os.path.join(BIN, "cloud_quick.py"))
+        q = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(q)
+        for rel, sel in q.SCAN_TESTS:  # every member of the one list
+            with self.subTest(scan=rel, selector=sel):
+                if rel.startswith("bin/test-"):
+                    self.assertEqual(q.cannot_run_quick(rel), sel is not None)
+        self.assertTrue(q.cannot_run_quick("bin/test-switchboard"))
+
     def test_m2_the_bound_says_how_many_files_were_selected_and_how_many_ran(self):
         repo = make_repo(self.tmp)
         put(repo, TD + "test_slow_a.py", "# reads a.txt\nimport time\ntime.sleep(3)\n")

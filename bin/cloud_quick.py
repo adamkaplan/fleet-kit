@@ -46,8 +46,9 @@ def readers(root, tracked, changed, test_ok=is_test):
 
 
 def cannot_run_quick(rel):
-    """A whole shell suite under bin/ (not one of the named scans) cannot finish in a quick run."""
-    return rel.startswith("bin/test-") and rel not in {r for r, _ in SCAN_TESTS}
+    """A whole shell suite under bin/ cannot finish in a quick run, unless a named scan runs it whole (no selector).
+    A suite with a selector is run only through its selector, as a scan, never whole as a reader."""
+    return rel.startswith("bin/test-") and rel not in {r for r, sel in SCAN_TESTS if sel is None}
 
 
 def split_readers(reads):
