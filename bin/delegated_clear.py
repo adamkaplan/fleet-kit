@@ -14,6 +14,7 @@ import base64
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 
 CONFIG_KEY = "delegated_clear"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
@@ -220,7 +221,7 @@ def judge(block, cells, entries, report, threshold, runs_required=1):
         reasons.append(over)
     runs = pick_runs(counted)
     if not reasons and runs_required > 1:   # #972: only a score the order would allow is asked for its corroboration; a score above the threshold is refused by score, not by count
-        head8 = str(report.get("head"))[0:8]
+        head8 = str(report.get("head"))[:8]
         sessions = {run_name(e.get("by")) for _, _, e in counted if run_name(e.get("by"))}
         if len(counted) < runs_required:
             reasons.append("%d counted impact rating%s at %s, %d required: a clear by score needs a second independent run at this head with the agent's block" % (len(counted), "" if len(counted) == 1 else "s", head8, runs_required))
@@ -305,7 +306,7 @@ FILE_REFUSALS = {
     "over_limit": "the pull request has more than %d changed files, more than GitHub lists: too many to read in full",
     "head_moved": "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared",
     "duplicate": "the changed files repeat %s (page %d, position %d, already listed on page %d): a page was served twice, so the list is not the pull request's own",
-    "cut": "GitHub itself says the file list is cut: it listed %d of %d changed files",
+    "cut": "the list was cut: a page was short or the count did not match (it listed %d of %d changed files)",
     "bad_entry": "page %d, position %d on the page (counting from 1) of the changed files is not a file entry (%s)",
     "no_count": "the pull request's count of changed files was %s, so the list cannot be checked against it",
     "no_source": "%d renamed or copied file(s) with no known source path (%s)",
@@ -325,30 +326,52 @@ class FileListError(Exception):
         return {"kind": "file_list", "path": None, "rule": self.kind, "text": str(self)}
 
 
+REASON_MAX = 300   # characters of a failed read's own text kept in the refusal; the status and the class are never cut. GitHub's error body is attacker-influenced text.
+_CONNECTION_WORDS = re.compile(r"timeout|timed out|connection (?:reset|refused)|dial tcp|\bEOF\b|no such host|temporary failure", re.I)
+
+
+def is_transient(err):
+    """True for the errors one retry can cure: a 5xx, a timeout, a connection error, an answer that is not JSON (a gateway's page). A 4xx (403, 404, 422), a gh that cannot run and an over-size answer are final."""
+    if isinstance(err, (TimeoutError, ConnectionError, subprocess.TimeoutExpired)) or isinstance(err, json.JSONDecodeError):
+        return True
+    reason, status = getattr(err, "reason", None), getattr(err, "status", None)
+    if reason == "unavailable":
+        return "did not answer" in str(err)
+    if reason == "gh":
+        if isinstance(status, int):
+            return status >= 500
+        return bool(_CONNECTION_WORDS.search(str(err)))
+    return False
+
+
 def error_class(err):
     """One short phrase for a failed read: the class (a timeout or gh that could not run, a gh failure with its HTTP status, an answer that is not JSON, an answer over the size cap) and a clipped detail."""
     detail = " ".join(str(err).split())
-    status = re.search(r"\bHTTP (\d{3})\b", detail)
+    if len(detail) > REASON_MAX:
+        detail = detail[:REASON_MAX] + " ... (%d more characters not kept)" % (len(detail) - REASON_MAX)
+    status = getattr(err, "status", None)   # the structured field of the gh runner's error; a number inside a body's text is never a status
     reason = getattr(err, "reason", None)
     if isinstance(err, json.JSONDecodeError):
         return "the answer was not JSON"
     if reason == "unavailable":
         return "gh unavailable: %s" % detail
     if reason == "gh":
-        return "gh failed%s: %s" % (" with HTTP %s" % status.group(1) if status else "", detail)
+        return "gh failed%s: %s" % (" with HTTP %d" % status if isinstance(status, int) else "", detail)
     if isinstance(err, ValueError):
         return "the answer was rejected: %s" % detail
     return "%s: %s" % (type(err).__name__, detail)
 
 
 def read_with_retry(get, path, is_good, what=""):
-    """`get(path)`, tried twice at most: a failure or an answer that is not what was asked for is tried once more, and the SECOND outcome is the one named."""
+    """`get(path)`, tried twice at most: a TRANSIENT failure (`is_transient`) or an answer that is not what was asked for is tried once more, and the SECOND outcome is the one named."""
     last = None
     for _ in (1, 2):
         try:
             answer = get(path)
         except Exception as err:
             last = FileListError("read_failed", what + error_class(err))
+            if not is_transient(err):
+                break   # a 403, 404 or 422 will answer the same again: one attempt
             continue
         if is_good(answer):
             return answer

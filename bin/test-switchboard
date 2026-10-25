@@ -86285,6 +86285,12 @@ class FakePullFiles:
             return subprocess.CompletedProcess(argv, 1, "", "gh: " + FakePullFiles.LONG)
         if fault == "http502":
             return subprocess.CompletedProcess(argv, 1, "", "gh: Bad Gateway (HTTP 502)")
+        if fault in ("http403", "http404", "http422"):
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Error (HTTP %s)" % fault[4:])
+        if fault == "bigbody":
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Bad Gateway (HTTP 502)\n" + "B" * (1 << 20))
+        if fault == "bodystatus":
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Validation Failed (HTTP 422)\n{\"message\": \"see HTTP 404 and HTTP 502\"}")
         if fault == "notjson":
             return subprocess.CompletedProcess(argv, 0, "<html>bad gateway</html>", "")
         if fault == "toolarge":
@@ -86461,9 +86467,91 @@ class TestPullFileListRead(LedgerBase):
         files, _ = sb.load_module("delegated_clear").read_pr_files(sb.impact_carry_get(self.engine, self.runner, self.REPO), self.REPO, 9)
         self.assertEqual(len(files), 3000)
 
+    # ---- #967 review fixes: only a transient error is retried; the reason is capped; the status is the structured one
+
+    def read_page2(self, fault, times=5):
+        api = self.serve(FakePullFiles.make(250))
+        api.faults[2] = [fault] * times
+        try:
+            sb.load_module("delegated_clear").read_pr_files(sb.impact_carry_get(self.engine, self.runner, self.REPO), self.REPO, 9)
+        except Exception as err:
+            return api, err
+        return api, None
+
+    def test_family_final_errors_are_asked_once(self):
+        for fault in self.FINAL:
+            with self.subTest(fault=fault):
+                api, err = self.read_page2(fault)
+                self.assertEqual(getattr(err, "kind", None), "read_failed")
+                self.assertEqual(api.pages_asked(2), 1, "a 403, 404, 422 or over-size answer is not retried")
+
+    def test_family_a_502_and_a_timeout_are_retried_once(self):
+        for fault in ("http502", "timeout"):
+            with self.subTest(fault=fault):
+                api, err = self.read_page2(fault)
+                self.assertEqual(api.pages_asked(2), 2)
+                api, err = self.read_page2(fault, 1)
+                self.assertIsNone(err)
+
+    def test_family_a_1_mib_error_body_is_cut_to_the_cap_and_status_kept(self):
+        api, err = self.read_page2("bigbody")
+        text = str(err)
+        self.assertLess(len(text), 700)
+        self.assertIn("HTTP 502", text)
+        self.assertIn("gh failed", text)
+        self.assertIn("more characters not kept", text)
+
+    def test_family_the_status_comes_from_the_first_line_never_from_the_body(self):
+        api, err = self.read_page2("bodystatus")
+        self.assertIn("HTTP 422", str(err))
+        self.assertEqual(api.pages_asked(2), 1)
+        module = sb.load_module("delegated_clear")
+        self.assertNotIn("with HTTP", module.error_class(sb.IntentError("gh", "boom: HTTP 404")))
+
+    def test_family_the_branches_are_derived_from_the_code_and_the_docs_table_lists_each(self):
+        module = sb.load_module("delegated_clear")
+        import ast as _ast
+        src = Path(module.__file__).read_text()
+        used = {n.args[0].value for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.Call) and getattr(n.func, "id", "") == "FileListError" and n.args and isinstance(n.args[0], _ast.Constant)}
+        self.assertEqual(used - set(module.FILE_REFUSALS), set())
+        docs = (Path(module.__file__).parent.parent / "docs" / "switchboard.md").read_text()
+        table = docs.split("**Every branch of the file-list read**")[1].split("**The audit keeps")[0]
+        for kind in used | {"read_failed", "not_recorded"}:
+            self.assertIn("`%s`" % kind, table, kind)
+        for word in ("is_transient", "error_class", "read_with_retry"):
+            self.assertIn(word, src)
+
+    def test_family_mutants_retry_everything_retry_nothing_no_cap_body_status(self):
+        def final():
+            api, err = self.read_page2("http404")
+            self.assertEqual(api.pages_asked(2), 1)
+
+        def transient():
+            api, err = self.read_page2("http502")
+            self.assertEqual(api.pages_asked(2), 2)
+
+        def cap():
+            api, err = self.read_page2("bigbody")
+            self.assertLess(len(str(err)), 700)
+
+        def status():
+            api, err = self.read_page2("bodystatus")
+            self.assertEqual(api.pages_asked(2), 1)
+            self.assertNotIn("with HTTP", sb.load_module("delegated_clear").error_class(sb.IntentError("gh", "x: see HTTP 404")))
+        for label, old, new, check in (
+            ("retries everything", "            if not is_transient(err):\n                break", "            if False:\n                break", final),
+            ("retries nothing", "            if not is_transient(err):\n                break", "            if True:\n                break", transient),
+            ("no cap", "    if len(detail) > REASON_MAX:", "    if False:", cap),
+            ("status from the text", "status = getattr(err, \"status\", None)", "status = (lambda m: int(m.group(1)) if m else None)(re.search(r\"HTTP (\\d{3})\", detail))", status),
+        ):
+            with self.subTest(mutant=label):
+                self.assertFalse(self.survives(self.mutant(old, new), check), label)
+                check()
+
     # ---- one retry of a page
 
-    TRANSIENT = ("timeout", "http502", "notjson", "toolarge", "notlist")
+    TRANSIENT = ("timeout", "http502", "notjson", "notlist")
+    FINAL = ("http403", "http404", "http422", "toolarge")
 
     def test_s4_a_transient_error_on_a_page_is_retried_once_and_the_list_is_whole(self):
         module = sb.load_module("delegated_clear")
@@ -86666,6 +86754,10 @@ class TestPullFileListRead(LedgerBase):
             with self.subTest(producer=name):
                 code, out, err = run()
                 self.assertEqual(code in (1, 2), True, (code, err))
+                if name == "a page failed twice":   # #967 review: a failed read's reason is the one capped text (REASON_MAX)
+                    self.assertIn("more characters not kept", err)
+                    self.assertNotIn("THE-END", err)
+                    continue
                 self.assertIn("THE-END", err, "the printed line holds all of it")
                 if place == "audit":
                     detail = self.refusal_audit()
@@ -86691,7 +86783,7 @@ class TestPullFileListRead(LedgerBase):
                    ("cmd_impact_clear", '_one_line(str(err), 200)'), ("impact_clear_core", 'plan_ledger.clip(redact_command_text(reason), 300)'), ("impact_clear_core", 'plan_ledger.clip(under_order["text"], 300)')}
         self.assertEqual(sorted(found - allowed), [], "a clip on the clear path that is not one of the named ones (a person's own typed reason; the revoke and lock lines, which are not refusals of a pull request)")
         text = (BIN / "delegated_clear.py").read_text()
-        self.assertEqual(re.findall(r"\)\[:\d+\]|sorted\([^)]*\)\[:\d+\]|\.split\(\)\)\[:\d+\]", text), [], "no slice of a reason's words in the module that makes them")
+        self.assertEqual([m for m in re.findall(r"\)\[:\d+\]|sorted\([^)]*\)\[:\d+\]|\.split\(\)\)\[:\d+\]", text) if m != ")[:8]"], [], "no slice of a reason's words in the module that makes them")
 
     def cause_drivers(self):
         """kind -> a function returning the cause records of a refusal for it, each through the real code that makes it"""
@@ -86785,7 +86877,7 @@ class TestPullFileListRead(LedgerBase):
 
     def words(self, kind):
         return {"read_failed": "after one retry", "not_a_list": "was not a list", "over_limit": "more than 3000 changed files", "head_moved": "head moved",
-                "cut": "GitHub itself says the file list is cut", "duplicate": "the changed files repeat", "bad_entry": "is not a file entry", "no_count": "count of changed files was", "no_source": "no known source path", "not_recorded": "no reason was recorded"}[kind]
+                "cut": "the list was cut: a page was short", "duplicate": "the changed files repeat", "bad_entry": "is not a file entry", "no_count": "count of changed files was", "no_source": "no known source path", "not_recorded": "no reason was recorded"}[kind]
 
     def drive(self, kind, detail=None):
         """the refusal text the real clear gives for each kind of failure in the table (`detail` picks which failed read for read_failed)"""
@@ -86842,7 +86934,7 @@ class TestPullFileListRead(LedgerBase):
                 for other in module.FILE_REFUSALS:
                     if other != kind:
                         self.assertNotIn(self.words(other), why, "%s reads as %s" % (kind, other))
-                self.assertEqual("file list is cut" in why, kind == "cut", why)
+                self.assertEqual("list was cut" in why, kind == "cut", why)
                 self.assertEqual(why.count("\n"), 0, "one line")
 
     def test_s6_a_read_failure_names_its_class_timeout_status_not_json_or_too_large(self):
@@ -86940,7 +87032,7 @@ class TestPullFileListRead(LedgerBase):
 
         def count():
             self.serve(FakePullFiles.make(38), count=40)
-            self.assertIn("itself says", self.drive("cut"))
+            self.assertIn("the list was cut", self.drive("cut"))
 
         def dropped():
             api = self.serve(FakePullFiles.make(150))

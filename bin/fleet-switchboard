@@ -14456,6 +14456,8 @@ def parse_intent(body):
 class IntentError(Exception):
     """GitHub could not answer. reason: "not_found", "unavailable" or "gh"."""
 
+    status = None   # the HTTP status of a failed gh call, set where gh's own first line gave one (#967)
+
     def __init__(self, reason, detail=None):
         self.reason = reason
         super().__init__("%s: %s" % (reason, detail) if detail else reason)
@@ -25385,7 +25387,11 @@ def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=Fa
         detail = _one_line(done.stderr, GH_ERROR_MAX) or _one_line(done.stdout, GH_ERROR_MAX) or "exit %d" % done.returncode   # #967: the failure's own words, whole (the clear's refusal shows them)
         if tolerate_missing and ("404" in detail or "Not Found" in detail):
             return done
-        raise IntentError("gh", accounts.scrub(detail) if accounts is not None else detail)
+        failure = IntentError("gh", accounts.scrub(detail) if accounts is not None else detail)
+        first = ((done.stderr or "").strip().splitlines() or [""])[0]   # #967: the status is read from gh's OWN first line only, never from a body that may quote "HTTP 404"
+        found = re.search(r"\(HTTP (\d{3})\)\s*$", first)
+        failure.status = int(found.group(1)) if found else None
+        raise failure
     return done
 
 

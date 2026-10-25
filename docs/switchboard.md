@@ -4962,11 +4962,26 @@ What each refusal means, and what to do:
 - `over_limit`: "more than 3000 changed files". GitHub lists no more than that, so the list cannot be read in full; this stays the owner's own clear.
 - `head_moved`: "the pull request's head moved while it was being checked". A push arrived between the reads; nothing was cleared; run the clear again at the new head.
 - `duplicate`: "the changed files repeat <file>": a file name appears twice in the paged list (a file name is unique in a pull request), so a page was served twice and the pages that were meant are not all there; the count alone cannot see that. A page equal to an earlier page repeats every name on it and is refused the same way. The refusal names the file, both pages and the position.
-- `cut`: "GitHub itself says the file list is cut": the pull request's own count of changed files differs from the list read. This is the only refusal that says the list is cut.
+- `cut`: "the list was cut: a page was short or the count did not match": the pull request's own count of changed files differs from the list read. The wording is neutral: a short page or a wrong count can be GitHub's or a bug in a page, and the refusal does not say which. It is the only refusal that says the list is cut.
 - `bad_entry`: "is not a file entry": GitHub's answer was a list, but an entry of it (named by its page and its position on that page, counting from 1) is not a file with a name. It is refused with its place, never dropped, so the count is never made to differ by the reader.
 - `no_count`: "count of changed files was missing", "was not a number" or "was negative": the pull request's own count of changed files could not be used, so the list cannot be checked against it.
 - `no_source`: "no known source path": a renamed or copied file whose source GitHub did not give, so a top tier path could be the source. The owner's own clear.
 - `not_recorded`: "no reason was recorded": a report that was not whole and carries no reason. The clear never makes one; it exists so the words never say "cut" for it.
+
+**Which errors are retried, and the reason's length (#967).** A read is tried twice only when the error is transient (`is_transient`): a 5xx, a timeout, a connection error, or an answer that is not JSON. A 403, a 404, a 422, a `gh` that cannot run and an answer over the size cap are asked ONCE. The HTTP status is the one `gh` printed on its own first line (the `status` of the error), never a number found in a body's text. The reason text of a failed read (`error_class`) is cut to 300 characters (`REASON_MAX`), saying how many were left out; the status and the class are kept in full. Bounds of the other lists: at most 3 file names in a refusal (`[:3]`), each a path GitHub itself bounds, then the one `AUDIT_LINE_MAX` cap.
+
+**Every branch of the file-list read** (`read_pr_files`, `read_with_retry`, `error_class`; a test derives the branches from the code and fails when a row is missing):
+
+| Branch | Trigger | Retry | Refusal text | Test and mutant |
+|---|---|---|---|---|
+| `read_failed` (transient) | 5xx, timeout, connection error, not JSON | once | "could not be read after one retry (...)" | `test_s4_a_transient_error_on_a_page_is_retried_once_and_the_list_is_whole`; mutant "no retry" |
+| `read_failed` (final) | 403, 404, 422, gh cannot run, over-size answer | none: one attempt | same, with the status | `test_family_final_errors_are_asked_once`; mutant "retry everything" |
+| `not_a_list` | the answer is not a list (page) or object (pull) | once | "was not a list" | `test_s5` page not a list; mutant "every failure is a cut list" |
+| `over_limit` | count over 3000, or a 31st page with files | none | "more than 3000 changed files" | `test_s9` "no limit" |
+| `head_moved` | head differs between reads | once for the reads | "head moved while it was being checked" | head tests; head mutants |
+| `cut` | count differs from the number read | none | "the list was cut: a page was short or the count did not match" | `test_s9` "no count check" |
+| `bad_entry`, `duplicate`, `no_count`, `no_source` | entry not an object or nameless; a repeated name; count missing, not a number or negative; rename with no source | none | the `FILE_REFUSALS` words | `test_s9` mutants of the same names |
+| `not_recorded` | a report not whole with no reason | none | "no reason was recorded" | `test_s9` |
 
 **The audit keeps the whole reason, and the causes as data.** `gate.hold_clear_refused` holds the refusal's reason with no character cut up to the one physical bound (`AUDIT_LINE_MAX`, 1 MiB of characters, a twentieth of the 20 MiB the audit file rotates at; the line then says how many characters were left out, and `causes_omitted` how many records did not fit), and the line printed to the person is the same whole line. Control characters (an escape sequence in a file name) are turned to spaces in both. Next to it the detail has `causes`, a list of records `{kind, path, rule, text}` made from one table (`CAUSE_RULES` in `bin/delegated_clear.py`) that the words are made from too: `path` is the file the cause is about, `rule` the key of the matrix's `owner_hold.delegated_clear` block (or the check) it comes from, `text` its words. The kinds:
 
