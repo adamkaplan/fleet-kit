@@ -2959,8 +2959,15 @@ class Switchboard:
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
             self.intents.discard_told()
         pending = merge_wake_facts(plan.recipient, plan.pending)   # #1275: the sweep, triage and load-alert items of one wake are ONE message
+        parts_file = (self.state_dir / "finding-parts.json") if self.state_dir is not None else None   # #1302: how many parts of an over-cap finding were delivered (survives a restart; derived from nothing else)
+        try:
+            parts_done = json.loads(parts_file.read_text()) if parts_file is not None and parts_file.exists() else {}
+        except (OSError, ValueError):
+            parts_done = {}
+        if not isinstance(parts_done, dict):
+            parts_done = {}
         text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
-                                repos=repos, delivered=self.now())
+                                repos=repos, delivered=self.now(), resume=parts_done)
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
             # Measure THE message delivered: the carried send alone (compose may cut a newer send, not pending[:1], the oldest fact).
@@ -2978,15 +2985,25 @@ class Switchboard:
             self.intents.discard_told()
             compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now())
         keys = []
+        part_keys = []   # ids of the parts delivered without the last: never acknowledged
         sent_lines = whole_lines(text)
         for fact in carried:
+            if getattr(fact, "partial", None):
+                part_keys.append((fact.key, fact.partial[0]))
+                continue
             lines = getattr(fact, "member_lines", None)
             for key in (getattr(fact, "members", None) or [fact.key]):
                 if lines is None or lines.get(key, "") in sent_lines:   # a merged member counts only if its line is in the message
                     keys.append(key)
         # The id lives in v2's namespace, so it is derived from the session the
         # recipient runs now: a relaunched agent is a new recipient for v2.
+        ack_keys = list(keys)
+        keys = keys + ["%s#part%d" % pair for pair in part_keys]   # a part has its own id; its fact key is acknowledged only with the LAST part
         message_id = derive_message_id(observation.session_id, keys)
+        for fact in carried:   # a cut line or a refused remainder goes to the audit in full, named
+            if self.audit is not None and (getattr(fact, "cut_lines", None) or getattr(fact, "refused", "")):
+                self.audit.append(self.actor, "finding-refused" if fact.refused else "finding-line-cut", plan.recipient,
+                                  {"key": fact.key, "kind": fact.kind, "lines": [l[:100000] for l in fact.cut_lines][:20], "refused": fact.refused[:1000000]})
         resume = plan.action == "wake" or interrupt
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
         busy = resume and not interrupt and steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None))
@@ -3031,7 +3048,13 @@ class Switchboard:
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
-        self._acknowledge(keys)
+        self._acknowledge(ack_keys)
+        if parts_file is not None and (part_keys or any(k in parts_done for k in ack_keys)):
+            for key, count in part_keys:
+                parts_done[key] = count
+            for key in ack_keys:
+                parts_done.pop(key, None)
+            parts_file.write_text(json.dumps(parts_done))
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "commit_told"):
             self.intents.commit_told()
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,

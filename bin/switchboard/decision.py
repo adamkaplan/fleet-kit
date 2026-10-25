@@ -122,7 +122,7 @@ def compose_order(fact):
     return (reminder, -fact.created, fact.key)
 
 
-def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
+def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None, resume=None):
     """One message for `facts`, newest first (a newer result is never held behind older reminders). Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
     message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
     same issue replaces (`superseded_by`) stays in the message, marked, so no key is left out of what is acknowledged.
@@ -191,31 +191,78 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         text = render(count)
         if len(text) <= cap:
             return text, facts[:count]
-    if facts[0].kind in ("sweep", "triage") and not getattr(facts[0], "shortened", False):   # #1302: a finding over the cap is shortened at its source (one line per item, the rest named as a count), never cut
-        for short in shortened_findings(facts[0], len(text) - cap):
-            again, carried = compose(recipient, [short] + facts[1:], cap, section, repos, delivered)
-            if len(again) <= cap and "[cut at" not in again[-40:]:
-                return again, carried
+    if facts[0].kind != "send" and not getattr(facts[0], "members", None):   # #1302: a finding over the cap is carried over successive messages, never cut
+        part = finding_part(recipient, facts[0], facts[1:], cap, section, repos, delivered, resume)
+        if part is not None:
+            return part
     marker = "\n[cut at %d characters]" % cap
     return text[:cap - len(marker)] + marker, facts[:1]
 
 
-def shortened_findings(fact, over):
-    """#1302: the candidate shortenings of a single finding (longest first): its lines cut from the end and the count left named, then a
-    character cut. The text names what was left out, so acknowledging its key loses nothing unsaid. Hostile text is cleaned per line."""
-    lines = [" ".join("".join(c if c.isprintable() else " " for c in line).split()) for line in fact.summary.splitlines() if line.strip()]
-    out = []
-    for keep in range(len(lines) - 1, 0, -1):
-        left = len(lines) - keep
-        out.append("\n".join(lines[:keep] + ["\u2026 and %d more line%s not shown (shortened at its source)" % (left, "" if left == 1 else "s")]))
-    flat = " ".join(lines)
-    for size in (2000, 1000, 500, 200, 50, 0):
-        out.append("%s\u2026 (shortened at its source, %d characters not shown)" % (flat[:size], max(0, len(flat) - size)))
-    for text in out:
-        short = copy.copy(fact)
-        short.summary = text
-        short.shortened = True
-        yield short
+FINDING_MAX_PARTS = 50   # a finding is carried over at most this many messages; beyond it the rest is refused (named, audited), never dropped silently
+LINE_CUT_MARK = " \u2026[line cut]"
+FINDING_REFUSED = []     # (key, kind, text refused): the daemon writes each to the audit as 'finding-refused' and empties this list
+
+
+def finding_parts(fact, budget):
+    """The summary of one finding as chunks of WHOLE lines, each at most `budget` characters (a single longer line is cut with a visible
+    mark: the only case that shortens; the daemon audits the full line). Pure and deterministic: the same fact gives the same chunks, so the
+    continuation is derived from how many parts were delivered. Returns (chunks, refused_text, cut_lines)."""
+    lines, cut = [], []
+    for line in fact.summary.strip().split("\n"):
+        line = "".join(c if c.isprintable() else " " for c in line).rstrip()
+        if len(line) > budget:
+            cut.append(line)
+            line = line[:budget - len(LINE_CUT_MARK)] + LINE_CUT_MARK
+        lines.append(line)
+    chunks, now, size = [], [], 0
+    for line in lines:
+        if now and size + len(line) + 3 > budget:
+            chunks.append("\n".join(now))
+            now, size = [], 0
+        now.append(line)
+        size += len(line) + 3
+    if now:
+        chunks.append("\n".join(now))
+    refused = ""
+    if len(chunks) > FINDING_MAX_PARTS:
+        refused = "\n".join(chunks[FINDING_MAX_PARTS:])
+        chunks = chunks[:FINDING_MAX_PARTS]
+    return chunks, refused, cut
+
+
+def finding_part(recipient, fact, rest, cap, section, repos, delivered, resume):
+    """#1302: the next part of an over-cap finding. `resume` maps a key to how many parts were already delivered (persisted by the daemon,
+    so a restart continues). The carried fact has `partial=(i, n)` when more parts follow (its key must NOT be acknowledged yet)."""
+    done = (resume or {}).get(fact.key, 0)
+    probe = copy.copy(fact)
+    probe.summary = "(part 99 of 99)\n"
+    fixed = len(compose(recipient, [probe], 10 ** 9, section, repos, delivered, None)[0])
+    budget = max(200, cap - fixed - 400)   # the header repeats the first 200 characters; the item indents every line; room for the part label and the refusal note
+    chunks, refused, cut = finding_parts(fact, budget)
+    if len(chunks) < 2:
+        if not cut:
+            return None
+        marker = "\n[cut at %d characters]" % cap   # one line over the cap: the only cut, marked; the full line goes to the audit
+        whole = copy.copy(fact)
+        whole.cut_lines = cut
+        text = compose(recipient, [whole], 10 ** 9, section, repos, delivered, None)[0]
+        return text[:cap - len(marker)] + marker, [whole]
+    n = len(chunks)
+    index = min(done, n - 1)
+    short = copy.copy(fact)
+    last = index == n - 1
+    tail = "\n(%d characters of this finding past the %d-part limit were refused; the full text is in the audit)" % (len(refused), FINDING_MAX_PARTS) if refused and last else ""
+    short.summary = "(part %d of %d)\n%s%s" % (index + 1, n, chunks[index], tail)
+    if len(short.summary) + fixed > cap:
+        short.summary = short.summary[:max(0, cap - fixed - 1)]
+    if not last:
+        short.partial = (index + 1, n)
+    short.cut_lines, short.refused = (cut, refused) if index == 0 else ([], "")
+    text, carried = compose(recipient, [short], 10 ** 9, section, repos, delivered, None)
+    if len(text) > cap:
+        text = text[:cap - 1]
+    return text, [short]
 
 
 ORDERS_CLOSING = ("These are the owner's standing instructions for this charter. Act on them without asking "

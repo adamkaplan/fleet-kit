@@ -2021,29 +2021,78 @@ class TestCompose(unittest.TestCase):
         self.assertTrue(text.endswith("\u2026 and 28 more: run fleet-switchboard pending platform"))
         self.assertEqual([f.key for f in carried], ["k29", "k28"])
 
-    def test_a_finding_over_the_cap_is_shortened_never_cut_1302(self):
-        # the table of finding kinds that can exceed the cap: each needs an over-cap case here
+    def whole_run(self, kind, body, cap=4000, others=(), position=0):
+        """Deliver one over-cap fact like the daemon: part after part, with the ledger of parts delivered."""
+        one = fact("%s:big" % kind, kind=kind, summary=body)
+        done, texts, acked, gone = {}, [], [], set()
+        for _ in range(sb.FINDING_MAX_PARTS + 5):
+            pending = [o for o in others if o.key not in gone]
+            pending.insert(position, one)
+            text, carried = sb.compose("platform", pending, cap=cap, resume=done)
+            self.assertLessEqual(len(text), cap)
+            self.assertNotIn("[cut at", text)
+            gone.update(f.key for f in carried if f.key != one.key)
+            mine = [f for f in carried if f.key == one.key]
+            if not mine:
+                continue
+            texts.append(text)
+            if getattr(mine[0], "partial", None):
+                done[one.key] = mine[0].partial[0]
+            else:
+                acked.append(one.key)
+                break
+        return texts, acked
+
+    def test_a_finding_over_the_cap_is_carried_over_successive_messages_1302(self):
         for kind in OVER_CAP_FINDING_KINDS:
-            body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
-            one = fact("%s:big" % kind, kind=kind, summary=body)
-            text, carried = sb.compose("platform", [one], cap=4000)
-            self.assertLessEqual(len(text), 4000, kind)
-            self.assertNotIn("[cut at", text, kind)
-            self.assertIn("more lines not shown", text, kind)
-            self.assertEqual([f.key for f in carried], [one.key])
+            for position in (0, 1, 2):   # the over-cap fact at EVERY position
+                body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
+                others = [fact("o%d" % n, kind="sweep", summary="small %d" % n) for n in range(2)]
+                texts, acked = self.whole_run(kind, body, others=others, position=position)
+                self.assertGreater(len(texts), 1, kind)
+                self.assertEqual(acked, ["%s:big" % kind], kind)   # acknowledged once, after the LAST part
+                got = [l.strip() for t in texts for l in t.split("\n")[1:] if l.strip().startswith("item ")]
+                self.assertEqual(got, ["item %03d %s" % (n, "z" * 60) for n in range(100)], kind)   # every line once, in order
+                for i, t in enumerate(texts):
+                    self.assertIn("(part %d of %d)" % (i + 1, len(texts)), t)
 
-    def test_a_single_long_line_is_shortened_by_characters_1302(self):
+    def test_over_cap_sizes_are_delivered_whole_1302(self):
+        for body in ("\n".join(["y" * 100] * 41), "\n".join(["y" * 100] * 120), "\n".join(["\u00e9\u4e2d" * 30] * 60), "\n".join("l%d" % n for n in range(1500))):
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked)
+            self.assertGreaterEqual(len(texts), 1)
+
+    def test_one_line_over_the_cap_is_the_only_cut_marked_and_audited_1302(self):
         text, carried = sb.compose("platform", [fact("s:1", kind="sweep", summary="y" * 6000)], cap=4000)
-        self.assertLessEqual(len(text), 4000)
-        self.assertNotIn("[cut at", text)
-        self.assertIn("characters not shown", text)
+        self.assertIn("[cut at 4000 characters]", text)
+        self.assertEqual(carried[0].cut_lines, ["y" * 6000])   # the daemon audits the full line
 
-    def test_the_over_cap_table_names_every_long_builder_1302(self):
-        import re as _re
-        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "switchboard", "decision.py")).read()
-        listed = set(_re.findall(r'kind in \(([^)]*)\) and not', src)[0].replace('"', "").replace(" ", "").split(","))
-        self.assertEqual(listed, set(OVER_CAP_FINDING_KINDS))   # the code's kinds and the table are one list
-        self.assertEqual(set(OVER_CAP_FINDING_KINDS), {"sweep", "triage"})
+    def test_one_megabyte_is_bounded_and_the_rest_refused_named_1302(self):
+        body = "\n".join("x" * 99 for _ in range(10500))
+        texts, acked = self.whole_run("sweep", body)
+        self.assertEqual(len(texts), sb.FINDING_MAX_PARTS)   # the maximum; beyond it the rest is refused, audited, named in the last part
+        self.assertIn("were refused; the full text is in the audit", texts[-1])
+        self.assertTrue(acked)
+
+    def test_a_restart_between_parts_continues_from_the_ledger_1302(self):
+        one = fact("sweep:big", kind="sweep", summary="\n".join("line %03d %s" % (n, "q" * 50) for n in range(300)))
+        first, carried = sb.compose("platform", [one], cap=4000, resume={})
+        self.assertEqual(carried[0].partial[0], 1)
+        second, _ = sb.compose("platform", [one], cap=4000, resume={one.key: 1})   # a fresh process: only the ledger survives
+        self.assertIn("(part 2 of", second)
+        self.assertNotIn("line 000", second)
+
+    def test_every_fact_kind_the_builders_make_is_in_the_table_1302(self):
+        import ast, glob
+        here = os.path.dirname(os.path.abspath(__file__))
+        found = set()
+        for path in [os.path.join(here, "fleet-switchboard")] + glob.glob(os.path.join(here, "switchboard", "*.py")):
+            for node in ast.walk(ast.parse(open(path).read())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "Fact":
+                    kind = node.args[2] if len(node.args) > 2 else next((k.value for k in node.keywords if k.arg == "kind"), None)
+                    if isinstance(kind, ast.Constant) and isinstance(kind.value, str) and kind.value in ("sweep", "triage", "alert", "wake", "send", "reminder", "disk", "cpu", "mem", "cpu-top", "spotlight", "janitor", "plan"):
+                        found.add(kind.value)
+        self.assertEqual(found, set(FACT_KIND_MODES), "a fact kind has no row in the table")
 
     def test_one_item_longer_than_the_cap_is_cut_and_says_so(self):
         text, carried = sb.compose("platform", [fact("big", summary="y" * 5000)], cap=500)
@@ -83474,7 +83523,10 @@ def _clock_at(hour, minute, second=0):
     return calendar.timegm((2027, 1, 15, hour, minute, second))
 
 
-OVER_CAP_FINDING_KINDS = ("sweep", "triage")   # sweep_queue_fact and the triage digest facts
+FACT_KIND_MODES = {"send": "cut marker (refused to the sender)", "wake": "merged within a 3000-character budget", "sweep": "parts", "triage": "parts",
+                   "alert": "parts", "reminder": "parts", "disk": "parts", "cpu": "parts", "mem": "parts", "cpu-top": "parts",
+                   "spotlight": "parts", "janitor": "parts", "plan": "parts"}
+OVER_CAP_FINDING_KINDS = tuple(k for k, v in FACT_KIND_MODES.items() if v == "parts")
 
 
 class TestMessageTimes(unittest.TestCase):
