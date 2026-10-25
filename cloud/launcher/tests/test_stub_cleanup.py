@@ -360,7 +360,8 @@ ENDERS = {"kill", "terminate", "send_signal", "stop_group", "killpg"}   # what E
 BACKGROUND = re.compile(r"(?<![&])&\s*($|[;\n)])|\bnohup\b|\bsetsid\b|\bdisown\b")   # a shell string that backgrounds something
 SERVER_WORDS = re.compile(r"stub_server|serve_forever|http\.server")   # a blocking call whose argument is a server never returns
 # a child that a string of code starts inside another process: allowed only with this reason (the scan finds the string; a new one fails)
-EMBEDDED_OK = {("bin/test-cloud-worker", "grandchild.pid"): "a bounded grandchild (sleep 60) of a stub tool; the test asserts it is gone"}
+EMBEDDED_OK = {("bin/test-cloud-worker", "grandchild.pid"): "a bounded grandchild (sleep 60) of a stub tool; the test asserts it is gone",
+               ("cloud/worker/tests/fixtures/prepush_spawner.py", "sleep"): "a bounded grandchild (sleep 77) of a fixture script; the hardening test asserts the check's process-group kill ends it"}
 
 
 def py_files(root):
@@ -368,7 +369,7 @@ def py_files(root):
     bases = [os.path.join(root, "cloud", d, "tests") for d in sorted(os.listdir(os.path.join(root, "cloud"))) if os.path.isdir(os.path.join(root, "cloud", d, "tests"))] if os.path.isdir(os.path.join(root, "cloud")) else []
     for base in bases:
         for dp, dn, names in os.walk(base):
-            dn[:] = [d for d in dn if d not in ("fixtures", "__pycache__")]
+            dn[:] = [d for d in dn if d != "__pycache__"]   # fixtures are scanned too: a script a test writes out and runs starts a child as much as a test does
             for n in sorted(names):
                 out.append(os.path.join(dp, n))
     cw = os.path.join(root, "bin", "test-cloud-worker")
@@ -526,13 +527,15 @@ def scan_tree(rel, tree):
             if kind in ("popen", "process") and var and fn is not None and cleanup_calls(fn, var):
                 sites.append(dict(s, kind=kind, var=var, fn=fn, ok=True, why="registers a cleanup that ends %s" % var))
             else:
-                sites.append(dict(s, kind=kind, var=var, fn=fn, ok=False, why="starts a child (%s) with no cleanup that ENDS it (kill, terminate, stop_group; a wait alone does not): use stub_support.start" % canon))
+                why = "starts a child (%s) with no cleanup that ENDS it (kill, terminate, stop_group; a wait alone does not): use stub_support.start" % canon
+                listed = [r for (f, snip), r in EMBEDDED_OK.items() if f == rel and "/fixtures/" in "/" + rel and snip in ast.unparse(n)]   # a script a test runs, with its reason
+                sites.append(dict(s, kind=kind, var=var, fn=fn, ok=bool(listed), listed=bool(listed), why=listed[0] if listed else why))
         elif isinstance(n, ast.Constant) and isinstance(n.value, str) and rel != THIS:
             text = n.value
-            starts = "subprocess.Popen(" in text or "%s.spawn(" % HELPER in text
+            starts, stops = string_starts(text)
             if not (starts or BACKGROUND.search(text)):
                 continue
-            ok = starts and "%s.stop_group(" % HELPER in text
+            ok = starts and stops
             reason = None
             for (f, snip), why in EMBEDDED_OK.items():
                 if f == rel and snip in text:
@@ -540,6 +543,19 @@ def scan_tree(rel, tree):
             sites.append(dict(file=rel, line=n.lineno, func="<string>", node=n, tree=tree, par=par, name="string", kind="embedded", ok=ok,
                               why=reason or ("the string stops its child with stop_group" if ok else "a string of code starts a child or backgrounds a process with no stop_group and no reason listed")))
     return sites
+
+
+def string_starts(text):
+    """(starts, stops) of a string a test hands to another process as code. A string that parses as Python is read like code, through its own import aliases: it
+    starts a child when a call resolves to a starter and stops it when a call resolves to stub_support.stop_group. A string that does not parse (a shell script, or
+    code with a placeholder) falls back to the word match."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return "subprocess.Popen(" in text or "%s.spawn(" % HELPER in text, "%s.stop_group(" % HELPER in text
+    aliases = aliases_of(tree)
+    names = {resolve(c.func, aliases) for c in ast.walk(tree) if isinstance(c, ast.Call)}
+    return bool(names & {"subprocess.Popen", HELPER + ".spawn"}), HELPER + ".stop_group" in names
 
 
 def find_sites(root):
@@ -659,7 +675,7 @@ SITES = find_sites(ROOT)
 
 
 def mutable(s, how):
-    if s["kind"] == "helper-itself" or s["kind"] == "blocking":
+    if s["kind"] == "helper-itself" or s["kind"] == "blocking" or s.get("listed"):   # a listed script has no cleanup to take away
         return False
     if s["kind"] == "embedded":
         return "stop_group" in s["node"].value and how != "alias"   # a string of code has no call to rename
@@ -768,6 +784,37 @@ class TestEverySite(unittest.TestCase):
             sites = scan_tree("cloud/worker/tests/test_x.py", ast.parse(src))
             self.assertEqual([x["kind"] for x in sites], ["popen"], src)
         self.assertEqual(scan_tree("cloud/worker/tests/test_x.py", ast.parse("from subprocess import Popen\n")), [])
+
+    def test_a_string_of_code_is_read_as_code_through_its_own_aliases(self):
+        embedded = lambda text: [x for x in scan_tree("cloud/worker/tests/test_x.py", ast.parse("CODE = %r\n" % text)) if x["kind"] == "embedded"]
+        spawn = "from subprocess import Popen as go\ngo(['sleep', '1'])\n"
+        self.assertEqual([(x["ok"]) for x in embedded(spawn)], [False], "an aliased spawn inside a string is a failing embedded site")
+        self.assertEqual([x["ok"] for x in embedded("import subprocess as sp\nsp.Popen(['x'])\n")], [False])
+        stopped = "import stub_support as ss\nfrom stub_support import stop_group as sg\np = ss.spawn(['x'])\nsg(p)\n"
+        self.assertEqual([x["ok"] for x in embedded(stopped)], [True], "an aliased stop_group in the string is a cleanup")
+        self.assertEqual(embedded("from subprocess import Popen as go\nprint('go(1)')\n"), [], "an import and a call that starts nothing: 0 sites")
+        self.assertEqual(embedded("print('subprocess.Popen(')\n"), [], "the words in a printed string are not a spawn when the string parses as code")
+        self.assertEqual([x["ok"] for x in embedded("subprocess.Popen(['x'\n")], [False], "a string that does not parse falls back to the word match")
+        self.assertEqual(embedded("plain text with no code"), [])
+
+    def test_a_script_under_a_fixtures_directory_is_a_counted_site_and_must_be_explained(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "cloud", "worker", "tests", "fixtures"))
+        path = os.path.join(root, "cloud", "worker", "tests", "fixtures", "spawner.py")
+        with open(path, "w") as fh:
+            fh.write("import subprocess\np = subprocess.Popen(['sleep', '5'])\n")
+        found = find_sites(root)
+        self.assertEqual([(x["file"], x["kind"], x["ok"]) for x in found], [("cloud/worker/tests/fixtures/spawner.py", "popen", False)])
+        with mock.patch.dict(EMBEDDED_OK, {("cloud/worker/tests/fixtures/spawner.py", "sleep"): "a bounded child"}):
+            self.assertEqual([x["ok"] for x in find_sites(root)], [True], "named in EMBEDDED_OK with a reason, it passes")
+
+    def test_every_script_under_the_real_fixtures_directories_is_counted_and_explained(self):
+        fixtures = [s for s in SITES if "/fixtures/" in s["file"]]
+        self.assertTrue(fixtures, "the fixture scripts are no longer scanned")
+        self.assertEqual([site_name(s) for s in fixtures if not s["ok"]], [], "a fixture starts a child with no cleanup and no reason in EMBEDDED_OK")
+        for key in EMBEDDED_OK:
+            self.assertTrue(os.path.exists(os.path.join(ROOT, key[0])), "EMBEDDED_OK names a file that is gone: %s" % (key,))
 
     def test_a_star_import_is_an_unresolved_limit_and_is_counted(self):
         tree = ast.parse("from subprocess import *\ndef t():\n    Popen(['x'])\n")
