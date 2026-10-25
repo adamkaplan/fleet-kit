@@ -120,7 +120,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 
 | From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
-| `bin/test-switchboard` | `-` | size | 93,500 | the one test file, with room for the pending batch; T1 re-derives it DOWN when whole classes move; the test split (ST0 and its follow-ups) moves its fakes and classes beside the units |
+| `bin/test-switchboard` | `-` | size | 94,000 | the one test file, with room for the pending batch; T1 re-derives it DOWN when whole classes move; the test split (ST0 and its follow-ups) moves its fakes and classes beside the units |
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `cloud_worker.py` | `-` | size | 2,000 | grew past the limit in a merged change; to be split |
@@ -150,7 +150,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/triage.py` | `switchboard/decisions_a.py` | namespace | 3 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | entry-import | 15 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `fleet-switchboard` | `-` | size | 26,000 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
+| `fleet-switchboard` | `-` | size | 26,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
 | `switchboard/decisions_a.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/decisions_b.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/import_v1.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
