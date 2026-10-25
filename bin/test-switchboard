@@ -92541,32 +92541,91 @@ class TestArchTools(unittest.TestCase):
 class ReviewCommentLineTests(unittest.TestCase):
     HEAD = "3f2a9c1b7d4e" + "0" * 28
 
-    def handle(self, body, cid=9001, state="open", author="alice", who="bob", action="created", merged=False):
+    def handle(self, body, cid=9001, state="open", author="alice", who="bob", action="created", merged=False, issue=True):
         pr = {"number": 10, "state": state, "user": {"login": author}, "body": "", "pull_request": {"merged_at": "x" if merged else None}}
         payload = {"action": action, "issue": pr, "comment": {"id": cid, "body": body, "user": {"login": who}}}
         return [i for i in sb._wh_issue_comment("o/r", payload, 1.0) if i.key.startswith("github.reviewcomment:")]
 
+    def line(self, verdict, who="bob", signed=None):
+        tail = " (signed %s)" % signed if signed else ""
+        return "PR #10 3f2a9c1b7d4e review comment by %s%s: %s (a comment, not a recorded verdict)" % (who, tail, verdict)
+
     def test_each_verdict_word_in_the_table_is_delivered(self):
         for word in sb.REVIEW_VERDICTS:
-            items = self.handle("Review of %s %s\nsecret sentence" % (self.HEAD, word))
-            self.assertEqual([i.summary for i in items], ["PR #10 3f2a9c1b7d4e %s" % word])
+            items = self.handle("Review of %s: %s\nsecret sentence" % (self.HEAD, word))
+            self.assertEqual([i.summary for i in items], [self.line(word)])
             self.assertNotIn("secret", items[0].summary)
 
-    def test_unknown_verdict_is_delivered(self):
-        self.assertEqual(self.handle("Review of %s maybe" % self.HEAD)[0].summary, "PR #10 3f2a9c1b7d4e UNKNOWN")
+    def test_no_marker_cloud_bot_is_delivered(self):
+        items = self.handle("Review of %s: APPROVE" % self.HEAD, who="fleetkit-cloud[bot]")
+        self.assertEqual([i.summary for i in items], [self.line("APPROVE", "fleetkit-cloud[bot]")])
+
+    def test_shared_account_with_reader_marker_is_delivered_with_signer(self):
+        body = "Review of %s: CHANGES REQUESTED\n<!-- fleet-switchboard:from=rev-1 -->" % self.HEAD
+        items = self.handle(body, who="alice")   # same login as the PR author
+        self.assertEqual([i.summary for i in items], [self.line("CHANGES REQUESTED", "alice", "rev-1")])
+        self.assertEqual(items[0].review_signer, "rev-1")
+
+    def test_author_lane_marker_is_not_delivered_at_routing(self):
+        agents = {"orch": types.SimpleNamespace(fleet={"role": "orchestrator"}), "w1": types.SimpleNamespace(fleet={"boss": "orch"}),
+                  "rev-1": types.SimpleNamespace(fleet={})}
+        self.assertTrue(sb._review_lane_member(agents, "w1", "orch"))
+        self.assertTrue(sb._review_lane_member(agents, "orch", "orch"))
+        self.assertFalse(sb._review_lane_member(agents, "rev-1", "orch"))
+        self.assertFalse(sb._review_lane_member(agents, "ghost", "orch"))
+
+    def test_route_drops_author_lane_and_audits_unowned(self):
+        agents = {"orch": types.SimpleNamespace(fleet={"role": "orchestrator"}), "w1": types.SimpleNamespace(fleet={"boss": "orch"})}
+        for signer, owner, expect in (("w1", "orch", False), ("rev-1", "orch", True), ("rev-1", None, False)):
+            item = sb.GitHubItem("github.reviewcomment:1", "github.comment", "x", "o/r", [], [], "bob", 1.0, [10], True)
+            item.review_signer = signer
+            audits = []
+            hub = types.SimpleNamespace(queue={item.key: item}, lock=threading.RLock(), _unrouted=set(), _filtered=set(),
+                                        _unrouted_batch=[], _filtered_batch=[], _routed_batch=[], _audit=lambda *a: audits.append(a),
+                                        route_of=lambda *a: (owner, "closing"))
+            sb.GitHubHub._route(hub, item, types.SimpleNamespace(problems=[], agents=agents), 1.0)
+            self.assertEqual(item.recipient == "orch", expect)
+            self.assertEqual([a[0] for a in audits], ["github.reviewcomment.unowned"] if owner is None else [])
+
+    def test_unmatching_forms_are_unknown_never_wrong(self):
+        for tail in (" not APPROVE", " do not APPROVE", ": APPROVE.", ": approve", ": CHANGES REQUESTED, not APPROVE", " APPROVE",
+                     ": APPROVE now", ":\tAPPROVE", ": APPROVE\tx", "", ":APPROVE"):
+            items = self.handle("Review of %s%s" % (self.HEAD, tail))
+            self.assertEqual([i.summary for i in items], [self.line("UNKNOWN")], tail)
+
+    def test_trailing_whitespace_is_still_strict(self):
+        self.assertEqual(self.handle("Review of %s: APPROVE \t" % self.HEAD)[0].summary, self.line("APPROVE"))
 
     def test_not_delivered(self):
-        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD, state="closed"), [])
-        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD, merged=True), [])
-        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD, who="alice"), [])
-        self.assertEqual(self.handle("x\nReview of %s APPROVE" % self.HEAD), [])
-        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD[:39]), [])
-        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD, action="edited"), [])
+        ok = "Review of %s: APPROVE" % self.HEAD
+        self.assertEqual(self.handle(ok, state="closed"), [])
+        self.assertEqual(self.handle(ok, merged=True), [])
+        self.assertEqual(self.handle("x\n" + ok), [])
+        self.assertEqual(self.handle(" " + ok), [])
+        self.assertEqual(self.handle("\ufeff" + ok), [])
+        self.assertEqual(self.handle(ok.replace("Review", "REVIEW")), [])
+        self.assertEqual(self.handle("Review of %s: APPROVE" % self.HEAD[:39]), [])
+        self.assertEqual(self.handle("Review of %s0: APPROVE" % self.HEAD), [])
+        self.assertEqual(self.handle("Review of %s: APPROVE" % self.HEAD.upper()), [])
+        self.assertEqual(self.handle(ok, action="edited"), [])
 
-    def test_key_is_by_comment_id_so_the_persisted_queue_dedups(self):
-        a = self.handle("Review of %s APPROVE" % self.HEAD)[0].key
-        self.assertEqual(a, self.handle("Review of %s APPROVE" % self.HEAD)[0].key)
-        self.assertNotEqual(a, self.handle("Review of %s APPROVE" % self.HEAD, cid=9002)[0].key)
+    def test_catchup_never_copies_text_and_shares_the_key(self):
+        body = "Review of %s: APPROVE\nsecret sentence" % self.HEAD
+        comment = {"id": 9001, "body": body, "user": {"login": "bob"}, "issue_url": "https://api.github.com/repos/o/r/issues/10"}
+        self.assertIsNone(sb._comment_item("o/r", comment, None, 1.0))
+        hook = self.handle(body)[0]
+        self.assertEqual(hook.key, "github.reviewcomment:9001")
+        self.assertNotIn("github.comment:9001", [hook.key])
+
+    def test_key_is_by_comment_id(self):
+        a = self.handle("Review of %s: APPROVE" % self.HEAD)[0].key
+        self.assertEqual(a, self.handle("Review of %s: APPROVE" % self.HEAD)[0].key)
+        self.assertNotEqual(a, self.handle("Review of %s: APPROVE" % self.HEAD, cid=9002)[0].key)
+
+    def test_plain_comment_keeps_old_item(self):
+        pr = {"number": 10, "state": "open", "user": {"login": "a"}, "pull_request": {}}
+        items = sb._wh_issue_comment("o/r", {"action": "created", "issue": pr, "comment": {"id": 5, "body": "hi", "user": {"login": "b"}}}, 1.0)
+        self.assertEqual([i.key for i in items], ["github.comment:5"])
 
 
 if __name__ == "__main__":

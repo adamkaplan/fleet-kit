@@ -5806,7 +5806,16 @@ The reviewer definitions and the review skill name these commands, not the bare 
 
 ## Review comments on a lane's pull request
 
-A new comment on an open pull request whose first line matches `^Review of [0-9a-f]{40}` is delivered to the owning lane's orchestrator as one line: `PR #N <12-char head> <verdict>`. The verdict is APPROVE or CHANGES REQUESTED (table `REVIEW_VERDICTS`), else UNKNOWN; the comment text is never copied. The item key is `github.reviewcomment:<comment id>`, so the existing persisted delivery record delivers it once across restarts; an edited event is not a new comment. Closed or merged pull requests, the pull request author's own comments and non-matching first lines get no such line. It uses only the comment event's data: no new GitHub read, no write.
+A new comment on an open pull request whose first line matches `^Review of [0-9a-f]{40}` is delivered to the owning lane's orchestrator as ONE line: `PR #N <12-char head> review comment by <login> (signed <NAME>): <VERDICT> (a comment, not a recorded verdict)`. The verdict is exactly `Review of <40 hex>: APPROVE` or `... : CHANGES REQUESTED` (case-sensitive, trailing whitespace only; table `REVIEW_VERDICTS`); any other line that matches the leading pattern is UNKNOWN, never a wrong verdict. The login (and the `from=` name, omitted when there is no marker) are cleaned and capped; the comment text is never copied, and a matching line is delivered as one line or dropped, never as the old text item. A comment is delivered unless its marker names the owner or a worker of the owner's lane (the author's own review); no marker means delivered (the cloud readers post as `fleetkit-cloud[bot]` with no marker; the login in the line shows who posted it). A pull request no lane owns delivers nothing and writes one audit line `github.reviewcomment.unowned` per comment id (the Chief of Staff reads it there; no message is sent). The key is `github.reviewcomment:<comment id>` on both the webhook and the catch-up path; the catch-up read carries no pull request state, so it SKIPS matching review lines (the webhook delivers them). What dedups: the daemon's delivered-key ledger, which keeps keys across a restart; an edited event is not a new comment. No new GitHub read, no write.
+
+### Every path by which a GitHub comment reaches an agent
+
+| Path | Key | Dedup | Author rule | Test |
+|---|---|---|---|---|
+| webhook `_wh_issue_comment` -> `_comment_item`, plain comment | `github.comment:<id>` | delivered-key ledger | fleet-signed comments dropped | `test_plain_comment_keeps_old_item` |
+| webhook, review comment on a PR | `github.reviewcomment:<id>` | same ledger | author-lane marker dropped at `_route` | `ReviewCommentLineTests` |
+| catch-up loop -> `_comment_item(.., None, ..)`, plain | `github.comment:<id>` | same ledger | fleet-signed dropped | `test_catchup_never_copies_text_and_shares_the_key` |
+| catch-up, review line | skipped (webhook delivers it) | none needed | n/a | same |
 
 | Input | Bound | Test |
 |---|---|---|

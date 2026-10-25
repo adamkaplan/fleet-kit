@@ -10757,6 +10757,7 @@ class GitHubItem:
         # `actionable` is false for news that is not worth an agent's turn (a passing check, a bot's comment) and
         # is delivered only to an owner the old links found; `routed_by` says which link found the owner.
         self.numbers, self.actionable, self.routed_by = list(numbers), actionable, None
+        self.review_signer = None   # the from= marker name of a review comment (`_review_comment_item`)
 
     @property
     def issue(self):
@@ -10918,46 +10919,64 @@ def _pr_numbers(obj):
 
 
 REVIEW_COMMENT_RE = re.compile(r"^Review of ([0-9a-f]{40})(?![0-9a-f])")
-# Verdict words, longest first; the line carries the word from this table, never the comment text.
+REVIEW_STRICT_RE = re.compile(r"^Review of ([0-9a-f]{40}): (APPROVE|CHANGES REQUESTED)\s*$")
+# Verdict words; the line carries the word from this table, never the comment text.
 REVIEW_VERDICTS = ("CHANGES REQUESTED", "APPROVE")
+REVIEW_NAME_CAP = 40
 
 
 def _review_verdict(first_line):
-    rest = first_line[50:].upper()
-    for word in REVIEW_VERDICTS:
-        if re.search(r"(?<![A-Z])%s(?![A-Z])" % word.replace(" ", r"[ _]"), rest):
-            return word
-    return "UNKNOWN"
+    """The verdict of a first line: exactly `Review of <40 hex>: <word>` (case-sensitive, trailing whitespace only), else UNKNOWN."""
+    m = REVIEW_STRICT_RE.match(first_line)
+    return m.group(2) if m and m.group(2) in REVIEW_VERDICTS else "UNKNOWN"
+
+
+def _review_lane_member(agents, signer, owner):
+    """True when `signer` is the owner or a worker of the owner's lane (the registry's boss/orchestrator link)."""
+    if signer == owner:
+        return True
+    fleet = (agents.get(signer).fleet if agents.get(signer) is not None else None) or {}
+    return any(fleet.get(k) == owner for k in ("boss", "orchestrator", "lane"))
 
 
 def _review_comment_item(repo, comment, issue, number, cid, now):
-    """A review comment on an open PR (first line `Review of <40 hex>`) as one line; None when not one."""
+    """A review comment on an open PR (first line `Review of <40 hex>`) as one line, or None. A matching line is
+    delivered as one line or dropped, never copied as text. With no PR data (the catch-up read carries none) it is
+    skipped: the webhook delivers it, under the same key `github.reviewcomment:<id>`. The author-lane rule needs the
+    registry and is applied when the item is routed (`_route`)."""
     body = comment.get("body")
-    if not _is_pr(issue) or not isinstance(body, str) or str(issue.get("state") or "open") != "open":
+    first = body.split("\n", 1)[0][:300] if isinstance(body, str) else ""
+    m = REVIEW_COMMENT_RE.match(first)
+    if not m or not _is_pr(issue) or str(issue.get("state") or "open") != "open":
         return None
     if issue.get("merged") or (issue.get("pull_request") or {}).get("merged_at"):
         return None
-    m = REVIEW_COMMENT_RE.match(body.split("\n", 1)[0][:300])
-    if not m:
+    login = _login(comment)
+    if not login:
         return None
-    author, login = _login(issue), _login(comment)
-    if not login or (author and login.lower() == author.lower()):
-        return None
+    signer = signed_by_fleet(body)
     known, lookups = _issue_refs(issue, number)
-    summary = "PR #%d %s %s" % (number, m.group(1)[:12], _review_verdict(body.split("\n", 1)[0][:300]))
-    return GitHubItem("github.reviewcomment:%d" % cid, "github.comment", summary, repo, known, lookups, login, now,
+    who = _one_line(login, REVIEW_NAME_CAP)
+    if signer:
+        who += " (signed %s)" % _one_line(signer, REVIEW_NAME_CAP)
+    summary = "PR #%d %s review comment by %s: %s (a comment, not a recorded verdict)" % (
+        number, m.group(1)[:12], who, _review_verdict(first))
+    item = GitHubItem("github.reviewcomment:%d" % cid, "github.comment", summary, repo, known, lookups, login, now,
                       [number], True)
+    item.review_signer = signer
+    return item
 
 
 def _comment_item(repo, comment, issue, now):
     cid = _id(comment)
     number = _number(issue) or _url_number(comment.get("issue_url"))
-    if cid is None or number is None or signed_by_fleet(comment.get("body")):
+    if cid is None or number is None:
         return None
-    if isinstance(comment, dict):
-        rc = _review_comment_item(repo, comment, issue, number, cid, now)
-        if rc:
-            return rc
+    body = comment.get("body") if isinstance(comment, dict) else None
+    if isinstance(body, str) and REVIEW_COMMENT_RE.match(body.split("\n", 1)[0][:300]):
+        return _review_comment_item(repo, comment, issue, number, cid, now)
+    if signed_by_fleet(body):
+        return None
     known, lookups = _issue_refs(issue, number)
     summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(comment.get("body") or "", 400))
     return GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now,
@@ -11719,6 +11738,20 @@ class GitHubHub:
             owner, routed_by = self.route_of(item, discovery.agents, now)
         except GitHubUnavailable:
             return
+        if item.key.startswith("github.reviewcomment:"):
+            if owner and item.review_signer and _review_lane_member(discovery.agents, item.review_signer, owner):
+                with self.lock:
+                    self.queue.pop(item.key, None)   # the author lane's own review: not delivered
+                return
+            if not owner:
+                with self.lock:
+                    seen_once = item.key in self._unrouted
+                    self._unrouted.add(item.key)
+                    self.queue.pop(item.key, None)
+                if not seen_once:
+                    self._audit("github.reviewcomment.unowned", item.repo, {"key": item.key, "prs": item.numbers[:GITHUB_AUDIT_KEYS],
+                                                                            "note": "no lane owns the pull request; nobody is told"})
+                return
         with self.lock:
             if owner and not item.actionable and routed_by != "closing":
                 # PR 52: an owner found by a new link is told what needs it, not every passing check
