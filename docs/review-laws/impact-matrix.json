@@ -391,7 +391,19 @@
         "bin/report_fold.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
-        "bin/work_sync.py"
+        "bin/work_sync.py",
+        "bin/switchboard/v2_transport.py",
+        "bin/switchboard/facts.py",
+        "bin/switchboard/decisions_a.py",
+        "bin/switchboard/reminders.py",
+        "bin/switchboard/plan_review.py",
+        "bin/switchboard/triage.py",
+        "bin/switchboard/alert_labels.py",
+        "bin/switchboard/handoff.py",
+        "bin/switchboard/audit.py",
+        "bin/switchboard/decision.py",
+        "bin/switchboard/engine.py",
+        "bin/switchboard/jev.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -446,6 +458,144 @@
         "bin/spotlight_guard.py": [
           "settings",
           "validate"
+        ],
+        "bin/switchboard/v2_transport.py": [
+          "V2Breaker",
+          "V2Client",
+          "V2Error",
+          "V2Http",
+          "V2Unreachable",
+          "_V2Unauthorized",
+          "_one_line",
+          "_without",
+          "refuse_real_opencode_under_test",
+          "state_write",
+          "v2_service_file",
+          "valid_description"
+        ],
+        "bin/switchboard/facts.py": [
+          "CpuFacts",
+          "DiskFacts",
+          "FactError",
+          "SpotlightFacts",
+          "disk_free",
+          "disk_guard_settings",
+          "validate_disk_guard"
+        ],
+        "bin/switchboard/decisions_a.py": [
+          "parse_bare_pr_ref"
+        ],
+        "bin/switchboard/reminders.py": [
+          "ReminderError",
+          "ReminderFacts",
+          "_clean_line",
+          "add_reminder",
+          "drop_superseded_item",
+          "found_reason",
+          "merge_wake",
+          "merge_wake_facts",
+          "read_record_file",
+          "read_reminders",
+          "reminders_lock",
+          "remove_reminders",
+          "wake_class_of",
+          "write_reminders"
+        ],
+        "bin/switchboard/plan_review.py": [
+          "ReviewError",
+          "_read_capped"
+        ],
+        "bin/switchboard/triage.py": [
+          "_alert_bad_label",
+          "_alert_bad_repo",
+          "_alert_duplicate_label",
+          "_alert_labels_not_a_list",
+          "_alert_not_a_map",
+          "_alert_repo_not_read",
+          "_check_sla",
+          "parked_until",
+          "read_mark",
+          "triage_awaiting_labels",
+          "triage_says_reviewed",
+          "validate_triage_config",
+          "whole",
+          "whole_skipped"
+        ],
+        "bin/switchboard/alert_labels.py": [
+          "AlertWakeFacts",
+          "RedCiFacts",
+          "TriageFacts"
+        ],
+        "bin/switchboard/handoff.py": [
+          "WorkerFacts",
+          "_Unread",
+          "_boss_of",
+          "_guard_awaiting_issue",
+          "_guard_awaiting_pr",
+          "_guard_ci",
+          "_guard_decision",
+          "_guard_last_report",
+          "_guard_reminder",
+          "_guard_review_requested",
+          "_guard_review_window",
+          "_issue_of",
+          "_label_names",
+          "_owned_issue",
+          "_owned_pulls",
+          "_owned_work_items",
+          "_readable_head",
+          "_readable_time",
+          "_stalled_age",
+          "legitimately_waiting",
+          "owned_readable",
+          "reply_text",
+          "worker_horizon",
+          "worker_owned"
+        ],
+        "bin/switchboard/audit.py": [
+          "AuditLog",
+          "_sensitive",
+          "redact",
+          "utc_now"
+        ],
+        "bin/switchboard/decision.py": [
+          "InterruptRefused",
+          "MessageTooLong",
+          "Plan",
+          "_line_of",
+          "clock_utc",
+          "collapse_riders",
+          "compose",
+          "compose_order",
+          "decide",
+          "describe_items",
+          "hold_reason",
+          "is_withdrawal",
+          "orders_note",
+          "steers_into_turn",
+          "superseded_by"
+        ],
+        "bin/switchboard/engine.py": [
+          "KeyTimes",
+          "LockError",
+          "SentLedger"
+        ],
+        "bin/switchboard/jev.py": [
+          "JevClient",
+          "JevError",
+          "KeyFileError",
+          "ReplayJev",
+          "_canonical",
+          "_checked_jev_settings",
+          "_clip",
+          "_is_probability",
+          "_scrub_provider_text",
+          "_usage_of",
+          "build_jev",
+          "check_answers",
+          "jev_key_file",
+          "locate_jev_key",
+          "validate_jev_config"
         ]
       },
       "dynamic_actions": [

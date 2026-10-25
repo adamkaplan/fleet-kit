@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""derive-closure: derive the clear's closure over the assembled daemon (the entry plus every part of bin/fleet-switchboard.parts).
+
+    derive-closure --check [--floor N] [--root DIR] [--matrix FILE]
+    derive-closure --write [--root DIR] [--matrix FILE]
+
+The closure is the one bin/delegated_clear.py computes (`closure`, from the daemon's roots), over ONE ast.Module made of the module-level
+statements of the entry and of every part, in manifest order. Every part that holds a closure definition is a file of the matrix's
+`closure_files`, and its closure definitions (functions and classes, sorted) are `module_roots[part]` (a part's own statements run at import
+for the clear: any top-level statement edit of a listed part is refused, as for any other module). The entry's own closure_roots,
+closure_files row and roots are never touched. --write rewrites only the lines of the part entries (the file's formatting is kept);
+--check exits 1 and names the part and the definition (missing: in the code, not in the matrix; extra: in the matrix, not in the code).
+Exit 0 ok, 1 differs, 2 usage. Standard library only; nothing of the daemon runs.
+"""
+import argparse
+import ast
+import importlib.util
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+PREFIX = "bin/switchboard/"
+MATRIX = "docs/review-laws/impact-matrix.json"
+
+
+def load_clear(root):
+    spec = importlib.util.spec_from_file_location("delegated_clear", os.path.join(root, "bin", "delegated_clear.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def manifest(root):
+    out = []
+    with open(os.path.join(root, "bin", "fleet-switchboard.parts"), encoding="utf-8") as handle:
+        for line in handle:
+            name = line.strip()
+            if name and not name.startswith("#"):
+                out.append(name)
+    return out
+
+
+def derive(root, rule):
+    """(entry-only closure names, assembled closure names, {part path: sorted closure definitions}, parts in order, (entry, assembled) counts from closure_roots alone).
+    The roots are the ones the clear uses for the daemon file (`daemon_roots`: closure_roots and rating_roots)."""
+    clear = load_clear(root)
+    roots = clear.daemon_roots(rule)
+    dynamic = list(rule.get("dynamic_actions") or [])
+    trees, parts = {}, []
+    for name in manifest(root):
+        rel = "bin/" + name
+        with open(os.path.join(root, "bin", name), encoding="utf-8") as handle:
+            trees[rel] = ast.parse(handle.read(), filename=rel)
+        if rel != rule["daemon_file"]:
+            parts.append(rel)
+    entry = trees[rule["daemon_file"]]
+    whole = ast.Module(body=[n for t in trees.values() for n in t.body], type_ignores=[])
+    entry_names = clear.closure(entry, roots, dynamic)[0]
+    names = clear.closure(whole, roots, dynamic)[0]
+    plain = (len(clear.closure(entry, rule["closure_roots"], dynamic)[0]), len(clear.closure(whole, rule["closure_roots"], dynamic)[0]))
+    per_part = {}
+    for rel in parts:
+        held = {n.name for n in trees[rel].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))} & set(names)
+        if held:
+            per_part[rel] = sorted(held)
+    return set(entry_names), set(names), per_part, parts, plain
+
+
+def load_rule(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)["owner_hold"]["delegated_clear"]
+
+
+def differences(rule, per_part):
+    out = []
+    listed = [f for f in rule["closure_files"] if f.startswith(PREFIX)]
+    roots = {k: v for k, v in rule["module_roots"].items() if k.startswith(PREFIX)}
+    for part in sorted(set(per_part) | set(listed) | set(roots)):
+        if part not in per_part:
+            out.append("%s: extra part in the matrix (it holds no closure definition)" % part)
+            continue
+        if part not in listed:
+            out.append("%s: missing from closure_files" % part)
+        have = set(roots.get(part) or [])
+        for name in sorted(set(per_part[part]) - have):
+            out.append("%s: missing definition %s" % (part, name))
+        for name in sorted(have - set(per_part[part])):
+            out.append("%s: extra definition %s" % (part, name))
+    if listed != [p for p in per_part] :
+        if not out:
+            out.append("closure_files lists the parts in a different order than the manifest")
+    return out
+
+
+def render(text, per_part):
+    """The matrix text with only the part entries replaced."""
+    lines = text.split("\n")
+    # closure_files: drop part lines, append derived ones after the last remaining entry
+    start = next(i for i, l in enumerate(lines) if l == '      "closure_files": [')
+    end = next(i for i in range(start, len(lines)) if lines[i] == "      ],")
+    body = [l for l in lines[start + 1:end] if PREFIX not in l]
+    body = [l.rstrip(",") + "," for l in body[:-1]] + [body[-1].rstrip(",")] if body else body
+    new = ['        "%s"' % p for p in per_part]
+    body = [l.rstrip(",") + "," for l in body] + [n + "," for n in new[:-1]] + new[-1:] if new else [l.rstrip(",") for l in body[:-1]] + [body[-1].rstrip(",")]
+    if new:
+        body = [l if l.endswith(",") else l + "," for l in body[:len(body) - len(new)]] + [n + ("," if i < len(new) - 1 else "") for i, n in enumerate(new)]
+    lines[start + 1:end] = body
+    # module_roots
+    start = next(i for i, l in enumerate(lines) if l == '      "module_roots": {')
+    end = next(i for i in range(start, len(lines)) if lines[i] == "      },")
+    kept, i, block = [], start + 1, lines[start + 1:end]
+    j = 0
+    while j < len(block):
+        if block[j].startswith('        "%s' % PREFIX):
+            while not block[j].startswith("        ]"):
+                j += 1
+            j += 1
+            continue
+        kept.append(block[j])
+        j += 1
+    kept = [l if not l.startswith("        ]") else "        ]," for l in kept]
+    fresh = []
+    for idx, (part, names) in enumerate(per_part.items()):
+        fresh.append('        "%s": [' % part)
+        fresh += ['          "%s"%s' % (n, "," if k < len(names) - 1 else "") for k, n in enumerate(names)]
+        fresh.append("        ]" + ("," if idx < len(per_part) - 1 else ""))
+    if not fresh and kept:
+        kept[-1] = "        ]"
+    lines[start + 1:end] = kept + fresh
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="derive-closure")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--write", action="store_true")
+    ap.add_argument("--root", default=ROOT)
+    ap.add_argument("--matrix", default=None)
+    ap.add_argument("--floor", type=int, default=None, help="--check also fails when the closure from closure_roots over the entry and the parts has fewer definitions than this (a floor: it can only grow)")
+    args = ap.parse_args(argv)
+    matrix = args.matrix or os.path.join(args.root, MATRIX)
+    try:
+        rule = load_rule(matrix)
+        entry_names, names, per_part, parts, plain = derive(args.root, rule)
+    except (OSError, ValueError, KeyError, SyntaxError) as err:
+        print("derive-closure: %s: %s" % (type(err).__name__, err), file=sys.stderr)
+        return 2
+    print("closure definitions: %d over the entry and %d parts (entry alone: %d); %d parts hold one" % (len(names), len(parts), len(entry_names), len(per_part)))
+    print("from closure_roots alone: %d over the entry, %d over the entry and the parts" % plain)
+    if args.write:
+        with open(matrix, encoding="utf-8") as handle:
+            text = handle.read()
+        out = render(text, per_part)
+        json.loads(out)
+        if out != text:
+            with open(matrix, "w", encoding="utf-8") as handle:
+                handle.write(out)
+        return 0
+    diffs = differences(rule, per_part)
+    if args.floor is not None and plain[1] < args.floor:
+        diffs.append("the assembled closure (closure_roots) holds %d definitions, below the floor of %d" % (plain[1], args.floor))
+    for line in diffs:
+        print(line)
+    return 1 if diffs else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

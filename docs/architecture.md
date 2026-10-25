@@ -117,6 +117,10 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_relay_daemon.py` | 5 | the daemon half of the cloud hub relay: pulls pod requests from the hub and runs them with the same rules as the local commands | |
 | `fleet-switchboard` | 6 | the entry: today also every section not yet moved to a part (the assembler, the engine, the commands) | |
 
+## The clear's closure follows the parts
+
+The delegated clear refuses a pull request that changes a definition of "the clear's closure" (`bin/delegated_clear.py`, `closure`). The closure is derived over the assembled daemon: the entry plus every part of `bin/fleet-switchboard.parts`, as one namespace. `tools/derive-closure --write` lists in `docs/review-laws/impact-matrix.json` each part that holds a closure definition (`closure_files`) with those definitions as `module_roots[part]`; `--check` fails in both directions (a name or part missing, a name or part extra) and names the part and the definition. A new part is in by derivation, not by a hand list. `tests/switchboard/test_closure.py` runs the check, pins a floor of 395 definitions for the assembled closure (from `closure_roots`; it can only grow) and keeps the entry's own `closure_roots` as they were. After moving a definition to another part, run `tools/derive-closure --write` in the same pull request. For a listed part, any top-level statement edit is refused, as for every module the clear loads.
+
 ## Known violations
 
 Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7): `namespace` (a part uses names the entry defines: one namespace), `entry-import` (a part relies on an import the entry made), `size` (a file over its limit: the ceiling is in lines), `ambiguous` (a name defined by two units and read by a third), `import` (a unit reaches a higher layer by an import or `load_module`), `cycle` (units of one layer that depend on each other).
