@@ -416,6 +416,11 @@ def aliases_of(tree):
     return out
 
 
+def star_imports(tree):
+    """'from m import *' cannot be resolved by name: the limit, counted so it is reported and never silent."""
+    return [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names)]
+
+
 def resolve(node, aliases):
     """The canonical dotted name of a callee: through import aliases and through getattr(module, 'name')."""
     if isinstance(node, ast.Name):
@@ -575,6 +580,9 @@ def _remove_stmt(parent, stmt):
 
 def mutate(tree, site, how="remove"):
     """The source of a copy of the tree with this site's cleanup removed (how=remove), or reduced to a wait (how=wait). None: no such mutant."""
+    alias, how = how == "alias", ("remove" if how == "alias" else how)   # alias: the remove mutant, with the started call renamed through an alias
+    if alias and site["kind"] not in ("popen", "process", "thread", "helper"):
+        return None
     t = ast.parse(ast.unparse(tree))   # a private copy; the same site is found again by its place among the sites of its kind in the file
     ordinal = [x["line"] for x in SITES if x["file"] == site["file"] and x["kind"] == site["kind"]].index(site["line"])
     target = sorted([x for x in scan_tree(site["file"], t) if x["kind"] == site["kind"]], key=lambda x: x["line"])[ordinal]
@@ -585,8 +593,12 @@ def mutate(tree, site, how="remove"):
         else:   # start(test, argv, port=..., **kw) -> Popen(argv, **kw): no cleanup is registered
             new = ast.Call(func=ast.parse("subprocess.Popen").body[0].value, args=node.args[1:], keywords=[k for k in node.keywords if k.arg != "port"])
         _replace(par[node], node, new)
+        if alias and not _alias_call(t, new, "os.execv" if call_name(node).endswith("exec_stub") else "subprocess.Popen"):
+            return None
     elif kind == "thread" and how == "remove":
         node.keywords = [k for k in node.keywords if k.arg != "daemon"]
+        if alias and not _alias_call(t, node, target["name"]):
+            return None
     elif kind in ("popen", "process"):
         var = target["var"]
         calls = cleanup_calls(target["fn"], var)
@@ -608,12 +620,31 @@ def mutate(tree, site, how="remove"):
                         c.args, c.keywords = [wait], []
                     else:
                         c.func, c.args, c.keywords = wait, [], []
+        if alias and not _alias_call(t, node, target["name"]):
+            return None
     elif kind == "embedded":
         node.value = node.value.replace("%s.stop_group(" % HELPER, "print(" if how == "remove" else "p.wait(")
     else:
         return None
     ast.fix_missing_locations(t)
     return ast.unparse(t)
+
+
+ALIAS = "_alias_start"
+
+
+def _alias_call(t, node, canon):
+    """Rename the started call (node, in tree t) through 'from <module> import <name> as _alias_start'. False: it cannot be aliased."""
+    if "." not in canon or not isinstance(node.func, (ast.Name, ast.Attribute)):
+        return False
+    module, name = canon.rsplit(".", 1)
+    node.func = ast.Name(id=ALIAS, ctx=ast.Load())
+    at = 0
+    while at < len(t.body) and (isinstance(t.body[at], ast.ImportFrom) and t.body[at].module == "__future__"
+                                or at == 0 and isinstance(t.body[at], ast.Expr) and isinstance(t.body[at].value, ast.Constant) and isinstance(t.body[at].value.value, str)):
+        at += 1
+    t.body.insert(at, ast.parse("from %s import %s as %s" % (module, name, ALIAS)).body[0])
+    return True
 
 
 def cleanup_calls_in(call, var):
@@ -631,11 +662,13 @@ def mutable(s, how):
     if s["kind"] == "helper-itself" or s["kind"] == "blocking":
         return False
     if s["kind"] == "embedded":
-        return "stop_group" in s["node"].value
+        return "stop_group" in s["node"].value and how != "alias"   # a string of code has no call to rename
     if s["kind"] == "thread":
-        return how == "remove"
+        return how in ("remove", "alias")
     if s["kind"] == "helper":
-        return how == "remove"
+        return how in ("remove", "alias")
+    if how == "alias":
+        return s["kind"] in ("popen", "process")
     return s["kind"] in ("popen", "process")
 
 
@@ -727,6 +760,20 @@ class TestEverySite(unittest.TestCase):
         want = sum(1 for s in SITES if mutable(s, "remove"))
         self.assertEqual(len({n for n in dir(TestEverySite) if n.startswith("test_mutant_remove_")}), want)
         self.assertEqual(len({n for n in dir(TestEverySite) if n.startswith("test_mutant_wait_")}), sum(1 for s in SITES if mutable(s, "wait")))
+        self.assertEqual(len({n for n in dir(TestEverySite) if n.startswith("test_mutant_alias_")}), sum(1 for s in SITES if mutable(s, "alias")))
+
+    def test_an_aliased_start_is_found_as_a_site(self):
+        for src in ("from subprocess import Popen as start\ndef t():\n    start(['x'])\n", "import subprocess as sp\ndef t():\n    sp.Popen(['x'])\n",
+                    "from subprocess import Popen as P\ndef t():\n    P(['x'])\n", "import subprocess\ndef t():\n    subprocess.Popen(['x'])\n"):
+            sites = scan_tree("cloud/worker/tests/test_x.py", ast.parse(src))
+            self.assertEqual([x["kind"] for x in sites], ["popen"], src)
+        self.assertEqual(scan_tree("cloud/worker/tests/test_x.py", ast.parse("from subprocess import Popen\n")), [])
+
+    def test_a_star_import_is_an_unresolved_limit_and_is_counted(self):
+        tree = ast.parse("from subprocess import *\ndef t():\n    Popen(['x'])\n")
+        self.assertEqual(len(star_imports(tree)), 1)
+        self.assertEqual(scan_tree("cloud/worker/tests/test_x.py", tree), [])   # not found: the documented limit
+        self.assertEqual(sum(len(star_imports(t)) for t in (parse(p) for p in py_files(ROOT)) if t is not None), 0, "a real test uses a star import: the scan cannot see its starts")
 
 
 def _case(s):
@@ -755,7 +802,7 @@ def _mutant_case(s, how):
 for _s in SITES:
     _tag = _tagname(site_name(_s))
     setattr(TestEverySite, "test_site_" + _tag, _case(_s))
-    for _how in ("remove", "wait"):
+    for _how in ("remove", "wait", "alias"):
         if mutable(_s, _how):
             setattr(TestEverySite, "test_mutant_%s_%s" % (_how, _tag), _mutant_case(_s, _how))
 
