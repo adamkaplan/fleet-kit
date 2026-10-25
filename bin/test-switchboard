@@ -2975,6 +2975,7 @@ class TestEachThingOnce(Base):
         src = Path(SWITCHBOARD).read_text()
         self.assertIn('"Blocked agent: " + text, "blocked-agent"', src)
         self.assertIn('"load-alert", "load", text', src)
+        self.assertIn('first=event != "blocked.repeat"', src, "only a repeat is held: the first report and the end line pass")
 
     def test_s10_s11_the_header_is_short_after_the_first_delivery_of_the_day(self):
         long_text = "Intent: " + "x" * 1000
@@ -3011,7 +3012,7 @@ class TestDeliver(Base):
         self.assertEqual(self.pass_()["waiting"], ["platform"])
         self.world.tick(60)
         report = self.pass_()
-        self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:1", "lab.fact:2"]])
+        self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:2", "lab.fact:1"]])
         (admitted,) = self.world.admissions("platform")
         sid = self.world.sessions["platform"]
         self.assertEqual((admitted["resume"], admitted["delivery"]), (True, "queue"))
