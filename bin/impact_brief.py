@@ -167,6 +167,12 @@ def _in_globs(path, globs):
     return False
 
 
+# The exact files CI runs as tests: the `bin/test-*` and `cloud/tests/test-cloud` steps of .github/workflows/test.yml, plus `bin/test-impact-brief` (collected by `bin/test-switchboard`). A test derives the workflow's steps from this list.
+TEST_RUNNERS = frozenset(("bin/test-app-mint", "bin/test-cloud-launcher", "bin/test-cloud-neutral-names", "bin/test-cloud-worker", "bin/test-fleet-doctor", "bin/test-fleet-doctor-config",
+                          "bin/test-fleet-doctor-heartbeat", "bin/test-gh-hold", "bin/test-health-records", "bin/test-heartbeat", "bin/test-impact-brief", "bin/test-switchboard",
+                          "bin/test-workflow-split", "cloud/tests/test-cloud"))
+
+
 def classify(path, top_tier_hits, owner_paths=None):
     """The class of one changed path. `owner_paths` is the matrix's `substance_decider.owner_only_paths` ({class: [globs]}): a path of the clear-and-hold machinery or the merge shim is that owner-only class
     first (so the owner-only classes are reachable from the real path list); else a matrix top tier class it hits, else tests, docs or code by place. A class this module does not know stays unknown (owner)."""
@@ -176,9 +182,12 @@ def classify(path, top_tier_hits, owner_paths=None):
     for cls in sorted(top_tier_hits or {}):
         if path in (top_tier_hits[cls] or []):
             return cls
-    if path.startswith("tests/") or "/tests/" in path or "/test-" in path or path.startswith("bin/test-"):
+    path = str(path)
+    if ".." in path.split("/") or "\\" in path or path.startswith("/"):
+        return "code"   # a hostile name never reads as tests or docs
+    if path.startswith("tests/") or path in TEST_RUNNERS:
         return "tests"
-    if path.startswith("docs/") or path.endswith(".md"):
+    if path.startswith("docs/"):
         return "docs"
     return "code"
 

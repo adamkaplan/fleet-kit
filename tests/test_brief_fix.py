@@ -152,5 +152,45 @@ class TestMutants(unittest.TestCase):
         self.assertEqual(brief_of(ib, [("tests/a.py", 1, 0, "MODIFIED")])["decider"], "chief_of_staff")
 
 
+class TestClassifyRoots(unittest.TestCase):
+    """The tests and docs classes are exact roots, so a hostile name never reads as tests-only or docs-only."""
+    HOSTILE = ("bin/x/test-evil.py", "bin/test-evil.sh", "bin/test-switchboard.sh", "bin/test-switchboard/x", "agents/x.md", "shims/notes.md", "README.md", "a/tests/x.py",
+               "tests/../bin/delegated_clear.py", "tests/../bin/other.py", "docs/../bin/other.py", "docs/../agents/x.md", "../tests/x.py", "Tests/x.py", "Docs/x.md")
+
+    def test_s34_each_root_reads_as_its_class(self):
+        for path in ("tests/a.py", "tests/sub/b.txt", "docs/a.md", "docs/sub/b.txt"):
+            self.assertEqual(ib.classify(path, {}, OWNER_PATHS), "tests" if path.startswith("tests") else "docs", path)
+        for path in sorted(ib.TEST_RUNNERS):
+            self.assertEqual(ib.classify(path, {}, OWNER_PATHS), "tests", path)
+
+    def test_s34_a_hostile_name_is_never_tests_or_docs(self):
+        for path in self.HOSTILE:
+            self.assertNotIn(ib.classify(path, {}, OWNER_PATHS), ("tests", "docs"), path)
+            b = brief_of(ib, [(path, 5, 0, "ADDED")])
+            self.assertNotIn("tests-only", b["text"], path)
+            self.assertNotIn("docs-only", b["text"], path)
+        self.assertEqual(ib.classify("tests/../bin/delegated_clear.py", {}, OWNER_PATHS), "clear_machinery")
+
+    def test_s34_the_runner_list_is_what_the_workflow_runs(self):
+        text = (ROOT / ".github/workflows/test.yml").read_text()
+        ran = set(re.findall(r"^\s+((?:bin|cloud/tests)/test-[a-z0-9-]+)\s*(?:2>&1.*)?$", text, re.M))
+        self.assertTrue(ran)
+        self.assertEqual(ran - ib.TEST_RUNNERS, set())
+        for path in ib.TEST_RUNNERS:
+            self.assertTrue((ROOT / path).is_file(), path)
+
+    def test_s34_a_substring_match_mutant_fails(self):
+        m = mutant('if path.startswith("tests/") or path in TEST_RUNNERS:', 'if path.startswith("tests/") or "/test-" in path or path.startswith("bin/test-"):')
+        self.assertEqual(m.classify("bin/x/test-evil.py", {}), "tests")
+        self.assertEqual(m.classify("bin/test-evil.sh", {}), "tests")
+        self.assertEqual(ib.classify("bin/x/test-evil.py", {}), "code")
+        self.assertEqual(ib.classify("bin/test-evil.sh", {}), "code")
+        d = mutant('if path.startswith("docs/"):', 'if path.startswith("docs/") or path.endswith(".md"):')
+        self.assertEqual(d.classify("agents/x.md", {}), "docs")
+        self.assertEqual(ib.classify("agents/x.md", {}), "code")
+        e = mutant('if ".." in path.split("/") or "\\\\" in path or path.startswith("/"):', 'if False:')
+        self.assertEqual(e.classify("tests/../bin/other.py", {}), "tests")
+
+
 if __name__ == "__main__":
     unittest.main()
