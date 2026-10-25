@@ -732,13 +732,18 @@ def _token_refusal(err):
     return "the cluster token could not be obtained (%s): %s" % (why, VAULT_CHECK)
 
 
-def cluster_token(env=None, now=None, recovery=None, timeout=TOKEN_CMD_SECONDS):
+def cluster_token(env=None, now=None, recovery=None):
     """A cluster token of at most one hour, minted NOW, in memory. CW_CLUSTER_TOKEN_CMD (a command that prints one), else the default: the cluster
     administrator kubeconfig is read from the vault (CW_CLUSTER_ADMIN_CMD, else `az keyvault secret show` with CW_VAULT_SUBSCRIPTION and
     CW_VAULT_NAME) and `kubectl create token cw-operator --duration=20m` is run with it on a pipe. Nothing is cached or kept. A failure is a
     Refusal that names the vault pre-check; no other credential or context is ever tried. With `recovery` (launch only), a vault read refused for
     the firewall runs the vault access check once and reads once more. The route itself is the launcher's own function (the reaper's refresh
-    runs the same one): this is the thin caller that keeps the wording and the recovery. `timeout` bounds each command of the mint (the status summary's bound)."""
+    runs the same one): this is the thin caller that keeps the wording and the recovery."""
+    return _cluster_token_bounded(env, now, recovery, TOKEN_CMD_SECONDS)
+
+
+def _cluster_token_bounded(env, now, recovery, timeout):
+    """The same mint as `cluster_token`, with `timeout` bounding each command of it (the status summary's bound; the launch entry passes the default)."""
     env = dict(os.environ if env is None else env)
     try:
         return _lib().cluster_token(env, duration=_duration(env), capture=lambda argv, env=None, feed=None: _capture(argv, env=env, feed=feed, timeout=timeout), now=now, recovery=recovery)
@@ -862,7 +867,7 @@ class Cluster:
                 raise Refusal("CW_CLOUD_SERVER is not set: no cluster to reach; nothing was changed")
             root = private_root()
             sweep_stale(root)
-            token = cluster_token(recovery=self.recovery, timeout=self.timeout)
+            token = _cluster_token_bounded(None, None, self.recovery, self.timeout)
             self.add(token)
             self.dir = tempfile.mkdtemp(prefix="cmd-%d-" % os.getpid(), dir=str(root))
             self.server = server
