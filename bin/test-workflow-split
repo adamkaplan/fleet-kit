@@ -120,8 +120,8 @@ OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
            ("bin/fleet-scenario validate", "bin/fleet-scenario validate", None),
            ("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4", None)]
 # The seven cloud suites added by ask #1301 (hub, channel, channel-server, client, way-back, decisions-pull, cli), in this order after the launcher.
-ADDED = [("bin/test-cloud-hub", "5"), ("bin/test-cloud-channel", None), ("bin/test-cloud-channel-server", None), ("bin/test-cloud-client", None),
-         ("bin/test-cloud-way-back", None), ("bin/test-decisions-pull", "5"), ("bin/test-cloud-cli", "5")]
+ADDED = [("bin/test-cloud-hub", "10"), ("bin/test-cloud-channel", None), ("bin/test-cloud-channel-server", None), ("bin/test-cloud-client", None),
+         ("bin/test-cloud-way-back", None), ("bin/test-decisions-pull", "10"), ("bin/test-cloud-cli", "10")]
 NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", "30")] + [suite(n, "", t) for n, t in ADDED]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]

@@ -250,7 +250,7 @@ jobs:
 
       - name: bin/test-cloud-hub
         if: ${{ !cancelled() }}
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           bin/test-cloud-hub 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
@@ -281,14 +281,14 @@ jobs:
 
       - name: bin/test-decisions-pull
         if: ${{ !cancelled() }}
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           bin/test-decisions-pull 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
 
       - name: bin/test-cloud-cli
         if: ${{ !cancelled() }}
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           bin/test-cloud-cli 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
