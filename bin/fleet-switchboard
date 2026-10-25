@@ -10911,6 +10911,7 @@ def decisions_from_github(engine, now):
     agents = engine.discovery.agents if engine.discovery is not None else {}
     items = []
     budget = [PLAN_KIND_READS_PER_REFRESH]
+    kinds = GitHubHub.plan_kinds(hub, records, budget)
     for record in records:
         numbers = [record["number"]] + ([record["parent"]] if record.get("parent") else [])
         items.append({"kind": "issue", "title": record["title"] or "issue #%d" % record["number"],
@@ -10920,7 +10921,7 @@ def decisions_from_github(engine, now):
                       "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
                       "parent": record.get("parent"), "closed": bool(record.get("closed")),
                       "waits_for": record.get("waits_for") or [],
-                      "plan_kind": hub.plan_kind(record["repo"], record["number"], budget)})
+                      "plan_kind": kinds[(record["repo"], record["number"])]})
     return items, problems
 
 
@@ -16189,6 +16190,17 @@ class GitHubHub:
         with self.lock:
             self._cache[key] = (now + GITHUB_LOOKUP_TTL, data)
         return data
+
+    def plan_kinds(self, records, budget):
+        """{(repo, number): kind} for the records, spending `budget` on never-read issues FIRST and on retries (an expired entry, e.g. a
+        persistent failure) last, so retries cannot starve rows that were never read (#1094)."""
+        def seen(r):
+            with self.lock:
+                return ("plan-kind", plan_ledger.normal_repo(r["repo"]), r["number"]) in self._cache
+        out = {}
+        for r in sorted(records, key=seen):
+            out[(r["repo"], r["number"])] = self.plan_kind(r["repo"], r["number"], budget)
+        return out
 
     def plan_kind(self, repo, number, budget=None):
         """"plan", "noplan" or "unknown" for an issue: whether a comment of it is the plan comment (the reading `plan check` uses,

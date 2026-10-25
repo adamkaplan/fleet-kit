@@ -1165,6 +1165,29 @@ Reads and caches of the panel path (each has a bound, a test and a mutant in `Te
 | reads per refresh (`decisions_from_github`) | `PLAN_KIND_READS_PER_REFRESH` = 10 | test_a_refresh_makes_at_most_the_cap_of_reads | cap removed |
 | `GitHubHub._cache` plan-kind keys | `PLAN_KIND_CACHE_MAX` = 512 | test_the_cache_is_bounded | eviction removed |
 
+Budget order (#1094): within a refresh the 10 new reads go to never-read issues first and to retries (an expired entry, e.g. a persistent failure) last, so failing rows cannot starve rows never read. Known limits: the width test (`the mark's cells are taken from the row width`) is a heuristic and allows `ROW_WIDTH + 2`; the cache evicts by expiry (earliest first), not strict LRU.
+
+Mutants of this PR, run by hand (killed = a test fails):
+
+| mutant | tests | result |
+| --- | --- | --- |
+| `paginate=True` on the comments read | TestPlanKind | killed |
+| `per_page=100` removed | TestPlanKind | killed |
+| full-page check removed | TestPlanKind | killed |
+| plan read as "noplan" | TestPlanKind | killed |
+| a plan in the issue body counts (reads the record) | TestPlanKind | killed |
+| failure cached for the full ttl | TestPlanKind | killed |
+| per-refresh cap removed | TestPlanKind | killed |
+| cache eviction removed | TestPlanKind | killed |
+| retries served before never-read rows | TestPlanKind | killed |
+| no cache write | TestPlanKind | killed |
+| same emoji for all kinds | kind.test.mjs | killed |
+| plan marked as noplan | kind.test.mjs | killed |
+| unknown shown as noplan | kind.test.mjs | killed |
+| emoji dropped from entry / row / wrapped row (3) | kind.test.mjs | killed |
+| `MARK_CELLS` = 0 | kind.test.mjs | killed |
+| pull request row not read as pr | kind.test.mjs | killed |
+
 **Clicking a row (issue 66).** A decision row links to its issue (`https://github.com/<repo>/issues/<ask>`, for an
 issue decision, a report with an issue number and a batch) and a heads-up row to its PR
 (`https://github.com/<repo>/pull/<number>`); a row with no repo or no number has no link and behaves as before. The

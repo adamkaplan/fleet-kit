@@ -44416,8 +44416,8 @@ class TestDecisionsPlugin(Base):
         self.assertEqual(view["rows"], [])
         (group,) = view["groups"]  # these two carry no repo: one group
         first, second = group["entries"]
-        self.assertEqual((first["head"], first["lines"]), ("#2ab 12m", ["Close #2? and a second deploy run?"]))
-        self.assertEqual(second["head"], "platform-481 45s")
+        self.assertEqual((first["head"], first["lines"]), ("❔ #2ab 12m", ["Close #2? and a second deploy run?"]))
+        self.assertEqual(second["head"], "❔ platform-481 45s")
         self.assertEqual(len(second["lines"]), 2)  # at most two lines, whatever the title
         self.assertTrue(second["lines"][-1].endswith("\u2026"))
         self.assertTrue("".join(second["lines"]).replace(" ", "").startswith("permission:shellxxxx"))
@@ -44435,7 +44435,7 @@ class TestDecisionsPlugin(Base):
         start = lines.index("Cleanup of stale issues (2 rows)")
         self.assertEqual(lines[start:start + 5], ["Cleanup of stale issues (2 rows)", "web#7: close it",
                                                   "web#9: close as duplicate of web#7", "and also label the other issue",
-                                                  "api#101 2h"])
+                                                  "❔ api#101 2h"])
         self.assertTrue(all(len(line) <= 34 for line in lines))
 
     def test_wrapping_keeps_every_word_and_breaks_an_over_long_word_hard(self):
@@ -44459,11 +44459,11 @@ class TestDecisionsPlugin(Base):
         self.assertEqual(lines[0], "Decisions (3) for you")
         heavy = "\u2501" * 34
         self.assertEqual(lines.count(heavy), 2)  # above the section and between the repos
-        self.assertEqual(lines[1:7], [heavy, "Waits on you (3)", "acme/api", "api only", "api#1 3m", heavy])
+        self.assertEqual(lines[1:7], [heavy, "Waits on you (3)", "acme/api", "api only", "❔ api#1 3m", heavy])
         self.assertEqual(lines[7:9], ["acme/web", "older web"])
         self.assertEqual(lines[9], "q" * 33 + "\u2026")  # two lines, then an ellipsis
-        self.assertEqual(lines[10:13], ["web#2 50m", "\u2504" * 34, "newer web"])  # a thin rule between entries
-        self.assertEqual(lines[13], "web#9 5m")
+        self.assertEqual(lines[10:13], ["❔ web#2 50m", "\u2504" * 34, "newer web"])  # a thin rule between entries
+        self.assertEqual(lines[13], "❔ web#9 5m")
 
     def test_a_file_older_than_the_stale_bound_is_not_current_and_says_so(self):
         self.assertEqual((self.r["staleStatus"], self.r["edge"]), ("stale", "ok"))
@@ -44478,7 +44478,7 @@ class TestDecisionsPlugin(Base):
     def test_unreadable_sources_are_said_and_junk_entries_are_skipped(self):
         self.assertEqual(self.r["errorsView"]["rows"][-1]["text"], "1 source(s) unreadable")
         (group,) = self.r["junkView"]["groups"]
-        self.assertEqual([(e["head"], e["lines"]) for e in group["entries"]], [("#1 ?", ["fine"])])
+        self.assertEqual([(e["head"], e["lines"]) for e in group["entries"]], [("❔ #1 ?", ["fine"])])
 
     def test_ages_read_the_same_as_the_command_prints_them(self):
         self.assertEqual(self.r["ages"], ["0s", "59s", "1m", "11m", "59m", "1h", "1h05m", "2h", "23h59m", "1d", "3d", "0s"])
@@ -46648,8 +46648,8 @@ console.log(JSON.stringify([entryOf(d, now), entryOf({ ...d, id: "api#2", repo: 
         done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
         long_e, short_e = json.loads(done.stdout.strip().splitlines()[-1])
-        self.assertEqual(long_e["head"], "acme/site#2ab 1m")
-        self.assertEqual(short_e["head"], "api#2 1m")
+        self.assertEqual(long_e["head"], "❔ acme/site#2ab 1m")
+        self.assertEqual(short_e["head"], "❔ api#2 1m")
         self.assertEqual(len(long_e["lines"]), 2)  # two lines at most, the second ending in an ellipsis
         self.assertTrue(long_e["lines"][1].endswith("\u2026"))
         self.assertTrue(all(len(x) <= 34 for x in long_e["lines"]))
@@ -63573,7 +63573,39 @@ class TestPlanKind(unittest.TestCase):
         self.assertEqual(self.kind(self.hub(full[:99])[0]), "plan")
 
     def test_a_plan_in_the_body_reads_noplan(self):
-        self.assertEqual(self.kind(self.hub([{"id": 1, "body": "hi"}])[0]), "noplan")   # the ask says a plan COMMENT; the body is not read
+        body = "## Plan (scenarios)\n\nx"
+
+        def answers(path):
+            return {"body": body} if path.endswith("/issues/1") else [{"id": 1, "body": "hi"}]
+        hub, calls, t = self.hub(answers)
+        self.assertEqual(self.kind(hub), "noplan")   # the ask says a plan COMMENT; a plan-looking BODY does not count
+
+    def test_every_row_is_read_over_several_refreshes(self):
+        hub, calls, t = self.hub([])
+        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
+        records = [{"repo": "acme/api", "number": n} for n in range(60)]
+        for _ in range(7):
+            sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
+        self.assertEqual(len(calls), 60)
+        kinds = sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
+        self.assertEqual(set(kinds.values()), {"noplan"})
+
+    def test_never_read_rows_are_served_before_retries(self):
+        bad = set(range(11))
+
+        def answers(path):
+            n = int(path.split("/issues/")[1].split("/")[0])
+            return sb.GitHubUnavailable("x") if n in bad else []
+        hub, calls, t = self.hub(answers)
+        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
+        records = [{"repo": "acme/api", "number": n} for n in range(11)]
+        sb.GitHubHub.plan_kinds(hub, records, [10])
+        t[0] += sb.GITHUB_LOOKUP_RETRY + 1
+        records += [{"repo": "acme/api", "number": n} for n in range(100, 105)]
+        calls.clear()
+        kinds = sb.GitHubHub.plan_kinds(hub, records, [10])
+        for n in range(100, 105):
+            self.assertEqual(kinds[("acme/api", n)], "noplan")
 
     def test_one_page_one_call_no_pagination(self):
         hub, calls, t = self.hub([])
