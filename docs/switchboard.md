@@ -4453,6 +4453,12 @@ A proof is bound to the head it was recorded at. A tester's, live check's or rev
 
 A carry is ONE ledger line of its own, kind `carried`, with the fields `proof` (the sequence number of the row), `scenario`, `old_head`, `new_head` and `facts` (`named_files_untouched`, `difference`, `ci`). The original proof row is never changed. `gates` shows the proof as carried, with the head it was recorded at. A proof that names no file is never carried; a proof whose named file is touched is void as before; proofs proven by CI are re-recorded by the daemon at each green head and are never carried. A carry never turns a proof into one for a head that fails any condition. The decision is `plan_ledger.carry_decision`; `fleet-switchboard`'s `carry_proofs` writes the lines from `carry_head_facts`. Reverting leaves the lines readable and ignored.
 
+The step that carries is `gates ci-record` (and the daemon's own recording of the `ci` verdicts, the same code): at a green head it carries, from the previous head, each proof the rule allows, one `carried` line each and never two for the same proof, old head and new head. A proof the rule refuses stays void and the step prints why, one line each (`not carried ...`). `gates <pr>` shows the carried line (`carried: row #N recorded at <head>, held here by carried line #M`), and the line itself is in the plan ledger. A `carried` line counts as evidence only for the plan hash it names.
+
+Two passes cannot write the same carry twice: the check "already carried" is made again under the ledger lock. The step runs whether or not the plan has a `ci` scenario. The facts of the diff are refused when they cannot be trusted: a compare of 300 files or more (GitHub's cap, a named file may be missing) reads "the diff is too large to judge", and a new head that is not a descendant of the old head (compare status other than `ahead` or `identical`: a force-push or rewind) is refused with that status named. A read that fails prints one line and writes an audit line `gate.ci_record_carry` (the pull request, both heads, the read); there is no retry in the step, the next pass retries by itself.
+
+Limits, stated: the carry line has no actor (it is derived from GitHub facts only). `previous_head_of` takes the newest row's head, so a proof at A with a newer row at B is not carried to C (conservative). The refusal branch for "CI not green" costs a few reads per pass (bounded).
+
 ## The merge gate and the merge lock: the fleet's own merge queue (#962)
 
 **It is the fleet's own merge queue.** Two pull requests that were each green against an older default branch can merge minutes apart and fail together (the
@@ -5585,6 +5591,31 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - **D3**: batch size against the review checkout's limits. Recommendation: cap a batch at what the checkout accepts, and split a larger one.
 - **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration` (and a `push` run of CI on `integration`; pull requests into it already run CI, as the workflow has no branch filter); a report of merges into `integration` while a batch is ready.
 
+## Cloud watch
+
+Cloud workers are outside discovery: `Engine.discover` builds observations only from the multiplexer's agent entries, and a cloud worker has no pane and no local session. Its records live in the cloud record directory, which only `status` and the reaper read. One `cloud_watch_tick` in `finish_pass` (the daemon's existing per-pass step, no new process or thread) reads those records each pass, under try/except like its sibling ticks (a failure is audited with step `cloud-watch`).
+
+Reads are bounded and never block. Every file is opened with `O_RDONLY|O_NONBLOCK|O_NOFOLLOW` and read only when `fstat` says it is a regular file (a FIFO named `x.json` cannot hang the pass). The tick is read-only (no write, process, network or remove call) and leaves its result on `engine.cloud_watch`. Reading starts after the last name examined in the previous pass (a cursor, wrapping round), so every record gets a turn. When a bound stops a pass, one audit line `cloud-watch.capped` names the bound and the skipped counts, once per episode (not an error). Relaying a cloud worker's report to its lane (#1020) shares this tick instead of adding a second read.
+
+Bounds: 50 valid records, 200 files examined, 64 KiB per file, 1 s monotonic per tick (`bound` is `records`, `files` or `time`). The result also holds `skips`, a count per kind. Tests are in `TestCloudWatchBounds` (one test and one mutant each; the mutant is the source with the named change, and the test fails on it).
+
+| Entry kind or bound | Skip kind / bound | Test | Mutant |
+|---|---|---|---|
+| name rejected by `valid_name` | `bad_name` | each_kind_is_skipped_and_counted | (counted before any open) |
+| directory | `not_regular` | each_kind_is_skipped_and_counted | (read fails, same kind) |
+| FIFO, no writer | `not_regular` | mutant_plain_open_hangs_on_a_fifo, each_kind | plain `open` without `O_NONBLOCK`; no `S_ISREG` check |
+| symlink | `symlink` | each_kind_is_skipped_and_counted | no `O_NOFOLLOW` |
+| over 64 KiB | `too_large` | each_kind_is_skipped_and_counted | no size check |
+| not UTF-8 | `not_utf8` | each_kind_is_skipped_and_counted | decode error not caught |
+| not JSON | `not_json` | each_kind_is_skipped_and_counted | kind mislabelled |
+| JSON that is not an object | `wrong_shape` | each_kind_is_skipped_and_counted | no shape check |
+| nested too deep | `too_deep` | each_kind_is_skipped_and_counted | recursion error not caught |
+| 50 valid records | `records` | record_bound_names_records | no record cap |
+| 200 files examined | `files` | files_examined_bound_with_more_bad_files_than_the_bound | no file cap |
+| 1 s monotonic | `time` | time_bound_stops_and_says_so | no deadline |
+| start rotates | cursor | rotation_gives_every_record_a_turn | no cursor |
+| no write/process/network/remove; audit once | - | tick_makes_no_write_process_network_or_remove_call | a recorded forbidden call fails the test |
+
 ## The assembler (#1092, slice S1)
 
 `bin/fleet-switchboard` builds the daemon's one module namespace from the manifest `bin/fleet-switchboard.parts`: one part path per line, relative to the entry's real path (symlinks resolved), `#` for comments.
@@ -5598,6 +5629,7 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - Slice S3 moved the v1 import converter (the `import-v1` section: the converter, the v2 shape checker and the command) to `switchboard/import_v1.py`, text unchanged, listed after the entry. Statements of that section stay in the entry, in place: `V1_MOVE_DEFAULTS` with the `DEFAULTS.update(V1_MOVE_DEFAULTS)` line (import time reads it, and the key order of `DEFAULTS` is as it was), `V1_LIST_PAGE`, `validate_v1_move_config`, `_v2_session_import` and `_v2_session_list_page` (the clear's closure reads them; they move with the clear batch, S13). No statement outside the section reads a moved name at import time (an ast check, run when the part was cut).
 - Slice S4 moved the decisions code (the escalated-request, PR-notice, order-notice and external-decision sections) to `switchboard/decisions_a.py` and `switchboard/decisions_b.py`, text unchanged, listed after the entry. 44 statements of those sections stay in the entry, in place, because the clear's closure reads them (`resolve_boss`, `boss_name`, `parse_pr_ref`, `read_pr_notices`, `read_pr_facts`, `read_pr_json`, `pr_marker`, `pr_hold_reasons`, `read_decisions_file`, `validate_order_burst` and what they read); they move with the clear batch (S13). The registry inventory (`docs/agent-registry.md`) names the part files for the readers that moved.
 - Slice S5 moved three whole sections no open pull request touched, each one job, to `switchboard/reminders.py` (the reminders file, `remind`, checkpoint reminders), `switchboard/plan_review.py` (`plan review`, slice R2) and `switchboard/pr_explain.py` (`pr-explain` and the held-body checks), text unchanged, listed after the entry. The waiting-on-the-person sweep and the triage code stay in the entry until the pull requests that edit them have merged. `tools/arch-part-cut` makes the cut and `tools/arch-split-check` proves it.
+- Slice S6 moved the daemon's core sections no open pull request touched and no test reads from the entry, one job each, to `switchboard/audit.py` (the audit log), `switchboard/v2_transport.py` (the OpenCode v2 client and its HTTP transport), `switchboard/facts.py` (the fact sources), `switchboard/decision.py` (the delivery decision), `switchboard/engine.py` (the engine) and `switchboard/jev.py` (the Jev client and the classifier), text unchanged. `v2_transport.py` and `facts.py` are listed right after the entry because earlier parts read their classes when they load. The event feed, the policy judge's questions and shadow mode, the heavy-reader budget block and the blocked-agent report stay in the entry.
 
 ## Running with no terminal multiplexer (#1072)
 
