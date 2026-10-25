@@ -42292,7 +42292,8 @@ class TestImpactHold(LedgerBase):
             if not more:
                 break
             on_path |= more
-        path = (on_path & set(from_main)) | touching | {x.id for fn in ("main", "private_parser") for x in ast.walk(defs[fn]) if isinstance(x, ast.Name) and x.id in defs}   # what main and the private parser name themselves
+        clear_dispatchers = {n for n, node in defs.items() if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Name) and x.id == "cmd_impact_clear" for x in ast.walk(node))}   # the clear's own entry: the definition that names it (`cmd_impact`) runs it, though `main` reaches it only by the string "cmd_" + action, which the walker follows for the rating's action only
+        path = (on_path & set(from_main)) | clear_dispatchers | touching | {x.id for fn in ("main", "private_parser") for x in ast.walk(defs[fn]) if isinstance(x, ast.Name) and x.id in defs}   # what main and the private parser name themselves
         handing = {c.func.id for n in path if n in defs for c in ast.walk(defs[n]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in defs and any(k.arg is None for k in c.keywords)}   # what the path hands the handler's arguments to (`call_command(handler, **available)`)
         return path | handing, daemon, rule
 
@@ -42309,7 +42310,7 @@ class TestImpactHold(LedgerBase):
             with self.subTest(root=root):
                 rest = dict(rule, rating_roots=[r for r in rule["rating_roots"] if r != root])
                 lost = sorted(n for n in derived if n not in module.closure(daemon, module.daemon_roots(rest), dynamic)[0])
-                self.assertEqual(lost, [], "%s is also reached by name from another root (main), so the list names it explicitly to hold it if that path changes" % root) if root != "main" else self.assertNotEqual(lost, [], "main is the root the others are reached from")
+                self.assertEqual(lost, [], "%s is also reached by name from another root (main), so the list names it explicitly to hold it if that path changes" % root) if root not in ("main", "cmd_impact") else self.assertNotEqual(lost, [], "main and cmd_impact are roots no other root reaches by name: without them the path leaves the closure; the others are reached from")
         self.assertTrue({"code_snapshot", "code_replaced", "direct_command", "private_parser", "add_impact_parsers"} <= derived & set(rule["rating_roots"]), "the guard main runs is a derived root (the definitions main names itself)")
         hand_list = "RATING_PATH" + "_FUNCTIONS"   # the hand-kept list of the old guard: gone, nothing to pin
         self.assertEqual([f.name for f in list((REPO / "bin").glob("*")) + list((REPO / "docs").glob("*.md")) if f.is_file() and f.name != "test-switchboard" and hand_list in f.read_text(errors="replace")], [])
@@ -42981,7 +42982,7 @@ class TestImpactHold(LedgerBase):
 
     # The vocabulary of a registrar (ONE table, #924): everything else is a finding. A registrar sets up ITS OWN parsers: it reads its own parameter (`sub`), the names it binds itself, literals, and the names below.
     REGISTRAR_VALUES = frozenset({"AGENTS_VERIFY_TIMEOUT", "BATCH_ROWS_MAX", "BLOCK_TABLE_TEXT", "CHARTER_HELP", "COS_WORKSPACE_LABEL", "DAEMON_HEALTH_WAIT", "DECISIONS_STALE_SECONDS", "IMPACT_RATING_FIELDS", "MEASURE_SCAN_MAX", "ORDERS_HEADING",
-                                  "ORDER_MAX_CHARS", "PROG", "REPORT_MAX", "REPORT_STATES", "add_decision_list_flags", "float", "int", "issue_arg"})   # constants and converters the registrars read
+                                  "ORDER_MAX_CHARS", "PROG", "REPORT_MAX", "REPORT_STATES", "RESUME_COMMAND", "RESUME_REASON", "RESUME_SECONDS", "add_decision_list_flags", "float", "int", "issue_arg"})   # constants and converters the registrars read
     REGISTRAR_MODULES = frozenset({"argparse", "plan_ledger", "scenario"})   # modules: only `Name.UPPER_CASE_CONSTANT` is read from them (`argparse.SUPPRESS`), never anything else, never the name alone
     REGISTRAR_ATTRIBUTES = frozenset({"add_argument", "add_parser", "add_subparsers", "add_mutually_exclusive_group", "add_argument_group", "set_defaults", "replace", "split", "join", "format", "default", "dest", "nargs"})   # what a registrar calls or reads on its own objects
 
@@ -43097,6 +43098,46 @@ class TestImpactHold(LedgerBase):
 
     RAW_SPELLINGS = (("the exact tokens", []), ("an abbreviated subcommand", ["cle"]), ("a double dash after the command", ["--"]), ("an unknown flag", ["--zz"]), ("a help flag first", ["-h"]),
                      ("a capitalised subcommand", ["Clear"]))
+
+    def traced_daemon_definitions(self, *argv):
+        """The module-level definitions of the daemon file that RUN (a real call, observed by the interpreter) while the real `main` runs `argv`: (names, the run's exit code)."""
+        import ast
+        path = os.path.realpath(sb.__file__) if hasattr(sb, "__file__") else None
+        defs = {(n.name, min([n.lineno] + [d.lineno for d in n.decorator_list])) for n in ast.parse(self.real_source()).body if isinstance(n, ast.FunctionDef)}   # name AND line: a method of the same name is not the definition
+        seen = set()
+        def profile(frame, event, arg):
+            code = frame.f_code
+            if event == "call" and (code.co_name, code.co_firstlineno) in defs and os.path.realpath(code.co_filename) == path:
+                seen.add(code.co_name)
+        sys.setprofile(profile)
+        try:
+            code, out, err = self.run_as(*argv)
+        finally:
+            sys.setprofile(None)
+        return seen, code, err
+
+    def test_the_derived_closure_is_a_superset_of_the_run_time_trace_of_the_clear_and_the_record(self):
+        """The contract (the Chief of Staff's ruling): the closure DERIVED from the code is never smaller than what the clear and the record really run. The real `main` runs `impact clear` and `review record`, the interpreter reports every
+        daemon-file definition that was called, and each must be in the derived closure of the matrix's roots. A mutant that drops a traced definition from the closure fails this."""
+        import ast
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        module = sb.load_module("delegated_clear")
+        tree = ast.parse(self.real_source())
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        cleared, code, err = self.traced_daemon_definitions("cos", "impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity")
+        self.assertEqual(code, 0, err)
+        self.record_pr_setup()
+        self.world.add_agent("rev", fleet={"role": "reviewer"}) if "rev" not in self.world.sessions else None
+        recorded, code, err = self.traced_daemon_definitions("rev", "review", "record", self.PR, *self.RATING_FLAGS, *self.EXPLICIT)
+        self.assertEqual(code, 0, err)
+        traced = cleared | recorded
+        self.assertTrue({"main", "cmd_impact", "cmd_review", "direct_command", "private_parser"} <= traced, sorted(traced))
+        derived = lambda names: set(module.closure(tree, names, rule["dynamic_actions"])[0])
+        closure = derived(module.daemon_roots(rule))
+        self.assertEqual(sorted(traced - closure), [], "the derived closure must contain every definition the clear and the record really run")
+        for dropped in sorted(traced & closure)[:]:   # the mutant: the closure without one traced definition is smaller than the trace, and the same comparison fails
+            with self.subTest(mutant_drops=dropped):
+                self.assertEqual(sorted(traced - (closure - {dropped})), [dropped], "a closure that dropped %s is smaller than the trace and must fail" % dropped)
 
     def test_no_spelling_of_the_clear_or_the_record_runs_in_a_process_where_a_registrar_ran(self):
         """#924 rev 4, the spelling table: for each spelling of the two commands (derived by running the real full parser over it), the outcome is a direct run with no registrar called, a usage error, or the refusal, never the command after a registrar."""

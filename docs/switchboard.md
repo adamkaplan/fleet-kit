@@ -4856,6 +4856,7 @@ A flag or subcommand of any command other than `review record` and `impact clear
 | `add_review_parsers` | registers the flags of review record, the rating's own flag set |
 | `build_parser` | the wiring: the registrar loop that makes add_review_parsers exist and the set of commands dispatch may run (the other commands are registered outside it, in add_core_parsers, so a flag of another command is not on the clear's path) |
 | `call_command` | calls the handler with the arguments it names |
+| `cmd_impact` | routes `impact` to `impact clear` (and its sibling impact commands) and refuses the clear in a process where a registrar ran: the dispatcher of the clear, which nothing else reaches by name |
 | `cmd_review` | writes the record: the rating path |
 | `code_replaced` | compares the two snapshots: a registrar that replaced any function or class stops the command, for every action |
 | `code_snapshot` | takes the snapshot of every function and class main runs by, before the registrars run and after |

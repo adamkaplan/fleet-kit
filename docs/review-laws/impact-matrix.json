@@ -439,6 +439,7 @@
         "review"
       ],
       "rating_roots": [
+        "cmd_impact",
         "add_review_parsers",
         "build_parser",
         "call_command",
@@ -467,6 +468,7 @@
         "dispatch": "chooses and calls the command's handler",
         "resolve_command": "maps the action to its cmd_ function",
         "call_command": "calls the handler with the arguments it names",
+        "cmd_impact": "routes `impact` to `impact clear` (and its sibling impact commands) and refuses the clear in a process where a registrar ran: the dispatcher of the clear, which nothing else reaches by name",
         "cmd_review": "writes the record: the rating path",
         "parse_review_block": "parses the reviewer's returned block into the rating"
       },
