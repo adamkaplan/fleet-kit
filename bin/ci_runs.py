@@ -164,11 +164,16 @@ def _attempt(entry):
     return int(found.group(1)) if found else 0
 
 
+def _order(entry, run):
+    """Order of runs of one workflow: created_at (or the start time), then run attempt, then run id. A missing time is "" (the old rule)."""
+    t = entry.get("created_at") or entry.get("createdAt") or entry.get("started_at") or entry.get("startedAt") or ""
+    return (t if isinstance(t, str) else "", _attempt(entry), run)
+
+
 def latest_runs(rollup, repo=None):
     """`rollup` without the checks of an OLDER run of a workflow. A workflow is its STABLE identity (the workflow id read from the run), never
     its display name (the PR author writes that: a second workflow could take the real one's name). Runs are grouped by (workflow id, event):
-    a newer run of another event never hides a red older one (the fail-closed choice). The highest run id of a group counts (ids grow with
-    creation). A run whose identity cannot be read (another repo, a failed read, over the read cap) is kept and marked UNREADABLE (never
+    a newer run of another event never hides a red older one (the fail-closed choice). The latest of a group counts (created_at, then run attempt, then the highest run id). A run whose identity cannot be read (another repo, a failed read, over the read cap) is kept and marked UNREADABLE (never
     green). Entries with no run id (status contexts) are kept."""
     if not isinstance(rollup, list):
         return []
@@ -184,14 +189,14 @@ def latest_runs(rollup, repo=None):
             capped.add((repo, run))
         known.append((run, ident))
         if ident is not None:
-            top[ident] = max(top.get(ident, (run, 0)), (run, _attempt(entry)))
+            top[ident] = max(top.get(ident, _order(entry, run)), _order(entry, run))
     out = []
     for entry, (run, ident) in zip(rollup, known):
         if run is None:
             out.append(entry)
         elif ident is None:
             out.append(dict(entry, status=CAP_STATUS if (repo, run) in capped else UNREADABLE, conclusion=""))
-        elif (run, _attempt(entry)) >= top[ident]:
+        elif _order(entry, run) >= top[ident]:
             out.append(entry)
     return out
 
@@ -256,6 +261,8 @@ def read_check_runs(api, repo, sha):
         total = data.get("total_count")
         if len(got) < CHECK_PAGE_SIZE and (not isinstance(total, int) or len(runs) >= total):
             return runs, None
+        if isinstance(total, int) and len(got) >= CHECK_PAGE_SIZE and total < len(runs):
+            return [], cap_why()   # GitHub's own count is below the runs read: not whole
         if isinstance(total, int) and len(runs) >= total:
             return runs, None
     return [], cap_why()

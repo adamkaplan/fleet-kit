@@ -90116,6 +90116,51 @@ class TestReadCheckRuns1237(unittest.TestCase):
         self.assertIn("a page failed", why)
         return calls
 
+    def test_1281_total_below_the_runs_read_is_refused(self):
+        self.refused([self.page(100, 50)])
+
+    def latest_of(self, entries, mod=None):
+        mod = mod or load_ci_runs()
+        old = mod.READER
+        mod.READER = lambda repo, run: (1, "push")
+        mod._CACHE.clear()
+        try:
+            return mod.latest_runs(entries, "o/r")
+        finally:
+            mod.READER = old
+            mod._CACHE.clear()
+
+    @staticmethod
+    def lrun(run, created, attempt=None):
+        url = "https://github.com/o/r/actions/runs/%d" % run + ("/attempts/%d" % attempt if attempt else "")
+        return {"name": "j", "detailsUrl": url, "created_at": created, "status": "COMPLETED", "conclusion": "SUCCESS"}
+
+    def test_1281_stale_high_id_does_not_win(self):
+        kept = self.latest_of([self.lrun(900, "2026-01-01T00:00:00Z"), self.lrun(500, "2026-02-01T00:00:00Z")])
+        self.assertEqual([e["detailsUrl"].rsplit("/", 1)[1] for e in kept], ["500"])
+
+    def test_1281_equal_time_attempt_then_id(self):
+        t = "2026-01-01T00:00:00Z"
+        kept = self.latest_of([self.lrun(900, t, 1), self.lrun(500, t, 2)])
+        self.assertEqual(len(kept), 1)
+        self.assertIn("/attempts/2", kept[0]["detailsUrl"])
+        kept = self.latest_of([self.lrun(500, t), self.lrun(900, t)])
+        self.assertTrue(kept[0]["detailsUrl"].endswith("/900") and len(kept) == 1)
+
+    def test_1281_total_mutant_and_stale_id_mutant_fail(self):
+        m = self.src_module("total < len(runs):", "False:")
+        (runs, why), _ = self.run_pages([self.page(100, 50)], m)
+        self.assertEqual(len(runs), 100)
+        m = self.src_module("return (t if isinstance(t, str) else \"\", _attempt(entry), run)", "return (0, 0, run)")
+        kept = self.latest_of([self.lrun(900, "2026-01-01T00:00:00Z"), self.lrun(500, "2026-02-01T00:00:00Z")], m)
+        self.assertTrue(kept[0]["detailsUrl"].endswith("/900"))
+
+    def test_1281_error_text_names_ids_or_paths(self):
+        with self.assertRaises(ValueError) as cm:
+            self.validate(ci_workflows="ci")
+        self.assertIn("workflow ids or paths", str(cm.exception))
+        self.assertNotIn("workflow names", str(cm.exception))
+
     def test_one_short_page_is_whole(self):
         (runs, why), calls = self.run_pages([self.page(3, 3)])
         self.assertEqual((len(runs), why, len(calls)), (3, None, 1))
