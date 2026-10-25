@@ -112,8 +112,11 @@ def superseded_by(facts):
     return found
 
 
+NEWEST_FIRST_MARK = " [newest first]"
+
+
 def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
-    """One message for `facts`, oldest first. Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
+    """One message for `facts`, newest first (a newer result is never held behind older reminders). Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
     message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
     same issue replaces (`superseded_by`) stays in the message, marked, so no key is left out of what is acknowledged.
 
@@ -123,13 +126,16 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     cap is cut, and says so. With `section` (PR 6, see sectioned_lines) every
     item that names an issue sits under its ask's Intent lines.
     """
-    facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
+    facts = sorted(facts, key=lambda fact: (-fact.created, fact.key))   # #1275: newest first; ties keep the key order
     if not facts:
         raise ValueError("nothing to compose")
     if facts[0].orders:  # PR 17: the orders note, whole: every order
         return orders_note(recipient, facts[0], repos), facts[:1]
 
     replaced = {}
+    if section is not None:   # one answer per ask for the whole compose (the retries under the cap must not turn a full header into a brief one)
+        _asked, _section = {}, section
+        section = lambda issue, repo=None: _asked.setdefault((issue, repo), _section(issue, repo))
 
     def item(fact):
         where = " (issue %s)" % issue_tag(fact.repo, fact.issue, repos) if fact.issue else ""
@@ -153,7 +159,12 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
             names = sorted({f.sender for f in taken if f.supersedes and f.sender})
             when = (when[:-1] + "; " if when else " (") + "supersedes %d earlier message%s from %s on this issue, still waiting: sent %s)" % (
                 len(waiting), "" if len(waiting) == 1 else "s", ", ".join(names) or "the same sender", ", ".join(clock_utc(t) for t in waiting[:5]))
-        head = "[switchboard] %d for %s%s: %s" % (count, recipient, when, _one_line(lead.summary, 200))
+        lead_text = _one_line(lead.summary, 200)
+        while lead_text.rstrip().endswith(NEWEST_FIRST_MARK.strip()):   # an agent's text must never forge the daemon's mark (numbering): only the count decides it
+            lead_text = lead_text.rstrip()[:-len(NEWEST_FIRST_MARK.strip())].rstrip()
+        head = "[switchboard] %d for %s%s: %s" % (count, recipient, when, lead_text)
+        if count > 1:
+            head += NEWEST_FIRST_MARK   # #1275: a reader of the transcript puts the lines back in time order
         idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider and getattr(fact, "clean", False)]
         shown = [fact for fact in taken if fact not in idle] if len(idle) < len(taken) else taken
         if shown is taken:

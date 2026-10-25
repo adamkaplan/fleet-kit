@@ -2933,6 +2933,7 @@ class Switchboard:
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
             # Unmerged on purpose: this measures the cut length of the ONE send being written (its own header and ask sections); merging wake items of other classes would not change that length.
+            # Unmerged on purpose: this measures the cut length of the ONE send being written (its own header and ask sections); merging wake items of other classes would not change that length.
             whole, _ = compose(plan.recipient, plan.pending[:1], cap=10 ** 9, section=section_resolver(self, observation),
                                repos=repos, delivered=self.now())
             allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
