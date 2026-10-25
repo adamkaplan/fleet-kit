@@ -54989,8 +54989,11 @@ class TestBatchAnswer(BatchWorld):
         self.assertEqual(self.gh.names(API, 3), ["bug"])
         self.assertEqual([c for c in self.gh.comments if (c["repo"], c["issue"]) != self.batch], [])
         for call in self.gh.calls:  # the daemon's listing reads aside, nothing names an issue but the batch
-            if "/issues?" not in call[2]:
-                self.assertRegex(call[2], r"^repos/acme/api/issues/101/", "a call that is not about the batch: %r" % call)
+            if "/issues?" in call[2]:
+                continue
+            if re.fullmatch(r"repos/acme/api/issues/\d+/comments\?per_page=100", call[2]) and "--method" not in call:
+                continue  # the plan-kind READ (#1094): a GET of a row issue's comments is a read, never a touch
+            self.assertRegex(call[2], r"^repos/acme/api/issues/101/", "a call that is not about the batch: %r" % call)
 
     def test_as_recommended_posts_one_comment_with_every_row_and_takes_both_labels_off(self):
         code, out, err = self.answer("--as-recommended")
