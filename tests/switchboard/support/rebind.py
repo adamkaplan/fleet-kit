@@ -11,6 +11,8 @@ from unittest import mock
 def rebound(name, value):
     """For the length of the block, `name` is `value` in every support module that has a global of that name."""
     modules = [module for key, module in list(sys.modules.items()) if key.startswith("support.") and name in vars(module)]
+    if not modules:
+        raise LookupError("no support module has a global named %r: a typo, or the module is not imported yet" % name)
     with contextlib.ExitStack() as stack:
         for module in modules:
             stack.enter_context(mock.patch.object(module, name, value))

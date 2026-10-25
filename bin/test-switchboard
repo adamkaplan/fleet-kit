@@ -75679,7 +75679,75 @@ def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2
 
 class TestSupportRebinding(unittest.TestCase):
     """The moved fakes read `sb` and the other moved globals from their own modules (tests/switchboard/support/), not from this file: a test that rebinds
-    a moved name here must rebind it there too (`rebound`). These two tests pin that, and find every such rebinding by reading this file."""
+    a moved name here must rebind it there too (`rebound`). These tests pin that, and find every such rebinding by reading this file."""
+
+    @staticmethod
+    def moved_names():
+        """Every top-level name the support modules define or import, read from their source."""
+        moved = set()
+        for path in sorted((REPO / "tests" / "switchboard" / "support").glob("*.py")):
+            for node in ast.parse(path.read_text()).body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    moved.add(node.name)
+                elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                        moved |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    moved |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        return moved - {"BIN", "REPO"}
+
+    @staticmethod
+    def rebindings(source, moved, skip=None):
+        """[(line, what)] for every way the source rebinds a moved name in its own module without rebinding it in the support modules (`rebound`)."""
+        tree = ast.parse(source)
+        parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        aliases = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign) and ast.unparse(n.value) in ("sys.modules[__name__]", "sys.modules['__main__']", "globals()")
+                   for t in n.targets if isinstance(t, ast.Name)}
+        is_module = lambda e: ast.unparse(e) in ("sys.modules[__name__]", "sys.modules['__main__']", "globals()") or (isinstance(e, ast.Name) and e.id in aliases)
+        found = []
+        def paired(node, name):
+            """Is the node inside a `with` that also enters `rebound(<name>, ...)`?"""
+            above = parents.get(id(node))
+            while above is not None:
+                if isinstance(above, (ast.With, ast.AsyncWith)):
+                    if any(isinstance(i.context_expr, ast.Call) and ast.unparse(i.context_expr.func) == "rebound" and i.context_expr.args
+                           and isinstance(i.context_expr.args[0], ast.Constant) and i.context_expr.args[0].value == name for i in above.items):
+                        return True
+                above = parents.get(id(above))
+            return False
+        for node in ast.walk(tree):
+            line = getattr(node, "lineno", None)
+            if skip and line is not None and skip[0] <= line <= skip[1]:
+                continue
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                found += [(node.lineno, "global " + n) for n in node.names if n in moved]
+            elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    if isinstance(target, ast.Subscript) and is_module(target.value):
+                        key = target.slice.value if isinstance(target.slice, ast.Constant) else None
+                        if key is None or key in moved:
+                            found.append((node.lineno, "module[%r] = ..." % key))
+                    elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and is_module(target.value) and target.attr in moved:
+                        found.append((node.lineno, "module.%s = ..." % target.attr))
+            elif isinstance(node, ast.Call):
+                what = ast.unparse(node.func)
+                if what.endswith("patch.dict") and node.args and is_module(node.args[0]):
+                    names = []
+                    if len(node.args) > 1 and isinstance(node.args[1], ast.Dict):
+                        names += [k.value if isinstance(k, ast.Constant) else None for k in node.args[1].keys]
+                    elif len(node.args) > 1:
+                        names.append(None)   # a dict that is not a literal
+                    names += [k.arg for k in node.keywords]
+                    for name in names:
+                        if (name is None or name in moved) and not paired(node, name):
+                            found.append((node.lineno, "patch.dict(module, %r) without rebound" % name))
+                elif what.endswith(("patch.object", "setattr", "monkeypatch.setattr")) and node.args and is_module(node.args[0]):
+                    name = node.args[1].value if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) else None
+                    if (name is None or name in moved) and not paired(node, name):
+                        found.append((node.lineno, "%s(module, %r) without rebound" % (what, name)))
+                elif what.endswith(".update") and is_module(getattr(node.func, "value", node)):
+                    found.append((node.lineno, "module.update(...)"))
+        return sorted(found)
 
     def test_a_moved_fake_reads_a_rebound_name_only_when_the_support_modules_are_rebound_too(self):
         sentinel = object()
@@ -75691,37 +75759,53 @@ class TestSupportRebinding(unittest.TestCase):
             self.assertIs(sys.modules["support.loader"].sb, sentinel)
         self.assertIsNot(Base.setUp.__globals__["sb"], sentinel, "restored afterwards")
         self.assertIsNot(sys.modules["support.loader"].sb, sentinel)
+        with self.assertRaises(LookupError):   # a name no support module has is an error, not a silent no-op
+            with rebound("no_such_name_in_any_support_module", sentinel):
+                pass
+
+    def test_the_moved_names_include_the_ones_a_test_rebinds(self):
+        moved = self.moved_names()
+        self.assertTrue({"sb", "sc", "Base", "FakeRunner", "SimClock", "FakeV2", "class_source", "SWITCHBOARD"} <= moved, sorted(moved)[:20])
+        self.assertTrue({"_MADE_UP_NEXT", "_pid_alive", "made_up_pid", "PidTable"}.isdisjoint(moved), "the pid helpers stay in this file")
+
+    FORMS = {   # a source that rebinds a moved name without rebound: each must be reported
+        "global": "def f():\n    global sb\n    sb = 1\n",
+        "patch.dict literal": "def f():\n    with mock.patch.dict(globals(), {'sb': 1}):\n        pass\n",
+        "patch.dict keyword": "def f():\n    with mock.patch.dict(globals(), sb=1):\n        pass\n",
+        "patch.dict not a literal": "def f(d):\n    with mock.patch.dict(globals(), d):\n        pass\n",
+        "patch.dict outside a with": "def f(self):\n    self.enterContext(mock.patch.dict(globals(), {'sb': 1}))\n",
+        "patch.dict in async with": "async def f():\n    async with mock.patch.dict(globals(), {'sb': 1}):\n        pass\n",
+        "patch.object on the module": "def f():\n    with mock.patch.object(sys.modules[__name__], 'SimClock', None):\n        pass\n",
+        "patch.object, a name decided at run time": "def f(n):\n    with mock.patch.object(sys.modules[__name__], n, None):\n        pass\n",
+        "setattr on the module": "def f():\n    setattr(sys.modules[__name__], 'FakeRunner', None)\n",
+        "globals()[...] =": "def f():\n    globals()['sb'] = 1\n",
+        "globals()[...] with a variable key": "def f(k):\n    globals()[k] = 1\n",
+        "module attribute": "def f():\n    module = sys.modules[__name__]\n    module.sb = 1\n",
+        "alias of the module, patch.object": "def f():\n    m = sys.modules[__name__]\n    with mock.patch.object(m, 'sb', None):\n        pass\n",
+        "globals().update": "def f():\n    globals().update(sb=1)\n",
+        "an annotated assignment": "def f():\n    globals()['sb']: object = 1\n",
+        "a paired rebound for another name": "def f():\n    with mock.patch.dict(globals(), {'sb': 1}), rebound('sc', 1):\n        pass\n",
+    }
+
+    def test_the_scan_reports_every_form_of_rebinding_and_none_of_the_paired_ones(self):
+        moved = self.moved_names()
+        for name, source in self.FORMS.items():
+            with self.subTest(form=name):
+                self.assertTrue(self.rebindings(source, moved), "a rebinding of a moved name this scan does not see")
+        for name, source in {
+            "paired": "def f():\n    with mock.patch.dict(globals(), {'sb': 1}), rebound('sb', 1):\n        pass\n",
+            "a name that did not move": "def f():\n    with mock.patch.dict(globals(), {'score_block': 1}):\n        pass\n",
+            "patch.object on a name that did not move": "def f():\n    with mock.patch.object(sys.modules[__name__], 'score_block', None):\n        pass\n",
+            "an object, not a module": "def f(x):\n    with mock.patch.dict(x, {'sb': 1}):\n        pass\n",
+        }.items():
+            with self.subTest(form=name):
+                self.assertEqual(self.rebindings(source, moved), [])
 
     def test_every_rebinding_of_a_moved_name_in_this_file_also_rebinds_it_in_the_support_modules(self):
-        moved = set()
-        for path in sorted((REPO / "tests" / "switchboard" / "support").glob("*.py")):
-            for node in ast.parse(path.read_text()).body:
-                if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-                    moved.add(node.name)
-                elif isinstance(node, ast.Assign):
-                    moved |= {t.id for t in node.targets if isinstance(t, ast.Name)}
-        moved -= {"BIN", "REPO"}
-        tree = ast.parse(Path(__file__).read_text())
-        own = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "TestSupportRebinding")   # its first test patches without rebound on purpose
-        found = []
-        for node in ast.walk(tree):
-            if getattr(node, "lineno", None) is not None and own.lineno <= node.lineno <= own.end_lineno:
-                continue
-            if isinstance(node, ast.Global):
-                found += [(node.lineno, "global " + name) for name in node.names if name in moved]
-            elif isinstance(node, ast.With):
-                texts = [ast.unparse(item.context_expr) for item in node.items]
-                for expr in (item.context_expr for item in node.items):
-                    if isinstance(expr, ast.Call) and ast.unparse(expr.func).endswith("patch.dict") and expr.args and ast.unparse(expr.args[0]) == "globals()" \
-                            and len(expr.args) > 1 and isinstance(expr.args[1], ast.Dict):
-                        for key in expr.args[1].keys:
-                            if isinstance(key, ast.Constant) and key.value in moved and not any(t.startswith("rebound(%r" % key.value) or t.startswith('rebound("%s"' % key.value) for t in texts):
-                                found.append((node.lineno, "patch.dict(globals(), {%r: ...}) without rebound" % key.value))
-            elif isinstance(node, ast.Call) and ast.unparse(node.func).endswith(("patch.object", "setattr")) and len(node.args) > 1 \
-                    and ast.unparse(node.args[0]) in ("sys.modules[__name__]", "globals()") and isinstance(node.args[1], ast.Constant) and node.args[1].value in moved:
-                found.append((node.lineno, "%s(module, %r)" % (ast.unparse(node.func), node.args[1].value)))
-        self.assertEqual(found, [], "a moved name rebound here does not reach the moved code: rebind it in the support modules as well (rebound)")
-
+        source = Path(__file__).read_text()
+        own = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "TestSupportRebinding")   # it names the forms on purpose
+        self.assertEqual(self.rebindings(source, self.moved_names(), skip=(own.lineno, own.end_lineno)), [],
+                         "a moved name rebound here does not reach the moved code: rebind it in the support modules as well (rebound)")
 
 def main(argv):
     watch_parent()
