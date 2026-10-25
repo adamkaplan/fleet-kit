@@ -137,6 +137,46 @@ STACK_SPEC_KEYS = {"restartPolicy", "activeDeadlineSeconds", "serviceAccountName
 STACK_CONTAINER_KEYS = {"name", "image", "securityContext", "env", "resources", "readinessProbe", "volumeMounts"}
 STACK_VOLUMES = {"tokens": {"name": "tokens", "emptyDir": {"medium": "Memory"}}, "scratch": {"name": "scratch", "emptyDir": {}}}
 STACK_MOUNT_PATHS = {"pw": "/run/cw", "tokens": "/run/cw-tmp", "scratch": "/work"}
+# The stack registry puller (ask #1022): a stack pod made with the three registry settings uses its own service account and ONE extra volume, a projected
+# service-account token (audience for the token exchange, the shortest life Kubernetes allows, mode 0400) plus three non-secret values, mounted read-only at
+# ONE path whose parent is root-owned mode 0700 in the image. Every other shape of a token is refused by the "service-account token" row.
+PULLER_SERVICE_ACCOUNT = "cw-stack-puller"
+PULLER_VOLUME_NAME = "registry-token"
+PULLER_MOUNT_PATH = "/opt/cw-registry/token"
+PULLER_AUDIENCE = "api://AzureADTokenExchange"
+PULLER_TOKEN_SECONDS = 600
+PULLER_ANNOTATIONS = {"registry-host": "cw/registry-host", "client-id": "cw/pull-client-id", "tenant-id": "cw/pull-tenant-id"}
+PULLER_VOLUME = {"name": PULLER_VOLUME_NAME, "projected": {"defaultMode": 0o400, "sources": [
+    {"serviceAccountToken": {"audience": PULLER_AUDIENCE, "expirationSeconds": PULLER_TOKEN_SECONDS, "path": "token"}},
+    {"downwardAPI": {"items": [{"path": k, "fieldRef": {"fieldPath": "metadata.annotations['%s']" % v}} for k, v in PULLER_ANNOTATIONS.items()]}}]}}
+PULLER_LABEL = "azure.workload.identity/use"
+STACK_REGISTRY_KEYS = ("CW_STACK_REGISTRY", "CW_STACK_PULL_CLIENT_ID", "CW_STACK_PULL_TENANT_ID")
+
+
+def _token_sources(pod):
+    return [s for v in pod.get("spec", {}).get("volumes", []) for s in (v.get("projected") or {}).get("sources", []) if "serviceAccountToken" in (s or {})]
+
+
+def _service_account_token(pod):
+    """The token row: automount stays false; a projected token is allowed ONLY as PULLER_VOLUME in a stack pod of the puller service account,
+    mounted once, read-only, at PULLER_MOUNT_PATH, with the workload-identity label absent. Anything else (any pod) is refused."""
+    spec = pod.get("spec", {})
+    if spec.get("automountServiceAccountToken") is not False:
+        return True
+    if not _token_sources(pod):
+        return False
+    vols = spec.get("volumes", [])
+    mounts = [m for k in _containers(pod) for m in k.get("volumeMounts", []) if m.get("name") == PULLER_VOLUME_NAME]
+    return not (
+        _is_stack(pod) and spec.get("serviceAccountName") == PULLER_SERVICE_ACCOUNT
+        and PULLER_LABEL not in (pod.get("metadata", {}).get("labels") or {})
+        and [v for v in vols if "projected" in v and _token_sources({"spec": {"volumes": [v]}})] == [PULLER_VOLUME]
+        and vols.count(PULLER_VOLUME) == 1
+        and mounts == [{"name": PULLER_VOLUME_NAME, "mountPath": PULLER_MOUNT_PATH, "readOnly": True}])
+
+
+def _has_puller_volume(pod):
+    return any(v.get("name") == PULLER_VOLUME_NAME for v in pod.get("spec", {}).get("volumes", []))
 
 
 def _stack_rest_differs(pod):
@@ -156,9 +196,10 @@ def _stack_rest_differs(pod):
         or any(set(e) != {"name", "value"} for k in ks for e in k.get("env", []))   # no valueFrom / secretKeyRef; no envFrom (key allow-list)
         or any(set((k.get("resources") or {})) != {"limits"} or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)   # limits stay
         or any(k.get("readinessProbe") != {"tcpSocket": {"port": 4096}} for k in ks)
-        or any(set(m) - {"name", "mountPath", "readOnly"} or STACK_MOUNT_PATHS.get(m.get("name")) != m.get("mountPath")
+        or any(set(m) - {"name", "mountPath", "readOnly"} or {**STACK_MOUNT_PATHS, PULLER_VOLUME_NAME: PULLER_MOUNT_PATH}.get(m.get("name")) != m.get("mountPath")
                for k in ks for m in k.get("volumeMounts", []))
-        or sorted(v.get("name") for v in vols) != ["pw", "scratch", "tokens"]   # no extra emptyDir, secret or configMap volume
+        or sorted(v.get("name") for v in vols) not in (["pw", "scratch", "tokens"], sorted(["pw", "scratch", "tokens", PULLER_VOLUME_NAME]))   # no extra emptyDir, secret or configMap volume
+        or (_has_puller_volume(pod) and vols[-1] != PULLER_VOLUME)
         or any(v != STACK_VOLUMES[v["name"]] for v in vols if v.get("name") in STACK_VOLUMES)
         or len(pw) != 1 or len(set(pw[0]) - {"name"}) != 1 or not set(pw[0]) - {"name"} <= {"secret", "projected"})
 
@@ -177,8 +218,7 @@ FORBIDDEN_POD_FIELDS = {
     "stack security context differs from STACK_SECURITY_CONTEXT": _stack_context_differs,
     "stack pod shape differs": _stack_shape_differs,
     "stack pod has a field or object outside the stack allow-list": _stack_rest_differs,
-    "service-account token": lambda p: p.get("spec", {}).get("automountServiceAccountToken") is not False
-        or any("serviceAccountToken" in (s or {}) for v in p.get("spec", {}).get("volumes", []) for s in (v.get("projected") or {}).get("sources", [])),
+    "service-account token": _service_account_token,
 }
 
 
@@ -1531,6 +1571,16 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         pw_volume = {"name": "pw", "projected": {"defaultMode": 0o600, "sources": [
             {"secret": {"name": name + "-pw", "items": [{"key": "password", "path": "server-password", "mode": 0o600}]}},
             {"secret": {"name": name + "-run", "items": [{"key": k, "path": k, "mode": 0o400} for k in run_names]}}]}}
+    puller = None
+    if stack:
+        set_keys = [k for k in STACK_REGISTRY_KEYS if (env.get(k) or "").strip()]
+        if set_keys:   # all three or none, each a valid value, BEFORE any object is made; a refusal names keys, never a value
+            if len(set_keys) != len(STACK_REGISTRY_KEYS):
+                raise CloudError("the stack registry settings are all three or none: set %s too; nothing was created" % ", ".join(k for k in STACK_REGISTRY_KEYS if k not in set_keys), EXIT_USAGE)
+            for k in STACK_REGISTRY_KEYS:
+                if not VALIDATORS[k][1](env[k].strip()):
+                    raise CloudError("%s must be %s; nothing was created" % (k, VALIDATORS[k][0]), EXIT_USAGE)
+            puller = {k: env[k].strip() for k in STACK_REGISTRY_KEYS}
     pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
@@ -1562,6 +1612,14 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         pod["spec"]["hostUsers"] = False
         pod["spec"]["nodeSelector"] = dict(STACK_NODE_SELECTOR)
         pod["spec"]["containers"][0]["securityContext"] = copy.deepcopy(STACK_SECURITY_CONTEXT)
+        if puller:   # the registry puller: its own service account, no workload-identity label (the webhook would mount a token into every container), one pinned volume
+            pod["spec"]["serviceAccountName"] = PULLER_SERVICE_ACCOUNT
+            del pod["metadata"]["labels"][PULLER_LABEL]
+            pod["metadata"]["annotations"].update({PULLER_ANNOTATIONS["registry-host"]: puller["CW_STACK_REGISTRY"],
+                                                   PULLER_ANNOTATIONS["client-id"]: puller["CW_STACK_PULL_CLIENT_ID"],
+                                                   PULLER_ANNOTATIONS["tenant-id"]: puller["CW_STACK_PULL_TENANT_ID"]})
+            pod["spec"]["volumes"].append(copy.deepcopy(PULLER_VOLUME))
+            pod["spec"]["containers"][0]["volumeMounts"].append({"name": PULLER_VOLUME_NAME, "mountPath": PULLER_MOUNT_PATH, "readOnly": True})
     bad = forbidden_pod_fields(pod)
     if bad:
         raise CloudError("refusing a pod spec with a forbidden field: %s" % ", ".join(bad), EXIT_USAGE)
@@ -2403,6 +2461,9 @@ SETTINGS = (
     ("CW_CLUSTER_TOKEN_DURATION", False, "duration"),    # the cluster token's requested life (default 20m)
     ("CW_HUB_CHANNEL_URL", False, "name"),         # the channel's address an orchestrator pod is told (default http://cloud-hub.cw.svc:8443/message); not a secret
     ("CW_HUB_REGISTRY_SECRET", False, "name"),     # the NAME of the hub's registry Secret in the cloud namespace (default cloud-hub-registry), never its content
+    ("CW_STACK_REGISTRY", False, "registry-host"),  # the stack registry's host name (pull-only for a stack pod); all three CW_STACK_ keys are set together or not at all
+    ("CW_STACK_PULL_CLIENT_ID", False, "guid"),    # the client id of the pull identity (not a secret)
+    ("CW_STACK_PULL_TENANT_ID", False, "guid"),    # the tenant id (not a secret)
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
@@ -2429,6 +2490,8 @@ _GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}
 _BARE_PROGRAM = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._+-]*")
 _VAULT_SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,126}")   # the vault secret-name grammar: a letter or digit first (the value reaches `az` as `--name <value>`, so it can never look like an option)
 _DURATION = re.compile(r"([0-9]{1,3})([mh])")   # the grammar of the launch wiring's own parse of CW_CLUSTER_TOKEN_DURATION (bin/cloud_worker.py `_duration`)
+_REGISTRY_SUFFIXES = (".azurecr.io",)   # a small table: a sovereign cloud is one more row
+_REGISTRY_HOST = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 _REFUSED_HOSTS = ("metadata.google.internal",)
 _REFUSED_SUFFIX = ".localhost"
@@ -2490,6 +2553,12 @@ def _server_ok(value):
             and not low.endswith(_REFUSED_SUFFIX) and _has_letter(last) and not _integer_host_label(last))
 
 
+def _registry_host_ok(value):
+    """A lower-case host name of at least two labels that ends in a known registry suffix: no scheme, path, port, user, IP or integer host."""
+    return (len(value) <= _MAX_HOST and bool(_REGISTRY_HOST.fullmatch(value)) and value.endswith(_REGISTRY_SUFFIXES)
+            and len(value) > max(len(x) for x in _REGISTRY_SUFFIXES) and not _integer_host_label(value.rsplit(".", 1)[-1]))
+
+
 def _allowed_ok(value):
     keys = allowed_repo_keys(value)
     return None not in keys   # the one function the launch's allow-list check uses
@@ -2536,6 +2605,9 @@ VALIDATORS = {
     "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
     "CW_HUB_CHANNEL_URL": ("an http or https URL: a host, an optional port, an optional one-segment path (/message), no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._-]{0,64})?", v))),
     "CW_HUB_REGISTRY_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
+    "CW_STACK_REGISTRY": ("a lower-case registry host name ending in .azurecr.io: no scheme, path, port, user or IP address", _registry_host_ok),
+    "CW_STACK_PULL_CLIENT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
+    "CW_STACK_PULL_TENANT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
@@ -2644,6 +2716,9 @@ def apply_settings(env=None, path=None):
     if text is None:
         return "environment"
     values = parse_settings(text, path)
+    part = [k for k in STACK_REGISTRY_KEYS if k in values]
+    if part and len(part) != len(STACK_REGISTRY_KEYS):   # all three or none (parse_settings judges one value at a time)
+        raise _bad(path, "sets %s but not %s: the stack registry settings are all three or none" % (", ".join(part), ", ".join(k for k in STACK_REGISTRY_KEYS if k not in values)))
     clash = [name for name, _, _ in SETTINGS if env.get(name) and name in values and env[name].strip() != values[name]]
     if clash:
         raise CloudError("refused: %s is set differently in the file %s and in the environment: unset one (the file is the one source when it exists); "
@@ -2661,6 +2736,82 @@ def apply_settings(env=None, path=None):
     return path
 
 
+# -- stack-registry-check (ask #1022): runs on the operator's machine with the operator's own `az` login, BEFORE any pod exists. It only READS
+# (az ... show / list); it never creates or changes an identity, a federated credential or a role. It cannot call the token exchange (that needs a
+# projected token): only the live pod proves the exchange. Exit 0 = OK, 1 = an owner step is missing, 2 = CANNOT TELL (never a pass).
+PULLER_IDENTITY = "cw-stack-puller-id"
+PULLER_FIC_AUDIENCE = PULLER_AUDIENCE
+PULL_ONLY_ROLES = ("AcrPull", "Reader")   # a role at the registry that is neither of these is write-capable (or wider) and is reported
+AZ_BIN = "az"   # a test hook (a module attribute): the program that is run
+
+
+class _AzCannotTell(Exception):
+    pass
+
+
+class _AzNotFound(Exception):
+    pass
+
+
+def _az_read(argv, env):
+    """One read call of az; returns parsed JSON. Only the verbs show, list and get are ever passed (a test records them)."""
+    try:
+        r = subprocess.run([AZ_BIN] + argv + ["-o", "json"], capture_output=True, text=True, timeout=120,
+                           env=dict(env))   # the operator's own environment: az is the operator's own login
+    except (OSError, subprocess.SubprocessError):
+        raise _AzCannotTell("az could not be run")
+    if r.returncode != 0:
+        if "ResourceNotFound" in r.stderr or "was not found" in r.stderr:
+            raise _AzNotFound()
+        raise _AzCannotTell("az is not logged in or may not read this resource (az exit %d)" % r.returncode)
+    try:
+        return json.loads(r.stdout or "null")
+    except ValueError:
+        raise _AzCannotTell("az answered something that is not JSON")
+
+
+def stack_registry_check(a, env, out):
+    """Report whether the pull identity can pull from the stack registry; name each missing owner step. Returns the exit status."""
+    registry, ns = (env.get("CW_STACK_REGISTRY") or "").strip(), (env.get("CW_CLOUD_NAMESPACE") or "").strip()
+    if not registry or not VALIDATORS["CW_STACK_REGISTRY"][1](registry) or not ns or not a.resource_group or not a.issuer:
+        print("CANNOT TELL: set CW_STACK_REGISTRY and CW_CLOUD_NAMESPACE and pass --resource-group and --issuer", file=out)
+        return 2
+    subject = "system:serviceaccount:%s:%s" % (ns, PULLER_SERVICE_ACCOUNT)
+    missing = []
+    try:
+        try:
+            ident = _az_read(["identity", "show", "--name", a.identity, "--resource-group", a.resource_group], env)
+        except _AzNotFound:
+            print("MISSING owner step 1: create the user-assigned identity %s in resource group %s" % (a.identity, a.resource_group), file=out)
+            return 1
+        principal, client = (ident or {}).get("principalId"), (ident or {}).get("clientId")
+        if not principal or not client:
+            raise _AzCannotTell("the identity shows no principal id")
+        creds = _az_read(["identity", "federated-credential", "list", "--identity-name", a.identity, "--resource-group", a.resource_group], env) or []
+        if not any(c.get("issuer") == a.issuer and c.get("subject") == subject and PULLER_FIC_AUDIENCE in (c.get("audiences") or []) for c in creds):
+            missing.append("MISSING owner step 2: create a federated credential on the identity with the cluster issuer, subject %s and audience %s" % (subject, PULLER_FIC_AUDIENCE))
+        acr = _az_read(["acr", "show", "--name", registry.split(".")[0]], env)
+        scope = (acr or {}).get("id")
+        if not scope:
+            raise _AzCannotTell("the registry shows no resource id")
+        roles = [r.get("roleDefinitionName") for r in (_az_read(["role", "assignment", "list", "--assignee", principal, "--scope", scope], env) or [])]
+        if "AcrPull" not in roles:
+            missing.append("MISSING owner step 3: the registry's owner grants AcrPull on %s to principal id %s (pull only)" % (registry, principal))
+        wide = sorted(set(r for r in roles if r not in PULL_ONLY_ROLES))
+        if wide:
+            missing.append("TOO WIDE owner step 3: remove the write-capable role %s from principal id %s at the registry" % (", ".join(map(str, wide)), principal))
+    except _AzCannotTell as e:
+        print("CANNOT TELL: %s" % e, file=out)
+        return 2
+    for m in missing:
+        print(m, file=out)
+    if missing:
+        print("principal id (the one value the registry owner needs): %s" % principal, file=out)
+        return 1
+    print("OK: principal id %s can pull from %s (the token exchange itself is proven only by a live stack pod)" % (principal, registry), file=out)
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="cloud-worker")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2671,6 +2822,10 @@ def build_parser():
             s.add_argument("worker", nargs=None if name != "status" else "?")
         s.add_argument("--json", action="store_true")
         return s
+    k = sub.add_parser("stack-registry-check", help="read-only: can the stack pull identity pull from the stack registry; names the missing owner step")
+    k.add_argument("--resource-group", required=True)
+    k.add_argument("--issuer", required=True, help="the cluster's OIDC issuer URL")
+    k.add_argument("--identity", default=PULLER_IDENTITY)
     c = cmd("create")
     c.add_argument("--repo", required=True)
     c.add_argument("--branch", required=True)
@@ -2850,6 +3005,8 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         except CloudError as e:
             print("cloud-worker: %s" % e, file=sys.stderr)
             return e.code
+    if a.cmd == "stack-registry-check":   # before any cluster login: it needs only the operator's own az
+        return stack_registry_check(a, env, sys.stdout)
     if not token_mode(env) and not (env.get("CW_KUBE_CONTEXT") or "").strip():
         if a.cmd == "reap":
             _reap_exit_line(clock, "cluster login failed: no login is set (CW_KUBE_CONTEXT or the token-file settings)")

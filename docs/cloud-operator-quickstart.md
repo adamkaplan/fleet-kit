@@ -40,7 +40,7 @@ ${EDITOR:-vi} ~/.config/fleet-switchboard/cloud.env
 ls -l ~/.config/fleet-switchboard/cloud.env   # -rw-------
 ```
 
-Each setting's name, whether the file requires it, and its kind (name, https URL, path, command, digest-ref, number, secret-name, duration):
+Each setting's name, whether the file requires it, and its kind (name, https URL, path, command, digest-ref, number, secret-name, duration, registry-host, guid):
 
 | Setting | Required | Kind | What it is |
 |---|---|---|---|
@@ -64,6 +64,8 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
 | `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id and key instead of the vault read (`app_token.py`) |
 | `CW_APP_INSTALLATION_CMD` | no | command | obsolete: accepted and ignored, never run. The installation is looked up per repository (see the next paragraph); the vault no longer needs `cw-app-installation-id` |
+| `CW_STACK_REGISTRY` | no | registry-host | the stack registry (lower case, ending `.azurecr.io`; no scheme, path, port or IP); with the next two, a stack pod pulls prebuilt images (see `cloud/README.md`); all three or none |
+| `CW_STACK_PULL_CLIENT_ID`, `CW_STACK_PULL_TENANT_ID` | no | guid | the pull identity's client id and tenant id (GUIDs, not secrets); set together with `CW_STACK_REGISTRY` |
 | `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
 
 How the installation is found: the mint signs a short-lived App token and asks GitHub which installation covers the repository (`GET /repos/OWNER/REPO/installation`), then mints the one-repository token for that installation. The answer must be one installation whose account is the repository's owner. A repository the App is not installed on is refused before any pod is created, with a message that says so. To cover a new repository, install the App on the account that owns it (an App installed on two accounts serves both) and add the repository to the installation; nothing in the vault changes.
