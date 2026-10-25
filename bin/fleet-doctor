@@ -615,25 +615,49 @@ for it in issues:
                 kv[k.strip()]=v.strip()
         if kv.get("status","").lower()!="active": continue
         pane=kv.get("pane","")
-        if not re.match(r"^w[0-9A-Za-z]+:p[0-9A-Za-z]+$", pane): continue
+        if not (re.match(r"^w[0-9A-Za-z]+:p[0-9A-Za-z]+$", pane) or re.match(r"^cloud:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", pane)): continue
         print("%s\t%s" % (it.get("number"), pane))
     except Exception:
         continue' "$TMPDIR_FD/charters.json" >"$TMPDIR_FD/active.txt" 2>/dev/null
 
-    total=0; drift=0; drift_desc=""
+    total=0; drift=0; drift_desc=""; cloud_total=0; cloud_live=0; cloud_unknown=0; cloud_desc=""
     while IFS="$(printf '\t')" read -r num pane; do
       [ -n "$pane" ] || continue
       total=$((total+1))
+      case "$pane" in
+        cloud:*)   # #1181: a cloud agent has no pane: live when its row's endpoint answers, unknown when not, never a dead pane
+          cloud_total=$((cloud_total+1))
+          cl="$(python3 - "$(dirname "$0")" "${pane#cloud:}" <<'PYEOF' 2>/dev/null
+import importlib.util, os, sys
+bin_dir, name = sys.argv[1], sys.argv[2]
+def load(m):
+    spec = importlib.util.spec_from_file_location(m, os.path.join(bin_dir, m + ".py")); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
+try:
+    reg = load("registry"); live = load("endpoint_liveness")
+    state = os.environ.get("FLEET_REGISTRY_DIR") or os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "fleet-switchboard")
+    got = reg.read(state)
+    row = got["agents"].get(name) if got.get("whole") else None
+    answer = live.check(name, row) if row else {"verdict": "unknown"}
+    print("live" if answer["verdict"] == "alive" else "unknown")
+except Exception:
+    print("unknown")
+PYEOF
+)"
+          if [ "$cl" = "live" ]; then cloud_live=$((cloud_live+1)); else cloud_unknown=$((cloud_unknown+1)); cloud_desc="$cloud_desc #$num->$pane"; fi
+          continue ;;
+      esac
       if ! grep -Fxq "$pane" "$TMPDIR_FD/panes.txt"; then
         drift=$((drift+1))
         drift_desc="$drift_desc #$num->$pane"
       fi
     done <"$TMPDIR_FD/active.txt"
 
+    if [ "$cloud_live" != "0" ]; then emit ok charters "$cloud_live cloud charter(s) live (the endpoint answered)"; fi
+    if [ "$cloud_unknown" != "0" ]; then emit WARN charters "$cloud_unknown cloud charter(s) unknown (the endpoint did not answer; not a dead pane):$cloud_desc"; fi
     if [ "$total" = "0" ]; then
       emit WARN charters "no active charters found with label $L_ORCH"
     elif [ "$drift" = "0" ]; then
-      emit ok charters "$total active charters, all panes live"
+      [ "$cloud_total" = "$total" ] || emit ok charters "$((total-cloud_total)) active charters, all panes live"
     else
       emit WARN charters "$drift of $total active charters name a dead pane:$drift_desc"
     fi
