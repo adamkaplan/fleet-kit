@@ -15398,7 +15398,7 @@ def pr_picture(engine, repo, number, state):
 def authoritative_plan(entries, pr, body):
     """(source, where) of the plan a PR is under, which its writer does not choose: the `PLAN:` line of the PR body, else
     the plan of the PR's FIRST ledger entry. (None, None) when neither exists yet."""
-    found = PLAN_LINE_RE.search(body or "")
+    found = PLAN_LINE_RE.search(plan_ledger.visible_body(body))
     if found:
         return found.group(1).strip("<>.,"), "the PR body's PLAN: line"
     for entry in entries:
@@ -16406,7 +16406,7 @@ def register_item_tester(engine, state, args, repo, launched_by, done, now):
             if not load_module("item_verdicts").sha_ok(pin):
                 why = "the default branch tip of %s could not be read" % repo
         if why is None:
-            link = PLAN_LINE_RE.search(issue["body"] or "")
+            link = PLAN_LINE_RE.search(plan_ledger.visible_body(issue["body"]))
             stored = plan_ledger.append_entry(state, {"kind": "item_tester", "pr": item, "item": item, "tester": args.name, "session": done.get("session"),
                                                       "orchestrator": launched_by, "head": pin, "plan_ref": link.group(1).strip("<>.,") if link else None, "by": launched_by}, now())
             _gates_audit(engine, "plan.item.register", item, {"item": item, "tester": args.name, "session": done.get("session"), "orchestrator": launched_by,

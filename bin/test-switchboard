@@ -86236,7 +86236,7 @@ class TestBatchingDocs(unittest.TestCase):
 PARENT_RULE = ("A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, "
                "and a Done-when the work item carries itself must still match exactly.")
 CLAIM_RULE = ("A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, "
-              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused.")
+              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).")
 WORK_ITEM_PLAN = LEDGER_PLAN.split("```yaml", 1)[0].split("## Intent", 1)[0] + "```yaml" + LEDGER_PLAN.split("```yaml", 1)[1]
 
 
@@ -86424,6 +86424,24 @@ class TestPrClaimLine(LedgerBase):
                 self.assertEqual(([s["id"] for s in claimed], left, error), (["S1", "S2", "S3", "U1"], [], None))
         claimed = sb.plan_ledger.pr_scenarios(self.scenarios, "```\nignored\n```\nPLAN: real#1\nCLAIMS: S1")[0]
         self.assertEqual([s["id"] for s in claimed], ["S1"])
+
+    FENCED = "```\nPLAN: other/x#9\n```\nPLAN: acme/app#7\nCLAIMS: S1\n"
+
+    def fenced_plan_read(self, reader):
+        return reader([], 1, self.FENCED)[0]
+
+    def test_a_fenced_plan_line_before_the_real_one_is_read_by_no_gate_and_no_claim(self):
+        self.assertEqual(self.fenced_plan_read(sb.authoritative_plan), "acme/app#7")
+        self.assertEqual(sb.authoritative_plan([], 1, "<!--\nPLAN: other/x#9\n-->\nPLAN: acme/app#7")[0], "acme/app#7")
+        self.assertEqual(sb.plan_ledger.claim_text(self.FENCED), "S1")
+        self.assertEqual(sb.authoritative_plan([], 1, "```\nPLAN: other/x#9\n```\n"), (None, None))
+
+    def test_mutant_authoritative_plan_on_the_raw_body_fails_the_fenced_line_test(self):
+        def mutant(entries, pr, body):
+            found = sb.PLAN_LINE_RE.search(body or "")
+            return (found.group(1).strip("<>.,"), "raw") if found else (None, None)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(self.fenced_plan_read(mutant), "acme/app#7")
 
     READERS = {"G1": "evaluate_gates", "prove": "_scenario_of", "verdict S": "_scenario_of", "verdict --all": "cmd_verdict", "ci recorder": "ci_record_core"}
 
