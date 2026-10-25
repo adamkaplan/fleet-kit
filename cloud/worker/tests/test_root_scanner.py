@@ -19,6 +19,11 @@ rnd = random.Random(1276)
 CERT = b"\x30\x82" + (396).to_bytes(2, "big") + b"\x30" + bytes(rnd.randrange(256) for _ in range(395))
 assert len(CERT) == 400
 FP = hashlib.sha256(CERT).hexdigest()
+CERT2 = b"\x30\x82" + (346).to_bytes(2, "big") + b"\x30" + bytes(rnd.randrange(256) for _ in range(345))
+CERT81 = b"\x30\x81" + (197).to_bytes(1, "big") + b"\x30" + bytes(rnd.randrange(256) for _ in range(196))
+CERT83 = b"\x30\x83" + (395).to_bytes(3, "big") + b"\x30" + bytes(rnd.randrange(256) for _ in range(394))
+assert len(CERT2) == 350 and len(CERT81) == 200 and len(CERT83) == 400
+MARK = "uniq-label-marker-%d" % rnd.randrange(10**9)
 NOISE = bytes(rnd.randrange(1, 256) for _ in range(5000))
 
 
@@ -37,7 +42,7 @@ class Scanner(unittest.TestCase):
         self.addCleanup(self.d.cleanup)
         self.list = self.w("list", ("%s synthetic-test-root\n" % FP).encode())
         self.der = self.w("der.bin", NOISE + CERT + NOISE)
-        self.clean = self.w("clean.bin", NOISE)
+        self.clean = self.w("clean.bin", NOISE + CERT2 + NOISE)
         pem = b"-----BEGIN CERTIFICATE-----\n" + base64.encodebytes(CERT) + b"-----END CERTIFICATE-----\n"
         self.pem = self.w("pem.bin", NOISE + pem + NOISE)
         self.pem_esc = self.w("pem_esc.bin", NOISE + pem.replace(b"\n", b"\\n") + NOISE)
@@ -51,13 +56,13 @@ class Scanner(unittest.TestCase):
     def test_der_found(self):
         rc, out = run([self.der], self.list)
         self.assertEqual(rc, 1)
-        self.assertIn("FOUND synthetic-test-root " + FP[:16], out)
+        self.assertIn("FOUND #1 " + FP[:8], out)
         self.assertIn("certificates examined", out)
 
     def test_clean(self):
         rc, out = run([self.clean], self.list)
         self.assertEqual(rc, 0)
-        self.assertIn("absent synthetic-test-root", out)
+        self.assertIn("absent #1 " + FP[:8], out)
         self.assertNotIn("FOUND", out)
 
     def test_pem_found(self):
@@ -84,6 +89,90 @@ class Scanner(unittest.TestCase):
 
     def test_unreadable_binary(self):
         self.refused(*run([os.path.join(self.d.name, "nobin")], self.list))
+
+    def test_zero_certificates_refused(self):
+        for name, data in (("e", b""), ("r", bytes(rnd.randrange(256) for _ in range(300000)))):
+            rc, out = run([self.w(name, data)], self.list)
+            self.assertEqual(rc, 2)
+            self.assertIn("nothing examined: the scan did not work", out)
+            self.assertNotIn("absent", out)
+
+    def test_one_cert_no_listed_root_clean(self):
+        rc, out = run([self.clean], self.list)
+        self.assertEqual(rc, 0)
+        self.assertIn("1 certificates examined", out)
+        self.assertIn("list entries used: 1", out)
+
+    def test_der_81_and_83_forms_found(self):
+        for c in (CERT81, CERT83):
+            lst = self.w("l", ("%s x\n" % hashlib.sha256(c).hexdigest()).encode())
+            self.assertEqual(run([self.w("b", NOISE + c + NOISE)], lst)[0], 1)
+
+    def test_output_has_no_label(self):
+        lst = self.w("lm", ("%s %s\n%s %s\n" % (FP, MARK, "ab" * 32, MARK)).encode())
+        for b in (self.der, self.clean):
+            rc, out = run([b], lst)
+            self.assertNotIn(MARK, out)
+            self.assertIn("#2 abababab", out)
+
+    def test_list_not_utf8_refused(self):
+        self.refused(*run([self.clean], self.w("nu", b"\xff\xfe" + FP.encode() + b" x\n")))
+
+    def test_list_over_cap_refused(self):
+        self.refused(*run([self.clean], self.w("big", (("%s x\n" % FP) * 10001).encode())))
+
+    def test_list_comment_refused_blank_allowed(self):
+        self.refused(*run([self.clean], self.w("c", ("# note\n%s x\n" % FP).encode())))
+        self.assertEqual(run([self.der], self.w("b2", ("\n%s x\n\n" % FP).encode()))[0], 1)
+
+    def test_pem_real_newlines_found_and_other_escape_not(self):
+        pem = b"-----BEGIN CERTIFICATE-----\n" + base64.encodebytes(CERT2) + b"-----END CERTIFICATE-----\n"
+        lst = self.w("l2", ("%s x\n" % hashlib.sha256(CERT2).hexdigest()).encode())
+        self.assertEqual(run([self.w("p", NOISE + pem + NOISE)], lst)[0], 1)
+
+    def split_binary(self, chunk):
+        # cert starts 200 bytes before the chunk boundary, so it is split across it
+        return self.w("split.bin", bytes(chunk - 200) + CERT + bytes(3000))
+
+    def test_cert_split_across_chunk_boundary_found(self):
+        sc = self.mutated("CHUNK = 8 * 1024 * 1024", "CHUNK = 5000")
+        rc, out = run([self.split_binary(5000)], self.list, scanner=sc)
+        self.assertEqual(rc, 1)
+
+    def test_mutant_no_overlap_fails(self):
+        sc = self.mutated("CHUNK = 8 * 1024 * 1024", "CHUNK = 5000")
+        with open(sc, encoding="utf-8") as f:
+            s = f.read()
+        self.assertIn("OVERLAP = 16384", s)
+        m = s.replace("OVERLAP = 16384", "OVERLAP = 0")
+        self.assertNotEqual(m, s)
+        rc, _ = run([self.split_binary(5000)], self.list, scanner=self.w("nov.py", m.encode()))
+        self.assertNotEqual(rc, 1)
+
+    def test_large_sparse_file_bounded_memory(self):
+        import resource
+        p = os.path.join(self.d.name, "sparse.bin")
+        try:
+            with open(p, "wb") as f:
+                f.seek(120 * 1024 * 1024)
+                f.write(CERT)
+        except OSError as e:
+            print("LOUD: SKIPPED the 120 MB sparse test: %s" % e)
+            self.skipTest("disk cannot hold the file")
+        rc, out = run([p], self.list)
+        self.assertEqual(rc, 1)
+        self.assertLess(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss, 150 * 1024)  # KiB
+
+    def test_mutant_zero_guard_removed_fails(self):
+        sc = self.mutated("if len(hits) == 0:", "if False:")
+        rc, _ = run([self.w("e2", b"")], self.list, scanner=sc)
+        self.assertNotEqual(rc, 2)
+
+    def test_mutant_label_printed_fails(self):
+        sc = self.mutated('print("absent #%d %s" % (i, fp[:8]))', 'print("absent #%d %s" % (i, label))')
+        lst = self.w("lm2", ("%s %s\n" % ("ab" * 32, MARK)).encode())
+        rc, out = run([self.clean], lst, scanner=sc)
+        self.assertIn(MARK, out)
 
     def mutated(self, old, new):
         with open(SCANNER, encoding="utf-8") as f:
