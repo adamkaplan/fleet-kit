@@ -92679,7 +92679,7 @@ class ReviewCommentLineTests(unittest.TestCase):
         self.assertEqual(items[0].review_signer, "rev-1")
 
     def test_author_lane_marker_is_not_delivered_at_routing(self):
-        agents = {"orch": types.SimpleNamespace(fleet={"role": "orchestrator"}), "w1": types.SimpleNamespace(fleet={"boss": "orch"}),
+        agents = {"orch": types.SimpleNamespace(fleet={"role": "orchestrator"}), "w1": types.SimpleNamespace(fleet={"reports_to": "orch"}),
                   "rev-1": types.SimpleNamespace(fleet={})}
         self.assertTrue(sb._review_lane_member(agents, "w1", "orch"))
         self.assertTrue(sb._review_lane_member(agents, "orch", "orch"))
@@ -92687,14 +92687,15 @@ class ReviewCommentLineTests(unittest.TestCase):
         self.assertFalse(sb._review_lane_member(agents, "ghost", "orch"))
 
     def test_route_drops_author_lane_and_audits_unowned(self):
-        agents = {"orch": types.SimpleNamespace(fleet={"role": "orchestrator"}), "w1": types.SimpleNamespace(fleet={"boss": "orch"})}
+        agents = {"orch": types.SimpleNamespace(fleet={"role": "orchestrator"}), "w1": types.SimpleNamespace(fleet={"reports_to": "orch"})}
         for signer, owner, expect in (("w1", "orch", False), ("rev-1", "orch", True), ("rev-1", None, False)):
             item = sb.GitHubItem("github.reviewcomment:1", "github.comment", "x", "o/r", [], [], "bob", 1.0, [10], True)
             item.review_signer = signer
             audits = []
+            item.sender = "fleetkit-cloud[bot]"
             hub = types.SimpleNamespace(queue={item.key: item}, lock=threading.RLock(), _unrouted=set(), _filtered=set(),
                                         _unrouted_batch=[], _filtered_batch=[], _routed_batch=[], _audit=lambda *a: audits.append(a),
-                                        route_of=lambda *a: (owner, "closing"))
+                                        route_of=lambda *a: (owner, "closing"), _fleet_login=lambda l: True, _unowned_seen=lambda k: False)
             sb.GitHubHub._route(hub, item, types.SimpleNamespace(problems=[], agents=agents), 1.0)
             self.assertEqual(item.recipient == "orch", expect)
             self.assertEqual([a[0] for a in audits], ["github.reviewcomment.unowned"] if owner is None else [])
@@ -92724,7 +92725,7 @@ class ReviewCommentLineTests(unittest.TestCase):
     def test_catchup_never_copies_text_and_shares_the_key(self):
         body = "Review of %s: APPROVE\nsecret sentence" % self.HEAD
         comment = {"id": 9001, "body": body, "user": {"login": "bob"}, "issue_url": "https://api.github.com/repos/o/r/issues/10"}
-        self.assertIsNone(sb._comment_item("o/r", comment, None, 1.0))
+        self.assertIsNone(sb._comment_item("o/r", comment, None, 1.0))   # no PR record: the catch-up loop passes one (see ReviewCommentEndToEndTests)
         hook = self.handle(body)[0]
         self.assertEqual(hook.key, "github.reviewcomment:9001")
         self.assertNotIn("github.comment:9001", [hook.key])
@@ -92738,6 +92739,144 @@ class ReviewCommentLineTests(unittest.TestCase):
         pr = {"number": 10, "state": "open", "user": {"login": "a"}, "pull_request": {}}
         items = sb._wh_issue_comment("o/r", {"action": "created", "issue": pr, "comment": {"id": 5, "body": "hi", "user": {"login": "b"}}}, 1.0)
         self.assertEqual([i.key for i in items], ["github.comment:5"])
+
+
+class ReviewCommentEndToEndTests(unittest.TestCase):
+    """Webhook payload / catch-up read -> the real hub routing -> the queue, on the fake GitHub and a real registry-shaped fleet."""
+    HEAD = "3f2a9c1b7d4e" + "0" * 28
+    OK = "Review of %s: CHANGES REQUESTED\nsecret sentence" % HEAD
+
+    def setUp(self):
+        self.rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1}, "w1": {"reports_to": "platform"}},
+                             config={"sweep": False, "triage": False})
+        self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
+        self.world.clock.t += 7200
+        self.hub.config["gh_users"] = {"other/repo": "shared"}   # the account the daemon acts as (a key for another repo: the fake gh has no auth)
+        self.gh.issue(12, parent=1)
+        self.gh.pull(20, closes=[12])
+        self.gh.pull(21)   # no lane owns it
+
+    def payload(self, number, body, cid, who, action="created", state="open"):
+        pr = dict(self.gh.pulls[number], pull_request={"url": "x", "merged_at": None}, state=state)
+        comment = {"id": cid, "body": body, "user": {"login": who}, "created_at": self.gh.stamp(), "updated_at": self.gh.stamp(),
+                   "issue_url": "https://api.github.com/repos/%s/issues/%d" % (GH_REPO, number)}
+        return {"action": action, "issue": pr, "comment": comment}
+
+    def post(self, number, body, cid, who="reader", forward=True, **kw):
+        p = self.payload(number, body, cid, who, **kw)
+        self.gh.comments.append(p["comment"])
+        if forward:
+            self.gh.send("issue_comment", p, "d-%d" % cid)
+
+    def after(self):
+        self.rig.pump(120)
+        return [k for k in self.rig.delivered() if k.startswith("github.reviewcomment:")]
+
+    def test_delivered_to_the_owners_orchestrator_as_one_line(self):
+        self.post(20, self.OK, 7001)
+        self.assertEqual(self.after(), ["github.reviewcomment:7001"])
+
+    def test_stranger_with_forged_lane_marker_is_delivered(self):
+        self.post(20, self.OK + "\n<!-- fleet-switchboard:from=w1 -->", 7002, who="stranger")
+        self.assertEqual(self.after(), ["github.reviewcomment:7002"])
+
+    def test_fleet_login_with_lane_marker_is_excluded(self):
+        for cid, who in ((7003, "shared"), (7004, "fleetkit-cloud[bot]")):
+            self.post(20, self.OK + "\n<!-- fleet-switchboard:from=w1 -->", cid, who=who)
+        self.assertEqual(self.after(), [])
+
+    def test_cloud_bot_without_marker_is_delivered(self):
+        self.post(20, self.OK, 7005, who="fleetkit-cloud[bot]")
+        self.assertEqual(self.after(), ["github.reviewcomment:7005"])
+
+    def test_unregistered_marker_is_delivered(self):
+        self.post(20, self.OK + "\n<!-- fleet-switchboard:from=ghost -->", 7006, who="shared")
+        self.assertEqual(self.after(), ["github.reviewcomment:7006"])
+
+    def test_orchestrator_marker_is_excluded(self):
+        self.post(20, self.OK + "\n<!-- fleet-switchboard:from=platform -->", 7007, who="shared")
+        self.assertEqual(self.after(), [])
+
+    def test_unowned_is_audited_once_even_after_a_restart(self):
+        before = self.audits("github.reviewcomment.unowned")   # the audit file may be shared between runs: count the change
+        cid = 7008
+        (Path(self.world.state) / sb.REVIEW_UNOWNED_FILE).unlink(missing_ok=True)
+        self.post(21, self.OK, cid)
+        self.assertEqual(self.after(), [])
+        self.assertEqual(self.audits("github.reviewcomment.unowned") - before, 1)
+        self.hub._unowned_seen("x")
+        fresh = sb.GitHubHub(self.world.config, self.world.state, sb.AuditLog(self.world.audit_path), self.gh.runner, self.gh.spawn, self.world.clock.now)
+        self.assertTrue(fresh._unowned_seen("github.reviewcomment:%d" % cid))
+        path = Path(self.world.state) / sb.REVIEW_UNOWNED_FILE
+        path.write_text("{not json")
+        self.assertFalse(fresh._unowned_seen("github.reviewcomment:1"))   # a corrupt file reads as empty
+        path.write_text(json.dumps(["k%d" % i for i in range(sb.REVIEW_UNOWNED_CAP + 5)]))
+        fresh._unowned_seen("new")
+        self.assertLessEqual(len(json.loads(path.read_text())), sb.REVIEW_UNOWNED_CAP)
+
+    def audits(self, name):
+        path = Path(self.world.audit_path)
+        return sum(1 for line in path.read_text().splitlines() if name in line) if path.exists() else 0
+
+    def test_catch_up_only_delivers_once(self):
+        self.post(20, self.OK, 7010, forward=False)
+        self.assertEqual(self.after(), ["github.reviewcomment:7010"])
+
+    def test_catch_up_unknown_pr_state_delivers_and_closed_pr_drops(self):
+        self.post(20, self.OK, 7011, forward=False)
+        items, _ = self.hub.catch_up_items(GH_REPO, self.world.clock.now(), since_epoch=self.world.clock.now() - 600)
+        self.assertIn("github.reviewcomment:7011", [i.key for i in items if i])
+        self.gh.pulls[20]["state"] = "closed"
+        items, _ = self.hub.catch_up_items(GH_REPO, self.world.clock.now(), since_epoch=self.world.clock.now() - 600)
+        self.assertNotIn("github.reviewcomment:7011", [i.key for i in items if i])
+
+    def test_webhook_then_catch_up_and_catch_up_then_webhook_are_one(self):
+        self.post(20, self.OK, 7012)
+        self.rig.pump(15)
+        self.gh.kill_forwarder()
+        self.assertEqual(self.after(), ["github.reviewcomment:7012"])
+        self.post(20, self.OK, 7013, forward=False)
+        self.rig.pump(15)
+        self.gh.send("issue_comment", self.payload(20, self.OK, 7013, "reader"), "d-x")
+        self.assertEqual(self.after(), ["github.reviewcomment:7012", "github.reviewcomment:7013"])
+
+    def test_catch_up_makes_no_extra_gh_call_per_comment(self):
+        def count(n):
+            gh = FakeGitHub(self.world.clock)
+            gh.pull(20, closes=[12])
+            for i in range(n):
+                gh.comments.append(self.payload(20, self.OK, 8000 + i, "reader")["comment"])
+            hub = sb.GitHubHub(self.world.config, self.world.state, None, gh.runner, gh.spawn, self.world.clock.now)
+            hub.catch_up_items(GH_REPO, self.world.clock.now(), since_epoch=self.world.clock.now() - 600)
+            return len(gh.api_calls)
+        self.assertEqual(count(50), count(0))
+
+    def test_restart_keeps_the_delivered_key(self):
+        led = sb.SentLedger(self.world.state)
+        led.reserve("s1", ["github.reviewcomment:7020"], 1.0)
+        led.confirm("s1", ["github.reviewcomment:7020"], 1.0)
+        again = sb.SentLedger(self.world.state)   # a new process on the same state dir
+        self.assertFalse(again.reserve("s1", ["github.reviewcomment:7020"], 2.0))
+        self.assertIn("github.reviewcomment:7020", again.known("s1", 0))
+
+    def test_hostile_logins_are_cleaned_and_capped(self):
+        for who in ("a" * 500, "bo\x1b[31mb\nx\x00y"):
+            items = ReviewCommentLineTests.handle(self, self.OK, who=who)
+            self.assertEqual(len(items), 1)
+            self.assertNotRegex(items[0].summary, r"[\x00-\x1f]")
+            self.assertLess(len(items[0].summary), 200)
+
+    def test_every_comment_path_is_in_the_docs_table(self):
+        src = (SWITCHBOARD).read_text()
+        paths = set(re.findall(r"github\.(?:comment|reviewcomment)[:.][a-z]*", src))
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        table = docs.split("### Every path by which a GitHub comment reaches an agent")[1].split("\n## ")[0]
+        for needle in ("_wh_issue_comment", "catch-up", "github.comment:<id>", "github.reviewcomment:<id>", "github.reviewcomment.unowned", "_route"):
+            self.assertIn(needle, table)
+        for name in ("_comment_item", "_review_comment_item", "_wh_issue_comment", "_route", "_unowned_seen"):
+            self.assertIn("def " + name, src)
+            self.assertIn(name if name != "_unowned_seen" else "review-unowned.json", table)
+        self.assertTrue(paths)
 
 
 if __name__ == "__main__":
