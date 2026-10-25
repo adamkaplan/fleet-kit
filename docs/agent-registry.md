@@ -50,6 +50,19 @@ rebuilt from another record.
 | `bin/switchboard/judge_request.py:433` | `decisions.json` | reads the open decisions to give the judge the ask's context | nobody (reader only) | the policy judge's request | derived (reader) |
 | `bin/switchboard/decisions_a.py:274` | `decisions.json` | comment only: the decisions list never rewrites the projection by itself | nobody | nobody | derived |
 | `bin/switchboard/decisions_b.py:281` | `decisions.json` | comment only: names the projection among what the store keeps | nobody | nobody | derived |
+| `bin/switchboard/plan_review.py:544` | `boss-resolution` | plan review escalates to the planner's boss through `boss_name`, then `resolve_boss` | nobody | plan review escalation | derived (reader) |
+| `bin/switchboard/plan_review.py:542` | `discovery.agents` | plan review reads the newest discovery to find the planner's boss | nobody | plan review escalation | derived (reader) |
+| `bin/switchboard/reminders.py:346` | `boss-resolution` | a reminder's recipient is resolved through `resolve_boss` | nobody | reminder delivery | derived (reader) |
+| `bin/switchboard/reminders.py:176` | `discovery.agents` | a reminder condition reads the discovered agents (recipient and sender) | nobody | reminder delivery | derived (reader) |
+| `bin/switchboard/reminders.py:143` | `last-reports.json` | a reminder's "no report since" condition reads the sender's last report time | nobody | reminder delivery | primary |
+| `bin/switchboard/agents_verify.py:155` | `discovery.agents` | `agents verify` reads the discovered agents to compare each with its registration | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/alert_labels.py:83` | `discovery.agents` | the alert-label wake finds a repository's orchestrators among the discovered agents | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/answer_delivery.py:592` | `decisions.json` | comment only: the delivery paths wait for the daemon's next write of the projection | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:587` | `boss-resolution` | the stop triage resolves a worker's boss by its registered name (`boss_name`) | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:325` | `decisions.json` | the handoff reads the decisions file for the open decisions of a worker | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:102` | `discovery.agents` | the handoff reads the discovered agents to find the named worker | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:642` | `last-reports.json` | comment only: the brief reads the last-reports record `report` wrote | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/triage.py:358` | `discovery.agents` | a triage rule reads the discovered agents to find the orchestrators | nobody | the moved code's own reader | derived (reader) |
 | `bin/fleet_health.py:298` | `decisions.json` | reads the held PR and waiting decisions per orchestrator | nobody (reader only) | load figures | derived (reader) |
 | `plugins/fleet-decisions-tui/decisions.mjs:9` | `decisions.json` | reads the list for the sidebar | nobody (reader only) | Decisions section | derived (reader) |
 | `bin/decisions_pull.py:28` | `decisions.json` | reads the cloud daemon's list from a configured source command and rewrites the local file (cleaned, atomic, mode 0600); ages its mtime when the source is down | the Mac-side pull (`write_atomic`, `mark_stale`) | the Decisions plugin (`decisions.mjs`) | derived |
