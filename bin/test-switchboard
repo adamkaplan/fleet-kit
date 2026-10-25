@@ -221,6 +221,14 @@ def made_up_pid():
     raise AssertionError("a test asked for more made-up process numbers than fit above %d: a wrap inside one test would make their order depend on the machine" % start)
 
 
+def s5_issue(number, body="", labels=(), pr=False, draft=None, **kw):
+    """The shared sweep_issue plus a draft flag, kept out of the shared fake (#1044)."""
+    record = sweep_issue(number, body, labels, pr=pr, **kw)
+    if draft is not None:
+        record["draft"] = draft
+    return record
+
+
 class PidTable(dict):
     """`self.px[4242]`: the made-up number a test uses where it once wrote the literal 4242. The same key is the same number inside one test, and
     each test gets numbers of its own."""
@@ -1780,7 +1788,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
 
     def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
         registered = {type(s).__name__ for s in sb.fact_sources(self.home)}
@@ -11068,7 +11076,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -15841,6 +15849,14 @@ class TestCharterSetGuard(CharterRig, Base):
 
     def audit_lines(self):
         return [e for e in self.world.audit() if e["event"].startswith("charter.") and e["event"] != "charter.disagree"]
+
+    def test_label_is_read_fresh_and_for_the_right_repository(self):
+        self.orchestrator("orch-b", registry=None)
+        seen = []
+        with mock.patch.object(sb.IntentReader, "invalidate", lambda reader, issue, repo=None: seen.append((issue, repo))):
+            self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertIn((3, self.REPO), seen)
+        self.assertTrue(all(r[0] == "parent" or r[0] == "issue" for r in self.cmd_reads))
 
     def test_non_orchestrator_is_refused_and_audited(self):
         self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
@@ -27945,6 +27961,55 @@ class TestSweep(Base):
         self.sweep([dict(self.human(10), waits_for=["other/repo#5"])])
         self.assertEqual([f for f in self.found() if f[0] == "S8"], [])
 
+    PARKED = "osuser:parked"
+
+    def s5_case(self, issues, aged=("d1",)):
+        self.hub.open = dict(issues)
+        old = sb.iso(self.world.clock.now() - 3 * 3600)
+        decisions = [{"id": "pr:acme/api#%s" % n, "kind": "ask", "tier": "cos", "repo": "acme/api", "number": int(n),
+                      "since": old, "title": "t"} for n in aged]
+        self.sweep(decisions)
+        return [f for f in self.found() if f[0] == "S5"], dict(sb.sweep_state(self.engine).current["s5_skipped"])
+
+    def future(self, days=5):
+        return time.strftime("%Y-%m-%d", time.gmtime(self.world.clock.now() + days * 86400))
+
+    def test_s5_skips_a_draft_pull_request_and_counts_it(self):
+        found, skipped = self.s5_case({5: s5_issue(5, "x", pr=True, draft=True)}, aged=(5,))
+        self.assertEqual(found, [])
+        self.assertEqual(skipped, {"draft": 1, "parked": 0})
+        self.assertIn("1 draft", "\n".join(sb.sweep_status_lines(sb.sweep_state(self.engine).current)))
+
+    def test_s5_skips_a_ready_pull_request_of_a_parked_ask_and_counts_it(self):
+        issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]),
+                  8: s5_issue(8, "Closes #7\n", pr=True, draft=False)}
+        found, skipped = self.s5_case(issues, aged=(8,))
+        self.assertEqual(found, [])
+        self.assertEqual(skipped, {"draft": 0, "parked": 1})
+
+    def test_s5_flags_as_before_an_expired_or_unreadable_date_a_missing_label_and_a_ready_pull_request(self):
+        past = time.strftime("%Y-%m-%d", time.gmtime(self.world.clock.now() - 3 * 86400))
+        issues = {1: s5_issue(1, "Parked until: %s\n" % past, [self.PARKED]), 2: s5_issue(2, "Closes #1\n", pr=True, draft=False),
+                  3: sweep_issue(3, "Parked until: soon\n", [self.PARKED]), 4: sweep_issue(4, "Closes #3\n", pr=True),
+                  5: sweep_issue(5, "Parked until: %s\n" % self.future()), 6: sweep_issue(6, "Closes #5\n", pr=True),
+                  9: s5_issue(9, "plain", pr=True, draft=False)}
+        found, skipped = self.s5_case(issues, aged=(2, 4, 6, 9))
+        self.assertEqual(len(found), 4)
+        self.assertEqual(skipped, {"draft": 0, "parked": 0})
+
+    def test_s5_makes_no_read_beyond_the_baseline_for_draft_and_parked_cases(self):
+        issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]),
+                  8: s5_issue(8, "Closes #7\n", pr=True), 9: s5_issue(9, "x", pr=True, draft=True)}
+        self.s5_case(issues, aged=(8, 9))
+        self.assertFalse([r for r in self.hub.reads if "issues/8" in str(r) or "issues/9" in str(r)], "no new read of the draft or parked PR")
+        self.assertLessEqual(len(self.hub.single), 2, "at most the one withdrawal check per distinct decision; S5 adds none")
+        self.assertEqual({p for _, p in self.hub.single} - {"issues/8", "issues/9"}, set())
+
+    def test_s5_has_one_parked_date_reader(self):
+        root = Path(__file__).resolve().parent   # the daemon is cut into parts (bin/switchboard/*.py): count them all
+        src = "".join(f.read_text() for f in [root / "fleet-switchboard"] + sorted((root / "switchboard").glob("*.py")))
+        self.assertEqual(src.count("PARKED_UNTIL_RE.findall"), 1)
+
     def test_s5_a_cos_decision_older_than_the_limit(self):
         old = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))
         fresh = dict(self.human(41), tier="cos", since=sb.iso(self.world.clock.now() - 600))
@@ -28129,6 +28194,82 @@ class TestSweep(Base):
             self.ready_pass(held, lambda r, n: self.ready(), now=t0)
             state = self.ready_pass(held, lambda r, n: self.ready(), now=t0 + self.engine.config["sweep"]["aged_cos_hours"] * 3600, mutant=mutant)
             self.assertEqual(len(state.s5) == 1, mutant is None)
+
+    # ---- #1044: the held-pull-request ready path skips a draft and a pull request of a parked ask (sweep_ready_pass)
+    S5_HELD_MUTANTS = {
+        "ignore_draft": ('if item.get("draft"):', 'if False:'),
+        "ignore_parked": ('return "parked" if any(', 'return None if any('),
+    }
+
+    def s5_held(self, issues, mutant=None, ticks=(0,)):
+        self.hub.open = dict(issues)
+        held = self.held_pr(600)
+        self.sweep([held])   # fills the picture
+        reads = []
+        for t in ticks:
+            self.world.tick(t)
+            state = sb.sweep_state(self.engine)
+            reading = lambda r, n: reads.append(n) or self.ready()
+            if mutant:
+                with self.mutated("sweep_s5_skip", *mutant):
+                    state = self.ready_pass([held], reading)
+            else:
+                state = self.ready_pass([held], reading)
+        return state, reads
+
+    def test_1044_held_draft_is_skipped_counted_and_not_read(self):
+        for mutant in (None, self.S5_HELD_MUTANTS["ignore_draft"]):
+            self.setUp()
+            state, reads = self.s5_held({600: s5_issue(600, "x", pr=True, draft=True)}, mutant)
+            self.assertEqual(reads == [] and state.s5_skipped["draft"] == 1 and state.s5_unchecked == 0 and not state.ready, mutant is None)
+
+    def test_1044_held_ready_pr_of_a_parked_ask_is_skipped_counted_and_not_read(self):
+        issues = {7: s5_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]), 600: s5_issue(600, "Closes #7\n", pr=True, draft=False)}
+        for mutant in (None, self.S5_HELD_MUTANTS["ignore_parked"]):
+            self.setUp()
+            state, reads = self.s5_held(issues, mutant)
+            self.assertEqual(reads == [] and state.s5_skipped["parked"] == 1 and state.s5_unchecked == 0 and not state.s5, mutant is None)
+
+    def test_1044_held_pr_clock_starts_only_after_the_park_ends(self):
+        issues = {7: s5_issue(7, "Parked until: %s\n" % self.future(1), [self.PARKED]), 600: s5_issue(600, "Closes #7\n", pr=True, draft=False)}
+        self.hub.open = dict(issues)
+        held = self.held_pr(600)
+        self.sweep([held])
+        state = self.ready_pass([held], lambda r, n: self.ready())
+        self.assertEqual((state.ready, state.s5), ({}, {}), "parked: no clock")
+        self.world.tick(2 * 86400)   # the date has passed
+        self.sweep([held])
+        t0 = self.world.clock.now()
+        state = self.ready_pass([held], lambda r, n: self.ready())
+        self.assertEqual(state.ready["acme/api#600"]["at"], t0, "the clock starts now, not earlier")
+        self.assertEqual(state.s5, {})
+
+    def test_1044_park_then_unpark_restarts_the_ready_clock(self):
+        pops = ("            state.ready.pop(key, None)\n            state.ready_read.pop(key, None)\n            state.not_checked_since.pop(key, None)\n            continue", "            continue")
+        key = "acme/api#600"
+        for mutant in (None, pops):
+            self.setUp()
+            self.hub.open = {7: sweep_issue(7, "Parked until: %s\n" % self.future(1), [self.PARKED]), 600: s5_issue(600, "Closes #7\n", pr=True, draft=False)}
+            held = self.held_pr(600)
+            self.sweep([held])
+            ctx = self.mutated("sweep_ready_pass", *mutant) if mutant else contextlib.nullcontext()
+            with ctx:
+                state = sb.sweep_state(self.engine)
+                state.ready[key] = {"head": self.HEAD_A, "at": self.world.clock.now() - 100}   # a ready row exists
+                state.ready_read[key], state.not_checked_since[key] = 1, 1
+                state = self.ready_pass([held], lambda r, n: self.ready())   # parked
+                gone = state.ready == {} and key not in state.ready_read and key not in state.not_checked_since
+                self.world.tick(2 * 86400)   # un-parked: the date has passed
+                self.sweep([held])
+                now = self.world.clock.now()
+                state = self.ready_pass([held], lambda r, n: self.ready())
+                restarted = state.ready.get(key, {}).get("at") == now
+            self.assertEqual(gone and restarted, mutant is None, mutant)
+
+    def test_1044_every_s5_path_is_in_the_docs_table(self):
+        doc = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        for path in ("sweep_findings", "sweep_ready_pass"):
+            self.assertIn("| `%s` (" % path, doc)
 
     def test_986_a_row_that_is_not_a_held_pr_is_never_read(self):
         issue = {"id": "d-x", "kind": "issue", "tier": "cos", "repo": "acme/api", "ask": 510, "title": "t", "since": sb.iso(self.world.clock.now() - 10 * 3600)}
@@ -32624,6 +32765,244 @@ class TestAlertRefreshOrder(Base):
         self.state.units.clear()
         order = self.refresh(["acme-org/r5", "acme-org/r6"], budget=3)
         self.assertEqual(order, [("acme-org/r5", "issues"), ("acme-org/r6", "issues")])
+
+
+class TestRedCi(Base):
+    """#1141: a required check failing at a worker-owned open head, and a red or green default branch, are told once. Real catch-up judge, fakes and temp dirs."""
+    REPO = "acme-org/widget-service"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": [self.REPO]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1, "repo": self.REPO})
+        self.world.add_agent("other", fleet={"role": "orchestrator", "charter": 2, "repo": "acme-org/other-service"})
+        self.world.add_agent("worker", fleet={"role": "coder", "issue": 7, "repo": self.REPO, "reports_to": "orch"})
+        self.engine = self.world.engine
+        self.engine.config["red_ci_required"] = {self.REPO: ["build"]}
+        self.engine.discover(self.world.clock.now())
+        self.source = sb.RedCiFacts()
+        self.source.bind(self.engine)
+        self.rid = 100
+
+    def run_rec(self, conclusion, head="h1", name="build", pr=7, branch="main", status="completed", rid=None, attempt=1):
+        self.rid = rid or self.rid + 1
+        rec = {"id": self.rid, "name": name, "status": status, "conclusion": conclusion, "head_sha": head, "head_branch": branch,
+               "html_url": "https://example.test/run/%d" % self.rid, "created_at": "2026-10-24T10:%02d:00Z" % (self.rid % 60), "pull_requests": [{"number": pr}] if pr else [], "run_attempt": attempt}
+        return rec
+
+    def feed(self, *runs):
+        self.world.tick(1)
+        sb.red_ci_runs(self.engine, self.REPO, list(runs), self.world.clock.now())
+
+    def lines(self, name):
+        self.engine.sources = [self.source]
+        return [f.summary for f in self.engine.collect_facts()[0] if f.recipient == name]
+
+    def test_failure_once_per_head_and_check(self):
+        self.feed(self.run_rec("failure", "h1"))
+        self.assertEqual(len(self.lines("orch")), 1)
+        self.assertIn("h1", self.lines("orch")[0])
+        self.assertIn("https://example.test/run/", self.lines("orch")[0])
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.assertEqual(len(self.lines("orch")), 1)    # the same run again: none
+        self.feed(self.run_rec("failure", "h2"))
+        self.assertEqual(len(self.lines("orch")), 2)    # a new head is a new event
+        self.assertEqual(self.lines("cos"), [])
+        self.assertEqual(self.lines("other"), [])
+
+    def test_restart_does_not_repeat(self):
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.engine.red_ci = None
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.assertEqual(len(self.lines("orch")), 1)
+
+    def test_nothing_for_quiet_conclusions_or_unrequired_or_unowned(self):
+        for conclusion, status in (("cancelled", "completed"), ("skipped", "completed"), ("neutral", "completed"), (None, "in_progress")):
+            self.feed(self.run_rec(conclusion, "h9", status=status))
+        self.feed(self.run_rec("failure", "h9", name="lint"))       # not required
+        self.feed(self.run_rec("failure", "h9", pr=55))             # no worker owns #55: only the Chief of Staff, once
+        self.assertEqual(self.lines("orch"), [])
+        self.assertEqual(len(self.lines("cos")), 1)
+        self.assertIn("no worker owns", self.lines("cos")[0])
+        self.feed(self.run_rec("failure", "h9", pr=55, name="build", rid=self.rid))
+        self.assertEqual(len(self.lines("cos")), 1)
+
+    def test_rerun_failing_again_at_same_head_is_new(self):
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.feed(self.run_rec("failure", "h1", rid=101, attempt=2))
+        self.assertEqual(len(self.lines("orch")), 2)
+        self.feed(self.run_rec("failure", "h1", rid=150))
+        self.assertEqual(len(self.lines("orch")), 3)
+
+    def test_timed_out_and_startup_failure_are_red_others_silent(self):
+        for i, (c, n) in enumerate((("timed_out", 1), ("startup_failure", 1), ("action_required", 0), ("stale", 0))):
+            self.feed(self.run_rec(c, "t%d" % i))
+        self.assertEqual(len(self.lines("orch")), 2)
+
+    def test_missing_status_is_unknown_and_green_without_red_memory_is_silent(self):
+        module = sb.load_module("red_ci")
+        self.assertEqual(module.colour({"conclusion": "failure"}), "none")
+        self.feed(self.run_rec("success", "m1", pr=None))
+        self.assertEqual(self.lines("cos"), [])
+
+    def test_a_failed_send_does_not_record_the_memory(self):
+        real = self.engine._note
+        calls = []
+        def boom(kind, *a, **k):
+            if kind == "red_ci.sent" and not calls:
+                calls.append(1)
+                raise RuntimeError("boom")
+            return real(kind, *a, **k)
+        with mock.patch.object(self.engine, "_note", boom):
+            self.feed(self.run_rec("failure", "h1", rid=101))
+        self.assertEqual(self.engine.red_ci.told, {})
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.assertEqual(len(self.lines("orch")), 1)
+
+    def test_hostile_text_is_cleaned(self):
+        hostile = "bad\x1b[31m\nname `*[x](y)*` <b>" + "z" * 500
+        self.engine.config["red_ci_required"] = {self.REPO: ["*"]}
+        self.feed(self.run_rec("failure", "h1", name=hostile))
+        text = self.lines("orch")[0]
+        self.assertLess(len(text), 600)
+        for bad in ("\x1b", "\n", "`", "<b>", "["):
+            self.assertNotIn(bad, text)
+
+    def test_an_older_head_of_a_moved_on_pull_request_is_skipped(self):
+        self.feed(self.run_rec("failure", "old", rid=101), self.run_rec("success", "new", name="lint", rid=102))
+        self.assertEqual(self.lines("orch"), [])
+
+    def test_unset_required_means_every_workflow_and_the_config_is_validated(self):
+        self.engine.config.pop("red_ci_required")
+        self.feed(self.run_rec("failure", "h1", name="anything"))
+        self.assertEqual(len(self.lines("orch")), 1)
+        for bad in ("x", {"r": "build"}, {"r": []}, {"r": [3]}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_red_ci_required({"red_ci_required": bad}, "t")
+
+    def test_cap_drops_are_audited_but_branch_alarms_are_never_capped(self):
+        for i in range(sb.RED_CI_PER_HOUR + 1):
+            self.feed(self.run_rec("failure", "x%d" % i))
+        self.assertEqual(len(self.lines("orch")), sb.RED_CI_PER_HOUR)
+        self.feed(self.run_rec("failure", "m1", pr=None))
+        self.assertEqual(len(self.lines("cos")), 1)
+
+    def test_one_table_row_per_conclusion(self):
+        import os
+        module = sb.load_module("red_ci")
+        expect = {"success": "green", "failure": "red", "timed_out": "red", "startup_failure": "red",
+                  "cancelled": "none", "skipped": "none", "neutral": "none", "action_required": "none", "stale": "none"}
+        for word, colour in expect.items():
+            self.assertEqual(module.colour({"status": "completed", "conclusion": word}), colour, word)
+            with mock.patch.dict(module.COLOUR, {word: "none" if colour != "none" else "red"}):
+                self.assertNotEqual(module.colour({"status": "completed", "conclusion": word}), colour, word)
+        self.assertEqual(module.colour({"status": "in_progress", "conclusion": None}), "none")
+        self.assertEqual(set(module.COLOUR), set(expect))
+        doc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "switchboard.md")).read()
+        for word in expect:
+            self.assertIn("`%s`" % word, doc)
+        for field in module.FIELDS:
+            self.assertIn("`%s`" % field, doc)
+
+    def test_red_branch_alarm_receivers_and_green(self):
+        self.feed(self.run_rec("failure", "m1", pr=None))
+        for name in ("orch", "cos"):
+            self.assertEqual(len(self.lines(name)), 1, name)
+        self.assertEqual(self.lines("other"), [])
+        self.assertEqual(self.lines("worker"), [])
+        self.feed(self.run_rec("failure", "m1", pr=None))
+        self.assertEqual(len(self.lines("orch")), 1)
+        self.feed(self.run_rec("success", "m2", pr=None))
+        for name in ("orch", "cos"):
+            self.assertEqual(len(self.lines(name)), 2, name)
+            self.assertTrue(any("green again" in l for l in self.lines(name)))
+
+    def test_cancelled_default_run_alarms_nobody(self):
+        self.feed(self.run_rec("cancelled", "m1", pr=None))
+        self.assertEqual(self.lines("cos") + self.lines("orch"), [])
+
+    def test_no_orchestrator_remembers_nothing(self):
+        self.engine.config["red_ci_required"] = {self.REPO: ["build"]}
+        self.engine.discovery.agents.pop("orch")
+        self.feed(self.run_rec("failure", "h1"))
+        self.assertEqual(self.engine.red_ci.told, {})
+
+    def test_hourly_bound(self):
+        for i in range(sb.RED_CI_PER_HOUR + 5):
+            self.feed(self.run_rec("failure", "x%d" % i))
+        self.assertEqual(len(self.lines("orch")), sb.RED_CI_PER_HOUR)
+
+    def test_mutants_fail(self):
+        def scenario():
+            self.setUp()
+            self.feed(self.run_rec("failure", "h1", rid=101)); self.feed(self.run_rec("failure", "h1", rid=101))
+            repeat = len(self.lines("orch"))
+            self.feed(self.run_rec("cancelled", "m0", pr=None))
+            cancelled = len(self.lines("cos"))
+            self.feed(self.run_rec("failure", "m1", pr=None)); self.feed(self.run_rec("success", "m2", pr=None))
+            return repeat, cancelled, len(self.lines("cos"))
+        self.assertEqual(scenario(), (1, 0, 2))
+        module = sb.load_module("red_ci")
+        real_tell = sb.red_ci_tell
+        def repeating(engine, state, key, repo, text, names, now):
+            state.told.pop(key, None)
+            repeating.n += 1
+            return real_tell(engine, state, key + "#%d" % repeating.n, repo, text, names, now)
+        repeating.n = 0
+        with mock.patch.object(sb, "red_ci_tell", repeating):
+            self.assertNotEqual(scenario()[0], 1)
+        with mock.patch.dict(module.COLOUR, {"cancelled": "red"}):
+            self.assertNotEqual(scenario()[1], 0)
+        with mock.patch.dict(module.COLOUR, {"success": "none"}):
+            self.assertNotEqual(scenario()[2], 2)
+        # mutant: the key drops the run id and attempt -> a re-run at the same head is lost
+        def no_run_key(repo, number, head, check, run_id=0, attempt=1):
+            return "pr:%s#%d:%s:%s" % (repo, number, head, check)
+        with mock.patch.object(module, "pr_key", no_run_key):
+            self.setUp()
+            self.feed(self.run_rec("failure", "h1", rid=101)); self.feed(self.run_rec("failure", "h1", rid=101, attempt=2))
+            self.assertNotEqual(len(self.lines("orch")), 2)
+        # mutant: no cleaning
+        with mock.patch.object(module, "clean", lambda t, cap=0: str(t)):
+            self.setUp()
+            self.engine.config["red_ci_required"] = {self.REPO: ["*"]}
+            self.feed(self.run_rec("failure", "h1", name="a\nb"))
+            self.assertIn("\n", self.lines("orch")[0])
+        # mutant: the cap also drops branch alarms
+        real_tell = sb.red_ci_tell
+        with mock.patch.object(sb, "red_ci_tell", lambda e, st, k, r, t, n, now, capped=True: real_tell(e, st, k, r, t, n, now, True)):
+            self.setUp()
+            for i in range(sb.RED_CI_PER_HOUR):
+                self.feed(self.run_rec("failure", "y%d" % i))
+            self.feed(self.run_rec("failure", "m1", pr=None))
+            self.assertEqual(self.lines("cos"), [])
+
+    def test_table_is_complete_and_agrees_with_the_existing_notice(self):
+        module = sb.load_module("red_ci")
+        known = {"success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required", "stale", "startup_failure"}
+        self.assertEqual(set(module.COLOUR), known)
+        self.assertEqual(module.colour({"status": "in_progress", "conclusion": "failure"}), "none")
+        self.assertEqual(module.colour({"conclusion": "unheard-of"}), "none")
+        doc = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "switchboard.md")).read()
+        for word, action in module.COLOUR.items():   # the docs table and the code table agree row by row
+            self.assertRegex(doc, r"`%s`[^\n]*\b%s\b" % (word, {"red": "red", "green": "green", "none": "(silent|none)"}[action]), word)
+        self.assertEqual({w for w, a in module.COLOUR.items() if a == "red"}, {"failure", "timed_out", "startup_failure"})
+
+    def test_unowned_note_is_new_for_a_rerun(self):
+        self.feed(self.run_rec("failure", "h9", pr=55, rid=201))
+        self.feed(self.run_rec("failure", "h9", pr=55, rid=201, attempt=2))
+        self.assertEqual(len(self.lines("cos")), 2)
+
+    def test_config_warns_on_matrix_job_names_and_validates_default_branches(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            sb.validate_config({"github_repos": [self.REPO], "red_ci_required": {self.REPO: ["test (ubuntu-latest)"]}})
+        self.assertIn("matrix JOB name", err.getvalue())
+        for bad in ({"a/b": ""}, [1], {"a/b": 3}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"github_repos": [self.REPO], "default_branches": bad})
+
 
 
 class TestAlertWake(Base):
@@ -45513,7 +45892,9 @@ class TestDecisionsFromGitHub(Base):
         issue["labels"] = []
         self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue), "label": {"name": DECISION_LABEL}})
         self.assertEqual(self.derive()[0], [])
-        self.assertEqual(len(self.gh.api_calls), calls)
+        added = self.gh.api_calls[calls:]
+        self.assertEqual([p for p in added if "/comments" not in p], [])   # #1094: only the plan kind's one cached read of the issue's comments
+        self.assertLessEqual(len(added), 1)
 
     def test_the_catch_up_read_asks_for_open_issues_only(self):
         self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
@@ -46034,8 +46415,8 @@ class TestDecisionsPlugin(Base):
         self.assertEqual(view["rows"], [])
         (group,) = view["groups"]  # these two carry no repo: one group
         first, second = group["entries"]
-        self.assertEqual((first["head"], first["lines"]), ("#2ab 12m", ["Close #2? and a second deploy run?"]))
-        self.assertEqual(second["head"], "platform-481 45s")
+        self.assertEqual((first["head"], first["lines"]), ("❔ #2ab 12m", ["Close #2? and a second deploy run?"]))
+        self.assertEqual(second["head"], "❔ platform-481 45s")
         self.assertEqual(len(second["lines"]), 2)  # at most two lines, whatever the title
         self.assertTrue(second["lines"][-1].endswith("\u2026"))
         self.assertTrue("".join(second["lines"]).replace(" ", "").startswith("permission:shellxxxx"))
@@ -46053,7 +46434,7 @@ class TestDecisionsPlugin(Base):
         start = lines.index("Cleanup of stale issues (2 rows)")
         self.assertEqual(lines[start:start + 5], ["Cleanup of stale issues (2 rows)", "web#7: close it",
                                                   "web#9: close as duplicate of web#7", "and also label the other issue",
-                                                  "api#101 2h"])
+                                                  "❔ api#101 2h"])
         self.assertTrue(all(len(line) <= 34 for line in lines))
 
     def test_wrapping_keeps_every_word_and_breaks_an_over_long_word_hard(self):
@@ -46077,11 +46458,11 @@ class TestDecisionsPlugin(Base):
         self.assertEqual(lines[0], "Decisions (3) for you")
         heavy = "\u2501" * 34
         self.assertEqual(lines.count(heavy), 2)  # above the section and between the repos
-        self.assertEqual(lines[1:7], [heavy, "Waits on you (3)", "acme/api", "api only", "api#1 3m", heavy])
+        self.assertEqual(lines[1:7], [heavy, "Waits on you (3)", "acme/api", "api only", "❔ api#1 3m", heavy])
         self.assertEqual(lines[7:9], ["acme/web", "older web"])
         self.assertEqual(lines[9], "q" * 33 + "\u2026")  # two lines, then an ellipsis
-        self.assertEqual(lines[10:13], ["web#2 50m", "\u2504" * 34, "newer web"])  # a thin rule between entries
-        self.assertEqual(lines[13], "web#9 5m")
+        self.assertEqual(lines[10:13], ["❔ web#2 50m", "\u2504" * 34, "newer web"])  # a thin rule between entries
+        self.assertEqual(lines[13], "❔ web#9 5m")
 
     def test_a_file_older_than_the_stale_bound_is_not_current_and_says_so(self):
         self.assertEqual((self.r["staleStatus"], self.r["edge"]), ("stale", "ok"))
@@ -46096,7 +46477,7 @@ class TestDecisionsPlugin(Base):
     def test_unreadable_sources_are_said_and_junk_entries_are_skipped(self):
         self.assertEqual(self.r["errorsView"]["rows"][-1]["text"], "1 source(s) unreadable")
         (group,) = self.r["junkView"]["groups"]
-        self.assertEqual([(e["head"], e["lines"]) for e in group["entries"]], [("#1 ?", ["fine"])])
+        self.assertEqual([(e["head"], e["lines"]) for e in group["entries"]], [("❔ #1 ?", ["fine"])])
 
     def test_ages_read_the_same_as_the_command_prints_them(self):
         self.assertEqual(self.r["ages"], ["0s", "59s", "1m", "11m", "59m", "1h", "1h05m", "2h", "23h59m", "1d", "3d", "0s"])
@@ -48266,8 +48647,8 @@ console.log(JSON.stringify([entryOf(d, now), entryOf({ ...d, id: "api#2", repo: 
         done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
         long_e, short_e = json.loads(done.stdout.strip().splitlines()[-1])
-        self.assertEqual(long_e["head"], "acme/site#2ab 1m")
-        self.assertEqual(short_e["head"], "api#2 1m")
+        self.assertEqual(long_e["head"], "❔ acme/site#2ab 1m")
+        self.assertEqual(short_e["head"], "❔ api#2 1m")
         self.assertEqual(len(long_e["lines"]), 2)  # two lines at most, the second ending in an ellipsis
         self.assertTrue(long_e["lines"][1].endswith("\u2026"))
         self.assertTrue(all(len(x) <= 34 for x in long_e["lines"]))
@@ -55456,6 +55837,7 @@ class TestBatchEntry(BatchWorld):
         self.gh.calls.clear()
         self.entry("api#101")
         reads = [c[2] for c in self.gh.calls]
+        reads = [r for r in reads if "/comments" not in r]   # #1094: the plan kind reads an issue's comments (cached), counted in TestPlanKind
         self.assertTrue(all("/issues?labels=" in r for r in reads), reads)
         self.assertEqual(len(reads), 4, "two reads (one per label) of each of the two repos, as before")
 
@@ -55526,8 +55908,11 @@ class TestBatchAnswer(BatchWorld):
         self.assertEqual(self.gh.names(API, 3), ["bug"])
         self.assertEqual([c for c in self.gh.comments if (c["repo"], c["issue"]) != self.batch], [])
         for call in self.gh.calls:  # the daemon's listing reads aside, nothing names an issue but the batch
-            if "/issues?" not in call[2]:
-                self.assertRegex(call[2], r"^repos/acme/api/issues/101/", "a call that is not about the batch: %r" % call)
+            if "/issues?" in call[2]:
+                continue
+            if re.fullmatch(r"repos/acme/api/issues/\d+/comments\?per_page=100", call[2]) and "--method" not in call:
+                continue  # the plan-kind READ (#1094): a GET of a row issue's comments is a read, never a touch
+            self.assertRegex(call[2], r"^repos/acme/api/issues/101/", "a call that is not about the batch: %r" % call)
 
     def test_as_recommended_posts_one_comment_with_every_row_and_takes_both_labels_off(self):
         code, out, err = self.answer("--as-recommended")
@@ -56576,14 +56961,14 @@ class TestDecisionsPanelLayout(Base):
 
     def test_an_entry_is_its_headline_in_two_lines_at_most_then_id_and_age(self):
         entry = self.r["entry"]
-        self.assertEqual(entry["head"], "api#2 1h30m")
+        self.assertEqual(entry["head"], "❔ api#2 1h30m")
         self.assertEqual(len(entry["lines"]), 2)
         self.assertTrue(entry["lines"][1].endswith("\u2026"))
         self.assertNotIn("RAW", " ".join(entry["lines"]))  # the headline, not the raw title
         self.assertEqual(self.r["noHeadline"]["lines"], ["only a title"])  # an older daemon's file: the title
 
     def test_a_folded_report_names_its_agent_on_the_id_line(self):
-        self.assertEqual(self.r["via"], "web#7 10m coder")
+        self.assertEqual(self.r["via"], "❔ web#7 10m coder")
 
     def test_entries_are_separated_thinly_and_repos_and_sections_heavily(self):
         lines = self.r["lines"]
@@ -56591,8 +56976,8 @@ class TestDecisionsPanelLayout(Base):
         self.assertEqual(lines[:3], ["Decisions (6) all", heavy, "Waits on you (4)"])
         self.assertEqual(lines.count(thin), 1)  # only the two web entries of the first section share a repo
         at = lines.index(thin)
-        self.assertEqual(lines[at - 2:at + 3], ["web for you", "web#7 10m coder", thin, "second for you", "web#8 5m"])
-        self.assertEqual(lines.index("Waits on cos (1, 0 over 1h)") - 1, lines.index(heavy, lines.index("web#8 5m")))
+        self.assertEqual(lines[at - 2:at + 3], ["web for you", "❔ web#7 10m coder", thin, "second for you", "❔ web#8 5m"])
+        self.assertEqual(lines.index("Waits on cos (1, 0 over 1h)") - 1, lines.index(heavy, lines.index("❔ web#8 5m")))
         self.assertTrue(all(len(x) <= 34 for x in lines))
 
     def test_the_tui_draws_the_sections_and_the_rules(self):
@@ -58453,11 +58838,11 @@ class TestHeadsUpPanelLayout(Base):
         e = self.r["entries"]["pr:web#9"]
         self.assertEqual(e["lines"], ["web#9 Add the retry budget to the", "client"])
         self.assertEqual(e["facts"], ["+120/-14, 5 files, CI failing, no", "review"])
-        self.assertEqual(e["head"], "pr:web#9 12m")
+        self.assertEqual(e["head"], "🔀 pr:web#9 12m")
         lines = self.r["humanLines"]
-        at = lines.index("pr:web#9 12m")
+        at = lines.index("🔀 pr:web#9 12m")
         self.assertEqual(lines[at - 4:at + 1], ["web#9 Add the retry budget to the", "client",
-                                               "+120/-14, 5 files, CI failing, no", "review", "pr:web#9 12m"])
+                                               "+120/-14, 5 files, CI failing, no", "review", "🔀 pr:web#9 12m"])
 
     def test_the_headline_is_cut_at_two_lines_and_a_hold_shows_when_it_merges_after_in_utc(self):
         e = self.r["entries"]["pr:api#12"]
@@ -60211,7 +60596,7 @@ class TestPanelCaptainRows(Base):
                 self.assertIn(self.PR, links)
                 self.assertIn("https://github.com/acme-org/widget-host/issues/41", links)
                 self.assertNotIn("https://github.com/acme-org/widget-host/issues/132", links)
-        self.assertEqual(self.r["entry"][1], ["widget-host#132 1d", self.PR])
+        self.assertEqual(self.r["entry"][1], ["🔀 widget-host#132 1d", self.PR])
 
     def test_the_id_is_the_short_ref_and_the_age_is_on_the_line(self):
         for mode in ("plain", "v3"):
@@ -60271,7 +60656,7 @@ r.ageSegs = [30, 3599, 86399, 86400].map((s) => lineWith([mk("web#1", "o/web", "
 r.ageLine = textOf(lineWith([mk("web#1", "o/web", "human", "x", 300)], human, (l) => l.id === "web#1"));
 // PR number coloured by state; the real id is kept on the line
 const prLine = (extra) => lineWith([pr(5, "o/a", 100, extra)], human, (l) => l.id);
-r.prState = [{ ci: "failing", review: "none" }, { ci: "green", review: "approved" }, { ci: "green", review: "none" }, { ci: "pending", review: "none" }].map((e) => prLine(e).segs.map((s) => [s[0].split(" ")[0], s[1]])[0]);
+r.prState = [{ ci: "failing", review: "none" }, { ci: "green", review: "approved" }, { ci: "green", review: "none" }, { ci: "pending", review: "none" }].map((e) => prLine(e).segs.map((s) => [s[0].split(" ")[0], s[1]])[1]);
 r.prId = [prLine({}).id, textOf(prLine({}))];
 // a decision that needs you: two lines, bold headline, id muted
 r.need = rows([mk("a#1", "o/a", "human", "Which database?", 600)], human).slice(-3).map((l) => [textOf(l), l.segs.map((s) => s[1])]);
@@ -60287,7 +60672,7 @@ r.plainFirst = d.viewLines(d.buildView(snap(mix), now, 34, chief)).slice(0, 3);
 // links and control characters
 const linked = rows([mk("web#1", "acme/web", "human", "Q?", 60, { ask: 12 }), pr(5, "acme/web", 60), mk("x#1", "bad repo", "human", "H", 60, { ask: 3 })], human);
 r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
-r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^H$/.test(t));
+r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^\u2754 H$/.test(t));
 const esc = rows([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })], human);
 r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|31m/.test(t));
 // iteration 3
@@ -60346,9 +60731,9 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_the_layout_in_the_chief_of_staffs_view(self):
         self.assertEqual(self.r["chief"], [
             "Decisions                      all", "2 need human \u00b7 3 PRs", "3 on cos (2 over 1h)", " ",
-            "Waits on you", "a", "Pick a cache", "a#2" + " " * 28 + "20m", " ", "Which database?", "a#1" + " " * 28 + "10m", " ",
-            "Heads-up", "a", "#6 Add a thing" + " " * 15 + "1h06m", "#5 Add a thing" + " " * 18 + "1m", " ",
-            "c", "#7 Add a thing" + " " * 18 + "1d", " ",
+            "Waits on you", "a", "❔ Pick a cache", "a#2" + " " * 28 + "20m", " ", "❔ Which database?", "a#1" + " " * 28 + "10m", " ",
+            "Heads-up", "a", "🔀 #6 Add a thing" + " " * 12 + "1h06m", "🔀 #5 Add a thing" + " " * 15 + "1m", " ",
+            "c", "🔀 #7 Add a thing" + " " * 15 + "1d", " ",
             "Waits on cos", "b" + " " * 20 + "3 \u00b7 oldest 1d"])
 
     def test_a_humans_view_has_no_cos_section_only_a_count(self):
@@ -60358,7 +60743,7 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_nothing_empty_is_drawn_and_no_rule(self):
         self.assertEqual(self.r["none"], ["Decisions                  for you", "0 need you", " ", "nothing waiting"])
         self.assertEqual(self.r["onlyCos"][1:], ["1 with cos", " ", "nothing waiting"])
-        self.assertEqual(self.r["onlyPr"][-3:], ["Heads-up", "a", "#5 Add a thing" + " " * 18 + "1m"])
+        self.assertEqual(self.r["onlyPr"][-3:], ["Heads-up", "a", "🔀 #5 Add a thing" + " " * 15 + "1m"])
         for name in ("chief", "human", "none", "onlyPr"):
             for line in self.r[name]:
                 self.assertFalse(set(line) & set("\u2501\u2504"), line)
@@ -60375,12 +60760,13 @@ class TestDecisionsStyledPanel(unittest.TestCase):
         self.assertEqual(self.r["prId"][0], "pr:o/a#5")
 
     def test_what_needs_you_is_two_lines_bold_headline_and_a_quiet_id(self):
-        self.assertEqual(self.r["need"], [["a", ["b"]], ["Which database?", ["b"]], ["a#1|10m", ["m"]]])
+        self.assertEqual(self.r["need"], [["a", ["b"]], ["❔ Which database?", ["", "b"]], ["a#1|10m", ["m"]]])
 
     def test_a_repo_name_is_shortened_only_when_unambiguous(self):
         self.assertIn("acme/web", self.r["clash"])
         self.assertIn("other/web", self.r["clash"])
-        self.assertIn("see #9 and other/web#4 and web#3", self.r["clash"])
+        self.assertIn("❔ see #9 and other/web#4 and", self.r["clash"])
+        self.assertIn("web#3", self.r["clash"])
         self.assertEqual(self.r["tidy"], ["fix web#9, #4.", "web", "true"])
 
     def test_the_states_the_plain_view_has(self):
@@ -60396,11 +60782,11 @@ class TestDecisionsStyledPanel(unittest.TestCase):
         self.assertEqual(self.r["plainFirst"][0], "Decisions (5) all")
 
     def test_every_line_of_an_entry_carries_its_link_and_no_control_character_reaches_a_line(self):
-        self.assertEqual(self.r["links"], [["Q?", "https://github.com/acme/web/issues/12", False],
+        self.assertEqual(self.r["links"], [["❔ Q?", "https://github.com/acme/web/issues/12", False],
                                            ["web#1|1m", "https://github.com/acme/web/issues/12", True],
-                                           ["#5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
-        self.assertEqual(self.r["noLink"], ["bad repo", "H"])
-        self.assertEqual(self.r["ctrl"], ["bad]8;;http://xtitle", "r[31mow"])
+                                           ["🔀 #5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
+        self.assertEqual(self.r["noLink"], ["bad repo", "❔ H"])
+        self.assertEqual(self.r["ctrl"], ["❔ bad]8;;http://xtitle", "r[31mow"])
 
     def test_iteration_3_hues_are_stable_and_glyphs_are_one_cell(self):
         v3 = self.r["v3"]
@@ -60415,12 +60801,12 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_iteration_3_marks_kind_and_state_and_keeps_the_text(self):
         v3 = self.r["v3"]
         by = {t: (st, right) for t, st, right in v3["styles"]}
-        self.assertEqual(by["\u2717 #6 Add a thing" + " " * 0 + "|1h06m"][0][0], "e", "failing: a red glyph")
-        self.assertEqual(by["\u2713 #5 Add a thing|1m"][0][0], "s", "ready: a green glyph")
-        self.assertEqual(by["\u25c6 #7 Add a thing|1d"][0][0], "m", "other: a quiet glyph")
+        self.assertEqual(by["🔀 \u2717 #6 Add a thing|1h06m"][0][1], "e", "failing: a red glyph")
+        self.assertEqual(by["🔀 \u2713 #5 Add a thing|1m"][0][1], "s", "ready: a green glyph")
+        self.assertEqual(by["🔀 \u25c6 #7 Add a thing|1d"][0][1], "m", "other: a quiet glyph")
         for text, (styles, right) in by.items():
-            if text[:1] in "\u2717\u2713\u25c6":
-                self.assertTrue(styles[1].startswith("p"), "the PR number takes the project hue: " + text)
+            if text.startswith("🔀 "):
+                self.assertTrue(styles[2].startswith("p"), "the PR number takes the project hue: " + text)
             if right:
                 self.assertTrue(right[-1].endswith("t"), "the age is italic: " + text)
         self.assertEqual(v3["size"][-1], ["  +900/-100", ["", "a", "m", "r"]], "the size uses the diff colours")
@@ -64675,11 +65061,11 @@ class TestDecisionsPanelOrder(unittest.TestCase):
     def test_the_plain_view_draws_the_order_nested_with_next_and_waits_for(self):
         lines = self.r["plain"]
         at = {name: i for i, name in enumerate(lines)}
-        heads = [l for l in lines if l.strip().startswith("#")]
-        self.assertEqual([h.strip().split(" ")[0] for h in heads], ["#2", "#1", "#3"], "by order, not oldest first")
-        self.assertIn("#2 1d02h \u00b7 next".replace("1d02h", [h for h in heads if h.startswith("#2")][0].split(" ")[1]), lines)
-        blocked = [h for h in heads if h.strip().startswith("#1")][0]
-        self.assertTrue(blocked.startswith("  #1 "), "indented under what it waits for")
+        heads = [l for l in lines if l.strip().startswith("❔ #")]
+        self.assertEqual([h.strip().split(" ")[1] for h in heads], ["#2", "#1", "#3"], "by order, not oldest first")
+        self.assertIn("❔ #2 1d02h \u00b7 next".replace("1d02h", [h for h in heads if h.startswith("❔ #2")][0].split(" ")[2]), lines)
+        blocked = [h for h in heads if h.strip().startswith("❔ #1")][0]
+        self.assertTrue(blocked.startswith("  ❔ #1 "), "indented under what it waits for")
         self.assertTrue(blocked.endswith("\u00b7 waits for #2"))
 
     def test_the_styled_panel_indents_the_blocked_item_and_marks_next_and_cycle(self):
@@ -65140,6 +65526,123 @@ class TestV2ReadVolume(Base):
         for key, value in (("v2_cache_seconds", -1), ("v2_reads_per_pass", "8"), ("v2_reads_per_minute", True)):
             with self.subTest(key=key), self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
+
+
+class TestPlanKind(unittest.TestCase):
+    """#1094: GitHubHub.plan_kind: plan / noplan / unknown, one cached read per issue, no write."""
+
+    def hub(self, answers):
+        import types
+        calls, t = [], [0.0]
+
+        def gh_api(path, paginate=True, timeout=None, **kw):
+            calls.append(path)
+            a = answers(path) if callable(answers) else answers
+            if isinstance(a, Exception):
+                raise a
+            return [a]
+        hub = types.SimpleNamespace(lock=threading.RLock(), _cache={}, now=lambda: t[0], gh_api=gh_api,
+                                    config={"call_timeout_seconds": 5})
+        return hub, calls, t
+
+    def kind(self, hub, n=1):
+        return sb.GitHubHub.plan_kind(hub, "acme/api", n)
+
+    def test_the_three_kinds(self):
+        plan = [{"id": 1, "created_at": "2026-01-01", "body": "## Plan (scenarios)\n\nx"}]
+        self.assertEqual(self.kind(self.hub(plan)[0]), "plan")
+        self.assertEqual(self.kind(self.hub([{"id": 1, "body": "hello"}])[0]), "noplan")
+        self.assertEqual(self.kind(self.hub(sb.GitHubUnavailable("down"))[0]), "unknown")
+        self.assertEqual(self.kind(self.hub({"not": "a list"})[0]), "unknown")
+
+    def test_a_second_refresh_within_the_ttl_adds_no_read(self):
+        hub, calls, t = self.hub([])
+        for n in range(1, 6):
+            self.kind(hub, n)
+        self.assertEqual(len(calls), 5)
+        for n in range(1, 6):
+            self.kind(hub, n)
+        self.assertEqual(len(calls), 5, "no read of the second refresh")
+        t[0] += sb.GITHUB_LOOKUP_TTL + 1
+        self.kind(hub, 1)
+        self.assertEqual(len(calls), 6)
+        self.assertTrue(all(c.startswith("repos/") and "comments" in c for c in calls))
+
+    def test_a_full_page_never_reads_noplan_and_a_plan_on_it_is_unknown(self):
+        full = [{"id": i, "created_at": "2026-01-01", "body": "x"} for i in range(100)]
+        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
+        full[3]["body"] = "## Plan (scenarios)\n\nx"
+        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
+        self.assertEqual(self.kind(self.hub(full[:99])[0]), "plan")
+
+    def test_a_plan_in_the_body_reads_noplan(self):
+        body = "## Plan (scenarios)\n\nx"
+
+        def answers(path):
+            return {"body": body} if path.endswith("/issues/1") else [{"id": 1, "body": "hi"}]
+        hub, calls, t = self.hub(answers)
+        self.assertEqual(self.kind(hub), "noplan")   # the ask says a plan COMMENT; a plan-looking BODY does not count
+
+    def test_every_row_is_read_over_several_refreshes(self):
+        hub, calls, t = self.hub([])
+        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
+        records = [{"repo": "acme/api", "number": n} for n in range(60)]
+        for _ in range(7):
+            sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
+        self.assertEqual(len(calls), 60)
+        kinds = sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
+        self.assertEqual(set(kinds.values()), {"noplan"})
+
+    def test_never_read_rows_are_served_before_retries(self):
+        bad = set(range(11))
+
+        def answers(path):
+            n = int(path.split("/issues/")[1].split("/")[0])
+            return sb.GitHubUnavailable("x") if n in bad else []
+        hub, calls, t = self.hub(answers)
+        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
+        records = [{"repo": "acme/api", "number": n} for n in range(11)]
+        sb.GitHubHub.plan_kinds(hub, records, [10])
+        t[0] += sb.GITHUB_LOOKUP_RETRY + 1
+        records += [{"repo": "acme/api", "number": n} for n in range(100, 105)]
+        calls.clear()
+        kinds = sb.GitHubHub.plan_kinds(hub, records, [10])
+        for n in range(100, 105):
+            self.assertEqual(kinds[("acme/api", n)], "noplan")
+
+    def test_one_page_one_call_no_pagination(self):
+        hub, calls, t = self.hub([])
+        seen = []
+        orig = hub.gh_api
+        hub.gh_api = lambda path, paginate=True, **kw: (seen.append(paginate), orig(path, paginate=paginate, **kw))[1]
+        self.kind(hub)
+        self.assertEqual(seen, [False])
+        self.assertIn("per_page=100", calls[0])
+
+    def test_a_failed_read_is_retried_after_the_short_ttl_not_the_full_one(self):
+        for err in (sb.GitHubUnavailable("403"), sb.GitHubUnavailable("404"), TimeoutError("t")):
+            hub, calls, t = self.hub(err)
+            self.assertEqual(self.kind(hub), "unknown")
+            self.kind(hub)
+            self.assertEqual(len(calls), 1)
+            t[0] += sb.GITHUB_LOOKUP_RETRY + 1
+            self.kind(hub)
+            self.assertEqual(len(calls), 2, "retried after the short ttl")
+
+    def test_a_refresh_makes_at_most_the_cap_of_reads(self):
+        hub, calls, t = self.hub([])
+        budget = [sb.PLAN_KIND_READS_PER_REFRESH]
+        kinds = [sb.GitHubHub.plan_kind(hub, "acme/api", n, budget) for n in range(60)]
+        self.assertEqual(len(calls), sb.PLAN_KIND_READS_PER_REFRESH)
+        self.assertEqual(kinds.count("unknown"), 60 - sb.PLAN_KIND_READS_PER_REFRESH)
+        self.assertEqual(sb.PLAN_KIND_READS_PER_REFRESH, 10)
+
+    def test_the_cache_is_bounded(self):
+        hub, calls, t = self.hub([])
+        for n in range(sb.PLAN_KIND_CACHE_MAX + 50):
+            self.kind(hub, n)
+        self.assertLessEqual(len(hub._cache), sb.PLAN_KIND_CACHE_MAX)
+
 
 
 class TestWriteOnlyOnChange(Base):

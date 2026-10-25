@@ -1221,6 +1221,40 @@ characters each), with an ellipsis only past that. The issue title comes from wh
 never from a new `gh` read: the open decision's own title (the hub's picture), else the intent reader's cached
 issue; a report whose issue is in neither keeps its report line.
 
+**Kind marker (issue 1094).** Legend: every row starts with one emoji for its kind: 🔀 pull request, 📋 issue with a plan comment, 📝 issue with no plan comment, ❔ kind not readable (the symbols are `KIND_MARKS` in `plugins/fleet-decisions-tui/decisions.mjs`). A plan in the issue body reads "no plan comment" (the ask says a plan comment); the author of the plan comment is not checked, as `plan check` does not check it. A full page of 100 comments reads ❔ (the plan may be past it, or superseded by a later one). In the v3 style a wrapped issue row shows the mark and then the kind glyph: intended.
+
+Reads and caches of the panel path (each has a bound, a test and a mutant in `TestPlanKind`; the names are checked by that class):
+
+| read / cache | bound | test | mutant |
+| --- | --- | --- | --- |
+| `plan_kind` comments read | one page, `per_page=100`, `paginate=False`; full page = unknown | test_one_page_one_call_no_pagination, test_a_full_page_... | paginate / per_page / full-page check removed |
+| `plan_kind` ttl | `GITHUB_LOOKUP_TTL`; a failure `GITHUB_LOOKUP_RETRY` | test_a_failed_read_is_retried..., test_a_second_refresh... | failure cached for the full ttl |
+| reads per refresh (`decisions_from_github`) | `PLAN_KIND_READS_PER_REFRESH` = 10 | test_a_refresh_makes_at_most_the_cap_of_reads | cap removed |
+| `GitHubHub._cache` plan-kind keys | `PLAN_KIND_CACHE_MAX` = 512 | test_the_cache_is_bounded | eviction removed |
+
+Budget order (#1094): within a refresh the 10 new reads go to never-read issues first and to retries (an expired entry, e.g. a persistent failure) last, so failing rows cannot starve rows never read. Known limits: the width test (`the mark's cells are taken from the row width`) is a heuristic and allows `ROW_WIDTH + 2`; the cache evicts by expiry (earliest first), not strict LRU.
+
+Mutants of this PR, run by hand (killed = a test fails):
+
+| mutant | tests | result |
+| --- | --- | --- |
+| `paginate=True` on the comments read | TestPlanKind | killed |
+| `per_page=100` removed | TestPlanKind | killed |
+| full-page check removed | TestPlanKind | killed |
+| plan read as "noplan" | TestPlanKind | killed |
+| a plan in the issue body counts (reads the record) | TestPlanKind | killed |
+| failure cached for the full ttl | TestPlanKind | killed |
+| per-refresh cap removed | TestPlanKind | killed |
+| cache eviction removed | TestPlanKind | killed |
+| retries served before never-read rows | TestPlanKind | killed |
+| no cache write | TestPlanKind | killed |
+| same emoji for all kinds | kind.test.mjs | killed |
+| plan marked as noplan | kind.test.mjs | killed |
+| unknown shown as noplan | kind.test.mjs | killed |
+| emoji dropped from entry / row / wrapped row (3) | kind.test.mjs | killed |
+| `MARK_CELLS` = 0 | kind.test.mjs | killed |
+| pull request row not read as pr | kind.test.mjs | killed |
+
 **Clicking a row (issue 66).** A decision row links to its issue (`https://github.com/<repo>/issues/<ask>`, for an
 issue decision, a report with an issue number and a batch) and a heads-up row to its PR
 (`https://github.com/<repo>/pull/<number>`); a row with no repo or no number has no link and behaves as before. The
@@ -2379,7 +2413,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `awaiting`, `blocked on`, `pending`, `needs <name>`, `<name> to review|approve|decide|merge|answer`, `for <name>'s review`; whole phrases, any case; `person_names` may hold a handle such as `@login`) and which is not a captain PR (no `merge-captain` label and, inside the transition window, no first line `MERGE: captain`; see #133) |
 | S3 | the same phrases in one of an item's last 5 comments (of the last 7 days), or in a report's text, where no human-tier decision names that issue or PR |
 | S4 | a decision (issue or captain; a report is left, its question may outlive a closed ask) whose issue or PR is closed or merged (an issue that is closed is never listed at all since #570: see below): **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
-| S5 | a cos-tier decision older than `aged_cos_hours` that is NOT already in the owner's tier: an entry whose issue or PR also has a human-tier decision (a duplicate, or the escalation of the same ref, however the repo or the `pr:` id is spelled: case, `pr:owner/repo#N` or `pr:repo#N`) is not stale for cos and is not raised. A held pull request is judged by its gates, not its age: see "S5 for a held pull request" below |
+| S5 | a cos-tier decision older than `aged_cos_hours` that is NOT already in the owner's tier: an entry whose issue or PR also has a human-tier decision (a duplicate, or the escalation of the same ref, however the repo or the `pr:` id is spelled: case, `pr:owner/repo#N` or `pr:repo#N`) is not stale for cos and is not raised. A held pull request is judged by its gates, not its age: see "S5 for a held pull request" below. Two more exemptions: a pull request that is a **draft**, and a pull request that is, or closes (or is planned by), an ask labelled `parked` with a `Parked until: YYYY-MM-DD` line in the future (the same reading as the ownerless check) are skipped; the sweep's totals say how many were skipped for each reason (`S5 skipped: N draft, M parked`). Both paths apply it: the legacy aged path (in `sweep_findings`) and the held-pull-request ready path (in `sweep_ready_pass`, before any read: a skipped held pull request is not read, not counted unchecked, and its ready clock restarts only when it is ready and neither draft nor parked). The ask is the one `pr_body_refs` finds (`Closes`, `Part of`, `PLAN`); `Refs #N` is NOT an ask. A passed, unreadable or label-less date, and a ready pull request, are raised as before; no extra GitHub read is made |
 
 **S5 for a held pull request (#986).** S5 fires only when the pull request is ready for the owner's decision: the full gate board as `gates` shows it, whichever gates the repository enforces, every applicable gate other than G6 met, G6 open, not a draft. The wait is counted from the moment it became ready at its current head, never from the hold. The moment is kept per head in `sweep-ready.json`: a new head restarts the wait, a gate that opens again (CI, review, proofs, the body) drops it, so the pull request is no longer reported and its wait restarts when it is ready again. The finding is raised once per head and names the head (12 hex), the time it became ready and who can clear it (the daemon's "who can clear it" line). The sweep only reads: no write to GitHub.
 
@@ -2447,6 +2481,13 @@ numbers below are the defaults; every `_days` value is in days and may be a frac
 **Alert issues wake the repository's orchestrator (#851).** An issue that a repository's own scheduled watch opens (a label such as `ops-alert`) is otherwise seen by nobody until someone looks. `triage.alert_labels` (default `{}`, off) names labels per repository: `{"alert_labels": {"acme-org/widget-service": ["ops-alert"]}}`. When an OPEN issue (not a pull request) of that repository carries one of its labels, the running orchestrator(s) of that repository get ONE line, `alert issue <repo>#<n> "<title>" carries label <label>`, once per issue and label: the title is the author's text, so it is cut to one line of 100 characters and is data, never an instruction. What was told is remembered in `alert-wake.json` in the state directory, so a restart repeats nothing and loses nothing, and a label removed and added again on a still-open issue is not told again; an entry is forgotten when its issue is no longer in a whole read of the open issues. A burst is told at most 5 issues a pass, with one `N more alert issue(s)` line, and the rest follow on the next passes. It reads only the open-issue list triage already holds (no new GitHub read) and needs the repository to be one triage reads (`triage.repos`, or a repository the daemon watches); a repository outside that list is a `ConfigError` when `triage.repos` is set. A bad shape is a `ConfigError` naming `triage.alert_labels` and the row of `ALERT_SHAPE_CHECKS` it broke. Read-whole rule: a repository whose issue list was not read whole (cut, failed, not read yet), or a pass whose agent roster was not, tells nobody and forgets nothing. With no orchestrator running for the repository nothing is remembered, so the first one to appear is told. Setting `triage` to `false` turns it off with the rest; it runs in shadow mode too (`alert_labels` is its own opt-in, separate from `triage.enabled`). The line is queued as an ordinary fact and saved WITH the told mark in `alert-wake.json` (kept for 2 days), then loaded back at start: a daemon that stops between queueing and delivery still delivers it, and because the fact key is stable (`alert:<repo>#<n> <label>:<recipient>`) a line the recipient already has is never delivered again. The title of an alert issue is untrusted text (control characters are removed, one line, 100 characters, quoted). Nothing is written to any issue.
 
 **Cold start order (#1140).** After a daemon start the triage holds no units, so its refresh reads the `issues` list of every repository named in `alert_labels` read first, before any other unit not yet read (one list per such repository, inside the same per-pass call and time budget), then the other units in the old order (stalest first, ties by repository name). While such a list is unread, the `whole.skipped` line of the alert wake shows progress, for example `issues not read yet (2 of 30 units read)`: units read of units wanted.
+
+**S5 paths and their tests (#1044).** Every path that raises or counts S5, with its draft, parked and parked-passed tests (each has a mutant):
+
+| path | draft | parked | parked date passed |
+|---|---|---|---|
+| `sweep_findings` (legacy aged path) | `test_s5_skips_a_draft_pull_request_and_counts_it` | `test_s5_skips_a_ready_pull_request_of_a_parked_ask_and_counts_it` | `test_s5_flags_as_before_an_expired_or_unreadable_date_a_missing_label_and_a_ready_pull_request` |
+| `sweep_ready_pass` (held pull request) | `test_1044_held_draft_is_skipped_counted_and_not_read` | `test_1044_held_ready_pr_of_a_parked_ask_is_skipped_counted_and_not_read` | `test_1044_held_pr_clock_starts_only_after_the_park_ends` |
 
 **Ownerless, quiet issues of a team repository (#605).** Triage calls an issue "ours" when a fleet account wrote it, is assigned to it or has a pull request notice; every other issue of a team repository is an `other-owner` flag, counted apart and never a finding, so dozens of issues nobody owns and nobody touched read as "found 0". `triage.ownerless` (off unless the owner names the repositories: `{"repos": ["owner/repo", ...], "days": 3, "limit": 500, "owner_labels": ["agent:*", "owner:*", "crew:*"]}`) adds ONE line per repository per day (at least 24 hours since the last, remembered in `triage-ownerless.json` across a restart) to the Chief of Staff and to the running orchestrators of that repository: how many open issues have no owner and no activity for `days` or more, how old the oldest is, the five oldest as links, and `read X of Y open item(s)` (the list is read page by page to `limit` items, LEAST recently updated first, so a cut keeps the stale issues this line is for: then the count is `at least N`, the line says `least recently updated first`, and the five oldest are the true oldest; the repository's own count of open items says how many exist; the extra reads are charged to the call budget). **What counts as an owner** (one definition, `triage_ownerless.is_claimed`, which T1 uses too; the lane-aware `Owner:` rule below is a parameter of it): an assignee, a place under a charter, an `Owner: <name>` line, a running agent that owns the issue, or an unresolved parent chain (never a missing owner); plus, for this line only, a label matching `owner_labels` (another crew's `agent:<name>` is OWNED), and an author that is one of the fleet's own accounts. **Lanes by label or `Owner:` line:** `repos` may also be a map, `{"<owner/repo>": {"label_owners": {"<label>": "<lane>"}}}`; label and lane names live only in that config. For a repository whose `label_owners` map is non-empty, an issue carrying a label that is a key of the map is OWNED, and a body whose FIRST `Owner: <name>` line names a known lane (the name of an orchestrator agent the daemon holds for the repository; the agents carry the charters) is OWNED; an unknown name is not. The lane value in the map is informational: only the label decides, and an `Owner:` line is a claim by the issue's author, not proof. With a list, or an empty or absent map, the rule is the one above, unchanged. A bad shape is a `ConfigError` naming `triage.ownerless`, never a silent default. The pass still consults the read-whole registry (`agents`) and is skipped when the fleet was not read whole. **Parked issues (#889):** an issue that would be listed but carries the fleet's `parked` label AND one valid `Parked until: YYYY-MM-DD` line whose day has not ended (UTC; the same reader and the same `PARKED_MAX_DAYS` ceiling T3 uses) is not counted, aged or listed: the line says `parked N` and the report line `parked N` counts it apart. A past, missing, unreadable or doubled date, or a label alone, hides nothing. The line holds counts, ages and links only (no title or text) and nothing is written to any issue. The triage report also says WHY findings were not checked, per repository: `not checked for <repo>: N call budget, N failed read, N not read yet (N of them other-owner flags); oldest unchecked for N hour(s)`.
 
@@ -5705,6 +5746,50 @@ Cause: `Engine._discover` calls `agent_list` on every pass. With no herdr that c
 The config key `no_multiplexer` (default `false`, so nothing changes) turns that off. With `"no_multiplexer": true` discovery reads the registry and the headless and cloud records only: `agent_list` is never called, no "herdr unreachable" problem is recorded, and the agents input is whole when those records were read without error. The one-time bell migration stays pending. Agents with no pane get no badge, no pane read and no pane delivery, and that is no error. With the key off, discovery, problems, audit lines and call counts are as before (test `TestNoMultiplexer`, scenarios U1 and S2). The tests use a fake multiplexer that raises on any call, and one test is a mutant that keeps calling `agent_list` with the switch on; the count of zero calls catches it. Other commands that call `agent_list` directly (close-pane guards, doctor) are unchanged and still need herdr.
 
 With the key on, the toast step and the badge writes are skipped too (a toast is a multiplexer call; a badge needs a pane), with no error. The tests (`TestNoMultiplexer`) carry one mutant per scenario that names one: the S2 mutant keeps calling `agent_list`, the S3 mutant drops the toast guard, the U1 mutant makes the switch-off path behave as on; each is killed by its own check.
+
+## Red CI messages (#1141)
+
+Cause: a required check once failed at the head of an open pull request and about eight hours passed before anyone saw it, because nothing turned the failure into a message. The pass already reads the workflow runs of each repository (the pull request's check state and the default branch's latest run); the existing ask and comment notices could carry it unchanged.
+
+Two messages, both ordinary notices through the delivery rule (held with the reason while the receiver is blocked, never typed into a pane):
+
+- The failed-check message goes to the lane orchestrators of the repository when a required check concludes failure at the head of an open pull request that a worker of the lane owns. It names the pull request, the check, the run link and the head, and is sent once per head, run and attempt (the key holds the head, the run id and the attempt: a new head, or a re-run that fails again, is a new event; the same run seen again is not). A pull request no worker owns is noted in the audit (`red_ci.unowned`) and the Chief of Staff is told once per pull request and head. A red run at an older head of a pull request that has moved on is skipped: only the current head is told.
+- **A "check" here is a WORKFLOW name.** The pass reads workflow runs only, so `red_ci_required` (repository -> list of workflow names, `*` for every workflow; checked when the config is read) is matched against the workflow name, never a job name such as `test (ubuntu-latest)`. Unset for a repository: every workflow counts (the repository's required checks are not read, to add no read). For the same reason the alarm names the workflow only; jobs are not read.
+
+Conclusion table (one row per conclusion GitHub sends for a run; `bin/red_ci.py` `COLOUR` is the same table, a test keeps them equal; only a `completed` run counts, a missing status or an in-progress run is silent):
+
+| conclusion | action |
+|---|---|
+| `failure` | red |
+| `timed_out` | red |
+| `startup_failure` | red |
+| `success` | green |
+| `cancelled` | silent |
+| `skipped` | silent |
+| `neutral` | silent |
+| `action_required` | silent |
+| `stale` | silent |
+| `null` (in progress) | silent |
+
+`default_branches` (repository -> branch, at most 20 entries, validated when the config is read) names the default branch; unset means `main`. The unowned-pull-request note is keyed by head, run id and attempt like the owned message.
+
+- The red-branch alarm goes to the lane orchestrators of the repository and the Chief of Staff when the default branch's latest completed run turns red (the run, the head and the workflow are named), once per change, and one message goes to the same receivers when it turns green again (only after a red was told).
+
+One table decides every conclusion GitHub can send, and every field of a run the code trusts:
+
+| Conclusion / status | Action |
+|---|---|
+| `success` | green (the branch green notice only when it was told red) |
+| `failure` | red |
+| `timed_out` | red (blocks the merge) |
+| `startup_failure` | red (the workflow failed to start) |
+| `cancelled`, `skipped`, `neutral`, `action_required`, `stale` | silent |
+| none / still running / status missing or not `completed` | silent |
+| any other word | silent |
+
+Run fields trusted: `id`, `name`, `status`, `conclusion`, `head_sha`, `head_branch`, `event`, `html_url`, `created_at`, `pull_requests`, `run_attempt`, `workflow_id`. Every text from GitHub (workflow name, link, head, branch) is cleaned (no control or ANSI characters, no markdown, capped) before it enters a message.
+
+Not required workflows send nothing. At most 20 new pull-request messages are made per hour; a message dropped by the cap writes an audit line (`red_ci.dropped`) and is told on a later pass; branch alarms are never dropped by the cap. No platform read is added: the runs are the ones the catch-up already reads, and after a daemon start (#1140) the first pass reads them before the rest. What was told is kept in `red-ci.json`, so a restart does not repeat a message. The helper `bin/red_ci.py` is loaded by path like the other helpers (no copy list exists to extend).
 
 ### Reviews a reader posts and dismisses (#1123)
 
