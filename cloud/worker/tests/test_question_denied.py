@@ -38,6 +38,8 @@ def strip_question(cfg):
     c["permission"].pop("question", None)
     for a in c.get("agent", {}).values():
         a.get("permission", {}).pop("question", None)
+    # an agent block left with no permission is the question-only override: not another key
+    c["agent"] = {k: v for k, v in c.get("agent", {}).items() if v != {"permission": {}}}
     return c
 
 
@@ -59,7 +61,7 @@ def orch_question(text):
 class T(unittest.TestCase):
     def test_s2_both_blocks_deny(self):
         cfg = load()
-        self.assertEqual(question_values(cfg), {"top": "deny", "agent:worker": "deny"})
+        self.assertEqual(question_values(cfg), {"top": "deny", "agent:worker": "deny", "agent:orchestrator": "deny"})
         self.assertEqual(check_blocks(cfg), {})
 
     def test_s4_no_other_permission_changed(self):
@@ -88,6 +90,26 @@ class T(unittest.TestCase):
         self.assertNotEqual(strip_question(m), base, "other key change not refused")
         refused += 1
         self.assertEqual(refused, 5)
+
+    def test_s3_orchestrator_block_only_question(self):
+        cfg = load()
+        self.assertEqual(cfg["agent"]["orchestrator"], {"permission": {"question": "deny"}})
+        local = os.path.join(ROOT, "agents/opencode/orchestrator.md")
+        with open(local, "rb") as a, open(os.path.join(ROOT, ORCH_REL), "rb") as b:
+            self.assertEqual(a.read(), b.read())
+
+    def test_s3_mutants_refused(self):
+        cfg = load()
+        m = copy.deepcopy(cfg); del m["agent"]["orchestrator"]
+        self.assertNotEqual(m, cfg, "mutation not applied")
+        self.assertNotIn("agent:orchestrator", question_values(m))
+        m = copy.deepcopy(cfg); m["agent"]["orchestrator"]["permission"]["question"] = "allow"
+        self.assertNotEqual(m, cfg, "mutation not applied")
+        self.assertIn("agent:orchestrator", check_blocks(m))
+        with open(os.path.join(ROOT, "agents/opencode/orchestrator.md"), "rb") as f:
+            local = f.read()
+        edited = orch_text().replace("question: allow", "question: deny").encode()
+        self.assertNotEqual(edited, local, "mutation not applied")
 
     def test_s1_s7_docs(self):
         with open(DOC) as f:
