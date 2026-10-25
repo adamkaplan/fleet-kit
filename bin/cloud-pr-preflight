@@ -13,7 +13,7 @@ Offline. Prints three sections; exits 0 when 1 and 2 pass (and no --expect stray
   3. existing test files this branch changes against the default branch (listed for you to justify; it does not change the exit status)
 Environment: CLOUD_PREFLIGHT_TIMEOUT (seconds per file, default 120), CLOUD_PREFLIGHT_BASE (default branch ref).
 """
-import glob, os, shutil, signal, subprocess, sys, tarfile, tempfile, io
+import glob, os, shutil, signal, subprocess, sys, tarfile, tempfile, io, time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 try:
