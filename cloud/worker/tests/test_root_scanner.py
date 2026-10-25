@@ -27,6 +27,40 @@ MARK = "uniq-label-marker-%d" % rnd.randrange(10**9)
 NOISE = bytes(rnd.randrange(1, 256) for _ in range(5000))
 
 
+SPARSE_MIB = 120
+BOUND_KIB = 80 * 1024
+CHILD = (
+    "import os, runpy, sys, resource\n"
+    "script = sys.argv[1]\n"
+    "sys.argv = sys.argv[1:]\n"
+    "code = 0\n"
+    "try:\n"
+    "    if script != '-':\n"
+    "        runpy.run_path(script, run_name='__main__')\n"
+    "except SystemExit as e:\n"
+    "    code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)\n"
+    "sys.stdout.flush()\n"
+    "sys.stderr.write('\\nPEAK %d\\n' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)\n"
+    "sys.stderr.flush()\n"
+    "os._exit(code)\n"
+)
+
+
+def kib(value, platform=sys.platform):
+    # ru_maxrss is bytes on macOS and KiB elsewhere
+    return value // 1024 if platform == "darwin" else value
+
+
+def own_peak(scanner, args, lst):
+    """Run the scanner (None: a baseline interpreter) in a child; return (exit code, own peak in KiB)."""
+    env = dict(os.environ)
+    env["CW_ROOT_LIST"] = lst
+    p = subprocess.run([sys.executable, "-c", CHILD, scanner or "-"] + args, env=env, capture_output=True, text=True)
+    last = [ln for ln in p.stderr.splitlines() if ln.strip()][-1]
+    assert last.startswith("PEAK "), p.stderr
+    return p.returncode, kib(int(last.split()[1]))
+
+
 def run(args, lst=None, scanner=SCANNER, env_unset=False):
     env = dict(os.environ)
     env.pop("CW_ROOT_LIST", None)
@@ -149,19 +183,42 @@ class Scanner(unittest.TestCase):
         rc, _ = run([self.split_binary(5000)], self.list, scanner=self.w("nov.py", m.encode()))
         self.assertNotEqual(rc, 1)
 
-    def test_large_sparse_file_bounded_memory(self):
-        import resource
+    def sparse(self):
         p = os.path.join(self.d.name, "sparse.bin")
         try:
             with open(p, "wb") as f:
-                f.seek(120 * 1024 * 1024)
+                f.seek(SPARSE_MIB * 1024 * 1024)
                 f.write(CERT)
         except OSError as e:
-            print("LOUD: SKIPPED the 120 MB sparse test: %s" % e)
+            print("LOUD: SKIPPED the %d MiB sparse test: %s" % (SPARSE_MIB, e))
             self.skipTest("disk cannot hold the file")
-        rc, out = run([p], self.list)
+        return p
+
+    def delta_kib(self, scanner, p, label):
+        rc, own = own_peak(scanner, [p], self.list)
+        _, base = own_peak(None, [p], self.list)
+        delta = own - base
+        print("PEAK %s: own=%d KiB baseline=%d KiB delta=%d KiB" % (label, own, base, delta))
+        return rc, delta
+
+    def test_kib_normalises_units(self):
+        self.assertEqual(kib(52346880, "darwin"), 51120)
+        self.assertEqual(kib(51120, "linux"), 51120)
+
+    def test_large_sparse_file_bounded_memory(self):
+        rc, delta = self.delta_kib(SCANNER, self.sparse(), "real")
         self.assertEqual(rc, 1)
-        self.assertLess(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss, 150 * 1024)  # KiB
+        self.assertLess(delta, BOUND_KIB)
+
+    def test_mutant_big_chunk_fails_memory_bound(self):
+        sc = self.mutated("CHUNK = 8 * 1024 * 1024", "CHUNK = 200 * 1024 * 1024")
+        rc, delta = self.delta_kib(sc, self.sparse(), "big-chunk mutant")
+        self.assertGreaterEqual(delta, BOUND_KIB)
+
+    def test_mutant_whole_file_read_fails_memory_bound(self):
+        sc = self.mutated("f.read(CHUNK)", "f.read()")
+        rc, delta = self.delta_kib(sc, self.sparse(), "whole-read mutant")
+        self.assertGreaterEqual(delta, BOUND_KIB)
 
     def test_mutant_zero_guard_removed_fails(self):
         sc = self.mutated("if len(hits) == 0:", "if False:")
