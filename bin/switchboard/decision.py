@@ -204,6 +204,13 @@ LINE_CUT_MARK = " \u2026[line cut]"
 FINDING_REFUSED = []     # (key, kind, text refused): the daemon writes each to the audit as 'finding-refused' and empties this list
 
 
+def _clone_fact(fact):
+    """A shallow copy of a fact (no import of the entry's `copy`: decision.py must not reach back into the entry)."""
+    clone = object.__new__(type(fact))
+    clone.__dict__.update(vars(fact))
+    return clone
+
+
 def finding_parts(fact, budget):
     """The summary of one finding as chunks of WHOLE lines, each at most `budget` characters (a single longer line is cut with a visible
     mark: the only case that shortens; the daemon audits the full line). Pure and deterministic: the same fact gives the same chunks, so the
@@ -235,7 +242,7 @@ def finding_part(recipient, fact, rest, cap, section, repos, delivered, resume):
     """#1302: the next part of an over-cap finding. `resume` maps a key to how many parts were already delivered (persisted by the daemon,
     so a restart continues). The carried fact has `partial=(i, n)` when more parts follow (its key must NOT be acknowledged yet)."""
     done = (resume or {}).get(fact.key, 0)
-    probe = copy.copy(fact)
+    probe = _clone_fact(fact)
     probe.summary = "(part 99 of 99)\n"
     fixed = len(compose(recipient, [probe], 10 ** 9, section, repos, delivered, None)[0])
     budget = max(200, cap - fixed - 400)   # the header repeats the first 200 characters; the item indents every line; room for the part label and the refusal note
@@ -244,13 +251,13 @@ def finding_part(recipient, fact, rest, cap, section, repos, delivered, resume):
         if not cut:
             return None
         marker = "\n[cut at %d characters]" % cap   # one line over the cap: the only cut, marked; the full line goes to the audit
-        whole = copy.copy(fact)
+        whole = _clone_fact(fact)
         whole.cut_lines = cut
         text = compose(recipient, [whole], 10 ** 9, section, repos, delivered, None)[0]
         return text[:cap - len(marker)] + marker, [whole]
     n = len(chunks)
     index = min(done, n - 1)
-    short = copy.copy(fact)
+    short = _clone_fact(fact)
     last = index == n - 1
     tail = "\n(%d characters of this finding past the %d-part limit were refused; the full text is in the audit)" % (len(refused), FINDING_MAX_PARTS) if refused and last else ""
     short.summary = "(part %d of %d)\n%s%s" % (index + 1, n, chunks[index], tail)
