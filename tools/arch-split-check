@@ -16,7 +16,7 @@ split, or the one file before it). Two things must hold:
 The parts of a side are joined into ONE module to read `dir()`, so a part that lacks an import it needs still passes: that
 is proved by the suites, and once a split makes real modules, by loading each part. When a side includes the daemon's entry
 (a file named `fleet-switchboard` with a `fleet-switchboard.parts` beside it), that entry is loaded as it runs and assembles its
-own parts from the manifest, in the manifest's order and namespace (the files listed are then used for the statement comparison only). The `dir(sb)` snapshot
+own parts from the manifest, in the manifest's order and namespace (the files listed are then used for the statement comparison only; a file listed that is not in that manifest is refused by name, because it would not reach the surface). A side that cannot be loaded gives a NAMED failure (the side, the part, the cause), after the statement differences, which usually name the part, are printed. The `dir(sb)` snapshot
 (`tests/golden/surface-dir-sb.txt`) is refreshed by hand, with `--write-surface`, in a move PR; CI does not compare it,
 so a PR that adds a function does not fail.
 Loading the modules runs their code: use `--no-surface` (statements only, nothing runs) on files you do not trust.
@@ -32,6 +32,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import traceback
 
 
 def statements(paths):
@@ -72,30 +73,74 @@ def statement_differences(before, after):
     return out
 
 
-def load_names(paths):
-    """dir() of the program the files make: the files, in order, run as one module."""
+class LoadError(Exception):
+    """The program a side makes could not be loaded: the message names the side, the part and the cause."""
+
+
+def _manifest_files(entry):
+    """The real paths of the files the entry's own manifest lists, or None when no manifest sits beside it."""
+    try:
+        with open(entry + ".parts", encoding="utf-8") as handle:
+            names = [n.strip() for n in handle.read().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+    except OSError:
+        return None
+    return {os.path.realpath(os.path.join(os.path.dirname(entry), n)) for n in names}
+
+
+def _where(err, known, ranges):
+    """`file:line` of the innermost frame of the failure that sits in one of the files of the program, or an empty string."""
+    here = ""
+    for frame in traceback.extract_tb(err.__traceback__):
+        name = os.path.realpath(frame.filename) if frame.filename else ""
+        if name in known:
+            here = "%s:%d" % (os.path.basename(name), frame.lineno)
+        elif ranges and os.path.basename(frame.filename or "").startswith("arch_split_join_"):
+            for part, start, end in ranges:
+                if start <= frame.lineno <= end:
+                    here = "%s:%d" % (os.path.basename(part), frame.lineno - start + 1)
+    return here
+
+
+def load_names(paths, side="after"):
+    """dir() of the program the files make: the files, in order, run as one module. A side that includes the daemon's entry (a file named
+    `fleet-switchboard` with its `fleet-switchboard.parts` beside it) is loaded as it runs: the entry assembles its parts from the manifest.
+    A failure to load is a LoadError that names the side and the part."""
     entry = next((p for p in paths if os.path.basename(p) == "fleet-switchboard" and os.path.exists(p + ".parts")), None)
+    ranges, cleanup, hint = None, None, ""
     if entry is not None:
-        # The daemon is assembled by its own entry from its manifest (bin/fleet-switchboard.parts): load it as it runs, so a part that
-        # reads a name another part defines later sees what the assembler gives it, not a text join.
-        path = entry
-        cleanup = None
+        listed = _manifest_files(entry) or set()
+        extra = [p for p in paths if os.path.realpath(p) not in listed and os.path.realpath(p) != os.path.realpath(entry)]
+        if extra:
+            raise LoadError("%s: %s is not in %s.parts: the entry is loaded in place and reads its parts from that manifest, so a file given but not listed "
+                            "would not reach the surface (list it, or leave it out)" % (side, ", ".join(os.path.basename(p) for p in extra), entry))
+        path, known = entry, listed | {os.path.realpath(entry)}
     elif len(paths) == 1:
-        path = paths[0]
-        cleanup = None
+        path, known = paths[0], {os.path.realpath(paths[0])}
     else:
-        handle = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8")
+        handle = tempfile.NamedTemporaryFile("w", prefix="arch_split_join_", suffix=".py", delete=False, encoding="utf-8")
+        ranges, line = [], 1
         for part in paths:
             with open(part, encoding="utf-8") as src:
-                handle.write(src.read().rstrip("\n") + "\n\n")
+                text = src.read().rstrip("\n") + "\n\n"
+            handle.write(text)
+            ranges.append((part, line, line + text.count("\n") - 1))
+            line += text.count("\n")
         handle.close()
         path = cleanup = handle.name
+        known = {os.path.realpath(p) for p in paths}
+    if any(os.path.basename(p) == "fleet-switchboard" for p in paths) and entry is None:
+        hint = " (fleet-switchboard has no fleet-switchboard.parts beside it, so the files were joined as one text: put the entry, its manifest and its parts in one directory, for example `git archive REV bin | tar -x`)"
     try:
         loader = importlib.machinery.SourceFileLoader("arch_split_subject", path)
         spec = importlib.util.spec_from_loader(loader.name, loader)
         module = importlib.util.module_from_spec(spec)
         loader.exec_module(module)
         return sorted(dir(module))
+    except SystemExit as err:
+        raise LoadError("%s: the program stopped while it loaded: %s%s" % (side, err, hint))
+    except Exception as err:
+        here = _where(err, known, ranges)
+        raise LoadError("%s: cannot load the program%s: %s: %s%s" % (side, " (in %s)" % here if here else "", type(err).__name__, err, hint))
     finally:
         if cleanup:
             os.unlink(cleanup)
@@ -115,7 +160,11 @@ def main(argv=None):
     parser.add_argument("--check-surface", metavar="SNAPSHOT")
     args = parser.parse_args(argv)
     if args.write_surface:
-        names = load_names(args.after)
+        try:
+            names = load_names(args.after, "after")
+        except LoadError as err:
+            print("RESULT: FAIL (%s)" % err)
+            return 1
         with open(args.write_surface, "w", encoding="utf-8") as handle:
             handle.write("".join(n + "\n" for n in names))
         print("wrote %d names to %s" % (len(names), args.write_surface))
@@ -123,7 +172,11 @@ def main(argv=None):
     if args.check_surface:
         with open(args.check_surface, encoding="utf-8") as handle:
             recorded = handle.read().split()
-        diffs = name_differences(recorded, load_names(args.after), "in the snapshot", "in the code")
+        try:
+            diffs = name_differences(recorded, load_names(args.after, "after"), "in the snapshot", "in the code")
+        except LoadError as err:
+            print("RESULT: FAIL (%s)" % err)
+            return 1
         for line in diffs:
             print(line)
         print("RESULT: %s (%d names in the snapshot)" % ("FAIL" if diffs else "PASS", len(recorded)))
@@ -131,13 +184,19 @@ def main(argv=None):
     if not args.before:
         parser.error("--before is needed to compare")
     diffs = statement_differences(args.before, args.after)
+    failed = None
     if not args.no_surface:
-        diffs += name_differences(load_names(args.before), load_names(args.after))
+        try:
+            diffs += name_differences(load_names(args.before, "before"), load_names(args.after, "after"))
+        except LoadError as err:
+            failed = err   # the statement differences, which usually name the part, are printed first
     for line in diffs:
         print(line)
     total = sum(statements(args.before)[0].values())
-    print("RESULT: %s (%d top-level statements compared, %d differences)" % ("FAIL" if diffs else "PASS", total, len(diffs)))
-    return 1 if diffs else 0
+    if failed is not None:
+        print("the surface could not be read: %s" % failed)
+    print("RESULT: %s (%d top-level statements compared, %d differences%s)" % ("FAIL" if diffs or failed else "PASS", total, len(diffs), ", surface not read" if failed else ""))
+    return 1 if diffs or failed else 0
 
 
 if __name__ == "__main__":
