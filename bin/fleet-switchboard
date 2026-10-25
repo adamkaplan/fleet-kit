@@ -10923,41 +10923,54 @@ REVIEW_VERDICTS = ("CHANGES REQUESTED", "APPROVE")
 
 
 def _review_verdict(first_line):
-    rest = first_line[50:].upper()
+    """STRICT: the first line is exactly `Review of <40 hex>: APPROVE` or `...: CHANGES REQUESTED` (case-sensitive, trailing whitespace only); anything else is UNKNOWN."""
+    m = REVIEW_COMMENT_RE.match(first_line)
+    if not m:
+        return "UNKNOWN"
     for word in REVIEW_VERDICTS:
-        if re.search(r"(?<![A-Z])%s(?![A-Z])" % word.replace(" ", r"[ _]"), rest):
+        if first_line.rstrip() == "Review of %s: %s" % (m.group(1), word):
             return word
     return "UNKNOWN"
 
 
+def review_comment_summary(number, head, login, signer, verdict):
+    """The one line. Built from the number, the head, the cleaned login, the signed name (omitted when None) and a table word only."""
+    by = " (signed %s)" % signer if signer else ""
+    return "PR #%d %s review comment by %s%s: %s (a comment, not a recorded verdict)" % (number, head, _one_line(login, 40), by, verdict)
+
+
 def _review_comment_item(repo, comment, issue, number, cid, now):
-    """A review comment on an open PR (first line `Review of <40 hex>`) as one line; None when not one."""
+    """A SIGNED review comment on an open PR (first line `Review of <40 hex>`) as one line; None when not one. The author-lane
+    exclusion is by the signed name and needs the registry, so it is made when the item is routed (`GitHubHub._route`)."""
     body = comment.get("body")
-    if not _is_pr(issue) or not isinstance(body, str) or str(issue.get("state") or "open") != "open":
+    signer = signed_by_fleet(body)
+    if not signer or not _is_pr(issue) or str(issue.get("state") or "open") != "open":
         return None
     if issue.get("merged") or (issue.get("pull_request") or {}).get("merged_at"):
         return None
-    m = REVIEW_COMMENT_RE.match(body.split("\n", 1)[0][:300])
-    if not m:
-        return None
-    author, login = _login(issue), _login(comment)
-    if not login or (author and login.lower() == author.lower()):
+    first = body.split("\n", 1)[0][:300]
+    m = REVIEW_COMMENT_RE.match(first)
+    login = _login(comment)
+    if not m or not login:
         return None
     known, lookups = _issue_refs(issue, number)
-    summary = "PR #%d %s %s" % (number, m.group(1)[:12], _review_verdict(body.split("\n", 1)[0][:300]))
-    return GitHubItem("github.reviewcomment:%d" % cid, "github.comment", summary, repo, known, lookups, login, now,
+    review = (number, m.group(1)[:12], login, signer, _review_verdict(first))
+    item = GitHubItem("github.reviewcomment:%d" % cid, "github.comment", review_comment_summary(*review), repo, known, lookups, login, now,
                       [number], True)
+    item.review = review
+    return item
 
 
 def _comment_item(repo, comment, issue, now):
     cid = _id(comment)
     number = _number(issue) or _url_number(comment.get("issue_url"))
-    if cid is None or number is None or signed_by_fleet(comment.get("body")):
+    if cid is None or number is None:
         return None
-    if isinstance(comment, dict):
-        rc = _review_comment_item(repo, comment, issue, number, cid, now)
-        if rc:
-            return rc
+    body = comment.get("body")
+    if signed_by_fleet(body):
+        # A signed comment is never a plain github.comment. A signed review comment is delivered as ONE line, and only from a comment event
+        # that holds the PR (the webhook): the catch-up has no PR state and makes no read for it, so it skips it (one key, github.reviewcomment, both paths).
+        return _review_comment_item(repo, comment, issue, number, cid, now) if isinstance(issue, dict) else None
     known, lookups = _issue_refs(issue, number)
     summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(comment.get("body") or "", 400))
     return GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now,
@@ -11719,6 +11732,12 @@ class GitHubHub:
             owner, routed_by = self.route_of(item, discovery.agents, now)
         except GitHubUnavailable:
             return
+        review = getattr(item, "review", None)
+        if review:
+            owner = self._route_review(item, review, owner, discovery)
+            if owner is None:
+                return
+            routed_by = routed_by or "closing"
         with self.lock:
             if owner and not item.actionable and routed_by != "closing":
                 # PR 52: an owner found by a new link is told what needs it, not every passing check
@@ -11739,6 +11758,42 @@ class GitHubHub:
                         self._unrouted.clear()
                     self._unrouted.add(item.key)
                     self._unrouted_batch.append(item)
+
+    def _route_review(self, item, review, owner, discovery):
+        """A review comment: the owner is the lane the PR's routing finds (the same `route_of` as every PR event). The signed name of one of that
+        lane's own agents is the author's own comment: dropped. No owner: one audit line `github.reviewcomment.unowned` and the Chief of Staff is
+        told once per comment id (the key). Returns the recipient, or None when the item was dropped."""
+        number, head, login, signer, verdict = review
+        agents = discovery.agents
+        if owner is None:
+            chiefs = chiefs_of_staff(discovery)
+            with self.lock:
+                self.queue.pop(item.key, None)
+                first = item.key not in self._unrouted
+                if first:
+                    if len(self._unrouted) > 20000:
+                        self._unrouted.clear()
+                    self._unrouted.add(item.key)
+                    if chiefs:
+                        item.recipient, item.routed_by = chiefs[0], "unowned"
+                        item.summary = "no lane owns it: " + item.summary
+                        self.queue[item.key] = item
+                        self._routed_batch.append(item)
+            if first:
+                self._audit("github.reviewcomment.unowned", item.repo, {"key": item.key, "pr": number, "told": chiefs[0] if chiefs else None})
+            return None
+        lane = {owner} | {n for n, o in agents.items() if boss_name(discovery, o) == owner}
+        if signer in lane:
+            with self.lock:
+                self.queue.pop(item.key, None)
+                if item.key not in self._filtered:
+                    if len(self._filtered) > 20000:
+                        self._filtered.clear()
+                    self._filtered.add(item.key)
+            self._audit("github.reviewcomment.own", item.repo, {"key": item.key, "pr": number, "signed": signer})
+            return None
+        item.summary = review_comment_summary(number, head, login, signer if signer in agents else None, verdict)
+        return owner
 
     def _audit_unrouted(self):
         """One audit line per repo per pass for the items that belong to nobody, not one line each."""
