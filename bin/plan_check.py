@@ -18,7 +18,7 @@ MAX_SCENARIOS = 200         # a hard limit; the guidance is about 30
 GUIDANCE_SCENARIOS = 30       # per slice, or in total when no scenario has a slice
 GUIDANCE_TOTAL_WITH_SLICES = 80
 
-PROOFS = ("test", "live", "measure", "screenshot")
+PROOFS = ("test", "live", "measure", "screenshot", "review")
 EVALUATORS = ("ci", "tester", "reviewer", "owner")
 # An older plan wrote the owner's evaluator under a personal name; it is still accepted as `owner` (a plan approved with it
 # keeps passing, and its hash, which covers the text as written, does not change), with a warning to rename it.
@@ -29,7 +29,9 @@ OPTIONAL = ("claim", "slice", "phase")
 KNOWN = REQUIRED + OPTIONAL
 # proof -> the evaluators that can record it
 PROOF_EVALUATORS = {"test": ("ci",), "screenshot": ("reviewer", "owner"), "live": ("tester", "owner"),
-                    "measure": ("tester", "owner")}
+                    "measure": ("tester", "owner"), "review": ("reviewer",)}
+# A `review` proof is a reviewer's read of text. A scenario whose subject is code behaviour a test can show is refused: use `test`.
+REVIEW_CODE_RE = re.compile(r"\b(?:exit status|exit code|stdout|stderr|returns?|raises?|throws?|function|endpoint|api call|code behaviou?r|runs? the (?:command|code|tests?)|refus(?:es|ed|e)|rejects?|rejected|prints?|printed|logs?|logged|exits?|exited|blocks?|blocked|allows?|allowed|writes?|written|contains?|non-zero|nonzero|mode 0[0-7]+|accepts?|accepted|sends?|sent|queued|names|removed|denies|denied|deletes?|deleted|emits?|creates?|created|posts?|fails|failed|stops?|aborts?|aborted|never|echoed)\b", re.IGNORECASE)
 
 ID_RE = re.compile(r"^[SU][0-9]+[a-z]?$")
 COVERS_RE = re.compile(r"^(DW|PC)-([0-9]+)$")
@@ -695,6 +697,8 @@ def validate(scenarios, clauses, text=""):
         proof, evaluator = _normal(scenario.get("proof", "")), _normal(scenario.get("evaluator", ""))
         if proof and proof not in PROOFS:
             bad(ident, "bad-proof", "proof %r must be one of %s" % (proof, "|".join(PROOFS)))
+        if proof == "review" and REVIEW_CODE_RE.search(_normal(scenario.get("text", "")) + " " + _normal(scenario.get("pass", ""))):
+            bad(ident, "review-for-code", "proof review is a reviewer's read of text, not of code behaviour a test can show: use test")
         if evaluator in EVALUATOR_ALIASES:
             warnings.append({"id": ident, "code": "evaluator-alias", "message": "%s: evaluator %r is a deprecated alias of "
                              "%r: rename it" % (ident, evaluator, EVALUATOR_ALIASES[evaluator])})
@@ -900,6 +904,7 @@ EXPLAIN = {
     "bad-evaluator": ("`evaluator` is one of " + "|".join(EVALUATORS), "pick who records the proof"),
     "evaluator-mismatch": ("the evaluator must be able to record the proof: test needs ci, screenshot needs reviewer or owner, live and measure need tester or owner", "change the evaluator or the proof"),
     "live-no-claim": ("a live or tester scenario should say who claims it with a `claim` line (a warning only)", "add `claim: epic` (needs the installed system) or `claim: pr`"),
+    "review-for-code": ("proof `review` is a reviewer's read of text, not of code behaviour a test can show", "use `proof: test` for code behaviour"),
     "bad-claim": ("`claim` is `pr` (default) or `epic`", "remove it or use one of the two"),
     "vague-pass": ("`pass` must be an observable a stranger can decide: a status or exit code, a count or threshold, a quoted value, or a named comparison", "for example `exit status is 0`, `exactly 3 items`, `shows \"Ready\"`"),
     "no-discriminator": ("`discriminates` names the specific wrong build that would FAIL this scenario", "write `a build that <does X> <observable wrong outcome>`"),

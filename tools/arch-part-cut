@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""arch-part-cut: cut whole top-level sections out of bin/fleet-switchboard into part files, byte for byte.
+
+    arch-part-cut --entry bin/fleet-switchboard --manifest bin/fleet-switchboard.parts --parts-dir bin/switchboard \\
+                  NAME:FIRST:LAST [NAME:FIRST:LAST ...] [--write]
+
+Each NAME:FIRST:LAST names a part and the 1-based lines it takes from the entry (FIRST is the section's first comment line, LAST a line of its
+last statement or after it). Every cut must sit on statement boundaries: a top-level statement is wholly inside the range or wholly outside,
+else the tool stops. The text is copied unchanged (trailing blank lines trimmed, one blank line left between the neighbours), the part is
+appended to the manifest after the last listed part, and the lines leave the entry. Without --write it only reports sizes.
+"""
+import argparse
+import ast
+import sys
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--entry", required=True)
+    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--parts-dir", required=True)
+    ap.add_argument("cuts", nargs="+")
+    ap.add_argument("--write", action="store_true")
+    args = ap.parse_args(argv)
+    text = open(args.entry, encoding="utf-8").read()
+    lines = text.split("\n")
+    tree = ast.parse(text)
+    cuts = []
+    for spec in args.cuts:
+        name, first, last = spec.split(":")
+        first, last = int(first), int(last)
+        while lines[last - 1].strip() == "" and last > first:
+            last -= 1
+        for node in tree.body:
+            inside = first <= node.lineno and node.end_lineno <= last
+            outside = node.end_lineno < first or node.lineno > last
+            if not (inside or outside):
+                sys.exit("%s: statement at line %d-%d is cut by %d-%d" % (name, node.lineno, node.end_lineno, first, last))
+        cuts.append((name, first, last))
+        print("%-14s lines %d-%d (%d lines)" % (name, first, last, last - first + 1))
+    if not args.write:
+        return 0
+    drop = set()
+    for name, first, last in cuts:
+        with open("%s/%s.py" % (args.parts_dir, name), "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines[first - 1:last]) + "\n")
+        drop.update(range(first - 1, last))
+    kept = []
+    for i, line in enumerate(lines):
+        if i in drop:
+            continue
+        if line == "" and len(kept) >= 2 and kept[-1] == "" and kept[-2] == "":
+            continue
+        kept.append(line)
+    open(args.entry, "w", encoding="utf-8").write("\n".join(kept))
+    manifest = open(args.manifest, encoding="utf-8").read()
+    if not manifest.endswith("\n"):
+        manifest += "\n"
+    for name, _f, _l in cuts:
+        manifest += "switchboard/%s.py\n" % name
+    open(args.manifest, "w", encoding="utf-8").write(manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
