@@ -222,6 +222,14 @@ handled. `tests/fixtures/containerd-aks-installer-form.toml` is a copy of such a
 `k8s/runtimeclass.yaml` has no scheduling block: an autoscaler's template node cannot carry a label that is set only
 after install, so a worker pod selects the pool label `sysbox-install=yes` itself. Evidence for the cause: issue #365, probe comment.
 
+## The pre-push check (`bin/cloud-prepush`)
+
+The cause: cloud workers push, and then continuous integration finds a failure the worker could have found itself (a test that reads an edited file, a repository-wide scan of added lines). A pod cannot run the whole suite in reasonable time, and each brief used to re-describe by hand which tests to pick. `bin/cloud-prepush <base>` replaces the hand-written rule.
+
+It is the last step before every push. It lists the files changed since the merge base, selects every test file whose text names a changed file (basename match) plus the scan tests listed in the script, runs each on the branch and on a clean worktree of the base (under the temporary directory, removed at the end), and prints only the differences with the counts run, identical and could not run. Exit 0: no difference; 1: a difference, a test that could not run (300 seconds each, or it needs docker), or no test selected for a non-empty change; 2: a refused input (unknown base, no merge base, dirty tree). It needs git and python3 only, makes no network call and writes nothing outside its temporary worktree.
+
+It is advice, never the gate: continuous integration stays the gate and its result is the only evidence. Tests: `cloud/worker/tests/test_cloud_prepush.py`.
+
 ## Tests (no cluster, no Azure)
 
 ```sh

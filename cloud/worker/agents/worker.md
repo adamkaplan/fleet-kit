@@ -12,6 +12,8 @@ The pod's entrypoint chooses this agent or the orchestrator from one value, `CW_
 
 Before you hand a plan file back, run `cw-plan-check --file <plan> --done-when <text>` (a local read; no network).
 
+This is the last step before every push: run `bin/cloud-prepush <base>`. Workers push and then continuous integration finds a failure the worker could have found (a test that reads an edited file, a repository-wide scan of added lines); this command replaces the hand-written rule of which tests to pick. It prints only the differences between your branch and a clean copy of the base. It is advice: continuous integration stays the gate and its result is the only evidence.
+
 ## STOP rules
 
 - Never merge a pull request (not `gh pr merge`, not the API, not auto-merge). Someone else merges.
