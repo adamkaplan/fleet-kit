@@ -483,7 +483,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     only for THIS plan hash and THIS head; one for another is shown as void, not hidden."""
     sid, evaluator = scenario["id"], evaluator_of(scenario)
     out = {"id": sid, "evaluator": evaluator, "claim": claim_of(scenario), "missing": [], "void": []}
-    carried = carried_seqs(entries, pr, head)   # #1129: {seq of the proof or verdict: its carried line}
+    carried = carried_seqs(entries, pr, head, plan_hash)   # #1129: {seq of the proof or verdict: its carried line}
     for kind in ("proof", "verdict"):
         mine = [e for e in entries if e.get("pr") == pr and e.get("scenario") == sid and e.get("kind") == kind
                 and (kind == "proof" or e.get("evaluator") == evaluator)]
@@ -517,11 +517,13 @@ CARRY_FIELDS = ("proof", "scenario", "old_head", "new_head", "facts")
 DOC_TEST_RE = re.compile(r"(^|/)(tests?|docs?)/|(^|/)test-[^/]*$|(^|/)test_[^/]*$|\.(md|rst|txt)$")
 
 
-def carried_seqs(entries, pr, head):
-    """{seq of a proof or verdict: its `carried` line} for the carries of `pr` whose new head is `head`. Empty without a head."""
+def carried_seqs(entries, pr, head, plan_hash=None):
+    """{seq of a proof or verdict: its `carried` line} for the carries of `pr` whose new head is `head`. Empty without a head. With `plan_hash`, only a carry line that
+    names THAT plan hash counts (a line of another plan is no evidence: #1217); every reader of a carried row as evidence passes it."""
     found = {}
     for entry in entries if head else ():
-        if entry.get("kind") == "carried" and entry.get("pr") == pr and entry.get("new_head") == head and isinstance(entry.get("proof"), int):
+        if entry.get("kind") == "carried" and entry.get("pr") == pr and entry.get("new_head") == head and isinstance(entry.get("proof"), int) \
+                and (plan_hash is None or entry.get("plan_hash") == plan_hash):
             found[entry["proof"]] = entry
     return found
 
@@ -947,7 +949,7 @@ def validate_plan_gates(raw, source):
         if "ci_workflows" in entry:   # #1237: workflow names the gate expects a run of at the head
             flows = entry["ci_workflows"]
             if not (isinstance(flows, list) and len(flows) <= 20 and all(isinstance(x, str) and x for x in flows)):
-                raise ValueError("%s: 'ci_workflows' must be a list of at most 20 workflow names" % name)
+                raise ValueError("%s: 'ci_workflows' must be a list of at most 20 workflow ids or paths" % name)
             repos[name]["ci_workflows"] = flows
     record = raw.get("ci_record") if raw.get("ci_record") is not None else {}
     if not isinstance(record, dict) or set(record) - {"enabled", "calls_per_pass", "pass_seconds"}:

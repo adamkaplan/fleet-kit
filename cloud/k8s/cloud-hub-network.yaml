@@ -1,0 +1,164 @@
+# Network policies of the cloud namespace (six NetworkPolicy documents).
+#
+# Two limits, as applied (nothing here changes them):
+#  (a) allow-egress selects EVERY pod of the namespace (podSelector: {}), so the hub itself may also reach the
+#      internet on ports 80 and 443 outside the excepted private ranges.
+#  (b) No cluster or pod CIDR is excepted: acceptable only because the cluster's ranges lie inside the private
+#      ranges that are excepted (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10).
+#
+# What this is: the namespace's network boundary, exactly as applied in the cluster
+# (read-only capture, server dry run: all six unchanged). Nothing here is widened.
+#
+# Apply: first a server dry run:
+#   kubectl -n cw apply --dry-run=server -f cloud/k8s/cloud-hub-network.yaml
+# then apply the whole file in this order: allow-egress, cloud-agents-ingress-from-hub,
+# cloud-agents-to-hub, cloud-hub-ingress, cloud-hub-to-agents, default-deny.
+# Apply the allow policies before the default deny; a default deny applied first would cut every pod off.
+# First check afterwards: a worker pod can still resolve names and the hub answers its health path.
+#
+# Roll back: the four hub policies by label:
+#   kubectl -n cw delete networkpolicy -l app.kubernetes.io/part-of=cloud-hub
+# and the two namespace-wide ones by name:
+#   kubectl -n cw delete networkpolicy allow-egress default-deny
+# Warning: deleting default-deny without allow-egress, or the reverse, changes the whole namespace's reachability.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress
+  namespace: cw
+spec:
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 80
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+              - 168.63.129.16/32
+              - 127.0.0.0/8
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloud-agents-ingress-from-hub
+  namespace: cw
+  labels:
+    app.kubernetes.io/part-of: cloud-hub
+    cw/run: first-ask
+spec:
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: cloud-hub
+      ports:
+        - port: 4096
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: cw-worker
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloud-agents-to-hub
+  namespace: cw
+  labels:
+    app.kubernetes.io/part-of: cloud-hub
+    cw/run: first-ask
+spec:
+  egress:
+    - ports:
+        - port: 8443
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: cloud-hub
+  podSelector:
+    matchLabels:
+      app: cw-worker
+  policyTypes:
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloud-hub-ingress
+  namespace: cw
+  labels:
+    app.kubernetes.io/part-of: cloud-hub
+    cw/run: first-ask
+spec:
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: cw-worker
+      ports:
+        - port: 8443
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: cloud-hub
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloud-hub-to-agents
+  namespace: cw
+  labels:
+    app.kubernetes.io/part-of: cloud-hub
+    cw/run: first-ask
+spec:
+  egress:
+    - ports:
+        - port: 4096
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: cw-worker
+  podSelector:
+    matchLabels:
+      app: cloud-hub
+  policyTypes:
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: cw
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
