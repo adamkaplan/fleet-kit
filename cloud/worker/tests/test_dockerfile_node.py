@@ -68,6 +68,21 @@ def problems(t):
     return out
 
 
+def xz_problems(t):
+    """Every .tar.xz unpack needs xz-utils in an apt install list earlier in the file."""
+    out = []
+    flat = t.replace("\\\n", " ")
+    for m in re.finditer(r"\btar\b[^\n&;|]*?(?:\s-\w*J\w*|\s--xz\b|\.tar\.xz)", flat):
+        before = flat[:m.start()]
+        ok = any(re.search(r"\bxz-utils\b", a)
+                 for a in re.findall(r"apt-get install[^&;|]*", before))
+        if not ok:
+            out.append("xz unpack without earlier xz-utils")
+    if not re.search(r"\btar\b[^\n]*(?:\s-\w*J|--xz)", flat):
+        out.append("no xz unpack found")
+    return out
+
+
 class T(unittest.TestCase):
     def test_real_file_clean(self):
         self.assertEqual(problems(read(DF)), [])
@@ -142,6 +157,18 @@ class T(unittest.TestCase):
 
     def test_mutant_major_20(self):
         self.assertTrue(problems(self.mut("NODE_VERSION=22.23.4", "NODE_VERSION=20.1.0")))
+
+    def test_xz_real_file(self):
+        self.assertEqual(xz_problems(read(DF)), [])
+
+    def test_xz_mutant_removed(self):
+        self.assertTrue(xz_problems(self.mut("xz-utils ", "")))
+
+    def test_xz_mutant_only_later(self):
+        t = self.mut("xz-utils ", "")
+        m = t + "\nRUN apt-get install -y xz-utils\n"
+        self.assertNotEqual(m, t)
+        self.assertTrue(xz_problems(m))
 
     def test_docs(self):
         d = read(os.path.join(CLOUD, "README.md"))
