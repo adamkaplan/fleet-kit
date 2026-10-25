@@ -27,6 +27,7 @@ import cloud_cli  # noqa: E402
 
 SECRETS = {"pod-a": "secret-a-1", "pod-b": "secret-b-2", "daemon": "secret-d-3"}
 HEAD = "a" * 40
+MESSAGE_STATUS = 400   # /message with a body that has no sender/recipient: the channel's own 400
 
 
 def sha(v):
@@ -323,7 +324,10 @@ class TestBoundsAndCaps(unittest.TestCase):
 
     def test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive(self):
         import socket
+        saved = dict(SECRETS)
+        self.addCleanup(lambda: (SECRETS.clear(), SECRETS.update(saved)))   # the module-level dict is restored whatever happens
         with Hub(wait=8.0, max_per_pod=50) as hub:   # default max_handlers=32 -> relay cap 16
+            self.assertEqual(hub.server.max_handlers, 32)
             self.assertEqual(hub.relay.max_inflight, 16)
             self.assertEqual((cloud_relay.MAX_WAIT_PER_POD, cloud_relay.MAX_WAIT_TOTAL), (4, 16))
             agents = {}
@@ -336,30 +340,47 @@ class TestBoundsAndCaps(unittest.TestCase):
             for i in range(4):          # 4 pods x 4 held waits = 16 held
                 for j in range(4):
                     t = threading.Thread(target=hub.relay_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
-            for _ in range(200):
-                if sum(hub.relay.waiting.values()) == 16: break
-                time.sleep(0.05)
+            self.wait_for(lambda: sum(hub.relay.waiting.values()) == 16)
             self.assertEqual(sum(hub.relay.waiting.values()), 16)
             socks = []
-            for _ in range(6):          # slow bodies beyond the relay cap: refused 503 or timed out, never fill the rest
+            for _ in range(hub.server.max_handlers):   # as many slow bodies as the hub has handlers: without the in-flight cap they would take every one
                 s = socket.create_connection(("127.0.0.1", hub.port))
+                s.settimeout(5)
                 s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-pod-0\r\nContent-Length: 100\r\n\r\n{")
                 socks.append(s)
-            time.sleep(0.5)
-            self.assertLessEqual(hub.relay.inflight, 16)
+            for s in socks:             # every excess one is refused 503 straight away, its body unread
+                first = s.recv(4096).split(b"\r\n")[0]
+                self.assertIn(b" 503 ", first)
+            self.assertEqual(hub.relay.inflight, 16)
             status, got = hub.call("GET", "/relay/pending", who="daemon")
             self.assertEqual(status, 200)
             self.assertEqual(len(got["requests"]), 10)
             for req in got["requests"]:
                 self.assertEqual(hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")[0], 200)
-            self.assertNotEqual(hub.call("POST", "/message", {"x": 1}, who="pod-0")[0], 0)   # channel route is served (answers, not starved)
+            self.assertEqual(hub.call("POST", "/message", {"x": 1}, who="pod-0")[0], MESSAGE_STATUS)   # channel route answers with its own refusal, not starved
             self.assertEqual(hub.call("GET", "/decisions", who="pod-0")[0], 200)
             for s in socks: s.close()
-            for r in list(hub.relay.pending.values()): pass
             while hub.relay.pending:
                 for req in hub.relay.list_pending():
                     hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")
             for t in threads: t.join()
+
+    def test_mutant_admit_removed_the_saturation_test_fails(self):
+        old = cloud_relay.Relay.admit
+        cloud_relay.Relay.admit = lambda self: True
+        try:
+            case = TestBoundsAndCaps("test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive")
+            with self.assertRaises(AssertionError):
+                case.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive()
+        finally:
+            cloud_relay.Relay.admit = old
+            case.doCleanups()
+
+    @staticmethod
+    def wait_for(cond, limit=10.0):
+        end = time.monotonic() + limit
+        while time.monotonic() < end and not cond():
+            time.sleep(0.01)
 
     def test_slow_body_trickle_cut_at_deadline(self):
         import socket
