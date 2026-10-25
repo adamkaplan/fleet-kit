@@ -165,29 +165,32 @@ def red_ci_state(engine):
     return state
 
 
-def red_ci_receivers(engine, repo, with_chief):
+def red_ci_receivers(engine, repo, with_chief, orchestrators=True):
     discovery = getattr(engine, "discovery", None)
     if discovery is None:
         return []
-    names = {n for n, a in discovery.agents.items() if _is_orchestrator(a) and _fleet_repo(a.fleet or {}, engine.config) == repo}
+    names = {n for n, a in discovery.agents.items() if orchestrators and _is_orchestrator(a) and _fleet_repo(a.fleet or {}, engine.config) == repo}
     if with_chief:
         names |= {n for n, a in discovery.agents.items() if (a.fleet or {}).get("role") == "chief-of-staff"}
     return sorted(names)
 
 
-def red_ci_tell(engine, state, key, repo, text, names, now):
-    """ONE message per key, to each receiver; nobody to tell, or over the hourly bound: nothing is remembered, so a later pass tells it."""
+def red_ci_tell(engine, state, key, repo, text, names, now, capped=True):
+    """ONE message per key, to each receiver; nobody to tell, or over the hourly bound (a branch alarm is never capped): nothing is remembered, so a later pass tells it.
+    The memory is written only after everything that can fail has run."""
     if key in state.told or not names:
         return False
-    state.recent = [t for t in state.recent if now - t < 3600]
-    if len(state.recent) >= RED_CI_PER_HOUR:
+    recent = [t for t in state.recent if now - t < 3600]
+    state.recent = recent
+    if capped and len(recent) >= RED_CI_PER_HOUR:
+        engine._note("red_ci.dropped", repo, {"key": key, "limit": RED_CI_PER_HOUR})
         return False
+    engine._note("red_ci.sent", repo, {"key": key, "to": names})
     state.recent.append(now)
     state.told[key] = now
     state.lines[key] = {n: text for n in names}
     for name in names:
         state.facts["red-ci:%s:%s" % (key, name)] = (text, now, name, repo)
-    engine._note("red_ci.sent", repo, {"key": key, "to": names})
     return True
 
 
@@ -222,12 +225,20 @@ def red_ci_runs(engine, repo, runs, now):
             return
         module, state, changed = load_module("red_ci"), red_ci_state(engine), False
         cfg = engine.config or {}
-        required = (cfg.get("red_ci_required") or {}).get(repo) or []
+        required = (cfg.get("red_ci_required") or {}).get(repo) or ["*"]   # unset: every workflow counts (the repository's required checks are not read: no new read)
         default = (cfg.get("default_branches") or {}).get(repo) or "main"
         discovery = getattr(engine, "discovery", None)
         agents = discovery.agents if discovery else {}
         newest = None
         runs = red_ci_latest(repo, runs)
+        current = {}   # pull request number -> (created_at, head) of its newest run: a red run at an older head is not told
+        for run in runs:
+            if isinstance(run, dict) and isinstance(run.get("head_sha"), str):
+                for p in run.get("pull_requests") or []:
+                    if isinstance(p, dict) and isinstance(p.get("number"), int):
+                        at = str(run.get("created_at") or "")
+                        if p["number"] not in current or at > current[p["number"]][0]:
+                            current[p["number"]] = (at, run["head_sha"])
         for run in runs:
             if not isinstance(run, dict) or not isinstance(run.get("id"), int):
                 continue
@@ -238,11 +249,19 @@ def red_ci_runs(engine, repo, runs, now):
             if prs:
                 if word != "red" or not module.is_required(required, name):
                     continue
+                attempt = run.get("run_attempt") if type(run.get("run_attempt")) is int else 1
                 for number in prs:
+                    if current.get(number, (0, head))[1] != head:
+                        continue   # the pull request moved on: only the current head is told
                     owner = pick_owner(agents, [number], repo)
-                    if owner is None or _is_orchestrator(agents[owner]):
-                        continue   # no worker of the lane owns it
-                    changed |= red_ci_tell(engine, state, module.pr_key(repo, number, head, name), repo,
+                    if owner is None:
+                        engine._note("red_ci.unowned", repo, {"pr": number, "head": module.clean(head, 64)})
+                        changed |= red_ci_tell(engine, state, "pr-unowned:%s#%d:%s" % (repo, number, module.clean(head, 64).replace(":", "_")), repo,
+                                               module.unowned_line(repo, number, name, url, head), red_ci_receivers(engine, repo, True, False), now)
+                        continue
+                    if _is_orchestrator(agents[owner]):
+                        continue   # an orchestrator's own pull request is not a worker's
+                    changed |= red_ci_tell(engine, state, module.pr_key(repo, number, head, name, run["id"], attempt), repo,
                                            module.pr_line(repo, number, name, url, head), red_ci_receivers(engine, repo, False), now)
             elif run.get("head_branch") == default and run.get("event") != "pull_request":
                 if newest is None or str(run.get("created_at") or "") > str(newest.get("created_at") or ""):
@@ -251,14 +270,13 @@ def red_ci_runs(engine, repo, runs, now):
             word, rid = module.colour(newest), newest["id"]
             head, url, name = newest.get("head_sha"), newest.get("html_url") or "", str(newest.get("name") or "run")
             if word == "red" and module.branch_key("red", repo, head) not in state.told:
-                job = newest.get("failing_job") or name
-                ok = red_ci_tell(engine, state, module.branch_key("red", repo, head), repo, module.branch_line("red", repo, default, name, url, head, job),
-                                 red_ci_receivers(engine, repo, True), now)
+                ok = red_ci_tell(engine, state, module.branch_key("red", repo, head), repo, module.branch_line("red", repo, default, name, url, head),
+                                 red_ci_receivers(engine, repo, True), now, False)
                 if ok:
                     state.branch[repo], changed = "red", True
             elif word == "green" and state.branch.get(repo) == "red":
                 ok = red_ci_tell(engine, state, module.branch_key("green", repo, rid), repo, module.branch_line("green", repo, default, name, url, head),
-                                 red_ci_receivers(engine, repo, True), now)
+                                 red_ci_receivers(engine, repo, True), now, False)
                 if ok:
                     state.branch[repo], changed = "green", True
                     for old in [k for k in state.told if k.startswith("branch-red:%s:" % repo)]:

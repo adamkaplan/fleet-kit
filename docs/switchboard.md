@@ -5613,10 +5613,25 @@ Cause: a required check once failed at the head of an open pull request and abou
 
 Two messages, both ordinary notices through the delivery rule (held with the reason while the receiver is blocked, never typed into a pane):
 
-- The failed-check message goes to the lane orchestrators of the repository when a required check (names listed in `red_ci_required`, `*` for all) concludes failure at the head of an open pull request that a worker of the lane owns. It names the pull request, the check, the run link and the head, and is sent once per head and check (a new head, or a re-run that fails again at a new head, is a new event).
-- The red-branch alarm goes to the lane orchestrators of the repository and the Chief of Staff when the default branch's latest completed run turns red (the run, the head and the failing job are named; the job is the workflow name, as no jobs are read), once per change, and one message goes to the same receivers when it turns green again.
+- The failed-check message goes to the lane orchestrators of the repository when a required check concludes failure at the head of an open pull request that a worker of the lane owns. It names the pull request, the check, the run link and the head, and is sent once per head, run and attempt (the key holds the head, the run id and the attempt: a new head, or a re-run that fails again, is a new event; the same run seen again is not). A pull request no worker owns is noted in the audit (`red_ci.unowned`) and the Chief of Staff is told once per pull request and head. A red run at an older head of a pull request that has moved on is skipped: only the current head is told.
+- **A "check" here is a WORKFLOW name.** The pass reads workflow runs only, so `red_ci_required` (repository -> list of workflow names, `*` for every workflow; checked when the config is read) is matched against the workflow name, never a job name such as `test (ubuntu-latest)`. Unset for a repository: every workflow counts (the repository's required checks are not read, to add no read). For the same reason the alarm names the workflow only; jobs are not read.
+- The red-branch alarm goes to the lane orchestrators of the repository and the Chief of Staff when the default branch's latest completed run turns red (the run, the head and the workflow are named), once per change, and one message goes to the same receivers when it turns green again (only after a red was told).
 
-Cancelled, skipped, neutral, timed out, still running and not required checks send nothing. At most 20 new messages are made per hour. No platform read is added: the runs are the ones the catch-up already reads, and after a daemon start (#1140) the first pass reads them before the rest. What was told is kept in `red-ci.json`, so a restart does not repeat a message.
+One table decides every conclusion GitHub can send, and every field of a run the code trusts:
+
+| Conclusion / status | Action |
+|---|---|
+| `success` | green (the branch green notice only when it was told red) |
+| `failure` | red |
+| `timed_out` | red (blocks the merge) |
+| `startup_failure` | red (the workflow failed to start) |
+| `cancelled`, `skipped`, `neutral`, `action_required`, `stale` | silent |
+| none / still running / status missing or not `completed` | silent |
+| any other word | silent |
+
+Run fields trusted: `id`, `name`, `status`, `conclusion`, `head_sha`, `head_branch`, `event`, `html_url`, `created_at`, `pull_requests`, `run_attempt`, `workflow_id`. Every text from GitHub (workflow name, link, head, branch) is cleaned (no control or ANSI characters, no markdown, capped) before it enters a message.
+
+Not required workflows send nothing. At most 20 new pull-request messages are made per hour; a message dropped by the cap writes an audit line (`red_ci.dropped`) and is told on a later pass; branch alarms are never dropped by the cap. No platform read is added: the runs are the ones the catch-up already reads, and after a daemon start (#1140) the first pass reads them before the rest. What was told is kept in `red-ci.json`, so a restart does not repeat a message. The helper `bin/red_ci.py` is loaded by path like the other helpers (no copy list exists to extend).
 
 ### Reviews a reader posts and dismisses (#1123)
 
