@@ -31,9 +31,9 @@ RUN curl -fsSL "https://opencode.ai/files/bin/${OPENCODE_VERSION}/opencode-linux
 # NODE_VERSION and the two sha256 constants of that release's .tar.xz (one per architecture) are the only constants.
 # A version bump = update the version AND both constants (see cloud/README.md). No checksum list is downloaded.
 # Root-owned /opt/node, linked into /usr/local/bin.
-ARG NODE_VERSION=22.23.2
-ARG NODE_SHA256_X64=d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307
-ARG NODE_SHA256_ARM64=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8
+ARG NODE_VERSION=22.23.4
+ARG NODE_SHA256_X64=1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce
+ARG NODE_SHA256_ARM64=6287aa46b6c375d816e63ae66d024fbbfd70404825aabdfdf898a970871d2f4b
 RUN set -eu; case "$(dpkg --print-architecture)" in amd64) a=x64; h="${NODE_SHA256_X64}" ;; arm64) a=arm64; h="${NODE_SHA256_ARM64}" ;; *) echo "unsupported architecture" >&2; exit 1 ;; esac \
  && f="node-v${NODE_VERSION}-linux-${a}.tar.xz" \
  && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${f}" -o "/tmp/${f}" \

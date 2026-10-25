@@ -32,6 +32,8 @@ the release for the image's architecture and checks it with `sha256sum -c` again
 No checksum list is downloaded and no checksum address can be overridden. The added image size was not measured. A repository's own prettier and eslint are its dev dependencies and run through `npx`; the image
 does not install them.
 
+The pinned version is a security floor: Node >= 22.23.4 (the older 22.23.2 carries trust roots that are being withdrawn).
+
 To bump Node: update `NODE_VERSION` (a full 22.x.y release; the only place the version is written) AND both sha256 constants (`NODE_SHA256_X64`,
 `NODE_SHA256_ARM64`) at the top of the Node block in `cloud/worker/Dockerfile`, keep the version equal to the product repository's `.node-version`, then rebuild and publish the image
 (an operator step) and record the previous digest as the rollback.

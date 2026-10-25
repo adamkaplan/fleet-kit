@@ -8,6 +8,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLOUD = os.path.dirname(os.path.dirname(HERE))
 DF = os.path.join(CLOUD, "worker", "Dockerfile")
+FLOOR = (22, 23, 4)  # security floor: Node >= 22.23.4
 
 
 def read(p):
@@ -20,6 +21,8 @@ def problems(t):
     defs = re.findall(r"^ARG NODE_VERSION=(\S+)$", t, re.M)
     if len(defs) != 1 or not re.fullmatch(r"22\.\d+\.\d+", defs[0]):
         out.append("NODE_VERSION must be defined once, a full 22.x.y")
+    elif tuple(int(x) for x in defs[0].split(".")) < FLOOR:
+        out.append("NODE_VERSION below the security floor")
     elif t.count(defs[0]) != 1:
         out.append("version spelled more than once")
     for n in ("NODE_SHA256_X64", "NODE_SHA256_ARM64"):
@@ -103,19 +106,19 @@ class T(unittest.TestCase):
         self.assertTrue(problems(tl[:k] + chk.rstrip("\\\n").rstrip() + " \\\n" + tl[k:]))
 
     def test_mutant_version_loosened(self):
-        for v in ("22.", "22.x", "22.23", "22.23.2-rc1"):
-            self.assertTrue(problems(self.mut("NODE_VERSION=22.23.2", "NODE_VERSION=" + v)))
+        for v in ("22.", "22.x", "22.23", "22.23.4-rc1"):
+            self.assertTrue(problems(self.mut("NODE_VERSION=22.23.4", "NODE_VERSION=" + v)))
 
     def test_mutant_shasums_url_back(self):
         self.assertTrue(problems(read(DF).replace("# ---- end Node", "ARG NODE_SHASUMS_URL=https://example.invalid/SHASUMS256.txt\n# ---- end Node")))
 
     def test_mutant_bad_hash(self):
-        self.assertTrue(problems(self.mut("NODE_SHA256_ARM64=fff4", "NODE_SHA256_ARM64=zzz4")))
+        self.assertTrue(problems(self.mut("NODE_SHA256_ARM64=6287", "NODE_SHA256_ARM64=zzz4")))
 
     def test_pinned_values(self):
         t = read(DF)
-        self.assertIn("NODE_SHA256_X64=d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307", t)
-        self.assertIn("NODE_SHA256_ARM64=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8", t)
+        self.assertIn("NODE_SHA256_X64=1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce", t)
+        self.assertIn("NODE_SHA256_ARM64=6287aa46b6c375d816e63ae66d024fbbfd70404825aabdfdf898a970871d2f4b", t)
 
     def test_mutant_apt_nodejs(self):
         self.assertTrue(problems(self.mut("jq procps", "jq procps nodejs npm")))
@@ -125,10 +128,20 @@ class T(unittest.TestCase):
         self.assertTrue(problems(t))
 
     def test_mutant_two_versions(self):
-        self.assertTrue(problems(self.mut("/dist/v${NODE_VERSION}/${f}", "/dist/v22.23.2/${f}")))
+        self.assertTrue(problems(self.mut("/dist/v${NODE_VERSION}/${f}", "/dist/v22.23.4/${f}")))
+
+    def test_version_floor(self):
+        t = read(DF)
+        v = re.search(r"^ARG NODE_VERSION=(\S+)$", t, re.M).group(1)
+        self.assertGreaterEqual(tuple(int(x) for x in v.split(".")), FLOOR)
+
+    def test_mutant_below_floor(self):
+        m = self.mut("NODE_VERSION=22.23.4", "NODE_VERSION=22.23.2")
+        self.assertIn("NODE_VERSION=22.23.2", m)
+        self.assertIn("NODE_VERSION below the security floor", problems(m))
 
     def test_mutant_major_20(self):
-        self.assertTrue(problems(self.mut("NODE_VERSION=22.23.2", "NODE_VERSION=20.1.0")))
+        self.assertTrue(problems(self.mut("NODE_VERSION=22.23.4", "NODE_VERSION=20.1.0")))
 
     def test_docs(self):
         d = read(os.path.join(CLOUD, "README.md"))
