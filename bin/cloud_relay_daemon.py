@@ -18,7 +18,7 @@ call id). Claims live in their own file (`relay_reports.json`, REPORT_MAX entrie
 damaged claim file refuses with 500 rather than forgetting). A report replay with a different pr or different args under the same call id is 409.
 Refusals (daemon-only credential, repo, allow-list, rules) write an AUDIT line `relay.refused` on purpose and leave the ledger and files
 byte-identical. The hub's 1000-entry finished cache can be flooded to evict another pod's hub-side replay record; the daemon-side dedupe
-above still holds it. Every hub request (connect, headers, body, response; GET and POST) has ONE wall-clock deadline (READ_DEADLINE 30 s), and a relay pass a budget (PASS_BUDGET 60 s: later requests wait for the next pass); worst case for the transport of a pass is PASS_BUDGET + READ_DEADLINE = 90 s, plus the GitHub reads of the request being handled. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock (bounded by HEAD_TIMEOUT, refused 504 with nothing written when late); inside the flock the build only compares it with the head the request judged: no network under the lock.
+above still holds it. Every hub request (connect, headers, body, response; GET and POST) has ONE wall-clock deadline (READ_DEADLINE 30 s), and a relay pass a budget (PASS_BUDGET 60 s: later requests wait for the next pass); each hub request runs in a worker thread joined at READ_DEADLINE (DNS and every connect attempt included; a late thread is abandoned and the pass records relay pass cut), so the transport of a pass is at most PASS_BUDGET + READ_DEADLINE = 90 s. The up to 40 GitHub context reads of a pass carry NO deadline inside the pass budget: they are unbounded. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock (bounded by HEAD_TIMEOUT, refused 504 with nothing written when late); inside the flock the build only compares it with the head the request judged: no network under the lock.
 GitHub reads per pass, worst case: at most 10 requests, each making _ctx reads (a ledger context = PR facts and plan from GitHub): report 1 (link), gates 2, prove 3 (link, plan, live head), verdict 4 (link, plan, PR facts, live head); so at most 10 x 4 = 40 context reads per pass.
 Memory limit, exactly: report claims survive restarts and a missing or pruned relay_calls.json (own file, REPORT_MAX 50000 entries; beyond that the oldest claim is forgotten, and a deleted relay_reports.json is an empty memory, so a report with that call id would then be delivered again). A damaged file refuses instead.
 
@@ -354,12 +354,21 @@ class Executor:
         return {"seq": stored["seq"], "hash": stored["hash"]}
 
 
+class PassCut(TimeoutError):
+    """A hub request outran the wall-clock deadline (DNS, connect or anything else): its thread is abandoned."""
+
+
 def pass_once(executor, fetch, post, budget=None, clock=time.monotonic):
     """One pull pass. fetch() -> {"requests": [...]} ; post(id, body). Returns the number answered. A request is started only while the
     pass has used less than `budget` seconds (PASS_BUDGET); the rest stay pending at the hub for the next pass."""
     start = clock()
     budget = PASS_BUDGET if budget is None else budget
-    pending = fetch() or {}
+    try:
+        pending = fetch() or {}
+    except PassCut:
+        with contextlib.suppress(Exception):
+            executor.backend.audit("relay.pass_cut", None, {"error": "relay pass cut"})
+        return 0
     done = 0
     for req in (pending.get("requests") or [])[:10]:
         if clock() - start >= budget:
@@ -378,6 +387,10 @@ def pass_once(executor, fetch, post, budget=None, clock=time.monotonic):
                 executor.backend.audit("relay.failed", None, {"id": rid, "error": clean_text(err, 160)})
         try:
             post(rid, {"status": status, "reason": reason, "record": record})
+        except PassCut:   # abandoned at the deadline: record it, the daemon goes on (the request stays at the hub)
+            with contextlib.suppress(Exception):
+                executor.backend.audit("relay.pass_cut", None, {"id": rid, "error": "relay pass cut"})
+            break
         except Exception:   # the hub could not take this answer: leave it to expire there, go on with the rest
             continue
         done += 1
@@ -398,6 +411,26 @@ def http_transport(base, token):
     import http.client
 
     def call(path, body=None):
+        """The request in a WORKER THREAD joined at READ_DEADLINE: DNS, every connect attempt and everything else share ONE wall clock. When
+        the join times out the thread is abandoned (daemon) and PassCut is raised; the request stays at the hub."""
+        box = []
+
+        def run():
+            try:
+                box.append((True, _call(path, body)))
+            except BaseException as err:
+                box.append((False, err))
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(READ_DEADLINE)
+        if not box:
+            raise PassCut("relay pass cut")
+        ok, value = box[0]
+        if ok:
+            return value
+        raise value
+
+    def _call(path, body=None):
         """One request under ONE wall-clock deadline (READ_DEADLINE) covering connect, headers, body and response: the socket timeout is the
         REMAINING time at each step, and a watchdog shuts the socket at the deadline (a hub trickling headers one byte at a time is cut)."""
         data = None if body is None else json.dumps(body).encode()
@@ -434,6 +467,11 @@ def http_transport(base, token):
                 if not chunk:
                     break
                 raw += chunk
+            declared = resp.getheader("Content-Length")
+            if time.monotonic() >= end and (not declared or not declared.isdigit() or len(raw) != int(declared)):
+                raise TimeoutError("hub answer not complete within %ds" % READ_DEADLINE)
+            if declared and declared.isdigit() and len(raw) != int(declared) and len(raw) <= PENDING_CAP:
+                raise ValueError("hub answer shorter than its Content-Length")
             if len(raw) > PENDING_CAP:
                 raise ValueError("hub answer over %d bytes" % PENDING_CAP)
             return cloud_relay.loads_strict(raw or b"{}")
@@ -524,9 +562,16 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ):
                     raise   # the outer handler records only the class name
                 engine._note("relay.pass_failed", None, {"error": "the token file is a symbolic link: it is not used"})
                 return 0
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):   # before fdopen: a directory would raise IsADirectoryError there
+                    engine._note("relay.pass_failed", None, {"error": "the token file is a directory / not a regular file: it is not used"})
+                    return 0
+            except BaseException:
+                os.close(fd)
+                raise
             with os.fdopen(fd, "rb") as handle:
-                info = os.fstat(handle.fileno())
-                loose = info.st_mode & 0o077 or info.st_uid != os.geteuid() or not stat.S_ISREG(info.st_mode)
+                loose = info.st_mode & 0o077 or info.st_uid != os.geteuid()
                 raw = handle.read(TOKEN_CAP + 1) if not loose else b""
             if loose:   # not a regular file, or readable by group or other: refused, never read or used
                 engine._note("relay.pass_failed", None, {"error": "the token file is not private to this user (regular file, owned by the user, mode 0600): it is not used"})

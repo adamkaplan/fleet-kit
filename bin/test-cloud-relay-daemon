@@ -16,7 +16,10 @@ Two kinds of mutant test, kept apart:
       PR-issue link (backend.pr_issues check)    -> test_pr_not_linked_to_the_pods_issue_refused_for_all_three
       call-id scope per pod (Index key)          -> test_same_call_id_two_pods
 """
+import contextlib
 import json
+import threading
+import types
 import os
 import sys
 import tempfile
@@ -929,7 +932,7 @@ class HubReadAndTransport(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 2.5)
 
     def test_mutant_without_the_total_deadline_is_caught(self):
-        mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"),))
+        mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
         old, mod.READ_DEADLINE = relay.READ_DEADLINE, 1.0
         import time
 
@@ -1018,7 +1021,7 @@ class HubReadAndTransport(unittest.TestCase):
             self.assertNotIn("not private", str(notes))
 
     def test_mutant_token_mode_unchecked_is_caught(self):
-        mod = load_backend_module("loose = info.st_mode & 0o077 or info.st_uid != os.geteuid() or not stat.S_ISREG(info.st_mode)", "loose = 0")
+        mod = load_backend_module("loose = info.st_mode & 0o077 or info.st_uid != os.geteuid()", "loose = 0")
         notes = []
 
         class Engine:
@@ -1097,7 +1100,7 @@ class Round2(Fixture):
         self.assertLess(took, 2.0)
 
     def test_mutant_without_the_watchdog_is_caught(self):
-        mod = load_backend_module("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)")
+        mod = load_backend_module("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)", extra=(("worker.join(READ_DEADLINE)", "worker.join()"),))
         took, _ = self.timed_fetch(mod)
         self.assertGreater(took, 2.0)
 
@@ -1193,7 +1196,21 @@ class Round2(Fixture):
         os.mkfifo(str(fifo), 0o600)
         finished, notes = self.run_token(relay, fifo)
         self.assertTrue(finished, "a FIFO blocked the daemon")
-        self.assertIn("not private to this user", notes[0][2]["error"])
+        self.assertIn("not a regular file", notes[0][2]["error"])
+
+    def test_directory_token_names_its_reason(self):
+        d = Path(self.state) / "adir"
+        d.mkdir()
+        finished, notes = self.run_token(relay, d)
+        self.assertTrue(finished)
+        self.assertIn("directory / not a regular file", notes[0][2]["error"])
+
+    def test_mutant_directory_token_only_class_name_is_caught(self):
+        mod = load_backend_module("if not stat.S_ISREG(info.st_mode):", "if False:")
+        d = Path(self.state) / "adir2"
+        d.mkdir()
+        _, notes = self.run_token(mod, d)
+        self.assertNotIn("directory / not a regular file", str(notes))
 
     def test_symlinked_token_is_refused(self):
         real = Path(self.state) / "real"
@@ -1218,6 +1235,119 @@ class Round2(Fixture):
         link.symlink_to(real)
         finished, notes = self.run_token(mod, link)
         self.assertNotIn("symbolic link", str(notes))
+
+
+class OneWallClock(unittest.TestCase):
+    """The deadline covers DNS and every connect attempt (a worker thread joined at it), and a cut body is never a complete parse."""
+
+    def setUp(self):
+        import socket
+        self.socket = socket
+        self.real_gai = socket.getaddrinfo
+        self.addCleanup(setattr, socket, "getaddrinfo", self.real_gai)
+
+    def timed(self, mod, url, deadline):
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, deadline
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        fetch, _ = mod.http_transport(url, "tok")
+        t0 = time.monotonic()
+        try:
+            fetch()
+        except Exception as err:
+            return time.monotonic() - t0, err
+        return time.monotonic() - t0, None
+
+    def slow_dns(self):
+        def gai(*a, **k):
+            time.sleep(10)
+            return self.real_gai(*a, **k)
+        self.socket.getaddrinfo = gai
+        return "http://127.0.0.1:9"
+
+    def full_backlog(self, n=4):
+        socket = self.socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(0)
+        port = srv.getsockname()[1]
+        fillers = []
+        for _ in range(5):
+            c = socket.socket()
+            c.setblocking(False)
+            with contextlib.suppress(OSError):
+                c.connect(("127.0.0.1", port))
+            fillers.append(c)
+        self.addCleanup(srv.close)
+        self.addCleanup(lambda: [c.close() for c in fillers])
+        real = self.real_gai
+        self.socket.getaddrinfo = lambda host, p, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))] * n
+        return "http://localhost:%d" % port
+
+    def test_slow_dns_is_cut_at_the_deadline(self):
+        took, err = self.timed(relay, self.slow_dns(), 1.0)
+        self.assertIsInstance(err, relay.PassCut)
+        self.assertLess(took, 2.0)
+
+    def test_mutant_without_the_thread_cut_is_caught_by_dns(self):
+        mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
+        took, _ = self.timed(mod, self.slow_dns(), 1.0)
+        self.assertGreater(took, 5.0)
+
+    def test_four_dead_addresses_share_one_deadline(self):
+        took, err = self.timed(relay, self.full_backlog(), 2.0)
+        self.assertIsInstance(err, TimeoutError)
+        self.assertLess(took, 3.5)
+
+    def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
+        mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
+        took, _ = self.timed(mod, self.full_backlog(), 2.0)
+        self.assertGreater(took, 5.0)
+
+    def test_pass_records_the_cut(self):
+        notes = []
+        backend = types.SimpleNamespace(audit=lambda *a: notes.append(a))
+        def fetch():
+            raise relay.PassCut("relay pass cut")
+        self.assertEqual(relay.pass_once(types.SimpleNamespace(backend=backend), fetch, None), 0)
+        self.assertEqual(notes[0][0], "relay.pass_cut")
+
+    def serve_padded(self):
+        import http.server
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    body = b'{"requests": []}'
+                    self.send_response(200)
+                    self.send_header("Content-Length", "1000")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                    for _ in range(40):
+                        time.sleep(0.1)
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                except OSError:
+                    pass
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d" % srv.server_port
+
+    def test_a_cut_body_is_never_a_complete_parse(self):
+        took, err = self.timed(relay, self.serve_padded(), 1.0)
+        self.assertIsNotNone(err)
+
+    def test_mutant_without_the_length_check_is_caught(self):
+        mod = load_backend_module("if time.monotonic() >= end and (not declared", "if False and (not declared",
+                                  extra=(("if declared and declared.isdigit() and len(raw)", "if False and len(raw)"), ("if left <= 0:", "if False:"), ("worker.join(READ_DEADLINE)", "worker.join()")))
+        _, err = self.timed(mod, self.serve_padded(), 1.0)
+        self.assertIsNone(err)   # the mutant parses the cut body as complete
 
 
 if __name__ == "__main__":
