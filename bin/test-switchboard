@@ -86233,7 +86233,6 @@ class TestBatchingDocs(unittest.TestCase):
             self.assertEqual(section.count(phrase), 1, phrase)
 
 
-<<<<<<< HEAD
 
 class FakePullFiles:
     """GitHub's pull request answers for ONE pull request, no more generous than the real API: the files are served 100 a page whatever per_page asks, only the first 3000 are ever listed (a page past
@@ -87015,14 +87014,7 @@ class TestPullFileListRead(LedgerBase):
                 self.assertIn(self.words(kind), refused)
                 self.assertIn(refused, err, "the audit's line is the printed line")
 
-def write_lane_hours(state, lanes, hour=None):
-    """The daemon's hourly record with `lanes` ({lane: {account: {endpoint class: n}}}) for the current hour (counting on, as the daemon makes it)."""
-    start = int(time.time()) // 3600 * 3600 if hour is None else hour
-    (Path(state) / "agent-calls-hours.json").write_text(json.dumps({"v": 1, "since": time.time() - 7200, "hours": {str(start): {"lanes": lanes}}}))
 
-
-=======
->>>>>>> origin/integration
 NO_CAP_WORDS = re.compile(r"(cap|quota|ceiling|allowance)", re.I)
 AGENT_WORDS = re.compile(r"(agent|lane|caller|worker|spender)", re.I)
 
