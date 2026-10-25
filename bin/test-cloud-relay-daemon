@@ -830,37 +830,48 @@ class LiveHead(Fixture):
         self.assertEqual(self.run_one(CODER, "prove", **PROVE)["status"], 200)
         self.assertTrue(seen[0], seen)
 
-    def test_a_head_that_moves_between_the_two_reads_is_refused(self):
-        heads = iter([HEAD, "c" * 40])
-        self.backend.live_head = lambda pr: next(heads)
-        self.refused(409, "stale head", CODER, "prove", **PROVE)
-        self.assertEqual(self.entries(), [])
+    def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
+        import threading
+        import time
 
-    def test_the_in_lock_read_is_bounded(self):
+        def slow(pr):   # every call is slow: a call made under the flock would hold every other writer for this long
+            time.sleep(0.7)
+            return HEAD
+        self.backend.live_head = slow
+        t = threading.Thread(target=lambda: self.run_one(CODER, "prove", **PROVE))
+        t.start()
+        worst, end = 0.0, time.monotonic() + 1.6
+        while time.monotonic() < end:
+            t0 = time.monotonic()
+            plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
+                kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e"))
+            worst = max(worst, time.monotonic() - t0)
+            time.sleep(0.05)
+        t.join(10)
+        self.assertLess(worst, 0.3)   # no writer waited for GitHub
+
+    def test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing(self):
         import time
         old = relay.HEAD_TIMEOUT
         relay.HEAD_TIMEOUT = 0.2
         self.addCleanup(setattr, relay, "HEAD_TIMEOUT", old)
-        calls = []
-
-        def slow(pr):
-            calls.append(1)
-            if len(calls) > 1:
-                time.sleep(3)
-            return HEAD
-        self.backend.live_head = slow
+        self.backend.live_head = lambda pr: (time.sleep(2), HEAD)[1]
         t0 = time.monotonic()
+        self.refused(504, "could not be read in time", CODER, "prove", **PROVE)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(self.raw(), b"")
+
+    def test_a_different_live_head_is_refused(self):
+        self.backend.head = "c" * 40
         self.refused(409, "stale head", CODER, "prove", **PROVE)
-        self.assertLess(time.monotonic() - t0, 2)
+        self.assertEqual(self.raw(), b"")
 
     def test_mutants_are_caught(self):
-        for guard, old, new in (("test_the_first_read_is_made_without_the_ledger_flock", "        first = b.live_head(pr)", "        first = head"),
-                                ("test_the_in_lock_read_is_bounded", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)", "b.live_head(pr)")):
+        for guard, old, new in (("test_a_slow_live_head_does_not_block_another_ledger_writer", "if not _same_head(first, head):   # compared", "first = b.live_head(pr)\n            if not _same_head(first, head):   # compared"),
+                                ("test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)", "b.live_head(pr)")):
             case = LiveHead(guard)
             case.setUp()
             make_mutant_executor(case, old, new)
-            if guard == "test_the_in_lock_read_is_bounded":
-                pass
             try:
                 with self.assertRaises(AssertionError, msg=guard):
                     getattr(case, guard)()
@@ -910,7 +921,7 @@ class HubReadAndTransport(unittest.TestCase):
         t0 = time.monotonic()
         with self.assertRaises(TimeoutError):
             fetch()
-        self.assertLess(time.monotonic() - t0, 4)
+        self.assertLess(time.monotonic() - t0, 2.5)
 
     def test_mutant_without_the_total_deadline_is_caught(self):
         mod = load_backend_module("if time.monotonic() > end:", "if False:")

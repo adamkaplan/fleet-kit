@@ -17,7 +17,9 @@ call id). Claims live in their own file (`relay_reports.json`, REPORT_MAX entrie
 damaged claim file refuses with 500 rather than forgetting). A report replay with a different pr or different args under the same call id is 409.
 Refusals (daemon-only credential, repo, allow-list, rules) write an AUDIT line `relay.refused` on purpose and leave the ledger and files
 byte-identical. The hub's 1000-entry finished cache can be flooded to evict another pod's hub-side replay record; the daemon-side dedupe
-above still holds it. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock.
+above still holds it. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock (bounded by HEAD_TIMEOUT, refused 504 with nothing written when late); inside the flock the build only compares it with the head the request judged: no network under the lock.
+GitHub reads per pass, worst case: at most 10 requests, each making _ctx reads (a ledger context = PR facts and plan from GitHub): report 1 (link), gates 2, prove 3 (link, plan, live head), verdict 4 (link, plan, PR facts, live head); so at most 10 x 4 = 40 context reads per pass.
+Memory limit, exactly: report claims survive restarts and a missing or pruned relay_calls.json (own file, REPORT_MAX 50000 entries; beyond that the oldest claim is forgotten, and a deleted relay_reports.json is an empty memory, so a report with that call id would then be delivered again). A damaged file refuses instead.
 
 The PR-to-issue link comes from the PR body's closing keywords (and the plan's issue). It is NOT a security boundary: anyone who can edit
 the PR body can set it. The boundaries are the prove holder check (`relay_holders`) and the verdict evaluator registry (`plan_evaluators`).
@@ -180,8 +182,11 @@ def _same_call(known, command, pr, head, digest=None):
     return known.get("command") == command and known.get("pr") == pr and known.get("head") == head
 
 
+_TIMEOUT = object()
+
+
 def _bounded(fn, timeout):
-    """fn() with a deadline: None (unknown head, so refused as stale) when it does not answer in time or raises."""
+    """fn() with a deadline: _TIMEOUT when it does not answer in time, None when it raises (an unknown head, refused as stale)."""
     box = []
 
     def run():
@@ -192,7 +197,7 @@ def _bounded(fn, timeout):
     t = threading.Thread(target=run, daemon=True)
     t.start()
     t.join(timeout)
-    return box[0] if box else None
+    return box[0] if box else _TIMEOUT
 
 
 def _answer(known):
@@ -331,12 +336,13 @@ class Executor:
                 ok2, why2 = plan_ledger.may_record_verdict(named, pod, {named: b.evaluators(named)}, a2)
                 if not ok2:
                     raise Refuse(403, "refused: %s" % why2)
-            live = _bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)   # re-read inside the append decision, bounded: a slow GitHub must not hold the flock
-            if not _same_head(live, head):
-                raise Refuse(409, "stale head: the PR head is %s, not %s" % ((live or "unknown")[:12], head[:12]))
+            if not _same_head(first, head):   # compared with the head read BEFORE the flock: no network under the lock
+                raise Refuse(409, "stale head: the PR head is %s, not %s" % ((first or "unknown")[:12], head[:12]))
             return entry
 
-        first = b.live_head(pr)   # the slow read is made BEFORE the flock; the re-check inside is bounded and refuses a head that moved
+        first = _bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)   # the slow read is made BEFORE the flock, under a short timeout
+        if first is _TIMEOUT:
+            raise Refuse(504, "the PR head could not be read in time: nothing was written", "live_head timed out after %ds" % HEAD_TIMEOUT)
         if not _same_head(first, head):
             raise Refuse(409, "stale head: the PR head is %s, not %s" % ((first or "unknown")[:12], head[:12]))
         stored = plan_ledger.append_checked(self.state, self.now(), build)
