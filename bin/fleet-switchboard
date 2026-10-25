@@ -17534,24 +17534,69 @@ def cmd_gates_stats(args, runner, now):
     return EXIT_OK
 
 
-def plan_peers(ctx, runner, now):
-    """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing). GETs only; raises when the list cannot be read."""
+PEER_PAGES = 10   # #976: `plan_peers` reads at most this many pages of 100 pull requests; more is refused, never truncated
+PEERS_TOO_MANY = "too many pull requests to judge"
+
+
+class ClaimUnknown(Exception):
+    pass
+
+
+def plan_peers(ctx, runner, now, closed=None):
+    """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing; `closed`, a list, is given
+    (number, body) of those). A MERGED sibling's body is the claim RECORDED in the ledger when its merge was gated (never its current body, which an author can edit): a merged
+    sibling with no recorded claim raises ClaimUnknown. An open one reads its current body. GETs only. Reads at most PEER_PAGES pages of 100: with more the read raises
+    `too many pull requests to judge` (fail closed, never a silent truncation). Raises when the list cannot be read."""
     repo = ctx.pr.rsplit("#", 1)[0]
     reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
-    listed = reader._api("repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100" % repo, repo)
-    if not isinstance(listed, list):
-        raise ValueError("the pull request list did not come back as a list")
+    listed = []
+    for page in range(1, PEER_PAGES + 1):
+        got = reader._api("repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100&page=%d" % (repo, page), repo)
+        if not isinstance(got, list):
+            raise ValueError("the pull request list did not come back as a list")
+        listed.extend(got)
+        if len(got) < 100:
+            break
+    else:
+        raise ValueError(PEERS_TOO_MANY)
     peers = []
     for other in listed:
         if not isinstance(other, dict) or other.get("number") == ctx.number:
             continue
-        if other.get("state") != "open" and not other.get("merged_at"):
-            continue
         link = plan_ledger.PLAN_LINK_RE.search(plan_ledger.visible_body(other.get("body")))
         if not link or not _same_plan(link.group(1).strip("<>.,"), ctx.source, ctx.config.get("intent_repo")):
             continue
-        peers.append(("open" if other.get("state") == "open" else "merged", other.get("body")))
+        if other.get("state") != "open" and not other.get("merged_at"):
+            if closed is not None:
+                closed.append((other.get("number"), other.get("body")))
+            continue
+        if other.get("state") == "open":
+            peers.append(("open", other.get("body")))
+            continue
+        found, text = plan_ledger.recorded_claim(ctx.entries, "%s#%s" % (repo, other.get("number")))
+        if not found:
+            raise ClaimUnknown("merged pull request #%s has no recorded claim: its claim is unknown" % other.get("number"))
+        peers.append(("merged", plan_ledger.claim_body(text)))
     return peers
+
+
+class _ClaimRecorded(Exception):
+    pass
+
+
+def record_claim(ctx, now):
+    """Bind this pull request's claim line as the merge gate sees it: ONE `claim` ledger line, written once for the same claim text (`append_checked`)."""
+    body = (ctx.facts or {}).get("body")
+    line = plan_ledger.claim_line(ctx.pr, (ctx.facts or {}).get("head"), body)
+
+    def build(have, seq):
+        if plan_ledger.recorded_claim(have, ctx.pr) == (True, line["claim_text"]):
+            raise _ClaimRecorded()
+        return line
+    try:
+        plan_ledger.append_checked(ctx.state, now(), build)
+    except _ClaimRecorded:
+        pass
 
 
 def claim_union_refusal(args, runner, now):
@@ -17566,10 +17611,15 @@ def claim_union_refusal(args, runner, now):
     body = (ctx.facts or {}).get("body")
     scenarios = ctx.plan["scenarios_parsed"]
     try:
+        record_claim(ctx, now)   # the claim as it stands at this merge gate: a later edit of the merged body binds nothing
+    except Exception as err:
+        if plan_ledger.pr_claim(body, scenarios)[0] is not None:
+            return "merge of %s refused: the claim could not be recorded (%s); the gate fails closed for a pull request with a claim line" % (ctx.pr, _one_line(str(err), 100))
+    try:
         peers = plan_peers(ctx, runner, now)
     except Exception as err:
         if plan_ledger.pr_claim(body, scenarios)[0] is None:
-            return None
+            return None   # a pull request with no claim line claims every per-PR scenario: the union is covered whatever the peers say (docs/switchboard.md)
         return "merge of %s refused: the claim union could not be read (%s); the gate fails closed for a pull request with a claim line" % (ctx.pr, _one_line(str(err), 100))
     applies, uncovered, last = plan_ledger.claim_union(scenarios, body, peers)
     if not (applies and last and uncovered):
@@ -17593,14 +17643,24 @@ def claim_union_note(report, ctx, runner, now):
         if error or not left or row is None:
             return
         covered = set()
-        for _, other_body in plan_peers(ctx, runner, now):
+        closed, closed_claims = [], []
+        peers = plan_peers(ctx, runner, now, closed)
+        for kind, other_body in [(k, b) for k, b in peers] + [("closed", b) for _, b in closed]:
             claimed, _, other_error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], other_body)
-            if not other_error:
+            if not other_error and kind != "closed":
                 covered.update(x["id"] for x in claimed)
+            if kind == "closed":
+                closed_claims.append(None if other_error else {x["id"] for x in claimed})
         missing = [x["id"] for x in left if x["id"] not in covered]
         report["unclaimed"] = missing
         report["claim_union"] = sorted(covered | {x["id"] for x in claimed_mine})   # the union of the open and merged claims of this ask (#976)
         row["detail"] = (row.get("detail") or "") + "; claimed by no other pull request (open or merged, same plan) yet: %s" % (", ".join(missing) if missing else "none")
+        lost = []
+        for (number, _), gone in zip(closed, closed_claims):   # M2: a sibling closed without a merge leaves its scenarios unclaimed, and no later merge enforces it
+            lost.extend("%s: its claimant #%s was closed without a merge" % (sid, number) for sid in missing if gone and sid in gone)
+        if lost:
+            report["closed_siblings"] = lost
+            row["detail"] += "; the ask's scenarios left unclaimed: %s" % "; ".join(lost)
     except Exception as err:   # said, never silent
         report["unclaimed_error"] = _one_line("%s: %s" % (type(err).__name__, err), 160)
 

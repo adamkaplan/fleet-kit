@@ -86517,13 +86517,27 @@ class TestClaimUnionAtLastMerge(LedgerBase):
     def body(self, claims):
         self.pr["body"] = "PLAN: acme/app#7\n%scanon: updated the docs" % ("CLAIMS: %s\n" % claims if claims is not None else "")
 
-    def refusal(self, peers=None):
+    def record(self, number, claim):
+        """The claim line the merge gate wrote for sibling #number when it was merged (the union reads this, never the merged body)."""
+        sb.plan_ledger.append_checked(self.world.state, self.world.clock.now(), lambda have, seq: {"kind": "claim", "pr": "acme/app#%d" % number, "head": "a" * 40, "claim_text": claim})
+
+    def refusal(self, peers=None, record=True, pages=None, edit=None, failing=False):
         listed = [dict(number=100 + n, state=state, merged_at="2026-01-01T00:00:00Z" if state == "merged" else None, body="PLAN: acme/app#7\n" + (("CLAIMS: %s" % c) if c else ""))
                   for n, (state, c) in enumerate(self.peers if peers is None else peers)]
         for one in listed:
+            if record and one["state"] == "merged":
+                self.record(one["number"], (one["body"].split("CLAIMS: ")[1] if "CLAIMS: " in one["body"] else None))
             one["state"] = "closed" if one["state"] == "merged" else one["state"]
+            if edit and one["number"] in edit:
+                one["body"] = "PLAN: acme/app#7\nCLAIMS: %s" % edit[one["number"]]   # the merged body edited AFTER the merge
+        listed = listed + (pages or [])
         route = self.route
-        route2 = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps(listed), "") if "/pulls?state=all" in " ".join(argv) else route(argv, **kw))
+        def pulls(argv):
+            if failing:
+                return subprocess.CompletedProcess(argv, 1, "", "boom")
+            page = int(re.search(r"&page=(\d+)", " ".join(argv)).group(1))
+            return subprocess.CompletedProcess(argv, 0, json.dumps(listed[(page - 1) * 100:page * 100]), "")
+        route2 = lambda argv, **kw: (pulls(argv) if "/pulls?state=all" in " ".join(argv) else route(argv, **kw))
         args = types.SimpleNamespace(pr=self.PR)
         saved, self.route = self.route, route2
         try:
@@ -86564,6 +86578,88 @@ class TestClaimUnionAtLastMerge(LedgerBase):
         self.assertIsNone(self.refusal([("open", None)]))
         self.body("S1")
         self.assertIsNone(self.refusal([("open", "S2 S3 U1")]))
+
+    def test_m1_a_merged_siblings_body_edited_after_the_merge_does_not_cover_the_scenario(self):
+        self.body("S1")
+        why = self.refusal([("merged", "S2 U1")], edit={100: "S2 U1 S3"})
+        self.assertIsNotNone(why)
+        self.assertIn("S3", why)
+        self.assertIsNone(self.refusal([("merged", "S2 U1 S3")]))     # a claim that was recorded does cover it
+
+    def test_m1_a_merged_sibling_with_no_recorded_claim_is_refused_as_unknown(self):
+        self.body("S1")
+        why = self.refusal([("merged", "S2 U1 S3")], record=False)
+        self.assertIn("could not be read", why)
+        self.assertIn("no recorded claim", why)
+
+    def test_m1_a_mutant_that_reads_the_current_body_of_a_merged_sibling_fails_the_edit_test(self):
+        def clause():
+            self.test_m1_a_merged_siblings_body_edited_after_the_merge_does_not_cover_the_scenario()
+        clause()
+        real = sb.plan_ledger.recorded_claim
+        def mutant(entries, pr):
+            return True, "S2 U1 S3"      # the edited current body
+        with mock.patch.object(sb.plan_ledger, "recorded_claim", mutant):
+            with self.assertRaises(AssertionError):
+                clause()
+
+    def test_m1_the_claim_is_recorded_once_by_the_merge_gate(self):
+        self.body("S1")
+        self.refusal([])
+        self.refusal([])
+        self.assertEqual([e["claim_text"] for e in self.ledger() if e["kind"] == "claim" and e["pr"] == self.PR], ["S1"])
+
+    def test_m2_gates_says_when_a_sibling_was_closed_without_a_merge(self):
+        self.body("S1 S2")
+        others = [{"number": 12, "state": "closed", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S3"}]
+        route = self.route
+        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps(others), "") if "/pulls?state=all" in " ".join(argv) else route(argv, **kw))
+        report = self.gates()[1]
+        self.assertIn("the ask's scenarios left unclaimed: S3: its claimant #12 was closed without a merge", self.row(report, "G1")["detail"])
+        others[0]["state"] = "open"
+        self.assertNotIn("closed without a merge", self.row(self.gates()[1], "G1")["detail"])
+
+    def test_m2_a_mutant_that_never_says_it_fails(self):
+        real = sb.claim_union_note
+        self.test_m2_gates_says_when_a_sibling_was_closed_without_a_merge()
+        def mutant(report, ctx, runner, now):
+            real(report, ctx, runner, now)
+            for row in report["gates"]:
+                row["detail"] = (row.get("detail") or "").replace("closed without a merge", "")
+        with mock.patch.object(sb, "claim_union_note", mutant):
+            with self.assertRaises(AssertionError):
+                self.test_m2_gates_says_when_a_sibling_was_closed_without_a_merge()
+
+    def test_m3_plan_peers_reads_every_page_up_to_the_bound_and_refuses_beyond_it(self):
+        self.body("S1 S2 S3 U1")
+        filler = [dict(number=1000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * 2)]
+        self.assertIsNone(self.refusal([("open", "S1")], pages=filler))      # 201 pull requests: all pages read
+        # the peer on page 2 is read: it is open, so this is not the ask's last merge
+        first = [dict(number=1000 + n, state="open", merged_at=None, body="no plan") for n in range(100)]
+        self.body("S1")
+        self.assertIsNone(self.refusal([], pages=first[:99] + [dict(number=2000, state="open", merged_at=None, body="PLAN: acme/app#7\nCLAIMS: S2")]))
+        many = [dict(number=3000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * sb.PEER_PAGES)]
+        why = self.refusal([], pages=many)
+        self.assertIn("too many pull requests to judge", why)
+
+    def test_m3_a_mutant_that_reads_the_first_page_only_fails(self):
+        def clause():
+            self.body("S1")
+            self.assertIsNone(self.refusal([], pages=[dict(number=2000 + n, state="open", merged_at=None, body="no plan") for n in range(99)]
+                                           + [dict(number=2999, state="open", merged_at=None, body="PLAN: acme/app#7\nCLAIMS: S2")]))
+            self.assertIn("too many pull requests to judge", self.refusal([], pages=[dict(number=4000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * sb.PEER_PAGES)]))
+        clause()
+        real = sb.PEER_PAGES
+        with mock.patch.object(sb, "PEER_PAGES", 1):
+            with self.assertRaises(AssertionError):
+                clause()
+
+    def test_m4_a_list_error_refuses_a_pull_request_with_a_claim_line_and_passes_one_without(self):
+        self.body("S1")
+        why = self.refusal([], failing=True)
+        self.assertIn("claim union could not be read", why)
+        self.body(None)
+        self.assertIsNone(self.refusal([], failing=True))   # no claim line: it claims every per-PR scenario, so the union is covered (docs/switchboard.md)
 
     def test_s5_a_mutant_that_ignores_the_union_fails_the_clause_tests(self):
         ledger = sb.load_plan_ledger()

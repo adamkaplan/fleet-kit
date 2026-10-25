@@ -31,7 +31,8 @@ EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus ent
 REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
 ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
 CARRY_KINDS = ("carried",)   # #1129: a proof or verdict that holds at a new head (see `carry_decision`); its own line, the original row is never touched
-KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS
+CLAIM_KINDS = ("claim",)   # #976: the claim line of a pull request AS IT WAS when its merge was gated (`claim_text`, or None: it claims every per-PR scenario); the union reads it for a merged sibling
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS + CLAIM_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
@@ -528,6 +529,24 @@ def claim_union(scenarios, this_body, others):
         if not error:
             covered.update(c.get("id") for c in claimed)
     return narrowed, [i for i in per if i not in covered], last
+
+
+def claim_line(pr, head, body):
+    """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""
+    return {"kind": "claim", "pr": pr, "head": head, "claim_text": claim_text(body)}
+
+
+def recorded_claim(entries, pr):
+    """(found, claim_text) from the NEWEST `claim` line of `pr`; found is False when none was recorded."""
+    for entry in reversed(entries):
+        if entry.get("kind") == "claim" and entry.get("pr") == pr:
+            return True, entry.get("claim_text")
+    return False, None
+
+
+def claim_body(text, link="PLAN: x#1"):
+    """A body that carries a recorded claim text, to be read by `pr_claim` like any other."""
+    return link + ("\nCLAIMS: %s" % text if text is not None else "")
 
 
 def union_refusal(ref, uncovered):

@@ -4712,7 +4712,15 @@ creation in a later slice). A PR URL of a fork is another repo: not listed, not 
 (`FLEET_SWITCHBOARD_OWN_GH=1`) are never probed, so the check cannot recurse into itself. Signing and the account environment are
 unchanged.
 
-**A work item's parent ask and a pull request's `CLAIMS:` line (#943).** Known limits. A parent ask edited after approval is not detected: its Done-when is a live read, with no hash. `claim_union_note` reads only the first 100 pull requests of the repository, and it is a warning only. A merged sibling's body can be edited later, so what it claimed can change. The other pull requests' claims are listed, not enforced: #976 adds the check at the ask's last merge. The plan is read from the visible body only: a `PLAN:` line in a code fence or an HTML comment is read by no gate and not by the claim.
+**A work item's parent ask and a pull request's `CLAIMS:` line (#943, #976).** Known limits and how the union is bound.
+
+- The parent ask's Done-when is read live, with no hash. A parent edited after approval changes the required Done-when silently.
+- A merged sibling's `PLAN:` link, omitted or forged, makes the gate stricter, never looser: a sibling that does not link the plan is not counted at all.
+- The plan is read from the visible body only: a `PLAN:` line in a code fence or an HTML comment is read by no gate and not by the claim.
+- **The claims are bound as merged.** The merge gate writes one `claim` ledger line for the pull request (its `CLAIMS:` text, or none) before it judges the union. The union reads that recorded line for a MERGED sibling, never its current body: an edit of a merged body adds no claim. A merged sibling with no recorded claim is refused as unknown (`merged pull request #N has no recorded claim: its claim is unknown`). An OPEN sibling is read from its current body.
+- **The list is bounded.** `plan_peers` reads at most 10 pages of 100 pull requests. Beyond that the read is refused with `too many pull requests to judge`. It is never silently truncated.
+- **A failed read fails closed only for a pull request with a claim line.** When the gate cannot read the plan, the plan is not `pass`, or the list fails, a pull request with NO claim line passes. That is accepted: it claims every per-pull-request scenario, so the union is covered whatever the siblings say. A pull request with a claim line is refused (`claim union could not be read`).
+- **Accepted limit: a sibling closed without a merge.** When the other open pull request of an ask is closed unmerged, no later merge happens, so nothing enforces the union. `gates <pr>` of a claiming pull request says it on one line: `the ask's scenarios left unclaimed: S3: its claimant #N was closed without a merge`. It is a warning only.
 
 ## `launch` checks the plan: shadow only (#107, slice 3c)
 
