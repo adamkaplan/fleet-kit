@@ -269,6 +269,39 @@ class TestRefusalInAPart(unittest.TestCase):
         self.assertTrue(module.closure_refusals(base, head, patch_of(base, head), rule_of()["module_roots"][part], set(), True))
 
 
+class TestTheDerivationIsHeld(unittest.TestCase):
+    """What decides the closure's coverage (the tool, this test, the manifest) is a clear_code_path: a patch to it is held for the owner by the floor, never delegated."""
+    PATHS = ("tools/derive-closure", "tests/switchboard/test_closure.py", "bin/fleet-switchboard.parts")
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("impact_floor_t", str(REPO / "bin" / "impact_floor.py"))
+        self.floor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.floor)
+        self.matrix = self.floor.load_matrix()
+
+    def decide(self, path, matrix):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        decision, reasons = self.floor.owner_decide(matrix, [path], [], None, self.floor.floor_paths([path], globs, exclude, force))
+        return decision, [r for r in reasons if r.startswith("clear_code_paths")]
+
+    def test_a_patch_to_the_tool_its_test_or_the_manifest_is_held_and_dropping_the_entry_releases_it(self):
+        for path in self.PATHS:
+            with self.subTest(path=path):
+                self.assertIn(path, self.matrix["owner_hold"]["delegated_clear"]["clear_code_paths"])
+                decision, why = self.decide(path, self.matrix)
+                self.assertEqual(decision, "hold")
+                self.assertEqual(len(why), 1)
+                self.assertIn(path, why[0])
+                mutant = json.loads(json.dumps(self.matrix))
+                mutant["owner_hold"]["delegated_clear"]["clear_code_paths"].remove(path)
+                self.assertEqual(self.decide(path, mutant)[1], [], "the mutant (the entry dropped) no longer names the list")
+
+    def test_a_part_of_the_daemon_is_not_held_by_the_list_and_a_new_part_is_already_a_new_file_of_the_clear(self):
+        self.assertEqual(self.decide("bin/switchboard/audit.py", self.matrix)[1], [], "a part is judged by the closure rule, not held wholesale")
+        rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.assertTrue(self.floor.matches("bin/switchboard/a_new_part.py", rule["new_file_globs"]), "adding a part is refused for the delegated clear by new_file_globs, so listing the manifest adds no burden there")
+
+
 class TestMovingADefinition(unittest.TestCase):
     def test_a_move_without_regenerating_fails_and_a_write_changes_only_the_part_entries(self):
         root = fixture()

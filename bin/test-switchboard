@@ -15483,8 +15483,10 @@ class TestConflictCarry(unittest.TestCase):
         listed = set(matrix["owner_hold"]["delegated_clear"]["clear_code_paths"]) if "owner_hold" in matrix else set(matrix["delegated_clear"]["clear_code_paths"])
         self.assertEqual(sorted(table - listed), [], "every protected path is one the matrix lists as the clear's own code")
         exact = {x for x in listed if "*" not in x}
-        self.assertEqual(sorted(exact - table), [], "every exact path the matrix lists as the clear's own code is never carried (plan_ledger decides who may confirm)")
-        left_out = sorted(listed - table)
+        derivation = {"tools/derive-closure", "tests/switchboard/test_closure.py", "bin/fleet-switchboard.parts"}   # S13: they decide what the closure covers; held for the owner, not carry-table entries (a conflict carry is about the clear's own code)
+        self.assertEqual(sorted(exact - table - derivation), [], "every exact path the matrix lists as the clear's own code is never carried (plan_ledger decides who may confirm)")
+        self.assertEqual(sorted(derivation - exact), [], "the closure's derivation paths are listed in the matrix")
+        left_out = sorted(listed - table - derivation)
         self.assertTrue(all("*" in x for x in left_out), "only the directory globs are left out, on purpose: %s" % left_out)
         for path in table:
             self.assertTrue((root / path).exists(), path)
@@ -78217,7 +78219,7 @@ _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
 # The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
 _closure = importlib.import_module("test_closure")
-TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition
+TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -78245,7 +78247,7 @@ class TestTheArchitectureTestIsRun(unittest.TestCase):
                 else:
                     yield item
         ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
-        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition"):
+        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld"):
             with self.subTest(case=name):
                 self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 2, "the hook that loads tests/switchboard/test_closure.py is gone")
 

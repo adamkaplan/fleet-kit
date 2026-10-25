@@ -362,6 +362,9 @@
         "shims/**",
         "templates/**",
         "tools/cos-permissions-proof/**",
+        "tools/derive-closure",
+        "tests/switchboard/test_closure.py",
+        "bin/fleet-switchboard.parts",
         ".github/workflows/**"
       ],
       "new_file_globs": [
