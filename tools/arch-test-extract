@@ -3,8 +3,8 @@
 
     arch-test-extract --source bin/test-switchboard --plan PLAN.json --out-dir tests/switchboard/support [--package support] [--insert-after-line N] [--write]
 
-PLAN.json maps a support module name to the list of `name@line` entries to move (a top-level def, class or assignment; the line is
-where the statement starts, so a name defined twice is told apart). The comment lines directly above a statement move with it.
+PLAN.json maps a support module name to the list of entries to move: `name` (a top-level def, class or assignment: its first definition) or
+`name@line` (the statement that starts at that line, to tell a name defined twice apart). The comment lines directly above a statement move with it.
 The tool never edits a statement: it cuts the lines, writes them to the module (separated by two blank lines), gives each module
 the source's import block and an explicit `from support.<other> import name, ...` for every name it takes from another module
 (and `from support.paths import BIN, REPO`), and puts an explicit `from support.<module> import name, ...` for every moved name the
@@ -53,6 +53,7 @@ def main(argv=None):
     for node in tree.body:
         for name in defined(node):
             by_key["%s@%d" % (name, node.lineno)] = node
+            by_key.setdefault(name, node)   # a plain name is its first definition at the top level
     home = {}      # name -> module
     chunks = {}    # module -> [(first, last, node)]
     for module, keys in plan.items():

@@ -19,6 +19,7 @@ import importlib.util
 import inspect
 import http.client
 import io
+import itertools
 import select
 import json
 import os
@@ -230,6 +231,7 @@ class FakeMergeGitHub:
         self.branch_runs = [{"id": 90, "name": "ci", "workflow_id": 10, "head_sha": MG_TIP, "conclusion": "success", "status": "completed", "created_at": mg_iso(start - 900)}]
         self.jobs = {2: [{"name": "unit-tests", "conclusion": "failure"}, {"name": "lint", "conclusion": "success"}]}
         self.reads, self.writes, self.broken = [], [], set()
+        self.merges, self.blocking_review, self.merge_own = [], False, []
         self.rerun_after, self.rerun_result, self.reopen_fails, self.due = 60, "success", False, []
 
     def clock(self):
@@ -246,7 +248,7 @@ class FakeMergeGitHub:
         return {"id": rid, "name": name, "workflow_id": workflow, "status": status, "conclusion": conclusion, "head_sha": self.head if hasattr(self, "head") else MG_HEAD,
                 "created_at": mg_iso(created), "pull_requests": [{"number": self.number, "base": {"sha": base, "ref": "main"}}]}
 
-    def __call__(self, argv):
+    def __call__(self, argv, own=True):
         if argv[0] == "api" and argv[1] == "-X":
             self.writes.append(list(argv))
             state = argv[-1].split("=", 1)[1]
@@ -262,11 +264,18 @@ class FakeMergeGitHub:
                     self.due.append(run)
                 self.runs = [run]
             return 0, "{}", ""
+        if argv[:2] == ["pr", "merge"]:
+            self.merges.append(list(argv))
+            self.merge_own.append(own)
+            return 0, "", ""
         self.reads.append(list(argv))
         key = " ".join(argv)
         if any(word in key for word in self.broken):
             return 1, "", "HTTP 500 boom"
         if argv[:2] == ["pr", "view"]:
+            reviews = [{"author": {"login": "reviewer-x"}, "state": "CHANGES_REQUESTED", "commit": {"oid": self.head}}] if self.blocking_review else []
+            if "reviews" in key:
+                return 0, json.dumps({"headRefOid": self.head, "reviews": reviews, "reviewDecision": ""}), ""
             return 0, json.dumps({"headRefOid": self.head, "baseRefName": self.base, "state": self.state, "isDraft": False, "labels": [{"name": n} for n in self.labels]}), ""
         path = argv[1]
         if path == "repos/%s" % self.repo:

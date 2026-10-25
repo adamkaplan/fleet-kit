@@ -19,6 +19,7 @@ import importlib.util
 import inspect
 import http.client
 import io
+import itertools
 import select
 import json
 import os

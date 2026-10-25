@@ -19,6 +19,7 @@ import importlib.util
 import inspect
 import http.client
 import io
+import itertools
 import select
 import json
 import os
@@ -113,7 +114,7 @@ sc = _load("t_fleet_scenario", SCENARIO)
 
 def class_source(name, method=None):
     """The source of a class in bin/fleet-switchboard, or of one of its methods."""
-    source = SWITCHBOARD.read_text()
+    source = switchboard_source()
     for node in ast.parse(source).body:
         if isinstance(node, ast.ClassDef) and node.name == name:
             if method is None:
@@ -133,7 +134,7 @@ def captured():
 
 def class_source_fn(name):
     """The source of a module-level function of bin/fleet-switchboard."""
-    source = SWITCHBOARD.read_text()
+    source = switchboard_source()
     for node in ast.parse(source).body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return ast.get_source_segment(source, node)
