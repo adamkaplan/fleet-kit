@@ -91159,15 +91159,25 @@ class TestCiRecordCarry(LedgerBase):
             with self.assertRaises(AssertionError):
                 self.test_the_carry_line_of_another_plan_hash_is_no_evidence()
 
-    def no_state_core(self):
+    def no_state_core(self, quiet=True):
         import types
-        facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": []})
+        facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]})
         ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": [], "plan_hash": "h"}, plan_problem=None, engine=None, pr=1, config={}, repo="o/r")
-        return sb.ci_record_core(ctx, lambda: 0, quiet=True)
+        return sb.ci_record_core(ctx, lambda: 0, quiet=quiet)
 
     def test_1217_ci_record_core_with_a_ctx_lacking_state_does_not_raise_and_carries_nothing(self):
-        self.assertEqual(self.no_state_core().get("carry") or [], [])
-        self.assertEqual(sb.carry_at_green(__import__('types').SimpleNamespace(facts={}, plan={}, pr=1), lambda: 0), [])
+        got = self.no_state_core()
+        self.assertEqual([d["reason"] for d in got["carry"]], ["no ledger state: nothing to carry"])
+        self.assertTrue(all(d["proof"] is None for d in got["carry"]))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), mock.patch.object(sb, "_gates_audit", lambda *a, **k: None):
+            self.no_state_core(quiet=False)
+        self.assertIn("no ledger state: nothing to carry", buf.getvalue())
+        audits = []
+        ns = __import__('types').SimpleNamespace(facts={}, plan={}, pr=1, engine=object())
+        with mock.patch.object(sb, "_gates_audit", lambda *a, **k: audits.append(a)):
+            self.assertEqual(sb.carry_at_green(ns, lambda: 0)[0]["reason"], "no ledger state: nothing to carry")
+        self.assertEqual(len(audits), 1)
 
     def test_1217_mutant_the_no_state_guard_removed_fails_the_no_state_test(self):
         real = sb.carry_at_green
@@ -91176,6 +91186,16 @@ class TestCiRecordCarry(LedgerBase):
         exec(src, ns)
         with mock.patch.object(sb, "carry_at_green", ns["carry_at_green"]):
             with self.assertRaises((AssertionError, AttributeError)):
+                self.test_1217_ci_record_core_with_a_ctx_lacking_state_does_not_raise_and_carries_nothing()
+
+    def test_1217_mutant_the_silent_empty_guard_fails_the_no_state_test(self):
+        real = sb.carry_at_green
+        src = inspect.getsource(real).replace("return [{\"proof\": None, \"scenario\": None, \"verdict\": \"refuse\", \"reason\": NO_STATE_REASON, \"noted\": True}]", "return []")
+        self.assertNotEqual(src, inspect.getsource(real))
+        ns = dict(vars(sb))
+        exec(src, ns)
+        with mock.patch.object(sb, "carry_at_green", ns["carry_at_green"]):
+            with self.assertRaises((AssertionError, KeyError)):
                 self.test_1217_ci_record_core_with_a_ctx_lacking_state_does_not_raise_and_carries_nothing()
 
     def test_S6_mutant_that_skips_the_ci_check_fails_a_test(self):
