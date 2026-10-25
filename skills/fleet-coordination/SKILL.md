@@ -34,6 +34,19 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
+
+## Builder checklist
+
+The mistakes that cost the most review rounds and the most lost work. Meet them in the first push.
+
+- (a) A table in the documentation of every input and every outside call of the new code; each row names its test and its run-by-hand mutant.
+- (b) Code that reads a directory other programs write uses the one shared safe reader (opens without blocking, refuses links, accepts only regular files, bounds the count, the size and the time). The repository has no such shared module yet (no `O_NONBLOCK` in `bin/`); the closest is `_read_settings_file` in `cloud/launcher/cloud_worker.py` (a single file, not a directory) and `_read_private` in `bin/cloud_worker.py`. Name the reader you use by its real module and function, and do not invent one.
+- (c) A test that checks a completeness claim derives its list from the code's syntax tree (`ast`), never a regular expression, and has a test that adds a new case in a differently spelled form and must fail.
+- (d) The body of a held pull request is in the owner format from the first push.
+- (e) A cloud builder opens its pull request as a draft at its first push, then updates it: the pod's git token expires after about an hour and a late open fails.
+- (f) A merger pod pushes the merge commit the minute it exists and runs the test classes after it, so a finished merge is never left unpushed when the pod ends.
+
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
 
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
