@@ -78,6 +78,42 @@ class Pin(unittest.TestCase):
         self.assertNotEqual(m, t, "mutation did not apply")
         self.assertIn("version below the security floor", check(m))
 
+    def test_old_version_2_0_28_fails(self):
+        self.assertIn("version below the security floor", self.mutant("ARG OPENCODE_VERSION=2.1.4", "ARG OPENCODE_VERSION=2.0.28"))
+
+    def test_version_2_1_2_fails_floor(self):
+        self.assertIn("version below the security floor", self.mutant("ARG OPENCODE_VERSION=2.1.4", "ARG OPENCODE_VERSION=2.1.2"))
+
+    def test_version_spelled_badly_fails(self):
+        self.assertIn("version does not parse", self.mutant("ARG OPENCODE_VERSION=2.1.4", "ARG OPENCODE_VERSION=v2.1"))
+
+    def test_version_defined_twice_fails(self):
+        self.assertTrue(self.mutant("ARG OPENCODE_VERSION=2.1.4\n", "ARG OPENCODE_VERSION=2.1.4\nARG OPENCODE_VERSION=2.1.4\n"))
+
+    def test_short_sha_fails(self):
+        t = read()
+        m = re.sub(r"^(ARG OPENCODE_SHA256=)[0-9a-f]{64}$", r"\g<1>abc123", t, flags=re.M)
+        self.assertNotEqual(m, t, "mutation did not apply")
+        self.assertIn("OPENCODE_SHA256 is not 64 lowercase hex", check(m))
+
+    def test_check_after_unpack_fails(self):
+        t = read()
+        line = ' && echo "${OPENCODE_SHA256}  /tmp/oc.tgz" | sha256sum -c - \\\n'
+        self.assertIn(line, t)
+        m = t.replace(line, "\\\n", 1)
+        i = m.find("tar ")
+        j = m.find("\n", i)
+        m = m[:j] + ' \\\n && echo "${OPENCODE_SHA256}  /tmp/oc.tgz" | sha256sum -c -' + m[j:]
+        self.assertNotEqual(m, t)
+        self.assertIn("sha256sum -c does not precede the unpack", check(m))
+
+    def test_docs_state_agent_floor(self):
+        with open(os.path.join(ROOT, "cloud", "README.md"), encoding="utf-8") as f:
+            d = f.read()
+        self.assertIn("a security floor: the agent release built on Bun 1.4.4 or later", d)
+        self.assertIn("floor 2.1.3 (Bun 1.4.4)", d)
+        self.assertIn("scan-embedded-roots.py", d)
+
     def test_dropped_sha_check_fails(self):
         probs = self.mutant(' && echo "${OPENCODE_SHA256}  /tmp/oc.tgz" | sha256sum -c - \\\n', "\\\n")
         self.assertTrue(probs)
