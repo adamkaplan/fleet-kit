@@ -20,6 +20,12 @@ PREVIOUS = {"ca-certificates", "curl", "gnupg", "git", "openssh-client", "python
 NAME, EMAIL = "cloud-worker", "cloud-worker@users.noreply.github.com"
 
 
+def guard_diff(base_ref, run, three_dot=True):
+    """The change's own edits of worker/guard.sh: merge-base compare (three dots) or a plain two-dot compare."""
+    spec = base_ref + "...HEAD" if three_dot else base_ref
+    return run(["diff", "--numstat", spec, "--", "worker/guard.sh"])
+
+
 def read(p):
     with open(p) as f:
         return f.read()
@@ -188,13 +194,70 @@ class Identity(unittest.TestCase):
         self.assertEqual(self.guard("git", "config", "--" + G, "alias.x", "y"), 3)
         self.assertEqual(self.guard("git", "config", "push.default", "y"), 3)
 
-    def test_s7_guard_is_byte_identical_to_main(self):
-        r = subprocess.run(["git", "-C", CLOUD, "diff", "--numstat", "origin/main", "--", "worker/guard.sh"], capture_output=True, text=True)
-        base = subprocess.run(["git", "-C", CLOUD, "rev-parse", "--verify", "-q", "origin/main"], capture_output=True, text=True)
-        if base.returncode != 0:   # skip only when the base ref is truly absent, and say so loudly
-            print("SKIPPED: test_s7_guard_is_byte_identical_to_main: the base ref is absent, nothing to compare", flush=True)
+    def test_s7_guard_is_unchanged_by_this_change(self):
+        def run(args):
+            return subprocess.run(["git", "-C", CLOUD] + args, capture_output=True, text=True)
+        ref = "origin/integration"
+        three_dot = True
+        if run(["rev-parse", "--verify", "-q", ref]).returncode != 0:
+            ref, three_dot = "origin/main", False   # no integration ref: the old compare against main
+        if run(["rev-parse", "--verify", "-q", ref]).returncode != 0:   # skip only when the base ref is truly absent, loudly
+            print("SKIPPED: test_s7_guard_is_unchanged_by_this_change: the base ref is absent, nothing to compare", flush=True)
             self.skipTest("the base ref is absent")
+        r = guard_diff(ref, run, three_dot)
         self.assertEqual(r.returncode, 0, r.stderr)   # the base exists: a failing diff is a failure, never a skip
+        self.assertEqual(r.stdout.strip(), "")
+
+    def make_repo(self, feature_edits_guard, base_moves_on):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+
+        def g(*a):
+            r = subprocess.run(["git", "-C", d] + list(a), capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r
+        g("init", "-q")
+        g("config", "user.name", "t")
+        g("config", "user.email", "t@example.invalid")
+        os.makedirs(os.path.join(d, "worker"))
+        gp = os.path.join(d, "worker", "guard.sh")
+        with open(gp, "w") as f:
+            f.write("one\n")
+        g("add", "worker/guard.sh")
+        g("commit", "-q", "-m", "init")
+        g("branch", "base")
+        g("checkout", "-q", "-b", "feat")
+        with open(os.path.join(d, "other.txt"), "w") as f:
+            f.write("x\n")
+        g("add", "other.txt")
+        if feature_edits_guard:
+            with open(gp, "w") as f:
+                f.write("feature\n")
+            g("add", "worker/guard.sh")
+        g("commit", "-q", "-m", "feat")
+        if base_moves_on:
+            g("checkout", "-q", "base")
+            with open(gp, "w") as f:
+                f.write("moved\n")
+            g("add", "worker/guard.sh")
+            g("commit", "-q", "-m", "base moved")
+            self.assertEqual(g("diff", "--numstat", "feat", "base", "--", "worker/guard.sh").stdout.count("guard.sh"), 1)  # setup applied
+            g("checkout", "-q", "feat")
+        return d
+
+    def test_s7_mutant_feature_edit_of_guard_is_detected(self):
+        d = self.make_repo(True, False)
+        run = lambda args: subprocess.run(["git", "-C", d] + args, capture_output=True, text=True)
+        r = guard_diff("base", run, True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("worker/guard.sh", r.stdout)
+
+    def test_s7_mutant_base_moving_on_is_not_a_difference(self):
+        d = self.make_repo(False, True)
+        run = lambda args: subprocess.run(["git", "-C", d] + args, capture_output=True, text=True)
+        self.assertIn("worker/guard.sh", guard_diff("base", run, False).stdout)   # the old two-dot compare gets this wrong
+        r = guard_diff("base", run, True)
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "")
 
     def test_s8_documentation(self):
