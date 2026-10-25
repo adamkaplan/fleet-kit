@@ -16,7 +16,7 @@ GUARD = os.path.join(WORKER, "guard.sh")
 DOCKERFILE = os.path.join(WORKER, "Dockerfile")
 README = os.path.join(CLOUD, "README.md")
 PREVIOUS = {"ca-certificates", "curl", "gnupg", "git", "openssh-client", "python3", "python3-pip", "python3-venv", "sudo",
-            "iptables", "jq", "procps", "docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin", "docker-buildx-plugin"}
+            "iptables", "jq", "procps", "docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin", "docker-buildx-plugin", "xz-utils"}
 NAME, EMAIL = "cloud-worker", "cloud-worker@users.noreply.github.com"
 
 
