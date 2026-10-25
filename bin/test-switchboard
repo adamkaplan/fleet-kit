@@ -50513,19 +50513,60 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
         self.assertIn("cloud reaper not installed: ", err)
         self.assertEqual(tree_of(self.home), before)
 
+    REAPER_OWN_NAMES = ("CW_CLOUD_AUDIT", "CW_CLOUD_RECORD_DIR", "CW_CLOUD_TOKEN_FILE", "CW_KUBECONFIG", "CW_KUBE_CONTEXT")
+
+    def settings_problems(self, table, installer_list, reaper_names):
+        """The three checks on the settings table; returns a list of problems (empty when all hold)."""
+        problems = []
+        # one direction on purpose: a launcher setting the reaper does not use cannot change what the installer does; the
+        # reaper-intersection check below catches any drift that matters
+        missing = sorted(n for n in installer_list if n not in table)
+        if missing:
+            problems.append("the installer lists names the launcher's table lacks: %s" % ", ".join(missing))
+        for name in reaper_names:
+            if name in self.REAPER_OWN_NAMES:
+                if name in table:
+                    problems.append("a reaper-own name is in the table: %s" % name)
+            elif name not in table:
+                problems.append("a reaper name is not in the table: %s" % name)
+        reaper = set(reaper_names)
+        if sorted(n for n in installer_list if n in reaper) != sorted(n for n in table if n in reaper):
+            problems.append("the installer's list and the table differ on the reaper's names")
+        return problems
+
     def test_the_settings_table_of_the_launcher_is_the_one_the_installer_knows(self):
-        """The launcher owns the table (cloud/launcher/cloud_worker.py); the installer must know the same names."""
+        """The launcher owns the table (cloud/launcher/cloud_worker.py); the installer must know the same reaper names."""
         table = self.launcher_settings()
-        self.assertEqual(sorted(table), sorted(sb.CLOUD_ENV_SETTING_NAMES))
-        # the names the reaper uses that the launcher's file may hold are in the launcher's table, and the installer's list
-        # filtered to the reaper's names equals the launcher's table filtered the same way (nothing hard-coded)
-        for name in sb.REAPER_SETTING_NAMES:
-            if name in ("CW_CLOUD_AUDIT", "CW_CLOUD_RECORD_DIR", "CW_CLOUD_TOKEN_FILE", "CW_KUBECONFIG", "CW_KUBE_CONTEXT"):
-                self.assertNotIn(name, table)   # the reaper's own names: never in the file
-            else:
-                self.assertIn(name, table)
-        reaper = set(sb.REAPER_SETTING_NAMES)
-        self.assertEqual(sorted(n for n in sb.CLOUD_ENV_SETTING_NAMES if n in reaper), sorted(n for n in table if n in reaper))
+        self.assertEqual(self.settings_problems(table, list(sb.CLOUD_ENV_SETTING_NAMES), list(sb.REAPER_SETTING_NAMES)), [])
+
+    def mutant_inputs(self):
+        table = list(self.launcher_settings())
+        return table, list(sb.CLOUD_ENV_SETTING_NAMES), list(sb.REAPER_SETTING_NAMES)
+
+    def test_mutant_an_installer_name_missing_from_the_table_fails(self):
+        table, installer, reaper = self.mutant_inputs()
+        table.remove(installer[0])
+        self.assertNotIn(installer[0], table)
+        self.assertTrue(self.settings_problems(table, installer, reaper))
+
+    def test_mutant_a_reaper_name_missing_from_the_installer_list_fails(self):
+        table, installer, reaper = self.mutant_inputs()
+        name = next(n for n in reaper if n in table and n in installer)
+        installer.remove(name)
+        self.assertNotIn(name, installer)
+        self.assertTrue(self.settings_problems(table, installer, reaper))
+
+    def test_mutant_a_reaper_own_name_in_the_table_fails(self):
+        table, installer, reaper = self.mutant_inputs()
+        table.append("CW_KUBECONFIG")
+        self.assertIn("CW_KUBECONFIG", table)
+        self.assertTrue(self.settings_problems(table, installer, reaper))
+
+    def test_extra_table_names_the_reaper_does_not_use_pass(self):
+        table, installer, reaper = self.mutant_inputs()
+        self.assertNotIn("CW_STACK_PULL_CLIENT_ID", reaper)
+        table.append("CW_STACK_PULL_CLIENT_ID")
+        self.assertEqual(self.settings_problems(table, installer, reaper), [])
 
     def test_the_settings_the_file_does_not_hold_are_the_ones_the_service_must_carry(self):
         table = set(self.launcher_settings())
