@@ -6,8 +6,8 @@
 # "What the token allows"). That narrows accidents only; the token's scope and the repository's rules are the boundary.
 # apt packages below are deliberately unversioned: they follow the base's security updates.
 FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS worker
-ARG OPENCODE_VERSION=2.0.28
-ARG OPENCODE_SHA256=15cc878cfc7462fe477238538df27ae3fbd03c1ea7631615cacf0977f5b629c6
+ARG OPENCODE_VERSION=2.1.4
+ARG OPENCODE_SHA256=2edaf8cf96e81dec5ee996a3196b03345cf59e5a1673d83a4599bb4afc5c5f6d
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # OpenCode v2: a pinned standalone binary (no node or npm), checked against its sha256 before it is unpacked.
+# The pin is a security floor: 2.1.4 is built on Bun 1.4.4 or later (cloud/README.md); a bump updates both ARGs.
 RUN curl -fsSL "https://opencode.ai/files/bin/${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" -o /tmp/oc.tgz \
  && echo "${OPENCODE_SHA256}  /tmp/oc.tgz" | sha256sum -c - \
  && tar -xzf /tmp/oc.tgz -C /usr/local/bin opencode \
