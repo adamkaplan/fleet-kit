@@ -44,7 +44,7 @@ DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch 
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss"}
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret"}
 LAUNCHER_SHAPES = ("XS", "S", "M")   # the launcher's SHAPES keys; the launcher's own default (XS, or S with --stack) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
@@ -417,6 +417,9 @@ def launcher_argv():
                   "or put `%s` on the PATH; nothing was called" % (LAUNCHER_ENV, own, _checkout_launcher_problem(str(own)), DEFAULT_LAUNCHER))
 
 
+STACK_MODEL_KEY_LIMIT = 16384   # bytes: a model API key is far smaller
+
+
 def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None, cluster=None, secrets=()):
     """Run `cloud-worker <command> <worker> <options> --json`. Returns (exit code, parsed JSON or None, one-line stderr). A launcher that is missing
     or too slow is a CloudError with a plain reason. `cluster` (a Cluster) gives the launcher its login: a token FILE in the cluster's private
@@ -626,50 +629,14 @@ def check_allowed(repo, env=None):
 
 def _capture(argv, env=None, feed=None, timeout=TOKEN_CMD_SECONDS, limit=1000000):
     """Run a short helper (a vault read, a mint). `feed` is a text handed over a pipe: the argument `{fd}` in argv names it, so it is never in an
-    argument, the environment or a file. Returns (exit code, stdout, stderr), or None when it could not run or was too slow."""
-    pass_fds, writer = (), None
-    if feed is not None:
-        read_end, write_end = os.pipe()
-        argv = [a.replace("{fd}", str(read_end)) for a in argv]
-        pass_fds = (read_end,)
-        writer = (read_end, write_end)
-    try:
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, pass_fds=pass_fds,
-                                 env=env, start_new_session=True)
-    except OSError:
-        if writer:
-            _close_quietly(*writer)
-        return None
-    if writer:
-        _close_quietly(writer[0])
-        threading.Thread(target=_feed, args=(writer[1], feed), daemon=True).start()
-    try:
-        out, err = child.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_group(child)
-        child.communicate()
-        return None
-    except BaseException:
-        _kill_group(child)
-        raise
-    return child.returncode, out[:limit + 1], err
+    argument, the environment or a file. Returns (exit code, stdout, stderr), or None when it could not run or was too slow. The one
+    implementation is the launcher's own (the reaper's refresh runs the same pipe)."""
+    return _lib().capture_command(argv, env=env, feed=feed, timeout=timeout, limit=limit)
 
 
 def _jwt_lifetime(token, now):
     """Seconds the token lives, read from its exp (and iat) claim when it is a JWT; None when it is not one (the requested duration is trusted)."""
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        body = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
-        exp = claims["exp"]
-        iat = claims.get("iat")
-    except (ValueError, KeyError, TypeError, AttributeError):
-        return None
-    if isinstance(exp, bool) or not isinstance(exp, (int, float)) or (iat is not None and (isinstance(iat, bool) or not isinstance(iat, (int, float)))):
-        return None
-    return exp - (iat if iat is not None else now)
+    return _lib().jwt_lifetime(token, now)
 
 
 def _duration(env):
@@ -685,10 +652,7 @@ def _duration(env):
 
 def firewall_refused(ran):
     """True when a vault read's result (exit code, stdout, stderr; None when it could not run) is the vault's FIREWALL refusing this machine."""
-    if ran is None or ran[0] == 0:
-        return False
-    text = (ran[2] or "").lower()
-    return any(marker in text for marker in FIREWALL_MARKERS)
+    return _lib().firewall_refused(ran)
 
 
 class VaultRecovery:
@@ -755,56 +719,31 @@ class VaultRecovery:
             os.close(fd)   # releases the lock
 
 
+def _token_refusal(err):
+    """The refusal of a cluster token that could not be made: the wording of the step that failed, never a value."""
+    if err.kind == "too-long":
+        return "the cluster token lives %d seconds, over the 60 minutes allowed (or already expired); refused, nothing was called" % err.lifetime
+    why = {"token-command-failed": "the token command failed",
+           "vault-settings-missing": "set CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME",
+           "admin-unreadable": "the administrator credential could not be read from the vault" +
+           (" even after the vault access check; ask " + VAULT_OWNER if err.recovered else ""),
+           "mint-failed": "the token could not be minted",
+           "not-a-token": "the answer is not a token"}.get(err.kind, "the token could not be obtained")
+    return "the cluster token could not be obtained (%s): %s" % (why, VAULT_CHECK)
+
+
 def cluster_token(env=None, now=None, recovery=None):
     """A cluster token of at most one hour, minted NOW, in memory. CW_CLUSTER_TOKEN_CMD (a command that prints one), else the default: the cluster
     administrator kubeconfig is read from the vault (CW_CLUSTER_ADMIN_CMD, else `az keyvault secret show` with CW_VAULT_SUBSCRIPTION and
     CW_VAULT_NAME) and `kubectl create token cw-operator --duration=20m` is run with it on a pipe. Nothing is cached or kept. A failure is a
     Refusal that names the vault pre-check; no other credential or context is ever tried. With `recovery` (launch only), a vault read refused for
-    the firewall runs the vault access check once and reads once more."""
+    the firewall runs the vault access check once and reads once more. The route itself is the launcher's own function (the reaper's refresh
+    runs the same one): this is the thin caller that keeps the wording and the recovery."""
     env = dict(os.environ if env is None else env)
-    clock = time.time() if now is None else now
-
-    def fail(why):
-        raise Refusal("the cluster token could not be obtained (%s): %s" % (why, VAULT_CHECK)) from None
-    custom = (env.get("CW_CLUSTER_TOKEN_CMD") or "").strip()
-    if custom:
-        ran = _capture(["sh", "-c", custom], env=env)
-        if ran is None or ran[0] != 0:
-            fail("the token command failed")
-        token = ran[1].strip()
-    else:
-        admin = (env.get("CW_CLUSTER_ADMIN_CMD") or "").strip()
-        if admin:
-            argv = ["sh", "-c", admin]
-        else:
-            sub, vault = (env.get("CW_VAULT_SUBSCRIPTION") or "").strip(), (env.get("CW_VAULT_NAME") or "").strip()
-            if not sub or not vault:
-                fail("set CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME")
-            argv = ["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault,
-                    "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
-        def read():
-            return _capture(argv, env=env)
-        ran = read()
-        recovered = False
-        if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
-            ran = recovery(read, env)
-            recovered = True
-        if ran is None or ran[0] != 0 or not ran[1].strip() or len(ran[1]) > 1000000:
-            fail("the administrator credential could not be read from the vault" + (
-                " even after the vault access check; ask " + VAULT_OWNER if recovered else ""))
-        admin_config = ran[1]
-        minted = _capture([env.get("CW_KUBECTL", "kubectl"), "--kubeconfig", "/dev/fd/{fd}", "-n", env.get("CW_CLOUD_NAMESPACE", "cw"), "create",
-                           "token", "cw-operator", "--duration=" + _duration(env)], env=dict(env, KUBECONFIG=os.devnull), feed=admin_config)
-        del admin_config
-        if minted is None or minted[0] != 0:
-            fail("the token could not be minted")
-        token = minted[1].strip()
-    if not token or len(token) > 8192 or re.search(r"\s", token) or re.search(r"[\x00-\x1f\x7f]", token):
-        fail("the answer is not a token")
-    lifetime = _jwt_lifetime(token, clock)
-    if lifetime is not None and not 0 < lifetime <= MAX_TOKEN_SECONDS:
-        raise Refusal("the cluster token lives %d seconds, over the 60 minutes allowed (or already expired); refused, nothing was called" % lifetime)
-    return token
+    try:
+        return _lib().cluster_token(env, duration=_duration(env), capture=_capture, now=now, recovery=recovery)
+    except _lib().ClusterLogin as err:
+        raise Refusal(_token_refusal(err)) from None
 
 
 def private_root():
@@ -1081,6 +1020,33 @@ def model_entry():
         raise Refusal(str(err)) from None
 
 
+def stack_model_secret(env=None):
+    """The stack-only model credential of a `--stack` launch: (secret NAME, value), or None when CW_STACK_MODEL_SECRET is unset. The value is read from
+    the vault (`az keyvault secret show`, the settings file's vault) into memory only, trimmed, size-capped; a missing, empty, over-cap or unreadable
+    secret is a Refusal naming the secret's NAME (never a value). Called BEFORE any cluster call, so a refusal leaves nothing made."""
+    env = dict(os.environ if env is None else env)
+    name = (env.get("CW_STACK_MODEL_SECRET") or "").strip()
+    if not name:
+        return None
+    sub, vault = (env.get("CW_VAULT_SUBSCRIPTION") or "").strip(), (env.get("CW_VAULT_NAME") or "").strip()
+    why = None
+    ran = None
+    if not sub or not vault:
+        why = "CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME are not set"
+    else:
+        ran = _capture(["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
+                       env={k: v for k, v in env.items() if k not in CLUSTER_DROP}, limit=STACK_MODEL_KEY_LIMIT + 1)
+        if ran is None or ran[0] != 0:
+            why = "could not be read from the vault"
+        elif len(ran[1]) > STACK_MODEL_KEY_LIMIT:
+            why = "is over the %d byte cap" % STACK_MODEL_KEY_LIMIT
+        elif not ran[1].strip():
+            why = "is empty"
+    if why:
+        raise Refusal("the stack model secret %s %s; nothing was created" % (name, why))
+    return name, ran[1].strip()
+
+
 def git_token(repo, cluster):
     """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does."""
     raw = os.environ.get("CW_GIT_TOKEN_CMD")
@@ -1167,6 +1133,9 @@ def _launch(args, runner, now, reserve):
         options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
+    stack_model = stack_model_secret() if getattr(args, "stack", False) else None   # before any cluster call; without --stack the setting is ignored
+    if stack_model:
+        options += [CREATE_OPTION["stack_model_secret"], stack_model[0]]
     launcher_argv()   # a launcher that cannot be found refuses here (exit 2), before the vault, the cluster or the launcher is touched
     recovery = VaultRecovery(cloud_dir(state) / VAULT_LOCK_NAME, lambda detail: _audit(engine, "cloud.vault_check", name, detail))
     with Cluster(recovery) as cluster:
@@ -1174,11 +1143,15 @@ def _launch(args, runner, now, reserve):
         cluster.add(model)
         token = git_token(repo, cluster)
         cluster.add(token)
+        run_secrets = [("model-auth", model), ("git-token", token)]
+        if stack_model:
+            cluster.add(stack_model[1])
+            run_secrets.append(("stack-model-key", stack_model[1]))
         read_fd, write_fd = os.pipe()
         try:
             try:
                 code, body, note = run_launcher(runner, "create", name, options, LAUNCH_SECONDS, password_fd=write_fd, cluster=cluster,
-                                                secrets=[("model-auth", model), ("git-token", token)])
+                                                secrets=run_secrets)
             except CloudError as err:
                 _stop_after_failure(engine, runner, name, run_id, "launch: the launcher did not finish", cluster)   # a pod made just before the cut is stopped too
                 raise LaunchError(str(err)) from None
@@ -1190,7 +1163,7 @@ def _launch(args, runner, now, reserve):
             finally:
                 if write_fd is not None:
                     os.close(write_fd)
-            del model, token
+            del model, token, run_secrets
             if code != 0:
                 _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160)})
                 raise LaunchError("the cloud worker was not created: %s" % _reason(code, note))
@@ -1207,6 +1180,8 @@ def _launch(args, runner, now, reserve):
             _write_private(password_path(state, name), password + "\n")
             record["auth_ref"] = "file:" + str(password_path(state, name))   # the switchboard's own copy: its path never comes from the launcher
             record["repo"], record["branch"] = repo, branch
+            if stack_model:
+                record["stack_model_secret"], record["stack_model_key"] = stack_model[0], "delivered"   # the name and that it was delivered; nothing else
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
             if args.reports_to:
                 record["reports_to"] = args.reports_to
@@ -1360,6 +1335,8 @@ def cmd_read(args, runner, now):
         raise LaunchError("name the agent: `%s read <name>`" % H["PROG"])
     limit = max(1, min(int(args.limit), 200))
     record = route(args.name)
+    if record is None and getattr(args, "cloud_only", False):
+        raise LaunchError("%s has no cloud record" % args.name)
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)
