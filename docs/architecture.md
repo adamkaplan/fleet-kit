@@ -109,8 +109,8 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 
 | From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
-| `bin/test-switchboard` | `-` | size | 92,500 | the one test file; the test split (ST0 and its follow-ups) moves its fakes and classes beside the units |
-| `fleet-switchboard` | `-` | size | 31,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
+| `bin/test-switchboard` | `-` | size | 90,600 | the one test file; the test split (ST0 and its follow-ups) moves its fakes and classes beside the units |
+| `fleet-switchboard` | `-` | size | 31,200 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
 | `switchboard/decisions_a.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/decisions_b.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/import_v1.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |

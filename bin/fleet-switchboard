@@ -11123,6 +11123,8 @@ def pr_ci_of(rollup):
     """`green`, `failing`, `pending` or `none` from gh's statusCheckRollup (check runs and status contexts)."""
     if not isinstance(rollup, list) or not rollup:
         return "none"
+    if len(rollup) >= load_module("ci_runs").ROLLUP_CAP:
+        return "pending"   # gh's rollup is one page: a list that reaches the cap may be cut, so it is never green
     failing = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR")
     pending = False
     for check in load_module("ci_runs").newest(rollup):   # the NEWEST run of each check decides: a green re-run supersedes the red run it replaced (#534)
@@ -11359,7 +11361,7 @@ def pr_facts_from(data):
             "reviews_older": pr_review_older(data.get("reviews"), head, pr_login(data.get("author"))),
             "head_at": pr_head_time(data.get("commits")),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
-            "ci": pr_ci_of(data.get("statusCheckRollup")), "review": review,
+            "ci": pr_ci_of(data.get("statusCheckRollup")), "ci_rollup": data.get("statusCheckRollup"), "review": review,
             # PR 52: a conflict is `mergeable` CONFLICTING, found in the read a notice already costs; the head
             # commit is what makes it one event per push
             "mergeable": str(data.get("mergeable") or "").upper() or None,
@@ -20542,8 +20544,16 @@ def cmd_item_ci_record(args, runner, now):
             if isinstance(default, str) and default:
                 compare = reader._api("repos/%s/compare/%s...%s" % (ctx.repo, urllib.parse.quote(default, safe=""), pin), ctx.repo)
                 on_branch = isinstance(compare, dict) and compare.get("status") in ("identical", "behind")
-            data = reader._api("repos/%s/commits/%s/check-runs?per_page=100" % (ctx.repo, pin), ctx.repo)
-            runs = data.get("check_runs") if isinstance(data, dict) and isinstance(data.get("check_runs"), list) else []
+            ci_mod = load_module("ci_runs")   # the ONE reader of check runs: paginated and bounded, then the latest run of each workflow (#1237)
+            runs, refusal = ci_mod.read_check_runs(lambda path: reader._api(path, ctx.repo), ctx.repo, pin)
+            if refusal:
+                _item_audit(ctx, "plan.item.ci_record", dict(audit, ok=False, why=refusal))
+                raise LedgerCommandError("%s at %s: nothing was recorded" % (refusal, pin[:8]))
+            runs = ci_mod.latest_check_runs(runs, ctx.repo)
+            absent = ci_mod.missing_workflows_of_checks(runs, (setting or {}).get("ci_workflows") or [], ctx.repo)
+            if absent:
+                _item_audit(ctx, "plan.item.ci_record", dict(audit, ok=False, why="; ".join(absent[:3])))
+                raise LedgerCommandError("%s at %s: nothing was recorded" % ("; ".join(absent[:3]), pin[:8]))
     except (IntentError, AttributeError) as err:
         _item_audit(ctx, "plan.item.ci_record", dict(audit, ok=False, why="the checks could not be read: %s" % _one_line(str(err), 120)))
         raise LedgerCommandError("the checks at %s could not be read: nothing was recorded" % pin[:8]) from None
@@ -22302,10 +22312,17 @@ def ci_record_core(ctx, now, quiet=False):
     detail = {"head": head, "ci": ci, "scenarios": out["scenarios"], "at": int(now())}
     if not head:
         return dict(out, status="no-head", why="the PR's head is unknown")
+    expected = (plan_ledger.repo_setting(getattr(ctx, "config", None) or {}, getattr(ctx, "repo", "")) or {}).get("ci_workflows") or []
+    absent = load_module("ci_runs").missing_workflows(load_module("ci_runs").newest((ctx.facts or {}).get("ci_rollup")), expected, getattr(ctx, "repo", None))
+    if absent:
+        if not quiet:
+            _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="; ".join(absent[:3])))
+        return dict(out, status="not-green", why="CI is not green at %s (only a complete, green run is recorded) [%s]" % (head[:8], "; ".join(absent[:3])))
     if ci != "green":
         if not quiet:
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
-        return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)" % (ci, head[:8]))
+        named = "; ".join("%s run %s is %s" % (w or "status", r, st) for w, r, st in load_module("ci_runs").not_green_runs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
+        return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)%s" % (ci, head[:8], " [%s]" % named if named else ""))
     if not wanted:
         if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))
