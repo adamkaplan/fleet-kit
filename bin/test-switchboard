@@ -2886,7 +2886,7 @@ class TestCompose(unittest.TestCase):
             fact("a", EPOCH, summary="First thing"),
         ])
         self.assertEqual(text.splitlines(), [
-            "[switchboard] 2 for platform: Second with detail",
+            "[switchboard] 2 for platform: Second with detail [newest first]",
             "- review from coder (issue #7): Second",
             "  with detail",
             "- lab.fact from the fleet: First thing",
@@ -83493,11 +83493,11 @@ class TestMessageTimes(unittest.TestCase):
         text, carried = sb.compose("platform", facts, delivered=_clock_at(14, 5))
         lines = [l for l in text.splitlines() if l.startswith("- send from")]
         self.assertEqual(len(lines), 2)
-        self.assertIn("superseded", lines[0])
-        self.assertIn("text 0", lines[0])
-        self.assertNotIn("superseded", lines[1])
-        self.assertIn("text 1", lines[1])
-        self.assertEqual([f.key for f in carried], ["k0", "k1"], "both keys are carried, so both are acknowledged")
+        self.assertNotIn("superseded", lines[0])   # #1275: newest first, so the newer send leads and the older one (still shown, marked) follows
+        self.assertIn("text 1", lines[0])
+        self.assertIn("superseded", lines[1])
+        self.assertIn("text 0", lines[1])
+        self.assertEqual([f.key for f in carried], ["k1", "k0"], "both keys are carried, so both are acknowledged")
 
     def test_s3_another_sender_or_another_issue_or_repo_is_never_superseded(self):
         for rows in (((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "other", 7, "acme/api")),
@@ -83519,7 +83519,7 @@ class TestMessageTimes(unittest.TestCase):
              ("other", 7, "acme/api"), ("coder", None, None), ("coder", 7, "acme/web")])]
         facts = self.sends(*rows)
         text, carried = sb.compose("platform", facts, delivered=_clock_at(14, 30))
-        self.assertEqual([f.key for f in carried], [f.key for f in facts])
+        self.assertEqual([f.key for f in carried], [f.key for f in reversed(facts)], "all keys, newest first (#1275)")
         self.assertEqual(text.count("- send from"), len(facts))
         for number in range(len(facts)):
             self.assertIn("text %d" % number, text)
@@ -83528,7 +83528,7 @@ class TestMessageTimes(unittest.TestCase):
     def test_three_sends_mark_the_two_older_ones_only(self):
         text, _ = sb.compose("platform", self.sends((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 2), "coder", 7, "acme/api"),
                                                     (_clock_at(14, 4), "coder", 7, "acme/api")), delivered=_clock_at(14, 5))
-        self.assertEqual([("superseded" in l) for l in text.splitlines() if l.startswith("- send from")], [True, True, False])
+        self.assertEqual([("superseded" in l) for l in text.splitlines() if l.startswith("- send from")], [False, True, True])
 
 
 class TestMessageTimesDelivery(Base):

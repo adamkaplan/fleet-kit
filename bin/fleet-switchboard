@@ -3573,6 +3573,9 @@ def superseded_by(facts):
     return found
 
 
+NEWEST_FIRST_MARK = " [newest first]"
+
+
 def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
     """One message for `facts`, newest first (a newer result is never held behind older reminders). Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
     message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
@@ -3618,6 +3621,8 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
             when = (when[:-1] + "; " if when else " (") + "supersedes %d earlier message%s from %s on this issue, still waiting: sent %s)" % (
                 len(waiting), "" if len(waiting) == 1 else "s", ", ".join(names) or "the same sender", ", ".join(clock_utc(t) for t in waiting[:5]))
         head = "[switchboard] %d for %s%s: %s" % (count, recipient, when, _one_line(lead.summary, 200))
+        if count > 1:
+            head += NEWEST_FIRST_MARK   # #1275: a reader of the transcript puts the lines back in time order
         idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider and getattr(fact, "clean", False)]
         shown = [fact for fact in taken if fact not in idle] if len(idle) < len(taken) else taken
         if shown is taken:
@@ -10978,8 +10983,16 @@ def synthetic_lines(engine, session_id, since, waiting=False):
         if not isinstance(item, dict) or item.get("type") != "synthetic" or item.get("id") in have \
                 or created is None or created < since or not isinstance(payload.get("text"), str):
             continue
-        waiting.extend((created, item.get("id"), number, line) for number, line in enumerate(payload["text"].splitlines()))
+        waiting.extend((created, item.get("id"), number, line) for number, line in numbered_lines(payload["text"]))
     return sorted(waiting, key=lambda line: -line[0]) + found
+
+
+def numbered_lines(text):
+    """[(number, line)] of a message; the number grows with time, so a message composed newest first (#1275) is numbered from its last line."""
+    lines = text.splitlines()
+    if lines and lines[0].endswith(NEWEST_FIRST_MARK):
+        return [(len(lines) - 1 - n, line) for n, line in enumerate(lines)]
+    return list(enumerate(lines))
 
 
 def transcript_lines(engine, session_id, since):
@@ -11000,7 +11013,7 @@ def transcript_lines(engine, session_id, since):
             if created < since:
                 complete = True
                 break
-            for number, line in enumerate(reply_text(message).splitlines()):
+            for number, line in numbered_lines(reply_text(message)):
                 found.append((created, message.get("id"), number, line))
         if complete or not more:
             break
@@ -14841,7 +14854,7 @@ def blocked_tick(engine, discovery, held):
         for who in recipients:   # #1275: only a REPEAT of the same state is held (6 hours); the first report and the end line always pass
             state_key = "%s|%s|%s" % (event, detail.get("held"), detail.get("refused"))
             add_repeat_reminder(engine.state_dir, who, now, now, "Blocked agent: " + text, "blocked-agent", observation.name, state_key,
-                                first=event != "blocked.repeat", answered_at=last_send_at(engine.state_dir, who, observation.name) if who == cos else None)
+                                first=event != "blocked.repeat", answered_at=last_send_at(engine.state_dir, who, observation.name))
         if engine.audit is not None:
             engine.audit.append(engine.actor, event, observation.name, dict(detail, told=recipients, text=_one_line(text, 400)))
 
