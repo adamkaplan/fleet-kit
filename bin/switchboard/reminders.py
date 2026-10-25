@@ -275,6 +275,21 @@ def remove_reminders(state_dir, ids):
     return gone
 
 
+DROP_HOOK = None  # test hook: called between the snapshot read and the locked drop
+
+
+def drop_superseded_item(state_dir, item_id, kept_id):
+    """Remove item_id only if kept_id is STILL in the file: one read-modify-write under the lock."""
+    if DROP_HOOK is not None:
+        DROP_HOOK()
+    with reminders_lock(state_dir):
+        items = read_reminders(state_dir)
+        if not any(i["id"] == kept_id for i in items) or not any(i["id"] == item_id for i in items):
+            return False
+        write_reminders(state_dir, [i for i in items if i["id"] != item_id])
+    return True
+
+
 def found_reason(why):
     return "merged" if why.endswith(" is merged") else "closed"
 
@@ -406,8 +421,10 @@ class ReminderFacts:
         everything = read_reminders(self.state_dir)
         for item in self.due():
             kept = self.superseded(item, everything)
+            if kept is not None and kept.get("condition") and self.verdict(kept) != "deliver":
+                kept = None   # the newer one is gated or unresolved: it may not be delivered, so deliver the older
             if kept is not None:
-                if remove_reminders(self.state_dir, {item["id"]}) and self.engine is not None and self.engine.audit is not None:
+                if drop_superseded_item(self.state_dir, item["id"], kept["id"]) and self.engine is not None and self.engine.audit is not None:
                     self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", item["to"],
                                              {"dropped": item["id"], "kept": kept["id"], "key": _one_line(item["key"], 60)})
                 continue
@@ -427,7 +444,8 @@ class ReminderFacts:
             late = (self.engine.now() if self.engine else time.time()) - item["at"]
             if late >= LATE_NOTE_SECONDS:
                 note = " (late by %d min)" % int(late // 60)
-                text = text[:max(0, TEXT_CAP - len(note))] + note   # the note is applied before the cap and kept: the body is cut, not the note
+                cut = len(text) + len(note) > TEXT_CAP
+                text = text[:max(0, TEXT_CAP - len(note) - (1 if cut else 0))] + ("\u2026" if cut else "") + note   # the note is applied before the cap and kept: the body is cut, not the note
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
             if isinstance(item.get("wake_class"), str):

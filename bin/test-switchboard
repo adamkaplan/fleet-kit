@@ -10543,7 +10543,7 @@ class TestReminders(PR4Base):
         new = self.keyed(delay=20)
         sb.write_reminders(self.world.state, [old, new])
         self.world.tick(30)
-        with mock.patch.object(sb, "remove_reminders", return_value=set()):
+        with mock.patch.object(sb, "drop_superseded_item", return_value=False):
             self.reminder_facts()
         self.assertEqual([e for e in self.world.audit() if e["event"] == "reminder.drop_superseded"], [])
         self.assertIn(old["id"], [i["id"] for i in sb.read_reminders(self.world.state)])
@@ -10557,6 +10557,62 @@ class TestReminders(PR4Base):
                 mock.patch.object(sys, "stderr", io.StringIO()), mock.patch.object(sys, "stdout", io.StringIO()):
             sb.cmd_remind(args, None, self.world.clock.now)
         self.assertEqual(sb.read_reminders(self.world.state)[0]["key"], "k" * 79 + "…")
+
+    def _gated_newer(self, verdict):
+        old = self.keyed(delay=10)
+        new = self.keyed(delay=20, condition={"until_closed": "acme/api#1"})
+        sb.write_reminders(self.world.state, [old, new])
+        self.world.tick(30)
+        src = self.source(sb.ReminderFacts)
+        src.verdict = lambda item: verdict
+        return old, new, src()
+
+    def test_older_is_delivered_when_newer_is_gated_by_a_met_condition(self):
+        old, new, facts = self._gated_newer("acme/api#1 is closed")
+        self.assertEqual([f.key for f in facts], ["reminder:" + old["id"]])
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "reminder.drop_superseded"], [])
+
+    def test_older_is_delivered_when_newer_verdict_is_unresolved(self):
+        old, new, facts = self._gated_newer(None)
+        self.assertEqual([f.key for f in facts], ["reminder:" + old["id"]])
+
+    def test_older_is_dropped_when_newer_will_be_delivered(self):
+        old, new, facts = self._gated_newer("deliver")
+        self.assertEqual([f.key for f in facts], ["reminder:" + new["id"]])
+
+    def test_cancel_between_read_and_drop_keeps_the_older(self):
+        old = self.keyed(delay=10)
+        new = self.keyed(delay=20)
+        sb.write_reminders(self.world.state, [old, new])
+        self.world.tick(30)
+        rm = sb
+        old_hook = rm.DROP_HOOK
+        rm.DROP_HOOK = lambda: sb.remove_reminders(self.world.state, {new["id"]})
+        try:
+            facts = self.reminder_facts()
+        finally:
+            rm.DROP_HOOK = old_hook
+        self.assertEqual([i["id"] for i in sb.read_reminders(self.world.state)], [old["id"]])
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "reminder.drop_superseded"], [])
+
+    def test_cut_body_shows_an_ellipsis_before_the_note(self):
+        for n in (4000, 4003):
+            sb.write_reminders(self.world.state, [])
+            self.remind(delay=10, text="y" * n)
+            self.world.tick(10 + 7 * 60)
+            (fact,) = self.reminder_facts()
+            self.assertLessEqual(len(fact.summary), sb.MESSAGE_CAP)
+            self.assertTrue(fact.summary.endswith("\u2026 (late by %d min)" % (7 + (n - 4000) * 0)) or "\u2026 (late by" in fact.summary)
+            sb.write_reminders(self.world.state, [])
+
+    def test_every_path_that_removes_or_skips_a_reminder_is_in_the_docs_table(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        src = open(os.path.join(here, "switchboard", "reminders.py")).read()
+        docs = open(os.path.join(here, "..", "docs", "switchboard.md")).read()
+        table = docs[docs.index("Where a reminder is dropped"):]
+        for place in sorted({"remove_reminders", "drop_superseded_item", "superseded", "verdict", "until_closed", "prune_delivered_reminders"} & {w for w in re.findall(r"[A-Za-z_]+", src)}):
+            with self.subTest(place=place):
+                self.assertIn(place, table)
 
     def test_every_drop_replace_delay_place_is_in_the_docs_table(self):
         here = os.path.dirname(os.path.abspath(__file__))
