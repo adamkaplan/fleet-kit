@@ -15402,7 +15402,7 @@ class TestOneCharter(CharterRig, Base):
                 self.assertFalse(enumerates, "%s is classified `own` but enumerates the agents" % (key,))
             if kind == "registry":
                 self.assertTrue("registry" in source or "owners" in source or "orchestrator_charters" in source, "%s is classified `registry` but never reads the registry" % (key,))
-        self.assertEqual(sorted(k for k, (n, e) in found.items() if e and self.READERS[k].startswith("set:")), [("bin/fleet-switchboard", "seam_applies")])
+        self.assertEqual(sorted(k for k, (n, e) in found.items() if e and self.READERS[k].startswith("set:")), [("bin/switchboard/handoff.py", "seam_applies")])
 
     READERS = {   # (file, function) -> "kind: reason". registry: decides who owns a charter and reads the registry's charter (#969); writer / display: writes or shows the registry row; own: reads ONE agent's own launch context and enumerates no other agent
         # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
@@ -15415,13 +15415,13 @@ class TestOneCharter(CharterRig, Base):
         ("bin/fleet-switchboard", "registry_retired_owners"): "registry: the charter a retired orchestrator's record kept",
         ("bin/registry.py", "orchestrator_charters"): "registry: the one reading", ("bin/registry.py", "duplicate_charters"): "registry: duplicates", ("bin/registry.py", "set_charter"): "writer: the audited setter",
         ("bin/registry.py", "change"): "writer: the registry's own writer", ("bin/fleet-switchboard", "registry_charter"): "writer: the pass's rule over the registry row",
-        ("bin/fleet-switchboard", "pane_health_pass"): "writer: writes the registry row through registry_charter", ("bin/fleet-switchboard", "charters_report"): "display: both records, read-only",
-        ("bin/fleet-switchboard", "cmd_agents_charters"): "display: the report", ("bin/fleet-switchboard", "cmd_charter"): "writer: the audited command",
+        ("bin/fleet-switchboard", "pane_health_pass"): "writer: writes the registry row through registry_charter", ("bin/switchboard/agents_verify.py", "charters_report"): "display: both records, read-only",
+        ("bin/switchboard/agents_verify.py", "cmd_agents_charters"): "display: the report", ("bin/fleet-switchboard", "cmd_charter"): "writer: the audited command",
         ("bin/fleet-switchboard", "record_launch_charter"): "writer: a launch writes the registry row (first sight; a relaunch under the name is a new launch)",
         ("bin/impact_hold.py", "clear_lane"): "display: carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "display: words the notice line",
-        ("bin/fleet-switchboard", "seam_applies"): "set: is this issue number known as a charter",
+        ("bin/switchboard/handoff.py", "seam_applies"): "set: is this issue number known as a charter",
         ("bin/fleet-switchboard", "owned_numbers"): "registry: the numbers an agent owns (an orchestrator: its row's charter only; others: their own assignment)",
-        ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/fleet-switchboard", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
+        ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/switchboard/triage.py", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
         ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
         ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/switchboard/decisions_b.py", "read_order_notices"): "own: the order notices' own records",
@@ -20052,7 +20052,9 @@ class TestDecorationIsAFact(ActingCase):
     def test_the_source_is_registered_and_the_engine_has_no_second_way_to_write(self):
         self.assertIsNotNone(sb.foreground_source(self.world.engine))
         source = switchboard_source()
-        section = source.split("# PR 8: foreground and background", 1)[1].split("# Worker events, reminders", 1)[0]
+        # the section runs on into the handoff part, where its closing marker now sits
+        section = (SWITCHBOARD.read_text().split("# PR 8: foreground and background", 1)[1].split("# ---- PR 13: workers report", 1)[0]
+                   + (BIN / "switchboard" / "handoff.py").read_text().split("# Worker events, reminders", 1)[0])
         for forbidden in ("v2.synthetic(", "v2.prompt(", "herdr.agent_prompt"):
             self.assertNotIn(forbidden, section.split("def launch_agent")[0], forbidden)
         self.assertNotIn(".synthetic(", section)
@@ -26819,6 +26821,10 @@ def sweep_comment(number, body, at, cid=None):
     return out
 
 
+class MutantSpliceError(Exception):
+    """A mutant whose target is not in the function it names: a broken test, never a caught mutant."""
+
+
 class TestSweep(Base):
     COS, USER = "osuser:awaiting-cos", "osuser:awaiting-user"
 
@@ -27468,7 +27474,7 @@ class TestSweep(Base):
             cos("pr:api#503", kind="captain", repo=None), human("pr:acme/api#503", kind="captain", number=503),   # short vs full pr: ref
             cos("pr:acme/api#504", kind="captain", number=504), human("pr:api#504", kind="captain", repo=None),   # and the other way
             cos("d-alone", ask=510),                                                                  # a cos-tier item alone still raises
-            cos("pr:acme/api#511", kind="captain", number=511),                                       # so does a captain PR alone
+            cos("pr:acme/api#511", kind="report", number=511),                                        # so does a report row about a PR (a held PR is judged by its gates, #986)
             cos("d-other-repo", ask=500, repo="acme/web"),                                            # another repo's #500 is not ours
         ]
         self.engine.config["github_repos"] = ["acme/api", "acme/web"]
@@ -27476,6 +27482,860 @@ class TestSweep(Base):
         self.sweep(decisions)
         self.assertEqual([f for f in self.found() if f[0] == "S5"],
                          [("S5", "d-alone"), ("S5", "d-other-repo"), ("S5", "pr:acme/api#511")])
+
+    # ---- #986: S5 for a held pull request is raised from its gates, counted from the moment it became ready at its head
+    HEAD_A, HEAD_B = "a" * 40, "b" * 40
+
+    def held_pr(self, number=600, hold_hours=10):
+        return {"id": "pr:acme/api#%d" % number, "kind": "captain", "tier": "cos", "repo": "acme/api", "number": number, "title": "t",
+                "since": sb.iso(self.world.clock.now() - hold_hours * 3600)}
+
+    def s5_run(self, reading, decisions, mutant=None):
+        """One pass with the gate reading `reading` (a dict that tests change between passes); returns the S5 audit lines so far."""
+        calls = []
+
+        def fake(engine, repo, number, now):
+            calls.append((repo, number))
+            return reading["value"]
+        patches = [mock.patch.object(sb, "sweep_gate_reading", fake)]
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            if mutant == "raises_not_ready":   # the REAL code, treating every readable pull request as ready
+                stack.enter_context(self.mutated("sweep_ready_pass", 'if opened != ["G6"]:', 'if False:'))
+            if mutant == "from_hold":   # the REAL code, counting from the hold
+                stack.enter_context(self.mutated("sweep_ready_pass", 'if now - row["at"] >= ', 'if now - (parse_iso(d.get("since")) or now) >= '))
+            self.sweep(decisions)
+        return [e for e in self.world.audit() if e["event"] == "sweep.finding" and e["detail"]["kind"] == "S5"]
+
+    def ready(self, head=None):
+        return (["G6"], head or self.HEAD_A, "Who can clear this: owner only: x", None)
+
+    def scenario_986(self, mutant=None):
+        """Every plan scenario in one run; raises AssertionError at the first one that does not hold."""
+        decisions = [self.held_pr()]
+        self.hub.open = {600: sweep_issue(600, "MERGE: captain", pr=True)}
+        reading = {"value": None}
+        for opened in (["G0a"], ["G1"], ["G4", "G6"], ["G6b", "G6"]):   # CI pending, review missing, proofs missing, body missing
+            reading["value"] = (opened, self.HEAD_A, None, None)
+            self.assertEqual(self.s5_run(reading, decisions, mutant), [])
+            self.world.tick(3 * 3600)   # past the threshold: a build that raises a not-ready pull request raises it by now
+            self.assertEqual(self.s5_run(reading, decisions, mutant), [])
+        reading["value"] = self.ready()
+        self.assertEqual(self.s5_run(reading, decisions, mutant), [])   # ready now, held for 10 hours: under the threshold counted from ready
+        self.world.tick(3600)
+        self.assertEqual(self.s5_run(reading, decisions, mutant), [])
+        self.world.tick(3600 + 60)
+        lines = self.s5_run(reading, decisions, mutant)
+        self.assertEqual(len(lines), 1)
+        (line,) = lines
+        self.assertEqual(len(self.s5_run(reading, decisions, mutant)), 1)   # a second run: still one
+        text = line["detail"]["text"]
+        self.assertRegex(text, r"head [0-9a-f]{12}\b")
+        self.assertIn("ready at", text)
+        self.assertIn("Who can clear", text)
+        self.world.tick(3600)
+        reading["value"] = (["G0a", "G6"], self.HEAD_A, None, None)   # a gate opens again
+        self.sweep_with(reading, decisions)
+        self.assertEqual(sb.sweep_state(self.engine).s5, {})
+        reading["value"] = self.ready()
+        self.sweep_with(reading, decisions)
+        self.assertEqual(sb.sweep_state(self.engine).s5, {})            # the wait restarts
+        self.world.tick(2 * 3600 + 1)
+        self.sweep_with(reading, decisions)
+        self.assertEqual(len(sb.sweep_state(self.engine).s5), 1)
+        reading["value"] = self.ready(self.HEAD_B)                      # a new head restarts it
+        self.sweep_with(reading, decisions)
+        self.assertEqual(sb.sweep_state(self.engine).s5, {})
+        reading["value"] = (None, None, None, "HTTP 502")               # unreadable: not checked, never raised
+        self.sweep_with(reading, decisions)
+        self.assertEqual((sb.sweep_state(self.engine).s5, sb.sweep_state(self.engine).s5_unchecked), ({}, 1))
+
+    def sweep_with(self, reading, decisions):
+        with mock.patch.object(sb, "sweep_gate_reading", lambda e, r, n, now: reading["value"]):
+            self.sweep(decisions)
+
+    def test_986_a_held_pr_is_raised_only_when_ready_and_after_the_wait_counted_from_ready(self):
+        self.scenario_986()
+
+    def test_986_the_mutants_fail(self):
+        for mutant in ("from_hold", "raises_not_ready"):
+            self.setUp()
+            with self.assertRaises(AssertionError, msg=mutant):
+                self.scenario_986(mutant)
+
+    def test_986_the_summary_and_status_count_not_checked(self):
+        reading = {"value": (None, None, None, "boom")}
+        self.hub.open = {600: sweep_issue(600, "x", pr=True)}
+        self.sweep_with(reading, [self.held_pr()])
+        self.assertEqual(self.engine.sweep.current["not_checked"], 1)
+        self.world.tick(5400)
+        self.sweep_with(reading, [self.held_pr()])   # unreadable on every pass: the age grows
+        current = self.engine.sweep.current
+        self.assertEqual((current["not_checked"], current["not_checked_oldest_seconds"]), (1, 5400))
+        text = "\n".join(sb.sweep_status_lines(current))
+        self.assertIn("1 held pull request(s) not checked for S5", text)
+        self.assertIn("oldest 1h30m", text)
+        self.assertNotIn("not checked for S5", "\n".join(sb.sweep_status_lines(dict(current, not_checked=0))))
+        with self.mutated("sweep_ready_pass", "state.not_checked_since.setdefault(key, now)\n            state.s5_unchecked += 1\n            continue\n        state.not_checked_since.pop", "state.s5_unchecked += 1\n            continue\n        state.not_checked_since.pop"):
+            self.setUp()
+            self.hub.open = {600: sweep_issue(600, "x", pr=True)}
+            self.sweep_with(reading, [self.held_pr()])
+            self.world.tick(5400)
+            self.sweep_with(reading, [self.held_pr()])
+            self.assertEqual(self.engine.sweep.current["not_checked_oldest_seconds"], 0)
+
+    def findings(self, decisions, s5, whole=True, now=None):
+        state = sb.sweep_state(self.engine)
+        state.s5 = s5
+        return sb.sweep_findings(self.engine, state, decisions, "acme/api", now or self.world.clock.now(), dict(sb.SWEEP_DEFAULTS), None, decisions_whole=whole)
+
+    FINDINGS_CASES = {   # name -> (mutant (function, old, new), check)
+        "raised_for_a_ready_held_pr": None,
+        "partial_list_raises_nothing": ("sweep_findings", "if decisions_whole and ready and not", "if ready and not"),
+        "owners_row_hides_it": ("sweep_findings", "if decisions_whole and ready and not (sweep_ref_keys(d, home, repos_known) & human_keys):", "if decisions_whole and ready:"),
+        "nothing_ready_nothing_raised": ("sweep_findings", "if decisions_whole and ready and not", "if decisions_whole and not"),
+        "never_falls_back_to_the_hold_clock": ("sweep_findings", "            continue\n        if (decisions_whole and d.get(\"tier\") == \"cos\"", "            pass\n        if (decisions_whole and d.get(\"tier\") == \"cos\""),
+        "an_issue_is_not_a_held_pr": ("sweep_held_pr", 'decision.get("kind") == "captain" and', ""),
+    }
+
+    def findings_case(self, name):
+        held = self.held_pr()
+        ready = {"pr:acme/api#600": (self.HEAD_A, self.world.clock.now(), "Who can clear this: owner only")}
+        s5 = lambda f: [x for x in f if x[0] == "S5"]
+        if name == "raised_for_a_ready_held_pr":
+            self.assertEqual(s5(self.findings([held], ready)), [("S5", "pr:acme/api#600@" + self.HEAD_A[:12])])
+        elif name == "partial_list_raises_nothing":
+            self.assertEqual(s5(self.findings([held], ready, whole=False)), [])
+        elif name == "owners_row_hides_it":
+            owner = {"id": "pr:api#600", "kind": "captain", "tier": "human", "repo": None, "number": 600, "title": "t", "since": self.at()}
+            self.assertEqual(s5(self.findings([held, owner], ready)), [])
+        elif name == "nothing_ready_nothing_raised":
+            self.assertEqual(s5(self.findings([held], {})), [])
+        elif name == "never_falls_back_to_the_hold_clock":
+            self.assertEqual(s5(self.findings([held], {})), [])   # held 10 hours, past the threshold, but not ready: the old hold clock raises it
+        elif name == "an_issue_is_not_a_held_pr":
+            issue = {"id": "d-alone", "kind": "issue", "tier": "cos", "repo": "acme/api", "ask": 510, "title": "t", "since": sb.iso(self.world.clock.now() - 10 * 3600)}
+            self.assertEqual(s5(self.findings([issue], {})), [("S5", "d-alone")])   # an issue keeps the hold clock
+
+    def test_986_the_s5_branch_of_the_findings_guards_and_their_mutants(self):
+        """Guards checked: decisions_whole, the owner's row (human_keys), the ready entry, no fall back to the hold clock, an issue is not a held PR."""
+        for name, mutant in self.FINDINGS_CASES.items():
+            self.setUp()
+            self.findings_case(name)
+            if mutant is None:
+                continue
+            self.setUp()
+            with self.assertRaises((AssertionError, TypeError), msg=name):
+                with self.mutated(*mutant):
+                    self.findings_case(name)
+
+    def test_986_the_wait_is_ripe_at_exactly_the_threshold(self):
+        for mutant in (None, ('if now - row["at"] >= ', 'if now - row["at"] > ')):
+            self.setUp()
+            held, t0 = [self.held_pr()], self.world.clock.now()
+            self.ready_pass(held, lambda r, n: self.ready(), now=t0)
+            state = self.ready_pass(held, lambda r, n: self.ready(), now=t0 + self.engine.config["sweep"]["aged_cos_hours"] * 3600, mutant=mutant)
+            self.assertEqual(len(state.s5) == 1, mutant is None)
+
+    def test_986_a_row_that_is_not_a_held_pr_is_never_read(self):
+        issue = {"id": "d-x", "kind": "issue", "tier": "cos", "repo": "acme/api", "ask": 510, "title": "t", "since": sb.iso(self.world.clock.now() - 10 * 3600)}
+        for mutant in (None, ("sweep_held_pr", 'decision.get("kind") == "captain" and', "")):
+            self.setUp()
+            reads = []
+            ctx = self.mutated(*mutant) if mutant else contextlib.nullcontext()
+            with ctx:
+                self.ready_pass([issue], lambda r, n: reads.append(n) or self.ready())
+            self.assertEqual(reads == [], mutant is None)
+
+    # ---- #986 (review): the REAL sweep_gate_reading and the edge paths of sweep_ready_pass, each with a mutant
+    @contextlib.contextmanager
+    def mutated(self, name, old, new):
+        """Run with the daemon function `name` rebuilt from its source with `old` replaced by `new` (the mutant must change it)."""
+        source = textwrap.dedent(inspect.getsource(getattr(sb, name)))
+        if old not in source:
+            raise MutantSpliceError("%s: the mutant target is not in the function: %r" % (name, old))
+        original = getattr(sb, name)
+        exec(compile(source.replace(old, new, 1), "<mutant>", "exec"), sb.__dict__)
+        try:
+            yield
+        finally:
+            setattr(sb, name, original)
+
+    def test_986_every_mutant_target_is_in_the_function_it_names(self):
+        """Checked: READING_MUTANTS (sweep_gate_reading), EDGES (sweep_ready_pass), once_per_head (sweep_decisions)."""
+        pairs = [("sweep_gate_reading", m) for m in self.READING_MUTANTS.values()]
+        pairs += [("sweep_ready_pass", m) for k, (_, m) in self.EDGES.items() if m and k != "ready_share_of_budget"]
+        pairs.append(("sweep_decisions", self.ONCE_PER_HEAD_MUTANT))
+        pairs.append(("sweep_decisions", self.EDGES["ready_share_of_budget"][1]))
+        for name, (old, new) in pairs:
+            self.assertIn(old, inspect.getsource(getattr(sb, name)), name)
+
+    def real_reading(self, gates, head=HEAD_A, unreadable=None, draft=False, floor=None, enforced=("G6",), clear=None, boom=None, mutant=None, plan_problem=None, problem=None, body_unreadable=False, captain=False, carries=None):
+        """sweep_gate_reading run for real over a fake context (gates table) and a fake who-can-clear answer."""
+        ctx = types.SimpleNamespace(unreadable=unreadable, facts=dict({"head": head} if head else {}, draft=draft, captain=captain, body_unreadable=body_unreadable, **({"carries": carries} if carries else {}), **({"floor": floor} if floor is not None else {})), plan=None, entries=[], problem=problem, plan_problem=plan_problem, pr="acme/api#600")
+        report = {"gates": [{"gate": g, "status": st} for g, st in gates], "ready": all(st == "ok" for _, st in gates)}
+
+        def context(*a, **k):
+            if boom:
+                raise boom
+            return ctx
+        who = clear if clear is not None else {"who": "owner only", "floor_ids": [], "owner_only": [{"why": "x"}], "threshold": None, "min_rating": None}
+
+        def clear_who(*a, **k):
+            if isinstance(who, Exception):
+                raise who
+            return who
+        stack = contextlib.ExitStack()
+        for name, value in (("_ledger_context", context), ("enforced_gates_of", lambda c: list(enforced) if enforced else None), ("clear_who", clear_who)):
+            stack.enter_context(mock.patch.object(sb, name, value))
+        stack.enter_context(mock.patch.object(sb.plan_ledger, "evaluate_gates", lambda *a, **k: report))
+        with stack:
+            if mutant:
+                with self.mutated("sweep_gate_reading", *mutant):
+                    return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+            return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+
+    READING_CASES = {
+        "ready_with_only_g6_open": dict(gates=[("G0a", "ok"), ("G6", "open")], check=lambda self, r: (self.assertEqual(r[:2], (["G6"], self.HEAD_A)), self.assertIn("Who can clear", r[2] or ""), self.assertIsNone(r[3]))),
+        "another_gate_failing": dict(gates=[("G1", "open"), ("G6", "open")], enforced=("G1", "G6"), check=lambda self, r: self.assertEqual((r[0], r[2]), (["G1", "G6"], None))),
+        "unreadable_context": dict(gates=[("G6", "open")], unreadable="HTTP 502", check=lambda self, r: self.assertEqual((r[:3], "502" in (r[3] or "")), ((None, None, None), True))),
+        "no_head": dict(gates=[("G6", "open")], head=None, check=lambda self, r: self.assertEqual((r[:3], r[3]), ((None, None, None), "no head"))),
+        "exception": dict(gates=[("G6", "open")], boom=ValueError("bad"), check=lambda self, r: self.assertEqual((r[:3], r[3]), ((None, None, None), "ValueError: bad"))),
+        "who_unknown": dict(gates=[("G6", "open")], clear=RuntimeError("x"), check=lambda self, r: self.assertEqual((r[0], r[2]), (["G6"], "who can clear it: not known"))),
+        "enforced_without_g6": dict(gates=[("G0a", "ok"), ("G1", "ok"), ("G4", "ok"), ("G6", "open")], enforced=("G0a", "G1"), check=lambda self, r: self.assertEqual(r[:2], (["G6"], self.HEAD_A))),
+        "g4_unenforced_and_pending": dict(gates=[("G0a", "ok"), ("G4", "pending"), ("G6", "open")], enforced=("G0a", "G1"), check=lambda self, r: self.assertEqual((r[0], r[2]), (["G4", "G6"], None))),
+        "g4_unenforced_and_green": dict(gates=[("G0a", "ok"), ("G4", "ok"), ("G6", "open")], enforced=("G0a",), check=lambda self, r: self.assertEqual(r[0], ["G6"])),
+        "all_enforced": dict(gates=[("G0a", "ok"), ("G1", "ok"), ("G4", "ok"), ("G6", "open")], enforced=("G0a", "G1", "G4", "G6"), check=lambda self, r: self.assertEqual(r[0], ["G6"])),
+        "draft_is_not_ready": dict(gates=[("G4", "ok"), ("G6", "open")], draft=True, check=lambda self, r: self.assertEqual((r[0], r[2]), (["draft", "G6"], None))),
+        "floor_unreadable": dict(gates=[("G6", "waiting")], floor={"decision": None, "unreadable": None, "rehold": None}, check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "rehold_unreadable": dict(gates=[("G6", "waiting")], floor={"decision": "hold", "unreadable": "impact-hold.json is not valid JSON", "rehold": None}, check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "plan_unreadable": dict(gates=[("G0a", "missing"), ("G6", "open")], plan_problem="HTTP 502", check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "ledger_corrupt": dict(gates=[("G1", "missing"), ("G6", "open")], problem="not JSON", check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "body_unreadable": dict(gates=[("G5", "missing"), ("G6", "open")], body_unreadable=True, check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "carries_unreadable": dict(gates=[("G0a", "missing"), ("G6", "open")], carries={"pr": "acme/api#5", "refusal": "could not be read", "unreadable": True}, check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "carries_refused_is_not_ready": dict(gates=[("G0a", "missing"), ("G6", "open")], carries={"pr": "acme/api#5", "refusal": "closed unmerged"}, check=lambda self, r: self.assertEqual(r[0], ["G0a", "G6"])),
+        "floor_none_and_hold_all": dict(gates=[("G6", "waiting")], floor={"decision": None, "unreadable": None, "rehold": "a clear for another head", "holds": ["hold-all"]}, check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "floor_wrong_type": dict(gates=[("G6", "waiting")], floor="hold", check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "floor_absent_label_set": dict(gates=[("G6", "waiting")], captain=True, check=lambda self, r: self.assertEqual((r[0], r[1]), (["G6"], self.HEAD_A))),
+        "head_extraction": dict(gates=[("G6", "open")], head="c" * 40, check=lambda self, r: self.assertEqual(r[1], "c" * 40)),
+    }
+    READING_MUTANTS = {
+        "ready_with_only_g6_open": ('if opened == ["G6"]:', 'if opened == []:'),
+        "another_gate_failing": ('if opened == ["G6"]:', 'if "G6" in opened:'),
+        "unreadable_context": ("if ctx.unreadable or not", "if not"),
+        "no_head": ("or not (ctx.facts or {}).get(\"head\")", "or False"),
+        "exception": ("except Exception as err:", "except KeyError as err:"),
+        "who_unknown": ("            except Exception:\n                line = None", "            except KeyError:\n                line = None"),
+        "enforced_without_g6": ('opened = [r["gate"] for r in report["gates"] if r["status"] not in plan_ledger.SATISFIED]', 'opened = [r["gate"] for r in report["gates"] if r["gate"] in (enforced_gates_of(ctx) or ()) and r["status"] not in plan_ledger.SATISFIED]'),
+        "g4_unenforced_and_pending": ('if r["status"] not in plan_ledger.SATISFIED]', 'if r["status"] not in plan_ledger.SATISFIED and (r["gate"] in (enforced_gates_of(ctx) or ()) or r["gate"] == "G6")]'),
+        "g4_unenforced_and_green": ('if r["status"] not in plan_ledger.SATISFIED]', 'if r["status"] not in plan_ledger.SATISFIED or r["gate"] == "G4"]'),
+        "all_enforced": ('opened = [r["gate"] for r in report["gates"]', 'opened = [] and [r["gate"] for r in report["gates"]'),
+        "draft_is_not_ready": ('if (ctx.facts or {}).get("draft") is True:', 'if False:'),
+        "floor_unreadable": ('floor.get("decision") is None:', 'floor.get("decision") == 0:'),
+        "rehold_unreadable": ('floor.get("unreadable"):   # the re-hold', 'floor.get("zzz"):   # the re-hold'),
+        "plan_unreadable": ("if ctx.plan_problem:", "if False:"),
+        "ledger_corrupt": ("if ctx.problem:", "if False:"),
+        "body_unreadable": ('if (ctx.facts or {}).get("body_unreadable"):', "if False:"),
+        "carries_unreadable": ('if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):', "if False:"),
+        "carries_refused_is_not_ready": ('if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):', 'if (ctx.facts or {}).get("carries"):'),
+        "floor_none_and_hold_all": ('if isinstance(floor, dict) and floor.get("decision") is None:', 'if isinstance(floor, dict) and floor.get("decision") is None and not floor.get("rehold"):'),
+        "floor_wrong_type": ("if floor is not None and not isinstance(floor, dict):", "if False:"),
+        "floor_absent_label_set": ("if floor is not None and not isinstance(floor, dict):", "if not isinstance(floor, dict):"),
+        "head_extraction": ('return opened, ctx.facts["head"], who, None', 'return opened, "0" * 40, who, None'),
+    }
+
+    def test_986_the_real_gate_reading_over_a_fake_ledger(self):
+        for name, case in self.READING_CASES.items():
+            args = {k: v for k, v in case.items() if k != "check"}
+            case["check"](self, self.real_reading(**args))
+
+    def test_986_each_real_gate_reading_path_has_a_mutant_that_fails(self):
+        self.assertEqual(set(self.READING_CASES), set(self.READING_MUTANTS))
+        for name, case in self.READING_CASES.items():
+            args = {k: v for k, v in case.items() if k != "check"}
+            with self.assertRaises(AssertionError, msg=name):
+                try:
+                    got = self.real_reading(mutant=self.READING_MUTANTS[name], **args)
+                except Exception as err:   # the mutant lets the error out: the reading no longer holds
+                    self.fail("%s: the mutant raised %s" % (name, type(err).__name__))
+                case["check"](self, got)
+
+    def ready_pass(self, decisions, reading, now=None, whole=True, mutant=None, budget=None, spent=False):
+        state = sb.sweep_state(self.engine)
+        now = now if now is not None else self.world.clock.now()
+        state.started = self.engine.now() - (sb.SWEEP_PASS_SECONDS + 1 if spent else 0)
+        extra = {"budget": budget}
+        with mock.patch.object(sb, "sweep_gate_reading", lambda e, r, n, t: reading(r, n)):
+            if mutant:
+                with self.mutated("sweep_ready_pass", *mutant):
+                    sb.sweep_ready_pass(self.engine, state, decisions, "acme/api", now, self.engine.config["sweep"], whole, **extra)
+            else:
+                sb.sweep_ready_pass(self.engine, state, decisions, "acme/api", now, self.engine.config["sweep"], whole, **extra)
+        return state
+
+    def ready_file(self):
+        return json.loads(Path(self.world.state, sb.SWEEP_READY_FILE).read_text()) if Path(self.world.state, sb.SWEEP_READY_FILE).exists() else {}
+
+    def edge_cap(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(sb.SWEEP_READY_READS + 1)]
+        reads = []
+        state = self.ready_pass(held, lambda r, n: reads.append(n) or self.ready(), mutant=mutant)
+        self.assertEqual((len(reads), state.s5_unchecked), (sb.SWEEP_READY_READS, 1))
+
+    def edge_roundtrip(self, mutant):
+        held = [self.held_pr()]
+        self.ready_pass(held, lambda r, n: self.ready())
+        self.assertEqual(self.ready_file()["acme/api#600"]["head"], self.HEAD_A)
+        state = sb.sweep_state(self.engine)
+        state.ready, state.ready_loaded = {}, False   # a restart: the moment comes back from the file
+        self.world.tick(3 * 3600)
+        state = self.ready_pass(held, lambda r, n: self.ready(), mutant=mutant)
+        self.assertEqual(len(state.s5), 1)
+
+    def edge_human_skip(self, mutant):
+        human = {"id": "pr:acme/api#600", "kind": "captain", "tier": "human", "repo": "acme/api", "number": 600, "title": "t", "since": self.at()}
+        reads = []
+        state = self.ready_pass([self.held_pr(), human], lambda r, n: reads.append(n) or self.ready(), mutant=mutant)
+        self.assertEqual((reads, state.ready, state.s5_unchecked), ([], {}, 0))
+
+    def edge_prune(self, mutant):
+        self.ready_pass([self.held_pr(601)], lambda r, n: self.ready())
+        self.assertIn("acme/api#601", sb.sweep_state(self.engine).ready)
+        state = self.ready_pass([], lambda r, n: self.ready(), mutant=mutant)
+        self.assertEqual((state.ready, self.ready_file()), ({}, {}))
+
+    def edge_partial_list(self, mutant):
+        self.ready_pass([self.held_pr(601)], lambda r, n: self.ready())
+        state = self.ready_pass([], lambda r, n: self.ready(), whole=False, mutant=mutant)
+        self.assertIn("acme/api#601", state.ready)
+        self.assertIn("acme/api#601", self.ready_file())
+
+    def edge_once_per_head(self, mutant):
+        held = [self.held_pr()]
+        self.hub.open = {600: sweep_issue(600, "MERGE: captain", pr=True)}
+        reading = {"value": self.ready()}
+        self.s5_run(reading, held)
+        self.world.tick(3 * 3600)
+        self.s5_run(reading, held)
+        self.world.tick(60)
+        context = self.mutated("sweep_decisions", *mutant) if mutant else contextlib.nullcontext()
+        with context:
+            lines = self.s5_run(reading, held)
+            self.world.tick(60)
+            lines = self.s5_run(reading, held)
+        self.assertEqual(len(lines), 1)
+        self.world.tick(60)
+        reading["value"] = self.ready(self.HEAD_B)   # a new head is a new finding
+        self.world.tick(3 * 3600)
+        self.s5_run(reading, held)
+        self.world.tick(3 * 3600)
+        self.assertEqual(len(self.s5_run(reading, held)), 2)
+
+    def edge_gate_opens(self, mutant):
+        held = [self.held_pr()]
+        self.ready_pass(held, lambda r, n: self.ready())
+        state = self.ready_pass(held, lambda r, n: (["G0a", "G6"], self.HEAD_A, None, None), mutant=mutant)
+        self.assertNotIn("acme/api#600", state.ready)
+
+    def edge_new_head(self, mutant):
+        held = [self.held_pr()]
+        self.ready_pass(held, lambda r, n: self.ready())
+        self.world.tick(3 * 3600)
+        state = self.ready_pass(held, lambda r, n: self.ready(self.HEAD_B), mutant=mutant)
+        self.assertEqual((state.s5, state.ready["acme/api#600"]["head"]), ({}, self.HEAD_B))
+
+    def edge_unread_drops(self, mutant):
+        """An unreadable pass drops the stored moment: a gate that opened and closed meanwhile cannot make a finding EARLY (late, never early)."""
+        held = [self.held_pr()]
+        t0 = self.world.clock.now()
+        threshold = self.engine.config["sweep"]["aged_cos_hours"] * 3600
+        self.ready_pass(held, lambda r, n: self.ready(), now=t0)
+        self.ready_pass(held, lambda r, n: (None, None, None, "boom"), now=t0 + 60, mutant=mutant)
+        state = self.ready_pass(held, lambda r, n: self.ready(), now=t0 + threshold)
+        self.assertEqual(state.s5, {})   # the wait restarted at t0 + threshold: not raised yet
+
+    def edge_real_calls(self, mutant):
+        """The calls a reading really makes are charged, beyond the least charge."""
+        budget = [100]
+
+        def reading(r, n):
+            self.engine.reading_calls = 30
+            return self.ready()
+        self.ready_pass([self.held_pr()], reading, budget=budget, mutant=mutant)
+        self.assertEqual(budget[0], 100 - 30)
+
+    FACT_FUNCTIONS = (("plan_ledger", "evaluate_gates"), ("plan_ledger", "carried_rows"), ("sb", "_ledger_context"), ("sb", "pr_picture"), ("sb", "sweep_gate_reading"), ("sb", "carries_context"))
+    FACT_HELPERS = {"carried_rows", "carries_context", "evaluate_gates"}   # the functions `facts` may be passed to: each is scanned too
+
+    @classmethod
+    def fact_sources(cls, overrides=None):
+        out = {}
+        for module, name in cls.FACT_FUNCTIONS:
+            out[name] = textwrap.dedent(inspect.getsource(getattr(sb.plan_ledger if module == "plan_ledger" else sb, name)))
+        out.update(overrides or {})
+        return out
+
+    @staticmethod
+    def fact_scan(sources):
+        """(keys, unrecognised): every key the functions read, set or pass on `facts` (or `ctx.facts`), found with the ast module. Recognised: a subscript or
+        .get with a literal key, a truth test, `facts = dict(facts or {}, k=...)` onto the same name, a pass to a scanned helper, the context carrier and the return of the picture.
+        Anything else is unrecognised and FAILS: a copy (dict(facts), {**facts}, copy.copy, an alias), .items/.keys/.values/.copy, getattr, an iteration, a computed key, a bare pass."""
+        keys, bad = set(), []
+        helpers = ("carried_rows", "carries_context", "evaluate_gates")
+        for fname, source in sources.items():
+            tree = ast.parse(source)
+            parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+            for node in ast.walk(tree):
+                named = isinstance(node, ast.Name) and node.id == "facts"
+                carried = isinstance(node, ast.Attribute) and node.attr == "facts" and isinstance(node.value, ast.Name) and node.value.id in ("ctx", "ns")
+                if not (named or carried) or isinstance(getattr(node, "ctx", None), ast.Store) or isinstance(parent.get(node), ast.arg):
+                    continue
+                at, up = node, parent.get(node)
+                while isinstance(up, ast.IfExp) and at is not up.test or isinstance(up, ast.BoolOp) and isinstance(up.op, ast.Or):
+                    at, up = up, parent.get(up)   # `facts or {}`, `facts if ... else None`
+                call = up if isinstance(up, ast.Call) else None
+                if isinstance(up, ast.keyword):
+                    call = parent.get(up)
+                if isinstance(up, ast.Subscript) and up.value is at and isinstance(up.slice, ast.Constant) and isinstance(up.slice.value, str):
+                    keys.add(up.slice.value)
+                elif isinstance(up, ast.Attribute) and up.attr == "get" and isinstance(parent.get(up), ast.Call) and parent[up].args and isinstance(parent[up].args[0], ast.Constant) and isinstance(parent[up].args[0].value, str):
+                    keys.add(parent[up].args[0].value)
+                elif isinstance(up, ast.Call) and up.args and up.args[0] is at and isinstance(up.func, ast.Name) and up.func.id == "dict" and isinstance(parent.get(up), ast.Assign) and [getattr(t, "id", None) for t in parent[up].targets] == ["facts"] and not any(k.arg is None for k in up.keywords):
+                    keys |= {k.arg for k in up.keywords}   # `facts = dict(facts or {}, k=...)`: the same name extended in place (a copy to ANOTHER name is unrecognised)
+                elif call is not None and isinstance(up, ast.Call) and at in call.args and (getattr(call.func, "id", None) in helpers or getattr(call.func, "attr", None) in helpers):
+                    pass   # passed to a helper whose source is scanned too
+                elif isinstance(up, ast.keyword) and up.arg and isinstance(call.func, ast.Attribute) and call.func.attr == "SimpleNamespace":
+                    pass   # the context carrier
+                elif isinstance(up, ast.BoolOp) and isinstance(up.op, ast.And) and at is not up.values[-1] or isinstance(up, (ast.If, ast.UnaryOp)) or isinstance(up, ast.IfExp):
+                    pass   # a truth test
+                elif isinstance(up, ast.Tuple) and isinstance(parent.get(up), ast.Return):
+                    pass   # pr_picture returns the facts to the caller, which is scanned
+                else:
+                    bad.append("%s line %s: facts used in an unrecognised way" % (fname, getattr(node, "lineno", "?")))
+        return keys, bad
+
+    @classmethod
+    def gate_fact_names(cls, overrides=None):
+        """Every input `evaluate_gates` reads (its arguments) and every `facts` key the gate path and its helpers read or set (the ast module), plus the context fields the reading checks."""
+        sources = cls.fact_sources(overrides)
+        names = set(inspect.signature(sb.plan_ledger.evaluate_gates).parameters)
+        keys, bad = cls.fact_scan(sources)
+        assert not bad, bad
+        names |= keys
+        names |= set(re.findall(r'ctx\.(plan_problem|problem|unreadable)\b', sources["sweep_gate_reading"]))
+        return {"ledger_problem" if n == "problem" else n for n in names}
+
+    @staticmethod
+    def docs_fact_rows():
+        text = Path(__file__).resolve().parent.parent.joinpath("docs", "switchboard.md").read_text()
+        block = text.split("**Per-fact table.**", 1)[1].split("S5 fact audit:", 1)[0]
+        return set(re.findall(r"^\| `(\w+)` \|", block, re.M))
+
+    def fact_gaps(self, names, rows):
+        return sorted(names - rows)
+
+    def fact_problems(self, overrides=None, rows=None):
+        """Why the completeness check would fail: an unrecognised use of facts, or a key with no row."""
+        keys, bad = self.fact_scan(self.fact_sources(overrides))
+        names = keys | set(inspect.signature(sb.plan_ledger.evaluate_gates).parameters) | {"ledger_problem", "plan_problem", "unreadable"}
+        return bad + ["no row: %s" % n for n in self.fact_gaps(names, self.docs_fact_rows() if rows is None else rows)]
+
+    def fact_mutants(self):
+        """(label, overrides): a key added in each spelling, and bare passes of facts."""
+        ev, cr = self.fact_sources()["evaluate_gates"], self.fact_sources()["carried_rows"]
+        head = '    head = (facts or {}).get("head")'
+        self.assertIn(head, ev)
+        first = cr.split("\n", 1)
+        yield "get", {"evaluate_gates": ev.replace(head, head + '\n    _zz = facts.get("zz_new") if facts else None', 1)}
+        yield "subscript", {"evaluate_gates": ev.replace(head, head + '\n    _zz = facts["zz_new"]', 1)}
+        yield "helper", {"carried_rows": first[0] + '\n    _zz = (facts or {}).get("zz_new")\n' + first[1]}
+        yield "unknown_pass", {"evaluate_gates": ev.replace(head, head + '\n    _zz = mystery(facts)', 1)}
+        yield "iteration", {"evaluate_gates": ev.replace(head, head + '\n    _zz = [k for k in facts]', 1)}
+
+    # every spelling of a read or copy of facts the scan must not let through, applied to each scanned function
+    FACT_SPELLINGS = (
+        "_z = dict(facts)", "_z = dict(facts or {})", "_z = dict(facts, zz_new=1)", "_z = {**facts}", "_z = f(**facts)", "_z = facts.items()",
+        "_z = facts.keys()", "_z = facts.values()", "_z = facts.copy()", "_z = copy.copy(facts)", "_z = getattr(facts, 'get')('zz_new')",
+        "_z = facts.get(_k)", "_z = facts[_k]", "_z = facts", "_z = facts or {}", "_z = [k for k in facts]", "_z = 'zz_new' in facts",
+        "_z = list(facts)", "_z = (_w := facts)", "_z = lambda: facts", "_z = facts.setdefault('zz_new', 1)", "_z = facts | {}",
+        "_z = copy.deepcopy(facts)", "_z = vars(facts)", "_z = {**(facts or {})}", "_z = SimpleNamespace(**facts)", "_z = other(facts=facts)",
+    )
+
+    @staticmethod
+    def with_line(source, line):
+        """`source` with `line` inserted as the first statement of the function body (after a docstring)."""
+        func = ast.parse(source).body[0]
+        first = func.body[0]
+        at = func.body[1] if len(func.body) > 1 and isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) else first
+        lines = source.split("\n")
+        lines.insert(at.lineno - 1, " " * at.col_offset + line)
+        return "\n".join(lines)
+
+    def test_986_every_spelling_of_a_facts_read_fails_the_scan_in_every_function(self):
+        sources = self.fact_sources()
+        self.assertEqual(self.fact_problems(), [])
+        for fname in ("evaluate_gates", "carried_rows", "_ledger_context"):
+            for line in self.FACT_SPELLINGS:
+                problems = self.fact_problems({fname: self.with_line(sources[fname], line)})
+                self.assertTrue(problems, (fname, line))
+                self.assertTrue(any(fname in p and "line" in p for p in problems), (fname, line, problems))
+
+    def test_986_every_fact_the_gates_read_has_a_row_in_the_table(self):
+        names = self.gate_fact_names()
+        self.assertTrue({"head", "ci", "draft", "body", "captain", "holds", "floor", "author", "notice_senders", "held_check", "carries", "plan", "entries", "ledger_problem", "plan_problem", "body_unreadable"} <= names)
+        self.assertEqual(self.fact_problems(), [])
+        self.assertEqual(self.fact_gaps(names, self.docs_fact_rows() - {"floor"}), ["floor"])   # a dropped row
+        audit = Path(__file__).resolve().parent.parent.joinpath("docs", "switchboard.md").read_text().split("S5 fact audit: ", 1)[1]
+        self.assertEqual(audit.split(" ", 1)[0], str(len(names)))   # the figure in the docs is the computed one
+
+    def test_986_a_new_fact_in_any_spelling_fails_the_completeness_test(self):
+        for label, overrides in self.fact_mutants():
+            self.assertTrue(self.fact_problems(overrides), label)
+            if label in ("get", "subscript", "helper"):
+                self.assertEqual(self.fact_problems(overrides), ["no row: zz_new"], label)
+
+    PH = "sha256:" + "0" * 64
+
+    def board_reading(self, change=None, plan="ok", entries="ok", ledger_problem=None, plan_problem=None, unreadable=None, boom=None, mutant=None, mutant_board=None):
+        """The REAL sweep_gate_reading with the REAL plan_ledger.evaluate_gates (nothing of the board is mocked) over a ready-looking baseline in which `change`
+        sets, drops or empties facts. Only the reads of GitHub (the context) and the who-can-clear answer are given."""
+        facts = {"head": self.HEAD_A, "ci": "green", "draft": False, "body": "canon: n/a nothing to update here", "captain": True, "holds": None, "author": "bob", "notice_senders": ["bob"], "held_check": lambda: []}
+        for key, value in (change or {}).items():
+            if value is KeyError:
+                facts.pop(key, None)
+            else:
+                facts[key] = value
+        the_plan = {"result": "pass", "defects": [], "plan_hash": self.PH, "text": "", "scenarios_parsed": [{"id": "S1", "evaluator": "ci", "proof": "test"}]} if plan == "ok" else None
+        pr = "acme/api#600"
+        ledger = [{"seq": 1, "kind": "proof", "pr": pr, "scenario": "S1", "plan_hash": self.PH, "head": self.HEAD_A, "result": "pass", "by": "coder"},
+                  {"seq": 2, "kind": "verdict", "pr": pr, "scenario": "S1", "plan_hash": self.PH, "head": self.HEAD_A, "result": "pass", "by": "cibot", "evaluator": "ci"}] if entries == "ok" else []
+        ctx = types.SimpleNamespace(unreadable=unreadable, facts=facts, plan=the_plan, entries=ledger, problem=ledger_problem, plan_problem=plan_problem, pr=pr)
+
+        def context(*a, **k):
+            if boom:
+                raise boom
+            return ctx
+        who = {"who": "owner only", "floor_ids": [], "owner_only": [{"why": "x"}], "threshold": None, "min_rating": None}
+        with mock.patch.object(sb, "_ledger_context", context), mock.patch.object(sb, "clear_who", lambda *a, **k: who):
+            board = contextlib.ExitStack()
+            if mutant_board:
+                source = textwrap.dedent(inspect.getsource(sb.plan_ledger.evaluate_gates))
+                self.assertIn(mutant_board[0], source)
+                scope = dict(sb.plan_ledger.__dict__)
+                exec(compile(source.replace(mutant_board[0], mutant_board[1], 1), "<mutant>", "exec"), scope)
+                board.enter_context(mock.patch.object(sb.plan_ledger, "evaluate_gates", scope["evaluate_gates"]))
+            with board:
+                if mutant:
+                    with self.mutated("sweep_gate_reading", *mutant):
+                        return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+                return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+
+    # (row of the table, the case, how the baseline changes, the outcome the table states). READY: the one open gate is the owner's clear.
+    BOARD_ROWS = (
+        ("baseline", "nothing changed", {}, {}, "ready"),
+        ("plan", "the PR names no plan", {}, {"plan": None}, "not ready"),
+        ("entries", "no proof or verdict in the ledger", {}, {"entries": None}, "not ready"),
+        ("plan_problem", "the plan fetch failed", {}, {"plan_problem": "HTTP 502"}, "not checked"),
+        ("ledger_problem", "the ledger is corrupt", {}, {"ledger_problem": "not JSON"}, "not checked"),
+        ("unreadable", "the PR view failed", {}, {"unreadable": "HTTP 502"}, "not checked"),
+        ("head", "no head", {"head": KeyError}, {}, "not checked"),
+        ("ci", "ci is None", {"ci": None}, {}, "not ready"),
+        ("ci", "ci is absent", {"ci": KeyError}, {}, "not ready"),
+        ("ci", "ci says none", {"ci": "none"}, {}, "not ready"),
+        ("draft", "a draft", {"draft": True}, {}, "not ready"),
+        ("body", "the body is empty", {"body": ""}, {}, "not ready"),
+        ("body", "the body is None", {"body": None}, {}, "not ready"),
+        ("body_unreadable", "the body is not text", {"body_unreadable": True}, {}, "not checked"),
+        ("captain", "captain None and no floor: G6 is not open", {"captain": None}, {}, "not ready"),
+        ("holds", "holds None (only the label of a hold)", {"holds": None}, {}, "ready"),
+        ("holds", "holds absent", {"holds": KeyError}, {}, "ready"),
+        ("author", "author None: the proof writers still exclude", {"author": None}, {}, "ready"),
+        ("notice_senders", "notice_senders absent: the proof writers still exclude", {"notice_senders": KeyError}, {}, "ready"),
+        ("held_check", "no held_check on a held PR", {"held_check": KeyError}, {}, "not ready"),
+        ("held_check", "a raising held_check", {"held_check": lambda: 1 / 0}, {}, "not checked"),
+        ("held_check", "a held_check that finds a defect", {"held_check": lambda: ["no table"]}, {}, "not ready"),
+        ("floor", "floor without a decision", {"floor": {"decision": None, "unreadable": None, "rehold": None}}, {}, "not checked"),
+        ("floor", "floor of the wrong type", {"floor": "hold"}, {}, "not checked"),
+        ("floor", "re-hold unreadable", {"floor": {"decision": "hold", "unreadable": "bad json", "rehold": None}}, {}, "not checked"),
+        ("floor", "floor absent, the label alone holds", {"floor": KeyError}, {}, "ready"),
+        ("floor", "floor absent and no label", {"floor": KeyError, "captain": None}, {}, "not ready"),
+        ("carries", "the dependency is unreadable", {"carries": {"pr": "acme/api#5", "refusal": "x", "unreadable": True}}, {}, "not checked"),
+        ("carries", "the dependency is refused", {"carries": {"pr": "acme/api#5", "refusal": "closed unmerged"}}, {}, "not ready"),
+    )
+    BOARD_MUTANTS = (   # (rows of the class it must break, where (None: the reading, "board": evaluate_gates), old, new)
+        ("flip", None, 'if opened == ["G6"]:', 'if opened == []:'),
+        ("unreadable", None, "if ctx.unreadable or not", "if not"),
+        ("plan_problem", None, "if ctx.plan_problem:", "if False:"),
+        ("ledger_problem", None, "if ctx.problem:", "if False:"),
+        ("body_unreadable", None, 'if (ctx.facts or {}).get("body_unreadable"):', "if False:"),
+        ("draft", None, 'if (ctx.facts or {}).get("draft") is True:', "if False:"),
+        ("floor", None, "if floor is not None and not isinstance(floor, dict):", "if False:"),
+        ("carries", None, 'if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):', "if False:"),
+        ("held_check", None, "except Exception as err:", "except KeyError as err:"),
+        ("ci", "board", 'if ci in ("green", "passing"):', "if True:"),
+        ("body", "board", 'ok, detail = canon_status((facts or {}).get("body"))', "ok, detail = True, ''"),
+        ("held_check", "board", "elif not callable(check):", "elif False:"),
+        ("captain", "board", 'if (facts or {}).get("captain"):', "if True:"),
+        ("plan", "board", 'if plan is None:\n                row.update(status="missing"', 'if False:\n                row.update(status="missing"'),
+    )
+
+    def board_outcome(self, got):
+        return "not checked" if got[0] is None else ("ready" if got[0] == ["G6"] and got[1] == self.HEAD_A and "Who can clear" in (got[2] or "") else "not ready")
+
+    def board_run(self, case, mutant=None, board=None):
+        row, label, change, kw, expected = case
+        return self.board_outcome(self.board_reading(change, mutant=mutant, mutant_board=board, **kw))
+
+    def test_986_every_row_of_the_table_is_probed_through_the_real_board(self):
+        for case in self.BOARD_ROWS:
+            self.assertEqual(self.board_run(case), case[4], case[:2])
+        self.assertEqual({c[0] for c in self.BOARD_ROWS} - {"baseline"}, self.docs_fact_rows() & {c[0] for c in self.BOARD_ROWS})
+        # every row of the docs table is tested here, or says in its own words that it is not a gate input
+        untested = self.docs_fact_rows() - {c[0] for c in self.BOARD_ROWS}
+        self.assertEqual(sorted(untested), sorted(self.NOT_PROBED))
+
+    NOT_PROBED = ["facts", "now", "pr"]   # always set, or the whole view (the `unreadable` row is probed)
+
+    def test_986_a_mutant_per_row_class_fails_the_real_board_probe(self):
+        for rows, where, old, new in self.BOARD_MUTANTS:
+            cases = [c for c in self.BOARD_ROWS if rows == "flip" or c[0] == rows]
+            self.assertTrue(cases, rows)
+            failed = []
+            for case in cases:
+                try:
+                    got = self.board_run(case, mutant=(old, new) if where is None else None, board=(old, new) if where == "board" else None)
+                except Exception as err:
+                    got = "raised %s" % type(err).__name__
+                failed.append(got != case[4])
+            self.assertTrue(any(failed), (rows, old))
+
+    def counted_calls(self):
+        """(calls the REAL reading makes, calls the REAL clear_who makes), each counted by a fake gh that serves a pull request (with a plan), its plan issue
+        and no comments: the real PR view, plan fetch, floor view (_ledger_context, gate_floor_fact) and clear_who run over it."""
+        log = []
+        pr = {"title": "t", "state": "OPEN", "headRefOid": "a" * 40, "isDraft": False, "labels": [{"name": "merge-captain"}], "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}], "reviews": [], "comments": [], "author": {"login": "bob"},
+              "body": "PLAN: acme/api#10\ncanon: n/a nothing to update here\n"}
+
+        def run(argv, *a, **k):
+            argv = list(argv)
+            log.append(" ".join(argv[1:6]))
+            out = json.dumps(pr) if argv[1:3] == ["pr", "view"] else ("[]" if "comments" in " ".join(argv) else json.dumps({"body": GOOD_PLAN, "number": 10, "state": "open"}))
+            return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+        self.engine.gh_runner = run
+        sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+        reading = len(log)
+        self.assertEqual(self.engine.reading_calls, reading)   # the reading's own counter agrees with the runner
+        log.clear()
+        sb.clear_who(self.engine, run, "acme/api", 600)
+        return reading, len(log)
+
+    def call_counter_case(self, cost):
+        reading, who = self.counted_calls()
+        self.assertGreaterEqual(reading, 4)   # PR view, floor view (a second PR view), plan issue, one comments page: the real functions made them
+        self.assertGreaterEqual(who, 1)
+        # the worst case this fake can show: a reading that goes on to clear_who; a hold with more reads is charged by its REAL count (edge_real_calls)
+        self.assertLessEqual(reading + who, cost)
+        self.assertLessEqual(reading, cost)
+
+    def test_986_a_reading_makes_no_more_calls_than_it_is_charged(self):
+        self.call_counter_case(sb.SWEEP_READY_READ_COST)
+
+    def test_986_a_lowered_call_cost_fails_the_call_counter(self):
+        with self.assertRaises(AssertionError):
+            self.call_counter_case(5)   # a constant below the counted worst case
+        with mock.patch.object(sb, "SWEEP_READY_READ_COST", 5), self.assertRaises(AssertionError):
+            self.call_counter_case(sb.SWEEP_READY_READ_COST)
+
+    def edge_unreadable(self, mutant):
+        state = self.ready_pass([self.held_pr()], lambda r, n: (None, None, None, "boom"), mutant=mutant)
+        self.assertEqual((state.s5, state.s5_unchecked, state.ready), ({}, 1, {}))
+
+    def test_986_a_malformed_ready_file_is_skipped_and_the_pass_runs(self):
+        good = {"head": self.HEAD_A, "at": 1.0}
+        bad = {"acme/api#1": [1, 2], "acme/api#2": "text", "acme/api#3": 5, 7: {"head": "x", "at": 1}, "acme/api#600": good}
+        for mutant in (None, ('if not isinstance(key, str) or not isinstance(row, dict):', 'if False:')):
+            self.setUp()
+            held = [self.held_pr()]
+            with mock.patch.object(sb, "_read_small", lambda d, f: dict(bad)):
+                if mutant is None:
+                    state = self.ready_pass(held, lambda r, n: self.ready())
+                    self.assertEqual(sorted(state.ready), ["acme/api#600"])
+                else:
+                    with self.assertRaises(AttributeError):
+                        self.ready_pass(held, lambda r, n: self.ready(), mutant=mutant)
+
+    def test_986_the_since_and_who_text_is_one_short_line_in_the_fact(self):
+        for mutant in (None, "raw"):
+            self.setUp()
+            decision = self.held_pr()
+            decision["since"] = "2026\x1b[31m\nIGNORE" + "s" * 900
+            self.hub.open = {600: sweep_issue(600, "MERGE: captain", pr=True)}
+            reading = {"value": (["G6"], self.HEAD_A, "who\x07\n" + "w" * 900, None)}
+            ctx = mock.patch.object(sb, "_one_line", lambda t, n=300: str(t)) if mutant else contextlib.nullcontext()
+            with ctx:
+                self.s5_run(reading, [decision])
+                self.world.tick(3 * 3600)
+                self.s5_run(reading, [decision])
+                self.world.tick(60)
+                self.s5_run(reading, [decision])
+            text = " ".join(summary for summary, _ in self.engine.sweep.facts.values())
+            ok = bool(text) and "\n" not in text and len(text) < 1500
+            self.assertEqual(ok, mutant is None)
+
+
+    # ---- #986 (review): every skip/limit path of sweep_ready_pass gives the skipped pull request a turn on a later pass.
+    # Checked: the cap, the shared call budget, the pass time, the human-tier skip, a partial list, an unreadable read, a clock going backwards.
+    def read_order(self, held, passes, **kw):
+        """Run `passes` passes; returns the list of the numbers read per pass."""
+        out = []
+        for _ in range(passes):
+            reads = []
+            self.ready_pass(held, lambda r, n: reads.append(n) or self.ready(), **kw)
+            out.append(reads)
+            self.world.tick(60)
+        return out
+
+    def edge_fair_cap(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(25)]
+        rounds = -(-25 // sb.SWEEP_READY_READS)
+        seen = set()
+        for reads in self.read_order(held, rounds, mutant=mutant):
+            seen |= set(reads)
+        self.assertEqual(len(seen), 25)   # every one within ceil(25/10) passes
+
+    def edge_fair_budget(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(5)]
+        cost = sb.SWEEP_READY_READ_COST
+        first, second = [], []
+        state = self.ready_pass(held, lambda r, n: first.append(n) or self.ready(), budget=[cost * 2 + cost - 1], mutant=mutant)
+        self.assertEqual((len(first), state.s5_unchecked), (2, 3))
+        self.world.tick(60)
+        self.ready_pass(held, lambda r, n: second.append(n) or self.ready(), budget=[cost * 3], mutant=mutant)
+        self.assertEqual(set(first) & set(second[:3]), set())   # the unread ones go first
+
+    def edge_fair_time(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(3)]
+        reads = []
+        state = self.ready_pass(held, lambda r, n: reads.append(n) or self.ready(), spent=True, mutant=mutant)
+        self.assertEqual((reads, state.s5_unchecked), ([], 3))
+        self.ready_pass(held, lambda r, n: reads.append(n) or self.ready())
+        self.assertEqual(sorted(reads), [700, 701, 702])
+
+    def edge_fair_human(self, mutant):
+        human = {"id": "pr:acme/api#700", "kind": "captain", "tier": "human", "repo": "acme/api", "number": 700, "title": "t", "since": self.at()}
+        reads = []
+        self.ready_pass([self.held_pr(700), human], lambda r, n: reads.append(n) or self.ready(), mutant=mutant)
+        self.assertEqual(reads, [])
+        self.ready_pass([self.held_pr(700)], lambda r, n: reads.append(n) or self.ready(), mutant=mutant)   # the owner's row is gone: its turn
+        self.assertEqual(reads, [700])
+
+    def edge_fair_partial(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(12)]
+        self.read_order(held, 1)
+        before = dict(sb.sweep_state(self.engine).ready_read)
+        self.ready_pass([], lambda r, n: self.ready(), whole=False, mutant=mutant)
+        self.assertEqual(sb.sweep_state(self.engine).ready_read, before)   # the order survives a partial list
+        reads = []
+        self.ready_pass(held, lambda r, n: reads.append(n) or self.ready())
+        self.assertEqual(sorted(reads[:2]), [710, 711])
+
+    def edge_fair_unreadable(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(11)]
+        reading = lambda r, n: (None, None, None, "boom") if n == 700 else self.ready()
+        passes = []
+        for _ in range(3):
+            reads = []
+            self.ready_pass(held, lambda r, n: reads.append(n) or reading(r, n), mutant=mutant)
+            passes.append(reads)
+            self.world.tick(60)
+        self.assertIn(710, passes[1][:1])      # the unreadable one does not keep the 11th out
+        self.assertIn(700, passes[2])          # and gets its turn again
+
+    def test_986_a_clock_going_backwards_raises_nothing_until_it_catches_up(self):
+        """Safe: now - start is negative, so nothing is raised early; it is raised when the clock passes the threshold again."""
+        for mutant in (None, ('if now - row["at"] >= ', 'if abs(now - row["at"]) >= ')):
+            self.setUp()
+            held = [self.held_pr()]
+            t0 = self.world.clock.now()
+            self.ready_pass(held, lambda r, n: self.ready(), now=t0)
+            state = self.ready_pass(held, lambda r, n: self.ready(), now=t0 - 3 * 3600, mutant=mutant)
+            self.assertEqual(state.s5 == {}, mutant is None)
+            if mutant is None:
+                state = self.ready_pass(held, lambda r, n: self.ready(), now=t0 + 3 * 3600)
+                self.assertEqual(len(state.s5), 1)
+
+    def edge_write(self, mutant):
+        self.ready_pass([self.held_pr()], lambda r, n: self.ready(), mutant=mutant)
+        self.assertEqual(self.ready_file().get("acme/api#600", {}).get("head"), self.HEAD_A)
+
+    def edge_share(self, mutant):
+        """#986 review: the FULL sweep with many held PRs and a small budget serves BOTH the held PRs and the S1 verification."""
+        held = [self.held_pr(700 + i) for i in range(60)]
+        self.hub.open = {n: sweep_issue(n, "## Decision required\nx") for n in range(100, 103)}
+        self.hub.open.update({700 + i: sweep_issue(700 + i, "MERGE: captain", pr=True) for i in range(60)})
+        self.engine.config["sweep"]["calls_per_pass"] = 30
+        reads, verified = [], []
+        reading = lambda e, r, n, t: reads.append(n) or self.ready()
+        real = sb.sweep_verify
+        def spy(engine, state, kind, ref, now, cfg, regex, budget):
+            verdict = real(engine, state, kind, ref, now, cfg, regex, budget)
+            if verdict:
+                verified.append(ref)
+            return verdict
+        passes = 0
+        with mock.patch.object(sb, "sweep_gate_reading", reading), mock.patch.object(sb, "sweep_verify", spy):
+            for _ in range(260):
+                passes += 1
+                verified.clear()
+                if mutant:
+                    with self.mutated("sweep_decisions", *mutant):
+                        self.sweep(list(held))
+                else:
+                    self.sweep(list(held))
+                self.assertEqual(len(set(verified)), 3, "pass %d: the other findings are verified every pass" % passes)
+                sb.sweep_state(self.engine).confirmed.clear()   # the 15-minute trust is spent: verify again
+                self.world.tick(60)
+                if set(reads) >= set(range(700, 760)):
+                    break
+        self.assertLessEqual(passes, 200)   # every held PR read within a bounded cycle (the S4 re-check of 60 PRs takes its half every 15 minutes: slow, never starved)
+        self.assertEqual(set(reads), set(range(700, 760)))
+
+    ONCE_PER_HEAD_MUTANT = ("if once not in state.logged or", "if True or")
+    EDGES = {
+        "cap": ("edge_cap", ("if reads >= SWEEP_READY_READS or", "if False or")),
+        "persistence_round_trip": ("edge_roundtrip", ("state.ready_loaded = True", "state.ready_loaded = True\n        return")),
+        "human_tier_skip": ("edge_human_skip", ("or sweep_ref_keys(d, home, repos_known) & human_keys", "")),
+        "prune_not_held": ("edge_prune", ("if k not in seen", "if False")),
+        "partial_list_keeps": ("edge_partial_list", ("if decisions_whole:", "if True:")),
+        "gate_opens_again": ("edge_gate_opens", ("state.ready.pop(key, None)   # a gate", "pass   # a gate")),
+        "new_head_restarts": ("edge_new_head", ('row["head"] != head', "False")),
+        "unread_drops_the_moment": ("edge_unread_drops", ("state.ready.pop(key, None)   # an unread pass", "pass   # an unread pass")),
+        "charges_real_calls": ("edge_real_calls", ("budget[0] = max(0, budget[0] - max(0, (getattr(engine, \"reading_calls\", 0) or 0) - SWEEP_READY_READ_COST))", "pass")),
+        "unreadable_not_checked": ("edge_unreadable", ("state.s5_unchecked += 1\n            continue\n        state.not_checked_since.pop", "continue\n        state.not_checked_since.pop")),
+        "write_on_change": ("edge_write", ("_write_small(engine.state_dir, SWEEP_READY_FILE", "(lambda *a: None)(engine.state_dir, SWEEP_READY_FILE")),
+        "raised_once_per_head": ("edge_once_per_head", None),
+        "ready_share_of_budget": ("edge_share", ("ready_share = [max(budget[0] // 2,", "ready_share = [max(budget[0],")),
+        "fair_cap_least_recently_read": ("edge_fair_cap", ("todo.sort(key=lambda t: (t[0], t[1]))", "todo.sort(key=lambda t: 0)")),
+        "fair_budget": ("edge_fair_budget", ("(budget is not None and budget[0] < SWEEP_READY_READ_COST)", "False")),
+        "fair_time": ("edge_fair_time", ("or engine.now() - state.started >= SWEEP_PASS_SECONDS:", ":")),
+        "fair_human_skip": ("edge_fair_human", ("or sweep_ref_keys(d, home, repos_known) & human_keys", "")),
+        "fair_partial_list": ("edge_fair_partial", ("if decisions_whole else []", "if True else []")),
+        "fair_unreadable": ("edge_fair_unreadable", ("state.ready_read[key] = state.read_seq", "pass")),
+    }
+
+    def test_986_the_edge_paths_of_the_ready_pass(self):
+        for name, (method, _) in self.EDGES.items():
+            self.setUp()
+            getattr(self, method)(None)
+
+    def test_986_each_edge_path_has_a_mutant_that_fails(self):
+        for name, (method, mutant) in self.EDGES.items():
+            if mutant is None:   # once per head: the confirmation window that keeps a finding from being raised again
+                mutant = self.ONCE_PER_HEAD_MUTANT
+            self.setUp()
+            with self.assertRaises(AssertionError, msg=name):
+                getattr(self, method)(mutant)
 
     def test_s5_ref_keys_read_both_spellings_and_an_ambiguous_short_name_resolves_nowhere(self):
         keys = lambda d, repos=("acme/api",): sb.sweep_ref_keys(d, "acme/api", list(repos))
@@ -34360,7 +35220,7 @@ class TestRecordingCommands(LedgerBase):
 
     def test_a_command_that_reaches_a_ledger_append_is_a_recording_command_or_named_exempt(self):
         """Derived from the code: every `cmd_*` function that reaches a `plan_ledger.append_*` call, through the module's own functions, is marked or exempt."""
-        tree = ast.parse(SWITCHBOARD.read_text(encoding="utf-8"))
+        tree = ast.parse(switchboard_source())   # the whole daemon: the entry and every part
         funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
         def called(node):
             names = set()
@@ -34476,7 +35336,7 @@ class TestRecordingCommands(LedgerBase):
         flocks_outside = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "flock"
                           and not (helper.lineno <= n.lineno <= helper.end_lineno)]
         self.assertEqual(flocks_outside, [], "a ledger wait outside `_lock_exclusive` has no bound")
-        text = SWITCHBOARD.read_text(encoding="utf-8")
+        text = switchboard_source()   # the whole daemon: the entry and every part
         functions = {n.name: n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef)}
         bad = []
         for name in ("run_recording", "cmd_prove", "cmd_verdict", "cmd_review", "_ledger_context", "_record", "_head_of"):
@@ -35333,6 +36193,226 @@ class TestCarriesLine(LedgerBase):
         mutant = lambda floor, state, pr, dep_pr: dict(floor, cleared=True, clear_head=None, names_both=True, rehold=None)
         with mock.patch.object(sb, "floor_for_carries", mutant), self.assertRaises(AssertionError):
             self.checks()
+
+
+class RecFacts(dict):
+    """(#986) A facts mapping that RECORDS every key touched, by any spelling; an access it cannot attribute to a key records '*'."""
+
+    seen = None   # set by the test: the one shared set of keys
+    quiet = False   # true while the proxy is built from a picture: that copy is not a read
+
+    def _note(self, key):
+        if not RecFacts.quiet:
+            RecFacts.seen.add(key)
+
+    def __getitem__(self, key):
+        self._note(key)
+        return dict.__getitem__(self, key)
+
+    def __setitem__(self, key, value):
+        self._note(key)
+        dict.__setitem__(self, key, value)
+
+    def __delitem__(self, key):
+        self._note(key)
+        dict.__delitem__(self, key)
+
+    def __contains__(self, key):
+        self._note(key)
+        return dict.__contains__(self, key)
+
+    def get(self, key, default=None):
+        self._note(key)
+        return dict.get(self, key, default)
+
+    def pop(self, key, *default):
+        self._note(key)
+        return dict.pop(self, key, *default)
+
+    def setdefault(self, key, default=None):
+        self._note(key)
+        return dict.setdefault(self, key, default)
+
+    def update(self, *a, **k):
+        RecFacts.seen.update(dict(*a, **k))
+        RecFacts.seen.add("*")
+        dict.update(self, *a, **k)
+
+    def _star(self):
+        if not RecFacts.quiet:
+            RecFacts.seen.add("*")
+
+    def items(self):
+        self._star()
+        return dict.items(self)
+
+    def keys(self):
+        self._star()
+        return dict.keys(self)
+
+    def values(self):
+        self._star()
+        return dict.values(self)
+
+    def __iter__(self):
+        self._star()
+        return dict.__iter__(self)
+
+    def copy(self):
+        self._star()
+        return RecFacts(dict.copy(self))
+
+    def __or__(self, other):
+        self._star()
+        return dict.__or__(self, other)
+
+    def __reversed__(self):
+        self._star()
+        return dict.__reversed__(self)
+
+    def __eq__(self, other):
+        self._star()
+        return dict.__eq__(self, other)
+
+    __hash__ = None
+
+    def __repr__(self):
+        self._star()
+        return dict.__repr__(self)
+
+
+class TestFactsReadAtRunTime(TestCarriesLine):
+    """(#986) The fact keys the gate path reads are derived at RUN TIME: the real `gates` and the real sweep reading run with every facts mapping replaced by a recording proxy,
+    over fixtures that drive every gate; the recorded keys must be rows of the docs table. A static scan by name cannot be complete; this cannot be bypassed by a spelling."""
+
+    for _name in [n for n in dir(TestCarriesLine) if n.startswith("test")]:
+        locals()[_name] = None   # the carrying tests are TestCarriesLine's own; only the fixtures are shared
+    del _name
+
+    SIX = (("plan_ledger", "evaluate_gates"), ("plan_ledger", "carried_rows"), ("sb", "_ledger_context"), ("sb", "pr_picture"), ("sb", "sweep_gate_reading"), ("sb", "carries_context"))
+    NOT_FACT_KEYS = {"facts", "now", "pr", "entries", "plan", "plan_problem", "ledger_problem", "unreadable"}   # table rows that are arguments or context fields, never keys of the facts mapping
+
+    def scenarios(self):
+        """(label, setup): each fixture changes the baseline (a carrying pull request, its plan and the dependency) and is undone by the next call of setUp."""
+        def proven():
+            self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+            self.record(self.DEP, self.DEP_HEAD, plan_ref="acme/app#8")
+        return (
+            ("carries, nothing proven (waiting/missing, pending)", lambda: None),
+            ("carries, everything proven (ok)", proven),
+            ("carries, the dependency's head is not in the branch (refused)", lambda: setattr(self, "compare_status", "diverged")),
+            ("carries, the dependency is closed", lambda: self.dep.update(state="CLOSED")),
+            ("carries, the dependency has no plan", lambda: self.dep.update(body="canon: updated the docs")),
+            ("carries, the dependency is merged (an ordinary pull request)", lambda: self.dep.update(state="MERGED")),
+            ("carries, the dependency cannot be read", lambda: self.dep.update(state=None)),
+            ("a held pull request, ci red, body without canon (captain, missing)", lambda: self.pr.update(body="PLAN: acme/app#7\n", labels=[{"name": "merge-captain"}], statusCheckRollup=[{"conclusion": "FAILURE", "status": "COMPLETED"}])),
+            ("a draft with no ci run", lambda: self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", isDraft=True, statusCheckRollup=[])),
+            ("a body that is not text", lambda: self.pr.update(body=7)),
+            ("no plan named", lambda: self.pr.update(body="canon: updated the docs")),
+            ("a plan that cannot be fetched", lambda: self.pr.update(body="PLAN: acme/app#99\ncanon: updated the docs")),
+            ("a ready, held pull request with every scenario proven", lambda: (self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "merge-captain"}]), self.record(self.PR, self.HEAD, plan_ref="acme/app#7"))),
+            ("the view is down", lambda: setattr(self, "gh_down", True)),
+        )
+
+    @contextlib.contextmanager
+    def proxied(self, mutant=None):
+        """Every facts mapping of the gate path is a RecFacts: the picture of the pull request, the copy `_ledger_context` makes of it, and what the board and the helpers are handed."""
+        RecFacts.seen = set()
+        real_pic, real_dict = sb.pr_facts_from, dict
+
+        def pic(data):
+            out = real_pic(data)
+            return RecFacts(out) if sys._getframe(1).f_code.co_name == "pr_picture" else out
+
+        class DictHook(type):
+            """`dict` as the daemon module sees it: the same type to isinstance and attributes, and the copy `_ledger_context` makes of the picture is a RecFacts."""
+            def __instancecheck__(cls, obj):
+                return isinstance(obj, real_dict)
+
+            def __getattr__(cls, name):
+                return getattr(real_dict, name)
+
+            def __call__(cls, *a, **k):
+                if sys._getframe(1).f_code.co_name == "_ledger_context" and a and "notice_senders" in k and isinstance(a[0], RecFacts):
+                    RecFacts.quiet = True
+                    try:
+                        return RecFacts(real_dict.copy(a[0]), **k)
+                    finally:
+                        RecFacts.quiet = False
+                return real_dict(*a, **k)
+        copy_ = DictHook("dict", (), {})
+        saved = {}
+        try:
+            with mock.patch.object(sb, "pr_facts_from", pic), mock.patch.object(sb, "dict", copy_, create=True):
+                if mutant:
+                    module, name, line = mutant
+                    target = getattr(sb.plan_ledger if module == "plan_ledger" else sb, name)
+                    scope = target.__globals__
+                    saved = (scope, name, target)
+                    source = textwrap.dedent(inspect.getsource(target))
+                    anchor = self.ANCHOR.get(name)
+                    if anchor is None:
+                        source = TestSweep.with_line(source, line)
+                    else:
+                        self.assertIn(anchor, source)
+                        at = source.index(anchor)
+                        start = source.rindex("\n", 0, at) + 1
+                        source = source[:start] + source[start:at] + line + "\n" + source[start:]
+                    exec(compile(source, "<mutant>", "exec"), scope)
+                yield RecFacts.seen
+        finally:
+            if saved:
+                saved[0][saved[1]] = saved[2]
+
+    def reset(self):
+        self.dep = {"title": "Dep", "state": "OPEN", "headRefOid": self.DEP_HEAD, "reviewDecision": "", "author": {"login": "shared"},
+                    "body": "PLAN: acme/app#8\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                    "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        self.pr = {"title": "Add it", "state": "OPEN", "headRefOid": self.HEAD, "reviewDecision": "", "author": {"login": "shared"},
+                   "body": "PLAN: acme/app#7\nCARRIES: #10\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                   "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        self.compare_status, self.gh_down = "ahead", False
+        for path in self.world.state.glob("plan-ledger*"):
+            path.unlink()
+
+    def drive(self):
+        """Every scenario through the real `gates` and the real sweep reading; the keys recorded (and the star accesses), and that a reading was made."""
+        for label, setup in self.scenarios():
+            self.reset()
+            setup()
+            self.run_as("coder", "gates", self.PR, "--json")
+            engine = sb.build_engine(self.route, self.world.clock.now, "cli", writable=False)[0]
+            sb.sweep_gate_reading(engine, "acme/app", 9, self.world.clock.now())
+
+    def test_986_every_fact_key_recorded_at_run_time_has_a_row_and_every_row_is_reached_or_not_read(self):
+        with self.proxied() as seen:
+            self.drive()
+        rows = TestSweep.docs_fact_rows()
+        self.assertEqual(sorted(seen - rows), [], "a fact the gate path touches that the docs table does not list (a '*' is an access that names no key)")
+        self.assertEqual(sorted(rows - seen - self.NOT_FACT_KEYS), [], "a row no fixture reaches: add a fixture, or drop the row")
+
+    SPELLINGS = (   # a new fact read, in each spelling (F is the facts mapping, C a namespace that carries it as `.facts`)
+        "_z = F.get('zz_new')", "_z = F['zz_new']", "_z = getattr(C, 'facts')['zz_new']", "_z = vars(C)['facts']['zz_new']", "_z = C.__dict__['facts']['zz_new']",
+        "_z = C.facts['zz_new']", "_z = 'zz_new' in F", "_z = list(F.items())", "_z = dict(F)", "_z = (lambda m: m.get('zz_new'))(F)", "_z = {**F}", "_z = [k for k in F]",
+        "_z = list(F.keys())", "_z = list(F.values())", "_z = F.copy()", "_z = list(F)",
+    )
+    ANCHOR = {"evaluate_gates": "authors = authors_of(", "_ledger_context": "source = plan_source_for(", "pr_picture": "body = raw.get(", "sweep_gate_reading": "if ctx.unreadable or not"}   # the first line after which the facts exist
+    CARRIER = {"evaluate_gates": "facts", "carried_rows": "facts", "_ledger_context": "facts", "pr_picture": "facts", "sweep_gate_reading": "ctx.facts", "carries_context": "facts"}
+
+    def mutant_line(self, name, spelling):
+        carrier = "(%s or {})" % self.CARRIER[name]   # None is possible in evaluate_gates: the new read must not be what fails
+        return "C = __import__('types').SimpleNamespace(facts=%s); %s" % (carrier, spelling.replace("F", carrier))
+
+    def test_986_a_new_fact_read_in_any_spelling_in_any_function_fails_the_run_time_test(self):
+        rows = TestSweep.docs_fact_rows()
+        for module, name in self.SIX:
+            for spelling in self.SPELLINGS:
+                with self.proxied((module, name, self.mutant_line(name, spelling))) as seen:
+                    try:
+                        self.drive()
+                    except (KeyError, TypeError, AttributeError):
+                        pass   # a read of a key no fact holds raises: the key was recorded before it did
+                self.assertTrue(seen - rows, (name, spelling))
 
 
 class TestPlanGatesCheck(LedgerBase):
@@ -48561,7 +49641,7 @@ class ReaperOnlyFakes:
 
     def installer_functions(self):
         """The module-level functions the installer's steps call, from the code: a new one must be classified."""
-        tree = ast.parse((REPO / "bin" / "fleet-switchboard").read_text())
+        tree = ast.parse(switchboard_source())   # the entry and every part
         module = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
         installer = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Installer")
         called = {node.func.id for node in ast.walk(installer)
@@ -69703,6 +70783,12 @@ class LightProbe:
     while every other line is told `True`. It changes no code: the same engine, the same fake source, one guard at a time."""
 
     FILE = str(SWITCHBOARD)
+    # the line a file starts at in switchboard_source() (the files are joined with one newline), so a read in a part is told apart by its own file
+    OFFSETS = {}
+    _at = 0
+    for _path in SWITCHBOARD_SOURCE_FILES:
+        OFFSETS[str(_path)] = _at
+        _at += _path.read_text().count("\n") + 1
 
     def __init__(self, flip=()):
         self.flip, self.hits = set(flip), collections.Counter()
@@ -69712,9 +70798,11 @@ class LightProbe:
 
         def get(engine):
             frame = sys._getframe(1)
-            if frame.f_code.co_filename == probe.FILE:
-                probe.hits[frame.f_lineno] += 1
-                if any(lo <= frame.f_lineno <= hi for lo, hi in probe.flip):
+            offset = probe.OFFSETS.get(frame.f_code.co_filename)
+            if offset is not None:
+                line = frame.f_lineno + offset
+                probe.hits[line] += 1
+                if any(lo <= line <= hi for lo, hi in probe.flip):
                     return False
             return engine.__dict__["light"]
 
@@ -71141,7 +72229,7 @@ class TestReviewPostAndDismiss(LedgerBase):
 
     def test_the_marker_has_one_writer_and_the_existing_recording_paths_text_is_unchanged(self):
         self.assertEqual(sb.fleet_mark("rdr1"), "<!-- fleet-switchboard:from=rdr1 -->")
-        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        source = switchboard_source()   # the entry and every part
         self.assertEqual(len(re.findall(r"fleet-switchboard:from=%s", source)), 1)   # the one function that builds the marker
         self.assertEqual(len(re.findall(r"def cmd_review_post", source)), 1)
 
@@ -71366,7 +72454,7 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.assertIn("--review 77", out)
         self.assertTrue(any(p.endswith("&page=2") for p in self.reads))
         self.assertNotIn("latest[author] = (state", (REPO / "shims" / "gh").read_text())   # the rule is not restated in the shim
-        self.assertNotIn("latest[author] = (state", (REPO / "bin" / "fleet-switchboard").read_text())
+        self.assertNotIn("latest[author] = (state", switchboard_source())
 
     # -- the definitions and the documentation (S11)
 
@@ -74791,6 +75879,73 @@ class TestLoadAlert(Base):
         fig = self.latest()["orch"]
         self.assertEqual((fig["busy"], fig["idle"]), (1, 1))
 
+    def _cloud_run(self, patch=None):
+        """#1097 R-TEST-1/2: load_tick over a fake cloud record directory: lane orch has 2 live, 1 finished, 1 stale (past deadline), 1 unreadable record; lane orchb has none."""
+        cdir = self.state_dir / "cloud"
+        cdir.mkdir(exist_ok=True)
+        for n, extra in (("l1", {}), ("l2", {}), ("fin", {}), ("old", {"hard_deadline": "2001-01-01T00:00:00Z"})):
+            (cdir / (n + ".json")).write_text(json.dumps(dict({"worker": n, "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z"}, **extra)))
+        (cdir / "bad.json").write_text("{not json")
+        (self.state_dir / "last-reports.json").write_text(json.dumps({"fin": {"state": "done", "at": self.T0}}))
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        mk = lambda n, role, status="idle", boss=None: types.SimpleNamespace(name=n, session_id=n, status=status, fleet={"role": role, "charter": 1, "repo": "acme/widget", "reports_to": boss})
+        discovery = types.SimpleNamespace(agents={"orch": mk("orch", "orchestrator"), "orchb": mk("orchb", "orchestrator"),
+                                                  "c1": mk("c1", "coder", "working", "orch"), "c2": mk("c2", "coder", "idle", "orch")})
+        if patch:
+            patch()
+        sb.load_tick(engine, discovery)
+        return self.latest()
+
+    def test_the_cloud_figure_is_in_the_load_record_and_the_health_status(self):
+        """Lane with cloud workers (2 live; finished, stale and unreadable records not counted), lane with none (0), local counts apart; the figure is also in the hourly series."""
+        latest = self._cloud_run()
+        self.assertEqual((latest["orch"]["busy"], latest["orch"]["idle"], latest["orch"]["cloud"]), (1, 1, 2))
+        self.assertEqual((latest["orchb"]["busy"], latest["orchb"]["idle"], latest["orchb"]["cloud"]), (0, 0, 0))
+        series = json.loads((self.state_dir / "load.json").read_text())["series"]["orch"]["hours"]
+        self.assertEqual([h["cloud"] for h in series.values()], [2])
+
+    def test_mutant_counting_cloud_as_local_is_caught(self):
+        """Real load_tick over fake discovery and fake cloud records; a spliced mutant that adds cloud workers to busy fails the exact figures."""
+        def figures(latest):
+            return {k: (latest[k]["busy"], latest[k]["idle"], latest[k]["cloud"]) for k in ("orch", "orchb")}
+        self.assertEqual(figures(self._cloud_run()), {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+        source = SWITCHBOARD.read_text()
+        import re as _re
+        body = _re.search(r"def load_tick\(.*?\n\n\n", source, _re.S).group(0)
+        old = '"busy": sum(1 for c in coders if c.status == "working"),'
+        self.assertIn(old, body)
+        scope = dict(vars(sb))
+        exec(body.replace(old, '"busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0),'), scope)
+        real = sb.load_tick
+        def patch():
+            sb.load_tick = scope["load_tick"]
+        try:
+            mutated = figures(self._cloud_run(patch))
+        finally:
+            sb.load_tick = real
+        self.assertEqual(mutated["orch"][0], 3)   # the mutant shows busy 3
+        self.assertNotEqual(mutated, {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+
+    def test_mutant_dropping_the_cloud_count_in_load_tick_is_caught(self):
+        original = sb.live_cloud_by_lane
+        sb.live_cloud_by_lane = lambda *a, **k: {}   # the mutant: the cloud count is dropped
+        try:
+            self.assertEqual(self._cloud_run()["orch"]["cloud"], 0)
+        finally:
+            sb.live_cloud_by_lane = original
+        self.assertEqual(self._cloud_run()["orch"]["cloud"], 2)   # the real build differs from the mutant
+
+    def test_mutant_dropping_the_cloud_figure_in_fleet_health_is_caught(self):
+        health = self.health
+        real = health.figures
+        health.figures = lambda name, info, *a, **k: real(name, dict(info, cloud=0), *a, **k)   # the mutant: health drops cloud
+        try:
+            self.assertEqual(self._cloud_run()["orch"]["cloud"], 0)
+        finally:
+            health.figures = real
+        self.assertEqual(self._cloud_run()["orch"]["cloud"], 2)
+
     def _load_names(self, orchs, retired=None, bodies=None, unreadable=False):
         """Run load_tick over `orchs` ({name: session}) and return the names that got figures."""
         if retired is not None:
@@ -76635,6 +77790,272 @@ class TestSpotlightGuard(Base):
             self.assertIsNone(self.sg.parse_count(odd), odd)
 
 
+class TestCloudLoad(Base):
+    """#1097: the load record counts each lane's live cloud workers apart from the local busy and idle counts."""
+
+    def setUp(self):
+        super().setUp()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.disc = types.SimpleNamespace(agents={"orch": sb.Observation("orch", "s", "w:p", "idle", {"name": "orch", "role": "orchestrator"})})
+
+    def rec(self, name, **extra):
+        directory = self.state_dir / "cloud"
+        directory.mkdir(exist_ok=True)
+        (directory / (name + ".json")).write_text(json.dumps(dict({"worker": name, "reports_to": "orch", "url": "u", "runtime_id": "r", "hard_deadline": "2999-01-01T00:00:00Z"}, **extra)))
+
+    def count(self, fn=None, retired=None, last=None, audit=None):
+        return (fn or sb.live_cloud_by_lane)(self.state_dir, self.disc, retired or {}, last or {}, audit)
+
+    def mutant(self, old, new):
+        import re as _re
+        source = SWITCHBOARD.read_text()
+        body = _re.search(r"def live_cloud_by_lane.*?\n\n\n", source, _re.S).group(0)
+        self.assertIn(old, body)
+        scope = dict(vars(sb))
+        exec(body.replace(old, new), scope)
+        return scope["live_cloud_by_lane"]
+
+    def test_live_workers_counted_by_lane_apart_from_local(self):
+        self.rec("c1"); self.rec("c2"); self.rec("other", reports_to="elsewhere")
+        self.assertEqual(self.count(), {"orch": 2, "elsewhere": 1})
+
+    def test_finished_retired_and_ended_are_not_counted(self):
+        self.rec("fin"); self.rec("ret"); self.rec("old", hard_deadline="2001-01-01T00:00:00Z")
+        self.assertEqual(self.count(retired={"ret": {"at": 1}}, last={"fin": {"state": "done"}}), {})
+
+    def test_no_cloud_directory_is_zero_and_silent(self):
+        self.assertEqual(self.count(), {})
+
+    def test_unreadable_directory_one_audit_line(self):
+        (self.state_dir / "cloud").write_text("not a directory")
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        original = sb.Path.is_dir
+        sb.Path.is_dir = lambda self: True
+        try:
+            self.assertEqual(self.count(audit=audit), {})
+        finally:
+            sb.Path.is_dir = original
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0][1], "load.cloud_unreadable")
+
+    def test_read_is_bounded_and_makes_no_call(self):
+        for i in range(sb.CLOUD_LOAD_MAX_ENTRIES + 5):
+            self.rec("w%03d" % i)
+        calls = []
+        original = sb.subprocess.run
+        sb.subprocess.run = lambda *a, **k: calls.append(a)
+        try:
+            self.assertEqual(self.count()["orch"], sb.CLOUD_LOAD_MAX_ENTRIES)
+        finally:
+            sb.subprocess.run = original
+        self.assertEqual(calls, [])
+
+    def test_mutant_counting_a_finished_worker_is_caught(self):
+        self.rec("fin")
+        broken = self.mutant('(last_reports.get(worker) or {}).get("state") in ("done", "failed")', 'False')
+        self.assertEqual(broken(self.state_dir, self.disc, {}, {"fin": {"state": "done"}}, None), {"orch": 1})   # the mutant differs
+        self.assertEqual(self.count(last={"fin": {"state": "done"}}), {})
+
+    def test_no_boss_worker_counted_under_named_fallback_lane(self):
+        self.rec("c1"); self.rec("lone"); 
+        p = self.state_dir / "cloud" / "lone.json"
+        record = json.loads(p.read_text()); record.pop("reports_to"); p.write_text(json.dumps(record))
+        self.assertEqual(self.count(), {"orch": 1, sb.CLOUD_NO_BOSS_LANE: 1})
+
+    def test_truncation_writes_one_audit_line_per_episode(self):
+        for i in range(sb.CLOUD_LOAD_MAX_ENTRIES + 3):
+            self.rec("w%03d" % i)
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        sb._CLOUD_TRUNCATED.clear()
+        self.count(audit=audit); self.count(audit=audit)
+        self.assertEqual([l[1] for l in lines], ["load.cloud_truncated"])
+        self.assertEqual(lines[0][3]["name"], "CLOUD_LOAD_MAX_ENTRIES")
+        for i in range(10):
+            (self.state_dir / "cloud" / ("w%03d.json" % i)).unlink()
+        self.count(audit=audit)            # the episode ends
+        for i in range(10):
+            self.rec("w%03d" % i)
+        self.count(audit=audit)            # a new episode
+        self.assertEqual(len(lines), 2)
+
+    def test_mutant_silent_truncation_is_caught(self):
+        for i in range(sb.CLOUD_LOAD_MAX_ENTRIES + 3):
+            self.rec("w%03d" % i)
+        broken = self.mutant('"load.cloud_truncated"', '"load.nothing"')
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        sb._CLOUD_TRUNCATED.clear()
+        broken(self.state_dir, self.disc, {}, {}, audit)
+        self.assertNotIn("load.cloud_truncated", [l[1] for l in lines])   # the mutant differs
+        sb._CLOUD_TRUNCATED.clear()
+        self.count(audit=audit)
+        self.assertIn("load.cloud_truncated", [l[1] for l in lines])
+
+    def _raw(self, name, data=b""):
+        d = self.state_dir / "cloud"; d.mkdir(exist_ok=True)
+        (d / name).write_bytes(data)
+
+    def _alarm(self, fn):
+        import signal as _sig
+        def boom(*a):
+            raise AssertionError("the read blocked")
+        old = _sig.signal(_sig.SIGALRM, boom); _sig.alarm(3)
+        try:
+            return fn()
+        finally:
+            _sig.alarm(0); _sig.signal(_sig.SIGALRM, old)
+
+    def _cw_mutant(self, old, new, *more):
+        src = (BIN / "cloud_worker.py").read_text()
+        pairs = [(old, new)] + [(more[i], more[i + 1]) for i in range(0, len(more), 2)]
+        for a, b in pairs:
+            self.assertIn(a, src)
+            src = src.replace(a, b)
+        mod = types.ModuleType("cw_mut")
+        mod.__dict__["__file__"] = str(BIN / "cloud_worker.py")
+        exec(compile(src, "cw_mut", "exec"), mod.__dict__)
+        return mod
+
+    def _with_reader(self, mod, fn):
+        real = sb.load_module
+        sb.load_module = lambda n: mod
+        try:
+            return fn()
+        finally:
+            sb.load_module = real
+
+    def test_fifo_does_not_block(self):
+        self.rec("ok")
+        os.mkfifo(str(self.state_dir / "cloud" / "f.json"))
+        self.assertEqual(self._alarm(self.count), {"orch": 1})
+
+    def test_mutant_blocking_open_is_caught(self):
+        self.rec("ok")
+        os.mkfifo(str(self.state_dir / "cloud" / "f.json"))
+        mod = self._cw_mutant("os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr", "os.O_RDONLY | os.O_NOFOLLOW | getattr")
+        with self.assertRaises(AssertionError):
+            self._with_reader(mod, lambda: self._alarm(self.count))   # the mutant hangs; the alarm fails it
+
+    def test_symlink_is_not_followed(self):
+        self.rec("real", reports_to="orch")
+        d = self.state_dir / "cloud"
+        os.symlink(str(d / "real.json"), str(d / "link.json"))
+        (d / "real.json").write_text(json.dumps({"worker": "link", "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z"}))   # the target names the link's worker
+        self.assertEqual(self.count(), {})   # real.json names "link", not "real": skipped; link.json is a symlink: skipped
+        mod = self._cw_mutant("os.O_NONBLOCK | os.O_NOFOLLOW | getattr", "os.O_NONBLOCK | getattr")
+        self.assertEqual(self._with_reader(mod, self.count), {"orch": 1})   # the mutant follows the link
+
+    def test_hostile_files_are_skipped(self):
+        self.rec("ok")
+        self._raw("huge.json", json.dumps({"worker": "huge", "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z", "pad": "x" * (sb.CLOUD_LOAD_MAX_BYTES + 10)}).encode())
+        self._raw("bin.json", b"\xff\xfe\x00")
+        self._raw("bad.json", b"{not json")
+        self._raw("list.json", b"[1]")
+        (self.state_dir / "cloud" / "dir.json").mkdir()
+        self.assertEqual(self._alarm(self.count), {"orch": 1})
+
+    def test_mutant_unbounded_read_is_caught(self):
+        self._raw("huge.json", json.dumps({"worker": "huge", "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z", "pad": "x" * (sb.CLOUD_LOAD_MAX_BYTES + 10)}).encode())
+        mod = self._cw_mutant("    if len(raw) > max_bytes:\n        return None, \"too_large\"\n", "", "os.read(fd, max_bytes + 1 - len(raw))", "os.read(fd, 1 << 20)")
+        self.assertEqual(self.count(), {})
+        self.assertEqual(self._with_reader(mod, self.count), {"orch": 1})   # no size bound: the huge record is read and counted
+
+    def test_mutant_non_dict_accepted_is_caught(self):
+        self._raw("list.json", b"[1]")
+        mod = self._cw_mutant("    if not isinstance(record, dict):\n        return None, \"wrong_shape\"\n", "")
+        with self.assertRaises(Exception):
+            self._with_reader(mod, self.count)   # the mutant passes a list on, and the caller breaks on it
+        self.assertEqual(self.count(), {})
+
+    def test_mutant_non_utf8_and_bad_json_and_directory_are_caught(self):
+        self.rec("ok")
+        self._raw("bin.json", b"\xff")
+        (self.state_dir / "cloud" / "dir.json").mkdir()
+        self._raw("bad.json", b"{")
+        for pair in (("    except UnicodeDecodeError:\n        return None, \"not_utf8\"", "    except UnicodeDecodeError:\n        raise RuntimeError('x')"),
+                         ("    except (ValueError, RecursionError):\n        return None, \"not_json\"", "    except RecursionError:\n        return None, \"not_json\""),
+                         ("    except OSError:\n        return None, \"not_regular\"\n    finally", "    except OSError:\n        raise\n    finally",
+                          "        if not stat.S_ISREG(os.fstat(fd).st_mode):\n            return None, \"not_regular\"\n", "")):
+            mod = self._cw_mutant(*pair)
+            try:
+                got = self._with_reader(mod, self.count)
+            except Exception:
+                continue   # the mutant breaks the pass: caught
+            self.assertNotEqual(got, {"orch": 1}, pair[0][:40])   # or loses the good record: caught
+        self.assertEqual(self.count(), {"orch": 1})
+
+    def test_record_without_valid_hard_deadline_is_not_live(self):
+        self.rec("a"); self.rec("b", hard_deadline="garbage"); self.rec("c", last_report_at="2001-01-01T00:00:00Z")
+        d = self.state_dir / "cloud"
+        r = json.loads((d / "a.json").read_text()); r.pop("hard_deadline"); (d / "a.json").write_text(json.dumps(r))
+        self.assertEqual(self.count(), {})
+        self.rec("fresh")
+        self.assertEqual(self.count(), {"orch": 1})
+        broken = self.mutant("if ends is None or ends < now:", "if ends is not None and ends < now:")
+        self.assertEqual(broken(self.state_dir, self.disc, {}, {}, None), {"orch": 3})   # the mutant counts the evidence-free records a and b with the fresh one
+
+    def test_scan_stops_at_the_files_bound_and_the_time_bound(self):
+        for i in range(20):
+            self.rec("w%02d" % i)
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        old = sb.CLOUD_LOAD_MAX_SCAN
+        try:
+            sb.CLOUD_LOAD_MAX_SCAN = 5; sb._CLOUD_TRUNCATED.clear()
+            self.assertLessEqual(self.count(audit=audit).get("orch", 0), 5)
+            self.assertEqual(lines[-1][3]["bound"], "files")
+            sb.CLOUD_LOAD_MAX_SCAN = 10 ** 6; sb._CLOUD_TRUNCATED.clear()
+            ticks = iter(range(0, 1000))
+            out = sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, audit, None, lambda: next(ticks) * 0.3)
+            self.assertLess(out.get("orch", 0), 20)
+            self.assertEqual(lines[-1][3]["bound"], "time")
+            broken = self.mutant("if clock() > deadline:", "if False:")
+            sb._CLOUD_TRUNCATED.clear(); ticks = iter(range(0, 1000))
+            self.assertEqual(broken(self.state_dir, self.disc, {}, {}, audit, None, lambda: next(ticks) * 0.3), {"orch": 20})
+        finally:
+            sb.CLOUD_LOAD_MAX_SCAN = old
+
+    def test_load_line_text_carries_the_cloud_mark(self):
+        fh = sb.load_fleet_health()
+        src = (BIN / "fleet_health.py").read_text()
+        self.assertIn("\\u2601 cloud", src)
+        self.assertIn('(" +%d\\u2601 cloud" % f["cloud"]) if f.get("cloud")', src)
+
+    def test_a_boss_with_control_characters_is_cleaned_at_the_source_and_a_non_string_is_no_boss(self):
+        self.rec("e", reports_to="a\x1b[31mb\nc"); self.rec("l", reports_to="x" * 500); self.rec("n", reports_to=["orch"]); self.rec("i", reports_to=7)
+        out = self.count()
+        self.assertEqual(out["a[31mbc"], 1)
+        self.assertEqual(out["x" * sb.CLOUD_BOSS_MAX], 1)
+        self.assertEqual(out[sb.CLOUD_NO_BOSS_LANE], 2)
+        self.assertTrue(all(k.isprintable() and len(k) <= sb.CLOUD_BOSS_MAX for k in out))
+        mutant = self.mutant("_cloud_boss(record.get(\"reports_to\"))", "str(record.get(\"reports_to\") or \"\")")   # the mutant: the raw string is the key
+        self.assertNotEqual(self.count(mutant), out)
+
+    def test_a_future_dated_last_report_is_not_fresh(self):
+        self.rec("f", last_report_at="2998-01-01T00:00:00Z")
+        self.assertEqual(self.count(), {})
+        mutant = self.mutant("seen is None or seen > now or", "seen is None or")
+        self.assertEqual(mutant(self.state_dir, self.disc, {}, {}, None), {"orch": 1})
+
+    def test_a_cloud_worker_with_no_orchestrator_lane_is_shown_in_status(self):
+        fh = sb.load_fleet_health()
+        src = (BIN / "fleet_health.py").read_text()
+        self.assertIn('state.get("cloud_unplaced")', src)
+        self.assertIn('state["cloud_unplaced"] = int(getattr(ctx, "cloud_unplaced", 0) or 0)', src)
+        import tempfile
+        d = tempfile.mkdtemp()
+        (Path(d) / "load.json").write_text(json.dumps({"latest": {"o": {"open_asks": 0, "stalled": 0, "oldest_stall_hours": None, "moved_1h": 0, "messages": 0, "decisions": 0, "busy": 0, "idle": 0}}, "cloud_unplaced": 2}))
+        lines = fh.status_lines(d, 1000)
+        self.assertTrue(any("2 live cloud worker(s) with no orchestrator lane" in l for l in lines), lines)
+
+    def test_now_is_injected(self):
+        self.rec("w", hard_deadline="2030-01-01T00:00:00Z")
+        self.assertEqual(self.disc and sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0 - 86400 * 365 * 5), {"orch": 1})
+        self.assertEqual(sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0), {})   # 2030-01-01T00:00:01Z
+
+
 class TestCoderBooks(Base):
     """#549: a coder finished (retired, or its final report made) is on the books but not counted among a workspace's coders."""
 
@@ -78272,19 +79693,19 @@ class TestOwnerClearModule(unittest.TestCase):
             self.assertIs(getattr(sb, name).__globals__, vars(sb), name + " runs in the daemon's own globals, as before the move")
 
     def test_s5_s7_none_of_the_moved_functions_is_defined_in_the_daemon_file_and_one_registration_names_the_module(self):
-        source = self.daemon.read_text()
+        source = switchboard_source()   # the entry and every part: a moved function defined in any of them is named
         self.assertEqual(self.defined(source) & set(self.module.MOVED), set())
         self.assertEqual(source.count('load_module("impact_hold").bind('), 1)
 
     def test_s7_a_moved_function_copied_back_into_the_daemon_is_named(self):
         name = self.module.MOVED[0]
-        copied = self.daemon.read_text() + "\n\ndef %s(*args):\n    return None\n" % name
+        copied = switchboard_source() + "\n\ndef %s(*args):\n    return None\n" % name
         self.assertEqual(sorted(self.defined(copied) & set(self.module.MOVED)), [name])
 
     def test_s3_no_code_outside_the_matrix_names_a_top_tier_path_as_a_literal(self):
         import ast
         listed = {g for globs in self.matrix["owner_hold"]["top_tier_paths"].values() for g in globs}
-        files = sorted(BIN.glob("*.py")) + [self.daemon]
+        files = sorted(BIN.glob("*.py")) + list(SWITCHBOARD_SOURCE_FILES)   # the entry and every part, from the one list
         hits = []
         for path in files:
             for node in ast.walk(ast.parse(path.read_text())):
@@ -79478,7 +80899,7 @@ class TestAdoption(LanesCase):
         return found
 
     def sites(self):
-        names = ["bin/fleet-switchboard"] + sorted(str(p.relative_to(REPO)) for p in (REPO / "bin").glob("*.py"))
+        names = [str(p.relative_to(REPO)) for p in SWITCHBOARD_SOURCE_FILES] + sorted(str(p.relative_to(REPO)) for p in (REPO / "bin").glob("*.py"))   # the entry and every part, from the one list
         return self.scan({rel: (REPO / rel).read_text() for rel in names})
 
     def test_every_reader_of_a_workers_boss_is_in_the_table_and_the_table_has_no_stale_member(self):   # S15
@@ -87717,7 +89138,7 @@ class TestAssembler(unittest.TestCase):
         self.assertEqual(lines[0], "fleet-switchboard")
 
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py", "part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -87766,7 +89187,7 @@ class TestAssembler(unittest.TestCase):
         self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py"])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py"])
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
 
@@ -88733,6 +90154,67 @@ class TestAskIssueSubject(unittest.TestCase):
         self.run_cmd("cmd_prove", scenario=["S1"], plan="acme-org/widget-service#5")   # another plan
         self.assertEqual(self.entries(), [])
 
+    def same_number(self, as_pull_request):
+        """Issue 9 and pull request 9 of one repository are ONE number: the read of `issues/9` answers as the issue or as the pull request (as GitHub does)."""
+        plain = self.api
+        self.nine = {"user": {"login": "human"}, "body": "## Intent\nreport it\nDone when: reported\n", "state": "open", "labels": [],
+                     "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/1000"}
+        self.pages["repos/%s/issues/9/comments?per_page=100&page=1" % self.REPO] = [{"id": 6, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}]
+
+        def api(path, repo=None):
+            if path == "repos/%s/issues/9" % self.REPO:
+                return dict(self.nine, pull_request={"url": "x"}) if as_pull_request[0] else self.nine
+            return plain(path, repo)
+        self.api = api
+
+    def test_x1_a_pull_request_of_the_number_of_an_issue_is_refused_by_name_and_writes_nothing(self):
+        self.same_number([True])
+        code, why, out, err = self.prove("S1", subject=self.PR)          # as an ask: it is no ask, so no record binds to the plan comment of the number
+        self.assertIsNone(code)
+        self.assertNotIn("recorded #", out + err)
+        self.assertEqual(self.entries(), [])
+        code, why, out, err = self.run_cmd("cmd_item_prove", item=self.PR)    # as a work item: refused by name
+        self.assertIsNone(code)
+        self.assertEqual((why or "").count("is a pull request"), 1, why)
+        self.assertEqual(self.entries(), [])
+
+    def test_x2_a_verdict_on_issue_9_is_not_seen_by_pull_request_9(self):
+        mode = [False]
+        self.same_number(mode)
+        self.assertEqual(self.prove("S1", subject=self.PR)[0], sb.EXIT_OK)
+        self.assertEqual(self.judge("S1", subject=self.PR)[0], sb.EXIT_OK)
+        self.assertEqual(len([e for e in self.entries() if e["kind"] == "verdict"]), 1)    # the issue sees 1
+        mode[0] = True
+        self.pr_readable = True
+        report = json.loads(self.run_cmd("cmd_gates", subject=self.PR, json=True)[2])
+        self.assertEqual(report["head"] if "head" in report else self.HEAD, self.HEAD)
+        seen = [e for e in self.entries() if e["kind"] == "verdict" and e["head"] == self.HEAD]
+        self.assertEqual(len(seen), 0)                                                       # the pull request sees 0
+        g1 = next(g for g in report["gates"] if g["gate"] == "G1")
+        self.assertIn("S1", " ".join(g1["missing"]))
+
+    def test_x3_mutant_that_removes_the_pull_request_refusal_records_on_it(self):
+        self.same_number([True])
+        real = sb.item_issue
+
+        def mutant(engine, repo, number):
+            data = engine.intents._api("repos/%s/issues/%d" % (repo, number), repo)
+            return real(types.SimpleNamespace(intents=types.SimpleNamespace(_api=lambda *a: {k: v for k, v in data.items() if k != "pull_request"})), repo, number)
+        with mock.patch.object(sb, "item_issue", mutant):
+            self.assertEqual(self.prove("S1", subject=self.PR)[0], sb.EXIT_OK)
+        self.assertEqual(len(self.entries()), 1)       # test_x1 fails on it: it wants a refusal and 0 rows
+
+    def test_x3_mutant_that_reads_an_issues_record_as_the_pull_requests_sees_one(self):
+        mode = [False]
+        self.same_number(mode)
+        self.prove("S1", subject=self.PR), self.judge("S1", subject=self.PR)
+        mode[0] = True
+        self.pr_readable = True
+        self.HEAD = sb.plan_ledger.ask_head(self.hash)     # the mutant: the pull request's head IS the issue's plan head, so the issue's record is read as its own
+        report = json.loads(self.run_cmd("cmd_gates", subject=self.PR, json=True)[2])
+        g1 = next(g for g in report["gates"] if g["gate"] == "G1")
+        self.assertNotIn("S1", " ".join(g1["missing"]))   # test_x2 fails on it: it wants S1 missing
+
 
 class TestNoPaneToJudge(StandInPids, Base):
     """#1181: a row with no pane to judge (kind cloud or orchestrator, or an endpoint and no pane) is alive or unknown, never dead."""
@@ -88827,7 +90309,7 @@ class TestNoPaneToJudge(StandInPids, Base):
             self.assertEqual(self.readers_without_the_predicate(source, exempt=self.READER_FUNCTIONS), [], name)
         reconcile = (BIN / "agent_reconcile.py").read_text()
         self.assertIn("no_pane_to_judge", reconcile)
-        self.assertGreaterEqual(len(self.readers_with(( BIN / "fleet-switchboard").read_text())), 4)
+        self.assertGreaterEqual(len(self.readers_with(switchboard_source())), 4)   # the entry and every part
 
     def readers_with(self, source):
         import ast
@@ -88870,7 +90352,7 @@ class TestNoPaneToJudge(StandInPids, Base):
         return sorted(out)
 
     def test_every_guard_block_holds_the_predicate_or_is_in_the_exact_exemption_table(self):
-        source = (BIN / "fleet-switchboard").read_text()
+        source = switchboard_source()   # the entry and every part
         hb = (BIN / "fleet-heartbeat").read_text()
         exempt = set(self.READER_FUNCTIONS)
         got = self.blocks_without_the_predicate(source, exempt_functions=exempt)
@@ -88989,7 +90471,7 @@ class TestNoPaneToJudge(StandInPids, Base):
             self.assertEqual(self.live.check("platform", row, 0.3, lambda n, l: True)["verdict"], "alive")   # the mutant: the real test above forbids this
 
     def test_mutant_the_pass_calling_the_check_again_is_caught(self):
-        source = (BIN / "fleet-switchboard").read_text()
+        source = switchboard_source()   # the entry and every part
         self.assertNotIn("endpoint_liveness", source)
         self.assertNotIn("row_liveness", source)
 
@@ -89076,6 +90558,223 @@ class TestNoPaneToJudge(StandInPids, Base):
         body = section[1].split("\n## ", 1)[0]
         for phrase in ("no_pane_to_judge", "alive", "unknown", "cloud:<agent name>"):
             self.assertIn(phrase, body)
+
+
+
+class TestArchTools(unittest.TestCase):
+    """The two move tools (S0 of #1092): `arch-split-check` reads the surface of the daemon as its own entry assembles it, and `arch-part-cut` never overwrites a part."""
+
+    def tool(self, name, *args):
+        return subprocess.run([sys.executable, "-B", str(REPO / "tools" / name)] + [str(a) for a in args], capture_output=True, text=True)
+
+    def test_the_surface_of_the_daemon_is_read_as_its_entry_assembles_it_not_as_a_text_join(self):
+        listed = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+        files = [str(BIN / n) for n in listed]
+        out = Path(tempfile.mkdtemp()) / "surface.txt"
+        self.addCleanup(shutil.rmtree, str(out.parent), True)
+        done = self.tool("arch-split-check", "--write-surface", out, "--after", *files)
+        self.assertEqual(done.returncode, 0, done.stderr[-600:])
+        self.assertEqual(out.read_text().split(), sorted(dir(sb)), "the names the tool reads are the names of the daemon as it loads")
+
+    def test_a_cut_refuses_a_part_name_already_listed_and_a_name_given_twice_and_writes_nothing(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "switchboard").mkdir()
+        entry = "def one():\n    return 1\n\n\ndef two():\n    return 2\n"
+        (root / "entry").write_text(entry)
+        (root / "entry.parts").write_text("# parts\nentry\nswitchboard/taken.py\n")
+        (root / "switchboard" / "taken.py").write_text("KEEP = 1\n")
+        common = ["--entry", root / "entry", "--manifest", root / "entry.parts", "--parts-dir", root / "switchboard", "--write"]
+        for cuts, word in ((["taken:1:2"], "already exists"), (["fresh:1:2", "fresh:5:6"], "given twice")):
+            with self.subTest(cuts=cuts):
+                done = self.tool("arch-part-cut", *common, *cuts)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn(word, done.stderr)
+                self.assertEqual((root / "entry").read_text(), entry, "the entry is untouched")
+                self.assertEqual((root / "switchboard" / "taken.py").read_text(), "KEEP = 1\n", "the listed part is not overwritten")
+                self.assertFalse((root / "switchboard" / "fresh.py").exists())
+        done = self.tool("arch-part-cut", *common, "fresh:1:2")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((root / "switchboard" / "fresh.py").read_text(), "def one():\n    return 1\n")
+        self.assertIn("switchboard/fresh.py", (root / "entry.parts").read_text())
+
+    @staticmethod
+    def snapshot(root):
+        return {str(p.relative_to(root)): p.read_bytes() for p in sorted(Path(root).rglob("*")) if p.is_file()}
+
+    def cut_tree(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "switchboard").mkdir()
+        (root / "out").mkdir()
+        (root / "entry").write_text("def one():\n    return 1\n\n\ndef two():\n    return 2\n")
+        (root / "entry.parts").write_text("# parts\nentry\nswitchboard/taken.py\n")
+        (root / "switchboard" / "taken.py").write_text("KEEP = 1\n")
+        (root / "switchboard" / "Mixed.py").write_text("MIXED = 1\n")   # differs from a new name only in case
+        (root / "switchboard" / "exists.py").write_text("EXISTS = 1\n")   # on disk, not in the manifest
+        return root, ["--entry", root / "entry", "--manifest", root / "entry.parts", "--parts-dir", root / "switchboard", "--write"]
+
+    def test_a_cut_refuses_a_traversal_an_outside_name_an_existing_file_and_a_bad_range_and_writes_nothing(self):
+        root, common = self.cut_tree()
+        before = self.snapshot(root)
+        refused = (
+            ("a path traversal", ["../out/esc:1:2"], "lower-case letters"),
+            ("an absolute name", ["/tmp/escape:1:2"], "lower-case letters"),
+            ("a name with a directory", ["sub/x:1:2"], "lower-case letters"),
+            ("a capital", ["Part:1:2"], "lower-case letters"),
+            ("a name that ends in a newline", ["fresh\n:1:2"], "lower-case letters"),
+            ("a name that is only a newline", ["\n:1:2"], "lower-case letters"),
+            ("a name with a leading digit", ["1fresh:1:2"], "lower-case letters"),
+            ("a lookalike name", ["fresh\u200b:1:2"], "lower-case letters"),
+            ("a name that matches an existing file but for case", ["mixed:1:2"], "already exists"),
+            ("an existing file that is not listed", ["exists:1:2"], "already exists"),
+            ("a listed part", ["taken:1:2"], "already exists"),
+            ("a range outside the entry", ["fresh:1:99"], "not inside the entry"),
+            ("a reversed range", ["fresh:6:1"], "not inside the entry"),
+            ("a statement cut in two", ["fresh:1:1"], "cut by"),
+            ("two cuts that overlap", ["a:1:2", "b:2:2"], "overlap"),
+            ("a valid cut then an existing file: the first is not written", ["fresh:1:2", "exists:5:6"], "already exists"),
+            ("a valid cut then a traversal: the first is not written", ["fresh:1:2", "../out/esc:5:6"], "lower-case letters"),
+            ("a spec that is not NAME:FIRST:LAST", ["fresh"], "not NAME:FIRST:LAST"),
+        )
+        for label, cuts, word in refused:
+            with self.subTest(case=label):
+                done = self.tool("arch-part-cut", *common, *cuts)
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertIn("nothing written", done.stderr)
+                self.assertIn(word, done.stderr)
+                self.assertNotIn("Traceback", done.stderr)
+                self.assertEqual(self.snapshot(root), before, "no file changed, no file appeared: the entry, the manifest, the parts and the directory outside")
+
+    def test_a_symlinked_or_outside_parts_directory_is_refused_and_nothing_is_written(self):
+        root, common = self.cut_tree()
+        outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(outside), True)
+        (root / "link").symlink_to(outside)
+        before, outside_before = self.snapshot(root), self.snapshot(outside)
+        for label, parts in (("a symlinked directory", root / "link"), ("a directory outside the manifest's", outside)):
+            with self.subTest(case=label):
+                args = [a for a in common]
+                args[args.index("--parts-dir") + 1] = parts
+                done = self.tool("arch-part-cut", *args, "fresh:1:2")
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertIn("nothing written", done.stderr)
+                self.assertNotIn("Traceback", done.stderr)
+                self.assertEqual(self.snapshot(root), before)
+                self.assertEqual(self.snapshot(outside), outside_before)
+
+    def test_a_cut_that_would_leave_a_decorator_behind_is_refused_and_one_that_takes_it_is_not(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "switchboard").mkdir()
+        entry = "import functools\n\n\n@functools.lru_cache(None)\ndef cached():\n    return 1\n\n\ndef plain():\n    return 2\n"
+        (root / "entry").write_text(entry)
+        (root / "entry.parts").write_text("entry\n")
+        common = ["--entry", root / "entry", "--manifest", root / "entry.parts", "--parts-dir", root / "switchboard", "--write"]
+        before = self.snapshot(root)
+        done = self.tool("arch-part-cut", *common, "fresh:5:6")   # from the def line: the decorator on line 4 stays behind
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("cut by", done.stderr)
+        self.assertEqual(self.snapshot(root), before)
+        done = self.tool("arch-part-cut", *common, "fresh:4:6")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((root / "switchboard" / "fresh.py").read_text(), "@functools.lru_cache(None)\ndef cached():\n    return 1\n")
+
+    def test_a_part_that_does_not_parse_is_a_named_failure_in_the_statement_comparison(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "good.py").write_text("A = 1\n")
+        (root / "bad.py").write_text("def broken(:\n")
+        done = self.split_check([root / "good.py"], [root / "bad.py"], "--no-surface")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("bad.py does not parse", done.stderr)
+        missing = self.split_check([root / "good.py"], [root / "absent.py"], "--no-surface")
+        self.assertNotIn("Traceback", missing.stdout + missing.stderr)
+        self.assertIn("cannot read", missing.stderr)
+
+    def test_a_cut_writes_only_inside_the_parts_directory_and_lists_the_part_relative_to_the_manifest(self):
+        root, common = self.cut_tree()
+        done = self.tool("arch-part-cut", *common, "fresh:1:2")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(sorted(self.snapshot(root)), ["entry", "entry.parts", "switchboard/Mixed.py", "switchboard/exists.py", "switchboard/fresh.py", "switchboard/taken.py"])
+        self.assertEqual((root / "entry.parts").read_text().splitlines()[-1], "switchboard/fresh.py")
+        self.assertEqual(list((root / "out").iterdir()), [])
+
+    def split_check(self, before, after, *flags):
+        return self.tool("arch-split-check", "--before", *before, "--after", *after, *flags)
+
+    def test_a_side_that_cannot_be_loaded_is_a_named_failure_after_the_statement_differences_not_a_traceback(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "a.py").write_text("A = 1\n")
+        (root / "b.py").write_text("B = 2\n")
+        (root / "b_bad.py").write_text("B = undefined_name_here\n")
+        done = self.split_check([root / "a.py", root / "b.py"], [root / "a.py", root / "b_bad.py"])
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("statement removed or changed (before): b.py:1 Assign B", done.stdout)   # the differences come first and name the part
+        self.assertIn("statement added or changed (after): b_bad.py:1 Assign B", done.stdout)
+        self.assertIn("after: cannot load the program (in b_bad.py:1): NameError", done.stdout)
+        self.assertLess(done.stdout.index("statement removed"), done.stdout.index("after: cannot load"))
+        self.assertIn("surface not read", done.stdout)
+
+    def entry_tree(self, with_manifest=True):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        for sibling in BIN.glob("*.py"):
+            shutil.copy(str(sibling), str(root / sibling.name))
+        if with_manifest:
+            copy_entry(root)
+        else:
+            shutil.copy(str(SWITCHBOARD), str(root / "fleet-switchboard"))
+        return root
+
+    def test_a_part_of_the_daemon_that_uses_an_undefined_name_at_load_time_is_named_by_part_and_side(self):
+        root = self.entry_tree()
+        part = root / "switchboard" / "judge.py"
+        part.write_text(part.read_text() + "\nLOAD_TIME_USE = an_undefined_name_at_load_time\n")
+        listed = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+        done = self.split_check([BIN / n for n in listed], [root / n for n in listed])
+        self.assertEqual(done.returncode, 1, done.stdout[-400:] + done.stderr[-400:])
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("statement added or changed (after): judge.py", done.stdout)
+        self.assertIn("after: cannot load the program (in judge.py:", done.stdout)
+        self.assertIn("NameError", done.stdout)
+
+    def test_an_entry_with_no_manifest_beside_it_is_a_named_failure_that_says_how_to_lay_it_out(self):
+        lone = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(lone), True)
+        shutil.copy(str(SWITCHBOARD), str(lone / "fleet-switchboard"))   # the entry alone, as `git show REV:bin/fleet-switchboard > tmp` leaves it
+        done = self.split_check([lone / "fleet-switchboard"], [lone / "fleet-switchboard"])
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("before: cannot load the program", done.stdout)
+        self.assertIn("fleet-switchboard.parts", done.stdout)
+
+    def test_a_file_given_that_is_not_in_the_manifest_beside_the_entry_is_refused_by_name(self):
+        root = self.entry_tree()
+        extra = root / "extra_part.py"
+        extra.write_text("EXTRA = 1\n")
+        listed = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+        done = self.split_check([root / n for n in listed], [root / n for n in listed] + [extra])
+        self.assertEqual(done.returncode, 1, done.stdout[-300:])
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("after: extra_part.py is not in", done.stdout)
+        self.assertIn("would not reach the surface", done.stdout)
+
+    def test_a_hostile_pair_one_statement_dropped_and_one_added_is_named_by_the_statements_and_by_the_surface(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "before.py").write_text("KEEP = 1\n\n\ndef dropped():\n    return 1\n")
+        (root / "after.py").write_text("KEEP = 1\n\n\ndef added():\n    return 1\n")   # the same number of statements: only the multiset differs
+        done = self.split_check([root / "before.py"], [root / "after.py"])
+        self.assertEqual(done.returncode, 1, done.stdout)
+        for line in ("statement removed or changed (before): before.py:4 FunctionDef dropped", "statement added or changed (after): after.py:4 FunctionDef added",
+                     "name only before: dropped", "name only after: added"):
+            self.assertIn(line, done.stdout)
+        same = self.split_check([root / "before.py"], [root / "before.py"])
+        self.assertEqual(same.returncode, 0, same.stdout)
 
 
 if __name__ == "__main__":
