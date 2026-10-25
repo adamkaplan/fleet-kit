@@ -45040,16 +45040,38 @@ class TestPlanReceipts(unittest.TestCase):
         self.assertEqual(sb.plan_check.plan_comment_defects([self.plan(10)]), [])
         self.assertEqual(sb.plan_check.plan_comment_defects([]), [])
 
-    def test_the_defects_reach_the_result_of_load_plan(self):
-        class Reader:
-            def __init__(inner, comments):
-                inner.comments = comments
+    class Reader:
+        def __init__(inner, comments):
+            inner.comments = comments
 
-            def _api(inner, path, repo):
-                return inner.comments if path.split("?")[0].endswith("/comments") else {"body": ""}
+        def _api(inner, path, repo):
+            return inner.comments if path.split("?")[0].endswith("/comments") else {"body": ""}
+
+    def test_the_defects_reach_the_result_of_load_plan(self):
         for comments, ok in (([self.plan(10), self.receipt(11)], True), ([self.plan(10), self.plan(20, day=4)], False)):
-            sb.fetch_plan(Reader(comments), "o/r", 1)
-            self.assertEqual(not sb.PLAN_COMMENT_DEFECTS, ok)
+            defects = sb.fetch_plan(self.Reader(comments), "o/r", 1)[3]
+            self.assertEqual(not defects, ok)
+
+    def test_an_explicit_comment_id_still_reports_a_second_plan_naming_both(self):
+        for explicit in (10, 20):
+            defects = sb.fetch_plan(self.Reader([self.plan(10), self.plan(20, day=4)]), "o/r", 1, explicit)[3]
+            self.assertEqual([d["code"] for d in defects], ["second-plan-comment"])
+            self.assertIn("comment 20", defects[0]["message"])
+            self.assertIn("comment 10", defects[0]["message"])
+
+    def test_no_module_global_holds_the_defects(self):
+        self.assertFalse(hasattr(sb, "PLAN_COMMENT_DEFECTS"))
+
+    def test_the_route_lookup_reports_a_second_plan_as_a_defect(self):
+        t = TestPlanKind()
+        hub = t.hub([self.plan(10), self.plan(20, day=4)])[0]
+        self.assertEqual(t.kind(hub), "defect")
+        self.assertEqual(t.kind(t.hub([self.plan(10), self.receipt(11)])[0]), "plan")
+
+    def test_mutant_route_lookup_that_skips_the_rule_fails(self):
+        t = TestPlanKind()
+        with mock.patch.object(sb, "second_plan_defects", lambda d: []):
+            self.assertEqual(t.kind(t.hub([self.plan(10), self.plan(20, day=4)])[0]), "plan")   # the test above fails on it
 
     def documents(self):
         texts = {"skill": (REPO / "skills" / "fleet-planning" / "SKILL.md").read_text(), "template": (REPO / "docs" / "plan-template.md").read_text()}
@@ -92486,6 +92508,22 @@ class TestAskIssueSubject(unittest.TestCase):
         with mock.patch.object(sb, "ask_plan_comment", lambda *a: "x"):
             self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)
         self.assertEqual(len(self.entries()), 1)    # the refusal test above fails on it
+
+    def test_a_second_plan_looking_comment_refuses_prove_and_verdict_naming_both(self):
+        self.pages = {"repos/%s/issues/1130/comments?per_page=100&page=1" % self.REPO: [
+            {"id": 5, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}, {"id": 8, "created_at": "2026-01-02", "body": "## Plan (scenarios): y\n"}]}
+        for command in ("prove", "judge"):
+            code, why, _, _ = getattr(self, command)("S1")
+            self.assertIsNone(code)
+            self.assertIn("comment 8", why)
+            self.assertIn("comment 5", why)
+        self.assertEqual(self.entries(), [])
+
+    def test_s6_mutant_ask_path_that_skips_the_second_plan_rule_records(self):
+        self.pages = {"repos/%s/issues/1130/comments?per_page=100&page=1" % self.REPO: [
+            {"id": 5, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}, {"id": 8, "created_at": "2026-01-02", "body": "## Plan (scenarios): y\n"}]}
+        with mock.patch.object(sb, "second_plan_defects", lambda d: []):
+            self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)    # the refusal test above fails on it
 
     def refused_everywhere(self, needle):
         for command in ("prove", "judge"):

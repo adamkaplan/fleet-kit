@@ -4460,6 +4460,14 @@ and the text of `send`, `report`, `remind`, `notice` and `intent` messages is ne
 - The subject is resolved in one place, `ask_subject`, called by `_ledger_context`; a pull request is resolved exactly as before.
 - A record is bound to the plan hash of the plan comment on the issue (the newest `Plan (scenarios)` comment). It names the issue where a pull request's record names the head; the stored head is the first 40 hex digits of the plan hash.
 - An issue with no plan comment is refused with the reason ("it has no plan comment"), and nothing is recorded. A record is VOID when the plan hash changed after it ("plan changed" in `gates`), as a pull request's is when its head moves.
+- A second plan-looking comment (#978) is a defect on every path that reads the plan, and the defect names both comment ids. `plan check` reports it (also when a `#issuecomment-ID` is named). `prove`, `verdict` and `gates` on an ask issue refuse. The route lookup reads the issue as `defect`.
+
+**Plan receipts (#978): what the checks do not do.**
+
+- A receipt's hash is only format-checked. It is not compared with the real hash of the canonical comment.
+- The "carries plan text" detection is narrow. A scenario table in prose of 3 to 6 lines passes.
+- The receipt author is not checked.
+- The brief-template sentence went into the reviewer lane brief (`plan_review`), not into the `agents/*` briefs.
 - An issue is an ask only when it is OPEN, has `## Intent` with a `Done when:` line, does not carry the `<user>:orchestrator` label and has a parent issue (a charter has none). Otherwise `prove`, `verdict`, `gates` and `gates ask-close` refuse with that reason and record nothing. The author of the ask may not record a verdict on it (as a pull request's author may not); `prove` stays the author's step.
 - If the issue itself cannot be read, the subject falls back to the pull request path and is refused there (it fails closed). Subject forms: `owner/repo#N` (any repository) resolves to the issue; a bare `N`, `#N` and an issue URL are refused with a named reason, and a pull request URL stays a pull request.
 - `gates <issue>` reads the records like a pull request's: scenarios proven and judged.
