@@ -56039,14 +56039,14 @@ class TestDecisionsPanelLayout(Base):
 
     def test_an_entry_is_its_headline_in_two_lines_at_most_then_id_and_age(self):
         entry = self.r["entry"]
-        self.assertEqual(entry["head"], "api#2 1h30m")
+        self.assertEqual(entry["head"], "❔ api#2 1h30m")
         self.assertEqual(len(entry["lines"]), 2)
         self.assertTrue(entry["lines"][1].endswith("\u2026"))
         self.assertNotIn("RAW", " ".join(entry["lines"]))  # the headline, not the raw title
         self.assertEqual(self.r["noHeadline"]["lines"], ["only a title"])  # an older daemon's file: the title
 
     def test_a_folded_report_names_its_agent_on_the_id_line(self):
-        self.assertEqual(self.r["via"], "web#7 10m coder")
+        self.assertEqual(self.r["via"], "❔ web#7 10m coder")
 
     def test_entries_are_separated_thinly_and_repos_and_sections_heavily(self):
         lines = self.r["lines"]
@@ -56054,8 +56054,8 @@ class TestDecisionsPanelLayout(Base):
         self.assertEqual(lines[:3], ["Decisions (6) all", heavy, "Waits on you (4)"])
         self.assertEqual(lines.count(thin), 1)  # only the two web entries of the first section share a repo
         at = lines.index(thin)
-        self.assertEqual(lines[at - 2:at + 3], ["web for you", "web#7 10m coder", thin, "second for you", "web#8 5m"])
-        self.assertEqual(lines.index("Waits on cos (1, 0 over 1h)") - 1, lines.index(heavy, lines.index("web#8 5m")))
+        self.assertEqual(lines[at - 2:at + 3], ["web for you", "❔ web#7 10m coder", thin, "second for you", "❔ web#8 5m"])
+        self.assertEqual(lines.index("Waits on cos (1, 0 over 1h)") - 1, lines.index(heavy, lines.index("❔ web#8 5m")))
         self.assertTrue(all(len(x) <= 34 for x in lines))
 
     def test_the_tui_draws_the_sections_and_the_rules(self):
@@ -57916,11 +57916,11 @@ class TestHeadsUpPanelLayout(Base):
         e = self.r["entries"]["pr:web#9"]
         self.assertEqual(e["lines"], ["web#9 Add the retry budget to the", "client"])
         self.assertEqual(e["facts"], ["+120/-14, 5 files, CI failing, no", "review"])
-        self.assertEqual(e["head"], "pr:web#9 12m")
+        self.assertEqual(e["head"], "🔀 pr:web#9 12m")
         lines = self.r["humanLines"]
-        at = lines.index("pr:web#9 12m")
+        at = lines.index("🔀 pr:web#9 12m")
         self.assertEqual(lines[at - 4:at + 1], ["web#9 Add the retry budget to the", "client",
-                                               "+120/-14, 5 files, CI failing, no", "review", "pr:web#9 12m"])
+                                               "+120/-14, 5 files, CI failing, no", "review", "🔀 pr:web#9 12m"])
 
     def test_the_headline_is_cut_at_two_lines_and_a_hold_shows_when_it_merges_after_in_utc(self):
         e = self.r["entries"]["pr:api#12"]
@@ -59674,7 +59674,7 @@ class TestPanelCaptainRows(Base):
                 self.assertIn(self.PR, links)
                 self.assertIn("https://github.com/acme-org/widget-host/issues/41", links)
                 self.assertNotIn("https://github.com/acme-org/widget-host/issues/132", links)
-        self.assertEqual(self.r["entry"][1], ["widget-host#132 1d", self.PR])
+        self.assertEqual(self.r["entry"][1], ["🔀 widget-host#132 1d", self.PR])
 
     def test_the_id_is_the_short_ref_and_the_age_is_on_the_line(self):
         for mode in ("plain", "v3"):
@@ -59734,7 +59734,7 @@ r.ageSegs = [30, 3599, 86399, 86400].map((s) => lineWith([mk("web#1", "o/web", "
 r.ageLine = textOf(lineWith([mk("web#1", "o/web", "human", "x", 300)], human, (l) => l.id === "web#1"));
 // PR number coloured by state; the real id is kept on the line
 const prLine = (extra) => lineWith([pr(5, "o/a", 100, extra)], human, (l) => l.id);
-r.prState = [{ ci: "failing", review: "none" }, { ci: "green", review: "approved" }, { ci: "green", review: "none" }, { ci: "pending", review: "none" }].map((e) => prLine(e).segs.map((s) => [s[0].split(" ")[0], s[1]])[0]);
+r.prState = [{ ci: "failing", review: "none" }, { ci: "green", review: "approved" }, { ci: "green", review: "none" }, { ci: "pending", review: "none" }].map((e) => prLine(e).segs.map((s) => [s[0].split(" ")[0], s[1]])[1]);
 r.prId = [prLine({}).id, textOf(prLine({}))];
 // a decision that needs you: two lines, bold headline, id muted
 r.need = rows([mk("a#1", "o/a", "human", "Which database?", 600)], human).slice(-3).map((l) => [textOf(l), l.segs.map((s) => s[1])]);
@@ -59750,7 +59750,7 @@ r.plainFirst = d.viewLines(d.buildView(snap(mix), now, 34, chief)).slice(0, 3);
 // links and control characters
 const linked = rows([mk("web#1", "acme/web", "human", "Q?", 60, { ask: 12 }), pr(5, "acme/web", 60), mk("x#1", "bad repo", "human", "H", 60, { ask: 3 })], human);
 r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
-r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^H$/.test(t));
+r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^\u2754 H$/.test(t));
 const esc = rows([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })], human);
 r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|31m/.test(t));
 // iteration 3
@@ -59809,9 +59809,9 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_the_layout_in_the_chief_of_staffs_view(self):
         self.assertEqual(self.r["chief"], [
             "Decisions                      all", "2 need human \u00b7 3 PRs", "3 on cos (2 over 1h)", " ",
-            "Waits on you", "a", "Pick a cache", "a#2" + " " * 28 + "20m", " ", "Which database?", "a#1" + " " * 28 + "10m", " ",
-            "Heads-up", "a", "#6 Add a thing" + " " * 15 + "1h06m", "#5 Add a thing" + " " * 18 + "1m", " ",
-            "c", "#7 Add a thing" + " " * 18 + "1d", " ",
+            "Waits on you", "a", "❔ Pick a cache", "a#2" + " " * 28 + "20m", " ", "❔ Which database?", "a#1" + " " * 28 + "10m", " ",
+            "Heads-up", "a", "🔀 #6 Add a thing" + " " * 12 + "1h06m", "🔀 #5 Add a thing" + " " * 15 + "1m", " ",
+            "c", "🔀 #7 Add a thing" + " " * 15 + "1d", " ",
             "Waits on cos", "b" + " " * 20 + "3 \u00b7 oldest 1d"])
 
     def test_a_humans_view_has_no_cos_section_only_a_count(self):
@@ -59821,7 +59821,7 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_nothing_empty_is_drawn_and_no_rule(self):
         self.assertEqual(self.r["none"], ["Decisions                  for you", "0 need you", " ", "nothing waiting"])
         self.assertEqual(self.r["onlyCos"][1:], ["1 with cos", " ", "nothing waiting"])
-        self.assertEqual(self.r["onlyPr"][-3:], ["Heads-up", "a", "#5 Add a thing" + " " * 18 + "1m"])
+        self.assertEqual(self.r["onlyPr"][-3:], ["Heads-up", "a", "🔀 #5 Add a thing" + " " * 15 + "1m"])
         for name in ("chief", "human", "none", "onlyPr"):
             for line in self.r[name]:
                 self.assertFalse(set(line) & set("\u2501\u2504"), line)
@@ -59838,12 +59838,13 @@ class TestDecisionsStyledPanel(unittest.TestCase):
         self.assertEqual(self.r["prId"][0], "pr:o/a#5")
 
     def test_what_needs_you_is_two_lines_bold_headline_and_a_quiet_id(self):
-        self.assertEqual(self.r["need"], [["a", ["b"]], ["Which database?", ["b"]], ["a#1|10m", ["m"]]])
+        self.assertEqual(self.r["need"], [["a", ["b"]], ["❔ Which database?", ["", "b"]], ["a#1|10m", ["m"]]])
 
     def test_a_repo_name_is_shortened_only_when_unambiguous(self):
         self.assertIn("acme/web", self.r["clash"])
         self.assertIn("other/web", self.r["clash"])
-        self.assertIn("see #9 and other/web#4 and web#3", self.r["clash"])
+        self.assertIn("❔ see #9 and other/web#4 and", self.r["clash"])
+        self.assertIn("web#3", self.r["clash"])
         self.assertEqual(self.r["tidy"], ["fix web#9, #4.", "web", "true"])
 
     def test_the_states_the_plain_view_has(self):
@@ -59859,11 +59860,11 @@ class TestDecisionsStyledPanel(unittest.TestCase):
         self.assertEqual(self.r["plainFirst"][0], "Decisions (5) all")
 
     def test_every_line_of_an_entry_carries_its_link_and_no_control_character_reaches_a_line(self):
-        self.assertEqual(self.r["links"], [["Q?", "https://github.com/acme/web/issues/12", False],
+        self.assertEqual(self.r["links"], [["❔ Q?", "https://github.com/acme/web/issues/12", False],
                                            ["web#1|1m", "https://github.com/acme/web/issues/12", True],
-                                           ["#5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
-        self.assertEqual(self.r["noLink"], ["bad repo", "H"])
-        self.assertEqual(self.r["ctrl"], ["bad]8;;http://xtitle", "r[31mow"])
+                                           ["🔀 #5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
+        self.assertEqual(self.r["noLink"], ["bad repo", "❔ H"])
+        self.assertEqual(self.r["ctrl"], ["❔ bad]8;;http://xtitle", "r[31mow"])
 
     def test_iteration_3_hues_are_stable_and_glyphs_are_one_cell(self):
         v3 = self.r["v3"]
@@ -59878,12 +59879,12 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_iteration_3_marks_kind_and_state_and_keeps_the_text(self):
         v3 = self.r["v3"]
         by = {t: (st, right) for t, st, right in v3["styles"]}
-        self.assertEqual(by["\u2717 #6 Add a thing" + " " * 0 + "|1h06m"][0][0], "e", "failing: a red glyph")
-        self.assertEqual(by["\u2713 #5 Add a thing|1m"][0][0], "s", "ready: a green glyph")
-        self.assertEqual(by["\u25c6 #7 Add a thing|1d"][0][0], "m", "other: a quiet glyph")
+        self.assertEqual(by["🔀 \u2717 #6 Add a thing|1h06m"][0][1], "e", "failing: a red glyph")
+        self.assertEqual(by["🔀 \u2713 #5 Add a thing|1m"][0][1], "s", "ready: a green glyph")
+        self.assertEqual(by["🔀 \u25c6 #7 Add a thing|1d"][0][1], "m", "other: a quiet glyph")
         for text, (styles, right) in by.items():
-            if text[:1] in "\u2717\u2713\u25c6":
-                self.assertTrue(styles[1].startswith("p"), "the PR number takes the project hue: " + text)
+            if text.startswith("🔀 "):
+                self.assertTrue(styles[2].startswith("p"), "the PR number takes the project hue: " + text)
             if right:
                 self.assertTrue(right[-1].endswith("t"), "the age is italic: " + text)
         self.assertEqual(v3["size"][-1], ["  +900/-100", ["", "a", "m", "r"]], "the size uses the diff colours")
@@ -64138,11 +64139,11 @@ class TestDecisionsPanelOrder(unittest.TestCase):
     def test_the_plain_view_draws_the_order_nested_with_next_and_waits_for(self):
         lines = self.r["plain"]
         at = {name: i for i, name in enumerate(lines)}
-        heads = [l for l in lines if l.strip().startswith("#")]
-        self.assertEqual([h.strip().split(" ")[0] for h in heads], ["#2", "#1", "#3"], "by order, not oldest first")
-        self.assertIn("#2 1d02h \u00b7 next".replace("1d02h", [h for h in heads if h.startswith("#2")][0].split(" ")[1]), lines)
-        blocked = [h for h in heads if h.strip().startswith("#1")][0]
-        self.assertTrue(blocked.startswith("  #1 "), "indented under what it waits for")
+        heads = [l for l in lines if l.strip().startswith("❔ #")]
+        self.assertEqual([h.strip().split(" ")[1] for h in heads], ["#2", "#1", "#3"], "by order, not oldest first")
+        self.assertIn("❔ #2 1d02h \u00b7 next".replace("1d02h", [h for h in heads if h.startswith("❔ #2")][0].split(" ")[2]), lines)
+        blocked = [h for h in heads if h.strip().startswith("❔ #1")][0]
+        self.assertTrue(blocked.startswith("  ❔ #1 "), "indented under what it waits for")
         self.assertTrue(blocked.endswith("\u00b7 waits for #2"))
 
     def test_the_styled_panel_indents_the_blocked_item_and_marks_next_and_cycle(self):
