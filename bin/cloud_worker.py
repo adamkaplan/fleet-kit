@@ -161,6 +161,47 @@ def _read_private(path, limit):
     return raw.decode("utf-8")
 
 
+WATCH_MAX_DEPTH = 64        # the deepest [ / { nesting a cloud record may have (a real record is about 5 deep)
+
+
+class TooDeep(ValueError):
+    """The text nests deeper than WATCH_MAX_DEPTH."""
+
+
+def nesting_too_deep(text, limit=None):
+    """True when `text` nests [ or { deeper than the limit. One iterative pass, O(n), no recursion; brackets inside JSON strings do not count
+    (backslash escapes honoured). Never depends on the interpreter's recursion limit."""
+    limit = WATCH_MAX_DEPTH if limit is None else limit
+    depth, in_string, escaped = 0, False, False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "[" or ch == "{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif ch == "]" or ch == "}":
+            depth -= 1
+    return False
+
+
+def parse_bounded(text):
+    """json.loads of untrusted text with the same depth limit on every Python (the ONE parse of a record the daemon did not write)."""
+    if nesting_too_deep(text):
+        raise TooDeep("nested deeper than %d" % WATCH_MAX_DEPTH)
+    try:
+        return json.loads(text)
+    except RecursionError:   # defence in depth
+        raise TooDeep("recursion limit") from None
+
+
 def read_record_file(path, max_bytes):
     """The ONE safe read of a file in the cloud record directory (#1097, the family of #1073): (record dict, None) or (None, kind). Never blocks (O_NONBLOCK,
     so a FIFO cannot hang the open), never follows a symlink (O_NOFOLLOW), reads only a regular file (fstat), at most max_bytes. Never raises.
@@ -189,8 +230,10 @@ def read_record_file(path, max_bytes):
     except UnicodeDecodeError:
         return None, "not_utf8"
     try:
-        record = json.loads(text)
-    except (ValueError, RecursionError):
+        record = parse_bounded(text)
+    except TooDeep:
+        return None, "too_deep"
+    except ValueError:
         return None, "not_json"
     if not isinstance(record, dict):
         return None, "wrong_shape"
@@ -203,7 +246,7 @@ def load_record(state, name):
     if not path.exists() and not path.is_symlink():
         return None
     try:
-        record = json.loads(_read_private(path, RECORD_MAX))
+        record = parse_bounded(_read_private(path, RECORD_MAX))
     except (OSError, ValueError) as err:
         raise CloudError("the record of %s cannot be read (%s)" % (name, _one(str(err), 80))) from None
     if not isinstance(record, dict) or record.get("worker") != name or any(not isinstance(record.get(k), str) for k in ("url", "runtime_id")):
@@ -278,8 +321,8 @@ def _read_one(path, max_bytes):
     except UnicodeDecodeError:
         return None, "not_utf8"
     try:
-        record = json.loads(text)
-    except RecursionError:
+        record = parse_bounded(text)
+    except TooDeep:
         return None, "too_deep"
     except ValueError:
         return None, "not_json"
@@ -1290,7 +1333,7 @@ def _launch(args, runner, now, reserve):
             options += [CREATE_OPTION[key], str(value)]
     if args.agent == "orchestrator":   # only on request: a worker launch hands the launcher exactly what it always did
         options += [CREATE_OPTION["agent"], args.agent, CREATE_OPTION["boss"], args.reports_to]
-    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip())   # the hub setting
+    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip() or args.agent == "orchestrator")   # the hub setting, or an orchestrator (the launcher registers its entry always: it needs the session)
     if hub and args.agent != "orchestrator":   # a worker joins the hub too: the launcher reads the setting itself, it only needs the boss
         options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
