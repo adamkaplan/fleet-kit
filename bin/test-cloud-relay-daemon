@@ -554,6 +554,67 @@ class RealRuleMutants(unittest.TestCase):
         self.caught("test_same_call_id_two_pods")
 
 
+def load_backend_module(old=None, new=None):
+    """The real cloud_relay_daemon source, optionally with ONE replacement (a mutant of the real code), as a fresh module."""
+    import types
+    src = (BIN / "cloud_relay_daemon.py").read_text()
+    if old is not None:
+        assert src.count(old) == 1, old
+        src = src.replace(old, new)
+    mod = types.ModuleType("cloud_relay_daemon_mut")
+    mod.__file__ = str(BIN / "cloud_relay_daemon.py")
+    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    return mod
+
+
+class RealBackend(unittest.TestCase):
+    """SwitchboardBackend itself, over a stub host (its _ledger_context) and stub parts (engine, state, config)."""
+    REPO = "acme-org/widget-service"
+
+    def backend(self, body="", source="", config=None, mod=relay):
+        import types
+        ctx = types.SimpleNamespace(repo=self.REPO, facts={"body": body}, source=source)
+        host = types.SimpleNamespace(_ledger_context=lambda *a, **k: ctx)
+        return mod.SwitchboardBackend(host, (None, "/nowhere", {} if config is None else config), None, lambda: 1)
+
+    def test_pr_issues_closing_keywords(self):
+        for body, want in (("Closes #7", {7}), ("fixes acme-org/widget-service#7", {7}), ("Resolved: #9 and fixes #3", {9, 3}),
+                           ("fixes other/repo#7", set()), ("closes#7", set()), ("see #7", set()), ("", set()), (None, set())):
+            self.assertEqual(self.backend(body).pr_issues(PR), want, body)
+
+    def test_pr_issues_plan_source_issue(self):
+        self.assertEqual(self.backend("", self.REPO + "#12").pr_issues(PR), {12})
+        self.assertEqual(self.backend("Closes #7", self.REPO + "#12").pr_issues(PR), {7, 12})
+        self.assertEqual(self.backend("", "other/repo#12").pr_issues(PR), set())
+        self.assertEqual(self.backend("", "docs/plan.md").pr_issues(PR), set())
+
+    def test_holder_and_evaluators_fail_closed(self):
+        b = self.backend(config={"relay_holders": {self.REPO + "#7": "widget-api-coder"}, "plan_evaluators": {"tester": ["widget-api-tester"]}})
+        self.assertEqual(b.holder_of(self.REPO, 7), "widget-api-coder")
+        self.assertIsNone(b.holder_of(self.REPO, 8))
+        self.assertEqual(b.evaluators("tester"), ["widget-api-tester"])
+        self.assertEqual(b.evaluators("nobody"), [])
+        for config in ({}, {"relay_holders": None}, {"relay_holders": {}}):
+            self.assertIsNone(self.backend(config=config).holder_of(self.REPO, 7))
+        self.assertEqual(self.backend(config={}).evaluators("tester"), [])
+
+    def test_mutants_of_the_real_regex_and_repo_check_are_caught(self):
+        for old, new in ((r"\s*:?\s+(?:(", r"\s*:?\s*(?:("),
+                         ("if m.group(1) in (None, repo):", "if True:"),
+                         ("if m and m.group(1) == repo:", "if m:")):
+            mod = load_backend_module(old, new)
+            with self.assertRaises(AssertionError, msg=old):
+                for name in ("test_pr_issues_closing_keywords", "test_pr_issues_plan_source_issue"):
+                    case = RealBackend(name)
+                    case.backend = lambda *a, _m=mod, _b=RealBackend.backend, _c=case, **k: _b(_c, *a, mod=_m, **k)
+                    getattr(case, name)()
+        mod = load_backend_module('.get("%s#%s" % (repo, issue))', '.get("%s#%s" % (repo, issue), "widget-api-coder")')
+        with self.assertRaises(AssertionError):
+            case = RealBackend("test_holder_and_evaluators_fail_closed")
+            case.backend = lambda *a, _b=RealBackend.backend, **k: _b(case, *a, mod=mod, **k)
+            case.test_holder_and_evaluators_fail_closed()
+
+
 class ReplyHygiene(Fixture):
     def test_plan_and_ledger_errors_are_fixed_reasons_with_detail_in_audit(self):
         self.proved()
