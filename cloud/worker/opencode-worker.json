@@ -1,5 +1,6 @@
 {
   "permission": {
+    "question": "deny",
     "bash": {
       "*": "allow",
       "gh pr merge*": "deny",
@@ -148,6 +149,7 @@
   "agent": {
     "worker": {
       "permission": {
+        "question": "deny",
         "bash": {
           "*": "allow",
           "gh pr merge*": "deny",
