@@ -1788,7 +1788,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
 
     def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
         registered = {type(s).__name__ for s in sb.fact_sources(self.home)}
@@ -10688,7 +10688,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -15453,6 +15453,14 @@ class TestCharterSetGuard(CharterRig, Base):
 
     def audit_lines(self):
         return [e for e in self.world.audit() if e["event"].startswith("charter.") and e["event"] != "charter.disagree"]
+
+    def test_label_is_read_fresh_and_for_the_right_repository(self):
+        self.orchestrator("orch-b", registry=None)
+        seen = []
+        with mock.patch.object(sb.IntentReader, "invalidate", lambda reader, issue, repo=None: seen.append((issue, repo))):
+            self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertIn((3, self.REPO), seen)
+        self.assertTrue(all(r[0] == "parent" or r[0] == "issue" for r in self.cmd_reads))
 
     def test_non_orchestrator_is_refused_and_audited(self):
         self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
@@ -32355,6 +32363,244 @@ class TestAlertRefreshOrder(Base):
         self.state.units.clear()
         order = self.refresh(["acme-org/r5", "acme-org/r6"], budget=3)
         self.assertEqual(order, [("acme-org/r5", "issues"), ("acme-org/r6", "issues")])
+
+
+class TestRedCi(Base):
+    """#1141: a required check failing at a worker-owned open head, and a red or green default branch, are told once. Real catch-up judge, fakes and temp dirs."""
+    REPO = "acme-org/widget-service"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": [self.REPO]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1, "repo": self.REPO})
+        self.world.add_agent("other", fleet={"role": "orchestrator", "charter": 2, "repo": "acme-org/other-service"})
+        self.world.add_agent("worker", fleet={"role": "coder", "issue": 7, "repo": self.REPO, "reports_to": "orch"})
+        self.engine = self.world.engine
+        self.engine.config["red_ci_required"] = {self.REPO: ["build"]}
+        self.engine.discover(self.world.clock.now())
+        self.source = sb.RedCiFacts()
+        self.source.bind(self.engine)
+        self.rid = 100
+
+    def run_rec(self, conclusion, head="h1", name="build", pr=7, branch="main", status="completed", rid=None, attempt=1):
+        self.rid = rid or self.rid + 1
+        rec = {"id": self.rid, "name": name, "status": status, "conclusion": conclusion, "head_sha": head, "head_branch": branch,
+               "html_url": "https://example.test/run/%d" % self.rid, "created_at": "2026-10-24T10:%02d:00Z" % (self.rid % 60), "pull_requests": [{"number": pr}] if pr else [], "run_attempt": attempt}
+        return rec
+
+    def feed(self, *runs):
+        self.world.tick(1)
+        sb.red_ci_runs(self.engine, self.REPO, list(runs), self.world.clock.now())
+
+    def lines(self, name):
+        self.engine.sources = [self.source]
+        return [f.summary for f in self.engine.collect_facts()[0] if f.recipient == name]
+
+    def test_failure_once_per_head_and_check(self):
+        self.feed(self.run_rec("failure", "h1"))
+        self.assertEqual(len(self.lines("orch")), 1)
+        self.assertIn("h1", self.lines("orch")[0])
+        self.assertIn("https://example.test/run/", self.lines("orch")[0])
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.assertEqual(len(self.lines("orch")), 1)    # the same run again: none
+        self.feed(self.run_rec("failure", "h2"))
+        self.assertEqual(len(self.lines("orch")), 2)    # a new head is a new event
+        self.assertEqual(self.lines("cos"), [])
+        self.assertEqual(self.lines("other"), [])
+
+    def test_restart_does_not_repeat(self):
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.engine.red_ci = None
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.assertEqual(len(self.lines("orch")), 1)
+
+    def test_nothing_for_quiet_conclusions_or_unrequired_or_unowned(self):
+        for conclusion, status in (("cancelled", "completed"), ("skipped", "completed"), ("neutral", "completed"), (None, "in_progress")):
+            self.feed(self.run_rec(conclusion, "h9", status=status))
+        self.feed(self.run_rec("failure", "h9", name="lint"))       # not required
+        self.feed(self.run_rec("failure", "h9", pr=55))             # no worker owns #55: only the Chief of Staff, once
+        self.assertEqual(self.lines("orch"), [])
+        self.assertEqual(len(self.lines("cos")), 1)
+        self.assertIn("no worker owns", self.lines("cos")[0])
+        self.feed(self.run_rec("failure", "h9", pr=55, name="build", rid=self.rid))
+        self.assertEqual(len(self.lines("cos")), 1)
+
+    def test_rerun_failing_again_at_same_head_is_new(self):
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.feed(self.run_rec("failure", "h1", rid=101, attempt=2))
+        self.assertEqual(len(self.lines("orch")), 2)
+        self.feed(self.run_rec("failure", "h1", rid=150))
+        self.assertEqual(len(self.lines("orch")), 3)
+
+    def test_timed_out_and_startup_failure_are_red_others_silent(self):
+        for i, (c, n) in enumerate((("timed_out", 1), ("startup_failure", 1), ("action_required", 0), ("stale", 0))):
+            self.feed(self.run_rec(c, "t%d" % i))
+        self.assertEqual(len(self.lines("orch")), 2)
+
+    def test_missing_status_is_unknown_and_green_without_red_memory_is_silent(self):
+        module = sb.load_module("red_ci")
+        self.assertEqual(module.colour({"conclusion": "failure"}), "none")
+        self.feed(self.run_rec("success", "m1", pr=None))
+        self.assertEqual(self.lines("cos"), [])
+
+    def test_a_failed_send_does_not_record_the_memory(self):
+        real = self.engine._note
+        calls = []
+        def boom(kind, *a, **k):
+            if kind == "red_ci.sent" and not calls:
+                calls.append(1)
+                raise RuntimeError("boom")
+            return real(kind, *a, **k)
+        with mock.patch.object(self.engine, "_note", boom):
+            self.feed(self.run_rec("failure", "h1", rid=101))
+        self.assertEqual(self.engine.red_ci.told, {})
+        self.feed(self.run_rec("failure", "h1", rid=101))
+        self.assertEqual(len(self.lines("orch")), 1)
+
+    def test_hostile_text_is_cleaned(self):
+        hostile = "bad\x1b[31m\nname `*[x](y)*` <b>" + "z" * 500
+        self.engine.config["red_ci_required"] = {self.REPO: ["*"]}
+        self.feed(self.run_rec("failure", "h1", name=hostile))
+        text = self.lines("orch")[0]
+        self.assertLess(len(text), 600)
+        for bad in ("\x1b", "\n", "`", "<b>", "["):
+            self.assertNotIn(bad, text)
+
+    def test_an_older_head_of_a_moved_on_pull_request_is_skipped(self):
+        self.feed(self.run_rec("failure", "old", rid=101), self.run_rec("success", "new", name="lint", rid=102))
+        self.assertEqual(self.lines("orch"), [])
+
+    def test_unset_required_means_every_workflow_and_the_config_is_validated(self):
+        self.engine.config.pop("red_ci_required")
+        self.feed(self.run_rec("failure", "h1", name="anything"))
+        self.assertEqual(len(self.lines("orch")), 1)
+        for bad in ("x", {"r": "build"}, {"r": []}, {"r": [3]}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_red_ci_required({"red_ci_required": bad}, "t")
+
+    def test_cap_drops_are_audited_but_branch_alarms_are_never_capped(self):
+        for i in range(sb.RED_CI_PER_HOUR + 1):
+            self.feed(self.run_rec("failure", "x%d" % i))
+        self.assertEqual(len(self.lines("orch")), sb.RED_CI_PER_HOUR)
+        self.feed(self.run_rec("failure", "m1", pr=None))
+        self.assertEqual(len(self.lines("cos")), 1)
+
+    def test_one_table_row_per_conclusion(self):
+        import os
+        module = sb.load_module("red_ci")
+        expect = {"success": "green", "failure": "red", "timed_out": "red", "startup_failure": "red",
+                  "cancelled": "none", "skipped": "none", "neutral": "none", "action_required": "none", "stale": "none"}
+        for word, colour in expect.items():
+            self.assertEqual(module.colour({"status": "completed", "conclusion": word}), colour, word)
+            with mock.patch.dict(module.COLOUR, {word: "none" if colour != "none" else "red"}):
+                self.assertNotEqual(module.colour({"status": "completed", "conclusion": word}), colour, word)
+        self.assertEqual(module.colour({"status": "in_progress", "conclusion": None}), "none")
+        self.assertEqual(set(module.COLOUR), set(expect))
+        doc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "switchboard.md")).read()
+        for word in expect:
+            self.assertIn("`%s`" % word, doc)
+        for field in module.FIELDS:
+            self.assertIn("`%s`" % field, doc)
+
+    def test_red_branch_alarm_receivers_and_green(self):
+        self.feed(self.run_rec("failure", "m1", pr=None))
+        for name in ("orch", "cos"):
+            self.assertEqual(len(self.lines(name)), 1, name)
+        self.assertEqual(self.lines("other"), [])
+        self.assertEqual(self.lines("worker"), [])
+        self.feed(self.run_rec("failure", "m1", pr=None))
+        self.assertEqual(len(self.lines("orch")), 1)
+        self.feed(self.run_rec("success", "m2", pr=None))
+        for name in ("orch", "cos"):
+            self.assertEqual(len(self.lines(name)), 2, name)
+            self.assertTrue(any("green again" in l for l in self.lines(name)))
+
+    def test_cancelled_default_run_alarms_nobody(self):
+        self.feed(self.run_rec("cancelled", "m1", pr=None))
+        self.assertEqual(self.lines("cos") + self.lines("orch"), [])
+
+    def test_no_orchestrator_remembers_nothing(self):
+        self.engine.config["red_ci_required"] = {self.REPO: ["build"]}
+        self.engine.discovery.agents.pop("orch")
+        self.feed(self.run_rec("failure", "h1"))
+        self.assertEqual(self.engine.red_ci.told, {})
+
+    def test_hourly_bound(self):
+        for i in range(sb.RED_CI_PER_HOUR + 5):
+            self.feed(self.run_rec("failure", "x%d" % i))
+        self.assertEqual(len(self.lines("orch")), sb.RED_CI_PER_HOUR)
+
+    def test_mutants_fail(self):
+        def scenario():
+            self.setUp()
+            self.feed(self.run_rec("failure", "h1", rid=101)); self.feed(self.run_rec("failure", "h1", rid=101))
+            repeat = len(self.lines("orch"))
+            self.feed(self.run_rec("cancelled", "m0", pr=None))
+            cancelled = len(self.lines("cos"))
+            self.feed(self.run_rec("failure", "m1", pr=None)); self.feed(self.run_rec("success", "m2", pr=None))
+            return repeat, cancelled, len(self.lines("cos"))
+        self.assertEqual(scenario(), (1, 0, 2))
+        module = sb.load_module("red_ci")
+        real_tell = sb.red_ci_tell
+        def repeating(engine, state, key, repo, text, names, now):
+            state.told.pop(key, None)
+            repeating.n += 1
+            return real_tell(engine, state, key + "#%d" % repeating.n, repo, text, names, now)
+        repeating.n = 0
+        with mock.patch.object(sb, "red_ci_tell", repeating):
+            self.assertNotEqual(scenario()[0], 1)
+        with mock.patch.dict(module.COLOUR, {"cancelled": "red"}):
+            self.assertNotEqual(scenario()[1], 0)
+        with mock.patch.dict(module.COLOUR, {"success": "none"}):
+            self.assertNotEqual(scenario()[2], 2)
+        # mutant: the key drops the run id and attempt -> a re-run at the same head is lost
+        def no_run_key(repo, number, head, check, run_id=0, attempt=1):
+            return "pr:%s#%d:%s:%s" % (repo, number, head, check)
+        with mock.patch.object(module, "pr_key", no_run_key):
+            self.setUp()
+            self.feed(self.run_rec("failure", "h1", rid=101)); self.feed(self.run_rec("failure", "h1", rid=101, attempt=2))
+            self.assertNotEqual(len(self.lines("orch")), 2)
+        # mutant: no cleaning
+        with mock.patch.object(module, "clean", lambda t, cap=0: str(t)):
+            self.setUp()
+            self.engine.config["red_ci_required"] = {self.REPO: ["*"]}
+            self.feed(self.run_rec("failure", "h1", name="a\nb"))
+            self.assertIn("\n", self.lines("orch")[0])
+        # mutant: the cap also drops branch alarms
+        real_tell = sb.red_ci_tell
+        with mock.patch.object(sb, "red_ci_tell", lambda e, st, k, r, t, n, now, capped=True: real_tell(e, st, k, r, t, n, now, True)):
+            self.setUp()
+            for i in range(sb.RED_CI_PER_HOUR):
+                self.feed(self.run_rec("failure", "y%d" % i))
+            self.feed(self.run_rec("failure", "m1", pr=None))
+            self.assertEqual(self.lines("cos"), [])
+
+    def test_table_is_complete_and_agrees_with_the_existing_notice(self):
+        module = sb.load_module("red_ci")
+        known = {"success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required", "stale", "startup_failure"}
+        self.assertEqual(set(module.COLOUR), known)
+        self.assertEqual(module.colour({"status": "in_progress", "conclusion": "failure"}), "none")
+        self.assertEqual(module.colour({"conclusion": "unheard-of"}), "none")
+        doc = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "switchboard.md")).read()
+        for word, action in module.COLOUR.items():   # the docs table and the code table agree row by row
+            self.assertRegex(doc, r"`%s`[^\n]*\b%s\b" % (word, {"red": "red", "green": "green", "none": "(silent|none)"}[action]), word)
+        self.assertEqual({w for w, a in module.COLOUR.items() if a == "red"}, {"failure", "timed_out", "startup_failure"})
+
+    def test_unowned_note_is_new_for_a_rerun(self):
+        self.feed(self.run_rec("failure", "h9", pr=55, rid=201))
+        self.feed(self.run_rec("failure", "h9", pr=55, rid=201, attempt=2))
+        self.assertEqual(len(self.lines("cos")), 2)
+
+    def test_config_warns_on_matrix_job_names_and_validates_default_branches(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            sb.validate_config({"github_repos": [self.REPO], "red_ci_required": {self.REPO: ["test (ubuntu-latest)"]}})
+        self.assertIn("matrix JOB name", err.getvalue())
+        for bad in ({"a/b": ""}, [1], {"a/b": 3}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"github_repos": [self.REPO], "default_branches": bad})
+
 
 
 class TestAlertWake(Base):

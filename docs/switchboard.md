@@ -5747,6 +5747,50 @@ The config key `no_multiplexer` (default `false`, so nothing changes) turns that
 
 With the key on, the toast step and the badge writes are skipped too (a toast is a multiplexer call; a badge needs a pane), with no error. The tests (`TestNoMultiplexer`) carry one mutant per scenario that names one: the S2 mutant keeps calling `agent_list`, the S3 mutant drops the toast guard, the U1 mutant makes the switch-off path behave as on; each is killed by its own check.
 
+## Red CI messages (#1141)
+
+Cause: a required check once failed at the head of an open pull request and about eight hours passed before anyone saw it, because nothing turned the failure into a message. The pass already reads the workflow runs of each repository (the pull request's check state and the default branch's latest run); the existing ask and comment notices could carry it unchanged.
+
+Two messages, both ordinary notices through the delivery rule (held with the reason while the receiver is blocked, never typed into a pane):
+
+- The failed-check message goes to the lane orchestrators of the repository when a required check concludes failure at the head of an open pull request that a worker of the lane owns. It names the pull request, the check, the run link and the head, and is sent once per head, run and attempt (the key holds the head, the run id and the attempt: a new head, or a re-run that fails again, is a new event; the same run seen again is not). A pull request no worker owns is noted in the audit (`red_ci.unowned`) and the Chief of Staff is told once per pull request and head. A red run at an older head of a pull request that has moved on is skipped: only the current head is told.
+- **A "check" here is a WORKFLOW name.** The pass reads workflow runs only, so `red_ci_required` (repository -> list of workflow names, `*` for every workflow; checked when the config is read) is matched against the workflow name, never a job name such as `test (ubuntu-latest)`. Unset for a repository: every workflow counts (the repository's required checks are not read, to add no read). For the same reason the alarm names the workflow only; jobs are not read.
+
+Conclusion table (one row per conclusion GitHub sends for a run; `bin/red_ci.py` `COLOUR` is the same table, a test keeps them equal; only a `completed` run counts, a missing status or an in-progress run is silent):
+
+| conclusion | action |
+|---|---|
+| `failure` | red |
+| `timed_out` | red |
+| `startup_failure` | red |
+| `success` | green |
+| `cancelled` | silent |
+| `skipped` | silent |
+| `neutral` | silent |
+| `action_required` | silent |
+| `stale` | silent |
+| `null` (in progress) | silent |
+
+`default_branches` (repository -> branch, at most 20 entries, validated when the config is read) names the default branch; unset means `main`. The unowned-pull-request note is keyed by head, run id and attempt like the owned message.
+
+- The red-branch alarm goes to the lane orchestrators of the repository and the Chief of Staff when the default branch's latest completed run turns red (the run, the head and the workflow are named), once per change, and one message goes to the same receivers when it turns green again (only after a red was told).
+
+One table decides every conclusion GitHub can send, and every field of a run the code trusts:
+
+| Conclusion / status | Action |
+|---|---|
+| `success` | green (the branch green notice only when it was told red) |
+| `failure` | red |
+| `timed_out` | red (blocks the merge) |
+| `startup_failure` | red (the workflow failed to start) |
+| `cancelled`, `skipped`, `neutral`, `action_required`, `stale` | silent |
+| none / still running / status missing or not `completed` | silent |
+| any other word | silent |
+
+Run fields trusted: `id`, `name`, `status`, `conclusion`, `head_sha`, `head_branch`, `event`, `html_url`, `created_at`, `pull_requests`, `run_attempt`, `workflow_id`. Every text from GitHub (workflow name, link, head, branch) is cleaned (no control or ANSI characters, no markdown, capped) before it enters a message.
+
+Not required workflows send nothing. At most 20 new pull-request messages are made per hour; a message dropped by the cap writes an audit line (`red_ci.dropped`) and is told on a later pass; branch alarms are never dropped by the cap. No platform read is added: the runs are the ones the catch-up already reads, and after a daemon start (#1140) the first pass reads them before the rest. What was told is kept in `red-ci.json`, so a restart does not repeat a message. The helper `bin/red_ci.py` is loaded by path like the other helpers (no copy list exists to extend).
+
 ### Reviews a reader posts and dismisses (#1123)
 
 Cause: a review marker (`<!-- fleet-switchboard:from=NAME -->`) was written only by `fleet_mark`, which `comment` and `handoff` use; `review record` writes the ledger and no GitHub text. A reader that posted with the bare `gh api .../reviews` left a review with no marker, a reader on a pull request of the same account could only post a comment, and clearing one's own CHANGES_REQUESTED was a raw `.../dismissals` call.

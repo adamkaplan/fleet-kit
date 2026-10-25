@@ -462,7 +462,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -707,6 +707,8 @@ def validate_config(raw, source="config"):
     validate_sweep_config(config, source)  # #117
     validate_triage_config(config, source)  # #130
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
+    validate_red_ci_required(config, source)  # #1141
+    validate_default_branches(config, source)
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
     validate_hold_labels_config(config, source)  # #376
@@ -794,6 +796,30 @@ def validate_plan_gates_config(config, source):
 
 
 PLAN_EVALUATOR_KINDS = ("ci", "tester", "reviewer", "owner")
+
+
+def validate_red_ci_required(config, source):
+    """`red_ci_required`: repository -> list of WORKFLOW names ("*" = every workflow). Absent: {} (and a repository not listed counts every workflow)."""
+    raw = config.get("red_ci_required")
+    if raw is None:
+        config.pop("red_ci_required", None)
+        return
+    if not isinstance(raw, dict) or not all(isinstance(r, str) and isinstance(v, list) and v and all(isinstance(n, str) and n for n in v) for r, v in raw.items()):
+        raise ConfigError("%s: 'red_ci_required' must be an object of repository -> non-empty list of workflow names (\"*\" for every workflow)" % source)
+    for repo, names in raw.items():
+        for n in names:
+            if re.search(r" \(.*\)$", n):   # 'test (ubuntu-latest)' is a matrix JOB name: the pass reads workflow runs and never matches it
+                warn_unknown_config("red_ci_required: %r for %s looks like a matrix JOB name; only WORKFLOW names are matched, so it will never fire" % (n, repo))
+
+
+def validate_default_branches(config, source):
+    """`default_branches`: repository -> branch name (at most 20). Absent: "main"."""
+    raw = config.get("default_branches")
+    if raw is None:
+        config.pop("default_branches", None)
+        return
+    if not isinstance(raw, dict) or len(raw) > 20 or not all(isinstance(r, str) and r and isinstance(b, str) and b for r, b in raw.items()):
+        raise ConfigError("%s: 'default_branches' must be an object of at most 20 repository -> non-empty branch name" % source)
 
 
 def validate_plan_evaluators(config, source):
@@ -1803,7 +1829,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -12161,9 +12187,11 @@ class GitHubHub:
                 if fresh(suite):
                     items.append(_check_item(repo, dict(suite, pull_requests=suite.get("pull_requests") or [
                         {"number": number}]), now, "", "check suite"))
-        for run in read("runs", "workflow runs", base + "actions/runs?per_page=%d" % GITHUB_PAGE_SIZE, "workflow_runs") or []:
+        found_runs = read("runs", "workflow runs", base + "actions/runs?per_page=%d" % GITHUB_PAGE_SIZE, "workflow_runs")
+        for run in found_runs or []:
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
+        red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now)   # #1141: the same runs, no new read
         self.last_failed_primary = bool(failed)
         self.last_incomplete = bool(stopped or failed)   # #494: a step is still to do: the caller keeps the cursor and the marker where they are
         items = [item for item in items if item is not None]
