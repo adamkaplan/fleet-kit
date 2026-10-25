@@ -18,7 +18,7 @@ def git(cwd, *a):
 
 
 class Scratch(unittest.TestCase):
-    def tree(self, names, tests=("test_x.py",), exceptions=""):
+    def tree(self, names, tests=("test_x.py",), exceptions="", raw=None, last=True, bins=()):
         d = tempfile.mkdtemp(prefix="chain-scratch-")
         self.addCleanup(shutil.rmtree, d, True)
         os.makedirs(os.path.join(d, "bin")); os.makedirs(os.path.join(d, "cloud/launcher/tests"))
@@ -31,15 +31,25 @@ class Scratch(unittest.TestCase):
         for n in tests:
             with open(os.path.join(d, "cloud/launcher/tests", n), "w") as f:
                 f.write("import sys, os\nopen(os.path.join(os.environ['CHAIN_LOG'], %r), 'a').write('x')\nsys.exit(int(%r.startswith('test_bad')))\n" % (n, n))
+        os.makedirs(os.path.join(d, "cloud/worker/tests"))
+        with open(os.path.join(d, FIXED_LAST), "w") as f:
+            f.write("import sys, os\nopen(os.path.join(os.environ['CHAIN_LOG'], 'LAST'), 'a').write('x')\n")
+        for b in bins:
+            with open(os.path.join(d, "bin", b), "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(os.path.join(d, "bin", b), 0o755)
+        text = "".join("cloud/launcher/tests/%s\n" % n for n in names) if raw is None else raw
+        if last and raw is None:
+            text += FIXED_LAST + "\n"
         with open(os.path.join(d, "bin", "test-cloud-launcher.chain"), "w") as f:
-            f.write("".join("cloud/launcher/tests/%s\n" % n for n in names))
+            f.write(text)
         return d
 
     def run_chain(self, d):
         log = tempfile.mkdtemp(prefix="chain-log-"); self.addCleanup(shutil.rmtree, log, True)
         env = dict(os.environ, CHAIN_LOG=log)
         p = subprocess.run([os.path.join(d, "bin", "test-cloud-launcher")], cwd=d, env=env, capture_output=True, text=True)
-        return p, sorted(os.listdir(log))
+        return p, sorted(x for x in os.listdir(log) if x != 'LAST')
 
     def test_s2_all_pass_runs_each_once_and_prints_pass(self):
         d = self.tree(["test_a.py", "test_b.py"], tests=("test_a.py", "test_b.py"))
@@ -74,6 +84,60 @@ class Scratch(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout)
 
 
+class Guards(Scratch):
+    def fails(self, d, msg):
+        p, ran = self.run_chain(d)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn(msg, p.stdout)
+        self.assertIn("RESULT: FAIL", p.stdout)
+        self.assertNotIn("RESULT: PASS", p.stdout)
+        return ran
+
+    def test_h2_empty_list_fails(self):
+        self.fails(self.tree([], tests=(), raw=""), "NOT RUN: the chain list holds no entry")
+
+    def test_h2_blank_only_list_fails(self):
+        self.fails(self.tree([], tests=(), raw="\n\n  \n"), "NOT RUN: the chain list holds no entry")
+
+    def test_h2_ran_count_is_printed(self):
+        p, _ = self.run_chain(self.tree(["test_a.py"], tests=("test_a.py",)))
+        self.assertIn("ran 2 entries", p.stdout)
+
+    def test_h1_unlisted_bin_script_fails(self):
+        self.fails(self.tree(["test_a.py"], tests=("test_a.py",), bins=("test-cloud-extra",)),
+                   "NOT RUN: bin/test-cloud-extra is neither chained nor in BIN_EXCEPTIONS")
+
+    def test_m2_last_line_not_fixed_fails(self):
+        d = self.tree([], tests=("test_a.py",), raw=FIXED_LAST + "\ncloud/launcher/tests/test_a.py\n")
+        self.fails(d, "the last line of bin/test-cloud-launcher.chain must be " + FIXED_LAST)
+
+    def test_low_duplicate_entry_fails_and_runs_nothing(self):
+        d = self.tree(["test_a.py", "test_a.py"], tests=("test_a.py",))
+        self.assertEqual(self.fails(d, "duplicate entry cloud/launcher/tests/test_a.py"), [])
+
+    def test_low_trailing_space_entry_is_missing(self):
+        d = self.tree([], tests=(), raw="cloud/launcher/tests/test_a.py \n" + FIXED_LAST + "\n")
+        self.fails(d, "does not exist")
+
+    def test_low_entry_outside_repository_refused(self):
+        for bad in ("../x.py", "/etc/passwd", "cloud/../../x.py"):
+            d = self.tree([], tests=(), raw=bad + "\n" + FIXED_LAST + "\n")
+            self.fails(d, "NOT RUN: entry outside the repository")
+
+    def test_m3_arguments_only_to_old_argument_entries(self):
+        d = self.tree([], tests=("test_driver.py", "test_other.py"), raw="")
+        for n in ("test_driver.py", "test_other.py"):
+            with open(os.path.join(d, "cloud/launcher/tests", n), "w") as f:
+                f.write("import sys, os\nopen(os.path.join(os.environ['CHAIN_LOG'], %r), 'w').write(' '.join(sys.argv[1:]))\n" % n)
+        with open(os.path.join(d, "bin", "test-cloud-launcher.chain"), "w") as f:
+            f.write("cloud/launcher/tests/test_driver.py\ncloud/launcher/tests/test_other.py\n" + FIXED_LAST + "\n")
+        log = tempfile.mkdtemp(prefix="chain-log-"); self.addCleanup(shutil.rmtree, log, True)
+        p = subprocess.run([os.path.join(d, "bin", "test-cloud-launcher"), "ARGX"], cwd=d, env=dict(os.environ, CHAIN_LOG=log), capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertEqual(open(os.path.join(log, "test_driver.py")).read(), "ARGX")
+        self.assertEqual(open(os.path.join(log, "test_other.py")).read(), "")
+
+
 class RealTree(unittest.TestCase):
     def test_s7_every_test_file_listed_or_excepted_and_every_entry_exists(self):
         text = open(SCRIPT).read()
@@ -83,6 +147,11 @@ class RealTree(unittest.TestCase):
                     and "cloud/launcher/tests/" + n not in listed and n + ":" not in exc]
         self.assertEqual(unlisted, [])
         self.assertEqual([e for e in listed if not os.path.isfile(os.path.join(ROOT, e))], [])
+
+    def test_h1_the_relay_family_scripts_are_listed_once(self):
+        listed = entries()
+        for b in ("bin/test-cloud-hub", "bin/test-cloud-relay", "bin/test-cloud-hub-relay", "bin/test-cloud-relay-daemon", "bin/test-cloud-cost-report"):
+            self.assertEqual(listed.count(b), 1, b)
 
     def test_s4_the_old_commands_are_each_one_entry(self):
         listed = entries()
@@ -127,6 +196,13 @@ class Merge(unittest.TestCase):
         rc, merged = self.merge(base, add_a, add_b)
         self.assertEqual(rc, 0)
         self.assertIn("test_new_a.py", merged); self.assertIn("test_new_z.py", merged)
+
+    def test_m1_adjacent_names_conflict_a_stated_limit(self):
+        base = "".join(e + "\n" for e in entries())
+        add_a = lambda t: t.replace("cloud/launcher/tests/test_app_token.py\n", "cloud/launcher/tests/test_app_token.py\ncloud/launcher/tests/test_new_a.py\n")
+        add_b = lambda t: t.replace("cloud/launcher/tests/test_app_token.py\n", "cloud/launcher/tests/test_app_token.py\ncloud/launcher/tests/test_new_b.py\n")
+        rc, _ = self.merge(base, add_a, add_b)
+        self.assertNotEqual(rc, 0)  # residual risk: inserts at the same place conflict
 
     def test_s10_mutant_single_line_form_conflicts(self):
         base = "if " + " && ".join("python3 " + e for e in entries()) + "; then echo RESULT: PASS; fi\n"

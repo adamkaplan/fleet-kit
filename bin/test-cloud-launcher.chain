@@ -1,4 +1,8 @@
 bin/test-cloud-cost-report
+bin/test-cloud-hub
+bin/test-cloud-hub-relay
+bin/test-cloud-relay
+bin/test-cloud-relay-daemon
 cloud/launcher/tests/test_app_token.py
 cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_cloud_allowlist.py
