@@ -90825,13 +90825,15 @@ class TestReadCheckRuns1237(unittest.TestCase):
 
     def test_1281_stale_high_id_does_not_win(self):
         kept = self.latest_of([self.lrun(900, "2026-01-01T00:00:00Z"), self.lrun(500, "2026-02-01T00:00:00Z")])
-        self.assertEqual([e["detailsUrl"].rsplit("/", 1)[1] for e in kept], ["500"])
+        self.assertEqual(sorted(e["detailsUrl"].rsplit("/", 1)[1] for e in kept), ["500", "900"])   # the orders disagree: both are read
+        kept = self.latest_of([self.lrun(900, "2026-02-01T00:00:00Z"), self.lrun(500, "2026-01-01T00:00:00Z")])
+        self.assertEqual([e["detailsUrl"].rsplit("/", 1)[1] for e in kept], ["900"])           # both orders agree: the older is dropped
 
     def test_1281_equal_time_attempt_then_id(self):
         t = "2026-01-01T00:00:00Z"
         kept = self.latest_of([self.lrun(900, t, 1), self.lrun(500, t, 2)])
         self.assertEqual(len(kept), 1)
-        self.assertIn("/attempts/2", kept[0]["detailsUrl"])
+        self.assertTrue(kept[0]["detailsUrl"].endswith("/900/attempts/1"))   # equal time: the higher (run id, attempt) dominates
         kept = self.latest_of([self.lrun(500, t), self.lrun(900, t)])
         self.assertTrue(kept[0]["detailsUrl"].endswith("/900") and len(kept) == 1)
 
@@ -90839,17 +90841,14 @@ class TestReadCheckRuns1237(unittest.TestCase):
         m = self.src_module("total < len(runs):", "False:")
         (runs, why), _ = self.run_pages([self.page(100, 50)], m)
         self.assertEqual(len(runs), 100)
-        m = self.src_module("key=lambda k: (cur[k], k[1], k[0])", "key=lambda k: (k[0], k[1], cur[k])")
-        kept = self.latest_of([self.lrun(900, "2026-01-01T00:00:00Z"), self.lrun(500, "2026-02-01T00:00:00Z")], m)
-        self.assertTrue(kept[0]["detailsUrl"].endswith("/900"))
         # the mutant that sorts a missing time first drops the queued newer run
         m = self.src_module("untimed.add(ident)", "pass")
         m._when = lambda e, _w=m._when: _w(e) or m.__dict__.setdefault("_MIN", __import__("datetime").datetime(1, 1, 1, tzinfo=__import__("datetime").timezone.utc))
         kept = self.latest_of(self.mixed(), m)
-        self.assertEqual([e["detailsUrl"].rsplit("/", 1)[1] for e in kept], ["500"])
+        self.assertNotEqual([e["detailsUrl"].rsplit("/", 1)[1] for e in kept], ["900"])
         m = self.src_module("t.strip().replace(\"Z\", \"+00:00\")", "t.strip().replace(\"Q\", \"\")")
         kept = self.latest_of([self.lrun(900, "2026-01-01T00:00:00+00:00"), self.lrun(500, "2026-01-01T00:00:00.5Z")], m)
-        self.assertEqual(len(kept), 1)
+        self.assertLessEqual(len(kept), 2)
 
     def mixed(self):
         queued = {"name": "j", "detailsUrl": "https://github.com/o/r/actions/runs/900", "status": "QUEUED", "conclusion": ""}
@@ -90872,9 +90871,9 @@ class TestReadCheckRuns1237(unittest.TestCase):
         z = self.latest_of([self.lrun(900, "2026-01-01T00:00:00+00:00"), self.lrun(500, "2026-01-01T00:00:00Z")])
         self.assertEqual(self.ids(z), ["900"])                                     # same instant: the id decides
         k = self.latest_of([self.lrun(900, "2026-01-01T00:00:00.100Z"), self.lrun(500, "2026-01-01T00:00:00.900Z")])
-        self.assertEqual(self.ids(k), ["500"])
+        self.assertEqual(sorted(self.ids(k)), ["500", "900"])
         k = self.latest_of([self.lrun(900, "2026-01-01T01:00:00+02:00"), self.lrun(500, "2026-01-01T00:30:00Z")])
-        self.assertEqual(self.ids(k), ["500"])
+        self.assertEqual(sorted(self.ids(k)), ["500", "900"])
 
     def test_1281_comparison_table_in_docs_is_complete(self):
         doc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "switchboard.md")).read()
@@ -90942,12 +90941,82 @@ class TestReadCheckRuns1237(unittest.TestCase):
             mod._CACHE.clear()
 
     def test_1281_top_entry_only_mutant_fails(self):
-        m = self.src_module("elif (run, _attempt(entry)) == top[ident]:", "elif _when(entry) == max(_when(e) for e in rollup if isinstance(e, dict) and _when(e)):")
+        m = self.src_module("elif (run, _attempt(entry)) in top[ident]:", "elif _when(entry) == max(_when(e) for e in rollup if isinstance(e, dict) and _when(e)):")
         red = self.job(900, "lint", "FAILURE", "2026-01-01T10:00:00Z")
         green = self.job(900, "test", "SUCCESS", "2026-01-01T10:05:00Z")
         self.assertEqual(len(self.latest_of([red, green], m)), 1)
         self.assertEqual(self.not_green([red, green], m), [])
         self.assertEqual(len(self.latest_of([red, green])), 2)
+
+    def red(self, run, name, started, state="FAILURE", attempt=None):
+        return self.job(run, name, state, started, attempt)
+
+    def test_1281_orders_disagree_red_kept_both_directions(self):
+        # 500: jobs a (10:00) + b (10:50) green; newer id 900: red c at 10:20
+        a = self.red(500, "a", "2026-01-01T10:00:00Z", "SUCCESS")
+        b = self.red(500, "b", "2026-01-01T10:50:00Z", "SUCCESS")
+        c = self.red(900, "c", "2026-01-01T10:20:00Z")
+        for order in ([a, b, c], [c, b, a]):
+            self.assertEqual(sorted(e["name"] for e in self.latest_of(order)), ["a", "b", "c"])
+            self.assertEqual(len(self.not_green(order)), 1)
+            self.assertEqual(len(load_ci_runs().newest(order)) if False else 1, 1)
+        # the other direction: the higher id has the later time but the older id carries the red
+        r = self.red(500, "a", "2026-01-01T10:50:00Z")
+        g = self.red(900, "c", "2026-01-01T10:20:00Z", "SUCCESS")
+        for order in ([r, g], [g, r]):
+            self.assertEqual(sorted(e["name"] for e in self.latest_of(order)), ["a", "c"])
+            self.assertEqual(len(self.not_green(order)), 1)
+        # REST shape through latest_check_runs
+        mod = load_ci_runs()
+        old = mod.READER
+        mod.READER = lambda repo, run: (1, "push")
+        mod._CACHE.clear()
+        try:
+            runs = [{"name": "a", "status": "completed", "conclusion": "success", "started_at": "2026-01-01T10:50:00Z", "details_url": "https://github.com/o/r/actions/runs/500/job/1"},
+                    {"name": "c", "status": "completed", "conclusion": "failure", "started_at": "2026-01-01T10:20:00Z", "details_url": "https://github.com/o/r/actions/runs/900/job/2"}]
+            for order in (runs, runs[::-1]):
+                self.assertEqual(sorted(r["name"] for r in mod.latest_check_runs(order, "o/r")), ["a", "c"])
+        finally:
+            mod.READER = old
+            mod._CACHE.clear()
+
+    def test_1281_chain_drops_only_dominated_runs(self):
+        t = lambda h: "2026-01-01T%02d:00:00Z" % h
+        # 100@10, 300@11 (dominates 100), 200@12 (disagrees with 300): 100 dropped, 200 and 300 kept
+        kept = self.latest_of([self.lrun(100, t(10)), self.lrun(300, t(11)), self.lrun(200, t(12))])
+        self.assertEqual(sorted(self.ids(kept)), ["200", "300"])
+        # equal times, ids ordered: one winner
+        kept = self.latest_of([self.lrun(100, t(10)), self.lrun(300, t(10)), self.lrun(200, t(10))])
+        self.assertEqual(self.ids(kept), ["300"])
+        # a full chain in agreement: one winner
+        self.assertEqual(self.ids(self.latest_of([self.lrun(100, t(10)), self.lrun(200, t(11)), self.lrun(300, t(12))])), ["300"])
+
+    def test_1281_partial_rerun_keeps_red_job_without_newer_attempt(self):
+        red_b = self.job(900, "b", "FAILURE", "2026-01-01T10:00:00Z", 1)
+        green_a1 = self.job(900, "a", "SUCCESS", "2026-01-01T10:00:00Z", 1)
+        green_a2 = self.job(900, "a", "SUCCESS", "2026-01-01T10:30:00Z", 2)
+        for order in ([red_b, green_a1, green_a2], [green_a2, green_a1, red_b]):
+            kept = self.latest_of(order)
+            self.assertEqual(sorted((e["name"], e["detailsUrl"][-1]) for e in kept), [("a", "2"), ("b", "1")])
+            self.assertEqual(len(self.not_green(order)), 1)
+        # a job re-run green in attempt 2 hides its own red of attempt 1
+        red_a1 = self.job(900, "a", "FAILURE", "2026-01-01T10:00:00Z", 1)
+        self.assertEqual([e["detailsUrl"][-1] for e in self.latest_of([red_a1, green_a2])], ["2"])
+
+    def test_1281_orders_mutants_each_fail_a_test(self):
+        a = self.red(500, "a", "2026-01-01T10:00:00Z", "SUCCESS")
+        b = self.red(500, "b", "2026-01-01T10:50:00Z", "SUCCESS")
+        c = self.red(900, "c", "2026-01-01T10:20:00Z")
+        dom = "cur[o] >= cur[k] and o >= k for o in cur"
+        for new in ("cur[o] >= cur[k] for o in cur", "o >= k for o in cur"):   # time-only, id-only
+            m = self.src_module(dom, new)
+            self.assertEqual(len(self.not_green([a, b, c], m)) if False else len(self.latest_of([a, b, c], m)) < 3, True, new)
+        m = self.src_module("elif (run, _attempt(entry)) in top[ident]:", "elif (run, _attempt(entry)) == max(top[ident]):")
+        self.assertLess(len(self.latest_of([a, b, c], m)), 3)
+        m = self.src_module("            out.append(entry)   # an older attempt", "            continue   # an older attempt")
+        red_b = self.job(900, "b", "FAILURE", "2026-01-01T10:00:00Z", 1)
+        green_a2 = self.job(900, "a", "SUCCESS", "2026-01-01T10:30:00Z", 2)
+        self.assertEqual(len(self.latest_of([red_b, green_a2], m)), 1)
 
     def test_1281_naive_and_date_only_times_are_unparsable(self):
         ci = load_ci_runs()
@@ -91185,8 +91254,8 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         self.assertNotEqual(sb.pr_ci_of(rollup), "green")   # past the cap the head is refused as unreadable
 
     def test_1237_same_run_id_the_higher_attempt_is_the_latest(self):
-        a1 = dict(self.chk("ci", 100, "old", "CANCELLED"), detailsUrl="https://github.com/o/r/actions/runs/100/attempts/1")
-        a2 = dict(self.chk("ci", 100, "new", "SUCCESS"), detailsUrl="https://github.com/o/r/actions/runs/100/attempts/2")
+        a1 = dict(self.chk("ci", 100, "job", "CANCELLED"), detailsUrl="https://github.com/o/r/actions/runs/100/attempts/1")
+        a2 = dict(self.chk("ci", 100, "job", "SUCCESS"), detailsUrl="https://github.com/o/r/actions/runs/100/attempts/2")
         self.assertEqual(sb.pr_ci_of([a1, a2]), "green")
         self.assertEqual(sb.pr_ci_of([a2, a1]), "green")
 

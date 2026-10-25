@@ -165,7 +165,7 @@ def _attempt(entry):
 
 
 def _when(entry):
-    """The instant of an entry as an aware datetime (created_at/createdAt, else started_at/startedAt), None when missing or unparsable."""
+    """The instant of an entry as an aware datetime (created_at/createdAt first, else started_at/startedAt), None when missing or unparsable."""
     from datetime import datetime, timezone
     for key in ("created_at", "createdAt", "started_at", "startedAt"):
         t = entry.get(key)
@@ -183,11 +183,9 @@ def _when(entry):
 
 
 def _winners(rollup, known):
-    """{identity: (run id, attempt)} of the winning run of each group. A run's time is the MAX start time over its jobs (fail-closed: the
-    jobs of one run start at different times, and a run is as new as its latest job; with MIN a run with an early job would lose to an older
-    run whose job started between, and its checks would be dropped). Winner: time, then attempt,
-    then run id. ANY missing or unparsable time in the group: the old rule (run id, then attempt). The residual: a newer run id with an
-    EARLIER start than an older green run is hidden when every time is valid (the intended reading of clause 3)."""
+    """{identity: set of (run id, attempt)} of the runs that count. A run's time is the MAX start time over its jobs. A run is dropped ONLY IF
+    another run of the group has BOTH a later-or-equal time AND a higher-or-equal (run id, attempt); where the two orders disagree both
+    runs are read (a red in either is seen). ANY missing or unparsable time in the group: the old rule (the highest run id, then attempt, wins)."""
     runs = {}
     untimed = set()
     for entry, (run, ident) in zip(rollup, known):
@@ -205,17 +203,16 @@ def _winners(rollup, known):
     out = {}
     for ident, cur in runs.items():
         if ident in untimed:
-            out[ident] = max(cur, key=lambda k: (k[0], k[1]))
+            out[ident] = {max(cur)}
         else:
-            out[ident] = max(cur, key=lambda k: (cur[k], k[1], k[0]))
+            out[ident] = {k for k in cur if not any(o != k and cur[o] >= cur[k] and o >= k for o in cur)}
     return out
 
 
 def latest_runs(rollup, repo=None):
     """`rollup` without the checks of an OLDER run of a workflow. A workflow is its STABLE identity (the workflow id read from the run), never
     its display name (the PR author writes that: a second workflow could take the real one's name). Runs are grouped by (workflow id, event):
-    a newer run of another event never hides a red older one (the fail-closed choice). The latest of a group counts (time, then run
-    attempt, then the highest run id; a group with any missing or unparsable time uses run id, then attempt). A run whose identity cannot
+    a newer run of another event never hides a red older one (the fail-closed choice). The latest of a group counts (a run is dropped only when another has both a later-or-equal time and a higher-or-equal run id and attempt; where the two orders disagree both runs are read; a group with any missing or unparsable time uses run id, then attempt; of an older attempt of a kept run id a job with no newer attempt stays). A run whose identity cannot
     be read (another repo, a failed read, over the read cap) is kept and marked UNREADABLE (never green). Entries with no run id (status contexts) are kept."""
     if not isinstance(rollup, list):
         return []
@@ -230,14 +227,20 @@ def latest_runs(rollup, repo=None):
             capped.add((repo, run))
         known.append((run, ident))
     top = _winners(rollup, known)
+    names = {}   # (ident, run id) -> job names present in a kept attempt of that run
+    for entry, (run, ident) in zip(rollup, known):
+        if run is not None and ident is not None and (run, _attempt(entry)) in top[ident]:
+            names.setdefault((ident, run), set()).add(entry.get("name"))
     out = []
     for entry, (run, ident) in zip(rollup, known):
         if run is None:
             out.append(entry)
         elif ident is None:
             out.append(dict(entry, status=CAP_STATUS if (repo, run) in capped else UNREADABLE, conclusion=""))
-        elif (run, _attempt(entry)) == top[ident]:
+        elif (run, _attempt(entry)) in top[ident]:
             out.append(entry)
+        elif (ident, run) in names and (entry.get("name") is None or entry.get("name") not in names[(ident, run)]):
+            out.append(entry)   # an older attempt of a kept run id: a job with no newer attempt keeps its result (a partial re-run)
     return out
 
 
