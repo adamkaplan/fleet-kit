@@ -37320,6 +37320,226 @@ class TestCarriesLine(LedgerBase):
             self.checks()
 
 
+class RecFacts(dict):
+    """(#986) A facts mapping that RECORDS every key touched, by any spelling; an access it cannot attribute to a key records '*'."""
+
+    seen = None   # set by the test: the one shared set of keys
+    quiet = False   # true while the proxy is built from a picture: that copy is not a read
+
+    def _note(self, key):
+        if not RecFacts.quiet:
+            RecFacts.seen.add(key)
+
+    def __getitem__(self, key):
+        self._note(key)
+        return dict.__getitem__(self, key)
+
+    def __setitem__(self, key, value):
+        self._note(key)
+        dict.__setitem__(self, key, value)
+
+    def __delitem__(self, key):
+        self._note(key)
+        dict.__delitem__(self, key)
+
+    def __contains__(self, key):
+        self._note(key)
+        return dict.__contains__(self, key)
+
+    def get(self, key, default=None):
+        self._note(key)
+        return dict.get(self, key, default)
+
+    def pop(self, key, *default):
+        self._note(key)
+        return dict.pop(self, key, *default)
+
+    def setdefault(self, key, default=None):
+        self._note(key)
+        return dict.setdefault(self, key, default)
+
+    def update(self, *a, **k):
+        RecFacts.seen.update(dict(*a, **k))
+        RecFacts.seen.add("*")
+        dict.update(self, *a, **k)
+
+    def _star(self):
+        if not RecFacts.quiet:
+            RecFacts.seen.add("*")
+
+    def items(self):
+        self._star()
+        return dict.items(self)
+
+    def keys(self):
+        self._star()
+        return dict.keys(self)
+
+    def values(self):
+        self._star()
+        return dict.values(self)
+
+    def __iter__(self):
+        self._star()
+        return dict.__iter__(self)
+
+    def copy(self):
+        self._star()
+        return RecFacts(dict.copy(self))
+
+    def __or__(self, other):
+        self._star()
+        return dict.__or__(self, other)
+
+    def __reversed__(self):
+        self._star()
+        return dict.__reversed__(self)
+
+    def __eq__(self, other):
+        self._star()
+        return dict.__eq__(self, other)
+
+    __hash__ = None
+
+    def __repr__(self):
+        self._star()
+        return dict.__repr__(self)
+
+
+class TestFactsReadAtRunTime(TestCarriesLine):
+    """(#986) The fact keys the gate path reads are derived at RUN TIME: the real `gates` and the real sweep reading run with every facts mapping replaced by a recording proxy,
+    over fixtures that drive every gate; the recorded keys must be rows of the docs table. A static scan by name cannot be complete; this cannot be bypassed by a spelling."""
+
+    for _name in [n for n in dir(TestCarriesLine) if n.startswith("test")]:
+        locals()[_name] = None   # the carrying tests are TestCarriesLine's own; only the fixtures are shared
+    del _name
+
+    SIX = (("plan_ledger", "evaluate_gates"), ("plan_ledger", "carried_rows"), ("sb", "_ledger_context"), ("sb", "pr_picture"), ("sb", "sweep_gate_reading"), ("sb", "carries_context"))
+    NOT_FACT_KEYS = {"facts", "now", "pr", "entries", "plan", "plan_problem", "ledger_problem", "unreadable"}   # table rows that are arguments or context fields, never keys of the facts mapping
+
+    def scenarios(self):
+        """(label, setup): each fixture changes the baseline (a carrying pull request, its plan and the dependency) and is undone by the next call of setUp."""
+        def proven():
+            self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+            self.record(self.DEP, self.DEP_HEAD, plan_ref="acme/app#8")
+        return (
+            ("carries, nothing proven (waiting/missing, pending)", lambda: None),
+            ("carries, everything proven (ok)", proven),
+            ("carries, the dependency's head is not in the branch (refused)", lambda: setattr(self, "compare_status", "diverged")),
+            ("carries, the dependency is closed", lambda: self.dep.update(state="CLOSED")),
+            ("carries, the dependency has no plan", lambda: self.dep.update(body="canon: updated the docs")),
+            ("carries, the dependency is merged (an ordinary pull request)", lambda: self.dep.update(state="MERGED")),
+            ("carries, the dependency cannot be read", lambda: self.dep.update(state=None)),
+            ("a held pull request, ci red, body without canon (captain, missing)", lambda: self.pr.update(body="PLAN: acme/app#7\n", labels=[{"name": "merge-captain"}], statusCheckRollup=[{"conclusion": "FAILURE", "status": "COMPLETED"}])),
+            ("a draft with no ci run", lambda: self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", isDraft=True, statusCheckRollup=[])),
+            ("a body that is not text", lambda: self.pr.update(body=7)),
+            ("no plan named", lambda: self.pr.update(body="canon: updated the docs")),
+            ("a plan that cannot be fetched", lambda: self.pr.update(body="PLAN: acme/app#99\ncanon: updated the docs")),
+            ("a ready, held pull request with every scenario proven", lambda: (self.pr.update(body="PLAN: acme/app#7\ncanon: updated the docs", labels=[{"name": "merge-captain"}]), self.record(self.PR, self.HEAD, plan_ref="acme/app#7"))),
+            ("the view is down", lambda: setattr(self, "gh_down", True)),
+        )
+
+    @contextlib.contextmanager
+    def proxied(self, mutant=None):
+        """Every facts mapping of the gate path is a RecFacts: the picture of the pull request, the copy `_ledger_context` makes of it, and what the board and the helpers are handed."""
+        RecFacts.seen = set()
+        real_pic, real_dict = sb.pr_facts_from, dict
+
+        def pic(data):
+            out = real_pic(data)
+            return RecFacts(out) if sys._getframe(1).f_code.co_name == "pr_picture" else out
+
+        class DictHook(type):
+            """`dict` as the daemon module sees it: the same type to isinstance and attributes, and the copy `_ledger_context` makes of the picture is a RecFacts."""
+            def __instancecheck__(cls, obj):
+                return isinstance(obj, real_dict)
+
+            def __getattr__(cls, name):
+                return getattr(real_dict, name)
+
+            def __call__(cls, *a, **k):
+                if sys._getframe(1).f_code.co_name == "_ledger_context" and a and "notice_senders" in k and isinstance(a[0], RecFacts):
+                    RecFacts.quiet = True
+                    try:
+                        return RecFacts(real_dict.copy(a[0]), **k)
+                    finally:
+                        RecFacts.quiet = False
+                return real_dict(*a, **k)
+        copy_ = DictHook("dict", (), {})
+        saved = {}
+        try:
+            with mock.patch.object(sb, "pr_facts_from", pic), mock.patch.object(sb, "dict", copy_, create=True):
+                if mutant:
+                    module, name, line = mutant
+                    target = getattr(sb.plan_ledger if module == "plan_ledger" else sb, name)
+                    scope = target.__globals__
+                    saved = (scope, name, target)
+                    source = textwrap.dedent(inspect.getsource(target))
+                    anchor = self.ANCHOR.get(name)
+                    if anchor is None:
+                        source = TestSweep.with_line(source, line)
+                    else:
+                        self.assertIn(anchor, source)
+                        at = source.index(anchor)
+                        start = source.rindex("\n", 0, at) + 1
+                        source = source[:start] + source[start:at] + line + "\n" + source[start:]
+                    exec(compile(source, "<mutant>", "exec"), scope)
+                yield RecFacts.seen
+        finally:
+            if saved:
+                saved[0][saved[1]] = saved[2]
+
+    def reset(self):
+        self.dep = {"title": "Dep", "state": "OPEN", "headRefOid": self.DEP_HEAD, "reviewDecision": "", "author": {"login": "shared"},
+                    "body": "PLAN: acme/app#8\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                    "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        self.pr = {"title": "Add it", "state": "OPEN", "headRefOid": self.HEAD, "reviewDecision": "", "author": {"login": "shared"},
+                   "body": "PLAN: acme/app#7\nCARRIES: #10\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                   "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        self.compare_status, self.gh_down = "ahead", False
+        for path in self.world.state.glob("plan-ledger*"):
+            path.unlink()
+
+    def drive(self):
+        """Every scenario through the real `gates` and the real sweep reading; the keys recorded (and the star accesses), and that a reading was made."""
+        for label, setup in self.scenarios():
+            self.reset()
+            setup()
+            self.run_as("coder", "gates", self.PR, "--json")
+            engine = sb.build_engine(self.route, self.world.clock.now, "cli", writable=False)[0]
+            sb.sweep_gate_reading(engine, "acme/app", 9, self.world.clock.now())
+
+    def test_986_every_fact_key_recorded_at_run_time_has_a_row_and_every_row_is_reached_or_not_read(self):
+        with self.proxied() as seen:
+            self.drive()
+        rows = TestSweep.docs_fact_rows()
+        self.assertEqual(sorted(seen - rows), [], "a fact the gate path touches that the docs table does not list (a '*' is an access that names no key)")
+        self.assertEqual(sorted(rows - seen - self.NOT_FACT_KEYS), [], "a row no fixture reaches: add a fixture, or drop the row")
+
+    SPELLINGS = (   # a new fact read, in each spelling (F is the facts mapping, C a namespace that carries it as `.facts`)
+        "_z = F.get('zz_new')", "_z = F['zz_new']", "_z = getattr(C, 'facts')['zz_new']", "_z = vars(C)['facts']['zz_new']", "_z = C.__dict__['facts']['zz_new']",
+        "_z = C.facts['zz_new']", "_z = 'zz_new' in F", "_z = list(F.items())", "_z = dict(F)", "_z = (lambda m: m.get('zz_new'))(F)", "_z = {**F}", "_z = [k for k in F]",
+        "_z = list(F.keys())", "_z = list(F.values())", "_z = F.copy()", "_z = list(F)",
+    )
+    ANCHOR = {"evaluate_gates": "authors = authors_of(", "_ledger_context": "source = plan_source_for(", "pr_picture": "body = raw.get(", "sweep_gate_reading": "if ctx.unreadable or not"}   # the first line after which the facts exist
+    CARRIER = {"evaluate_gates": "facts", "carried_rows": "facts", "_ledger_context": "facts", "pr_picture": "facts", "sweep_gate_reading": "ctx.facts", "carries_context": "facts"}
+
+    def mutant_line(self, name, spelling):
+        carrier = "(%s or {})" % self.CARRIER[name]   # None is possible in evaluate_gates: the new read must not be what fails
+        return "C = __import__('types').SimpleNamespace(facts=%s); %s" % (carrier, spelling.replace("F", carrier))
+
+    def test_986_a_new_fact_read_in_any_spelling_in_any_function_fails_the_run_time_test(self):
+        rows = TestSweep.docs_fact_rows()
+        for module, name in self.SIX:
+            for spelling in self.SPELLINGS:
+                with self.proxied((module, name, self.mutant_line(name, spelling))) as seen:
+                    try:
+                        self.drive()
+                    except (KeyError, TypeError, AttributeError):
+                        pass   # a read of a key no fact holds raises: the key was recorded before it did
+                self.assertTrue(seen - rows, (name, spelling))
+
+
 class TestPlanGatesCheck(LedgerBase):
     """#107 slice 3a: `gates-check`, the per-repo mode, the kill switches and the role guard. Nothing enforces: no shim calls it."""
 
