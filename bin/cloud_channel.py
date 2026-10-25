@@ -17,7 +17,7 @@ Rules:
     - The sender is the agent the token proves (the ServiceAccount's name), never the name in the body. A body that
       names another sender is refused with 403 and one audit line.
     - A token that is missing, expired, not authenticated or not issued for this audience is refused with 401.
-    - The ServiceAccount must be in the pinned namespace (default `fleet-agents`); a same-named account elsewhere is
+    - The ServiceAccount must be in the pinned namespace (the hub's FLEET_CLOUD_AGENT_NAMESPACE setting, passed in by the caller); a same-named account elsewhere is
       refused, and so is every call when the namespace is empty (fail closed).
     - A key already in the recipient's inbox is not delivered again (the same shape as the daemon's delivery dedupe:
       a key found in the inbox is never delivered twice); the repeat answers 200 with "duplicate": true. The key is
@@ -34,7 +34,6 @@ import re
 AUDIENCE = "fleet-switchboard"
 SERVICE_ACCOUNT_PREFIX = "system:serviceaccount:"
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-NAMESPACE = "fleet-agents"
 MAX_TOKEN = 4096
 KEY = re.compile(r"[\x21-\x7e]{1,200}")   # printable ASCII, no spaces or control characters
 MAX_TEXT = 20000
@@ -69,7 +68,7 @@ def agent_of(user, namespace):
     return parts[1]
 
 
-def handle(request, reviewer, inbox, audit, audience=AUDIENCE, namespace=NAMESPACE):
+def handle(request, reviewer, inbox, audit, audience=AUDIENCE, *, namespace):
     """Verify the token, hold the claimed sender to it, deliver the keyed message once. Returns {"status": N, ...}."""
     header = request.get("authorization") if isinstance(request, dict) else None
     token = header[len(BEARER):].strip() if isinstance(header, str) and header.startswith(BEARER) else ""
