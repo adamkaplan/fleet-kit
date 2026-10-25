@@ -65,8 +65,17 @@ def fixtures():
 
 
 def run(repo, base="trunk", script=SCRIPT, env=None):
+    """Run a copy of the script that sits beside a fake preflight which passes (the real one is tested elsewhere)."""
     e = dict(ENV, **(env or {}))
-    return subprocess.run([sys.executable, script, base], cwd=repo, capture_output=True, text=True, env=e)
+    d = tempfile.mkdtemp(prefix="prepush-bin-")
+    try:
+        shutil.copy(script, os.path.join(d, "cloud-prepush"))
+        with open(os.path.join(d, "cloud-pr-preflight"), "w") as f:
+            f.write("import sys\nsys.exit(0)\n")
+        return subprocess.run([sys.executable, os.path.join(d, "cloud-prepush"), base], cwd=repo, capture_output=True,
+                              text=True, env=e)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def mutant(tmp, old, new):
@@ -83,8 +92,9 @@ def core_checks(script, tmp):
     repo = make_repo(tmp, fixtures())
     p = run(repo, script=script)
     out = p.stdout
-    if "run 4, identical 2, could not run 0" not in out:
+    if "run 4, identical: 2 (of which failing on both sides: 1), could not run 0" not in out:
         bad.append("counts")
+    out = "\n".join(l for l in out.splitlines() if not l.startswith("FAILS ON BOTH SIDES"))
     if "test_fail_branch_only.py" not in out or "test_fail_differently.py" not in out or "test_fail_same.py" in out:
         bad.append("differences")
     if p.returncode != 1:
@@ -96,7 +106,7 @@ def core_checks(script, tmp):
          TD + "test_other.py": "# nothing\n" + PASS}
     repo = make_repo(tmp, t)
     p = run(repo, script=script)
-    if "run 4, identical 4, could not run 0" not in p.stdout or p.returncode != 0:
+    if "run 4, identical: 4 (of which failing on both sides: 0), could not run 0" not in p.stdout or p.returncode != 0:
         bad.append("selection")
     shutil.rmtree(repo)
     # S8: no selection on a non-empty change

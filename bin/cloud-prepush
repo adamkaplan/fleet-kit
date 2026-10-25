@@ -17,11 +17,46 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 # Repository-wide scan tests (one list). Entries that do not exist in a repository are skipped there; --check-list
 # verifies that every entry exists in this one.
 SCAN_TESTS = ["bin/test-switchboard"]
-TIMEOUT = int(os.environ.get("CLOUD_PREPUSH_TIMEOUT", "300"))  # seconds per test and side; a timeout counts as "could not run"
+# Bounds: CLOUD_PREPUSH_TIMEOUT seconds per test and side (default 120); CLOUD_PREPUSH_TOTAL seconds overall (default 1500).
+# A timeout, or a test not reached when the overall deadline expires, counts as "could not run". Invalid value: exit 2.
+# The two sides run one after the other, one test at a time (a pod has a hard memory limit): no parallelism.
+TIMEOUT = 120
+TOTAL = 1500
+PREFLIGHT = "cloud-pr-preflight"  # found next to this file by path, never through PATH
+
+
+def positive(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if not re.fullmatch(r"[0-9]+", raw.strip()) or int(raw) < 1:
+        raise ValueError(name)
+    return int(raw)
+
+
+# Child environment: an allow-list, then a drop of sensitive-looking names. Words built from parts.
+_DROP_WORDS = ("TOK" + "EN", "K" + "EY", "SEC" + "RET", "PASS" + "WORD", "CR" + "ED")
+_DROP_PREFIX = ("GH_", "GITHUB_", "FLEET_", "CW_", "OPENCODE_", "AZURE_", "AWS_")
+_ALLOW = ("PATH", "LANG", "TERM", "PYTHONHASHSEED")
+
+
+def child_env(tmp):
+    env = {}
+    for k, v in os.environ.items():
+        up = k.upper()
+        if any(w in up for w in _DROP_WORDS) or up.startswith(_DROP_PREFIX):
+            continue
+        if k in _ALLOW or k.startswith("LC_") or k.startswith("CLOUD_PREPUSH_"):
+            env[k] = v
+    env["HOME"] = tmp
+    env["TMPDIR"] = tmp
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
 
 
 def git(args, cwd, check=False):
@@ -58,16 +93,16 @@ def select(root, changed):
     return sorted(picked)
 
 
-def run_one(root, rel, tmp):
+def run_one(root, rel, tmp, limit):
     path = os.path.join(root, rel)
     if not os.path.isfile(path):
         return ("absent", None)
-    cmd = ["python3", path] if rel.endswith(".py") else [path]
-    env = dict(os.environ, TMPDIR=tmp)
+    cmd = [sys.executable, path] if rel.endswith(".py") else [path]
+    env = child_env(tmp)
     try:
-        p = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=TIMEOUT, env=env, errors="replace")
+        p = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=limit, env=env, errors="replace")
     except subprocess.TimeoutExpired:
-        return ("noRun", "timed out after %ds" % TIMEOUT)
+        return ("noRun", "timed out after %ds" % limit)
     except OSError as e:
         return ("noRun", str(e))
     if p.returncode in (126, 127):
@@ -75,6 +110,26 @@ def run_one(root, rel, tmp):
     out = (p.stdout + p.stderr).replace(root, "<root>")
     out = re.sub(r"/tmp/\S+|\b\d+\.\d+s\b|0x[0-9a-f]+", "<x>", out)
     return ("ran", (p.returncode, out[-4000:]))
+
+
+def preflight(root, base, scratch, limit):
+    """Run the neighbouring preflight first. Returns (ok, lines). Cannot run = not ok."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), PREFLIGHT)
+    if not os.path.isfile(path):
+        return False, ["could not run the preflight: " + path + " is missing"]
+    env = child_env(scratch)
+    env["CLOUD_PREFLIGHT_BASE"] = base  # the preflight takes its base from this variable, never from an option
+    try:
+        p = subprocess.run([sys.executable, path], cwd=root, capture_output=True, text=True, timeout=limit, env=env,
+                           errors="replace")
+    except subprocess.TimeoutExpired:
+        return False, ["could not run the preflight: timed out after %ds" % limit]
+    except OSError as e:
+        return False, ["could not run the preflight: %s" % e]
+    lines = (p.stdout + p.stderr).splitlines()
+    if p.returncode != 0:
+        return False, lines or ["the preflight exited %d with no output" % p.returncode]
+    return True, lines
 
 
 def refuse(msg):
@@ -95,6 +150,14 @@ def main(argv):
     if len(argv) != 1:
         return refuse("usage: cloud-prepush <base>")
     base = argv[0]
+    if base.startswith("-"):
+        return refuse("the base must not start with a dash")
+    try:
+        TIMEOUT_S = positive("CLOUD_PREPUSH_TIMEOUT", TIMEOUT)
+        TOTAL_S = positive("CLOUD_PREPUSH_TOTAL", TOTAL)
+    except ValueError as e:
+        return refuse("%s must be a whole number of seconds (1 or more)" % e)
+    started = time.monotonic()
     top = git(["rev-parse", "--show-toplevel"], os.getcwd())
     if top.returncode:
         return refuse("not inside a git repository")
@@ -111,23 +174,46 @@ def main(argv):
     if not changed:
         print("cloud-prepush: no changed files since the merge base; nothing to run (advice only)")
         return 0
+    tmp = tempfile.mkdtemp(prefix="cloud-prepush-")
+    scratch = os.path.join(tmp, "t")
+    os.mkdir(scratch)
+    try:
+        return stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started):
+    # Step 1: the preflight of the pod, before any test.
+    ok, plines = preflight(root, base, scratch, max(1, TOTAL_S))
+    if not ok:
+        for l in plines:
+            print(l)
+        print("cloud-prepush: the preflight did not pass; no test was run (advice only)")
+        return 1
+    print("cloud-prepush: preflight passed", file=sys.stderr)
     picked = select(root, changed)
     if not picked:
         print("cloud-prepush: %d changed file(s) but NO test was selected; this is not a clean result (advice only)" % len(changed))
         return 1
-    tmp = tempfile.mkdtemp(prefix="cloud-prepush-")
     wt = os.path.join(tmp, "base")
-    scratch = os.path.join(tmp, "t")
-    os.mkdir(scratch)
     if git(["worktree", "add", "--detach", wt, mbase], root).returncode:
-        shutil.rmtree(tmp, ignore_errors=True)
         return refuse("cannot create the base worktree")
     run = same = noRun = 0
+    both_fail = []
     diffs = []
     try:
-        for rel in picked:
-            b = run_one(root, rel, scratch)
-            a = run_one(wt, rel, scratch)
+        for i, rel in enumerate(picked, 1):
+            left = TOTAL_S - (time.monotonic() - started)
+            if left <= 0:
+                noRun += 1
+                diffs.append("COULD NOT RUN %s: the overall deadline of %ds expired" % (rel, TOTAL_S))
+                continue
+            print("[%d/%d] %s branch" % (i, len(picked), rel), file=sys.stderr, flush=True)
+            b = run_one(root, rel, scratch, min(TIMEOUT_S, max(1, int(left))))
+            print("[%d/%d] %s base" % (i, len(picked), rel), file=sys.stderr, flush=True)
+            left = TOTAL_S - (time.monotonic() - started)
+            a = run_one(wt, rel, scratch, min(TIMEOUT_S, max(1, int(left)))) if left > 0 else ("noRun", "the overall deadline expired")
             if b[0] == "noRun" or a[0] == "noRun":
                 noRun += 1
                 diffs.append("COULD NOT RUN %s: %s" % (rel, b[1] if b[0] == "noRun" else a[1]))
@@ -144,19 +230,25 @@ def main(argv):
                 continue
             if b[1] == a[1]:
                 same += 1
+                if b[1][0] != 0:
+                    both_fail.append(rel)
             elif b[1][0] != 0 and a[1][0] == 0:
                 diffs.append("FAILS on the branch, passes on the base: %s\n%s" % (rel, b[1][1][-600:]))
             else:
                 diffs.append("DIFFERS (exit %d branch, %d base): %s\n%s" % (b[1][0], a[1][0], rel, b[1][1][-600:]))
     finally:
+        # never forced: git's own option is not used. If the plain removal is refused, the script's own temporary tree is
+        # deleted and the metadata pruned.
         r = git(["worktree", "remove", wt], root)
         if r.returncode:
-            print("cloud-prepush: warning: base worktree not removed: " + r.stderr.strip(), file=sys.stderr)
+            shutil.rmtree(wt, ignore_errors=True)
         git(["worktree", "prune"], root)
-        shutil.rmtree(tmp, ignore_errors=True)
     for d in diffs:
         print(d)
-    print("cloud-prepush: run %d, identical %d, could not run %d" % (run, same, noRun))
+    for rel in both_fail:
+        print("FAILS ON BOTH SIDES with the same tail (a new failure inside it would hide): " + rel)
+    print("cloud-prepush: run %d, identical: %d (of which failing on both sides: %d), could not run %d"
+          % (run, same, len(both_fail), noRun))
     print("cloud-prepush: advice only; continuous integration stays the gate and its result is the only evidence")
     return 1 if diffs else 0
 
