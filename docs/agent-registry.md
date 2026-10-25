@@ -30,6 +30,7 @@ rebuilt from another record.
 | `bin/switchboard/plan_notice.py:49` | `discovery.agents` | reads the agents of the newest `discover()` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
 | `bin/switchboard/sweep.py:941` | `discovery.agents` | reads the agents of the newest `discover()` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
 | `bin/switchboard/workers_report.py:116` | `discovery.agents` | reads the agents of the newest `discover()` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
+| `bin/switchboard/batch_decision.py:182` | `boss-resolution` | defines `boss_name`: the registered name of the agent an observation reports to, through `resolve_boss` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
 | `bin/switchboard/heavy_budget.py:146` | `boss-resolution` | resolves a worker's boss through `resolve_boss` (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
 | `bin/switchboard/heavy_budget.py:182` | `last-reports.json` | reads the last report of a sender (moved out of the entry unchanged) | nobody | the part's own pass or command | derived (reader) |
 | `bin/switchboard/decisions_a.py:209` | `boss-resolution` | the decisions list resolves each worker's boss through `resolve_boss` | nobody | the Decisions list (`decisions_from_reports`) | derived (reader) |
