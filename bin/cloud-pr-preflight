@@ -203,7 +203,7 @@ def main():
         t_start = time.monotonic()
         for rel in names:
             path, sel = sel_of.get(rel, (rel, None))
-            if quick and time.monotonic() - t_start > QUICK_TOTAL:
+            if quick and time.monotonic() - t_start >= QUICK_TOTAL:
                 print("NOT RUN: quick run exceeded %d s (stopped before %s)" % (QUICK_TOTAL, rel))
                 failed = True
                 break
