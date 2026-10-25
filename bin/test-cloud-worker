@@ -34,6 +34,8 @@ spec = importlib.util.spec_from_loader("cw_fleet_switchboard", loader)
 sb = importlib.util.module_from_spec(spec)
 sys.modules["cw_fleet_switchboard"] = sb   # what the removed load_module() did before executing
 loader.exec_module(sb)
+sys.path.insert(0, str(BIN.parent / "cloud" / "worker" / "tests"))
+import stub_support  # noqa: E402  (starts a child with a cleanup that always runs: #956)
 
 PASSWORD = "pw-" + "x" * 20
 
@@ -110,9 +112,9 @@ if command == "create":
     if unknown:
         sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
         sys.exit(2)
-    shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "S"
-    if shape not in ("S", "M"):
-        sys.stderr.write("error: shape must be S or M\\n")
+    shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "XS"
+    if shape not in ("XS", "S", "M"):
+        sys.stderr.write("error: shape must be XS, S or M\\n")
         sys.exit(2)
 if command == "create":
     for item in argv:
@@ -748,7 +750,7 @@ class TestWiring(Base):
         (self.stub_dir / "pf_hang").write_text("")
         before = len((self.stub_dir / "pf.pid").read_text().split())
         env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
-        child = subprocess.Popen([sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = stub_support.start(self, [sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
         while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before and child.poll() is None:
             time.sleep(0.1)
@@ -769,7 +771,7 @@ class TestWiring(Base):
     def test_u3_a_killed_command_leaves_a_directory_that_the_next_command_sweeps(self):
         self.assertEqual(self.launch()[0], 0)
         self.root.mkdir(mode=0o700, exist_ok=True)
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = stub_support.start(self, [sys.executable, "-c", "pass"])
         dead.wait()
         stale = self.root / ("cmd-%d-abcd1234" % dead.pid)
         stale.mkdir(mode=0o700)
@@ -897,7 +899,7 @@ class TestSignalsAndOrphans(Base):
         (self.stub_dir / "pf_hang").write_text("")
         before = len((self.stub_dir / "pf.pid").read_text().split())
         env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
-        child = subprocess.Popen([sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = stub_support.start(self, [sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
         while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before:
             time.sleep(0.1)
@@ -2330,7 +2332,7 @@ class TestVaultCheckProcess(VaultBase):
 
     def two_launches(self):
         results = [None, None]
-        threads = [threading.Thread(target=self.recover, args=(results, i)) for i in (0, 1)]
+        threads = [threading.Thread(target=self.recover, args=(results, i), daemon=True) for i in (0, 1)]
         threads[0].start()
         self.wait_started()   # the first holds the lock (its check has started and sleeps) when the second arrives
         threads[1].start()
@@ -2361,7 +2363,7 @@ class TestVaultCheckProcess(VaultBase):
         self.make_checkout(code=0, fixes=False, sleep=3)
         env = dict(os.environ)
         results = [None]
-        holder = threading.Thread(target=self.recover, args=(results, 0))
+        holder = threading.Thread(target=self.recover, args=(results, 0), daemon=True)
         holder.start()
         self.wait_started()
         recovery = self.cw.VaultRecovery(self.home / "vault.lock", None, sleep=lambda s: time.sleep(0.05), clock=time.monotonic)

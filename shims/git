@@ -110,8 +110,27 @@ def is_network(args, verb_at):
     return False
 
 
+NO_DIALOG_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+NO_DIALOG_CONFIG = "credential.interactive=false"
+
+
+def no_dialog(args):
+    """`-c credential.interactive=false` for EVERY call (any verb, any host): a credential helper must never open a dialog on the person's screen. It goes right before the
+    verb (after the caller's own -c, so it wins over a caller's `credential.interactive=true`); a caller's other credential.* settings stay."""
+    try:
+        verb_at, _ = parse(args)
+        at = 0 if verb_at is None else verb_at
+        return args[:at] + ["-c", NO_DIALOG_CONFIG] + args[at:]
+    except Exception:
+        return ["-c", NO_DIALOG_CONFIG] + args
+
+
 def routed(args):
     """The arguments to give the real git."""
+    return no_dialog(route_credentials(args))
+
+
+def route_credentials(args):
     try:
         verb_at, settings = parse(args)
         if verb_at is None or not is_network(args, verb_at) or not routing_wanted():
@@ -192,7 +211,7 @@ def main(args):
         sys.stderr.write(refused)
         return 1
     try:
-        os.execv(git, [git] + routed(args))
+        os.execve(git, [git] + routed(args), dict(os.environ, **NO_DIALOG_ENV))
     except OSError as err:
         sys.stderr.write("git: cannot run %s (%s)\n" % (git, err.strerror or err))
         return 126
