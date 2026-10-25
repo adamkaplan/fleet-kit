@@ -215,8 +215,17 @@ def refuse(msg):
     return 2
 
 
+def _sibling_needs_helper():
+    """True when the preflight next to this script is the real one (it imports cloud_quick)."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cloud-pr-preflight")) as fh:
+            return "cloud_quick" in fh.read()
+    except OSError:
+        return False
+
+
 def main(argv):
-    if cloud_quick is None:
+    if cloud_quick is None and _sibling_needs_helper():  # a real install lost its helper (a lone copy or a stub sibling does not)
         print("cloud_quick helper missing", file=sys.stderr)
         return 2
     if argv and argv[0] in ("-h", "--help"):
