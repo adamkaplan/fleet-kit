@@ -15041,6 +15041,9 @@ class TestClearMarker(Base):
         self.assertFalse(sb.pr_marker_state([], sb.marker_edit("MERGE: captain\n")[0], now=0)["captain"])
 
 
+REAL_INTENT_ISSUE, REAL_INTENT_PARENT = sb.IntentReader.issue, sb.IntentReader.parent   # before any rig patches them
+
+
 class CharterRig:
     """The shared setUp and helpers of the charter classes (a mixin, so a class that only needs the rig does not re-run another class's tests)."""
 
@@ -15060,7 +15063,7 @@ class CharterRig:
         self.cmd_parents = {1: None, 3: None, 4: None, 9: None, 5: 4, 6: 3, 7: None}   # 5 and 6 are asks; 7 is a root issue with no label
         self.cmd_labels = {1: True, 3: True, 4: True, 9: True, 5: False, 6: False, 7: False}
         self.cmd_reads = []
-        def cmd_parent(reader, number, repo=None):
+        def cmd_parent(reader, number, repo=None, **kw):
             self.cmd_reads.append(("parent", number))
             return self.cmd_parents[number]
         def cmd_issue(reader, number, repo=None):
@@ -15495,7 +15498,7 @@ class TestCharterSetGuard(CharterRig, Base):
     def retire(self, name):
         self.registry._mutate(self.world.state, lambda doc: (doc["retired"].__setitem__(name, {"at": "2026-01-01T00:00:00Z"}) or True, [], None))
 
-    def unreadable(self, reader, number, repo=None):
+    def unreadable(self, reader, number, repo=None, **kw):
         raise RuntimeError("HTTP 502")
 
     def test_an_unreadable_parent_is_refused_unverified_and_nothing_is_written(self):
@@ -15557,6 +15560,141 @@ class TestCharterSetGuard(CharterRig, Base):
         with mock.patch.object(sb.IntentReader, "parent", self.unreadable), self.without("unverified"):
             code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertEqual(self.row("orch-b")["charter"], 3)   # the write the real guard refuses: test_an_unreadable_parent... fails for this mutant
+
+    OTHER = "other-org/other-repo"
+
+    def per_repo_fakes(self):
+        """Fakes that answer a different shape per repository: the intent repository gets the charter shape, any other (or none) the shape of an ask that is no charter."""
+        seen = []
+        def parent(reader, number, repo=None, **kw):
+            seen.append(("parent", repo))
+            return None if repo == self.REPO else 1
+        def issue(reader, number, repo=None):
+            seen.append(("issue", repo))
+            return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if repo == self.REPO else ["other"])
+        return seen, parent, issue
+
+    def test_both_reads_receive_the_intent_repository(self):
+        self.orchestrator("orch-b", registry=None)
+        seen, parent, issue = self.per_repo_fakes()
+        with mock.patch.object(sb.IntentReader, "parent", parent), mock.patch.object(sb.IntentReader, "issue", issue):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen, [("parent", self.REPO), ("issue", self.REPO)])
+        self.assertEqual(self.row("orch-b")["charter"], 3)
+
+    def test_a_row_whose_repository_changed_between_the_read_and_the_lock_is_refused(self):
+        self.orchestrator("orch-b", registry=None)
+        seen, parent, issue = self.per_repo_fakes()
+        def moving_parent(reader, number, repo=None, **kw):
+            found = parent(reader, number, repo)
+            self.registry.upsert(self.world.state, "orch-b", dict(self.row("orch-b"), repo=self.OTHER))
+            return found
+        with mock.patch.object(sb.IntentReader, "parent", moving_parent), mock.patch.object(sb.IntentReader, "issue", issue):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 2, err)
+        self.assertIn("the repository changed", err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+
+    def test_the_label_read_is_never_served_from_the_cache(self):
+        self.orchestrator("orch-b", registry=None)
+        labels, reads = [sb.orchestrator_label()], []
+        def api(reader, path, repo=None):
+            reads.append(path)
+            if path.endswith("/parent"):
+                raise sb.IntentError("not_found", "HTTP 404 no parent")
+            return {"number": 3, "labels": [{"name": n} for n in labels]}
+        with mock.patch.object(sb.IntentReader, "issue", REAL_INTENT_ISSUE), mock.patch.object(sb.IntentReader, "parent", REAL_INTENT_PARENT), mock.patch.object(sb.IntentReader, "_api", api):
+            shared = {("issue", self.REPO, 3): (float("inf"), types.SimpleNamespace(number=3, labels=list(labels)), None)}   # a cached answer that never expires, from before the label was removed
+            real_init = sb.IntentReader.__init__
+            def init(reader, *args, **kwargs):
+                real_init(reader, *args, **kwargs)
+                reader._cache = shared
+            labels[:] = []   # the label is removed since
+            reads.clear()
+            with mock.patch.object(sb.IntentReader, "__init__", init):
+                code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(len([r for r in reads if not r.endswith("/parent")]), 1)
+        self.assertEqual(code, 2, err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+
+    def test_a_labelled_root_issue_with_no_parent_is_accepted(self):
+        self.orchestrator("orch-b", registry=None)
+        self.add_root(10)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "10")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.row("orch-b")["charter"], 10)
+
+    def add_root(self, number):
+        self.cmd_parents[number], self.cmd_labels[number] = None, True
+
+    NOPARENT = sb.IntentError("not_found", "HTTP 404 no parent")
+
+    def real_set(self, parent, issue, repo_row=None):
+        """One `charter set orch-b 3` through the REAL IntentReader methods and a fake _api. `parent` / `issue`: a dict (the JSON), an exception to raise, or a str (non-JSON)."""
+        self.orchestrator("orch-b", registry=None)
+        paths = []
+        def api(reader, path, repo=None):
+            paths.append((path, repo))
+            answer = parent if path.endswith("/parent") else issue
+            if isinstance(answer, Exception):
+                raise answer
+            if isinstance(answer, str):
+                raise sb.IntentError("gh", "gh returned non-JSON: " + answer)
+            return answer
+        with mock.patch.object(sb.IntentReader, "issue", REAL_INTENT_ISSUE), mock.patch.object(sb.IntentReader, "parent", REAL_INTENT_PARENT), mock.patch.object(sb.IntentReader, "_api", api):
+            result = self.run_as("cos", "charter", "set", "orch-b", "3")
+        return result, paths
+
+    def test_the_real_reads_carry_the_intent_repository_in_the_request_path(self):
+        label = {"number": 3, "labels": [{"name": sb.orchestrator_label()}]}
+        (code, out, err), paths = self.real_set(self.NOPARENT, label)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(paths, [("repos/%s/issues/3/parent" % self.REPO, self.REPO), ("repos/%s/issues/3" % self.REPO, self.REPO)])
+
+    SHAPES = {   # every shape the guard can receive: name -> (parent read, issue record, refusal text or None)
+        "root, labelled, 404 no parent": (NOPARENT, {"number": 3, "labels": [{"name": "LABEL"}]}, None),
+        "root, labelled, closed": (NOPARENT, {"number": 3, "state": "closed", "labels": [{"name": "LABEL"}]}, None),
+        "has a parent": ({"number": 1}, {"number": 3, "labels": [{"name": "LABEL"}]}, "is an ask, not a charter"),
+        "pull request with the label": (NOPARENT, {"number": 3, "pull_request": {"url": "x"}, "labels": [{"name": "LABEL"}]}, "is a pull request, not a charter"),
+        "no label": (NOPARENT, {"number": 3, "labels": [{"name": "bug"}]}, "is not a charter"),
+        "label look-alike": (NOPARENT, {"number": 3, "labels": [{"name": "other:orchestrator"}]}, "is not a charter"),
+        "404 that is not no-parent": (sb.IntentError("not_found", "HTTP 404 repository moved or renamed"), {"number": 3, "labels": [{"name": "LABEL"}]}, "cannot read #3's parent"),
+        "parent read error": (sb.IntentError("gh", "HTTP 502"), {"number": 3, "labels": [{"name": "LABEL"}]}, "cannot read #3's parent"),
+        "parent read non-JSON": ("<html>", {"number": 3, "labels": [{"name": "LABEL"}]}, "cannot read #3's parent"),
+        "issue unreadable": (NOPARENT, sb.IntentError("gh", "HTTP 502"), "cannot read #3's parent"),
+        "issue 404 (foreign repository)": (NOPARENT, sb.IntentError("not_found", "HTTP 404"), "cannot read #3's parent"),
+    }
+
+    def test_every_shape_of_the_two_reads_through_the_real_methods(self):
+        label = sb.orchestrator_label()
+        for name, (parent, issue, refusal) in self.SHAPES.items():
+            with self.subTest(name):
+                if isinstance(issue, dict):
+                    issue = json.loads(json.dumps(issue).replace("LABEL", label))
+                if isinstance(parent, dict):
+                    parent = dict(parent)
+                (code, out, err), paths = self.real_set(parent, issue)
+                if refusal is None:
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(self.row("orch-b")["charter"], 3)
+                else:
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(refusal, err)
+                    self.assertIsNone(self.row("orch-b")["charter"])
+                self.registry.upsert(self.world.state, "orch-b", dict(self.row("orch-b"), charter=None))
+
+    def test_label_look_alikes_are_refused(self):
+        self.orchestrator("orch-b", registry=None)
+        real = sb.orchestrator_label()
+        for look in ("other:orchestrator", "orchestrator", real.upper()):
+            def issue(reader, number, repo=None, look=look):
+                return types.SimpleNamespace(number=number, labels=[look])
+            with mock.patch.object(sb.IntentReader, "issue", issue):
+                code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+            self.assertEqual(code, 2, (look, err))
+            self.assertIn("is not a charter", err)
+        self.assertIsNone(self.row("orch-b")["charter"])
 
     def test_a_retired_holder_does_not_hold_the_issue(self):
         self.orchestrator("orch-a", registry=3)
@@ -15746,7 +15884,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
     def test_the_parents_are_read_before_the_lock_and_never_inside_it(self):
         self.orchestrator("orch-b", registry=None)
         seen = []
-        real_parent = lambda reader, number, repo=None: (seen.append(("parent", number)), self.cmd_parents[number])[1]
+        real_parent = lambda reader, number, repo=None, **kw: (seen.append(("parent", number)), self.cmd_parents[number])[1]
         real = self.registry.set_charter
 
         def spy(state_dir, name, charter, by, now=None, check=None):
