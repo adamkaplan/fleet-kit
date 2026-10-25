@@ -406,9 +406,15 @@ def check_directory_is_fsynced_after_rename(module):
         assert events == [("fsync", False), ("replace", False), ("fsync", True)], events
 
 
+def daemon_source():
+    """The daemon's whole source: the entry and every part of its manifest, in manifest order."""
+    lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+    return "\n".join((BIN / n).read_text() for n in lines)
+
+
 def daemon_keys():
     """The keys the daemon's DecisionStore.publish writes into decisions.json, read from its source."""
-    text = (BIN / "fleet-switchboard").read_text()
+    text = daemon_source()
     start = text.index("    def publish(self, decisions, errors, now, provisional=False):")
     block = text[start:text.index("temp = path.with_name", start)]
     keys = set(re.findall(r'body = \{(.*?)\}', block, re.S)[0].replace("\n", " ").split('"')[1::2])
