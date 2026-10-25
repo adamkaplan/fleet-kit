@@ -150,7 +150,7 @@ def _write_private(path, text):
 
 def _read_private(path, limit):
     """The text of a private regular file (ours, mode 0600, not a symlink), at most `limit` bytes; OSError/ValueError otherwise."""
-    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)   # O_NONBLOCK: a FIFO in the record directory must not block the open
     with os.fdopen(fd, "rb") as handle:
         found = os.fstat(handle.fileno())
         if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
@@ -159,6 +159,42 @@ def _read_private(path, limit):
     if len(raw) > limit:
         raise ValueError("too large")
     return raw.decode("utf-8")
+
+
+def read_record_file(path, max_bytes):
+    """The ONE safe read of a file in the cloud record directory (#1097, the family of #1073): (record dict, None) or (None, kind). Never blocks (O_NONBLOCK,
+    so a FIFO cannot hang the open), never follows a symlink (O_NOFOLLOW), reads only a regular file (fstat), at most max_bytes. Never raises.
+    kind: not_regular, too_large, not_utf8, not_json, wrong_shape."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None, "not_regular"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "not_regular"
+        raw = b""
+        while len(raw) <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return None, "not_regular"
+    finally:
+        os.close(fd)
+    if len(raw) > max_bytes:
+        return None, "too_large"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "not_utf8"
+    try:
+        record = json.loads(text)
+    except (ValueError, RecursionError):
+        return None, "not_json"
+    if not isinstance(record, dict):
+        return None, "wrong_shape"
+    return record, None
 
 
 def load_record(state, name):
@@ -206,6 +242,92 @@ def list_records(state):
             if record is not None:
                 found.append(record)
     return found
+
+
+WATCH_MAX_RECORDS = 50      # the most valid records one pass reads
+WATCH_MAX_BYTES = 65536     # the most bytes read from one record
+WATCH_MAX_FILES = 200       # the most files one pass examines, valid or not
+WATCH_SECONDS = 1.0         # the most monotonic time one pass spends
+SKIP_KINDS = ("bad_name", "not_regular", "symlink", "too_large", "not_utf8", "not_json", "wrong_shape", "too_deep")
+
+
+def _read_one(path, max_bytes):
+    """One record file: (record, None) or (None, skip kind). Never blocks: O_NONBLOCK (a FIFO with no writer opens at once), O_NOFOLLOW, regular files only."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError as err:
+        import errno
+        return None, ("symlink" if err.errno == errno.ELOOP else "not_regular")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "not_regular"
+        raw = b""
+        while len(raw) <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return None, "not_regular"
+    finally:
+        os.close(fd)
+    if len(raw) > max_bytes:
+        return None, "too_large"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "not_utf8"
+    try:
+        record = json.loads(text)
+    except RecursionError:
+        return None, "too_deep"
+    except ValueError:
+        return None, "not_json"
+    if not isinstance(record, dict):
+        return None, "wrong_shape"
+    return record, None
+
+
+def read_records_bounded(state, max_records=WATCH_MAX_RECORDS, max_bytes=WATCH_MAX_BYTES, max_files=WATCH_MAX_FILES,
+                         seconds=WATCH_SECONDS, cursor=None, clock=None):
+    """The cloud record directory read for the per-pass watch. Read-only; never raises on a bad file, never blocks on one.
+    {"records": [...], "skipped": n, "skips": {kind: n}, "capped": bool, "bound": None|"records"|"files"|"time", "cursor": last name examined}.
+    The start rotates: reading resumes after `cursor`, so every record gets a turn."""
+    import time as _time
+    clock = clock or _time.monotonic
+    base = Path(state) / CLOUD_DIR
+    out = {"records": [], "skipped": 0, "skips": {k: 0 for k in SKIP_KINDS}, "capped": False, "bound": None, "cursor": cursor}
+    if not base.is_dir():
+        return out
+    names = sorted(n for n in os.listdir(str(base)) if n.endswith(".json"))
+    if cursor is not None:
+        after = [n for n in names if n > cursor]
+        names = after + [n for n in names if n <= cursor]
+    deadline = clock() + seconds
+    examined = 0
+    for name in names:
+        if len(out["records"]) >= max_records:
+            out["bound"] = "records"
+        elif examined >= max_files:
+            out["bound"] = "files"
+        elif clock() > deadline:
+            out["bound"] = "time"
+        if out["bound"]:
+            out["capped"] = True
+            break
+        examined += 1
+        out["cursor"] = name
+        kind = None
+        if not valid_name(name[:-5]):
+            kind = "bad_name"
+        else:
+            record, kind = _read_one(str(base / name), max_bytes)
+        if kind:
+            out["skips"][kind] += 1
+            out["skipped"] += 1
+        else:
+            out["records"].append(record)
+    return out
 
 
 def _reserved(name):
