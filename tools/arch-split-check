@@ -106,7 +106,7 @@ def main(argv=None):
     parser.add_argument("--before", nargs="+", metavar="FILE")
     parser.add_argument("--after", nargs="+", metavar="FILE", required=True)
     parser.add_argument("--no-surface", action="store_true", help="compare statements only, never load the code")
-    parser.add_argument("--ignore-imports", action="store_true", help="leave import statements and docstrings out of the statement comparison (for a move of test support code)")
+    parser.add_argument("--ignore-imports", action="store_true", help="leave import statements and docstrings out of the statement comparison (for a move of test support code). It also skips any top-level statement whose line ends '# support import', so it cannot prove that a moved helper kept its imports: only a NameError at test time shows that")
     parser.add_argument("--write-surface", metavar="SNAPSHOT")
     parser.add_argument("--check-surface", metavar="SNAPSHOT")
     args = parser.parse_args(argv)
