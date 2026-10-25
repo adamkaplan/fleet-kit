@@ -10882,11 +10882,47 @@ def _pr_numbers(obj):
     return [n for n in (_number(p) for p in (prs if isinstance(prs, list) else [])) if n]
 
 
+REVIEW_COMMENT_RE = re.compile(r"^Review of ([0-9a-f]{40})(?![0-9a-f])")
+# Verdict words, longest first; the line carries the word from this table, never the comment text.
+REVIEW_VERDICTS = ("CHANGES REQUESTED", "APPROVE")
+
+
+def _review_verdict(first_line):
+    rest = first_line[50:].upper()
+    for word in REVIEW_VERDICTS:
+        if re.search(r"(?<![A-Z])%s(?![A-Z])" % word.replace(" ", r"[ _]"), rest):
+            return word
+    return "UNKNOWN"
+
+
+def _review_comment_item(repo, comment, issue, number, cid, now):
+    """A review comment on an open PR (first line `Review of <40 hex>`) as one line; None when not one."""
+    body = comment.get("body")
+    if not _is_pr(issue) or not isinstance(body, str) or str(issue.get("state") or "open") != "open":
+        return None
+    if issue.get("merged") or (issue.get("pull_request") or {}).get("merged_at"):
+        return None
+    m = REVIEW_COMMENT_RE.match(body.split("\n", 1)[0][:300])
+    if not m:
+        return None
+    author, login = _login(issue), _login(comment)
+    if not login or (author and login.lower() == author.lower()):
+        return None
+    known, lookups = _issue_refs(issue, number)
+    summary = "PR #%d %s %s" % (number, m.group(1)[:12], _review_verdict(body.split("\n", 1)[0][:300]))
+    return GitHubItem("github.reviewcomment:%d" % cid, "github.comment", summary, repo, known, lookups, login, now,
+                      [number], True)
+
+
 def _comment_item(repo, comment, issue, now):
     cid = _id(comment)
     number = _number(issue) or _url_number(comment.get("issue_url"))
     if cid is None or number is None or signed_by_fleet(comment.get("body")):
         return None
+    if isinstance(comment, dict):
+        rc = _review_comment_item(repo, comment, issue, number, cid, now)
+        if rc:
+            return rc
     known, lookups = _issue_refs(issue, number)
     summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(comment.get("body") or "", 400))
     return GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now,

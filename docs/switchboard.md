@@ -5803,3 +5803,12 @@ Cause: a review marker (`<!-- fleet-switchboard:from=NAME -->`) was written only
 - `gates` prints `blocking review: <name> CHANGES_REQUESTED at <head> (dismiss with: fleet-switchboard review dismiss ...)` for each LOGIN whose latest decisive review (dismissals count) is CHANGES_REQUESTED while GitHub's reviewDecision says so: the same rule as the merge shim, one function in `shims/review_rule.py`, with a parity test.
 
 The reviewer definitions and the review skill name these commands, not the bare GitHub command. A cloud reader can use them once its token allows it (a separate question for the owner).
+
+## Review comments on a lane's pull request
+
+A new comment on an open pull request whose first line matches `^Review of [0-9a-f]{40}` is delivered to the owning lane's orchestrator as one line: `PR #N <12-char head> <verdict>`. The verdict is APPROVE or CHANGES REQUESTED (table `REVIEW_VERDICTS`), else UNKNOWN; the comment text is never copied. The item key is `github.reviewcomment:<comment id>`, so the existing persisted delivery record delivers it once across restarts; an edited event is not a new comment. Closed or merged pull requests, the pull request author's own comments and non-matching first lines get no such line. It uses only the comment event's data: no new GitHub read, no write.
+
+| Input | Bound | Test |
+|---|---|---|
+| comment body | first line only, 300 chars, verdict from the table | ReviewCommentLineTests |
+| comment id, PR state, logins | event payload only | ReviewCommentLineTests |

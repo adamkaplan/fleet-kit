@@ -91962,6 +91962,37 @@ class TestArchTools(unittest.TestCase):
         self.assertEqual(same.returncode, 0, same.stdout)
 
 
+class ReviewCommentLineTests(unittest.TestCase):
+    HEAD = "3f2a9c1b7d4e" + "0" * 28
+
+    def handle(self, body, cid=9001, state="open", author="alice", who="bob", action="created", merged=False):
+        pr = {"number": 10, "state": state, "user": {"login": author}, "body": "", "pull_request": {"merged_at": "x" if merged else None}}
+        payload = {"action": action, "issue": pr, "comment": {"id": cid, "body": body, "user": {"login": who}}}
+        return [i for i in sb._wh_issue_comment("o/r", payload, 1.0) if i.key.startswith("github.reviewcomment:")]
+
+    def test_each_verdict_word_in_the_table_is_delivered(self):
+        for word in sb.REVIEW_VERDICTS:
+            items = self.handle("Review of %s %s\nsecret sentence" % (self.HEAD, word))
+            self.assertEqual([i.summary for i in items], ["PR #10 3f2a9c1b7d4e %s" % word])
+            self.assertNotIn("secret", items[0].summary)
+
+    def test_unknown_verdict_is_delivered(self):
+        self.assertEqual(self.handle("Review of %s maybe" % self.HEAD)[0].summary, "PR #10 3f2a9c1b7d4e UNKNOWN")
+
+    def test_not_delivered(self):
+        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD, state="closed"), [])
+        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD, merged=True), [])
+        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD, who="alice"), [])
+        self.assertEqual(self.handle("x\nReview of %s APPROVE" % self.HEAD), [])
+        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD[:39]), [])
+        self.assertEqual(self.handle("Review of %s APPROVE" % self.HEAD, action="edited"), [])
+
+    def test_key_is_by_comment_id_so_the_persisted_queue_dedups(self):
+        a = self.handle("Review of %s APPROVE" % self.HEAD)[0].key
+        self.assertEqual(a, self.handle("Review of %s APPROVE" % self.HEAD)[0].key)
+        self.assertNotEqual(a, self.handle("Review of %s APPROVE" % self.HEAD, cid=9002)[0].key)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
