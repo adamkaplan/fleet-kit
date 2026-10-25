@@ -3,7 +3,15 @@
 Three parts: the shared helper (cloud/worker/tests/stub_support.py) kills the process group and frees the port on pass, failure and a
 setUp that raises; the stub server ends by itself (SIGTERM even when the parent ignored it, a SIGKILLed parent, an idle cap); and a scan
 of the cloud tests finds every place that starts a child process by its syntax tree, with one case per site and one mutant per site
-(the cleanup removed) that the scan must catch. Offline: loopback only. Children are only ever the ones this file started: never a name pattern."""
+(the cleanup removed) that the scan must catch. Offline: loopback only. Children are only ever the ones this file started: never a name pattern.
+
+THE CLOSED RULE of the scan: a spawning primitive (the subprocess module and its names, os.spawn*/exec*/system/popen/fork, posix_spawn,
+asyncio.create_subprocess_*, threading.Thread, multiprocessing) is a start site when a constant call names it, through import aliases and getattr(module, 'name');
+ANY OTHER REFERENCE to one is itself a site that fails closed: an assignment or class-attribute alias, functools.partial(subprocess.Popen, ..), a primitive passed as
+a value, the namespace of one of these modules, a bare spawning module used as a value, a getattr or vars of one with a name the scan cannot read, and
+importlib.import_module / __import__ of one (or of a name the scan cannot read). A string of code that parses is read as code through its own aliases; a string that
+does not parse (a template with a placeholder) fails closed on any use of the primitive. A Python file the scan cannot parse is a site. Such a site passes only when
+it is listed in EMBEDDED_OK by its exact text, with a reason. What the scan cannot follow is LIMITS, below, and a test counts it."""
 import ast
 import errno
 import http.client
@@ -361,6 +369,8 @@ BACKGROUND = re.compile(r"(?<![&])&\s*($|[;\n)])|\bnohup\b|\bsetsid\b|\bdisown\b
 SERVER_WORDS = re.compile(r"stub_server|serve_forever|http\.server")   # a blocking call whose argument is a server never returns
 # a child that a string of code starts inside another process: allowed only with this reason (the scan finds the string; a new one fails)
 EMBEDDED_OK = {("bin/test-cloud-worker", "grandchild.pid"): "a bounded grandchild (sleep 60) of a stub tool; the test asserts it is gone",
+               ("bin/test-cloud-worker", "test_u3_a_signal_right_after_the_tunnel_spawn_still_stops_the_tunnel: subprocess.Popen"): "wraps the real Popen to raise a signal right after the tunnel spawn; the tunnel is started and stopped by the code under test, which the test asserts",
+               ("bin/test-cloud-worker", "test_u3_a_signal_right_after_the_tunnel_spawn_still_stops_the_tunnel: subprocess"): "the module named only to patch its Popen with that wrapper",
                ("cloud/worker/tests/fixtures/prepush_spawner.py", "subprocess.Popen(['sleep', '77'])"): "a bounded grandchild (sleep 77) of a fixture script; the hardening test asserts the check's process-group kill ends it"}
 
 
@@ -542,20 +552,91 @@ def scan_tree(rel, tree):
                     ok, reason = True, why
             sites.append(dict(file=rel, line=n.lineno, func="<string>", node=n, tree=tree, par=par, name="string", kind="embedded", ok=ok,
                               why=reason or ("the string stops its child with stop_group" if ok else "a string of code starts a child or backgrounds a process with no stop_group and no reason listed")))
+    sites.extend(reference_sites(rel, tree, par, aliases))
     return sites
 
 
+# THE CLOSED RULE (what the scan follows, and what it refuses to guess): a spawning primitive is a start site when a constant call names it (found above, through
+# import aliases and getattr(module, 'name')), and ANY OTHER REFERENCE to a spawning primitive is itself a site that fails closed: the primitive used as a value
+# (an assignment or class-attribute alias, functools.partial(subprocess.Popen, ..), an argument, a subscript of a module's __dict__), the module of a spawning
+# family used as a bare value (passed, assigned, or the target of a getattr with a name the scan cannot read), and a dynamic import of such a module
+# (importlib.import_module / __import__ with a name of one, or with a name the scan cannot read). A site of this kind has no cleanup the scan can see: it
+# passes only when it is listed in EMBEDDED_OK by its exact text and a reason. What the rule cannot follow, stated once (and counted by a test): LIMITS.
+SPAWN_MODULES = {"subprocess", "multiprocessing", "pty", "os", "asyncio", "threading", "concurrent", "concurrent.futures"}
+BARE_MODULES = {"subprocess", "multiprocessing", "pty", "concurrent.futures"}   # a bare reference to these is a spawn family on its own (os, asyncio, threading have much else)
+DYNAMIC_IMPORTS = {"importlib.import_module", "importlib.__import__", "__import__"}
+LIMITS = (
+    "a star import (from subprocess import *) is not resolved: star_imports() counts it, and no real test uses one",
+    "a name assembled at run time ('sub' + 'process'), or read from data, is not followed",
+    "a spawn done by a callable the test imports from product code (not a primitive of the table) is not a site",
+    "directories are walked with os.walk, without a bound; symlinked directories are not followed",
+)
+
+
+def reference_sites(rel, tree, par, aliases):
+    """Every reference to a spawning primitive that is not the func of a call the scan followed (the closed rule above)."""
+    found = []
+
+    def site(n, why):
+        fn = enclosing_function(n, par)
+        where = fn.name if fn else "<module>"
+        listed = [r for (f, snip), r in EMBEDDED_OK.items() if f == rel and snip == "%s: %s" % (where, ast.unparse(n))]   # the function and the exact text
+        found.append(dict(file=rel, line=n.lineno, func=where, node=n, tree=tree, par=par, name=ast.unparse(n), kind="reference", ok=bool(listed), listed=bool(listed),
+                          why=listed[0] if listed else "a reference to a spawning primitive that is not a followed call (%s): the scan cannot see its cleanup, so it fails closed; use stub_support.start, or list it in EMBEDDED_OK ('<function>: <exact text>') with a reason" % why))
+    primitives = {name for kind, names in STARTERS.items() if kind not in ("blocking",) for name in names}
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Name, ast.Attribute)):
+            parent = par.get(n)
+            if isinstance(parent, ast.Attribute) and parent.value is n:
+                continue   # the base of a longer chain: the chain is judged as a whole
+            canon = resolve(n, aliases) or ""
+            followed = isinstance(parent, ast.Call) and parent.func is n
+            if canon in primitives and not followed:
+                site(n, "the primitive %s used as a value" % canon)
+            elif canon in BARE_MODULES and not followed and not (isinstance(parent, ast.Call) and parent.func is not n and _is_getattr_constant(parent)):
+                site(n, "the module %s used as a bare value" % canon)
+            elif isinstance(n, ast.Attribute) and n.attr == "__dict__" and (resolve(n.value, aliases) or "") in SPAWN_MODULES:
+                site(n, "the namespace of %s" % resolve(n.value, aliases))
+        elif isinstance(n, ast.Call):
+            canon = resolve(n.func, aliases) or ""
+            if canon in DYNAMIC_IMPORTS:
+                arg = n.args[0] if n.args else None
+                if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+                    site(n, "a dynamic import of a name the scan cannot read")
+                elif arg.value.split(".")[0] in SPAWN_MODULES:
+                    site(n, "a dynamic import of %s" % arg.value)
+            elif canon in ("getattr", "vars") and n.args and (resolve(n.args[0], aliases) or "") in SPAWN_MODULES:
+                if canon == "vars" or not (len(n.args) >= 2 and isinstance(n.args[1], ast.Constant) and isinstance(n.args[1].value, str)):
+                    site(n, "%s of %s with a name the scan cannot read" % (canon, resolve(n.args[0], aliases)))
+                elif (resolve(n, aliases) or "") in primitives and not (isinstance(par.get(n), ast.Call) and par[n].func is n):
+                    site(n, "getattr of a primitive used as a value")
+    return found
+
+
+def _is_getattr_constant(call):
+    """getattr(module, 'name') with a constant name: judged by what it names, not as a bare module."""
+    return isinstance(call.func, ast.Name) and call.func.id == "getattr" and len(call.args) >= 2 and isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str)
+
+
 def string_starts(text):
-    """(starts, stops) of a string a test hands to another process as code. A string that parses as Python is read like code, through its own import aliases: it
-    starts a child when a call resolves to a starter and stops it when a call resolves to stub_support.stop_group. A string that does not parse (a shell script, or
-    code with a placeholder) falls back to the word match."""
+    """(starts, stops) of a string a test hands to another process as code. A string that parses as Python is read like code, through its own import aliases:
+    it starts a child when a call resolves to a starter, and stops it when stub_support.stop_group is applied to the handle the start returned. A string that
+    does NOT parse (a template with a placeholder, a shell script) cannot be read that way, so it fails closed: any import of subprocess, use of its names, call of Popen or of the helper's
+    spawn is a start (the aliases a template declares make no difference), and it stops only when stop_group is applied to a name the string assigned."""
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
-        return "subprocess.Popen(" in text or "%s.spawn(" % HELPER in text, "%s.stop_group(" % HELPER in text
+        starts = bool(re.search(r"\bimport\s+subprocess\b|\bfrom\s+subprocess\b|\bsubprocess\.[A-Za-z_]|\bPopen\s*\(|%s\.spawn\s*\(" % HELPER, text))   # code, not prose that names the word
+        assigned = set(re.findall(r"^\s*(\w+)\s*=", text, re.M))
+        return starts, any(h in assigned for h in re.findall(r"%s\.stop_group\(\s*(\w+)" % HELPER, text))
     aliases = aliases_of(tree)
+    starters = {"subprocess.Popen", HELPER + ".spawn"}
+    handles = {t.id for a in ast.walk(tree) if isinstance(a, ast.Assign) and isinstance(a.value, ast.Call) and resolve(a.value.func, aliases) in starters
+               for t in a.targets if isinstance(t, ast.Name)}
     names = {resolve(c.func, aliases) for c in ast.walk(tree) if isinstance(c, ast.Call)}
-    return bool(names & {"subprocess.Popen", HELPER + ".spawn"}), HELPER + ".stop_group" in names
+    stops = any(isinstance(c, ast.Call) and resolve(c.func, aliases) == HELPER + ".stop_group" and c.args and isinstance(c.args[0], ast.Name) and c.args[0].id in handles
+                for c in ast.walk(tree))
+    return bool(names & starters), stops
 
 
 def find_sites(root):
@@ -565,6 +646,9 @@ def find_sites(root):
         tree = parse(path)
         if tree is not None:
             sites.extend(scan_tree(os.path.relpath(path, root), tree))
+        elif path.endswith(".py"):   # a Python file in scope that cannot be parsed hides its starts: it is a site, never silently skipped
+            sites.append(dict(file=os.path.relpath(path, root), line=1, func="<file>", node=None, tree=None, par=None, name="file", kind="unparseable", ok=False,
+                              why="a Python file the scan cannot parse (a syntax error or an encoding it cannot read): its starts cannot be seen"))
     sites.sort(key=lambda s: (s["file"], s["line"]))
     return sites
 
@@ -675,7 +759,7 @@ SITES = find_sites(ROOT)
 
 
 def mutable(s, how):
-    if s["kind"] == "helper-itself" or s["kind"] == "blocking" or s.get("listed"):   # a listed script has no cleanup to take away
+    if s["kind"] in ("helper-itself", "blocking", "unparseable", "reference") or s.get("listed"):   # a listed script has no cleanup to take away
         return False
     if s["kind"] == "embedded":
         return "stop_group" in s["node"].value and how != "alias"   # a string of code has no call to rename
@@ -820,6 +904,80 @@ class TestEverySite(unittest.TestCase):
         for key in EMBEDDED_OK:
             self.assertTrue(os.path.exists(os.path.join(ROOT, key[0])), "EMBEDDED_OK names a file that is gone: %s" % (key,))
 
+    SHAPES = {
+        "an assignment alias": "import subprocess\ndef t():\n    p = subprocess.Popen\n    p(['x'])\n",
+        "a class-attribute alias": "import subprocess\nclass A:\n    p = subprocess.Popen\n",
+        "functools.partial of the primitive": "import functools, subprocess\ndef t():\n    return functools.partial(subprocess.Popen, ['x'])\n",
+        "a bare attribute as an argument": "import subprocess\ndef t(run):\n    run(subprocess.Popen)\n",
+        "an aliased primitive as a value": "from subprocess import Popen as go\ndef t(run):\n    run(go)\n",
+        "the namespace of the module": "import subprocess\ndef t():\n    subprocess.__dict__['Popen'](['x'])\n",
+        "a dynamic import by constant name": "import importlib\ndef t():\n    importlib.import_module('subprocess').Popen(['x'])\n",
+        "__import__ by constant name": "def t():\n    __import__('subprocess').Popen(['x'])\n",
+        "a dynamic import of a name that is read at run time": "import importlib\ndef t(name):\n    importlib.import_module(name).Popen(['x'])\n",
+        "getattr of the module with a name read at run time": "import subprocess\ndef t(name):\n    getattr(subprocess, name)(['x'])\n",
+        "vars of the module": "import subprocess\ndef t():\n    vars(subprocess)['Popen'](['x'])\n",
+        "getattr of the primitive used as a value": "import subprocess\ndef t():\n    p = getattr(subprocess, 'Popen')\n",
+        "the module passed as a value": "import subprocess\ndef t(use):\n    use(subprocess)\n",
+        "os.fork as a value": "import os\ndef t(run):\n    run(os.fork)\n",
+    }
+
+    def test_any_other_reference_to_a_spawning_primitive_is_a_failing_site(self):
+        for name, src in self.SHAPES.items():
+            with self.subTest(shape=name):
+                bad = [x for x in scan_tree("cloud/worker/tests/test_x.py", ast.parse(src)) if not x["ok"]]
+                self.assertTrue(bad, "the scan lets this shape through: %s" % name)
+        for name, src in {"a followed constant call": "import subprocess\ndef t():\n    subprocess.Popen(['x'])\n",
+                          "a followed getattr call": "import subprocess\ndef t():\n    getattr(subprocess, 'Popen')(['x'])\n",
+                          "subprocess.PIPE and run": "import subprocess\ndef t():\n    subprocess.run(['x'], stdout=subprocess.PIPE)\n",
+                          "an import of a spawn-free module": "import importlib\ndef t():\n    importlib.import_module('json')\n",
+                          "an import that starts nothing": "from subprocess import Popen\n"}.items():
+            with self.subTest(allowed=name):
+                self.assertEqual([x["kind"] for x in scan_tree("cloud/worker/tests/test_x.py", ast.parse(src)) if x["kind"] == "reference"], [], name)
+
+    def test_a_reference_site_is_listed_by_its_function_and_exact_text_or_it_fails(self):
+        src = "import subprocess\ndef t():\n    p = subprocess.Popen\n"
+        sites = scan_tree("cloud/worker/tests/test_x.py", ast.parse(src))
+        self.assertEqual([(x["kind"], x["ok"]) for x in sites], [("reference", False)])
+        with mock.patch.dict(EMBEDDED_OK, {("cloud/worker/tests/test_x.py", "t: subprocess.Popen"): "wrapped by the test"}):
+            self.assertEqual([x["ok"] for x in scan_tree("cloud/worker/tests/test_x.py", ast.parse(src))], [True])
+            other = scan_tree("cloud/worker/tests/test_x.py", ast.parse(src.replace("def t", "def u")))
+            self.assertEqual([x["ok"] for x in other], [False], "the listing names the function: another function is not excused")
+
+    def test_an_unparseable_template_string_with_an_aliased_start_is_a_failing_site(self):
+        embedded = lambda text: [x for x in scan_tree("cloud/worker/tests/test_x.py", ast.parse("CODE = %r\n" % text)) if x["kind"] == "embedded"]
+        for tail in ("if @X@:\n pass\n", "echo $FOO\n"):
+            with self.subTest(tail=tail):
+                found = embedded('from subprocess import Popen as go\ngo(["x", "@PIDFILE@"])\n' + tail)
+                self.assertEqual([x["ok"] for x in found], [False], "a template with a placeholder hides an aliased start")
+        self.assertEqual([x["ok"] for x in embedded('import subprocess as sp\nsp.Popen(["x"])\nif @X@:\n pass\n')], [False])
+        self.assertEqual(embedded("a docstring that says the word subprocess and Popen in prose"), [], "prose is not code")
+        stopped = 'import stub_support\np = stub_support.spawn(["x", "@PIDFILE@"])\nstub_support.stop_group(p)\nif @X@:\n pass\n'
+        self.assertEqual([x["ok"] for x in embedded(stopped)], [True], "a template whose handle is stopped passes")
+        other = 'import stub_support\np = stub_support.spawn(["x", "@PIDFILE@"])\nstub_support.stop_group(other)\nif @X@:\n pass\n'
+        self.assertEqual([x["ok"] for x in embedded(other)], [False], "stop_group of another name does not stop the started handle")
+        parsed_other = "import stub_support\np = stub_support.spawn(['x'])\nstub_support.stop_group(other)\n"
+        self.assertEqual([x["ok"] for x in embedded(parsed_other)], [False])
+
+    def test_a_python_file_the_scan_cannot_parse_is_a_site_and_not_skipped(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "cloud", "worker", "tests", "fixtures"))
+        with open(os.path.join(root, "cloud", "worker", "tests", "fixtures", "broken.py"), "w") as fh:
+            fh.write("import subprocess\nsubprocess.Popen(['x'\n")
+        with open(os.path.join(root, "cloud", "worker", "tests", "fixtures", "data.json"), "w") as fh:
+            fh.write("{")
+        found = find_sites(root)
+        self.assertEqual([(x["file"], x["kind"], x["ok"]) for x in found], [("cloud/worker/tests/fixtures/broken.py", "unparseable", False)])
+
+    def test_the_limits_are_stated_and_counted(self):
+        self.assertEqual(len(LIMITS), 4)
+        self.assertEqual(len(star_imports(ast.parse("from subprocess import *\nfrom os import *\n"))), 2, "a star import is counted, not silent")
+        self.assertEqual([x for x in scan_tree("cloud/worker/tests/test_x.py", ast.parse("from subprocess import *\nPopen(['x'])\n"))], [], "the stated limit: a star import is not followed")
+        doc = (__doc__ or "")
+        self.assertIn("CLOSED RULE", doc)
+        for word in ("star import", "run time", "os.walk"):
+            self.assertTrue(any(word in limit for limit in LIMITS), word)
+
     def test_a_star_import_is_an_unresolved_limit_and_is_counted(self):
         tree = ast.parse("from subprocess import *\ndef t():\n    Popen(['x'])\n")
         self.assertEqual(len(star_imports(tree)), 1)
@@ -837,6 +995,8 @@ def _mutant_case(s, how):
     def run(self):
         src = mutate(s["tree"], s, how)
         self.assertIsNotNone(src, "no mutant for %s" % site_name(s))
+        if how == "alias":
+            self.assertIn(ALIAS, src, "the alias mutant of %s does not carry the alias" % site_name(s))
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         dest = os.path.join(d, s["file"])
