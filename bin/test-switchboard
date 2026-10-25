@@ -75692,21 +75692,31 @@ class TestSupportRebinding(unittest.TestCase):
                 elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                     for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
                         moved |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
-                elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                    moved |= {(a.asname or a.name).split(".")[0] for a in node.names}
+                elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("support."):   # a name another support module holds (the standard library's is not a fake)
+                    moved |= {a.asname or a.name for a in node.names}
         return moved - {"BIN", "REPO"}
 
     @staticmethod
     def rebindings(source, moved, skip=None):
-        """[(line, what)] for every way the source rebinds a moved name in its own module without rebinding it in the support modules (`rebound`)."""
+        """[(line, what)] for every way the source writes to its own module or rebinds a moved name there without `rebound`: the scan is inverted, so a
+        write it did not foresee is reported. A write is a call that takes the module (`sys.modules[__name__]`, `globals()`, `__main__`, an alias, its
+        `__dict__` or `vars()`) as an argument or receiver, a store or delete on it, a `patch` with a string target in it, and any binding of a moved
+        name in the file itself (an assignment, a def, a class, an import) that is not one of the tagged support imports."""
         tree = ast.parse(source)
+        lines = source.split("\n")
         parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
-        aliases = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign) and ast.unparse(n.value) in ("sys.modules[__name__]", "sys.modules['__main__']", "globals()")
-                   for t in n.targets if isinstance(t, ast.Name)}
-        is_module = lambda e: ast.unparse(e) in ("sys.modules[__name__]", "sys.modules['__main__']", "globals()") or (isinstance(e, ast.Name) and e.id in aliases)
-        found = []
+        roots = ("sys.modules[__name__]", "sys.modules['__main__']", "globals()", "__main__")
+        aliases = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign) and ast.unparse(n.value) in roots for t in n.targets if isinstance(t, ast.Name)}
+
+        def is_module(e):
+            text = ast.unparse(e)
+            if text in roots or (isinstance(e, ast.Name) and e.id in aliases):
+                return True
+            if isinstance(e, ast.Attribute) and e.attr == "__dict__":
+                return is_module(e.value)
+            return isinstance(e, ast.Call) and ast.unparse(e.func) == "vars" and bool(e.args) and is_module(e.args[0])
+
         def paired(node, name):
-            """Is the node inside a `with` that also enters `rebound(<name>, ...)`?"""
             above = parents.get(id(node))
             while above is not None:
                 if isinstance(above, (ast.With, ast.AsyncWith)):
@@ -75715,38 +75725,67 @@ class TestSupportRebinding(unittest.TestCase):
                         return True
                 above = parents.get(id(above))
             return False
+
+        def at_module_level(node):
+            above = parents.get(id(node))
+            while above is not None:
+                if isinstance(above, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    return False   # a name bound inside a function or a class is local to it: it does not rebind the module's
+                above = parents.get(id(above))
+            return True
+
+        found = []
+        def flag(node, what, names):
+            for name in names:
+                if (name is None or name in moved) and not paired(node, name):
+                    found.append((node.lineno, "%s (%r) without rebound" % (what, name)))
+
         for node in ast.walk(tree):
             line = getattr(node, "lineno", None)
             if skip and line is not None and skip[0] <= line <= skip[1]:
                 continue
+            if line is not None and 0 < line <= len(lines) and lines[line - 1].rstrip().endswith("# support import"):
+                continue   # the explicit imports of the moved names are the tagged lines
             if isinstance(node, (ast.Global, ast.Nonlocal)):
                 found += [(node.lineno, "global " + n) for n in node.names if n in moved]
-            elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-                for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
-                    if isinstance(target, ast.Subscript) and is_module(target.value):
-                        key = target.slice.value if isinstance(target.slice, ast.Constant) else None
-                        if key is None or key in moved:
-                            found.append((node.lineno, "module[%r] = ..." % key))
-                    elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and is_module(target.value) and target.attr in moved:
-                        found.append((node.lineno, "module.%s = ..." % target.attr))
+            elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+                targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+                for target in targets:
+                    for t in (target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]):
+                        if isinstance(t, ast.Subscript) and is_module(t.value):
+                            flag(node, "module[...] write", [t.slice.value if isinstance(t.slice, ast.Constant) else None])
+                        elif isinstance(t, ast.Attribute) and is_module(t.value):
+                            flag(node, "module attribute write", [t.attr])
+                        elif isinstance(t, ast.Name) and t.id in moved and at_module_level(node):
+                            found.append((node.lineno, "a binding of the moved name %s in this file" % t.id))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in moved and at_module_level(node):
+                found.append((node.lineno, "a definition of the moved name %s in this file" % node.name))
+            elif isinstance(node, (ast.Import, ast.ImportFrom)) and at_module_level(node):
+                names = [(a.asname or a.name).split(".")[0] for a in node.names]
+                found += [(node.lineno, "an import of the moved name %s in this file" % n) for n in names if n in moved]
             elif isinstance(node, ast.Call):
                 what = ast.unparse(node.func)
-                if what.endswith("patch.dict") and node.args and is_module(node.args[0]):
-                    names = []
-                    if len(node.args) > 1 and isinstance(node.args[1], ast.Dict):
-                        names += [k.value if isinstance(k, ast.Constant) else None for k in node.args[1].keys]
-                    elif len(node.args) > 1:
-                        names.append(None)   # a dict that is not a literal
-                    names += [k.arg for k in node.keywords]
-                    for name in names:
-                        if (name is None or name in moved) and not paired(node, name):
-                            found.append((node.lineno, "patch.dict(module, %r) without rebound" % name))
-                elif what.endswith(("patch.object", "setattr", "monkeypatch.setattr")) and node.args and is_module(node.args[0]):
-                    name = node.args[1].value if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) else None
-                    if (name is None or name in moved) and not paired(node, name):
-                        found.append((node.lineno, "%s(module, %r) without rebound" % (what, name)))
-                elif what.endswith(".update") and is_module(getattr(node.func, "value", node)):
-                    found.append((node.lineno, "module.update(...)"))
+                if what.endswith(".patch") or what == "patch":   # a string target
+                    target = node.args[0] if node.args else None
+                    if isinstance(target, ast.Constant) and isinstance(target.value, str) and target.value.split(".")[0] in ("__main__", "tsb") and "." in target.value:
+                        flag(node, "patch with a string target", [target.value.split(".")[1]])
+                if node.args and is_module(node.args[0]) and what.split(".")[-1] not in ("getattr", "hasattr", "isinstance", "id", "repr", "str", "type", "len", "loadTestsFromModule"):   # these only read the module
+                    if what.endswith("patch.dict"):
+                        names = []
+                        if len(node.args) > 1 and isinstance(node.args[1], ast.Dict):
+                            names += [k.value if isinstance(k, ast.Constant) else None for k in node.args[1].keys]
+                        elif len(node.args) > 1:
+                            names.append(None)
+                        names += [k.arg for k in node.keywords]
+                        flag(node, "patch.dict", names or [None])
+                    elif what.endswith("patch.multiple"):
+                        flag(node, "patch.multiple", [k.arg for k in node.keywords] or [None])
+                    elif what.split(".")[-1] in ("patch", "setattr", "delattr") or what.endswith("patch.object"):
+                        flag(node, what, [node.args[1].value if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) else None])
+                    elif ast.unparse(node.args[0]) in roots:   # an unknown callee handed the module itself (not an alias: a name like `module` is common)
+                        flag(node, "a call that takes the module: " + what, [None])
+                if isinstance(node.func, ast.Attribute) and is_module(node.func.value) and node.func.attr in ("update", "pop", "popitem", "setdefault", "clear", "__setitem__", "__delitem__"):
+                    flag(node, "module.%s" % node.func.attr, [None])
         return sorted(found)
 
     def test_a_moved_fake_reads_a_rebound_name_only_when_the_support_modules_are_rebound_too(self):
@@ -75784,6 +75823,20 @@ class TestSupportRebinding(unittest.TestCase):
         "alias of the module, patch.object": "def f():\n    m = sys.modules[__name__]\n    with mock.patch.object(m, 'sb', None):\n        pass\n",
         "globals().update": "def f():\n    globals().update(sb=1)\n",
         "an annotated assignment": "def f():\n    globals()['sb']: object = 1\n",
+        "patch with a string target": "def f():\n    with mock.patch('__main__.sb', 1):\n        pass\n",
+        "patch.multiple": "def f():\n    with mock.patch.multiple(sys.modules[__name__], sb=1):\n        pass\n",
+        "a write to the module dict": "def f():\n    sys.modules[__name__].__dict__['sb'] = 1\n",
+        "patch.dict on the module dict": "def f():\n    with mock.patch.dict(sys.modules[__name__].__dict__, {'sb': 1}):\n        pass\n",
+        "vars of the module": "def f():\n    vars(sys.modules[__name__])['sb'] = 1\n",
+        "globals().pop": "def f():\n    globals().pop('sb')\n",
+        "globals().setdefault": "def f():\n    globals().setdefault('sb', 1)\n",
+        "del globals()[...]": "def f():\n    del globals()['sb']\n",
+        "a top-level assignment of the name": "sb = 1\n",
+        "a def of a moved name": "def FakeRunner():\n    pass\n",
+        "a class of a moved name": "class SimClock:\n    pass\n",
+        "an import of a moved name at the top level": "from elsewhere import sb\n",
+        "__main__ attribute": "import __main__\n\ndef f():\n    __main__.sb = 1\n",
+        "a call that takes the module": "def f():\n    helper(sys.modules[__name__])\n",
         "a paired rebound for another name": "def f():\n    with mock.patch.dict(globals(), {'sb': 1}), rebound('sc', 1):\n        pass\n",
     }
 
@@ -75797,6 +75850,12 @@ class TestSupportRebinding(unittest.TestCase):
             "a name that did not move": "def f():\n    with mock.patch.dict(globals(), {'score_block': 1}):\n        pass\n",
             "patch.object on a name that did not move": "def f():\n    with mock.patch.object(sys.modules[__name__], 'score_block', None):\n        pass\n",
             "an object, not a module": "def f(x):\n    with mock.patch.dict(x, {'sb': 1}):\n        pass\n",
+            "a local variable named like a moved name": "def f():\n    sb = 1\n    return sb\n",
+            "a name bound inside a class": "class C:\n    def FakeRunner(self):\n        pass\n",
+            "an import of a moved name inside a function": "def f():\n    from elsewhere import sb\n",
+            "a read of the module": "def f():\n    return getattr(sys.modules[__name__], 'sb')\n",
+            "the tagged support import": "sb = _support_loader.sb   # support import\n",
+            "the pid helper that stays": "def f():\n    with mock.patch.object(sys.modules[__name__], '_MADE_UP_NEXT', [1]):\n        pass\n",
         }.items():
             with self.subTest(form=name):
                 self.assertEqual(self.rebindings(source, moved), [])
