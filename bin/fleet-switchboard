@@ -409,6 +409,7 @@ DEFAULTS = {
     "cos_orders_file": None,        # PR 18: the Chief of Staff's own standing orders, an absolute path; None means standing-orders.md beside config.json
     # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
     "gh_users": {},
+    "github_bot_logins": [],  # the cloud readers' bot account(s), each a fleet identity besides the `gh_users` accounts (at most 10); none by default
     "intent_live_silence_minutes": 10,  # #367: a live forwarder whose last event (or start) is older than this does not get the long intent trust (0 = always trusted, as before)
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
 }
@@ -10707,6 +10708,10 @@ def _validate_github(config, source):
             raise ConfigError("%s: 'gh_users' names %r and %r, the same repo, with different accounts (%s, %s)" % (source, seen_keys[same][0], key, seen_keys[same][1], account))
         seen_keys.setdefault(same, (key, account))
     config["gh_users"] = dict(users)
+    bots = config["github_bot_logins"]
+    if not isinstance(bots, list) or len(bots) > 10 or not all(isinstance(a, str) and GITHUB_LOGIN_RE.match(a) for a in bots):
+        raise ConfigError("%s: 'github_bot_logins' must be a list of at most 10 GitHub logins, got %r" % (source, bots))
+    config["github_bot_logins"] = list(bots)
     poll = config["github_poll_seconds"]
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
         raise ConfigError("%s: 'github_poll_seconds' must be a number of at least %d (each read of a repo costs "
@@ -10923,7 +10928,6 @@ REVIEW_STRICT_RE = re.compile(r"^Review of ([0-9a-f]{40}): (APPROVE|CHANGES REQU
 # Verdict words; the line carries the word from this table, never the comment text.
 REVIEW_VERDICTS = ("CHANGES REQUESTED", "APPROVE")
 REVIEW_NAME_CAP = 40
-FLEET_BOT_LOGIN = "fleetkit-cloud[bot]"   # the cloud readers' account: a fleet identity besides the `gh_users` accounts
 REVIEW_UNOWNED_FILE, REVIEW_UNOWNED_CAP = "review-unowned.json", 2000
 
 
@@ -11777,10 +11781,10 @@ class GitHubHub:
                     self._unrouted_batch.append(item)
 
     def _fleet_login(self, login):
-        """True when `login` is a fleet identity: a `gh_users` account (the account the daemon acts as) or the cloud bot. A `from=` marker is
+        """True when `login` is a fleet identity: a `gh_users` account (the account the daemon acts as) or a `github_bot_logins` account (the cloud readers' bot). A `from=` marker is
         trusted only from these; from any other login it is ignored (anyone can type a marker)."""
         users = {str(v).lower() for v in (self.config.get("gh_users") or {}).values()}
-        return str(login or "").lower() in users | {FLEET_BOT_LOGIN}
+        return str(login or "").lower() in users | {str(b).lower() for b in (self.config.get("github_bot_logins") or [])}
 
     def _unowned_seen(self, key):
         """True when the unowned review comment `key` was audited before (kept in `review-unowned.json`: bounded, a corrupt file reads as empty);

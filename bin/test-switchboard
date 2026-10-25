@@ -261,7 +261,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
+            "owner_logins": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -92669,8 +92669,8 @@ class ReviewCommentLineTests(Base):
             self.assertNotIn("secret", items[0].summary)
 
     def test_no_marker_cloud_bot_is_delivered(self):
-        items = self.handle("Review of %s: APPROVE" % self.HEAD, who="fleetkit-cloud[bot]")
-        self.assertEqual([i.summary for i in items], [self.line("APPROVE", "fleetkit-cloud[bot]")])
+        items = self.handle("Review of %s: APPROVE" % self.HEAD, who="acme-cloud[bot]")
+        self.assertEqual([i.summary for i in items], [self.line("APPROVE", "acme-cloud[bot]")])
 
     def test_shared_account_with_reader_marker_is_delivered_with_signer(self):
         body = "Review of %s: CHANGES REQUESTED\n<!-- fleet-switchboard:from=rev-1 -->" % self.HEAD
@@ -92692,7 +92692,7 @@ class ReviewCommentLineTests(Base):
             item = sb.GitHubItem("github.reviewcomment:1", "github.comment", "x", "o/r", [], [], "bob", 1.0, [10], True)
             item.review_signer = signer
             audits = []
-            item.sender = "fleetkit-cloud[bot]"
+            item.sender = "acme-cloud[bot]"
             hub = types.SimpleNamespace(queue={item.key: item}, lock=threading.RLock(), _unrouted=set(), _filtered=set(),
                                         _unrouted_batch=[], _filtered_batch=[], _routed_batch=[], _audit=lambda *a: audits.append(a),
                                         route_of=lambda *a: (owner, "closing"), _fleet_login=lambda l: True, _unowned_seen=lambda k: False)
@@ -92767,6 +92767,7 @@ class ReviewCommentEndToEndTests(Base):
         self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
         self.world.clock.t += 7200
         self.hub.tick()   # start the forwarder: a webhook sent before it exists is lost
+        self.hub.config["github_bot_logins"] = ["acme-cloud[bot]"]
         self.hub.config["gh_users"] = {"other/repo": "shared"}   # the account the daemon acts as (a key for another repo: the fake gh has no auth)
         self.gh.issue(12, parent=1)
         self.gh.pull(20, closes=[12])
@@ -92797,13 +92798,24 @@ class ReviewCommentEndToEndTests(Base):
         self.assertEqual(self.after(), ["github.reviewcomment:7002"])
 
     def test_fleet_login_with_lane_marker_is_excluded(self):
-        for cid, who in ((7003, "shared"), (7004, "fleetkit-cloud[bot]")):
+        for cid, who in ((7003, "shared"), (7004, "acme-cloud[bot]")):
             self.post(20, self.OK + "\n<!-- fleet-switchboard:from=w1 -->", cid, who=who)
         self.assertEqual(self.after(), [])
 
     def test_cloud_bot_without_marker_is_delivered(self):
-        self.post(20, self.OK, 7005, who="fleetkit-cloud[bot]")
+        self.post(20, self.OK, 7005, who="acme-cloud[bot]")
         self.assertEqual(self.after(), ["github.reviewcomment:7005"])
+
+    def test_default_config_does_not_trust_a_bot_login_marker(self):
+        self.hub.config["github_bot_logins"] = []
+        self.post(20, self.OK + "\n<!-- fleet-switchboard:from=w1 -->", 7008, who="acme-cloud[bot]")
+        self.assertEqual(self.after(), ["github.reviewcomment:7008"])
+
+    def test_github_bot_logins_is_validated(self):
+        self.assertEqual(sb.validate_config(dict(sb.load_config(), github_bot_logins=["acme-cloud[bot]"]))["github_bot_logins"], ["acme-cloud[bot]"])
+        for bad in ("x", ["a b"], [1], ["a"] * 11):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(sb.load_config(), github_bot_logins=bad))
 
     def test_unregistered_marker_is_delivered(self):
         self.post(20, self.OK + "\n<!-- fleet-switchboard:from=ghost -->", 7006, who="shared")
