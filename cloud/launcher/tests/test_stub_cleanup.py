@@ -361,7 +361,7 @@ BACKGROUND = re.compile(r"(?<![&])&\s*($|[;\n)])|\bnohup\b|\bsetsid\b|\bdisown\b
 SERVER_WORDS = re.compile(r"stub_server|serve_forever|http\.server")   # a blocking call whose argument is a server never returns
 # a child that a string of code starts inside another process: allowed only with this reason (the scan finds the string; a new one fails)
 EMBEDDED_OK = {("bin/test-cloud-worker", "grandchild.pid"): "a bounded grandchild (sleep 60) of a stub tool; the test asserts it is gone",
-               ("cloud/worker/tests/fixtures/prepush_spawner.py", "sleep"): "a bounded grandchild (sleep 77) of a fixture script; the hardening test asserts the check's process-group kill ends it"}
+               ("cloud/worker/tests/fixtures/prepush_spawner.py", "subprocess.Popen(['sleep', '77'])"): "a bounded grandchild (sleep 77) of a fixture script; the hardening test asserts the check's process-group kill ends it"}
 
 
 def py_files(root):
@@ -528,7 +528,7 @@ def scan_tree(rel, tree):
                 sites.append(dict(s, kind=kind, var=var, fn=fn, ok=True, why="registers a cleanup that ends %s" % var))
             else:
                 why = "starts a child (%s) with no cleanup that ENDS it (kill, terminate, stop_group; a wait alone does not): use stub_support.start" % canon
-                listed = [r for (f, snip), r in EMBEDDED_OK.items() if f == rel and "/fixtures/" in "/" + rel and snip in ast.unparse(n)]   # a script a test runs, with its reason
+                listed = [r for (f, snip), r in EMBEDDED_OK.items() if f == rel and "/fixtures/" in "/" + rel and snip == ast.unparse(n)]   # a script a test runs: the EXACT call, with its reason (a different call is not excused)
                 sites.append(dict(s, kind=kind, var=var, fn=fn, ok=bool(listed), listed=bool(listed), why=listed[0] if listed else why))
         elif isinstance(n, ast.Constant) and isinstance(n.value, str) and rel != THIS:
             text = n.value
@@ -806,8 +806,12 @@ class TestEverySite(unittest.TestCase):
             fh.write("import subprocess\np = subprocess.Popen(['sleep', '5'])\n")
         found = find_sites(root)
         self.assertEqual([(x["file"], x["kind"], x["ok"]) for x in found], [("cloud/worker/tests/fixtures/spawner.py", "popen", False)])
-        with mock.patch.dict(EMBEDDED_OK, {("cloud/worker/tests/fixtures/spawner.py", "sleep"): "a bounded child"}):
+        with mock.patch.dict(EMBEDDED_OK, {("cloud/worker/tests/fixtures/spawner.py", "subprocess.Popen(['sleep', '5'])"): "a bounded child"}):
             self.assertEqual([x["ok"] for x in find_sites(root)], [True], "named in EMBEDDED_OK with a reason, it passes")
+        with open(path, "a") as fh:
+            fh.write("q = subprocess.Popen(['sleep', '6'])\n")
+        with mock.patch.dict(EMBEDDED_OK, {("cloud/worker/tests/fixtures/spawner.py", "subprocess.Popen(['sleep', '5'])"): "a bounded child"}):
+            self.assertEqual([x["ok"] for x in find_sites(root)], [True, False], "a different sleep spawn in the same file is not excused by the listed one")
 
     def test_every_script_under_the_real_fixtures_directories_is_counted_and_explained(self):
         fixtures = [s for s in SITES if "/fixtures/" in s["file"]]
