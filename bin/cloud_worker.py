@@ -36,11 +36,17 @@ from pathlib import Path
 
 H = {}   # the switchboard's own namespace, set by bind()
 
+_OWN_BIN = Path(__file__).resolve().parent   # fixed at import
 LAUNCHER_ENV = "FLEET_CLOUD_WORKER_BIN"   # the launcher program; default `cloud-worker` on PATH
 DEFAULT_LAUNCHER = "cloud-worker"
 CLOUD_DIR = "cloud"
 DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch volume (writable by the image's user via fsGroup); /workspace does not exist there
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
+# The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
+# cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss"}
+LAUNCHER_SHAPES = ("XS", "S", "M")   # the launcher's SHAPES keys; the launcher's own default (XS, or S with --stack) applies when --shape is not given
+LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
@@ -347,8 +353,68 @@ def remote_v2(state, record, timeout=20, connect=None):
 
 # ---------------------------------------------------------------- the launcher (slice B): one program, called by argv
 
+def checkout_launcher_path():
+    """The launcher of the switchboard's OWN checkout: <checkout>/cloud/launcher/cloud-worker, found relative to this file (the checkout's real path:
+    a link in the checkout's location is followed once, here, so the walk judges the real parents)."""
+    return Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "cloud-worker"
+
+
+_WALK = []
+
+
+def _walk():
+    """The one walk (bin/path_walk.py, beside this file), loaded once by path from where THIS module was imported."""
+    if not _WALK:
+        spec = importlib.util.spec_from_file_location("path_walk", str(_OWN_BIN / "path_walk.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _WALK.append(module)
+    return _WALK[0]
+
+
+def _checkout_launcher_problem(path):
+    """Why the checkout's launcher is not used, or None. The file and every parent go through the one walk of bin/path_walk.py (`entry_problem`,
+    `parents_problem`: lstat, never followed). The entry itself is the kit's `cloud-worker` link to its sibling `cloud_worker.py` (a bare file name in
+    the same directory): that target is the file judged: a regular file, executable, the user's, not group- or world-writable. A plain file is judged as it is."""
+    walk = _walk()
+    entry_problem, parents_problem = walk.entry_problem, walk.parents_problem
+    try:
+        found = os.lstat(path)
+    except OSError:
+        return "is not there"
+    target = path
+    if stat.S_ISLNK(found.st_mode):
+        link = os.readlink(path)
+        if not link or "/" in link or link in (".", ".."):
+            return "is a link that does not name a file beside it"
+        target = os.path.join(os.path.dirname(path), link)
+        try:
+            found = os.lstat(target)
+        except OSError:
+            return "is a link to a file that is not there"
+    if not stat.S_ISREG(found.st_mode):
+        return "is not a regular file"
+    if not found.st_mode & 0o100:
+        return "is not executable"
+    return entry_problem(found, "itself") or parents_problem(str(target))
+
+
+LAUNCHER_ORDER = ("variable", "checkout", "path")   # the lookup's sources, first wins; none left is a refusal (tests derive the ordering rules from this)
+
+
 def launcher_argv():
-    return [os.environ.get(LAUNCHER_ENV) or DEFAULT_LAUNCHER]
+    """The launcher program: the variable FLEET_CLOUD_WORKER_BIN when set (it wins, unchanged); else the launcher of this checkout when it is a safe
+    executable; else `cloud-worker` on the PATH; else a refusal naming the variable and the checkout path looked in (exit 2, nothing called)."""
+    given = os.environ.get(LAUNCHER_ENV)
+    if given:
+        return [given]
+    own = checkout_launcher_path()
+    if _checkout_launcher_problem(str(own)) is None:
+        return [str(own)]
+    if shutil.which(DEFAULT_LAUNCHER):
+        return [DEFAULT_LAUNCHER]
+    raise Refusal("no cloud launcher found: set %s to the launcher program, or run the switchboard from a checkout that holds %s (that file %s), "
+                  "or put `%s` on the PATH; nothing was called" % (LAUNCHER_ENV, own, _checkout_launcher_problem(str(own)), DEFAULT_LAUNCHER))
 
 
 def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None, cluster=None, secrets=()):
@@ -478,6 +544,14 @@ class Refusal(CloudError):
 
 VAULT_CHECK = ("run the platform team's firewall check for the vault (the vault pre-check) first; nothing was changed and no other credential "
                "was tried")
+# What a vault refusal FOR THE FIREWALL looks like: the text `az` prints for the vault's data plane (Microsoft documents both: the message and the inner
+# error code). Matched case-insensitively in the error text only (never printed). Any other vault error (no permission, no such secret, not signed
+# in, unreachable) matches neither and is never retried and never runs the check.
+FIREWALL_MARKERS = ("client address is not authorized and caller is not a trusted service", "forbiddenbyfirewall")
+VAULT_LOCK_NAME = "vault-check.lock"
+VAULT_LOCK_GRACE = 45          # on top of the check's own run limit: how long a second launch waits for the lock
+VAULT_LOCK_POLL = 0.2
+VAULT_OWNER = "the owner of the vault access check"
 MAX_TOKEN_SECONDS = 3600
 HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 TOKEN_CMD_SECONDS = 60
@@ -505,6 +579,15 @@ def _lib():
 
 def _scrub_lib():
     return _lib().scrub
+
+
+def use_settings():
+    """THE settings source of every cloud command: the launcher library's one reader (`apply_settings`): the private settings file when it
+    exists, else the environment as before. Returns the source (the file's path or "environment"). A refusal is exit 2, nothing called."""
+    try:
+        return _lib().apply_settings()
+    except _lib().CloudError as err:
+        raise Refusal(str(err).replace("refused: ", "", 1)) from None
 
 
 _OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
@@ -543,50 +626,14 @@ def check_allowed(repo, env=None):
 
 def _capture(argv, env=None, feed=None, timeout=TOKEN_CMD_SECONDS, limit=1000000):
     """Run a short helper (a vault read, a mint). `feed` is a text handed over a pipe: the argument `{fd}` in argv names it, so it is never in an
-    argument, the environment or a file. Returns (exit code, stdout, stderr), or None when it could not run or was too slow."""
-    pass_fds, writer = (), None
-    if feed is not None:
-        read_end, write_end = os.pipe()
-        argv = [a.replace("{fd}", str(read_end)) for a in argv]
-        pass_fds = (read_end,)
-        writer = (read_end, write_end)
-    try:
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, pass_fds=pass_fds,
-                                 env=env, start_new_session=True)
-    except OSError:
-        if writer:
-            _close_quietly(*writer)
-        return None
-    if writer:
-        _close_quietly(writer[0])
-        threading.Thread(target=_feed, args=(writer[1], feed), daemon=True).start()
-    try:
-        out, err = child.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_group(child)
-        child.communicate()
-        return None
-    except BaseException:
-        _kill_group(child)
-        raise
-    return child.returncode, out[:limit + 1], err
+    argument, the environment or a file. Returns (exit code, stdout, stderr), or None when it could not run or was too slow. The one
+    implementation is the launcher's own (the reaper's refresh runs the same pipe)."""
+    return _lib().capture_command(argv, env=env, feed=feed, timeout=timeout, limit=limit)
 
 
 def _jwt_lifetime(token, now):
     """Seconds the token lives, read from its exp (and iat) claim when it is a JWT; None when it is not one (the requested duration is trusted)."""
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        body = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
-        exp = claims["exp"]
-        iat = claims.get("iat")
-    except (ValueError, KeyError, TypeError, AttributeError):
-        return None
-    if isinstance(exp, bool) or not isinstance(exp, (int, float)) or (iat is not None and (isinstance(iat, bool) or not isinstance(iat, (int, float)))):
-        return None
-    return exp - (iat if iat is not None else now)
+    return _lib().jwt_lifetime(token, now)
 
 
 def _duration(env):
@@ -600,48 +647,100 @@ def _duration(env):
     return "%dm" % minutes
 
 
-def cluster_token(env=None, now=None):
+def firewall_refused(ran):
+    """True when a vault read's result (exit code, stdout, stderr; None when it could not run) is the vault's FIREWALL refusing this machine."""
+    return _lib().firewall_refused(ran)
+
+
+class VaultRecovery:
+    """After a vault read was refused for the firewall: run the vault access check ONCE, then read again ONCE. One exclusive file lock (0600, in the
+    private state directory) is held around the check and the read after it, because the check has no lock of its own and two runs at once are
+    untested. A launch that has to WAIT for the lock reads the vault again first: the run it waited for may have fixed it, and then it does not run
+    the check. `audit(detail)` writes the one audit line of a run (an outcome, the exit code and the counts: never an address)."""
+
+    def __init__(self, lock_path, audit=None, sleep=time.sleep, clock=time.monotonic):
+        self.lock_path, self.audit, self.sleep, self.clock = str(lock_path), audit, sleep, clock
+
+    def _lock(self):
+        problem = _lib().parents_problem(os.path.abspath(self.lock_path))   # the same walk as the checkout's: the lock file's parents
+        if problem:
+            raise Refusal("the vault check lock %s; refused, nothing was called" % problem)
+        try:
+            fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            found = os.fstat(fd)
+            if found.st_uid != os.getuid() or not stat.S_ISREG(found.st_mode):
+                os.close(fd)
+                raise Refusal("the vault check lock is not the user's own regular file; refused, nothing was called")
+            os.fchmod(fd, 0o600)
+        except OSError as err:
+            raise Refusal("the vault check lock cannot be made (%s); nothing was called" % (err.strerror or err)) from None
+        waited, deadline = False, self.clock() + _lib().VAULT_CHECK_SECONDS + _lib().VAULT_CHECK_GRACE + VAULT_LOCK_GRACE
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd, waited
+            except OSError:
+                waited = True
+            if self.clock() >= deadline:
+                os.close(fd)
+                raise Refusal("the vault check lock %s was not freed in time (another launch is running the vault access check); nothing was created" % VAULT_LOCK_NAME)
+            self.sleep(VAULT_LOCK_POLL)
+
+    def __call__(self, read, env):
+        lib = _lib()
+        try:
+            lib.vault_check_ready(env)   # a missing key or a bad checkout refuses here, before the lock, and runs nothing
+        except lib.CloudError as err:
+            raise Refusal(str(err).replace("refused: ", "", 1)) from None
+        fd, waited = self._lock()
+        try:
+            if waited:   # the run we waited for may have fixed it
+                ran = read()
+                if not firewall_refused(ran):
+                    return ran
+            try:
+                result = lib.run_vault_check(env)
+            except lib.CloudError as err:
+                raise Refusal(str(err).replace("refused: ", "", 1)) from None
+            if self.audit is not None:
+                self.audit({"exit": result.code, "outcome": result.outcome, "rules_before": result.before, "rules_after": result.after})
+            code = result.effective
+            if not lib.VAULT_CHECK_CODES[code][1]:
+                raise Refusal("the vault access check stopped this launch (exit %s: %s); ask %s; it adds at most one address and never removes one, "
+                              "so nothing more is done here; nothing was created" % (result.code if result.code is not None else "none", lib.VAULT_CHECK_CODES[code][2], VAULT_OWNER))
+            if code == 10:
+                sys.stderr.write("%s: the vault access check added an address: %s: forward this line to whoever records it\n"
+                                 % (H["PROG"], result.line or "its count line was not found in its output; ask " + VAULT_OWNER))
+            return read()
+        finally:
+            os.close(fd)   # releases the lock
+
+
+def _token_refusal(err):
+    """The refusal of a cluster token that could not be made: the wording of the step that failed, never a value."""
+    if err.kind == "too-long":
+        return "the cluster token lives %d seconds, over the 60 minutes allowed (or already expired); refused, nothing was called" % err.lifetime
+    why = {"token-command-failed": "the token command failed",
+           "vault-settings-missing": "set CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME",
+           "admin-unreadable": "the administrator credential could not be read from the vault" +
+           (" even after the vault access check; ask " + VAULT_OWNER if err.recovered else ""),
+           "mint-failed": "the token could not be minted",
+           "not-a-token": "the answer is not a token"}.get(err.kind, "the token could not be obtained")
+    return "the cluster token could not be obtained (%s): %s" % (why, VAULT_CHECK)
+
+
+def cluster_token(env=None, now=None, recovery=None):
     """A cluster token of at most one hour, minted NOW, in memory. CW_CLUSTER_TOKEN_CMD (a command that prints one), else the default: the cluster
     administrator kubeconfig is read from the vault (CW_CLUSTER_ADMIN_CMD, else `az keyvault secret show` with CW_VAULT_SUBSCRIPTION and
     CW_VAULT_NAME) and `kubectl create token cw-operator --duration=20m` is run with it on a pipe. Nothing is cached or kept. A failure is a
-    Refusal that names the vault pre-check; no other credential or context is ever tried."""
+    Refusal that names the vault pre-check; no other credential or context is ever tried. With `recovery` (launch only), a vault read refused for
+    the firewall runs the vault access check once and reads once more. The route itself is the launcher's own function (the reaper's refresh
+    runs the same one): this is the thin caller that keeps the wording and the recovery."""
     env = dict(os.environ if env is None else env)
-    clock = time.time() if now is None else now
-
-    def fail(why):
-        raise Refusal("the cluster token could not be obtained (%s): %s" % (why, VAULT_CHECK)) from None
-    custom = (env.get("CW_CLUSTER_TOKEN_CMD") or "").strip()
-    if custom:
-        ran = _capture(["sh", "-c", custom], env=env)
-        if ran is None or ran[0] != 0:
-            fail("the token command failed")
-        token = ran[1].strip()
-    else:
-        admin = (env.get("CW_CLUSTER_ADMIN_CMD") or "").strip()
-        if admin:
-            argv = ["sh", "-c", admin]
-        else:
-            sub, vault = (env.get("CW_VAULT_SUBSCRIPTION") or "").strip(), (env.get("CW_VAULT_NAME") or "").strip()
-            if not sub or not vault:
-                fail("set CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME")
-            argv = ["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault,
-                    "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
-        ran = _capture(argv, env=env)
-        if ran is None or ran[0] != 0 or not ran[1].strip() or len(ran[1]) > 1000000:
-            fail("the administrator credential could not be read from the vault")
-        admin_config = ran[1]
-        minted = _capture([env.get("CW_KUBECTL", "kubectl"), "--kubeconfig", "/dev/fd/{fd}", "-n", env.get("CW_CLOUD_NAMESPACE", "cw"), "create",
-                           "token", "cw-operator", "--duration=" + _duration(env)], env=dict(env, KUBECONFIG=os.devnull), feed=admin_config)
-        del admin_config
-        if minted is None or minted[0] != 0:
-            fail("the token could not be minted")
-        token = minted[1].strip()
-    if not token or len(token) > 8192 or re.search(r"\s", token) or re.search(r"[\x00-\x1f\x7f]", token):
-        fail("the answer is not a token")
-    lifetime = _jwt_lifetime(token, clock)
-    if lifetime is not None and not 0 < lifetime <= MAX_TOKEN_SECONDS:
-        raise Refusal("the cluster token lives %d seconds, over the 60 minutes allowed (or already expired); refused, nothing was called" % lifetime)
-    return token
+    try:
+        return _lib().cluster_token(env, duration=_duration(env), capture=_capture, now=now, recovery=recovery)
+    except _lib().ClusterLogin as err:
+        raise Refusal(_token_refusal(err)) from None
 
 
 def private_root():
@@ -737,7 +836,8 @@ class Cluster:
     place it touches disk: the launcher's tokenFile mechanism needs a file), and removes the directory on every way out: normal end, failure,
     SIGINT, SIGTERM, SIGHUP and SIGQUIT. A stale directory of a killed command is swept at the start of every command. No token is kept between commands."""
 
-    def __init__(self):
+    def __init__(self, recovery=None):
+        self.recovery = recovery
         self.known = set()
         self.dir = None
         self.kubeconfig = None
@@ -752,12 +852,13 @@ class Cluster:
             # otherwise, which ends the process with no cleanup and leaves the tunnel (its own session gets no hangup) running
             self.old = {sig: signal.signal(sig, self._on_signal) for sig in HANDLED_SIGNALS}
         try:
+            use_settings()   # idempotent: the same file gives the same values; send, read, retire and status log in from the file too
             server = (os.environ.get("CW_CLOUD_SERVER") or "").strip()
             if not server:
                 raise Refusal("CW_CLOUD_SERVER is not set: no cluster to reach; nothing was changed")
             root = private_root()
             sweep_stale(root)
-            token = cluster_token()
+            token = cluster_token(recovery=self.recovery)
             self.add(token)
             self.dir = tempfile.mkdtemp(prefix="cmd-%d-" % os.getpid(), dir=str(root))
             self.server = server
@@ -902,16 +1003,18 @@ def refusals(function):
 
 
 def model_entry():
-    """The github-copilot entry of the OpenCode auth file (the driver's rule), as one JSON text; nothing else of the file."""
-    path = os.environ.get("CW_MODEL_AUTH_FILE") or os.path.expanduser("~/.local/share/opencode/auth.json")
+    """The live model credential: the ONE provider entry of OpenCode's own store (`opencode auth export`, in memory), as a one-element JSON array."""
+    path = Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "model_credential.py"
+    spec = importlib.util.spec_from_file_location("cw_model_credential", str(path))
+    module = importlib.util.module_from_spec(spec)
     try:
-        with open(path) as handle:
-            entry = json.loads(handle.read(1000001)[:1000000]).get(MODEL_PROVIDER)
-    except (OSError, ValueError, AttributeError):
-        entry = None
-    if not entry or not isinstance(entry, dict):
-        raise Refusal("the model auth file is missing, unreadable or has no %s entry; nothing was created" % MODEL_PROVIDER)
-    return json.dumps({MODEL_PROVIDER: entry})
+        spec.loader.exec_module(module)
+    except Exception as err:
+        raise CloudError("the model credential reader is not found beside this program (%s)" % _one(str(err), 80)) from None
+    try:
+        return module.read_provider_entry(MODEL_PROVIDER)
+    except module.ModelCredentialError as err:
+        raise Refusal(str(err)) from None
 
 
 def git_token(repo, cluster):
@@ -955,6 +1058,8 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud and --headless do not combine: a cloud worker has its own endpoint, a headless one runs in the local service")
     if not args.agent:
         raise LaunchError("--agent is required")
+    if args.agent == "orchestrator" and not args.reports_to:
+        raise Refusal("--agent orchestrator needs --reports-to BOSS (the pod's FLEET_BOSS); nothing was created")
     if args.dir:
         given = str(args.dir)   # a normal absolute path (no `..`, no doubled or trailing slash) under a pod root
         if given != os.path.normpath(given) or not any(given == root or given.startswith(root + "/") for root in POD_DIR_ROOTS):
@@ -966,7 +1071,11 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
+    source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
+    print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
+    if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_STACK_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
+        raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_STACK_SHAPES)))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
@@ -981,13 +1090,22 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
     brief = H["read_brief"](args.brief_file, sys.stdin)
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
-    options = ["--repo", repo, "--branch", branch, "--run-id", run_id]
-    for flag, value in (("--idle", args.idle), ("--hard", args.hard), ("--shape", args.shape)):
+    options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
+    for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
         if value:
-            options += [flag, str(value)]
+            options += [CREATE_OPTION[key], str(value)]
+    if args.agent == "orchestrator":   # only on request: a worker launch hands the launcher exactly what it always did
+        options += [CREATE_OPTION["agent"], args.agent, CREATE_OPTION["boss"], args.reports_to]
+    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip())   # the hub setting
+    if hub and args.agent != "orchestrator":   # a worker joins the hub too: the launcher reads the setting itself, it only needs the boss
+        options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
+    if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
+        options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
-    with Cluster() as cluster:
+    launcher_argv()   # a launcher that cannot be found refuses here (exit 2), before the vault, the cluster or the launcher is touched
+    recovery = VaultRecovery(cloud_dir(state) / VAULT_LOCK_NAME, lambda detail: _audit(engine, "cloud.vault_check", name, detail))
+    with Cluster(recovery) as cluster:
         model = model_entry()
         cluster.add(model)
         token = git_token(repo, cluster)
@@ -1050,10 +1168,14 @@ def _launch(args, runner, now, reserve):
         try:
             with tunnel(cluster, record) as live:
                 v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
-                session = v2.session_create(CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
+                session = v2.session_create(args.agent if args.agent == "orchestrator" else CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
                                             {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}})["id"]
                 record["session"] = session
                 save_record(state, record)
+                if hub:   # the hub entry gets the session id (the launcher's one verb for it; the cluster login is the launcher's own)
+                    hcode, _, hnote = run_launcher(runner, "hub-session", name, ["--session", session], 120, cluster=cluster)
+                    if hcode != 0:
+                        raise CloudError("the hub entry could not be given the session: %s" % _reason(hcode, hnote))
                 if brief:
                     v2.prompt(session, SETUP_PREAMBLE % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
         except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
@@ -1174,6 +1296,8 @@ def cmd_read(args, runner, now):
         raise LaunchError("name the agent: `%s read <name>`" % H["PROG"])
     limit = max(1, min(int(args.limit), 200))
     record = route(args.name)
+    if record is None and getattr(args, "cloud_only", False):
+        raise LaunchError("%s has no cloud record" % args.name)
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)

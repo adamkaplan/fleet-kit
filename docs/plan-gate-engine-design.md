@@ -77,6 +77,8 @@ polarity named differently.
 | E3 | `gh pr merge <pr>` | G1 to G4 and G6 resolved at the head; a draft cannot be merged | the `gh` shim |
 | E4 | `fleet-switchboard launch` (an assignment under a plan) | the brief's `PLAN:` link has a **consensus record at its current plan hash** (G0b); no `PLAN:` is refused only in `enforce` | `launch` itself |
 
+Exempt when enforced (E4): a launch of the reviewer role (a standing independent reviewer has no plan); every other role still needs a readable `PLAN:` line. The exemption is keyed by the role the launch itself records (never by a name, nor by a line a worker writes in a brief), and it is a launch-time exemption only: a reviewer's verdicts still bind to a pull request's head.
+
 **Merge: the head checked is the head merged.** `gh pr merge` checks the head at the moment of the command, then the real `gh`
 merges whatever the head is by then. The shim therefore reads the head SHA once, checks the gates **at that SHA**, and runs the
 real `gh pr merge` with `--match-head-commit <that SHA>` added, so a push between the check and the merge makes the merge fail

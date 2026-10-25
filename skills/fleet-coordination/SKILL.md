@@ -46,6 +46,8 @@ bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte c
 bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
 ```
 
+**Local runs are focused by default.** Run the focused classes of what you changed through `heavy --short`; CI runs the whole suite. Run the whole suite only for a change to the CI workflow itself or to a test CI cannot run; say which in the pull request. The heavy wrapper refuses a second full-suite job in a worktree while one is queued or running.
+
 A change that deletes something or raises an alert is checked against three lines before its first push:
 
 - Drive the real code path in the tests, never a copied helper.
@@ -82,7 +84,7 @@ orders or escalates it to the owner. Never apply `awaiting-user` yourself.
 
 A PR held for the owner carries the `<user>:merge-captain` label and a `<user>:hold-<reason>` label (`security`, `credential`, `contract`, `policy`, `prod-config` or `other-area`) and gets a `fleet-switchboard notice pr`; keep `MERGE: captain` as the first line of its body too, in repos whose own checks read it and until 2026-11-10, after which it is dropped. A held PR's body then opens (after those lines) with `## Why this needs you`, `## What changes for you` (a Before | After table), `## Example`, an optional real image, then `## Questions for you` (each with a Recommendation:); any Mermaid diagram goes below. Any other owner decision is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the `<user>:awaiting-cos` label, never `awaiting-user`), never only words in a report: a report or comment saying something waits on the owner does not reach the panel; the section and label do. The switchboard sweep (#117) flags mismatches to cos. A deliberately deferred item carries `<user>:parked` and a `Parked until: <YYYY-MM-DD>` line in its body; it is exempt from the no-next-step flag until that date (never from an owner wait or a held PR).
 
-Where a repository has an `integration` branch, typical changes merge into it and reach the default branch in one daily batch pull request, opened and kept by the Chief of Staff's lane; the owner clears the batch. Urgent fixes and asks the owner makes alone go straight to the default branch. A held change is batched too, held and cleared on its own pull request by the matrix's rules, and the batch holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High. While the batch is out of draft (ready for the owner's clear), a freeze applies: nothing merges into `integration`. See `docs/switchboard.md`, "Batching".
+Where a repository has an `integration` branch, typical changes merge into it and reach the default branch in one daily batch pull request, opened and kept by the Chief of Staff's lane; the owner clears the batch. Urgent fixes and asks the owner makes alone go straight to the default branch. A held change is batched too, held and cleared on its own pull request by the matrix's rules, and the batch holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High. While the batch is out of draft (ready for the owner's clear), a freeze applies: nothing merges into `integration`. Keep `integration` current with the default branch before a pull request opens into it: fast-forward it, or merge the default branch into it when it holds unbatched members; a stale `integration` makes the diff and the impact floor read the whole difference. See `docs/switchboard.md`, "Batching".
 
 Related findings go up as one **batch**, never one question each: `fleet-switchboard decisions batch
 --title "<title>" --row "<repo#N> | <finding> | <recommendation>" ...` (or `--file`, or stdin) creates one
@@ -279,7 +281,7 @@ nothing.
 
 Anything that takes more than a few minutes (a full test suite, a build) is started with
 `fleet-switchboard job start <name> -- <command>`: it runs detached in its own session, and the
-exit code and what it printed are kept under the shared temp dir. Before you report it as running,
+exit code and what it printed are kept under your `TMPDIR`, which the operating system may clean after 3 days without a read: copy a result you need later into the worktree or the issue. Before you report it as running,
 ask `fleet-switchboard job status <name>`: one line, **alive**, **finished** (exit code and result
 file) or **dead** (killed, no exit code). A restart of the service or the pane can kill a plain
 background command without any message, and an agent that never looks keeps saying "running" for
@@ -320,7 +322,7 @@ handoff, on the issue — the GitHub record has to survive a lost message.
 
 **Pushing.** git push works as the repository's account (fetch, pull and clone too): the fleet's `git` shim, first on your shell's PATH next to `gh`, routes the credential through the `gh` shim, which picks the account for your session's repository. Use plain `git push`: no manual -c credential route is needed, and if the account lookup fails, or no account is mapped for your repository in `gh_users`, the push fails with one clear line rather than going out as another login, when the shim is first on your PATH (with no `gh_users` at all, git keeps its own credentials, and `FLEET_GIT_SHIM=off` turns the routing off) (say so in your report and retry; do not try the stored login). It is a guardrail, not a boundary: the account's own permissions are the boundary.
 
-Write scratch files (PR bodies, message bodies, notes) under a private directory made with mktemp -d, never under a fixed name in the shared temp folder: another agent may write the same name, and a body file is published as it stands.
+Write scratch files (PR bodies, message bodies, notes) under a private directory made with mktemp -d, never under a fixed name in the shared temp folder: another agent may write the same name, and a body file is published as it stands. Nothing that must last goes under `/tmp` or the shared temp folder at all: the operating system deletes files unread for 3 days, so keep it in the worktree or in your private `TMPDIR` under the profile.
 
 ## Evidence
 

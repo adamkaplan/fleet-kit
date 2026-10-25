@@ -13,7 +13,9 @@ import importlib.util
 import io
 import json
 import os
+import re
 import stat
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +34,8 @@ spec = importlib.util.spec_from_loader("cw_fleet_switchboard", loader)
 sb = importlib.util.module_from_spec(spec)
 sys.modules["cw_fleet_switchboard"] = sb   # what the removed load_module() did before executing
 loader.exec_module(sb)
+sys.path.insert(0, str(BIN.parent / "cloud" / "worker" / "tests"))
+import stub_support  # noqa: E402  (starts a child with a cleanup that always runs: #956)
 
 PASSWORD = "pw-" + "x" * 20
 
@@ -102,6 +106,16 @@ tf = os.environ.get("CW_CLOUD_TOKEN_FILE")
 login = {"command": command, "argv": argv, "env": dict(os.environ), "token_ok": bool(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA"),
          "token_mode": oct(os.stat(tf).st_mode & 0o777) if tf else None}
 open(os.environ["STUB_DIR"] + "/login.log", "a").write(json.dumps(login) + "\\n")
+CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
+if command == "create":
+    unknown = [a for a in argv[2:] if a.startswith("--") and a not in CREATE_OPTIONS]
+    if unknown:
+        sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
+        sys.exit(2)
+    shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "XS"
+    if shape not in ("XS", "S", "M"):
+        sys.stderr.write("error: shape must be XS, S or M\\n")
+        sys.exit(2)
 if command == "create":
     for item in argv:
         if "=" in item and item.split("=")[0] in ("model-auth", "git-token"):
@@ -199,7 +213,9 @@ def make_jwt(lifetime, issued=None):
 
 CLUSTER_TOKEN = make_jwt(1200)
 ADMIN_KUBECONFIG = "apiVersion: v1\nclusters: []\nusers:\n- name: admin\n  user: {token: ADMINSECRET-q8w7e6r5t4y3}\n"
+FAKE_EXPORT = str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "tests" / "fake_opencode_export.sh")
 MODEL_ENTRY = {"type": "oauth", "refresh": "ghu_ModelRefreshSecret0123456789", "access": "gho_ModelAccessSecret9876543210", "expires": 0}
+MODEL_ROW = {"id": "id-model", "integrationID": "github-copilot", "label": "acme", "active": True, "value": MODEL_ENTRY}
 GIT_TOKEN = "ghs_GitInstallationTokenAbCdEf0123456789"
 
 
@@ -227,7 +243,8 @@ class Base(unittest.TestCase):
         (self.stub_dir / "mint_token").write_text(CLUSTER_TOKEN)
         (self.stub_dir / "admin_kubeconfig").write_text(ADMIN_KUBECONFIG)
         (self.stub_dir / "git_token").write_text(GIT_TOKEN + "\n")
-        (self.home / "auth.json").write_text(json.dumps({"github-copilot": MODEL_ENTRY, "other": {"key": "must-not-travel"}}))
+        (self.home / "export.json").write_text(json.dumps([MODEL_ROW, {"id": "id-other", "integrationID": "other", "label": "x", "active": True,
+                                                                          "value": {"type": "api", "key": "must-not-travel"}}]))   # what the stand-in `opencode auth export` prints
         (self.home / "tmp").mkdir()
         self.root = self.home / "tmp" / ("cwtok-%d" % os.getuid())
         tmpdir = mock.patch.object(tempfile, "tempdir", str(self.home / "tmp"))
@@ -238,8 +255,8 @@ class Base(unittest.TestCase):
             "PATH": "%s:/usr/bin:/bin" % self.stub_dir, "FLEET_CLOUD_WORKER_BIN": str(self.stub), "STUB_DIR": str(self.stub_dir),
             "STUB_PASSWORD": PASSWORD, "STUB_URL": self.remote.url, "STUB_STOP_EXIT": "0",
             "CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
-            "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "sub-example", "CW_VAULT_NAME": "vault-example",
-            "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_MODEL_AUTH_FILE": str(self.home / "auth.json"),
+            "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example",
+            "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_OPENCODE_BIN": FAKE_EXPORT,
             "STUB_TOKEN_SHA": hashlib.sha256(CLUSTER_TOKEN.encode()).hexdigest(),
             "STUB_ADMIN_SHA": hashlib.sha256(ADMIN_KUBECONFIG.encode()).hexdigest(), "TMPDIR": str(self.home / "tmp"),
             "CW_TUNNEL_TIMEOUT": "10"})
@@ -296,6 +313,19 @@ class Base(unittest.TestCase):
         brief.write_text("Build the thing.\n")
         return self.main("launch", name, "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main",
                          "--role", "coder", "--reports-to", "orch", "--brief-file", str(brief))
+
+    @staticmethod
+    def shaped(argv):
+        """The launcher's argument list with the per-run values (the run id, the descriptor numbers) replaced by a placeholder."""
+        run_id = argv[argv.index("--run-id") + 1]
+        return ["<run-id>" if a == run_id else re.sub(r"=\d+$", "=<fd>", a) if re.match(r"(model-auth|git-token)=\d+$", a) else
+                "<fd>" if argv[max(i - 1, 0)] in ("--password-fd", "--run-secret-fd") and a.isdigit() else a for i, a in enumerate(argv)]
+
+    def launch_with(self, *extra, repo="acme-org/widget-service", name="coder7"):
+        brief = self.home / "brief.txt"
+        brief.write_text("Build the thing.\n")
+        return self.main("launch", name, "--agent", "coder", "--repo", repo, "--branch", "main", "--role", "coder", "--reports-to", "orch",
+                         "--brief-file", str(brief), *extra)
 
     def everything_written(self):
         """All text the switchboard left behind (state files, the audit log), to prove the password is in none of it but its own file."""
@@ -538,7 +568,7 @@ class TestWiring(Base):
     def test_s1_launch_passes_both_secrets_by_descriptor_and_nowhere_else(self):
         code, out, err = self.launch()
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads((self.stub_dir / "received-model-auth").read_text()), {"github-copilot": MODEL_ENTRY})   # only that entry travels
+        self.assertEqual(json.loads((self.stub_dir / "received-model-auth").read_text()), [MODEL_ROW])   # only that entry travels, as a one-entry array
         self.assertEqual((self.stub_dir / "received-git-token").read_text().strip(), GIT_TOKEN)
         for entry in self.jsonl("login.log"):
             self.assertTrue(entry["token_ok"], entry["command"])
@@ -720,7 +750,7 @@ class TestWiring(Base):
         (self.stub_dir / "pf_hang").write_text("")
         before = len((self.stub_dir / "pf.pid").read_text().split())
         env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
-        child = subprocess.Popen([sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = stub_support.start(self, [sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
         while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before and child.poll() is None:
             time.sleep(0.1)
@@ -741,7 +771,7 @@ class TestWiring(Base):
     def test_u3_a_killed_command_leaves_a_directory_that_the_next_command_sweeps(self):
         self.assertEqual(self.launch()[0], 0)
         self.root.mkdir(mode=0o700, exist_ok=True)
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = stub_support.start(self, [sys.executable, "-c", "pass"])
         dead.wait()
         stale = self.root / ("cmd-%d-abcd1234" % dead.pid)
         stale.mkdir(mode=0o700)
@@ -869,7 +899,7 @@ class TestSignalsAndOrphans(Base):
         (self.stub_dir / "pf_hang").write_text("")
         before = len((self.stub_dir / "pf.pid").read_text().split())
         env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
-        child = subprocess.Popen([sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = stub_support.start(self, [sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
         while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before:
             time.sleep(0.1)
@@ -1262,6 +1292,1084 @@ class TestLaunchRunsThePreflight(Base):
         self.assertEqual(code, 2, err)
         self.assertFalse(mark.exists(), "the preflight was called")
         self.nothing_made()
+
+
+class TestSettingsFile(Base):
+    """#876 slice 1: `launch --cloud` and the other cloud commands read ONE private settings file when it exists (S1-S5, U1, U2)."""
+
+    DIGEST = "registry.example.internal/acme/worker@sha256:" + "cd34" * 16
+    TABLE_KEYS = None
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.home / "settings"
+        self.cfg.mkdir(mode=0o700)
+        self.file = self.cfg / "cloud.env"
+        hook = mock.patch.object(self.lib, "SETTINGS_PATH", str(self.file))
+        hook.start()
+        self.addCleanup(hook.stop)
+        for key in self.table_keys():
+            os.environ.pop(key, None)   # an EMPTY environment: every setting comes from the file
+        self.values = {"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_IMAGE": self.DIGEST, "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
+                       "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example", "CW_CLOUD_NAMESPACE": "cw",
+                       "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"),
+                       "CW_OPENCODE_BIN": FAKE_EXPORT}
+
+    @property
+    def lib(self):
+        return sb.load_module("cloud_worker").bind(sb.__dict__)._lib()
+
+    def table_keys(self):
+        return [name for name, _, _ in self.lib.SETTINGS]
+
+    def write(self, values=None, mode=0o600, text=None):
+        values = self.values if values is None else values
+        self.file.write_text(text if text is not None else "# settings\n" + "".join("%s=%s\n" % kv for kv in values.items()))
+        self.file.chmod(mode)
+
+    def nothing_was_called(self):
+        self.assertEqual(self.stub_calls(), [])
+        self.assertEqual(self.jsonl("kubectl.log"), [])
+        self.assertEqual(self.jsonl("login.log"), [])
+
+    def test_s1_a_file_with_every_setting_and_an_empty_environment_launches(self):
+        self.write()
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        create = [e for e in self.jsonl("login.log") if e["command"] == "create"][0]
+        self.assertEqual(create["env"]["CW_CLOUD_IMAGE"], self.DIGEST)   # the launcher's own environment carries the file's values
+        self.assertEqual(create["env"]["CW_CLOUD_NAMESPACE"], "cw")
+        self.assertEqual(err.count("cloud settings from"), 1)
+        self.assertIn("cloud settings from %s" % self.file, err)
+
+    def test_s1_the_other_commands_log_in_from_the_file_too(self):
+        self.write()
+        self.assertEqual(self.launch()[0], 0)
+        for argv in (("send", "coder7", "hi"), ("read", "coder7"), ("retire", "coder7")):
+            code, out, err = self.main(*argv)
+            self.assertEqual(code, 0, (argv, err))
+            self.assertNotIn("cloud settings from", err)   # said once, by launch
+
+    def test_u1_no_file_launches_as_before_and_says_environment_once(self):
+        os.environ.update({"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
+                           "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example",
+                           "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_OPENCODE_BIN": FAKE_EXPORT})
+        self.assertFalse(self.file.exists())
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.count("cloud settings from environment"), 1)
+        argv = [a for a in self.stub_calls()[0]]
+        shaped = self.shaped(argv)
+        expected = json.loads((BIN.parent / "cloud" / "tests" / "fixtures" / "launch-create-argv.json").read_text())
+        self.assertEqual(shaped, expected)
+
+    def test_environment_alone_needs_no_new_setting(self):
+        for key in ("CW_CLOUD_IMAGE", "CW_CLOUD_NAMESPACE"):
+            self.assertNotIn(key, os.environ)   # the environment route never required the image or the namespace for launch
+        os.environ.update({"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
+                           "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example",
+                           "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_OPENCODE_BIN": FAKE_EXPORT})
+        self.assertEqual(self.launch()[0], 0)
+
+    def test_the_test_hook_is_not_an_environment_variable(self):
+        self.write()
+        with mock.patch.object(self.lib, "SETTINGS_PATH", None), mock.patch.dict(os.environ, {"FLEET_CLOUD_SETTINGS": str(self.file), "CW_CLOUD_SETTINGS": str(self.file)}):
+            code, out, err = self.launch()
+        self.assertIn("cloud settings from environment", err)   # the variable moved nothing
+        self.assertNotEqual(code, 0)
+
+    def test_s2_a_file_others_can_read_or_write_is_refused_before_any_call(self):
+        for mode in (0o640, 0o604, 0o666, 0o644, 0o660):
+            with self.subTest(mode=oct(mode)):
+                self.write(mode=mode)
+                code, out, err = self.launch()
+                self.assertEqual(code, 2)
+                self.assertIn(str(self.file), err)
+                self.assertIn("%04o" % mode, err)
+                self.nothing_was_called()
+
+    def test_s2_a_symlink_a_writable_directory_and_another_owner_are_refused_before_any_call(self):
+        real = self.cfg / "real.env"
+        real.write_text("x\n")
+        real.chmod(0o600)
+        self.file.symlink_to(real)
+        self.assertIn("symlink", self.launch()[2])
+        self.nothing_was_called()
+        self.file.unlink()
+        self.write()
+        self.cfg.chmod(0o770)
+        try:
+            self.assertIn("writable", self.launch()[2])
+        finally:
+            self.cfg.chmod(0o700)
+        with mock.patch.object(self.lib.os, "geteuid", return_value=os.geteuid() + 1):
+            self.assertIn("another user", self.launch()[2])
+        self.nothing_was_called()
+
+    def test_s3_a_secret_shaped_value_is_refused_for_every_shape_and_never_printed(self):
+        lib = self.lib
+        samples = {"a JWT": "eyJ" + "hbGciOiJIUzI1" + "." + "eyJ" + "zdWIiOiJ4eHh4", "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
+                   "a URL with a password": "https://user:" + "hunter2" + "pass@host.example/x", "a 40-character hex string": "x " + "0123456789abcdef" * 2 + "01234567"}
+        samples.update({"token prefix " + p.strip(): "x " + p + "A1b2C3d4E5f6G7h8" for p in lib._PREFIXES})
+        self.assertEqual(set(samples), {name for name, _, _ in lib.SECRET_SHAPES})   # every member of the family has a case
+        for shape, value in samples.items():
+            with self.subTest(shape):
+                self.write(dict(self.values, CW_GIT_TOKEN_CMD=value))
+                code, out, err = self.launch()
+                self.assertEqual(code, 2)
+                self.assertIn("CW_GIT_TOKEN_CMD", err)
+                for text in (out, err):
+                    self.assertNotIn(value, text)
+                    self.assertNotIn(value.split()[-1], text)
+                self.nothing_was_called()
+
+    def test_s4_each_required_key_missing_is_named_and_only_it(self):
+        required = [name for name, needed, _ in self.lib.SETTINGS if needed]
+        self.assertTrue(required)
+        for key in required:
+            with self.subTest(key):
+                self.write({k: v for k, v in self.values.items() if k != key})
+                code, out, err = self.launch()
+                self.assertEqual(code, 2)
+                self.assertIn(key, err)
+                for other in required:
+                    if other != key:
+                        self.assertNotIn(other, err)
+                self.nothing_was_called()
+
+    def test_s4_all_missing_ones_are_listed(self):
+        self.write({k: v for k, v in self.values.items() if k not in ("CW_VAULT_NAME", "CW_CLOUD_NAMESPACE")})
+        err = self.launch()[2]
+        self.assertIn("CW_VAULT_NAME", err)
+        self.assertIn("CW_CLOUD_NAMESPACE", err)
+
+    def test_a_hostile_value_is_refused_by_launch_before_any_call_naming_the_key_and_not_the_value(self):
+        for key, value in (("CW_CLOUD_SERVER", "http://169.254.169.254"), ("CW_CLOUD_NAMESPACE", "kube-system"), ("CW_VAULT_NAME", "a;touch SENT"),
+                           ("CW_ALLOWED_REPOS", "acme-org/*"), ("CW_VAULT_SUBSCRIPTION", "sub-example"), ("CW_CLOUD_IMAGE", "x:tag@sha256:" + "cd34" * 16)):
+            with self.subTest(key):
+                self.write(dict(self.values, **{key: value}))
+                code, out, err = self.launch()
+                self.assertEqual(code, 2)
+                self.assertIn(key, err)
+                self.assertNotIn(value, err)
+                self.nothing_was_called()
+
+    def test_s5_a_tag_is_refused_and_a_digest_launches(self):
+        self.write(dict(self.values, CW_CLOUD_IMAGE="registry.example.internal/acme/worker:1.2"))
+        code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertIn("CW_CLOUD_IMAGE", err)
+        self.nothing_was_called()
+        self.write()
+        self.assertEqual(self.launch()[0], 0)
+
+    def test_a_clash_between_the_file_and_the_environment_is_refused_naming_both_and_no_value(self):
+        self.write()
+        os.environ["CW_CLOUD_NAMESPACE"] = "other-ns-zz"
+        code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertIn("CW_CLOUD_NAMESPACE", err)
+        self.assertIn(str(self.file), err)
+        self.assertIn("environment", err)
+        self.assertNotIn("other-ns-zz", err)
+        self.nothing_was_called()
+
+    def test_with_a_file_the_environment_is_not_read(self):
+        self.write()
+        os.environ["CW_TOOLING_REPO"] = "acme-org/widget-service"   # a table key the file does not set: it would refuse this repository
+        self.assertEqual(self.launch()[0], 0)
+
+    def test_u2_no_value_from_the_file_or_the_token_mint_shows_in_any_output_state_or_argument(self):
+        marker = "vault-marker-zz9"
+        self.write(dict(self.values, CW_VAULT_NAME=marker))
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        planted = [GIT_TOKEN, CLUSTER_TOKEN, PASSWORD, marker]
+        captures = [out, err] + list(self.everything_written().values())
+        for entry in self.jsonl("login.log"):
+            captures.append(json.dumps(entry["argv"]))
+        for entry in self.jsonl("kubectl.log"):
+            captures.append(json.dumps(entry["args"]))
+        for text in captures:
+            for value in planted:
+                self.assertNotIn(value, text)
+
+
+class TestLaunchStack(Base):
+    """#910 (S9, S10): `launch --cloud --stack [--shape S|M]` hands the launcher's create the stack option, and only then."""
+
+    FIXTURES = BIN.parent / "cloud" / "tests" / "fixtures"
+    SHAPES = (None, "S", "M")
+    BAD_SHAPES = ("L", "m", "s", "XL", "2", "SM", "S M", "S\n", "--privileged", "S --stack", "/etc/passwd", "S=1")
+
+    def create_argv(self):
+        calls = [c for c in self.stub_calls() if c[0] == "create"]
+        self.assertEqual(len(calls), 1)
+        return self.shaped(calls[0])
+
+    def nothing_was_called(self):
+        self.assertEqual(self.stub_calls(), [])           # the fake launcher
+        self.assertEqual(self.jsonl("kubectl.log"), [])   # the fake token command (the vault and the cluster)
+        self.assertEqual(self.jsonl("login.log"), [])
+
+    def test_s9_a_launch_without_stack_hands_the_stored_fixture_exactly(self):
+        code, out, err = self.launch_with("--cloud")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.create_argv(), json.loads((self.FIXTURES / "launch-create-argv.json").read_text()))   # taken from the base before this change
+
+    def test_s9_a_stack_launch_hands_the_stack_option_and_the_shape(self):
+        for shape in self.SHAPES:
+            with self.subTest(shape=shape):
+                self.state_clean()
+                extra = ("--shape", shape) if shape else ()
+                code, out, err = self.launch_with("--cloud", "--stack", *extra)
+                self.assertEqual(code, 0, err)
+                base = json.loads((self.FIXTURES / "launch-create-argv.json").read_text())
+                at = base.index("<run-id>") + 1
+                expected = base[:at] + list(extra) + ["--stack"] + base[at:]
+                self.assertEqual(self.create_argv(), expected)
+                self.assertEqual(self.create_argv().count("--stack"), 1)
+
+    def state_clean(self):
+        """Between two launches of one test: the fakes' call logs and the worker records start empty."""
+        for name in ("calls.log", "kubectl.log", "login.log"):
+            self.stub_dir.joinpath(name).unlink(missing_ok=True)
+        for path in list((self.state / "cloud").glob("*")) if (self.state / "cloud").exists() else []:
+            path.unlink()
+
+    def test_s9_shape_without_stack_is_handed_as_before(self):
+        code, out, err = self.launch_with("--cloud", "--shape", "M")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("--stack", self.create_argv())
+        self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "M")
+
+    def test_s9_the_fake_launcher_refuses_an_option_it_does_not_know(self):
+        text = self.stub.read_text().replace('"--stack", ', "")
+        self.stub.write_text(text)
+        code, out, err = self.launch_with("--cloud", "--stack")
+        self.assertEqual(code, 1)   # the create failed: a wrong option name fails the test, it is not swallowed
+        self.assertIn("unrecognized arguments", err + out)
+
+    def test_s10_stack_without_cloud_is_refused_before_any_call(self):
+        for extra in ((), ("--headless",), ("--terminal",), ("--shape", "M"), ("--shape", "L"), ("--idle", "5m"), ("--hard", "1h")):
+            with self.subTest(extra=extra):
+                self.state_clean()
+                code, out, err = self.launch_with("--stack", *extra)
+                self.assertEqual(code, 2, err)
+                self.assertIn("--stack", err)
+                self.assertIn("--cloud", err)
+                self.nothing_was_called()
+
+    def test_s10_a_repository_off_the_allow_list_is_refused_before_any_call(self):
+        for shape in self.SHAPES:
+            with self.subTest(shape=shape):
+                self.state_clean()
+                code, out, err = self.launch_with("--cloud", "--stack", *(("--shape", shape) if shape else ()), repo="acme-org/other-service")
+                self.assertEqual(code, 2, err)
+                self.assertIn("acme-org/other-service", err)
+                self.nothing_was_called()
+
+    def test_s10_an_unknown_shape_is_refused_before_any_call(self):
+        for shape in self.BAD_SHAPES:
+            with self.subTest(shape=shape):
+                self.state_clean()
+                code, out, err = self.launch_with("--cloud", "--stack", "--shape=" + shape)
+                self.assertEqual(code, 2, err)
+                self.assertIn("--shape", err)
+                self.assertIn(repr(shape), err)
+                self.nothing_was_called()
+
+    def test_s10_off_list_with_a_bad_shape_reports_the_allow_list(self):
+        code, out, err = self.launch_with("--cloud", "--stack", "--shape", "SM", repo="acme-org/other-service")
+        self.assertEqual(code, 2, err)
+        self.assertIn("allow-list", err)
+        self.assertNotIn("pod shape", err)
+        self.nothing_was_called()
+
+    def test_s10_a_bad_shape_is_handed_on_without_stack_as_before(self):
+        code, out, err = self.launch_with("--cloud", "--shape", "L")
+        self.assertNotEqual(code, 0)   # the launcher (here its fake) refuses it: the switchboard does not validate it without --stack
+        self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "L")
+
+    def test_family_every_flag_combination_with_stack(self):
+        """The table of flag combinations is the product of the launch flags the code reads (cloud, mode, timing, shape); the oracle is stated once."""
+        import itertools
+        for cloud, mode, timing, shape in itertools.product((True, False), (None, "--headless", "--terminal"), (None, "--idle", "--hard"), self.SHAPES + self.BAD_SHAPES[:1]):
+            with self.subTest(cloud=cloud, mode=mode, timing=timing, shape=shape):
+                self.state_clean()
+                extra = (["--cloud"] if cloud else []) + (["--stack"]) + ([mode] if mode else []) + ([timing, "5m" if timing == "--idle" else "1h"] if timing else []) + (["--shape", shape] if shape else [])
+                code, out, err = self.launch_with(*extra)
+                if not cloud:
+                    self.assertEqual(code, 2, err)
+                    self.assertEqual(self.stub_calls(), [])
+                elif mode == "--headless":
+                    self.assertEqual(code, 1, err)   # unchanged: a cloud worker is never headless, and that check comes first
+                    self.assertEqual(self.stub_calls(), [])
+                elif shape in self.BAD_SHAPES[:1]:
+                    self.assertEqual(code, 2, err)
+                    self.assertEqual(self.nothing_was_called(), None)
+                else:
+                    self.assertEqual(code, 0, err)
+                    argv = self.create_argv()
+                    self.assertEqual(argv.count("--stack"), 1)
+                    self.assertEqual(argv.count("--shape"), 1 if shape else 0)
+                    if timing:
+                        self.assertEqual(argv[argv.index(timing) + 1], "5m" if timing == "--idle" else "1h")
+                    self.cleanup_worker()
+
+    def cleanup_worker(self):
+        self.assertEqual(self.main("retire", "coder7")[0], 0)
+
+
+FAKE_CHECK = """import json, os, sys, time
+from pathlib import Path
+root = Path(__file__).resolve().parents[2]
+cfg = json.loads((root / "fake.json").read_text())
+def note(kind):
+    with open(str(root / "runs.jsonl"), "a") as f:
+        f.write(json.dumps({"kind": kind, "t": time.time(), "argv": sys.argv[1:], "cwd": os.getcwd(), "env": sorted(os.environ), "pid": os.getpid(),
+                            "pgid": os.getpgid(0), "home": os.environ.get("HOME")}) + "\\n")
+note("start")
+if cfg.get("grandchild"):
+    import subprocess
+    sub = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])   # keeps the check's stdout open
+    with open(str(root / "grandchild.pid"), "w") as f:
+        f.write(str(sub.pid))
+time.sleep(cfg.get("sleep", 0))
+if cfg.get("fixes"):
+    (root / "fixed").write_text("x")
+print("checking address " + cfg.get("address", "addr-marker"))
+print(cfg.get("line", "rules 3 -> 4, 2026-10-19"))
+sys.stderr.write("address " + cfg.get("address", "addr-marker") + "\\n")
+note("end")
+sys.exit(cfg["code"])
+"""
+
+AZ_VAULT = """#!/bin/sh
+echo run >> "$STUB_DIR/az.log"
+mode=$(cat "$STUB_DIR/az_mode" 2>/dev/null)
+if [ "$mode" = firewall ] && [ ! -e "$FAKE_CHECKOUT/fixed" ]; then
+  echo "(Forbidden) Client address is not authorized and caller is not a trusted service. Code: Forbidden Inner error: ForbiddenByFirewall" >&2
+  exit 1
+fi
+if [ "$mode" = down ]; then
+  echo "vault unreachable" >&2
+  exit 1
+fi
+if [ "$mode" = auth ]; then
+  echo "(Forbidden) The user, group or application does not have secrets get permission on key vault. Inner error: AccessDenied" >&2
+  exit 1
+fi
+cat "$STUB_DIR/admin_kubeconfig"
+"""
+
+
+class TestLauncherLookup(Base):
+    """S17: the launcher is the variable's program, else the checkout's own, else `cloud-worker` on the PATH, else a refusal (exit 2, zero calls)."""
+
+    def setUp(self):
+        super().setUp()
+        self.mod = sb.load_module("cloud_worker")
+        self.fake = Path(os.path.realpath(self.home)) / "checkout"
+        self.entry = self.fake / "cloud" / "launcher" / "cloud-worker"
+        self.entry.parent.mkdir(parents=True)
+        shutil.copy(str(self.stub), str(self.entry))
+        self.entry.chmod(0o755)
+        self.bare = self.home / "bare-path"
+        self.bare.mkdir()
+        moved = self.stub_dir / "launcher-stub"            # nothing called cloud-worker is on the PATH (the stub directory stays on it for kubectl and az)
+        self.stub.rename(moved)
+        self.stub = moved
+        os.environ["PATH"] = "%s:%s" % (self.bare, os.environ["PATH"])
+        patch = mock.patch.object(self.mod, "checkout_launcher_path", lambda: self.entry)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("FLEET_CLOUD_WORKER_BIN", None)
+
+    def test_an_empty_environment_uses_the_launcher_of_the_checkout(self):
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sum(1 for c in self.stub_calls() if "create" in c), 1)   # the checkout's launcher was called once
+
+    def test_the_variable_still_wins_over_the_checkout(self):
+        other = self.home / "other"
+        other.mkdir()
+        elsewhere = other / "cloud-worker"
+        elsewhere.write_text("#!/bin/sh\nexit 7\n")
+        elsewhere.chmod(0o755)
+        os.environ["FLEET_CLOUD_WORKER_BIN"] = str(elsewhere)
+        code, out, err = self.launch()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.stub_calls(), [])           # the checkout's launcher was never called
+
+    def test_the_path_is_the_last_resort_before_the_refusal(self):
+        self.entry.chmod(0o644)                            # the checkout's is unusable
+        path_launcher = self.bare / "cloud-worker"
+        shutil.copy(str(self.stub), str(path_launcher))
+        path_launcher.chmod(0o755)
+        self.assertEqual(self.mod.launcher_argv(), ["cloud-worker"])
+
+    def refused(self):
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertIn("FLEET_CLOUD_WORKER_BIN", err)
+        self.assertIn(str(self.entry), err)
+        self.assertEqual(self.stub_calls(), [])
+        self.assertEqual(sum("no cloud launcher found" in line for line in err.splitlines()), 1)
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+
+    def test_with_neither_it_refuses_naming_both_places_and_calls_nothing(self):
+        self.entry.unlink()
+        self.refused()
+
+    def test_an_unsafe_checkout_launcher_is_not_used(self):
+        """One case per judgement of the one walk: not executable, group-writable, world-writable, a link naming a path, a directory, a writable parent."""
+        def not_exec():
+            self.entry.chmod(0o644)
+
+        def group_writable():
+            self.entry.chmod(0o775)
+
+        def world_writable():
+            self.entry.chmod(0o757)
+
+        def link_elsewhere():
+            self.entry.unlink()
+            os.symlink(str(self.stub), str(self.entry))
+
+        def directory():
+            self.entry.unlink()
+            self.entry.mkdir()
+
+        def parent_writable():
+            self.entry.parent.chmod(0o777)
+            self.addCleanup(self.entry.parent.chmod, 0o755)
+
+        for case in (not_exec, group_writable, world_writable, link_elsewhere, directory, parent_writable):
+            with self.subTest(case=case.__name__):
+                self.setUp_again()
+                case()
+                self.assertIsNotNone(self.mod._checkout_launcher_problem(str(self.entry)))
+                self.assertRaises(self.mod.Refusal, self.mod.launcher_argv)
+
+    def setUp_again(self):
+        if self.entry.is_dir() and not self.entry.is_symlink():
+            self.entry.rmdir()
+        elif self.entry.is_symlink() or self.entry.exists():
+            self.entry.unlink()
+        self.entry.parent.chmod(0o755)
+        shutil.copy(str(self.stub), str(self.entry))
+        self.entry.chmod(0o755)
+
+    def test_the_kits_own_launcher_link_is_accepted(self):
+        """The real checkout's `cloud-worker` is a link to its sibling cloud_worker.py: judged by that file, the entry used is the link."""
+        real = Path(self.mod.__file__).resolve().parent.parent / "cloud" / "launcher" / "cloud-worker"
+        self.assertTrue(real.is_symlink())
+        self.assertIsNone(self.mod._checkout_launcher_problem(str(real)))
+
+
+class TestLauncherLookupInputs(Base):
+    """S17, the whole family: every INPUT the lookup could read (the variable, the checkout's own file, the working directory, the PATH, a symlinked
+    checkout, an unsafe checkout) x the launcher it must give. The REAL checkout_launcher_path runs: only the module's own location is moved."""
+
+    def setUp(self):
+        super().setUp()
+        self.mod = sb.load_module("cloud_worker")
+        self.base = Path(os.path.realpath(self.home))
+        self.checkout = self.make_checkout(self.base / "checkout")
+        self.decoy = self.make_checkout(self.base / "decoy")           # a valid-looking checkout the working directory holds
+        self.on_path = self.base / "on-path"
+        self.on_path.mkdir()
+        shutil.copy(str(self.stub), str(self.on_path / "cloud-worker"))
+        (self.on_path / "cloud-worker").chmod(0o755)
+        os.environ.pop("FLEET_CLOUD_WORKER_BIN", None)
+        self.cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.cwd)
+
+    def make_checkout(self, root):
+        (root / "bin").mkdir(parents=True)
+        (root / "bin" / "cloud_worker.py").write_text("")
+        (root / "cloud" / "launcher").mkdir(parents=True)
+        entry = root / "cloud" / "launcher" / "cloud-worker"
+        shutil.copy(str(self.stub), str(entry))
+        entry.chmod(0o755)
+        return root
+
+    def lookup(self, module_dir=None, path=None, cwd=None, variable=None):
+        """launcher_argv() with the module located in module_dir/bin, the PATH given (the stub directory kept for kubectl and az), the cwd given."""
+        module_dir = module_dir or self.checkout
+        env = {"PATH": path if path is not None else "/usr/bin:/bin"}
+        if variable:
+            env["FLEET_CLOUD_WORKER_BIN"] = variable
+        os.chdir(str(cwd or self.cwd))
+        with mock.patch.object(self.mod, "__file__", str(module_dir / "bin" / "cloud_worker.py")), mock.patch.dict(os.environ, env):
+            return self.mod.launcher_argv()
+
+    def entry_of(self, root):
+        return str(Path(os.path.realpath(root)) / "cloud" / "launcher" / "cloud-worker")
+
+    def test_the_table_of_inputs_and_the_launcher_each_gives(self):
+        path = str(self.on_path) + ":/usr/bin:/bin"
+        link = self.base / "link-to-checkout"
+        os.symlink(str(self.checkout), str(link))
+        table = [
+            ("the checkout's own file, nothing else", dict(), self.entry_of(self.checkout)),
+            ("the working directory holds another checkout", dict(cwd=self.decoy), self.entry_of(self.checkout)),
+            ("a different cloud-worker on the PATH", dict(path=path), self.entry_of(self.checkout)),                      # the checkout comes BEFORE the PATH
+            ("the variable wins over both", dict(path=path, cwd=self.decoy, variable="/opt/acme/launcher"), "/opt/acme/launcher"),
+            ("a symlinked checkout: judged on its real parents, the real path is run", dict(module_dir=link), self.entry_of(self.checkout)),
+        ]
+        for label, args, expected in table:
+            with self.subTest(label):
+                self.assertEqual(self.lookup(**args), [expected])
+
+    def test_an_unsafe_checkout_launcher_never_falls_to_the_working_directory(self):
+        (self.checkout / "cloud" / "launcher" / "cloud-worker").chmod(0o644)
+        with self.assertRaises(self.mod.Refusal) as caught:
+            self.lookup(cwd=self.decoy)
+        self.assertIn(self.entry_of(self.checkout), str(caught.exception))
+        self.assertNotIn(str(self.decoy), str(caught.exception))
+
+    def test_an_unsafe_checkout_launcher_falls_to_the_path_and_the_working_directory_is_never_looked_in(self):
+        (self.checkout / "cloud" / "launcher" / "cloud-worker").chmod(0o644)
+        self.assertEqual(self.lookup(cwd=self.decoy, path=str(self.on_path) + ":/usr/bin:/bin"), ["cloud-worker"])
+
+
+    # ---- the ordering class: one rule per adjacent pair of LAUNCHER_ORDER, one mutant that picks the OTHER candidate
+
+    def candidates(self, name):
+        """What it takes for source `name` to offer a launcher, and the argv it then gives: (lookup arguments, expected argv)."""
+        return {"variable": (dict(variable="/opt/acme/launcher"), ["/opt/acme/launcher"]),
+                "checkout": (dict(), [self.entry_of(self.checkout)]),
+                "path": (dict(path=str(self.on_path) + ":/usr/bin:/bin"), ["cloud-worker"])}[name]
+
+    def ordering_failures(self):
+        """Every rule the lookup must keep, checked on the module as it is now: the failures it names (an empty list on the real build)."""
+        bad = []
+        order = self.mod.LAUNCHER_ORDER
+        for i, early in enumerate(order[:-1]):
+            for late in order[i + 1:]:
+                args = {**self.candidates(late)[0], **self.candidates(early)[0]}
+                if early == "checkout":
+                    args.pop("variable", None)
+                want = self.candidates(early)[1]                        # the earlier source's launcher must be the one given
+                try:
+                    got = self.lookup(**args)
+                except self.mod.Refusal:
+                    got = "refused"
+                if got != want:
+                    bad.append("%s before %s" % (early, late))
+        # the checkout is vetted: an unsafe one is skipped, and the working directory is never a source
+        (self.checkout / "cloud" / "launcher" / "cloud-worker").chmod(0o644)
+        try:
+            got = self.lookup(cwd=self.decoy, path=str(self.on_path) + ":/usr/bin:/bin")
+        except self.mod.Refusal:
+            got = "refused"
+        if got != ["cloud-worker"]:
+            bad.append("an unsafe checkout falls to the PATH, never to the working directory")
+        try:
+            self.lookup(cwd=self.decoy)
+            bad.append("the working directory is a source")
+        except self.mod.Refusal:
+            pass
+        (self.checkout / "cloud" / "launcher" / "cloud-worker").chmod(0o755)
+        try:
+            got = self.lookup(cwd=self.decoy)
+        except self.mod.Refusal:
+            got = "refused"
+        if got != [self.entry_of(self.checkout)]:
+            bad.append("the working directory beats the checkout")
+        return bad
+
+    def test_the_real_lookup_keeps_every_ordering_rule(self):
+        self.assertEqual(self.mod.LAUNCHER_ORDER, ("variable", "checkout", "path"))
+        self.assertEqual(self.ordering_failures(), [])
+
+    def test_a_mutant_per_rule_is_caught(self):
+        real_argv, real_path = self.mod.launcher_argv, self.mod.checkout_launcher_path
+        which = shutil.which
+
+        def mutant_path_first():            # the PATH is consulted before the checkout's own launcher
+            found = which("cloud-worker")
+            return [found] if found else real_argv()
+
+        def mutant_variable_last():         # the variable only after the checkout
+            own = real_path()
+            if self.mod._checkout_launcher_problem(str(own)) is None:
+                return [str(own)]
+            return real_argv()
+
+        def mutant_cwd():                   # the working directory instead of the module's own location
+            return Path(os.getcwd()) / "cloud" / "launcher" / "cloud-worker"
+
+        def mutant_path_only():             # no checkout lookup at all
+            given = os.environ.get("FLEET_CLOUD_WORKER_BIN")
+            if given:
+                return [given]
+            if which("cloud-worker"):
+                return ["cloud-worker"]
+            raise self.mod.Refusal("none")
+
+        for label, patch in (("path before checkout", mock.patch.object(self.mod, "launcher_argv", mutant_path_first)),
+                             ("checkout before variable", mock.patch.object(self.mod, "launcher_argv", mutant_variable_last)),
+                             ("working directory as the checkout", mock.patch.object(self.mod, "checkout_launcher_path", mutant_cwd)),
+                             ("no checkout lookup", mock.patch.object(self.mod, "launcher_argv", mutant_path_only))):
+            with self.subTest(label), patch:
+                self.assertNotEqual(self.ordering_failures(), [], label)
+
+
+class VaultBase(Base):
+    """#876 slice 2: the vault access check, run by `launch --cloud` only after a vault read was refused for the firewall (offline: a fake `az` and a
+    fake check module in a temp checkout)."""
+
+    def setUp(self):
+        super().setUp()
+        self.lib = sb.load_module("cloud_worker").bind(sb.__dict__)._lib()
+        self.cw = sb.load_module("cloud_worker")
+        (self.stub_dir / "az").write_text(AZ_VAULT)
+        (self.stub_dir / "az").chmod(0o755)
+        self.checkout = self.home / "checkout"
+        self.make_checkout()
+        os.environ["FAKE_CHECKOUT"] = str(self.checkout)
+        os.environ["CW_VAULT_CHECK_DIR"] = str(self.checkout)
+        (self.stub_dir / "az_mode").write_text("firewall")
+        recorder = self.home / "python-recorder"
+        recorder.write_text('#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/python-args"\nexec "%s" "$@"\n' % (self.stub_dir, sys.executable))
+        recorder.chmod(0o755)
+        hook = mock.patch.object(self.lib, "VAULT_CHECK_PYTHON", str(recorder))
+        hook.start()
+        self.addCleanup(hook.stop)
+
+    def make_checkout(self, code=0, fixes=True, **extra):
+        module = self.checkout / "scripts" / "v2" / "cw_vault_firewall.py"
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.write_text(FAKE_CHECK)
+        (self.checkout / "fake.json").write_text(json.dumps(dict(extra, code=code, fixes=fixes)))
+        for path in (self.checkout, self.checkout / "scripts", module.parent):
+            path.chmod(0o755)
+        module.chmod(0o644)
+
+    def runs(self):
+        path = self.checkout / "runs.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def check_runs(self):
+        return [r for r in self.runs() if r["kind"] == "start"]
+
+    def az_reads(self):
+        path = self.stub_dir / "az.log"
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
+    def all_audit_lines(self):
+        return [line for p in self.state.rglob("*") if p.is_file() for line in p.read_text(errors="replace").splitlines() if "cloud.vault_check" in line]
+
+    def audit_lines(self):
+        return self.all_audit_lines()[getattr(self, "seen", 0):]
+
+
+class TestVaultCheckRelay(VaultBase):
+    """S6, S8, S8c, U3: the five exit codes, one table."""
+
+    def test_the_table_is_the_five_codes_of_the_contract(self):
+        self.assertEqual(sorted(self.lib.VAULT_CHECK_CODES), [0, 10, 20, 30, 40])
+        self.assertEqual([c for c, row in sorted(self.lib.VAULT_CHECK_CODES.items()) if row[1]], [0, 10])   # only these continue
+
+    def test_s6_each_exit_code_is_relayed_audited_once_and_the_count_line_is_printed_for_10_only(self):
+        codes = sorted(self.lib.VAULT_CHECK_CODES) + [7, 255]   # 7 and 255: a code the contract does not have is treated as 40 (a stop)
+        for code in codes:
+            with self.subTest(code=code):
+                for stale in (self.checkout / "runs.jsonl", self.checkout / "fixed", self.stub_dir / "az.log", self.stub_dir / "calls.log"):
+                    stale.unlink(missing_ok=True)
+                self.make_checkout(code=code, fixes=code in (0, 10), address="addr-marker-%d" % code)
+                for old in self.state.glob("cloud/*.json"):
+                    old.unlink()
+                self.audit_lines_clear()
+                got, out, err = self.launch()
+                continues = code in (0, 10)
+                self.assertEqual(got, 0 if continues else 2, err)
+                self.assertEqual(len(self.check_runs()), 1)
+                lines = self.audit_lines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn('"exit": %d' % code, lines[0])
+                self.assertEqual(err.count("rules 3 -> 4, 2026-10-19"), 1 if code == 10 else 0, err)
+                self.assertEqual(out.count("rules 3 -> 4"), 0)
+                if not continues:
+                    self.assertIn("the owner of the vault access check", err)
+                    self.assertIn("exit %d" % code, err)
+                    self.assertEqual(self.stub_calls(), [], "something was created")
+                for text in [out, err] + lines:
+                    self.assertNotIn("addr-marker", text)
+                self.audit_lines_clear()
+
+    def audit_lines_clear(self):
+        self.seen = len(self.all_audit_lines())
+
+    def test_s8c_the_count_line_is_printed_once_and_audited_with_the_counts_and_no_address(self):
+        self.make_checkout(code=10, fixes=True, address="addr-marker-xyz")
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.count("rules 3 -> 4, 2026-10-19"), 1, err)
+        (line,) = self.audit_lines()
+        self.assertIn('"rules_before": 3', line)
+        self.assertIn('"rules_after": 4', line)
+        self.assertIn('"exit": 10', line)
+        for text in (out, err, line):
+            self.assertNotIn("addr-marker", text)
+
+    def test_s8_a_firewall_refusal_runs_the_check_once_and_reads_twice(self):
+        self.make_checkout(code=10, fixes=True)
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads()), (1, 2))
+        self.assertEqual(len(self.audit_lines()), 1)
+
+    def test_s8_a_read_the_vault_already_answers_never_runs_the_check(self):
+        (self.stub_dir / "az_mode").write_text("ok")
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads(), self.audit_lines()), (0, 1, []))
+
+    def test_s8_the_retry_is_once_even_when_the_vault_still_refuses(self):
+        self.make_checkout(code=0, fixes=False)   # the check says "answered", the vault disagrees
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads()), (1, 2))
+        self.assertIn("the owner of the vault access check", err)
+        self.assertEqual(self.stub_calls(), [])
+
+    def test_s8_any_other_vault_error_is_not_retried_and_runs_no_check(self):
+        for mode in ("auth", "down"):
+            with self.subTest(mode=mode):
+                (self.stub_dir / "az.log").unlink(missing_ok=True)
+                (self.stub_dir / "az_mode").write_text(mode)
+                code, out, err = self.launch()
+                self.assertEqual(code, 2, err)
+                self.assertEqual((len(self.check_runs()), self.az_reads(), self.audit_lines()), (0, 1, []))
+
+    def test_an_operator_admin_command_that_prints_the_firewall_text_is_not_retried_and_runs_no_check(self):
+        self.make_checkout(code=10, fixes=True)
+        os.environ["CW_CLUSTER_ADMIN_CMD"] = "echo ForbiddenByFirewall >&2; exit 1"
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads(), self.audit_lines()), (0, 0, []))
+
+    def test_a_mint_with_no_recovery_never_runs_the_check(self):
+        self.make_checkout(code=10, fixes=True)
+        self.assertIsNone(self.cw.Cluster().recovery)   # every command but launch builds its login this way
+        with self.assertRaises(self.cw.Refusal):
+            self.cw.cluster_token(env=dict(os.environ))
+        self.assertEqual((len(self.check_runs()), self.az_reads()), (0, 1))
+
+    def test_an_off_list_repository_never_runs_the_check(self):
+        os.environ["CW_ALLOWED_REPOS"] = "acme-org/other"
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads()), (0, 0))
+
+    def test_u3_the_argument_list_is_exactly_the_module_and_check_and_the_cwd_is_the_checkout(self):
+        self.make_checkout(code=10, fixes=True)
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.stub_dir / "python-args").read_text().split("\n")[:-1], ["-m", "scripts.v2.cw_vault_firewall", "check"])
+        (start,) = self.check_runs()
+        self.assertEqual(start["argv"], ["check"])
+        self.assertEqual(os.path.realpath(start["cwd"]), os.path.realpath(str(self.checkout)))
+
+    def test_u3_the_child_environment_is_scrubbed_and_each_poisoned_name_is_absent(self):
+        poison = {"CW_VAULT_NAME": "x", "CW_VAULT_SUBSCRIPTION": "x", "CW_APP_KEY_CMD": "x", "PYTHONPATH": "/nowhere", "HTTPS_PROXY": "http://proxy.example.internal",
+                  "GH_TOKEN": "x", "CW_OPENSSL": "/usr/bin/openssl", "LANG": "C", "CW_VAULT_CHECK_DIR": str(self.checkout), "AZURE_CLI_X": "x", "CW_ALLOWED_REPOS_X": "x"}
+        self.make_checkout(code=10, fixes=True)
+        with mock.patch.dict(os.environ, poison):
+            code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        (start,) = self.check_runs()
+        keys = set(start["env"])
+        for name in poison:
+            self.assertNotIn(name, keys, name)
+        ours = {"PATH", "HOME", "TMPDIR", "AZURE_CONFIG_DIR"}
+        # what a BARE python3 on the fixed PATH adds to such an environment by itself (the macOS /usr/bin/python3 shim adds SDKROOT and friends), plus the recording sh wrapper's own
+        bare = subprocess.run([shutil.which("python3", path=self.lib.PREFLIGHT_PATH), "-c", "import os,json;print(json.dumps(sorted(os.environ)))"], capture_output=True, text=True,
+                              env={"PATH": self.lib.PREFLIGHT_PATH, "HOME": str(self.home), "TMPDIR": str(self.home), "AZURE_CONFIG_DIR": str(self.home)}).stdout
+        shim = set(json.loads(bare)) - ours | {"SHLVL", "PWD", "_", "__CF_USER_TEXT_ENCODING"}
+        self.assertEqual({k for k in keys if not k.startswith("LC_")} - shim, ours)   # nothing of ours beyond the four, and nothing of the caller's
+        import pwd
+        self.assertEqual(start["home"], pwd.getpwuid(os.getuid()).pw_dir)   # the password database's home: the poisoned HOME variable is ignored
+        self.assertNotEqual(start["home"], os.environ["HOME"])
+
+    def test_the_lock_file_is_private_and_a_linked_lock_path_is_refused(self):
+        self.make_checkout(code=10, fixes=True)
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        lock = self.state / "cloud" / self.cw.VAULT_LOCK_NAME
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        lock.unlink()
+        os.symlink(str(self.home / "elsewhere"), str(lock))   # a linked lock path is never followed
+        for old in self.state.glob("cloud/*.json"):
+            old.unlink()
+        (self.checkout / "fixed").unlink()
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertIn("lock", err)
+        self.assertFalse((self.home / "elsewhere").exists())
+
+
+class TestVaultCheckPath(VaultBase):
+    """S6b: a missing key or a bad checkout refuses naming the key, runs nothing, and never prints the path."""
+
+    def cases(self):
+        """ONE table of the bad checkouts: label -> (a function that spoils a fresh checkout, optionally the checkout to point the key at)."""
+        mod = self.checkout / "scripts" / "v2" / "cw_vault_firewall.py"
+        v2, scripts = mod.parent, self.checkout / "scripts"
+
+        def add_file(where, name, mode):
+            def spoil():
+                (where / name).write_text("x = 1\n")
+                (where / name).chmod(mode)
+            return spoil
+
+        def link(where, name):
+            return lambda: os.symlink(str(self.checkout / "fake.json"), str(where / name))
+
+        def parent(mode_or_link):
+            def spoil():
+                nest = self.home / "par"
+                nest.mkdir()
+                shutil.move(str(self.checkout), str(nest / "checkout"))
+                if mode_or_link == "link":
+                    os.rename(str(nest), str(self.home / "par-real"))
+                    os.symlink(str(self.home / "par-real"), str(nest))
+                else:
+                    nest.chmod(mode_or_link)
+                os.environ["CW_VAULT_CHECK_DIR"] = str(nest / "checkout")
+            return spoil
+        cases = {
+            "no key": lambda: os.environ.pop("CW_VAULT_CHECK_DIR"),
+            "missing directory": lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.home / "nope")),
+            "relative path": lambda: os.environ.update(CW_VAULT_CHECK_DIR="checkout"),
+            "dot-dot path": lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.checkout) + "/../checkout"),
+            "a file, not a directory": lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.checkout / "fake.json")),
+            "checkout group-writable": lambda: self.checkout.chmod(0o775),
+            "checkout world-writable": lambda: self.checkout.chmod(0o757),
+            "checkout is a symlink": lambda: (os.symlink(str(self.checkout), str(self.home / "link")), os.environ.update(CW_VAULT_CHECK_DIR=str(self.home / "link"))),
+            "module missing": lambda: os.unlink(str(mod)),
+            "module a directory": lambda: (os.unlink(str(mod)), os.mkdir(str(mod))),
+            "module symlink": lambda: (os.unlink(str(mod)), os.symlink(str(self.checkout / "fake.json"), str(mod))),
+            "module group-writable": lambda: mod.chmod(0o664),
+            "module world-writable": lambda: mod.chmod(0o646),
+            "another file group-writable (a module it imports)": add_file(v2, "helper.py", 0o664),
+            "another file world-writable": add_file(v2, "helper.py", 0o666),
+            "an __init__.py world-writable": add_file(scripts, "__init__.py", 0o666),
+            "an __init__.py at the root group-writable": add_file(self.checkout, "__init__.py", 0o664),
+            "a directory group-writable": lambda: (v2 / "pkg").mkdir() or (v2 / "pkg").chmod(0o775),
+            "a directory deep inside world-writable": lambda: ((v2 / "a" / "b").mkdir(parents=True), (v2 / "a" / "b").chmod(0o777)),
+            "a symlink to a file": link(v2, "linked.py"),
+            "a symlink in a deep directory": lambda: ((v2 / "a").mkdir(), link(v2 / "a", "x.py")()),
+            "scripts is a symlink": lambda: (shutil.move(str(scripts), str(scripts) + ".real"), os.symlink(str(scripts) + ".real", str(scripts))),
+            "scripts/v2 is a symlink": lambda: (shutil.move(str(v2), str(v2) + ".real"), os.symlink(str(v2) + ".real", str(v2))),
+            "a parent group-writable": parent(0o775),
+            "a parent world-writable": parent(0o777),
+            "a symlink in the parents": parent("link"),
+        }
+        return cases
+
+    def test_s6b_each_bad_path_refuses_naming_the_key_and_runs_nothing(self):
+        for label, spoil in self.cases().items():
+            with self.subTest(label):
+                for leftover in ("link", "par", "par-real"):
+                    path = self.home / leftover
+                    if path.is_symlink():
+                        path.unlink()
+                    elif path.exists():
+                        os.chmod(str(path), 0o755)
+                        shutil.rmtree(str(path), ignore_errors=True)
+                shutil.rmtree(str(self.checkout), ignore_errors=True)
+                self.make_checkout(code=10, fixes=True)
+                os.environ["CW_VAULT_CHECK_DIR"] = str(self.checkout)
+                spoil()
+                (self.stub_dir / "az.log").unlink(missing_ok=True)
+                for old in self.state.glob("cloud/*.json"):
+                    old.unlink()
+                code, out, err = self.launch()
+                self.assertEqual(code, 2, (label, err))
+                self.assertIn("CW_VAULT_CHECK_DIR", err)
+                self.assertEqual(len(self.check_runs()) + len(list(self.home.glob("par*/checkout/runs.jsonl"))), 0, label)
+                self.assertEqual(self.audit_lines(), [])
+                self.assertNotIn(str(self.home), err)   # never the path
+                self.assertEqual(self.stub_calls(), [])
+
+    def test_a_good_checkout_with_a_git_directory_and_pycache_is_accepted(self):
+        (self.checkout / ".git").mkdir()
+        os.symlink("/nonexistent", str(self.checkout / ".git" / "link"))   # the version-control directory is not loaded by python and is not walked
+        (self.checkout / "scripts" / "v2" / "__pycache__").mkdir()
+        self.assertIsNone(self.lib.vault_check_dir_problem(str(self.checkout)))
+
+    def test_each_entry_branch_has_its_reason(self):
+        import types
+        user = os.getuid()
+        mk = lambda mode, uid=user: types.SimpleNamespace(st_mode=mode, st_uid=uid)
+        for found, reason in ((mk(stat.S_IFLNK | 0o777), "symlink"), (mk(stat.S_IFREG | 0o644, user + 1), "not owned"), (mk(stat.S_IFREG | 0o664), "writable"),
+                              (mk(stat.S_IFREG | 0o646), "writable")):
+            self.assertIn(reason, self.lib._entry_problem(found, "an entry"))
+        self.assertIsNone(self.lib._entry_problem(mk(stat.S_IFREG | 0o644), "an entry"))
+
+    def test_each_parent_branch_has_its_own_reason(self):
+        for label, mode, reason in (("link", "link", "symlink"), ("group", 0o775, "writable"), ("world", 0o777, "writable")):
+            nest = self.home / ("p-" + label)
+            real = self.home / ("r-" + label)
+            real.mkdir()
+            (real / "c").mkdir()
+            if mode == "link":
+                os.symlink(str(real), str(nest))
+            else:
+                real.chmod(mode)
+                nest = real
+            self.assertIn(reason, self.lib.parents_problem(str(nest / "c" / "x")), label)
+
+    def test_a_sticky_parent_is_accepted_and_one_owned_by_another_user_is_not(self):
+        sticky = self.home / "sticky"
+        sticky.mkdir()
+        sticky.chmod(0o1777)
+        (sticky / "x").mkdir()
+        self.assertIsNone(self.lib.parents_problem(str(sticky / "x" / "y")))
+        other = os.getuid() + 7
+        with mock.patch.object(os, "getuid", lambda: other):
+            self.assertIn("another user", self.lib.parents_problem(str(sticky / "x" / "y")))
+
+    def test_the_lock_directorys_parents_are_judged_by_the_same_walk(self):
+        self.make_checkout(code=10, fixes=True)
+        (self.home / "state").mkdir(exist_ok=True)
+        os.chmod(str(self.home / "state"), 0o777)
+        code, out, err = self.launch()
+        os.chmod(str(self.home / "state"), 0o755)
+        self.assertEqual(code, 2, err)
+        self.assertIn("vault check lock", err)
+        self.assertEqual(len(self.check_runs()), 0)
+
+    def test_an_unset_key_does_not_refuse_a_launch_the_vault_already_answers(self):
+        (self.stub_dir / "az_mode").write_text("ok")
+        os.environ.pop("CW_VAULT_CHECK_DIR")
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+
+
+class TestVaultCheckProcess(VaultBase):
+    """The run limit kills the process group; two launches never run the check at once (S8b)."""
+
+    def test_a_check_past_its_limit_is_killed_and_is_a_stop(self):
+        self.make_checkout(code=10, fixes=True, sleep=30)
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 1), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+            code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertIn("the owner of the vault access check", err)
+        (start,) = self.check_runs()
+        end = time.monotonic() + 10
+        gone = False
+        while not gone and time.monotonic() < end:   # a bounded wait for the killed group to be reaped
+            try:
+                os.kill(start["pid"], 0)
+                time.sleep(0.05)
+            except ProcessLookupError:
+                gone = True
+        self.assertTrue(gone, "the check is still running")
+        (line,) = self.audit_lines()
+        self.assertIn('"outcome": "timed-out"', line)
+
+    def pid_gone(self, pid, limit=10):
+        end = time.monotonic() + limit
+        while time.monotonic() < end:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_a_grandchild_that_outlives_the_check_is_killed_and_does_not_hold_the_result(self):
+        self.make_checkout(code=10, fixes=True, grandchild=True)
+        started = time.monotonic()
+        result = self.lib.run_vault_check(dict(os.environ))
+        self.assertEqual((result.code, result.outcome), (10, "added"))
+        self.assertLess(time.monotonic() - started, 30, "the result waited for the grandchild's pipe")
+        self.assertTrue(self.pid_gone(int((self.checkout / "grandchild.pid").read_text())), "the grandchild survived")
+
+    def test_a_grandchild_is_killed_with_a_check_that_timed_out(self):
+        self.make_checkout(code=10, fixes=True, grandchild=True, sleep=30)
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 1), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+            result = self.lib.run_vault_check(dict(os.environ))
+        self.assertEqual((result.code, result.outcome), (None, "timed-out"))
+        self.assertTrue(self.pid_gone(int((self.checkout / "grandchild.pid").read_text())), "the grandchild survived")
+
+    def test_a_holder_killed_with_no_chance_to_react_frees_the_lock(self):
+        lock = str(self.home / "holder.lock")
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl,os,sys,time\nfd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT,0o600)\nfcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(60)", lock],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        recovery = self.cw.VaultRecovery(lock, None, sleep=lambda s: time.sleep(0.02))
+        with mock.patch.object(self.cw, "VAULT_LOCK_GRACE", 0), mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+            with self.assertRaises(self.cw.Refusal):   # held: refused after its bounded wait
+                recovery(lambda: None, dict(os.environ))
+        holder.kill()   # SIGKILL: the kernel frees the lock with the process
+        holder.wait()
+        fd, waited = recovery._lock()
+        os.close(fd)
+        self.assertFalse(waited)
+
+    def recover(self, results, index):
+        env = dict(os.environ)
+        recovery = self.cw.VaultRecovery(self.state / "cloud" / "vault-check.lock", None)
+        recovery.lock_path = str(self.home / "vault.lock")
+        read = lambda: self.cw._capture(["az", "keyvault", "secret", "show"], env=env)
+        results[index] = recovery(read, env)
+
+    def wait_started(self, limit=30):
+        end = time.monotonic() + limit
+        while not self.check_runs() and time.monotonic() < end:
+            time.sleep(0.02)
+        self.assertTrue(self.check_runs(), "the first check never started")
+
+    def two_launches(self):
+        results = [None, None]
+        threads = [threading.Thread(target=self.recover, args=(results, i), daemon=True) for i in (0, 1)]
+        threads[0].start()
+        self.wait_started()   # the first holds the lock (its check has started and sleeps) when the second arrives
+        threads[1].start()
+        for thread in threads:
+            thread.join(60)
+        return results
+
+    def intervals(self):
+        starts = [r["t"] for r in self.runs() if r["kind"] == "start"]
+        ends = [r["t"] for r in self.runs() if r["kind"] == "end"]
+        return sorted(zip(starts, ends))
+
+    def test_s8b_two_launches_run_the_check_once_and_the_second_reads_again_first(self):
+        self.make_checkout(code=10, fixes=True, sleep=1.5)
+        results = self.two_launches()
+        self.assertEqual(len(self.check_runs()), 1)
+        self.assertEqual([r[0] for r in results], [0, 0])
+        self.assertEqual(self.az_reads(), 2 + 0)   # the second's re-read answered: no read after a check of its own
+
+    def test_s8b_when_the_re_read_is_still_refused_the_second_runs_its_own_check_with_no_overlap(self):
+        self.make_checkout(code=0, fixes=False, sleep=1.0)
+        self.two_launches()
+        spans = self.intervals()
+        self.assertEqual(len(spans), 2)
+        self.assertLessEqual(spans[0][1], spans[1][0], "the two checks overlapped")
+
+    def test_a_lock_that_is_not_freed_in_time_refuses_naming_the_lock(self):
+        self.make_checkout(code=0, fixes=False, sleep=3)
+        env = dict(os.environ)
+        results = [None]
+        holder = threading.Thread(target=self.recover, args=(results, 0), daemon=True)
+        holder.start()
+        self.wait_started()
+        recovery = self.cw.VaultRecovery(self.home / "vault.lock", None, sleep=lambda s: time.sleep(0.05), clock=time.monotonic)
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0), mock.patch.object(self.cw, "VAULT_LOCK_GRACE", 0.3):
+            with self.assertRaises(self.cw.Refusal) as caught:
+                recovery(lambda: self.cw._capture(["az", "x"], env=env), env)
+        self.assertIn("vault-check.lock", str(caught.exception))
+        holder.join(30)
 
 
 if __name__ == "__main__":

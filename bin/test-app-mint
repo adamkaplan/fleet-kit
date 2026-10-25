@@ -236,7 +236,7 @@ class TestToken(Base):
         self.write_config(gh_users=None)
         done = subprocess.run([sys.executable, str(GIT_SHIM), "push", "origin", "main"], capture_output=True, text=True, env=self.environ(), timeout=60)
         argv = json.loads((self.home / "git.json").read_text())
-        self.assertEqual(argv, ["-c", "credential.https://github.com.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", "push", "origin", "main"])
+        self.assertEqual(argv, ["-c", "credential.https://github.com.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", "-c", "credential.interactive=false", "push", "origin", "main"])
 
     def test_s2_a_corrupt_config_naming_the_app_still_routes_git_so_the_gh_shim_can_refuse(self):
         (self.home / ".config" / "fleet-switchboard" / "config.json").write_text('{"app_installations": {')

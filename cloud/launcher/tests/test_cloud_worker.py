@@ -43,6 +43,10 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=self.TMP_BASE)
         self.addCleanup(self.tmp.cleanup)
         d = self.tmp.name
+        self.lock_root = os.path.join(d, "locks")   # never the user's real lock directory: tests of one suite run side by side
+        old_root = cw.REAPER_LOCK_ROOT
+        cw.REAPER_LOCK_ROOT = self.lock_root
+        self.addCleanup(setattr, cw, "REAPER_LOCK_ROOT", old_root)
         self.state = os.path.join(d, "kube.json")
         self.write_state({"pods": {}})
         self.env = {"CW_KUBECTL": os.path.join(HERE, "fake_kubectl"), "FAKE_KUBE_STATE": self.state,
@@ -348,9 +352,9 @@ class S4Audit(Base):
 
     def test_spend_cap_exit_5(self):
         self.env["CW_CLOUD_SPEND_CAP_USD"] = "0.25"
-        self.create("coder7")
+        self.create("coder7", "--shape", "S")   # S by name: the cost is the S rate (the unnamed default is XS, #1081)
         self.clock.advance(hours=1)
-        self.assertEqual(self.run_cli("create", "coder8", "--repo", "a/b", "--branch", "m")[0], 5)
+        self.assertEqual(self.run_cli("create", "coder8", "--repo", "a/b", "--branch", "m", "--shape", "S")[0], 5)
 
     def test_idempotent_stop_and_delete_of_gone_worker(self):
         self.assertEqual(self.run_cli("stop", "nobody")[0], 0)
@@ -545,7 +549,7 @@ class S5EndHook(Base):
         src = open(os.path.join(os.path.dirname(os.path.abspath(cw.__file__)), "cloud_worker.py")).read()
         fn = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "_reap_main"][0]
         whys = sorted({ast.unparse(a.value)[:20] for a in ast.walk(fn) if isinstance(a, ast.Assign) and any(getattr(t, "id", "") == "why" for t in a.targets)})
-        self.assertEqual(len(whys), 3, whys)   # end of its pass, stopped by (a signal or an interrupt), an error: a form added needs its case
+        self.assertEqual(len(whys), 4, whys)   # end of its pass, stopped by (a signal or an interrupt), an error, not started (the lock): a form added needs its case (test_reaper_managed.ENDINGS)
         shape = r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: "
         orig = cw.Launcher.reap
         self.addCleanup(setattr, cw.Launcher, "reap", orig)
@@ -607,7 +611,7 @@ class S6Context(Base):
         calls = self.calls()
         self.assertGreater(len(calls), 15)
         verbs = {c[c.index("-n") + 2] for c in calls}
-        self.assertTrue({"create", "get", "annotate", "delete", "exec"} <= verbs, verbs)
+        self.assertTrue({"create", "get", "patch", "delete", "exec"} <= verbs, verbs)
         for c in calls:
             self.assertEqual(c[:4], ["--kubeconfig", "/home/user/.kube/cw-config", "--context", "acme-cw"], c)
 
@@ -762,8 +766,8 @@ class S8Cap(Base):
         self.assertEqual(self.st()["pods"], {})
 
     def test_unset_cap_refuses_when_running_pods_already_cost_25(self):
-        self.create("coder8")
-        self.clock.advance(hours=300)  # 0.10 USD/h
+        self.create("coder8", "--shape", "S")
+        self.clock.advance(hours=300)  # S: 0.10 USD/h (the unnamed default XS is 0.05)
         self.assertEqual(self.create_code()[0], 5)
 
     def test_zero_negative_and_junk_are_refused(self):

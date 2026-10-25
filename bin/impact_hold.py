@@ -13,6 +13,7 @@ daemon's globals and are not meant to be called from this module's own namespace
 import types
 
 MOVED = ('rating_at',
+         'applied_for_repo',
          '_plan_hold',
          'rehold_reason',
          'gate_floor_fact',
@@ -25,6 +26,9 @@ MOVED = ('rating_at',
          '_labels_ours',
          '_apply_impact_hold_locked',
          'clear_fingerprint',
+         'carry_confirmer',
+         'restore_marker',
+         'impact_rehold_open',
          'marker_edit',
          'neutralise_marker',
          '_plan_issue_of',
@@ -51,7 +55,9 @@ MOVED = ('rating_at',
          'cmd_impact_clear',
          'cmd_impact_delegated',
          'delegated_clear_checks',
+         'delegated_clear_inputs',
          'delegated_clear_pr_checks',
+         'clear_who',
          'delegated_clear_score',
          'delegated_clear_map',
          '_gh_json',
@@ -81,6 +87,8 @@ def rehold_reason(engine, state, repo, pr, head):
     if not isinstance(cleared, dict) or not cleared.get("head") or (head and cleared.get("head") == head):
         return None
     carried = (state.get("carried") or {}).get(pr) or {}
+    if cleared.get("names"):   # (#1196) the clear of a carrying pull request never carries to a later head
+        carried = {}
     if head and carried.get("head") == head and carried.get("from") == cleared.get("head") and impact_floor.carry_enabled(engine.config, repo):
         return None
     if head and rating_at(engine, pr, head)[0]:
@@ -104,6 +112,12 @@ def gate_floor_fact(engine, state, repo, number, head):
         return {"decision": None, "reasons": [], "cleared": False, "rehold": None, "unreadable": _one_line("%s: %s" % (type(err).__name__, err), 150)}
 
 
+def applied_for_repo(applied, repo):
+    """(#999) The pull requests of exactly `repo` whose `applied` record lists labels this daemon added: a key is `<repo>#<number>` (the `#` ends the name, so
+    `acme/web` never takes `acme/web2#1`), and a record that is not an object is no record of ours. The ONE match the daemon's pass and `impact hold --dry-run` share."""
+    return {pr for pr, entry in (applied or {}).items() if isinstance(pr, str) and pr.startswith(repo + "#") and isinstance(entry, dict)}
+
+
 def read_impact_state(state_dir):
     """(state, problem): {"clears", "applied"} and None, or an EMPTY state and what is wrong when the file is corrupt, not an object or over
     IMPACT_STATE_MAX_BYTES. A missing file is an empty state with no problem. A corrupt file is REPORTED, never silently read as empty."""
@@ -125,7 +139,7 @@ def read_impact_state(state_dir):
     if not isinstance(raw, dict):
         return empty, "%s is not an object" % IMPACT_STATE_FILE
     found = {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}
-    for extra in ("posted", "matrix_error", "carried", "carry_void"):   # only when the file has them: a state file that never had them reads exactly as it always did
+    for extra in ("posted", "matrix_error", "carried", "carry_void", "carry_wait"):   # only when the file has them: a state file that never had them reads exactly as it always did
         if isinstance(raw.get(extra), dict):
             found[extra] = raw[extra]   # posted, matrix_error: slice 3 (#451); carried, carry_void: the carry (#510)
     return found, None
@@ -176,10 +190,16 @@ def impact_carry_decision(engine, repo, number, head):
         cleared = state["clears"].get(pr) or {}
         if not cleared.get("head") or cleared.get("head") == head:
             return None
+        if cleared.get("names"):   # (#1196) a clear that names two pull requests is for its own head only
+            return None
         if (state.get("carried", {}).get(pr) or {}).get("head") == head or (state.get("carry_void", {}).get(pr) or {}).get("head") == head:
             return None   # decided once per new head: no repeated reads and no repeated audit lines
         runner = getattr(engine, "gh_runner", None) or subprocess.run
-        return load_module("clear_carry").decide(impact_carry_get(engine, runner, repo), repo, number, cleared["head"], cleared.get("fingerprint"), head)
+        waiting = state.get("carry_wait", {}).get(pr) or {}
+        if waiting.get("head") == head and (impact_carry_marks(engine.state_dir)[0].get((pr, head)) or 0) <= waiting.get("marks", 0):
+            return None   # waiting for a reviewer's confirmation at this head, and none is recorded: nothing to read yet (a new record at this head wakes it)
+        return load_module("clear_carry").decide(impact_carry_get(engine, runner, repo), repo, number, cleared["head"], cleared.get("fingerprint"), head,
+                                                 lines_fingerprint=cleared.get("lines_fingerprint"), confirm=carry_confirmer(engine, repo, number), protected=impact_floor.carry_never_paths())
     except Exception as err:
         engine._note("impact.carry_error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
         return None
@@ -244,16 +264,36 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
         return 0   # carried already for this head (and the owner has not switched the carry off since)
     if carry is not None and cleared.get("head") == carry["from"]:
         if carry["carried"]:
-            state.setdefault("carried", {})[pr] = {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"], "at": int(engine.now())}
+            record_carried = {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"], "at": int(engine.now())}
+            detail = {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"], "why": "only main was merged in: the pull request's own change is the one the owner cleared"}
+            if carry.get("route") == "lines":   # (#815) a conflict was resolved by hand: the audit names both heads, the fingerprints and the reviewer's confirmation
+                extra = {"route": "lines", "lines_fingerprint": carry["lines_fingerprint"], "confirmation": carry["confirmation"]}
+                record_carried.update(extra)
+                detail.update(extra, why="a conflict with main was resolved by hand: the lines the pull request adds and removes are the ones the owner cleared, and an independent reviewer confirmed the resolution touched none of them")
+            names = label_names(engine.config)
+            lifted = _labels_ours(names, state, pr)   # the labels this daemon put on this head while the confirmation was missing (none on a pure merge)
+            state.setdefault("carried", {})[pr] = record_carried
             state.setdefault("carry_void", {}).pop(pr, None)
+            state.setdefault("carry_wait", {}).pop(pr, None)
+            state["applied"].pop(pr, None)
             write_impact_state(engine.state_dir, state)
-            engine.audit.append(engine.actor, "gate.clear_carried", pr, {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"],
-                                                                         "why": "only main was merged in: the pull request's own change is the one the owner cleared"})
+            engine.audit.append(engine.actor, "gate.clear_carried", pr, detail)
+            if lifted:
+                live = read_pr_json(engine, repo, number).get("labels")
+                have = {(l.get("name") if isinstance(l, dict) else l) for l in (live if isinstance(live, list) else [])}
+                remove = [l for l in lifted if l in have]
+                if remove:
+                    change_issue_labels(engine, getattr(engine, "gh_runner", None) or subprocess.run, repo, number, remove=remove)
+                    engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": head, "removed": remove, "reasons": ["the owner's clear carried to this head"]})
             return 0
-        state.setdefault("carry_void", {})[pr] = {"head": head, "reason": _one_line(carry["reason"] or "", 200)}
-        _consume_record(state, pr, cleared)   # the clear took the daemon's labels off: an older record of them is no longer a claim
-        write_impact_state(engine.state_dir, state)
-        engine.audit.append(engine.actor, "gate.clear_carry_void", pr, {"head": head, "from": carry["from"], "reason": _one_line(carry["reason"] or "", 200)})
+        if carry.get("waiting"):   # (#815) only the reviewer's confirmation is missing at this head: not a void (it may still arrive), and the hold below stands meanwhile
+            state.setdefault("carry_wait", {})[pr] = {"head": head, "marks": impact_carry_marks(engine.state_dir)[0].get((pr, head)) or 0, "reason": _one_line(carry["reason"] or "", 200)}
+            write_impact_state(engine.state_dir, state)
+        else:
+            state.setdefault("carry_void", {})[pr] = {"head": head, "reason": _one_line(carry["reason"] or "", 200)}
+            _consume_record(state, pr, cleared)   # the clear took the daemon's labels off: an older record of them is no longer a claim
+            write_impact_state(engine.state_dir, state)
+            engine.audit.append(engine.actor, "gate.clear_carry_void", pr, {"head": head, "from": carry["from"], "reason": _one_line(carry["reason"] or "", 200)})
     names = label_names(engine.config)
     raw = read_pr_json(engine, repo, number)   # the labels NOW, under the lock: the record claims only what this write adds, never a label that was already there
     live = raw.get("labels")
@@ -287,6 +327,8 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
         spent += 1
     added = sorted(recorded | set(missing) | set(adopt))   # a re-apply MERGES into what an earlier apply added: it never forgets one
     state["applied"][pr] = {"head": head, "merge_label_added": names["merge-captain"] in added, "added": added, "at": int(engine.now())}
+    if report.get("rehold"):
+        state["applied"][pr]["rehold"] = True   # (#815) the sweep reads it: a held-again pull request is not a disagreement
     write_impact_state(engine.state_dir, state)
     for label in adopt:   # after the record is written (a restart finds it recorded and adopts nothing more)
         engine.audit.append(engine.actor, "gate.label_adopted", pr, {"head": head, "label": label})
@@ -295,40 +337,126 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
     engine.audit.append(engine.actor, "gate.hold_applied", pr, {"head": head, "labels": missing, "reasons": report["reasons"],
                                                                  "floor_paths": report["floor_paths"][:20], "globs": report["globs"][:20]})
     if report.get("rehold"):   # said once per head: the labels were missing, so this is the pass that put them back
-        engine.audit.append(engine.actor, "gate.hold_reapplied", pr, {"head": head, "cleared_head": cleared.get("head"), "labels": missing, "why": report["rehold"]})
+        detail = {"head": head, "cleared_head": cleared.get("head"), "labels": missing, "why": report["rehold"]}
+        marker = restore_marker(engine, runner, repo, number, head, raw)   # (#815) the clear set the first line to `MERGE: automatic`: it says captain again, once, in this pass
+        if marker is not None:
+            detail["marker"] = marker
+        engine.audit.append(engine.actor, "gate.hold_reapplied", pr, detail)
     return spent
 
 
 def clear_fingerprint(engine, runner, repo, number, head):
-    """(fingerprint, problem): the fingerprint of the pull request's own change at `head`, stored WITH a clear so a later pure merge of main can carry it (bin/clear_carry.py).
-    Only when `impact_hold.carry_clear` is on (the default is off: a clear then records nothing new). The ONE function `clear_carry.own_change_fingerprint` computes it, here and at the
-    carry. A change that cannot be read in full, or a head that moved while it was read, records NO fingerprint (so nothing carries) and never stops the clear."""
+    """(fingerprint, problem, lines_fingerprint): the fingerprints of the pull request's own change at `head`, stored WITH a clear so a later merge of main can carry it (bin/clear_carry.py): the full
+    one (a pure merge of main) and the lines-only one (a merge that resolved a conflict, #815). Only when `impact_hold.carry_clear` is on (the default is off: a clear then records nothing new).
+    The ONE function `clear_carry.own_change_fingerprint` computes both, here and at the carry. A change that cannot be read in full, or a head that moved while it was read, records NO
+    fingerprint (so nothing carries) and never stops the clear; a lines-only fingerprint that cannot be read leaves the full one in place."""
     if not impact_floor.carry_enabled(engine.config, repo):
-        return None, None
+        return None, None, None
     cc = load_module("clear_carry")
-    try:
-        fingerprint, fp_head, _ = cc.own_change_fingerprint(impact_carry_get(engine, runner, repo), repo, number)
-    except cc.CarryVoid as err:
-        return None, _one_line(str(err), 200)
-    except Exception as err:
-        return None, _one_line("%s: %s" % (type(err).__name__, err), 200)
-    if fp_head != head:
-        return None, "the head moved while its change was being read"
-    return fingerprint, None
+    get = impact_carry_get(engine, runner, repo)
+    found = []
+    for lines in (False, True):   # the full one first: without it nothing is stored; the lines-only one is only for the conflict-resolving carry
+        try:
+            fingerprint, fp_head, _ = cc.own_change_fingerprint(get, repo, number, lines=lines)
+        except cc.CarryVoid as err:
+            if not found:
+                return None, _one_line(str(err), 200), None
+            break
+        except Exception as err:
+            if not found:
+                return None, _one_line("%s: %s" % (type(err).__name__, err), 200), None
+            break
+        if fp_head != head:
+            if not found:
+                return None, "the head moved while its change was being read", None
+            break
+        found.append(fingerprint)
+    return found[0], None, (found[1] if len(found) == 2 else None)
 
 
-def marker_edit(body):
-    """(new body, line before, line after) when the body's FIRST non-empty line says `MERGE: captain` (the very rule `pr_marker` reads), with ONLY that marker changed to
-    `MERGE: automatic` and every other byte of the body (the rest of the line and its ending included) as it was. None when the first line is anything else."""
-    if pr_marker(body) != "captain":
+def carry_confirmer(engine, repo, number):
+    """`confirm(head)` for `clear_carry.decide` (#815): the reference (`ledger entry <seq> <hash prefix> by <name>`) of the independent reviewer's confirmation recorded for EXACTLY `head`,
+    else CarryVoid. A confirmation is a `review_record` of this pull request with `carry_confirmed` and an `approve` verdict, at this head (the ledger binds a record to the head it
+    judged, so a record from before this head existed, or for another head, never matches), and it counts only when the newest record of its writer for that role at that head still
+    is one, its writer is registered under `plan_evaluators.reviewer`, is a named agent (never the person's own terminal) whose RECORDED role is one of the score block's `rating_roles` (the independent reviewer, as for a rating, #835) and is not a writer of the pull request (the author GitHub
+    reports, whoever recorded a proof for it, the senders of its notice). Nothing in a comment, a label or a body counts."""
+    cc = load_module("clear_carry")
+
+    def confirm(head):
+        pr = "%s#%d" % (repo, number)
+        entries, problem = plan_ledger.read_ledger(engine.state_dir)
+        if problem:
+            raise cc.CarryVoid("the ledger cannot be read in full (%s)" % _one_line(str(problem), 80))
+        newest = {}
+        for entry in entries:
+            if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head:
+                newest[(entry.get("by"), entry.get("reviewer"))] = entry
+        found = [e for e in newest.values() if e.get("carry_confirmed") is True and e.get("verdict") == "approve"]
+        if not found:
+            raise cc.CarryVoid("no confirmation at this head")
+        raw = read_pr_json(engine, repo, number)
+        item = next((i for i in read_pr_notices(engine.state_dir) if i["repo"] == repo and i["number"] == number), None)
+        authors = plan_ledger.authors_of(entries, pr, notice_senders(item) if item else [], pr_facts_from(raw).get("author"))
+        registered = ((engine.config.get("plan_evaluators") or {}).get("reviewer") or []) if isinstance(engine.config, dict) else []
+        try:
+            roles = load_module("delegated_clear").score_block()["rating_roles"]   # the ONE list of roles that count as the independent reviewer (#835): the rating and this confirmation read the same
+        except Exception:
+            roles = []
+        for entry in sorted(found, key=lambda e: e["seq"], reverse=True):
+            by = entry.get("by")
+            if isinstance(by, str) and by and by != "person" and by in registered and by not in authors and entry.get("by_role") in roles:
+                return "ledger entry %d %s by %s" % (entry["seq"], str(entry.get("hash"))[:12], by)
+        raise cc.CarryVoid("no confirmation at this head by a registered reviewer who is not a writer of the pull request")
+    return confirm
+
+
+def marker_edit(body, source="captain", target="automatic"):
+    """(new body, line before, line after) when the body's FIRST non-empty line says `MERGE: <source>` (the very rule `pr_marker` reads), with ONLY that marker changed to
+    `MERGE: <target>` (the clear: captain to automatic; a re-hold, #815: automatic back to captain) and every other byte of the body (the rest of the line and its ending included) as
+    it was. None when the first line is anything else."""
+    if pr_marker(body) != source:
         return None
     lines = body.splitlines(keepends=True)
     index = next(i for i, line in enumerate(lines) if line.strip())
     line = lines[index]
-    at = line.index("MERGE: captain")
-    edited = line[:at] + "MERGE: automatic" + line[at + len("MERGE: captain"):]
+    at = line.index("MERGE: " + source)
+    edited = line[:at] + "MERGE: " + target + line[at + len("MERGE: " + source):]
     lines[index] = edited
     return "".join(lines), line.rstrip("\r\n"), edited.rstrip("\r\n")
+
+
+def restore_marker(engine, runner, repo, number, head, first):
+    """(#815) {"before", "after"} when this pull request's body was rewritten from `MERGE: automatic` back to `MERGE: captain` (the owner's clear had set it; the pull request is HELD AGAIN at
+    `head`, so the sweep must not read the two as disagreeing); {"error": why} when it could not be (nothing was written); None when there is nothing to do (no MERGE line, or it already says
+    captain). `first` is the read the caller made a moment ago; the body is read again right before the write and written only when it is the same, for this head only, then read back. One body
+    edit through the daemon's own route; best effort: the hold labels have already been written and stand either way. Never raises."""
+    try:
+        if not isinstance(first, dict) or first.get("headRefOid") != head:
+            return {"error": "the head moved: nothing was written"}
+        edit = marker_edit(first.get("body"), "automatic", "captain")
+        if edit is None:
+            return None
+        new_body, before, after = edit
+        again = read_pr_json(engine, repo, number)
+        if again.get("body") != first.get("body") or again.get("headRefOid") != head:
+            return {"error": "the body or the head changed while it was being edited: nothing was written"}
+        _gh_write(engine, runner, repo, "repos/%s/pulls/%d" % (repo, number), "PATCH", {"body": new_body})   # no conditional write exists: an edit landing after the read above is the accepted window (the rewrite only moves toward the hold)
+        if read_pr_json(engine, repo, number).get("body") != new_body:
+            return {"error": "the body read back is not the one written"}
+        clean = lambda t: re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", t)
+        return {"before": _one_line(clean(before), 80), "after": _one_line(clean(after), 80)}
+    except Exception as err:
+        return {"error": _one_line("%s: %s" % (type(err).__name__, err), 120)}
+
+
+def impact_rehold_open(state_dir, repo, number):
+    """(#815) True when the daemon's record of this pull request says its hold is a RE-HOLD (`applied.rehold`): the owner cleared an earlier head and it is held again. The sweep reads it so a
+    body line that still says `MERGE: automatic` beside the hold labels is not reported as a disagreement. An unreadable state is False (the sweep then says what it always said)."""
+    try:
+        state, problem = read_impact_state(state_dir)
+        return not problem and (state["applied"].get("%s#%d" % (repo, number)) or {}).get("rehold") is True
+    except Exception:
+        return False
 
 
 def neutralise_marker(engine, runner, repo, number, head, first=None):
@@ -399,6 +527,11 @@ def _lane_of_issue(engine, repo, issue, orchestrators):
     except IntentError:
         pass   # the chain so far is all that can be told
     default_repo = engine.config.get("intent_repo") if len(getattr(engine, "watches", ()) or ()) > 1 else None
+    registry = load_module("registry")   # #969: an orchestrator's charter is the registry row's `charter`, the ONE record; the live session's metadata (written once at launch, never corrected) is never a second owner
+    reg = registry.read(engine.state_dir) if engine.state_dir is not None else None
+    if reg is None or not reg["whole"]:
+        return None   # an unreadable registry gives no lane: never a guess
+    charters = registry.orchestrator_charters(reg["agents"])
     for number in chain:
         owners = []
         for name, agent in sorted(orchestrators.items()):
@@ -406,14 +539,7 @@ def _lane_of_issue(engine, repo, issue, orchestrators):
             theirs = fleet.get("repo") if isinstance(fleet.get("repo"), str) else default_repo
             if repo and theirs and theirs != repo:
                 continue
-            owned = set()
-            for field in ("issue", "charter"):
-                value = fleet.get(field)
-                if isinstance(value, int) and not isinstance(value, bool):
-                    owned.add(value)
-                elif isinstance(value, str) and value.strip().lstrip("#").isdigit():
-                    owned.add(int(value.strip().lstrip("#")))
-            if number in owned:
+            if charters.get(name) == number:
                 owners.append(name)
         if len(owners) == 1:
             return ("one", owners[0])
@@ -855,7 +981,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         raise NoticeError("the PR's head moved since the owner was shown it (%s, not %s): nothing was cleared" % (current[:8], head[:8]))
     if verify is not None:
         verify(raw)
-    fingerprint, fingerprint_problem = clear_fingerprint(engine, runner, repo, number, current)
+    fingerprint, fingerprint_problem, lines_fingerprint = clear_fingerprint(engine, runner, repo, number, current)
     names = label_names(engine.config)
     if remove is not None:
         cc = load_module("chat_clear")
@@ -884,11 +1010,17 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             remove = list(remove)
         head_now = current
         state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now()), "removed": sorted(remove)}   # `removed`: the labels a re-hold at a new head puts back (#830)
+        carried_number = plan_ledger.carries_of(raw.get("body"))   # (#1196) a carrying pull request: the clear names BOTH pull requests and is for this head only
+        if carried_number is not None:
+            state["clears"][pr]["names"] = [pr, "%s#%d" % (repo, carried_number)]
         _consume_record(state, pr)   # the labels it took off were the daemon's record: consumed with the clear, in this write
         state.get("carried", {}).pop(pr, None)   # a new clear starts from this head: an earlier carry is not part of it
         state.get("carry_void", {}).pop(pr, None)
+        state.get("carry_wait", {}).pop(pr, None)   # (#815) a waiting carry belongs to the clear it was for
         if fingerprint is not None:
             state["clears"][pr]["fingerprint"] = fingerprint
+            if lines_fingerprint is not None:
+                state["clears"][pr]["lines_fingerprint"] = lines_fingerprint
         elif fingerprint_problem:
             state["clears"][pr]["fingerprint_problem"] = fingerprint_problem
         write_impact_state(engine.state_dir, state)   # the clear first: a failed removal never leaves a hold the daemon would re-add
@@ -901,6 +1033,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             detail["order"] = plan_ledger.clip(under_order["text"], 300)
             if under_order.get("threshold"):   # #835: a clear by score shows the score and the threshold it was made under
                 detail["score"], detail["threshold"] = under_order.get("score"), under_order["threshold"]
+                detail["runs"] = under_order.get("runs") or []   # #972: the two runs the clear rests on (record id, rater, cell)
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
@@ -980,7 +1113,7 @@ def delegated_clear_score(engine, module, report, threshold):
         if not rated and not problem:
             problem = "no independent impact rating at this head"
         block = module.score_block()
-        scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold) if not problem and block is not None else None
+        scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold, module.RUNS_REQUIRED) if not problem and block is not None else None
     except Exception as err:
         scored, problem = None, "%s: %s" % (type(err).__name__, _one_line(str(err), 80))
     if scored is None:
@@ -988,13 +1121,17 @@ def delegated_clear_score(engine, module, report, threshold):
     return scored
 
 
-def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None):
-    """(report, None) when this pull request may be cleared under an order, else (None, why). The owner-hold decision is the daemon's own (`pr_floor_report`: no second rule), the rule (the classes
-    never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661. With a `threshold` (the order's max_level, #835) the SCORE of the
-    independent rating at this head is the rule about the pull request's classes; `info` (a dict) gets the score it read, for the audit of a refusal too."""
+def delegated_clear_inputs(engine, runner, repo, number, take=False, report=None):
+    """(inputs, None) or (None, why): everything the clear's rule needs about one pull request, READ ONLY (GETs): {"report" (the daemon's own `pr_floor_report`), "rule" (the matrix's
+    `owner_hold.delegated_clear`), "files" (the changed files, None when they cannot be read in full), "closure" ({file: reasons or None})}. The file list and the decision must be of ONE head. Read by the
+    clear (`delegated_clear_pr_checks`) and by the line the daemon posts (`clear_who`): one reading, no second copy. #661, #946."""
     try:
-        report = pr_floor_report(engine, repo, number)
-        rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear")
+        report = report if isinstance(report, dict) else pr_floor_report(engine, repo, number)   # the line is given the report the pass just judged: one floor read per pull request per pass
+        matrix = impact_floor.load_matrix()
+        rule = (matrix.get("owner_hold") or {}).get("delegated_clear")
+        listed, problem = impact_floor.clear_code_paths(matrix)   # the ONE reader of the list: the floor holds these paths, the clear refuses them
+        if isinstance(rule, dict) and listed is not None and problem is None:
+            rule = dict(rule, clear_code_paths=listed)
     except (impact_floor.MatrixError, NoticeError, ValueError) as err:
         return None, "the owner-hold decision or its rule cannot be read (%s): refused" % _one_line(str(err), 140)
     files, get = [], impact_carry_get(engine, runner, repo)
@@ -1010,7 +1147,7 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
             files = None   # more than 3000 files: not read in full
     except Exception:
         files = None
-    module, base_sha, closure = load_module("delegated_clear"), None, {}
+    base_sha, closure = None, {}
     if files is not None:   # the file list and the decision must be of ONE head: the head read again after the files must still be the one the decision read
         try:
             pull = get("repos/%s/pulls/%d" % (repo, number))
@@ -1024,14 +1161,39 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
             return None, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(report.get("head"))[:8], str(after)[:8])
         for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
             if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
-                closure[item["filename"]] = delegated_clear_map(engine, runner, repo, item, base_sha, rule)
+                closure[item["filename"]] = load_module("delegated_clear").cached_map(load_module("delegated_clear").map_key(engine.state_dir, repo, item, base_sha, rule),
+                                                                                     lambda: delegated_clear_map(engine, runner, repo, item, base_sha, rule), take)   # the line the daemon posts hands what it read to the clear, once
+    return {"report": report, "rule": rule, "files": files, "closure": closure}, None
+
+
+def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None):
+    """(report, None) when this pull request may be cleared under an order, else (None, why). The owner-hold decision is the daemon's own (`pr_floor_report`: no second rule), the rule (the classes
+    never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661. With a `threshold` (the order's max_level, #835) the SCORE of the
+    independent rating at this head is the rule about the pull request's classes; `info` (a dict) gets the score it read, for the audit of a refusal too."""
+    got, why = delegated_clear_inputs(engine, runner, repo, number, True)
+    if why:
+        return None, why
+    report, module = got["report"], load_module("delegated_clear")
     scored = delegated_clear_score(engine, module, report, threshold) if threshold is not None else None
     if scored is not None and info is not None:
         info["score"] = scored["level"]
-    reasons = module.refusals(rule, report, files, impact_floor.matches, closure, scored)
+        info["runs"] = scored.get("runs") or []
+    reasons = module.refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored)
     if reasons:
         return None, "; ".join(reasons)
     return report, None
+
+
+def clear_who(engine, runner, repo, number, report=None):
+    """`delegated_clear.who_can_clear` for one pull request, from the clear's own inputs (`delegated_clear_inputs`): who can clear it, as plain data (#946; the packet command reads the same). READ ONLY: GETs
+    and nothing else (no label, no state file, no audit line, no send). Inputs that cannot be read give the `unknown` answer, never a confident one."""
+    module, pr = load_module("delegated_clear"), "%s#%d" % (repo, number)
+    got, why = delegated_clear_inputs(engine, runner, repo, number, False, report)
+    block = module.score_block()
+    delegation = module.delegation_of(engine.config, block)
+    if why:
+        return module.who_can_clear(None, None, None, None, None, block, delegation, pr=pr, unread=why)
+    return module.who_can_clear(got["rule"], got["report"], got["files"], impact_floor.matches, got["closure"], block, delegation, pr=pr)
 
 
 def cmd_impact_clear(args, runner, now):
@@ -1078,6 +1240,7 @@ def cmd_impact_clear(args, runner, now):
                 had = state["clears"].pop(pr, None)
                 carried = state.get("carried", {}).pop(pr, None)
                 state.get("carry_void", {}).pop(pr, None)
+                state.get("carry_wait", {}).pop(pr, None)
                 if had is not None:
                     _consume_record(state, pr, had)   # an older record of the daemon's labels is stale (a newer one, applied after the clear, is kept)
                 if had is not None or carried is not None:   # nothing to take back: nothing is written
@@ -1100,7 +1263,15 @@ def cmd_impact_clear(args, runner, now):
                     engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300)}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
                 sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
                 return EXIT_USAGE
-            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"))}
+            if delegated.get("threshold"):   # #972: a clear by score names both runs it rests on
+                problems = load_module("delegated_clear").reason_problems(reason, info.get("runs") or [])
+                if problems:
+                    why = "; ".join(problems)
+                    if engine.audit is not None:
+                        engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300), "score": info.get("score"), "threshold": delegated["threshold"]})
+                    sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
+                    return EXIT_USAGE
+            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"), runs=info.get("runs"))}
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300), **extra):
             print(line)
     except (NoticeError, IntentError) as err:
@@ -1181,8 +1352,8 @@ def impact_plan(engine, report, labels, state, records, records_problem):
     names = label_names(engine.config)
     have = set(labels or ())
     pr = report["pr"]
-    if report.get("draft"):
-        return "none", []   # the daemon judges no draft pull request
+    if report.get("draft") and report.get("owner_decision") == "hold":
+        return "none", []   # the daemon adds no hold to a draft pull request (it still releases one the rule no longer holds, #999)
     if report.get("owner_decision") == "hold":
         carried = (state.get("carried", {}).get(pr) or {}).get("head") == report["head"] and impact_floor.carry_enabled(engine.config, report["pr"].rpartition("#")[0])
         if (state["clears"].get(pr) or {}).get("head") == report["head"] or carried:   # the owner's clear, or a clear carried over a pure merge of main (#510)
@@ -1212,7 +1383,7 @@ def cmd_impact_hold(args, runner, now):
         except impact_floor.MatrixError as err:   # the matrix file cannot be read: say so and stop, never read it as "no floor"
             sys.stderr.write("%s: impact hold: %s\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
-        if not has_floor:
+        if not has_floor and not applied_for_repo(read_impact_state(state)[0].get("applied"), repo):   # a repo with no floor now is still judged while it holds labels of ours (#999)
             continue
         try:
             items = read_open_items(engine, runner, repo)[0]
@@ -1275,7 +1446,7 @@ def release_impact_hold(engine, repo, number, report, record):
         del state["applied"][pr]
         write_impact_state(engine.state_dir, state)
         engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": report["head"], "removed": remove, "reasons": report.get("owner_reasons", [])[:5],
-                                                                      "rule": engine.__dict__.get("impact_rule")})
+                                                                      "reason": report.get("release_reason") or "rule no longer holds", "rule": engine.__dict__.get("impact_rule")})
         return len(remove)
 
 

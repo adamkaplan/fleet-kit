@@ -1,0 +1,4 @@
+{
+ "command": "budget-notice",
+ "help": "usage: fleet-switchboard budget-notice [-h] --account ACCOUNT `budget-notice --account NAME`: when the account's fresh reading is below the low-budget line, names the agent that made the most agent-shell GitHub calls in the last hour to that agent's orchestrator (the Chief of Staff when it has none), in one message, at most once an hour per account. It takes only the account's name: the budget, the ranking and the text all come from the daemon's own records, so a call to it cannot invent a message. There is no per-agent cap: the shim only makes that agent's reads that are not answered from the cache wait a few seconds while the account is low. options: -h, --help show this help message and exit --account ACCOUNT The gh account's name as `status` shows it"
+}

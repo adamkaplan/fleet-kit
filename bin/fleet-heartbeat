@@ -70,6 +70,61 @@ def _load_ack_module():
 
 ack, ACK_PATH = _load_ack_module()
 
+def _load_registry_module():
+    """The agent registry (bin/registry.py, beside this file), or None when it is not installed: then no pass can be whole."""
+    path = Path(__file__).resolve().parent / "registry.py"
+    if not path.is_file():
+        return None
+    loader = importlib.machinery.SourceFileLoader("fleet_heartbeat_registry", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+registry = _load_registry_module()
+
+
+def registry_state_dir():
+    """The daemon's state directory, where registry.json lives (FLEET_REGISTRY_DIR overrides, as for tests)."""
+    override = os.environ.get("FLEET_REGISTRY_DIR")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "fleet-switchboard"
+
+
+# Fail mode, decided: a record with no `bell` field is opted out. Until the switchboard daemon's one-time migration has run (`bell-migrated.json` absent) every
+# agent reads as opted out, so nobody is nudged (closed, never open); `status` says "bell migration pending" meanwhile.
+GONE_STATES = ("dead", "detached")   # a recorded agent whose pane is gone or unattached: never nudged
+
+
+def registry_targets():
+    """Who exists, from the registry: (targets, problem). A read that is not whole gives no targets and one line saying why (fail closed).
+    A target is a registry agent with a pane that has opted in (its `bell` field, read here through the registry's read seam; policy, never identity)
+    and whose recorded state is not dead or detached (the live listing this replaced never showed such a pane)."""
+    if registry is None:
+        return [], "registry module not found: nothing supervised this pass"
+    try:
+        found = registry.read(registry_state_dir())
+    except Exception as err:   # a read that raises is a read that is not whole
+        return [], "registry read failed (%s): nobody nudged this pass" % type(err).__name__
+    if not isinstance(found, dict) or found.get("whole") is not True:
+        reason = found.get("problem") if isinstance(found, dict) else None
+        return [], "registry read was not whole (%s): nobody nudged this pass" % (reason or "no reason given")
+    agents = found.get("agents")
+    if not isinstance(agents, dict):
+        return [], "registry read was not whole (agents is not a map): nobody nudged this pass"
+    targets = []
+    for name, agent in sorted(agents.items(), key=lambda kv: str(kv[0])):
+        pane = agent.get("pane") if isinstance(agent, dict) else None
+        if registry.no_pane_to_judge(agent):   # #1181: a row with no pane to judge is never a wake target (no nudge, so no failure or alert)
+            continue
+        if isinstance(pane, str) and pane.strip() and registry.bell_of(agent) and agent.get("state") not in GONE_STATES:
+            targets.append({"name": str(name), "pane_id": pane, "workspace_id": agent.get("workspace"), "tab_id": None})
+    return targets, None
+
+
 utc = ack.utc
 atomic_write = ack.atomic_write
 stagger_offset = ack.stagger_offset
@@ -503,40 +558,6 @@ class Herdr:
         except (OSError, ValueError):
             raise Unavailable("cli_unavailable") from None
 
-    def tabs_with_agents(self):
-        """Every tab that currently hosts an agent, supervised or not."""
-        tabs = self.call("tab", "list").get("result", {}).get("tabs", [])
-        agents = self.call("agent", "list").get("result", {}).get("agents", [])
-        by_tab = {a.get("tab_id"): a for a in agents if a.get("tab_id")}
-
-        found = []
-        for tab in tabs:
-            agent = by_tab.get(tab.get("tab_id"))
-            if not agent:
-                continue
-            label = tab.get("label", "")
-            found.append({
-                "workspace_id": tab.get("workspace_id"),
-                "tab_id": tab.get("tab_id"),
-                "pane_id": agent.get("pane_id"),
-                "label": label,
-                "agent_kind": agent.get("agent"),
-                "wakeable": agent.get("agent") in WAKEABLE_KINDS,
-                "supervised": BELL in label,
-            })
-        return found
-
-    def discover(self):
-        """Supervised panes. The bell in the tab label is the only rule.
-
-        The original also required a particular word in the label. That gate was
-        undocumented, so renaming a tab silently ended its supervision, and the
-        same regex existed in three places across two repos and had already
-        drifted. One visible rule, in one place, that a person can read straight
-        off the tab bar.
-        """
-        return [t for t in self.tabs_with_agents() if t["supervised"]]
-
     def inspect_pane(self, pane_id):
         """Is it safe to send right now? Returns (status, observed telemetry).
 
@@ -821,13 +842,10 @@ def _loop_once(state_dir, config_path, config):
 
     now = time.time()
     suspect = False
-    try:
-        targets = transport.discover()
-    except Unavailable as err:
-        logging.error("discovery failed: %s", err)
-        record_service(state_dir, last_error="discover:%s" % err)
-        targets = []
-        suspect = str(err) in HERDR_SUSPECT_STATUSES
+    targets, problem = registry_targets()
+    if problem:
+        logging.error("%s", problem)
+        record_service(state_dir, last_error="registry:%s" % problem)
 
     for target in targets:
         pane_id = target["pane_id"]
@@ -901,7 +919,7 @@ def daemon_liveness(service):
 
 def format_status(state, live_pane_ids, now_ts, notes=()):
     service = state.get("service", {})
-    lines = ["FLEET HEARTBEAT  (cadence 5-59m, opt in by putting %s in a tab label)" % BELL, "=" * 96]
+    lines = ["FLEET HEARTBEAT  (cadence 5-59m, opt in with `fleet-heartbeat bell NAME on`)", "=" * 96]
     verdict, detail = daemon_liveness(service)
     if verdict == "FAULT":
         lines.append("SERVICE FAULT  %s" % detail)
@@ -945,7 +963,7 @@ def format_status(state, live_pane_ids, now_ts, notes=()):
         # Judged from the attempts, not the stored flag, so state written
         # before `not_wakeable` existed (chronic_failure true) reads right too.
         if health["not_wakeable"]:
-            lines.append("  ^ not wakeable: %s (🔔 has no effect on this agent)"
+            lines.append("  ^ not wakeable: %s (the bell has no effect on this agent)"
                          % health["chronic_reason"])
         elif pane.get("chronic_failure"):
             lines.append("  ^ chronic failure: %s" % pane.get("chronic_reason"))
@@ -1059,12 +1077,12 @@ def cmd_status(args):
         if fault:
             notes.append("herdr unusable: %s" % fault[1])
         else:
-            try:
-                live = {t["pane_id"] for t in Herdr(config).discover()}
-            except Unavailable as err:
-                notes.append("live discovery unavailable (%s); showing recorded state only" % err)
+            live = {t["pane_id"] for t in registry_targets()[0]}   # the opted-in panes of the registry; no live listing
     except ConfigError as err:
         notes.append(str(err))
+
+    if registry is not None and not registry.bell_migrated(registry_state_dir()):
+        notes.append("bell migration pending: no agent is supervised until the switchboard daemon has copied the bell opt-in into the registry")
 
     service_manager = service_manager_state()
     if service_manager:
@@ -1092,35 +1110,41 @@ def cmd_status(args):
 
 
 def cmd_list(args):
-    try:
-        config = load_config(args.config)
-    except ConfigError as err:
-        sys.stderr.write("fleet-heartbeat: %s\n" % err)
+    """Every recorded agent with a pane and whether it opts in, from the registry (no live listing)."""
+    if registry is None:
+        sys.stderr.write("fleet-heartbeat: registry module not found\n")
         return EXIT_FAULT
-    fault = verify_herdr(config["herdr"])
-    if fault:
-        sys.stderr.write("fleet-heartbeat: %s\n" % fault[1])
+    found = registry.read(registry_state_dir())
+    if found.get("whole") is not True:
+        sys.stderr.write("fleet-heartbeat: registry read was not whole (%s)\n" % (found.get("problem") or "no reason given"))
         return EXIT_FAULT
-    try:
-        targets = Herdr(config).tabs_with_agents()
-    except Unavailable as err:
-        sys.stderr.write("fleet-heartbeat: herdr unavailable (%s)\n" % err)
-        return EXIT_FAULT
-
     state = read_state(ack.resolve_state_dir(args.state_dir))
-    row = "%-10s %-8s %-9s %-11s %-11s %-9s %-9s %-8s %s"
-    print(row % ("WORKSPACE", "TAB", "PANE", "KIND", "SUPERVISED", "WAKEABLE", "CADENCE", "STAGGER", "LABEL"))
-    print("-" * 118)
-    for target in targets:
-        pane = state.get("panes", {}).get(target["pane_id"], {})
+    row = "%-24s %-10s %-9s %-9s %-10s %-9s %-8s"
+    print(row % ("AGENT", "WORKSPACE", "PANE", "STATE", "SUPERVISED", "CADENCE", "STAGGER"))
+    print("-" * 90)
+    for name, agent in sorted(found["agents"].items()):
+        pane_id = agent.get("pane")
+        if not isinstance(pane_id, str) or not pane_id.strip():
+            continue
+        pane = state.get("panes", {}).get(pane_id, {})
+        on = registry.bell_of(agent)
         print(row % (
-            target["workspace_id"] or "-", target["tab_id"] or "-", target["pane_id"] or "-",
-            target["agent_kind"] or "-",
-            "yes" if target["supervised"] else "no (no %s)" % BELL,
-            "yes" if target["wakeable"] else "no",
-            "%.1fm" % pane.get("interval_minutes", DEFAULT_INTERVAL_MINUTES),
-            "%ds" % stagger_offset(target["pane_id"] or ""),
-            target["label"]))
+            name[:24], agent.get("workspace") or "-", pane_id, agent.get("state") or "-",
+            "yes" if on else "no (bell off)",
+            "%.1fm" % pane.get("interval_minutes", DEFAULT_INTERVAL_MINUTES), "%ds" % stagger_offset(pane_id)))
+    return 0
+
+
+def cmd_bell(args):
+    """`bell NAME on|off`: set the registry's per-agent opt-in. An agent the registry does not record is refused."""
+    if registry is None:
+        sys.stderr.write("fleet-heartbeat: registry module not found\n")
+        return EXIT_FAULT
+    got = registry.set_bell(registry_state_dir(), args.name, args.setting == "on")
+    if got["problem"]:
+        sys.stderr.write("fleet-heartbeat: %s\n" % got["problem"])
+        return EXIT_FAULT
+    print("%s: bell %s%s" % (args.name, args.setting, "" if got["changed"] else " (already)"))
     return 0
 
 
@@ -1149,9 +1173,8 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="fleet-heartbeat",
         description="Wake supervised orchestrator panes on their own adaptive schedule.",
-        epilog="A tab opts in by having %s in its label. There is no enable command:\n"
-               "this daemon never writes tab titles, so what you see in the tab bar is\n"
-               "the truth about what is supervised." % BELL,
+        epilog="An agent opts in through the `bell` field of its registry record: `%s bell NAME on`\n"
+               "(or off). `list` shows who is supervised. This daemon never writes tab titles." % "fleet-heartbeat",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path,
                         default=Path(os.environ.get("FLEET_HEARTBEAT_CONF") or DEFAULT_CONFIG_PATH),
@@ -1165,7 +1188,11 @@ def build_parser():
     status = sub.add_parser("status", help="Human-readable service and per-pane health")
     status.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
 
-    sub.add_parser("list", help="Tabular view of every tab with an agent, and whether it opts in")
+    sub.add_parser("list", help="Tabular view of every registry agent with a pane, and whether it opts in")
+
+    bell = sub.add_parser("bell", help="Set an agent's opt-in (the registry's `bell` field)")
+    bell.add_argument("name", help="The agent's registry name")
+    bell.add_argument("setting", choices=("on", "off"))
 
     init = sub.add_parser("init", help="Write config.json with a verified herdr path")
     init.add_argument("--herdr", default=None, help="Absolute path to herdr (default: $HERDR_BIN_PATH, then PATH)")
@@ -1185,6 +1212,8 @@ def main(argv=None):
         return cmd_status(args)
     if args.action == "list":
         return cmd_list(args)
+    if args.action == "bell":
+        return cmd_bell(args)
     if args.action == "init":
         return cmd_init(args)
     if args.action == "plist":
