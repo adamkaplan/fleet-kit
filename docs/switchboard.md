@@ -5749,6 +5749,15 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 
 - **Numbering is structural.** A message is numbered newest-first only when it is the daemon's own (from the switchboard, with keys), its header ends with the mark, and the mark is added only when the item count is above one. A trailing ` [newest first]` in an agent-controlled summary is stripped from the header before it is composed, so a one-item message cannot be reversed. Test: `test_a_hostile_summary_cannot_forge_the_newest_first_mark` (one item and several, mark at the end, in the middle, with escapes). Mutant: the strip loop disabled (text-based decision) fails it.
 - **The cut check composes the carried send.** Every place that measures a message or decides a cut measures THE message delivered: the `[sent]` fact `compose` carried (it may be the newest, not the oldest pending fact). Test: `test_1275_the_cut_check_measures_the_carried_send_with_two_facts_pending` (a 5-character send, then 4,500 characters: allowed is about 3,754 and the resend of that length is not cut). Mutant: `plan.pending[:1]` restored fails it (allowed 8,410). The recompose adds compose's own "and N more" line when others wait, so the stated length is exact. Other measuring places (`load_tick`, the header method of `IntentReader`, the deliver tail, `merge_wake_facts`, other callers of `numbered_lines`/`compose`) were read: none measures a cut length of its own.
+- **Carried is what is acknowledged (family rule).** Every place a composed message can carry fewer facts than were passed in acknowledges or commits ONLY what was carried. Each has one test with more facts than fit and a mutant:
+
+  | Place | Rule | Test / mutant |
+  |---|---|---|
+  | `merge_wake_facts` | merges only the items that fit `WAKE_MERGE_BUDGET` (header counted); the rest stay separate pending facts for the next message, so every finding is delivered and none is lost | `test_cap_20_findings_of_300_chars_...` / `test_mutant_merging_everything_loses_findings` |
+  | `deliver` keys | a merged fact's member is acknowledged only if its line is in the sent text (`member_lines`) | same test |
+  | `commit_told` | after `compose`, the told set is rebuilt from the carried facts only; an ask whose header was dropped is not told | `test_told_only_the_asks_of_the_carried_facts` / `test_mutant_telling_every_composed_ask_fails_the_told_probe` |
+  | `compose` "and N more", `facts[:count]` | the carried facts are exactly the rendered ones | existing compose cap tests |
+
 - **Cosmetic:** the strip also removes a legitimate trailing ` [newest first]` from a lead summary header.
 - **Sender derivation follows ONE wrapper level** (a call through a wrapper of the base calls is found; a wrapper of a wrapper is not).
 - **The load key's subject is the agent only.**

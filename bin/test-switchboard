@@ -2127,6 +2127,42 @@ class TestEachThingOnce(Base):
             with self.assertRaises(AssertionError):
                 self.test_cap_20_findings_of_300_chars_are_all_delivered_over_successive_messages_none_lost()
 
+    def told_world(self, run=True):
+        class Intents:
+            repo = "o/r"
+            def __init__(self):
+                self.pending, self.told = {}, set()
+            def header(self, number, repo=None, repos=None):
+                self.pending[number] = True
+                return number, ["Ask #%d Intent: x" % number], None, []
+            def commit_told(self):
+                self.told |= set(self.pending)
+                self.pending = {}
+            def discard_told(self):
+                self.pending = {}
+        world = World(self, agents=("platform",))
+        world.engine.intents = Intents()
+        for n in range(1, 9):
+            world.fact("platform", "f%d" % n, "y" * 900, issue=n)
+        world.tick(120)
+        if run:
+            world.engine.run_pass()
+        return world
+
+    def test_told_only_the_asks_of_the_carried_facts(self):
+        world = self.told_world()
+        (sent,) = world.admissions("platform")
+        carried = {int(k[1:]) for k in sent["keys"]}
+        self.assertLess(len(carried), 8)
+        self.assertEqual(world.engine.intents.told, carried, "the dropped asks were never shown: they are not told")
+
+    def test_mutant_telling_every_composed_ask_fails_the_told_probe(self):
+        world = self.told_world(run=False)
+        with mock.patch.object(type(world.engine.intents), "discard_told", lambda self: None):
+            world.engine.run_pass()
+        (sent,) = world.admissions("platform")
+        self.assertGreater(len(world.engine.intents.told), len({int(k[1:]) for k in sent["keys"]}))
+
     def test_the_delivered_message_acknowledges_every_member_key(self):
         world = self.wake_world()
         (sent,) = world.admissions("platform")
