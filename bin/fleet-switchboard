@@ -19208,6 +19208,7 @@ class IssueIntent:
         found = cls(number, data.get("state"), data.get("title") or "", intent, done_when,
                     data.get("updated_at"), bool(_CHARTER_BLOCK.search(body)))
         found.workspace = charter_workspace(body)
+        found.pull_request = bool(data.get("pull_request"))   # #1249: a pull request is never a charter
         found.labels = [l.get("name") if isinstance(l, dict) else l for l in (data.get("labels") or []) if isinstance(l.get("name") if isinstance(l, dict) else l, str)]   # #432: the load feed's waiting and parked asks
         found.parked_until = parked_until(body, found.labels)   # the switchboard's own parser: the load module never copies it
         return found
@@ -19359,8 +19360,10 @@ class IntentReader:
         repo = repo or self.repo
         return self._cached(("orders", repo, number), lambda: fetch_orders(self, number, repo))
 
-    def parent(self, number, repo=None):
-        """The parent issue's number, or None when the issue has no parent."""
+    NO_PARENT_SHAPE = re.compile(r"(not_found: )?(gh: )?(not found|http 404 no parent)( \(http 404\))?", re.I)
+
+    def parent(self, number, repo=None, strict=False):
+        """The parent issue's number, or None when the issue has no parent. `strict` (#1249, charter set): a 404 whose body is not the exact "no parent" shape raises."""
         repo = repo or self.repo
 
         def fetch():
@@ -19368,6 +19371,8 @@ class IntentReader:
                 found = self._api("repos/%s/issues/%d/parent" % (repo, number), repo)
             except IntentError as err:
                 if err.reason == "not_found":
+                    if strict and not self.NO_PARENT_SHAPE.fullmatch(str(err).strip()):
+                        raise IntentError("gh", "404 that is not the no-parent answer: %s" % _one_line(str(err), 60)) from None
                     return None
                 raise
             return IssueIntent.from_api(found).number
@@ -27355,12 +27360,15 @@ def cmd_charter(args, runner, now):
     if value is not None and isinstance(row0, dict):   # #1143: the GitHub reads happen BEFORE the registry lock, bound to the issue number and the repo; the lock only re-checks registry facts
         repo0 = row0.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
         try:
-            parent = engine.intents.parent(value, repo0)   # None only for the "no parent" answer; any other failure raises
+            parent = engine.intents.parent(value, repo0, strict=True)   # None only for the "no parent" answer; any other failure raises
             labelled = None
+            is_pr = False
             if parent is None:   # a charter has no parent: the one extra read is its label
                 engine.intents.invalidate(value, repo0)   # #1249: the label read is never a cached answer
-                labelled = orchestrator_label(engine.config) in (engine.intents.issue(value, repo0).labels or [])
-            pre = {"key": (value, repo0), "parent": parent, "labelled": labelled}
+                record = engine.intents.issue(value, repo0)
+                labelled = orchestrator_label(engine.config) in (record.labels or [])
+                is_pr = bool(getattr(record, "pull_request", False))
+            pre = {"key": (value, repo0), "parent": parent, "labelled": labelled, "pr": parent is None and is_pr}
         except Exception as err:
             pre = {"key": (value, repo0), "error": safe(_one_line(str(err), 80))}
 
@@ -27381,6 +27389,8 @@ def cmd_charter(args, runner, now):
                 return ("unverified", "cannot read #%d's parent (%s)" % (value, pre["error"]))
             if pre["parent"] is not None:
                 return ("is an ask", "#%d is an ask, not a charter (it has a parent, #%s)" % (value, pre["parent"]))
+            if pre.get("pr"):
+                return ("not a charter", "#%d is a pull request, not a charter" % value)
             if not pre["labelled"]:
                 return ("not a charter", "#%d is not a charter (no parent, but it lacks the %s label)" % (value, orchestrator_label(engine.config)))
         return None
