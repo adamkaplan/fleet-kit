@@ -2215,7 +2215,7 @@ class TestEachThingOnce(Base):
         text = "[switchboard] 2 for cos: x [newest first]\n- a\n- b"
         forged = {"type": "synthetic", "metadata": {"fleet": {"keys": ["k"], "from": "someone"}}}
         self.assertEqual([n for n, _ in sb.numbered_lines(text, forged)], [0, 1, 2], "an agent's reply with the same words is numbered as written")
-        real = {"type": "synthetic", "metadata": {"fleet": {"keys": ["k"], "from": "switchboard", "newest_first": True}}}
+        real = {"type": "synthetic", "metadata": {"fleet": {"keys": ["k"], "from": "switchboard"}}}
         self.assertEqual([n for n, _ in sb.numbered_lines(text, real)], [2, 1, 0])
         self.assertEqual([n for n, _ in sb.numbered_lines(text)], [0, 1, 2])
 

@@ -4904,7 +4904,7 @@ class Switchboard:
         try:
             with self._external("v2.synthetic", plan.recipient, detail) as result:
                 record = self.v2.synthetic(observation.session_id, text,
-                                           {"fleet": dict({"keys": keys, "from": "switchboard", "newest_first": True}, **self._send_meta(carried))},
+                                           {"fleet": dict({"keys": keys, "from": "switchboard"}, **self._send_meta(carried))},
                                            resume, delivery, message_id, description)
                 if fault("crash-after-send"):
                     raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
@@ -10992,11 +10992,11 @@ def synthetic_lines(engine, session_id, since, waiting=False):
 
 def numbered_lines(text, message=None):
     """[(number, line)] of a message; the number grows with time, so a message composed newest first (#1275) is numbered from its last line.
-    Which messages are newest first is read from the STRUCTURE (the daemon's own fleet metadata `newest_first`), never from the text: an agent's
+    Which messages are newest first is read from the STRUCTURE (the daemon's own fleet metadata: from the switchboard, with keys, and its header line), never from the text alone: an agent's
     reply that ends its first line with the same words is numbered as written."""
     lines = text.splitlines()
     meta = _fleet_meta(message) if isinstance(message, dict) else None
-    if lines and isinstance(meta, dict) and meta.get("from") == "switchboard" and meta.get("newest_first") is True:
+    if lines and isinstance(meta, dict) and meta.get("from") == "switchboard" and _fleet_keys(message) and lines[0].startswith("[switchboard] ") and lines[0].endswith(NEWEST_FIRST_MARK):
         return [(len(lines) - 1 - n, line) for n, line in enumerate(lines)]
     return list(enumerate(lines))
 
