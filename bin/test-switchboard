@@ -78218,6 +78218,9 @@ TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.T
 # The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
 _closure = importlib.import_module("test_closure")
 TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
+# The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
+_shadow = importlib.import_module("test_shadow")
+TestShadow = _shadow.TestShadow
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):

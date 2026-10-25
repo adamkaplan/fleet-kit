@@ -339,7 +339,7 @@ def refusal_items(rule, report, files, matches=None, closure=None, scored=None):
             items.append(_item("new-file", "it adds, deletes or renames a file under a directory the daemon loads at start (%s): that stays the owner's own clear" % item["filename"][:80], [item["filename"]],
                                verb={"removed": "deletes a file", "renamed": "renames a file"}.get(item.get("status") if not item.get("previous_filename") else "renamed", "adds a file")))
         for path in both:
-            if matches(path, rule["closure_files"]):
+            if matches(path, rule["closure_files"]) or (matches(path, ["bin/switchboard/*.py"]) and (closure or {}).get(item["filename"]) is not None):   # a part the closure does not list is judged when the caller read it, for an added closure name (#1339)
                 mapped = (closure or {}).get(item["filename"])
                 if mapped is None:
                     items.append(_item("unreadable", "the change to %s cannot be mapped to its definitions: refused" % path[:60], why="a change cannot be mapped to its definitions"))
@@ -678,6 +678,37 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
                 else:
                     reasons.append("it changes a module-level statement (%s line %d) that is not a definition or a binding: refused" % (side, number))
     return sorted(set(reasons))
+
+
+def shadow_names(rule):
+    """The names of the clear's closure the matrix lists: `closure_roots` and every `module_roots` list (`*` is not a name). The matrix is the only source: a binding the closure reads that is
+    not one of these names is NOT known here (a stated limit, #1339)."""
+    names = set(rule.get("closure_roots") or [])
+    for roots in (rule.get("module_roots") or {}).values():
+        names |= {r for r in roots if isinstance(r, str) and r != "*"}
+    return names
+
+
+def _top_names(tree):
+    """{name: how many top-level statements bind it} (a plain `import x` is not counted: it binds the module, it does not define a closure name by a body)."""
+    count = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            continue
+        for name in _bound_names(node):
+            count[name] = count.get(name, 0) + 1
+    return count
+
+
+def shadow_refusals(base_src, head_src, names, filename):
+    """[reasons] a change ADDS, in `filename`, a top-level definition or module-level binding whose name is in `names` (the clear's closure): the assembled daemon is one namespace, so a second
+    definition of a closure name in another file could take the place of the one the clear judged. Added = bound more times in the head than in the base. A file that does not parse: refused."""
+    try:
+        before, after = _top_names(ast.parse(base_src)), _top_names(ast.parse(head_src))
+    except (SyntaxError, ValueError):
+        return ["%s does not parse before or after the change: refused" % filename[:80]]
+    return sorted("it adds %s in %s, a name of the clear's closure (a second definition of it could take its place): refused" % (name, filename[:80])
+                  for name in names if after.get(name, 0) > before.get(name, 0))
 
 
 def decode_blob(answer):

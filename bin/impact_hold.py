@@ -1079,23 +1079,29 @@ def delegated_clear_checks(engine, runner, now, kind, number):
 def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
     """[reasons] for ONE changed file of the daemon's own (`closure_refusals` over its text before and after and its patch), or None when it cannot be read or mapped. The text comes from the
     git blobs API (the contents API refuses a file this large): the head's blob id is the file's own `sha`, the base's is the file's own `sha` at the base commit. #661."""
+    unread = None if impact_floor.matches(item["filename"], rule.get("closure_files") or []) or item["filename"] == rule.get("daemon_file") else ["%s cannot be read, so an added closure name cannot be ruled out: refused" % str(item["filename"])[:80]]   # a part the closure does not list: unreadable is refused here (the clear's mapper skips a path it does not judge)
     try:
         if not isinstance(base_sha, str) or not base_sha:
-            return None   # no merge-base: nothing to read the old text from
+            return unread   # no merge-base: nothing to read the old text from
         module = load_module("delegated_clear")
         entry = _gh_json(engine, runner, repo, "repos/%s/contents/%s?ref=%s" % (repo, item["filename"], base_sha))
         base_blob = entry["sha"] if isinstance(entry, dict) and entry.get("type") == "file" else None
         if not isinstance(base_blob, str):
-            return None
+            return unread
         base = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, base_blob)))
         head = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, item["sha"])))
         if base is None or head is None or not isinstance(item.get("patch"), str):
-            return None
+            return unread
+        names, listed = module.shadow_names(rule), impact_floor.matches(item["filename"], rule.get("closure_files") or [])
         if item["filename"] == rule["daemon_file"]:
-            return module.closure_refusals(base, head, item["patch"], module.daemon_roots(rule), set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or []))
-        return module.closure_refusals(base, head, item["patch"], list((rule.get("module_roots") or {}).get(item["filename"]) or []), set(), True)   # any other module the clear loads: its import-time code and the functions the clear runs
+            found = module.closure_refusals(base, head, item["patch"], module.daemon_roots(rule), set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or []))
+            return found or module.shadow_refusals(base, head, names, item["filename"])   # the entry's own definitions are judged above; the added name is the only thing left to say
+        if not listed:   # a part the closure does not list: only a name added under a closure name is looked at (#1339)
+            return module.shadow_refusals(base, head, names, item["filename"])
+        found = module.closure_refusals(base, head, item["patch"], list((rule.get("module_roots") or {}).get(item["filename"]) or []), set(), True)   # any other module the clear loads: its import-time code and the functions the clear runs
+        return sorted(set(found) | set(module.shadow_refusals(base, head, names, item["filename"])))
     except Exception:
-        return None
+        return unread
 
 
 def _gh_json(engine, runner, repo, path):
@@ -1158,7 +1164,7 @@ def delegated_clear_inputs(engine, runner, repo, number, take=False, report=None
         if after != report.get("head"):
             return None, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(report.get("head"))[:8], str(after)[:8])
         for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
-            if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
+            if isinstance(item.get("filename"), str) and (impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) or impact_floor.matches(item["filename"], ["bin/switchboard/*.py"])) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
                 closure[item["filename"]] = load_module("delegated_clear").cached_map(load_module("delegated_clear").map_key(engine.state_dir, repo, item, base_sha, rule),
                                                                                      lambda: delegated_clear_map(engine, runner, repo, item, base_sha, rule), take)   # the line the daemon posts hands what it read to the clear, once
     return {"report": report, "rule": rule, "files": files, "closure": closure}, None
