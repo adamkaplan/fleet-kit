@@ -2021,6 +2021,30 @@ class TestCompose(unittest.TestCase):
         self.assertTrue(text.endswith("\u2026 and 28 more: run fleet-switchboard pending platform"))
         self.assertEqual([f.key for f in carried], ["k29", "k28"])
 
+    def test_a_finding_over_the_cap_is_shortened_never_cut_1302(self):
+        # the table of finding kinds that can exceed the cap: each needs an over-cap case here
+        for kind in OVER_CAP_FINDING_KINDS:
+            body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
+            one = fact("%s:big" % kind, kind=kind, summary=body)
+            text, carried = sb.compose("platform", [one], cap=4000)
+            self.assertLessEqual(len(text), 4000, kind)
+            self.assertNotIn("[cut at", text, kind)
+            self.assertIn("more lines not shown", text, kind)
+            self.assertEqual([f.key for f in carried], [one.key])
+
+    def test_a_single_long_line_is_shortened_by_characters_1302(self):
+        text, carried = sb.compose("platform", [fact("s:1", kind="sweep", summary="y" * 6000)], cap=4000)
+        self.assertLessEqual(len(text), 4000)
+        self.assertNotIn("[cut at", text)
+        self.assertIn("characters not shown", text)
+
+    def test_the_over_cap_table_names_every_long_builder_1302(self):
+        import re as _re
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "switchboard", "decision.py")).read()
+        listed = set(_re.findall(r'kind in \(([^)]*)\) and not', src)[0].replace('"', "").replace(" ", "").split(","))
+        self.assertEqual(listed, set(OVER_CAP_FINDING_KINDS))   # the code's kinds and the table are one list
+        self.assertEqual(set(OVER_CAP_FINDING_KINDS), {"sweep", "triage"})
+
     def test_one_item_longer_than_the_cap_is_cut_and_says_so(self):
         text, carried = sb.compose("platform", [fact("big", summary="y" * 5000)], cap=500)
         self.assertEqual(len(text), 500)
@@ -83448,6 +83472,9 @@ class TestAgentCredentialsDoc(unittest.TestCase):
 # ======================================================================
 def _clock_at(hour, minute, second=0):
     return calendar.timegm((2027, 1, 15, hour, minute, second))
+
+
+OVER_CAP_FINDING_KINDS = ("sweep", "triage")   # sweep_queue_fact and the triage digest facts
 
 
 class TestMessageTimes(unittest.TestCase):

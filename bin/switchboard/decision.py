@@ -191,8 +191,31 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         text = render(count)
         if len(text) <= cap:
             return text, facts[:count]
+    if facts[0].kind in ("sweep", "triage") and not getattr(facts[0], "shortened", False):   # #1302: a finding over the cap is shortened at its source (one line per item, the rest named as a count), never cut
+        for short in shortened_findings(facts[0], len(text) - cap):
+            again, carried = compose(recipient, [short] + facts[1:], cap, section, repos, delivered)
+            if len(again) <= cap and "[cut at" not in again[-40:]:
+                return again, carried
     marker = "\n[cut at %d characters]" % cap
     return text[:cap - len(marker)] + marker, facts[:1]
+
+
+def shortened_findings(fact, over):
+    """#1302: the candidate shortenings of a single finding (longest first): its lines cut from the end and the count left named, then a
+    character cut. The text names what was left out, so acknowledging its key loses nothing unsaid. Hostile text is cleaned per line."""
+    lines = [" ".join("".join(c if c.isprintable() else " " for c in line).split()) for line in fact.summary.splitlines() if line.strip()]
+    out = []
+    for keep in range(len(lines) - 1, 0, -1):
+        left = len(lines) - keep
+        out.append("\n".join(lines[:keep] + ["\u2026 and %d more line%s not shown (shortened at its source)" % (left, "" if left == 1 else "s")]))
+    flat = " ".join(lines)
+    for size in (2000, 1000, 500, 200, 50, 0):
+        out.append("%s\u2026 (shortened at its source, %d characters not shown)" % (flat[:size], max(0, len(flat) - size)))
+    for text in out:
+        short = copy.copy(fact)
+        short.summary = text
+        short.shortened = True
+        yield short
 
 
 ORDERS_CLOSING = ("These are the owner's standing instructions for this charter. Act on them without asking "
