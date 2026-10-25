@@ -923,7 +923,7 @@ def validate_plan_gates(raw, source):
         seen[normal_repo(name)] = name
         if not isinstance(entry, dict):
             raise ValueError("%s: 'plan_gates.repos.%s' must be an object" % (source, name))
-        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks"})
+        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks", "ci_workflows"})
         if extra:
             raise ValueError("%s: 'plan_gates.repos.%s' has key(s) this tool does not read: %s" % (source, name, ", ".join(extra)))
         mode = entry.get("mode", "shadow")
@@ -944,6 +944,11 @@ def validate_plan_gates(raw, source):
         repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
         if "item_checks" in entry:   # #770: declared and validated by bin/item_verdicts.py; carried here untouched, and absent when the repo does not list it
             repos[name]["item_checks"] = entry["item_checks"]
+        if "ci_workflows" in entry:   # #1237: workflow names the gate expects a run of at the head
+            flows = entry["ci_workflows"]
+            if not (isinstance(flows, list) and len(flows) <= 20 and all(isinstance(x, str) and x for x in flows)):
+                raise ValueError("%s: 'ci_workflows' must be a list of at most 20 workflow names" % name)
+            repos[name]["ci_workflows"] = flows
     record = raw.get("ci_record") if raw.get("ci_record") is not None else {}
     if not isinstance(record, dict) or set(record) - {"enabled", "calls_per_pass", "pass_seconds"}:
         raise ValueError("%s: 'plan_gates.ci_record' must be an object with enabled, calls_per_pass and pass_seconds" % source)
