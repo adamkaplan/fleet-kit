@@ -45,8 +45,8 @@ def block_orchestrator(body):
 
 def charter_orchestrators(sb, discovery, repo, charter, body=None):
     """The live orchestrator of `charter` in `repo` as a list of exactly one name, or [] when none or more than one can be told apart.
-    The orchestrator the charter body's top block names wins when it is a live orchestrator of THIS repo; the `charter` field of an
-    orchestrator's session metadata (in this repo) is the fallback."""
+    The orchestrator the charter body's top block names wins when it is a live orchestrator of THIS repo; the registry row's `charter` of an
+    orchestrator (in this repo) is the fallback (#969: never the session metadata)."""
     def mine(agent):
         fleet = agent.fleet or {}
         return fleet.get("role") == "orchestrator" and sb._fleet_repo(fleet, sb.engine.config) == repo
@@ -55,7 +55,12 @@ def charter_orchestrators(sb, discovery, repo, charter, body=None):
     agent = discovery.agents.get(named) if named else None
     if agent is not None and mine(agent):
         return [agent.name]
-    found = sorted(a.name for a in discovery.agents.values() if mine(a) and (a.fleet or {}).get("charter") == charter)
+    registry = sb.load_module("registry")   # #969: the registry row's charter is the one record; the live session's metadata is never a second owner
+    reg = registry.read(sb.engine.state_dir) if sb.engine.state_dir is not None else None
+    if reg is None or not reg["whole"]:
+        return []
+    charters = registry.orchestrator_charters(reg["agents"])
+    found = sorted(a.name for a in discovery.agents.values() if mine(a) and charters.get(a.name) == charter)
     return found if len(found) == 1 else []
 
 

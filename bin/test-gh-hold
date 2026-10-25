@@ -65,8 +65,12 @@ class Base(unittest.TestCase):
         (self.bin / "gh").write_text(FAKE_GH)
         (self.bin / "gh").chmod(0o755)
         self.sb = self.home / "fakesb"
-        self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ]; then\n  if [ \"$2\" = --json ]; then echo \"{\\\"name\\\": \\\"${FAKE_NAME:-worker}\\\", \\\"repo\\\": \\\"acme/app\\\"}\"; "
-                           "else echo ${FAKE_NAME:-worker}; fi; exit 0; fi\nexit 2\n")
+        self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ]; then\n  sleep $(cat SLEEPFILE 2>/dev/null || echo 0)\n  if [ \"$2\" = --json ]; then echo \"{\\\"name\\\": \\\"$(cat NAMEFILE)\\\", \\\"repo\\\": \\\"acme/app\\\"}\"; "
+                           "else echo $(cat NAMEFILE); fi; exit 0; fi\nexit 2\n")
+        self.namefile = self.home / "fakename"   # the shim hands the switchboard a fixed environment, so the fake's name comes from a file, not a variable
+        self.sb.write_text(self.sb.read_text().replace("NAMEFILE", str(self.namefile)))
+        self.sleepfile = self.home / "fakesleep"
+        self.sb.write_text(self.sb.read_text().replace("SLEEPFILE", str(self.sleepfile)))
         self.sb.chmod(0o755)
         self.state = self.home / "state"
         self.state.mkdir()
@@ -84,6 +88,8 @@ class Base(unittest.TestCase):
                    "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_SHIM_LOOKUP_SECONDS": "10", "FAKE_CALLS": str(self.calls), "FAKE_LABELS": labels,
                    "FLEET_REAL_GH": str(self.bin / "gh")}
         environ.update(env or {})
+        self.namefile.write_text(environ.get("FAKE_NAME", "worker"))
+        self.sleepfile.write_text(environ.get("FAKE_WHOAMI_SLEEP", "0"))
         if self.calls.exists():
             self.calls.unlink()
         done = subprocess.run([sys.executable, str(shim), *args], capture_output=True, text=True, env=environ, timeout=60)
@@ -155,6 +161,12 @@ class TestRefusals(Base):
         self.refused("api", "-X", "PUT", "repos/%s/issues/7/labels" % CFG_REPO, "-f", "labels[]=bug")
         self.refused("api", "-X", "PATCH", "repos/%s/issues/7" % CFG_REPO, "-f", "labels[]=bug")
         self.passed("api", "-X", "PATCH", "repos/%s/issues/7" % CFG_REPO, "-f", "labels[]=bug", labels="bug")   # an unlabelled pull request: nothing held
+
+    def test_s4b_a_slow_identity_lookup_refuses_the_removal_and_the_merge(self):
+        slow = {"FAKE_NAME": "coordinator", "FAKE_WHOAMI_SLEEP": "5", "FLEET_SHIM_LOOKUP_SECONDS": "0.5"}   # a loaded machine: the lookup misses its deadline
+        self.refused("pr", "edit", "7", "--remove-label", LABEL, "-R", CFG_REPO, env=slow)
+        self.refused("label", "delete", LABEL, "--yes", "-R", CFG_REPO, env=slow)
+        self.refused("pr", "merge", "7", "-R", CFG_REPO, env=slow)
 
     def test_s5_a_failed_read_refuses_with_the_retry_message(self):
         for env in ({"FAKE_READ_FAIL": "1"}, {"FAKE_READ_RAW": "not json"}, {"FAKE_READ_RAW": "{}"}, {"FAKE_READ_RAW": "[]"},
@@ -318,15 +330,38 @@ class TestHostileInput(Base):
                 done, calls = self.run_gh("pr", "view", "7", "-R", CFG_REPO)
                 self.assertEqual(done.returncode, 7)
 
-    def test_a_missing_module_refuses_while_a_hold_is_named(self):
+    MISSING_TEXT = "could not be loaded"
+
+    def merge_in_copy(self, with_module):
         copy = self.home / "shimcopy"
         copy.mkdir()
+        for sibling in (REPO / "shims").glob("*.py"):              # the shim as installed: every sibling module, from the real directory
+            if with_module or sibling.name != MODULE.name:
+                shutil.copy(str(sibling), str(copy / sibling.name))
         shutil.copy(str(SHIM), str(copy / "gh"))
-        done, _ = self.run_gh("pr", "merge", "7", "-R", CFG_REPO, shim=copy / "gh")
+        return copy, self.run_gh("pr", "merge", "7", "-R", CFG_REPO, shim=copy / "gh")[0]
+
+    def check_missing_module_refusal(self, with_module):
+        copy, done = self.merge_in_copy(with_module)
         self.assertEqual(done.returncode, 1)
+        self.assertEqual((done.stdout + done.stderr).count(self.MISSING_TEXT), 1)
         self.config(None)
         done, _ = self.run_gh("pr", "merge", "7", "-R", CFG_REPO, shim=copy / "gh")
         self.assertEqual(done.returncode, 7)
+
+    def test_a_missing_module_refuses_while_a_hold_is_named(self):
+        self.check_missing_module_refusal(False)
+
+    def test_the_hold_module_present_refuses_with_the_held_merge_text(self):
+        _, done = self.merge_in_copy(True)
+        out = done.stdout + done.stderr
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(out.count("the project merges this one itself"), 1)
+        self.assertEqual(out.count(self.MISSING_TEXT), 0)
+
+    def test_mutant_copying_the_hold_module_in_fails_the_first_test(self):
+        with self.assertRaises(AssertionError):
+            self.check_missing_module_refusal(True)
 
 
 class TestAudit(Base):
@@ -415,6 +450,12 @@ HOSTILE = ["", "   ", "\n", "acme-org/", "/widget-api", "acme-org", "acme-org/..
            "https://github.com/acme-org/widget-api", "acme-org/widget api", None, 5, ["acme-org/widget-api"]]
 
 
+def daemon_source():
+    """The daemon's whole source: the entry and every part of its manifest, in manifest order."""
+    lines = [n.strip() for n in (REPO / "bin" / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+    return "\n".join((REPO / "bin" / n).read_text() for n in lines)
+
+
 REPO_SHAPE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
@@ -474,7 +515,7 @@ class TestSharedMatcher(unittest.TestCase):
                 self.assertIsNone(self.m.account_for(users, text))
 
     def test_the_guard_is_untouched_by_this_change_and_the_shim_does_not_import_it(self):
-        self.assertNotIn("repo_match", (REPO / "bin" / "fleet-switchboard").read_text())
+        self.assertNotIn("repo_match", daemon_source())
 
     def test_s4_the_docs_no_longer_say_the_matching_is_the_same_for_every_caller(self):
         text = (REPO / "docs" / "switchboard.md").read_text()

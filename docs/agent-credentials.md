@@ -29,7 +29,7 @@ Names below are neutral (`acme-org/widget-api`, `acme-bot`, used only to describ
 | 2 | `git` shim credential route | No token of its own. Network verbs (`push`, `fetch`, `pull`, `clone`, `ls-remote`) are sent through `gh auth git-credential`, which is row 1 | Same as row 1 | Git itself cannot call the settings API, but the token it is given is the row 1 token: yes in the sense that matters |
 | 3 | Token in the shell environment (`GH_TOKEN`, `GITHUB_TOKEN` and the two enterprise names) | Inherited from whoever started the pane | On the machine read: a broad classic token (repository, workflow and organisation administration scopes). The shim replaces it for a repository with a mapping; reads and unmapped repositories fall back to it | Yes (admin of repositories it owns, and organisation administration) |
 | 4 | Keyring logins of `gh` | `gh auth login`, stored by the operating system keyring | Broad classic tokens: the owner-account login includes organisation administration; a login for another account has repository access without it | Yes for repositories where that account is admin. The other-account login must stay unused for settings by policy, not by its scope |
-| 5 | Cloud token mint (#450; the permission check is in the launcher: #545, merged) | An App installation token for one repository, one hour at most, minted inside the pod from the pod's federated identity | Exactly `contents: write`, `pull_requests: write`, `metadata: read`. The mint refuses an answer with an extra key, a higher level or a missing key | No. There is no `Administration` permission. A token a cloud worker holds cannot reach settings |
+| 5 | Cloud token mint (#450; the permission check is in the launcher: #545, merged) | An App installation token for one repository, one hour at most, minted inside the pod from the pod's federated identity | Exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read` (the mint asks for these and checks the answer). The mint refuses an answer with an extra key, a higher level or a missing key. The worker can read issues and their comments of its repository and cannot write issues, labels, merges or settings | No. There is no `Administration` permission. A token a cloud worker holds cannot reach settings |
 | 6 | The switchboard's own calls (daemon, sweeps, intent reads) | The same per-account tokens as row 1, marked `FLEET_SWITCHBOARD_OWN_GH` | Same as row 4 | Yes in scope, but it is the daemon's own process, not an agent's shell |
 
 Reading the table:
@@ -44,7 +44,7 @@ Reading the table:
 
 Option C is recommended; A and B are compared and rejected. All three keep the owner's own login as the only credential that can change settings, rulesets, branch protection and collaborators. Repositories outside the scope above are not touched by any option: no step below edits their entry.
 
-The permission set for an agent on a repository: `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `metadata: read`, and never `Administration`. The cloud mint today grants only `contents`, `pull_requests` and `metadata`; the owner adds `issues: write` and `checks: read` to the App.
+The permission set for an agent on a repository: `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `metadata: read`, and never `Administration`. The cloud mint today grants only `contents`, `pull_requests`, `issues` (read) and `metadata`; the owner adds `issues: write` and `checks: read` to the App.
 
 ### Option A: a fine-grained token per repository, no Administration (rejected)
 
@@ -125,6 +125,10 @@ Every step that creates or changes a credential is the owner's (see "The owner's
 5. The owner removes the broad token from the agents' environment for in-scope repositories, so there is nothing broader to fall back on.
 6. An agent, with the owner present, runs the live proof of clause (4): an admin call is refused (403 or 404) and a branch push, pull request, label, comment and a merge through the ruleset still work. The same proof checks that the fleet-kit repository itself is unchanged.
 
+## Cloud worker: reading issues
+
+The cloud mint asks for, and accepts, exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`. The worker can read issues and their comments of its own repository and cannot write issues, labels, merges or settings. The owner step is one numbered step with two actions, done only after the change is merged: add `issues: read` to the App's permissions, then accept it on each installation. Until then every cloud launch is refused before any pod exists, with a line that names `issues` and this step. This is the cloud token's own set and a different credential from the Mac agent set above.
+
 ## Rollback
 
 If the App token breaks agent work on an in-scope repository, return to the current login:
@@ -132,7 +136,7 @@ If the App token breaks agent work on an in-scope repository, return to the curr
 1. Remove that repository's entry from the installation map, or restore the previous `gh_users` entry from the copy kept before step 4. The shims read it on every call, so there is no restart.
 2. Restore the inherited token for the agent's shell, if step 5 removed it.
 3. The previous keyring login was never deleted by this migration, so it is still there.
-4. If the cause was the key, the owner rotates it in the App's settings. If widening the App made cloud tokens refused, narrow the App back to `contents: write`, `pull_requests: write`, `metadata: read`.
+4. If the cause was the key, the owner rotates it in the App's settings. If widening the App made cloud tokens refused, narrow the App back to its previous permissions (the cloud mint now needs `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`; revert the change that added `issues: read` first, then remove it from the App).
 
 Rollback returns to today's behaviour, including admin reach for agents on that repository, so record why and treat it as temporary.
 
@@ -148,3 +152,13 @@ These are the only credential-creating or credential-changing steps. No command 
 6. Remove the broad inherited token from the agents' shells for in-scope repositories.
 7. Put the key's rotation date in a calendar; at rotation, generate a new key in the App's settings and replace the stored one.
 8. Leave the fleet-kit repository itself and any repository without the App alone.
+
+## Cloud stack pod: registry pull identity (row 7, ask #1022)
+
+This row is added; rows 1 to 6 (the table above ends at row 6) and the default pod are unchanged. A cloud stack pod that pulls prebuilt images holds one extra short-lived credential path:
+
+| # | Path | Where it comes from | Real scope | Can change repository settings? |
+|---|------|---------------------|------------|---------------------------------|
+| 7 | Stack registry pull | A projected service-account token (service account `cw-stack-puller`, audience `api://AzureADTokenExchange`, 600 seconds, mode 0400) mounted only at `/opt/cw-registry/token` (root-only parent), exchanged by a root-run step for a registry credential kept in a 0700 tmpfs directory and removed afterwards | Pull from one registry (`AcrPull` for the identity's principal id, granted by the registry's owner); no write access, no long-lived key. A role of `AcrPull` or `Reader` at the registry is read as pull-only; any other role is reported as write-capable | No |
+
+Owner steps, in order: (1) create the user-assigned identity and give the operator its principal id; (2) create the federated credential for the subject `system:serviceaccount:<ns>:cw-stack-puller` on the cluster issuer, audience `api://AzureADTokenExchange`; (3) the registry's owner grants `AcrPull` at the registry only; (4) apply the service account and set the three `CW_STACK_` settings. `cloud-worker stack-registry-check` reads and reports which step is missing before any pod exists. Residual risk: the coder is in the docker group, which inside the pod is root-equivalent, so a coder who deliberately builds a container can read the token file; it is a 10 minute token good only for a pull from one registry. See `cloud/README.md`.

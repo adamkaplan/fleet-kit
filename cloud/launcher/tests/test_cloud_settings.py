@@ -15,11 +15,14 @@ DIGEST = "registry.example.internal/acme/worker@sha256:" + "ab12" * 16
 GOOD = {"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_IMAGE": DIGEST, "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
         "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example", "CW_CLOUD_NAMESPACE": "cw"}
 OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "/home/user/ca.pem", "CW_PULL_SECRET": "pull-example",
-                    "CW_KUBECTL": "kubectl", "CW_MODEL_AUTH_FILE": "/home/user/auth.json", "CW_RUN_RECORD_DIR": "/home/user/runs",
+                    "CW_KUBECTL": "kubectl", "CW_OPENCODE_BIN": "/usr/local/bin/opencode", "CW_RUN_RECORD_DIR": "/home/user/runs",
                     "CW_CLOUD_SPEND_CAP_USD": "25", "CW_CLUSTER_TOKEN_CMD": "cat /home/user/token", "CW_CLUSTER_ADMIN_CMD": "cat /home/user/kc",
                     "CW_GIT_TOKEN_CMD": "cat /home/user/git", "CW_APP_ID_CMD": "cat /home/user/id", "CW_APP_INSTALLATION_CMD": "cat /home/user/inst",
                     "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check",
-                    "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m"}
+                    "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m", "CW_STACK_MODEL_SECRET": "acme-stack-model",
+                    "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry",
+                    "CW_STACK_REGISTRY": "acme-registry.azurecr.io", "CW_STACK_PULL_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
+                    "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000"}
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -57,12 +60,19 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_VAULT_NAME": ["$(touch SENT)", "a;touch SENT", "ab", "a" * 25, "1abc", "a b", "a_b", "abc-"[:-1] + "/"],
     "CW_CLOUD_NAMESPACE": ["a/b;c", "kube-system", "kube-public", "default", "A", "-a", "a-", "a b", "a" * 64, "$(x)"],
     "CW_KUBECTL": ["../kubectl", "/x/../y", "-x", "a b", "$(x)", "a/b"],
-    "CW_MODEL_AUTH_FILE": ["auth.json", "/a/../b", "-x"],
+    "CW_OPENCODE_BIN": ["../opencode", "/a/../b", "-x", "a b", "$(x)", "a/b"],
     "CW_RUN_RECORD_DIR": ["runs", "/a/../b", "-x"],
     "CW_CLOUD_SPEND_CAP_USD": ["0", "-1", "1e3", "100001", "1.2.3", "abc", "0.0"],
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
     "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
+    "CW_STACK_REGISTRY": ["https://acme-registry.azurecr.io", "acme-registry.azurecr.io/x", "acme-registry.azurecr.io:443", "10.0.0.1", "azurecr.io", "acme-registry",
+                          "acme.example.com", "-acme.azurecr.io", "Acme.azurecr.io", "user@acme.azurecr.io", "ghp_" + "A1b2C3d4E5f6G7h8.azurecr.io", "0x7f000001"],
+    "CW_STACK_PULL_CLIENT_ID": ["x", "1111", "-1111-2222"],
+    "CW_STACK_PULL_TENANT_ID": ["x", "1111", "-1111-2222"],
+    "CW_HUB_CHANNEL_URL": ["ftp://hub.example", "http://user@hub.example", "http://hub.example/x?y=1", "hub.example", "http://hub example", "$(x)"],
+    "CW_HUB_REGISTRY_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
+    "CW_STACK_MODEL_SECRET": ["https://vault.example.internal/secrets/x", "/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "$(x)", "-x", "--help"],
     "CW_CLUSTER_ADMIN_SECRET": ["/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "a;b", "$(x)", "a\u00e9", "-x", "--help", "--", "--query", "-", "-a"],
     "CW_CLUSTER_TOKEN_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "20", "m", "20s", "1.5h", "20 m", "/tmp/20m", "20m5s", "\u0662\u0660m", "-1h", "0h"],
 }
@@ -101,7 +111,7 @@ class Tables(unittest.TestCase):
     def test_every_setting_has_a_known_kind_and_the_samples_cover_the_table(self):
         self.assertEqual({k for k, _, _ in cw.SETTINGS}, set(GOOD) | set(OPTIONAL_SAMPLES))
         self.assertEqual(set(cw.SETTING_REQUIRED), set(GOOD))
-        self.assertLessEqual({kind for _, _, kind in cw.SETTINGS}, {"name", "path", "command", "digest-ref", "number", "secret-name", "duration"})
+        self.assertLessEqual({kind for _, _, kind in cw.SETTINGS}, {"name", "path", "command", "digest-ref", "number", "secret-name", "duration", "guid", "registry-host"})
         self.assertEqual(len(cw.SETTINGS), len({k for k, _, _ in cw.SETTINGS}))
         self.assertIn(("CW_VAULT_CHECK_DIR", False, "path"), cw.SETTINGS)   # reserved for the pre-check, optional
 
@@ -661,6 +671,9 @@ NOT_SETTINGS = {
     "CW_HARD_DEADLINE": "set by the launcher into the pod's environment from the hard limit",
     "CW_AUDIT_RUNTIME_ID": "set by the launcher into the pod's environment (pod/NAME): an identifier, not a choice",
     "CW_CLOUD_TOKEN_FILE": "set by the launch wiring for its child from the in-memory mint (a private temp file it removes); no operator names it",
+    "CW_AGENT": "set by the launcher into an orchestrator pod's environment from --agent (worker or orchestrator); the entrypoint reads it inside the pod",
+    "FLEET_CLOUD_CHANNEL_URL": "set by the launcher into an orchestrator pod's environment from the CW_HUB_CHANNEL_URL row (or its default); the cloud command reads it in the pod",
+    "FLEET_CLOUD_TOKEN_FILE": "set by the launcher into an orchestrator pod's environment: the fixed path of the channel secret's file in the pod's memory-backed directory",
     "CW_WORKDIR": "the pod's own working directory (default /work/repo), read by the hook and the record inside the pod",
     # the other login kind: a file with CW_CLOUD_SERVER (required) is the token route; these select kubectl's own context instead
     "CW_KUBE_CONTEXT": "the other login kind (kubectl's own context); a lane with the settings file has the required CW_CLOUD_SERVER and so the token route, and the two never mix",

@@ -24,7 +24,7 @@ export const SPARK_MINUTES = 15
 export const WORKING_MINUTES = 3          // tool calls within this many minutes: the workspace is working
 export const BAR_HOURS = 8                // hours of today drawn on the second line (the most recent ones)
 export const NAME_WIDTH = 9
-export const LEGEND = ["q open  s stalled  d decisions", "c busy/all coders  p pushes/hour", "ctx context use  moved asks/hour", "work idle wait dead  ? unknown"]
+export const LEGEND = ["q open  s stalled  d decisions", "c busy/all coders  p pushes/hour", "ctx context use  moved asks/hour", "work idle wait"]
 
 export const concernsHealth = (filename) => typeof filename === "string" && WATCHED.includes(filename)
 
@@ -170,7 +170,8 @@ export function buildBlocks(inputs, now) {
     if (!lead) continue
     // A lead is drawn only while the switchboard watches it: it has a row in the pane states (attached, detached, not yet checked, or found dead).
     // A retired lead has none (the daemon drops it), so its workspace is not drawn. Nothing else is read.
-    if (inputs.pane && !obj(states[lead.name]).state) continue
+    // A lead found dead is removed by the registry's reconcile on read, never drawn (#919).
+    if (inputs.pane && (!obj(states[lead.name]).state || obj(states[lead.name]).state === "dead")) continue
     const sessions = members.map((m) => m.session).filter((s) => typeof s === "string")
     // The Chief of Staff has no load row: what the owner is owed is its state and what waits on the owner (every open decision for the human tier).
     const ownerWaiting = listed ? listed.filter((d) => d && !d.closed && d.kind !== "notice" && (d.tier ?? "human") === "human").length : null
@@ -178,21 +179,18 @@ export function buildBlocks(inputs, now) {
     const series = calls ?? stepSeries(inputs.records, sessions)
     const seriesKind = calls ? "calls" : series ? "steps" : null
     const fig = obj(latest[lead.name])
-    // Only a pane the switchboard has found dead is "dead". An unchecked (unknown) or detached pane, or a pane file that does not know the agent,
-    // is not recorded: the state word is "?".
+    // An unchecked (unknown) or detached pane, or a pane file that does not know the agent, has no state word (never "?", never "dead").
     const paneState = inputs.pane ? obj(states[lead.name]).state : undefined
-    const dead = paneState === "dead"
     const isCos = lead.role === "chief-of-staff"
-    const uncertain = paneState !== "attached" && paneState !== "dead"
+    const uncertain = paneState !== "attached"
     const waiting = listed ? waitingFor.get(lead.name) ?? 0 : null
     const recent = series ? series.slice(-WORKING_MINUTES).reduce((a, b) => a + b, 0) : null
     // The state word of an attached pane: waiting on the owner (decisions), else working or idle from the tool calls when they are recorded,
-    // else from the load record every workspace has (coders busy, or asks moved this hour). No source at all: "?".
+    // else from the load record every workspace has (coders busy, or asks moved this hour). No source at all: no word.
     const figBusy = isNum(fig.busy) ? fig.busy : null
     const figMoved = isNum(fig.moved_1h) ? fig.moved_1h : null
     let state = null
-    if (dead) state = "dead"
-    else if (uncertain) state = null
+    if (uncertain) state = null
     else if (isCos ? ownerWaiting : waiting) state = "wait"
     else if (recent !== null) state = recent > 0 ? "work" : "idle"
     else if (figBusy !== null || figMoved !== null) state = (figBusy ?? 0) > 0 || (figMoved ?? 0) > 0 ? "work" : "idle"
@@ -212,14 +210,14 @@ export function buildBlocks(inputs, now) {
     const context = isNum(ctx.percent) ? { percent: ctx.percent } : isNum(ctx[CONTEXT_USED]) ? { used: ctx[CONTEXT_USED] } : null
     blocks.push({
       key: ws, name: lead.name, state, alert, spark: series, sparkKind: seriesKind, bars: movedBars(load, lead.name, now), open, stalled,
-      decisions: isCos ? ownerWaiting : isNum(fig.decisions) ? fig.decisions : waiting, busy, total: busy !== null && idle !== null ? busy + idle : null, pushes, context, cos: isCos, toolWhy: series ? null : toolWhy(inputs.records, (figBusy ?? 0) > 0), ctxOff: usageOff(inputs.records), ctxWhy: context || usageRow.hours ? null : ctxWhy(inputs.records),
+      decisions: isCos ? ownerWaiting : isNum(fig.decisions) ? fig.decisions : waiting, busy, cloud: isNum(fig.cloud) && fig.cloud > 0 ? fig.cloud : 0, total: busy !== null && idle !== null ? busy + idle + (isNum(fig.cloud) && fig.cloud > 0 ? fig.cloud : 0) : null, pushes, context, cos: isCos, toolWhy: series ? null : toolWhy(inputs.records, (figBusy ?? 0) > 0), ctxOff: usageOff(inputs.records), ctxWhy: context || usageRow.hours ? null : ctxWhy(inputs.records),
       heat: (alert ? 1000 : 0) + (stalled ?? 0) * 10 + (open ?? 0) + (series ? series.reduce((a, b) => a + b, 0) / 10 : 0),
     })
   }
   return blocks.sort((a, b) => b.heat - a.heat || a.name.localeCompare(b.name))
 }
 
-const DOT = { work: ["●", "s"], idle: ["●", "m"], wait: ["●", "w"], dead: ["●", "e"] }
+const DOT = { work: ["●", "s"], idle: ["●", "m"], wait: ["●", "w"] }
 const kilo = (n) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
 
 // The two lines of a block as styled segments [[text, keys]], the shape the Decisions rows use. Each line is cut to `width`.
@@ -227,7 +225,7 @@ export function blockLines(b, width) {
   const [dot, color] = DOT[b.state] ?? ["○", "m"]
   const name = clean(b.name, NAME_WIDTH).padEnd(NAME_WIDTH)
   const first = [
-    [dot, color], [b.alert ? "!" : " ", "e+b"], [" ", ""], [name, "b"], [" ", ""], [(b.state ?? "?").padEnd(4), color], [" ", ""],
+    [dot, color], [b.alert ? "!" : " ", "e+b"], [" ", ""], [name, "b"], [" ", ""], [(b.state ?? "").padEnd(4), color], [" ", ""],
     b.spark ? [sparkline(b.spark) + (b.sparkKind === "steps" ? "≈steps" : "≈"), ""] : b.toolWhy ? [b.toolWhy === "plugin not installed" ? "no plugin" : b.toolWhy === "restart for counter" || b.toolWhy === "no calls in 15 min" ? b.toolWhy : "plugin off", "m"] : [NOT_RECORDED, "m"],
   ]
   const piece = (label, value) => (value === null ? [`${label} ${NOT_RECORDED}`, "m"] : [`${label}${value}`, ""])
@@ -237,7 +235,7 @@ export function blockLines(b, width) {
   const second = [
     b.bars ? [bars(b.bars), ""] : [`moved ${NOT_RECORDED}`, "m"],
     piece(" q", b.open), piece(" s", b.stalled), piece(" d", b.decisions),
-    b.busy !== null && b.total !== null ? [` c${b.busy}/${b.total}`, ""] : [` coders ${NOT_RECORDED}`, "m"],
+    b.busy !== null && b.total !== null ? [` c${b.busy}${b.cloud > 0 ? `+${b.cloud}☁` : ""}/${b.total}`, ""] : [` coders ${NOT_RECORDED}`, "m"],
     piece(" p", b.pushes),
     b.context ? [b.context.percent !== undefined ? ` ctx${Math.round(b.context.percent)}%` : ` ctx${kilo(b.context.used)}`, ""] : b.ctxOff ? [" ctx off", "m"] : b.ctxWhy ? [` ctx ${b.ctxWhy}`, "m"] : [` ctx ${NOT_RECORDED}`, "m"],
   ]

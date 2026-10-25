@@ -56,7 +56,7 @@ When you wait on time (CI, a rate limit, a checkpoint, another agent), set a rem
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
 turn: you are woken then, free while idle. Never poll. If you were launched with a CHECKPOINT, a reminder reaches you at it ("checkpoint due: report now, one line"), so set none of your own for it: report then.
 Never poll GitHub in a shell loop; wait with `fleet-switchboard remind` and read with `fleet-switchboard pr-state <owner/repo#N>`.
-Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>` (a few CPU slots).
+Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>` (a few CPU slots). Run the focused classes of what you changed through `heavy --short`; CI runs the whole suite. Run the whole suite only for a change to the CI workflow itself or to a test CI cannot run; say which in the pull request. The heavy wrapper refuses a second full-suite job in a worktree while one is queued or running.
 
 ## Writing
 

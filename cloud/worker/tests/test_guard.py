@@ -153,7 +153,6 @@ EXTRA_ALLOWED = [
     ["gh", "pr", "create", "--title", "t"],
     ["gh", "pr", "view", "5"],
     ["gh", "pr", "comment", "5", "--body", "x"],
-    ["gh", "pr", "edit", "5", "--title", "t"],
     ["gh", "api", "graphql", "-f", "query={ viewer { login } }"],
     ["gh", "api", "graphql", "-f", "query=query($o:String!){ repository(owner:$o,name:\"x\"){ id } }", "-F", "o=acme-org"],
     ["gh", "api", U + "/pulls/5"],
@@ -209,7 +208,8 @@ class Guard(unittest.TestCase):
                         'echo "real %s ran: $*"\nexit 0\n' % tool)
             os.chmod(os.path.join(cls.realbin, tool), 0o755)
         cls.env = {"PATH": cls.realbin + ":/usr/bin:/bin", "HOME": cls.home, "WORKER_DOCKER": "0", "CW_RUN_DIR": cls.run_dir,
-                   "CW_TMP_DIR": cls.tmpfs, "CW_SHARE_DIR": cls.share, "CW_DEFAULT_BRANCH": "trunk", "GIT_CONFIG_NOSYSTEM": "1"}
+                   "CW_TMP_DIR": cls.tmpfs, "CW_SHARE_DIR": cls.share, "CW_DEFAULT_BRANCH": "trunk", "GIT_CONFIG_NOSYSTEM": "1",
+                   "CW_GH_CLIENT": os.path.join(cls.realbin, "gh")}   # the image has no real gh: the stand-in is the client the wrapper runs
         r = subprocess.run(["sh", ENTRYPOINT, "true"], env=cls.env, capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, r.stderr
         cls.bin = os.path.join(cls.tmpfs, "bin")
@@ -392,6 +392,19 @@ class Guard(unittest.TestCase):
             text = read(path)
             self.assertIn("by its path", text, path)
             self.assertRegex(text, r"(?i)not the guard|only a convenience", path)
+
+
+    def test_1019_a_read_of_an_issue_passes_and_a_write_of_the_same_issue_is_refused(self):
+        path = "repos/%s/issues/3" % REPO
+        for cmd in (["gh", "api", path], ["gh", "api", path + "/comments"], ["gh", "issue", "view", "3"]):
+            with self.subTest(read=" ".join(cmd)):
+                self.assertEqual(self.call(cmd).returncode, 0, cmd)
+        for cmd in (["gh", "api", "-X", "POST", path], ["gh", "api", "-X", "PATCH", path], ["gh", "api", "-X", "POST", path + "/comments"],
+                    ["gh", "issue", "comment", "3", "--body", "x"]):
+            with self.subTest(write=" ".join(cmd)):
+                r = self.call(cmd)
+                self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+                self.assertEqual(r.stderr, "refused: writing issues: %s\n" % TAIL)
 
 
 def cfg_table():
