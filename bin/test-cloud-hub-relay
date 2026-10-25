@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""test-cloud-hub-relay: offline tests for the hub relay (bin/cloud_relay.py, routes in bin/cloud_hub.py) and `cloud_cli.py relay`.
+
+A stub daemon pulls /relay/pending and posts /relay/result with the daemon credential. No GitHub token exists anywhere here.
+
+    bin/test-cloud-hub-relay
+"""
+import hashlib
+import http.client
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import cloud_hub  # noqa: E402
+import cloud_relay  # noqa: E402
+import cloud_cli  # noqa: E402
+
+SECRETS = {"pod-a": "secret-a-1", "pod-b": "secret-b-2", "daemon": "secret-d-3"}
+HEAD = "a" * 40
+MESSAGE_STATUS = 400   # /message with a body that has no sender/recipient: the channel's own 400
+
+
+def sha(v):
+    return hashlib.sha256(v.encode()).hexdigest()
+
+
+class Hub:
+    def __init__(self, wait=3.0, agents=None, max_handlers=None, hub_mod=cloud_hub, relay_mod=cloud_relay, **relay_kw):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        (t / "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
+        (t / "agents.json").write_text(json.dumps(agents or {
+            "pod-a": {"url": "http://127.0.0.1:1", "session": "s1", "password_file": "x", "repo": "acme-org/widget-service", "issue": 7},
+            "pod-b": {"url": "http://127.0.0.1:1", "session": "s2", "password_file": "x", "repo": "acme-org/widget-api", "issue": 8}}))
+        self.lines = []
+        agents_path = str(t / "agents.json")
+        self.relay = relay_mod.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=wait, **relay_kw)
+        self.server = hub_mod.make_hub(("127.0.0.1", 0), cloud_hub.make_secrets_reviewer(str(t / "secrets.json"), "fleet-agents"),
+                                         cloud_hub.Inbox(agents_path), self.lines.append, relay=self.relay, daemon="daemon", max_handlers=max_handlers, namespace="fleet-agents")
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_address[1]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def call(self, method, path, body=None, who="pod-a", raw=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        h = {"Authorization": "Bearer " + (SECRETS.get(who) or who)} if who else {}
+        data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+        try:
+            conn.request(method, path, body=data, headers=h)
+            r = conn.getresponse()
+            return r.status, json.loads(r.read() or b"null")
+        finally:
+            conn.close()
+
+    def relay_call(self, who="pod-a", **over):
+        body = {"call_id": "c1", "command": "prove", "pr": "acme-org/widget-service#12", "head": HEAD, "args": {"scenario": "S1"}}
+        body.update(over)
+        body = {k: v for k, v in body.items() if v is not None}
+        return self.call("POST", "/relay", body, who)
+
+    def daemon_answer(self, status=200, reason="", record=None):
+        """The stub daemon: pull once, answer each pending request."""
+        _, got = self.call("GET", "/relay/pending", who="daemon")
+        for req in got["requests"]:
+            self.call("POST", "/relay/result/" + req["id"], {"status": status, "reason": reason, "record": record}, "daemon")
+        return got["requests"]
+
+
+class TestRefusals(unittest.TestCase):
+    def check_refused(self, hub, status, result, rule):
+        self.assertEqual(result[0], status, result)
+        self.assertIn(rule, result[1]["error"])
+        self.assertEqual(hub.call("GET", "/relay/pending", who="daemon")[1], {"requests": []})   # nothing queued
+        self.assertTrue(any("refused status=%d" % status in l and rule in l for l in hub.lines), hub.lines)
+        self.assertFalse(any(s in l for l in hub.lines for s in SECRETS.values()))
+
+    def test_unknown_pod_404(self):
+        with Hub() as hub:
+            r = hub.call("POST", "/relay", {"call_id": "c", "command": "gates", "pr": "acme-org/widget-service#1"}, "daemon")
+            self.check_refused(hub, 404, r, "unknown pod")
+
+    def test_wrong_and_missing_secret_401(self):
+        with Hub() as hub:
+            self.assertEqual(hub.relay_call(who="nope")[0], 401)
+            self.assertEqual(hub.relay_call(who=None)[0], 401)
+            self.assertEqual(hub.call("GET", "/relay/pending", who="daemon")[1], {"requests": []})
+
+    def test_wrong_repo_403_body_cannot_override(self):
+        with Hub() as hub:
+            self.check_refused(hub, 403, hub.relay_call(pr="acme-org/widget-api#12"), "bound repo")
+            # pod-b is bound to widget-api: its own repo is allowed, so the binding comes from the map, not the body
+            hub.relay.wait = 0.05
+            self.assertEqual(hub.relay_call(who="pod-b", pr="acme-org/widget-api#3")[0], 504)
+
+    def test_unlisted_command_400(self):
+        with Hub() as hub:
+            self.check_refused(hub, 400, hub.relay_call(command="notice"), "command not allowed")
+
+    def test_missing_or_bad_call_id_400(self):
+        with Hub() as hub:
+            self.check_refused(hub, 400, hub.relay_call(call_id=None), "call_id")
+            self.assertEqual(hub.relay_call(call_id="x" * 65)[0], 400)
+            self.assertEqual(hub.relay_call(call_id="has space")[0], 400)
+
+    def test_head_required_for_prove_and_verdict(self):
+        with Hub() as hub:
+            self.check_refused(hub, 400, hub.relay_call(head=None), "head required")
+            self.assertEqual(hub.relay_call(command="verdict", head=None)[0], 400)
+
+    def test_oversized_413(self):
+        with Hub() as hub:
+            raw = json.dumps({"call_id": "c", "command": "report", "pr": "acme-org/widget-service#1",
+                              "args": {"text": "x" * 40000}}).encode()
+            self.check_refused(hub, 413, hub.call("POST", "/relay", raw=raw), "too large")
+
+    def test_result_and_pending_are_daemon_only(self):
+        with Hub(wait=0.05) as hub:
+            hub.relay_call()
+            self.assertEqual(hub.call("GET", "/relay/pending", who="pod-a")[0], 403)
+            entry = hub.call("GET", "/relay/pending", who="daemon")[1]["requests"][0]
+            self.assertEqual(hub.call("POST", "/relay/result/" + entry["id"], {"status": 200, "record": None}, "pod-a")[0], 403)
+            self.assertEqual(hub.call("POST", "/relay/result/" + entry["id"], {"status": 200}, "nope")[0], 401)
+            self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 1)
+
+
+class TestRoundTrip(unittest.TestCase):
+    def test_pod_waits_and_gets_exactly_the_daemons_answer(self):
+        with Hub() as hub:
+            out = []
+            t = threading.Thread(target=lambda: out.append(hub.relay_call()))
+            t.start()
+            for _ in range(100):
+                reqs = hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]
+                if reqs:
+                    break
+                time.sleep(0.02)
+            req = reqs[0]
+            self.assertEqual((req["pod"], req["repo"], req["issue"]), ("pod-a", "acme-org/widget-service", 7))
+            self.assertEqual(req["call"]["call_id"], "c1")
+            self.assertEqual(req["call"]["args"], {"scenario": "S1"})
+            rec = {"seq": 4, "hash": "ab" * 32}
+            self.assertEqual(hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "", "record": rec}, "daemon")[0], 200)
+            t.join(5)
+            self.assertEqual(out[0][0], 200)
+            self.assertEqual(out[0][1]["record"], rec)
+            self.assertEqual(hub.call("GET", "/relay/pending", who="daemon")[1], {"requests": []})
+
+    def test_refusal_status_passes_through(self):
+        with Hub() as hub:
+            t = threading.Thread(target=lambda: (time.sleep(0.2), hub.daemon_answer(409, "stale head")))
+            t.start()
+            status, body = hub.relay_call()
+            self.assertEqual((status, body["error"], body["record"]), (409, "stale head", None))
+
+    def test_timeout_504_then_replay_joins_same_entry(self):
+        with Hub(wait=0.2) as hub:
+            self.assertEqual(hub.relay_call()[0], 504)
+            self.assertEqual(hub.relay_call()[0], 504)
+            reqs = hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]
+            self.assertEqual(len(reqs), 1)   # one entry for one call id
+            hub.relay.wait = 3
+            t = threading.Thread(target=lambda: (time.sleep(0.2), hub.daemon_answer(200, "", {"seq": 1, "hash": "h"})))
+            t.start()
+            self.assertEqual(hub.relay_call()[1]["record"], {"seq": 1, "hash": "h"})
+
+    def test_late_answer_is_replayed_to_the_same_call_id(self):
+        with Hub(wait=0.1) as hub:
+            self.assertEqual(hub.relay_call()[0], 504)
+            hub.daemon_answer(200, "", {"seq": 2, "hash": "h2"})
+            self.assertEqual(hub.relay_call()[1]["record"], {"seq": 2, "hash": "h2"})
+
+    def test_same_call_id_for_a_different_call_is_409(self):
+        with Hub(wait=0.1) as hub:
+            self.assertEqual(hub.relay_call()[0], 504)
+            for over in (dict(command="verdict"), dict(pr="acme-org/widget-service#13"), dict(head="b" * 40)):
+                status, body = hub.relay_call(**over)
+                self.assertEqual((status, body["error"]), (409, "call_id reused for a different call"))
+            self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 1)
+
+    def test_same_call_id_with_different_args_is_409_and_same_args_joins(self):
+        with Hub(wait=0.1) as hub:
+            self.assertEqual(hub.relay_call()[0], 504)
+            status, body = hub.relay_call(args={"scenario": "S2"})
+            self.assertEqual((status, body["error"]), (409, "call_id reused for a different call"))
+            self.assertEqual(hub.relay_call(args={"scenario": "S1"})[0], 504)   # the same call joins the queued entry
+            self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 1)
+
+    def test_mutant_fingerprint_without_args_lets_a_different_call_join(self):
+        old = cloud_relay.fingerprint
+        cloud_relay.fingerprint = lambda call: (call.get("command"), call.get("pr"), call.get("head"))
+        try:
+            with Hub(wait=0.1) as hub:
+                hub.relay_call()
+                self.assertNotEqual(hub.relay_call(args={"scenario": "S2"})[0], 409)   # the mutant is what the test above forbids
+        finally:
+            cloud_relay.fingerprint = old
+
+    def test_arg_key_is_not_echoed_in_the_refusal(self):
+        with Hub() as hub:
+            key = "k\x1b[31m\nforged-line"
+            status, body = hub.relay_call(args={key: {"nested": 1}})
+            self.assertEqual(status, 400)
+            self.assertNotIn("forged", body["error"])
+            self.assertFalse(any("forged" in l for l in hub.lines), hub.lines)
+            self.assertFalse(any("\x1b" in l for l in hub.lines))
+
+    def test_a_refused_answer_is_not_replayable(self):
+        with Hub(wait=0.1) as hub:
+            self.assertEqual(hub.relay_call()[0], 504)
+            hub.daemon_answer(403, "pr not linked")
+            self.assertEqual(hub.relay_call()[0], 504)   # queued afresh, not answered from the cache
+            self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 1)
+
+    def test_call_ids_are_scoped_per_pod(self):
+        with Hub(wait=0.1) as hub:
+            hub.relay_call()
+            hub.relay_call(who="pod-b", pr="acme-org/widget-api#3")
+            reqs = hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]
+            self.assertEqual(sorted(r["pod"] for r in reqs), ["pod-a", "pod-b"])
+
+    def test_pending_oldest_first_max_10(self):
+        with Hub(wait=0.01) as hub:
+            for i in range(12):
+                hub.relay_call(call_id="id%02d" % i)
+            ids = [r["call"]["call_id"] for r in hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]]
+            self.assertEqual(ids, ["id%02d" % i for i in range(10)])
+
+    def test_unknown_result_id_404_and_bad_status_400(self):
+        with Hub(wait=0.01) as hub:
+            self.assertEqual(hub.call("POST", "/relay/result/" + "0" * 32, {"status": 200}, "daemon")[0], 404)
+            hub.relay_call()
+            rid = hub.call("GET", "/relay/pending", who="daemon")[1]["requests"][0]["id"]
+            self.assertEqual(hub.call("POST", "/relay/result/" + rid, {"status": "ok"}, "daemon")[0], 400)
+
+    def test_existing_routes_unchanged(self):
+        with Hub() as hub:
+            self.assertEqual(hub.call("GET", "/decisions")[0], 200)
+            self.assertEqual(hub.call("GET", "/other")[0], 404)
+
+
+class TestClient(unittest.TestCase):
+    def run_cli(self, argv, answer):
+        seen = []
+        tmp = tempfile.TemporaryDirectory()
+        tok = Path(tmp.name) / "tok"
+        tok.write_text("tok-SECRET.abc\n")
+        env = {"FLEET_CLOUD_CHANNEL_URL": "http://hub.svc:8080/message", "FLEET_CLOUD_TOKEN_FILE": str(tok)}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cloud_cli.main(argv, env, lambda req: (seen.append(req), answer)[1])
+        tmp.cleanup()
+        return code, out.getvalue(), seen
+
+    def test_relay_builds_body_and_exit_codes(self):
+        code, out, seen = self.run_cli(["relay", "prove", "--pr", "acme-org/widget-service#12", "--head", HEAD, "--arg", "scenario=S1"],
+                                       {"status": 200, "record": {"seq": 1, "hash": "h"}})
+        body = seen[0]["body"]
+        self.assertEqual((code, body["command"], body["pr"], body["head"], body["args"]), (0, "prove", "acme-org/widget-service#12", HEAD, {"scenario": "S1"}))
+        self.assertRegex(body["call_id"], r"^[0-9a-f]{32}$")
+        self.assertNotIn("tok-SECRET", out)
+        self.assertEqual(self.run_cli(["relay", "gates", "--pr", "a/b#1"], {"status": 403, "error": "x"})[0], 1)
+        self.assertEqual(self.run_cli(["relay", "gates", "--pr", "a/b#1"], {"status": 0})[0], 1)
+
+    def test_given_call_id_kept_and_bad_usage(self):
+        code, _, seen = self.run_cli(["relay", "gates", "--pr", "a/b#1", "--call-id", "mine"], {"status": 200})
+        self.assertEqual(seen[0]["body"]["call_id"], "mine")
+        self.assertEqual(self.run_cli(["relay", "gates"], {})[0], 2)
+        self.assertEqual(self.run_cli(["relay", "gates", "--pr", "a/b#1", "--arg", "novalue"], {})[0], 2)
+
+    def test_posts_to_relay_path(self):
+        urls = []
+        orig = cloud_cli.make_post
+        cloud_cli.make_post = lambda url, timeout=10: (urls.append(url), lambda r: {"status": 200})[1]
+        try:
+            tmp = tempfile.TemporaryDirectory()
+            tok = Path(tmp.name) / "tok"
+            tok.write_text("t0k\n")
+            with redirect_stdout(io.StringIO()):
+                cloud_cli.main(["relay", "gates", "--pr", "a/b#1"], {"FLEET_CLOUD_CHANNEL_URL": "http://hub.svc:8080/message", "FLEET_CLOUD_TOKEN_FILE": str(tok)})
+        finally:
+            cloud_cli.make_post = orig
+        self.assertEqual(urls, ["http://hub.svc:8080/relay"])
+
+class TestBoundsAndCaps(unittest.TestCase):
+    def test_caps_derive_from_max_handlers(self):
+        for mh, total in ((4, 2), (16, 8), (None, 16)):
+            with Hub(max_handlers=mh) as hub:
+                self.assertEqual((hub.relay.max_inflight, hub.relay.max_wait_total), ((mh or 32) // 2, total))
+        for bad in (1,):
+            with self.assertRaises(ValueError):
+                Hub(max_handlers=bad)
+
+    def test_small_server_held_waits_leave_slots(self):
+        with Hub(wait=2.0, max_handlers=6) as hub:   # 3 relay handlers at most
+            threads = [threading.Thread(target=hub.relay_call, kwargs={"who": "pod-a", "call_id": "c%d" % i}) for i in range(3)]
+            for t in threads: t.start()
+            for _ in range(100):
+                if sum(hub.relay.waiting.values()) == 3: break
+                time.sleep(0.05)
+            status, body = hub.relay_call(who="pod-b", call_id="x", pr="acme-org/widget-api#3")
+            self.assertEqual(status, 503)
+            status, got = hub.call("GET", "/relay/pending", who="daemon")
+            self.assertEqual((status, len(got["requests"])), (200, 3))
+            for req in got["requests"]:
+                self.assertEqual(hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")[0], 200)
+            for t in threads: t.join()
+
+    def test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive(self):
+        import socket
+        saved = dict(SECRETS)
+        self.addCleanup(lambda: (SECRETS.clear(), SECRETS.update(saved)))   # the module-level dict is restored whatever happens
+        with Hub(wait=8.0, max_per_pod=50) as hub:   # default max_handlers=32 -> relay cap 16
+            self.assertEqual(hub.server.max_handlers, 32)
+            self.assertEqual(hub.relay.max_inflight, 16)
+            self.assertEqual((cloud_relay.MAX_WAIT_PER_POD, cloud_relay.MAX_WAIT_TOTAL), (4, 16))
+            agents = {}
+            for i in range(4):
+                agents["pod-%d" % i] = {"url": "http://127.0.0.1:1", "session": "s", "password_file": "x", "repo": "acme-org/r%d" % i, "issue": i}
+            for name in agents: SECRETS[name] = "secret-" + name
+            Path(hub.tmp.name, "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
+            Path(hub.tmp.name, "agents.json").write_text(json.dumps(agents))
+            threads = []
+            for i in range(4):          # 4 pods x 4 held waits = 16 held
+                for j in range(4):
+                    t = threading.Thread(target=hub.relay_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
+            self.wait_for(lambda: sum(hub.relay.waiting.values()) == 16)
+            self.assertEqual(sum(hub.relay.waiting.values()), 16)
+            socks = []
+            for _ in range(hub.server.max_handlers):   # as many slow bodies as the hub has handlers: without the in-flight cap they would take every one
+                s = socket.create_connection(("127.0.0.1", hub.port))
+                s.settimeout(5)
+                s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-pod-0\r\nContent-Length: 100\r\n\r\n{")
+                socks.append(s)
+            for s in socks:             # every excess one is refused 503 straight away, its body unread
+                first = s.recv(4096).split(b"\r\n")[0]
+                self.assertIn(b" 503 ", first)
+            self.assertEqual(hub.relay.inflight, 16)
+            status, got = hub.call("GET", "/relay/pending", who="daemon")
+            self.assertEqual(status, 200)
+            self.assertEqual(len(got["requests"]), 10)
+            for req in got["requests"]:
+                self.assertEqual(hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")[0], 200)
+            self.assertEqual(hub.call("POST", "/message", {"x": 1}, who="pod-0")[0], MESSAGE_STATUS)   # channel route answers with its own refusal, not starved
+            self.assertEqual(hub.call("GET", "/decisions", who="pod-0")[0], 200)
+            for s in socks: s.close()
+            while hub.relay.pending:
+                for req in hub.relay.list_pending():
+                    hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")
+            for t in threads: t.join()
+
+    def test_mutant_admit_removed_the_saturation_test_fails(self):
+        old = cloud_relay.Relay.admit
+        cloud_relay.Relay.admit = lambda self: True
+        try:
+            case = TestBoundsAndCaps("test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive")
+            with self.assertRaises(AssertionError):
+                case.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive()
+        finally:
+            cloud_relay.Relay.admit = old
+            case.doCleanups()
+
+    @staticmethod
+    def wait_for(cond, limit=10.0):
+        end = time.monotonic() + limit
+        while time.monotonic() < end and not cond():
+            time.sleep(0.01)
+
+    def test_slow_body_trickle_cut_at_deadline(self):
+        import socket
+        old = cloud_relay.BODY_DEADLINE
+        cloud_relay.BODY_DEADLINE = 1.0
+        try:
+            with Hub() as hub:
+                s = socket.create_connection(("127.0.0.1", hub.port))
+                s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-a-1\r\nContent-Length: 100\r\n\r\n")
+                t0 = time.time()
+                for _ in range(8):   # a byte every 0.4 s would pass a per-read timeout
+                    try: s.sendall(b" ")
+                    except OSError: break
+                    time.sleep(0.4)
+                data = s.recv(4096)
+                self.assertIn(b" 408 ", data.split(b"\r\n")[0])
+                self.assertLess(time.time() - t0, 3.5)
+                s.close()
+                self.assertEqual(hub.relay.inflight, 0)
+        finally:
+            cloud_relay.BODY_DEADLINE = old
+
+    def test_held_wait_caps_keep_daemon_routes_alive(self):
+        # per pod 4, global 6; both pods saturate, a refused call queues nothing, the daemon still gets through
+        with Hub(wait=2.0, max_per_pod=20, max_pending=200, agents=None) as hub:
+            hub.relay.max_wait_total = 6
+            results, threads = [], []
+            def go(who, pr, i):
+                results.append((who, i, hub.relay_call(who=who, call_id="%s-%d" % (who, i), pr=pr)))
+            for who, pr, n in (("pod-a", "acme-org/widget-service#12", 4), ("pod-b", "acme-org/widget-api#3", 2)):
+                for i in range(n):
+                    t = threading.Thread(target=go, args=(who, pr, i)); t.start(); threads.append(t)
+            for _ in range(100):
+                if sum(hub.relay.waiting.values()) == 6:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(sum(hub.relay.waiting.values()), 6)
+            status, body = hub.relay_call(who="pod-a", call_id="extra")
+            self.assertEqual(status, 429); self.assertIn("4 held calls per pod", body["error"])
+            status, body = hub.relay_call(who="pod-b", call_id="extra2", pr="acme-org/widget-api#3")
+            self.assertEqual(status, 503); self.assertIn("6 held calls on the hub", body["error"])
+            self.assertEqual(len(hub.relay.pending), 6)   # refused calls wrote nothing
+            status, got = hub.call("GET", "/relay/pending", who="daemon")
+            self.assertEqual((status, len(got["requests"])), (200, 6))
+            for req in got["requests"]:
+                self.assertEqual(hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")[0], 200)
+            for t in threads:
+                t.join()
+            self.assertEqual([r[2][0] for r in results], [200] * 6)
+            self.assertEqual(hub.relay.waiting, {})
+
+    def test_per_pod_cap_names_itself_and_other_pods_still_served(self):
+        with Hub(wait=0.01, max_per_pod=2, max_pending=50) as hub:
+            for i in range(2):
+                self.assertEqual(hub.relay_call(call_id="c%d" % i)[0], 504)
+            status, body = hub.relay_call(call_id="c9")
+            self.assertEqual(status, 503)
+            self.assertIn("per-pod cap", body["error"])
+            self.assertEqual(hub.relay_call(who="pod-b", pr="acme-org/widget-api#3")[0], 504)   # another pod is not starved
+            self.assertEqual(hub.relay_call(call_id="c1")[0], 504)   # a replay joins the queued entry, it is not a new one
+
+    def test_global_cap_names_itself(self):
+        with Hub(wait=0.01, max_per_pod=50, max_pending=2) as hub:
+            hub.relay_call(call_id="a")
+            hub.relay_call(who="pod-b", call_id="b", pr="acme-org/widget-api#3")
+            status, body = hub.relay_call(call_id="c")
+            self.assertEqual(status, 503)
+            self.assertIn("global cap", body["error"])
+
+    def test_unanswered_entries_expire_and_free_the_caps(self):
+        now = [1000.0]
+        with Hub(wait=0.01, max_per_pod=2, ttl=60, clock=lambda: now[0]) as hub:
+            hub.relay_call(call_id="a")
+            hub.relay_call(call_id="b")
+            self.assertEqual(hub.relay_call(call_id="c")[0], 503)
+            self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 2)
+            now[0] += 61
+            self.assertEqual(hub.call("GET", "/relay/pending", who="daemon")[1], {"requests": []})   # dropped, never handed to the daemon
+            self.assertEqual(hub.relay_call(call_id="c")[0], 504)   # the cap is free again
+            self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 1)
+
+    def test_args_are_bounded(self):
+        with Hub() as hub:
+            many = {"k%d" % i: "v" for i in range(cloud_relay.MAX_ARGS + 1)}
+            for args in (many, {"x" * 65: "v"}, {"a": "y" * (cloud_relay.MAX_ARG_VALUE + 1)}, {"a": {"nested": 1}}, {"a": [1]}):
+                status, body = hub.relay_call(args=args)
+                self.assertEqual(status, 400, args)
+                self.assertIn("args", body["error"])
+            self.assertEqual(hub.call("GET", "/relay/pending", who="daemon")[1], {"requests": []})
+
+    def test_head_must_be_the_full_sha(self):
+        with Hub() as hub:
+            self.assertEqual(hub.relay_call(head="a" * 7)[0], 400)
+            self.assertEqual(hub.relay_call(head="a" * 41)[0], 400)
+
+    def test_the_daemon_credential_is_not_a_pod_and_must_be_named(self):
+        with Hub(agents={"daemon": {"url": "http://127.0.0.1:1", "session": "s", "password_file": "x", "repo": "acme-org/widget-service", "issue": 1}}) as hub:
+            status, body = hub.call("POST", "/relay", {"call_id": "c", "command": "gates", "pr": "acme-org/widget-service#1"}, "daemon")
+            self.assertEqual((status, "cannot relay as a pod" in body["error"]), (403, True))   # even registered in the map
+        with self.assertRaises(ValueError):   # no default daemon name: the relay needs it set explicitly
+            cloud_hub.make_hub(("127.0.0.1", 0), lambda t, a: {}, None, print, relay=cloud_relay.Relay(lambda: {}), namespace="fleet-agents")
+
+    def test_serve_without_a_daemon_name_leaves_the_relay_off(self):
+        seen = {}
+        orig = cloud_hub.make_hub
+
+        class Stop(Exception):
+            pass
+
+        def fake(*a, **k):
+            seen.update(k)
+            raise Stop
+        cloud_hub.make_hub = fake
+        try:
+            for env, expect in (({}, None), ({"FLEET_CLOUD_HUB_DAEMON": "d1"}, "d1")):
+                with self.assertRaises(Stop):
+                    cloud_hub.serve(dict(env, FLEET_CLOUD_AGENT_NAMESPACE="fleet-agents", FLEET_CLOUD_CHANNEL_LISTEN="127.0.0.1:18765"), reviewer=lambda t, a: {}, inbox=object(), audit=print)
+                self.assertEqual(seen["daemon"], expect)
+                self.assertEqual(seen["relay"] is None, expect is None)
+        finally:
+            cloud_hub.make_hub = orig
+
+    def test_agents_map_unavailable_fails_closed_503(self):
+        relay = cloud_relay.Relay(lambda: (_ for _ in ()).throw(OSError("gone")))
+        with self.assertRaises(cloud_relay.Refusal) as ctx:
+            relay.submit("pod-a", {})
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(relay.pending, {})
+
+
+def mutant(module, old, new, rename=None):
+    """The REAL source of `module` with ONE replacement (a mutant of the real code), as a fresh module; its Refusal stays the real class."""
+    import types
+    path = Path(module.__file__)
+    src = path.read_text()
+    assert src.count(old) >= 1, old
+    mod = types.ModuleType(module.__name__ + "_mut")
+    mod.__file__ = str(path)
+    exec(compile(src.replace(old, new), str(path), "exec"), mod.__dict__)
+    if hasattr(module, "Refusal"):
+        mod.Refusal = module.Refusal
+    return mod
+
+
+class TestHostileBodies(unittest.TestCase):
+    """L1: a body that is deeply nested, holds NaN or a duplicate key is a 400 on the pod route AND the daemon route; the handler lives."""
+    BODIES = {"nested": b"[" * 30000, "nan": b'{"call_id": "c", "args": {"n": NaN}}',
+              "duplicate": b'{"call_id": "c1", "call_id": "c2", "command": "report", "pr": "acme-org/widget-service#1"}',
+              "infinity": b'{"status": Infinity}'}
+
+    def test_pod_route_and_daemon_route_refuse_each_with_400_and_stay_up(self):
+        with Hub(wait=0.05) as hub:
+            hub.relay_call()
+            rid = hub.call("GET", "/relay/pending", who="daemon")[1]["requests"][0]["id"]
+            for name, raw in self.BODIES.items():
+                self.assertEqual(hub.call("POST", "/relay", raw=raw)[0], 400, name)
+                self.assertEqual(hub.call("POST", "/relay/result/" + rid, raw=raw, who="daemon")[0], 400, name)
+            self.assertEqual(hub.call("GET", "/relay/pending", who="daemon")[0], 200)   # the server still answers
+
+    def test_mutant_recursion_error_not_caught_is_seen(self):
+        mod = mutant(cloud_hub, "except (ValueError, RecursionError):", "except ValueError:")
+        with Hub(wait=0.05, hub_mod=mod) as hub:
+            with self.assertRaises(Exception):   # the handler thread dies: no answer
+                self.assertEqual(hub.call("POST", "/relay", raw=self.BODIES["nested"])[0], 400)
+
+    def test_mutant_duplicate_keys_accepted_is_seen(self):
+        mod = mutant(cloud_relay, "raise ValueError(\"duplicate key\")", "pass")
+        with Hub(wait=0.05) as hub:
+            cloud_relay_real = cloud_hub.cloud_relay.loads_strict
+            cloud_hub.cloud_relay.loads_strict = mod.loads_strict
+            try:
+                self.assertNotEqual(hub.call("POST", "/relay", raw=self.BODIES["duplicate"])[0], 400)
+            finally:
+                cloud_hub.cloud_relay.loads_strict = cloud_relay_real
+
+
+class TestRefusalMutants(unittest.TestCase):
+    """L4: the daemon-only check, the repo check and the command allow-list each have a refusal test AND a mutant of the real code."""
+
+    def daemon_only(self, hub):
+        pending = hub.call("GET", "/relay/pending", who="pod-a")[0]
+        hub.relay_call()
+        entry = hub.call("GET", "/relay/pending", who="daemon")[1]["requests"][0]
+        posted = hub.call("POST", "/relay/result/" + entry["id"], {"status": 200, "record": None}, "pod-a")[0]
+        return pending, posted
+
+    def test_daemon_only_refused(self):
+        with Hub(wait=0.05) as hub:
+            self.assertEqual(self.daemon_only(hub), (403, 403))
+
+    def test_mutant_daemon_only_removed(self):
+        mod = mutant(cloud_hub, "if pod != daemon:", "if False:")
+        with Hub(wait=0.05, hub_mod=mod) as hub:
+            self.assertNotEqual(self.daemon_only(hub), (403, 403))
+
+    def test_repo_check_refused(self):
+        with Hub() as hub:
+            self.assertEqual(hub.relay_call(pr="acme-org/other#1")[0], 403)
+
+    def test_mutant_repo_check_removed(self):
+        mod = mutant(cloud_relay, "if match.group(1) != record[\"repo\"]:", "if False:")
+        with Hub(wait=0.05, relay_mod=mod) as hub:
+            self.assertNotEqual(hub.relay_call(pr="acme-org/other#1")[0], 403)
+
+    def test_command_allow_list_refused(self):
+        with Hub() as hub:
+            self.assertEqual(hub.relay_call(command="merge")[0], 400)
+
+    def test_mutant_command_allow_list_removed(self):
+        mod = mutant(cloud_relay, "if command not in COMMANDS:", "if False:")
+        with Hub(wait=0.05, relay_mod=mod) as hub:
+            self.assertNotEqual(hub.relay_call(command="merge")[0], 400)
+
+
+if __name__ == "__main__":
+    unittest.main()
