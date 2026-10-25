@@ -27410,7 +27410,7 @@ class TestSweep(Base):
     def s5_case(self, issues, aged=("d1",)):
         self.hub.open = dict(issues)
         old = sb.iso(self.world.clock.now() - 3 * 3600)
-        decisions = [{"id": "pr:acme/api#%s" % n, "kind": "captain", "tier": "cos", "repo": "acme/api", "number": int(n),
+        decisions = [{"id": "pr:acme/api#%s" % n, "kind": "ask", "tier": "cos", "repo": "acme/api", "number": int(n),
                       "since": old, "title": "t"} for n in aged]
         self.sweep(decisions)
         return [f for f in self.found() if f[0] == "S5"], dict(sb.sweep_state(self.engine).current["s5_skipped"])
@@ -27450,7 +27450,8 @@ class TestSweep(Base):
         self.assertEqual({p for _, p in self.hub.single} - {"issues/8", "issues/9"}, set())
 
     def test_s5_has_one_parked_date_reader(self):
-        src = open(sb.__file__ if hasattr(sb, "__file__") else "bin/fleet-switchboard").read()
+        root = Path(__file__).resolve().parent   # the daemon is cut into parts (bin/switchboard/*.py): count them all
+        src = "".join(f.read_text() for f in [root / "fleet-switchboard"] + sorted((root / "switchboard").glob("*.py")))
         self.assertEqual(src.count("PARKED_UNTIL_RE.findall"), 1)
 
     def test_s5_a_cos_decision_older_than_the_limit(self):
