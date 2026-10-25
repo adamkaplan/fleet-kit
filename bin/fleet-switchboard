@@ -708,6 +708,7 @@ def validate_config(raw, source="config"):
     validate_triage_config(config, source)  # #130
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
     validate_red_ci_required(config, source)  # #1141
+    validate_default_branches(config, source)
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
     validate_hold_labels_config(config, source)  # #376
@@ -805,6 +806,20 @@ def validate_red_ci_required(config, source):
         return
     if not isinstance(raw, dict) or not all(isinstance(r, str) and isinstance(v, list) and v and all(isinstance(n, str) and n for n in v) for r, v in raw.items()):
         raise ConfigError("%s: 'red_ci_required' must be an object of repository -> non-empty list of workflow names (\"*\" for every workflow)" % source)
+    for repo, names in raw.items():
+        for n in names:
+            if re.search(r" \(.*\)$", n):   # 'test (ubuntu-latest)' is a matrix JOB name: the pass reads workflow runs and never matches it
+                warn_unknown_config("red_ci_required: %r for %s looks like a matrix JOB name; only WORKFLOW names are matched, so it will never fire" % (n, repo))
+
+
+def validate_default_branches(config, source):
+    """`default_branches`: repository -> branch name (at most 20). Absent: "main"."""
+    raw = config.get("default_branches")
+    if raw is None:
+        config.pop("default_branches", None)
+        return
+    if not isinstance(raw, dict) or len(raw) > 20 or not all(isinstance(r, str) and r and isinstance(b, str) and b for r, b in raw.items()):
+        raise ConfigError("%s: 'default_branches' must be an object of at most 20 repository -> non-empty branch name" % source)
 
 
 def validate_plan_evaluators(config, source):

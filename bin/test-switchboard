@@ -15064,13 +15064,9 @@ class CharterRig:
         self.cmd_labels = {1: True, 3: True, 4: True, 9: True, 5: False, 6: False, 7: False}
         self.cmd_reads = []
         def cmd_parent(reader, number, repo=None, **kw):
-            if repo != self.REPO:
-                raise sb.IntentError("not_found", "read for the wrong repository: %r" % (repo,))
             self.cmd_reads.append(("parent", number))
             return self.cmd_parents[number]
         def cmd_issue(reader, number, repo=None):
-            if repo != self.REPO:
-                raise sb.IntentError("not_found", "read for the wrong repository: %r" % (repo,))
             self.cmd_reads.append(("issue", number))
             return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
         for name, fake in (("parent", cmd_parent), ("issue", cmd_issue)):
@@ -32294,7 +32290,7 @@ class TestRedCi(Base):
         self.assertEqual(self.lines("orch"), [])
         self.assertEqual(len(self.lines("cos")), 1)
         self.assertIn("no worker owns", self.lines("cos")[0])
-        self.feed(self.run_rec("failure", "h9", pr=55, name="build"))
+        self.feed(self.run_rec("failure", "h9", pr=55, name="build", rid=self.rid))
         self.assertEqual(len(self.lines("cos")), 1)
 
     def test_rerun_failing_again_at_same_head_is_new(self):
@@ -32453,6 +32449,24 @@ class TestRedCi(Base):
         self.assertEqual(set(module.COLOUR), known)
         self.assertEqual(module.colour({"status": "in_progress", "conclusion": "failure"}), "none")
         self.assertEqual(module.colour({"conclusion": "unheard-of"}), "none")
+        doc = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "switchboard.md")).read()
+        for word, action in module.COLOUR.items():   # the docs table and the code table agree row by row
+            self.assertRegex(doc, r"`%s`[^\n]*\b%s\b" % (word, {"red": "red", "green": "green", "none": "(silent|none)"}[action]), word)
+        self.assertEqual({w for w, a in module.COLOUR.items() if a == "red"}, {"failure", "timed_out", "startup_failure"})
+
+    def test_unowned_note_is_new_for_a_rerun(self):
+        self.feed(self.run_rec("failure", "h9", pr=55, rid=201))
+        self.feed(self.run_rec("failure", "h9", pr=55, rid=201, attempt=2))
+        self.assertEqual(len(self.lines("cos")), 2)
+
+    def test_config_warns_on_matrix_job_names_and_validates_default_branches(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            sb.validate_config({"github_repos": [self.REPO], "red_ci_required": {self.REPO: ["test (ubuntu-latest)"]}})
+        self.assertIn("matrix JOB name", err.getvalue())
+        for bad in ({"a/b": ""}, [1], {"a/b": 3}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"github_repos": [self.REPO], "default_branches": bad})
 
 
 

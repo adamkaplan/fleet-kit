@@ -5714,6 +5714,24 @@ Two messages, both ordinary notices through the delivery rule (held with the rea
 
 - The failed-check message goes to the lane orchestrators of the repository when a required check concludes failure at the head of an open pull request that a worker of the lane owns. It names the pull request, the check, the run link and the head, and is sent once per head, run and attempt (the key holds the head, the run id and the attempt: a new head, or a re-run that fails again, is a new event; the same run seen again is not). A pull request no worker owns is noted in the audit (`red_ci.unowned`) and the Chief of Staff is told once per pull request and head. A red run at an older head of a pull request that has moved on is skipped: only the current head is told.
 - **A "check" here is a WORKFLOW name.** The pass reads workflow runs only, so `red_ci_required` (repository -> list of workflow names, `*` for every workflow; checked when the config is read) is matched against the workflow name, never a job name such as `test (ubuntu-latest)`. Unset for a repository: every workflow counts (the repository's required checks are not read, to add no read). For the same reason the alarm names the workflow only; jobs are not read.
+
+Conclusion table (one row per conclusion GitHub sends for a run; `bin/red_ci.py` `COLOUR` is the same table, a test keeps them equal; only a `completed` run counts, a missing status or an in-progress run is silent):
+
+| conclusion | action |
+|---|---|
+| `failure` | red |
+| `timed_out` | red |
+| `startup_failure` | red |
+| `success` | green |
+| `cancelled` | silent |
+| `skipped` | silent |
+| `neutral` | silent |
+| `action_required` | silent |
+| `stale` | silent |
+| `null` (in progress) | silent |
+
+`default_branches` (repository -> branch, at most 20 entries, validated when the config is read) names the default branch; unset means `main`. The unowned-pull-request note is keyed by head, run id and attempt like the owned message.
+
 - The red-branch alarm goes to the lane orchestrators of the repository and the Chief of Staff when the default branch's latest completed run turns red (the run, the head and the workflow are named), once per change, and one message goes to the same receivers when it turns green again (only after a red was told).
 
 One table decides every conclusion GitHub can send, and every field of a run the code trusts:

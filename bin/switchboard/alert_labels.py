@@ -256,7 +256,7 @@ def red_ci_runs(engine, repo, runs, now):
                     owner = pick_owner(agents, [number], repo)
                     if owner is None:
                         engine._note("red_ci.unowned", repo, {"pr": number, "head": module.clean(head, 64)})
-                        changed |= red_ci_tell(engine, state, "pr-unowned:%s#%d:%s" % (repo, number, module.clean(head, 64).replace(":", "_")), repo,
+                        changed |= red_ci_tell(engine, state, "pr-unowned:%s#%d:%s:%s:%s" % (repo, number, module.clean(head, 64).replace(":", "_"), run["id"], attempt), repo,
                                                module.unowned_line(repo, number, name, url, head), red_ci_receivers(engine, repo, True, False), now)
                         continue
                     if _is_orchestrator(agents[owner]):
