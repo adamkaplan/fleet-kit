@@ -5724,11 +5724,24 @@ Bounds: 50 valid records, 200 files examined, 64 KiB per file, 1 s monotonic per
 | not JSON | `not_json` | each_kind_is_skipped_and_counted | kind mislabelled |
 | JSON that is not an object | `wrong_shape` | each_kind_is_skipped_and_counted | no shape check |
 | nested too deep | `too_deep` | each_kind_is_skipped_and_counted | recursion error not caught |
+| nested deeper than `WATCH_MAX_DEPTH` (64) on any Python | `too_deep` | depth_exactly_at_the_limit_parses_and_one_over_is_too_deep, all_bracket_file_of_64_kib_is_too_deep_and_fast | limit of 10**9 (fails on every Python) |
 | 50 valid records | `records` | record_bound_names_records | no record cap |
 | 200 files examined | `files` | files_examined_bound_with_more_bad_files_than_the_bound | no file cap |
 | 1 s monotonic | `time` | time_bound_stops_and_says_so | no deadline |
 | start rotates | cursor | rotation_gives_every_record_a_turn | no cursor |
 | no write/process/network/remove; audit once | - | tick_makes_no_write_process_network_or_remove_call | a recorded forbidden call fails the test |
+
+### Depth limit of untrusted record parses (#1073, repair of #1155 on Python 3.15)
+
+Cause: `read_record_file` answered `too_deep` from `except RecursionError`, which depends on the interpreter. On Python 3.15 `json.loads('[' * N + ']' * N)` parses for N = 1000, 10000, 30000 and 100000 and raises only near N = 1,000,000 (a stack limit, not the recursion limit of 1000), so a 30000-deep file landed in `wrong_shape`. Every parse of a record file the daemon did not write now goes through `parse_bounded` (cloud_worker.py): an iterative one-pass scan (`nesting_too_deep`, brackets in strings and escapes not counted) refuses more than `WATCH_MAX_DEPTH` = 64 levels with `too_deep` before `json.loads`; `except RecursionError` stays as defence in depth.
+
+| Reader | Used by | Test | Mutant |
+|---|---|---|---|
+| `read_record_file` | `live_cloud_by_lane` (the load line) | every_reader_refuses_too_deep_with_its_own_kind | plain `json.loads` at that site |
+| `_read_one` | `read_records_bounded` (`cloud_watch_tick`) | every_reader_refuses_too_deep_with_its_own_kind | plain `json.loads` at that site |
+| `load_record` | `list_records`, status, reaper | every_reader_refuses_too_deep_with_its_own_kind | plain `json.loads` at that site |
+
+All three also have the limit mutant (`WATCH_MAX_DEPTH = 10**9`), which fails on every Python. Hub and decisions files are written by the daemon and are not parsed by these readers. `test_every_untrusted_record_parse_is_bounded_and_listed_in_the_docs` derives the readers from the source and checks this table.
 
 ## The assembler (#1092, slice S1)
 
