@@ -75726,6 +75726,40 @@ class TestSupportRebinding(unittest.TestCase):
                 above = parents.get(id(above))
             return False
 
+        def is_support_import(node):
+            """`name = _support_<module>.name` (or the tuple of them) on a line that ends with the tag: nothing else is exempt, whatever the line ends with."""
+            if not (0 < node.lineno <= len(lines) and lines[node.lineno - 1].rstrip().endswith("# support import")):
+                return False
+            names = lambda e: [x.id for x in (e.elts if isinstance(e, (ast.Tuple, ast.List)) else [e])] if all(isinstance(x, ast.Name) for x in (e.elts if isinstance(e, (ast.Tuple, ast.List)) else [e])) else None
+            values = lambda e: [x for x in (e.elts if isinstance(e, (ast.Tuple, ast.List)) else [e])]
+            if len(node.targets) != 1 or names(node.targets[0]) is None:
+                return False
+            targets, vals = names(node.targets[0]), values(node.value)
+            return len(targets) == len(vals) and all(isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name) and v.value.id.startswith("_support_") and v.attr == t
+                                                     for t, v in zip(targets, vals))
+
+        def enclosing_function(node):
+            above = parents.get(id(node))
+            while above is not None:
+                if isinstance(above, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    return above
+                above = parents.get(id(above))
+            return None
+
+        def declared_global(node, name):
+            function = enclosing_function(node)
+            return function is not None and any(isinstance(n, ast.Global) and name in n.names for n in ast.walk(function))
+
+        def module_scope(node, name):
+            """Does binding `name` here bind the module's name? At the top level of the file, or in a function that declares it global (a class body is its own scope)."""
+            return at_module_level(node) or (declared_global(node, name) and not any(isinstance(a, ast.ClassDef) for a in ancestors(node)))
+
+        def ancestors(node):
+            above = parents.get(id(node))
+            while above is not None:
+                yield above
+                above = parents.get(id(above))
+
         def at_module_level(node):
             above = parents.get(id(node))
             while above is not None:
@@ -75734,7 +75768,7 @@ class TestSupportRebinding(unittest.TestCase):
                 above = parents.get(id(above))
             return True
 
-        found = []
+        found, exempt = [], set()
         def flag(node, what, names):
             for name in names:
                 if (name is None or name in moved) and not paired(node, name):
@@ -75744,8 +75778,11 @@ class TestSupportRebinding(unittest.TestCase):
             line = getattr(node, "lineno", None)
             if skip and line is not None and skip[0] <= line <= skip[1]:
                 continue
-            if line is not None and 0 < line <= len(lines) and lines[line - 1].rstrip().endswith("# support import"):
-                continue   # the explicit imports of the moved names are the tagged lines
+            if id(node) in exempt:
+                continue
+            if isinstance(node, ast.Assign) and is_support_import(node):
+                exempt.update(id(n) for n in ast.walk(node))   # the explicit import of the moved names: only `name = _support_<module>.name` on a tagged line
+                continue
             if isinstance(node, (ast.Global, ast.Nonlocal)):
                 found += [(node.lineno, "global " + n) for n in node.names if n in moved]
             elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
@@ -75756,13 +75793,17 @@ class TestSupportRebinding(unittest.TestCase):
                             flag(node, "module[...] write", [t.slice.value if isinstance(t.slice, ast.Constant) else None])
                         elif isinstance(t, ast.Attribute) and is_module(t.value):
                             flag(node, "module attribute write", [t.attr])
-                        elif isinstance(t, ast.Name) and t.id in moved and at_module_level(node):
-                            found.append((node.lineno, "a binding of the moved name %s in this file" % t.id))
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in moved and at_module_level(node):
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in moved and module_scope(node, node.name):
                 found.append((node.lineno, "a definition of the moved name %s in this file" % node.name))
-            elif isinstance(node, (ast.Import, ast.ImportFrom)) and at_module_level(node):
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = [(a.asname or a.name).split(".")[0] for a in node.names]
-                found += [(node.lineno, "an import of the moved name %s in this file" % n) for n in names if n in moved]
+                found += [(node.lineno, "an import of the moved name %s in this file" % n) for n in names if n in moved and module_scope(node, n)]
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in moved and module_scope(node, node.id):
+                found.append((node.lineno, "a binding of the moved name %s in this file (any Store or Del)" % node.id))   # for, with, except as, tuples, walrus, augmented, annotated
+            elif isinstance(node, ast.ExceptHandler) and node.name in moved and module_scope(node, node.name):
+                found.append((node.lineno, "except ... as %s" % node.name))
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in moved and module_scope(node, node.name):
+                found.append((node.lineno, "a match capture %s" % node.name))
             elif isinstance(node, ast.Call):
                 what = ast.unparse(node.func)
                 if what.endswith(".patch") or what == "patch":   # a string target
@@ -75837,6 +75878,23 @@ class TestSupportRebinding(unittest.TestCase):
         "an import of a moved name at the top level": "from elsewhere import sb\n",
         "__main__ attribute": "import __main__\n\ndef f():\n    __main__.sb = 1\n",
         "a call that takes the module": "def f():\n    helper(sys.modules[__name__])\n",
+        "for": "for sb in range(3):\n    pass\n",
+        "with ... as": "with open('x') as sb:\n    pass\n",
+        "except ... as": "try:\n    pass\nexcept Exception as sb:\n    pass\n",
+        "walrus at the top level": "(sb := 1)\n",
+        "a nested tuple target": "a, (sb, b) = 1, (2, 3)\n",
+        "a starred target": "a, *sb = 1, 2, 3\n",
+        "an augmented assignment": "sb += 1\n",
+        "an annotated assignment of the name": "sb: int = 1\n",
+        "a match capture": "match 1:\n    case sb:\n        pass\n",
+        "an import in a try": "try:\n    from elsewhere import sb\nexcept ImportError:\n    pass\n",
+        "an import-as alias of a moved name": "import elsewhere as sb\n",
+        "a global declaration with a store": "def f():\n    global sb\n    sb = 1\n",
+        "a store in a function that declares the name global": "def f():\n    global sc\n    for sc in range(2):\n        pass\n",
+        "the marker on a non-import line": "sb = 1  # support import\n",
+        "the marker on a module write": "globals()['sb'] = 1  # support import\n",
+        "the marker with another value": "sb = _support_loader.sc  # support import\n",
+        "the marker with a call": "sb = _support_loader.sb()  # support import\n",
         "a paired rebound for another name": "def f():\n    with mock.patch.dict(globals(), {'sb': 1}), rebound('sc', 1):\n        pass\n",
     }
 
@@ -75850,6 +75908,10 @@ class TestSupportRebinding(unittest.TestCase):
             "a name that did not move": "def f():\n    with mock.patch.dict(globals(), {'score_block': 1}):\n        pass\n",
             "patch.object on a name that did not move": "def f():\n    with mock.patch.object(sys.modules[__name__], 'score_block', None):\n        pass\n",
             "an object, not a module": "def f(x):\n    with mock.patch.dict(x, {'sb': 1}):\n        pass\n",
+            "the tagged support import, a tuple of them": "a, b = (_support_x.a, _support_x.b)   # support import\n",
+            "a parameter named like a moved name": "def f(sb):\n    return sb\n",
+            "a for variable inside a function": "def f():\n    for sb in range(2):\n        pass\n",
+            "an except name inside a function": "def f():\n    try:\n        pass\n    except Exception as sb:\n        pass\n",
             "a local variable named like a moved name": "def f():\n    sb = 1\n    return sb\n",
             "a name bound inside a class": "class C:\n    def FakeRunner(self):\n        pass\n",
             "an import of a moved name inside a function": "def f():\n    from elsewhere import sb\n",
