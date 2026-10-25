@@ -153,6 +153,10 @@
               {
                 "name": "FLEET_CLOUD_HUB_DECISIONS",
                 "value": "/var/hub/decisions.json"
+              },
+              {
+                "name": "FLEET_CLOUD_AGENT_NAMESPACE",
+                "value": "cw"
               }
             ],
             "ports": [
