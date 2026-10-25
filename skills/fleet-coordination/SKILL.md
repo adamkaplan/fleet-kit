@@ -47,6 +47,9 @@ The mistakes that cost the most review rounds and the most lost work. Meet them 
 - (e) A cloud builder opens its pull request as a draft at its first push, then updates it: the pod's git token expires after about an hour and a late open fails.
 - (f) A merger pod pushes the merge commit the minute it exists and runs the test classes after it, so a finished merge is never left unpushed when the pod ends.
 - (g) A guard or scan test states its closed rule and its known-limits list in its first version, and fails closed: anything not proven harmless is a site. Reviewers judge the rule and the limits: a spelling inside the stated limits is a Low, a spelling that escapes a rule claimed closed is a High.
+- (h) Any change to `.github/workflows/*` is built by a local job, never a cloud pod: a pod's git token has no workflows permission, so the push is refused and the pod cannot be retired.
+- (i) Compare failure messages, not only test names, between the branch and a clean tree, and keep new strings and comments clear of the added-lines scans (`TestGitShim` in `bin/test-switchboard` and `TestEverySite` in `test_stub_cleanup`): no literal ampersand, `nohup` or spawn text, no git-config variable names, no renamed import to pass a scan.
+- (j) Push the first version by minute 20, run slow suites afterwards in the background with a timeout, and say which git version the tests ran on: the runner's git is 2.55, so tests that depend on git behaviour are verified on a new git.
 
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
 

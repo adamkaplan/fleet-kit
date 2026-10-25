@@ -19659,7 +19659,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
 
 
 class TestBuilderChecklist(unittest.TestCase):
-    """#1283: the coordination skill carries the seven builder checklist items and the brief template names the checklist."""
+    """#1283: the coordination skill carries the ten builder checklist items and the brief template names the checklist."""
     ITEMS = {
         "a": "every input and every outside call of the new code; each row names its test and its run-by-hand mutant",
         "b": "uses the one shared safe reader",
@@ -19668,6 +19668,9 @@ class TestBuilderChecklist(unittest.TestCase):
         "e": "opens its pull request as a draft at its first push",
         "f": "pushes the merge commit the minute it exists",
         "g": "states its closed rule and its known-limits list in its first version",
+        "h": "is built by a local job, never a cloud pod",
+        "i": "Compare failure messages, not only test names",
+        "j": "say which git version the tests ran on",
     }
     BRIEF = "Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line."
 
@@ -19680,9 +19683,9 @@ class TestBuilderChecklist(unittest.TestCase):
             found.append("brief")
         return found
 
-    def test_the_skill_carries_the_seven_items_and_the_brief_sentence(self):
+    def test_the_skill_carries_the_ten_items_and_the_brief_sentence(self):
         self.assertEqual(self.problems(self.text()), [])
-        self.assertEqual(len(self.ITEMS), 7)   # 7 of 7 markers
+        self.assertEqual(len(self.ITEMS), 10)   # 10 of 10 markers
 
     def test_a_mutant_that_removes_each_item_or_the_brief_sentence_fails(self):
         text = self.text()
