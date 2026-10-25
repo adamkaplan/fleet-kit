@@ -8227,6 +8227,63 @@ def pr_body_refs(body):
     return out[:10]
 
 
+CLOSING_WORD_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?[ \t]+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(\d{1,7})(?![0-9])")
+
+
+def closing_keyword_issues(body):
+    """[[repo or None, number]] each issue a pull request body would close on merge: a closing keyword and a number, outside fenced code and inline code, in order, without repeats."""
+    kept, fence = [], None
+    for line in (body if isinstance(body, str) else "").splitlines():
+        mark = re.match(r"[ \t]{0,3}(`{3,}|~{3,})", line)
+        if fence is None and mark:
+            fence = mark.group(1)
+        elif fence is not None:
+            if mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence):
+                fence = None
+        else:
+            kept.append(re.sub(r"`[^`]*`", " ", line))
+    out = []
+    for match in CLOSING_WORD_RE.finditer("\n".join(kept)):
+        ref = [match.group(1), int(match.group(2))]
+        if ref not in out:
+            out.append(ref)
+    return out
+
+
+def closing_warnings(body, repo, is_ask):
+    """One warning line per issue of `body` that is an ask (`is_ask(repo, number)` True). Only text: the caller never blocks on it."""
+    return ["warning: this pull request body would close %s#%d, an ask, on merge: write `Refs #%d` instead (an ask is closed by its owner, not by one scenario's pull request; `Closes` only where the plan says so)"
+            % (found_repo or repo, number, number)
+            for found_repo, number in closing_keyword_issues(body) if is_ask(found_repo or repo, number)]
+
+
+def issue_is_ask(runner, repo, number):
+    """True when the issue has a parent that is not a charter, read with ONE gh call. Any read error or odd answer is False (quiet)."""
+    try:
+        done = runner(["gh", "api", "repos/%s/issues/%d/parent" % (repo, number)], capture_output=True, text=True)
+        if done.returncode != 0:
+            return False
+        data = json.loads(done.stdout)
+        return isinstance(data, dict) and isinstance(data.get("number"), int) and not IssueIntent.from_api(data).charter
+    except Exception:
+        return False
+
+
+def preflight_body_warnings(runner):
+    """The warning lines for the body of this branch's pull request; [] on any read error."""
+    try:
+        done = runner(["gh", "pr", "view", "--json", "body,url"], capture_output=True, text=True)
+        if done.returncode != 0:
+            return []
+        data = json.loads(done.stdout)
+        match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/", str(data.get("url")))
+        if not match:
+            return []
+        return closing_warnings(data.get("body"), match.group(1), lambda repo, number: issue_is_ask(runner, repo, number))
+    except Exception:
+        return []
+
+
 def pr_facts_from(data):
     """The facts the panel shows, from `gh pr view --json` output; NoticeError when it is not one."""
     if not isinstance(data, dict) or not isinstance(data.get("state"), str):
@@ -20551,6 +20608,8 @@ def cmd_preflight_pr(args, runner, now):
         sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
         return EXIT_USAGE
     root = top.stdout.strip()
+    for line in preflight_body_warnings(runner):
+        print(line)   # advisory: never changes the exit status
     changed = preflight_changed(runner, root)
     failed = 0
     with tempfile.TemporaryDirectory(prefix="preflight-") as work:

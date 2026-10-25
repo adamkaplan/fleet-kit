@@ -84793,6 +84793,93 @@ class TestDeployFromMainSentence(unittest.TestCase):
         self.assertEqual(text.count(self.SENTENCE), 1)
 
 
+class TestClosingKeywordWarning(unittest.TestCase):
+    """#1197: `preflight-pr` warns, never blocks, when the body closes an ask. The REAL `cmd_preflight_pr` runs with a faked runner.
+    CLOSED rule (guard): the warning path makes only reads: every `gh` call it builds is `gh pr view` or `gh api` (no write verb).
+    Known limits: a work item with a live check and no parent is not an ask here; a keyword in a quote or comment counts; the set of reads is read from the syntax tree of the two helpers only."""
+    URL = "https://github.com/o/r/pull/9"
+
+    def run_body(self, body, asks=(), unreadable=False):
+        def runner(argv, **kwargs):
+            done = mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[:2] == ["git", "rev-parse"]:
+                done.stdout = "/work/repo\n"
+            elif argv[:3] == ["gh", "pr", "view"]:
+                if unreadable:
+                    done.returncode = 1
+                else:
+                    done.stdout = json.dumps({"body": body, "url": self.URL})
+            elif argv[:2] == ["gh", "api"]:
+                number = int(argv[2].split("/")[4])
+                if number in asks:
+                    done.stdout = json.dumps({"number": 34, "body": "an ordinary parent"})
+                elif number == 700:   # parent is a charter
+                    done.stdout = json.dumps({"number": 612, "body": "```yaml\norchestrator: x\n```"})
+                else:
+                    done.returncode = 1
+            return done
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), mock.patch.object(sb, "preflight_load", lambda: (0.0, 4)):
+            code = sb.cmd_preflight_pr(None, runner, time.time)
+        return code, [l for l in out.getvalue().splitlines() if l.startswith("warning:")]
+
+    def test_closes_an_ask_is_warned_once_and_the_exit_is_unchanged(self):
+        code, warned = self.run_body("Closes #5", asks=(5,))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(warned), 1)
+        self.assertIn("o/r#5", warned[0])
+        self.assertIn("Refs #5", warned[0])
+
+    def test_refs_an_ask_is_silent(self):
+        self.assertEqual(self.run_body("Refs #5", asks=(5,)), (0, []))
+
+    def test_a_closing_keyword_for_a_plain_work_item_or_under_a_charter_is_silent(self):
+        self.assertEqual(self.run_body("Closes #6", asks=(5,)), (0, []))
+        self.assertEqual(self.run_body("Fixes #700", asks=(5,)), (0, []))
+
+    def test_several_keywords_in_one_body(self):
+        code, warned = self.run_body("Closes #5\nfixes #6\nResolves #7 and Closes #5\nResolves o/x#8", asks=(5, 7, 8))
+        self.assertEqual(code, 0)
+        self.assertEqual([("#5" in w, "#7" in w, "#8" in w) for w in warned], [(True, False, False), (False, True, False), (False, False, True)])
+
+    def test_a_keyword_inside_code_is_silent(self):
+        body = "```\nCloses #5\n```\nand `Fixes #5` here\n~~~sh\nResolves #5\n~~~"
+        self.assertEqual(self.run_body(body, asks=(5,)), (0, []))
+
+    def test_an_unreadable_body_is_silent(self):
+        self.assertEqual(self.run_body("Closes #5", asks=(5,), unreadable=True), (0, []))
+
+    def test_mutant_that_never_warns_fails_the_warned_case(self):
+        with mock.patch.object(sb, "closing_warnings", lambda body, repo, is_ask: []):
+            with self.assertRaises(AssertionError):
+                self.test_closes_an_ask_is_warned_once_and_the_exit_is_unchanged()
+
+    def test_mutant_that_warns_on_refs_fails_the_silent_case(self):
+        real = sb.closing_keyword_issues
+        with mock.patch.object(sb, "closing_keyword_issues", lambda body: real(str(body).replace("Refs", "Closes"))):
+            with self.assertRaises(AssertionError):
+                self.test_refs_an_ask_is_silent()
+
+    def test_the_warning_path_only_reads(self):
+        tree = ast.parse(switchboard_source())
+        seen = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in ("issue_is_ask", "preflight_body_warnings"):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.List) and sub.elts and isinstance(sub.elts[0], ast.Constant) and sub.elts[0].value == "gh":
+                        seen.append(tuple(e.value for e in sub.elts[1:3] if isinstance(e, ast.Constant)))
+        self.assertEqual(sorted(seen), [("api",), ("pr", "view")])
+
+    def test_the_rule_is_in_the_texts_and_the_docs(self):
+        for rel in ("skills/fleet-coordination/SKILL.md", "agents/opencode/coder.md", "agents/copilot/coder.agent.md"):
+            text = (REPO / rel).read_text()
+            self.assertIn("Refs #N", text, rel)
+            self.assertIn("never `Closes`", text, rel)
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("`Refs #N`, never `Closes`", docs)
+        self.assertIn("The warning never blocks", docs)
+
+
 class TestPreflightPr(unittest.TestCase):
     """`preflight-pr` (#716): one PASS or FAIL line per CI-critical class, run under `heavy`; the runner is faked, nothing real runs."""
     SENTENCE = "`fleet-switchboard preflight-pr` runs the CI-critical focused classes"
@@ -84894,8 +84981,7 @@ class TestPreflightPr(unittest.TestCase):
     def test_s4_it_only_runs_git_reads_and_heavy_tests_and_leaves_no_scratch(self):
         _, _, calls = self.run_preflight(["cloud/x"])
         for argv, kwargs in calls:
-            self.assertTrue(argv[0] == "git" and argv[1] in ("rev-parse", "merge-base", "diff") or "heavy" in argv, argv)
-            self.assertNotIn("gh", argv[0])
+            self.assertTrue(argv[0] == "git" and argv[1] in ("rev-parse", "merge-base", "diff") or "heavy" in argv or argv[:3] == ["gh", "pr", "view"] or argv[:2] == ["gh", "api"], argv)   # #1197: the two gh READS of the body warning
         scratch = {os.path.dirname(c[1]["env"]["TMPDIR"]) for c in calls if "TMPDIR" in c[1].get("env", {}) and "cloud" in " ".join(c[0])}
         self.assertTrue(scratch and not any(os.path.exists(d) for d in scratch))
 

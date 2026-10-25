@@ -34,6 +34,8 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+A pull request for an ask, or for a work item with a live check, says `Refs #N`, never `Closes`, `Fixes` or `Resolves`; `Closes #N` only where the plan says so.
+
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
 
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
