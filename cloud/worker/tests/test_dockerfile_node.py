@@ -72,10 +72,10 @@ def xz_problems(t):
     """Every .tar.xz unpack needs xz-utils in an apt install list earlier in the file."""
     out = []
     flat = t.replace("\\\n", " ")
-    for m in re.finditer(r"\btar\b[^\n&;|]*?(?:\s-\w*J\w*|\s--xz\b|\.tar\.xz)", flat):
+    for m in re.finditer(r"\btar\b[^\n\x26;|]*?(?:\s-\w*J\w*|\s--xz\b|\.tar\.xz)", flat):
         before = flat[:m.start()]
         ok = any(re.search(r"\bxz-utils\b", a)
-                 for a in re.findall(r"apt-get install[^&;|]*", before))
+                 for a in re.findall(r"apt-get install[^\x26;|]*", before))
         if not ok:
             out.append("xz unpack without earlier xz-utils")
     if not re.search(r"\btar\b[^\n]*(?:\s-\w*J|--xz)", flat):
