@@ -165,6 +165,11 @@
         "bin/cloud_worker.py",
         "bin/cloud_channel.py",
         "bin/cloud_channel_server.py",
+        "bin/cloud_relay_daemon.py",
+        "bin/cloud_hub.py",
+        "bin/cloud_relay.py",
+        "cloud/worker/bin/cloud_relay.py",
+        "bin/cloud_cli.py",
         "bin/external_adapter.py",
         "bin/delegated_clear.py",
         "bin/impact_hold.py",
@@ -211,6 +216,11 @@
           "bin/cloud_worker.py",
           "bin/cloud_channel.py",
           "bin/cloud_channel_server.py",
+          "bin/cloud_relay_daemon.py",
+          "bin/cloud_hub.py",
+          "bin/cloud_relay.py",
+          "cloud/worker/bin/cloud_relay.py",
+          "bin/cloud_cli.py",
           "bin/external_adapter.py",
           "bin/delegated_clear.py",
           "bin/impact_hold.py",
@@ -282,6 +292,7 @@
       ],
       "exempt": {
         "bin/agent_calls.py": "release_notice gives back a once-an-hour message claim for an account's budget notice. Trace: its only caller is the budget notice command in bin/fleet-switchboard, which calls it after claim_notice when the reminder could not be added; it truncates a rate-limit file in the state directory and returns nothing, so no role, tier, identity, verdict or clear is produced or read.",
+        "bin/plan_approval.py": "`evaluate` returns the verdict and the one stderr line of a refused approval. Trace: its only caller is `check_approval` in bin/fleet-switchboard (the send command), which prints the line and records an approval only after a GET-only read of the plan comment; the module is pure, reads and writes nothing, and returns no role, tier, identity or clear, and nothing in bin/ reads its result as one. Exemption reason: refusal-only; no clear or hold depends on plan.approved; list it as an authority module if a clear ever depends on plan.approved.",
         "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry. Trace: used only inside bin/spotlight_guard.py (the Spotlight index check of ask #438); the module returns no role, tier, identity, verdict or clear, and nothing in bin/ reads its result as one.",
         "bin/triage_digest.py": "gate is a rate limit on the stale digest (warm-up and interval). Trace: its only caller is the triage digest in bin/fleet-switchboard, where `allowed` decides whether a digest message is SENT now; no role, tier, verdict or clear is produced or read.",
         "bin/triage_plan_open.py": "merged_links reads which links a merged unit names. Trace: its callers are the triage's plan-open check in bin/fleet-switchboard, which only lists findings for people to read; nothing it returns reaches answer_authority, a caller check, a verdict or a clear."
@@ -374,6 +385,7 @@
         "bin/pr_events.py",
         "bin/queue_ejections.py",
         "bin/reassign.py",
+        "bin/red_ci.py",
         "bin/reds.py",
         "bin/registry.py",
         "bin/report_fold.py",
@@ -390,6 +402,9 @@
           "validate"
         ],
         "bin/ci_runs.py": [
+          "*"
+        ],
+        "bin/red_ci.py": [
           "*"
         ],
         "bin/cpu_guard.py": [
@@ -545,6 +560,7 @@
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
+        "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
         "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
@@ -552,6 +568,7 @@
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
+        "bin/plan_approval.py": "loaded only by `check_approval`, the send command's approval check (#951), which the clear never calls",
         "bin/pr_reading.py": "loaded only by `cmd_merge_gate`: the merge gate command, not the clear",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",

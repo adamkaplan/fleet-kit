@@ -1,0 +1,241 @@
+# The cloud hub (ask #1161): Deployment, two Services (cloud-hub, and the headless cw-agents) and two Secrets (registry, and an empty password Secret), all in the workers namespace, nothing cluster-wide.
+# Every object carries app.kubernetes.io/part-of=cloud-hub. First install: kubectl create -f (never apply: applying the whole file again resets the registry Secret to empty objects and deregisters every live agent). Change a running hub with kubectl set image / patch.
+# Rollback that keeps the Secrets: kubectl -n cw delete deployment,service -l app.kubernetes.io/part-of=cloud-hub (adding "secret" to that list also deletes the registry and the per-agent passwords).
+# The network boundary of the hub (which pods may reach it, which hosts it may reach) is enforced by the namespace's network policies, which are written in a separate manifest file under ask #1256 (cloud/k8s/cloud-hub-network.yaml); until that file is merged the policies exist only as applied in the cluster.
+# Start path: the worker Dockerfile (cloud/worker/Dockerfile) copies cloud_hub.py to /usr/local/bin, so the command is python3 /usr/local/bin/cloud_hub.py.
+# The pw Secret is mounted at /etc/hub/pw, nested under the /etc/hub Secret mount: this works on the cluster's runtime (the live hub uses it); if a runtime refuses it use /etc/hub-pw.
+# IMAGE_DIGEST is a placeholder: the operator replaces it with the settings' CW_CLOUD_IMAGE (name@sha256:...). No real digest is held here.
+# (JSON is valid YAML: the file is written as JSON documents so the offline test needs no YAML library.)
+---
+{
+  "apiVersion": "v1",
+  "kind": "Secret",
+  "metadata": {
+    "name": "cloud-hub-registry",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "type": "Opaque",
+  "stringData": {
+    "secrets.json": "{}",
+    "agents.json": "{}"
+  }
+}
+---
+{
+  "apiVersion": "v1",
+  "kind": "Secret",
+  "metadata": {
+    "name": "cloud-hub-pw",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "type": "Opaque",
+  "stringData": {}
+}
+---
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "cloud-hub",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "spec": {
+    "type": "ClusterIP",
+    "selector": {
+      "app": "cloud-hub"
+    },
+    "ports": [
+      {
+        "name": "http",
+        "port": 8443,
+        "targetPort": 8443
+      }
+    ]
+  }
+}
+---
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "cw-agents",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "spec": {
+    "clusterIP": "None",
+    "publishNotReadyAddresses": true,
+    "selector": {
+      "app": "cw-worker"
+    },
+    "ports": [
+      {
+        "name": "agent",
+        "port": 4096,
+        "targetPort": 4096,
+        "protocol": "TCP"
+      }
+    ]
+  }
+}
+---
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "cloud-hub",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "spec": {
+    "replicas": 1,
+    "selector": {
+      "matchLabels": {
+        "app": "cloud-hub"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "cloud-hub",
+          "app.kubernetes.io/part-of": "cloud-hub"
+        }
+      },
+      "spec": {
+        "automountServiceAccountToken": false,
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 1000,
+          "fsGroup": 1000,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "imagePullSecrets": [
+          {
+            "name": "cw-pull"
+          }
+        ],
+        "containers": [
+          {
+            "name": "hub",
+            "image": "IMAGE_DIGEST",
+            "command": [
+              "python3",
+              "/usr/local/bin/cloud_hub.py"
+            ],
+            "env": [
+              {
+                "name": "FLEET_CLOUD_CHANNEL_LISTEN",
+                "value": "0.0.0.0:8443"
+              },
+              {
+                "name": "FLEET_CLOUD_HUB_AGENTS",
+                "value": "/etc/hub/agents.json"
+              },
+              {
+                "name": "FLEET_CLOUD_HUB_SECRETS",
+                "value": "/etc/hub/secrets.json"
+              },
+              {
+                "name": "FLEET_CLOUD_HUB_DECISIONS",
+                "value": "/var/hub/decisions.json"
+              },
+              {
+                "name": "FLEET_CLOUD_AGENT_NAMESPACE",
+                "value": "cw"
+              }
+            ],
+            "ports": [
+              {
+                "containerPort": 8443
+              }
+            ],
+            "readinessProbe": {
+              "tcpSocket": {
+                "port": 8443
+              },
+              "periodSeconds": 10
+            },
+            "resources": {
+              "requests": {
+                "cpu": "100m",
+                "memory": "128Mi"
+              },
+              "limits": {
+                "cpu": "500m",
+                "memory": "256Mi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "registry",
+                "mountPath": "/etc/hub",
+                "readOnly": true
+              },
+              {
+                "name": "pw",
+                "mountPath": "/etc/hub/pw",
+                "readOnly": true
+              },
+              {
+                "name": "state",
+                "mountPath": "/var/hub"
+              },
+              {
+                "name": "tmp",
+                "mountPath": "/tmp"
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "registry",
+            "secret": {
+              "secretName": "cloud-hub-registry",
+              "defaultMode": 288
+            }
+          },
+          {
+            "name": "pw",
+            "secret": {
+              "secretName": "cloud-hub-pw",
+              "defaultMode": 288
+            }
+          },
+          {
+            "name": "state",
+            "emptyDir": {}
+          },
+          {
+            "name": "tmp",
+            "emptyDir": {}
+          }
+        ]
+      }
+    }
+  }
+}

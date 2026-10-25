@@ -24,12 +24,16 @@ rebuilt from another record.
 | `bin/fleet-switchboard:4331` | `boss-overrides.json` | per worker: the boss a reassign set, bound to one session | `reassign` (bin/reassign.py, under a lock) | discovery overlay (`Engine.discover`, headless records), `reattach_caller_problem` | primary (clear machinery) |
 | `bin/reassign.py:4` | `boss-overrides.json` | the same file: reads and writes the overrides | `run_reassign` | `overlay` | primary (clear machinery) |
 | `bin/fleet-switchboard:3382` | `boss-resolution` | no file: `resolve_boss` and `boss_name` map `reports_to` (or the role alias) to a registered agent from the discovery | nobody | sends, reports, decisions, reattach, pane pass, `steers_into_turn` | derived from discovery (clear machinery) |
+| `bin/switchboard/decisions_a.py:209` | `boss-resolution` | the decisions list resolves each worker's boss through `resolve_boss` | nobody | the Decisions list (`decisions_from_reports`) | derived (reader) |
+| `bin/switchboard/decisions_b.py:459` | `boss-resolution` | the external-decision host resolves a decision's boss through `boss_name` | nobody | external decision sync | derived (reader) |
 | `bin/impact_hold.py:426` | `boss-resolution` | the impact hold resolves a boss through `boss_name`/`resolve_boss` | nobody | impact hold routing | derived |
 | `bin/lanes.py:197` | `boss-resolution` | the lane rule resolves a boss | nobody | lane resolution | derived |
 | `bin/reassign.py:237` | `boss-resolution` | `reassign` resolves the current boss for consent | nobody | `reassign` | derived |
 | `bin/fleet-switchboard:2385` | `discovery.agents` | the agents of the newest `discover()`: name, session, pane, role, charter, repo, workspace, cwd, reports_to | `Engine.discover` (each pass and on demand) | the whole daemon: fact routing, status, pane pass, decisions, chiefs lookup, badges, toasts | primary (the live list), derived from herdr and the v2 service |
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
 | `bin/switchboard/judge.py:53` | `discovery.agents` | the judge's own sessions: the session ids of the discovered agents | nobody | the policy judge's socket | derived (reader) |
+| `bin/switchboard/decisions_a.py:209` | `discovery.agents` | the decisions list reads the discovered agents to find each worker's boss | nobody | the Decisions list | derived (reader) |
+| `bin/switchboard/decisions_b.py:457` | `discovery.agents` | the external-decision host reads the newest discovery | nobody | external decision sync | derived (reader) |
 | `bin/impact_hold.py:401` | `discovery.agents` | looks up the orchestrator of a block | nobody | impact hold | derived (reader) |
 | `bin/lanes.py:55` | `discovery.agents` | looks up lanes by agent | nobody | lane resolution | derived (reader) |
 | `bin/queue_ejections.py:365` | `discovery.agents` | routes an ejection to an owner | nobody | `route_of` | derived (reader) |
@@ -44,6 +48,24 @@ rebuilt from another record.
 | `bin/fleet-switchboard:4239` | `decisions.json` | open decisions, notices, held PRs, each naming agents (boss and worker) | the daemon (`DecisionStore`, atomic, when the list changed) | `decisions` command, sidebar, `fleet_health`, `status` | derived |
 | `bin/decision_core.py:1032` | `decisions.json` | comment only: names the file as the local store | nobody | nobody | derived |
 | `bin/switchboard/judge_request.py:433` | `decisions.json` | reads the open decisions to give the judge the ask's context | nobody (reader only) | the policy judge's request | derived (reader) |
+| `bin/switchboard/decisions_a.py:274` | `decisions.json` | comment only: the decisions list never rewrites the projection by itself | nobody | nobody | derived |
+| `bin/switchboard/decisions_b.py:281` | `decisions.json` | comment only: names the projection among what the store keeps | nobody | nobody | derived |
+| `bin/switchboard/plan_review.py:544` | `boss-resolution` | plan review escalates to the planner's boss through `boss_name`, then `resolve_boss` | nobody | plan review escalation | derived (reader) |
+| `bin/switchboard/plan_review.py:542` | `discovery.agents` | plan review reads the newest discovery to find the planner's boss | nobody | plan review escalation | derived (reader) |
+| `bin/switchboard/reminders.py:346` | `boss-resolution` | a reminder's recipient is resolved through `resolve_boss` | nobody | reminder delivery | derived (reader) |
+| `bin/switchboard/reminders.py:176` | `discovery.agents` | a reminder condition reads the discovered agents (recipient and sender) | nobody | reminder delivery | derived (reader) |
+| `bin/switchboard/reminders.py:143` | `last-reports.json` | a reminder's "no report since" condition reads the sender's last report time | nobody | reminder delivery | primary |
+| `bin/switchboard/decision.py:86` | `boss-resolution` | the delivery decision compares a send's sender with the observation's boss through `boss_name` | nobody | the delivery decision | derived (reader) |
+| `bin/switchboard/facts.py:120` | `discovery.agents` | a fact source reads the discovered agents to find the chiefs of staff | nobody | fact sources | derived (reader) |
+| `bin/switchboard/v2_transport.py:24` | `pane-health.json` | comment only: the heartbeat-health bound is named for the derived file; nothing reads its time here | nobody | nobody | derived |
+| `bin/switchboard/agents_verify.py:155` | `discovery.agents` | `agents verify` reads the discovered agents to compare each with its registration | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/alert_labels.py:83` | `discovery.agents` | the alert-label wake finds a repository's orchestrators among the discovered agents | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/answer_delivery.py:592` | `decisions.json` | comment only: the delivery paths wait for the daemon's next write of the projection | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:587` | `boss-resolution` | the stop triage resolves a worker's boss by its registered name (`boss_name`) | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:325` | `decisions.json` | the handoff reads the decisions file for the open decisions of a worker | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:102` | `discovery.agents` | the handoff reads the discovered agents to find the named worker | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:642` | `last-reports.json` | comment only: the brief reads the last-reports record `report` wrote | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/triage.py:358` | `discovery.agents` | a triage rule reads the discovered agents to find the orchestrators | nobody | the moved code's own reader | derived (reader) |
 | `bin/fleet_health.py:298` | `decisions.json` | reads the held PR and waiting decisions per orchestrator | nobody (reader only) | load figures | derived (reader) |
 | `plugins/fleet-decisions-tui/decisions.mjs:9` | `decisions.json` | reads the list for the sidebar | nobody (reader only) | Decisions section | derived (reader) |
 | `bin/decisions_pull.py:28` | `decisions.json` | reads the cloud daemon's list from a configured source command and rewrites the local file (cleaned, atomic, mode 0600); ages its mtime when the source is down | the Mac-side pull (`write_atomic`, `mark_stale`) | the Decisions plugin (`decisions.mjs`) | derived |
@@ -146,3 +168,11 @@ Status: FROZEN 2026-10-20, v1.1 additive (2026-10-20) (the product, chief-of-sta
 - **Liveness rule.** A row with no pane is never read as dead for that reason. Reconcile on read removes it only on a whole read, audited, when the endpoint's bounded check answers `dead`; `unknown`, unreachable, failed and partial reads remove nothing. The default check answers `unknown`.
 - **Route rule.** `registry.route_for` answers the agent's pane when it has one, else its registry `endpoint`, else none. The send path uses it (#1131): an agent with a pane is routed as before; one with no pane and an endpoint is sent to that endpoint through the cloud channel client (`bin/cloud_client.py`), with the same sender identity and the same held-while-blocked rule; an unknown agent sends nothing and says why. The endpoint must be `https`, or `http` only for an in-cluster service host (`.svc`, `.svc.cluster.local` or a single label), and a redirect from it is refused, never followed. A text over 16 KiB is refused with a named reason. On a half read the send falls through to the old pane path unless the recipient's row is known to be an endpoint row, and is refused only when the old path also finds nothing.
 - **One tuple.** `registry.ROW_FIELDS` is the one tuple; discovery, the pane pass's change test and the retirement record derive from it (`EXEMPT` names each exception); a completeness test pins it.
+
+## A row with no pane to judge
+
+One predicate, `registry.no_pane_to_judge(row)`, says a row has no pane to judge: its kind is `cloud` or `orchestrator`, or it holds an endpoint and no pane. Every supervising reader asks it before it reads "no pane" as anything: the daemon's pane pass and its missing count, the pane alerts, the dead hint of `status`, `reattach --all-detached`, the heartbeat's wake targets and the reconcile on read. A test derived from the code fails on any function that reads the dead verdict or the missing count without it.
+
+Such a row is **alive** or **unknown**, never dead. The liveness check (`bin/endpoint_liveness.py`) is ON DEMAND (the doctor's charters check; the daemon pass never calls it). It needs a cloud record (`state/cloud/NAME.json`; none: `unknown`, and a local agent of the same name never makes a cloud row alive) and makes one bounded request through it, `fleet-switchboard read NAME --cloud-only` (tunnel and the pod's own password, handled inside that read, never here); it does not read the row's endpoint value. It answers `alive` with the time, or `unknown` for a failed, slow, refused or partial answer, and `unknown` removes nothing. One time limit (`LIVENESS_SECONDS`) bounds the request and the wait.
+
+A charter's `pane:` line may read `cloud:<agent name>`. `fleet-doctor` reports such a charter live when the row's endpoint answers and unknown when it does not, never as a dead pane. A local agent with a pane is judged as before.
