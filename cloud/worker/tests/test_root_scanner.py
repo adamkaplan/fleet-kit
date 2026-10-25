@@ -4,6 +4,7 @@
 The scanner needs only the SEQUENCE framing (0x30 0x82 <len> 0x30 ...), so the certificate here is a
 hand-made 400-byte blob with that framing, not a real certificate. No real fingerprint is used."""
 import base64
+import contextlib
 import hashlib
 import os
 import random
@@ -40,7 +41,18 @@ CHILD = (
     "except SystemExit as e:\n"
     "    code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)\n"
     "sys.stdout.flush()\n"
-    "sys.stderr.write('\\nPEAK %d\\n' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)\n"
+    "peak = None\n"
+    "kind = 'hwm'\n"
+    "try:\n"
+    "    for ln in open('/proc/self/status'):\n"
+    "        if ln.startswith('VmHWM:'):\n"
+    "            peak = int(ln.split()[1])\n"
+    "except OSError:\n"
+    "    pass\n"
+    "if peak is None:\n"
+    "    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+    "    kind = 'rss'\n"
+    "sys.stderr.write('\\nPEAK %d %s\\n' % (peak, kind))\n"
     "sys.stderr.flush()\n"
     "os._exit(code)\n"
 )
@@ -51,6 +63,21 @@ def kib(value, platform=sys.platform):
     return value // 1024 if platform == "darwin" else value
 
 
+BIG_PARENT_MIB = 250
+
+
+@contextlib.contextmanager
+def big_parent(mib=BIG_PARENT_MIB):
+    """Make this (parent) process big: a touched bytearray kept alive, so a child that
+    inherits the parent's peak RSS across exec (Linux ru_maxrss) would read it."""
+    block = bytearray(mib * 1024 * 1024)
+    block[::4096] = b"a" * len(block[::4096])
+    try:
+        yield block
+    finally:
+        del block
+
+
 def own_peak(scanner, args, lst):
     """Run the scanner (None: a baseline interpreter) in a child; return (exit code, own peak in KiB)."""
     env = dict(os.environ)
@@ -58,7 +85,8 @@ def own_peak(scanner, args, lst):
     p = subprocess.run([sys.executable, "-c", CHILD, scanner or "-"] + args, env=env, capture_output=True, text=True)
     last = [ln for ln in p.stderr.splitlines() if ln.strip()][-1]
     assert last.startswith("PEAK "), p.stderr
-    return p.returncode, kib(int(last.split()[1]))
+    value, kind = int(last.split()[1]), last.split()[2]
+    return p.returncode, (kib(value) if kind == "rss" else value)
 
 
 def run(args, lst=None, scanner=SCANNER, env_unset=False):
@@ -195,8 +223,9 @@ class Scanner(unittest.TestCase):
         return p
 
     def delta_kib(self, scanner, p, label):
-        rc, own = own_peak(scanner, [p], self.list)
-        _, base = own_peak(None, [p], self.list)
+        with big_parent():
+            rc, own = own_peak(scanner, [p], self.list)
+            _, base = own_peak(None, [p], self.list)
         delta = own - base
         print("PEAK %s: own=%d KiB baseline=%d KiB delta=%d KiB" % (label, own, base, delta))
         return rc, delta
@@ -204,6 +233,12 @@ class Scanner(unittest.TestCase):
     def test_kib_normalises_units(self):
         self.assertEqual(kib(52346880, "darwin"), 51120)
         self.assertEqual(kib(51120, "linux"), 51120)
+
+    def test_peak_not_inflated_by_big_parent(self):
+        with big_parent():
+            _, base = own_peak(None, [], self.list)
+        print("PEAK baseline under a %d MiB parent: %d KiB" % (BIG_PARENT_MIB, base))
+        self.assertLess(base, 100 * 1024)
 
     def test_large_sparse_file_bounded_memory(self):
         rc, delta = self.delta_kib(SCANNER, self.sparse(), "real")
