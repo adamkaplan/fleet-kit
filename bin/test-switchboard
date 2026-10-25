@@ -92650,7 +92650,7 @@ class TestArchTools(unittest.TestCase):
         self.assertEqual(same.returncode, 0, same.stdout)
 
 
-class ReviewCommentLineTests(unittest.TestCase):
+class ReviewCommentLineTests(Base):
     HEAD = "3f2a9c1b7d4e" + "0" * 28
 
     def handle(self, body, cid=9001, state="open", author="alice", who="bob", action="created", merged=False, issue=True):
@@ -92741,16 +92741,32 @@ class ReviewCommentLineTests(unittest.TestCase):
         self.assertEqual([i.key for i in items], ["github.comment:5"])
 
 
-class ReviewCommentEndToEndTests(unittest.TestCase):
+class ReviewCommentIsolationTests(unittest.TestCase):
+    """Regression (#1287): the review classes must leave os.environ and the patched names as they found them."""
+
+    def test_the_review_classes_leave_the_environment_and_globals_unchanged(self):
+        names = ("memory_sleep", "LAB_ENV")
+        env, glob = dict(os.environ), {n: getattr(sb, n) for n in names}
+        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(c)
+                                   for c in (ReviewCommentLineTests, ReviewCommentEndToEndTests))
+        result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(dict(os.environ), env)
+        self.assertEqual({n: getattr(sb, n) for n in names}, glob)
+
+
+class ReviewCommentEndToEndTests(Base):
     """Webhook payload / catch-up read -> the real hub routing -> the queue, on the fake GitHub and a real registry-shaped fleet."""
     HEAD = "3f2a9c1b7d4e" + "0" * 28
     OK = "Review of %s: CHANGES REQUESTED\nsecret sentence" % HEAD
 
     def setUp(self):
+        super().setUp()
         self.rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1}, "w1": {"reports_to": "platform"}},
                              config={"sweep": False, "triage": False})
         self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
         self.world.clock.t += 7200
+        self.hub.tick()   # start the forwarder: a webhook sent before it exists is lost
         self.hub.config["gh_users"] = {"other/repo": "shared"}   # the account the daemon acts as (a key for another repo: the fake gh has no auth)
         self.gh.issue(12, parent=1)
         self.gh.pull(20, closes=[12])
@@ -92819,7 +92835,9 @@ class ReviewCommentEndToEndTests(unittest.TestCase):
         return sum(1 for line in path.read_text().splitlines() if name in line) if path.exists() else 0
 
     def test_catch_up_only_delivers_once(self):
+        self.rig.pump(60)   # the first catch-up of a fresh state only sets the read marker: the comment must come after it
         self.post(20, self.OK, 7010, forward=False)
+        self.gh.kill_forwarder()   # the hub restarts the forwarder and catches up what it missed
         self.assertEqual(self.after(), ["github.reviewcomment:7010"])
 
     def test_catch_up_unknown_pr_state_delivers_and_closed_pr_drops(self):
