@@ -64,7 +64,7 @@ class Base(unittest.TestCase):
         self.out = os.path.join(self.t, "out")
         # macOS has no GNU timeout: a small stand-in at the front of PATH ('timeout [-k N] SECONDS cmd args' runs cmd args).
         # CW_TEST_FAKE_TIMEOUT=1 forces the stand-in even where GNU timeout exists.
-        self.fake_timeout = bool(os.environ.get("CW_TEST_FAKE_TIMEOUT")) or shutil.which("timeout") is None
+        self.fake_timeout = bool(os.environ.get("CW_TEST_FAKE_TIMEOUT")) or shutil.which("timeout", path="/usr/bin:/bin") is None
         if self.fake_timeout:
             fake = os.path.join(self.bin, "timeout")
             open(fake, "w").write('#!/bin/sh\nif [ "$1" = -k ]; then shift 2; fi\nshift\nexec "$@"\n')
@@ -412,7 +412,7 @@ class Grammar(Base):
         self.cfg = os.path.join(self.work, ".git", "config")
         self.plain = open(self.cfg).read()
         self.base_head = sh("git", "-C", self.work, "rev-parse", "HEAD")
-        self.fake_git('echo "$@" >> %s\n{ echo "ARGS $@"; env | sort; echo "HOMEFILES $(ls -A "$HOME" | wc -l)"; echo; } >> %s\nexec REAL "$@"\n'
+        self.fake_git('echo "$@" >> %s\n{ echo "ARGS $@"; env | sort; echo "HOMEFILES $(ls -A "$HOME" | wc -l | tr -d " ")"; echo; } >> %s\nexec REAL "$@"\n'
                       % (self.calls, self.envlog))
 
     def fill(self, v):
@@ -943,14 +943,15 @@ class LaunchSequence(Base):
             with self.subTest(depth=depth):
                 d = tempfile.mkdtemp(dir=self.t)
                 work = os.path.join(d, "repo")
+                branch = "cw/task-%s" % ("shallow" if depth else "full")   # one branch per subtest: the second push to a shared name is rejected (non-fast-forward) when the two commits differ
                 sh("git", "clone", "-q", *depth, "file://" + self.origin, work)
-                sh("git", "-C", work, "checkout", "-q", "-b", "cw/task")
+                sh("git", "-C", work, "checkout", "-q", "-b", branch)
                 sh("git", "-C", work, "config", "user.name", "worker")
                 sh("git", "-C", work, "config", "user.email", "worker@users.noreply.github.com")
                 open(os.path.join(work, "n.txt"), "w").write("n")
                 sh("git", "-C", work, "add", "n.txt")
                 sh("git", "-C", work, "commit", "-qm", "c")
-                sh("git", "-C", work, "push", "-q", "-u", "origin", "cw/task")
+                sh("git", "-C", work, "push", "-q", "-u", "origin", branch)
                 keys = sh("git", "-C", work, "config", "--local", "--list", "--name-only").split()
                 print("keys of a normal clone (%s): %s" % (depth or "full", sorted(set(keys))))
                 sh("git", "-C", work, "remote", "set-url", "origin", URL)   # the pod's clone names the repository's address
