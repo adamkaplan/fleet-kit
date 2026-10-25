@@ -379,6 +379,10 @@ read the diff). An image by tag is accepted by design: the operator picks the im
 Details: `docs/cloud-worker-interface.md`. The live runs are in
 "Live proof" below.
 
+## A stack-only model credential
+
+The pod holds only the coder's model entry (`model-auth`); the containers a stack starts hold none, and giving them `model-auth` would put the coder's key into the stack. With `launch --cloud --stack` and the setting `CW_STACK_MODEL_SECRET` (a vault secret name), the switchboard reads that secret before any pod exists and hands it over as the per-run secret `stack-model-key`; the entrypoint copies it to `/run/cw-tmp/stack/model-key` (0600). `cw-stack-up` (use it instead of `docker compose`) gives the compose child the variable `CW_STACK_MODEL_KEY`; a service lists `CW_STACK_MODEL_KEY` under `environment:`. `cw-stack-up down` removes the copy. The audit and run record carry the name and `delivered`. The coder can read this credential (same user, docker group); the protection is purpose-scoping, a spend cap and revocation at the provider. Owner steps: `docs/cloud-operator-quickstart.md`, "A stack-only model credential".
+
 ## Pulling prebuilt stack images (ask #1022)
 
 **The cause.** A worker pod sets `automountServiceAccountToken: false` and the guard refuses any pod with a service-account token, so no cloud identity works in a pod today: the label `azure.workload.identity/use` has nothing to exchange. (Whether the cluster's webhook injects a token for the default account is read live by the tester in the live slice; this text changes if it does.) A stack therefore built its images inside the pod, and peaked at 95 percent of its memory limit.
