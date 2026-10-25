@@ -15483,10 +15483,8 @@ class TestConflictCarry(unittest.TestCase):
         listed = set(matrix["owner_hold"]["delegated_clear"]["clear_code_paths"]) if "owner_hold" in matrix else set(matrix["delegated_clear"]["clear_code_paths"])
         self.assertEqual(sorted(table - listed), [], "every protected path is one the matrix lists as the clear's own code")
         exact = {x for x in listed if "*" not in x}
-        derivation = {"tools/derive-closure", "tests/switchboard/test_closure.py", "bin/fleet-switchboard.parts"}   # S13: they decide what the closure covers; held for the owner, not carry-table entries (a conflict carry is about the clear's own code)
-        self.assertEqual(sorted(exact - table - derivation), [], "every exact path the matrix lists as the clear's own code is never carried (plan_ledger decides who may confirm)")
-        self.assertEqual(sorted(derivation - exact), [], "the closure's derivation paths are listed in the matrix")
-        left_out = sorted(listed - table - derivation)
+        self.assertEqual(sorted(exact - table), [], "every exact path the matrix lists as the clear's own code is never carried (plan_ledger decides who may confirm)")
+        left_out = sorted(listed - table)
         self.assertTrue(all("*" in x for x in left_out), "only the directory globs are left out, on purpose: %s" % left_out)
         for path in table:
             self.assertTrue((root / path).exists(), path)

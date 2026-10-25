@@ -319,7 +319,10 @@
       "bin/plan_check.py",
       "bin/plan_ledger.py",
       "bin/repo_exclusion.py",
-      "docs/review-laws/impact-matrix.json"
+      "docs/review-laws/impact-matrix.json",
+      "tools/derive-closure",
+      "tests/switchboard/test_closure.py",
+      "bin/fleet-switchboard.parts"
     ],
     "never_carried_meaning": "The owner's clear is NEVER carried over a merge of main that resolved a conflict by hand (bin/clear_carry.py, bin/impact_hold.py: the carry reads this list through impact_floor.carry_never_paths and holds no path of its own) when that merge touches one of these paths or the pull request's own change does: the clear's own code and this matrix. Credential and identity paths are not here: they are carried like any other path (the owner's answer, ask #815). Every exact path of `delegated_clear.clear_code_paths` is here, because the ledger and the plan check decide who may confirm a carry; its directory globs (the plugin, the shims, the templates, the proof tools, the workflows) are not, and the shims are identity paths the owner chose to carry. A test checks both lists against each other and that every bin module named for the clear, the hold or the floor is here. The guard for what is not listed (the daemon file, the globs) is the independent reviewer's confirmation and the continuous tests, not a proof.",
     "delegated_clear": {

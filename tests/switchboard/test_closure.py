@@ -288,6 +288,7 @@ class TestTheDerivationIsHeld(unittest.TestCase):
         for path in self.PATHS:
             with self.subTest(path=path):
                 self.assertIn(path, self.matrix["owner_hold"]["delegated_clear"]["clear_code_paths"])
+                self.assertIn(path, self.floor.carry_never_paths(self.matrix), "and a conflict-resolving carry never lifts it (every exact clear_code_paths entry is in never_carried_paths)")
                 decision, why = self.decide(path, self.matrix)
                 self.assertEqual(decision, "hold")
                 self.assertEqual(len(why), 1)
