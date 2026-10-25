@@ -2757,7 +2757,7 @@ and names `--keep-if-closed`.
 owner and key; another owner's or another key's reminder is never touched), and `remind --list` shows the key. A fired, undelivered
 reminder is dropped when a newer one of the same owner and key exists (one `reminder.drop_superseded` audit line names both ids). A
 delivery 5 minutes or more after its due time says "late by N min". Arming a text over 4000 characters (the delivery cap) prints a
-warning with the number of characters over. Without `--key` nothing changes. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
+warning with the number of characters over. A newer reminder still in the future does NOT drop an older fired one: the older is delivered (with its late note) and the newer fires as usual, so a lane never gets nothing. A keyed reminder needs a known sender (an unidentified caller is refused). The key is cut at 80 characters, so two longer keys with the same first 80 characters are one key. The late note is added before the 4000 cap and kept: the body is cut, not the note. Without `--key` nothing changes. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
 reason (the issue closed, the pull request merged), audited as `reminder.drop_notice`; the notice is sent only by the sweep
 that removes the reminder, so it is never repeated. An issue already closed at creation is refused (exit 2, "already
 closed") unless `--keep-if-closed` is given, which keeps the reminder and fires it. A reminder without `--issue`, or whose
@@ -5858,3 +5858,14 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 - **Sender derivation follows ONE wrapper level** (a call through a wrapper of the base calls is found; a wrapper of a wrapper is not).
 - **The load key's subject is the agent only.**
 - Every place agent text reaches a daemon message (header lead, item summary via `_clean_line`/`one_line`, keys by data) and every place numbering or order is decided (`compose`, `numbered_lines`) has a hostile-text test.
+
+### Where a reminder is dropped, replaced, delayed or rewritten
+
+| Place | What happens | Loss case probed by |
+| --- | --- | --- |
+| `reminders_lock` in `add_reminder` | a keyed arming replaces the pending item of the same owner and key | other owner/key, fired item, sender-less |
+| `reminder.drop_superseded` | a fired older item is dropped for a newer due one | newer still in the future is not a drop |
+| `reminder.drop` / `reminder.drop_notice` | the issue closed or the pull request merged | `--keep-if-closed` |
+| `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
+| `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
+| `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
