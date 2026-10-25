@@ -68,14 +68,18 @@ def problems(t):
     return out
 
 
+XZ_TAR_RE = re.compile(r"\btar\b[^\n\x26;|]*?(?:\s-\w*J\w*|\s--xz\b|\.tar\.xz)")
+XZ_APT_RE = re.compile(r"apt-get install[^\x26;|]*")
+
+
 def xz_problems(t):
     """Every .tar.xz unpack needs xz-utils in an apt install list earlier in the file."""
     out = []
     flat = t.replace("\\\n", " ")
-    for m in re.finditer(r"\btar\b[^\n\x26;|]*?(?:\s-\w*J\w*|\s--xz\b|\.tar\.xz)", flat):
+    for m in XZ_TAR_RE.finditer(flat):
         before = flat[:m.start()]
         ok = any(re.search(r"\bxz-utils\b", a)
-                 for a in re.findall(r"apt-get install[^\x26;|]*", before))
+                 for a in XZ_APT_RE.findall(before))
         if not ok:
             out.append("xz unpack without earlier xz-utils")
     if not re.search(r"\btar\b[^\n]*(?:\s-\w*J|--xz)", flat):
@@ -169,6 +173,19 @@ class T(unittest.TestCase):
         m = t + "\nRUN apt-get install -y xz-utils\n"
         self.assertNotEqual(m, t)
         self.assertTrue(xz_problems(m))
+
+    def test_xz_hex_escape_same_as_ampersand_form(self):
+        amp = chr(38)
+        probes = ["a" + amp + "b", "a;b", "a|b", "a\nb",
+                  "tar -xJf x.tar.xz " + amp * 2 + " y",
+                  "apt-get install a b " + amp * 2 + " c"]
+        for rx in (XZ_TAR_RE, XZ_APT_RE):
+            self.assertIn("\\x26", rx.pattern)
+            old = re.compile(rx.pattern.replace("\\x26", amp))
+            self.assertNotEqual(old.pattern, rx.pattern)
+            for s in probes:
+                a, b = rx.search(s), old.search(s)
+                self.assertEqual(a and a.span(), b and b.span(), s)
 
     def test_docs(self):
         d = read(os.path.join(CLOUD, "README.md"))
