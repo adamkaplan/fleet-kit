@@ -5812,3 +5812,52 @@ A new comment on an open pull request whose first line matches `^Review of [0-9a
 |---|---|---|
 | comment body | first line only, 300 chars, verdict from the table | ReviewCommentLineTests |
 | comment id, PR state, logins | event payload only | ReviewCommentLineTests |
+
+## Each thing once on the Chief of Staff's wake channel (#1275)
+
+canon: the wake channel carries each thing once.
+
+- **6 hours.** A reminder with the same kind, the same subject and an unchanged state is delivered at most once per 6 hours; a change of state (for a blocked agent: the event, the held and refused counts, the kind of block and the held reason) delivers at once. A load alert is keyed by its data (the lane and its severity and reasons), never its text. A clock that went backwards counts as due. The first report of a dead or blocked agent, an owner wait and a held PR are never held: only repeats are.
+- **Answered.** An item the Chief of Staff already answered (a send by it to that agent since the finding; the record is per recipient, not per issue) is not re-raised until its state changes, and for at most 6 hours after the answer.
+- **One message per wake.** Sweeps, triage and load alerts of one wake are one message, one line per item (`merge_wake_facts`, called by the delivery; the first blocked report, an owner wait and a held PR are never folded in).
+- **Order.** `compose` (`compose_order`) puts every pass-through fact (owner wait, held PR, first blocked report, send) BEFORE the reminders (the merged wake fact and the sweep/triage/load items not merged yet), whatever their age; each group is newest first, ties keep the key order. A newer result is never held behind older reminders, and an older owner wait or send is never held behind a newer merged fact: under the message cap the reminders are the ones that wait.
+- **Short header.** After the first delivery of an ask on a day, its group header is one line of at most 160 characters; the full Intent and Done-when come again on the first delivery of the next day.
+
+| Sender function | Finding kind | Repeat key | Window | Test |
+| --- | --- | --- | --- | --- |
+| `blocked_tick` | Blocked agent | agent, recipient, event, held, refused, kind, reason | 6 hours; first report and end line at once | `test_tell_holds_a_repeat_and_passes_the_first_report` |
+| `load_tick` | load alert | lane, severity and reasons | 6 hours; merged into the wake message | `test_load_alert_is_keyed_by_the_data_not_the_text` |
+| `friction_tick` | friction wake | slot (own state) | per slot | `test_one_wake_per_orchestrator_per_day_not_for_cos_or_coders` |
+| `cmd_budget_notice` | budget notice | account (own claim) | 1 hour | `test_s2_the_top_spenders_orchestrator_gets_one_message_with_the_agent_and_the_numbers_and_a_second_call_sends_none` |
+| `_impact_matrix_episode` | impact matrix unreadable | episode (own state) | per episode | `test_s6_an_unreadable_matrix_changes_nothing_and_says_so_once_for_the_episode` |
+| `_impact_post_list` | owner-hold rule list | rule version (own state) | per rule | `test_s8_an_unreadable_decision_or_rule_or_file_list_is_refused_and_nothing_is_lifted` |
+| `cmd_remind` | a reminder the agent set (`remind`) | its own id (a request, not a finding) | none: sent as asked | `test_a_reminder_is_a_fact_only_once_it_is_due` |
+| `set_checkpoint_reminders` | checkpoint reminder | launch (own id) | once per launch | `test_a_launch_checkpoint_reminder_is_not_a_wait_and_a_workers_own_reminder_is` |
+| `notify_drop` | reminder drop notice | dropped reminder (removed first) | once | `test_a_drop_sends_the_setter_one_notice_naming_text_and_reason_audited_once` |
+| `SweepFacts` | sweep (a fact, merged per wake) | set and slot (own key) | re-alarm hours | `test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines` |
+| `TriageFacts` | triage (a fact, merged per wake) | set and slot (own key) | re-alarm hours | `test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines` |
+
+State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every_state_file_the_gate_touches_is_in_the_table_and_the_docs`): `reminder-repeats.json` (read by `repeat_held`, written by `repeat_record`, only after the reminder was stored; keys older than twice the window are dropped; read with the one safe reader `read_record_file`: no symlink, no FIFO, 1 MB cap) and `last-reports.json` (read by `last_send_at`; written by `report` and `send`).
+
+### #1275 follow-ups: hostile text, the cut check, the derivations
+
+- **Numbering is structural.** A message is numbered newest-first only when it is the daemon's own (from the switchboard, with keys), its header ends with the mark, and the mark is added only when the item count is above one. A trailing ` [newest first]` in an agent-controlled summary is stripped from the header before it is composed, so a one-item message cannot be reversed. Test: `test_a_hostile_summary_cannot_forge_the_newest_first_mark` (one item and several, mark at the end, in the middle, with escapes). Mutant: the strip loop disabled (text-based decision) fails it.
+- **The cut check composes the carried send.** Every place that measures a message or decides a cut measures THE message delivered: the `[sent]` fact `compose` carried (it may be the newest, not the oldest pending fact). Test: `test_1275_the_cut_check_measures_the_carried_send_with_two_facts_pending` (a 5-character send, then 4,500 characters: allowed is about 3,754 and the resend of that length is not cut). Mutant: `plan.pending[:1]` restored fails it (allowed 8,410). The recompose adds compose's own "and N more" line when others wait, so the stated length is exact. Other measuring places (`load_tick`, the header method of `IntentReader`, the deliver tail, `merge_wake_facts`, other callers of `numbered_lines`/`compose`) were read: none measures a cut length of its own.
+- **Carried is what is acknowledged (family rule).** Every place a composed message can carry fewer facts than were passed in acknowledges or commits ONLY what was carried. Each has one test with more facts than fit and a mutant:
+
+  | Place | Rule | Test / mutant |
+  |---|---|---|
+  | `merge_wake_facts` | merges only the items that fit `WAKE_MERGE_BUDGET` (header counted); the rest stay separate pending facts for the next message, so every finding is delivered and none is lost | `test_cap_20_findings_of_300_chars_...` / `test_mutant_merging_everything_loses_findings` |
+  | `deliver` keys | a merged fact's member is acknowledged only if its line is in the sent text (`member_lines`) | same test |
+  | `commit_told` | after `compose`, the told set is rebuilt from the carried facts only; an ask whose header was dropped is not told | `test_told_only_the_asks_of_the_carried_facts` / `test_mutant_telling_every_composed_ask_fails_the_told_probe` |
+  | `deliver` guard | whole lines only: `whole_lines(text)` (a member line that is a prefix of another line in the text does not count) | `test_1275_a_cut_member_line_is_not_acknowledged`, `test_1275_a_member_line_that_is_a_prefix_of_another_line_is_not_acknowledged` / `test_mutant_acknowledging_every_member_fails_the_cut_tests` (every member, and substring match) |
+  | `compose` ordering (`compose_order`) | pass-through before reminders; probe: 20 sweeps (created 100..119) + an OLDER 3,500-character send: the send is in the FIRST message | `test_1275_an_older_send_is_carried_in_the_first_message_not_behind_the_merged_wake`, `test_1275_pass_through_facts_all_sort_before_the_merged_fact_newest_first` / `test_mutant_newest_first_for_everything_fails_the_older_send_probe` |
+  | `decide` sort (oldest first) | only starts the batch clock and picks the action; it does not decide what is carried | existing batch tests |
+  | `merge_wake_facts` sort (newest first) | picks which reminders fit the budget; passes the rest on as pending | `test_cap_merge_only_what_fits_and_the_rest_stay_pending` |
+  | `compose` "and N more", `facts[:count]` | the carried facts are exactly the rendered ones | existing compose cap tests |
+
+- **Known limits (follow-up, not fixed here):** (1) a single UNMERGED sweep/triage fact over 4,000 characters is cut with `[cut at 4000 characters]` and its key acknowledged, so the content is lost silently (pre-existing; `MessageTooLong` covers sends only). (2) `derive_message_id(session, [])` is not checked for the case where a cut leaves ZERO member lines. (3) `discard_told` runs on two or three composes: cost only.
+- **Cosmetic:** the strip also removes a legitimate trailing ` [newest first]` from a lead summary header.
+- **Sender derivation follows ONE wrapper level** (a call through a wrapper of the base calls is found; a wrapper of a wrapper is not).
+- **The load key's subject is the agent only.**
+- Every place agent text reaches a daemon message (header lead, item summary via `_clean_line`/`one_line`, keys by data) and every place numbering or order is decided (`compose`, `numbered_lines`) has a hostile-text test.
