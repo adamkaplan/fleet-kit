@@ -77990,6 +77990,32 @@ def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2
     return thread
 
 
+
+# The architecture test lives beside the support files (docs/architecture.md, ask #1092): the suite runs it with the rest. Imported by name through
+# importlib, so the hygiene scan of this file's imports stays about the standard library.
+sys.path.insert(0, str(REPO / "tests" / "switchboard"))
+_architecture = importlib.import_module("test_architecture")
+TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
+
+
+class TestTheArchitectureTestIsRun(unittest.TestCase):
+    """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a
+    word. This class fails then, because it asks the suite this file builds what it holds."""
+
+    def test_the_suite_holds_every_test_of_the_architecture_document_test(self):
+        def flat(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from flat(item)
+                else:
+                    yield item
+        ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
+        for name in ("TestArchitectureDocument", "TestArchitectureDocumentFailurePaths"):
+            with self.subTest(case=name):
+                self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 4, "the hook that loads tests/switchboard/test_architecture.py is gone")
+        self.assertEqual(os.path.realpath(_architecture.__file__), os.path.realpath(str(REPO / "tests" / "switchboard" / "test_architecture.py")))
+
+
 class TestSupportRebinding(unittest.TestCase):
     """The moved fakes read `sb` and the other moved globals from their own modules (tests/switchboard/support/), not from this file: a test that rebinds
     a moved name here must rebind it there too (`rebound`). These tests pin that, and find every such rebinding by reading this file."""
