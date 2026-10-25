@@ -282,20 +282,21 @@ def main(argv):
 def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S, MODE="quick"):
     # Step 1: the preflight of the pod, before any test.
     PREFLIGHT_MODE[0] = MODE
-    if MODE == "quick" and changed:  # decide "no reader" at once, before the preflight and any test
+    no_reader = False
+    if MODE == "quick" and changed:  # decide "no reader" at once: the preflight and every test are skipped
         select(root, changed)
-        if not READERS[0]:
-            print("NOT RUN: no check reads " + ", ".join(sorted(changed)))
-            print("cloud-prepush: %d changed file(s) but NO test was selected; this is not a clean result (advice only)" % len(changed))
-            return 1
-    print("cloud-prepush: preflight mode: " + MODE, file=sys.stderr, flush=True)
-    ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
+        no_reader = not READERS[0]
+    if no_reader:
+        ok, plines = True, []
+    else:
+        ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
     if not ok:
         for l in plines:
             print(l)
         print("cloud-prepush: the preflight did not pass; no test was run (advice only)")
         return 1
-    print("cloud-prepush: preflight passed", file=sys.stderr)
+    if not no_reader:
+        print("cloud-prepush: preflight passed", file=sys.stderr)
     picked = select(root, changed)
     if changed and not READERS[0]:
         print("NOT RUN: no check reads " + ", ".join(sorted(changed)))
