@@ -1,6 +1,6 @@
 """Cloud relay (issue 1225, slice A): the hub half of pod -> hub -> daemon calls for report, prove, verdict, gates.
 
-    POST /relay               pod: {"call_id", "command", "pr": "owner/repo#N", "head", "args"}; the pod's per-pod secret as Bearer.
+    POST /relay               pod: {"call_id", "command", "pr": "owner/repo#N", "head", "args"}; the pod's own service-account token as Bearer.
     GET  /relay/pending       daemon only: {"requests": [{"id", "pod", "repo", "issue", "call"}]}, oldest first, at most 10.
     POST /relay/result/<id>   daemon only: {"status", "reason", "record": {"seq", "hash"} | null}; answers the waiting pod call.
 
@@ -42,6 +42,24 @@ MAX_ARGS = 16
 MAX_ARG_KEY = 64
 MAX_ARG_VALUE = 8192
 MAX_DONE = 1000
+
+
+def _no_constant(name):
+    raise ValueError("%s is not JSON" % name)
+
+
+def _no_duplicates(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+
+def loads_strict(raw):
+    """json.loads for a relay body: NaN/Infinity and duplicate keys are ValueError. Very deep nesting raises RecursionError (callers catch both)."""
+    return json.loads(raw, parse_constant=_no_constant, object_pairs_hook=_no_duplicates)
 
 
 class Refusal(Exception):

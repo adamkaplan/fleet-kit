@@ -9,8 +9,15 @@ The world (GitHub, the plan, the registry, the audit) is a Backend, so the rules
 One ledger entry per prove or verdict, written by `plan_ledger.append_checked` under its flock; the head is re-read from GitHub INSIDE
 that decision. Replay memory: `relay_calls.json` (pod + call id -> seq, hash), backed by the call id stored in the entry itself.
 
-Report delivery is AT-LEAST-ONCE: the report is delivered, then the index record is written; a crash between the two delivers it again on
-replay. A report replay with a different pr or different args under the same call id is 409.
+Report delivery is AT-MOST-ONCE per call id (exactly one record, never two): the call id is CLAIMED first (a PENDING record, get-or-claim in one
+step under the index flock), then delivered, then marked DONE. A replay of a done id answers 200 "replay: already reported"; a replay of a
+PENDING id (a crash, or a delivery that raised, between claim and done) is resolved deliberately: it answers 409 "already claimed" and
+NEVER delivers a second time (the first delivery may have happened; the owner sees the audit line `report.claimed` and may resend under a new
+call id). Claims live in their own file (`relay_reports.json`, REPORT_MAX entries, so a flood of prove/verdict entries cannot evict them; a
+damaged claim file refuses with 500 rather than forgetting). A report replay with a different pr or different args under the same call id is 409.
+Refusals (daemon-only credential, repo, allow-list, rules) write an AUDIT line `relay.refused` on purpose and leave the ledger and files
+byte-identical. The hub's 1000-entry finished cache can be flooded to evict another pod's hub-side replay record; the daemon-side dedupe
+above still holds it. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock.
 
 The PR-to-issue link comes from the PR body's closing keywords (and the plan's issue). It is NOT a security boundary: anyone who can edit
 the PR body can set it. The boundaries are the prove holder check (`relay_holders`) and the verdict evaluator registry (`plan_evaluators`).
@@ -24,6 +31,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -32,6 +41,10 @@ import plan_ledger  # noqa: E402
 import cloud_relay  # noqa: E402  (the one definition of the wire shapes, shared with the hub)
 
 INDEX_FILE = "relay_calls.json"
+REPORT_FILE = "relay_reports.json"
+REPORT_MAX = 50000   # report claims kept (their own file); the oldest are pruned beyond this
+READ_DEADLINE = 30.0   # seconds in TOTAL for one hub answer (the socket timeout alone is per read)
+HEAD_TIMEOUT = 10.0    # seconds the in-lock head re-check may take before the write is refused
 INDEX_MAX = 5000   # entries kept; the oldest are pruned (the ledger's own call ids still answer a pruned replay)
 COMMANDS = cloud_relay.COMMANDS
 NEEDS_HEAD = cloud_relay.NEEDS_HEAD
@@ -65,46 +78,79 @@ def _same_head(known, given):
 
 class Index:
     """pod + call id -> {seq, hash, command, pr, head}, for prove and verdict only. A separate daemon-side file, written under a flock
-    with a unique temp name and pruned to INDEX_MAX (oldest first); a missing or damaged file falls back to the entries' own call ids."""
+    with a unique temp name and pruned to `cap` (oldest first); a missing or damaged file falls back to the entries' own call ids.
+    With strict=True (the report claims) a DAMAGED or oversized file is an error (OSError/ValueError), never an empty memory: a report
+    must not be delivered again because its memory was lost. A file that does not exist yet is an empty memory."""
 
-    def __init__(self, state_dir):
-        self.path = Path(state_dir) / INDEX_FILE
+    def __init__(self, state_dir, name=INDEX_FILE, cap=None, strict=False):
+        self.name, self._cap, self.strict = name, cap, strict
+        self.path = Path(state_dir) / name
+
+    @property
+    def cap(self):
+        return self._cap or INDEX_MAX
 
     def _read(self):
         try:
             with open(str(self.path), "rb") as handle:
                 raw = handle.read(INDEX_READ_CAP + 1)
             if len(raw) > INDEX_READ_CAP:
-                return {}
+                raise ValueError("index over %d bytes" % INDEX_READ_CAP)
             data = json.loads(raw.decode())
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                raise ValueError("index is not an object")
+            return data
+        except FileNotFoundError:
+            return {}
         except (OSError, ValueError):
+            if self.strict:
+                raise
             return {}
 
     def get(self, pod, call_id):
         return self._read().get("%s\n%s" % (pod, call_id))
 
-    def put(self, pod, call_id, record):
-        lock = self.path.with_name(INDEX_FILE + ".lock")
+    @contextlib.contextmanager
+    def _locked(self):
+        lock = self.path.with_name(self.name + ".lock")
         with os.fdopen(os.open(str(lock), os.O_WRONLY | os.O_CREAT, 0o600), "a") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
+            yield
+
+    def _store(self, data):
+        while len(data) > self.cap:
+            data.pop(next(iter(data)))
+        tmp = self.path.with_name("%s.%d.%s.tmp" % (self.name, os.getpid(), uuid.uuid4().hex))
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps(data))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(tmp), str(self.path))
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(str(tmp))
+
+    def put(self, pod, call_id, record):
+        with self._locked():
             data = self._read()
             key = "%s\n%s" % (pod, call_id)
             data.pop(key, None)
             data[key] = record     # json keeps insertion order: the newest is last
-            while len(data) > INDEX_MAX:
-                data.pop(next(iter(data)))
-            tmp = self.path.with_name("%s.%d.%s.tmp" % (INDEX_FILE, os.getpid(), uuid.uuid4().hex))
-            try:
-                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w") as handle:
-                    handle.write(json.dumps(data))
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(str(tmp), str(self.path))
-            finally:
-                with contextlib.suppress(OSError):
-                    os.unlink(str(tmp))
+            self._store(data)
+
+    def claim(self, pod, call_id, record):
+        """Get-or-claim in ONE locked step: the existing record when there is one (nothing written), else None after `record` is
+        stored. Two concurrent passes cannot both get None."""
+        with self._locked():
+            data = self._read()
+            key = "%s\n%s" % (pod, call_id)
+            if key in data:
+                return data[key]
+            data[key] = record
+            self._store(data)
+            return None
 
 
 def clean_text(value, limit=2000):
@@ -134,6 +180,21 @@ def _same_call(known, command, pr, head, digest=None):
     return known.get("command") == command and known.get("pr") == pr and known.get("head") == head
 
 
+def _bounded(fn, timeout):
+    """fn() with a deadline: None (unknown head, so refused as stale) when it does not answer in time or raises."""
+    box = []
+
+    def run():
+        try:
+            box.append(fn())
+        except Exception:
+            box.append(None)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    return box[0] if box else None
+
+
 def _answer(known):
     return {"seq": known["seq"], "hash": known["hash"]}
 
@@ -145,6 +206,7 @@ class Executor:
     def __init__(self, state_dir, backend, now):
         self.state, self.backend, self.now = state_dir, backend, now
         self.index = Index(state_dir)
+        self.reports = Index(state_dir, REPORT_FILE, REPORT_MAX, strict=True)
 
     # one request -> (status, reason, record)
     def handle(self, req):
@@ -172,21 +234,25 @@ class Executor:
                 self._check_linked(pr, req)
             if command == "gates":   # read-only and not indexed: nothing to replay
                 out = self.backend.gates(pr)
-                self.backend.audit("gates", pr, {"by": pod, "call_id": cid})
+                self.backend.audit("gates", pr, {"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})
                 text = json.dumps(out, sort_keys=True)
                 if len(text) > REASON_MAX:   # a clipped JSON would be unreadable: send a short valid one
                     text = json.dumps({"ready": out.get("ready") if isinstance(out, dict) else None, "truncated": True})
                 return 200, text, None
-            if command == "report":   # delivered once per call id; kept under its own key ("report\n...", no seq or hash), so it never answers a prove or verdict
-                seen = self.index.get("report\n" + pod, cid)
-                digest = hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()
+            if command == "report":   # claimed, then delivered, then marked done; kept apart from prove/verdict (no seq or hash)
+                digest = args_digest(args)
+                mine = {"command": "report", "pr": pr, "args": digest}
+                seen = self.reports.claim(pod, cid, dict(mine, state="pending"))
                 if seen:
                     if seen.get("pr") != pr or seen.get("args") != digest:
                         raise Refuse(409, "call_id reused for a different call")
-                    return 200, "replay: already reported", None
+                    if seen.get("state") == "done":
+                        return 200, "replay: already reported", None
+                    self.backend.audit("report.claimed", pr, {"by": pod, "call_id": clean_text(cid, 64)})
+                    raise Refuse(409, "already claimed: not delivered again", "report replay of a pending claim")
                 # only the state and the text come from the pod; the issue is the hub's, and `everything` is dropped
                 self.backend.report(pod, {"state": args.get("state"), "text": clean_text(args.get("text")), "issue": req.get("issue")})
-                self.index.put("report\n" + pod, cid, {"command": "report", "pr": pr, "args": digest})
+                self.reports.put(pod, cid, dict(mine, state="done"))
                 return 200, "reported", None
             known = self.index.get(pod, cid)
             if known:
@@ -201,15 +267,15 @@ class Executor:
             clipped = plan_ledger.clip(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT)
             if (not _same_call(first, command, pr, call.get("head")) or first.get("scenario") != args.get("scenario")
                     or first.get("result") != args.get("result") or first.get("evidence") != clipped):
-                self.backend.audit("relay.refused", pr, {"by": pod, "status": 409, "why": "call_id reused for a different call"})
+                self.backend.audit("relay.refused", clean_text(pr, 120), {"by": clean_text(pod, 80), "status": 409, "why": "call_id reused for a different call"})
                 return 409, "call_id reused for a different call", None
             self.index.put(pod, cid, dict(_answer(first), command=command, pr=pr, head=call.get("head"), args=args_digest(args)))
             return 200, "replay: already recorded", _answer(first)
         except Refuse as err:
-            self.backend.audit("relay.refused", pr, {"by": pod, "status": err.status, "why": clean_text(err.detail or err.reason)})
+            self.backend.audit("relay.refused", clean_text(pr, 120), {"by": clean_text(pod, 80), "status": err.status, "why": clean_text(err.detail or err.reason)})
             return err.status, err.reason, None
         except plan_ledger.LedgerError as err:
-            self.backend.audit("relay.refused", pr, {"by": pod, "status": 409, "why": clean_text(err)})
+            self.backend.audit("relay.refused", clean_text(pr, 120), {"by": clean_text(pod, 80), "status": 409, "why": clean_text(err)})
             return 409, "the ledger refused the write", None
 
     def _check_linked(self, pr, req):
@@ -265,11 +331,14 @@ class Executor:
                 ok2, why2 = plan_ledger.may_record_verdict(named, pod, {named: b.evaluators(named)}, a2)
                 if not ok2:
                     raise Refuse(403, "refused: %s" % why2)
-            live = b.live_head(pr)   # re-read from GitHub inside the append decision
+            live = _bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)   # re-read inside the append decision, bounded: a slow GitHub must not hold the flock
             if not _same_head(live, head):
                 raise Refuse(409, "stale head: the PR head is %s, not %s" % ((live or "unknown")[:12], head[:12]))
             return entry
 
+        first = b.live_head(pr)   # the slow read is made BEFORE the flock; the re-check inside is bounded and refuses a head that moved
+        if not _same_head(first, head):
+            raise Refuse(409, "stale head: the PR head is %s, not %s" % ((first or "unknown")[:12], head[:12]))
         stored = plan_ledger.append_checked(self.state, self.now(), build)
         b.audit("plan.%s" % entry["kind"], pr, {"scenario": sid, "result": result, "seq": stored["seq"], "by": pod,
                                                "chain": stored["hash"], "via": "relay"})
@@ -323,11 +392,19 @@ def http_transport(base, token):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(base + path, data=data, method="POST" if body is not None else "GET",
                                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+        end = time.monotonic() + READ_DEADLINE
         with opener.open(req, timeout=20) as resp:
-            raw = resp.read(PENDING_CAP + 1)
+            raw = b""
+            while len(raw) <= PENDING_CAP:   # read in pieces so the TOTAL time, not just each read, is bounded
+                if time.monotonic() > end:
+                    raise TimeoutError("hub answer not complete within %ds" % READ_DEADLINE)
+                chunk = (getattr(resp, "read1", None) or resp.read)(min(8192, PENDING_CAP + 1 - len(raw)))   # read1: returns at the first bytes, so a trickle is seen
+                if not chunk:
+                    break
+                raw += chunk
             if len(raw) > PENDING_CAP:
                 raise ValueError("hub answer over %d bytes" % PENDING_CAP)
-            return json.loads(raw or b"{}")
+            return cloud_relay.loads_strict(raw or b"{}")
     return (lambda: call("/relay/pending")), (lambda rid, body: call("/relay/result/" + rid, body))
 
 
@@ -400,7 +477,11 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ):
     try:
         try:
             with open(tokfile, "rb") as handle:
-                raw = handle.read(TOKEN_CAP + 1)
+                loose = os.fstat(handle.fileno()).st_mode & 0o077
+                raw = handle.read(TOKEN_CAP + 1) if not loose else b""
+            if loose:   # a token readable by group or other is refused, never read or used
+                engine._note("relay.pass_failed", None, {"error": "token file is readable by group or other (mode must be 0600)"})
+                return 0
             if len(raw) > TOKEN_CAP:
                 engine._note("relay.pass_failed", None, {"error": "token file over %d bytes" % TOKEN_CAP})
                 return 0

@@ -345,8 +345,8 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
                 self._deny(408, "request timeout")
                 return None
             try:
-                return json.loads(raw.decode("utf-8"))
-            except ValueError:
+                return cloud_relay.loads_strict(raw.decode("utf-8"))
+            except (ValueError, RecursionError):   # also NaN, duplicate keys and nesting deep enough to exhaust the stack
                 self._deny(400, "body is not JSON")
                 return None
 

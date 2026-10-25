@@ -17,6 +17,7 @@ Two kinds of mutant test, kept apart:
       call-id scope per pod (Index key)          -> test_same_call_id_two_pods
 """
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -446,6 +447,7 @@ class Case(Fixture):
                 notes.append(a)
         tok = Path(self.state) / "tok"
         tok.write_text("x" * (relay.TOKEN_CAP + 1))
+        tok.chmod(0o600)
         env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(tok)}
         self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env), 0)
         self.assertIn("token file over", notes[0][2]["error"])
@@ -699,6 +701,352 @@ class ReplyHygiene(Fixture):
         relay.INDEX_READ_CAP = 10
         self.addCleanup(setattr, relay, "INDEX_READ_CAP", old)
         self.assertEqual(idx._read(), {})
+
+class Crash(BaseException):
+    """Stands for a killed daemon: not an Exception, so pass_once does not catch it."""
+
+
+def make_mutant_executor(case, old, new):
+    mod = load_backend_module(old, new)
+    case.ex = mod.Executor(case.state, case.backend, lambda: 1000)
+    case.fresh = lambda: mod.Executor(case.state, case.backend, lambda: 1000)
+    return mod
+
+
+class ReportOnce(Fixture):
+    """MEDIUM 1: report is claimed (pending) BEFORE delivery, then delivered, then marked done: exactly one record, never two."""
+    REPORT = dict(head=None, state="done", text="x", cid="R1")
+
+    def replay(self):
+        return self.run_one(CODER, "report", ex=self.fresh(), **self.REPORT)
+
+    def crash_report(self):
+        def boom(pod, args):
+            raise Crash()
+        self.backend.report = boom
+        with self.assertRaises(Crash):
+            self.run_one(CODER, "report", **self.REPORT)
+        del self.backend.report
+
+    def test_crash_between_claim_and_delivery_never_delivers_twice(self):
+        self.crash_report()
+        got = self.replay()
+        self.assertEqual((got["status"], self.backend.reported), (409, []))
+        self.assertIn("already claimed", got["reason"])
+
+    def test_crash_between_delivery_and_done_never_delivers_twice(self):
+        ex = self.ex
+        ex.reports.put = lambda *a: (_ for _ in ()).throw(Crash())
+        with self.assertRaises(Crash):
+            self.run_one(CODER, "report", ex=ex, **self.REPORT)
+        self.assertEqual(len(self.backend.reported), 1)
+        got = self.replay()
+        self.assertEqual((got["status"], len(self.backend.reported)), (409, 1))
+
+    def test_index_failure_after_delivery_does_not_redeliver(self):
+        self.ex.reports.put = lambda *a: (_ for _ in ()).throw(OSError("disk full"))
+        self.assertEqual(self.run_one(CODER, "report", **self.REPORT)["status"], 500)
+        self.assertEqual(self.replay()["status"], 409)
+        self.assertEqual(len(self.backend.reported), 1)
+
+    def test_done_replay_is_200_and_a_different_call_is_409(self):
+        self.assertEqual(self.run_one(CODER, "report", **self.REPORT)["reason"], "reported")
+        self.assertEqual(self.replay()["reason"], "replay: already reported")
+        self.assertEqual(self.run_one(CODER, "report", ex=self.fresh(), **dict(self.REPORT, text="y"))["status"], 409)
+        self.assertEqual(len(self.backend.reported), 1)
+
+    def test_two_concurrent_passes_deliver_once(self):
+        import threading
+        import time
+        real = self.backend.report
+        self.backend.report = lambda pod, args: (time.sleep(0.2), real(pod, args))
+        rids = [self.hub.submit(CODER, "report", **self.REPORT) for _ in range(1)]
+        req = self.hub.queue[0]
+        exes = [self.fresh() for _ in range(6)]   # six passes, each its own Executor (as six processes would be)
+        out = []
+        ts = [threading.Thread(target=lambda e=e: out.append(e.handle(dict(req))[0])) for e in exes]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(len(self.backend.reported), 1)
+        self.assertEqual(sorted(out), [200] + [409] * 5)
+
+    def test_a_pruned_prove_index_does_not_redeliver(self):
+        self.run_one(CODER, "report", **self.REPORT)
+        old = relay.INDEX_MAX
+        relay.INDEX_MAX = 2
+        self.addCleanup(setattr, relay, "INDEX_MAX", old)
+        for i in range(5):   # flood the prove/verdict index past its cap: the report claims live in their own file
+            self.ex.index.put("p", "c%d" % i, {"seq": i, "hash": "h"})
+        (Path(self.state) / relay.INDEX_FILE).unlink()
+        self.assertEqual(self.replay()["reason"], "replay: already reported")
+        self.assertEqual(len(self.backend.reported), 1)
+
+    def test_a_damaged_claim_file_refuses_and_does_not_deliver(self):
+        (Path(self.state) / relay.REPORT_FILE).write_text("{not json")
+        self.assertEqual(self.run_one(CODER, "report", **self.REPORT)["status"], 500)
+        self.assertEqual(self.backend.reported, [])
+
+    def test_mutant_deliver_before_claim_is_caught(self):
+        """The old order (look, deliver, then write) is the real code with the claim replaced by a plain read."""
+        for guard in ("test_crash_between_delivery_and_done_never_delivers_twice", "test_two_concurrent_passes_deliver_once",
+                      "test_crash_between_claim_and_delivery_never_delivers_twice"):
+            case = ReportOnce(guard)
+            case.setUp()
+            make_mutant_executor(case, 'seen = self.reports.claim(pod, cid, dict(mine, state="pending"))', "seen = self.reports.get(pod, cid)")
+            try:
+                with self.assertRaises(AssertionError, msg=guard):
+                    getattr(case, guard)()
+            finally:
+                case.doCleanups()
+                case.tmp.cleanup()
+
+    def test_unmutated_guards_pass(self):
+        for guard in ("test_crash_between_delivery_and_done_never_delivers_twice", "test_two_concurrent_passes_deliver_once",
+                      "test_crash_between_claim_and_delivery_never_delivers_twice"):
+            case = ReportOnce(guard)
+            case.setUp()
+            getattr(case, guard)()
+            case.tmp.cleanup()
+
+
+class LiveHead(Fixture):
+    """MEDIUM 2b: live_head is read before the ledger flock; the bounded in-lock re-check still refuses a head that moved."""
+
+    def lock_free(self):
+        import fcntl
+        fd = os.open(str(Path(self.state) / plan_ledger.LEDGER_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+    def test_the_first_read_is_made_without_the_ledger_flock(self):
+        seen = []
+        real = self.backend.live_head
+        self.backend.live_head = lambda pr: (seen.append(self.lock_free()), real(pr))[1]
+        self.assertEqual(self.run_one(CODER, "prove", **PROVE)["status"], 200)
+        self.assertTrue(seen[0], seen)
+
+    def test_a_head_that_moves_between_the_two_reads_is_refused(self):
+        heads = iter([HEAD, "c" * 40])
+        self.backend.live_head = lambda pr: next(heads)
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.assertEqual(self.entries(), [])
+
+    def test_the_in_lock_read_is_bounded(self):
+        import time
+        old = relay.HEAD_TIMEOUT
+        relay.HEAD_TIMEOUT = 0.2
+        self.addCleanup(setattr, relay, "HEAD_TIMEOUT", old)
+        calls = []
+
+        def slow(pr):
+            calls.append(1)
+            if len(calls) > 1:
+                time.sleep(3)
+            return HEAD
+        self.backend.live_head = slow
+        t0 = time.monotonic()
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.assertLess(time.monotonic() - t0, 2)
+
+    def test_mutants_are_caught(self):
+        for guard, old, new in (("test_the_first_read_is_made_without_the_ledger_flock", "        first = b.live_head(pr)", "        first = head"),
+                                ("test_the_in_lock_read_is_bounded", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)", "b.live_head(pr)")):
+            case = LiveHead(guard)
+            case.setUp()
+            make_mutant_executor(case, old, new)
+            if guard == "test_the_in_lock_read_is_bounded":
+                pass
+            try:
+                with self.assertRaises(AssertionError, msg=guard):
+                    getattr(case, guard)()
+            finally:
+                case.doCleanups()
+                case.tmp.cleanup()
+
+
+class HubReadAndTransport(unittest.TestCase):
+    """MEDIUM 2a, L1 (daemon side), L6 and L7: a hostile hub."""
+
+    def _serve(self, handler_body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    handler_body(self)
+                except OSError:
+                    pass
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d" % srv.server_port
+
+    def test_a_trickling_hub_is_cut_at_the_total_deadline(self):
+        import time
+        old = relay.READ_DEADLINE
+        relay.READ_DEADLINE = 1.0
+        self.addCleanup(setattr, relay, "READ_DEADLINE", old)
+
+        def trickle(h):
+            h.send_response(200)
+            h.send_header("Content-Length", "100000")
+            h.end_headers()
+            for _ in range(200):   # a byte every 0.2 s: every single read succeeds well inside the 20 s socket timeout
+                h.wfile.write(b" ")
+                h.wfile.flush()
+                time.sleep(0.2)
+        fetch, _ = relay.http_transport(self._serve(trickle), "tok")
+        t0 = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            fetch()
+        self.assertLess(time.monotonic() - t0, 4)
+
+    def test_mutant_without_the_total_deadline_is_caught(self):
+        mod = load_backend_module("if time.monotonic() > end:", "if False:")
+        old, mod.READ_DEADLINE = relay.READ_DEADLINE, 1.0
+        import time
+
+        def trickle(h):
+            h.send_response(200)
+            h.send_header("Content-Length", "100000")
+            h.end_headers()
+            for _ in range(15):
+                h.wfile.write(b" ")
+                h.wfile.flush()
+                time.sleep(0.2)
+        fetch, _ = mod.http_transport(self._serve(trickle), "tok")
+        t0 = time.monotonic()
+        with self.assertRaises(Exception):
+            fetch()   # it ends only when the stub stops (ValueError from the empty JSON), after 3 s: not at the deadline
+        self.assertGreater(time.monotonic() - t0, 2.5)
+
+    def test_endless_stream_without_a_length_is_cut(self):
+        def endless(h):
+            h.send_response(200)
+            h.end_headers()
+            while True:
+                h.wfile.write(b" " * 4096)
+        old = relay.PENDING_CAP
+        relay.PENDING_CAP = 100000
+        self.addCleanup(setattr, relay, "PENDING_CAP", old)
+        fetch, _ = relay.http_transport(self._serve(endless), "tok")
+        with self.assertRaises(ValueError):
+            fetch()
+
+    def test_oversize_body_is_refused(self):
+        def big(h):
+            data = b"[" + b"1," * (relay.PENDING_CAP // 2 + 10) + b"1]"
+            h.send_response(200)
+            h.send_header("Content-Length", str(len(data)))
+            h.end_headers()
+            h.wfile.write(data)
+        fetch, _ = relay.http_transport(self._serve(big), "tok")
+        with self.assertRaises(ValueError):
+            fetch()
+
+    def test_nested_nan_and_duplicate_json_are_refused_not_fatal(self):
+        for raw in (b"[" * 40000, b'{"requests": [], "n": NaN}', b'{"requests": [], "requests": []}'):
+            def body(h, raw=raw):
+                h.send_response(200)
+                h.send_header("Content-Length", str(len(raw)))
+                h.end_headers()
+                h.wfile.write(raw)
+            fetch, _ = relay.http_transport(self._serve(body), "tok")
+            with self.assertRaises((ValueError, RecursionError)):
+                fetch()
+
+    def test_the_same_request_over_and_over_writes_once(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        backend, hub = FakeBackend(), FakeHub()
+        ex = relay.Executor(tmp.name, backend, lambda: 1000)
+        hub.submit(CODER, "prove", cid="same", **PROVE)
+        req = hub.queue[0]
+        for _ in range(5):
+            hub.queue = [req]
+            relay.pass_once(ex, hub.fetch, hub.post)
+        entries, _ = plan_ledger.read_ledger(tmp.name)
+        self.assertEqual(len(entries), 1)
+
+    def test_a_token_file_readable_by_group_or_other_is_refused(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        with tempfile.TemporaryDirectory() as d:
+            tok = Path(d) / "tok"
+            tok.write_text("abc")
+            env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(tok)}
+            for mode in (0o644, 0o640, 0o604):
+                tok.chmod(mode)
+                notes.clear()
+                self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env), 0)
+                self.assertIn("readable by group or other", notes[0][2]["error"], oct(mode))
+            tok.chmod(0o600)
+            notes.clear()
+            relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env)
+            self.assertNotIn("readable", str(notes))
+
+    def test_mutant_token_mode_unchecked_is_caught(self):
+        mod = load_backend_module("loose = os.fstat(handle.fileno()).st_mode & 0o077", "loose = 0")
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        with tempfile.TemporaryDirectory() as d:
+            tok = Path(d) / "tok"
+            tok.write_text("abc")
+            tok.chmod(0o644)
+            mod.pass_if_configured(Engine(), None, None, lambda: 1, environ={"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(tok)})
+            self.assertNotIn("readable by group", str(notes))
+
+
+class DaemonRefusalMutants(Fixture):
+    """L4 (daemon side): the repo check and the command allow-list each have a refusal test and a mutant of the real code; L5 clipping."""
+
+    def refusal_checks(self):
+        self.refused(403, "bound repo", CODER, "prove", repo="acme-org/other", **PROVE)
+        self.refused(400, "not one of", CODER, "merge", head=None)
+
+    def test_refusals(self):
+        self.refusal_checks()
+
+    def test_mutant_repo_check_removed(self):
+        make_mutant_executor(self, 'if m.group(1) != req.get("repo"):', "if False:")
+        with self.assertRaises(AssertionError):
+            self.refused(403, "bound repo", CODER, "prove", repo="acme-org/other", **PROVE)
+
+    def test_mutant_command_allow_list_removed(self):
+        make_mutant_executor(self, "if command not in COMMANDS:", "if False:")
+        with self.assertRaises(AssertionError):
+            self.refused(400, "not one of", CODER, "merge", head=None)
+
+    def test_audit_line_is_intended_and_pod_and_pr_are_clipped(self):
+        before = self.raw()
+        got = self.run_one("p\x07" + "x" * 500, "merge", head=None, pr="y" * 500)
+        self.assertEqual(got["status"], 400)
+        kind, detail = self.backend.audits[-1]
+        self.assertEqual(kind, "relay.refused")
+        self.assertLessEqual(len(detail["by"]), 80)
+        self.assertNotIn("\x07", detail["by"])
+        self.assertEqual(self.raw(), before)
 
 
 if __name__ == "__main__":

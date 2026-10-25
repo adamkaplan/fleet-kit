@@ -35,7 +35,7 @@ def sha(v):
 
 
 class Hub:
-    def __init__(self, wait=3.0, agents=None, max_handlers=None, **relay_kw):
+    def __init__(self, wait=3.0, agents=None, max_handlers=None, hub_mod=cloud_hub, relay_mod=cloud_relay, **relay_kw):
         self.tmp = tempfile.TemporaryDirectory()
         t = Path(self.tmp.name)
         (t / "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
@@ -44,8 +44,8 @@ class Hub:
             "pod-b": {"url": "http://127.0.0.1:1", "session": "s2", "password_file": "x", "repo": "acme-org/widget-api", "issue": 8}}))
         self.lines = []
         agents_path = str(t / "agents.json")
-        self.relay = cloud_relay.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=wait, **relay_kw)
-        self.server = cloud_hub.make_hub(("127.0.0.1", 0), cloud_hub.make_secrets_reviewer(str(t / "secrets.json"), "fleet-agents"),
+        self.relay = relay_mod.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=wait, **relay_kw)
+        self.server = hub_mod.make_hub(("127.0.0.1", 0), cloud_hub.make_secrets_reviewer(str(t / "secrets.json"), "fleet-agents"),
                                          cloud_hub.Inbox(agents_path), self.lines.append, relay=self.relay, daemon="daemon", max_handlers=max_handlers, namespace="fleet-agents")
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.port = self.server.server_address[1]
@@ -509,6 +509,90 @@ class TestBoundsAndCaps(unittest.TestCase):
             relay.submit("pod-a", {})
         self.assertEqual(ctx.exception.status, 503)
         self.assertEqual(relay.pending, {})
+
+
+def mutant(module, old, new, rename=None):
+    """The REAL source of `module` with ONE replacement (a mutant of the real code), as a fresh module; its Refusal stays the real class."""
+    import types
+    path = Path(module.__file__)
+    src = path.read_text()
+    assert src.count(old) >= 1, old
+    mod = types.ModuleType(module.__name__ + "_mut")
+    mod.__file__ = str(path)
+    exec(compile(src.replace(old, new), str(path), "exec"), mod.__dict__)
+    if hasattr(module, "Refusal"):
+        mod.Refusal = module.Refusal
+    return mod
+
+
+class TestHostileBodies(unittest.TestCase):
+    """L1: a body that is deeply nested, holds NaN or a duplicate key is a 400 on the pod route AND the daemon route; the handler lives."""
+    BODIES = {"nested": b"[" * 30000, "nan": b'{"call_id": "c", "args": {"n": NaN}}',
+              "duplicate": b'{"call_id": "c1", "call_id": "c2", "command": "report", "pr": "acme-org/widget-service#1"}',
+              "infinity": b'{"status": Infinity}'}
+
+    def test_pod_route_and_daemon_route_refuse_each_with_400_and_stay_up(self):
+        with Hub(wait=0.05) as hub:
+            hub.relay_call()
+            rid = hub.call("GET", "/relay/pending", who="daemon")[1]["requests"][0]["id"]
+            for name, raw in self.BODIES.items():
+                self.assertEqual(hub.call("POST", "/relay", raw=raw)[0], 400, name)
+                self.assertEqual(hub.call("POST", "/relay/result/" + rid, raw=raw, who="daemon")[0], 400, name)
+            self.assertEqual(hub.call("GET", "/relay/pending", who="daemon")[0], 200)   # the server still answers
+
+    def test_mutant_recursion_error_not_caught_is_seen(self):
+        mod = mutant(cloud_hub, "except (ValueError, RecursionError):", "except ValueError:")
+        with Hub(wait=0.05, hub_mod=mod) as hub:
+            with self.assertRaises(Exception):   # the handler thread dies: no answer
+                self.assertEqual(hub.call("POST", "/relay", raw=self.BODIES["nested"])[0], 400)
+
+    def test_mutant_duplicate_keys_accepted_is_seen(self):
+        mod = mutant(cloud_relay, "raise ValueError(\"duplicate key\")", "pass")
+        with Hub(wait=0.05) as hub:
+            cloud_relay_real = cloud_hub.cloud_relay.loads_strict
+            cloud_hub.cloud_relay.loads_strict = mod.loads_strict
+            try:
+                self.assertNotEqual(hub.call("POST", "/relay", raw=self.BODIES["duplicate"])[0], 400)
+            finally:
+                cloud_hub.cloud_relay.loads_strict = cloud_relay_real
+
+
+class TestRefusalMutants(unittest.TestCase):
+    """L4: the daemon-only check, the repo check and the command allow-list each have a refusal test AND a mutant of the real code."""
+
+    def daemon_only(self, hub):
+        pending = hub.call("GET", "/relay/pending", who="pod-a")[0]
+        hub.relay_call()
+        entry = hub.call("GET", "/relay/pending", who="daemon")[1]["requests"][0]
+        posted = hub.call("POST", "/relay/result/" + entry["id"], {"status": 200, "record": None}, "pod-a")[0]
+        return pending, posted
+
+    def test_daemon_only_refused(self):
+        with Hub(wait=0.05) as hub:
+            self.assertEqual(self.daemon_only(hub), (403, 403))
+
+    def test_mutant_daemon_only_removed(self):
+        mod = mutant(cloud_hub, "if pod != daemon:", "if False:")
+        with Hub(wait=0.05, hub_mod=mod) as hub:
+            self.assertNotEqual(self.daemon_only(hub), (403, 403))
+
+    def test_repo_check_refused(self):
+        with Hub() as hub:
+            self.assertEqual(hub.relay_call(pr="acme-org/other#1")[0], 403)
+
+    def test_mutant_repo_check_removed(self):
+        mod = mutant(cloud_relay, "if match.group(1) != record[\"repo\"]:", "if False:")
+        with Hub(wait=0.05, relay_mod=mod) as hub:
+            self.assertNotEqual(hub.relay_call(pr="acme-org/other#1")[0], 403)
+
+    def test_command_allow_list_refused(self):
+        with Hub() as hub:
+            self.assertEqual(hub.relay_call(command="merge")[0], 400)
+
+    def test_mutant_command_allow_list_removed(self):
+        mod = mutant(cloud_relay, "if command not in COMMANDS:", "if False:")
+        with Hub(wait=0.05, relay_mod=mod) as hub:
+            self.assertNotEqual(hub.relay_call(command="merge")[0], 400)
 
 
 if __name__ == "__main__":
