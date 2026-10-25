@@ -91024,6 +91024,7 @@ class TestCiRecordCarry(LedgerBase):
     def setUp(self):
         super().setUp()
         self.changed = ["bin/other.py"]
+        self.status = "ahead"
         self.parents = ["p" * 40, "q" * 40]
         self.reads = []
         self.pr["headRefOid"] = LEDGER_HEAD
@@ -91033,7 +91034,7 @@ class TestCiRecordCarry(LedgerBase):
             path = argv[2]
             self.reads.append(path)
             if "/compare/%s...%s" % ("a" * 40, self.NEW) in path:
-                body = {"files": [{"filename": f} for f in self.changed]}
+                body = {"status": self.status, "files": [{"filename": f} for f in self.changed]}
             elif path.endswith("/commits/%s" % self.NEW):
                 body = {"parents": [{"sha": x} for x in self.parents]}
             elif path.endswith("/check-runs"):
@@ -91166,15 +91167,138 @@ class TestCiRecordCarry(LedgerBase):
                 self.assertEqual(self.carried(), [])
 
     def test_S6_mutant_that_carries_twice_fails_a_test(self):
-        real = sb.plan_ledger.append_entry
+        real = sb.plan_ledger.append_checked
 
-        def twice(state, entry, now):
-            real(state, entry, now)
-            if entry.get("kind") == "carried":
-                real(state, entry, now)
-        with mock.patch.object(sb.plan_ledger, "append_entry", twice):
+        def twice(state, now, build):   # the carry is now written through append_checked (#1217 M1)
+            first = real(state, now, build)
+            if first.get("kind") == "carried":
+                real(state, now, lambda have, seq: dict(first))
+            return first
+        with mock.patch.object(sb.plan_ledger, "append_checked", twice):
             with self.assertRaises(AssertionError):
                 self.test_S4_and_U2_a_second_run_writes_nothing_and_the_ledger_bytes_are_unchanged()
+
+    def test_M1_two_writers_racing_between_the_read_and_the_append_leave_one_carried_line(self):
+        self.proofs()
+        real = sb.plan_ledger.append_checked
+        state = {"raced": False}
+
+        def racing(st, now, build):   # a second writer gets in first, once, as it could between a read and an append
+            if not state["raced"]:
+                state["raced"] = True
+                self.step()
+            return real(st, now, build)
+        with mock.patch.object(sb.plan_ledger, "append_checked", racing):
+            self.step()
+        self.assertEqual(len(self.carried()), 3)
+        self.assertEqual(len({(c["proof"], c["old_head"], c["new_head"]) for c in self.carried()}), 3)
+
+    def test_M1_mutant_that_appends_outside_the_lock_fails(self):
+        real_checked, real_entry = sb.plan_ledger.append_checked, sb.plan_ledger.append_entry
+
+        def outside(st, now, build):   # the decision is not re-made under the lock
+            return real_entry(st, build([], 0), now)
+        with mock.patch.object(sb.plan_ledger, "append_checked", outside):
+            with self.assertRaises(AssertionError):
+                self.test_M1_two_writers_racing_between_the_read_and_the_append_leave_one_carried_line()
+
+    def no_ci_scenario(self):
+        plan = LEDGER_PLAN
+        return plan
+
+    def test_M2_a_plan_with_proofs_and_no_ci_scenario_carries_at_a_green_head(self):
+        self.proofs()
+        real = sb.ci_record_core
+
+        def no_ci(ctx, now, quiet=False):
+            ctx.plan = dict(ctx.plan, scenarios_parsed=[x for x in ctx.plan["scenarios_parsed"] if x.get("evaluator") != "ci"])
+            return real(ctx, now, quiet)
+        with mock.patch.object(sb, "ci_record_core", no_ci):
+            code, out, err = self.step()
+        self.assertEqual(code, 0, err)
+        self.assertIn("no per-PR scenario that names `ci`", out)
+        self.assertEqual(len(self.carried()), 3)
+        self.assertEqual(out.count("carried proof #"), 3)
+
+    def test_M2_mutant_that_carries_after_the_early_return_fails(self):
+        real = sb.carry_at_green
+
+        def late(ctx, now, get=None, green=True):
+            if not [x for x in ctx.plan["scenarios_parsed"] if x.get("evaluator") == "ci"]:
+                return []
+            return real(ctx, now, get, green)
+        with mock.patch.object(sb, "carry_at_green", late):
+            with self.assertRaises(AssertionError):
+                self.test_M2_a_plan_with_proofs_and_no_ci_scenario_carries_at_a_green_head()
+
+    def refusal_text(self, out, err):
+        return [l for l in (out + err).splitlines() if l.startswith("not carried")]
+
+    def test_M3_a_compare_of_300_files_is_refused_as_too_large(self):
+        self.proofs()
+        self.changed = ["f%d.py" % n for n in range(300)]
+        code, out, err = self.step()
+        self.assertEqual(self.carried(), [])
+        self.assertIn(sb.CARRY_TOO_LARGE, "\n".join(self.refusal_text(out, err)))
+
+    def test_M3_a_compare_flagged_truncated_is_refused_too(self):
+        self.proofs()
+        with self.assertRaises(sb.CarryRefused):
+            sb.carry_head_facts(lambda path: {"status": "ahead", "files": [], "truncated": True}, "acme/app", "a" * 40, self.NEW)
+
+    def not_a_descendant(self, status):
+        self.proofs()
+        self.status = status
+        code, out, err = self.step()
+        self.assertEqual(self.carried(), [])
+        self.assertIn(sb.CARRY_NOT_DESCENDANT % status, "\n".join(self.refusal_text(out, err)))
+
+    def test_M3_a_head_that_is_not_a_descendant_is_refused(self):
+        for status in ("diverged", "behind"):
+            with self.subTest(status=status):
+                self.tearDown()
+                self.setUp()
+                self.not_a_descendant(status)
+
+    def test_M3_ahead_with_few_files_carries_and_identical_too(self):
+        for status in ("ahead", "identical"):
+            self.tearDown()
+            self.setUp()
+            self.proofs()
+            self.status = status
+            self.assertEqual(self.step()[0], 0)
+            self.assertEqual(len(self.carried()), 3)
+
+    def test_M3_mutant_without_the_cap_guard_fails(self):
+        real = sb.CARRY_COMPARE_FILE_CAP
+        with mock.patch.object(sb, "CARRY_COMPARE_FILE_CAP", 10 ** 9):
+            with self.assertRaises(AssertionError):
+                self.test_M3_a_compare_of_300_files_is_refused_as_too_large()
+        self.assertEqual(sb.CARRY_COMPARE_FILE_CAP, real)
+
+    def test_M3_mutant_without_the_descendant_guard_fails(self):
+        real = sb.carry_head_facts
+
+        def lax(get, repo, old, new):
+            return real(lambda path: dict(get(path), status="ahead") if "/compare/%s...%s" % (old, new) in path else get(path), repo, old, new)
+        with mock.patch.object(sb, "carry_head_facts", lax):
+            with self.assertRaises(AssertionError):
+                self.not_a_descendant("diverged")
+
+    def test_M4_a_failed_read_writes_an_audit_line_naming_the_heads_and_the_read(self):
+        self.proofs()
+        self.parents = None
+        calls = []
+        real = sb._gates_audit
+        with mock.patch.object(sb, "_gates_audit", lambda eng, ev, subj, det: (calls.append((ev, subj, det)), real(eng, ev, subj, det))[1]):
+            orig = self.route
+            self.route = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "gh: boom") if argv[2:3] and "/commits/" in argv[2] else orig(argv, **kw)
+            code, out, err = self.step()
+        self.assertEqual(self.carried(), [])
+        got = [c for c in calls if c[0] == "gate.ci_record_carry"]
+        self.assertEqual(len(got), 1, calls)
+        self.assertEqual((got[0][1], got[0][2]["old_head"], got[0][2]["new_head"]), (self.PR, LEDGER_HEAD, self.NEW))
+        self.assertIn("commits", got[0][2]["read"])
 
     def test_the_daemon_recording_and_the_command_share_the_one_call(self):
         text = SWITCHBOARD.read_text(encoding="utf-8")

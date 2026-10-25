@@ -4416,6 +4416,10 @@ A carry is ONE ledger line of its own, kind `carried`, with the fields `proof` (
 
 The step that carries is `gates ci-record` (and the daemon's own recording of the `ci` verdicts, the same code): at a green head it carries, from the previous head, each proof the rule allows, one `carried` line each and never two for the same proof, old head and new head. A proof the rule refuses stays void and the step prints why, one line each (`not carried ...`). `gates <pr>` shows the carried line (`carried: row #N recorded at <head>, held here by carried line #M`), and the line itself is in the plan ledger. A `carried` line counts as evidence only for the plan hash it names.
 
+Two passes cannot write the same carry twice: the check "already carried" is made again under the ledger lock. The step runs whether or not the plan has a `ci` scenario. The facts of the diff are refused when they cannot be trusted: a compare of 300 files or more (GitHub's cap, a named file may be missing) reads "the diff is too large to judge", and a new head that is not a descendant of the old head (compare status other than `ahead` or `identical`: a force-push or rewind) is refused with that status named. A read that fails prints one line and writes an audit line `gate.ci_record_carry` (the pull request, both heads, the read); there is no retry in the step, the next pass retries by itself.
+
+Limits, stated: the carry line has no actor (it is derived from GitHub facts only). `previous_head_of` takes the newest row's head, so a proof at A with a newer row at B is not carried to C (conservative). The refusal branch for "CI not green" costs a few reads per pass (bounded).
+
 ## The merge gate and the merge lock: the fleet's own merge queue (#962)
 
 **It is the fleet's own merge queue.** Two pull requests that were each green against an older default branch can merge minutes apart and fail together (the

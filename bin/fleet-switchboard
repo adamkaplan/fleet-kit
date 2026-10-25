@@ -21745,11 +21745,28 @@ def cmd_gates_stats(args, runner, now):
     return EXIT_OK
 
 
+CARRY_COMPARE_FILE_CAP = 300   # GitHub lists at most 300 files of a compare: a named file beyond the cap would read as untouched
+CARRY_TOO_LARGE = "the diff is too large to judge (GitHub lists at most 300 files of a compare, so a file may be missing): nothing carried"
+CARRY_NOT_DESCENDANT = "the new head is not a descendant of the old head (compare status %s: a force-push or rewind; the compare does not show changes only in the old head): nothing carried"
+
+
+class CarryRefused(Exception):
+    """A carry the facts of the diff cannot support; its text is the printed reason."""
+
+
+class _CarryDone(Exception):
+    pass
+
+
 def carry_head_facts(get, repo, old_head, new_head):
     """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
     "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
     files = [f["filename"] for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+    if len(files) >= CARRY_COMPARE_FILE_CAP or compared.get("truncated") or (compared.get("total_files") or 0) >= CARRY_COMPARE_FILE_CAP:
+        raise CarryRefused(CARRY_TOO_LARGE)
+    if compared.get("status") not in ("ahead", "identical"):
+        raise CarryRefused(CARRY_NOT_DESCENDANT % compared.get("status"))
     commit = get("repos/%s/commits/%s" % (repo, new_head))
     parents = [p.get("sha") for p in (commit.get("parents") or []) if isinstance(p, dict)]
     merge = False
@@ -21783,7 +21800,16 @@ def carry_proofs(state, pr, plan, old_head, new_head, facts, now):
             continue
         verdict, reason = plan_ledger.carry_decision(row, evaluators.get(sid), facts["files"], facts["merge_of_default"], facts["ci_green"])
         if verdict == "carry":
-            plan_ledger.append_entry(state, plan_ledger.carry_line(row, sid, old_head, new_head, facts["merge_of_default"], pr), now)
+            line = plan_ledger.carry_line(row, sid, old_head, new_head, facts["merge_of_default"], pr)
+
+            def build(have, seq, row=row, line=line):   # the check is made under the ledger lock: two passes cannot both write the line
+                if row["seq"] in plan_ledger.carried_seqs(have, pr, new_head, plan["plan_hash"]):
+                    raise _CarryDone()
+                return line
+            try:
+                plan_ledger.append_checked(state, now, build)
+            except _CarryDone:
+                continue
         out.append({"proof": row["seq"], "scenario": sid, "verdict": verdict, "reason": reason})
     return out
 
@@ -22323,6 +22349,7 @@ def ci_record_core(ctx, now, quiet=False):
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
         named = "; ".join("%s run %s is %s" % (w or "status", r, st) for w, r, st in load_module("ci_runs").not_green_runs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
         return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)%s" % (ci, head[:8], " [%s]" % named if named else ""))
+    out["carry"] = carry_at_green(ctx, now)   # the carry does not depend on whether any ci verdict is wanted
     if not wanted:
         if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))
@@ -22341,7 +22368,6 @@ def ci_record_core(ctx, now, quiet=False):
         out["recorded"].append(scenario["id"])
     if out["recorded"] or not quiet:
         _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=True, recorded=out["recorded"], already=out["already"]))
-    out["carry"] = carry_at_green(ctx, now)
     return dict(out, status="recorded")
 
 
@@ -22391,7 +22417,13 @@ def carry_at_green(ctx, now, get=None, green=True):
         facts["ci_green"] = green and (ctx.facts or {}).get("ci") == "green"
         ci_ids = {x["id"] for x in ctx.plan["scenarios_parsed"] if plan_ledger.evaluator_of(x) == "ci"}   # re-recorded at each green head, never carried: not a refusal to print
         return [d for d in carry_proofs(ctx.state, ctx.pr, ctx.plan, old, head, facts, now()) if d["scenario"] not in ci_ids]
+    except CarryRefused as err:
+        return [{"proof": None, "scenario": None, "verdict": "refuse", "reason": str(err)}]
     except (GitHubUnavailable, LedgerCommandError, AttributeError, KeyError, TypeError, ValueError) as err:
+        try:
+            _gates_audit(ctx.engine, "gate.ci_record_carry", ctx.pr, {"ok": False, "old_head": old, "new_head": head, "read": _one_line(str(err), 160)})
+        except Exception:
+            pass
         return [{"proof": None, "scenario": None, "verdict": "refuse", "reason": "the facts of the head could not be read: %s" % _one_line(str(err), 160)}]
 
 
@@ -22419,6 +22451,8 @@ def cmd_gates_ci_record(args, runner, now):
         raise LedgerCommandError("%s: nothing was recorded" % got["why"])
     if got["status"] == "nothing":
         print("CI is green at %s; the plan has no per-PR scenario that names `ci`: nothing to record" % got["head"][:8])
+        for line in carry_lines(got.get("carry") or []):
+            print(line)
         return EXIT_OK
     print("CI is green at %s: recorded %s%s" % (got["head"][:8], ", ".join(got["recorded"]) or "nothing new",
                                                " (already recorded: %s)" % ", ".join(got["already"]) if got["already"] else ""))
