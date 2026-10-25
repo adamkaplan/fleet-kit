@@ -49,11 +49,11 @@ class TestScansRun(unittest.TestCase):
     def test_total_bound_exceeded_is_not_clean(self):
         with open(os.path.join(self.wt, "cloud", "launcher", "cloud_worker.py"), "a") as f:
             f.write("\n# bound probe\n")
-        env = dict(os.environ, CLOUD_PREFLIGHT_QUICK_TOTAL="0", CLOUD_PREFLIGHT_BASE="HEAD", PYTHONDONTWRITEBYTECODE="1")
+        env = dict(os.environ, CLOUD_PREFLIGHT_QUICK_TOTAL="1", CLOUD_PREFLIGHT_BASE="HEAD", PYTHONDONTWRITEBYTECODE="1")
         r = subprocess.run([sys.executable, os.path.join(self.wt, "bin", "cloud-pr-preflight"), "--quick"], cwd=self.wt,
                            env=env, capture_output=True, text=True, timeout=140)
         self.assertEqual(r.returncode, 1, r.stderr[-500:])
-        self.assertIn("NOT RUN: quick run exceeded 0 s", r.stdout)
+        self.assertIn("NOT RUN: quick run exceeded 1 s", r.stdout)
         self.assertNotIn("RESULT: PASS", r.stdout)
 
     def test_missing_helper_is_loud_in_prepush(self):
