@@ -41249,6 +41249,30 @@ class Box:
         static = dc.closure(ast.parse(mutant_source), ["entry"])
         self.assertEqual(self.outside_the_closure(ran, static), ["hidden"], "the trace test sees the definition the static walk cannot")
 
+    def test_the_derived_closure_is_a_superset_of_the_run_time_trace_and_a_mutant_that_drops_any_traced_definition_fails_it(self):
+        """The contract (the Chief of Staff's ruling): the derived closure is a SUPERSET of what the real clear and record run, never less. One mutant for each traced definition: the closure without it must fail the check."""
+        import ast
+        dc, rule, tree, sets = self.closure_sets()
+        daemon_path = BIN / "fleet-switchboard"
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        ran = self.traced_definitions(lambda: self.under(), daemon_path, ("cmd_impact", "cmd_review"))
+        self.record_pr_setup()
+        ran |= self.traced_definitions(lambda: self.record_run(self.EXPLICIT), daemon_path, ("cmd_impact", "cmd_review"))
+        entry_callers = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and set(rule["clear_entry_points"]) & {x.id for x in ast.walk(n) if isinstance(x, ast.Name)}}
+        self.assertTrue(ran, "the trace saw the real run execute daemon code")
+        self.assertEqual(self.outside_the_closure(ran, sets, entry_callers), [], "the derived closure holds everything that ran")
+        defs, bound, refs, members = sets
+        tops = sorted({top for top, _ in ran if top not in entry_callers}, key=str)
+        self.assertTrue(tops)
+        for top in tops:
+            with self.subTest("dropped %s" % top):
+                smaller = (set(defs) - {top}, set(bound) - {top}, refs, {k: v for k, v in members.items() if k != top})
+                self.assertIn(top, self.outside_the_closure(ran, smaller, entry_callers), "a closure smaller than the trace (without %s) must fail" % top)
+        for top, method in sorted((r for r in ran if r[1] is not None and r[0] in members and not (r[1].startswith("__") and r[1].endswith("__"))), key=str):
+            with self.subTest("dropped method %s.%s" % (top, method)):
+                narrower = (defs, bound, refs, dict(members, **{top: set(members[top]) - {method}}))
+                self.assertIn("%s.%s" % (top, method), self.outside_the_closure(ran, narrower, entry_callers))
+
     def test_the_refusal_and_the_hold_read_the_one_derivation_and_no_list_of_daemon_names_is_left(self):
         import ast
         dc, rule, tree, sets = self.closure_sets()
@@ -41267,7 +41291,7 @@ class Box:
                         calls.setdefault(getattr(x.func, "attr", getattr(x.func, "id", None)), set()).add(fn.name)
         self.assertEqual(calls.get("closure_refusals"), {"delegated_clear_map"}, "ONE reader of the walk")
         self.assertEqual(calls.get("daemon_roots"), {"delegated_clear_map"}, "ONE reader of the roots")
-        self.assertEqual(calls.get("delegated_clear_map"), {"delegated_clear_pr_checks", "clear_closure_hold"}, "the refusal and the hold both call the one mapper")
+        self.assertEqual(calls.get("delegated_clear_map"), {"delegated_clear_inputs", "clear_closure_hold"}, "the refusal (through the one reading of the clear's inputs, which the clear and the line read) and the hold both call the one mapper")
         self.assertNotIn("closure", calls, "no other code walks the daemon file by name")
 
     def test_the_hold_and_the_refusal_call_the_same_mapper_with_the_same_input_and_the_hold_fails_toward_hold(self):
