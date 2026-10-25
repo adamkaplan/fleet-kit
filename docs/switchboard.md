@@ -1259,10 +1259,10 @@ Mutants of this PR, run by hand (killed = a test fails):
 issue decision, a report with an issue number and a batch) and a heads-up row to its PR
 (`https://github.com/<repo>/pull/<number>`); a row with no repo or no number has no link and behaves as before. The
 `id age` line is drawn as an OSC 8 hyperlink (OpenTUI's own link attribute, not text, so no line gets wider), and
-a click on the row copies the link through OSC 52 and shows a toast. In herdr inside iTerm2 that means: hold
+a click on the row copies its short code `repo:#number` (the repository name without its owner, for example `fleet-kit:#935`; never the URL) through OSC 52 and shows a toast. In herdr inside iTerm2 that means: hold
 Ctrl (herdr's own link click) and click the `id age` line to open the issue or PR in the
-browser, or click the row to copy the link. A terminal that ignores OSC 8 shows the same plain text, and one that
-ignores OSC 52 shows the link in the toast to copy by hand. The plugin spawns no process and makes no network
+browser, or click the row to copy the short code. A terminal that ignores OSC 8 shows the same plain text, and one that
+ignores OSC 52 shows the short code in the toast to copy by hand. The plugin spawns no process and makes no network
 call: the terminal opens the link. The URL is built only from the entry's `repo` and `ask` or `number`, each
 matched against a strict pattern, never from a title; control characters in a title or row are dropped.
 
