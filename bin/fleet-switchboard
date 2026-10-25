@@ -22407,6 +22407,8 @@ def carry_at_green(ctx, now, get=None, green=True):
     """#1217: the ONE call of the carry from the CI-verdict recording step (the command and the daemon pass both come through `ci_record_core`). Carries each proof of the
     previous head the rule allows (`carry_proofs`) and returns [{"proof", "scenario", "verdict", "reason"}] (refusals included); a read that fails is one refused line. Writes no
     line for anything the rule refuses. `get(path)` reads GitHub (default: the engine's `gh_api`)."""
+    if getattr(ctx, "state", None) is None:   # a context with no ledger state has no ledger to carry from: nothing to carry, never a raise
+        return []
     head = (ctx.facts or {}).get("head")
     entries, problem = plan_ledger.read_ledger(ctx.state)
     old = None if problem else previous_head_of(entries, ctx.pr, head, ctx.plan["plan_hash"])
