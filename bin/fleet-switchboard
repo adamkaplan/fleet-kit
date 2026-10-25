@@ -278,6 +278,11 @@ def health_write(engine, state, now):
         _health_fault(engine, "write", err)
 
 
+def whole_lines(text):
+    """The lines of a sent message, stripped: a merged member is acknowledged only when its whole line is one of them (never a substring)."""
+    return {line.strip() for line in text.splitlines()}
+
+
 class _LazyImpactFloor:
     def __getattr__(self, name):
         return getattr(load_impact_floor(), name)
@@ -2973,10 +2978,11 @@ class Switchboard:
             self.intents.discard_told()
             compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now())
         keys = []
+        sent_lines = whole_lines(text)
         for fact in carried:
             lines = getattr(fact, "member_lines", None)
             for key in (getattr(fact, "members", None) or [fact.key]):
-                if lines is None or lines.get(key, "") in text:   # a merged member counts only if its line is in the message
+                if lines is None or lines.get(key, "") in sent_lines:   # a merged member counts only if its line is in the message
                     keys.append(key)
         # The id lives in v2's namespace, so it is derived from the session the
         # recipient runs now: a relaunched agent is a new recipient for v2.

@@ -115,6 +115,13 @@ def superseded_by(facts):
 NEWEST_FIRST_MARK = " [newest first]"
 
 
+def compose_order(fact):
+    """#1275 ordering rule: every pass-through fact (owner wait, held PR, first report, send) sorts BEFORE the merged wake fact whatever its age,
+    newest first among themselves; the merged fact (the reminders) is LAST."""
+    reminder = bool(getattr(fact, "members", None)) or fact.kind in ("sweep", "triage") or bool(getattr(fact, "wake_class", None))   # the merged fact and the sweep/triage/load items left over
+    return (reminder, -fact.created, fact.key)
+
+
 def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
     """One message for `facts`, newest first (a newer result is never held behind older reminders). Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
     message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
@@ -126,7 +133,8 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     cap is cut, and says so. With `section` (PR 6, see sectioned_lines) every
     item that names an issue sits under its ask's Intent lines.
     """
-    facts = sorted(facts, key=lambda fact: (-fact.created, fact.key))   # #1275: newest first; ties keep the key order
+    # #1275: pass-through facts (owner wait, held PR, first report, send: all that is not a merged wake) first, newest first; the merged wake (reminders, and the wake items not merged yet) LAST whatever its age
+    facts = sorted(facts, key=compose_order)
     if not facts:
         raise ValueError("nothing to compose")
     if facts[0].orders:  # PR 17: the orders note, whole: every order
