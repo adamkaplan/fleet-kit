@@ -5492,6 +5492,9 @@ The body is the owner v2 body plus one table with a row per change. Use neutral 
 <1 to 3 sentences: what the batch is and why the owner's clear is needed.>
 
 ## What changes for you
+
+The Before and After columns are found by header name, in any order; extra columns are allowed.
+
 | Before | After |
 |---|---|
 | Each change waited for your clear. | One batch, cleared once. |
