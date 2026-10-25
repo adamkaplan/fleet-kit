@@ -79085,7 +79085,7 @@ class TestCloudLoad(Base):
         (self.state_dir / "cloud" / "dir.json").mkdir()
         self._raw("bad.json", b"{")
         for pair in (("    except UnicodeDecodeError:\n        return None, \"not_utf8\"", "    except UnicodeDecodeError:\n        raise RuntimeError('x')"),
-                         ("    except (ValueError, RecursionError):\n        return None, \"not_json\"", "    except RecursionError:\n        return None, \"not_json\""),
+                         ("    except ValueError:\n        return None, \"not_json\"", "    except ZeroDivisionError:\n        return None, \"not_json\""),
                          ("    except OSError:\n        return None, \"not_regular\"\n    finally", "    except OSError:\n        raise\n    finally",
                           "        if not stat.S_ISREG(os.fstat(fd).st_mode):\n            return None, \"not_regular\"\n", "")):
             mod = self._cw_mutant(*pair)
@@ -90175,7 +90175,7 @@ class TestCloudWatchBounds(unittest.TestCase):
             "not_utf8": (lambda: self.put("x.json", b"\xff\xfe{}"), "except UnicodeDecodeError:", "except ZeroDivisionError:"),
             "not_json": (lambda: self.put("x.json", b"{nope"), "except ValueError:\n        return None, \"not_json\"", "except ValueError:\n        return None, \"too_deep\""),
             "wrong_shape": (lambda: self.put("x.json", b"[1]"), "if not isinstance(record, dict):", "if False:"),
-            "too_deep": (lambda: self.put("x.json", b"[" * 30000 + b"]" * 30000), "except RecursionError:", "except ZeroDivisionError:"),
+            "too_deep": (lambda: self.put("x.json", b"[" * 30000 + b"]" * 30000), None, None),   # mutants: test_depth_* below
         }
 
     def test_each_kind_is_skipped_and_counted_under_its_own_name(self):
@@ -90204,6 +90204,118 @@ class TestCloudWatchBounds(unittest.TestCase):
                 except (AssertionError, Exception):
                     continue   # the mutant hung or raised: caught
                 self.assertNotEqual((got["records"], got["skips"][want]), ([], 1), "the mutant of %s survived" % kind)
+
+    # ---- #1073 repair of #1155: a Python-independent depth limit (the scan never reads the interpreter's recursion limit)
+    def nested(self, n):
+        return "".join('{"a":' for _ in range(n)) + "1" + "}" * n
+
+    def test_depth_exactly_at_the_limit_parses_and_one_over_is_too_deep(self):
+        limit = self.cloud.WATCH_MAX_DEPTH
+        self.assertEqual(limit, 64)
+        self.put("x.json", self.nested(limit).encode())
+        got = self.read()
+        self.assertEqual((len(got["records"]), got["skipped"]), (1, 0))
+        for f in self.dir.iterdir():
+            f.unlink()
+        self.put("x.json", self.nested(limit + 1).encode())
+        got = self.read()
+        self.assertEqual((got["records"], got["skips"]["too_deep"]), ([], 1))
+
+    def test_brackets_in_strings_and_escaped_quotes_do_not_count(self):
+        c = self.cloud
+        self.assertFalse(c.nesting_too_deep(json.dumps({"a": "[" * 500 + "{" * 500})))
+        self.assertFalse(c.nesting_too_deep(json.dumps({"a": 'x\\" ' + "[" * 500})))
+        self.assertFalse(c.nesting_too_deep('{"a": "\\\\", "b": "[[[[[[[[[["}', 2))
+        self.assertTrue(c.nesting_too_deep("[" * 65))
+        self.assertTrue(c.nesting_too_deep('["\\"", ' + "[" * 70))
+
+    def test_all_bracket_file_of_64_kib_is_too_deep_and_fast(self):
+        import time
+        self.put("x.json", b"[" * 65536)
+        start = time.monotonic()
+        got = self.read()
+        self.assertLess(time.monotonic() - start, 1.0)
+        self.assertEqual(got["skips"]["too_deep"], 1)
+        start = time.monotonic()
+        self.assertTrue(self.cloud.nesting_too_deep("[" * 65536))
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    def reader_checks(self):
+        deep = self.nested(65)
+        def watch(mod):
+            self.put("x.json", deep.encode())
+            return mod.read_records_bounded(self.tmp)["skips"]["too_deep"] == 1
+        def shared(mod):
+            f = self.dir / "y.json"
+            f.write_text(deep)
+            return mod.read_record_file(str(f), 65536) == (None, "too_deep")
+        def load(mod):
+            (self.dir / "z.json").write_text(deep)
+            os.chmod(str(self.dir / "z.json"), 0o600)
+            try:
+                mod.load_record(self.tmp, "z")
+            except mod.CloudError as err:
+                return "nested deeper" in str(err)
+            return False
+        return {
+            "read_records_bounded (_read_one)": (watch, "        record = parse_bounded(text)\n    except TooDeep:\n        return None, \"too_deep\"\n    except ValueError:\n        return None, \"not_json\"\n    if not isinstance(record, dict):\n        return None, \"wrong_shape\"\n    return record, None\n\n\ndef read_records_bounded", None),
+            "read_record_file": (shared, None, None),
+            "load_record": (load, "record = parse_bounded(_read_private(path, RECORD_MAX))", "record = json.loads(_read_private(path, RECORD_MAX))"),
+        }
+
+    def test_every_reader_refuses_too_deep_with_its_own_kind(self):
+        for name, (check, _o, _n) in self.reader_checks().items():
+            with self.subTest(reader=name):
+                self.assertTrue(check(self.cloud))
+
+    def test_a_limit_of_a_billion_fails_every_reader_on_every_python(self):
+        mutant = self.module("WATCH_MAX_DEPTH = 64 ", "WATCH_MAX_DEPTH = 10**9 ")
+        for name, (check, _o, _n) in self.reader_checks().items():
+            with self.subTest(reader=name):
+                for f in list(self.dir.iterdir()):
+                    f.unlink()
+                try:
+                    self.assertFalse(check(mutant))
+                except Exception:
+                    pass
+
+    def test_each_reader_mutant_that_drops_the_bounded_parse_is_caught(self):
+        """Per-reader mutant: that reader parses with a plain json.loads and a 65-deep record is no longer refused."""
+        checks = self.reader_checks()
+        text = self.SRC.read_text()
+        # one mutant per reader: swap that reader's parse_bounded call for json.loads (the first, second, third call site in file order)
+        sites = [i for i in range(len(text)) if text.startswith("parse_bounded(", i) and not text.startswith("parse_bounded(text):", i)]
+        self.assertEqual(len(sites), 3)
+        for site, key in zip(sites, ("read_record_file", "load_record", "read_records_bounded (_read_one)")):
+            with self.subTest(reader=key):
+                mutated = text[:site] + "json.loads(" + text[site + len("parse_bounded("):]
+                mod = types.ModuleType("cloud_mutant")
+                mod.__file__ = str(self.SRC)
+                sys.modules["cloud_mutant"] = mod
+                self.addCleanup(sys.modules.pop, "cloud_mutant", None)
+                exec(compile(mutated, str(self.SRC), "exec"), mod.__dict__)
+                for f in list(self.dir.iterdir()):
+                    f.unlink()
+                check = checks[key][0]
+                try:
+                    ok = check(mod.bind(sb.__dict__))
+                except Exception:
+                    ok = False
+                self.assertFalse(ok, "the mutant of %s survived" % key)
+
+    def test_every_untrusted_record_parse_is_bounded_and_listed_in_the_docs(self):
+        """Completeness: every json.loads in cloud_worker.py of a record file goes through parse_bounded, and the docs table names each reader."""
+        text = self.SRC.read_text()
+        loads = [l.strip() for l in text.splitlines() if "json.loads(" in l and not l.lstrip().startswith("#")]
+        self.assertEqual(loads, ["return json.loads(text)", "body = json.loads(out) if (out or \"\").strip() else None"])
+        import re
+        readers = sorted(set(re.findall(r"^def (\w+)\(", text, re.M)) & {"read_record_file", "_read_one", "load_record"})
+        sites = text.count("parse_bounded(")
+        self.assertEqual((len(readers), sites), (3, 4))   # 3 call sites + the definition
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        section = docs[docs.index("## Cloud watch"):docs.index("## The assembler")]
+        for name in readers + ["live_cloud_by_lane", "WATCH_MAX_DEPTH", "parse_bounded"]:
+            self.assertIn(name, section)
 
     def test_mutant_plain_open_hangs_on_a_fifo(self):
         os.mkfifo(str(self.dir / "x.json"))
