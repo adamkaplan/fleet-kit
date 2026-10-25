@@ -9,15 +9,16 @@ The world (GitHub, the plan, the registry, the audit) is a Backend, so the rules
 One ledger entry per prove or verdict, written by `plan_ledger.append_checked` under its flock; the head is re-read from GitHub INSIDE
 that decision. Replay memory: `relay_calls.json` (pod + call id -> seq, hash), backed by the call id stored in the entry itself.
 
-Report delivery is AT-MOST-ONCE per call id (exactly one record, never two): the call id is CLAIMED first (a PENDING record, get-or-claim in one
+Report delivery is AT-MOST-ONCE per call id: a report can be LOST (never duplicated); for `report` the ask's "exactly one" reads "at most one". A lost report is
+told to the pod by name (409 "lost or still pending: resend with a NEW call_id"). Report delivery, in detail: the call id is CLAIMED first (a PENDING record, get-or-claim in one
 step under the index flock), then delivered, then marked DONE. A replay of a done id answers 200 "replay: already reported"; a replay of a
-PENDING id (a crash, or a delivery that raised, between claim and done) is resolved deliberately: it answers 409 "already claimed" and
+PENDING id (a crash, or a delivery that raised, between claim and done) is resolved deliberately: it answers that named 409 and
 NEVER delivers a second time (the first delivery may have happened; the owner sees the audit line `report.claimed` and may resend under a new
 call id). Claims live in their own file (`relay_reports.json`, REPORT_MAX entries, so a flood of prove/verdict entries cannot evict them; a
 damaged claim file refuses with 500 rather than forgetting). A report replay with a different pr or different args under the same call id is 409.
 Refusals (daemon-only credential, repo, allow-list, rules) write an AUDIT line `relay.refused` on purpose and leave the ledger and files
 byte-identical. The hub's 1000-entry finished cache can be flooded to evict another pod's hub-side replay record; the daemon-side dedupe
-above still holds it. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock (bounded by HEAD_TIMEOUT, refused 504 with nothing written when late); inside the flock the build only compares it with the head the request judged: no network under the lock.
+above still holds it. Every hub request (connect, headers, body, response; GET and POST) has ONE wall-clock deadline (READ_DEADLINE 30 s), and a relay pass a budget (PASS_BUDGET 60 s: later requests wait for the next pass); worst case for the transport of a pass is PASS_BUDGET + READ_DEADLINE = 90 s, plus the GitHub reads of the request being handled. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock (bounded by HEAD_TIMEOUT, refused 504 with nothing written when late); inside the flock the build only compares it with the head the request judged: no network under the lock.
 GitHub reads per pass, worst case: at most 10 requests, each making _ctx reads (a ledger context = PR facts and plan from GitHub): report 1 (link), gates 2, prove 3 (link, plan, live head), verdict 4 (link, plan, PR facts, live head); so at most 10 x 4 = 40 context reads per pass.
 Memory limit, exactly: report claims survive restarts and a missing or pruned relay_calls.json (own file, REPORT_MAX 50000 entries; beyond that the oldest claim is forgotten, and a deleted relay_reports.json is an empty memory, so a report with that call id would then be delivered again). A damaged file refuses instead.
 
@@ -27,6 +28,7 @@ the PR body can set it. The boundaries are the prove holder check (`relay_holder
 Pod evidence text (prove/verdict args) is stored in the ledger UNSCRUBBED: the ledger is not secret-safe, so pods must never put secrets in it.
 """
 import contextlib
+import errno
 import hashlib
 import fcntl
 import json
@@ -55,6 +57,8 @@ NEEDS_LINK = cloud_relay.NEEDS_LINK
 PENDING_CAP = 4 * 1024 * 1024   # bytes of the hub's pending list; larger is refused
 TOKEN_CAP = 4096                # bytes of the token file
 REASON_FIXED = "relay failed"
+PENDING_REASON = "already claimed, never delivered twice: lost or still pending: resend with a NEW call_id"
+PASS_BUDGET = 60.0              # wall-clock seconds of one relay pass; requests not started by then wait for the next pass
 REASON_MAX = 1900               # the hub refuses a reason over 2000 characters; every answer is clipped below that
 INDEX_READ_CAP = 8 * 1024 * 1024   # bytes of relay_calls.json read; the file is written only by this daemon (INDEX_MAX entries), a larger one is treated as damaged
 RID_RE = re.compile(r"[0-9a-f]{32}")
@@ -254,8 +258,8 @@ class Executor:
                         raise Refuse(409, "call_id reused for a different call")
                     if seen.get("state") == "done":
                         return 200, "replay: already reported", None
-                    self.backend.audit("report.claimed", pr, {"by": pod, "call_id": clean_text(cid, 64)})
-                    raise Refuse(409, "already claimed: not delivered again", "report replay of a pending claim")
+                    self.backend.audit("report.claimed", pr, {"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})
+                    raise Refuse(409, PENDING_REASON, "report replay of a pending claim")
                 # only the state and the text come from the pod; the issue is the hub's, and `everything` is dropped
                 self.backend.report(pod, {"state": args.get("state"), "text": clean_text(args.get("text")), "issue": req.get("issue")})
                 self.reports.put(pod, cid, dict(mine, state="done"))
@@ -337,26 +341,29 @@ class Executor:
                 ok2, why2 = plan_ledger.may_record_verdict(named, pod, {named: b.evaluators(named)}, a2)
                 if not ok2:
                     raise Refuse(403, "refused: %s" % why2)
-            if not _same_head(first, head):   # compared with the head read BEFORE the flock: no network under the lock
+            if not _same_head(first, head):   # the ONLY compare: with the head read BEFORE the flock (no network under the lock)
                 raise Refuse(409, "stale head: the PR head is %s, not %s" % ((first or "unknown")[:12], head[:12]))
             return entry
 
         first = _bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)   # the slow read is made BEFORE the flock, under a short timeout
         if first is _TIMEOUT:
             raise Refuse(504, "the PR head could not be read in time: nothing was written", "live_head timed out after %ds" % HEAD_TIMEOUT)
-        if not _same_head(first, head):
-            raise Refuse(409, "stale head: the PR head is %s, not %s" % ((first or "unknown")[:12], head[:12]))
         stored = plan_ledger.append_checked(self.state, self.now(), build)
         b.audit("plan.%s" % entry["kind"], pr, {"scenario": sid, "result": result, "seq": stored["seq"], "by": pod,
                                                "chain": stored["hash"], "via": "relay"})
         return {"seq": stored["seq"], "hash": stored["hash"]}
 
 
-def pass_once(executor, fetch, post):
-    """One pull pass. fetch() -> {"requests": [...]} ; post(id, body). Returns the number answered."""
+def pass_once(executor, fetch, post, budget=None, clock=time.monotonic):
+    """One pull pass. fetch() -> {"requests": [...]} ; post(id, body). Returns the number answered. A request is started only while the
+    pass has used less than `budget` seconds (PASS_BUDGET); the rest stay pending at the hub for the next pass."""
+    start = clock()
+    budget = PASS_BUDGET if budget is None else budget
     pending = fetch() or {}
     done = 0
     for req in (pending.get("requests") or [])[:10]:
+        if clock() - start >= budget:
+            break
         if not isinstance(req, dict):
             continue
         rid = req.get("id")
@@ -379,9 +386,7 @@ def pass_once(executor, fetch, post):
 
 def http_transport(base, token):
     """(fetch, post) over HTTPS with the daemon credential the decisions pull already uses (`token` is read by the caller, never printed)."""
-    import urllib.error
     import urllib.parse
-    import urllib.request
     import cloud_cli
     base = base.rstrip("/")
     parts = urllib.parse.urlsplit(base)
@@ -390,28 +395,57 @@ def http_transport(base, token):
     if parts.scheme == "http" and not cloud_cli._http_allowed(parts, {}):
         raise ValueError("plain http to a host that is not loopback or cluster-local is refused")
 
-    class NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *args, **kwargs):   # the bearer is never forwarded
-            return None
-    opener = urllib.request.build_opener(NoRedirect)
+    import http.client
 
     def call(path, body=None):
+        """One request under ONE wall-clock deadline (READ_DEADLINE) covering connect, headers, body and response: the socket timeout is the
+        REMAINING time at each step, and a watchdog shuts the socket at the deadline (a hub trickling headers one byte at a time is cut)."""
         data = None if body is None else json.dumps(body).encode()
-        req = urllib.request.Request(base + path, data=data, method="POST" if body is not None else "GET",
-                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
         end = time.monotonic() + READ_DEADLINE
-        with opener.open(req, timeout=20) as resp:
+        conn_class = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        conn = conn_class(parts.netloc, timeout=READ_DEADLINE)
+
+        def cut():
+            sock = conn.sock
+            if sock is not None:
+                with contextlib.suppress(OSError):
+                    sock.shutdown(2)
+                with contextlib.suppress(OSError):
+                    sock.close()
+        watchdog = threading.Timer(READ_DEADLINE, cut)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            conn.request("POST" if data is not None else "GET", (parts.path or "") + path, body=data,
+                         headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})   # connect happens here: bounded by the timeout above
+            if conn.sock is not None:
+                conn.sock.settimeout(max(0.05, end - time.monotonic()))
+            resp = conn.getresponse()
+            if resp.status != 200:   # a redirect is not followed (the bearer is never forwarded)
+                raise OSError("hub answered %d" % resp.status)
             raw = b""
-            while len(raw) <= PENDING_CAP:   # read in pieces so the TOTAL time, not just each read, is bounded
-                if time.monotonic() > end:
+            while len(raw) <= PENDING_CAP:   # read in pieces, each under the REMAINING time
+                left = end - time.monotonic()
+                if left <= 0:
                     raise TimeoutError("hub answer not complete within %ds" % READ_DEADLINE)
-                chunk = (getattr(resp, "read1", None) or resp.read)(min(8192, PENDING_CAP + 1 - len(raw)))   # read1: returns at the first bytes, so a trickle is seen
+                if conn.sock is not None:
+                    conn.sock.settimeout(left)
+                chunk = resp.read1(min(8192, PENDING_CAP + 1 - len(raw)))
                 if not chunk:
                     break
                 raw += chunk
             if len(raw) > PENDING_CAP:
                 raise ValueError("hub answer over %d bytes" % PENDING_CAP)
             return cloud_relay.loads_strict(raw or b"{}")
+        except TimeoutError:
+            raise
+        except (OSError, http.client.HTTPException):
+            if time.monotonic() >= end - 0.01:
+                raise TimeoutError("hub answer not complete within %ds" % READ_DEADLINE) from None
+            raise
+        finally:
+            watchdog.cancel()
+            conn.close()
     return (lambda: call("/relay/pending")), (lambda rid, body: call("/relay/result/" + rid, body))
 
 
@@ -483,11 +517,18 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ):
         return 0
     try:
         try:
-            with open(tokfile, "rb") as handle:
+            try:   # NONBLOCK: a FIFO cannot hang the daemon; NOFOLLOW: a symlink is refused; fstat BEFORE any read
+                fd = os.open(tokfile, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            except OSError as err:
+                if err.errno != errno.ELOOP:
+                    raise   # the outer handler records only the class name
+                engine._note("relay.pass_failed", None, {"error": "the token file is a symbolic link: it is not used"})
+                return 0
+            with os.fdopen(fd, "rb") as handle:
                 info = os.fstat(handle.fileno())
                 loose = info.st_mode & 0o077 or info.st_uid != os.geteuid() or not stat.S_ISREG(info.st_mode)
                 raw = handle.read(TOKEN_CAP + 1) if not loose else b""
-            if loose:   # a token readable by group or other is refused, never read or used
+            if loose:   # not a regular file, or readable by group or other: refused, never read or used
                 engine._note("relay.pass_failed", None, {"error": "the token file is not private to this user (regular file, owned by the user, mode 0600): it is not used"})
                 return 0
             if len(raw) > TOKEN_CAP:

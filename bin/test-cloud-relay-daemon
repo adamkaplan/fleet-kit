@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -590,13 +591,16 @@ class RealRuleMutants(unittest.TestCase):
         self.caught("test_same_call_id_two_pods")
 
 
-def load_backend_module(old=None, new=None):
+def load_backend_module(old=None, new=None, extra=()):
     """The real cloud_relay_daemon source, optionally with ONE replacement (a mutant of the real code), as a fresh module."""
     import types
     src = (BIN / "cloud_relay_daemon.py").read_text()
     if old is not None:
         assert src.count(old) == 1, old
         src = src.replace(old, new)
+    for o, n in extra:   # more replacements of the same mutant (a deadline kept in two places)
+        assert src.count(o) == 1, o
+        src = src.replace(o, n)
     mod = types.ModuleType("cloud_relay_daemon_mut")
     mod.__file__ = str(BIN / "cloud_relay_daemon.py")
     exec(compile(src, mod.__file__, "exec"), mod.__dict__)
@@ -733,7 +737,7 @@ class ReportOnce(Fixture):
         self.crash_report()
         got = self.replay()
         self.assertEqual((got["status"], self.backend.reported), (409, []))
-        self.assertIn("already claimed", got["reason"])
+        self.assertIn("lost or still pending: resend with a NEW call_id", got["reason"])
 
     def test_crash_between_delivery_and_done_never_delivers_twice(self):
         ex = self.ex
@@ -868,7 +872,7 @@ class LiveHead(Fixture):
         self.assertEqual(self.raw(), b"")
 
     def test_mutants_are_caught(self):
-        for guard, old, new in (("test_a_slow_live_head_does_not_block_another_ledger_writer", "if not _same_head(first, head):   # compared", "first = b.live_head(pr)\n            if not _same_head(first, head):   # compared"),
+        for guard, old, new in (("test_a_slow_live_head_does_not_block_another_ledger_writer", "if not _same_head(first, head):   # the ONLY", "first = b.live_head(pr)\n            if not _same_head(first, head):   # the ONLY"),
                                 ("test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)", "b.live_head(pr)")):
             case = LiveHead(guard)
             case.setUp()
@@ -925,7 +929,7 @@ class HubReadAndTransport(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 2.5)
 
     def test_mutant_without_the_total_deadline_is_caught(self):
-        mod = load_backend_module("if time.monotonic() > end:", "if False:")
+        mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"),))
         old, mod.READ_DEADLINE = relay.READ_DEADLINE, 1.0
         import time
 
@@ -1060,6 +1064,160 @@ class DaemonRefusalMutants(Fixture):
         self.assertLessEqual(len(self.backend.audit_prs[-1]), 80)
         self.assertNotIn("\x07", detail["by"])
         self.assertEqual(self.raw(), before)
+
+
+class Round2(Fixture):
+    """Last push of #1225: total deadline incl. headers, pass budget, named pending reason, token file open, audit clip, in-lock head."""
+
+    def serve(self, handler):
+        return HubReadAndTransport._serve(self, handler)
+
+    @staticmethod
+    def header_trickle(h):
+        import time
+        for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 60:   # one byte per 0.2 s: every socket read succeeds
+            h.wfile.write(bytes([byte]))
+            h.wfile.flush()
+            time.sleep(0.2)
+
+    def timed_fetch(self, mod):
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 1.0
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        fetch, _ = mod.http_transport(self.serve(self.header_trickle), "tok")
+        t0 = time.monotonic()
+        try:
+            fetch()
+        except Exception as err:
+            return time.monotonic() - t0, err
+        return time.monotonic() - t0, None
+
+    def test_trickling_headers_are_cut_at_the_total_deadline(self):
+        took, err = self.timed_fetch(relay)
+        self.assertIsInstance(err, TimeoutError)
+        self.assertLess(took, 2.0)
+
+    def test_mutant_without_the_watchdog_is_caught(self):
+        mod = load_backend_module("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)")
+        took, _ = self.timed_fetch(mod)
+        self.assertGreater(took, 2.0)
+
+    def test_pass_budget_leaves_later_requests_pending(self):
+        t = [0.0]
+        rids = [self.hub.submit(CODER, "gates", head=None) for _ in range(5)]
+        orig = self.hub.post
+
+        def slow_post(rid, body):
+            t[0] += 30.0   # every answer takes 30 s of the pass
+            orig(rid, body)
+        done = relay.pass_once(self.ex, self.hub.fetch, slow_post, budget=60.0, clock=lambda: t[0])
+        self.assertEqual(done, 2)
+        self.assertEqual([q["id"] for q in self.hub.queue], rids[2:])   # still pending for the next pass
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 3)
+
+    def test_mutant_without_the_pass_budget_is_caught(self):
+        mod = load_backend_module("if clock() - start >= budget:", "if False:")
+        t = [0.0]
+        for _ in range(5):
+            self.hub.submit(CODER, "gates", head=None)
+
+        def slow_post(rid, body):
+            t[0] += 30.0
+            self.hub.post(rid, body)
+        done = mod.pass_once(self.ex, self.hub.fetch, slow_post, budget=60.0, clock=lambda: t[0])
+        self.assertEqual(done, 5)   # the budget is ignored: the guarding test (done == 2) fails
+
+    def test_pending_claim_names_the_reason(self):
+        def boom(pod, args):
+            raise ValueError("bad state")
+        self.backend.report = boom
+        self.assertEqual(self.run_one(CODER, "report", head=None, state="done", text="x", cid="R9")["status"], 500)
+        del self.backend.report
+        got = self.run_one(CODER, "report", head=None, state="done", text="x", cid="R9")
+        self.assertEqual(got["status"], 409)
+        self.assertIn("lost or still pending: resend with a NEW call_id", got["reason"])
+        self.assertEqual(self.backend.reported, [])
+
+    def test_mutant_unnamed_pending_reason_is_caught(self):
+        mod = load_backend_module("twice: lost or still pending: resend with a NEW call_id", "twice")
+        self.ex = mod.Executor(self.state, self.backend, lambda: 1000)
+        self.backend.report = lambda pod, args: (_ for _ in ()).throw(ValueError("x"))
+        self.run_one(CODER, "report", head=None, state="done", text="x", cid="R9")
+        del self.backend.report
+        got = self.run_one(CODER, "report", head=None, state="done", text="x", cid="R9")
+        self.assertNotIn("resend with a NEW call_id", got["reason"])
+
+    def test_report_claimed_audit_clips_by(self):
+        pod = "p" * 300
+        self.backend.report = lambda pod, args: (_ for _ in ()).throw(ValueError("x"))
+        self.run_one(pod, "report", head=None, state="done", text="x", cid="R8")
+        del self.backend.report
+        self.run_one(pod, "report", head=None, state="done", text="x", cid="R8")
+        kind, detail = [a for a in self.backend.audits if a[0] == "report.claimed"][0]
+        self.assertLessEqual(len(detail["by"]), 80)
+
+    def test_mutant_unclipped_by_is_caught(self):
+        mod = load_backend_module('{"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})\n                    raise Refuse(409, PENDING_REASON', '{"by": pod, "call_id": clean_text(cid, 64)})\n                    raise Refuse(409, PENDING_REASON')
+        self.ex = mod.Executor(self.state, self.backend, lambda: 1000)
+        with self.assertRaises(AssertionError):
+            self.test_report_claimed_audit_clips_by()
+
+    def test_the_in_lock_head_compare_is_the_guard(self):
+        self.backend.head = "c" * 40
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.assertEqual(self.raw(), b"")
+
+    def test_mutant_in_lock_head_compare_removed_is_caught(self):
+        make_mutant_executor(self, "if not _same_head(first, head):   # the ONLY", "if False:   # the ONLY")
+        with self.assertRaises(AssertionError):
+            self.test_the_in_lock_head_compare_is_the_guard()
+
+    # ---- token file open
+    def run_token(self, mod, path):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        import threading
+        box = []
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(path)}
+        th = threading.Thread(target=lambda: box.append(mod.pass_if_configured(Engine(), None, None, lambda: 1, environ=env)), daemon=True)
+        th.start()
+        th.join(3)
+        return (not th.is_alive()), notes
+
+    def test_fifo_token_returns_quickly_and_is_refused(self):
+        fifo = Path(self.state) / "fifo"
+        os.mkfifo(str(fifo), 0o600)
+        finished, notes = self.run_token(relay, fifo)
+        self.assertTrue(finished, "a FIFO blocked the daemon")
+        self.assertIn("not private to this user", notes[0][2]["error"])
+
+    def test_symlinked_token_is_refused(self):
+        real = Path(self.state) / "real"
+        real.write_text("abc")
+        real.chmod(0o600)
+        link = Path(self.state) / "link"
+        link.symlink_to(real)
+        finished, notes = self.run_token(relay, link)
+        self.assertTrue(finished)
+        self.assertIn("symbolic link", notes[0][2]["error"])
+
+    def test_mutant_open_without_nonblock_nofollow_is_caught(self):
+        mod = load_backend_module("os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW", "os.O_RDONLY")
+        fifo = Path(self.state) / "fifo2"
+        os.mkfifo(str(fifo), 0o600)
+        finished, _ = self.run_token(mod, fifo)
+        self.assertFalse(finished)   # the mutant hangs on a FIFO: the guard above fails
+        real = Path(self.state) / "real2"
+        real.write_text("abc")
+        real.chmod(0o600)
+        link = Path(self.state) / "link2"
+        link.symlink_to(real)
+        finished, notes = self.run_token(mod, link)
+        self.assertNotIn("symbolic link", str(notes))
 
 
 if __name__ == "__main__":
