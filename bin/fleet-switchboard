@@ -11464,6 +11464,7 @@ class SweepState:
         self.s5 = {}             # decision id -> (head, ready time, who clears) for each held pull request that has waited past the threshold
         self.not_checked_since = {}   # "repo#n" -> when it was first not checked (unreadable or skipped), until it is read
         self.s5_oldest = 0       # seconds the longest not-checked held pull request has gone unread
+        self.s5_skipped = {"draft": 0, "parked": 0}
         self.s5_unchecked = 0    # held pull requests whose gates could not be read this pass: never raised (#986)
         self.details = {}        # (kind, ref) -> the finding's own sentence
 
@@ -11717,6 +11718,7 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
     moment, the wait does not restart), so a finding can be late, never early. The pass draws at most half of the call budget left
     (at least one reading when the budget allows two), the rest is for verifying the findings. The read order is in memory only. A clock that goes backwards makes now - start negative: nothing is raised until it catches up."""
     state.s5, state.s5_unchecked, state.s5_oldest = {}, 0, 0
+    state.s5_skipped = {"draft": 0, "parked": 0}   # the ONE counter of a sweep: reset here (this pass runs first), added to by sweep_findings
     if engine.state_dir is not None and not state.ready_loaded:
         state.ready_loaded = True
         for key, row in list(_read_small(engine.state_dir, SWEEP_READY_FILE).items())[:2000]:
@@ -11739,6 +11741,13 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
         todo.append((state.ready_read.get("%s#%d" % held, 0), "%s#%d" % held, held, d))
     todo.sort(key=lambda t: (t[0], t[1]))   # the least recently read first
     for _, key, held, d in todo:
+        skip = sweep_s5_skip(state, held, d, now)   # a draft, or a pull request of a parked ask: not read, not unchecked, the clock restarts when it is ready and neither
+        if skip:
+            state.s5_skipped[skip] += 1
+            state.ready.pop(key, None)
+            state.ready_read.pop(key, None)
+            state.not_checked_since.pop(key, None)
+            continue
         if reads >= SWEEP_READY_READS or (budget is not None and budget[0] < SWEEP_READY_READ_COST) \
                 or engine.now() - state.started >= SWEEP_PASS_SECONDS:
             state.not_checked_since.setdefault(key, now)
@@ -11846,7 +11855,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
     for d in decisions:   # everything the owner's tier already holds, however its ref is spelled
         if d.get("tier", "human") == "human" and d.get("kind") != "notice":
             human_keys |= sweep_ref_keys(d, home, repos_known)
-    skipped = {"draft": 0, "parked": 0}   # S5 decisions left out, by reason
+    skipped = state.s5_skipped   # shared with sweep_ready_pass, reset once per sweep there
     for d in decisions:
         ref = sweep_ref_of(d, home)
         # a report is about the refs its sentence names, never assumed to be about its own ask
@@ -11898,7 +11907,6 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
     except Exception:
         pass   # an unreadable registry raises nothing: the lookup itself says "unknown"
     state.unattributed = unattributed
-    state.s5_skipped = skipped
     return sorted(found)
 
 
