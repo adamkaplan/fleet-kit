@@ -856,6 +856,8 @@ def tick(ctx):
         if hold_back:
             text, episodes[name] = None, before   # nothing judged: the episode memory is exactly as it was
         if text and ctx.cfg["enabled"] and ctx.cos:
+            severity, reasons = crossing(fig, ctx.cfg)
+            ctx.alert = {"agent": name, "state": "%s|%s" % (severity, ",".join(sorted(reasons)))}   # what the alert is ABOUT, for the daemon's repeat rule
             ctx.wake(text)
             sent.append((name, text))
         elif text:

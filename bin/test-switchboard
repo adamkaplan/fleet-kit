@@ -2929,7 +2929,7 @@ class TestEachThingOnce(Base):
 
     def test_s5_an_answered_item_is_not_re_raised_until_its_state_changes(self):
         self.blocked(0)
-        self.assertIsNone(self.blocked(7 * 3600, answered=100), "answered after the finding: not re-raised even past 6 hours")
+        self.assertIsNone(self.blocked(3600, answered=100), "answered after the finding: not re-raised")
         self.assertIsNotNone(self.blocked(7 * 3600 + 1, state="blocked.repeat|9|0", answered=100))
 
     def test_u1_a_first_report_an_owner_wait_and_a_held_pr_are_never_held(self):
@@ -2948,34 +2948,233 @@ class TestEachThingOnce(Base):
         self.assertIn("old reminder", lines[2])
         self.assertEqual([f.key for f in carried], ["result:new", "reminder:old"])
 
-    def test_s4_one_wake_is_one_message_one_line_per_item(self):
-        items = [("sweep", "S5 a"), ("sweep", "S5 b"), ("triage", "T1 a"), ("triage", "T2 b"), ("load", "high")]
-        text = sb.merge_wake(items)
-        self.assertEqual(len(text.splitlines()), 6)   # one header and five lines
-        for cls, line in items:
-            self.assertIn(line, text)
+    # ---- one message per wake: the REAL delivery path (a fake queue = the fake v2 of the World)
 
-    def test_s7_the_table_names_every_sender_found_in_the_source(self):
-        found = set()
+    def wake_world(self, merge=True):
+        world = World(self, agents=("platform",))
+        for key, kind, text in (("sweep:1", "sweep", "sweep: 2 findings: o/r#1 S5"), ("triage:1", "triage", "triage: 3 due"), ):
+            world.fact("platform", key, text, kind=kind)
+        sb.add_repeat_reminder(str(world.state), "platform", world.clock.now(), world.clock.now(), "Load alert: orch is overloaded", "load-alert", "orch", "2|stalled",
+                               wake_class=sb.WAKE_LOAD)
+        world.tick(120)
+        world.engine.run_pass()
+        return world
 
-        def walk(node, stack):
-            for child in ast.iter_child_nodes(node):
-                inner = stack + [child.name] if isinstance(child, ast.FunctionDef) else stack
-                if isinstance(child, ast.Call) and getattr(child.func, "id", None) in ("add_reminder", "add_repeat_reminder") and stack:
-                    found.add("load_tick" if stack[-1] == "wake" else stack[-1])   # load_tick's inner wake is load_tick's send
-                walk(child, inner)
-        walk(ast.parse(Path(SWITCHBOARD).read_text()), [])
-        found.discard("add_repeat_reminder")
+    def test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines(self):
+        world = self.wake_world()
+        (sent,) = world.admissions("platform")
+        lines = [l for l in sent["text"].splitlines() if l.startswith("  - ")]
+        self.assertEqual(len(lines), 3, sent["text"])
+        for part in ("sweep: 2 findings", "triage: 3 due", "Load alert: orch"):
+            self.assertIn(part, sent["text"])
+
+    def test_mutant_sending_the_kinds_separately_fails_s4(self):
+        with mock.patch.object(sb, "merge_wake_facts", lambda recipient, facts: list(facts)):
+            with self.assertRaises(AssertionError):
+                self.test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines()
+
+    def test_merge_wake_leaves_a_blocked_report_an_owner_wait_and_a_held_pr_alone_and_strips_escapes(self):
+        facts = [fact("a", kind="sweep"), fact("b", kind="triage"), fact("blocked", kind="reminder"), fact("owner", kind="owner.wait"), fact("held", kind="held.pr")]
+        merged = sb.merge_wake_facts("platform", facts)
+        self.assertEqual(sorted(f.key for f in merged if f.kind != "wake"), ["blocked", "held", "owner"])
+        self.assertEqual(len(merged), 4)
+        self.assertNotIn("\x1b", sb.merge_wake([("sweep", "bad \x1b[31mred\x1b[0m \x07 line")]))
+
+    def test_the_delivered_message_acknowledges_every_member_key(self):
+        world = self.wake_world()
+        (sent,) = world.admissions("platform")
+        world.tick(30)
+        self.assertEqual(world.engine.run_pass()["sent"], [])
+
+    # ---- the repeat rule: the behavioural tests of the real gate and its senders
+
+    def test_a_failed_add_records_nothing_and_the_next_tick_delivers(self):
+        with mock.patch.object(sb, "add_reminder", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.blocked(0)
+        self.assertEqual(sb.read_reminders(self.state), [])
+        self.assertIsNotNone(self.blocked(60), "the item was never recorded as sent")
+
+    def test_mutant_recording_before_the_add_hides_the_repeat(self):
+        def early(state_dir, to, at, created, text, kind, subject, state, first=False, answered_at=None, **more):
+            if sb.repeat_held(state_dir, to, kind, subject, state, at, first=first, answered_at=answered_at):
+                return None
+            sb.repeat_record(state_dir, to, kind, subject, state, at)
+            return sb.add_reminder(state_dir, to, at, created, text, **more)
+        with mock.patch.object(sb, "add_repeat_reminder", early):
+            with self.assertRaises(AssertionError):
+                self.test_a_failed_add_records_nothing_and_the_next_tick_delivers()
+
+    def test_answered_is_bounded_by_the_window_and_is_a_send_to_the_item(self):
+        self.blocked(0)
+        self.assertIsNone(self.blocked(3600, answered=100))
+        self.assertIsNotNone(self.blocked(7 * 3600, answered=100), "an answer older than the window silences nothing")
+        self.assertIsNone(self.blocked(7 * 3600 + 60, answered=7 * 3600 + 30))
+        self.assertEqual(sb.last_send_at(self.state, "cos", "coder"), None)
+        sb._write_small(self.state, sb.LAST_REPORT_FILE, {"cos": {"send_to": {"coder": 5.0}}})
+        self.assertEqual(sb.last_send_at(self.state, "cos", "coder"), 5.0)
+
+    def test_mutant_an_unbounded_answer_silences_for_ever(self):
+        real = sb.repeat_held
+        def unbounded(state_dir, to, kind, subject, state, now, first=False, answered_at=None, window=None):
+            return real(state_dir, to, kind, subject, state, now, first=first, answered_at=answered_at, window=10 ** 12)
+        with mock.patch.object(sb, "repeat_held", unbounded):
+            with self.assertRaises(AssertionError):
+                self.test_answered_is_bounded_by_the_window_and_is_a_send_to_the_item()
+
+    def test_a_clock_going_backwards_is_due_and_old_keys_are_evicted(self):
+        self.blocked(10 * 3600)
+        self.assertIsNotNone(self.blocked(3 * 3600), "now before the record is due, not held for skew + 6 h")
+        self.blocked(3 * 3600)
+        sb.add_repeat_reminder(self.state, "cos", 100 * 3600, 0, "x", "blocked-agent", "other", "s")
+        known = json.loads((Path(self.state) / sb.REPEAT_FILE).read_text())
+        self.assertEqual(sorted(known), ["blocked-agent|other|cos"], "the key older than twice the window is gone")
+
+    def test_mutant_a_backwards_clock_is_held(self):
+        real = sb.repeat_held
+        def held(state_dir, to, kind, subject, state, now, **kw):
+            before = sb._repeat_read(state_dir).get(sb.repeat_key(kind, subject, to))
+            if isinstance(before, dict) and before.get("state") == state and now < before["at"]:
+                return True
+            return real(state_dir, to, kind, subject, state, now, **kw)
+        with mock.patch.object(sb, "repeat_held", held):
+            with self.assertRaises(AssertionError):
+                self.test_a_clock_going_backwards_is_due_and_old_keys_are_evicted()
+
+    def read_fifo_in_a_thread(self):
+        import threading
+        path = Path(self.state) / sb.REPEAT_FILE
+        os.mkfifo(str(path))
+        out = []
+        worker = threading.Thread(target=lambda: out.append(sb._repeat_read(self.state)), daemon=True)
+        worker.start()
+        worker.join(3)
+        alive = worker.is_alive()
+        if alive:   # let the blocked reader go so the thread ends
+            fd = os.open(str(path), os.O_WRONLY | os.O_NONBLOCK)
+            os.close(fd)
+            worker.join(3)
+        self.assertFalse(alive, "a FIFO hung the read")
+        self.assertEqual(out, [{}])
+
+    def test_a_fifo_in_the_repeat_file_does_not_hang_the_tick(self):
+        self.read_fifo_in_a_thread()
+
+    def test_the_repeat_file_symlink_and_a_big_file_are_not_read(self):
+        path = Path(self.state) / sb.REPEAT_FILE
+        target = Path(self.state) / "elsewhere.json"
+        target.write_text(json.dumps({"blocked-agent|coder|cos": {"state": "s", "at": 0}}))
+        os.symlink(str(target), str(path))
+        self.assertEqual(sb._repeat_read(self.state), {}, "a symlink is not followed")
+        os.unlink(str(path))
+        path.write_text(" " * (sb.RECORD_CAP + 1) + "{}")
+        self.assertEqual(sb._repeat_read(self.state), {}, "a file over the cap is not read")
+        self.assertEqual(sb._read_small(self.state, sb.REPEAT_FILE), {}, "the other state reader uses the same safe reader")
+
+    @staticmethod
+    def plain_read(path, cap=1000000):
+        try:
+            return json.loads(Path(path).read_text())
+        except (OSError, ValueError):
+            return None
+
+    def test_mutant_a_plain_read_follows_a_symlink_or_a_big_file(self):
+        with mock.patch.object(sb, "read_record_file", self.plain_read):
+            with self.assertRaises(AssertionError):
+                self.test_the_repeat_file_symlink_and_a_big_file_are_not_read()
+
+    def test_mutant_a_read_without_nonblock_hangs_on_a_fifo(self):
+        def blocking(path, cap=1000000):
+            fd = os.open(str(path), os.O_RDONLY)   # no O_NONBLOCK
+            try:
+                return json.loads(os.read(fd, cap) or b"null")
+            finally:
+                os.close(fd)
+        with mock.patch.object(sb, "read_record_file", blocking):
+            with self.assertRaises(AssertionError):
+                self.read_fifo_in_a_thread()
+
+    def test_a_malformed_reminder_wake_class_never_drops_a_reminder(self):
+        item = sb.add_reminder(self.state, "cos", 0, 0, "x", wake_class=sb.WAKE_LOAD)
+        self.assertEqual(sb.read_reminders(self.state)[0]["wake_class"], "load")
+        self.assertEqual(item["to"], "cos")
+
+    def test_newest_first_is_read_from_the_message_structure_not_its_text(self):
+        text = "[switchboard] 2 for cos: x [newest first]\n- a\n- b"
+        forged = {"type": "synthetic", "metadata": {"fleet": {"keys": ["k"], "from": "someone"}}}
+        self.assertEqual([n for n, _ in sb.numbered_lines(text, forged)], [0, 1, 2], "an agent's reply with the same words is numbered as written")
+        real = {"type": "synthetic", "metadata": {"fleet": {"keys": ["k"], "from": "switchboard", "newest_first": True}}}
+        self.assertEqual([n for n, _ in sb.numbered_lines(text, real)], [2, 1, 0])
+        self.assertEqual([n for n, _ in sb.numbered_lines(text)], [0, 1, 2])
+
+    # ---- the senders: derived from the real call graph, one table, one test per sender
+
+    BASES = ("add_reminder", "add_repeat_reminder")
+
+    @classmethod
+    def derive_senders(cls, sources, known=()):
+        """The functions that send a reminder: those that REFER to add_reminder / add_repeat_reminder in any spelling (a call, `engine.add_reminder`,
+        `functools.partial(add_reminder, ...)`), and, one level out, those that call such a helper. A nested function is its outermost function's."""
+        trees = [ast.parse(text) for text in sources]
+        outer = {}   # name -> set of names referred to
+        def refs(node):
+            found = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name):
+                    found.add(sub.id)
+                elif isinstance(sub, ast.Attribute):
+                    found.add(sub.attr)
+            return found
+        for tree in trees:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    scopes = [n for n in node.body if isinstance(n, ast.FunctionDef)]
+                elif node is tree:
+                    scopes = [n for n in node.body if isinstance(n, ast.FunctionDef)]
+                else:
+                    continue
+                for fn in scopes:
+                    outer.setdefault(fn.name, set()).update(refs(fn) - {fn.name})
+        direct = {name for name, used in outer.items() if used & set(cls.BASES)} - set(cls.BASES)
+        helpers = direct - set(known)   # a helper that is not a table row yet: its callers are senders too (the pass drivers of a known sender are not)
+        one_level = {name for name, used in outer.items() if used & helpers and name not in cls.BASES}
+        return sorted(direct | one_level)
+
+    def sources(self):
+        base = Path(SWITCHBOARD).parent
+        names = [l.strip() for l in (base / "fleet-switchboard.parts").read_text().splitlines() if l.strip() and not l.startswith("#")]
+        return [(base / n).read_text() if n != "fleet-switchboard" else Path(SWITCHBOARD).read_text() for n in names]
+
+    def test_the_derivation_finds_a_differently_spelled_sender(self):
+        found = self.derive_senders(["def via_helper():\n    wrap()\ndef wrap():\n    add_reminder(1)\n"
+                                     "def via_attr(engine):\n    engine.add_reminder(1)\n"
+                                     "def via_partial():\n    functools.partial(add_reminder, 1)()\n"
+                                     "def quiet():\n    pass\n"])
+        self.assertEqual(found, ["via_attr", "via_helper", "via_partial", "wrap"])
+        self.assertEqual(self.derive_senders(["def a():\n    add_reminder(1)\ndef driver():\n    a()\n"], known=("a",)), ["a"])
+
+    def test_every_sender_is_in_the_table_and_the_docs_table_equals_FINDING_TABLE(self):
+        found = set(self.derive_senders(self.sources(), known=sb.FINDING_TABLE)) - {"add_repeat_reminder"}
+        self.assertEqual(sorted(found - set(sb.FINDING_TABLE)), [], "a sender of a reminder is missing from FINDING_TABLE")
+        self.assertEqual(sorted(set(sb.FINDING_TABLE) - found - {"SweepFacts", "TriageFacts"}), [], "FINDING_TABLE names a function that sends nothing")
         docs = (Path(SWITCHBOARD).parent.parent / "docs" / "switchboard.md").read_text()
-        self.assertEqual(sorted(found - set(sb.FINDING_TABLE)), [], "a finding sender is missing from FINDING_TABLE")
-        for name in sb.FINDING_TABLE:
-            self.assertIn("`%s`" % name, docs, "%s is missing from the docs table" % name)
+        rows = {}
+        for line in docs.splitlines():
+            cells = [c.strip().strip("`") for c in line.strip().strip("|").split("|")]
+            if len(cells) == 5 and cells[0] in sb.FINDING_TABLE:
+                rows[cells[0]] = tuple(cells[1:])
+        self.assertEqual(rows, {k: tuple(v) for k, v in sb.FINDING_TABLE.items()}, "the docs table differs from FINDING_TABLE")
+        for name, (_, _, _, test) in sb.FINDING_TABLE.items():
+            self.assertTrue(hasattr(type(self), test) or any(hasattr(c, test) for c in globals().values() if isinstance(c, type)), "%s: %s does not exist" % (name, test))
 
-    def test_blocked_agent_and_load_alert_senders_are_gated(self):
-        src = Path(SWITCHBOARD).read_text()
-        self.assertIn('"Blocked agent: " + text, "blocked-agent"', src)
-        self.assertIn('"load-alert", "load", text', src)
-        self.assertIn('first=event != "blocked.repeat"', src, "only a repeat is held: the first report and the end line pass")
+    def test_every_state_file_the_gate_touches_is_in_the_table_and_the_docs(self):
+        docs = (Path(SWITCHBOARD).parent.parent / "docs" / "switchboard.md").read_text()
+        for name in sb.STATE_FILE_TABLE:
+            self.assertIn("`%s`" % name, docs)
+        text = "\n".join(self.sources())
+        gate = text[text.index("def repeat_held"):text.index("# The table of every finding kind")]
+        for used in re.findall(r"[A-Z_]+_FILE\b", gate):
+            self.assertIn(getattr(sb, used), sb.STATE_FILE_TABLE, "%s is read or written by the gate but is not in STATE_FILE_TABLE" % used)
 
     def test_s10_s11_the_header_is_short_after_the_first_delivery_of_the_day(self):
         long_text = "Intent: " + "x" * 1000
@@ -2988,11 +3187,15 @@ class TestEachThingOnce(Base):
         reader.ask_of = lambda n, repo=None: (5, None)
         full = reader.header(5)[1]
         self.assertGreater(sum(len(l) for l in full), 300)
+        self.assertGreater(sum(len(l) for l in reader.header(5)[1]), 300, "an undelivered message already used nothing: the day's full header stands until a delivery")
+        reader.commit_told()
         short = reader.header(5)[1]
         self.assertEqual(len(short), 1)
         self.assertLessEqual(len(short[0]), 160)
         clock["t"] += 86400
         self.assertGreater(sum(len(l) for l in reader.header(5)[1]), 300, "the next day carries the full text again")
+        reader.discard_told()
+        self.assertGreater(sum(len(l) for l in reader.header(5)[1]), 300, "a discarded (undelivered) compose records nothing")
 
 
 # ------------------------------------------------------------------ delivering
@@ -77683,6 +77886,60 @@ class TestLoadAlert(Base):
         self.assertIn("2 with no real movement in 2 h", reminders[0]["text"])
         self.assertEqual([a[0] for a in audited], ["load.alert"])
 
+    def load_fixture(self, numbers=(1, 2)):
+        clock = [self.T0]
+        intents = types.SimpleNamespace(repo="acme/widget", open_asks=lambda charter, repo: [types.SimpleNamespace(repo="acme/widget", number=n) for n in intents.numbers])
+        intents.numbers = numbers
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: clock[0], audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        seen = lambda name, fleet, status: types.SimpleNamespace(name=name, fleet=fleet, status=status)
+        discovery = types.SimpleNamespace(agents={"orch": seen("orch", {"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, "idle"),
+                                                  "cos": seen("cos", {"role": "chief-of-staff"}, "idle")})
+        return clock, intents, engine, discovery
+
+    def reopen_episode(self):
+        path = self.state_dir / "load.json"
+        data = json.loads(path.read_text())
+        data["episodes"] = {"orch": {"sent": 0}}
+        path.write_text(json.dumps(data))
+
+    def run_load_keyed_by_data(self):   # #1275
+        clock, intents, engine, discovery = self.load_fixture()
+        coder = types.SimpleNamespace(name="c1", session_id="s", fleet={"role": "coder", "reports_to": "orch"}, status="idle")
+        discovery.agents["c1"] = coder
+        sb.load_tick(engine, discovery)
+        clock[0] = self.T0 + 3 * 3600
+        sb.load_tick(engine, discovery)
+        self.reopen_episode()
+        self.assertEqual(len(sb.read_reminders(str(self.state_dir))), 1)
+        coder.status = "stopped"   # the text changes (the coder counts), the data (lane, severity, reasons) does not
+        clock[0] = self.T0 + 4 * 3600
+        sb.load_tick(engine, discovery)
+        self.reopen_episode()
+        self.assertEqual(len(sb.read_reminders(str(self.state_dir))), 1, "the same alert about the same lane is delivered once")
+        known = json.loads((self.state_dir / sb.REPEAT_FILE).read_text())
+        self.assertEqual(list(known), ["load-alert|orch|cos"], "keyed by the lane, not by 'load' or the text")
+        coder.status = "working"   # worse: every coder busy and an ask stalled (another reason)
+        clock[0] = self.T0 + 5 * 3600
+        sb.load_tick(engine, discovery)
+        self.assertEqual(len(sb.read_reminders(str(self.state_dir))), 2, "a worse state is delivered at once")
+
+    def test_load_alert_is_keyed_by_the_data_not_the_text(self):
+        self.run_load_keyed_by_data()
+
+    def test_mutant_load_alert_keyed_by_its_text(self):
+        real = sb.add_repeat_reminder
+        def by_text(state_dir, to, at, created, text, kind, subject, state, **kw):
+            return real(state_dir, to, at, created, text, kind, "load", text, **kw)
+        with mock.patch.object(sb, "add_repeat_reminder", by_text):
+            with self.assertRaises(AssertionError):
+                self.run_load_keyed_by_data()
+
+    def test_mutant_load_alert_with_no_gate_repeats(self):
+        with mock.patch.object(sb, "repeat_held", lambda *a, **k: False):
+            with self.assertRaises(AssertionError):
+                self.run_load_keyed_by_data()
+
     def test_the_move_log_survives_torn_lines_a_burst_and_a_prune(self):
         d = str(self.state_dir)
         (self.state_dir / "ask-moves.jsonl").write_text('{"at": 1, "numbers": [1], "repo": "r"}\nnot json\n{"at": 2')
@@ -89026,6 +89283,65 @@ class TestBlockedReport(Base):
         sb._write_small(self.world.state, sb.BLOCKED_HELD_SENDS, {"coder": {"rows": "nope"}})
         self.world.engine.run_pass()
         self.assertEqual(self.world.engine.run_pass()["errors"], [])
+
+    def test_tell_holds_a_repeat_and_passes_the_first_report(self):   # #1275
+        self.block()
+        self.wait(25)
+        self.assertEqual(len(self.told("cos")), 1, "the first report always passes")
+        self.wait(60)
+        self.assertEqual(len(self.told("cos")), 2, "the first repeat is a first sight of its own state")
+        self.wait(60)
+        self.assertEqual(len(self.told("cos")), 2, "the same repeat state within 6 hours is held")
+        self.wait(6 * 60)
+        self.assertEqual(len(self.told("cos")), 3, "and delivered again after 6 hours")
+        self.pane["status"] = "idle"
+        self.passes()
+        self.assertEqual(len(self.told("cos")), 4, "the end line always passes")
+
+    def kind_changes_in_one_episode(self):
+        self.block()
+        self.wait(25)
+        with mock.patch.object(sb, "blocked_kind", return_value="a permission request"):
+            self.wait(60)
+        first = len(self.told("cos"))
+        with mock.patch.object(sb, "blocked_kind", return_value="a question"):
+            self.wait(60)
+        self.assertEqual(len(self.told("cos")), first + 1, "the kind of block changed: the repeat is not hidden as unchanged")
+
+    def test_tell_a_changed_kind_of_block_is_not_hidden_as_a_repeat(self):   # #1275
+        self.kind_changes_in_one_episode()
+
+    def test_mutant_tell_with_a_coarse_state_hides_the_changed_kind(self):
+        real = sb.add_repeat_reminder
+        def coarse(state_dir, to, at, created, text, kind, subject, state, **kw):
+            return real(state_dir, to, at, created, text, kind, subject, "|".join(state.split("|")[:3]), **kw)
+        with mock.patch.object(sb, "add_repeat_reminder", coarse):
+            with self.assertRaises(AssertionError):
+                self.kind_changes_in_one_episode()
+
+    def a_report_sent_again_with_the_same_state(self):
+        self.block()
+        self.wait(25)
+        first = len(self.told("cos"))
+        sb.blocked_update(self.world.state, sb.BLOCKED_ALERT_STATE, lambda state: {k: {a: b for a, b in v.items() if a != "reported"} for k, v in state.items()})   # a crash before it was saved: the report is made again
+        self.wait(5)
+        self.assertEqual(len(self.told("cos")), first + 1, "a first report passes even when its state equals the last one's")
+
+    def test_tell_a_first_report_made_again_with_the_same_state_passes(self):
+        self.a_report_sent_again_with_the_same_state()
+
+    def test_mutant_tell_gating_every_event_holds_the_first_report_of_the_state(self):
+        real = sb.add_repeat_reminder
+        def always_held(state_dir, to, at, created, text, kind, subject, state, **kw):
+            return real(state_dir, to, at, created, text, kind, subject, state, **dict(kw, first=False))
+        with mock.patch.object(sb, "add_repeat_reminder", always_held):
+            with self.assertRaises(AssertionError):
+                self.a_report_sent_again_with_the_same_state()
+
+    def test_mutant_tell_with_no_gate_repeats(self):
+        with mock.patch.object(sb, "repeat_held", lambda *a, **k: False):
+            with self.assertRaises(AssertionError):
+                self.test_tell_holds_a_repeat_and_passes_the_first_report()
 
     def test_the_threshold_is_exact(self):
         self.block()

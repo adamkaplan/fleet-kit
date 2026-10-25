@@ -5585,17 +5585,24 @@ The reviewer definitions and the review skill name these commands, not the bare 
 
 canon: the wake channel carries each thing once.
 
-- **6 hours.** A reminder with the same kind, the same subject and an unchanged state is delivered at most once per 6 hours; a change of state delivers at once. The first report of a dead or blocked agent, an owner wait and a held PR are never held: only repeats are.
-- **Answered.** An item the Chief of Staff already answered (a send to that agent since the finding) is not re-raised until its state changes.
-- **One message per wake.** Sweeps, triage and load alerts of one wake are one message, one line per item (`merge_wake`).
+- **6 hours.** A reminder with the same kind, the same subject and an unchanged state is delivered at most once per 6 hours; a change of state (for a blocked agent: the event, the held and refused counts, the kind of block and the held reason) delivers at once. A load alert is keyed by its data (the lane and its severity and reasons), never its text. A clock that went backwards counts as due. The first report of a dead or blocked agent, an owner wait and a held PR are never held: only repeats are.
+- **Answered.** An item the Chief of Staff already answered (a send by it to that agent since the finding; the record is per recipient, not per issue) is not re-raised until its state changes, and for at most 6 hours after the answer.
+- **One message per wake.** Sweeps, triage and load alerts of one wake are one message, one line per item (`merge_wake_facts`, called by the delivery; the first blocked report, an owner wait and a held PR are never folded in).
 - **Newest first.** `compose` orders a message newest first (oldest last); ties keep the key order. A newer result is never held behind older reminders, and under the message cap the older ones are the ones that wait.
 - **Short header.** After the first delivery of an ask on a day, its group header is one line of at most 160 characters; the full Intent and Done-when come again on the first delivery of the next day.
 
 | Sender function | Finding kind | Repeat key | Window | Test |
 | --- | --- | --- | --- | --- |
-| `tell` | Blocked agent | agent, recipient, held, refused | 6 hours; first report and end line at once | `test_s2_s3_the_same_state_is_delivered_once_per_six_hours` |
-| `load_tick` | load alert | alert text | 6 hours | `test_blocked_agent_and_load_alert_senders_are_gated` |
-| `friction_tick` | friction wake | slot (own state) | per slot | `test_s7_the_table_names_every_sender_found_in_the_source` |
-| `cmd_budget_notice` | budget notice | account (own claim) | 1 hour | `test_s7_the_table_names_every_sender_found_in_the_source` |
-| `_impact_matrix_episode` | impact matrix unreadable | episode (own state) | per episode | `test_s7_the_table_names_every_sender_found_in_the_source` |
-| `_impact_post_list` | owner-hold rule list | rule version (own state) | per rule | `test_s7_the_table_names_every_sender_found_in_the_source` |
+| `blocked_tick` | Blocked agent | agent, recipient, event, held, refused, kind, reason | 6 hours; first report and end line at once | `test_tell_holds_a_repeat_and_passes_the_first_report` |
+| `load_tick` | load alert | lane, severity and reasons | 6 hours; merged into the wake message | `test_load_alert_is_keyed_by_the_data_not_the_text` |
+| `friction_tick` | friction wake | slot (own state) | per slot | `test_one_wake_per_orchestrator_per_day_not_for_cos_or_coders` |
+| `cmd_budget_notice` | budget notice | account (own claim) | 1 hour | `test_s2_the_top_spenders_orchestrator_gets_one_message_with_the_agent_and_the_numbers_and_a_second_call_sends_none` |
+| `_impact_matrix_episode` | impact matrix unreadable | episode (own state) | per episode | `test_s6_an_unreadable_matrix_changes_nothing_and_says_so_once_for_the_episode` |
+| `_impact_post_list` | owner-hold rule list | rule version (own state) | per rule | `test_s8_an_unreadable_decision_or_rule_or_file_list_is_refused_and_nothing_is_lifted` |
+| `cmd_remind` | a reminder the agent set (`remind`) | its own id (a request, not a finding) | none: sent as asked | `test_a_reminder_is_a_fact_only_once_it_is_due` |
+| `set_checkpoint_reminders` | checkpoint reminder | launch (own id) | once per launch | `test_a_launch_checkpoint_reminder_is_not_a_wait_and_a_workers_own_reminder_is` |
+| `notify_drop` | reminder drop notice | dropped reminder (removed first) | once | `test_a_drop_sends_the_setter_one_notice_naming_text_and_reason_audited_once` |
+| `SweepFacts` | sweep (a fact, merged per wake) | set and slot (own key) | re-alarm hours | `test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines` |
+| `TriageFacts` | triage (a fact, merged per wake) | set and slot (own key) | re-alarm hours | `test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines` |
+
+State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every_state_file_the_gate_touches_is_in_the_table_and_the_docs`): `reminder-repeats.json` (read by `repeat_held`, written by `repeat_record`, only after the reminder was stored; keys older than twice the window are dropped; read with the one safe reader `read_record_file`: no symlink, no FIFO, 1 MB cap) and `last-reports.json` (read by `last_send_at`; written by `report` and `send`).

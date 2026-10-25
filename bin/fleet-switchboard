@@ -4862,7 +4862,10 @@ class Switchboard:
                 return {"sent": False, "action": again.action, "reason": again.reason}
             observation = fresh
         repos = self.repos_in_play()
-        text, carried = compose(plan.recipient, plan.pending, section=section_resolver(self, observation),
+        if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
+            self.intents.discard_told()
+        pending = merge_wake_facts(plan.recipient, plan.pending)   # #1275: the sweep, triage and load-alert items of one wake are ONE message
+        text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
                                 repos=repos, delivered=self.now())
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
@@ -4873,7 +4876,7 @@ class Switchboard:
                                  "ask sections are added; the allowed text for this message is %d characters: nothing was "
                                  "sent. Write it to a file in the opencode temp dir and send the path"
                                  % (len(sent.summary), MESSAGE_CAP, allowed))
-        keys = [fact.key for fact in carried]
+        keys = [key for fact in carried for key in (getattr(fact, "members", None) or [fact.key])]
         # The id lives in v2's namespace, so it is derived from the session the
         # recipient runs now: a relaunched agent is a new recipient for v2.
         message_id = derive_message_id(observation.session_id, keys)
@@ -4901,7 +4904,7 @@ class Switchboard:
         try:
             with self._external("v2.synthetic", plan.recipient, detail) as result:
                 record = self.v2.synthetic(observation.session_id, text,
-                                           {"fleet": dict({"keys": keys, "from": "switchboard"}, **self._send_meta(carried))},
+                                           {"fleet": dict({"keys": keys, "from": "switchboard", "newest_first": True}, **self._send_meta(carried))},
                                            resume, delivery, message_id, description)
                 if fault("crash-after-send"):
                     raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
@@ -4922,6 +4925,8 @@ class Switchboard:
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
         self._acknowledge(keys)
+        if getattr(self, "intents", None) is not None and hasattr(self.intents, "commit_told"):
+            self.intents.commit_told()
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
 
@@ -6846,10 +6851,8 @@ def release_stale_binding(engine, name, taken, session_id, replace=False):
 
 
 def _read_small(state_dir, name):
-    try:
-        with open(str(Path(state_dir) / name), "rb") as handle:
-            raw = json.loads(handle.read(1000001).decode("utf-8"))
-    except (OSError, ValueError, UnicodeError):
+    raw = read_record_file(Path(state_dir) / name)   # #1275: the ONE safe reader (no FIFO hang, no symlink, a size cap)
+    if raw is None:
         return {}
     return {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
 
@@ -10983,14 +10986,17 @@ def synthetic_lines(engine, session_id, since, waiting=False):
         if not isinstance(item, dict) or item.get("type") != "synthetic" or item.get("id") in have \
                 or created is None or created < since or not isinstance(payload.get("text"), str):
             continue
-        waiting.extend((created, item.get("id"), number, line) for number, line in numbered_lines(payload["text"]))
+        waiting.extend((created, item.get("id"), number, line) for number, line in numbered_lines(payload["text"], item))
     return sorted(waiting, key=lambda line: -line[0]) + found
 
 
-def numbered_lines(text):
-    """[(number, line)] of a message; the number grows with time, so a message composed newest first (#1275) is numbered from its last line."""
+def numbered_lines(text, message=None):
+    """[(number, line)] of a message; the number grows with time, so a message composed newest first (#1275) is numbered from its last line.
+    Which messages are newest first is read from the STRUCTURE (the daemon's own fleet metadata `newest_first`), never from the text: an agent's
+    reply that ends its first line with the same words is numbered as written."""
     lines = text.splitlines()
-    if lines and lines[0].endswith(NEWEST_FIRST_MARK):
+    meta = _fleet_meta(message) if isinstance(message, dict) else None
+    if lines and isinstance(meta, dict) and meta.get("from") == "switchboard" and meta.get("newest_first") is True:
         return [(len(lines) - 1 - n, line) for n, line in enumerate(lines)]
     return list(enumerate(lines))
 
@@ -11013,7 +11019,7 @@ def transcript_lines(engine, session_id, since):
             if created < since:
                 complete = True
                 break
-            for number, line in numbered_lines(reply_text(message)):
+            for number, line in numbered_lines(reply_text(message), message):
                 found.append((created, message.get("id"), number, line))
         if complete or not more:
             break
@@ -14842,7 +14848,7 @@ def blocked_tick(engine, discovery, held):
     refused = blocked_update(engine.state_dir, BLOCKED_HELD_SENDS, forget)
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
 
-    def tell(observation, text, event, detail):
+    def tell(observation, text, event, detail, why=(None, None)):   # why: (blocked kind, the held reason): part of the repeat state
         boss = boss_name(discovery, observation)
         boss_seen = discovery.agents.get(boss) if boss else None
         recipients = []
@@ -14852,7 +14858,7 @@ def blocked_tick(engine, discovery, held):
             recipients.append(cos)
         recipients = [r for r in recipients if r != observation.name]
         for who in recipients:   # #1275: only a REPEAT of the same state is held (6 hours); the first report and the end line always pass
-            state_key = "%s|%s|%s" % (event, detail.get("held"), detail.get("refused"))
+            state_key = "%s|%s|%s|%s|%s" % (event, detail.get("held"), detail.get("refused"), why[0], why[1])
             add_repeat_reminder(engine.state_dir, who, now, now, "Blocked agent: " + text, "blocked-agent", observation.name, state_key,
                                 first=event != "blocked.repeat", answered_at=last_send_at(engine.state_dir, who, observation.name))
         if engine.audit is not None:
@@ -14881,7 +14887,8 @@ def blocked_tick(engine, discovery, held):
             continue
         kind = blocked_kind(engine, seen, resume_first_recovery(engine, discovery, seen, last))
         tell(seen, blocked_line(engine, seen, entry["since"], now, messages, refusals, kind),
-             event, {"since": iso(entry["since"]), "held": len(messages), "refused": len(refusals)})
+             event, {"since": iso(entry["since"]), "held": len(messages), "refused": len(refusals)},
+             (str(kind), _one_line(str(plan.reason), 120) if plan is not None else None))
         entry["reported"] = now
         blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)   # after each one: a crash repeats at most one
         done.append((name, event.split(".")[1]))
@@ -18985,11 +18992,18 @@ class IntentReader:
         day, told = int(self.now() // 86400), self.__dict__.setdefault("_told_day", {})
         if told.get((repo, ask)) == day:   # #1275: the full Intent and Done-when only on the first delivery per ask per day
             lines = [_one_line(" ".join(lines), ASK_BRIEF)]
-        told[(repo, ask)] = day
+        self.__dict__.setdefault("_told_pending", {})[(repo, ask)] = day   # recorded by `commit_told` when the message was DELIVERED, never at compose
         if work is None:
             return ask, lines, None, []
         return (ask, lines, work,
                 work_lines(self.issue(work, repo), issue_tag(repo, work, repos)))
+
+    def commit_told(self):
+        """The asks whose header went out in a delivered message: their full text is not repeated today."""
+        self.__dict__.setdefault("_told_day", {}).update(self.__dict__.pop("_told_pending", {}))
+
+    def discard_told(self):
+        self.__dict__.pop("_told_pending", None)
 
     def missing_intent(self, number, repo=None):
         """The issues in this one's ask chain (ask, work item) with no Intent line. Charters are exempt."""
@@ -26085,8 +26099,10 @@ def load_tick(engine, discovery):
         return int(found.group(2)) if found and found.group(1).lower() == str(repo).lower() else None
 
     def wake(text):
-        if add_repeat_reminder(engine.state_dir, cos, now, now, text, "load-alert", "load", text) is None:
-            return   # #1275: the same alert text within 6 hours is a repeat
+        alert = getattr(context, "alert", None) or {}   # #1275: keyed by the DATA (the lane and its severity and reasons), never by the prose
+        if add_repeat_reminder(engine.state_dir, cos, now, now, text, "load-alert", str(alert.get("agent") or "unknown"), str(alert.get("state") or "unknown"),
+                               wake_class=WAKE_LOAD) is None:
+            return
         if engine.audit is not None:
             engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})
 

@@ -70,7 +70,7 @@ def write_reminders(state_dir, items):
         raise
 
 
-def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None):
+def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, wake_class=None):
     if not isinstance(to, str) or not to.strip():
         raise ReminderError("a reminder needs the name of the agent it is for")
     if not text.strip():
@@ -79,6 +79,8 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
             "text": text, "issue": issue, "from": sender}
     if repo:
         item["repo"] = repo  # PR 15: the repo `issue` is in
+    if wake_class:
+        item["wake_class"] = wake_class  # #1275: folded with the sweep and triage items of the same wake
     if condition:
         item["condition"] = dict(condition)  # checked when it is due: {"unless_report_from", "since"} or {"while_running"}
     with reminders_lock(state_dir):
@@ -90,13 +92,33 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
 
 REPEAT_WINDOW = 6 * 3600
 REPEAT_FILE = "reminder-repeats.json"
+RECORD_CAP = 1000000   # bytes a state record may have before it is not read
+
+
+def read_record_file(path, cap=RECORD_CAP):
+    """THE safe reader of a small JSON state record: never follows a symlink, never blocks on a FIFO or device, refuses a file that is not
+    regular or is over `cap` bytes. Returns the parsed value or None (missing, unsafe, too big or damaged)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > cap:
+            return None
+        data = os.read(fd, cap + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return None
 
 
 def _repeat_read(state_dir):
-    try:
-        raw = json.loads((Path(state_dir) / REPEAT_FILE).read_text())
-    except (OSError, ValueError):
-        return {}
+    raw = read_record_file(Path(state_dir) / REPEAT_FILE)
     return raw if isinstance(raw, dict) else {}
 
 
@@ -110,52 +132,114 @@ def last_send_at(state_dir, sender, recipient):
     return float(sent) if _is_number(sent) else None
 
 
-def repeat_due(state_dir, to, kind, subject, state, now, first=False, answered_at=None, window=None):
-    """True when a reminder of this (kind, subject, state) for `to` is to be delivered now, and remembers it.
-    A first sight, a changed state and a `first` report always pass (an owner wait, a held PR and the FIRST report of a
-    dead or blocked agent are never repeats). An unchanged state is held for `window` seconds (6 hours), and
-    while it stays unchanged after `answered_at` (a send on that item since the finding) it is not re-raised."""
+def repeat_key(kind, subject, to):
+    return "%s|%s|%s" % (kind, subject, to)
+
+
+def repeat_held(state_dir, to, kind, subject, state, now, first=False, answered_at=None, window=None):
+    """True when a reminder of this (kind, subject, state) for `to` is a repeat to hold back. Writes nothing.
+    A first sight, a changed state and a `first` report are never held (an owner wait, a held PR and the FIRST report of a dead or blocked agent
+    are not repeats). An unchanged state is held for `window` seconds (6 hours) after it was delivered. ANSWERED means `answered_at`: the
+    recipient's own send to the item's subject since the finding; it silences an unchanged state for `window` after the answer, never longer.
+    A clock that went backwards (now before the record) is no reason to hold: it is due."""
     window = REPEAT_WINDOW if window is None else window
-    key = "%s|%s|%s" % (kind, subject, to)
+    before = _repeat_read(state_dir).get(repeat_key(kind, subject, to))
+    if first or not (isinstance(before, dict) and before.get("state") == state and _is_number(before.get("at"))):
+        return False
+    if now < before["at"]:
+        return False
+    if answered_at is not None and answered_at >= before["at"] and now - answered_at < window:
+        return True
+    return now - before["at"] < window
+
+
+def repeat_record(state_dir, to, kind, subject, state, now, window=None):
+    """Remember that this (kind, subject, state) was delivered at `now`; forgets the keys older than twice the window."""
+    window = REPEAT_WINDOW if window is None else window
     with reminders_lock(state_dir):
         known = _repeat_read(state_dir)
-        before = known.get(key)
-        if not first and isinstance(before, dict) and before.get("state") == state and _is_number(before.get("at")):
-            if answered_at is not None and answered_at >= before["at"]:
-                return False
-            if now - before["at"] < window:
-                return False
-        known[key] = {"state": state, "at": float(now)}
+        known[repeat_key(kind, subject, to)] = {"state": state, "at": float(now)}
+        known = {k: v for k, v in known.items() if isinstance(v, dict) and _is_number(v.get("at")) and not now - v["at"] > 2 * window}
         path = Path(state_dir) / REPEAT_FILE
         temp = path.with_name("%s.%d.tmp" % (REPEAT_FILE, os.getpid()))
-        temp.write_text(json.dumps(known, sort_keys=True))
-        os.replace(str(temp), str(path))
-    return True
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps(known, sort_keys=True))
+            os.replace(str(temp), str(path))
+        except BaseException:
+            try:
+                os.unlink(str(temp))
+            except OSError:
+                pass
+            raise
 
 
 def add_repeat_reminder(state_dir, to, at, created, text, kind, subject, state, first=False, answered_at=None, **more):
-    """add_reminder behind the repeat rule: returns the item, or None when it is a repeat held back."""
-    if not repeat_due(state_dir, to, kind, subject, state, at, first=first, answered_at=answered_at):
+    """add_reminder behind the repeat rule: returns the item, or None when it is a repeat held back. The repeat is recorded only AFTER the
+    reminder was stored: a failed add leaves nothing recorded, so the next tick delivers it."""
+    if repeat_held(state_dir, to, kind, subject, state, at, first=first, answered_at=answered_at):
         return None
-    return add_reminder(state_dir, to, at, created, text, **more)
+    item = add_reminder(state_dir, to, at, created, text, **more)
+    repeat_record(state_dir, to, kind, subject, state, at)
+    return item
 
 
 # The table of every finding kind sent to the Chief of Staff, by the function that sends it:
 # function -> (kind, repeat key, window, test). docs/switchboard.md carries the same table; a test derives the senders from the source.
 FINDING_TABLE = {
-    "tell": ("Blocked agent", "(agent, recipient, held, refused)", "6 hours; first report and end line at once", "test_s2_s3_the_same_state_is_delivered_once_per_six_hours"),
-    "load_tick": ("load alert", "(alert text)", "6 hours", "test_blocked_agent_and_load_alert_senders_are_gated"),
-    "friction_tick": ("friction wake", "once per slot (own slot state)", "per slot", "test_s7_the_table_names_every_sender_found_in_the_source"),
-    "cmd_budget_notice": ("budget notice", "once per hour per account (own claim)", "1 hour", "test_s7_the_table_names_every_sender_found_in_the_source"),
-    "_impact_matrix_episode": ("impact matrix unreadable", "once per episode (own state)", "per episode", "test_s7_the_table_names_every_sender_found_in_the_source"),
-    "_impact_post_list": ("owner-hold rule list", "once per rule version (own state)", "per rule", "test_s7_the_table_names_every_sender_found_in_the_source"),
+    "blocked_tick": ("Blocked agent", "agent, recipient, event, held, refused, kind, reason", "6 hours; first report and end line at once", "test_tell_holds_a_repeat_and_passes_the_first_report"),
+    "load_tick": ("load alert", "lane, severity and reasons", "6 hours; merged into the wake message", "test_load_alert_is_keyed_by_the_data_not_the_text"),
+    "friction_tick": ("friction wake", "slot (own state)", "per slot", "test_one_wake_per_orchestrator_per_day_not_for_cos_or_coders"),
+    "cmd_budget_notice": ("budget notice", "account (own claim)", "1 hour", "test_s2_the_top_spenders_orchestrator_gets_one_message_with_the_agent_and_the_numbers_and_a_second_call_sends_none"),
+    "_impact_matrix_episode": ("impact matrix unreadable", "episode (own state)", "per episode", "test_s6_an_unreadable_matrix_changes_nothing_and_says_so_once_for_the_episode"),
+    "_impact_post_list": ("owner-hold rule list", "rule version (own state)", "per rule", "test_s8_an_unreadable_decision_or_rule_or_file_list_is_refused_and_nothing_is_lifted"),
+    "cmd_remind": ("a reminder the agent set (`remind`)", "its own id (a request, not a finding)", "none: sent as asked", "test_a_reminder_is_a_fact_only_once_it_is_due"),
+    "set_checkpoint_reminders": ("checkpoint reminder", "launch (own id)", "once per launch", "test_a_launch_checkpoint_reminder_is_not_a_wait_and_a_workers_own_reminder_is"),
+    "notify_drop": ("reminder drop notice", "dropped reminder (removed first)", "once", "test_a_drop_sends_the_setter_one_notice_naming_text_and_reason_audited_once"),
+    "SweepFacts": ("sweep (a fact, merged per wake)", "set and slot (own key)", "re-alarm hours", "test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines"),
+    "TriageFacts": ("triage (a fact, merged per wake)", "set and slot (own key)", "re-alarm hours", "test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines"),
 }
+# Every state file the gate reads or writes: file -> (who reads it, who writes it)
+STATE_FILE_TABLE = {
+    REPEAT_FILE: ("repeat_held", "repeat_record"),
+    LAST_REPORT_FILE: ("last_send_at", "report and send"),
+}
+# The sweep, triage and load-alert items of one wake are ONE message (merge_wake_facts); these are the classes it merges
+WAKE_KINDS = ("sweep", "triage")
+WAKE_LOAD = "load"
+
+_ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _clean_line(line):
+    return " ".join(_ESCAPES.sub("", str(line)).split())
 
 
 def merge_wake(items):
-    """One message per wake: `items` is [(class, line)]; one line per item, one header with the count."""
-    lines = ["- %s: %s" % (cls, " ".join(str(line).split())) for cls, line in items]
-    return "[switchboard] %d item%s this wake\n%s" % (len(lines), "" if len(lines) == 1 else "s", "\n".join(lines))
+    """One message per wake: `items` is [(class, line)]; one line per item, one header with the count. Escape sequences are stripped."""
+    lines = ["- %s: %s" % (_clean_line(cls), _clean_line(line)) for cls, line in items]
+    return "%d item%s this wake\n%s" % (len(lines), "" if len(lines) == 1 else "s", "\n".join(lines))
+
+
+def wake_class_of(fact):
+    return fact.kind if fact.kind in WAKE_KINDS else getattr(fact, "wake_class", None)
+
+
+def merge_wake_facts(recipient, facts):
+    """The facts of ONE wake for `recipient` with the sweep, triage and load-alert items folded into one fact (one line per item, oldest
+    last). Everything else (an owner wait, a held PR, a blocked agent's report, a send) is passed through untouched. One such fact stays
+    as it is. The merged fact carries every member's key, so each is acknowledged once it is delivered."""
+    mine = [f for f in facts if wake_class_of(f)]
+    if len(mine) < 2:
+        return list(facts)
+    mine.sort(key=lambda f: (-f.created, f.key))
+    keys = [f.key for f in mine]
+    merged = Fact("wake:" + hashlib.sha256("|".join(keys).encode()).hexdigest()[:12], recipient, "wake",
+                  merge_wake([(wake_class_of(f), f.summary) for f in mine]), max(f.created for f in mine),
+                  batch=all(f.batch for f in mine), sender="switchboard")
+    merged.members = keys
+    return [f for f in facts if not wake_class_of(f)] + [merged]
 
 
 def remove_reminders(state_dir, ids):
@@ -301,6 +385,8 @@ class ReminderFacts:
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
+            if isinstance(item.get("wake_class"), str):
+                facts[-1].wake_class = item["wake_class"]
         return facts
 
 
