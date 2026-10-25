@@ -58,6 +58,14 @@ rebuilt from another record.
 | `bin/switchboard/decision.py:86` | `boss-resolution` | the delivery decision compares a send's sender with the observation's boss through `boss_name` | nobody | the delivery decision | derived (reader) |
 | `bin/switchboard/facts.py:120` | `discovery.agents` | a fact source reads the discovered agents to find the chiefs of staff | nobody | fact sources | derived (reader) |
 | `bin/switchboard/v2_transport.py:24` | `pane-health.json` | comment only: the heartbeat-health bound is named for the derived file; nothing reads its time here | nobody | nobody | derived |
+| `bin/switchboard/agents_verify.py:155` | `discovery.agents` | `agents verify` reads the discovered agents to compare each with its registration | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/alert_labels.py:83` | `discovery.agents` | the alert-label wake finds a repository's orchestrators among the discovered agents | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/answer_delivery.py:592` | `decisions.json` | comment only: the delivery paths wait for the daemon's next write of the projection | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:587` | `boss-resolution` | the stop triage resolves a worker's boss by its registered name (`boss_name`) | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:325` | `decisions.json` | the handoff reads the decisions file for the open decisions of a worker | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:102` | `discovery.agents` | the handoff reads the discovered agents to find the named worker | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/handoff.py:642` | `last-reports.json` | comment only: the brief reads the last-reports record `report` wrote | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/triage.py:358` | `discovery.agents` | a triage rule reads the discovered agents to find the orchestrators | nobody | the moved code's own reader | derived (reader) |
 | `bin/fleet_health.py:298` | `decisions.json` | reads the held PR and waiting decisions per orchestrator | nobody (reader only) | load figures | derived (reader) |
 | `plugins/fleet-decisions-tui/decisions.mjs:9` | `decisions.json` | reads the list for the sidebar | nobody (reader only) | Decisions section | derived (reader) |
 | `bin/decisions_pull.py:28` | `decisions.json` | reads the cloud daemon's list from a configured source command and rewrites the local file (cleaned, atomic, mode 0600); ages its mtime when the source is down | the Mac-side pull (`write_atomic`, `mark_stale`) | the Decisions plugin (`decisions.mjs`) | derived |

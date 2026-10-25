@@ -330,18 +330,38 @@ class TestHostileInput(Base):
                 done, calls = self.run_gh("pr", "view", "7", "-R", CFG_REPO)
                 self.assertEqual(done.returncode, 7)
 
-    def test_a_missing_module_refuses_while_a_hold_is_named(self):
+    MISSING_TEXT = "could not be loaded"
+
+    def merge_in_copy(self, with_module):
         copy = self.home / "shimcopy"
         copy.mkdir()
         for sibling in (REPO / "shims").glob("*.py"):              # the shim as installed: every sibling module, from the real directory
-            if sibling.name != MODULE.name:
+            if with_module or sibling.name != MODULE.name:
                 shutil.copy(str(sibling), str(copy / sibling.name))
         shutil.copy(str(SHIM), str(copy / "gh"))
-        done, _ = self.run_gh("pr", "merge", "7", "-R", CFG_REPO, shim=copy / "gh")
+        return copy, self.run_gh("pr", "merge", "7", "-R", CFG_REPO, shim=copy / "gh")[0]
+
+    def check_missing_module_refusal(self, with_module):
+        copy, done = self.merge_in_copy(with_module)
         self.assertEqual(done.returncode, 1)
+        self.assertEqual((done.stdout + done.stderr).count(self.MISSING_TEXT), 1)
         self.config(None)
         done, _ = self.run_gh("pr", "merge", "7", "-R", CFG_REPO, shim=copy / "gh")
         self.assertEqual(done.returncode, 7)
+
+    def test_a_missing_module_refuses_while_a_hold_is_named(self):
+        self.check_missing_module_refusal(False)
+
+    def test_the_hold_module_present_refuses_with_the_held_merge_text(self):
+        _, done = self.merge_in_copy(True)
+        out = done.stdout + done.stderr
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(out.count("the project merges this one itself"), 1)
+        self.assertEqual(out.count(self.MISSING_TEXT), 0)
+
+    def test_mutant_copying_the_hold_module_in_fails_the_first_test(self):
+        with self.assertRaises(AssertionError):
+            self.check_missing_module_refusal(True)
 
 
 class TestAudit(Base):

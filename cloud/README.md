@@ -18,7 +18,7 @@ Ubuntu 24.04, Python 3, git, `cw-gh` (our own small GitHub client; the real `gh`
 `OPENCODE_VERSION=2.0.28`, a standalone binary checked against its sha256 before it is unpacked; no node or npm). The
 launcher's end hook and token mint are copied in as `cw-end-hook` and `cw-token-mint`, and the activity reader as
 `cw-worker-activity` (it reads the v2 object shape of `GET /api/session/active`). `cw-plan-check` and `plan_check.py` (a byte-identical copy of `bin/plan_check.py`, pinned by a CI test) let a worker check its own plan with `cw-plan-check --file PLAN --done-when TEXT`: a pure local read, same output and exit codes (0 pass, 1 fail, 2 unreadable) as `plan check --file`; if the plan has an `## Intent` section with its own `Done when:` line, the pod compares it with `--done-when` exactly as the local check does. Slice B (a retire of a worker whose pod is already gone) is described in `docs/cloud-worker-interface.md`; the image must be rebuilt and published by an operator before pods have the command. It runs as user `worker` (uid 1000). `worker` may run one command as root (`start-dockerd`) through sudo;
-the entrypoint uses it to start the nested `dockerd` and then execs the command. Default command:
+the entrypoint uses it to start the nested `dockerd` and then execs the command. The image also carries `make` (the one package, no compiler toolchain). The image writes ONE system-level git file at build (`/etc/gitconfig`) with a default `user.name` and `user.email`, taken from the one constant pair `CW_DEFAULT_IDENT_NAME` and `CW_DEFAULT_IDENT_EMAIL` (build arguments with defaults, in their own block of the Dockerfile). The entrypoint exports no identity variable and writes no git configuration, and nothing is written in the home directory or at run time. Git's own order applies (system, then global, then local), so a repository's configured identity and a local `git config user.name` or `user.email` win over the default. The shell guard still allows only the two identity keys in `git config`. A branch name containing the word main or master is refused by the shell guard's patterns (main or master anywhere in the command line), so name branches without them. The image changes only by an operator rebuild after merge. The default command is
 `opencode serve --hostname 0.0.0.0 --port 4096`. Set `WORKER_DOCKER=0` to skip the Docker daemon. No credential is
 built in: `OPENCODE_SERVER_PASSWORD`, `GH_TOKEN` and any cloud identity are supplied by the launcher at run time.
 
@@ -378,6 +378,29 @@ constant and the fixture together (regenerate with `CW_WRITE_STACK_FIXTURE=1 pyt
 read the diff). An image by tag is accepted by design: the operator picks the image, and no digest is required here.
 Details: `docs/cloud-worker-interface.md`. The live runs are in
 "Live proof" below.
+
+## A stack-only model credential
+
+The pod holds only the coder's model entry (`model-auth`); the containers a stack starts hold none, and giving them `model-auth` would put the coder's key into the stack. With `launch --cloud --stack` and the setting `CW_STACK_MODEL_SECRET` (a vault secret name), the switchboard reads that secret before any pod exists and hands it over as the per-run secret `stack-model-key`; the entrypoint copies it to `/run/cw-tmp/stack/model-key` (0600). `cw-stack-up` (use it instead of `docker compose`) gives the compose child the variable `CW_STACK_MODEL_KEY`; a service lists `CW_STACK_MODEL_KEY` under `environment:`. `cw-stack-up down` removes the copy. The audit and run record carry the name and `delivered`. The coder can read this credential (same user, docker group); the protection is purpose-scoping, a spend cap and revocation at the provider. Owner steps: `docs/cloud-operator-quickstart.md`, "A stack-only model credential".
+
+## Pulling prebuilt stack images (ask #1022)
+
+**The cause.** A worker pod sets `automountServiceAccountToken: false` and the guard refuses any pod with a service-account token, so no cloud identity works in a pod today: the label `azure.workload.identity/use` has nothing to exchange. (Whether the cluster's webhook injects a token for the default account is read live by the tester in the live slice; this text changes if it does.) A stack therefore built its images inside the pod, and peaked at 95 percent of its memory limit.
+
+**What a stack pod gets when the three settings are set.** With `CW_STACK_REGISTRY` (a registry host ending in `.azurecr.io`), `CW_STACK_PULL_CLIENT_ID` and `CW_STACK_PULL_TENANT_ID` (GUIDs, not secrets) all set, `create --stack` makes a pod that uses the service account `cw-stack-puller` (manifest: `cloud/k8s/stack-puller-sa.yaml`, token not auto-mounted), has no workload-identity label, and carries one extra volume: a projected service-account token (audience `api://AzureADTokenExchange`, 600 seconds, mode 0400) plus the three values as files, mounted read-only at ONE path, `/opt/cw-registry/token`, whose parent `/opt/cw-registry` is root-owned mode 0700 in the image. With none of the keys set the pod is exactly as before; one or two of them are refused, naming keys and never values.
+
+**The step.** `sudo cw-stack-pull IMAGE...` (a root-run script; the sudoers rule names it and `start-dockerd` only, with `env_reset`) trades the token for an Entra access token, trades that for a short-lived registry credential, logs the nested Docker in with `--password-stdin` into a 0700 directory on the memory tmpfs (files 0600), pulls each image (which must be on the configured registry host, read from the root-only file, never from the caller), and removes the directory on success, failure and SIGTERM. The credential is never an argument, an environment variable, a log line or part of the run record. A pod that never pulls never holds a credential.
+
+**Honest residual risk.** The coder is in the `docker` group, which inside the pod is root-equivalent: a nested container can bind-mount `/` and read the token file. So the isolation covers an accidental or prompt-injected shell (`cat`, `printenv`, a copied log) and any container the stack starts by default; it does not stop a coder who deliberately builds a container to read it. The bound: a 10 minute token, valid only for the exchange for one identity whose only right is to pull from one small registry.
+
+**Owner steps, in order** (the launcher never creates or changes an identity, a credential or a role):
+
+1. Create a user-assigned managed identity (`cw-stack-puller-id`) and give the launcher's operator its **principal id** (the one value the registry's owner needs).
+2. Create a federated credential on it: the cluster's OIDC issuer, subject `system:serviceaccount:<ns>:cw-stack-puller`, audience `api://AzureADTokenExchange`.
+3. The registry's owner grants `AcrPull` to the principal id, at the registry only (no write-capable role).
+4. Apply `cloud/k8s/stack-puller-sa.yaml` with the identity's client id and tenant id as annotations, then set the three keys, then publish the rebuilt image (new files: `cloud/worker/cw-stack-pull`, the Dockerfile lines).
+
+**The check, before any pod exists.** `cloud-worker stack-registry-check --resource-group RG --issuer ISSUER_URL` (needs `CW_STACK_REGISTRY` and `CW_CLOUD_NAMESPACE`; runs with your own `az` login; read-only) prints the principal id and `OK`, or each missing owner step (exit 1, also for a write-capable role), or `CANNOT TELL: <reason>` (exit 2, never a pass). It cannot call the token exchange: only a live stack pod proves that.
 
 ## Live proof (S10 runtime half and S12), run on a cluster
 
