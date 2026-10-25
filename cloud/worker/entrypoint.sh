@@ -59,12 +59,23 @@ case "${CW_MODEL:-}" in
   *[!A-Za-z0-9._/:-]*) echo "worker: CW_MODEL has a character outside [A-Za-z0-9._/:-]; refusing to start" >&2; exit 1 ;;
 esac
 cfgdir="$TMP/config"
+defn="${CW_SHARE_DIR:-/usr/local/share/cw}/$AGENT.md"
+if [ "$AGENT" = orchestrator ]; then
+  # a config block cannot beat the definition's own rule (the last match wins): the pod's copy says deny; fail closed, before any copy exists
+  if [ "$(grep -c -x -F '  question: allow' "$defn")" != 1 ]; then
+    echo "orchestrator: the question permission line was not found exactly once; refusing to start" >&2; exit 1
+  fi
+fi
 ( umask 077; mkdir -p "$cfgdir/opencode"
   printf '{"model": "%s",\n' "${CW_MODEL:-github-copilot/claude-sonnet-5.5}" > "$cfgdir/opencode/opencode.json"
   # the worker agent (default) and the shell tool's deny rules: the template's first line is its opening brace
   tail -n +2 "${CW_SHARE_DIR:-/usr/local/share/cw}/opencode-worker.json" >> "$cfgdir/opencode/opencode.json"
   mkdir -p "$cfgdir/opencode/agents"
-  cat "${CW_SHARE_DIR:-/usr/local/share/cw}/$AGENT.md" > "$cfgdir/opencode/agents/$AGENT.md" )
+  if [ "$AGENT" = orchestrator ]; then
+    sed 's/^  question: allow$/  question: deny/' "$defn" > "$cfgdir/opencode/agents/$AGENT.md"
+  else
+    cat "$defn" > "$cfgdir/opencode/agents/$AGENT.md"
+  fi )
 chmod 600 "$cfgdir/opencode/opencode.json"
 XDG_CONFIG_HOME="$cfgdir"; export XDG_CONFIG_HOME
 

@@ -377,6 +377,7 @@
         "bin/pr_events.py",
         "bin/queue_ejections.py",
         "bin/reassign.py",
+        "bin/red_ci.py",
         "bin/reds.py",
         "bin/registry.py",
         "bin/report_fold.py",
@@ -393,6 +394,9 @@
           "validate"
         ],
         "bin/ci_runs.py": [
+          "*"
+        ],
+        "bin/red_ci.py": [
           "*"
         ],
         "bin/cpu_guard.py": [
