@@ -285,6 +285,8 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
             return status
         return unreserved(token, audience)
     server = cloud_channel_server.make_server(address, unreserved, inbox, audit, max_handlers)
+    if relay is not None:
+        relay.configure(server.max_handlers)   # caps derive from the real handler count (ValueError when < 2)
     base = server.RequestHandlerClass
     local = threading.local()
 
@@ -328,10 +330,17 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
             if int(length) > cloud_channel_server.MAX_BODY:
                 self._deny(413, "body too large")
                 return None
-            try:
-                raw = self.rfile.read(int(length))
-                if len(raw) < int(length):
-                    raise TimeoutError("short")
+            try:   # a relay body has BODY_DEADLINE seconds in total, not just per read
+                end, raw = time.monotonic() + cloud_relay.BODY_DEADLINE, b""
+                while len(raw) < int(length):
+                    left = end - time.monotonic()
+                    if left <= 0:
+                        raise TimeoutError("slow body")
+                    self.connection.settimeout(left)
+                    chunk = self.rfile.read1(int(length) - len(raw)) if hasattr(self.rfile, "read1") else self.rfile.read(int(length) - len(raw))
+                    if not chunk:
+                        raise TimeoutError("short")
+                    raw += chunk
             except (TimeoutError, OSError):
                 self._deny(408, "request timeout")
                 return None
@@ -343,6 +352,19 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
 
         def _relay_post(self):
             self.close_connection = True
+            if self.path == "/relay":
+                # EVERY pod relay handler counts from here (token review, body read, held wait), at most max_handlers//2.
+                # Guaranteed: pod relay posts alone can never take more than half the slots. Not guaranteed: the other
+                # half is shared by the daemon routes, channel and decisions requests, so slow clients of those can still crowd the daemon out.
+                if not relay.admit():
+                    return self._deny(503, "relay busy: too many in-flight relay requests")
+                try:
+                    return self._relay_post_admitted()
+                finally:
+                    relay.release()
+            return self._relay_post_admitted()
+
+        def _relay_post_admitted(self):
             pod = self._caller()
             if pod is None:
                 return

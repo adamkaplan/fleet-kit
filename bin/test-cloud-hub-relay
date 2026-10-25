@@ -34,7 +34,7 @@ def sha(v):
 
 
 class Hub:
-    def __init__(self, wait=3.0, agents=None, **relay_kw):
+    def __init__(self, wait=3.0, agents=None, max_handlers=None, **relay_kw):
         self.tmp = tempfile.TemporaryDirectory()
         t = Path(self.tmp.name)
         (t / "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
@@ -45,7 +45,7 @@ class Hub:
         agents_path = str(t / "agents.json")
         self.relay = cloud_relay.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=wait, **relay_kw)
         self.server = cloud_hub.make_hub(("127.0.0.1", 0), cloud_hub.make_secrets_reviewer(str(t / "secrets.json")),
-                                         cloud_hub.Inbox(agents_path), self.lines.append, relay=self.relay, daemon="daemon")
+                                         cloud_hub.Inbox(agents_path), self.lines.append, relay=self.relay, daemon="daemon", max_handlers=max_handlers)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.port = self.server.server_address[1]
 
@@ -271,6 +271,90 @@ class TestClient(unittest.TestCase):
         self.assertEqual(urls, ["http://hub.svc:8080/relay"])
 
 class TestBoundsAndCaps(unittest.TestCase):
+    def test_caps_derive_from_max_handlers(self):
+        for mh, total in ((4, 2), (16, 8), (None, 16)):
+            with Hub(max_handlers=mh) as hub:
+                self.assertEqual((hub.relay.max_inflight, hub.relay.max_wait_total), ((mh or 32) // 2, total))
+        for bad in (1,):
+            with self.assertRaises(ValueError):
+                Hub(max_handlers=bad)
+
+    def test_small_server_held_waits_leave_slots(self):
+        with Hub(wait=2.0, max_handlers=6) as hub:   # 3 relay handlers at most
+            threads = [threading.Thread(target=hub.relay_call, kwargs={"who": "pod-a", "call_id": "c%d" % i}) for i in range(3)]
+            for t in threads: t.start()
+            for _ in range(100):
+                if sum(hub.relay.waiting.values()) == 3: break
+                time.sleep(0.05)
+            status, body = hub.relay_call(who="pod-b", call_id="x", pr="acme-org/widget-api#3")
+            self.assertEqual(status, 503)
+            status, got = hub.call("GET", "/relay/pending", who="daemon")
+            self.assertEqual((status, len(got["requests"])), (200, 3))
+            for req in got["requests"]:
+                self.assertEqual(hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")[0], 200)
+            for t in threads: t.join()
+
+    def test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive(self):
+        import socket
+        with Hub(wait=8.0, max_per_pod=50) as hub:   # default max_handlers=32 -> relay cap 16
+            self.assertEqual(hub.relay.max_inflight, 16)
+            self.assertEqual((cloud_relay.MAX_WAIT_PER_POD, cloud_relay.MAX_WAIT_TOTAL), (4, 16))
+            agents = {}
+            for i in range(4):
+                agents["pod-%d" % i] = {"url": "http://127.0.0.1:1", "session": "s", "password_file": "x", "repo": "acme-org/r%d" % i, "issue": i}
+            for name in agents: SECRETS[name] = "secret-" + name
+            Path(hub.tmp.name, "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
+            Path(hub.tmp.name, "agents.json").write_text(json.dumps(agents))
+            threads = []
+            for i in range(4):          # 4 pods x 4 held waits = 16 held
+                for j in range(4):
+                    t = threading.Thread(target=hub.relay_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
+            for _ in range(200):
+                if sum(hub.relay.waiting.values()) == 16: break
+                time.sleep(0.05)
+            self.assertEqual(sum(hub.relay.waiting.values()), 16)
+            socks = []
+            for _ in range(6):          # slow bodies beyond the relay cap: refused 503 or timed out, never fill the rest
+                s = socket.create_connection(("127.0.0.1", hub.port))
+                s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-pod-0\r\nContent-Length: 100\r\n\r\n{")
+                socks.append(s)
+            time.sleep(0.5)
+            self.assertLessEqual(hub.relay.inflight, 16)
+            status, got = hub.call("GET", "/relay/pending", who="daemon")
+            self.assertEqual(status, 200)
+            self.assertEqual(len(got["requests"]), 10)
+            for req in got["requests"]:
+                self.assertEqual(hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")[0], 200)
+            self.assertNotEqual(hub.call("POST", "/message", {"x": 1}, who="pod-0")[0], 0)   # channel route is served (answers, not starved)
+            self.assertEqual(hub.call("GET", "/decisions", who="pod-0")[0], 200)
+            for s in socks: s.close()
+            for r in list(hub.relay.pending.values()): pass
+            while hub.relay.pending:
+                for req in hub.relay.list_pending():
+                    hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")
+            for t in threads: t.join()
+
+    def test_slow_body_trickle_cut_at_deadline(self):
+        import socket
+        old = cloud_relay.BODY_DEADLINE
+        cloud_relay.BODY_DEADLINE = 1.0
+        try:
+            with Hub() as hub:
+                s = socket.create_connection(("127.0.0.1", hub.port))
+                s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-a-1\r\nContent-Length: 100\r\n\r\n")
+                t0 = time.time()
+                for _ in range(8):   # a byte every 0.4 s would pass a per-read timeout
+                    try: s.sendall(b" ")
+                    except OSError: break
+                    time.sleep(0.4)
+                data = s.recv(4096)
+                self.assertIn(b" 408 ", data.split(b"\r\n")[0])
+                self.assertLess(time.time() - t0, 3.5)
+                s.close()
+                self.assertEqual(hub.relay.inflight, 0)
+        finally:
+            cloud_relay.BODY_DEADLINE = old
+
     def test_held_wait_caps_keep_daemon_routes_alive(self):
         # per pod 4, global 6; both pods saturate, a refused call queues nothing, the daemon still gets through
         with Hub(wait=2.0, max_per_pod=20, max_pending=200, agents=None) as hub:

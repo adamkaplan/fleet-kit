@@ -33,7 +33,8 @@ BATCH = 10
 MAX_PENDING = 200
 MAX_PER_POD = 20
 MAX_WAIT_PER_POD = 4   # held POST /relay waits per pod (each holds a hub handler slot for up to WAIT seconds)
-MAX_WAIT_TOTAL = 16    # held waits overall: at most MAX_HANDLERS/2, so the daemon's pending/result calls always find a slot
+MAX_WAIT_TOTAL = 16    # upper bound on held waits; Relay.configure(max_handlers) lowers it to max_handlers//2 when the server is smaller
+BODY_DEADLINE = 5.0    # seconds in total for a pod's relay request body to arrive (the socket timeout alone is per read)
 PENDING_TTL = 120.0   # seconds an unanswered entry may wait for the daemon before it is dropped
 MAX_ARGS = 16
 MAX_ARG_KEY = 64
@@ -71,9 +72,33 @@ class Relay:
         self.lock = threading.Lock()
         self.waiting = {}   # pod -> waits held right now
         self.max_wait_pod, self.max_wait_total = MAX_WAIT_PER_POD, MAX_WAIT_TOTAL
+        self.max_inflight, self.inflight = None, 0   # POST /relay handlers in the hub right now (any stage); None until configure()
+
         self.pending = collections.OrderedDict()   # id -> Entry, unanswered
         self.by_call = {}                          # (pod, call_id) -> Entry (unanswered or recently answered)
         self.finished = collections.OrderedDict()  # (pod, call_id) -> Entry, answered, bounded
+
+    def configure(self, max_handlers):
+        """Derive the caps from the server's real handler count. Pod POST /relay handlers (every stage: token review,
+        body read, held wait) are admitted at most max_handlers//2 at once, so at least half the slots stay free for the
+        daemon's GET /relay/pending and POST /relay/result AND for channel/decisions requests (those share that other
+        half; the daemon routes are not reserved against them). ValueError when max_handlers < 2 (no half to keep)."""
+        if not isinstance(max_handlers, int) or isinstance(max_handlers, bool) or max_handlers < 2:
+            raise ValueError("the relay needs max_handlers >= 2 to keep half the slots for the daemon, got %r" % (max_handlers,))
+        self.max_inflight = max_handlers // 2
+        self.max_wait_total = min(MAX_WAIT_TOTAL, self.max_inflight)
+
+    def admit(self):
+        """Count one pod relay handler in; False (answer 503) when max_inflight are already in. Pair with release()."""
+        with self.lock:
+            if self.max_inflight is not None and self.inflight >= self.max_inflight:
+                return False
+            self.inflight += 1
+            return True
+
+    def release(self):
+        with self.lock:
+            self.inflight -= 1
 
     def validate(self, pod, body):
         """The call dict for a pod's body, or Refusal. Touches nothing."""
@@ -126,6 +151,9 @@ class Relay:
         with self.lock:
             self._expire()
             entry = self.by_call.get(key)
+            # NOTE: the wait caps below are checked BEFORE joining an existing entry: a replay of an already queued,
+            # still unanswered call from a pod at its per-pod cap gets 429 (it would hold a slot like any other wait).
+            # A replay of an already answered call is served without any cap.
             if entry is not None and entry.fingerprint != fingerprint(call):
                 return 409, {"status": 409, "error": "call_id reused for a different call"}
             if not (entry is not None and entry.done.is_set()):
