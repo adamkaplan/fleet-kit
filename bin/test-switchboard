@@ -15390,8 +15390,10 @@ class CharterRig:
             if not repo:
                 raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
+        real_invalidate = sb.IntentReader.invalidate
         def cmd_invalidate(reader, number, repo=None):
             self.cmd_reads.append(("invalidate", number, repo))
+            return real_invalidate(reader, number, repo)   # the real forgetting still happens (TestCharterSetGuard relies on it)
         for name, fake in (("parent", cmd_parent), ("issue", cmd_issue), ("invalidate", cmd_invalidate)):
             patcher = mock.patch.object(sb.IntentReader, name, fake)
             patcher.start()
