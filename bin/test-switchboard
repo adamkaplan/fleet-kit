@@ -67,6 +67,8 @@ os.environ["GCM_INTERACTIVE"] = "never"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests" / "switchboard"))   # support import
 
 import importlib
+_support_rebind = importlib.import_module("support.rebind")   # support import
+rebound = _support_rebind.rebound   # support import
 
 _support_core = importlib.import_module("support.core")   # support import
 Base, COS_ALLOWING, COS_ALLOWING_FULL, COS_GUARDS, FakeRunner, REAL_NODE, SAFE_PATH, cos_rules_text = (_support_core.Base, _support_core.COS_ALLOWING, _support_core.COS_ALLOWING_FULL, _support_core.COS_GUARDS, _support_core.FakeRunner, _support_core.REAL_NODE, _support_core.SAFE_PATH, _support_core.cos_rules_text)   # support import
@@ -75675,6 +75677,52 @@ def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2
     return thread
 
 
+class TestSupportRebinding(unittest.TestCase):
+    """The moved fakes read `sb` and the other moved globals from their own modules (tests/switchboard/support/), not from this file: a test that rebinds
+    a moved name here must rebind it there too (`rebound`). These two tests pin that, and find every such rebinding by reading this file."""
+
+    def test_a_moved_fake_reads_a_rebound_name_only_when_the_support_modules_are_rebound_too(self):
+        sentinel = object()
+        with mock.patch.dict(globals(), {"sb": sentinel}):
+            self.assertIs(sb, sentinel)
+            self.assertIsNot(Base.setUp.__globals__["sb"], sentinel, "patching this file alone does not reach the moved code")
+        with mock.patch.dict(globals(), {"sb": sentinel}), rebound("sb", sentinel):
+            self.assertIs(Base.setUp.__globals__["sb"], sentinel)
+            self.assertIs(sys.modules["support.loader"].sb, sentinel)
+        self.assertIsNot(Base.setUp.__globals__["sb"], sentinel, "restored afterwards")
+        self.assertIsNot(sys.modules["support.loader"].sb, sentinel)
+
+    def test_every_rebinding_of_a_moved_name_in_this_file_also_rebinds_it_in_the_support_modules(self):
+        moved = set()
+        for path in sorted((REPO / "tests" / "switchboard" / "support").glob("*.py")):
+            for node in ast.parse(path.read_text()).body:
+                if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    moved.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    moved |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        moved -= {"BIN", "REPO"}
+        tree = ast.parse(Path(__file__).read_text())
+        own = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "TestSupportRebinding")   # its first test patches without rebound on purpose
+        found = []
+        for node in ast.walk(tree):
+            if getattr(node, "lineno", None) is not None and own.lineno <= node.lineno <= own.end_lineno:
+                continue
+            if isinstance(node, ast.Global):
+                found += [(node.lineno, "global " + name) for name in node.names if name in moved]
+            elif isinstance(node, ast.With):
+                texts = [ast.unparse(item.context_expr) for item in node.items]
+                for expr in (item.context_expr for item in node.items):
+                    if isinstance(expr, ast.Call) and ast.unparse(expr.func).endswith("patch.dict") and expr.args and ast.unparse(expr.args[0]) == "globals()" \
+                            and len(expr.args) > 1 and isinstance(expr.args[1], ast.Dict):
+                        for key in expr.args[1].keys:
+                            if isinstance(key, ast.Constant) and key.value in moved and not any(t.startswith("rebound(%r" % key.value) or t.startswith('rebound("%s"' % key.value) for t in texts):
+                                found.append((node.lineno, "patch.dict(globals(), {%r: ...}) without rebound" % key.value))
+            elif isinstance(node, ast.Call) and ast.unparse(node.func).endswith(("patch.object", "setattr")) and len(node.args) > 1 \
+                    and ast.unparse(node.args[0]) in ("sys.modules[__name__]", "globals()") and isinstance(node.args[1], ast.Constant) and node.args[1].value in moved:
+                found.append((node.lineno, "%s(module, %r)" % (ast.unparse(node.func), node.args[1].value)))
+        self.assertEqual(found, [], "a moved name rebound here does not reach the moved code: rebind it in the support modules as well (rebound)")
+
+
 def main(argv):
     watch_parent()
     loader = unittest.TestLoader()
@@ -85855,7 +85903,7 @@ class TestResume(Base):
                 sys.modules[module.__name__] = module
                 self.addCleanup(sys.modules.pop, module.__name__, None)
                 exec(compile(text.replace(old, new), str(SWITCHBOARD), "exec"), module.__dict__)
-                with mock.patch.dict(globals(), {"sb": module}):
+                with mock.patch.dict(globals(), {"sb": module}), rebound("sb", module):
                     result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestResume(test)]))
                 self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
 
@@ -86474,7 +86522,7 @@ class TestBlockedMutants(Base):
 
     def killed(self, module, test):
         suite = unittest.TestSuite([TestBlockedReport(test)])
-        with mock.patch.dict(globals(), {"sb": module}):
+        with mock.patch.dict(globals(), {"sb": module}), rebound("sb", module):
             result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
         return bool(result.failures or result.errors)
 
