@@ -32,6 +32,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -272,15 +273,15 @@ class Executor:
             clipped = plan_ledger.clip(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT)
             if (not _same_call(first, command, pr, call.get("head")) or first.get("scenario") != args.get("scenario")
                     or first.get("result") != args.get("result") or first.get("evidence") != clipped):
-                self.backend.audit("relay.refused", clean_text(pr, 120), {"by": clean_text(pod, 80), "status": 409, "why": "call_id reused for a different call"})
+                self.backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": 409, "why": "call_id reused for a different call"})
                 return 409, "call_id reused for a different call", None
             self.index.put(pod, cid, dict(_answer(first), command=command, pr=pr, head=call.get("head"), args=args_digest(args)))
             return 200, "replay: already recorded", _answer(first)
         except Refuse as err:
-            self.backend.audit("relay.refused", clean_text(pr, 120), {"by": clean_text(pod, 80), "status": err.status, "why": clean_text(err.detail or err.reason)})
+            self.backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": err.status, "why": clean_text(err.detail or err.reason)})
             return err.status, err.reason, None
         except plan_ledger.LedgerError as err:
-            self.backend.audit("relay.refused", clean_text(pr, 120), {"by": clean_text(pod, 80), "status": 409, "why": clean_text(err)})
+            self.backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": 409, "why": clean_text(err)})
             return 409, "the ledger refused the write", None
 
     def _check_linked(self, pr, req):
@@ -483,10 +484,11 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ):
     try:
         try:
             with open(tokfile, "rb") as handle:
-                loose = os.fstat(handle.fileno()).st_mode & 0o077
+                info = os.fstat(handle.fileno())
+                loose = info.st_mode & 0o077 or info.st_uid != os.geteuid() or not stat.S_ISREG(info.st_mode)
                 raw = handle.read(TOKEN_CAP + 1) if not loose else b""
             if loose:   # a token readable by group or other is refused, never read or used
-                engine._note("relay.pass_failed", None, {"error": "token file is readable by group or other (mode must be 0600)"})
+                engine._note("relay.pass_failed", None, {"error": "the token file is not private to this user (regular file, owned by the user, mode 0600): it is not used"})
                 return 0
             if len(raw) > TOKEN_CAP:
                 engine._note("relay.pass_failed", None, {"error": "token file over %d bytes" % TOKEN_CAP})
