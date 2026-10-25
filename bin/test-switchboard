@@ -2974,6 +2974,22 @@ class TestSteerToWorking(Base):
         code, _, err = send("short")
         self.assertEqual(code, 0, err)
 
+    def test_1275_the_cut_check_measures_the_carried_send_with_two_facts_pending(self):
+        self.work()
+        engine = self.world.engine
+        now = self.world.clock.now()
+        discovery = engine.discover(now)
+
+        def deliver(text):
+            older = sb.Fact("send:cos:old", "platform", "send", "short", now - 1, batch=False, sender="cos")
+            newer = sb.Fact("send:cos:new", "platform", "send", text, now, batch=False, sender="cos")
+            return engine.send_fact(newer, discovery, now, carried=[older])
+        with self.assertRaises(sb.MessageTooLong) as cm:
+            deliver("x" * 4500)
+        allowed = int(re.search(r"allowed text for this message is (\d+) characters", str(cm.exception)).group(1))
+        self.assertTrue(3000 < allowed < 4000, allowed)   # about 3,754, never the 8,444 of the short older fact
+        self.assertTrue(deliver("y" * allowed).get("sent"), "the resend of the allowed length is not cut")
+
 
 PLAN_CLAUSES = ["first clause is stated here", "second clause is stated here"]
 APPROVAL_DW = "(1) %s (2) %s" % tuple(PLAN_CLAUSES)

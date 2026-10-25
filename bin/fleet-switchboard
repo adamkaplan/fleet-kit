@@ -2932,10 +2932,11 @@ class Switchboard:
                                 repos=repos, delivered=self.now())
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
-            # Unmerged on purpose: this measures the cut length of the ONE send being written (its own header and ask sections); merging wake items of other classes would not change that length.
-            # Unmerged on purpose: this measures the cut length of the ONE send being written (its own header and ask sections); merging wake items of other classes would not change that length.
-            whole, _ = compose(plan.recipient, plan.pending[:1], cap=10 ** 9, section=section_resolver(self, observation),
+            # Measure THE message delivered: the carried send alone (compose may cut a newer send, not pending[:1], the oldest fact).
+            whole, _ = compose(plan.recipient, [sent], cap=10 ** 9, section=section_resolver(self, observation),
                                repos=repos, delivered=self.now())
+            if len(pending) > 1:   # the carried send goes alone, with the line that says the others wait (compose's own rest line)
+                whole += "\n\u2026 and %d more: run fleet-switchboard pending %s" % (len(pending) - 1, plan.recipient)
             allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
             raise MessageTooLong("message is %d characters and would be cut at the delivery cap of %d once its header and "
                                  "ask sections are added; the allowed text for this message is %d characters: nothing was "
