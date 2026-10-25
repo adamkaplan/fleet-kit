@@ -1,5 +1,8 @@
 # ------------------------------------------------------------ the decision
 
+import copy
+
+
 class MessageTooLong(Exception):
     """A message that would be cut at the delivery cap: refused to the sender, nothing delivered."""
 

@@ -3048,7 +3048,9 @@ class Switchboard:
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
-        self._acknowledge(ack_keys)
+        sent_keys, keys = keys, ack_keys   # #1302: only the finished findings are acknowledged (a part's own id is not)
+        self._acknowledge(keys)
+        keys = sent_keys
         if parts_file is not None and (part_keys or any(k in parts_done for k in ack_keys)):
             for key, count in part_keys:
                 parts_done[key] = count
