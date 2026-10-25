@@ -63,7 +63,7 @@ def kill_children():
     del CHILD[:]
 
 
-QUICK_TOTAL = int(os.environ.get("CLOUD_PREFLIGHT_QUICK_TOTAL", "300"))  # seconds for the whole quick run
+QUICK_TOTAL = int(os.environ.get("CLOUD_PREFLIGHT_QUICK_TOTAL", "240"))  # seconds for the whole quick run (240: the pre-push command's own tests still fit in a 300 s pod)
 
 
 def run_one(root, rel, timeout, selector=None):
@@ -191,7 +191,8 @@ def main():
                   % (cloud_quick.mode_line(len(reads), len(changed_files)), timeout))
             if changed_files and not reads:
                 print("NOT RUN: no check reads " + ", ".join(sorted(changed_files)))
-                failed = True
+                print("\nRESULT: FAIL")
+                return 1  # decided from the reader picks alone: no scan is started
             if changed_files and not names:
                 print("NOT RUN: quick mode selected no check for a non-empty change; this is not a clean result")
                 failed = True
@@ -203,7 +204,8 @@ def main():
         t_start = time.monotonic()
         for rel in names:
             path, sel = sel_of.get(rel, (rel, None))
-            if quick and time.monotonic() - t_start >= QUICK_TOTAL:
+            remaining = QUICK_TOTAL - (time.monotonic() - t_start)
+            if quick and remaining <= 0:
                 print("NOT RUN: quick run exceeded %d s (stopped before %s)" % (QUICK_TOTAL, rel))
                 failed = True
                 break
@@ -211,8 +213,11 @@ def main():
                 print("%-52s %-9s %-9s %s" % (rel, "-", "-", "skipped: memory-heavy " + path))
                 verdicts.append((rel, "-", "-", "skipped")); failed = True
                 continue
-            b = run_one(root, path, timeout, sel) if os.path.exists(os.path.join(root, path)) else "absent"
-            d = run_one(basedir, path, timeout, sel) if os.path.exists(os.path.join(basedir, path)) else "absent"
+            tmo = min(timeout, max(1, int(remaining))) if quick else timeout  # clamp to the time left
+            b = run_one(root, path, tmo, sel) if os.path.exists(os.path.join(root, path)) else "absent"
+            if quick:
+                tmo = min(timeout, max(1, int(QUICK_TOTAL - (time.monotonic() - t_start))))
+            d = run_one(basedir, path, tmo, sel) if os.path.exists(os.path.join(basedir, path)) else "absent"
             n = os.path.basename(path)
             if "timeout" in (b, d):
                 if n in TIMEOUT_ALLOW:

@@ -125,7 +125,7 @@ def git(args, cwd, check=False):
 READERS = [0]  # number of reader tests of the last select()
 
 
-def _is_test(rel):  # used only by a lone copy without the helper
+def _is_test(rel):  # only a fallback of a lone copy without the helper
     base = os.path.basename(rel)
     return rel.startswith("bin/test-") or (base.startswith("test_") and base.endswith(".py") and "tests" in rel.split("/")[:-1])
 
@@ -282,6 +282,12 @@ def main(argv):
 def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S, MODE="quick"):
     # Step 1: the preflight of the pod, before any test.
     PREFLIGHT_MODE[0] = MODE
+    if MODE == "quick" and changed:  # decide "no reader" at once, before the preflight and any test
+        select(root, changed)
+        if not READERS[0]:
+            print("NOT RUN: no check reads " + ", ".join(sorted(changed)))
+            print("cloud-prepush: %d changed file(s) but NO test was selected; this is not a clean result (advice only)" % len(changed))
+            return 1
     print("cloud-prepush: preflight mode: " + MODE, file=sys.stderr, flush=True)
     ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
     if not ok:
