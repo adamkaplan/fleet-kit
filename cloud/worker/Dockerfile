@@ -21,6 +21,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
  && rm -rf /var/lib/apt/lists/*
 
+# ---- #1165: the build tool `make` (one package, no compiler toolchain: --no-install-recommends) ----
+RUN apt-get update && apt-get install -y --no-install-recommends make \
+ && rm -rf /var/lib/apt/lists/*
+# ---- end #1165 ----
+
+# ---- #1165 identity: ONE system-level git file, written at image build (nothing at run time, nothing in the home directory) ----
+# The pair below is the ONE constant. A repository's own configured identity, and a local `git config user.name/user.email`,
+# still win over it (git's own order: system, then global, then local). The entrypoint exports no identity variable.
+ARG CW_DEFAULT_IDENT_NAME=cloud-worker
+ARG CW_DEFAULT_IDENT_EMAIL=cloud-worker@users.noreply.github.com
+RUN printf '[user]\n\tname = %s\n\temail = %s\n' "${CW_DEFAULT_IDENT_NAME}" "${CW_DEFAULT_IDENT_EMAIL}" > /etc/gitconfig \
+ && chmod 0644 /etc/gitconfig
+# ---- end #1165 identity ----
+
 # OpenCode v2: a pinned standalone binary (no node or npm), checked against its sha256 before it is unpacked.
 RUN curl -fsSL "https://opencode.ai/files/bin/${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" -o /tmp/oc.tgz \
  && echo "${OPENCODE_SHA256}  /tmp/oc.tgz" | sha256sum -c - \
@@ -49,12 +63,14 @@ COPY worker/probe-reach.sh /usr/local/bin/cw-probe-reach
 COPY worker/bin/cloud_cli.py /usr/local/bin/cw-cloud
 COPY worker/bin/cloud_client.py worker/bin/cloud_hub.py worker/bin/cloud_channel.py worker/bin/cloud_channel_server.py /usr/local/bin/
 COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/
+COPY worker/cw-stack-up /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/local/bin/worker-entrypoint \
       /usr/local/bin/cw-end-hook /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
       /usr/local/bin/cw-gh /usr/local/bin/cw-probe-reach /usr/local/bin/cw-plan-check /usr/local/bin/cw-cloud \
       /usr/local/bin/cloud_client.py /usr/local/bin/cloud_hub.py /usr/local/bin/cloud_channel.py /usr/local/bin/cloud_channel_server.py \
  && chmod 0644 /usr/local/bin/plan_check.py \
  && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md /usr/local/share/cw/orchestrator.md
+RUN chmod 0755 /usr/local/bin/cw-stack-up && chown root:root /usr/local/bin/cw-stack-up
 
 USER worker
 WORKDIR /home/worker
