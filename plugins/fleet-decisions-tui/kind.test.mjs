@@ -45,3 +45,9 @@ test("S6 apart from the marker the rows and their order are unchanged; links unc
   assert.equal(urlOf(withPlan), "https://github.com/acme/api/issues/7")
   assert.equal(urlOf(pr), "https://github.com/acme/api/pull/5")
 })
+
+test("the mark's cells are taken from the row width", () => {
+  const long = { ...withPlan, title: "w".repeat(80), headline: "w".repeat(80) }
+  for (const v3 of [false, true]) for (const r of styledRows(snap([long, { ...pr, title: "p".repeat(80) }]), NOW, ROW_WIDTH, undefined, { v3 }))
+    assert.ok(r.segs.reduce((n, [t]) => n + [...t].length + ([...t].some((c) => c.codePointAt(0) > 0x2000) ? 1 : 0), 0) <= ROW_WIDTH + 2, JSON.stringify(r.segs))
+})

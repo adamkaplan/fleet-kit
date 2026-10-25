@@ -64502,6 +64502,50 @@ class TestPlanKind(unittest.TestCase):
         self.assertEqual(len(calls), 6)
         self.assertTrue(all(c.startswith("repos/") and "comments" in c for c in calls))
 
+    def test_a_full_page_never_reads_noplan_and_a_plan_on_it_is_unknown(self):
+        full = [{"id": i, "created_at": "2026-01-01", "body": "x"} for i in range(100)]
+        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
+        full[3]["body"] = "## Plan (scenarios)\n\nx"
+        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
+        self.assertEqual(self.kind(self.hub(full[:99])[0]), "plan")
+
+    def test_a_plan_in_the_body_reads_noplan(self):
+        self.assertEqual(self.kind(self.hub([{"id": 1, "body": "hi"}])[0]), "noplan")   # the ask says a plan COMMENT; the body is not read
+
+    def test_one_page_one_call_no_pagination(self):
+        hub, calls, t = self.hub([])
+        seen = []
+        orig = hub.gh_api
+        hub.gh_api = lambda path, paginate=True, **kw: (seen.append(paginate), orig(path, paginate=paginate, **kw))[1]
+        self.kind(hub)
+        self.assertEqual(seen, [False])
+        self.assertIn("per_page=100", calls[0])
+
+    def test_a_failed_read_is_retried_after_the_short_ttl_not_the_full_one(self):
+        for err in (sb.GitHubUnavailable("403"), sb.GitHubUnavailable("404"), TimeoutError("t")):
+            hub, calls, t = self.hub(err)
+            self.assertEqual(self.kind(hub), "unknown")
+            self.kind(hub)
+            self.assertEqual(len(calls), 1)
+            t[0] += sb.GITHUB_LOOKUP_RETRY + 1
+            self.kind(hub)
+            self.assertEqual(len(calls), 2, "retried after the short ttl")
+
+    def test_a_refresh_makes_at_most_the_cap_of_reads(self):
+        hub, calls, t = self.hub([])
+        budget = [sb.PLAN_KIND_READS_PER_REFRESH]
+        kinds = [sb.GitHubHub.plan_kind(hub, "acme/api", n, budget) for n in range(60)]
+        self.assertEqual(len(calls), sb.PLAN_KIND_READS_PER_REFRESH)
+        self.assertEqual(kinds.count("unknown"), 60 - sb.PLAN_KIND_READS_PER_REFRESH)
+        self.assertEqual(sb.PLAN_KIND_READS_PER_REFRESH, 10)
+
+    def test_the_cache_is_bounded(self):
+        hub, calls, t = self.hub([])
+        for n in range(sb.PLAN_KIND_CACHE_MAX + 50):
+            self.kind(hub, n)
+        self.assertLessEqual(len(hub._cache), sb.PLAN_KIND_CACHE_MAX)
+
+
 
 class TestWriteOnlyOnChange(Base):
     """The per-pass state files are written only when their content changed (an mtime moves only on a write, and every write is a rename the file

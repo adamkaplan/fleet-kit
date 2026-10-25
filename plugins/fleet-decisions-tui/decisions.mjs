@@ -46,6 +46,7 @@ export function kindOf(d) {
   if (d.kind === "issue" && (d.plan_kind === "plan" || d.plan_kind === "noplan")) return d.plan_kind
   return "unknown"
 }
+export const MARK_CELLS = 3   // the emoji is 2 cells wide, plus its space: a row has that much less room
 export const markOf = (d) => KIND_MARKS[kindOf(d)]
 
 // The decisions a view shows. A decision with no tier (a file an older daemon wrote) is the human's.
@@ -251,7 +252,7 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const via = Array.isArray(decision.reported_by) && decision.reported_by.length ? ` ${decision.reported_by.join(",")}` : ""
   // the daemon's headline (an older file has none: its title), never more than HEADLINE_LINES lines
   const text = stripControls(typeof decision.headline === "string" && decision.headline ? decision.headline : decision.title)
-  const entry = { key: decision.id, head: "  ".repeat(depthOf(decision)) + markOf(decision) + " " + oneLine(`${idOf(decision)} ${age}${via}${orderNote(decision)}`, width - 2 * depthOf(decision)), lines: wrapText(text, width, HEADLINE_LINES) }
+  const entry = { key: decision.id, head: "  ".repeat(depthOf(decision)) + markOf(decision) + " " + oneLine(`${idOf(decision)} ${age}${via}${orderNote(decision)}`, width - MARK_CELLS - 2 * depthOf(decision)), lines: wrapText(text, width, HEADLINE_LINES) }
   // a batch: one line (wrapped to ROW_LINES) per row, between the headline and the id; the daemon wrote each row's text
   const rows = Array.isArray(decision.rows) ? decision.rows.filter((r) => r && typeof r.text === "string") : []
   if (rows.length) entry.rows = rows.map((r) => wrapText(stripControls(r.text), width, ROW_LINES))
@@ -524,7 +525,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
           // a heads-up's headline starts with its own ref, which the id line below says: it is not said twice
           const shownHeadline = isNotice(d) ? headline.replace(/^\S+#\d+\s+/, "") : headline
           const lead = v3 && !isNotice(d) ? [kindGlyph(d), "m"] : null  // one cell and a space: the headline wraps in what is left
-          wrapText(shownHeadline, (lead ? width - 2 : width) - indent.length, HEADLINE_LINES).forEach((t, ti) => {
+          wrapText(shownHeadline, (lead ? width - 2 : width) - MARK_CELLS - indent.length, HEADLINE_LINES).forEach((t, ti) => {
             const base = lead && ti === 0 ? { segs: [[lead[0] + " ", lead[1]], [t, section.need ? "b" : ""]] } : lead ? { segs: [["  ", ""], [t, section.need ? "b" : ""]] } : row(t, section.need ? "b" : "")
             put(ti === 0 ? { ...base, segs: [[markOf(d) + " ", ""], ...base.segs] } : base)
           })
@@ -540,7 +541,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
             put({ segs: left, right: long ? [[GLYPH.long + " ", "w"], [age[0], "w+t"]] : [[age[0], "m+t"]], id: d.id })
           } else put({ segs: left, right: [age], id: d.id })
         } else {
-          const room = Math.max(8, width - age[0].length - 1 - (v3 ? 2 : 0))
+          const room = Math.max(8, width - MARK_CELLS - age[0].length - 1 - (v3 ? 2 : 0))
           const flatText = oneLine(headline, room)
           const failing = d.ci === "failing" || d.ci === "failed"
           const ready = refStyle(d) === "s"
