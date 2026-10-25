@@ -1,19 +1,33 @@
 #!/bin/sh
 # test-cloud-launcher: offline tests for the cloud-worker launcher (fake kubectl, fake clock). Prints RESULT: PASS.
+# The chain is the list file bin/test-cloud-launcher.chain, ONE entry per line (a path), sorted, with one fixed last line.
+# (It used to be ONE shell line of more than forty commands joined by &&; every member appended to it and every pair conflicted.)
+# To add a test: add one line to bin/test-cloud-launcher.chain at its alphabetical place, above the fixed last line.
 cd "$(dirname "$0")/.." || exit 1
-# Completeness check: every test_*.py must be named below, or listed here with a reason.
+LIST=bin/test-cloud-launcher.chain
+# Completeness check: every test_*.py must be listed in $LIST, or named here with a reason; every listed entry must exist.
 EXCEPTIONS="test_cloud_pod_deadline.py:slow(26s),not-yet-chained test_cloud_stop_nonce.py:slow(57s),not-yet-chained test_reaper_record_family.py:did-not-finish-in-120s,not-yet-chained"
+[ -f "$LIST" ] || { echo "NOT RUN: $LIST is missing"; echo "RESULT: FAIL"; exit 1; }
 for f in cloud/launcher/tests/test_*.py; do
   n=$(basename "$f")
-  grep -q "tests/$n" "$0" && continue
+  grep -q "tests/$n\$" "$LIST" && continue
   case " $EXCEPTIONS " in *" $n:"*) continue ;; esac
   echo "NOT RUN: $n is neither chained nor in EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
 done
 for f in bin/test-cloud-cost-*; do
   n=$(basename "$f")
-  grep -q "bin/$n" "$0" && continue
+  grep -q "bin/$n\$" "$LIST" && continue
   echo "NOT RUN: bin/$n is not chained"; echo "RESULT: FAIL"; exit 1
 done
-if python3 cloud/launcher/tests/test_cloud_worker.py "$@" && python3 cloud/launcher/tests/test_cloud_stack.py "$@" && python3 cloud/launcher/tests/test_cloud_stack_wait.py "$@" && python3 cloud/launcher/tests/test_cw_names.py "$@" && python3 cloud/launcher/tests/test_cloud_k1.py "$@" && python3 cloud/launcher/tests/test_driver.py "$@" && python3 cloud/launcher/tests/test_run_record.py "$@" && python3 cloud/launcher/tests/test_cloud_allowlist.py "$@" && python3 cloud/launcher/tests/test_cloud_settings.py "$@" && python3 cloud/launcher/tests/test_cloud_preflight_wired.py "$@" && python3 cloud/launcher/tests/test_cloud_docs_wording.py && python3 cloud/launcher/tests/test_reaper_managed.py && python3 cloud/launcher/tests/test_app_token.py && python3 cloud/launcher/tests/test_git_token_renewal.py && python3 cloud/launcher/tests/test_cloud_pod_replaced.py && python3 cloud/launcher/tests/test_token_read_at_call.py && python3 cloud/launcher/tests/test_preflight.py && python3 cloud/launcher/tests/test_issues_read.py && python3 cloud/launcher/tests/test_stub_cleanup.py && python3 cloud/launcher/tests/test_model_credential.py && python3 cloud/launcher/tests/test_orchestrator_agent.py && python3 cloud/launcher/tests/test_cloud_shapes.py && python3 cloud/launcher/tests/test_vault_check_pins.py && python3 cloud/worker/tests/test_guard_table.py && python3 cloud/worker/tests/test_cw_gh_comments.py && python3 cloud/worker/tests/test_pr_edit.py && python3 cloud/worker/tests/test_pr_edit_hardening.py && python3 cloud/launcher/tests/test_cloud_hub_network.py && bin/test-cloud-cost-report && python3 cloud/launcher/tests/test_cloud_hub_manifest.py && python3 cloud/launcher/tests/test_cluster_token_refresh.py && python3 cloud/launcher/tests/test_cw_minter_manifest.py && python3 cloud/launcher/tests/test_stack_registry_pod.py && python3 cloud/launcher/tests/test_stack_registry_check.py && python3 cloud/worker/tests/test_stack_pull.py && python3 cloud/worker/tests/test_identity_image.py && python3 cloud/launcher/tests/test_stack_model_key.py && python3 cloud/worker/tests/test_stack_up.py && python3 cloud/launcher/tests/test_cloud_pr_preflight.py && python3 cloud/worker/tests/test_question_denied.py && python3 cloud/worker/tests/test_entrypoint_question.py && python3 cloud/launcher/tests/test_cloud_status_summary.py && python3 cloud/worker/tests/test_cloud_prepush_hardening.py && python3 cloud/worker/tests/test_cloud_prepush.py && python3 cloud/launcher/tests/test_orchestrator_hub_session.py && python3 cloud/launcher/tests/test_cloud_prestop.py && python3 cloud/worker/tests/test_cloud_prepush_preflight.py; then :; else echo "RESULT: FAIL"; exit 1; fi
-bin/test-cloud-hub && bin/test-cloud-relay && bin/test-cloud-hub-relay && bin/test-cloud-relay-daemon || { echo "RESULT: FAIL"; exit 1; }
+while IFS= read -r e; do
+  [ -n "$e" ] || continue
+  [ -f "$e" ] || { echo "NOT RUN: $e is listed in $LIST but does not exist"; echo "RESULT: FAIL"; exit 1; }
+done < "$LIST"
+while IFS= read -r e; do
+  [ -n "$e" ] || continue
+  case "$e" in
+    *.py) python3 "$e" "$@" ;;
+    *) "$e" "$@" ;;
+  esac || { echo "FAILED: $e"; echo "RESULT: FAIL"; exit 1; }
+done < "$LIST"
 echo "RESULT: PASS"
