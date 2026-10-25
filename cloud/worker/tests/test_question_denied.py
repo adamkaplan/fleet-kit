@@ -28,8 +28,12 @@ def question_values(cfg):
 
 def check_blocks(cfg):
     vals = question_values(cfg)
-    assert "agent:worker" in vals, "no worker block"
-    bad = {k: v for k, v in vals.items() if v != "deny"}
+    bad = {}
+    if vals.get("top") is None:
+        bad["top"] = None
+    if "agent:worker" not in vals:
+        bad["agent:worker"] = None
+    bad.update( {k: v for k, v in vals.items() if v != "deny"})
     return bad
 
 
@@ -38,18 +42,27 @@ def strip_question(cfg):
     c["permission"].pop("question", None)
     for a in c.get("agent", {}).values():
         a.get("permission", {}).pop("question", None)
-    # an agent block left with no permission is the question-only override: not another key
-    c["agent"] = {k: v for k, v in c.get("agent", {}).items() if v != {"permission": {}}}
     return c
 
 
-def base_other_keys():
-    """Other permissions of the base file: git show of the merge base, else None."""
+def base_file(rel, mode="text"):
+    """The base commit's copy of a file through git (origin/integration, else origin/main); (ref, content) or (None, None)."""
     for ref in ("origin/integration", "origin/main"):
-        r = subprocess.run(["git", "show", ref + ":" + JSON_REL], cwd=ROOT, capture_output=True, text=True)
+        r = subprocess.run(["git", "show", ref + ":" + rel], cwd=ROOT, capture_output=True)
         if r.returncode == 0:
-            return strip_question(json.loads(r.stdout))
-    return None
+            return ref, r.stdout
+    return None, None
+
+
+def loud_skip(test, what):
+    msg = "SKIPPED: no origin/integration and no origin/main ref (fallback tried: origin/main); " + what + " not compared"
+    print(msg, file=sys.stderr)
+    test.skipTest(msg)
+
+
+def base_other_keys():
+    ref, data = base_file(JSON_REL)
+    return None if ref is None else strip_question(json.loads(data))
 
 
 def orch_question(text):
@@ -61,14 +74,42 @@ def orch_question(text):
 class T(unittest.TestCase):
     def test_s2_both_blocks_deny(self):
         cfg = load()
-        self.assertEqual(question_values(cfg), {"top": "deny", "agent:worker": "deny", "agent:orchestrator": "deny"})
+        self.assertEqual(question_values(cfg), {"top": "deny", "agent:worker": "deny"})
         self.assertEqual(check_blocks(cfg), {})
 
     def test_s4_no_other_permission_changed(self):
         base = base_other_keys()
         if base is None:
-            self.skipTest("no base ref available")
+            loud_skip(self, "the base permission file")
         self.assertEqual(strip_question(load()), base)
+
+    def test_s4_empty_agent_block_is_not_dropped(self):
+        cfg = load()
+        m = copy.deepcopy(cfg); m["agent"]["extra"] = {"permission": {}}
+        self.assertNotEqual(m, cfg, "mutation not applied")
+        self.assertNotEqual(strip_question(m), strip_question(cfg))
+        m = copy.deepcopy(cfg); m["agent"]["extra"] = {"permission": {"question": "deny"}}
+        self.assertNotEqual(strip_question(m), strip_question(cfg))
+
+    def test_s4_mutant_on_real_base_copy(self):
+        ref, data = base_file(JSON_REL)
+        if ref is None:
+            loud_skip(self, "the base permission file")
+        base = json.loads(data)
+        m = copy.deepcopy(base)
+        rule = next(k for k, v in m["permission"]["bash"].items() if v == "deny")
+        m["permission"]["bash"][rule] = "allow"
+        self.assertNotEqual(m, base, "mutation not applied")
+        self.assertNotEqual(strip_question(m), strip_question(load()), "bash rule edit not refused")
+
+    def test_s4_check_blocks_flags_missing_blocks(self):
+        cfg = load()
+        m = copy.deepcopy(cfg); del m["permission"]["question"]
+        self.assertNotEqual(m, cfg, "mutation not applied")
+        self.assertIn("top", check_blocks(m))
+        m = copy.deepcopy(cfg); del m["agent"]["worker"]
+        self.assertNotEqual(m, cfg, "mutation not applied")
+        self.assertIn("agent:worker", check_blocks(m))
 
     def test_mutants_refused(self):
         refused = 0
@@ -82,7 +123,6 @@ class T(unittest.TestCase):
             self.assertNotEqual(m, cfg, name + ": mutation not applied")
             self.assertIn(key, check_blocks(m), name + " not refused")
             refused += 1
-        # another key changed: compare against the base other-keys
         base = strip_question(cfg)
         m = copy.deepcopy(cfg)
         m["permission"]["bash"]["*"] = "ask"
@@ -91,31 +131,26 @@ class T(unittest.TestCase):
         refused += 1
         self.assertEqual(refused, 5)
 
-    def test_s3_orchestrator_block_only_question(self):
-        cfg = load()
-        self.assertEqual(cfg["agent"]["orchestrator"], {"permission": {"question": "deny"}})
-        local = os.path.join(ROOT, "agents/opencode/orchestrator.md")
-        with open(local, "rb") as a, open(os.path.join(ROOT, ORCH_REL), "rb") as b:
-            self.assertEqual(a.read(), b.read())
+    def test_s3_image_definition_unchanged(self):
+        with open(os.path.join(ROOT, "agents/opencode/orchestrator.md"), "rb") as a, open(os.path.join(ROOT, ORCH_REL), "rb") as b:
+            img = b.read()
+            self.assertEqual(a.read(), img)
+        ref, data = base_file(ORCH_REL)
+        if ref is None:
+            loud_skip(self, "the base orchestrator definition")
+        self.assertEqual(img, data)
 
-    def test_s3_mutants_refused(self):
-        cfg = load()
-        m = copy.deepcopy(cfg); del m["agent"]["orchestrator"]
-        self.assertNotEqual(m, cfg, "mutation not applied")
-        self.assertNotIn("agent:orchestrator", question_values(m))
-        m = copy.deepcopy(cfg); m["agent"]["orchestrator"]["permission"]["question"] = "allow"
-        self.assertNotEqual(m, cfg, "mutation not applied")
-        self.assertIn("agent:orchestrator", check_blocks(m))
-        with open(os.path.join(ROOT, "agents/opencode/orchestrator.md"), "rb") as f:
-            local = f.read()
-        edited = orch_text().replace("question: allow", "question: deny").encode()
-        self.assertNotEqual(edited, local, "mutation not applied")
+    def test_no_orchestrator_block_in_config(self):
+        self.assertEqual(sorted(load()["agent"]), ["worker"])
 
     def test_s1_s7_docs(self):
         with open(DOC) as f:
             d = f.read()
         self.assertIn("a question prompt on a headless pod is never answered", d.lower())
-        self.assertIn("the question tool is refused in a pod; a question goes out through the report path", d)
+        low = d.lower()
+        for phrase in ("the question tool is refused in a pod", "a question goes out through the report path", "kind `question`",
+                       "written with `deny` at pod start", "last match wins", "is unchanged, a byte-identical copy"):
+            self.assertIn(phrase, low, "missing doc phrase: " + phrase)
 
 
 if __name__ == "__main__":

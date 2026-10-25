@@ -295,11 +295,6 @@
           "gh api*DELETE*": "deny"
         }
       }
-    },
-    "orchestrator": {
-      "permission": {
-        "question": "deny"
-      }
     }
   }
 }
