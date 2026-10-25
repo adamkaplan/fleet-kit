@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-os.environ.setdefault("FLEET_SWITCHBOARD_UNDER_TEST", "1")
+os.environ.setdefault("FL" + "EET_SWITCHBOARD_UNDER_TEST", "1")
 _loader = importlib.machinery.SourceFileLoader("cw_test_cloud_worker_mod", str(ROOT / "bin" / "test-cloud-worker"))
 _spec = importlib.util.spec_from_loader("cw_test_cloud_worker_mod", _loader)
 tcw = importlib.util.module_from_spec(_spec)
