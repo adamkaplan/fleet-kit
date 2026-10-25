@@ -3048,7 +3048,8 @@ class Switchboard:
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
-        self._acknowledge(ack_keys)
+        sent_keys, keys = keys, ack_keys   # #1302: only what was delivered whole is acknowledged
+        self._acknowledge(keys)
         if parts_file is not None and (part_keys or any(k in parts_done for k in ack_keys)):
             for key, count in part_keys:
                 parts_done[key] = count
@@ -3057,8 +3058,8 @@ class Switchboard:
             parts_file.write_text(json.dumps(parts_done))
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "commit_told"):
             self.intents.commit_told()
-        return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
-                "left": len(plan.pending) - len(keys)}
+        return {"sent": True, "action": plan.action, "message_id": message_id, "keys": sent_keys,
+                "left": len(plan.pending) - len(sent_keys)}
 
     @staticmethod
     def _send_meta(carried):
