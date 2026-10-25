@@ -1819,6 +1819,10 @@ def cmd_retire(args, runner, now, record):
     _registry_note(engine, "retire", state, args.name, reason)
     remove_record(state, args.name)
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
+    if isinstance(body, dict) and body.get("pod_gone") is True:   # only the launcher's explicit reply: an unreadable pod never says it
+        _audit(engine, "cloud.name_freed", args.name, {"why": "pod gone", "runtime_id": record.get("runtime_id")})
+        print("%s is retired: its pod was already gone; the name is free to launch again" % args.name)
+        return H["EXIT_OK"]
     print("%s is retired: its pod and scratch volume are deleted%s" % (
         args.name, "; work was pushed to branch %s" % wip if pushed and wip else "; nothing needed pushing" if pushed is False else ""))
     return H["EXIT_OK"]

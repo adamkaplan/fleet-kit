@@ -2070,7 +2070,9 @@ class Launcher:
             if not pod:
                 if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
                     self._remove(name, nonce)
-                return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None}
+                # The pod read said NotFound (an operator deleted it); any other read error raised in _need above and never reaches here.
+                # By name nothing else is touched: a pinned test (test_cloud_stop_nonce) keeps a by-name stop of a gone pod from deleting Secrets.
+                return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None, "pod_gone": True}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
                 where = self.recorder.record(worker, name, reason or "stop", repo=_pod_repo(pod), started=ann(pod, "started") or "",
