@@ -91758,7 +91758,7 @@ class TestArchTools(unittest.TestCase):
         root, common = self.cut_tree()
         done = self.tool("arch-part-cut", *common, "fresh:1:2")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(sorted(self.snapshot(root)), ["entry", "entry.parts", "switchboard/exists.py", "switchboard/fresh.py", "switchboard/taken.py"])
+        self.assertEqual(sorted(self.snapshot(root)), ["entry", "entry.parts", "switchboard/Mixed.py", "switchboard/exists.py", "switchboard/fresh.py", "switchboard/taken.py"])
         self.assertEqual((root / "entry.parts").read_text().splitlines()[-1], "switchboard/fresh.py")
         self.assertEqual(list((root / "out").iterdir()), [])
 
