@@ -9128,6 +9128,7 @@ class SweepState:
         self.s5 = {}             # decision id -> (head, ready time, who clears) for each held pull request that has waited past the threshold
         self.not_checked_since = {}   # "repo#n" -> when it was first not checked (unreadable or skipped), until it is read
         self.s5_oldest = 0       # seconds the longest not-checked held pull request has gone unread
+        self.s5_skipped = {"draft": 0, "parked": 0}
         self.s5_unchecked = 0    # held pull requests whose gates could not be read this pass: never raised (#986)
         self.details = {}        # (kind, ref) -> the finding's own sentence
 
@@ -9188,6 +9189,9 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
                          "author": (pr_login(record.get("user")) or "").lower(),
                          "created": parse_iso(record.get("created_at")), "updated": parse_iso(record.get("updated_at")),
                          "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
+                         "draft": _is_pr(record) and record.get("draft") is True,   # S5: a draft is a paused change
+                         "parked_until": parked_until(body, names),   # S5: the one reader of the parked date
+                         "closes": [r for r in pr_body_refs(body) if r[0] in (None, repo)] if _is_pr(record) else [],
                          "body_waits": sweep_says_waiting(regex, body), "comments": [], "comment_ids": [],
                          "latest_strong": False, "latest_refs": [], "latest_source": None}
     closed_holds = {}   # S9: the most recent closed (or merged) PRs that still carry a merge or hold label
@@ -9378,6 +9382,7 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
     moment, the wait does not restart), so a finding can be late, never early. The pass draws at most half of the call budget left
     (at least one reading when the budget allows two), the rest is for verifying the findings. The read order is in memory only. A clock that goes backwards makes now - start negative: nothing is raised until it catches up."""
     state.s5, state.s5_unchecked, state.s5_oldest = {}, 0, 0
+    state.s5_skipped = {"draft": 0, "parked": 0}   # the ONE counter of a sweep: reset here (this pass runs first), added to by sweep_findings
     if engine.state_dir is not None and not state.ready_loaded:
         state.ready_loaded = True
         for key, row in list(_read_small(engine.state_dir, SWEEP_READY_FILE).items())[:2000]:
@@ -9400,6 +9405,13 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
         todo.append((state.ready_read.get("%s#%d" % held, 0), "%s#%d" % held, held, d))
     todo.sort(key=lambda t: (t[0], t[1]))   # the least recently read first
     for _, key, held, d in todo:
+        skip = sweep_s5_skip(state, held, d, now)   # a draft, or a pull request of a parked ask: not read, not unchecked, the clock restarts when it is ready and neither
+        if skip:
+            state.s5_skipped[skip] += 1
+            state.ready.pop(key, None)
+            state.ready_read.pop(key, None)
+            state.not_checked_since.pop(key, None)
+            continue
         if reads >= SWEEP_READY_READS or (budget is not None and budget[0] < SWEEP_READY_READ_COST) \
                 or engine.now() - state.started >= SWEEP_PASS_SECONDS:
             state.not_checked_since.setdefault(key, now)
@@ -9507,6 +9519,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
     for d in decisions:   # everything the owner's tier already holds, however its ref is spelled
         if d.get("tier", "human") == "human" and d.get("kind") != "notice":
             human_keys |= sweep_ref_keys(d, home, repos_known)
+    skipped = state.__dict__.setdefault("s5_skipped", {"draft": 0, "parked": 0})   # shared with sweep_ready_pass, reset once per sweep there
     for d in decisions:
         ref = sweep_ref_of(d, home)
         # a report is about the refs its sentence names, never assumed to be about its own ask
@@ -9530,6 +9543,10 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
         if (decisions_whole and d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
+            skip = sweep_s5_skip(state, ref, d, now)
+            if skip:
+                skipped[skip] += 1
+                continue
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
     for repo, picture in state.repos.items():   # S9: a merge or hold label left on a closed, unmerged PR (read-only: nothing is removed; a merged one is the daemon's to clean, #559)
         for number in sorted(picture.get("closed_holds") or {}):
@@ -9555,6 +9572,21 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
         pass   # an unreadable registry raises nothing: the lookup itself says "unknown"
     state.unattributed = unattributed
     return sorted(found)
+
+
+def sweep_s5_skip(state, ref, decision, now):
+    """"draft" or "parked" when the decision's pull request is a draft, or closes or belongs to an ask parked now (the one reader
+    `parked_until`, judged by `triage_parked_now`); else None. Reads only the picture the sweep holds: an item not in it leaves S5 raised."""
+    picture = (state.repos.get(ref[0]) or {}).get("items", {}) if ref and ref[0] else {}
+    item = picture.get(ref[1]) if ref else None
+    if item is None or not item.get("pr"):
+        return None
+    if item.get("draft"):
+        return "draft"
+    asks = [item] + [picture.get(n) for _, n in item.get("closes", [])]
+    if isinstance(decision.get("ask"), int) and not isinstance(decision.get("ask"), bool):
+        asks.append(picture.get(decision["ask"]))
+    return "parked" if any(a and triage_parked_now(a, now) for a in asks) else None
 
 
 def _issue_pr_merged(record):
@@ -9766,7 +9798,8 @@ def sweep_decisions(engine, decisions, now, errors=()):
                      "truncated": sorted(r for r, p in state.repos.items() if p.get("truncated")),
                      "unreadable": sorted(r for r, p in state.repos.items() if p.get("error")), "at": iso(now),
                      "deferred": deferred, "unchecked": unchecked, "not_checked": state.s5_unchecked, "not_checked_oldest_seconds": int(max(state.s5_oldest, 0)),
-                     "unattributed": getattr(state, "unattributed", 0)}
+                     "unattributed": getattr(state, "unattributed", 0), "s5_skipped": dict(getattr(state, "s5_skipped", {}))}
+
     sweep_write(engine, state)
     return kept if cfg["enabled"] else decisions
 
@@ -12709,6 +12742,9 @@ def sweep_status_lines(sweep):
     if sweep.get("unattributed"):
         lines.append("      sweep      %d comment(s) say it waits but name only refs outside the watched repos: not "
                      "attributed to their own item" % sweep["unattributed"])
+    skipped = sweep.get("s5_skipped") or {}
+    if skipped.get("draft") or skipped.get("parked"):
+        lines.append("      sweep      S5 skipped: %d draft, %d parked" % (skipped.get("draft", 0), skipped.get("parked", 0)))
     if sweep.get("unchecked"):
         lines.append("      sweep      %d finding(s) not checked this pass (call budget or a failed read): neither "
                      "raised nor audited" % sweep["unchecked"])

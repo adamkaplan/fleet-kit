@@ -221,6 +221,14 @@ def made_up_pid():
     raise AssertionError("a test asked for more made-up process numbers than fit above %d: a wrap inside one test would make their order depend on the machine" % start)
 
 
+def s5_issue(number, body="", labels=(), pr=False, draft=None, **kw):
+    """The shared sweep_issue plus a draft flag, kept out of the shared fake (#1044)."""
+    record = sweep_issue(number, body, labels, pr=pr, **kw)
+    if draft is not None:
+        record["draft"] = draft
+    return record
+
+
 class PidTable(dict):
     """`self.px[4242]`: the made-up number a test uses where it once wrote the literal 4242. The same key is the same number inside one test, and
     each test gets numbers of its own."""
@@ -27543,6 +27551,55 @@ class TestSweep(Base):
         self.sweep([dict(self.human(10), waits_for=["other/repo#5"])])
         self.assertEqual([f for f in self.found() if f[0] == "S8"], [])
 
+    PARKED = "osuser:parked"
+
+    def s5_case(self, issues, aged=("d1",)):
+        self.hub.open = dict(issues)
+        old = sb.iso(self.world.clock.now() - 3 * 3600)
+        decisions = [{"id": "pr:acme/api#%s" % n, "kind": "ask", "tier": "cos", "repo": "acme/api", "number": int(n),
+                      "since": old, "title": "t"} for n in aged]
+        self.sweep(decisions)
+        return [f for f in self.found() if f[0] == "S5"], dict(sb.sweep_state(self.engine).current["s5_skipped"])
+
+    def future(self, days=5):
+        return time.strftime("%Y-%m-%d", time.gmtime(self.world.clock.now() + days * 86400))
+
+    def test_s5_skips_a_draft_pull_request_and_counts_it(self):
+        found, skipped = self.s5_case({5: s5_issue(5, "x", pr=True, draft=True)}, aged=(5,))
+        self.assertEqual(found, [])
+        self.assertEqual(skipped, {"draft": 1, "parked": 0})
+        self.assertIn("1 draft", "\n".join(sb.sweep_status_lines(sb.sweep_state(self.engine).current)))
+
+    def test_s5_skips_a_ready_pull_request_of_a_parked_ask_and_counts_it(self):
+        issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]),
+                  8: s5_issue(8, "Closes #7\n", pr=True, draft=False)}
+        found, skipped = self.s5_case(issues, aged=(8,))
+        self.assertEqual(found, [])
+        self.assertEqual(skipped, {"draft": 0, "parked": 1})
+
+    def test_s5_flags_as_before_an_expired_or_unreadable_date_a_missing_label_and_a_ready_pull_request(self):
+        past = time.strftime("%Y-%m-%d", time.gmtime(self.world.clock.now() - 3 * 86400))
+        issues = {1: s5_issue(1, "Parked until: %s\n" % past, [self.PARKED]), 2: s5_issue(2, "Closes #1\n", pr=True, draft=False),
+                  3: sweep_issue(3, "Parked until: soon\n", [self.PARKED]), 4: sweep_issue(4, "Closes #3\n", pr=True),
+                  5: sweep_issue(5, "Parked until: %s\n" % self.future()), 6: sweep_issue(6, "Closes #5\n", pr=True),
+                  9: s5_issue(9, "plain", pr=True, draft=False)}
+        found, skipped = self.s5_case(issues, aged=(2, 4, 6, 9))
+        self.assertEqual(len(found), 4)
+        self.assertEqual(skipped, {"draft": 0, "parked": 0})
+
+    def test_s5_makes_no_read_beyond_the_baseline_for_draft_and_parked_cases(self):
+        issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]),
+                  8: s5_issue(8, "Closes #7\n", pr=True), 9: s5_issue(9, "x", pr=True, draft=True)}
+        self.s5_case(issues, aged=(8, 9))
+        self.assertFalse([r for r in self.hub.reads if "issues/8" in str(r) or "issues/9" in str(r)], "no new read of the draft or parked PR")
+        self.assertLessEqual(len(self.hub.single), 2, "at most the one withdrawal check per distinct decision; S5 adds none")
+        self.assertEqual({p for _, p in self.hub.single} - {"issues/8", "issues/9"}, set())
+
+    def test_s5_has_one_parked_date_reader(self):
+        root = Path(__file__).resolve().parent   # the daemon is cut into parts (bin/switchboard/*.py): count them all
+        src = "".join(f.read_text() for f in [root / "fleet-switchboard"] + sorted((root / "switchboard").glob("*.py")))
+        self.assertEqual(src.count("PARKED_UNTIL_RE.findall"), 1)
+
     def test_s5_a_cos_decision_older_than_the_limit(self):
         old = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))
         fresh = dict(self.human(41), tier="cos", since=sb.iso(self.world.clock.now() - 600))
@@ -27727,6 +27784,82 @@ class TestSweep(Base):
             self.ready_pass(held, lambda r, n: self.ready(), now=t0)
             state = self.ready_pass(held, lambda r, n: self.ready(), now=t0 + self.engine.config["sweep"]["aged_cos_hours"] * 3600, mutant=mutant)
             self.assertEqual(len(state.s5) == 1, mutant is None)
+
+    # ---- #1044: the held-pull-request ready path skips a draft and a pull request of a parked ask (sweep_ready_pass)
+    S5_HELD_MUTANTS = {
+        "ignore_draft": ('if item.get("draft"):', 'if False:'),
+        "ignore_parked": ('return "parked" if any(', 'return None if any('),
+    }
+
+    def s5_held(self, issues, mutant=None, ticks=(0,)):
+        self.hub.open = dict(issues)
+        held = self.held_pr(600)
+        self.sweep([held])   # fills the picture
+        reads = []
+        for t in ticks:
+            self.world.tick(t)
+            state = sb.sweep_state(self.engine)
+            reading = lambda r, n: reads.append(n) or self.ready()
+            if mutant:
+                with self.mutated("sweep_s5_skip", *mutant):
+                    state = self.ready_pass([held], reading)
+            else:
+                state = self.ready_pass([held], reading)
+        return state, reads
+
+    def test_1044_held_draft_is_skipped_counted_and_not_read(self):
+        for mutant in (None, self.S5_HELD_MUTANTS["ignore_draft"]):
+            self.setUp()
+            state, reads = self.s5_held({600: s5_issue(600, "x", pr=True, draft=True)}, mutant)
+            self.assertEqual(reads == [] and state.s5_skipped["draft"] == 1 and state.s5_unchecked == 0 and not state.ready, mutant is None)
+
+    def test_1044_held_ready_pr_of_a_parked_ask_is_skipped_counted_and_not_read(self):
+        issues = {7: s5_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]), 600: s5_issue(600, "Closes #7\n", pr=True, draft=False)}
+        for mutant in (None, self.S5_HELD_MUTANTS["ignore_parked"]):
+            self.setUp()
+            state, reads = self.s5_held(issues, mutant)
+            self.assertEqual(reads == [] and state.s5_skipped["parked"] == 1 and state.s5_unchecked == 0 and not state.s5, mutant is None)
+
+    def test_1044_held_pr_clock_starts_only_after_the_park_ends(self):
+        issues = {7: s5_issue(7, "Parked until: %s\n" % self.future(1), [self.PARKED]), 600: s5_issue(600, "Closes #7\n", pr=True, draft=False)}
+        self.hub.open = dict(issues)
+        held = self.held_pr(600)
+        self.sweep([held])
+        state = self.ready_pass([held], lambda r, n: self.ready())
+        self.assertEqual((state.ready, state.s5), ({}, {}), "parked: no clock")
+        self.world.tick(2 * 86400)   # the date has passed
+        self.sweep([held])
+        t0 = self.world.clock.now()
+        state = self.ready_pass([held], lambda r, n: self.ready())
+        self.assertEqual(state.ready["acme/api#600"]["at"], t0, "the clock starts now, not earlier")
+        self.assertEqual(state.s5, {})
+
+    def test_1044_park_then_unpark_restarts_the_ready_clock(self):
+        pops = ("            state.ready.pop(key, None)\n            state.ready_read.pop(key, None)\n            state.not_checked_since.pop(key, None)\n            continue", "            continue")
+        key = "acme/api#600"
+        for mutant in (None, pops):
+            self.setUp()
+            self.hub.open = {7: sweep_issue(7, "Parked until: %s\n" % self.future(1), [self.PARKED]), 600: s5_issue(600, "Closes #7\n", pr=True, draft=False)}
+            held = self.held_pr(600)
+            self.sweep([held])
+            ctx = self.mutated("sweep_ready_pass", *mutant) if mutant else contextlib.nullcontext()
+            with ctx:
+                state = sb.sweep_state(self.engine)
+                state.ready[key] = {"head": self.HEAD_A, "at": self.world.clock.now() - 100}   # a ready row exists
+                state.ready_read[key], state.not_checked_since[key] = 1, 1
+                state = self.ready_pass([held], lambda r, n: self.ready())   # parked
+                gone = state.ready == {} and key not in state.ready_read and key not in state.not_checked_since
+                self.world.tick(2 * 86400)   # un-parked: the date has passed
+                self.sweep([held])
+                now = self.world.clock.now()
+                state = self.ready_pass([held], lambda r, n: self.ready())
+                restarted = state.ready.get(key, {}).get("at") == now
+            self.assertEqual(gone and restarted, mutant is None, mutant)
+
+    def test_1044_every_s5_path_is_in_the_docs_table(self):
+        doc = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        for path in ("sweep_findings", "sweep_ready_pass"):
+            self.assertIn("| `%s` (" % path, doc)
 
     def test_986_a_row_that_is_not_a_held_pr_is_never_read(self):
         issue = {"id": "d-x", "kind": "issue", "tier": "cos", "repo": "acme/api", "ask": 510, "title": "t", "since": sb.iso(self.world.clock.now() - 10 * 3600)}
