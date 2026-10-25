@@ -35,7 +35,7 @@ import tempfile
 import traceback
 
 
-def statements(paths):
+def statements(paths, ignore_imports=False):
     """A Counter of the dump of every top-level statement, and a label for each dump."""
     counts = collections.Counter()
     labels = {}
@@ -50,6 +50,9 @@ def statements(paths):
         except SyntaxError as err:
             sys.exit("arch-split-check: %s does not parse: %s (line %s)" % (path, err.msg, err.lineno))
         for node in tree.body:
+            if ignore_imports and (isinstance(node, (ast.Import, ast.ImportFrom)) or (
+                    isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)) or source.splitlines()[node.lineno - 1].endswith("# support import")):
+                continue   # --ignore-imports: a move adds imports (and a module docstring) to the parts; they are not code
             dump = ast.dump(node, include_attributes=False)
             counts[dump] += 1
             labels.setdefault(dump, describe(node, path))
@@ -66,9 +69,9 @@ def describe(node, path):
     return "%s:%d %s %s" % (os.path.basename(path), node.lineno, type(node).__name__, name)
 
 
-def statement_differences(before, after):
-    b_counts, b_labels = statements(before)
-    a_counts, a_labels = statements(after)
+def statement_differences(before, after, ignore_imports=False):
+    b_counts, b_labels = statements(before, ignore_imports)
+    a_counts, a_labels = statements(after, ignore_imports)
     out = []
     for dump in sorted(set(b_counts) | set(a_counts), key=lambda d: (b_labels.get(d) or a_labels.get(d))):
         delta = a_counts[dump] - b_counts[dump]
@@ -162,6 +165,7 @@ def main(argv=None):
     parser.add_argument("--before", nargs="+", metavar="FILE")
     parser.add_argument("--after", nargs="+", metavar="FILE", required=True)
     parser.add_argument("--no-surface", action="store_true", help="compare statements only, never load the code")
+    parser.add_argument("--ignore-imports", action="store_true", help="leave import statements and docstrings out of the statement comparison (for a move of test support code). It also skips any top-level statement whose line ends '# support import', so it cannot prove that a moved helper kept its imports: only a NameError at test time shows that")
     parser.add_argument("--write-surface", metavar="SNAPSHOT")
     parser.add_argument("--check-surface", metavar="SNAPSHOT")
     args = parser.parse_args(argv)
@@ -189,7 +193,7 @@ def main(argv=None):
         return 1 if diffs else 0
     if not args.before:
         parser.error("--before is needed to compare")
-    diffs = statement_differences(args.before, args.after)
+    diffs = statement_differences(args.before, args.after, args.ignore_imports)
     failed = None
     if not args.no_surface:
         try:
@@ -198,7 +202,7 @@ def main(argv=None):
             failed = err   # the statement differences, which usually name the part, are printed first
     for line in diffs:
         print(line)
-    total = sum(statements(args.before)[0].values())
+    total = sum(statements(args.before, args.ignore_imports)[0].values())
     if failed is not None:
         print("the surface could not be read: %s" % failed)
     print("RESULT: %s (%d top-level statements compared, %d differences%s)" % ("FAIL" if diffs or failed else "PASS", total, len(diffs), ", surface not read" if failed else ""))
