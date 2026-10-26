@@ -774,6 +774,7 @@ def check_held_lock_skips_within_the_bound_and_writes_nothing(module):
             assert not thread.is_alive(), "the pull hangs on a held lock"
         finally:
             os.close(fd)
+            thread.join(8)   # a blocked pull wakes on release: let it finish before the directory is removed
         assert out["r"] == "untouched" and out["t"] < 4, out
         assert "lock" in err.getvalue() and len(err.getvalue().splitlines()) == 1, err.getvalue()
         assert (held.read_bytes(), held.stat().st_mtime_ns) == before, "the held file changed without the lock"
