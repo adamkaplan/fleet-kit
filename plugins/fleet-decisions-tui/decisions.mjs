@@ -82,7 +82,7 @@ export function urlOf(d) {
 export function shortCodeOf(d) {
   const url = urlOf(d)
   if (!url) return null
-  const m = /^https:\/\/github\.com\/[^/]+\/([^/]+)\/(?:issues|pull)\/([0-9]+)$/.exec(url)
+  const m = url.match(/^https:\/\/github\.com\/[^/]+\/([^/]+)\/(?:issues|pull)\/([0-9]+)$/)
   return m ? `${m[1]}:#${m[2]}` : null
 }
 
