@@ -19611,6 +19611,45 @@ class TestBuilderChecklist(unittest.TestCase):
         self.assertEqual([a.arg for a in found[0].args.args], ["path", "max_bytes"])
 
 
+class TestDispatchRules(unittest.TestCase):
+    """#1351: four dispatch rules, one sentence each, in the same words in the dispatch section and in the brief template."""
+    RULES = {
+        "a": "A strict read of a pull request that changes `bin/fleet-switchboard`, `bin/test-switchboard` or `docs/review-laws/impact-matrix.json` starts after the first full Ubuntu `test` leg at that head has finished (or the reader is told it was not run and the head is read again after it), and the coder's brief for such a pull request names the classes that read or pin each edited file and requires them to be run locally before the push.",
+        "b": "A fixer for such a pull request is by default a local coder that commits and pushes after each commit, and a cloud pod stays for reads and small pull requests.",
+        "c": "An invariant named in a brief ships with its failing test or derived check in the same pull request or before the next slice that could break it, and a rule kept only in prose is a defect a reader reports as a Medium.",
+        "d": "A cloud reader pushes its findings to a file on its own branch before minute 20 and updates it, because a pod's last message is never the only copy of its findings.",
+    }
+
+    def parts(self):
+        text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        template = re.search(r"```text\nISSUE:.*?```", text, re.S).group(0)
+        return {"dispatch section": " ".join(text.replace(template, "").split()), "brief template": " ".join(template.split())}
+
+    def problems(self, parts):
+        return ["rule %s missing from the %s: %s" % (k, place, sentence) for place, body in parts.items()
+                for k, sentence in self.RULES.items() if body.count(sentence) != 1]
+
+    def test_both_places_carry_all_four_sentences_once(self):
+        self.assertEqual(self.problems(self.parts()), [])
+        self.assertEqual(len(self.RULES), 4)
+
+    def test_a_mutant_that_removes_one_sentence_from_one_place_fails_and_names_it(self):
+        parts = self.parts()
+        count = 0
+        for place in parts:
+            for key, sentence in self.RULES.items():
+                with self.subTest(place=place, rule=key):
+                    mutant = dict(parts, **{place: parts[place].replace(sentence, "")})
+                    self.assertEqual(self.problems(mutant), ["rule %s missing from the %s: %s" % (key, place, sentence)])
+                    count += 1
+        self.assertEqual(count, 8)   # 4 rules x 2 places
+
+    def test_a_reworded_sentence_in_the_template_fails(self):
+        parts = self.parts()
+        mutant = dict(parts, **{"brief template": parts["brief template"].replace("by default a local coder", "usually a local coder")})
+        self.assertEqual(len(self.problems(mutant)), 1)
+
+
 class TestOwnMeasurementTester(unittest.TestCase):
     """An orchestrator that measured a scenario itself re-measures through a tester of its lane, never a waiver."""
     PLANNING = "**Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself."

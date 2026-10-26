@@ -32,9 +32,21 @@ STOP:       <holds and exclusions — what you must not touch>
 NEXT:       <the next deliverable and who owns it>
 AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
+RULES:
+  A strict read of a pull request that changes `bin/fleet-switchboard`, `bin/test-switchboard` or `docs/review-laws/impact-matrix.json` starts after the first full Ubuntu `test` leg at that head has finished (or the reader is told it was not run and the head is read again after it), and the coder's brief for such a pull request names the classes that read or pin each edited file and requires them to be run locally before the push.
+  A fixer for such a pull request is by default a local coder that commits and pushes after each commit, and a cloud pod stays for reads and small pull requests.
+  An invariant named in a brief ships with its failing test or derived check in the same pull request or before the next slice that could break it, and a rule kept only in prose is a defect a reader reports as a Medium.
+  A cloud reader pushes its findings to a file on its own branch before minute 20 and updates it, because a pod's last message is never the only copy of its findings.
 ```
 
 Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
+
+The brief carries these four dispatch rules word for word (the cause is in `docs/switchboard.md`, "Dispatch rules for a change to the entry, the main test file or the impact matrix"):
+
+- A strict read of a pull request that changes `bin/fleet-switchboard`, `bin/test-switchboard` or `docs/review-laws/impact-matrix.json` starts after the first full Ubuntu `test` leg at that head has finished (or the reader is told it was not run and the head is read again after it), and the coder's brief for such a pull request names the classes that read or pin each edited file and requires them to be run locally before the push.
+- A fixer for such a pull request is by default a local coder that commits and pushes after each commit, and a cloud pod stays for reads and small pull requests.
+- An invariant named in a brief ships with its failing test or derived check in the same pull request or before the next slice that could break it, and a rule kept only in prose is a defect a reader reports as a Medium.
+- A cloud reader pushes its findings to a file on its own branch before minute 20 and updates it, because a pod's last message is never the only copy of its findings.
 
 ## Builder checklist
 
