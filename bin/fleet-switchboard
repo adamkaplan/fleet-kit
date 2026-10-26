@@ -10869,6 +10869,7 @@ def _validate_github(config, source):
         raise ConfigError("%s: 'gh' must be a non-empty string (a path or a command name), got %r"
                           % (source, config["gh"]))
     try:
+        config["gh_by_name"] = config["gh"]   # #1216: as configured (`gh`: PATH finds the shim); the one merge call of `merge-gate --pass --merge` goes through it, so the shim gates it
         config["gh"] = own_gh_path(config["gh"])   # #1216: the daemon's own calls name the real gh by path
     except ConfigError as err:
         raise ConfigError("%s: %s" % (source, err)) from None
@@ -18099,7 +18100,7 @@ def add_merge_gate_parsers(sub):
 
 def merge_gate_gh(config, runner, repo):
     """`gh(argv, own=True) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call runs the real gh by its resolved path (own_gh_path, config['gh']), so it never reaches the shim,
-    EXCEPT with `own=False` (the one merge call of `--pass --merge`): that call goes through `gh` as PATH finds it (the shim where it is installed), so the shim's own checks (the review check among them) run."""
+    EXCEPT with `own=False` (the one merge call of `--pass --merge`): that call goes through the gh as configured (`gh_by_name`: the shim where PATH finds it), so the shim's own checks (the review check among them) run."""
     accounts = GhAccounts(config, runner, time.time)
     try:
         refuse_excluded(config, repo)
@@ -18111,7 +18112,7 @@ def merge_gate_gh(config, runner, repo):
 
     def gh(argv, own=True):
         try:
-            done = runner([config["gh"] if own else "gh"] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
+            done = runner([config["gh"] if own else config.get("gh_by_name", config["gh"])] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
                           env=env)
         except (OSError, subprocess.SubprocessError) as err:
             return 1, "", accounts.scrub(_one_line(str(err), 120))
