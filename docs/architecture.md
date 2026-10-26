@@ -230,6 +230,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `fleet-switchboard` | `_fleet_parts:exec` | 1 | execs text |
 | `fleet-switchboard` | `_fleet_parts:exec(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `fleet-switchboard` | `_make_loader.loader:load_module(non-constant)` | 1 | a dynamic load |
+| `fleet-switchboard` | `code_snapshot:sys.modules` | 1 | only READS the loaded modules to take the snapshot; nothing is imported |
 | `fleet-switchboard` | `launcher_module:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `launcher_module:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `fleet-switchboard` | `launcher_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
