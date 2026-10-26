@@ -317,8 +317,13 @@ def daemon_roots(rule, daemon_tree=None, hold_tree=None):
     return sorted(moved_roots(daemon_tree, hold_tree) | set(rule.get("rating_roots") or []))
 
 
+def _clean(text):
+    """A reason is one printable line: a path comes from a pull request, so a control character in it (an escape, a newline) is replaced, never carried into a posted reason. The ONE place: `_item`."""
+    return "".join(c if c.isprintable() else "?" for c in text) if isinstance(text, str) else text
+
+
 def _item(kind, text, paths=(), **extra):
-    return dict({"kind": kind, "text": text, "paths": list(paths)}, **extra)
+    return dict({"kind": kind, "text": _clean(text), "paths": [_clean(p) for p in paths]}, **extra)
 
 
 def refusal_items(rule, report, files, matches=None, closure=None, scored=None):
@@ -365,7 +370,7 @@ def refusal_items(rule, report, files, matches=None, closure=None, scored=None):
             items.append(_item("new-file", "it adds, deletes or renames a file under a directory the daemon loads at start (%s): that stays the owner's own clear" % item["filename"][:80], [item["filename"]],
                                verb={"removed": "deletes a file", "renamed": "renames a file"}.get(item.get("status") if not item.get("previous_filename") else "renamed", "adds a file")))
         for path in both:
-            if matches(path, rule["closure_files"]):
+            if matches(path, rule["closure_files"]) or matches(path, ["bin/switchboard/*.py"]):   # a part the closure does not list is judged like a listed one: a file nobody mapped (any status but `modified`) is refused as unmappable, never skipped
                 mapped = (closure or {}).get(item["filename"])
                 if mapped is None:
                     items.append(_item("unreadable", "the change to %s cannot be mapped to its definitions: refused" % path[:60], why="a change cannot be mapped to its definitions"))
@@ -730,6 +735,91 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
                 else:
                     reasons.append("it changes a module-level statement (%s line %d) that is not a definition or a binding: refused" % (side, number))
     return sorted(set(reasons))
+
+
+def shadow_names(rule):
+    """The names of the clear's closure the matrix carries: the daemon's roots (`closure_roots` and `rating_roots`) and every `module_roots` list (`*` is not a name). The matrix is the only
+    source: a binding the closure reads that is not one of these names is NOT known here (a stated limit, #1339; CI's `tools/derive-closure --check` lists the part that holds it)."""
+    names = {r for r in daemon_roots(rule) if isinstance(r, str) and r != "*"}
+    for roots in (rule.get("module_roots") or {}).values():
+        names |= {r for r in roots if isinstance(r, str) and r != "*"}
+    return names
+
+
+_MATCH_KINDS = tuple(getattr(ast, n) for n in ("MatchAs", "MatchStar", "MatchMapping") if hasattr(ast, n))
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _store_names(node):
+    """The names an expression, target, argument list or pattern binds when it runs: every Name stored or deleted, every walrus target and every pattern capture, found by walking ALL its children
+    (not a list of fields). A lambda's BODY and a comprehension's loop variables are their own scope (not entered; a walrus inside a comprehension binds in the enclosing scope), but a lambda's
+    defaults and annotations run now and are walked."""
+    found, todo = set(), [node]
+    while todo:
+        x = todo.pop()
+        if isinstance(x, ast.Lambda):
+            todo.append(x.args)
+            continue
+        if isinstance(x, _COMPREHENSIONS):
+            found.update(n.target.id for n in ast.walk(x) if isinstance(n, ast.NamedExpr))
+            continue
+        if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
+            found.add(x.id)
+        elif isinstance(x, ast.NamedExpr):
+            found.add(x.target.id)
+        elif _MATCH_KINDS and isinstance(x, _MATCH_KINDS):
+            for attr in ("name", "rest"):
+                if isinstance(getattr(x, attr, None), str):
+                    found.add(getattr(x, attr))
+        todo.extend(ast.iter_child_nodes(x))
+    return found
+
+
+def bound_names(tree):
+    """THE CLOSED RULE of the shadow check (#1339): the names a file BINDS at module level are every name bound by ANY statement that runs when the file is imported, found by walking the module
+    body through its blocks (if/try/for/while/with/match, every field of them: tests, targets, handler types, patterns, guards, bodies) and NOT into function or class bodies. Everything of a def or
+    class that runs at definition counts (its name, decorators, argument defaults and annotations, return annotation, bases and keywords). Bound are: def and class names; Assign, AnnAssign and
+    AugAssign targets (nested, starred); Import and ImportFrom aliases (the alias, or the first dotted segment); for, with and except targets; walrus targets anywhere that runs; match captures; names
+    deleted by `del`; and every name a `global` declaration names anywhere in the file (how a function binds a module name). The walk takes every child of a statement, so a position nobody listed is
+    still read. LIMITS, stated: `exec`/`eval`, writes through `globals()`/`vars()`/`setattr` on the module, bindings made by a call (`globals().update(...)`) and `from x import *` are not followed."""
+    found = set()
+
+    def visit(node):
+        if isinstance(node, DEF_KINDS):
+            found.add(node.name)
+            for part in list(node.decorator_list) + ([node.args, node.returns] if not isinstance(node, ast.ClassDef) else list(node.bases) + list(node.keywords)):
+                if part is not None:
+                    found.update(_store_names(part))
+            return
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            found.update((a.asname or a.name).split(".")[0] for a in node.names if a.name != "*")
+            return
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            found.add(node.name)
+        for _field, value in ast.iter_fields(node):
+            for item in (value if isinstance(value, list) else [value]):
+                if isinstance(item, (ast.stmt, ast.ExceptHandler)) or (hasattr(ast, "match_case") and isinstance(item, ast.match_case)):
+                    visit(item)
+                elif isinstance(item, ast.AST):
+                    found.update(_store_names(item))   # a test, target, iterable, context manager, handler type, pattern or guard
+
+    for statement in tree.body:
+        visit(statement)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            found.update(node.names)
+    return found
+
+
+def shadow_refusals(base_src, head_src, names, filename):
+    """[reasons] a change ADDS, in `filename`, a bound name (`bound_names`: the head's set minus the base's) that is in `names`, the clear's closure: the assembled daemon is one namespace, so a second
+    binding of a closure name in another file (or a nested one in the same file) could take the place of the one the clear judged. A file that does not parse before or after the change: refused."""
+    try:
+        added = bound_names(ast.parse(head_src)) - bound_names(ast.parse(base_src))
+    except (SyntaxError, ValueError):
+        return ["%s does not parse before or after the change: refused" % filename[:80]]
+    return sorted("it adds %s in %s, a name of the clear's closure (a second definition of it could take its place): refused" % (name, _clean(filename[:80]))   # cleaned here too: the reason is also returned by delegated_clear_map
+                  for name in set(names) & added)
 
 
 def decode_blob(answer):

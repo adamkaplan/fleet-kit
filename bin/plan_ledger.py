@@ -464,6 +464,53 @@ UNTRACKED_WHY = {
 PER_PR_NONE_RE = re.compile(r"(?im)^[\s#>*-]*per-pr scenarios:\s*none\s+because\s+(\S.*)$")
 PLAN_LINK_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
 CANON_RE = re.compile(r"(?im)^\s*canon:\s*(\S.*)$")
+HIDDEN_RE = re.compile(r"(?ms)^[ \t]*(```|~~~).*?(?:^[ \t]*\1[^\n]*$|\Z)|<!--.*?(?:-->|\Z)")   # a code fence or an HTML comment: text the reader of the rendered body does not take as the body's own
+PLAN_FIRST_RE = re.compile(r"(?m)^[ \t]*PLAN:[^\n]*")
+CLAIMS_UNDER_RE = re.compile(r"\n[ \t]*CLAIMS:[ \t]*(.*)")
+
+
+def visible_body(body):
+    return HIDDEN_RE.sub("", body or "")
+
+
+def claim_text(body):
+    """The text of the `CLAIMS:` line directly under the FIRST `PLAN:` line outside code fences and HTML comments, or None."""
+    shown = visible_body(body)
+    first = PLAN_FIRST_RE.search(shown)
+    found = CLAIMS_UNDER_RE.match(shown, first.end()) if first else None
+    return found.group(1) if found else None
+
+
+def pr_claim(body, scenarios):
+    """(ids, error) for the claim line of a PR body: a `CLAIMS: S3 S4 S5` line directly under the `PLAN:` line names the scenarios THIS pull request proves.
+    `ids` is None when the body has no claim line (the PR behaves as it always did: every scenario read as `pr` is its own). The error says why a claim is
+    REFUSED: it names a scenario the plan does not declare, one the plan claims at the epic (a claim line only narrows), or names nothing."""
+    text = claim_text(body)
+    if text is None:
+        return None, None
+    names = [n for n in re.split(r"[\s,;]+", text.strip()) if n]
+    if not names:
+        return None, "the `CLAIMS:` line names no scenario: list the scenario ids this pull request proves (`CLAIMS: S3 S4`), or remove the line"
+    by_id = {s.get("id"): s for s in scenarios}
+    unknown = [n for n in names if n not in by_id]
+    if unknown:
+        return None, "the `CLAIMS:` line names %s, which the plan does not declare (it declares %s)" % (", ".join(unknown), ", ".join(sorted(map(str, by_id))[:12]))
+    epic = [n for n in names if claim_of(by_id[n]) != "pr"]
+    if epic:
+        return None, "the `CLAIMS:` line names %s, which the plan claims at the epic: a claim line only narrows what a pull request proves" % ", ".join(epic)
+    return list(dict.fromkeys(names)), None
+
+
+def pr_scenarios(scenarios, body):
+    """(claimed, left, error): the scenarios this PR proves (`claim_of` reads `pr`, narrowed by its claim line), the `pr` ones its claim line leaves to
+    the epic's other pull requests, and the claim line's refusal (then `claimed` is empty)."""
+    mine = [s for s in scenarios if claim_of(s) == "pr"]
+    ids, error = pr_claim(body, scenarios)
+    if error:
+        return [], [], error
+    if ids is None:
+        return mine, [], None
+    return [s for s in mine if s.get("id") in ids], [s for s in mine if s.get("id") not in ids], None
 
 
 def canon_status(body):
@@ -483,7 +530,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     only for THIS plan hash and THIS head; one for another is shown as void, not hidden."""
     sid, evaluator = scenario["id"], evaluator_of(scenario)
     out = {"id": sid, "evaluator": evaluator, "claim": claim_of(scenario), "missing": [], "void": []}
-    carried = carried_seqs(entries, pr, head)   # #1129: {seq of the proof or verdict: its carried line}
+    carried = carried_seqs(entries, pr, head, plan_hash)   # #1129: {seq of the proof or verdict: its carried line}
     for kind in ("proof", "verdict"):
         mine = [e for e in entries if e.get("pr") == pr and e.get("scenario") == sid and e.get("kind") == kind
                 and (kind == "proof" or e.get("evaluator") == evaluator)]
@@ -517,11 +564,13 @@ CARRY_FIELDS = ("proof", "scenario", "old_head", "new_head", "facts")
 DOC_TEST_RE = re.compile(r"(^|/)(tests?|docs?)/|(^|/)test-[^/]*$|(^|/)test_[^/]*$|\.(md|rst|txt)$")
 
 
-def carried_seqs(entries, pr, head):
-    """{seq of a proof or verdict: its `carried` line} for the carries of `pr` whose new head is `head`. Empty without a head."""
+def carried_seqs(entries, pr, head, plan_hash=None):
+    """{seq of a proof or verdict: its `carried` line} for the carries of `pr` whose new head is `head`. Empty without a head. With `plan_hash`, only a carry line that
+    names THAT plan hash counts (a line of another plan is no evidence: #1217); every reader of a carried row as evidence passes it."""
     found = {}
     for entry in entries if head else ():
-        if entry.get("kind") == "carried" and entry.get("pr") == pr and entry.get("new_head") == head and isinstance(entry.get("proof"), int):
+        if entry.get("kind") == "carried" and entry.get("pr") == pr and entry.get("new_head") == head and isinstance(entry.get("proof"), int) \
+                and (plan_hash is None or entry.get("plan_hash") == plan_hash):
             found[entry["proof"]] = entry
     return found
 
@@ -706,7 +755,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif not head:
                 row.update(status="missing", missing=["the PR head is unknown"])
             else:
-                claimed = [s for s in plan["scenarios_parsed"] if claim_of(s) == "pr"]
+                claimed, left, claim_error = pr_scenarios(plan["scenarios_parsed"], (facts or {}).get("body"))
                 scen_rows = [scenario_state(s, entries, pr, plan["plan_hash"], head, authors) for s in claimed]
                 if carries and not carries.get("refusal") and carries.get("plan") and carries["plan"].get("result") == "pass" and carries.get("head"):
                     dep_rows, carried_reviews = carried_rows(carries, entries, facts)
@@ -717,7 +766,9 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 bad = [s for s in scen_rows if s["status"] != "ok"]
                 row["detail"] = "%d of %d claimed scenarios proven and judged at %s" % (len(scen_rows) - len(bad), len(scen_rows), head[:8])
                 none_because = PER_PR_NONE_RE.search(plan.get("text") or "")
-                if not claimed:
+                if claim_error:
+                    row.update(status="missing", missing=["refused: " + claim_error])
+                elif not claimed:
                     # G1 never passes vacuously: no per-PR scenario needs an explicit, reasoned statement
                     if none_because and len(none_because.group(1).strip()) >= 20:
                         row.update(status="n/a", detail="no per-PR scenarios: %s (the epic gate applies)" % none_because.group(1).strip()[:80])
@@ -729,6 +780,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 else:
                     row["status"] = "ok"
                 epic = [s["id"] for s in plan["scenarios_parsed"] if claim_of(s) == "epic"]
+                if left:
+                    row["detail"] += "; left to the epic's other pull requests by the CLAIMS line: %s" % ", ".join(s["id"] for s in left)
                 if epic:
                     row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s" % ", ".join(epic)
         elif gid == "G4":
@@ -923,7 +976,7 @@ def validate_plan_gates(raw, source):
         seen[normal_repo(name)] = name
         if not isinstance(entry, dict):
             raise ValueError("%s: 'plan_gates.repos.%s' must be an object" % (source, name))
-        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks"})
+        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks", "ci_workflows"})
         if extra:
             raise ValueError("%s: 'plan_gates.repos.%s' has key(s) this tool does not read: %s" % (source, name, ", ".join(extra)))
         mode = entry.get("mode", "shadow")
@@ -944,6 +997,11 @@ def validate_plan_gates(raw, source):
         repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
         if "item_checks" in entry:   # #770: declared and validated by bin/item_verdicts.py; carried here untouched, and absent when the repo does not list it
             repos[name]["item_checks"] = entry["item_checks"]
+        if "ci_workflows" in entry:   # #1237: workflow names the gate expects a run of at the head
+            flows = entry["ci_workflows"]
+            if not (isinstance(flows, list) and len(flows) <= 20 and all(isinstance(x, str) and x for x in flows)):
+                raise ValueError("%s: 'ci_workflows' must be a list of at most 20 workflow ids or paths" % name)
+            repos[name]["ci_workflows"] = flows
     record = raw.get("ci_record") if raw.get("ci_record") is not None else {}
     if not isinstance(record, dict) or set(record) - {"enabled", "calls_per_pass", "pass_seconds"}:
         raise ValueError("%s: 'plan_gates.ci_record' must be an object with enabled, calls_per_pass and pass_seconds" % source)

@@ -165,6 +165,10 @@
         "bin/cloud_worker.py",
         "bin/cloud_channel.py",
         "bin/cloud_channel_server.py",
+        "bin/cloud_relay_daemon.py",
+        "bin/cloud_hub.py",
+        "bin/cloud_relay.py",
+        "cloud/worker/bin/cloud_relay.py",
         "bin/cloud_cli.py",
         "bin/external_adapter.py",
         "bin/delegated_clear.py",
@@ -212,6 +216,10 @@
           "bin/cloud_worker.py",
           "bin/cloud_channel.py",
           "bin/cloud_channel_server.py",
+          "bin/cloud_relay_daemon.py",
+          "bin/cloud_hub.py",
+          "bin/cloud_relay.py",
+          "cloud/worker/bin/cloud_relay.py",
           "bin/cloud_cli.py",
           "bin/external_adapter.py",
           "bin/delegated_clear.py",
@@ -284,6 +292,7 @@
       ],
       "exempt": {
         "bin/agent_calls.py": "release_notice gives back a once-an-hour message claim for an account's budget notice. Trace: its only caller is the budget notice command in bin/fleet-switchboard, which calls it after claim_notice when the reminder could not be added; it truncates a rate-limit file in the state directory and returns nothing, so no role, tier, identity, verdict or clear is produced or read.",
+        "bin/plan_approval.py": "`evaluate` returns the verdict and the one stderr line of a refused approval. Trace: its only caller is `check_approval` in bin/fleet-switchboard (the send command), which prints the line and records an approval only after a GET-only read of the plan comment; the module is pure, reads and writes nothing, and returns no role, tier, identity or clear, and nothing in bin/ reads its result as one. Exemption reason: refusal-only; no clear or hold depends on plan.approved; list it as an authority module if a clear ever depends on plan.approved.",
         "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry. Trace: used only inside bin/spotlight_guard.py (the Spotlight index check of ask #438); the module returns no role, tier, identity, verdict or clear, and nothing in bin/ reads its result as one.",
         "bin/triage_digest.py": "gate is a rate limit on the stale digest (warm-up and interval). Trace: its only caller is the triage digest in bin/fleet-switchboard, where `allowed` decides whether a digest message is SENT now; no role, tier, verdict or clear is produced or read.",
         "bin/triage_plan_open.py": "merged_links reads which links a merged unit names. Trace: its callers are the triage's plan-open check in bin/fleet-switchboard, which only lists findings for people to read; nothing it returns reaches answer_authority, a caller check, a verdict or a clear."
@@ -310,7 +319,10 @@
       "bin/plan_check.py",
       "bin/plan_ledger.py",
       "bin/repo_exclusion.py",
-      "docs/review-laws/impact-matrix.json"
+      "docs/review-laws/impact-matrix.json",
+      "tools/derive-closure",
+      "tests/switchboard/test_closure.py",
+      "bin/fleet-switchboard.parts"
     ],
     "never_carried_meaning": "The owner's clear is NEVER carried over a merge of main that resolved a conflict by hand (bin/clear_carry.py, bin/impact_hold.py: the carry reads this list through impact_floor.carry_never_paths and holds no path of its own) when that merge touches one of these paths or the pull request's own change does: the clear's own code and this matrix. Credential and identity paths are not here: they are carried like any other path (the owner's answer, ask #815). Every exact path of `delegated_clear.clear_code_paths` is here, because the ledger and the plan check decide who may confirm a carry; its directory globs (the plugin, the shims, the templates, the proof tools, the workflows) are not, and the shims are identity paths the owner chose to carry. A test checks both lists against each other and that every bin module named for the clear, the hold or the floor is here. The guard for what is not listed (the daemon file, the globs) is the independent reviewer's confirmation and the continuous tests, not a proof.",
     "delegated_clear": {
@@ -353,6 +365,9 @@
         "shims/**",
         "templates/**",
         "tools/cos-permissions-proof/**",
+        "tools/derive-closure",
+        "tests/switchboard/test_closure.py",
+        "bin/fleet-switchboard.parts",
         ".github/workflows/**"
       ],
       "new_file_globs": [
@@ -376,12 +391,26 @@
         "bin/pr_events.py",
         "bin/queue_ejections.py",
         "bin/reassign.py",
+        "bin/red_ci.py",
         "bin/reds.py",
         "bin/registry.py",
         "bin/report_fold.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
-        "bin/work_sync.py"
+        "bin/work_sync.py",
+        "bin/switchboard/v2_transport.py",
+        "bin/switchboard/facts.py",
+        "bin/switchboard/import_v1.py",
+        "bin/switchboard/decisions_a.py",
+        "bin/switchboard/reminders.py",
+        "bin/switchboard/plan_review.py",
+        "bin/switchboard/triage.py",
+        "bin/switchboard/alert_labels.py",
+        "bin/switchboard/handoff.py",
+        "bin/switchboard/audit.py",
+        "bin/switchboard/decision.py",
+        "bin/switchboard/engine.py",
+        "bin/switchboard/jev.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -392,6 +421,9 @@
           "validate"
         ],
         "bin/ci_runs.py": [
+          "*"
+        ],
+        "bin/red_ci.py": [
           "*"
         ],
         "bin/cpu_guard.py": [
@@ -433,6 +465,146 @@
         "bin/spotlight_guard.py": [
           "settings",
           "validate"
+        ],
+        "bin/switchboard/v2_transport.py": [
+          "V2Breaker",
+          "V2Client",
+          "V2Error",
+          "V2Http",
+          "V2Unreachable",
+          "_V2Unauthorized",
+          "_one_line",
+          "_without",
+          "refuse_real_opencode_under_test",
+          "state_write",
+          "v2_service_file",
+          "valid_description"
+        ],
+        "bin/switchboard/facts.py": [
+          "CpuFacts",
+          "DiskFacts",
+          "FactError",
+          "SpotlightFacts",
+          "disk_free",
+          "disk_guard_settings",
+          "validate_disk_guard"
+        ],
+        "bin/switchboard/import_v1.py": [
+        ],
+        "bin/switchboard/decisions_a.py": [
+          "parse_bare_pr_ref"
+        ],
+        "bin/switchboard/reminders.py": [
+          "ReminderError",
+          "ReminderFacts",
+          "_clean_line",
+          "add_reminder",
+          "drop_superseded_item",
+          "found_reason",
+          "merge_wake",
+          "merge_wake_facts",
+          "read_record_file",
+          "read_reminders",
+          "reminders_lock",
+          "remove_reminders",
+          "wake_class_of",
+          "write_reminders"
+        ],
+        "bin/switchboard/plan_review.py": [
+          "ReviewError",
+          "_read_capped"
+        ],
+        "bin/switchboard/triage.py": [
+          "_alert_bad_label",
+          "_alert_bad_repo",
+          "_alert_duplicate_label",
+          "_alert_labels_not_a_list",
+          "_alert_not_a_map",
+          "_alert_repo_not_read",
+          "_check_sla",
+          "parked_until",
+          "read_mark",
+          "triage_awaiting_labels",
+          "triage_says_reviewed",
+          "validate_triage_config",
+          "whole",
+          "whole_skipped"
+        ],
+        "bin/switchboard/alert_labels.py": [
+          "AlertWakeFacts",
+          "RedCiFacts",
+          "TriageFacts"
+        ],
+        "bin/switchboard/handoff.py": [
+          "WorkerFacts",
+          "_Unread",
+          "_boss_of",
+          "_guard_awaiting_issue",
+          "_guard_awaiting_pr",
+          "_guard_ci",
+          "_guard_decision",
+          "_guard_last_report",
+          "_guard_reminder",
+          "_guard_review_requested",
+          "_guard_review_window",
+          "_issue_of",
+          "_label_names",
+          "_owned_issue",
+          "_owned_pulls",
+          "_owned_work_items",
+          "_readable_head",
+          "_readable_time",
+          "_stalled_age",
+          "legitimately_waiting",
+          "owned_readable",
+          "reply_text",
+          "worker_horizon",
+          "worker_owned"
+        ],
+        "bin/switchboard/audit.py": [
+          "AuditLog",
+          "_sensitive",
+          "redact",
+          "utc_now"
+        ],
+        "bin/switchboard/decision.py": [
+          "InterruptRefused",
+          "MessageTooLong",
+          "Plan",
+          "_line_of",
+          "clock_utc",
+          "collapse_riders",
+          "compose",
+          "compose_order",
+          "decide",
+          "describe_items",
+          "hold_reason",
+          "is_withdrawal",
+          "orders_note",
+          "steers_into_turn",
+          "superseded_by"
+        ],
+        "bin/switchboard/engine.py": [
+          "KeyTimes",
+          "LockError",
+          "SentLedger"
+        ],
+        "bin/switchboard/jev.py": [
+          "JevClient",
+          "JevError",
+          "KeyFileError",
+          "ReplayJev",
+          "_canonical",
+          "_checked_jev_settings",
+          "_clip",
+          "_is_probability",
+          "_scrub_provider_text",
+          "_usage_of",
+          "build_jev",
+          "check_answers",
+          "jev_key_file",
+          "locate_jev_key",
+          "validate_jev_config"
         ]
       },
       "dynamic_actions": [
@@ -467,6 +639,7 @@
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
+        "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
         "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
@@ -474,6 +647,7 @@
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
+        "bin/plan_approval.py": "loaded only by `check_approval`, the send command's approval check (#951), which the clear never calls",
         "bin/pr_reading.py": "loaded only by `cmd_merge_gate`: the merge gate command, not the clear",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",

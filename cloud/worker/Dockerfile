@@ -21,6 +21,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
  && rm -rf /var/lib/apt/lists/*
 
+# ---- #1165: the build tool `make` (one package, no compiler toolchain: --no-install-recommends) ----
+RUN apt-get update && apt-get install -y --no-install-recommends make \
+ && rm -rf /var/lib/apt/lists/*
+# ---- end #1165 ----
+
+# ---- #1165 identity: ONE system-level git file, written at image build (nothing at run time, nothing in the home directory) ----
+# The pair below is the ONE constant. A repository's own configured identity, and a local `git config user.name/user.email`,
+# still win over it (git's own order: system, then global, then local). The entrypoint exports no identity variable.
+ARG CW_DEFAULT_IDENT_NAME=cloud-worker
+ARG CW_DEFAULT_IDENT_EMAIL=cloud-worker@users.noreply.github.com
+RUN printf '[user]\n\tname = %s\n\temail = %s\n' "${CW_DEFAULT_IDENT_NAME}" "${CW_DEFAULT_IDENT_EMAIL}" > /etc/gitconfig \
+ && chmod 0644 /etc/gitconfig
+# ---- end #1165 identity ----
+
 # OpenCode v2: a pinned standalone binary (no node or npm), checked against its sha256 before it is unpacked.
 # The pin is a security floor: 2.1.4 is built on Bun 1.4.4 or later (cloud/README.md); a bump updates both ARGs.
 RUN curl -fsSL "https://opencode.ai/files/bin/${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" -o /tmp/oc.tgz \
@@ -48,27 +62,33 @@ RUN set -eu; case "$(dpkg --print-architecture)" in amd64) a=x64; h="${NODE_SHA2
 # runs inside the Sysbox pod's own user namespace.
 RUN userdel -r ubuntu 2>/dev/null || true \
  && useradd -m -u 1000 -s /bin/bash worker && usermod -aG docker worker \
- && echo 'worker ALL=(root) NOPASSWD: /usr/local/bin/start-dockerd' > /etc/sudoers.d/worker-dockerd \
+ && echo 'worker ALL=(root) NOPASSWD: /usr/local/bin/start-dockerd, /usr/local/bin/cw-stack-pull' > /etc/sudoers.d/worker-dockerd \
+ && echo 'Defaults:worker env_reset' >> /etc/sudoers.d/worker-dockerd \
+ && install -d -m 0700 -o root -g root /opt/cw-registry \
  && chmod 0440 /etc/sudoers.d/worker-dockerd
 
 COPY worker/start-dockerd.sh /usr/local/bin/start-dockerd
+COPY worker/cw-stack-pull /usr/local/bin/cw-stack-pull
 COPY worker/entrypoint.sh /usr/local/bin/worker-entrypoint
 COPY worker/guard.sh worker/opencode-worker.json worker/agents/worker.md worker/agents/orchestrator.md /usr/local/share/cw/
 COPY launcher/end_hook.py /usr/local/bin/cw-end-hook
+COPY worker/cw-prestop /usr/local/bin/cw-prestop
 COPY launcher/token_mint.py /usr/local/bin/cw-token-mint
 COPY worker/activity.py /usr/local/bin/cw-worker-activity
 COPY worker/guard-table.tsv /usr/local/share/cw/guard-table.tsv
 COPY worker/cw-gh /usr/local/bin/cw-gh
 COPY worker/probe-reach.sh /usr/local/bin/cw-probe-reach
 COPY worker/bin/cloud_cli.py /usr/local/bin/cw-cloud
-COPY worker/bin/cloud_client.py worker/bin/cloud_hub.py worker/bin/cloud_channel.py worker/bin/cloud_channel_server.py /usr/local/bin/
+COPY worker/bin/cloud_client.py worker/bin/cloud_hub.py worker/bin/cloud_channel.py worker/bin/cloud_channel_server.py worker/bin/cloud_relay.py /usr/local/bin/
 COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/worker-entrypoint \
-      /usr/local/bin/cw-end-hook /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
+COPY worker/cw-stack-up /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/cw-stack-pull /usr/local/bin/worker-entrypoint \
+      /usr/local/bin/cw-end-hook /usr/local/bin/cw-prestop /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
       /usr/local/bin/cw-gh /usr/local/bin/cw-probe-reach /usr/local/bin/cw-plan-check /usr/local/bin/cw-cloud \
-      /usr/local/bin/cloud_client.py /usr/local/bin/cloud_hub.py /usr/local/bin/cloud_channel.py /usr/local/bin/cloud_channel_server.py \
+      /usr/local/bin/cloud_client.py /usr/local/bin/cloud_hub.py /usr/local/bin/cloud_channel.py /usr/local/bin/cloud_channel_server.py /usr/local/bin/cloud_relay.py \
  && chmod 0644 /usr/local/bin/plan_check.py \
  && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md /usr/local/share/cw/orchestrator.md
+RUN chmod 0755 /usr/local/bin/cw-stack-up && chown root:root /usr/local/bin/cw-stack-up
 
 USER worker
 WORKDIR /home/worker

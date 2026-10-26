@@ -3,6 +3,11 @@
 
     cloud_cli.py send RECIPIENT TEXT...
     cloud_cli.py report KIND TEXT...
+    cloud_cli.py relay COMMAND --pr OWNER/REPO#N [--head SHA] [--arg K=V ...] [--call-id ID]    (installed as `cw-cloud relay`)
+
+`relay` posts to the hub's /relay (same host as FLEET_CLOUD_CHANNEL_URL) with the pod's token; COMMAND is report, prove,
+verdict or gates. A call id is generated when none is given (print it; reuse it to replay). Prints the hub's answer as one
+JSON line; exit 0 only on status 200. No GitHub token is involved.
 
 Environment: FLEET_AGENT_NAME (sender), FLEET_BOSS (report target), FLEET_CLOUD_CHANNEL_URL (http URL of the channel),
 FLEET_CLOUD_TOKEN_FILE (optional; default is the projected token path),
@@ -34,13 +39,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def make_post(url):
+def make_post(url, timeout=TIMEOUT):
     def post(request):
         data = json.dumps(request["body"]).encode()
         req = urllib.request.Request(url, data=data, method="POST", headers={
             "Authorization": request["authorization"], "Content-Type": "application/json"})
         try:
-            with OPENER.open(req, timeout=TIMEOUT) as answer:
+            with OPENER.open(req, timeout=timeout) as answer:
                 status, raw = answer.status, answer.read(65536)
         except urllib.error.HTTPError as err:
             status = err.code
@@ -83,9 +88,57 @@ def _usage(line):
     return 2
 
 
+RELAY_TIMEOUT = 40   # the hub waits up to 30 s for the daemon
+
+
+def relay_main(args, env, post):
+    import argparse
+    import uuid
+    parser = argparse.ArgumentParser(prog="cw-cloud relay", add_help=False)
+    parser.add_argument("command")
+    parser.add_argument("--pr", required=True)
+    parser.add_argument("--head")
+    parser.add_argument("--arg", action="append", default=[])
+    parser.add_argument("--call-id")
+    try:
+        ns = parser.parse_args(args)
+    except SystemExit:
+        return _usage("usage: cloud_cli.py relay COMMAND --pr OWNER/REPO#N [--head SHA] [--arg K=V ...] [--call-id ID]")
+    extra = {}
+    for item in ns.arg:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            return _usage("cloud_cli: --arg needs K=V")
+        extra[key] = value
+    url = env.get("FLEET_CLOUD_CHANNEL_URL", "").strip()
+    try:
+        parts = urllib.parse.urlparse(url)
+    except ValueError:
+        parts = None
+    if not parts or parts.scheme not in ("http", "https") or not parts.netloc or "@" in parts.netloc:
+        return _usage("cloud_cli: FLEET_CLOUD_CHANNEL_URL must be set to an http or https URL without user information")
+    call_id = ns.call_id or uuid.uuid4().hex
+    body = {"call_id": call_id, "command": ns.command, "pr": ns.pr, "args": extra}
+    if ns.head:
+        body["head"] = ns.head
+    token_path = env.get("FLEET_CLOUD_TOKEN_FILE") or cloud_client.TOKEN_PATH
+    try:
+        token = cloud_client._read_token(token_path)
+    except cloud_client._TokenError as err:
+        return _usage(str(err))
+    post = post or make_post(urllib.parse.urlunparse(parts._replace(path="/relay", params="", query="", fragment="")), RELAY_TIMEOUT)
+    answer = post({"authorization": "Bearer " + token, "body": body})
+    answer = dict(answer) if isinstance(answer, dict) else {"status": 0}
+    answer["call_id"] = call_id
+    print(json.dumps(answer).replace(token, "?"))
+    return 0 if answer.get("status") == 200 else 1
+
+
 def main(argv, env=None, post=None):
     env = os.environ if env is None else env
     args = list(argv)
+    if args and args[0] == "relay":
+        return relay_main(args[1:], env, post)
     if len(args) < 3 or args[0] not in ("send", "report"):
         return _usage("usage: cloud_cli.py send RECIPIENT TEXT... | report KIND TEXT...")
     cmd, first, text = args[0], args[1], " ".join(args[2:]).strip()
