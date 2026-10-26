@@ -9,11 +9,26 @@ One document to set up, run and take down the cloud hub and the pod-side command
   to the recipient agent's OpenCode session. Routes:
   - `POST /message`: JSON body `{"sender", "recipient", "key", "text"}` with `Authorization: Bearer <token>`.
   - `GET /decisions`: serves the JSON object from the file named by `FLEET_CLOUD_HUB_DECISIONS`
-    (`{"decisions": [], "errors": []}` if the file is absent), behind the same token check and the same reserved-name refusal as
+    plus one top-level integer `age_seconds`: the age of that file, from its mtime on the hub's own clock (`os.fstat` on the same open
+    descriptor the body is read from, so body and age come from ONE read). **An absent or unreadable file answers 503** with the fixed body
+    `{"status": 503, "error": "decisions unreadable"}` (no path); this replaces the old `{"decisions": [], "errors": []}` 200. An mtime more
+    than 60 s ahead of the hub clock is unreadable too (503), so a clock step or copy cannot make an old list read fresh; within 60 s the age is 0.
+    The age is the file's mtime on the hub: a backup, copy or remount that touches the mtime makes an old list read fresh. Behind the same token check and the same reserved-name refusal as
     POST (a token of a reserved service account other than the captain is refused 401 here too). The answer is scoped per caller: the captain sees the whole file; any other agent sees only the
     decisions whose `"agent"` field equals its pinned name (a decision with no `"agent"` field is the captain's alone; no `errors`).
     This is a trust choice: the captain is the orchestrator's own boss identity, and no pod can obtain that name (it is a reserved
     name: refused on send, and a secrets file that names it refuses everyone).
+    **The pull (`bin/decisions_pull.py`).** It reads the body and `age_seconds` from ONE response (`fetch` runs once), takes `age_seconds` out
+    before writing, and sets the written file's mtime to now minus the age. `age_seconds` must be an integer from 0 to 86400; anything else,
+    or none, or a 503, is an unreachable source and the local file is marked stale (older than 180 s: the plugin shows "daemon not
+    updating"). `--age-command CMD` is for a plain-file source only (no hub): it prints the file's age in seconds, and then a body's own
+    `age_seconds` is ignored. `written_at` is not a liveness signal; it is only checked to be no more than 60 s in the future (`Z` or a
+    numeric offset, fractions allowed). Generation: a lower generation from the same `daemon_pid` is a stale replay and is refused (file
+    aged); a different `daemon_pid` is a restart and is accepted; a body with no `daemon_pid` is accepted (the source is trusted for
+    generation order). `--reset-generation` accepts any in-bound generation (0 to 2**31-1) once; deleting `decisions.json` does the same.
+    The check and the write run under one lock, so two pulls cannot let a lower generation overwrite a higher one.
+    **Rollout order (deploy note).** The hub that sends `age_seconds` and the new pull go out TOGETHER. An older pull reads the 503 for an
+    absent file as unreachable and marks the list stale; a new pull against an older hub (no `age_seconds`) reads it as unreachable too.
   - POST to a path other than /message and GET to a path other than /decisions answer 404. PUT, DELETE and PATCH answer 405 on
     any path. GET /message answers 404. HEAD and OPTIONS are not handled (501).
 - **The pod command** (`bin/cloud_cli.py`) runs in an agent pod and sends through the channel (via `bin/cloud_client.py`):
