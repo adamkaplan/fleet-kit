@@ -44,6 +44,7 @@ import shlex
 import shutil
 import textwrap
 import zipfile
+import pwd
 import signal
 import socket
 import stat
@@ -80,6 +81,8 @@ _support_installs_and_keys = importlib.import_module("support.installs_and_keys"
 ACME_API, ACME_WEB, API, BAD_STATE_REASON, BAD_TARGET_STATES, CloudReaperInstall, DECISIONS_PLUGIN, DEFAULT_TOKEN, FAKE_TOKENS, FakeDaemons, GOOD_DONE_WHEN, GOOD_PLAN, InstallCase, KeyCase, ORDERS_CHARTER_BODY, PR16_KEY, PR16_NOTICE, RealStatusAfterInstall, TIER_LABELS, WEB, WrittenFilesAreGuarded, secrets_in, tree_of = (_support_installs_and_keys.ACME_API, _support_installs_and_keys.ACME_WEB, _support_installs_and_keys.API, _support_installs_and_keys.BAD_STATE_REASON, _support_installs_and_keys.BAD_TARGET_STATES, _support_installs_and_keys.CloudReaperInstall, _support_installs_and_keys.DECISIONS_PLUGIN, _support_installs_and_keys.DEFAULT_TOKEN, _support_installs_and_keys.FAKE_TOKENS, _support_installs_and_keys.FakeDaemons, _support_installs_and_keys.GOOD_DONE_WHEN, _support_installs_and_keys.GOOD_PLAN, _support_installs_and_keys.InstallCase, _support_installs_and_keys.KeyCase, _support_installs_and_keys.ORDERS_CHARTER_BODY, _support_installs_and_keys.PR16_KEY, _support_installs_and_keys.PR16_NOTICE, _support_installs_and_keys.RealStatusAfterInstall, _support_installs_and_keys.TIER_LABELS, _support_installs_and_keys.WEB, _support_installs_and_keys.WrittenFilesAreGuarded, _support_installs_and_keys.secrets_in, _support_installs_and_keys.tree_of)   # support import
 _support_loader = importlib.import_module("support.loader")   # support import
 SCENARIO, SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, captured, class_source, class_source_fn, copy_entry, sb, sc, switchboard_source, with_http_head = (_support_loader.SCENARIO, _support_loader.SWITCHBOARD, _support_loader.SWITCHBOARD_SOURCE_FILES, _support_loader._load, _support_loader.captured, _support_loader.class_source, _support_loader.class_source_fn, _support_loader.copy_entry, _support_loader.sb, _support_loader.sc, _support_loader.switchboard_source, _support_loader.with_http_head)   # support import
+_REAL = sb.real_locations_from(os.environ)   # the real state, config and audit locations, computed once BEFORE any test isolates HOME or XDG_*, and passed on to every child process (a child with a temporary HOME is then not "the real one")
+os.environ.setdefault(sb.REAL_LOCATIONS_ENV, json.dumps({"state": sorted(_REAL[0]), "config": sorted(_REAL[1]), "audit": sorted(_REAL[2])}))
 _support_orders_and_adapters = importlib.import_module("support.orders_and_adapters")   # support import
 BoundedList, BoundedOut, EA, EXTERNAL_ADAPTER, ExternalAdapterCase, FakeDoorServer, FakeExternal, FakeGhPr, FakePruneDocker, FakeWorkHost, FakeWorkSink, HEAD_A, HEAD_B, PermanentRefusal, PickyExternal, baseline_failing_send, baseline_failing_source, baseline_golden, captain_pr, cos_orders_file, fake_mapping, janitor_review, pr_view_json, put_cos_orders, report, reviewed_janitor_argv, worker = (_support_orders_and_adapters.BoundedList, _support_orders_and_adapters.BoundedOut, _support_orders_and_adapters.EA, _support_orders_and_adapters.EXTERNAL_ADAPTER, _support_orders_and_adapters.ExternalAdapterCase, _support_orders_and_adapters.FakeDoorServer, _support_orders_and_adapters.FakeExternal, _support_orders_and_adapters.FakeGhPr, _support_orders_and_adapters.FakePruneDocker, _support_orders_and_adapters.FakeWorkHost, _support_orders_and_adapters.FakeWorkSink, _support_orders_and_adapters.HEAD_A, _support_orders_and_adapters.HEAD_B, _support_orders_and_adapters.PermanentRefusal, _support_orders_and_adapters.PickyExternal, _support_orders_and_adapters.baseline_failing_send, _support_orders_and_adapters.baseline_failing_source, _support_orders_and_adapters.baseline_golden, _support_orders_and_adapters.captain_pr, _support_orders_and_adapters.cos_orders_file, _support_orders_and_adapters.fake_mapping, _support_orders_and_adapters.janitor_review, _support_orders_and_adapters.pr_view_json, _support_orders_and_adapters.put_cos_orders, _support_orders_and_adapters.report, _support_orders_and_adapters.reviewed_janitor_argv, _support_orders_and_adapters.worker)   # support import
 _support_policy_and_import = importlib.import_module("support.policy_and_import")   # support import
@@ -495,6 +498,32 @@ class TestStateDir(Base):
             with self.subTest(kind=kind):
                 with self.assertRaises(sb.RealStateRefused):
                     sb.refuse_real_location(path, kind)
+
+    def child_state(self, home, extra=None):
+        """A real child process, marker inherited, HOME and XDG_* at `home`: what its state_dir_path() says, or the refusal."""
+        code = ("import importlib.machinery, importlib.util, sys\n"
+                "l = importlib.machinery.SourceFileLoader('sbx', %r)\n"
+                "s = importlib.util.spec_from_loader('sbx', l); m = importlib.util.module_from_spec(s); l.exec_module(m)\n"
+                "try:\n    print(m.state_dir_path())\nexcept m.RealStateRefused as e:\n    print('REFUSED')\n" % str(SWITCHBOARD))
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+        env.update({"HOME": str(home), "XDG_STATE_HOME": str(home / "xdg-state"), "XDG_CONFIG_HOME": str(home / "xdg-config"), **(extra or {})})
+        return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120).stdout.strip()
+
+    def test_a_real_child_with_a_temporary_home_runs_and_one_pointed_at_the_real_directory_is_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        self.assertEqual(self.child_state(tmp), str(tmp / "xdg-state" / sb.PROG))
+        real = Path(json.loads(os.environ[sb.REAL_LOCATIONS_ENV])["state"][0])
+        child_home = tmp / "h"
+        self.assertEqual(self.child_state(child_home, {"XDG_STATE_HOME": str(real.parent)}), "REFUSED")
+
+    def test_mutant_without_the_passed_locations_a_child_with_a_temporary_home_is_still_fine_and_the_account_home_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        gone = {k: v for k, v in os.environ.items() if k != sb.REAL_LOCATIONS_ENV}
+        with mock.patch.dict(os.environ, gone, clear=True):
+            self.assertEqual(self.child_state(tmp), str(tmp / "xdg-state" / sb.PROG))
+            self.assertEqual(self.child_state(tmp, {"XDG_STATE_HOME": str(Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state")}), "REFUSED")
 
     def test_without_the_marker_nothing_is_refused_and_a_temporary_path_is_fine(self):
         real = self.real_home()

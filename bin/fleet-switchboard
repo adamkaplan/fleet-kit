@@ -449,28 +449,45 @@ class RealStateRefused(ConfigError):
     """The test suite (FLEET_SWITCHBOARD_UNDER_TEST) was about to use the real state, config or audit location of the running daemon."""
 
 
-def _real_locations():
-    """The state directory, the config directory and the audit path the running daemon uses, resolved: the account's own home (not $HOME) and the
-    XDG variables as the process had them at start (a test's isolation changes them later, so a test's own directory never equals these)."""
+REAL_LOCATIONS_ENV = "FLEET_SWITCHBOARD_REAL_LOCATIONS"   # a JSON object {"state": [...], "config": [...], "audit": [...]} the test process sets before it isolates anything
+
+
+def real_locations_from(env, with_pwd=True):
+    """The state directories, config directories and audit paths of the running daemon, resolved, for the environment `env` (a mapping): the account's
+    own home (not $HOME) and, from `env`, HOME and the XDG variables."""
     import pwd
-    try:
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except KeyError:
-        home = None
-    homes = [h for h in (home, _PROCESS_START_ENV.get("HOME") and Path(_PROCESS_START_ENV["HOME"])) if h]
+    homes = []
+    if with_pwd:
+        try:
+            homes.append(Path(pwd.getpwuid(os.getuid()).pw_dir))
+        except KeyError:
+            pass
+    if env.get("HOME"):
+        homes.append(Path(env["HOME"]))
     states, configs = [], []
     for h in homes:
         states.append(h / ".local/state" / PROG)
         configs.append(h / ".config" / PROG)
-    for variable, fallback, into in (("XDG_STATE_HOME", None, states), ("XDG_CONFIG_HOME", None, configs)):
-        value = _PROCESS_START_ENV.get(variable)
+    for variable, into in (("XDG_STATE_HOME", states), ("XDG_CONFIG_HOME", configs)):
+        value = env.get(variable)
         if value and os.path.isabs(value):
             into.append(Path(value) / PROG)
     resolve = lambda path: os.path.realpath(str(path))
     return ({resolve(p) for p in states}, {resolve(p) for p in configs}, {resolve(p / "audit.jsonl") for p in states})
 
 
-_PROCESS_START_ENV = {k: os.environ.get(k) for k in ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME")}
+def _real_locations():
+    """The real locations a test run refuses. A test run computes them in its own process before any isolation and passes them to its children in
+    REAL_LOCATIONS_ENV: a child started with a temporary HOME is then fine, and one pointed at the real directory is refused. Without it: the
+    account's own home only."""
+    given = os.environ.get(REAL_LOCATIONS_ENV)
+    if given:
+        try:
+            table = json.loads(given)
+            return tuple({os.path.realpath(str(p)) for p in table[k]} for k in ("state", "config", "audit"))
+        except (ValueError, KeyError, TypeError):
+            pass
+    return real_locations_from({})
 
 
 def refuse_real_location(path, kind):
