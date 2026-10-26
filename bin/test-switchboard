@@ -72150,6 +72150,7 @@ class TestV2LightGuards(Base):
         ("triage_stop", 1): (3, "stop", ()),
         ("synthetic_lines", 1): (5, "lines", (("transcript_lines", 1),)),
         ("transcript_lines", 1): (5, "transcript", ()),
+        ("undelivered_wake_tick", 1): ("list", "wedged", (("V2Reads.inbox", 1),)),
         ("chat_clear_live_now", 1): ("chat", "the live decision: shadow under light; pinned by TestChatClearHook test_light_live_route_* and test_light_live_every_route_*", ()),
         ("chat_clear_prompts", 1): ("chat", "the ONE allowed read: pinned by TestChatClearHook (S1 to S4)", ()),
     }
@@ -72187,6 +72188,11 @@ class TestV2LightGuards(Base):
             world.v2.sessions[world.sessions["coder"]]["metadata"]["fleet"]["reports_to"] = "cos"
             world.tick(5)
             world.new_engine("cli").report("coder", "question", "which one?")
+            self.passes(world, 2)
+        elif name == "wedged":   # #1337: an old queued wake no turn took; under light the tick reads nothing and resumes nothing
+            world.v2.sessions[sid]["inbox"].append({
+                "id": "inb_w", "sessionID": sid, "text": "wake", "metadata": {"fleet": {"keys": ["lab.fact:wedged"], "from": "switchboard"}},
+                "resume": True, "delivery": "queue", "time": {"created": world.v2.clock.ms(now - 16 * 60)}})
             self.passes(world, 2)
         elif name == "newest":
             sb.newest_prompts(engine, world.sessions["cos"])
