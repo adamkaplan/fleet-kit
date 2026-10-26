@@ -2,6 +2,7 @@
 """derive-closure: print and check the clear's closure, derived from the code (ask #940).
 
     derive-closure --check [--floor N] [--floor-bindings N] [--root DIR] [--matrix FILE]
+    derive-closure --load --since YYYY-MM-DD [--ref REF] [--root DIR]
 
 The closure is the ONE set `bin/delegated_clear.py` derives (`derive_closure`) from the code of the entry, every part of bin/fleet-switchboard.parts and the bin modules the clear loads or runs: the
 delegated clear's refusal and the owner hold both read it through `closure_read` in bin/impact_hold.py. Nothing of it is kept in the matrix: this tool only READS it. It prints the counts and fails closed
@@ -10,6 +11,9 @@ closure with fewer definitions or bindings than a floor (`--floor`, `--floor-bin
 Exit 0 ok, 1 differs, 2 the tool could not run (a file it reads is unreadable). Standard library only; nothing of the daemon runs.
 """
 import argparse
+import datetime
+import re
+import subprocess
 import importlib.util
 import json
 import os
@@ -39,10 +43,50 @@ def derive(root, rule):
     return clear.closure_for(rule, root=root, matches=floor.matches), clear.ClosureError
 
 
+def git(root, *args):
+    return subprocess.run(["git", "-C", root] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True).stdout
+
+
+def load(root, since, ref, rule, derived, clear, floor):
+    """The owner's load, read-only: for each pull request merged into `ref` since `since` (a first-parent commit whose subject ends `(#N)`), would the closure hold it? Each changed file the closure judges (and that is not clear
+    machinery) is mapped by `closure_refusals` on the text of the commit's parent and of the commit, with the closure of THIS checkout; `entry alone` maps only the daemon file against the entry points and the rating roots."""
+    rows, listed = [], rule.get("clear_code_paths") or []
+    log = git(root, "log", "--first-parent", "--since=%s" % since, "--format=%H%x09%cs%x09%s", ref).splitlines()
+    for line in log:
+        sha, date, subject = line.split("\t", 2)
+        found = re.search(r"\(#(\d+)\)$", subject)
+        if not found:
+            continue
+        week = datetime.date.fromisoformat(date)
+        monday = (week - datetime.timedelta(days=week.weekday())).isoformat()
+        full, entry = False, False
+        for path in git(root, "diff", "--name-only", sha + "^", sha).splitlines():
+            if path not in derived.files or floor.matches(path, listed):
+                continue
+            try:
+                before, after = git(root, "show", "%s^:%s" % (sha, path)), git(root, "show", "%s:%s" % (sha, path))
+            except subprocess.CalledProcessError:
+                full = True   # added or deleted: cannot be mapped
+                continue
+            patch = "".join(__import__("difflib").unified_diff(before.splitlines(True), after.splitlines(True), "a", "b", n=0))
+            info = derived.files[path]
+            daemon = path == rule["daemon_file"]
+            roots = clear.daemon_roots(rule, derived) if daemon else info["roots"]
+            if clear.closure_refusals(before, after, patch, roots, set(rule["clear_entry_points"]) if daemon else set(), not daemon, list(rule.get("dynamic_actions") or [])):
+                full = True
+            if daemon and clear.closure_refusals(before, after, patch, sorted(set(rule["clear_entry_points"]) | set(rule.get("rating_roots") or [])), set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or [])):
+                entry = True
+        rows.append((monday, found.group(1), full, entry))
+    return rows
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="derive-closure")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
+    mode.add_argument("--load", action="store_true", help="read-only: how many pull requests merged since a date the closure would hold, per Monday-week, with the list")
+    ap.add_argument("--since", default=None)
+    ap.add_argument("--ref", default="origin/integration")
     ap.add_argument("--root", default=ROOT)
     ap.add_argument("--matrix", default=None)
     ap.add_argument("--floor", type=int, default=None, help="--check also fails when the closure from the derived roots over the entry and the parts has fewer definitions than this (a floor: it can only grow)")
@@ -59,6 +103,17 @@ def main(argv=None):
             return 1
         print("derive-closure: %s: %s" % (type(err).__name__, err), file=sys.stderr)
         return 2
+    if args.load:
+        if not args.since:
+            print("derive-closure: --load needs --since YYYY-MM-DD", file=sys.stderr)
+            return 2
+        rows = load(args.root, args.since, args.ref, rule, derived, clear, load_module_from(args.root, "impact_floor"))
+        for monday in sorted({r[0] for r in rows}):
+            week = [r for r in rows if r[0] == monday]
+            print("week of %s: merged %d, held by the closure %d (entry points and rating path alone: %d)" % (monday, len(week), sum(r[2] for r in week), sum(r[3] for r in week)))
+            print("  held: %s" % (", ".join("#" + r[1] for r in week if r[2]) or "none"))
+        print("total: merged %d, held %d, entry alone %d" % (len(rows), sum(r[2] for r in rows), sum(r[3] for r in rows)))
+        return 0
     parts = [p for p in derived.files if p != rule["daemon_file"]]
     print("closure definitions: %d over the entry and the parts (entry alone: %d); %d bindings; %d files judged (%d modules of bin/)" % (len(derived.defs), len(derived.entry_defs), len(derived.binds), len(parts) + 1, len(derived.flat_modules)))
     print("from the derived roots alone: definitions %d over the entry, %d over the entry and the parts; bindings %d over the entry, %d over the entry and the parts" % derived.plain)

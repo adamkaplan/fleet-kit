@@ -38458,9 +38458,8 @@ class TestImpactFloorPure(unittest.TestCase):
         m = self._meaning_of(self.matrix)
         keys = set(re.findall(r"`([a-z_]+)`", m))
         block = self.matrix["owner_hold"]["delegated_clear"]
-        self.assertTrue({"never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files",
-                         "module_roots", "closure_roots", "clear_entry_points", "score", "max_level"} <= keys)
-        for k in keys - {"max_level"}:                      # max_level is the owner's configuration key, not a matrix key
+        self.assertTrue({"never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "rating_roots", "dynamic_actions", "clear_entry_points", "score", "max_level"} <= keys)
+        for k in keys - {"max_level", "closure_read", "derive_closure"}:   # the two functions the meaning names are code, not keys                      # max_level is the owner's configuration key, not a matrix key
             self.assertIn(k, block, k)
         self.assertEqual((REPO / "docs/switchboard.md").read_text().count(m), 1)
 
@@ -42173,97 +42172,62 @@ class TestImpactHold(LedgerBase):
         self.assertIn("nothing touches credentials", detail["reason"])
         self.assertNotEqual(detail["by"], "owner")
 
-    def test_the_modules_the_clear_loads_or_runs_are_all_judged_and_the_list_is_derived_from_what_runs(self):
+    def test_the_modules_the_clear_loads_or_runs_are_derived_and_every_function_the_real_clear_runs_is_in_the_closure(self):
+        """#940: the closure is derived from the code (nothing is listed in the matrix), and a run-time trace of the REAL clear (every function of the entry, the parts and the flat modules that executed) is a SUBSET of it: the
+        test fails when the derived closure is smaller than the trace."""
         import sys, os, ast
+        tests = importlib.util.spec_from_file_location("closure_tests_940", str(REPO / "tests" / "switchboard" / "test_closure.py"))
+        closure_tests = importlib.util.module_from_spec(tests)
+        tests.loader.exec_module(closure_tests)
+        module = sb.load_module("delegated_clear")
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
-        roots = rule["module_roots"]
+        self.assertEqual(sorted(set(rule) & {"closure_roots", "closure_files", "module_roots", "closure_exempt"}), [], "no list of closure names in the matrix")
+        derived = module.closure_for(rule)
+        roots = {f: i["roots"] for f, i in derived.files.items()}
+        matches = sb.impact_floor.matches
         self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
         seen = set()
         def prof(frame, event, arg):
-            if event == "call" and os.path.dirname(frame.f_code.co_filename) == str(BIN) and not frame.f_code.co_name.startswith("<"):
-                seen.add(("bin/" + os.path.basename(frame.f_code.co_filename), frame.f_code.co_name))
+            if event == "call" and not frame.f_code.co_name.startswith("<") and str(frame.f_code.co_filename).startswith(str(REPO)):
+                seen.add((frame.f_code.co_filename, frame.f_code.co_firstlineno))
         sys.setprofile(prof)
         try:
             code, out, err = self.under()
         finally:
             sys.setprofile(None)
         self.assertEqual(code, 0, err)
-        matches = sb.impact_floor.matches
-        missing = sorted("%s:%s" % (f, n) for f, n in seen if f.endswith(".py") and not matches(f, rule["clear_code_paths"]) and n not in (roots.get(f) or []))
-        self.assertEqual(missing, [], "a function the real clear ran in a module that is not refused whole is not in module_roots")
-        self.assertTrue(seen, "the profile saw the clear run")
-        # every module's config readers run at config load (a key set or not): its validate and settings are roots
+        self.assertTrue(any(p.endswith("fleet-switchboard") for p, _ in seen) and any("/bin/" in p for p, _ in seen), "the profile saw the clear run")
+        self.assertEqual(closure_tests.executed_outside(module, derived, rule, str(REPO), seen, matches), [], "a function the real clear ran is not in the derived closure")
+        # a refused run too (the hostile side): a change to the daemon file is refused, and the refusal's own code ran inside the closure
+        self.floor_pr(path="bin/fleet-switchboard"); self.files_of_pr("bin/fleet-switchboard")
+        seen = set()
+        sys.setprofile(prof)
+        try:
+            self.under()
+        finally:
+            sys.setprofile(None)
+        self.assertEqual(closure_tests.executed_outside(module, derived, rule, str(REPO), seen, matches), [], "a function the refusing clear ran is not in the derived closure")
+        # the derived judged files: every module the clear loads is judged or is machinery
         for path in sorted(BIN.glob("*.py")):
             tree = ast.parse(path.read_text())
             readers = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings")]
-            if readers and not matches("bin/" + path.name, rule["clear_code_paths"]):
-                self.assertTrue(set(readers) <= set(roots.get("bin/" + path.name) or []), "%s has a config reader (%s) that is not a root" % (path.name, readers))
-        # the modules the clear loads or runs, DERIVED: every loader of the daemon (a `load_module("x")` call, a name in HELPER_MODULES, a function that returns one) is enumerated by ast; a module
-        # is judged when the clear reaches its loader, the daemon loads it at import, it has a config reader, or the recorded run executed it; every other loaded module is listed with its reason
-        daemon, hold = ast.parse(switchboard_source()), ast.parse((BIN / "impact_hold.py").read_text())
-        names = {p.stem for p in BIN.glob("*.py")}
-        helper = next(ast.literal_eval(n.value) for n in daemon.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "HELPER_MODULES" for t in n.targets))
-        defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
-        direct = lambda node: {x.args[0].value for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "load_module" and x.args and isinstance(x.args[0], ast.Constant)}
-        loaders = {name: direct(node) for name, node in defs.items() if direct(node)}
-        def modules_of(node):
-            found = direct(node)
-            for x in ast.walk(node):
-                if isinstance(x, ast.Name):
-                    found |= ({helper[x.id]} if x.id in helper else set()) | loaders.get(x.id, set())
-            return found
-        clear_functions = [n for n in hold.body if isinstance(n, ast.FunctionDef)]
-        wanted_roots = sorted({x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[0]) | {x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[1]))
-        self.assertEqual(sorted(rule["closure_roots"]), sorted(set(wanted_roots) | {"HELPER_MODULES", "_make_loader"}), "closure_roots is every daemon name the moved clear code reads (bin/impact_hold.py), and the table that generates the daemon's loaders")
-        reach = sb.load_module("delegated_clear").closure(daemon, rule["closure_roots"])[0]
-        reached = set()
-        for name in reach:
-            reached |= modules_of(defs[name])
-        for f in clear_functions:
-            reached |= modules_of(f)
-        at_load = set()
-        for node in daemon.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for x in ast.walk(node):
-                if isinstance(x, ast.Import):
-                    at_load |= {a.name for a in x.names}
-                elif isinstance(x, ast.ImportFrom) and x.module:
-                    at_load.add(x.module)
-                elif isinstance(x, ast.Call):
-                    f = getattr(x.func, "id", "")
-                    if f == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
-                        at_load.add(x.args[0].value)
-                    at_load |= ({helper[f]} if f in helper else set()) | loaders.get(f, set())
-        with_reader = {p.stem for p in BIN.glob("*.py") if any(isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings") for n in ast.parse(p.read_text()).body)}
-        profiled = {f[len("bin/"):-3] for f, _ in seen if f.endswith(".py")}
-        named = lambda m: matches("bin/%s.py" % m, rule["clear_code_paths"])
-        judged = {m for m in (reached | at_load | with_reader | profiled) if m in names and not named(m)}
-        listed = {f[len("bin/"):-3] for f in rule["closure_files"] if f.endswith(".py") and not f.startswith("bin/switchboard/")}   # a part of the daemon is judged by tools/derive-closure (tests/switchboard/test_closure.py), not by this list of flat modules
-        self.assertEqual(sorted(judged ^ listed), [], "closure_files is the set of modules the clear loads or runs, derived (a module in one and not the other)")
-        every_loaded = {m for m in (set(helper.values()) | set().union(*loaders.values()) | set().union(*[direct(f) for f in clear_functions])) if m in names and not named(m)}
-        exempt = {"bin/%s.py" % m for m in every_loaded - judged}
-        self.assertEqual(sorted(exempt), sorted(rule["closure_exempt"]), "every loaded module is judged or listed, with its reason, as one the clear cannot reach")
-        self.assertTrue(all(isinstance(why, str) and len(why) > 20 for why in rule["closure_exempt"].values()))
-        for module_name in reached & names:   # a module whose loader the clear reaches must say which of its functions run
-            if not named(module_name):
-                self.assertIn("bin/%s.py" % module_name, roots, "%s is loaded by the clear's own code: its roots are named (`*` for every function)" % module_name)
+            rel = "bin/" + path.name
+            if readers and not matches(rel, rule["clear_code_paths"]):
+                self.assertTrue(set(readers) <= set(roots.get(rel) or []), "%s has a config reader (%s) that is not a root" % (rel, readers))
         for dropped in ("agent_presence", "ci_runs"):
-            self.assertIn("bin/%s.py" % dropped, rule["closure_files"])
-        self.assertNotIn("bin/lanes.py", rule["closure_files"])
+            self.assertIn("bin/%s.py" % dropped, derived.files)
+        for pinned in ("impact_carry_get", "fetch_orders", "read_pr_json", "HELPER_MODULES", "_make_loader"):
+            self.assertIn(pinned, derived.roots)
         import collections, difflib
+        hold = ast.parse((BIN / "impact_hold.py").read_text())
         counts = collections.Counter(n.name for n in hold.body if isinstance(n, ast.FunctionDef))
         self.assertEqual([k for k, v in counts.items() if v > 1], [], "each function of the moved clear code is defined once (a later copy would silently replace the first)")
-        for pinned in ("impact_carry_get", "fetch_orders", "read_pr_json", "HELPER_MODULES", "_make_loader"):
-            self.assertIn(pinned, rule["closure_roots"])
         table = switchboard_source().split("\n")
         k = next(i for i, l in enumerate(table) if l.strip().startswith('"load_agent_presence":'))
         mutated = list(table)
         mutated[k] = mutated[k].replace('"agent_presence"', '"lanes"')
         diff = "\n".join(list(difflib.unified_diff(table, mutated, lineterm="", n=1))[2:])
-        self.assertTrue(sb.load_module("delegated_clear").closure_refusals("\n".join(table), "\n".join(mutated), diff, rule["closure_roots"], set(rule["clear_entry_points"])), "a HELPER_MODULES value changed")
-        self.assertTrue(rule["closure_files"] and "bin/lanes.py" not in rule["closure_files"], "lanes.py is not judged, so the same edit to it is not refused")
-        # the way in a strict review found: the notice path runs agent_presence through a generated loader; a change to it is refused, and to a module the clear does not load it is not
+        self.assertTrue(module.closure_refusals("\n".join(table), "\n".join(mutated), diff, derived.roots, set(rule["clear_entry_points"])), "a HELPER_MODULES value changed")
         import difflib
         presence = (BIN / "agent_presence.py").read_text().split("\n")
         k = next(i for i, l in enumerate(presence) if l.startswith("def ") and i + 1 < len(presence))
@@ -42271,7 +42235,7 @@ class TestImpactHold(LedgerBase):
         edited = list(presence)
         edited[j] = edited[j] + "  # touched"
         diff = "\n".join(list(difflib.unified_diff(presence, edited, lineterm="", n=1))[2:])
-        self.assertTrue(sb.load_module("delegated_clear").closure_refusals("\n".join(presence), "\n".join(edited), diff, rule["module_roots"]["bin/agent_presence.py"], set(), True), "a change to agent_presence.py is refused")
+        self.assertTrue(sb.load_module("delegated_clear").closure_refusals("\n".join(presence), "\n".join(edited), diff, roots["bin/agent_presence.py"], set(), True), "a change to agent_presence.py is refused")
         self.assertIn("one_line", roots["bin/decision_core.py"])
         # a module is judged on its import-time code too, and a function the clear does not run stays allowed
         module = sb.load_module("delegated_clear")
@@ -42624,7 +42588,7 @@ class TestImpactHold(LedgerBase):
             answers["contents/bin/fleet-switchboard"] = [{"name": "x"}]
             self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, "b" * 40, rule), "a directory, not a file")
             self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, None, rule), "no merge-base: refused")
-            self.assertTrue(rule["closure_roots"], "the roots are named")
+            self.assertTrue(sb.load_module("delegated_clear").closure_for(rule).roots, "the roots are derived")
 
     def test_a_repeated_order_number_makes_the_whole_feature_off(self):
         module = sb.load_module("delegated_clear")
@@ -43322,7 +43286,7 @@ class TestImpactHold(LedgerBase):
                 head = source.replace(old, new)
                 diff = "\n".join(list(difflib.unified_diff(source.split("\n"), head.split("\n"), lineterm="", n=3))[2:])
                 self.assertTrue(self.closure_check(head, diff), "refused: %s" % label)
-                self.assertEqual(module.closure_refusals(source, head, diff, sorted(rule["closure_roots"]), set(rule["clear_entry_points"])), [], "the mutant (the roots of round 2, no dynamic edge) lets %s through" % label)
+                self.assertEqual(module.closure_refusals(source, head, diff, sb.load_module("delegated_clear").closure_for(rule).roots, set(rule["clear_entry_points"])), [], "the mutant (the roots of round 2, no dynamic edge) lets %s through" % label)
 
     def test_one_definition_of_rated_at_this_head_the_clear_and_every_other_reader_use_it(self):
         import ast
@@ -80521,7 +80485,7 @@ class TestWhoCanClear(unittest.TestCase):
         self.floor = sb.load_module("impact_floor")
         self.module = sb.load_module("delegated_clear")
         self.matrix = self.floor.load_matrix()
-        self.rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.rule = sb.load_module("delegated_clear").with_closure(self.matrix["owner_hold"]["delegated_clear"], sb.load_module("delegated_clear").closure_for(self.matrix["owner_hold"]["delegated_clear"]))   # the derived judged files are the rule's `closure_files` (never read from the matrix, #940)
         self.block = self.rule["score"]
         self.on = {"threshold": "Serious"}
 
@@ -81129,7 +81093,7 @@ class TestClearCodePathsAlwaysHeld(unittest.TestCase):
         self.floor = sb.load_module("impact_floor")
         self.clear = sb.load_module("delegated_clear")
         self.matrix = self.floor.load_matrix()
-        self.rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.rule = sb.load_module("delegated_clear").with_closure(self.matrix["owner_hold"]["delegated_clear"], sb.load_module("delegated_clear").closure_for(self.matrix["owner_hold"]["delegated_clear"]))   # the derived judged files are the rule's `closure_files` (never read from the matrix, #940)
         self.listed = list(self.rule["clear_code_paths"])
 
     def decide(self, paths, matrix=None):

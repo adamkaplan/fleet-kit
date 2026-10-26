@@ -1156,7 +1156,7 @@ def closure_read(engine, runner, repo, number, head, rule, take=False):
         for item in files:   # a changed file the closure judges: each changed LINE is mapped to its definition by the ast of the file it belongs to
             if isinstance(item.get("filename"), str) and (item["filename"] in derived.files or impact_floor.matches(item["filename"], ["bin/switchboard/*.py"])) and not impact_floor.matches(item["filename"], listed) and item.get("status") == "modified":
                 closure[item["filename"]] = module.cached_map(module.map_key(engine.state_dir, repo, item, base_sha, rule),
-                                                              lambda: delegated_clear_map(engine, runner, repo, item, base_sha, rule, derived), take)   # the line the daemon posts hands what it read to the clear, once
+                                                              lambda: delegated_clear_map(engine, runner, repo, item, base_sha, rule), take)   # the line the daemon posts hands what it read to the clear, once
     return files, closure, None
 
 

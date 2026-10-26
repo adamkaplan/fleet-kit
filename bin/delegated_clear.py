@@ -309,6 +309,11 @@ def refusal_items(rule, report, files, matches=None, closure=None, scored=None):
     `class` (a path class never delegated), `review` (the independent review at this head), `machinery`, `new-file`, `closure`."""
     if not isinstance(rule, dict) or not isinstance(report, dict) or matches is None:
         return [_item("unreadable", "the delegated-clear rule or the owner-hold decision cannot be read", why="the rule or the decision cannot be read")], False
+    if isinstance(rule.get("clear_code_paths"), list) and "closure_files" not in rule:   # the judged files are the derivation's, never the matrix's: a rule that carries none is given them here (the one function)
+        try:
+            rule = with_closure(rule, closure_for(rule))
+        except Exception:
+            return [_item("unreadable", "the clear's closure cannot be derived: refused", why="the clear's closure cannot be derived")], False
     for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files"):
         if not isinstance(rule.get(key), list) or not all(isinstance(x, str) for x in rule[key]):
             return [_item("unreadable", "the delegated-clear rule is malformed (%s)" % key, why="the clear rule is malformed")], False
@@ -900,7 +905,7 @@ class Closure:
     entry file alone; `plain`: (entry defs, assembled defs, entry bindings, assembled bindings) from the derived roots alone; `files`: {path: {"roots": [...], "module_level": bool}} of every file judged by the closure
     rule (the entry, each part that holds a definition or a binding the closure reads, each flat module the clear loads or runs); `problems`: why the closure is not decided by the code."""
     def __init__(self):
-        self.roots, self.defs, self.binds, self.entry_defs, self.plain, self.files, self.problems, self.flat_modules = [], set(), set(), set(), (0, 0, 0, 0), {}, [], []
+        self.roots, self.defs, self.binds, self.entry_defs, self.plain, self.files, self.problems, self.flat_modules, self.members = [], set(), set(), set(), (0, 0, 0, 0), {}, [], [], {}
 
 
 def derive_closure(rule, sources, flat, matches):
@@ -936,8 +941,8 @@ def derive_closure(rule, sources, flat, matches):
     out.roots = sorted(roots)
     daemon_roots_ = sorted(roots | set(rule.get("rating_roots") or []))
     out.entry_defs = set(closure(entry, daemon_roots_, dynamic)[0])
-    defs, binds, refs, _members = closure(whole, daemon_roots_, dynamic)
-    out.defs, out.binds = set(defs), set(binds)
+    defs, binds, refs, members = closure(whole, daemon_roots_, dynamic)
+    out.defs, out.binds, out.members = set(defs), set(binds), {k: set(v) for k, v in members.items()}
     pe, pw = closure(entry, out.roots, dynamic), closure(whole, out.roots, dynamic)
     out.plain = (len(pe[0]), len(pw[0]), len(pe[1]), len(pw[1]))
     owners, per_part = {}, {}

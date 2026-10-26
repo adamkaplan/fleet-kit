@@ -6,8 +6,7 @@ every changed file under bin/switchboard/ and for the entry, listed in the matri
 the function that calls the rule) with a mutant that removes the call, and the entry's reasons compared with the recorded baseline.
 
 LIMITS, stated: `exec`/`eval`, writes through `globals()`/`vars()`/`setattr` on the module, bindings made by a call (`globals().update(...)`) and `from x import *` are not followed; the closure names are
-the ones the matrix carries (`closure_roots`, `rating_roots`, `module_roots`), so a closure-read binding the matrix does not name is not caught by the clear (CI's tools/derive-closure --check lists the part
-that holds it); `delegated_clear_inputs` (which asks for the map of an unlisted part) is not driven here, only the map it calls.
+the ones the one derivation gives (`delegated_clear.derive_closure`: nothing is listed in the matrix, #940); `delegated_clear_inputs` (which asks for the map of an unlisted part) is not driven here, only the map it calls.
 """
 import base64
 import difflib
@@ -34,6 +33,8 @@ def load(name, path):
 
 
 RULE = json.loads((REPO / "docs/review-laws/impact-matrix.json").read_text())["owner_hold"]["delegated_clear"]
+DERIVED = load("delegated_clear_derived", REPO / "bin" / "delegated_clear.py").closure_for(RULE, root=str(REPO), matches=impact_floor.matches)   # the one closure: the judged files and roots are its, never the matrix's
+FILES = sorted(DERIVED.files)
 BASE = "import os\n\n\ndef keep(a):\n    return a\n"
 NAME = "boss_name"
 
@@ -181,10 +182,10 @@ class TestShadowGlue(unittest.TestCase):
         add = BINDERS["def"]
         for path, listed in (("bin/switchboard/audit.py", True), ("bin/switchboard/judge.py", False)):
             with self.subTest(file=path):
-                self.assertEqual(impact_floor.matches(path, RULE["closure_files"]), listed)
+                self.assertEqual(impact_floor.matches(path, FILES), listed)
                 got = self.run_map(path, BASE, BASE + add)
                 self.assertTrue(any(NAME in r and path in r for r in got), got)
-                alone = self.m.closure_refusals(BASE, BASE + add, diff(BASE, BASE + add), RULE["module_roots"].get(path, []), set(), True)
+                alone = self.m.closure_refusals(BASE, BASE + add, diff(BASE, BASE + add), DERIVED.files.get(path, {}).get("roots", []), set(), True)
                 self.assertFalse(any(NAME in r for r in alone), "the check as it was lets the shadow through")
 
     def test_the_glue_applies_the_rule_to_the_two_bypass_forms_in_an_unlisted_part(self):
@@ -316,7 +317,7 @@ class TestShadowStatuses(unittest.TestCase):
         self.hold.load_module = lambda name: self.m
 
     def test_every_status_of_a_listed_part_an_unlisted_part_and_the_entry(self):
-        self.assertFalse(impact_floor.matches("bin/switchboard/judge.py", RULE["closure_files"]))
+        self.assertFalse(impact_floor.matches("bin/switchboard/judge.py", FILES))
         for kind in ("listed", "unlisted", "entry"):
             for status in self.STATUSES:
                 with self.subTest(file=kind, status=status):
