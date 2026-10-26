@@ -4023,6 +4023,45 @@ def agent_tmp_env(engine, name):
     return {AGENT_TMP_ENV: str(path)}
 
 
+SCRATCH_ENV = "FLEET_SCRATCH"   # #1329 (slice A of #948): the agent's own durable scratch directory
+# The launch kinds, one row each: (kind, has a local side, exports SCRATCH_ENV in its environment, names the path in the brief). A kind added to launch is added here;
+# the completeness test derives its check from this table and from the code, never from a hand copy. Headless tools run in the OpenCode service's environment
+# (no per-worker environment exists), so a headless worker is told the path in its brief only; a cloud worker has no local side.
+LAUNCH_KINDS = (
+    ("pane", True, True, True),
+    ("headless", True, False, True),
+    ("cloud", False, False, False),
+)
+
+
+def agent_scratch_dir(engine, name):
+    """The agent's scratch directory <state>/scratch/<name>, made through job_ensure_root (the one private-directory helper: 0700, ours, lstat so a
+    symlink is refused). An existing directory is reused and never emptied. An unsafe path refuses the launch (LaunchError, one line naming it)."""
+    if engine.state_dir is None:
+        raise LaunchError("no state directory: no scratch directory can be made for %s" % name)
+    if not NAME_RE.fullmatch(name or ""):
+        raise LaunchError("no scratch directory for %r: not a valid agent name" % (name,))
+    base = Path(engine.state_dir)
+    path = base / "scratch" / name
+    try:
+        job_ensure_root(base / "scratch")
+        job_ensure_root(path)
+    except OSError as err:
+        raise LaunchError("the scratch directory %s is not safe (%s): %s was not started" % (path, err.strerror or err, name)) from None
+    return path
+
+
+def agent_scratch_env(engine, name):
+    return {SCRATCH_ENV: str(agent_scratch_dir(engine, name))}
+
+
+def scratch_brief(brief, path):
+    """The brief with one line naming the scratch directory; an empty brief stays empty (nothing is sent)."""
+    if not brief:
+        return brief
+    return "%s\n\nYour private scratch directory (it is kept): %s (also $%s in a terminal worker)." % (brief.rstrip("\n"), path, SCRATCH_ENV)
+
+
 def reclaim_agent_tmp(engine, name, headless=False):
     """At retire: the agent's private TMPDIR is removed when it is EMPTY, else kept and the reason said. Never forced, never recursive. Returns lines.
     A headless worker's directory (#846, made by the plugin) is under the same root and goes by the same rule."""
@@ -4074,6 +4113,8 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     env = launch_base_env(engine.config)
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
+    env.update(agent_scratch_env(engine, name))   # #1329: likewise
+    brief = scratch_brief(brief, env[SCRATCH_ENV])
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is not None:  # PR 15: the agent works as its repo's gh account, and as nobody else
         problem = launch_account_problem(engine.config, accounts, repo)
@@ -4141,6 +4182,8 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
         raise LaunchError("; ".join(problems))
     if engine.state_dir is None:
         raise LaunchError("no state directory: a headless worker needs its record")
+    scratch = agent_scratch_dir(engine, name)   # #1329: before the lock and the session: an unsafe path starts nothing
+    brief = scratch_brief(brief, str(scratch))
     try:
         with agent_lock(engine.state_dir, name):   # the name check, the session create and the record write are ONE step: two launches of one name cannot both pass
             taken = engine.discover(engine.now()).agents.get(name)
@@ -4339,6 +4382,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     repo = fleet.get("repo") or (engine.config.get("intent_repo") if fleet.get("charter") else None)
     env.update(view_env(fleet.get("role"), repo))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767
+    env.update(agent_scratch_env(engine, name))   # #1329
     accounts = getattr(engine, "accounts", None)
     if fleet.get("repo") and accounts is not None:
         try:

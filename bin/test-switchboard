@@ -4154,6 +4154,7 @@ class TestLaunch(StandInPids, Base):
                                      sb.HerdrClient(FAKE_HERDR, tracing("herdr", herdr), socket_call=socket_call),
                                      sb.AuditLog(self.world.audit_path), sb.fact_sources(self.world.state),
                                      self.world.clock.now, "cli")
+        self.engine.state_dir = Path(self.world.state)               # #1329: launch makes the agent's scratch directory under it
         self.sleeps = []
         patch = mock.patch.object(sb, "PANE_SETTLE_SECONDS", 0)       # the two looks before a close are instant in tests
         patch.start()
@@ -4190,12 +4191,12 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(method, "layout.apply")
         self.assertEqual(params["workspace_id"], "w1")
         self.assertEqual(params["root"]["command"], [FAKE_OPENCODE, "-s", done["session"]])
-        self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
+        self.assertEqual({k: v for k, v in params["root"]["env"].items() if k != "FLEET_SCRATCH"}, {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
                                                      "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": "", **sb.NO_CREDENTIAL_DIALOG_ENV})  # PR 18: who this pane is; the switchboard's own-gh marker is blanked
         self.assertEqual(done["pane"], "w1:p%d" % self.world.herdr._pane_n)
         brief = [m for m in session["messages"] if m["type"] == "user"]
         self.assertEqual([(m["text"], m["metadata"]) for m in brief],
-                         [("Add a health check", {"fleet": {"from": "switchboard", "brief": True}})])
+                         [(sb.scratch_brief("Add a health check", str(Path(self.world.state) / "scratch" / "coder")), {"fleet": {"from": "switchboard", "brief": True}})])
         opened = self.order.index(("socket", ["layout.apply"]))
         prompt = self.order.index(("v2", ["session.prompt"]))
         between = self.order[opened:prompt]  # after the tab opens and before the brief: the checks
@@ -4264,6 +4265,7 @@ class TestLaunch(StandInPids, Base):
         self.launch()
         env = dict(self.world.herdr.socket_calls[0][1]["root"]["env"])
         del env["FLEET_AGENT_TMPDIR"]
+        del env["FLEET_SCRATCH"]   # #1329: asserted in its own tests below
         self.assertEqual(env, {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1", "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": "", **sb.NO_CREDENTIAL_DIALOG_ENV})
 
     def test_retire_removes_an_empty_private_directory_and_keeps_one_with_files(self):
@@ -4415,9 +4417,82 @@ class TestLaunch(StandInPids, Base):
                                    ("v2.session.prompt", "intent"), ("v2.session.prompt", "result")])
         layout = [e for e in self.world.audit() if e["event"] == "herdr.layout.apply"]
         self.assertEqual(layout[0]["detail"]["env_names"],
-                         ["FLEET_SWITCHBOARD_LAB_PANE", "FLEET_SWITCHBOARD_ROLE"] + sorted(sb.NO_CREDENTIAL_DIALOG_ENV) + ["XDG_CONFIG_HOME"])
+                         ["FLEET_SCRATCH", "FLEET_SWITCHBOARD_LAB_PANE", "FLEET_SWITCHBOARD_ROLE"] + sorted(sb.NO_CREDENTIAL_DIALOG_ENV) + ["XDG_CONFIG_HOME"])
         self.assertNotIn("/lab/config", json.dumps(layout))  # names, never values
         self.assertEqual(layout[1]["detail"]["pane"], self.world.herdr.panes and layout[1]["detail"]["pane"])
+
+    # --- #1329: the agent's private scratch directory
+    def scratch_path(self, name="coder"):
+        return Path(self.world.state) / "scratch" / name
+
+    def test_scratch_s1_launch_makes_the_directory_through_the_one_helper_private_and_ours(self):
+        real = sb.job_ensure_root
+        calls = []
+        with mock.patch.object(sb, "job_ensure_root", lambda root: (calls.append(str(root)), real(root))[1]):
+            done = self.launch()
+        path = self.scratch_path()
+        self.assertEqual(calls.count(str(path)), 1, calls)   # a bare mkdir would leave 0 calls
+        info = os.lstat(str(path))
+        self.assertEqual((stat.S_IMODE(info.st_mode), info.st_uid), (0o700, os.getuid()))
+        env = [c[1]["root"]["env"] for c in self.world.herdr.socket_calls][0]
+        self.assertEqual(env["FLEET_SCRATCH"], str(path))
+        text = [m["text"] for m in self.new_session(done)["messages"] if m["type"] == "user"][0]
+        self.assertEqual(text.count(str(path)), 1)
+
+    def test_scratch_s2_an_unsafe_path_refuses_the_launch_and_starts_nothing(self):
+        base = Path(self.world.state) / "scratch"
+        outside = self.home / "elsewhere"
+        outside.mkdir()
+        cases = {}
+        base.mkdir(parents=True, mode=0o700)
+        (base / "dangling").symlink_to(self.home / "nowhere")
+        (base / "tolink").symlink_to(outside)
+        (base / "loose").mkdir(mode=0o755)
+        os.chmod(str(base / "loose"), 0o755)
+        for name in ("dangling", "tolink", "loose"):
+            with self.subTest(name=name):
+                before = set(self.world.v2.sessions)
+                with self.assertRaises(sb.LaunchError) as caught:
+                    self.launch(name=name)
+                self.assertIn(str(base / name), str(caught.exception))
+                self.assertEqual(self.world.herdr.socket_calls, [])
+                self.assertEqual(set(self.world.v2.sessions), before)
+        self.assertEqual(os.listdir(str(outside)), [])   # nothing was made through the link
+        self.assertFalse((self.home / "nowhere").exists())
+        shutil.rmtree(str(base))   # the scratch root itself a link out of the state area
+        base.symlink_to(outside)
+        with self.assertRaises(sb.LaunchError):
+            self.launch(name="fresh")
+        self.assertEqual(os.listdir(str(outside)), [])
+
+    def test_scratch_s4_a_second_launch_reuses_the_directory_and_never_empties_it(self):
+        self.launch()
+        path = self.scratch_path()
+        (path / "note.txt").write_text("keep me")
+        inode = os.stat(str(path)).st_ino
+        retired = sb.agent_scratch_dir(self.engine, "coder")   # what a relaunch calls
+        self.assertEqual(retired, path)
+        self.assertEqual((os.listdir(str(path)), os.stat(str(path)).st_ino), (["note.txt"], inode))
+
+    def test_scratch_s3_s5_every_launch_kind_with_a_local_side_exports_and_names_it_derived_from_the_table_and_the_code(self):
+        import inspect
+        functions = {"pane": sb.launch_agent, "headless": sb.launch_headless}
+        def missing(table):
+            count = 0
+            for kind, local, exports, names in table:
+                if not local:
+                    continue
+                source = inspect.getsource(functions[kind])
+                if (exports and "agent_scratch_env(" not in source) or "scratch_brief(" not in source or "agent_scratch" not in source:
+                    count += 1
+            return count
+        self.assertEqual(missing(sb.LAUNCH_KINDS), 0)
+        self.assertEqual({row[0] for row in sb.LAUNCH_KINDS if row[1]}, set(functions))   # a local kind with no function here fails
+        broken = sb.LAUNCH_KINDS + (("pane2", True, True, True),)
+        with self.assertRaises(KeyError):
+            missing(broken)   # a row added to the table without a launch function cannot pass
+        functions["pane2"] = lambda: None
+        self.assertEqual(missing(broken), 1)
 
     def test_no_brief_means_no_prompt(self):
         done = self.launch(brief=None)
@@ -4431,7 +4506,7 @@ class TestLaunch(StandInPids, Base):
                 world.herdr.launch_mode = mode
                 engine = sb.Switchboard(world.config, sb.V2Client(FAKE_OPENCODE, {}, world.v2, 5),
                                         sb.HerdrClient(FAKE_HERDR, world.herdr, socket_call=world.herdr.socket),
-                                        sb.AuditLog(world.audit_path), [], world.clock.now, "cli")
+                                        sb.AuditLog(world.audit_path), [], world.clock.now, "cli", state_dir=world.state)
                 before = set(world.herdr.panes)
                 with self.assertRaises(sb.LaunchError) as caught:
                     sb.launch_agent(engine, "coder", "coder", str(self.work), "w1", "coder", brief="hello",
@@ -4462,6 +4537,7 @@ class TestLaunch(StandInPids, Base):
                 if sleeps and len(sleeps) == 2:
                     entry.pop("undetected", None)
 
+        engine.state_dir = Path(world.state)
         done = sb.launch_agent(engine, "coder", "coder", str(self.work), "w1", brief="hello", patience=10, sleep=sleep)
         self.assertEqual(len(sleeps), 2)
         self.assertEqual(world.herdr.closed, [])
@@ -6457,7 +6533,7 @@ class TestLaunch(StandInPids, Base):
         method, params = self.world.herdr.socket_calls[-1]
         self.assertEqual((method, params["root"]["command"], params["root"]["cwd"]),
                          ("layout.apply", [FAKE_OPENCODE, "-s", session], self.world.v2.sessions[session]["directory"]))
-        self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
+        self.assertEqual({k: v for k, v in params["root"]["env"].items() if k != "FLEET_SCRATCH"}, {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
                                                  "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": "", **sb.NO_CREDENTIAL_DIALOG_ENV})
         found = self.engine.discover(self.world.clock.now()).agents["platform"]
         self.assertEqual((found.session_id, found.pane), (session, done["pane"]))
@@ -6705,7 +6781,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(sorted(done), ["name", "pane", "session", "tab"])
         session = self.world.v2.sessions[done["session"]]
         self.assertEqual(session["metadata"]["fleet"]["reports_to"], "platform")
-        self.assertEqual(session["messages"][0]["text"], "Do the thing\n")
+        self.assertTrue(session["messages"][0]["text"].startswith("Do the thing\n"))
 
     def test_a_launch_records_who_ran_it_from_its_pane_and_nobody_from_a_plain_shell(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -18526,6 +18602,18 @@ class TestHeadlessPresence(Base):
         args.update(overrides)
         return sb.launch_headless(self.engine, **args)
 
+    def test_scratch_a_headless_launch_makes_the_private_directory_names_it_in_the_brief_and_refuses_a_symlink(self):
+        done = self.launch_hl()
+        path = Path(self.world.state) / "scratch" / "hw"
+        self.assertEqual(stat.S_IMODE(os.lstat(str(path)).st_mode), 0o700)
+        text = [m["text"] for m in self.world.v2.sessions[done["session"]]["messages"] if m["type"] == "user"][0]
+        self.assertEqual(text.count(str(path)), 1)
+        (Path(self.world.state) / "scratch" / "linked").symlink_to(self.home)
+        before = set(self.world.v2.sessions)
+        with self.assertRaises(sb.LaunchError):
+            self.launch_hl(name="linked")
+        self.assertEqual(set(self.world.v2.sessions), before)
+
     def test_a_headless_launch_records_who_ran_it_so_a_headless_tester_can_count_for_its_orchestrator(self):
         done = self.launch_hl(name="hw-tst", role="tester", launched_by="boss")
         fleet = self.world.v2.sessions[done["session"]]["metadata"]["fleet"]
@@ -18544,7 +18632,7 @@ class TestHeadlessPresence(Base):
         self.assertEqual(self.world.herdr.panes, panes_before, "no pane appeared")
         self.assertEqual(self.world.herdr.socket_calls, calls_before, "herdr was asked for no layout, tab or pane")
         brief = [m for m in session["messages"] if m["type"] == "user"]
-        self.assertEqual([(m["text"], m["metadata"]) for m in brief], [("Add a health check", {"fleet": {"from": "switchboard", "brief": True}})])
+        self.assertEqual([(m["text"], m["metadata"]) for m in brief], [(sb.scratch_brief("Add a health check", str(Path(self.world.state) / "scratch" / "hw")), {"fleet": {"from": "switchboard", "brief": True}})])
         record = self.ap.load_record(self.world.state, "hw")
         self.assertEqual((record["worker"], record["session"], record["kind"]), ("hw", done["session"], "local"))
         found = self.discover().agents["hw"]
