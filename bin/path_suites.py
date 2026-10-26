@@ -238,7 +238,8 @@ def guard_missing(root, guard):
         body = _read(root, path)
         if not re.search(r"(?m)^class %s\b" % re.escape(cls), body):
             return "class %s is not defined in %s" % (cls, path)
-        if test and not re.search(r"def %s\b" % re.escape(test), body):
+        block = re.search(r"(?ms)^class %s\b.*?(?=^class |\Z)" % re.escape(cls), body)
+        if test and not re.search(r"def %s\b" % re.escape(test), block.group(0)):
             return "test %s is not defined in %s" % (test, path)
     return ""
 
@@ -338,13 +339,30 @@ def resolve_base(root, base, runner=subprocess.run):
     return sha
 
 
+PID_FILE = "pid"   # the holder of a merged run holds the pid (and start time) of the process that owns it: a live owner is never swept, however old the holder is
+
+
+def _owner_alive(holder):
+    """True when the process recorded in the holder is still running (a holder with no readable record has no live owner)."""
+    try:
+        with open(os.path.join(holder, PID_FILE), encoding="utf-8") as handle:
+            pid = int(handle.read().split()[0])
+        os.kill(pid, 0)
+    except PermissionError:
+        return True   # the process exists, it is another user's: not ours to sweep from under it
+    except (OSError, ValueError, IndexError):
+        return False
+    return True
+
+
 def sweep_stale(root, runner=subprocess.run, now=None, age=SWEEP_AGE):
-    """Startup sweep: prune the administrative entries whose directory is gone, and remove a stale `merged-run-*` holder (older than `age` seconds) that a crash left,
-    then prune again. Only holders this module made (a `merged-run-` directory, under the temporary directory, holding a `tree`) are ever deleted; never forced, never a branch."""
+    """Startup sweep: remove a stale `merged-run-*` holder (older than `age` seconds, its recorded owner process no longer running) that a crash left. Only holders this module made
+    (a `merged-run-` directory, a real one directly under the temporary directory, holding a `tree`) are ever touched, and only THEIR administrative entry is removed, by a plain
+    `git worktree remove` (never forced, never a branch, never a repository-wide `git worktree prune`: that could drop the entry of the owner's own worktree on a volume that is
+    unmounted for the moment). A tree git will not remove without force is left, with its holder."""
     import shutil
     import time
     now = time.time() if now is None else now
-    _git(root, "worktree", "prune", runner=runner)
     listing = _git(root, "worktree", "list", "--porcelain", runner=runner)
     tmp = os.path.realpath(tempfile.gettempdir())
     for line in (listing.stdout or "").split("\n"):
@@ -355,11 +373,13 @@ def sweep_stale(root, runner=subprocess.run, now=None, age=SWEEP_AGE):
         if os.path.basename(tree) != "tree" or not os.path.basename(holder).startswith("merged-run-") or os.path.dirname(os.path.realpath(holder)) != tmp:
             continue
         try:
-            if now - os.lstat(holder).st_mtime > age:
+            if os.path.islink(holder) or now - os.lstat(holder).st_mtime <= age or _owner_alive(holder):
+                continue
+            runner(["git", "clean", "-fdxq"], cwd=tree, capture_output=True, text=True)
+            if runner(["git", "worktree", "remove", tree], cwd=root, capture_output=True, text=True).returncode == 0:
                 shutil.rmtree(holder, ignore_errors=True)
         except OSError:
             continue
-    _git(root, "worktree", "prune", runner=runner)
 
 
 class Merged:
@@ -387,6 +407,8 @@ class Merged:
     def _enter(self, sha):
         sweep_stale(self.root, self.runner)
         self.holder = tempfile.mkdtemp(prefix="merged-run-")
+        with open(os.path.join(self.holder, PID_FILE), "w", encoding="utf-8") as handle:
+            handle.write("%d\n" % os.getpid())
         tree = os.path.join(self.holder, "tree")
         _git(self.root, "worktree", "add", "--detach", tree, "HEAD", runner=self.runner, check=True)
         self.path = tree
@@ -414,7 +436,6 @@ class Merged:
                 sys.stderr.write("merged run: the temporary worktree %s could not be removed without force (%s): it is left there; the next merged run's sweep removes it after a day\n"
                                  % (self.path, " ".join((gone.stderr or "").split())[:120]))
                 return False
-            self.runner(["git", "worktree", "prune"], cwd=self.root, capture_output=True, text=True)
         if self.holder:
             shutil.rmtree(self.holder, ignore_errors=True)   # the holder only: it holds nothing once the tree is removed (or when `worktree add` failed)
         return False

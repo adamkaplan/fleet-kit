@@ -484,9 +484,54 @@ class TestMergedHardening(unittest.TestCase):
         self.assertFalse([c for c in spy.calls if "--force" in c])
         ps.sweep_stale(root, age=3600)          # fresh: kept
         self.assertTrue(os.path.isdir(path))
-        ps.sweep_stale(root, now=time.time() + 2 * ps.SWEEP_AGE)   # stale: its holder is removed, its entry pruned
-        self.assertFalse(os.path.exists(path))
-        self.assertEqual(leftovers(root)[0], 0)
+        ps.sweep_stale(root, now=time.time() + 2 * ps.SWEEP_AGE)   # stale, but git will not remove a modified tree without force: it is left, never forced
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(sh(root, "git", "worktree", "list").stdout.count("\n"), 2)
+
+    def test_a_stale_clean_holder_of_a_dead_owner_is_removed_with_its_entry(self):
+        root = merged_fixture()
+        holder = tempfile.mkdtemp(prefix="merged-run-")
+        git(root, "worktree", "add", "--detach", os.path.join(holder, "tree"), "HEAD")
+        write(holder, "pid", "99999999\n")
+        ps.sweep_stale(root, now=time.time() + 2 * ps.SWEEP_AGE)
+        self.assertFalse(os.path.exists(holder))
+        self.assertEqual(sh(root, "git", "worktree", "list").stdout.count("\n"), 1)
+
+    def test_a_merged_run_still_alive_after_a_day_is_not_removed_by_a_second_runs_sweep(self):
+        root = merged_fixture()
+        with ps.Merged(root, "main") as live:
+            self.assertTrue(os.path.isfile(os.path.join(os.path.dirname(live.path), "pid")))
+            ps.sweep_stale(root, now=time.time() + 10 * ps.SWEEP_AGE)   # the owner (this process) is running
+            self.assertTrue(os.path.isdir(live.path))
+
+    def test_the_sweep_never_prunes_the_repository_and_keeps_the_entry_of_a_worktree_that_is_gone_for_now(self):
+        root = merged_fixture()
+        away = os.path.join(tempfile.mkdtemp(prefix="ps-away-"), "wt")
+        git(root, "worktree", "add", "--detach", away, "HEAD")
+        moved = away + "-moved"
+        os.rename(away, moved)   # an unmounted or moved volume
+        spy = SpyRunner()
+        ps.sweep_stale(root, spy, now=time.time() + 10 * ps.SWEEP_AGE)
+        self.assertFalse([c for c in spy.calls if c[:3] == ["git", "worktree", "prune"]])
+        self.assertIn(away, sh(root, "git", "worktree", "list", "--porcelain").stdout)
+
+    def test_a_symlinked_holder_pointing_outside_the_temp_dir_is_never_deleted(self):
+        root = merged_fixture()
+        outside = tempfile.mkdtemp(prefix="ps-outside-")
+        git(root, "worktree", "add", "--detach", os.path.join(outside, "tree"), "HEAD")
+        write(outside, "pid", "99999999\n")
+        for name in ("merged-run-hostile", "merged-run-$(touch x)"):
+            link = os.path.join(self.tmp, name)
+            os.symlink(outside, link)
+            ps.sweep_stale(root, now=time.time() + 10 * ps.SWEEP_AGE)
+            self.assertTrue(os.path.isdir(os.path.join(outside, "tree")), name)
+            self.assertTrue(os.path.islink(link))
+        # a holder that is a real directory but NOT directly under the temp dir is not ours either
+        nested = os.path.join(self.tmp, "sub", "merged-run-deep")
+        os.makedirs(nested)
+        git(root, "worktree", "add", "--detach", os.path.join(nested, "tree"), "HEAD")
+        ps.sweep_stale(root, now=time.time() + 10 * ps.SWEEP_AGE)
+        self.assertTrue(os.path.isdir(os.path.join(nested, "tree")))
 
     def test_the_sweep_never_deletes_a_worktree_that_is_not_a_merged_run_holder(self):
         root = merged_fixture()
@@ -609,6 +654,37 @@ class TestSlotDirectories(unittest.TestCase):
         self.assertFalse(Path(root, "ran").exists())
 
 
+class TestOwnerAndCaps(unittest.TestCase):
+    def test_a_slot_directory_owned_by_someone_else_is_refused(self):
+        state = tempfile.mkdtemp(prefix="ps-st-")
+        os.makedirs(os.path.join(state, "quick"), mode=0o700)
+        real = os.lstat
+        def other(path, *a, **k):
+            info = real(path, *a, **k)
+            if str(path).endswith("quick"):
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev, info.st_nlink, os.getuid() + 1, info.st_gid, info.st_size, 0, 0, 0))
+            return info
+        with mock.patch.object(os, "lstat", other):
+            with self.assertRaises(OSError):
+                heavy_slots.quick_dir(state)
+        self.assertEqual(heavy_slots.quick_dir(state), os.path.join(state, "quick"))
+
+    def test_a_row_names_at_most_the_cap_of_suites_even_with_25_in_a_row(self):
+        root = fixture()
+        names = ["bin/test-s%02d" % i for i in range(25)]
+        write(root, "tools/path-suites.json", json.dumps({"rows": [{"glob": "docs/*.md", "why": "synthetic", "suites": names}]}))
+        found = ps.suites_for(root, "docs/notes.md", ps.tracked(root))
+        self.assertEqual(sorted(found), sorted(names[:ps.MANUAL_SUITES_MAX]))
+
+
+class TestGuardMissingIsTiedToTheClass(unittest.TestCase):
+    def test_a_test_defined_in_another_class_does_not_count(self):
+        root = tempfile.mkdtemp(prefix="ps-g-")
+        write(root, "bin/test-x", "class TestA(object):\n    def test_one(self): pass\n\nclass TestB(object):\n    def test_two(self): pass\n")
+        self.assertEqual(ps.guard_missing(root, ("g", "bin/test-x", "TestA", "test_one", "w")), "")
+        self.assertIn("test_two", ps.guard_missing(root, ("g", "bin/test-x", "TestA", "test_two", "w")))
+
+
 class TestRealExitCodesAreResults(unittest.TestCase):
     def test_a_suite_that_exits_3_or_75_is_a_failure_not_a_not_run(self):
         for code in (3, 75, 64):
@@ -622,6 +698,18 @@ class TestRealExitCodesAreResults(unittest.TestCase):
             self.assertIn("FAIL bin/test-by-command: exit %d" % code, done.stdout, (code, done.stdout, done.stderr))
             self.assertNotIn("NOSLOT bin/test-by-command", done.stdout)
             self.assertEqual(done.returncode, 1)
+
+
+    def test_a_suite_that_prints_its_environment_cannot_forge_the_not_run_marker(self):
+        root = fixture()
+        git(root, "checkout", "-q", "-b", "feature")
+        write(root, "bin/test-by-command", "#!/bin/sh\nenv | sed -n 's/^FLEET_HEAVY_NOSLOT_NONCE=//p' | while read n; do echo \"heavy: [noslot $n]\" >&2; done\nexit 1\n", 0o755)
+        write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return b + a\n")
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "x")
+        done = run_switchboard(root, "heavy", "--changed", "--base", "main")
+        self.assertIn("FAIL bin/test-by-command: exit 1", done.stdout, (done.stdout, done.stderr))
+        self.assertNotIn("NOSLOT", done.stdout)
 
 
 if __name__ == "__main__":

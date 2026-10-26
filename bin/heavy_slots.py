@@ -1199,6 +1199,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         if queue is not None and not (queue.leave() or queue.leave()):   # it has its slot (or none will come): out of the line at once; one more try before it says so
             out.write("heavy: could not leave the waiting order: the others pass this caller's ticket once its slot shows as held\n")
         env = dict(environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")   # #1050: a suite's git never opens a credential dialog
+        env.pop(NOSLOT_NONCE_ENV, None)   # the wrapper keeps the nonce to itself: a command that prints its environment cannot forge the "not run" marker line
         mem_mb = ceilings(environ)[0]
         max_seconds = resolve_ceiling(kind, environ, ceiling, ceiling_config)
         if fd is not None and short and index == EXPRESS:   # the express slot's own time ceiling (an environment value may only make it shorter)

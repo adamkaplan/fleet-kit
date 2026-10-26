@@ -20692,8 +20692,9 @@ def cmd_preflight_pr(args, runner, now):
             return EXIT_USAGE
         try:
             added = ps.added_paths(root, base, runner)
-        except ps.PathSuitesError:
+        except ps.PathSuitesError as err:
             added = []
+            print("NOTE: the files this branch adds under bin/ could not be listed (%s): the new-bin-file guards are not run" % err)
         with ps.Merged(root, base, runner) as merged:
             if merged.problem:
                 print("FAIL: %s" % merged.problem)
