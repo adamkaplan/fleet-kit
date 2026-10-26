@@ -88086,11 +88086,13 @@ class TestGhShimMergeGate(Base):
             self.assertEqual(done.returncode, 0, args)
             self.assertNotIn("review rule unreadable", done.stderr)
 
-    def test_the_own_gh_marker_skips_the_review_check_entirely_a_known_limit(self):
-        """KNOWN limit (pre-existing, not changed here): FLEET_SWITCHBOARD_OWN_GH=1 skips review_probe, so even a bad rule does not refuse."""
+    def test_the_own_gh_marker_does_not_skip_the_review_check(self):
+        """#1216: FLEET_SWITCHBOARD_OWN_GH=1 means nothing to the shim: review_probe still runs, so a bad rule still refuses."""
         self.bad_rule_shim(None)
         done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FLEET_SWITCHBOARD_OWN_GH="1"))
-        self.assertNotIn("review rule unreadable", done.stderr)
+        self.assertEqual(done.returncode, 10)
+        self.assertIsNone(seen)
+        self.assertIn("review rule unreadable", done.stderr)
 
     def test_every_sibling_module_the_shim_loads_ships_beside_it(self):
         shipped = {p.name for p in SHIM.parent.iterdir() if p.suffix == ".py" or p.name in ("gh", "git")}
@@ -88140,9 +88142,9 @@ class TestGhShimMergeGate(Base):
                 environ = {"PATH": "%s:%s:%s" % (self.home / "shimbin", self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
                            "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_REAL_GH": str(fake), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS,
                            "FLEET_SHIM_GATE_SECONDS": SHIM_LOOKUP_SECONDS}
-                if inner.own_marker or own:
-                    environ["FLEET_SWITCHBOARD_OWN_GH"] = "1"
-                done = subprocess.run([str(shim_gh)] + argv, capture_output=True, text=True, env=environ, timeout=60)
+                # #1216: no marker. An own call (own=True) runs the real gh by its path, so the shim never sees it; the merge call (own=False) goes through the shim
+                binary = str(fake) if own else str(shim_gh)
+                done = subprocess.run([binary] + argv, capture_output=True, text=True, env=environ, timeout=60)
                 inner.merges.append(list(argv))
                 return done.returncode, done.stdout, done.stderr
 
