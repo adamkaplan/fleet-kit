@@ -26310,6 +26310,10 @@ def code_snapshot():
     `bin/` already loaded, every function and class and the module itself (#924). `main` takes it before the registrars run and compares it after, for every action: a command registrar that replaces or rebinds any of them (the clear's code, the rating's path, the ledger the clear
     reads its score from) stops the command. Derived from what is loaded, never a list of names, so a binding added later is held the day it is added."""
     here = os.path.dirname(os.path.realpath(__file__))
+    try:
+        load_plan_ledger()   # the lazy ledger module is held whether or not an earlier command loaded it: its own first load by a command is not a registrar's edit
+    except Exception:
+        pass   # a missing module stops only the commands that use it
     held = {}
     def take(where, namespace, everything):
         for name, value in list(namespace.items()):
