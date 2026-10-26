@@ -93201,6 +93201,14 @@ class TestTriageStandingLine(unittest.TestCase):
         self.assertIn("T3", self.judge(10, facts("stranger")))
         self.assertIn("T12", self.judge(130, sb.triage_comment_facts([{"created_at": "2026-10-26T07:55:00Z", "body": self.LINE_DATED}])))   # no author read: not trusted
 
+    def test_an_unreadable_author_on_both_sides_does_not_silence(self):
+        item = {"author": "", "standing": None}
+        c = [{"author": "", "standing": ("date", sb.parse_iso("2026-10-29T00:00:00Z")), "at": sb.parse_iso("2026-10-26T07:55:00Z")}]
+        self.assertFalse(sb.triage_standing_silent(item, c, self.NOW, trusted=frozenset({"bot"})))
+        item["author"] = "writer"
+        c[0]["author"] = "writer"
+        self.assertTrue(sb.triage_standing_silent(item, c, self.NOW, trusted=frozenset({"bot"})))
+
     def test_s2_the_batch_shape_before_the_date_silences_t12(self):
         self.assertNotIn("T12", self.judge(130, self.comment(self.LINE_BATCH)))
 

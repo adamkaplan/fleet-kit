@@ -145,7 +145,9 @@ def triage_standing_silent(item, comments, now, merged_batch=False, trusted=froz
     latest = item.get("standing")   # (posted, state) from the body
     newer = False
     for c in comments or ():
-        if c.get("standing") is not None and (c.get("author") in trusted or c.get("author") == item.get("author")):   # only a fleet login or the issue's author can silence
+        if c.get("standing") is not None and (c.get("author") in trusted or (c.get("author") and c.get("author") == item.get("author"))):
+            # only a fleet login or the issue's author can silence. `trusted` is `triage_our_logins` (config `our_logins`, else gh_users values + owner_logins, lowercased, exact
+            # membership): the set triage already uses. A bot listed only in `github_bot_logins` does not silence until #1304 lands. An unreadable author ('' on both sides) never matches.
             latest, newer = (c["at"], c["standing"]), False
         else:
             newer = True
