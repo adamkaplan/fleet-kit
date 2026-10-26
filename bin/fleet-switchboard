@@ -2635,15 +2635,31 @@ class Switchboard:
             processes = self.herdr.pane_process_info(pane)
         except HerdrError:
             return entry
-        if runs_session(processes, reported):
+        sessions = own_sessions(processes, self.executable)   # the sessions of the AGENT'S OWN program, in a fixed order: never a wrapper's or a `grep -s ses_x`'s
+        if len(sessions) > 1:
+            self._note("fleetpane.report_ambiguous", pane, {"pane": pane, "reported": reported, "process_runs": sorted(sessions),
+                                                           "why": "the pane's processes name more than one session: nothing is bound to it"})
+            return None
+        if not sessions:   # no session on any process line (a fresh agent without -s, a shell): the report is trusted, but NEVER for a cloud session
+            if self.is_cloud_session(reported):
+                self._note("fleetpane.report_refused", pane, {"pane": pane, "reported": reported, "why": "a cloud session has no pane: the report is not trusted"})
+                return None
             return entry
-        running = [m.group(1) for p in processes if runs_program(p.get("cmdline"), self.executable)
-                   for m in [re.search(r"(?:^|\s)(?:-s|--session)(?:\s+|=)(ses_\S+)", str(p.get("cmdline") or ""))] if m]
-        if not running:
-            return entry   # no session named by the process (a shell, another program, a fresh opencode): nothing contradicts the report, and the program guard and the pane's health verdict judge it as before
-        self._note("fleetpane.report_disagrees", pane, {"pane": pane, "reported": reported, "process_runs": running[0] if running else None,
+        if sessions[0] == reported:
+            return entry
+        self._note("fleetpane.report_disagrees", pane, {"pane": pane, "reported": reported, "process_runs": sessions[0],
                                                    "why": "the multiplexer reports one session, the pane's process runs another: the report is not trusted"})
-        return dict(entry, agent_session=running[0], agent_status=None)
+        return dict(entry, agent_session=sessions[0], agent_status=None)
+
+    def is_cloud_session(self, session_id):
+        """True when the registry holds a row of a kind with no pane (a cloud worker) for this session."""
+        if self.state_dir is None:
+            return False
+        try:
+            rows = load_module("registry").read(self.state_dir)["agents"]
+        except Exception:
+            return False
+        return any(isinstance(r, dict) and r.get("session") == session_id and (r.get("kind") or "local") == "cloud" for r in rows.values())
 
     def check_program(self, observation):
         """The restart hazard: after a herdr restart a pane may be a shell, and
@@ -4444,6 +4460,7 @@ RETIRED_SHOW_DAYS = 7                    # a retired agent is listed once in `st
 PANE_HEALTH_FILE = "pane-health.json"
 PANE_CHECK_SECONDS = 60      # a pane is looked at again after this
 PANE_CHECKS_PER_PASS = 20    # `herdr pane get` + `pane read` pairs one pass may make
+PANE_HELD_PASSES = 20         # a pane gone from the list but held alive by its process this many passes in a row is said once
 PANE_MISSING_PASSES = 3      # a known agent absent from the herdr list this many passes in a row is DEAD (herdr restarts blink)
 PANE_ATTACHED, PANE_DETACHED, PANE_DEAD, PANE_UNKNOWN = "attached", "detached", "dead", "unknown"
 
@@ -4460,12 +4477,31 @@ def _shown_text(title, visible):
     return ("%s\n%s" % (title or "", visible or "")).lower()
 
 
-def runs_session(processes, session_id):
-    """True when a foreground process of the pane is `opencode ... -s <session_id>` (or --session): POSITIVE evidence the pane IS that session."""
+SESSION_ARG = r"(?:^|\s)(?:-s|--session)(?:\s+|=)(%s)(?:\s|$)"
+
+
+def own_sessions(processes, executable):
+    """The DISTINCT sessions named (`-s`/`--session`) by the foreground processes whose program is `executable`, in the order of the list. A process of
+    another program (`grep -s ses_x`) names none."""
+    out = []
+    for p in processes:
+        cmdline = str(p.get("cmdline") or "")
+        if not runs_program(cmdline, executable):
+            continue
+        m = re.search(SESSION_ARG % r"ses_\S+?", cmdline)
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def runs_session(processes, session_id, executable=None):
+    """True when a foreground process of the pane is `opencode ... -s <session_id>` (or --session): POSITIVE evidence the pane IS that session.
+    With `executable`, only a process of that program counts."""
     if not session_id:
         return False
-    pattern = re.compile(r"(?:^|\s)(?:-s|--session)(?:\s+|=)%s(?:\s|$)" % re.escape(session_id))
-    return any(pattern.search(str(p.get("cmdline") or "")) for p in processes)
+    pattern = re.compile(SESSION_ARG % re.escape(session_id))
+    return any(pattern.search(str(p.get("cmdline") or "")) for p in processes
+               if executable is None or runs_program(p.get("cmdline"), executable))
 
 
 def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()):
@@ -4849,6 +4885,19 @@ def bell_migration(engine, registry, now):
         engine.audit.append(engine.actor, "registry.bell_migrated", None, {"agents": got["changed"]})
 
 
+def live_cloud_record(state_dir, name, retired, now):
+    """#1066: True when `cloud/NAME.json` is the record of a LIVE cloud worker (`cloud_record_live`). A local agent that reuses the name of a finished
+    cloud worker is not a cloud worker: its pane and state are left alone."""
+    path = Path(state_dir) / "cloud" / (name + ".json")
+    try:
+        record, _kind = load_module("cloud_worker").read_record_file(path, CLOUD_LOAD_MAX_BYTES)
+    except (OSError, ValueError):
+        return False
+    if record is None or record.get("worker") != name:
+        return False
+    return cloud_record_live(record, name, retired, _read_small(state_dir, LAST_REPORT_FILE), now)
+
+
 def pane_health_pass(engine, now):
     """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
     audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
@@ -4871,7 +4920,7 @@ def pane_health_pass(engine, now):
               if isinstance(row, dict) and (row.get("kind") or "local") == "local" and not registry.no_pane_to_judge(row)}   # the agent list is the registry's; a row with no pane to judge (#1181) is never in it
     registered = {n: row for n, row in reg["agents"].items() if isinstance(row, dict)}
     for name, row in sorted(registered.items()):   # #1066: a cloud worker recorded as a local agent with a pane (the wrong record of a past pass) is put right by this pass
-        if (row.get("kind") or "local") == "local" and (Path(engine.state_dir) / "cloud" / (name + ".json")).is_file():
+        if (row.get("kind") or "local") == "local" and live_cloud_record(engine.state_dir, name, reg["retired"], now):
             fixed = dict(row, kind="cloud", pane=None, workspace=None, cwd=None, state="working")
             got = registry.upsert(engine.state_dir, name, fixed, now=now)
             if got["problem"]:
@@ -4899,6 +4948,7 @@ def pane_health_pass(engine, now):
         if (registered.get(name) or {}).get("kind", "local") != "local":
             continue         # a cloud worker has no pane (#1066): a local session of its name gets none
         missing.pop(name, None)
+        engine.__dict__.setdefault("pane_held", {}).pop(name, None)
         if name in retired and retired[name].get("session") == obs.session_id:
             states.pop(name, None)       # a retired agent is not judged; it stays listed under its own heading
             continue
@@ -4944,9 +4994,15 @@ def pane_health_pass(engine, now):
         missing[name] = int(missing.get(name, 0)) + 1
         if missing[name] >= PANE_MISSING_PASSES and agents[name].get("pane") and agents[name].get("session"):
             try:   # #1066: a pane whose process runs the agent's session is never dead, whatever the multiplexer's list says
-                if runs_session(engine.herdr.pane_process_info(agents[name]["pane"]), agents[name]["session"]):
+                if runs_session(engine.herdr.pane_process_info(agents[name]["pane"]), agents[name]["session"], engine.executable):
                     missing[name] = PANE_MISSING_PASSES - 1
+                    held = engine.__dict__.setdefault("pane_held", {})
+                    held[name] = held.get(name, 0) + 1
+                    if held[name] > PANE_HELD_PASSES:   # a lingering process keeps the agent alive: said once, still held (never declared dead on a process alone)
+                        engine._note("fleetpane.missing_held", name, {"pane": agents[name]["pane"], "passes": PANE_HELD_PASSES,
+                                                                      "why": "herdr no longer lists the pane but its process still runs the session"})
                     continue
+                engine.__dict__.setdefault("pane_held", {}).pop(name, None)
             except HerdrError:
                 pass
         if missing[name] >= PANE_MISSING_PASSES and (states.get(name) or {}).get("state") != PANE_DEAD:
@@ -22298,6 +22354,22 @@ def _cloud_when(text):
         return None
 
 
+def cloud_record_live(record, worker, retired, last_reports, now):
+    """The ONE liveness test of a cloud worker's record (#1097, #1066): not retired, no final report, not past its hard deadline (a record WITHOUT a valid
+    one is no evidence of life), and a last_report_at, if present, neither future-dated nor older than CLOUD_LOAD_STALE_SECONDS. An ended record stays on
+    disk until cloud-clear, so a file's existence proves nothing."""
+    if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+        return False
+    ends = _cloud_when(record.get("hard_deadline"))
+    if ends is None or ends < now:
+        return False
+    if "last_report_at" in record:
+        seen = _cloud_when(record.get("last_report_at"))
+        if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
+            return False
+    return True
+
+
 def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None, clock=None):
     """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded scan, no GitHub read, no process). A worker
     that is retired, made its final report, or is past its hard deadline is not counted; a record WITHOUT a valid hard_deadline (no evidence of liveness)
@@ -22336,15 +22408,8 @@ def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, 
                 record, _kind = reader(base / fname, CLOUD_LOAD_MAX_BYTES)
                 if record is None or record.get("worker") != worker:
                     continue
-                if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+                if not cloud_record_live(record, worker, retired, last_reports, now):
                     continue
-                ends = _cloud_when(record.get("hard_deadline"))
-                if ends is None or ends < now:
-                    continue   # no valid hard deadline is no evidence of life; a past one is an ended pod
-                if "last_report_at" in record:
-                    seen = _cloud_when(record.get("last_report_at"))
-                    if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
-                        continue   # a future-dated report is not fresh (a forged or skewed clock cannot keep a record live)
                 boss = _cloud_boss(record.get("reports_to"))
                 lane = resolve_boss(discovery, boss) if boss else CLOUD_NO_BOSS_LANE
                 counts[lane] = counts.get(lane, 0) + 1

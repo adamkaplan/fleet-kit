@@ -3200,7 +3200,7 @@ class TestPaneBoundByProcess(Base):
         self.registry.upsert(self.world.state, "cloud-w", {"session": "ses_cloud", "pane": "w9:p9"})
         cloud = self.world.state / "cloud"
         cloud.mkdir(exist_ok=True)
-        (cloud / "cloud-w.json").write_text("{}")
+        (cloud / "cloud-w.json").write_text(json.dumps({"worker": "cloud-w", "hard_deadline": "2999-01-01T00:00:00Z"}))
         self.world.clock.advance(sb.PANE_CHECK_SECONDS + 1) if hasattr(self.world.clock, "advance") else self.world.tick(sb.PANE_CHECK_SECONDS + 1)
         self.run_pass()
         rows = self.registry.read(self.world.state)["agents"]
@@ -3214,6 +3214,98 @@ class TestPaneBoundByProcess(Base):
         self.world.herdr.panes[self.pane_a]["undetected"] = True
         for _ in range(sb.PANE_MISSING_PASSES + 2):
             self.run_pass()
+        self.assertNotEqual(self.registry.read(self.world.state)["agents"]["agent-a"]["state"], "dead")
+
+
+    # -- S11: a local agent that reuses the name of a FINISHED cloud worker keeps its pane
+
+    def cloud_record(self, name, **extra):
+        cloud = self.world.state / "cloud"
+        cloud.mkdir(exist_ok=True)
+        (cloud / (name + ".json")).write_text(json.dumps(dict({"worker": name, "hard_deadline": "2999-01-01T00:00:00Z"}, **extra)))
+
+    def collide(self, how):
+        if how == "ended":
+            self.cloud_record("agent-a", retired=True)
+        elif how == "deadline":
+            self.cloud_record("agent-a", hard_deadline="2001-01-01T00:00:00Z")
+        elif how == "reported":
+            self.cloud_record("agent-a")
+            (self.world.state / sb.LAST_REPORT_FILE).write_text(json.dumps({"agent-a": {"state": "done", "at": int(self.world.clock.now())}}))
+
+    def test_S11_a_local_agent_reusing_a_finished_cloud_workers_name_keeps_its_pane_and_state(self):
+        for how in ("ended", "deadline", "reported", "retired"):
+            with self.subTest(how=how):
+                self.run_pass()
+                before = self.registry.read(self.world.state)["agents"]["agent-a"]["state"]
+                if how == "retired":
+                    self.cloud_record("agent-a")
+                    self.registry.retire(self.world.state, "agent-a", "test", "finished", session="ses_old_cloud")
+                else:
+                    self.collide(how)
+                self.run_pass()
+                row = self.registry.read(self.world.state)["agents"]["agent-a"]
+                self.assertEqual((row.get("kind") or "local", row["pane"]), ("local", self.pane_a))
+                self.assertEqual(row["state"], before)
+                self.assertEqual(self.lines("fleetpane.cloud_repaired"), [])
+
+    def test_S11_a_mutant_that_repairs_on_file_existence_fails(self):
+        self.run_pass()
+        self.cloud_record("agent-a", hard_deadline="2001-01-01T00:00:00Z")
+        with mock.patch.object(sb, "live_cloud_record", lambda state, name, retired, now: (Path(state) / "cloud" / (name + ".json")).is_file()):
+            self.run_pass()
+        self.assertTrue(self.lines("fleetpane.cloud_repaired"))   # the mutant repairs: the test above would catch it
+
+    # -- S12: when the terminal report is trusted
+
+    def test_S12_a_report_is_trusted_when_the_process_line_names_no_session(self):
+        self.world.herdr.panes[self.pane_a]["program"] = self.world.herdr.panes[self.pane_a]["program"].split(" -s")[0]
+        entry = {"pane_id": self.pane_a, "agent_session": self.a, "agent_status": "idle"}
+        self.assertEqual(self.engine.pane_truth(entry), entry)
+
+    def test_S12_a_cloud_session_in_the_report_is_never_bound(self):
+        self.registry.upsert(self.world.state, "cloud-w", {"session": "ses_cloud", "kind": "cloud"})
+        self.world.herdr.panes[self.pane_a]["program"] = self.world.herdr.panes[self.pane_a]["program"].split(" -s")[0]
+        self.assertIsNone(self.engine.pane_truth({"pane_id": self.pane_a, "agent_session": "ses_cloud", "agent_status": "idle"}))
+
+    def test_S12_a_disagreeing_report_binds_nothing_for_the_reported_agent(self):
+        got = self.engine.pane_truth({"pane_id": self.pane_a, "agent_session": self.b, "agent_status": "idle"})
+        self.assertEqual(got["agent_session"], self.a)
+        self.assertEqual(len(self.lines("fleetpane.report_disagrees")), 1)
+
+    # -- S13: several sessions in one pane
+
+    def procs(self, *cmdlines):
+        return [{"cmdline": c, "name": c.split(" ")[0], "pid": 1} for c in cmdlines]
+
+    def truth_with(self, processes, reported):
+        with mock.patch.object(sb.HerdrClient, "pane_process_info", return_value=processes):
+            return self.engine.pane_truth({"pane_id": self.pane_a, "agent_session": reported, "agent_status": "idle"})
+
+    def test_S13_the_result_is_the_same_in_both_process_orders_and_a_grep_names_no_session(self):
+        exe = self.engine.executable
+        mine, other = "%s -s %s" % (exe, self.a), "grep -s ses_other"
+        for order in ((mine, other), (other, mine)):
+            with self.subTest(order=order):
+                got = self.truth_with(self.procs(*order), self.b)
+                self.assertEqual(got["agent_session"], self.a)
+
+    def test_S13_two_distinct_sessions_bind_nothing_with_one_audit_line(self):
+        exe = self.engine.executable
+        for order in ((self.a, self.b), (self.b, self.a)):
+            self.assertIsNone(self.truth_with(self.procs(*["%s -s %s" % (exe, s) for s in order]), self.a))
+        self.assertEqual(len(self.lines("fleetpane.report_ambiguous")), 1)
+
+    # -- S14: a lingering process is held, and said
+
+    def test_S14_a_pane_gone_from_the_list_but_alive_by_process_is_said_once_after_many_passes(self):
+        self.run_pass()
+        del self.world.herdr.panes[self.pane_b]
+        self.world.herdr.panes[self.pane_a]["session"] = None
+        self.world.herdr.panes[self.pane_a]["undetected"] = True
+        for _ in range(sb.PANE_HELD_PASSES + 5):
+            self.run_pass()
+        self.assertEqual(len(self.lines("fleetpane.missing_held")), 1)
         self.assertNotEqual(self.registry.read(self.world.state)["agents"]["agent-a"]["state"], "dead")
 
 
