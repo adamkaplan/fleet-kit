@@ -88372,6 +88372,8 @@ class TestPullFileListRead(LedgerBase):
             "no_review": lambda: pure({"review_action": None}),
             "review_no_class": lambda: pure({"review_action": "hold", "review_class": None}),
             "review_top_class": lambda: pure({"review_class": "authority"}),
+            "registrar": lambda: pure({"registrar_reasons": ["bin/daemon.py: a registrar calls a name of the clear's closure"]}),
+            "registrar_unreadable": lambda: pure({"registrar_reasons": None}),
             "score": lambda: pure(scored={"level": "High", "reasons": ["the score is High: High is the owner's"]}),
             "files_unreadable": lambda: module.causes_of(rule, {"owner_decision": "none", "complete": True, "review_action": "none"}, None, matches),
             "file_unreadable": lambda: pure(files=[{"status": "modified"}]),
