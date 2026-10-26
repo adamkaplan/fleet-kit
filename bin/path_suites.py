@@ -373,7 +373,7 @@ def sweep_stale(root, runner=subprocess.run, now=None, age=SWEEP_AGE):
         if os.path.basename(tree) != "tree" or not os.path.basename(holder).startswith("merged-run-") or os.path.dirname(os.path.realpath(holder)) != tmp:
             continue
         try:
-            if os.path.islink(holder) or now - os.lstat(holder).st_mtime <= age or _owner_alive(holder):
+            if now - os.lstat(holder).st_mtime <= age or _owner_alive(holder):
                 continue
             runner(["git", "clean", "-fdxq"], cwd=tree, capture_output=True, text=True)
             if runner(["git", "worktree", "remove", tree], cwd=root, capture_output=True, text=True).returncode == 0:
