@@ -94131,6 +94131,10 @@ class ReviewCommentEndToEndTests(Base):
         path = Path(self.world.state) / sb.REVIEW_UNOWNED_FILE
         path.write_text("{not json")
         self.assertFalse(fresh._unowned_seen("github.reviewcomment:1"))   # a corrupt file reads as empty
+        path.write_text("[" * 100000 + "]" * 100000)
+        self.assertFalse(fresh._unowned_seen("deep"))   # nested past the bound: empty, no exception
+        self.assertEqual(json.loads(path.read_text()), ["deep"])
+        self.assertTrue(fresh._unowned_seen("deep"))
         path.write_text(json.dumps(["k%d" % i for i in range(sb.REVIEW_UNOWNED_CAP + 5)]))
         fresh._unowned_seen("new")
         self.assertLessEqual(len(json.loads(path.read_text())), sb.REVIEW_UNOWNED_CAP)

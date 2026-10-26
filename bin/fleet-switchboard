@@ -11945,7 +11945,7 @@ class GitHubHub:
         otherwise records it and returns False."""
         path = Path(self.state_dir) / REVIEW_UNOWNED_FILE
         try:
-            seen = json.loads(path.read_text())
+            seen = load_module("record_json").parse_bounded(path.read_text())   # too deep reads as empty, like a corrupt file (#1314)
             seen = [k for k in seen if isinstance(k, str)] if isinstance(seen, list) else []
         except (OSError, ValueError):
             seen = []
