@@ -437,7 +437,7 @@ class TestTheReadersAgree(unittest.TestCase):
             if "/pulls/7/files" in api:
                 return done(files)
             if api.endswith("/pulls/7"):
-                return done({"head": {"sha": "h" * 40}, "base": {"sha": "b" * 40}})
+                return done({"head": {"sha": "h" * 40}, "base": {"sha": "b" * 40}, "changed_files": len(files)})
             if "/compare/" in api:
                 return done({"merge_base_commit": {"sha": "b" * 40}})
             if "/contents/" in api:
@@ -468,7 +468,7 @@ class TestTheReadersAgree(unittest.TestCase):
         listed, _ = self.sb.impact_floor.clear_code_paths(matrix)
         rule = dict(matrix["owner_hold"]["delegated_clear"], clear_code_paths=listed)
         _files, refusal, why = self.sb.closure_read(engine, runner, "acme-org/widget-api", 7, head, rule)
-        self.assertIsNone(why)
+        self.assertEqual(why, [])
         held, why = self.sb.closure_hold(engine, "acme-org/widget-api", 7, head, paths, matrix)
         self.assertIsNone(why)
         self.assertEqual(sorted(set(refusal)), sorted(edits), "every changed file of the closure is read")
@@ -509,7 +509,7 @@ class TestTheReadersAgree(unittest.TestCase):
             self.assertIn("cannot be derived", why)
             listed, _ = self.sb.impact_floor.clear_code_paths(matrix)
             _f, _c, why = self.sb.closure_read(engine, runner, "acme-org/widget-api", 7, head, dict(matrix["owner_hold"]["delegated_clear"], clear_code_paths=listed))
-            self.assertIn("cannot be derived", why)
+            self.assertIn("cannot be derived", why[0]["text"])
         decision, _ = self.sb.impact_floor.owner_decide(matrix, ["docs/x.md"], [], None, (), None, None, (None, "the clear's closure cannot be derived: held"))
         self.assertEqual(decision, "hold")
 
