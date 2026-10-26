@@ -21643,7 +21643,7 @@ def impact_would_hold_pass(engine, now):
             except impact_floor.MatrixError as err:   # fail LOUD: no judgement is made while the matrix file cannot be read (never read as "no floor")
                 _impact_matrix_episode(engine, now, err)
                 return
-            if not globs:   # no floor paths: only an independent `hold` rating (or the release of one the daemon wrote) is judged here, never a path rule (#1041)
+            if not globs and (not ours or ((records.get((pr, head)) or ("",))[0] == "hold" and not records_problem)):   # no floor paths: only an independent `hold` rating (or the release of one the daemon wrote) is judged here, never a path rule (#1041)
                 spent, skipped = _impact_unpathed_judge(engine, now, key, number, head, rule, enforce, records, records_problem, record, budget, seen, reports, released_now)
                 budget -= spent
                 unjudged += skipped
