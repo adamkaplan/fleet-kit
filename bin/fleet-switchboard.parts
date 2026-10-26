@@ -20,7 +20,7 @@ switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
 switchboard/faults.py
-switchboard/policy_questions.py
+switchboard/shadow_classifier.py
 switchboard/worktree_lifecycle.py
 switchboard/verification.py
 switchboard/judge_rule.py
