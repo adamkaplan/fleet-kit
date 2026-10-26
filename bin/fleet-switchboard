@@ -445,12 +445,72 @@ def _xdg(variable, fallback):
     return Path.home() / fallback
 
 
+class RealStateRefused(ConfigError):
+    """The test suite (FLEET_SWITCHBOARD_UNDER_TEST) was about to use the real state, config or audit location of the running daemon."""
+
+
+REAL_LOCATIONS_ENV = "FLEET_SWITCHBOARD_REAL_LOCATIONS"   # a JSON object {"state": [...], "config": [...], "audit": [...]} the test process sets before it isolates anything
+
+
+def real_locations_from(env, with_pwd=True):
+    """The state directories, config directories and audit paths of the running daemon, resolved, for the environment `env` (a mapping): the account's
+    own home (not $HOME) and, from `env`, HOME and the XDG variables."""
+    import pwd
+    homes = []
+    if with_pwd:
+        try:
+            homes.append(Path(pwd.getpwuid(os.getuid()).pw_dir))
+        except KeyError:
+            pass
+    if env.get("HOME"):
+        homes.append(Path(env["HOME"]))
+    states, configs = [], []
+    for h in homes:
+        states.append(h / ".local/state" / PROG)
+        configs.append(h / ".config" / PROG)
+    for variable, into in (("XDG_STATE_HOME", states), ("XDG_CONFIG_HOME", configs)):
+        value = env.get(variable)
+        if value and os.path.isabs(value):
+            into.append(Path(value) / PROG)
+    resolve = lambda path: os.path.realpath(str(path))
+    return ({resolve(p) for p in states}, {resolve(p) for p in configs}, {resolve(p / "audit.jsonl") for p in states})
+
+
+def _real_locations():
+    """The real locations a test run refuses. A test run computes them in its own process before any isolation and passes them to its children in
+    REAL_LOCATIONS_ENV: a child started with a temporary HOME is then fine, and one pointed at the real directory is refused. Without it: the
+    account's own home only."""
+    given = os.environ.get(REAL_LOCATIONS_ENV)
+    if given:
+        try:
+            table = json.loads(given)
+            return tuple({os.path.realpath(str(p)) for p in table[k]} for k in ("state", "config", "audit"))
+        except (ValueError, KeyError, TypeError):
+            pass
+    return real_locations_from({})
+
+
+def refuse_real_location(path, kind):
+    """Under FLEET_SWITCHBOARD_UNDER_TEST, raise RealStateRefused when `path` (kind: state, config or audit) resolves, by EQUALITY after realpath
+    (a temporary directory under the real home is fine), to the real one. Inert when the marker is not set: the daemon never sets it."""
+    if not os.environ.get(UNDER_TEST_ENV):
+        return path
+    states, configs, audits = _real_locations()
+    real = {"state": states, "config": configs, "audit": audits}[kind]
+    resolved = os.path.realpath(str(path))
+    if resolved in real:
+        raise RealStateRefused("a test run must not use the real %s location %s (resolved from %s): run the test in an isolating class (Base) or pass a temporary path" % (kind, resolved, path))
+    return path
+
+
 def config_path():
-    return _xdg("XDG_CONFIG_HOME", ".config") / PROG / "config.json"
+    return refuse_real_location(_xdg("XDG_CONFIG_HOME", ".config") / PROG, "config") / "config.json"
 
 
-def state_dir_path():
-    return _xdg("XDG_STATE_HOME", ".local/state") / PROG
+def state_dir_path(guard=True):
+    """The default state directory. guard=False is for the one caller that takes a CPU slot, which is shared with the daemon by design (`heavy`)."""
+    path = _xdg("XDG_STATE_HOME", ".local/state") / PROG
+    return refuse_real_location(path, "state") if guard else path
 
 
 RETIRE_IDLE_MIN, RETIRE_IDLE_MAX = 1, 10080   # minutes: `retire_idle_minutes` is a finite number in this range (a week at most)
@@ -940,7 +1000,7 @@ def ensure_state_dir(path=None):
     someone else owns, or that the group or world can read, is refused rather
     than repaired: something changed it, and that deserves a person's look.
     """
-    path = Path(path) if path else state_dir_path()
+    path = refuse_real_location(Path(path) if path else state_dir_path(), "state")
     if not path.exists():
         try:
             path.mkdir(parents=True, mode=0o700)

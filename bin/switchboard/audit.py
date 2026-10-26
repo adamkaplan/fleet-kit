@@ -46,7 +46,7 @@ class AuditLog:
     _failed = {}   # path -> (error text, monotonic time) of the last rotation failure said
 
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = refuse_real_location(Path(path), "audit")
 
     def append(self, actor, event, subject=None, detail=None, **extra):
         entry = {"ts": utc_now(), "actor": actor, "event": event,
