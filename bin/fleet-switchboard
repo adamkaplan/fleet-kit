@@ -11861,7 +11861,7 @@ class GitHubHub:
         return out
 
     def plan_kind(self, repo, number, budget=None):
-        """"plan", "noplan" or "unknown" for an issue: whether a comment of it is the plan comment (the reading `plan check` uses,
+        """"plan", "noplan", "defect" (a second plan-looking comment: the one rule of plan_comment_choice) or "unknown" for an issue: whether a comment of it is the plan comment (the reading `plan check` uses,
         plan_check.select_plan_text; it does not check the author, the latest heading comment counts whoever wrote it; a plan in the
         issue BODY reads "noplan": the ask says a plan COMMENT). One read of the first 100 comments, cached for GITHUB_LOOKUP_TTL; a failed
         read is remembered for GITHUB_LOOKUP_RETRY and says "unknown". A full page (100) with no plan found reads "unknown" (the plan may
@@ -11884,7 +11884,8 @@ class GitHubHub:
                                 timeout=min(self.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT))
             comments = pages[0] if pages and isinstance(pages[0], list) else None
             if comments is not None and len(comments) < 100:
-                kind = "plan" if plan_check.select_plan_text("", comments)[1] != "issue body" else "noplan"
+                text, source, defects = plan_comment_choice("", comments)
+                kind = "defect" if second_plan_defects(defects) else ("plan" if source != "issue body" else "noplan")
                 ttl = GITHUB_LOOKUP_TTL
         except Exception:
             pass
@@ -15097,8 +15098,20 @@ def parse_plan_source(text, default_repo=None):
     return repo, int(found.group(2)), None
 
 
+def plan_comment_choice(body, comments):
+    """(text, source, defects): the ONE rule every reader of an issue's plan applies: the plan select_plan_text picks, with the comment-level
+    defects (a second plan-looking comment naming both ids, a bad receipt) RETURNED beside it, never kept in a global."""
+    text, source = plan_check.select_plan_text(body, comments)
+    return text, source, plan_check.plan_comment_defects(comments)
+
+
+def second_plan_defects(defects):
+    return [d for d in defects if d.get("code") == "second-plan-comment"]
+
+
 def fetch_plan(reader, repo, number, comment_id=None):
-    """(text, source label, done_when of the issue) read from GitHub with GETs only. `reader` has `_api(path, repo)`."""
+    """(text, source label, done_when of the issue, comment-level defects) read from GitHub with GETs only. `reader` has `_api(path, repo)`.
+    The defects are computed from every comment of the issue also when `comment_id` names one: naming a comment does not skip the report."""
     try:
         issue = reader._api("repos/%s/issues/%d" % (repo, number), repo)
         comments = []
@@ -15112,14 +15125,15 @@ def fetch_plan(reader, repo, number, comment_id=None):
     except IntentError as err:
         raise PlanInputError("cannot read %s#%d: %s" % (repo, number, err)) from None
     body = issue.get("body") if isinstance(issue, dict) and isinstance(issue.get("body"), str) else ""
+    defects = plan_check.plan_comment_defects(comments)
     if comment_id is not None:
         picked = [c for c in comments if isinstance(c, dict) and c.get("id") == comment_id]
         if not picked:
             raise PlanInputError("%s#%d has no comment %d" % (repo, number, comment_id))
         text, source = picked[0].get("body") or "", "comment %d%s" % (comment_id, plan_check.comment_author(picked[0]))
     else:
-        text, source = plan_check.select_plan_text(body, comments)
-    return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1]
+        text, source, defects = plan_comment_choice(body, comments)
+    return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1], defects
 
 
 def _parent_ask_done_when(reader, repo, number):
@@ -15170,6 +15184,7 @@ def load_plan(args, runner, now):
         raise PlanInputError("the plan checker (bin/plan_check.py) cannot be loaded: %s" % _one_line(str(err), 150)) from None
     done_when = args.done_when
     plan_own = None
+    comment_defects = []
     if args.file:
         if args.source:
             raise PlanInputError("give a plan source or --file, not both")
@@ -15191,7 +15206,7 @@ def load_plan(args, runner, now):
         repo, number, comment_id = parse_plan_source(args.source, config.get("intent_repo"))
         reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"],
                               accounts=GhAccounts(config, runner, now))
-        text, source, issue_done = fetch_plan(reader, repo, number, comment_id)
+        text, source, issue_done, comment_defects = fetch_plan(reader, repo, number, comment_id)
         if args.ask and not done_when:
             ask_repo, ask_number, _ = parse_plan_source(args.ask, repo)
             done_when = reader.issue(ask_number, ask_repo).done_when  # the ask is the authority
@@ -15204,7 +15219,11 @@ def load_plan(args, runner, now):
                 done_when = _parent_ask_done_when(reader, repo, number)
     if args.ask and args.file and not args.done_when:
         raise PlanInputError("--ask needs a plan read from GitHub; for --file give --done-when TEXT")
-    return text, source, plan_check.check(text, done_when, plan_own)
+    result = plan_check.check(text, done_when, plan_own)
+    if comment_defects:
+        result["defects"] = list(result["defects"]) + list(comment_defects)
+        result["result"] = "fail"
+    return text, source, result
 
 
 def cmd_plan_check(args, runner, now):
@@ -15459,7 +15478,7 @@ def ask_refusal(issue, ref):
 
 
 def ask_plan_comment(engine, repo, number):
-    """The newest plan comment (a heading `Plan (scenarios)`) of the issue `repo#number`, or None. GETs only; a page that cannot be read is no plan."""
+    """The newest plan comment (a heading `Plan (scenarios)`) of the issue `repo#number`, or None; a second plan-looking comment raises LedgerCommandError naming both. GETs only; a page that cannot be read is no plan."""
     comments = []
     try:
         for page in range(1, PLAN_COMMENT_PAGES + 1):
@@ -15471,7 +15490,9 @@ def ask_plan_comment(engine, repo, number):
                 break
     except (IntentError, AttributeError):
         return None
-    text, source = plan_check.select_plan_text("", comments)
+    text, source, defects = plan_comment_choice("", comments)
+    if second_plan_defects(defects):
+        raise LedgerCommandError("refused: %s#%d: %s, nothing was recorded" % (repo, number, second_plan_defects(defects)[0]["message"]))
     return text if source != "issue body" else None
 
 

@@ -17,6 +17,12 @@ constraint (`PC-n`) with its reason.
 | the reply arrives within 5 s | use a background queue with a 2 s poll |
 | existing projects are listed exactly as before | do not touch `list()` |
 
+## One plan comment
+
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+
+**Receipts.** A receipt is the line `<!-- plan-receipt -->`, then `plan hash: sha256:<the new hash>`, then two to four lines of what changed and why. It carries no plan text; `plan check` reports a receipt that quotes the plan, and a second comment that looks like a plan.
+
 ## Sections of a plan
 
 Recorded as an issue, or a section of one, **in the repo the work concerns**. Required:

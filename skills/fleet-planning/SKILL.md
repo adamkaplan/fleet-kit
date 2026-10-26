@@ -16,6 +16,12 @@ workspace's plan. No plan, no assignment. A tiny work item under an already-revi
 Who approves: a work item's plan, its orchestrator (the Chief of Staff if it touches a held-PR area); an ask's, the Chief of
 Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
+## One plan comment
+
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+
+Receipt format: `docs/plan-template.md`.
+
 ## The method, in order
 
 1. **Done-when**: copy the ask's clauses, numbered `(1) ... (2) ...`. They are the authority; never reword them.
