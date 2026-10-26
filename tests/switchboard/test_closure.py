@@ -321,7 +321,7 @@ class TestEveryMember(unittest.TestCase):
     """A changed line in EACH member of the closure (definitions and bindings, derived here from the real files) is refused by the real mapper and named; one patch for a file changes one line of every member of it."""
 
     def reasons_for(self, rel, text, head, roots, module_level, entry_points=frozenset()):
-        return CLEAR.closure_refusals(text, head, patch_of(text, head), roots, entry_points, module_level, list(RULE["dynamic_actions"]))
+        return CLEAR.closure_refusals(text, head, patch_of(text, head), roots, entry_points, module_level, list(RULE["dynamic_actions"]), CLEAR.known_of(derived()) if rel == RULE["daemon_file"] else None)
 
     def test_s9_every_member_is_refused_and_named(self):
         found, total = derived(), 0
@@ -358,7 +358,7 @@ class TestEveryMember(unittest.TestCase):
             head = changed(text, [node.body[-1].end_lineno])
             info = found.files.get(rel, {"roots": [], "module_level": True})
             roots = CLEAR.daemon_roots(RULE, found) if rel == RULE["daemon_file"] else info["roots"]
-            got = CLEAR.closure_refusals(text, head, patch_of(text, head), roots, set(RULE["clear_entry_points"]) if rel == RULE["daemon_file"] else set(), info["module_level"], list(RULE["dynamic_actions"]))
+            got = CLEAR.closure_refusals(text, head, patch_of(text, head), roots, set(RULE["clear_entry_points"]) if rel == RULE["daemon_file"] else set(), info["module_level"], list(RULE["dynamic_actions"]), CLEAR.known_of(found) if rel == RULE["daemon_file"] else None)
             self.assertEqual([r for r in got if node.name in r], [], rel)
             outside += 1
         self.assertEqual(outside, 2)
@@ -387,8 +387,10 @@ class TestEveryMember(unittest.TestCase):
                 d, g, r, m = cached_closure(tree, roots_, dynamic)
                 return d - {drop}, g - {drop}, r - {drop}, {k: v for k, v in m.items() if k != drop}
             parse = lambda source, *a, **k: base_tree
+            whole = CLEAR.known_of(found)
+            known = (whole[0] - {drop}, whole[1] - {drop}, whole[2] - {drop}, {k: v for k, v in whole[3].items() if k != drop})
             with unittest.mock.patch.object(CLEAR, "closure", mutant), unittest.mock.patch.object(CLEAR.ast, "parse", parse):
-                return [r for r in CLEAR.closure_refusals(text, head, patch, roots, set(), False, list(RULE["dynamic_actions"])) if re.search(r"\b%s\b" % re.escape(name), r)]
+                return [r for r in CLEAR.closure_refusals(text, head, patch, roots, set(), False, list(RULE["dynamic_actions"]), known) if re.search(r"\b%s\b" % re.escape(name), r)]
         survivors = []
         for name, line in sorted(lines.items()):
             real = refused(name, line, None)

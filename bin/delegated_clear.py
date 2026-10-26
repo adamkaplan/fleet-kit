@@ -643,7 +643,7 @@ def changed_lines(patch):
     return old, new
 
 
-def closure_refusals(base_src, head_src, patch, roots, entry_points, module_level=False, dynamic_actions=()):
+def closure_refusals(base_src, head_src, patch, roots, entry_points, module_level=False, dynamic_actions=(), known=None):
     """[reasons] a change to the daemon file touches the clear closure. `base_src` and `head_src` are the file before and after, `patch` the diff of it, `roots` the clear command's entry points and
     `entry_points` the names a NEW caller of is refused. The closure is computed on BOTH files and united (a pull request that ADDS a call into it counts). The changed lines are mapped to the
     top-level definition they are in by the ast of the file they belong to (removed lines against the base, added lines against the head). Refused: a closure definition changed; a module-level
@@ -658,6 +658,10 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
     base_closure, head_closure = closure(base, roots, dynamic_actions), closure(head, roots, dynamic_actions)
     in_defs, in_globals, in_refs = (base_closure[0] | head_closure[0]), (base_closure[1] | head_closure[1]), (base_closure[2] | head_closure[2])
     in_members = {k: base_closure[3].get(k, set()) | head_closure[3].get(k, set()) for k in set(base_closure[3]) | set(head_closure[3])}
+    if known is not None:   # the ONE closure of the whole assembly (#940): what the entry file's own walk cannot reach because it passes through a part is still in the closure
+        in_defs, in_globals, in_refs = in_defs | known[0], in_globals | known[1], in_refs | known[2]
+        for k, v in known[3].items():
+            in_members[k] = in_members.get(k, set()) | v
     reasons = []
     for side, tree, numbers in (("base", base, lines[0]), ("head", head, lines[1])):
         spans = [(_span(n), n) for n in tree.body]
@@ -905,7 +909,7 @@ class Closure:
     entry file alone; `plain`: (entry defs, assembled defs, entry bindings, assembled bindings) from the derived roots alone; `files`: {path: {"roots": [...], "module_level": bool}} of every file judged by the closure
     rule (the entry, each part that holds a definition or a binding the closure reads, each flat module the clear loads or runs); `problems`: why the closure is not decided by the code."""
     def __init__(self):
-        self.roots, self.defs, self.binds, self.entry_defs, self.plain, self.files, self.problems, self.flat_modules, self.members = [], set(), set(), set(), (0, 0, 0, 0), {}, [], [], {}
+        self.roots, self.defs, self.binds, self.entry_defs, self.plain, self.files, self.problems, self.flat_modules, self.members, self.refs = [], set(), set(), set(), (0, 0, 0, 0), {}, [], [], {}, set()
 
 
 def derive_closure(rule, sources, flat, matches):
@@ -942,7 +946,7 @@ def derive_closure(rule, sources, flat, matches):
     daemon_roots_ = sorted(roots | set(rule.get("rating_roots") or []))
     out.entry_defs = set(closure(entry, daemon_roots_, dynamic)[0])
     defs, binds, refs, members = closure(whole, daemon_roots_, dynamic)
-    out.defs, out.binds, out.members = set(defs), set(binds), {k: set(v) for k, v in members.items()}
+    out.defs, out.binds, out.members, out.refs = set(defs), set(binds), {k: set(v) for k, v in members.items()}, set(refs)
     pe, pw = closure(entry, out.roots, dynamic), closure(whole, out.roots, dynamic)
     out.plain = (len(pe[0]), len(pw[0]), len(pe[1]), len(pw[1]))
     owners, per_part = {}, {}
@@ -1070,6 +1074,11 @@ def closure_for(rule, root=None, matches=None):
             _CACHE.clear()
         _CACHE[key] = derive_closure(rule, sources, flat, matches)
     return _CACHE[key]
+
+
+def known_of(derived):
+    """What the closure of the whole assembly holds, in the shape `closure_refusals` takes as `known`."""
+    return (derived.defs, derived.binds, derived.refs, derived.members)
 
 
 def with_closure(rule, derived):

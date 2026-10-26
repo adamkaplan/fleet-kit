@@ -1103,7 +1103,7 @@ def delegated_clear_map(engine, runner, repo, item, base_sha, rule, derived=None
             return unread
         names = module.shadow_names(rule, derived)
         if item["filename"] == rule["daemon_file"]:
-            found = module.closure_refusals(base, head, item["patch"], module.daemon_roots(rule, derived), set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or []))
+            found = module.closure_refusals(base, head, item["patch"], module.daemon_roots(rule, derived), set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or []), module.known_of(derived))
             return found or module.shadow_refusals(base, head, names, item["filename"])   # the entry's own definitions are judged above; the added name is the only thing left to say
         if not judged:   # a part the closure does not judge: only a name added under a closure name is looked at (#1339)
             return module.shadow_refusals(base, head, names, item["filename"])
