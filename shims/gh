@@ -356,11 +356,15 @@ def warn_low(account, low):
 # There is NO per-agent cap, count or quota here or in any configuration: the top spender is a RANKING of the last hour, recomputed from the daemon's record at every
 # call, never a limit and never remembered. The wait is bounded and ends the moment no account the caller tops is low; nothing is refused.
 #
-# WHAT A CALLER CAN SET. This block reads NO environment variable of its own: the state directory is the account's home from the password database (never HOME,
-# XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE), the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN), (the retired FLEET_SWITCHBOARD_OWN_GH
-# is read nowhere in this file, the switchboard's own calls run the real gh by path), the timeouts are constants, and it looks at EVERY low account (never the one a configuration variable maps this call to). The one thing it
-# cannot defend is the identity itself: "who is this caller" is the switchboard's answer from the caller's own session and pane. A caller can only make ITSELF wait
-# less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch the wait off.
+# WHAT A CALLER CAN SET. This block reads NO environment variable of its own:
+#   - the state directory is the account's home from the password database (never HOME, XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE);
+#   - the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN);
+#   - the retired FLEET_SWITCHBOARD_OWN_GH is read nowhere in this file (the switchboard's own calls run the real gh by path);
+#   - the timeouts are constants;
+#   - it looks at EVERY low account (never the one a configuration variable maps this call to).
+# The one thing it cannot defend is the identity itself: "who is this caller" is the switchboard's answer from the caller's own session and pane. A caller can only
+# make ITSELF wait less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch
+# the wait off.
 SLOW_SECONDS = 2.0            # the longest any one uncached read of the top spender waits
 NOTICE_EVERY = 3600           # at most one message per account in this many seconds
 TRY_EVERY = 300               # at most one ATTEMPT to send per account in this many seconds, whether or not it made a message (a failing or slow switchboard costs one call in this many, not every call)

@@ -2663,7 +2663,8 @@ the retired `FLEET_SWITCHBOARD_OWN_GH` does not bypass it, and the switchboard's
 names a repository, the next `gh` call is checked. On a labelled pull request run `gh pr merge <n> -R <owner/repo>`: it exits 1 with the
 configured message and nothing is merged; on an unlabelled one it behaves as before. Removing the config entry switches it off.
 
-**Audit of every `gh` write** (a guardrail: the retired `FLEET_SWITCHBOARD_OWN_GH=1` no longer skips the audit line, #1216). Each write the shim passes on, and each it refuses, leaves one JSON line (`ts`, `verb`, `repo`, `number`,
+**Audit of every `gh` write** (a guardrail: the retired `FLEET_SWITCHBOARD_OWN_GH=1` no longer skips the audit line, #1216). Each write the shim
+passes on, and each it refuses, leaves one JSON line (`ts`, `verb`, `repo`, `number`,
 `caller`, `outcome` = `passed` or `refused`) in `gh-writes.jsonl` in the directory beside the state directory with `-audit` added
 (`~/.local/state/fleet-switchboard-audit/` by default), so "who merged this pull request" has an answer. A command line, a body, a token or a
 query value is never copied; `repo` and `number` are `null` when the command names neither (a number of the current branch); `passed` means
@@ -4656,6 +4657,20 @@ early). A lock whose holder has held it longer than `lock_minutes` (default 20) 
 
 **`merge-gate <repo#N> --pass --merge`** does the pass and the merge in ONE process, so the lock cannot run out between them (the two-step form takes the lock at the end of a pass that may have waited a long while for the runner; the merge that follows minutes later is then refused with "nobody holds the merge lock"). After the pass it reads the pull request again: the head, the labels and the gates, and the branch tip against the pass. When all four agree it runs `gh pr merge --squash --match-head-commit <head>`. A moved head, a label that appeared, a gate that is no longer ready or a moved branch merges nothing, releases the lock and says which one. Before the merge it reads the reviews itself, with the same rule as the shim's `review_blockers`: a reviewer whose latest decisive review at the head is CHANGES_REQUESTED merges nothing, releases the lock and is named (exit 10). The merge call itself goes through the `gh` shim with the own-call marker (`FLEET_SWITCHBOARD_OWN_GH`) UNSET, so the shim's own probes, its review check included, apply exactly as in the two-step form (a refusal there is exit 10 and the lock is released); only the pass and the lock calls carry the marker. The option never passes `--admin`, `--auto` or any flag that skips a review. One audit line (`merge_gate.pass_merge`) records the pull request, the head, the pass, each re-read and the merge or the refusal. A **held** pull request keeps the two-step form: `--pass --merge` refuses it before the pass, because the owner's clear is a separate step that a single command must not shortcut (`--pass`, then the owner's merge). `--pass` alone and every merge without the option behave as before.
 
+**The shim gates the merge call only when it is first on the daemon's PATH.** The merge call runs `gh` by its configured name (`gh_by_name`), so it
+meets the shim only where PATH finds the shim before any real `gh`. Where the real `gh` is first on PATH, or no shim is installed, `merge-gate --pass --merge`
+runs the real `gh` with none of the shim's probes (hold, review and gate probes, audit line): the same as before the own-call change, so not worse, but nothing there promises
+that the shim gates it. The review check the command makes itself, before the merge, runs either way.
+What sets the command's PATH:
+
+- A command run in your shell (the usual `merge-gate`) uses that shell's PATH: an agent's shell has the shim first (the fleet-hooks plugin puts it there).
+- The daemon is not what runs the merge, but its own PATH is fixed or inherited by how it starts. Under the launchd or systemd service it is fixed by the unit:
+  `service_path_dirs` gives the kit's `bin`, the directories of the absolute tool paths, the interpreter's directory,
+  then `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
+  (rendered into `Environment="PATH=__PATH__"` of `templates/fleet-kit-switchboard.service` and the plist). The kit's `shims` directory is not in it.
+- Started by `ensure` or the hook (`spawn_daemon`), it inherits the starter's PATH, minus the caller's identity names only (`daemon_environment`).
+
+
 **Enforcement is in the `gh` shim** (`shims/gh`, a credentials path). Before `gh pr merge` into a gated branch of a listed repository it asks `merge-gate --check`
 and **refuses in one line** unless a gate pass for this exact head and branch tip is recorded and the caller holds the lock; a merge that goes through is bound to
 the checked head and `--auto` is refused. While the latest completed run on the branch is red, no merge into it is allowed. It fails closed: no switchboard, no
@@ -4744,7 +4759,8 @@ Shapes it probes: `pr ready <n>` and `pr merge <n>` with a number, `-R/--repo ow
 Shapes it does **not** probe, and passes through: no PR argument (the current branch), a branch name, more than one positional, an
 unknown flag, `ready --undo`, `--`, and `pr create` (a new PR has no number before the command runs, so it is checked after
 creation in a later slice). A PR URL of a fork is another repo: not listed, not probed. The switchboard's own `gh` calls
-reach the real `gh` by its resolved path and never meet the shim, so the check cannot recurse into itself (the variable is not read). Signing and the account environment are
+reach the real `gh` by its resolved path and never meet the shim, so the check cannot recurse into itself (the variable is not read). Signing and the
+account environment are
 unchanged.
 
 **A work item's parent ask and a pull request's `CLAIMS:` line (#943).** Known limits. A parent ask edited after approval is not detected: its Done-when is a live read, with no hash. `claim_union_note` reads only the first 100 pull requests of the repository, and it is a warning only. A merged sibling's body can be edited later, so what it claimed can change. The other pull requests' claims are listed, not enforced: #976 adds the check at the ask's last merge. The plan is read from the visible body only: a `PLAN:` line in a code fence or an HTML comment is read by no gate and not by the claim.
@@ -5309,7 +5325,9 @@ A worker's repository decides which gh account it acts as. `launch` without `--r
 - **What the `gh` shim does** (`shims/gh`, with the same shared matcher as every other shim rule): for such a worker every repository a command names, from `-R`/`--repo`, a GitHub URL argument, a `gh api repos/OWNER/NAME/...` path or the argument of `gh repo ...`, must be its own repository (any spelling the matcher reads as it) or exactly the recorded one. A READ of the extra repository (`issue view`, `pr view`, `api` GET, `repo view`...) runs with the token of that repository's `gh_users` account, never the worker's own or the inherited one. A WRITE there (`issue comment`, `issue edit`, `pr merge`, `api -X POST`, `api -f`...) is refused with exit 1 and nothing reaches GitHub. Any other repository, a spelling that is not exactly the recorded one (case, whitespace, `.git`, `owner/*`, empty, lookalikes, path-like), two different repositories in one command, and a `gh api` path that does not name a repository (`graphql`, `search`, `repositories/ID`, `orgs/...`) are refused too. So are the groups that can reach any repository without naming one (`search`, `gist`, `status`, `browse`, `attestation`, `extension`, `alias`, `org`, `project`, `codespace`, `ssh-key`, `gpg-key`). A `gh api` command must be exactly `api ENDPOINT` once the flags it knows take their values (anything else is refused). A worker can also point `gh` at another default repository with the `GH_REPO` variable, and git at another url with `git -c url.X.insteadOf=...` or `GIT_CONFIG_*`, which the shim does not read. `gh auth` is not guarded: `gh auth token --user ACCOUNT` hands a worker that account's token, which is one more reason this is a guard and not a boundary.
 - **What the `git` shim does** (`shims/git`): `git push` with the extra repository's url anywhere in its arguments (including an option's value or `--repo=URL`), or with a url that cannot be read as a GitHub `owner/name`, is refused for such a worker; every argument is judged, none is guessed to be the target. A push to a NAMED remote is not resolved (no shim reads a directory's remote settings, #473, because a worker controls them): it still goes out as the worker's own account only. A fetch is not a push.
 - **Fails closed:** a record that is present but not an exact `owner/name` (`whoami --json` then says `read_repo: false`) makes the shim refuse every `gh` command that reaches GitHub and every `git push`; a missing account, mapping or token for the extra repository refuses the read. A lookup that did not answer at all says nothing about the record and behaves as it always did (reads fall through, writes are refused).
-- **A shim guard, not a GitHub guard.** The tokens are not read only: the extra repository's account may well be able to write there, and a worker can still reach GitHub without the shim (another `gh` by its path, `curl`; the retired `FLEET_SWITCHBOARD_OWN_GH` changes nothing). The boundary stays the account's own permissions. Rollback: stop passing `--read-repo`; a worker already launched keeps it until relaunched.
+- **A shim guard, not a GitHub guard.** The tokens are not read only: the extra repository's account may well be able to write there, and a worker can
+  still reach GitHub without the shim (another `gh` by its path, `curl`; the retired `FLEET_SWITCHBOARD_OWN_GH` changes nothing). The boundary stays
+  the account's own permissions. Rollback: stop passing `--read-repo`; a worker already launched keeps it until relaunched.
 
 ### `launch --headless`: a worker with no terminal (#433, slice 2b)
 
@@ -5853,21 +5871,37 @@ With the key on, the toast step and the badge writes are skipped too (a toast is
 
 ## The retired `FLEET_SWITCHBOARD_OWN_GH` marker and the own-call path (#1216)
 
-**What the variable does now:** nothing in `shims/gh`: no code in it reads or sets the name. The switchboard only *clears* it (an agent's pane children, its own children),
-and drops an inherited one at start. **What changed:** the shim no longer reads it anywhere: `review_probe`, `gate_probe`, `merge_gate_probe` (the held-pass and lock probe),
-`hold_probe`, `read_scope`, `audit_write`, `count_call`, `read_account_env`, `account_env` and the cache and budget block all run for a caller that sets it, exactly as without it.
-A merge with a blocking review and the variable set is refused (exit 10), set or unset. **The switchboard's own calls bypass the shim by path, not by a marker:** the daemon's
-`gh` is resolved once, at configuration load (`own_gh_path`): an absolute configured `gh` is used as it is (unless it IS the shim), else `FLEET_REAL_GH`, else the first `gh` on
-PATH that is not the shim. A resolved gh that would be the shim (a configured absolute path to it, or a PATH holding only the shim, as under a minimal launchd or systemd PATH)
-makes the daemon **refuse to start** with `no real gh behind the shim`: with no marker, every own call through the shim would be re-identified (its token swapped), counted,
-gate-probed and audited as an agent's. The shim is told from a real gh by its docstring signature (`SHIM_HEAD`, the first 400 bytes of `shims/gh`); a test pins it against the real file.
+**What the variable does now:** nothing in `shims/gh`: no code in it reads or sets the name. The switchboard only *clears* it (an agent's pane
+children, its own children),
+and drops an inherited one at start. **What changed:** the shim no longer reads it anywhere: `review_probe`, `gate_probe`, `merge_gate_probe` (the
+held-pass and lock probe),
+`hold_probe`, `read_scope`, `audit_write`, `count_call`, `read_account_env`, `account_env` and the cache and budget block all run for a caller that
+sets it, exactly as without it.
+A merge with a blocking review and the variable set is refused (exit 10), set or unset. **The switchboard's own calls bypass the shim by path, not by
+a marker:** the daemon's
+`gh` is resolved once, at configuration load (`own_gh_path`): an absolute configured `gh` is used as it is (unless it IS the shim), else
+`FLEET_REAL_GH`, else the first `gh` on
+PATH that is not the shim. A resolved gh that would be the shim (a configured absolute path to it, or a PATH holding only the shim, as under a minimal
+launchd or systemd PATH)
+makes the daemon **refuse to start** with `no real gh behind the shim`: with no marker, every own call through the shim would be re-identified (its
+token swapped), counted,
+gate-probed and audited as an agent's. The shim is told from a real gh by its docstring signature (`SHIM_HEAD`, the first 400 bytes of `shims/gh`); a
+test pins it against the real file.
 
-**Limits (#1216).** A *relative* configured `gh` (`./gh`) is resolved against the daemon's working directory and checked against the shim the same way as an absolute one. A `gh` found by a bare name other than `gh` is used as given and not checked. **A shim linked into one of the fixed directories the shim's own `whoami` runs with** (`/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`, `ENV_PATH`), with the real gh outside them: the shim's identity lookup then finds the shim, not the real gh, and the configuration is **refused**, so an agent's writes **fail closed** (`account lookup failed`) rather than run with the wrong token. Put the real gh in one of those directories, or set `FLEET_REAL_GH`.
+**Limits (#1216).** A *relative* configured `gh` (`./gh`) is resolved against the daemon's working directory and checked against the shim the same way
+as an absolute one. A `gh` found by a bare name other than `gh` is used as given and not checked. **A shim linked into one of the fixed directories
+the shim's own `whoami` runs with** (`/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`, `ENV_PATH`), with the real gh outside them: the
+shim's identity lookup then finds the shim, not the real gh, and the configuration is **refused**, so an agent's writes **fail closed** (`account
+lookup failed`) rather than run with the wrong token. Put the real gh in one of those directories, or set `FLEET_REAL_GH`.
 
-**What the #949 budget numbers miss.** The shim's per-account call file (`agent-calls.jsonl`, the agent-shell column of the hourly record and of the top-spender ranking) never
-sees the daemon's own reads any more, since they do not reach the shim. They are counted only by the daemon's own counter (`GhAccounts.calls`, shown by `status`) and show in the
-real usage the daemon reads (`used`, `remaining`). So the agent-shell numbers are agent calls only, as before, and "recorded N, outside the shim and the daemon about M" is unchanged in meaning;
-a call made by another route (a `gh` by its path, `curl`) is in neither count. No call of the switchboard's own goes through the shim: the merge gate's own gh calls (`merge_gate_gh`) run the real gh by path, and merge-gate has no `--merge` yet.
+**What the #949 budget numbers miss.** The shim's per-account call file (`agent-calls.jsonl`, the agent-shell column of the hourly record and of the
+top-spender ranking) never
+sees the daemon's own reads any more, since they do not reach the shim. They are counted only by the daemon's own counter (`GhAccounts.calls`, shown
+by `status`) and show in the
+real usage the daemon reads (`used`, `remaining`). So the agent-shell numbers are agent calls only, as before, and "recorded N, outside the shim and
+the daemon about M" is unchanged in meaning;
+a call made by another route (a `gh` by its path, `curl`) is in neither count. No call of the switchboard's own goes through the shim: the merge
+gate's own gh calls (`merge_gate_gh`) run the real gh by path, and merge-gate has no `--merge` yet.
 
 ## Red CI messages (#1141)
 

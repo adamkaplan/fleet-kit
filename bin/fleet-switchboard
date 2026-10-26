@@ -16171,7 +16171,7 @@ def gates_suites_finding(runner, ctx):
     try:
         ps = load_module("path_suites")
         top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-        done = runner(["gh", "pr", "diff", str(ctx.number), "--repo", ctx.repo, "--name-only"], capture_output=True, text=True)
+        done = runner([ctx.config["gh"], "pr", "diff", str(ctx.number), "--repo", ctx.repo, "--name-only"], capture_output=True, text=True)
         if top.returncode != 0 or done.returncode != 0:
             return None
         root, changed = top.stdout.strip(), [p for p in done.stdout.split("\n") if p.strip()]
@@ -20768,11 +20768,12 @@ def _changed_plan(args, runner):
         number = str(args.pr).strip().split("#")[-1]
         if not re.fullmatch(r"[0-9]{1,9}", number):
             raise ps.PathSuitesError("--pr %r: the number after '#' must be digits" % str(args.pr)[:60])
-        theirs = runner(["gh", "pr", "view", number, "--json", "headRefOid", "-q", ".headRefOid"], cwd=root, capture_output=True, text=True)
+        real_gh = load_config()["gh"]   # #1216: the real gh by path (own_gh_path), never the bare name the shim answers
+        theirs = runner([real_gh, "pr", "view", number, "--json", "headRefOid", "-q", ".headRefOid"], cwd=root, capture_output=True, text=True)
         mine = runner(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True)
         if theirs.returncode != 0 or (theirs.stdout or "").strip() != (mine.stdout or "").strip() or not (mine.stdout or "").strip():
             raise ps.PathSuitesError("--pr %s: the checked-out HEAD is not the pull request's head (or its head could not be read): check out the pull request's branch" % number)
-        done = runner(["gh", "pr", "diff", number, "--name-only"], cwd=root, capture_output=True, text=True)
+        done = runner([real_gh, "pr", "diff", number, "--name-only"], cwd=root, capture_output=True, text=True)
         if done.returncode == 0 and done.stdout.strip():
             paths = sorted(p for p in done.stdout.split("\n") if p.strip())
     if paths is None:
