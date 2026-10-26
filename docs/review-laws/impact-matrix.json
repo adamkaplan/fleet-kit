@@ -418,6 +418,9 @@
         "bin/agent_presence.py": [
           "*"
         ],
+        "bin/record_json.py": [
+          "*"
+        ],
         "bin/awaiting_live.py": [
           "validate"
         ],
