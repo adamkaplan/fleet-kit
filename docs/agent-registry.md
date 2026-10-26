@@ -33,7 +33,7 @@ rebuilt from another record.
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
 | `bin/switchboard/job_runs.py:348` | `discovery.agents` | the agents of the newest `discover()`: a dead job's starter is found among them by session and name | nobody | `JobFacts` | derived (reader) |
 | `bin/switchboard/job_runs.py:350` | `boss-resolution` | the starter's boss, by `boss_name` over the discovery | nobody | `JobFacts` | derived (reader) |
-| `bin/switchboard/policy_questions.py:124` | `discovery.agents` | the discovered agents, read for the judge's questions about sessions and names | nobody | `ask_of` and the policy questions | derived (reader) |
+| `bin/switchboard/shadow_classifier.py:32` | `discovery.agents` | the discovered agents, read to find the open asks of the chief of staff for the shadow classifier | nobody | `open_asks_of`, `run_shadow_classifier` | derived (reader) |
 | `bin/switchboard/work_moves.py:16` | `discovery.agents` | the sender found among the discovered agents | nobody | `move` | derived (reader) |
 | `bin/switchboard/worktree_lifecycle.py:304` | `discovery.agents` | the newest discovery, read to say who asks a reclaim | nobody | `reclaim-worktrees` | derived (reader) |
 | `bin/switchboard/worktree_lifecycle.py:164` | `pane-health.json` | named in a comment only: the agents a worktree sweep treats as known are those of the pane-health registry and the last discovery | nobody | `worktree_session_in_use` (through `known_agent`) | derived (reader) |
