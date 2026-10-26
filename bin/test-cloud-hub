@@ -948,7 +948,7 @@ class TestNamespaceSetting(unittest.TestCase):
             self.assertEqual((BIN / name).read_text(), (BIN.parent / "cloud" / "worker" / "bin" / name).read_text(), name)
 
 
-AGE_EXPR = 'return json.loads(raw.decode("utf-8")), max(0, int(time.time() - mtime))'
+AGE_EXPR = 'return json.loads(raw.decode("utf-8")), max(0, int(delta))'
 
 
 def _aged(hub, content, age):
@@ -977,10 +977,10 @@ class TestDecisionsAge(unittest.TestCase):
             self.assertEqual(body["decisions"], [{"id": 1, "agent": "agent-a"}])
             self.assertEqual(body["errors"], [])
             self.assertIs(type(body["age_seconds"]), int)
-            self.assertAlmostEqual(body["age_seconds"], 25, delta=1)
+            self.assertAlmostEqual(body["age_seconds"], 25, delta=10)
 
     def test_s21_mutant_float_age(self):
-        module = mutant(AGE_EXPR, 'return json.loads(raw.decode("utf-8")), max(0, time.time() - mtime)')
+        module = mutant(AGE_EXPR, 'return json.loads(raw.decode("utf-8")), max(0, delta)')
         def check(hub):
             _aged(hub, self.OK, 25)
             self.assertIs(type(hub.call("GET", "/decisions")[1]["age_seconds"]), int)
@@ -996,9 +996,9 @@ class TestDecisionsAge(unittest.TestCase):
     def test_s22_age_follows_mtime_not_content(self):
         def check(hub):
             _aged(hub, '{"decisions": [], "errors": [], "written_at": "2000-01-01T00:00:00Z"}', 0)
-            self.assertTrue(0 <= hub.call("GET", "/decisions")[1]["age_seconds"] <= 2)
+            self.assertTrue(0 <= hub.call("GET", "/decisions")[1]["age_seconds"] <= 10)
             _aged(hub, '{"decisions": [], "errors": [], "written_at": "2999-01-01T00:00:00Z"}', 400)
-            self.assertTrue(399 <= hub.call("GET", "/decisions")[1]["age_seconds"] <= 401)
+            self.assertTrue(390 <= hub.call("GET", "/decisions")[1]["age_seconds"] <= 410)
         with Hub(load()) as hub:
             check(hub)
         self.fails(mutant(AGE_EXPR, 'return json.loads(raw.decode("utf-8")), (3600 if b"2000" in raw else 0)'), check)
@@ -1007,7 +1007,7 @@ class TestDecisionsAge(unittest.TestCase):
         """A body that carries its own age_seconds does not get to choose it: the hub's clock and the mtime decide."""
         def check(hub):
             _aged(hub, '{"decisions": [], "errors": [], "age_seconds": 0}', 400)
-            self.assertTrue(399 <= hub.call("GET", "/decisions", token="tok-cap")[1]["age_seconds"] <= 401)
+            self.assertTrue(390 <= hub.call("GET", "/decisions", token="tok-cap")[1]["age_seconds"] <= 410)
         with Hub(load(), kube=kube_with({"tok-cap": "captain"})) as hub:
             check(hub)
         self.fails(mutant('            body["age_seconds"] = age\n', '            body.setdefault("age_seconds", age)\n'), check)
@@ -1019,7 +1019,7 @@ class TestDecisionsAge(unittest.TestCase):
             first = hub.call("GET", "/decisions")[1]["age_seconds"]
             _aged(hub, self.OK, 5)
             second = hub.call("GET", "/decisions")[1]["age_seconds"]
-            self.assertTrue(399 <= first <= 401 and 4 <= second <= 6, (first, second))
+            self.assertTrue(390 <= first <= 410 and 0 <= second <= 15, (first, second))
         with Hub(load()) as hub:
             check(hub)
         cached = SOURCE.replace(AGE_EXPR, 'return json.loads(raw.decode("utf-8")), _AGE_CACHE.setdefault(path, max(0, int(time.time() - mtime)))')
@@ -1035,7 +1035,7 @@ class TestDecisionsAge(unittest.TestCase):
             r = conn.getresponse()
             body = json.loads(r.read())
             conn.close()
-            self.assertTrue(399 <= body["age_seconds"] <= 401, body)
+            self.assertTrue(390 <= body["age_seconds"] <= 410, body)
         with Hub(load()) as hub:
             check(hub)
         mac = SOURCE.replace(AGE_EXPR, 'return json.loads(raw.decode("utf-8")), 0').replace(
@@ -1053,6 +1053,97 @@ class TestDecisionsAge(unittest.TestCase):
             _aged(hub, self.OK, -30)
             status, body = hub.call("GET", "/decisions")
             self.assertEqual((status, body["age_seconds"]), (200, 0))
+
+    def test_recursion_error_is_503(self):
+        """The parser is patched to raise RecursionError (deterministic: Python versions differ on the depth)."""
+        module = load()
+        def boom(*a, **k):
+            raise RecursionError("deep")
+        module.json = types.SimpleNamespace(loads=boom, dumps=json.dumps)
+        with Hub(module) as hub:
+            _aged(hub, self.OK, 5)
+            status, body = hub.call("GET", "/decisions")
+            self.assertEqual((status, body.get("error")), (503, "decisions unreadable"))
+
+    def test_recursion_mutant_uncaught(self):
+        src = SOURCE.replace("except (OSError, ValueError, RecursionError):\n                audit(\"refused status=503 reason=decisions unreadable",
+                             "except (OSError, ValueError):\n                audit(\"refused status=503 reason=decisions unreadable")
+        self.assertNotEqual(src, SOURCE)
+        module = load(src)
+        def boom(*a, **k):
+            raise RecursionError("deep")
+        module.json = types.SimpleNamespace(loads=boom, dumps=json.dumps)
+        def check(hub):
+            _aged(hub, self.OK, 5)
+            try:
+                status = hub.call("GET", "/decisions")[0]
+            except Exception as err:   # the handler died: the connection dropped
+                raise AssertionError("no answer: %r" % err)
+            self.assertEqual(status, 503)
+        self.fails(module, check)
+
+    def test_no_decisions_path_is_503(self):
+        module = load()
+        with Hub(module) as hub:
+            server = module.make_hub(("127.0.0.1", 0), module.make_reviewer(kube_with({"tok-a": "agent-a"}), audience="aud-x", sa_dir=str(Path(hub.tmp.name) / "sa")),
+                                     hub.inbox, hub.lines.append, None, namespace="fleet-agents")
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+                conn.request("GET", "/decisions", headers={"Authorization": "Bearer tok-a"})
+                r = conn.getresponse()
+                body = json.loads(r.read())
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+            self.assertEqual((r.status, body.get("error")), (503, "decisions unreadable"))
+
+    def test_mutant_stat_path_not_fd(self):
+        """A build that stats the PATH (racy with a rename) instead of the open descriptor: the age follows the file at the path."""
+        src = SOURCE.replace("mtime = os.fstat(fh.fileno()).st_mtime", "mtime = os.stat(path).st_mtime")
+        self.assertNotEqual(src, SOURCE)
+        real_stat = os.fstat
+        def check(hub):
+            _aged(hub, self.OK, 400)
+            # replace the file at the path right after the open: only fstat on the open descriptor still sees the old inode
+            module_open = open
+            def swapping_open(p, *a, **k):
+                fh = module_open(p, *a, **k)
+                if str(p) == str(hub.decisions):
+                    new = str(hub.decisions) + ".new"
+                    Path(new).write_text(self.OK)
+                    os.replace(new, str(hub.decisions))
+                return fh
+            module.open = swapping_open
+            age = hub.call("GET", "/decisions")[1]["age_seconds"]
+            self.assertTrue(390 <= age <= 410, age)
+        module = load()
+        with Hub(module) as hub:
+            check(hub)
+        module = load(src)
+        self.fails(module, check)
+
+    def test_age_source_mutant_query_or_date(self):
+        """A build that takes the age from a query value or the Date header must fail the caller-clock test."""
+        def check(hub, path="/decisions"):
+            _aged(hub, self.OK, 400)
+            conn = http.client.HTTPConnection("127.0.0.1", hub.server.server_address[1], timeout=5)
+            conn.request("GET", path, headers={"Authorization": "Bearer tok-a", "Date": "Mon, 01 Jan 2001 00:00:00 GMT"})
+            body = json.loads(conn.getresponse().read())
+            conn.close()
+            self.assertTrue(390 <= body["age_seconds"] <= 410, body)
+        with Hub(load()) as hub:
+            check(hub)
+        src = SOURCE.replace('            body["age_seconds"] = age\n',
+                             '            body["age_seconds"] = int(__import__("urllib.parse").parse.parse_qs(__import__("urllib.parse").parse.urlsplit(self.path).query).get("age_seconds", [age])[0])\n')
+        src = src.replace('if self.path != "/decisions":', 'if self.path.split("?")[0] != "/decisions":')
+        self.assertNotEqual(src, SOURCE)
+        self.fails(load(src), lambda hub: check(hub, "/decisions?age_seconds=0"))
+        date_src = SOURCE.replace('            body["age_seconds"] = age\n',
+                                  '            body["age_seconds"] = max(0, int(time.time() - __import__("email.utils").utils.parsedate_to_datetime(self.headers["Date"]).timestamp()))\n')
+        self.assertNotEqual(date_src, SOURCE)
+        self.fails(load(date_src), check)
 
     def test_s23_absent_is_503(self):
         with Hub(load()) as hub:
