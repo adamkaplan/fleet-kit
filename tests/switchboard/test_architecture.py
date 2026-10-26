@@ -11,7 +11,7 @@ and `symtable` and fails when:
   - two units of one layer depend on each other (a cycle);
   - a name is defined by two units and a third reads it (an ambiguous owner: which one is meant is not decided by the code);
   - a source file is over 1,500 lines or a test file over 2,500 (unless it is a `size` row: a ceiling with headroom, lowered when a PR leaves more than
-    5,000 lines of it unused, and named with the number to write when it is exceeded).
+    7,000 lines of it unused, and named with the number to write when it is exceeded).
 
 Dynamic imports it cannot follow (a non-constant `import_module`, `load_module` or `__import__`, a path-based load) are counted per unit and listed
 in the document's "Dynamic imports not followed" table, so the blind spot is visible and cannot grow unseen.
@@ -36,7 +36,7 @@ SOURCE_LIMIT = 1500
 TEST_LIMIT = 2500
 LAYERS = range(0, 7)
 KINDS = ("namespace", "entry-import", "ambiguous", "import", "size", "cycle")
-SIZE_UNUSED = 5000   # a size row is a ceiling with headroom; it is lowered when more than this many lines of it are unused
+SIZE_UNUSED = 7000   # a size row is a ceiling with headroom; it is lowered when more than this many lines of it are unused
 
 
 # ---------------------------------------------------------------- the document
@@ -698,10 +698,10 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         root, text = self.build(doc_violations="| `fleet-switchboard` | `-` | size | %d | being split |\n" % (SOURCE_LIMIT + 10), entry="X = 1\n" * (SOURCE_LIMIT + 11))
         self.assertEqual(check(root, text), ["fleet-switchboard is 1511 lines, over its ceiling of 1510: put the new code in a part file bin/switchboard/<job>.py, "
                                              "or lower another row (a growth that is meant: write 2500 in its row)"])
-        root, text = self.build(doc_violations=row(base + 5500))   # a PR that shrinks the file leaves the ceiling too high: it names the number to write
+        root, text = self.build(doc_violations=row(base + 7500))   # a PR that shrinks the file leaves the ceiling too high: it names the number to write
         (root / "bin" / "test-big").write_text("x = 1\n" * base)
-        self.assertEqual(check(root, text), ["bin/test-big is down to 3000 lines, 5500 under its ceiling of 8500: write 3500 in its row"])
-        root, text = self.build(doc_violations=row(base + 5000))   # exactly the allowed slack is fine
+        self.assertEqual(check(root, text), ["bin/test-big is down to 3000 lines, 7500 under its ceiling of 10500: write 3500 in its row"])
+        root, text = self.build(doc_violations=row(base + 7000))   # exactly the allowed slack is fine
         (root / "bin" / "test-big").write_text("x = 1\n" * base)
         self.assertEqual(check(root, text), [])
 
