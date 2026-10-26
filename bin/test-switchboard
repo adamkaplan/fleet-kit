@@ -36259,6 +36259,7 @@ class TestRecordingCommands(LedgerBase):
         "gates": "reads; its `ci-record` form is the daemon's recorder", "gates_ci_record": "the built-in `ci` recorder",
         "item_prove": "a work item, not a pull request", "item_verdict": "a work item, not a pull request", "item_ci_record": "a work item, not a pull request",
         "waive": "a waiver, not a proof or a verdict", "launch": "registers a tester; not a record of a judgement",
+        "merge_gate": "records the claim line as a side effect of gating; its own output is the gate result",
     }
 
     def setUp(self):

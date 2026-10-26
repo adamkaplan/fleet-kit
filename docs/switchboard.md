@@ -4512,7 +4512,7 @@ The verdict stays fail. A fail after a pass still records (the more severe one w
 
 **Limits of the final line.**
 - The audit append and the review's read of the ledger run after the record is written. If the command is cut there, `not recorded` can be printed for a row that landed. This is narrow. A retry is safe: it prints `already recorded`.
-- Other ledger-writing commands are exempt: `waive`, `ci-record`, `item prove`, `item verdict`, `item tester`, `consensus` and `carry_proofs` (the automatic writer, called by nothing yet). They get the bounded lock but no final line.
+- Other ledger-writing commands are exempt: `waive`, `ci-record`, `item prove`, `item verdict`, `item tester`, `consensus`, `merge-gate` (it records the `claim` line as a side effect of gating; its own output is the gate result) and `carry_proofs` (the automatic writer, called by nothing yet). They get the bounded lock but no final line.
 - A partial `prove` prints `recorded #..` on standard output and `not recorded: N of M scenarios refused` on standard error. The two lines are on different streams and are not unified; the exit status is 4.
 
 **The plan is the PR's, not the writer's:** the `PLAN: <link>` line of the PR body, else the plan of the PR's first ledger entry. `--plan` may only repeat it (or name the first plan when there is none yet); a different one is refused. Change the plan by changing the PR body's `PLAN:` line, which voids the earlier entries (the view says `PLAN CHANGED`). The plan's hash is computed from the GitHub text at that link.
