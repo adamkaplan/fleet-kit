@@ -86251,7 +86251,9 @@ class TestBatchingDocs(unittest.TestCase):
 PARENT_RULE = ("A work item with no Done-when takes its parent ask's: `plan check` and the structure gate (G0a) read it there; "
                "one the item carries itself must still match exactly.")
 CLAIM_RULE = ("A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, "
-              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge).")
+              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). "
+              "So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).")
+CLAIM_SENTENCE = "So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes)."
 WORK_ITEM_PLAN = LEDGER_PLAN.split("```yaml", 1)[0].split("## Intent", 1)[0] + "```yaml" + LEDGER_PLAN.split("```yaml", 1)[1]
 
 
@@ -86536,8 +86538,11 @@ class TestClaimUnionAtLastMerge(LedgerBase):
         """The claim line the merge gate wrote for sibling #number when it was merged (the union reads this, never the merged body)."""
         sb.plan_ledger.append_checked(self.world.state, self.world.clock.now(), lambda have, seq: {"kind": "claim", "pr": "acme/app#%d" % number, "head": "a" * 40, "claim_text": claim})
 
-    def refusal(self, peers=None, record=True, pages=None, edit=None, failing=False, base=100):
-        listed = [dict(number=base + n, state=state, merged_at="2026-01-01T00:00:00Z" if state == "merged" else None, body="PLAN: acme/app#7\n" + (("CLAIMS: %s" % c) if c else ""))
+    def merged_iso(self, after=1000):
+        return _dt.datetime.fromtimestamp(int(self.world.clock.now()) + after, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def refusal(self, peers=None, record=True, pages=None, edit=None, failing=False, base=100, merged_after=1000, seen=None):
+        listed = [dict(number=base + n, state=state, merged_at=self.merged_iso(merged_after) if state == "merged" else None, body="PLAN: acme/app#7\n" + (("CLAIMS: %s" % c) if c else ""))
                   for n, (state, c) in enumerate(self.peers if peers is None else peers)]
         for one in listed:
             if record and one["state"] == "merged":
@@ -86548,6 +86553,8 @@ class TestClaimUnionAtLastMerge(LedgerBase):
         listed = listed + (pages or [])
         route = self.route
         def pulls(argv):
+            if seen is not None:
+                seen.append(" ".join(argv))
             if failing:
                 return subprocess.CompletedProcess(argv, 1, "", "boom")
             page = int(re.search(r"&page=(\d+)", " ".join(argv)).group(1))
@@ -86560,6 +86567,16 @@ class TestClaimUnionAtLastMerge(LedgerBase):
             return sb.claim_union_refusal(args, route2, self.world.clock.now)
         finally:
             self.route = saved
+
+    def test_the_plan_link_search_sends_the_quoted_link_with_the_hash_percent_encoded(self):
+        self.body("S1")
+        seen = []
+        self.refusal([("open", "S2 U1 S3")], seen=seen)
+        url = [u for u in seen if "search/issues" in u][0]
+        query = re.search(r"search/issues\?q=([^&\s]*)", url).group(1)
+        self.assertEqual(query, 'repo%3Aacme%2Fapp+is%3Apr+%22acme%2Fapp%237%22+in%3Abody')   # `"acme/app#7"` quoted; the `#` is %23, never a raw fragment
+        self.assertNotIn("#", query)
+        self.assertEqual(urllib.parse.unquote_plus(query), 'repo:acme/app is:pr "acme/app#7" in:body')
 
     def test_s2_two_prs_claiming_s1_and_s2_of_three_leave_s3_and_the_union_is_pure(self):
         applies, uncovered, last = sb.plan_ledger.claim_union(self.THREE, "PLAN: x#1\nCLAIMS: S2", [("merged", "PLAN: x#1\nCLAIMS: S1")])
@@ -86759,22 +86776,53 @@ class TestClaimUnionAtLastMerge(LedgerBase):
             self.assertIn("not open", why or "", state)
             self.assertEqual([e for e in self.ledger() if e["kind"] == "claim" and e["pr"] == self.PR], [], state)
 
-    def test_h2_a_merged_sibling_reads_the_first_recorded_claim_not_the_newest(self):
-        entries = [{"kind": "claim", "pr": "a#1", "claim_text": "S1"}, {"kind": "claim", "pr": "a#1", "claim_text": "S1 S2"}]
-        self.assertEqual(sb.plan_ledger.recorded_claim(entries, "a#1", first=True), (True, "S1"))
-        self.assertEqual(sb.plan_ledger.recorded_claim(entries, "a#1"), (True, "S1 S2"))
-        self.body("S1")
-        self.record(100, "S2 U1")
-        self.record(100, "S2 U1 S3")                       # a second, later line for the same merged sibling
-        why = self.refusal([("merged", "S2 U1")], record=False)
-        self.assertIn("S3", why)
+    def record_at(self, number, claim, offset):
+        """A claim line for sibling #number stamped `offset` seconds from now (the sibling's merge is 1000 seconds from now)."""
+        sb.plan_ledger.append_checked(self.world.state, self.world.clock.now() + offset, lambda have, seq: {"kind": "claim", "pr": "acme/app#%d" % number, "head": "a" * 40, "claim_text": claim})
 
-    def test_h2_a_mutant_where_the_newest_wins_or_a_merged_pr_is_recorded_fails(self):
+    def test_h2_a_merged_sibling_reads_the_claim_in_force_at_its_merge_not_a_later_line(self):
+        entries = [{"kind": "claim", "pr": "a#1", "claim_text": "S1", "ts": 10}, {"kind": "claim", "pr": "a#1", "claim_text": "S1 S2", "ts": 20}]
+        self.assertEqual(sb.plan_ledger.recorded_claim(entries, "a#1", at=15), (True, "S1"))
+        self.assertEqual(sb.plan_ledger.recorded_claim(entries, "a#1", at=20), (True, "S1 S2"))
+        self.assertEqual(sb.plan_ledger.recorded_claim(entries, "a#1", at=5), (False, None))
+        self.assertEqual(sb.plan_ledger.recorded_claim(entries[:1] + [{"kind": "claim", "pr": "a#1", "claim_text": "S1"}], "a#1", at=15), (False, None))   # no usable timestamp
+        self.body("S1")
+        self.record_at(100, "S2 U1 S3", 500)               # in force at the merge
+        self.record_at(100, "S2 U1", 2000)                 # a later NARROWER line, after the merge: the union does not narrow
+        self.assertIsNone(self.refusal([("merged", "S2 U1")], record=False))
+
+    def test_h2_a_broad_line_recorded_while_open_then_narrowed_before_the_merge_refuses(self):
+        self.body("S2 U1")
+        self.record_at(100, None, 100)                     # recorded by an early gate run: no claim line, it claims every scenario
+        self.record_at(100, "S1", 200)                     # narrowed, then merged: its own proof gate counted only S1
+        why = self.refusal([("merged", "S1")], record=False)
+        self.assertIn("S3", why or "")
+
+    def test_h2_a_later_broader_line_after_the_merge_does_not_move_the_union(self):
+        self.body("S2 U1")
+        self.record_at(100, "S1", 500)
+        self.record_at(100, "S1 S2 S3 U1", 2000)           # a broader edit recorded after the merge
+        self.assertIn("S3", self.refusal([("merged", "S1")], record=False) or "")
+
+    def test_h2_a_merged_sibling_with_no_usable_timestamp_or_merge_time_is_refused_as_unknown(self):
+        self.body("S1")
+        self.record_at(100, "S2 U1 S3", 500)
+        self.assertIsNone(self.refusal([("merged", "S2 U1")], record=False))
+        self.assertIn("no recorded claim", self.refusal([("merged", "S2 U1")], record=False, merged_after=-100) or "")   # every line is after the merge
+
+    def test_h2_a_mutant_where_the_first_or_the_newest_line_wins_fails(self):
         real = sb.plan_ledger.recorded_claim
-        self.test_h2_a_merged_sibling_reads_the_first_recorded_claim_not_the_newest()
-        with mock.patch.object(sb.plan_ledger, "recorded_claim", lambda e, p, first=False: real(e, p)):
-            with self.assertRaises(AssertionError):
-                self.test_h2_a_merged_sibling_reads_the_first_recorded_claim_not_the_newest()
+        def clause():
+            self.test_h2_a_merged_sibling_reads_the_claim_in_force_at_its_merge_not_a_later_line()
+            self.test_h2_a_broad_line_recorded_while_open_then_narrowed_before_the_merge_refuses()
+            self.test_h2_a_later_broader_line_after_the_merge_does_not_move_the_union()
+        clause()
+        first = lambda e, p, first=False, at=None: real(e, p, first=True)
+        newest = lambda e, p, first=False, at=None: real(e, p)
+        for name, mutant in (("first line wins", first), ("newest line wins regardless of merged_at", newest)):
+            with mock.patch.object(sb.plan_ledger, "recorded_claim", mutant):
+                with self.assertRaises(AssertionError, msg=name):
+                    clause()
 
     def test_h2_a_mutant_that_records_a_merged_pull_request_fails(self):
         self.test_h2_a_closed_or_merged_pull_request_with_no_claim_line_is_not_recorded()
@@ -86833,6 +86881,20 @@ class TestPlanRulesWordedAlike(unittest.TestCase):
             text = self.squash(path)
             for rule in (PARENT_RULE, CLAIM_RULE):
                 self.assertEqual(text.count(rule), 1, (path.name, rule[:40]))
+
+    def sentence_clause(self, sentence):
+        """The whole sentence, word for word, is in the template, the skill and the code's rule."""
+        self.assertTrue(CLAIM_RULE.endswith(sentence))
+        for path in (REPO / "docs" / "plan-template.md", REPO / "skills" / "fleet-planning" / "SKILL.md"):
+            self.assertEqual(self.squash(path).count(sentence), 1, path.name)
+
+    def test_the_every_scenario_sentence_is_identical_in_the_template_the_skill_and_the_rule(self):
+        self.sentence_clause(CLAIM_SENTENCE)
+
+    def test_a_mutant_that_changes_one_word_of_the_sentence_fails(self):
+        self.sentence_clause(CLAIM_SENTENCE)
+        with self.assertRaises(AssertionError):
+            self.sentence_clause(CLAIM_SENTENCE.replace("must be claimed", "has to be claimed"))
 
     def test_the_rules_in_the_code_match_the_words(self):
         self.assertIn("CLAIMS:", PARENT_RULE + CLAIM_RULE)

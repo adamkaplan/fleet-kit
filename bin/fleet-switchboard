@@ -17545,7 +17545,7 @@ class ClaimUnknown(Exception):
 
 def plan_peers(ctx, runner, now, closed=None):
     """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing; `closed`, a list, is given
-    (number, body) of those). A MERGED sibling's body is the claim RECORDED in the ledger when it was gated (the FIRST claim line: never its current body, which an author can edit):
+    (number, body) of those). A MERGED sibling's body is the claim RECORDED in the ledger when it was gated (the NEWEST claim line recorded at or before its `merged_at`, the claim in force at the merge: never its current body, which an author can edit, and never a line recorded after the merge):
     a merged sibling with no recorded claim raises ClaimUnknown. An open one reads its current body. GETs only. The list is GitHub's search for the pull requests whose body holds
     the plan link (`GET /search/issues?q=repo:R is:pr "<plan>" in:body`), not the whole repository: at most PEER_PAGES pages of 100, with more the read raises
     `too many pull requests to judge` (fail closed, never a silent truncation). Raises when the list cannot be read."""
@@ -17577,9 +17577,9 @@ def plan_peers(ctx, runner, now, closed=None):
         if other.get("state") == "open":
             peers.append(("open", other.get("body")))
             continue
-        found, text = plan_ledger.recorded_claim(ctx.entries, "%s#%s" % (repo, other.get("number")), first=True)
+        found, text = plan_ledger.recorded_claim(ctx.entries, "%s#%s" % (repo, other.get("number")), at=_measure_time(other.get("merged_at")) if _measure_time(other.get("merged_at")) is not None else -1)
         if not found:
-            raise ClaimUnknown("merged pull request #%s has no recorded claim: its claim is unknown" % other.get("number"))
+            raise ClaimUnknown("merged pull request #%s has no recorded claim at or before its merge: its claim is unknown" % other.get("number"))
         peers.append(("merged", plan_ledger.claim_body(text)))
     return peers
 
@@ -17677,8 +17677,17 @@ def claim_union_refusal(args, runner, now):
         if claiming:
             return refuse("the claim could not be recorded", "the claim could not be recorded (%s); the gate fails closed for a pull request with a claim line" % _one_line(str(err), 100))
     if (ctx.facts or {}).get("state") == "merged":   # the claim of a merged pull request is the one recorded, never its current body
-        found, text = plan_ledger.recorded_claim(ctx.entries, ctx.pr, first=True)
-        body = plan_ledger.claim_body(text) if found else body
+        when = None
+        try:
+            engine, _, _ = build_engine(runner, now, "cli", writable=False)
+            repo, _, number = ctx.pr.rpartition("#")
+            when = _measure_time(read_pr_json(engine, repo, int(number), "mergedAt,state").get("mergedAt"))
+        except Exception:
+            when = None
+        found, text = plan_ledger.recorded_claim(ctx.entries, ctx.pr, at=when if when is not None else -1)
+        if not found:
+            return refuse("unknown sibling", "this merged pull request has no claim recorded at or before its merge: its claim is unknown; the gate fails closed for a pull request with a claim line") if claiming else None
+        body = plan_ledger.claim_body(text)
     try:
         peers = plan_peers(ctx, runner, now)
     except Exception as err:

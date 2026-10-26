@@ -538,13 +538,17 @@ def claim_line(pr, head, body):
     return {"kind": "claim", "pr": pr, "head": head, "claim_text": None if text is None else clip(text, CLAIM_TEXT_LIMIT)}   # a refused claim covers nothing, so a clipped one is never wider
 
 
-def recorded_claim(entries, pr, first=False):
-    """(found, claim_text) from the NEWEST `claim` line of `pr`, or the FIRST with `first` (a merged pull request: the claim as it was recorded, never a later rewrite);
-    found is False when none was recorded."""
-    for entry in (entries if first else reversed(entries)):
-        if entry.get("kind") == "claim" and entry.get("pr") == pr:
-            return True, entry.get("claim_text")
-    return False, None
+def recorded_claim(entries, pr, first=False, at=None):
+    """(found, claim_text) from the NEWEST `claim` line of `pr`, or the FIRST with `first`. With `at` (epoch seconds, a merged pull request's `merged_at`): the NEWEST line
+    recorded AT OR BEFORE `at`, the claim in force at the merge; a claim line of `pr` with no usable timestamp reads nothing (found False). found is False when none qualifies."""
+    mine = [e for e in entries if e.get("kind") == "claim" and e.get("pr") == pr]
+    if at is not None:
+        if any(isinstance(e.get("ts"), bool) or not isinstance(e.get("ts"), int) for e in mine):
+            return False, None
+        mine = [e for e in mine if e["ts"] <= at]
+    if not mine:
+        return False, None
+    return True, mine[0 if first else -1].get("claim_text")
 
 
 def claim_body(text, link="PLAN: x#1"):
