@@ -398,6 +398,7 @@
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
         "bin/work_sync.py",
+        "bin/switchboard/observing.py",
         "bin/switchboard/v2_transport.py",
         "bin/switchboard/facts.py",
         "bin/switchboard/import_v1.py",
@@ -410,7 +411,15 @@
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
-        "bin/switchboard/jev.py"
+        "bin/switchboard/jev.py",
+        "bin/switchboard/docker_reaper.py",
+        "bin/switchboard/workers_report.py",
+        "bin/switchboard/batch_decision.py",
+        "bin/switchboard/sweep.py",
+        "bin/switchboard/plan_notice.py",
+        "bin/switchboard/heavy_budget.py",
+        "bin/switchboard/config_reload.py",
+        "bin/switchboard/labels_ensure.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -465,6 +474,19 @@
         "bin/spotlight_guard.py": [
           "settings",
           "validate"
+        ],
+        "bin/switchboard/observing.py": [
+          "Discovery",
+          "Observation",
+          "_created",
+          "_fleet_keys",
+          "_fleet_meta",
+          "_seconds",
+          "agent_session",
+          "iso",
+          "program_version",
+          "resolve_program",
+          "runs_program"
         ],
         "bin/switchboard/v2_transport.py": [
           "V2Breaker",
@@ -605,6 +627,62 @@
           "jev_key_file",
           "locate_jev_key",
           "validate_jev_config"
+        ],
+        "bin/switchboard/docker_reaper.py": [
+          "DockerReapFacts",
+          "Fact",
+          "HeavyOrphanFacts",
+          "TempJanitorFacts",
+          "_docker_executable",
+          "_docker_inspect",
+          "_docker_labelled",
+          "_docker_problem",
+          "_docker_run",
+          "docker_reap",
+          "fact_sources",
+          "janitor_apply_allowed",
+          "lab_fact_source",
+          "read_janitor_record"
+        ],
+        "bin/switchboard/workers_report.py": [
+          "ReportError",
+          "ask_report_owed",
+          "assigning_input",
+          "report_jev",
+          "report_owed_questions",
+          "report_owed_state",
+          "triage_stop",
+          "validate_report_triage_config"
+        ],
+        "bin/switchboard/batch_decision.py": [
+          "boss_name",
+          "numbered_lines",
+          "resolve_boss",
+          "synthetic_lines",
+          "transcript_lines"
+        ],
+        "bin/switchboard/sweep.py": [
+          "SweepFacts",
+          "sweep_ref_of",
+          "validate_sweep_config"
+        ],
+        "bin/switchboard/plan_notice.py": [
+          "PlanWakeFacts"
+        ],
+        "bin/switchboard/heavy_budget.py": [
+          "SourceBudget",
+          "set_source_state",
+          "source_budget_seconds",
+          "validate_load_alert_config",
+          "validate_source_budgets"
+        ],
+        "bin/switchboard/config_reload.py": [
+          "load_runnable_config"
+        ],
+        "bin/switchboard/labels_ensure.py": [
+          "ensure_labels",
+          "label_names",
+          "read_open_items"
         ]
       },
       "dynamic_actions": [
