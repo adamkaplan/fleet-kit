@@ -259,7 +259,7 @@ class FakeGitHub:
         if "/pulls/7/files" in path:
             return [{k: v for k, v in f.items() if k not in ("base", "head")} for f in self.files]
         if path.endswith("/pulls/7"):
-            return {"head": {"sha": "H1"}, "base": {"sha": "B1"}}
+            return {"head": {"sha": "H1"}, "base": {"sha": "B1"}, "changed_files": len(self.files)}
         if "/compare/" in path:
             return {"merge_base_commit": {"sha": "MB"}}
         raise AssertionError("unexpected read: " + path)
