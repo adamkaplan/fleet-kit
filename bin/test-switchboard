@@ -2062,10 +2062,18 @@ class TestCompose(unittest.TestCase):
             self.assertTrue(acked)
             self.assertGreaterEqual(len(texts), 1)
 
-    def test_one_line_over_the_cap_is_the_only_cut_marked_and_audited_1302(self):
-        text, carried = sb.compose("platform", [fact("s:1", kind="sweep", summary="y" * 6000)], cap=4000)
-        self.assertIn("[cut at 4000 characters]", text)
-        self.assertEqual(carried[0].cut_lines, ["y" * 6000])   # the daemon audits the full line
+    def test_a_long_line_is_split_never_cut_1302(self):
+        for size in (3900, 4000, 4001, 12000):
+            body = "".join(chr(97 + (i // 7) % 26) for i in range(size))
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked, size)
+            self.assertGreater(len(texts), 1, size)
+            for t in texts:
+                self.assertNotIn("[cut at", t)
+                self.assertLessEqual(len(t), 4000)
+            got = "".join(t.split("\n", 1)[1] if False else t for t in texts)
+            joined = got.replace(" (line continues)", "").replace("(line continues) ", "")
+            self.assertEqual(sum(joined.count(body[i:i + 40]) >= 1 for i in range(0, size - 40, 40)), len(range(0, size - 40, 40)), size)
 
     def test_one_megabyte_is_bounded_and_the_rest_refused_named_1302(self):
         body = "\n".join("x" * 99 for _ in range(10500))
@@ -2095,7 +2103,7 @@ class TestCompose(unittest.TestCase):
         self.assertEqual(found, set(FACT_KIND_MODES), "a fact kind has no row in the table")
 
     def test_one_item_longer_than_the_cap_is_cut_and_says_so(self):
-        text, carried = sb.compose("platform", [fact("big", summary="y" * 5000)], cap=500)
+        text, carried = sb.compose("platform", [fact("big", kind="send", summary="y" * 5000)], cap=500)
         self.assertEqual(len(text), 500)
         self.assertTrue(text.endswith("[cut at 500 characters]"))
         self.assertEqual(len(carried), 1)
