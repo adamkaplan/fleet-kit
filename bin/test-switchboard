@@ -64600,6 +64600,7 @@ class TestHeavyWaitRecord(StandInPids, unittest.TestCase):
         self.assertEqual(set(self.COMMANDS), {kind for kind, _s, _m in self.hs.KINDS}, "a kind with no command here (or one the code no longer has)")
         for kind, command in self.COMMANDS.items():
             self.assertEqual(self.hs.classify(command), "focused" if kind == "quick" else kind)   # classify never returns "quick": run_quick takes that row by name, for a command classify calls focused
+        self.assertNotIn("quick", {self.hs.classify(c) for c in self.COMMANDS.values()}, "classify never returns the quick kind")
         self.assertEqual(set(self.SLOTS), {0, self.hs.EXPRESS}, "the slots the code has: an ordinary one and the express one")
 
     def test_s2_a_run_that_waited_past_its_ceiling_and_then_ran_less_is_not_stopped(self):
