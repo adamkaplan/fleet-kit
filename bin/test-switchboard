@@ -93482,6 +93482,71 @@ work_sync.py:_read_json
             self.assertIn(name.split(":")[-1], section)
 
 
+class TestScanDriftGuard(unittest.TestCase):
+    """#1314: bin/record_json.py copies the cloud_worker depth scan; both scans must give the SAME RESULT on the same inputs."""
+    BATTERY = {
+        "nested_strings": '{"a": "[[[{{{", "b": ["x", "{"]}',
+        "escaped_quote": '{"a": "q\\"' + "[" * 70 + '", "b": [1]}',
+        "escaped_backslash_deep": '"\\\\"' + "[" * 70,
+        "escaped_backslash": '{"a": "path\\\\", "b": [[[1]]]}',
+        "escaped_backslash_then_quote": '["\\\\"][[[[',
+        "brackets_in_string": '"' + "[" * 200 + '"',
+        "unbalanced_closers": "]]]}}}" + "[" * 64,
+        "unbalanced_closers_then_deep": "}" * 10 + "[" * 70,
+        "unbalanced_openers": "[" * 30,
+        "unbalanced_openers_over": "{" * 100,
+        "exactly_64": "[" * 64 + "]" * 64,
+        "exactly_65": "[" * 65 + "]" * 65,
+        "exactly_64_objects": '{"a":' * 64 + "1" + "}" * 64,
+        "exactly_65_objects": '{"a":' * 65 + "1" + "}" * 65,
+        "deep_30000": "[" * 30000 + "]" * 30000,
+        "all_bracket_64k": "[" * 65536,
+        "all_bracket_64k_mixed": "[{" * 32768,
+        "empty": "",
+        "whitespace": " \t\r\n  ",
+        "scalar": "42",
+        "scalar_string": '"x"',
+        "object_in_arrays": "[" * 40 + '{"a":' * 30 + "1" + "}" * 30 + "]" * 40,
+        "arrays_in_objects": '{"a":' * 40 + "[" * 30 + "]" * 30 + "}" * 40,
+        "object_in_arrays_over": "[" * 40 + '{"a":' * 30 + "1" + "}" * 30 + "]" * 40 + "[" * 30,
+        "non_ascii": '{"k\u00e9y": "\u2603[[[\U0001F600", "z": ["\u00fc"]}',
+        "non_ascii_deep": "\u00e9" + "[" * 65,
+    }
+
+    @staticmethod
+    def scans(record_src=None):
+        rj = sb.load_module("record_json")
+        cw = sb.load_module("cloud_worker")
+        return rj.nesting_too_deep, cw.nesting_too_deep
+
+    def compare(self, a, b):
+        return {n: (a(t), b(t)) for n, t in self.BATTERY.items() if a(t) != b(t)}
+
+    def test_both_scans_agree_on_the_battery(self):
+        a, b = self.scans()
+        for name, text in self.BATTERY.items():
+            with self.subTest(name):
+                self.assertEqual(a(text), b(text), name)
+
+    def test_battery_expectations(self):
+        a, b = self.scans()
+        for name, want in (("exactly_64", False), ("exactly_65", True), ("deep_30000", True), ("empty", False),
+                           ("whitespace", False), ("scalar", False), ("unbalanced_closers", False), ("brackets_in_string", False)):
+            self.assertIs(a(self.BATTERY[name]), want, name)
+            self.assertIs(b(self.BATTERY[name]), want, name)
+
+    def test_mutants_make_the_guard_fail(self):
+        src = (REPO / "bin" / "record_json.py").read_text()
+        _, b = self.scans()
+        for old, new in (('elif ch == "[" or ch == "{":', 'elif ch == "[":'),
+                         ('elif ch == "\\\\":\n                escaped = True', 'elif False:\n                escaped = True'),
+                         ('elif ch == "]" or ch == "}":\n            depth -= 1', 'elif False:\n            depth -= 1')):
+            self.assertIn(old, src)
+            ns = {}
+            exec(compile(src.replace(old, new), "mutant", "exec"), ns)
+            self.assertTrue(self.compare(ns["nesting_too_deep"], b), old)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
