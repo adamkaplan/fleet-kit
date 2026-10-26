@@ -15527,6 +15527,24 @@ def run_recording(fn, a, kw, args):
             signal.signal(signal.SIGALRM, before_handler)
 
 
+def make_effect_latch():
+    """The refusal of the clear and the record at the point of effect (#924). The state lives ONLY in this closure: no module attribute holds it, so a registrar cannot reset it, call the clear and put it back (the review of c77a44d4). `effect_check` is what the effect functions call: it counts the call and says whether the registrar window is open. `window` is held by `main` alone (a default argument of `main`, handed over below): it opens or closes the window and returns the count of effect calls so far. In one process a hostile registrar can always undo a guard (frames, gc, sys.modules, `main.__defaults__`); this raises the bar for ordinary edits, a registrar edit is held for the owner by the registrar lint (#971), and a perfect in-process guard does not exist."""
+    state = {"open": False, "calls": 0}
+
+    def effect_check():
+        state["calls"] += 1
+        return state["open"]
+
+    def window(open_=None):
+        if open_ is not None:
+            state["open"] = open_
+        return state["calls"]
+    return effect_check, window
+
+
+EFFECT_CHECK, _WINDOW = make_effect_latch()   # `_WINDOW` is removed below, once `main` has taken it as its own default
+
+
 def recording(kind, applies=None):
     """Mark a command function as a recording command of `kind` (`proof`, `verdict`, `review_record`), run under `run_recording`. `applies(args)`
     says which of its forms record (`review` records only for `review record`). Marked functions are the ONE list: `RECORDING_COMMANDS` is read from them."""
@@ -16862,9 +16880,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             "base": raw.get("baseRefOid")}
 
 
-def cmd_impact(args, runner, now):
+def cmd_impact(args, runner, now, *, _effect_check=EFFECT_CHECK):  # #924: the check is bound HERE, at definition: rebinding the module-level name changes nothing
     """`impact floor|hold|clear`."""
-    if args.impact_action == "clear" and EFFECT_CHECK():   # #924: at the point of effect too: the clear never runs in a process where a registrar ran
+    if args.impact_action == "clear" and _effect_check():   # #924: at the point of effect too: the clear never runs in a process where a registrar ran
         sys.stderr.write("%s: impact clear: refused: a command registrar ran in this process\n" % PROG)
         return EXIT_ERROR
     return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated, "matrix": cmd_impact_matrix}[args.impact_action](args, runner, now)
@@ -19576,11 +19594,11 @@ def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decisi
 
 
 @recording("review_record", applies=is_review_record)
-def cmd_review(args, runner, now):
+def cmd_review(args, runner, now, *, _effect_check=EFFECT_CHECK):  # #924: bound at definition (see `cmd_impact`)
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit, and ends with one line (#1049):
     `recorded #<id> ...`, `already recorded #<id> ...` or `not recorded: <reason>`."""
-    if args.review_cmd == "record" and EFFECT_CHECK():   # #924: at the point of effect too: the record is never written in a process where a registrar ran
+    if args.review_cmd == "record" and _effect_check():   # #924: at the point of effect too: the record is never written in a process where a registrar ran
         sys.stderr.write("%s: review record: refused: a command registrar ran in this process\n" % PROG)
         return EXIT_ERROR
     if args.review_cmd == "measure":
@@ -22653,22 +22671,7 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
 DIRECT_COMMANDS = {"review": ("review_cmd", "record"), "impact": ("impact_action", "clear")}   # #924: the action, the destination of its subcommand and the subcommand of the two commands that run BEFORE any registrar: `review record` and `impact clear`
 
 
-def make_effect_latch():
-    """The refusal of the clear and the record at the point of effect (#924). The state lives ONLY in this closure: no module attribute holds it, so a registrar cannot reset it, call the clear and put it back (the review of c77a44d4). `effect_check` is what the effect functions call: it counts the call and says whether the registrar window is open. `window` is held by `main` alone (a default argument of `main`, handed over below): it opens or closes the window and returns the count of effect calls so far. In one process a hostile registrar can always undo a guard (frames, gc, sys.modules, `main.__defaults__`); this raises the bar for ordinary edits, a registrar edit is held for the owner by the registrar lint (#971), and a perfect in-process guard does not exist."""
-    state = {"open": False, "calls": 0}
-
-    def effect_check():
-        state["calls"] += 1
-        return state["open"]
-
-    def window(open_=None):
-        if open_ is not None:
-            state["open"] = open_
-        return state["calls"]
-    return effect_check, window
-
-
-EFFECT_CHECK, _WINDOW = make_effect_latch()   # `_WINDOW` is removed below, once `main` has taken it as its own default
+# (the latch, `make_effect_latch`, is made above `recording`: the effect functions bind its check at definition)
 
 
 def direct_command(raw):

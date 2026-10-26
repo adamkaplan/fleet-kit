@@ -957,7 +957,7 @@ def authors_hold_labels(names, raw, already):
     return [label for label in ours if label in have and label not in already]
 
 
-def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None):
+def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None, *, _effect_check=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, plus (#742) every other
     hold label of the fleet's prefix the PR carries at that head (`merge-captain` and each `hold-<reason>`, whoever added it). A DELEGATED clear (`under_order`)
     keeps the narrower rule: only `hold-impact` and a `merge-captain` the switchboard added come off, and it is refused (audited, nothing written) when the PR
@@ -968,7 +968,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
     is refused when the PR's head is any other. `verify(raw)` (the chat clear's) is run on the PR this call just read, before anything is written, and raises NoticeError to refuse:
     the check and the effect use ONE read. `via` is said in the audit line. The head-bound clear state is recorded for any clear, even one that removes no impact label: it only
     stops the daemon adding its impact hold for that head. Nothing here ever ADDS a label."""
-    if EFFECT_CHECK():   # #924: a command registrar is running (it calls this itself): refused before anything is read or written
+    if _effect_check is None or _effect_check():   # #924: the check is handed over by `bind` at definition (no global name to rebind); a registrar is running (it calls this itself), or none was handed over: refused before anything is read or written
         raise RuntimeError("a command registrar ran in this process: an impact clear is refused")
     pr = "%s#%d" % (repo, number)
     if engine.audit is None:   # a clear is a logged act: with no audit sink it is refused, loudly, before anything changes
@@ -1202,9 +1202,9 @@ def clear_who(engine, runner, repo, number, report=None):
     return module.who_can_clear(got["rule"], got["report"], got["files"], impact_floor.matches, got["closure"], block, delegation, pr=pr)
 
 
-def cmd_impact_clear(args, runner, now):
+def cmd_impact_clear(args, runner, now, *, _effect_check=None):
     """`impact clear <repo#N> --reason TEXT`: the owner's own terminal only (the Chief of Staff cannot: G6 is never waivable by it)."""
-    if EFFECT_CHECK():   # #924: a command registrar is running (it calls this itself): refused at the point of effect, before anything is read
+    if _effect_check is None or _effect_check():   # #924: bound by `bind` at definition; a registrar is running, or none was handed over: refused at the point of effect, before anything is read
         sys.stderr.write("%s: impact clear: refused: a command registrar ran in this process\n" % PROG)
         return EXIT_ERROR
     kind = gates_caller_kind(runner, now)
@@ -1463,7 +1463,9 @@ def bind(namespace):
     for name in MOVED:
         original = here[name]
         bound = types.FunctionType(original.__code__, namespace, original.__name__, original.__defaults__, original.__closure__)
-        bound.__kwdefaults__ = original.__kwdefaults__
+        bound.__kwdefaults__ = dict(original.__kwdefaults__) if original.__kwdefaults__ else None
+        if bound.__kwdefaults__ is not None and "_effect_check" in bound.__kwdefaults__:   # #924: the latch's check is captured HERE, once, as a default: a later rebinding of `EFFECT_CHECK` in the namespace changes nothing
+            bound.__kwdefaults__["_effect_check"] = namespace["EFFECT_CHECK"]
         bound.__dict__.update(original.__dict__)   # the attributes a command declares (`ledger`, `ensure_on_use`, ...)
         bound.__doc__ = original.__doc__
         bound.__module__ = namespace.get("__name__", bound.__module__)
