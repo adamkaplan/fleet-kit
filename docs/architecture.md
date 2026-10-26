@@ -11,7 +11,7 @@ A **unit** is a file: the entry `bin/fleet-switchboard`, a part under `bin/switc
 4. No unit file is over 1,500 lines, and no test file (`bin/test-*` and `tests/switchboard/**`) over 2,500 lines.
 5. A name two units define and a third reads is an ambiguous owner: which one is meant is not decided by the code, so it is a violation (kind `ambiguous`; the row's To is the owners joined by `+`).
 6. Every file of `bin/*.py`, `bin/switchboard/*.py` and the entry is a row of the unit table, and every row is a file.
-7. Today's code breaks some of these rules: the daemon grew as one namespace. Each break is a row of **Known violations**, with its count. A violation that is not a row fails the test; a row with no violation left fails the test (delete it); a dependency count that is not exactly its row's number fails the test (more is a new break; fewer means the row is written lower, and the message names the number). The two `size` rows (the entry and `bin/test-switchboard`) are ceilings with headroom: a file within its ceiling passes, a file over it fails with the number to write and what to do, and a row more than 7,000 lines above its file fails with the lower number to write. The list only shrinks. It must end empty. A move that lowers a count lowers its row in the same pull request.
+7. Today's code breaks some of these rules: the daemon grew as one namespace. Each break is a row of **Known violations**, with its count. A violation that is not a row fails the test; a row with no violation left fails the test (delete it); a dependency count that is not exactly its row's number fails the test (more is a new break; fewer means the row is written lower, and the message names the number). The two `size` rows (the entry and `bin/test-switchboard`) are ceilings with headroom: a file within its ceiling passes, a file over it fails with the number to write and what to do, and a row more than 3,000 lines above its file fails with the lower number to write. The list only shrinks. It must end empty. A move that lowers a count lowers its row in the same pull request.
 
 ## Where a new test goes
 
@@ -123,7 +123,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 
 | From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
-| `bin/test-switchboard` | `-` | size | 100,000 | the one test file, with room for the pending batch (the unused-headroom allowance is 7,000 lines for it); T1 re-derives this row DOWN from the new real count and returns the allowance to 3,000 when whole classes move; the test split (ST0 and its follow-ups) moves its fakes and classes beside the units |
+| `bin/test-switchboard` | `-` | size | 84,100 | the one test file; whole classes have moved to `tests/switchboard/test_cases_NN.py` (T1), and the lanes still add tests until the next split, so the row is the real count plus about 3,000 |
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `cloud_worker.py` | `-` | size | 2,000 | grew past the limit in a merged change; to be split |
