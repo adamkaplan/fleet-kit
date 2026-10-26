@@ -5813,6 +5813,20 @@ Cause: `read_record_file` answered `too_deep` from `except RecursionError`, whic
 
 All three also have the limit mutant (`WATCH_MAX_DEPTH = 10**9`), which fails on every Python. Hub and decisions files are written by the daemon and are not parsed by these readers. `test_every_untrusted_record_parse_is_bounded_and_listed_in_the_docs` derives the readers from the source and checks this table.
 
+### Every reader of record JSON uses the bounded-depth parse (#1314)
+
+Cause: the repair for Python 3.15 (#1312) put the bounded-depth scan (`parse_bounded` in cloud_worker.py) on the cloud record readers only. Two other readers of record text were not covered: `read_record` (behind `load_record`) in `bin/agent_presence.py`, which caught only `(OSError, ValueError, UnicodeError)`, and `read_reminders` and `read_record_file` in `bin/switchboard/reminders.py`, which had no `RecursionError` catch at all. A deep file raised out of a pass or was refused only where the interpreter's recursion limit happened to trip.
+
+Now every reader of record JSON uses the shared bounded-depth parse `parse_bounded` in `bin/record_json.py` (limit `RECORD_MAX_DEPTH` = 64, the same number as `WATCH_MAX_DEPTH`): a record nested deeper is refused the same way on every Python, one nested exactly at the limit parses. `load_record` answers "is not readable JSON", `read_reminders` raises its `ReminderError` ("cannot read ..."), `read_record_file` answers None.
+
+| Reader | Input | Refusal | Test | Mutant |
+|---|---|---|---|---|
+| `agent_presence.py:read_record` | `headless/<name>.json` | "is not readable JSON" | TestRecordJsonReaders s2, s4, s5 | `json.loads` in place of `parse_bounded` |
+| `switchboard/reminders.py:read_reminders` | `reminders.json` | `ReminderError` | TestRecordJsonReaders s3, s4, s6 | `json.loads` in place of `parse_bounded` |
+| `switchboard/reminders.py:read_record_file` | `reminder-repeats.json` | None | TestRecordJsonReaders s3, s6 | `json.loads` in place of `parse_bounded` |
+
+`TestRecordJsonReaders` derives the list of readers from the source (every `json.loads`, `json.load` and `from json import loads` call in `bin/`, found with `ast`) and fails when a reader is in neither the covered set nor its table of exempt sites (daemon-written state, command output, request bodies, log lines), and when a table entry is stale.
+
 ## The assembler (#1092, slice S1)
 
 `bin/fleet-switchboard` builds the daemon's one module namespace from the manifest `bin/fleet-switchboard.parts`: one part path per line, relative to the entry's real path (symlinks resolved), `#` for comments.

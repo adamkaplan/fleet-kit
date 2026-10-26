@@ -33,7 +33,7 @@ def reminders_lock(state_dir):
 def read_reminders(state_dir):
     path = Path(state_dir) / REMINDERS
     try:
-        raw = json.loads(path.read_text())
+        raw = load_module("record_json").parse_bounded(path.read_text())
     except FileNotFoundError:
         return []
     except (OSError, ValueError) as err:
@@ -121,7 +121,7 @@ def read_record_file(path, cap=RECORD_CAP):
     finally:
         os.close(fd)
     try:
-        return json.loads(data.decode("utf-8"))
+        return load_module("record_json").parse_bounded(data.decode("utf-8"))
     except (ValueError, UnicodeError):
         return None
 
