@@ -1576,6 +1576,8 @@ class World:
     """Fake v2, fake herdr and a simulated clock, and an engine on the real clients."""
 
     def __init__(self, test, agents=("platform", "coder"), config=None, state=None):
+        if state is None and not isinstance(test, Base):
+            raise sb.RealStateRefused("World(state=None) in %s: a world with no state of its own is the real state directory; derive the test from Base (isolating) or pass a temporary state" % type(test).__name__)
         os.environ[sb.LAB_ENV] = "1"  # lab facts are the event source in these tests
         patch = mock.patch.object(sb, "memory_sleep", lambda seconds: None)   # a new launch's memory test (#779) never waits 30 s here
         patch.start()
@@ -7515,6 +7517,8 @@ class GithubRig:
     """A hub on fake GitHub, attached to an engine on the fake fleet, on one simulated clock."""
 
     def __init__(self, test, agents=None, config=None, repos=(GH_REPO,)):
+        if not isinstance(test, Base):
+            raise sb.RealStateRefused("GithubRig in %s: a rig with no state of its own is the real state directory; derive the test from Base (isolating)" % type(test).__name__)
         raw = {"github_repos": list(repos), "gh": GH_BIN}
         raw.update(config or {})
         self.world = World(test, agents=(), config=raw)
@@ -93139,11 +93143,16 @@ class TestArchTools(unittest.TestCase):
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
-    _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__),
-                                                                  state_dir=sb.state_dir_path())
-    if _wrapped is not None:
-        try:
-            os.execv(_wrapped[0], _wrapped)
-        except OSError as _err:
-            sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
+    _marker = os.environ.pop(sb.UNDER_TEST_ENV, None)   # the slot wrapper reads the daemon's own config and slot directory by design (CPU slots are shared with the daemon): the guard is off for this one call
+    try:
+        _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__),
+                                                                      state_dir=sb.state_dir_path())
+        if _wrapped is not None:
+            try:
+                os.execv(_wrapped[0], _wrapped)   # the marker stays off: the wrapper is not a test; the suite it starts sets the marker again
+            except OSError as _err:
+                sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
+    finally:
+        if _marker is not None:
+            os.environ[sb.UNDER_TEST_ENV] = _marker
     sys.exit(main(sys.argv[1:]))
