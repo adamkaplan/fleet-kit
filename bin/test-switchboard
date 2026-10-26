@@ -40290,7 +40290,7 @@ class TestImpactHold(LedgerBase):
             self.assertTrue(callable(held["_effect_check"]), name)
         self.assertTrue({"rating_inputs", "gates_caller_kind", "build_engine"} <= every | {"rating_inputs", "gates_caller_kind", "build_engine"}, sorted(every)[:10])
         self.assertGreater(len(every), 5, sorted(every))
-        mutant = self.real_source().replace("def cmd_impact_clear(", "def cmd_impact_clear(", 1).replace("    if args.impact_action == \"clear\" and _effect_check():", "    zzz_unlisted_global()\n    if args.impact_action == \"clear\" and _effect_check():", 1)
+        mutant = self.real_source().replace("    if args.impact_action == \"clear\" and _effect_check():", "    zzz_unlisted_global()\n    if args.impact_action == \"clear\" and _effect_check():", 1)
         self.assertNotEqual(mutant, self.real_source())
         grown = self.effect_globals(mutant, dict(vars(sb), zzz_unlisted_global=len))
         self.assertIn("zzz_unlisted_global", grown["cmd_impact"], "an effect that starts reading a new module global is in the derived attack set (the parametrised test then runs it)")
