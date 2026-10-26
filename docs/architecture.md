@@ -90,6 +90,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `launch_testers.py` | 5 | testers from the launch record | |
 | `merge_gate.py` | 5 | the fleet's own merge queue | |
 | `orders_copy.py` | 5 | `orders copy`: a charter's standing orders copied to another charter | |
+| `path_suites.py` | 5 | which test suites exercise a changed path, and the local merge `heavy --changed` runs them on | |
 | `plan_check.py` | 5 | the mechanical check of a plan's scenarios | |
 | `plan_ledger.py` | 5 | the evidence ledger and the gates view of plan-driven development | |
 | `plan_review.py` | 5 | the plan review engine's pure core | |

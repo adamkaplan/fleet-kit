@@ -46,6 +46,8 @@ bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte c
 bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
 ```
 
+**Name the suites that exercise your change.** Before offering a head, and in every brief you write for a coder, run `fleet-switchboard heavy --changed --list` and put its list (the header `suites that exercise your change`) in the brief; run those suites with `fleet-switchboard heavy --changed` (on a local merge of the current base) before offering the head. A change is never offered on the classes its diff happens to name while another suite runs the same code. A path the list says no suite exercises is said so in the pull request.
+
 **Local runs are focused by default.** Run the focused classes of what you changed through `heavy --short`; CI runs the whole suite. Run the whole suite only for a change to the CI workflow itself or to a test CI cannot run; say which in the pull request. The heavy wrapper refuses a second full-suite job in a worktree while one is queued or running.
 
 A change that deletes something or raises an alert is checked against three lines before its first push:
