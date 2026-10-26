@@ -4442,7 +4442,8 @@ class TestLaunch(StandInPids, Base):
     def test_scratch_s2_an_unsafe_path_refuses_the_launch_and_starts_nothing(self):
         base = Path(self.world.state) / "scratch"
         outside = self.home / "elsewhere"
-        outside.mkdir()
+        outside.mkdir(mode=0o700)
+        os.chmod(str(outside), 0o700)   # a private target: only the symlink check can refuse it
         cases = {}
         base.mkdir(parents=True, mode=0o700)
         (base / "dangling").symlink_to(self.home / "nowhere")
@@ -82845,7 +82846,8 @@ class TestTempJanitorResume(Base):
 
     def test_a_corrupt_cursor_a_symlink_or_directory_it_names_and_a_type_change_never_remove_what_was_not_judged(self):
         outside = self.home / "outside-dir"
-        outside.mkdir()
+        outside.mkdir(mode=0o700)
+        os.chmod(str(outside), 0o700)   # a private target: only the symlink check can refuse it
         (outside / "precious.txt").write_text("keep me")
         self.twelve(old_from=6)
         cursor = self.state / self.jan.CURSOR_FILE
