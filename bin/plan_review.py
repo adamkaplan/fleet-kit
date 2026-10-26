@@ -384,6 +384,8 @@ CHARTERS = {
           "smaller plan still meets the Done-when.",
     "L6": "Take the owner's view: would the owner be surprised; does this solve the asked problem or a neighbouring one.",
 }
+PLAN_RULE = ("A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed "
+             "and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.")   # the same words as bin/plan_check.py, the planning skill and docs/plan-template.md
 VERDICT_FORMAT = ("End your final message with exactly one fenced block:\n```verdict\nlane: %(lane)s\nplan_hash: %(plan_hash)s\n"
                   "verdict: approve|iterate|reject\n- id: O1; severity: blocking|advisory; state: open; text: <the objection, with the "
                   "evidence you quote from the plan>\n```\nOne line per objection. Echo the plan hash exactly as given.")
@@ -400,6 +402,7 @@ def lane_brief(lane, plan_ref, plan_hash, plan_text, intent, done_when, carried=
         "Plan: %s\nPlan hash: %s" % (plan_ref, plan_hash),
         "Intent: %s\nDone when: %s" % (intent, done_when),
         "Your charter: %s" % CHARTERS[lane],
+        PLAN_RULE,
     ]
     if closing:
         parts.append("This is the CLOSING round: confirm (approve) this exact final text, or raise a new blocking objection.")
