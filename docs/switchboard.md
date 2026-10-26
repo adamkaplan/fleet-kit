@@ -5841,6 +5841,15 @@ canon: the wake channel carries each thing once.
 - **Answered.** An item the Chief of Staff already answered (a send by it to that agent since the finding; the record is per recipient, not per issue) is not re-raised until its state changes, and for at most 6 hours after the answer.
 - **One message per wake.** Sweeps, triage and load alerts of one wake are one message, one line per item (`merge_wake_facts`, called by the delivery; the first blocked report, an owner wait and a held PR are never folded in).
 - **Order.** `compose` (`compose_order`) puts every pass-through fact (owner wait, held PR, first blocked report, send) BEFORE the reminders (the merged wake fact and the sweep/triage/load items not merged yet), whatever their age; each group is newest first, ties keep the key order. A newer result is never held behind older reminders, and an older owner wait or send is never held behind a newer merged fact: under the message cap the reminders are the ones that wait.
+- **Never cut, for every non-send kind (#1302).** A fact over the 4000-character message cap is carried OVER SUCCESSIVE MESSAGES: `compose` delivers whole lines that fit (header included), the header says `(part i of n)`, and the next tick delivers the next part. Its key is acknowledged only after the LAST part. The count of parts delivered is persisted in `finding-parts.json` in the state directory, so a crash between two parts continues with the next one after a restart (a part sent but not yet recorded is sent again under its own derived message id, which the transport deduplicates). A line longer than a part is split over parts with a `(line continues)` mark at the end of one piece and the start of the next: lines are split, findings are never cut, nothing is lost or repeated. A finding needing more than 50 parts (about 190 KB) is delivered in 50, the last part names the refused characters, and the audit gets them in full (`finding-refused`): nothing is dropped silently. The key is ACKED after part 50 (the last part delivered), and the 50-part limit is a bound, not a delivery: the remaining text beyond it is not delivered, and the last part names the undelivered characters. Sends keep the cut marker by design (a send over the cap is refused to its sender).
+
+| kind | over the cap |
+| --- | --- |
+| send | cut marker, refused to the sender |
+| wake (merged) | bounded by the merge budget (3000); members that do not fit stay pending |
+| sweep, triage, alert, reminder, disk, cpu, mem, cpu-top, spotlight, janitor, plan | carried in parts, at any position |
+
+The table is `FACT_KIND_MODES` in `bin/test-switchboard`; a test derives the kinds from the builders (`Fact(` calls, by ast) and fails when one has no row.
 - **Short header.** After the first delivery of an ask on a day, its group header is one line of at most 160 characters; the full Intent and Done-when come again on the first delivery of the next day.
 
 | Sender function | Finding kind | Repeat key | Window | Test |

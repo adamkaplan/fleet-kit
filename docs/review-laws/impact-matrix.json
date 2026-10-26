@@ -578,6 +578,8 @@
           "compose_order",
           "decide",
           "describe_items",
+          "finding_part",
+          "finding_parts",
           "hold_reason",
           "is_withdrawal",
           "orders_note",

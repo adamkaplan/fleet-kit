@@ -2021,8 +2021,116 @@ class TestCompose(unittest.TestCase):
         self.assertTrue(text.endswith("\u2026 and 28 more: run fleet-switchboard pending platform"))
         self.assertEqual([f.key for f in carried], ["k29", "k28"])
 
+    def whole_run(self, kind, body, cap=4000, others=(), position=0):
+        """Deliver one over-cap fact like the daemon: part after part, with the ledger of parts delivered."""
+        one = fact("%s:big" % kind, kind=kind, summary=body)
+        done, texts, acked, gone = {}, [], [], set()
+        for _ in range(sb.FINDING_MAX_PARTS + 5):
+            pending = [o for o in others if o.key not in gone]
+            pending.insert(position, one)
+            text, carried = sb.compose("platform", pending, cap=cap, resume=done)
+            self.assertLessEqual(len(text), cap)
+            self.assertNotIn("[cut at", text)
+            gone.update(f.key for f in carried if f.key != one.key)
+            mine = [f for f in carried if f.key == one.key]
+            if not mine:
+                continue
+            texts.append(text)
+            if getattr(mine[0], "partial", None):
+                done[one.key] = mine[0].partial[0]
+            else:
+                acked.append(one.key)
+                break
+        return texts, acked
+
+    def test_a_finding_over_the_cap_is_carried_over_successive_messages_1302(self):
+        for kind in OVER_CAP_FINDING_KINDS:
+            for position in (0, 1, 2):   # the over-cap fact at EVERY position
+                body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
+                others = [fact("o%d" % n, kind="sweep", summary="small %d" % n) for n in range(2)]
+                texts, acked = self.whole_run(kind, body, others=others, position=position)
+                self.assertGreater(len(texts), 1, kind)
+                self.assertEqual(acked, ["%s:big" % kind], kind)   # acknowledged once, after the LAST part
+                got = [l.strip() for t in texts for l in t.split("\n")[1:] if l.strip().startswith("item ")]
+                self.assertEqual(got, ["item %03d %s" % (n, "z" * 60) for n in range(100)], kind)   # every line once, in order
+                for i, t in enumerate(texts):
+                    self.assertIn("(part %d of %d)" % (i + 1, len(texts)), t)
+
+    def test_over_cap_sizes_are_delivered_whole_1302(self):
+        for body in ("\n".join(["y" * 100] * 41), "\n".join(["y" * 100] * 120), "\n".join(["\u00e9\u4e2d" * 30] * 60), "\n".join("l%d" % n for n in range(1500))):
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked)
+            self.assertGreaterEqual(len(texts), 1)
+
+    def test_a_long_line_is_split_never_cut_1302(self):
+        for size in (3900, 4000, 4001, 12000):
+            body = "".join(chr(97 + (i // 7) % 26) for i in range(size))
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked, size)
+            self.assertGreater(len(texts), 1, size)
+            for t in texts:
+                self.assertNotIn("[cut at", t)
+                self.assertLessEqual(len(t), 4000)
+            got = "".join(t.split("\n", 1)[1] if False else t for t in texts)
+            joined = got.replace(" (line continues)", "").replace("(line continues) ", "")
+            self.assertEqual(sum(joined.count(body[i:i + 40]) >= 1 for i in range(0, size - 40, 40)), len(range(0, size - 40, 40)), size)
+
+    def test_a_long_line_is_delivered_in_exact_content_and_order_1302(self):
+        for size in (4001, 12000):
+            body = "".join(chr(97 + (i * 7 + i // 13) % 26) for i in range(size))
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked, size)
+            pieces = []
+            for t in texts:
+                lines = t.split("\n")
+                at = [i for i, l in enumerate(lines) if l.startswith("- sweep")][0]
+                piece = lines[at + 1].strip()   # the item's header, then the one body line (the first line's header copy is cut to 200 characters)
+                piece = piece.replace("(part %d of %d) " % (len(pieces) + 1, len(texts)), "", 1)
+                if piece.startswith("(line continues) "):
+                    piece = piece[len("(line continues) "):]
+                if piece.endswith(" (line continues)"):
+                    piece = piece[:-len(" (line continues)")]
+                pieces.append(piece)
+            self.assertEqual("".join(pieces), body, size)
+
+    def test_a_part_over_a_tiny_cap_is_cut_visibly_1302(self):
+        one = fact("sweep:big", kind="sweep", summary="\n".join("line %03d %s" % (n, "q" * 50) for n in range(300)))
+        probe = fact("p", kind="sweep", summary="(part 99 of 99)\n")
+        fixed = len(sb.compose("platform", [probe], cap=10 ** 9)[0])
+        for cap in (fixed + 60, fixed + 120, fixed + 250):   # the budget floor of 200 makes the part longer than the cap
+            text, carried = sb.finding_part("platform", one, [], cap, None, None, None, {})
+            self.assertLessEqual(len(text), cap)
+            self.assertIn(sb.PART_TRUNCATED, text, cap)
+
+    def test_one_megabyte_is_bounded_and_the_rest_refused_named_1302(self):
+        body = "\n".join("x" * 99 for _ in range(10500))
+        texts, acked = self.whole_run("sweep", body)
+        self.assertEqual(len(texts), sb.FINDING_MAX_PARTS)   # the maximum; beyond it the rest is refused, audited, named in the last part
+        self.assertIn("were refused; the full text is in the audit", texts[-1])
+        self.assertTrue(acked)
+
+    def test_a_restart_between_parts_continues_from_the_ledger_1302(self):
+        one = fact("sweep:big", kind="sweep", summary="\n".join("line %03d %s" % (n, "q" * 50) for n in range(300)))
+        first, carried = sb.compose("platform", [one], cap=4000, resume={})
+        self.assertEqual(carried[0].partial[0], 1)
+        second, _ = sb.compose("platform", [one], cap=4000, resume={one.key: 1})   # a fresh process: only the ledger survives
+        self.assertIn("(part 2 of", second)
+        self.assertNotIn("line 000", second)
+
+    def test_every_fact_kind_the_builders_make_is_in_the_table_1302(self):
+        import ast, glob
+        here = os.path.dirname(os.path.abspath(__file__))
+        found = set()
+        for path in [os.path.join(here, "fleet-switchboard")] + glob.glob(os.path.join(here, "switchboard", "*.py")):
+            for node in ast.walk(ast.parse(open(path).read())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "Fact":
+                    kind = node.args[2] if len(node.args) > 2 else next((k.value for k in node.keywords if k.arg == "kind"), None)
+                    if isinstance(kind, ast.Constant) and isinstance(kind.value, str) and kind.value in ("sweep", "triage", "alert", "wake", "send", "reminder", "disk", "cpu", "mem", "cpu-top", "spotlight", "janitor", "plan"):
+                        found.add(kind.value)
+        self.assertEqual(found, set(FACT_KIND_MODES), "a fact kind has no row in the table")
+
     def test_one_item_longer_than_the_cap_is_cut_and_says_so(self):
-        text, carried = sb.compose("platform", [fact("big", summary="y" * 5000)], cap=500)
+        text, carried = sb.compose("platform", [fact("big", kind="send", summary="y" * 5000)], cap=500)
         self.assertEqual(len(text), 500)
         self.assertTrue(text.endswith("[cut at 500 characters]"))
         self.assertEqual(len(carried), 1)
@@ -2181,6 +2289,55 @@ class TestEachThingOnce(Base):
     def test_1275_a_cut_member_line_is_not_acknowledged(self):
         sent = self.cut_world(["alpha", "beta", "gamma"])
         self.assertEqual(sorted(sent["keys"]), ["s1", "s2"])
+
+    def test_1302_a_cut_that_leaves_no_member_line_sends_nothing_and_acknowledges_nothing(self):
+        world = World(self, agents=("platform",))
+        for n, text in enumerate(["alpha", "beta", "gamma"]):
+            world.fact("platform", "s%d" % n, text, kind="sweep", created=world.clock.now() + n)
+        world.tick(120)
+        real = sb.compose
+        def cut(*args, **kwargs):
+            text, carried = real(*args, **kwargs)
+            return text.splitlines()[0], carried   # the header only: every member line is cut off
+        acked = []
+        with mock.patch.dict(sb.compose.__globals__, {"compose": cut}):
+            with mock.patch.object(sb.Switchboard, "_acknowledge", lambda self, keys: acked.append(list(keys))):
+                result = world.engine.run_pass()
+        (error,) = result["errors"]   # derive_message_id raised: the pass reports it, nothing more
+        self.assertEqual((error["step"], error["error"]), ("deliver", "ValueError: keys must be a non-empty list of non-empty strings"))
+        self.assertEqual(result["sent"], [])
+        self.assertEqual(world.admissions("platform"), [])
+        self.assertEqual([key for keys in acked for key in keys], [])   # no key was acknowledged
+
+    def parts_run(self):
+        """One over-cap finding through the real deliver, pass after pass; the order of every send and every acknowledgement."""
+        world = World(self, agents=("platform",))
+        body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
+        world.fact("platform", "review:big", body, kind="review")
+        events = []
+        real_send, real_ack = world.engine.v2.synthetic, sb.Switchboard._acknowledge
+        def send(*args, **kwargs):
+            events.append("send")
+            return real_send(*args, **kwargs)
+        def ack(engine, keys):
+            events.append(("ack", list(keys)))
+            return real_ack(engine, keys)
+        with mock.patch.object(world.engine.v2, "synthetic", send), mock.patch.object(sb.Switchboard, "_acknowledge", ack):
+            for _ in range(60):
+                world.tick(120)
+                world.engine.run_pass()
+        return events
+
+    def test_1302_the_key_is_acknowledged_only_after_the_last_part_is_sent(self):
+        events = self.parts_run()
+        first = next(i for i, e in enumerate(events) if e != "send" and "review:big" in e[1])   # the first acknowledgement of the finding's key
+        self.assertEqual(events[first], ("ack", ["review:big"]))   # by the delivery itself
+        self.assertEqual(events[:first].count("send"), events.count("send"))   # every part was sent before it, none after
+        self.assertGreater(events.count("send"), 1)
+
+    def test_1302_the_continuation_after_the_first_part_is_delivered(self):
+        events = self.parts_run()
+        self.assertGreater(events.count("send"), 1)   # a dropped continuation sends one part and acknowledges nothing more
 
     def test_1275_a_member_line_that_is_a_prefix_of_another_line_is_not_acknowledged(self):
         sent = self.cut_world(["aaa", "aaa bbb"])   # "- sweep: aaa" is a prefix of the line that is in the text
@@ -83708,6 +83865,12 @@ class TestAgentCredentialsDoc(unittest.TestCase):
 # ======================================================================
 def _clock_at(hour, minute, second=0):
     return calendar.timegm((2027, 1, 15, hour, minute, second))
+
+
+FACT_KIND_MODES = {"send": "cut marker (refused to the sender)", "wake": "merged within a 3000-character budget", "sweep": "parts", "triage": "parts",
+                   "alert": "parts", "reminder": "parts", "disk": "parts", "cpu": "parts", "mem": "parts", "cpu-top": "parts",
+                   "spotlight": "parts", "janitor": "parts", "plan": "parts"}
+OVER_CAP_FINDING_KINDS = tuple(k for k, v in FACT_KIND_MODES.items() if v == "parts")
 
 
 class TestMessageTimes(unittest.TestCase):
