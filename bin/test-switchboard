@@ -94120,6 +94120,7 @@ class TestRecordJsonReaders(unittest.TestCase):
     HELPERS = {"record_json.py:parse_bounded", "cloud_worker.py:parse_bounded"}
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
+    # path_suites.py:check_manual and load_manual read the repository's OWN checked-in manual (tools/path-suites.json), a trusted repo file, not untrusted record text
     EXEMPT = """
 agent_calls.py:_read_json
 agent_calls.py:_spool_lines
@@ -94227,6 +94228,8 @@ judge-eval:read_jsonl
 judge-sample:read_verdicts
 merge_gate.py:pass_and_merge
 merge_gate.py:read_json
+path_suites.py:check_manual
+path_suites.py:load_manual
 plan_ledger.py:_read_head
 plan_ledger.py:cos_rules
 plan_ledger.py:read_ledger
