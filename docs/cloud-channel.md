@@ -26,7 +26,7 @@ One document to set up, run and take down the cloud hub and the pod-side command
     numeric offset, fractions allowed). Generation: a lower generation from the same `daemon_pid` is a stale replay and is refused (file
     aged); a different `daemon_pid` is a restart and is accepted; a body with no `daemon_pid` is accepted (the source is trusted for
     generation order). `--reset-generation` accepts any in-bound generation (0 to 2**31-1) once; deleting `decisions.json` does the same.
-    The check and the write run under one lock, so two pulls cannot let a lower generation overwrite a higher one.
+    The check and the write run under one lock, taken without blocking (the pull skips the refresh if it cannot get the lock within about 2 s), so two pulls cannot let a lower generation overwrite a higher one.
     **Rollout order (deploy note).** The hub that sends `age_seconds` and the new pull go out TOGETHER. An older pull reads the 503 for an
     absent file as unreachable and marks the list stale; a new pull against an older hub (no `age_seconds`) reads it as unreachable too.
   - POST to a path other than /message and GET to a path other than /decisions answer 404. PUT, DELETE and PATCH answer 405 on
