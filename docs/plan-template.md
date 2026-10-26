@@ -17,11 +17,19 @@ constraint (`PC-n`) with its reason.
 | the reply arrives within 5 s | use a background queue with a 2 s poll |
 | existing projects are listed exactly as before | do not touch `list()` |
 
+## One plan comment
+
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+
+**Receipts.** A receipt is the line `<!-- plan-receipt -->`, then `plan hash: sha256:<the new hash>`, then two to four lines of what changed and why. It carries no plan text; `plan check` reports a receipt that quotes the plan, and a second comment that looks like a plan.
+
 ## Sections of a plan
 
 Recorded as an issue, or a section of one, **in the repo the work concerns**. Required:
 
 1. **Done-when**: the ask's clauses, copied, numbered `(1) ... (2) ...` as in the ask.
+   A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).
 2. **Scenarios**: the yaml block below, including unchanged (U) ones.
 3. **Constraints** (`PC-n`): what must hold, and why.
 4. **Out of scope**.
@@ -199,3 +207,10 @@ Use `CARRIES: #N` as a standing line of the pull request body only for a depende
 
 A proof (`prove`) and a verdict count when both exist at the same head and plan hash, in either order; the daemon records the `ci` verdict
 itself within minutes of green checks. A push voids every proof and verdict, so after one they are made again.
+
+## Why a work item reads its ask, and a pull request can claim
+
+Two recorded cases (numbers are neutral) led to the two rules after the Done-when item above.
+
+1. **Case 1, the structure gate (G0a).** Work item `#124` belongs to ask `#123` and had no Done-when of its own, because the Done-when lives on the ask. The gate read the Done-when of the issue the plan is on, found none, and failed with `plan check fails: 1 defect` until the ask's Done-when was pasted into the work item. `plan check --ask` already read another issue's Done-when, but the gate did not use it.
+2. **Case 2, the proof gate (G1).** Ask `#123` shipped in two pull requests, `#201` and `#202`, under one plan that had no way to say which scenarios each proves. The first pull request showed the second's scenarios as missing proofs until the ask was split into two work items.

@@ -200,6 +200,25 @@ def wait_for_run(reading, gh, conf, repo, number, since, facts, clock, sleep, wa
         sleep(POLL_SECONDS)
 
 
+def wait_in_flight(reading, gh, conf, repo, number, facts, clock, sleep, wait_seconds=None):
+    """Wait, within the same bound as for a run the gate starts, for the run already in flight at the head. Returns (facts, why); `why` is a refusal
+    when the head moved during the wait (both heads named) or the run did not finish in time (the run named)."""
+    seed = facts["head"]
+    bound = conf["wait"] if wait_seconds is None else wait_seconds
+    limit = clock() + bound
+    ids = ", ".join("%s run %s" % (r["workflow"], r["id"]) for r in facts["runs"] if reading.run_result(r) == "pending") or "unknown run"
+    while True:
+        sleep(POLL_SECONDS)
+        latest = read_facts(reading, gh, repo, number, conf)
+        if not latest["problems"] and latest["head"] and latest["head"] != seed:
+            return latest, "the head moved while waiting for CI: it was %s and is now %s: run the gate again" % (seed, latest["head"])
+        if latest["problems"] or latest["pr_result"] != "pending":
+            return latest, None
+        ids = ", ".join("%s run %s" % (r["workflow"], r["id"]) for r in latest["runs"] if reading.run_result(r) == "pending") or ids
+        if clock() >= limit:
+            return latest, "CI run in flight at the head %s (%s) did not finish within %d minutes: nothing was allowed" % (seed[:8], ids, bound // 60)
+
+
 # ------------------------------------------------------------------------------------------------ the lock and the pass record
 
 def _dir(state, create):
@@ -333,6 +352,13 @@ def gate_pass(reading, gh, conf, state, repo, number, holder, pid, clock, sleep,
     lines = []
     facts = read_facts(reading, gh, repo, number, conf)
     allowed, reason, need = decide(facts)
+    if (not allowed and facts["gated"] and not facts["problems"] and facts["state"] == "OPEN" and facts["branch_result"] != "red"
+            and facts["pr_result"] == "pending"):
+        facts, why = wait_in_flight(reading, gh, conf, repo, number, facts, clock, sleep, wait_seconds)
+        if why:
+            return False, [why]
+        lines.append("waited for the CI run in flight at the head %s" % facts["head"][:8])
+        allowed, reason, need = decide(facts)
     if need == "rerun" and facts["gated"] and not facts["problems"]:
         problem = rerun(gh, repo, number, facts["labels"], allow_held)
         if problem:

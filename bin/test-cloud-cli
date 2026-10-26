@@ -3,13 +3,16 @@
 
     bin/test-cloud-cli
 """
+import contextlib
 import http.server
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 
@@ -261,6 +264,197 @@ class TestMutants(Base):
         self.run_cli(["send", "imposter", "x"], source=src)
         self.assertEqual(self.srv.seen[0]["body"]["sender"], "imposter")
         self.assertNotEqual(self.srv.seen[0]["body"]["sender"], "worker-a")
+
+
+def hmutate(old, new, source=SOURCE):
+    assert source.count(old) == 1, old
+    out = source.replace(old, new)
+    assert out != source
+    return out
+
+
+def load(source=SOURCE):
+    module = types.ModuleType("cloud_cli_under_test")
+    module.__file__ = str(BIN / "cloud_cli.py")
+    exec(compile(source, "cloud_cli.py", "exec"), module.__dict__)
+    return module
+
+
+class Plain(Base):
+    def refused_before_any_request(self, source=None, **env):
+        code, out, err = self.run_cli(["send", "p", "x"], source=source, FLEET_CLOUD_CHANNEL_URL="http://hub.invalid:9/send", **env)
+        return code, out, err
+
+    def test_plain_http_to_a_non_loopback_host_is_refused(self):
+        code, out, err = self.refused_before_any_request()
+        self.assertEqual(code, 2)
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertIn("plain http", out)
+        self.assertNotIn(SECRET, out + err)
+        self.assertEqual(self.srv.seen, [])
+
+    def test_mutant_plain_http_allowed_is_caught(self):
+        source = hmutate('parts.scheme == "http" and not _http_allowed(parts, env)', "False")
+        code, out, _ = self.refused_before_any_request(source=source)
+        self.assertNotEqual(code, 2)          # the real command stops at 2 with the named line; the mutant tries the host
+
+    def test_named_host_flag_allows_it(self):
+        code, out, _ = self.refused_before_any_request(FLEET_CLOUD_ALLOW_HTTP_HOST="hub.invalid")
+        self.assertEqual(code, 1)             # allowed: the request is attempted (the name does not resolve), not refused as usage
+        self.assertNotIn("plain http", out)
+        code, out, _ = self.refused_before_any_request(FLEET_CLOUD_ALLOW_HTTP_HOST="other.invalid")
+        self.assertEqual(code, 2)
+
+    def test_mutant_flag_ignored_is_caught(self):
+        source = hmutate('env.get("FLEET_CLOUD_ALLOW_HTTP_HOST", "")', '""')
+        code, _, _ = self.refused_before_any_request(source=source, FLEET_CLOUD_ALLOW_HTTP_HOST="hub.invalid")
+        self.assertEqual(code, 2)             # the mutant refuses a named host
+
+    def test_https_and_loopback_pass_the_rule(self):
+        module = load()
+        for url, ok in (("http://127.0.0.1:1/x", True), ("http://[::1]:1/x", True), ("http://localhost/x", True),
+                        ("http://a.ns.svc/x", True), ("http://a.ns.svc.cluster.local/x", True), ("http://a.svc.evil.com/x", False), ("http://169.254.169.254/x", False), ("http://2852039166/x", False), ("http://example.com/x", False)):
+            self.assertEqual(module._http_allowed(module.urllib.parse.urlparse(url), {}), ok, url)
+
+    def test_empty_netloc_keeps_its_own_message(self):
+        code, out, _ = self.run_cli(["send", "p", "x"], FLEET_CLOUD_CHANNEL_URL="http:///x")
+        self.assertEqual(code, 2)
+        self.assertIn("http or https URL", out)
+        source = hmutate(" or not parts.netloc:", ":")
+        code, out, _ = self.run_cli(["send", "p", "x"], source=source, FLEET_CLOUD_CHANNEL_URL="http:///x")
+        self.assertNotIn("http or https URL", out)
+
+
+class Pins(unittest.TestCase):
+    def run_main(self, source=SOURCE, argv=("send", "p", "x"), env=None, send=None, post=None):
+        module = load(source)
+        sent = []
+
+        def fake_send(sender, recipient, text, post_fn, token_path=None, **kw):
+            sent.append((sender, token_path))
+            return send(sender) if send else (True, "")
+        module.cloud_client = types.SimpleNamespace(send=fake_send, report=fake_send, TOKEN_PATH=module.cloud_client.TOKEN_PATH)
+        env = dict({"FLEET_AGENT_NAME": "worker-a", "FLEET_CLOUD_CHANNEL_URL": "http://127.0.0.1:1/send"}, **(env or {}))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = module.main(list(argv), env, post=lambda r: {})
+        return code, buf.getvalue(), sent
+
+    def test_one_line_output(self):
+        code, out, _ = self.run_main(send=lambda s: (False, "first\nsecond"))
+        self.assertEqual((code, out), (1, "first\n"))
+        code, out, _ = self.run_main(source=hmutate('.splitlines()[0]', ""), send=lambda s: (False, "first\nsecond"))
+        self.assertNotEqual(out, "first\n")
+
+    def test_sender_is_stripped(self):
+        code, out, sent = self.run_main(env={"FLEET_AGENT_NAME": "  "})
+        self.assertEqual((code, sent), (2, []))
+        code, out, sent = self.run_main(env={"FLEET_AGENT_NAME": " worker-a "})
+        self.assertEqual(sent[0][0], "worker-a")
+        source = hmutate('env.get("FLEET_AGENT_NAME", "").strip()', 'env.get("FLEET_AGENT_NAME", "")')
+        self.assertNotEqual(self.run_main(source=source, env={"FLEET_AGENT_NAME": " worker-a "})[2][0][0], "worker-a")
+
+    def test_default_token_path_is_pinned(self):
+        self.assertEqual(load().cloud_client.TOKEN_PATH, "/var/run/secrets/tokens/fleet-switchboard")
+        self.assertEqual(self.run_main()[2][0][1], "/var/run/secrets/tokens/fleet-switchboard")
+        source = hmutate("env.get(\"FLEET_CLOUD_TOKEN_FILE\") or cloud_client.TOKEN_PATH\n    post = post or make_post(url)", "env.get(\"FLEET_CLOUD_TOKEN_FILE\") or '/elsewhere'\n    post = post or make_post(url)")
+        self.assertNotEqual(self.run_main(source=source)[2][0][1], "/var/run/secrets/tokens/fleet-switchboard")
+
+    def test_timeout_is_ten_seconds(self):
+        self.assertEqual(load().TIMEOUT, 10)
+
+
+class Wire(unittest.TestCase):
+    """The real post function against a loopback server."""
+
+    def serve(self, handler):
+        srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        srv.seen = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv, "http://127.0.0.1:%d/send" % srv.server_address[1]
+
+    def request(self):
+        return {"authorization": "Bearer " + SECRET, "body": {"sender": "a", "recipient": "b", "key": "k", "text": "t"}}
+
+    def test_content_type_is_json(self):
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.server.seen.append(self.headers.get("Content-Type"))
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+        for source, expected in ((SOURCE, "application/json"), (hmutate(', "Content-Type": "application/json"', ""), None)):
+            srv, url = self.serve(H)
+            load(source).make_post(url)(self.request())
+            self.assertEqual(srv.seen == ["application/json"], expected is not None)
+
+    def test_success_body_is_capped(self):
+        pad = json.dumps({"delivered": True, "pad": "x" * 200000}).encode()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(pad)))
+                self.end_headers()
+                self.wfile.write(pad)
+
+            def log_message(self, *a):
+                pass
+        _, url = self.serve(H)
+        self.assertNotIn("pad", load().make_post(url)(self.request()))    # cut at 64 KiB: not valid JSON, so nothing is read from it
+        self.assertIn("pad", load(hmutate("answer.read(65536)\n        except urllib.error", "answer.read()\n        except urllib.error"))
+                      .make_post(url)(self.request()))
+
+    def test_refusal_shows_the_server_reason(self):
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                data = json.dumps({"reason": "quota used"}).encode()
+                self.send_response(403)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+        _, url = self.serve(H)
+        self.assertEqual(load().make_post(url)(self.request())["error"], "quota used")
+        self.assertNotIn("error", load(hmutate("if status != 200:", "if False:")).make_post(url)(self.request()))
+
+    def test_stalled_server_is_cut_by_the_timeout(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                release.wait(30)
+
+            def log_message(self, *a):
+                pass
+        _, url = self.serve(H)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "run.py"
+
+        def run(source):
+            (Path(tmp.name) / "cloud_cli.py").write_text(source)
+            (Path(tmp.name) / "cloud_client.py").write_text((BIN / "cloud_client.py").read_text())
+            script.write_text("import sys; sys.path.insert(0, %r)\nimport cloud_cli\nprint(cloud_cli.make_post(%r)(%r)['status'])\n"
+                              % (tmp.name, url, self.request()))
+            return subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=6).stdout.strip()
+        fast = SOURCE.replace("TIMEOUT = 10\n", "TIMEOUT = 1\n")
+        self.assertNotEqual(fast, SOURCE)
+        self.assertEqual(run(fast), "0")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run(hmutate("timeout=TIMEOUT", "timeout=None", fast))
 
 
 if __name__ == "__main__":
