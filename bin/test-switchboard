@@ -78220,7 +78220,7 @@ _closure = importlib.import_module("test_closure")
 TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
-TestShadowRule, TestShadowGlue = _shadow.TestShadowRule, _shadow.TestShadowGlue
+TestShadowRule, TestShadowGlue, TestShadowStatuses = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -78248,7 +78248,7 @@ class TestTheArchitectureTestIsRun(unittest.TestCase):
                 else:
                     yield item
         ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
-        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue"):
+        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses"):
             with self.subTest(case=name):
                 self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 2, "the hook that loads tests/switchboard/test_closure.py is gone")
 
@@ -80428,7 +80428,10 @@ class TestWhoCanClear(unittest.TestCase):
                 self.assertEqual(self.who(report, files, {path: None})["who"], "unknown")
                 self.assertEqual(self.who(report, files, {path: []})["who"], "owner or chief of staff")
                 mutant = dict(self.rule, closure_files=[g for g in self.rule["closure_files"] if g != path])
-                self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "owner or chief of staff", "a path the rule does not judge is not mapped")
+                if self.floor.matches(path, ["bin/switchboard/*.py"]):   # #1339: a part of the daemon is judged whether the matrix lists it or not (an unmapped one is refused)
+                    self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "unknown", "a part is judged even when the rule does not list it")
+                else:
+                    self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "owner or chief of staff", "a path the rule does not judge is not mapped")
 
     def test_every_floor_class_gives_its_rule_id_and_the_lowest_rating_and_the_never_delegated_ones_are_owner_only_without_a_max_level(self):
         for rid, cls in self.block["floor"]["rules"].items():

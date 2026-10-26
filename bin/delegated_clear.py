@@ -339,7 +339,7 @@ def refusal_items(rule, report, files, matches=None, closure=None, scored=None):
             items.append(_item("new-file", "it adds, deletes or renames a file under a directory the daemon loads at start (%s): that stays the owner's own clear" % item["filename"][:80], [item["filename"]],
                                verb={"removed": "deletes a file", "renamed": "renames a file"}.get(item.get("status") if not item.get("previous_filename") else "renamed", "adds a file")))
         for path in both:
-            if matches(path, rule["closure_files"]) or (matches(path, ["bin/switchboard/*.py"]) and (closure or {}).get(item["filename"]) is not None):   # a part the closure does not list is judged when the caller read it, for an added closure name (#1339)
+            if matches(path, rule["closure_files"]) or matches(path, ["bin/switchboard/*.py"]):   # a part the closure does not list is judged like a listed one: a file nobody mapped (any status but `modified`) is refused as unmappable, never skipped
                 mapped = (closure or {}).get(item["filename"])
                 if mapped is None:
                     items.append(_item("unreadable", "the change to %s cannot be mapped to its definitions: refused" % path[:60], why="a change cannot be mapped to its definitions"))
@@ -761,7 +761,8 @@ def shadow_refusals(base_src, head_src, names, filename):
         added = bound_names(ast.parse(head_src)) - bound_names(ast.parse(base_src))
     except (SyntaxError, ValueError):
         return ["%s does not parse before or after the change: refused" % filename[:80]]
-    return sorted("it adds %s in %s, a name of the clear's closure (a second definition of it could take its place): refused" % (name, filename[:80])
+    shown = "".join(c if c.isprintable() else "?" for c in filename[:80])   # a path is text from a pull request: no control characters in a reason
+    return sorted("it adds %s in %s, a name of the clear's closure (a second definition of it could take its place): refused" % (name, shown)
                   for name in set(names) & added)
 
 

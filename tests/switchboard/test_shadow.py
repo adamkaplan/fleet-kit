@@ -225,5 +225,60 @@ class TestShadowGlue(unittest.TestCase):
             self.assertTrue(any(other in r for r in self.run_map(entry, base, added)), "when the old check says nothing the added name is what the entry says")
 
 
+class TestShadowStatuses(unittest.TestCase):
+    """The real `refusals` (the clear's one rule), fed as `delegated_clear_inputs` feeds it: a map only for a file whose status is `modified`. Any other status of a part or of the entry is unmapped and REFUSED
+    ('cannot be mapped'), never skipped: a listed part, an unlisted part and the entry alike."""
+    FILES = {"listed": "bin/switchboard/audit.py", "unlisted": "bin/switchboard/judge.py", "entry": RULE["daemon_file"]}
+    STATUSES = ("changed", "unchanged", None, "renamed", "copied", "removed", "added", "modified")
+    REPORT = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "changed_paths": []}
+
+    def setUp(self):
+        self.m = load("delegated_clear_statuses", REPO / "bin" / "delegated_clear.py")
+
+    def refused(self, module, path, status, closure_map):
+        item = {"filename": path}
+        if status is not None:
+            item["status"] = status
+        report = dict(self.REPORT, changed_paths=[path])
+        closure = {path: closure_map} if status == "modified" else {}   # what delegated_clear_inputs maps
+        return module.refusals(RULE, report, [item], impact_floor.matches, closure)
+
+    def test_every_status_of_a_listed_part_an_unlisted_part_and_the_entry(self):
+        self.assertFalse(impact_floor.matches(self.FILES["unlisted"], RULE["closure_files"]))
+        for kind, path in self.FILES.items():
+            for status in self.STATUSES:
+                with self.subTest(file=kind, status=status):
+                    got = self.refused(self.m, path, status, [])
+                    if status == "modified":
+                        self.assertEqual(got, [], "a mapped file with no reason is judged normally and passes this rule")
+                        self.assertTrue(self.refused(self.m, path, status, ["it adds boss_name in %s, a name of the clear's closure: refused" % path]), "and a mapped reason is carried")
+                    else:
+                        self.assertTrue(any("cannot be mapped" in r for r in got), got)
+
+    def test_a_mutant_that_restores_the_skip_lets_the_unmapped_unlisted_part_through(self):
+        source = (REPO / "bin" / "delegated_clear.py").read_text()
+        old = 'matches(path, rule["closure_files"]) or matches(path, ["bin/switchboard/*.py"]):'
+        self.assertIn(old, source)
+        mutant = source.replace(old, 'matches(path, rule["closure_files"]) or (matches(path, ["bin/switchboard/*.py"]) and (closure or {}).get(item["filename"]) is not None):', 1)
+        spec = importlib.util.spec_from_loader("delegated_clear_mutant", loader=None)
+        module = importlib.util.module_from_spec(spec)
+        module.__dict__["__file__"] = str(REPO / "bin" / "delegated_clear.py")
+        exec(compile(mutant, "delegated_clear_mutant", "exec"), module.__dict__)
+        for status in ("changed", "unchanged", None):
+            with self.subTest(status=status):
+                self.assertEqual(self.refused(module, self.FILES["unlisted"], status, []), [], "the old skip passes it")
+                self.assertTrue(self.refused(self.m, self.FILES["unlisted"], status, []), "the rule refuses it")
+
+    def test_a_control_character_in_a_path_is_not_carried_into_the_reason(self):
+        got = self.m.shadow_refusals("x = 1\n", "boss_name = 1\n", {"boss_name"}, "bin/switchboard/a\x1b[31m\nb.py")
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].isprintable(), repr(got[0]))
+        self.assertIn("boss_name", got[0])
+
+    def test_the_part_glob_matches_a_dotfile_and_not_a_subdirectory(self):   # stated: the parts directory is flat (derive-closure fails closed on any other file there)
+        self.assertTrue(impact_floor.matches("bin/switchboard/.x.py", ["bin/switchboard/*.py"]))
+        self.assertFalse(impact_floor.matches("bin/switchboard/sub/x.py", ["bin/switchboard/*.py"]))
+
+
 if __name__ == "__main__":
     unittest.main()
