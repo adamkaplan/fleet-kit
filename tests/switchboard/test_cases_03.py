@@ -46,13 +46,13 @@ import uuid
 import urllib.parse
 from unittest import mock
 from support.core import Base, FakeRunner, SAFE_PATH
-from support.installs_and_keys import InstallCase, tree_of
+from support.fake_jev import FakeOpener, JEV_SETTINGS, jev_reply, noul_answers
+from support.installs_and_keys import InstallCase, KeyCase, PR16_KEY, tree_of
 from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, captured, class_source, sb, sc, switchboard_source
 from support.orders_and_adapters import EA, ExternalAdapterCase, FakeDoorServer, FakeWorkHost, FakeWorkSink, fake_mapping, report, worker
 from support.paths import BIN, REPO
 from support.policy_and_import import TRIAL
 from support.scenario_roles import AGENT_FILES, ROLE_BYTE_LIMITS, role_of
-from support.service_and_merge import feed_line
 from support.wire_fakes import EPOCH, MSG, SES, routed
 
 
@@ -529,13 +529,6 @@ class GitHubOverGit:
         raise RuntimeError("the fake GitHub has no answer for %s" % path)
 
 
-class TestSyncReportFreezePerBoss(unittest.TestCase):
-    def test_the_cycle_scopes_the_freeze_by_the_errors_boss(self):
-        source = (REPO / "bin" / "decision_sync.py").read_text()
-        self.assertIn('e.get("source") == "reports" and e.get("boss")', source)
-        self.assertIn("plan_operations(desired, self._projected(), kinds, now, scoped)", source)
-
-
 class TestReportFoldVariants(unittest.TestCase):
     """#126 from first principles: a report about an issue that is already the person's decision must not sit beside it as a
     second, cos-tier entry, however the report names the issue or reaches it. Synthetic names; 4-digit issue numbers."""
@@ -960,6 +953,163 @@ class TestCommissioningDocs(unittest.TestCase):
             self.assertRegex(text, r"(?m)^\| %s \|" % sid)
 
 
+class TestKeyFile(KeyCase):
+    def test_the_default_key_file_sits_beside_the_config(self):
+        self.assertEqual(sb.jev_key_file(dict(sb.JEV_DEFAULTS)), self.key_file)
+        self.assertIsNone(sb.JEV_DEFAULTS["key_file"])
+
+    def test_the_variable_wins_over_the_file(self):
+        self.put_key()
+        os.environ["OPENROUTER_API_KEY"] = "from-the-environment"
+        self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS)), ("from-the-environment", "environment"))
+
+    def test_the_file_is_read_when_the_variable_is_unset(self):
+        self.put_key()
+        self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS)), (PR16_KEY, "file"))
+
+    def test_the_variable_named_by_key_env_is_the_one_read(self):
+        os.environ["MY_JEV_KEY"] = "named"
+        self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS, key_env="MY_JEV_KEY")), ("named", "environment"))
+
+    def test_no_key_anywhere_is_none(self):
+        self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS)), (None, "none"))
+
+    def test_a_file_anyone_else_could_read_is_refused_and_says_why(self):
+        for mode in (0o640, 0o604, 0o660, 0o644):
+            with self.subTest(mode=oct(mode)):
+                self.put_key(mode=mode)
+                with self.assertRaises(sb.KeyFileError) as caught:
+                    sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+                self.assertIn("0600", str(caught.exception))
+                self.assertIn(str(self.key_file), str(caught.exception))
+                self.assertNotIn(PR16_KEY, str(caught.exception))
+
+    def test_a_file_you_may_read_and_write_alone_is_taken(self):
+        for mode in (0o600, 0o400, 0o700):
+            with self.subTest(mode=oct(mode)):
+                self.put_key(mode=mode)
+                self.assertEqual(sb.locate_jev_key(dict(sb.JEV_DEFAULTS))[1], "file")
+
+    def test_a_link_a_directory_a_stranger_s_file_and_an_empty_file_are_refused(self):
+        real = self.home / "elsewhere.key"
+        real.write_text(PR16_KEY)
+        os.chmod(str(real), 0o600)
+        self.key_file.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(real), str(self.key_file))
+        with self.assertRaises(sb.KeyFileError) as caught:
+            sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+        self.assertIn("regular file", str(caught.exception))
+        self.key_file.unlink()
+        self.key_file.mkdir()
+        with self.assertRaises(sb.KeyFileError):
+            sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+        self.key_file.rmdir()
+        self.put_key()
+        with mock.patch.object(sb.os, "getuid", return_value=os.getuid() + 1), \
+                self.assertRaises(sb.KeyFileError) as caught:
+            sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+        self.assertIn("owned by you", str(caught.exception))
+        self.key_file.write_text("  \n")
+        os.chmod(str(self.key_file), 0o600)
+        with self.assertRaises(sb.KeyFileError) as caught:
+            sb.locate_jev_key(dict(sb.JEV_DEFAULTS))
+        self.assertIn("empty", str(caught.exception))
+
+    def test_a_key_file_path_in_the_config_is_used_and_must_be_absolute(self):
+        other = self.home / "custom.key"
+        other.write_text(PR16_KEY)
+        os.chmod(str(other), 0o600)
+        config = sb.validate_config({"jev": {"key_file": str(other)}})
+        self.assertEqual(sb.locate_jev_key(config["jev"]), (PR16_KEY, "file"))
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"jev": {"key_file": "relative.key"}})
+        self.assertIn("key_file", str(caught.exception))
+
+    def test_the_client_sends_the_file_s_key_only_as_the_authorization_header(self):
+        self.put_key()
+        opener = FakeOpener(jev_reply(noul_answers(q=0.2)))
+        client = sb.JevClient(dict(JEV_SETTINGS), opener=opener)
+        out = client.decide({"x": 1}, {"q": {"type": "noul", "instructions": "x"}})
+        self.assertEqual(opener.calls[0]["headers"]["Authorization"], "Bearer " + PR16_KEY)
+        self.assertNotIn(PR16_KEY, json.dumps(opener.calls[0]["body"]))
+        self.assertNotIn(PR16_KEY, json.dumps(out))
+
+    def test_a_refused_file_makes_the_client_fail_open_without_the_key(self):
+        self.put_key(mode=0o644)
+        client = sb.JevClient(dict(JEV_SETTINGS), opener=FakeOpener(jev_reply(noul_answers(q=0.2))))
+        with self.assertRaises(sb.JevError) as caught:
+            client.decide({"x": 1}, {"q": {"type": "noul", "instructions": "x"}})
+        self.assertEqual(caught.exception.reason, "unauthorized")
+        self.assertNotIn(PR16_KEY, str(caught.exception) + caught.exception.detail)
+
+
+class TestTodolistPlugin(Base):
+    """The vendored todo plugin: src/ copied beside a one-line loader in plugins/, temp config dirs only."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = self.home / "cfg"
+        self.src = REPO / "plugins" / "opencode-todolist" / "src"
+        self.loader = self.config / "plugins" / "opencode-todolist.ts"
+
+    def test_a_fresh_install_copies_every_src_file_byte_for_byte_and_writes_the_loader(self):
+        self.assertTrue(sb.install_todolist_plugin(self.config, REPO))
+        files = [p for p in self.src.rglob("*") if p.is_file()]
+        self.assertTrue(files)
+        for path in files:
+            self.assertEqual((self.config / "opencode-todolist" / path.relative_to(self.src)).read_bytes(), path.read_bytes())
+        self.assertEqual(self.loader.read_text(), 'export { default } from "../opencode-todolist/src/index.ts"\n')
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "already installed")
+
+    def test_a_second_run_changes_nothing(self):
+        sb.install_todolist_plugin(self.config, REPO)
+        before = tree_of(self.config)
+        self.assertFalse(sb.install_todolist_plugin(self.config, REPO))
+        self.assertEqual(tree_of(self.config), before)
+
+    def test_a_loader_the_kit_did_not_write_is_not_overwritten(self):
+        self.loader.parent.mkdir(parents=True)
+        self.loader.write_text("// mine\n")
+        with self.assertRaises(sb.InstallError):
+            sb.install_todolist_plugin(self.config, REPO)
+        self.assertEqual(self.loader.read_text(), "// mine\n")
+        self.assertFalse((self.config / "opencode-todolist").exists())
+
+    def test_a_src_file_the_kit_did_not_write_is_not_overwritten(self):
+        (self.config / "opencode-todolist").mkdir(parents=True)
+        (self.config / "opencode-todolist" / "index.ts").write_text("// mine\n")
+        with self.assertRaises(sb.InstallError):
+            sb.install_todolist_plugin(self.config, REPO)
+        self.assertEqual((self.config / "opencode-todolist" / "index.ts").read_text(), "// mine\n")
+        self.assertFalse(self.loader.exists())
+
+    def test_status_says_differs_from_the_kit_after_an_edit_and_a_rerun_restores_it(self):
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "not installed")
+        sb.install_todolist_plugin(self.config, REPO)
+        (self.config / "opencode-todolist" / "todos.ts").write_text("edited\n")
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "differs from the kit")
+        self.assertTrue(sb.install_todolist_plugin(self.config, REPO))
+        self.assertEqual(sb.todolist_plugin_status(self.config, REPO), "already installed")
+
+    def test_uninstall_removes_only_what_the_kit_wrote(self):
+        sb.install_todolist_plugin(self.config, REPO)
+        (self.config / "opencode-todolist" / "todos.ts").write_text("edited\n")
+        (self.config / "plugins" / "other.js").write_text("x")
+        self.assertTrue(sb.uninstall_todolist_plugin(self.config, REPO))
+        self.assertFalse(self.loader.exists())
+        self.assertEqual(sorted(p.name for p in (self.config / "opencode-todolist").iterdir()), ["todos.ts"])
+        self.assertTrue((self.config / "plugins" / "other.js").exists())
+        (self.config / "opencode-todolist" / "todos.ts").unlink()
+        self.assertFalse(sb.uninstall_todolist_plugin(self.config, REPO))
+        self.assertFalse((self.config / "opencode-todolist").exists())
+
+    def test_uninstall_of_a_foreign_loader_leaves_it(self):
+        self.loader.parent.mkdir(parents=True)
+        self.loader.write_text("// mine\n")
+        self.assertFalse(sb.uninstall_todolist_plugin(self.config, REPO))
+        self.assertEqual(self.loader.read_text(), "// mine\n")
+
+
 class ReaperOnlyFakes:
     """The reaper-only install (ask #982): the parser's own arguments, the fake machine, the fake home."""
 
@@ -1216,156 +1366,234 @@ class TestInstallPutsTheCliOnPath(InstallCase):
         self.assertEqual(self.statuses(out)["cli link"], ["would be done"])
 
 
-class TestExternalAdapterErrors(ExternalAdapterCase):
-    def test_http_statuses_map_to_the_hierarchy_and_4xx_is_not_retried(self):
-        cases = ((401, "cred", EA.CredentialError), (403, "off", EA.DisabledError), (404, "nf", EA.NotFound),
-                 (400, "bad", EA.InvalidRequest), (415, "media", EA.InvalidRequest), (409, "clash", EA.Conflict),
-                 (422, "odd", EA.InvalidRequest), (409, "decided", EA.AlreadyDecided))
-        adapter = self.adapter("http")
-        for status, code, cls in cases:
-            self.slept.clear()
-            before = len(self.server.requests)
-            self.server.fail_next("raise", status, {"code": code, "message": "m"})
-            with self.assertRaises(cls) as ctx:
-                self.push(adapter, self.decision(), "k-%d" % status)
-            self.assertIs(type(ctx.exception), cls)
-            self.assertEqual(self.slept, [], status)
-            self.assertEqual(len(self.server.requests), before)  # the injected reply is the one and only call
+class TestExternalAdapterKeys(ExternalAdapterCase):
+    def test_env_source(self):
+        self.assertEqual(EA.load_key(EA.parse_key_source("env:K"), environ={"K": " abc \n"}).reveal(), "abc")
+        with self.assertRaises(EA.KeySourceError):
+            EA.load_key(EA.parse_key_source("env:K"), environ={})
 
-    def test_a_4xx_is_asked_once(self):
-        adapter = self.adapter("http")
-        for status in (400, 401, 403, 404, 409):
-            self.server.fail_next("raise", status, {"code": "z", "message": "m"}, count=10)
-            with self.assertRaises(EA.AdapterError):
-                self.push(adapter, self.decision(), "k")
-            self.assertEqual(len([1 for i in self.server.inject if i["count"] == 9]), 1, status)
-            self.server.inject.clear()
+    def test_file_source_needs_mode_0600(self):
+        path = self.tmp / "key"
+        path.write_text("file-key-value\n")
+        os.chmod(path, 0o600)
+        self.assertEqual(EA.load_key(EA.parse_key_source("file:%s" % path)).reveal(), "file-key-value")
+        for mode in (0o644, 0o640, 0o604, 0o660):
+            os.chmod(path, mode)
+            with self.assertRaises(EA.KeySourceError) as ctx:
+                EA.load_key(EA.parse_key_source("file:%s" % path))
+            self.assertIn("0600", str(ctx.exception))
+            self.assertNotIn("file-key-value", str(ctx.exception))
+        with self.assertRaises(EA.KeySourceError):
+            EA.load_key(EA.parse_key_source("file:%s" % (self.tmp / "absent")))
 
-    def test_429_honours_retry_after_then_succeeds(self):
-        adapter = self.adapter("http")
-        self.server.fail_next("raise", 429, {"code": "slow", "message": "later"}, {"Retry-After": "2"})
-        self.assertTrue(self.push(adapter, self.decision(), "k-1").startswith("it-"))
-        self.assertEqual(self.slept, [2.0])
+    def test_command_source_runs_without_a_shell_and_is_held_in_memory(self):
+        argv = [sys.executable, "-c", "print('cmd-key-value')"]
+        self.assertEqual(EA.load_key(EA.parse_key_source({"command": argv})).reveal(), "cmd-key-value")
+        self.assertEqual(EA.load_key(EA.parse_key_source("command:" + json.dumps(argv))).reveal(), "cmd-key-value")
+        # a shell metacharacter is an argument, not a shell
+        marker = self.tmp / "ran"
+        argv = [sys.executable, "-c", "import sys; print(sys.argv[1])", "x; touch %s" % marker]
+        EA.load_key(EA.parse_key_source({"command": argv}))
+        self.assertFalse(marker.exists())
 
-    def test_a_long_retry_after_is_reported_not_slept(self):
+    def test_command_timeout_failure_and_empty_output(self):
+        slow = [sys.executable, "-c", "import time; time.sleep(5)"]
+        started = time.time()
+        with self.assertRaises(EA.KeySourceError) as ctx:
+            EA.load_key(EA.parse_key_source({"command": slow, "timeout": 0.3}))
+        self.assertIn("did not answer", str(ctx.exception))
+        self.assertLess(time.time() - started, 3)
+        bad = [sys.executable, "-c", "import sys; print('leaked-key-value'); sys.exit(3)"]
+        with self.assertRaises(EA.KeySourceError) as ctx:
+            EA.load_key(EA.parse_key_source({"command": bad}))
+        self.assertIn("exit 3", str(ctx.exception))
+        self.assertNotIn("leaked-key-value", str(ctx.exception))
+        with self.assertRaises(EA.KeySourceError):
+            EA.load_key(EA.parse_key_source({"command": [sys.executable, "-c", "pass"]}))
+        with self.assertRaises(EA.KeySourceError):
+            EA.load_key(EA.parse_key_source({"command": ["/nonexistent/binary-xyz"]}))
+
+    def test_the_key_never_appears_in_any_text(self):
+        key = FakeDoorServer.KEY
         adapter = self.adapter("http")
-        self.server.fail_next("raise", 429, {"code": "slow", "message": "later"}, {"Retry-After": "60"})
-        with self.assertRaises(EA.RateLimited) as ctx:
+        texts = [repr(adapter.keys.current()), str(adapter.keys.current()), repr(adapter.keys)]
+        with self.assertRaises(EA.CredentialError) as ctx:  # the server echoes the credential it was shown
+            self.server.fail_next("raise", 401, {"code": "cred", "message": "refused Key %s for %s" % (key, key)})
             self.push(adapter, self.decision(), "k-1")
-        self.assertEqual(ctx.exception.retry_after, 60.0)
-        self.assertEqual(self.slept, [])
-        self.server.fail_next("raise", 429, {"code": "slow", "message": "later", "retry_after_s": 7})
-        with self.assertRaises(EA.RateLimited) as ctx:
+        texts.append(str(ctx.exception))
+        self.assertIn("[key]", str(ctx.exception))
+        self.server.fail_next("raise", 400, {"code": "bad", "message": "Bearer %s" % key})
+        with self.assertRaises(EA.InvalidRequest) as ctx:
             self.push(adapter, self.decision(), "k-2")
-        self.assertEqual(ctx.exception.retry_after, 7.0)  # no header: the mapped body field
-        self.server.fail_next("raise", 429, {"code": "x", "message": "later"}, count=10)
-        with self.assertRaises(EA.RateLimited) as ctx:
+        texts.append(str(ctx.exception))
+        self.server.fail_next("raise", 500, {"code": "x", "message": key}, count=5)
+        with self.assertRaises(EA.Unavailable) as ctx:
             self.push(adapter, self.decision(), "k-3")
-        self.assertEqual(ctx.exception.retry_after, 1.0)  # neither: the default (short: slept, then given up)
-        self.assertEqual(self.slept, [1.0, 1.0])
-
-    def test_5xx_is_retried_with_a_doubling_delay_and_a_cap(self):
-        adapter = self.adapter("http")
-        self.server.fail_next("raise", 503, count=2)
-        self.assertTrue(self.push(adapter, self.decision(), "k-1").startswith("it-"))
-        self.assertEqual(self.slept, [0.5, 1.0])
-        self.slept.clear()
-        self.server.fail_next("raise", 500, count=10)
-        with self.assertRaises(EA.Unavailable):
-            self.push(adapter, self.decision(), "k-2")
-        self.assertEqual(self.slept, [0.5, 1.0])  # three attempts, two waits
-        self.slept.clear()
-        many = self.adapter("http", retry={"attempts": 5})
-        self.server.inject.clear()
-        self.server.fail_next("raise", 500, count=10)
-        with self.assertRaises(EA.Unavailable):
-            self.push(many, self.decision(), "k-3")
-        self.assertEqual(self.slept, [0.5, 1.0, 1.5, 1.5])  # capped at max_delay
-
-    def test_a_timeout_a_dropped_connection_and_a_closed_port_are_unavailable_and_retried(self):
-        data = fake_mapping(self.server.url, "http", timeouts={"request": 0.3}, retry={"attempts": 2})
-        adapter = EA.McpRestAdapter(data, sleep=self.slept.append, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
-        self.server.delay = 1.0
-        with self.assertRaises(EA.Unavailable):
-            self.push(adapter, self.decision(), "k-1")
-        self.assertEqual(self.slept, [0.5])
-        self.server.delay = 0
+        texts.append(str(ctx.exception))
         self.server.down = True
-        with self.assertRaises(EA.Unavailable):
-            self.push(adapter, self.decision(), "k-2")
+        texts.append(str(adapter.health()))
         self.server.down = False
-        probe = socket.socket()
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-        probe.close()
-        data["base_url"] = "http://127.0.0.1:%d" % port
-        self.slept.clear()
-        with self.assertRaises(EA.Unavailable):
-            self.push(EA.McpRestAdapter(data, sleep=self.slept.append,
-                                        environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY}), self.decision(), "k-3")
-        self.assertEqual(self.slept, [0.5])
+        self.server.fail_next(None, 401, {"code": "cred", "message": key})
+        texts.append(str(adapter.health()))
+        for text in texts:
+            self.assertNotIn(key, text)
+        with self.assertRaises(TypeError):
+            import pickle
+            pickle.dumps(adapter.keys.current())
+        self.assertEqual(EA.scrub("a %s b Bearer abc.def" % key, [EA.Secret(key)]), "a [key] b Bearer [key]")
 
-    def test_tool_channel_refusals_map_by_code(self):
-        adapter = self.adapter("tool")
-        for code, cls in (("off", EA.DisabledError), ("decided", EA.AlreadyDecided), ("clash", EA.Conflict),
-                          ("slow", EA.RateLimited), ("nf", EA.InvalidRequest), ("bad", EA.InvalidRequest)):
-            self.slept.clear()
-            self.server.fail_next("raise", 400, {"code": code, "message": "refused: %s" % code, "retry_after_s": 90},
-                                  level="result")
-            with self.assertRaises(cls) as ctx:
-                self.push(adapter, self.decision(), "k-" + code)
-            self.assertIs(type(ctx.exception), cls)
-            self.assertEqual(self.slept, [])
+    def test_a_refused_key_rotates_to_the_next_source(self):
+        env = {"OLD": "stale-key", "NEW": FakeDoorServer.KEY}
+        data = fake_mapping(self.server.url, "http", key_source=["env:OLD", "env:NEW"])
+        adapter = EA.McpRestAdapter(data, sleep=self.slept.append, environ=env)
+        self.assertEqual(self.push(adapter, self.decision(), "k-1")[:3], "it-")
+        self.assertEqual(adapter.keys.index, 1)
 
-    def test_tool_channel_credential_and_schema_failures(self):
-        adapter = self.adapter("tool")
-        self.server.fail_next("raise", 401, {"code": "cred", "message": "no"}, level="http")
-        with self.assertRaises(EA.CredentialError):
-            self.push(adapter, self.decision(), "k-1")
-        self.server.fail_next("raise", 503, level="http")
-        self.assertTrue(self.push(adapter, self.decision(), "k-2").startswith("it-"))  # retried
-        # schema failures arrive as text, not JSON
-        with self.assertRaises(EA.InvalidRequest) as ctx:
-            adapter.door.mcp.call_tool("item_raise", {"bad_schema": 1})
-        self.assertIn("validation", str(ctx.exception))
-        with self.assertRaises(EA.InvalidRequest):
-            adapter.door.mcp.call_tool("no_such_tool", {})
+    def test_a_bad_source_is_found_at_start(self):
+        adapter = EA.McpRestAdapter(fake_mapping(self.server.url), environ={})
+        self.assertIn("not set", adapter.start())
+        self.assertIsNone(self.adapter().start())
+        self.assertIn("not set", adapter.health())
 
-    def test_the_tool_session_sse_and_expiry(self):
-        adapter = self.adapter("tool")
-        self.assertEqual(adapter.door.mcp.list_tools()[:2], ["seats_list", "item_raise"])
-        self.assertEqual(adapter.door.mcp.session, "sess-1")
-        self.push(adapter, self.decision(), "k-1")
-        self.assertEqual(self.server.sid, 1)  # one session for all of it
-        self.server.sessions.clear()  # the server forgot it
-        self.push(adapter, self.decision(), "k-2")
-        self.assertEqual(self.server.sid, 2)
-        self.server.session_miss = 400   # some servers answer a session they forgot with a 400
-        self.server.sessions.clear()
-        self.push(adapter, self.decision(), "k-2b")
-        self.assertEqual(self.server.sid, 3)
-        with self.assertRaises(EA.InvalidRequest):   # a real 400 with a good session is asked once, not looped
-            self.server.fail_next("raise", 400, {"code": "bad", "message": "m"}, count=2)
-            self.push(adapter, self.decision(), "k-2c")
-        self.assertEqual(self.server.sid, 4)
-        self.server.session_miss = 404
-        self.server.sse = True
-        fresh = self.adapter("tool")
-        self.assertTrue(self.push(fresh, self.decision(), "k-3").startswith("it-"))
-        self.assertEqual(fresh.pull_normalised(None)[1], 0)
 
-    def test_a_list_of_messages_is_joined(self):
-        adapter = self.adapter("tool")
-        self.server.fail_next("raise", 400, {"code": "bad", "message": ["first", "second"]}, level="result")
-        with self.assertRaises(EA.InvalidRequest) as ctx:
-            self.push(adapter, self.decision(), "k-1")
-        self.assertIn("first; second", str(ctx.exception))
+class TestExternalAdapterOperations(ExternalAdapterCase):
+    def each_channel(self):
+        for channel in ("tool", "http"):
+            self.setUp()
+            yield channel
+            self.server.close()
 
-    def test_a_redirect_is_never_followed(self):
+    def test_raise_maps_the_decision_over_both_channels(self):
+        for channel in self.each_channel():
+            adapter = self.adapter(channel)
+            ident = self.push(adapter, self.decision(), "decision-key-1")
+            sent = [a for c, o, a in self.server.requests if o == "raise"][0]
+            self.assertEqual(self.server.log[-1], (channel, "raise"))
+            self.assertEqual(sent["label"], "routine", channel)
+            self.assertEqual(sent["floor"], "minor")
+            self.assertEqual(sent["seat"], "seat-1")
+            self.assertEqual(sent["body"], "Ship it?\n\nThe build is green.\n\nref: dk:decision-key-1")
+            self.assertEqual(sent["advice"], "yes")
+            self.assertEqual(sent["choices"], [{"name": "approve", "key": "c1"},
+                                               {"name": "hold", "price": "a day", "key": "c2"}])
+            self.assertEqual(str(uuid.UUID(sent["op_id"])), sent["op_id"])
+            self.assertEqual(self.server.items[ident]["floor"], "minor")
+
+    def test_the_floor_follows_the_tier_and_a_hint_may_only_raise_it(self):
         adapter = self.adapter("http")
-        self.server.fail_next("raise", 302, {"code": "x", "message": "moved"}, {"Location": "http://127.0.0.1:1/"})
+        for tier, hint, floor in (("orchestrator", None, "minor"), ("cos", None, "major"), ("human", None, "sealed"),
+                                  ("orchestrator", "moderate", "middling"), ("cos", "low", "major")):
+            self.push(adapter, self.decision(tier=tier, consequence=hint), "k-%s-%s" % (tier, hint))
+            self.assertEqual(self.server.requests[-1][2]["floor"], floor)
         with self.assertRaises(EA.InvalidRequest):
-            self.push(adapter, self.decision(), "k-1")
+            self.push(adapter, self.decision(tier="nobody"), "k-x")
+
+    def test_options_with_their_own_ids_and_optional_fields(self):
+        adapter = self.adapter("tool")
+        self.push(adapter, self.decision(options=[{"label": "a", "id": "mine-1", "recommended": True}],
+                                   grounds="g", stakes="s", evidence=[{"text": "t", "link": "http://127.0.0.1/e"}]),
+                     "k-o")
+        sent = self.server.requests[-1][2]
+        self.assertEqual(sent["choices"], [{"name": "a", "preferred": True, "key": "mine-1"}])
+        self.assertEqual((sent["because"], sent["stakes"]), ("g", "s"))
+        self.assertEqual(sent["refs"], [{"note": "t", "href": "http://127.0.0.1/e"}])
+
+    def test_a_recommendation_is_required_or_defaulted(self):
+        adapter = self.adapter("http")
+        self.push(adapter, self.decision(recommendation=None), "k-d")
+        self.assertEqual(self.server.requests[-1][2]["advice"], "proceed")
+        data = fake_mapping(self.server.url, "http")
+        data.pop("defaults")
+        bare = EA.McpRestAdapter(data, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
+        with self.assertRaises(EA.InvalidRequest):
+            self.push(bare, self.decision(recommendation=None), "k-e")
+
+    def test_revise_withdraw_and_acted_over_both_channels(self):
+        for channel in self.each_channel():
+            adapter = self.adapter(channel)
+            ident = self.push(adapter, self.decision(), "k-1")
+            self.assertEqual(self.push(adapter, {"op": "revise", "external_id": ident, "body": "new words"}, "k-r"), ident)
+            self.assertEqual(self.server.items[ident]["body"], "new words\n\nref: dk:k-r")
+            self.assertEqual(self.server.log[-1], (channel, "revise"))
+            self.server.items[ident]["answer"] = {"answer_id": "a-1"}
+            self.assertEqual(adapter.acted(ident, "a-1", "done", "did it", "k-a"), ident)
+            self.assertEqual(self.server.requests[-1][2]["result"], "did")
+            with self.assertRaises(EA.Conflict):
+                adapter.acted(ident, "not-an-answer", "done")
+            second = self.push(adapter, self.decision(), "k-2")
+            self.push(adapter, {"external_id": second, "status": "withdrawn", "reason": "gone"}, "k-w")
+            self.assertEqual(self.server.items[second]["withdrawn"], {"why": "gone"})
+            self.assertEqual(self.server.log[-1], (channel, "withdraw"))
+            self.push(adapter, {"op": "withdraw", "external_id": second}, "k-w")  # idempotent
+
+    def test_revise_and_withdraw_after_a_decision_are_refused(self):
+        adapter = self.adapter("tool")
+        ident = self.push(adapter, self.decision(), "k-1")
+        self.server.items[ident].update(state="closed", answer={"answer_id": "a-1"})
+        with self.assertRaises(EA.AlreadyDecided):
+            self.push(adapter, {"op": "revise", "external_id": ident, "body": "late"}, "k-r")
+        with self.assertRaises(EA.AlreadyDecided):
+            self.push(adapter, {"op": "withdraw", "external_id": ident}, "k-w")
+        with self.assertRaises(EA.InvalidRequest):
+            self.push(adapter, {"op": "revise", "external_id": ident}, "k-r2")
+
+    def test_status_without_a_mapping_for_it_is_a_local_only_no_op_not_an_error(self):
+        adapter = self.adapter()
+        self.assertNotIn("status", adapter.capabilities)
+        before = len(self.server.log)
+        self.assertEqual(self.push(adapter, {"op": "status", "external_id": "x", "status": "s"}, "k"), "x")
+        self.assertEqual(len(self.server.log), before, "nothing was sent: the engine must not retry it forever")
+
+    def test_idempotent_replay_and_conflict(self):
+        for channel in self.each_channel():
+            adapter = self.adapter(channel)
+            first = self.push(adapter, self.decision(), "same-key")
+            self.assertEqual(self.push(adapter, self.decision(), "same-key"), first)
+            self.assertEqual(len(self.server.items), 1)
+            with self.assertRaises(EA.Conflict):
+                self.push(adapter, self.decision(body="a different body"), "same-key")
+            other = self.push(adapter, self.decision(), "another-key")
+            self.assertNotEqual(other, first)
+            # a key that already is a UUID is kept as it is
+            ident = str(uuid.uuid4())
+            self.push(adapter, self.decision(), ident)
+            self.assertEqual(self.server.requests[-1][2]["op_id"], ident)
+
+    def test_lookup_finds_an_item_by_its_decision_key(self):
+        adapter = self.adapter("http")
+        first = self.push(adapter, self.decision(), "k-1")
+        self.assertEqual(adapter.lookup("dk:k-1"), {"external_id": first, "revision": 1})
+        self.assertIsNone(adapter.lookup("dk:never-raised"))
+        self.assertIsNone(adapter.lookup("dk:k"))  # a prefix of a key is not the key
+        self.server.items[first]["withdrawn"] = {"why": "x"}
+        self.assertIsNone(adapter.lookup("dk:k-1"))
+        bare = fake_mapping(self.server.url, "http")
+        bare["options"] = {"id_prefix": "c"}
+        self.assertIsNone(EA.McpRestAdapter(bare, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY}).lookup("dk:k-1"))
+
+    def test_read_items_are_normalised(self):
+        adapter = self.adapter("tool")
+        ident = self.push(adapter, self.decision(), "k-1")
+        self.server.items[ident].update(state="closed", answer=self.answer_fields(), ask_back=None)
+        found = adapter.read_items()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["external_id"], ident)
+        self.assertEqual(found[0]["status"], "decided")
+        self.assertEqual(found[0]["answer"]["option_id"], "k1")
+        self.assertEqual(found[0]["answer"]["by"]["role"], "human")
+
+    def test_health(self):
+        adapter = self.adapter("http")
+        self.assertIsNone(adapter.health())
+        self.server.disabled = True
+        self.assertIn("disabled", adapter.health())
+        self.server.disabled = False
+        self.server.down = True
+        self.assertIn("request failed", adapter.health())
+        self.server.down = False
+        data = fake_mapping(self.server.url)
+        data["key_source"] = "env:NOT_SET_ANYWHERE"
+        self.assertIn("not set", EA.McpRestAdapter(data, environ={}).health())
 
 
 class TestExternalAdapterPort(ExternalAdapterCase):
@@ -1470,6 +1698,104 @@ class TestExternalAdapterPort(ExternalAdapterCase):
     def test_scrub_takes_out_a_key_with_url_unsafe_characters(self):
         self.assertEqual(EA.scrub("x a/b+c y", [EA.Secret("a/b+c")]), "x [key] y")
         self.assertEqual(EA.scrub("x a%2Fb%2Bc y", [EA.Secret("a/b+c")]), "x [key] y")
+
+
+class TestExternalAdapterWork(ExternalAdapterCase):
+    def test_put_is_idempotent_and_goes_over_http_only(self):
+        adapter = self.adapter("tool")
+        first = adapter.work.put("w-1", "Build the thing", kind="assignment", state="running", doer="coder")
+        self.assertTrue(first["recorded"])
+        self.assertEqual(first["item"]["state"], "going")
+        again = adapter.work.put("w-1", "Build the thing", kind="assignment", state="running", doer="coder")
+        self.assertFalse(again["recorded"])
+        self.assertEqual(self.server.count("work_put", "tool"), 0)
+        self.assertEqual(self.server.count("work_put", "http"), 2)
+        self.assertEqual(adapter.work.get("w-1")["item"]["title"], "Build the thing")
+        self.assertEqual(len(adapter.work.list()), 1)
+        with self.assertRaises(EA.InvalidRequest):
+            adapter.work.put("w-2", "t", unmapped_field=1)
+        with self.assertRaises(EA.Unsupported):
+            adapter.door.call("work_put", {}, ident="w", force="tool")
+
+    def test_a_waiting_or_blocked_state_carries_a_reason_where_the_mapping_names_one(self):
+        adapter = self.adapter()
+        adapter.work.put("w-8", "t", state="awaiting", progress="needs a review")
+        self.assertEqual(self.server.tasks[("seat-1", "w-8")]["why_state"], "needs a review")
+        adapter.work.put("w-7", "t", state="blocked")
+        self.assertEqual(self.server.tasks[("seat-1", "w-7")]["why_state"], "blocked")
+        adapter.work.put("w-6", "t", state="running", progress="going")
+        self.assertNotIn("why_state", self.server.tasks[("seat-1", "w-6")])
+        self.clock_now[0], self.server.now = 100, 1100.0
+        adapter.work.patch("w-6", state="blocked")
+        self.assertEqual(self.server.tasks[("seat-1", "w-6")]["why_state"], "going", "the last progress line")
+        adapter.work.put("w-5", "t", state="awaiting", state_reason="given")
+        self.assertEqual(self.server.tasks[("seat-1", "w-5")]["why_state"], "given")
+
+    def test_an_empty_line_is_not_sent(self):
+        adapter = self.adapter()
+        first = adapter.work.put("w-9", "t", state="running", progress="", doer="  ")
+        self.assertTrue(first["recorded"])
+        self.assertNotIn("progress", self.server.tasks[("seat-1", "w-9")])
+        self.assertEqual(adapter.work.patch("w-9", progress=" "), {"sent": False, "unchanged": True})
+
+    def test_updates_are_coalesced_and_the_last_state_wins(self):
+        adapter = self.adapter()
+        adapter.work.put("w-1", "t", state="running")
+        self.server.now, self.clock_now[0] = 1000.0, 0.0
+        first = adapter.work.patch("w-1", progress="a")
+        self.assertEqual((first["sent"], first["deferred"]), (False, True))  # the put just recorded: wait
+        self.clock_now[0] = 30
+        adapter.work.patch("w-1", progress="b")
+        second = adapter.work.patch("w-1", progress="c", doer="d")
+        self.assertAlmostEqual(second["due_in"], 30)
+        self.assertEqual(self.server.count("work_patch"), 0)
+        self.server.now, self.clock_now[0] = 1061.0, 61
+        self.assertEqual(adapter.work.flush()["w-1"]["sent"], True)
+        self.assertEqual(self.server.count("work_patch"), 1)
+        task = self.server.tasks[("seat-1", "w-1")]
+        self.assertEqual((task["progress"], task["doer"]), ({"text": "c"}, "d"))  # b was never sent
+        again = adapter.work.patch("w-1", progress="c")
+        self.assertEqual(again, {"sent": False, "unchanged": True})
+        self.assertEqual(adapter.work.flush(), {})
+
+    def test_a_rate_limit_defers_and_keeps_the_pending_state(self):
+        adapter = self.adapter()
+        adapter.work.put("w-1", "t")
+        self.clock_now[0] = 100  # our clock says it is due, the server's says it is not
+        self.server.now = 1010.0
+        result = adapter.work.patch("w-1", progress="x")
+        self.assertEqual((result["sent"], result["deferred"], result["due_in"]), (False, True, 60.0))
+        self.assertEqual(self.slept, [])  # not slept: reported
+        self.assertEqual(adapter.work.flush(), {})  # still deferred by the wait
+        self.clock_now[0], self.server.now = 161, 1100.0
+        self.assertTrue(adapter.work.flush()["w-1"]["sent"])
+        self.assertEqual(self.server.tasks[("seat-1", "w-1")]["progress"], {"text": "x"})
+
+    def test_finish_is_final_and_idempotent(self):
+        adapter = self.adapter()
+        adapter.work.put("w-1", "t")
+        adapter.work.patch("w-1", progress="pending")
+        done = adapter.work.finish("w-1", "done", "all good")
+        self.assertEqual(done["item"]["end"], {"state": "ok", "said": "all good"})
+        self.assertNotIn("w-1", adapter.work.items)  # pending dropped
+        adapter.work.finish("w-1", "done", "all good")  # the same outcome again is fine
+        with self.assertRaises(EA.Conflict):
+            adapter.work.finish("w-1", "failed", "no")
+        self.server.now = 5000.0
+        with self.assertRaises(EA.Conflict):
+            adapter.door.call("work_patch", {"progress": "late"}, ident="w-1", force="http")
+
+    def test_work_errors_map_like_the_rest(self):
+        adapter = self.adapter()
+        self.server.disabled = True
+        with self.assertRaises(EA.DisabledError):
+            adapter.work.put("w-1", "t")
+        self.server.disabled = False
+        with self.assertRaises(EA.NotFound):
+            adapter.work.get("never")
+
+    def test_the_interval_is_at_least_a_minute(self):
+        self.assertEqual(self.adapter().work.interval, 60.0)
 
 
 class TestWorkSyncPump(unittest.TestCase):
@@ -1611,422 +1937,98 @@ class TestWorkSyncPump(unittest.TestCase):
         self.assertNotIn("abcdef123456", (self.dir / "work-items.json").read_text())
 
 
-class TestJobTool(unittest.TestCase):
-    """`job start` / `job status`: detached long runs, told apart by evidence. Real short processes; each test waits on the process it started
-    (no polling of a clock), so a loaded machine only makes it slower."""
+class TestDecisionOrder(unittest.TestCase):
+    """Ask #67: the order of decisions (`Waits for:`), parsed, arranged, and drawn by the CLI. Synthetic names only."""
 
-    def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, str(self.root), True)
-        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root)})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.procs, self.pids = {}, []
-        self.addCleanup(self.reap)
+    def entry(self, ident, number, waits=None, repo="acme/api", since="2027-01-01T00:00:00Z", kind="issue"):
+        found = {"id": ident, "kind": kind, "repo": repo, "ask": number, "agent": "coder", "since": since, "tier": "human", "title": "Item %d" % number,
+                 "headline": "Item %d" % number}
+        if waits:
+            found["waits_for"] = waits
+        return found
 
-    def reap(self):
-        for pid in self.pids:
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
-        for proc in self.procs.values():
-            try:
-                proc.wait(timeout=10)
-            except subprocess.SubprocessError:
-                pass
+    def render(self, decisions):
+        return sb.format_decisions({"stale": False, "decisions": decisions, "errors": []}, sb.parse_iso("2027-01-02T00:00:00Z")).split("\n")
 
-    def spawn(self, argv, **kwargs):
-        proc = subprocess.Popen(argv, **kwargs)
-        self.last = proc
-        return proc
+    def test_the_waits_for_line_is_read_only_inside_the_decision_required_section(self):
+        body = ("Waits for: acme/api#9\n## Decision required\nPick one.\nWaits for: acme/api#2, #3, not-a-ref, ACME/Web#7, #3\n"
+                "## Notes\nWaits for: acme/api#4\n")
+        self.assertEqual(sb.decision_core.parse_waits_for(body, "acme/api"), ["acme/api#2", "acme/api#3", "acme/web#7"])
+        self.assertEqual(sb.decision_core.parse_waits_for("## Decision required\nno line\n", "acme/api"), [])
+        self.assertEqual(sb.decision_core.parse_waits_for("## Decision required (re-verified)\r\nWaits for: #5\r\n", "acme/api"), ["acme/api#5"])
+        self.assertEqual(sb.decision_core.parse_waits_for("## Decision required\nWaits for: #5\n", None), [], "a bare number with no repo to mean is skipped")
+        many = "## Decision required\nWaits for: " + ", ".join("#%d" % n for n in range(1, 30))
+        self.assertEqual(len(sb.decision_core.parse_waits_for(many, "acme/api")), sb.decision_core.WAITS_FOR_MAX)
+        self.assertEqual(sb.decision_core.parse_waits_for(None, "acme/api"), [])
 
-    def job(self, *argv, spawn=None):
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.dict(os.environ):
-            code = sb.main(["job", *argv], spawn=spawn or self.spawn)
-        return code, out.getvalue().strip(), err.getvalue()
+    def test_an_entry_carries_waits_for_only_when_the_issue_names_one(self):
+        item = lambda n, waits: {"kind": "issue", "title": "t%d" % n, "ask": n, "agent": None, "since": 100.0, "seed": "issue:acme/api#%d" % n,
+                                 "bare": True, "repo": "acme/api", "tier": "human", "waits_for": waits}
+        entries = sb.decision_core.build_entries([item(1, ["acme/api#2"]), item(2, [])], ["d1", "d2"], "acme/api", lambda repo, number: None)
+        by = {e["ask"]: e for e in entries}
+        self.assertEqual(by[1]["waits_for"], ["acme/api#2"])
+        self.assertNotIn("waits_for", by[2])
 
-    def started(self, name, *command):
-        code, out, err = self.job("start", name, "--", *command)
-        self.assertEqual(code, 0, err)
-        self.procs[name] = self.last
-        record = sb.job_read(name, self.root)
-        self.pids.append(record["pid"])
-        return record
+    def test_a_blocked_item_is_indented_under_what_it_waits_for_and_the_first_actionable_is_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2), self.entry("#3", 3, ["acme/api#1"]), self.entry("#4", 4)]
+        sb.decision_core.annotate_order(decisions)
+        lines = self.render(decisions)
+        self.assertRegex(lines[0], r"^#2 +waiting 1d +coder +Item 2  \[next\]$")
+        self.assertRegex(lines[1], r"^   #1 +waiting 1d +coder +Item 1  \[waits for #2\]$")
+        self.assertRegex(lines[2], r"^      #3 +waiting 1d +coder +Item 3  \[waits for #1\]$")
+        self.assertRegex(lines[3], r"^#4 +waiting 1d +coder +Item 4$")
+        self.assertEqual(decisions[1]["mark"], "next")
+        self.assertEqual([d.get("mark") for d in decisions if d["id"] != "#2"], [None, None, None])
 
-    def settled(self, name, want):
-        """Wait for the job's own process (the wrapper), then read its state: no polling."""
-        self.procs[name].wait(timeout=60)
-        state = sb.job_state(sb.job_read(name, self.root), self.root)
-        self.assertEqual(state[0], want)
-        return state
+    def test_a_cycle_is_drawn_at_the_top_marked_and_never_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2, ["acme/api#1"]), self.entry("#3", 3)]
+        sb.decision_core.annotate_order(decisions)
+        lines = self.render(decisions)
+        self.assertRegex(lines[0], r"^#1 .*\[cycle: they wait for each other\]$")
+        self.assertRegex(lines[1], r"^#2 .*\[cycle: they wait for each other\]$")
+        self.assertRegex(lines[2], r"^#3 .*\[next\]$", "the first item that CAN be done is next, not a cycle member")
+        self.assertEqual(sb.decision_core.find_cycles(decisions), [["acme/api#1", "acme/api#2"]])
 
-    def test_a_finished_job_reads_its_exit_code_and_its_result_file(self):
-        self.started("suite", "sh", "-c", "echo hello; exit 3")
-        self.assertEqual(self.settled("suite", "finished"), ("finished", 3))
-        code, out, err = self.job("status", "suite")
-        self.assertEqual(code, 1, "a non-zero exit is not success")
-        self.assertRegex(out, r"^finished: suite exit code 3 after it started \d+s ago; result .*out\.log$")
-        self.assertEqual((self.root / "suite" / "out.log").read_text(), "hello\n")
+    def test_a_self_wait_and_a_three_cycle_are_cycles_and_the_rest_is_next(self):
+        decisions = [self.entry("#1", 1, ["acme/api#2"]), self.entry("#2", 2, ["acme/api#3"]), self.entry("#3", 3, ["acme/api#1"]),
+                     self.entry("#4", 4, ["acme/api#4"]), self.entry("#5", 5, ["acme/api#6"]), self.entry("#6", 6, ["acme/api#5"]), self.entry("#7", 7)]
+        self.assertEqual(sb.decision_core.find_cycles(decisions), [["acme/api#1", "acme/api#2", "acme/api#3"], ["acme/api#4"], ["acme/api#5", "acme/api#6"]])
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual([(d["id"], d.get("mark")) for d in sb.decision_core.arranged(decisions)],
+                         [("#1", "cycle"), ("#2", "cycle"), ("#3", "cycle"), ("#4", "cycle"), ("#5", "cycle"), ("#6", "cycle"), ("#7", "next")])
 
-    def test_a_job_that_exits_zero_reads_finished_and_status_succeeds(self):
-        self.started("ok", "sh", "-c", "exit 0")
-        self.settled("ok", "finished")
-        self.assertEqual(self.job("status", "ok")[0], 0)
+    def test_a_wait_for_something_that_is_not_an_open_decision_blocks_nothing(self):
+        decisions = [self.entry("#1", 1, ["acme/api#99"]), self.entry("#2", 2)]
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual([(d["id"], d["depth"], d.get("mark")) for d in sb.decision_core.arranged(decisions)], [("#1", 0, "next"), ("#2", 0, None)])
 
-    def test_a_killed_job_reads_dead_with_no_exit_code(self):
-        record = self.started("long", "sleep", "60")
-        code, out, err = self.job("status", "long")
-        self.assertEqual((code, out.split(":")[0]), (0, "alive"))
-        os.killpg(record["pid"], signal.SIGKILL)   # the whole group: what a restart does
-        self.assertEqual(self.settled("long", "dead"), ("dead", None))
-        code, out, err = self.job("status", "long")
-        self.assertEqual(code, 1)
-        self.assertRegex(out, r"^dead: long was killed \(no exit code\); it started \d+s ago; what it printed is in .*out\.log$")
-        self.assertFalse((self.root / "long" / "exit").exists())
+    def test_a_list_in_which_nothing_waits_is_exactly_what_it_was(self):
+        decisions = [self.entry("#2", 2, since="2027-01-01T06:00:00Z"), self.entry("#1", 1)]
+        before = self.render([dict(d) for d in decisions])
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual(self.render(decisions), before)
+        self.assertTrue(all(set(d) == {"id", "kind", "repo", "ask", "agent", "since", "tier", "title", "headline"} for d in decisions), "no field was added")
+        self.assertNotIn("next", "\n".join(before))
 
-    def test_a_pid_reused_by_another_process_is_not_the_job(self):
-        self.started("reuse", "sleep", "60")
-        job = sb.job_read("reuse", self.root)
-        job["token"] = "Thu Jan  1 00:00:00 1970"   # the recorded start time is not this process's
-        (self.root / "reuse" / "job.json").write_text(json.dumps(job))
-        self.assertEqual(sb.job_state(sb.job_read("reuse", self.root), self.root)[0], "dead")
+    def test_a_chain_deeper_than_the_cap_stays_at_the_cap_and_is_still_a_chain(self):
+        n = sb.decision_core.ORDER_DEPTH_MAX + 3
+        decisions = [self.entry("#%d" % i, i, ["acme/api#%d" % (i + 1)] if i < n else None) for i in range(1, n + 1)]
+        sb.decision_core.annotate_order(decisions)
+        depths = [d["depth"] for d in sb.decision_core.arranged(decisions)]
+        self.assertEqual(depths, [min(i, sb.decision_core.ORDER_DEPTH_MAX) for i in range(n)])
+        self.assertEqual(max(depths), sb.decision_core.ORDER_DEPTH_MAX)
 
-    def test_a_record_with_no_pid_reads_unknown(self):
-        self.assertEqual(sb.job_state({"name": "x"}, self.root), ("unknown", None))
+    def test_the_docs_describe_the_line_the_next_mark_and_the_two_sweep_findings(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text.split("### The order of decisions (`Waits for:`)", 1)[1]
+        for needle in ("Waits for:", "`next`", "`cycle`", "**S7**", "**S8**", "writes nothing to GitHub"):
+            self.assertIn(needle, section)
 
-    def test_a_name_still_alive_is_refused_and_a_dead_or_finished_one_is_replaced_with_its_markers_cleared(self):
-        self.started("again", "sleep", "60")
-        code, out, err = self.job("start", "again", "--", "true")
-        self.assertEqual(code, 1)
-        self.assertIn("is still running", err)
-        record = self.started("dead", "sleep", "60")
-        os.killpg(record["pid"], signal.SIGKILL)
-        self.settled("dead", "dead")
-        self.job("status", "dead")   # collected
-        self.assertTrue((self.root / "dead" / "collected").exists())
-        self.started("dead", "sh", "-c", "exit 2")
-        self.assertEqual(self.settled("dead", "finished"), ("finished", 2))
-        self.assertFalse((self.root / "dead" / "collected").exists(), "a new run starts uncollected")
-
-    def test_a_command_that_cannot_start_is_said_and_leaves_no_record(self):
-        def refuse(argv, **kwargs):
-            raise OSError(errno.ENOENT, "No such file or directory")
-        code, out, err = self.job("start", "nope", "--", "x", spawn=refuse)
-        self.assertEqual(code, 1)
-        self.assertIn("cannot start x", err)
-        self.assertIsNone(sb.job_read("nope", self.root))
-
-    def test_a_bad_name_no_command_and_an_unknown_job_are_refused(self):
-        self.assertEqual(self.job("start", "Bad Name", "--", "true")[0], 2)
-        self.assertEqual(self.job("start", "x", "--")[0], 2)
-        code, out, err = self.job("status", "nope")
-        self.assertEqual(code, 1)
-        self.assertIn("no job named nope", err)
-
-    def test_asking_after_it_died_collects_it_so_nobody_else_is_told(self):
-        record = self.started("c", "sleep", "60")
-        os.killpg(record["pid"], signal.SIGKILL)
-        self.settled("c", "dead")
-        self.assertFalse((self.root / "c" / "collected").exists())
-        self.job("status", "c")
-        self.assertTrue((self.root / "c" / "collected").exists())
-
-    def test_a_jobs_dir_that_is_not_private_is_refused_and_not_believed(self):
-        os.chmod(str(self.root), 0o755)
-        code, out, err = self.job("start", "x", "--", "true")
-        self.assertEqual(code, 1)
-        self.assertIn("not a private directory", err)
-        self.assertFalse(sb.job_private(self.root))
-        os.chmod(str(self.root), 0o700)
-        self.assertTrue(sb.job_private(self.root))
-
-    def test_a_record_is_written_whole_or_not_at_all(self):
-        target = self.root / "f"
-        sb.job_write_atomic(target, "one")
-        with mock.patch.object(sb.os, "replace", side_effect=OSError("boom")):
-            with self.assertRaises(OSError):
-                sb.job_write_atomic(target, "two")
-        self.assertEqual(target.read_text(), "one", "the old file is intact")
-        self.assertEqual([p.name for p in self.root.iterdir()], ["f"], "no temp file is left")
-
-    def test_the_starter_is_established_from_its_own_session_and_otherwise_nobody(self):
-        with mock.patch.object(sb, "build_engine", return_value=(types.SimpleNamespace(herdr=None, v2=None), None, None)), \
-                mock.patch.object(sb, "session_identity", return_value={"name": "coder"}), mock.patch.dict(os.environ, {sb.SESSION_ENV: "ses_example1"}):
-            self.assertEqual(sb.job_starter(None, time.time), ("ses_example1", "coder"))
-        with mock.patch.object(sb, "build_engine", side_effect=sb.ConfigError("no config")):
-            self.assertEqual(sb.job_starter(None, time.time), (None, None))
-
-
-class TestPlanKind(unittest.TestCase):
-    """#1094: GitHubHub.plan_kind: plan / noplan / unknown, one cached read per issue, no write."""
-
-    def hub(self, answers):
-        import types
-        calls, t = [], [0.0]
-
-        def gh_api(path, paginate=True, timeout=None, **kw):
-            calls.append(path)
-            a = answers(path) if callable(answers) else answers
-            if isinstance(a, Exception):
-                raise a
-            return [a]
-        hub = types.SimpleNamespace(lock=threading.RLock(), _cache={}, now=lambda: t[0], gh_api=gh_api,
-                                    config={"call_timeout_seconds": 5})
-        return hub, calls, t
-
-    def kind(self, hub, n=1):
-        return sb.GitHubHub.plan_kind(hub, "acme/api", n)
-
-    def test_the_three_kinds(self):
-        plan = [{"id": 1, "created_at": "2026-01-01", "body": "## Plan (scenarios)\n\nx"}]
-        self.assertEqual(self.kind(self.hub(plan)[0]), "plan")
-        self.assertEqual(self.kind(self.hub([{"id": 1, "body": "hello"}])[0]), "noplan")
-        self.assertEqual(self.kind(self.hub(sb.GitHubUnavailable("down"))[0]), "unknown")
-        self.assertEqual(self.kind(self.hub({"not": "a list"})[0]), "unknown")
-
-    def test_a_second_refresh_within_the_ttl_adds_no_read(self):
-        hub, calls, t = self.hub([])
-        for n in range(1, 6):
-            self.kind(hub, n)
-        self.assertEqual(len(calls), 5)
-        for n in range(1, 6):
-            self.kind(hub, n)
-        self.assertEqual(len(calls), 5, "no read of the second refresh")
-        t[0] += sb.GITHUB_LOOKUP_TTL + 1
-        self.kind(hub, 1)
-        self.assertEqual(len(calls), 6)
-        self.assertTrue(all(c.startswith("repos/") and "comments" in c for c in calls))
-
-    def test_a_full_page_never_reads_noplan_and_a_plan_on_it_is_unknown(self):
-        full = [{"id": i, "created_at": "2026-01-01", "body": "x"} for i in range(100)]
-        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
-        full[3]["body"] = "## Plan (scenarios)\n\nx"
-        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
-        self.assertEqual(self.kind(self.hub(full[:99])[0]), "plan")
-
-    def test_a_plan_in_the_body_reads_noplan(self):
-        body = "## Plan (scenarios)\n\nx"
-
-        def answers(path):
-            return {"body": body} if path.endswith("/issues/1") else [{"id": 1, "body": "hi"}]
-        hub, calls, t = self.hub(answers)
-        self.assertEqual(self.kind(hub), "noplan")   # the ask says a plan COMMENT; a plan-looking BODY does not count
-
-    def test_every_row_is_read_over_several_refreshes(self):
-        hub, calls, t = self.hub([])
-        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
-        records = [{"repo": "acme/api", "number": n} for n in range(60)]
-        for _ in range(7):
-            sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
-        self.assertEqual(len(calls), 60)
-        kinds = sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
-        self.assertEqual(set(kinds.values()), {"noplan"})
-
-    def test_never_read_rows_are_served_before_retries(self):
-        bad = set(range(11))
-
-        def answers(path):
-            n = int(path.split("/issues/")[1].split("/")[0])
-            return sb.GitHubUnavailable("x") if n in bad else []
-        hub, calls, t = self.hub(answers)
-        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
-        records = [{"repo": "acme/api", "number": n} for n in range(11)]
-        sb.GitHubHub.plan_kinds(hub, records, [10])
-        t[0] += sb.GITHUB_LOOKUP_RETRY + 1
-        records += [{"repo": "acme/api", "number": n} for n in range(100, 105)]
-        calls.clear()
-        kinds = sb.GitHubHub.plan_kinds(hub, records, [10])
-        for n in range(100, 105):
-            self.assertEqual(kinds[("acme/api", n)], "noplan")
-
-    def test_one_page_one_call_no_pagination(self):
-        hub, calls, t = self.hub([])
-        seen = []
-        orig = hub.gh_api
-        hub.gh_api = lambda path, paginate=True, **kw: (seen.append(paginate), orig(path, paginate=paginate, **kw))[1]
-        self.kind(hub)
-        self.assertEqual(seen, [False])
-        self.assertIn("per_page=100", calls[0])
-
-    def test_a_failed_read_is_retried_after_the_short_ttl_not_the_full_one(self):
-        for err in (sb.GitHubUnavailable("403"), sb.GitHubUnavailable("404"), TimeoutError("t")):
-            hub, calls, t = self.hub(err)
-            self.assertEqual(self.kind(hub), "unknown")
-            self.kind(hub)
-            self.assertEqual(len(calls), 1)
-            t[0] += sb.GITHUB_LOOKUP_RETRY + 1
-            self.kind(hub)
-            self.assertEqual(len(calls), 2, "retried after the short ttl")
-
-    def test_a_refresh_makes_at_most_the_cap_of_reads(self):
-        hub, calls, t = self.hub([])
-        budget = [sb.PLAN_KIND_READS_PER_REFRESH]
-        kinds = [sb.GitHubHub.plan_kind(hub, "acme/api", n, budget) for n in range(60)]
-        self.assertEqual(len(calls), sb.PLAN_KIND_READS_PER_REFRESH)
-        self.assertEqual(kinds.count("unknown"), 60 - sb.PLAN_KIND_READS_PER_REFRESH)
-        self.assertEqual(sb.PLAN_KIND_READS_PER_REFRESH, 10)
-
-    def test_the_cache_is_bounded(self):
-        hub, calls, t = self.hub([])
-        for n in range(sb.PLAN_KIND_CACHE_MAX + 50):
-            self.kind(hub, n)
-        self.assertLessEqual(len(hub._cache), sb.PLAN_KIND_CACHE_MAX)
-
-
-class TestPluginPush(unittest.TestCase):
-    """#290 slice 6: the plugin's pushes. The receiver only MARKS a session; the pass thread makes the one bounded read."""
-    SESSION = "ses_alpha"
-
-    class Stub:
-        def __init__(self):
-            self.calls = []
-
-        def message_list(self, session, limit=None, order=None, type=None, cursor=None):
-            self.calls.append((session, limit, type))
-            return []
-
-        def __getattr__(self, name):   # any other call (a write, a send) is a failure of the test
-            raise AssertionError("the push must cause no call but a bounded read: %s" % name)
-
-    def setUp(self):
-        self.now, self.audits = [1000.0], []
-        audit = types.SimpleNamespace(append=lambda actor, name, subject, detail: self.audits.append((name, detail)))
-        self.feed = sb.EventFeed(None, audit, lambda: self.now[0])
-        self.feed.connected, self.feed.needs_resync = True, False
-        self.receiver = sb.EventReceiver(self.feed, audit, lambda: self.now[0], known=lambda: {self.SESSION, "ses_beta"})
-
-    def message(self, **fields):
-        body = {"v": 1, "kind": "event", "event": "prompt", "sessionID": self.SESSION, "at": 1000000}
-        body.update(fields)
-        return json.dumps(body).encode()
-
-    def test_s9_a_good_message_marks_only_that_session_and_the_next_pass_reads_it_once(self):
-        engine = types.SimpleNamespace(v2=self.Stub())
-        self.assertTrue(self.receiver.handle(self.message()))
-        self.assertEqual(engine.v2.calls, [], "the receiver reads nothing")
-        self.assertEqual(list(self.feed.seen), [self.SESSION])
-        self.feed.tick(engine, [self.SESSION, "ses_beta"])
-        self.assertEqual(engine.v2.calls, [(self.SESSION, sb.FEED_PAGE, "assistant")], "one bounded read, for that session only")
-        self.feed.tick(engine, [self.SESSION, "ses_beta"])
-        self.assertEqual(len(engine.v2.calls), 1, "read once: nothing new was pushed")
-
-    def test_s10_seven_kinds_of_bad_message_touch_nothing_and_are_counted(self):
-        bad = [self.message(pad="x" * 3000), self.message(v=2), self.message(event="nonsense"), self.message(sessionID="not a session"),
-               self.message(text="a prompt"), b"this is not json", bytes(range(128, 200))]
-        for raw in bad:
-            self.assertFalse(self.receiver.handle(raw))
-        self.assertEqual((self.feed.seen, self.receiver.status()["ignored"]), ({}, 7))
-        self.assertFalse(self.receiver.handle(self.message(sessionID="ses_stranger")), "a valid id of no agent of this fleet proves nothing")
-
-    def test_s11_a_burst_is_limited_counted_audited_once_and_never_queued(self):
-        for _ in range(100):
-            self.receiver.handle(self.message())
-        status = self.receiver.status()
-        self.assertEqual((status["accepted"], status["rate_limited"]), (sb.PLUGIN_SESSION_PER_SECOND, 100 - sb.PLUGIN_SESSION_PER_SECOND))
-        self.assertEqual([n for n, _ in self.audits].count("event.rate_limited"), 1)
-        self.now[0] += 2
-        self.assertTrue(self.receiver.handle(self.message()), "the next second starts clean: nothing was queued")
-
-    def test_s15_an_event_limited_away_is_still_found_by_the_reconciliation_and_said_to_be_missed(self):
-        engine = types.SimpleNamespace(v2=types.SimpleNamespace(calls=[], message_list=lambda *a, **k: [{"id": "msg_new"}]))
-        self.feed.need("test")
-        self.feed.handle(feed_line("session.step.ended", session=self.SESSION, assistantMessageID="msg_old"))
-        for _ in range(sb.PLUGIN_SESSION_PER_SECOND + 5):
-            self.receiver.handle(self.message())
-        self.assertEqual(self.receiver.status()["rate_limited"], 5, "the last pushes were limited away")
-        self.feed.seen[self.SESSION]["read"] = self.now[0] + 1   # the pushed read already happened: only the reconciliation is left to find it
-        self.now[0] += sb.FEED_RECONCILE_SECONDS + 2
-        self.feed.tick(engine, [self.SESSION])
-        self.assertEqual([n for n, _ in self.audits].count("event.missed"), 1)
-
-    def test_a_push_is_read_while_the_stream_is_down_at_most_four_sessions_a_pass_and_a_failed_read_is_tried_again(self):
-        sessions = ["ses_%02d" % n for n in range(6)]
-        self.receiver.known = lambda: set(sessions)
-        self.feed.connected = False   # the stream is down and nobody registered as a consumer
-        for session in sessions:
-            self.receiver.handle(self.message(sessionID=session))
-        engine = types.SimpleNamespace(v2=self.Stub())
-        self.feed.tick(engine, sessions)
-        self.assertEqual(len(engine.v2.calls), sb.FEED_PUSHED_PER_PASS)
-        self.feed.tick(engine, sessions)
-        self.assertEqual(sorted(c[0] for c in engine.v2.calls), sessions, "the other two the next pass; none twice")
-
-        class Failing:
-            calls = 0
-
-            def message_list(self, *a, **k):
-                Failing.calls += 1
-                raise sb.V2Error("backoff", None, "skipped")
-        self.now[0] += 1
-        self.receiver.handle(self.message(sessionID="ses_00"))
-        self.feed.tick(types.SimpleNamespace(v2=Failing()), sessions)
-        self.feed.tick(types.SimpleNamespace(v2=Failing()), sessions)
-        self.assertEqual(Failing.calls, 2, "a failed read is tried again, and counted")
-        self.assertEqual(self.feed.status()["read_errors"], 2)
-
-    def test_under_v2_light_a_push_causes_no_read(self):
-        engine = types.SimpleNamespace(v2=self.Stub(), light=True, feed=self.feed, discovery=types.SimpleNamespace(agents={"a": types.SimpleNamespace(session_id=self.SESSION)}))
-        self.receiver.handle(self.message())
-        sb.feed_tick(engine)
-        self.assertEqual(engine.v2.calls, [], "the owner's hotfix switch stops every optional history read, a pushed one too")
-
-    def test_s16_with_no_pushes_ten_simulated_minutes_for_twenty_idle_agents_cost_at_most_fifty_calls(self):
-        engine = types.SimpleNamespace(v2=self.Stub())
-        self.feed.need("test")
-        sessions = ["ses_%02d" % n for n in range(20)]
-        for _ in range(120):
-            self.now[0] += 5
-            self.feed.tick(engine, sessions)
-        self.assertLessEqual(len(engine.v2.calls), 50)
-
-    def test_u4_no_text_of_a_message_reaches_the_audit_or_the_status(self):
-        self.receiver.handle(self.message(text="SENTINEL-PROMPT-TEXT"))
-        for _ in range(40):
-            self.receiver.handle(self.message(event="idle"))
-        self.assertNotIn("SENTINEL-PROMPT-TEXT", repr(self.audits) + repr(self.receiver.status()) + repr(self.feed.status()) + repr(self.feed.seen))
-
-    def test_u5_a_pushed_claim_causes_no_write(self):
-        engine = types.SimpleNamespace(v2=self.Stub())   # any call but message_list raises
-        self.receiver.handle(self.message(id="msg_claimed", person=True))
-        self.feed.tick(engine, [self.SESSION])
-        self.assertEqual(len(engine.v2.calls), 1)
-
-    def test_the_socket_carries_pushes_to_the_receiver_without_a_reply_and_judge_requests_as_before(self):
-        state = Path(tempfile.mkdtemp(prefix="sbp"))
-        self.addCleanup(shutil.rmtree, state, True)
-        arrived = threading.Event()
-
-        def on_event(raw):
-            self.receiver.handle(raw)
-            arrived.set()
-        server = sb.JudgeServer(state, lambda text: sb.policy_reply("deny", "judged"), on_event).start()
-        self.addCleanup(server.stop)
-        reply = sb.ask_judge_daemon(state, json.dumps({"sessionID": self.SESSION, "tool": "shell", "arguments": "ls", "outcome": "allow"}), 2)
-        self.assertEqual(reply["outcome"], "deny", "a judge request is answered as before")
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(2)
-        with sb.in_directory(state):
-            sock.connect(sb.POLICY_SOCKET)
-        sock.sendall(self.message() + b"\n")   # no shutdown(SHUT_WR): the server ends at the newline and may close first, and macOS then refuses it (ENOTCONN)
-        self.assertEqual(sock.recv(100), b"", "a push gets no reply")
-        sock.close()
-        self.assertTrue(arrived.wait(5), "the receiver was reached")   # the wait is only a failure bound
-        self.assertEqual(self.receiver.status()["accepted"], 1)
-
-    def test_the_socket_is_bound_for_pushes_when_the_judge_is_off_and_only_when_a_feed_runs(self):
-        state = Path(tempfile.mkdtemp(prefix="sbp"))
-        self.addCleanup(shutil.rmtree, state, True)
-        config = {"policy": {"enabled": False}, "v2_plugin_events": "auto"}
-        self.assertIsNone(sb.start_judge_server(config, state, None, time.time, types.SimpleNamespace(feed=None, audit=None)))
-        engine = types.SimpleNamespace(feed=self.feed, audit=None)
-        server = sb.start_judge_server(config, state, None, time.time, engine)
-        self.addCleanup(server.stop)
-        self.assertTrue((state / sb.POLICY_SOCKET).exists())
-        self.assertIsNotNone(engine.event_receiver)
-        server.stop()
-        self.assertIsNone(sb.start_judge_server(dict(config, v2_plugin_events="off"), state, None, time.time, engine), "off: the gate is the only signal")
+    def test_a_report_is_never_a_target_so_nothing_waits_under_it(self):
+        decisions = [self.entry("r1", 5, kind="report"), self.entry("#6", 6, ["acme/api#5"])]
+        sb.decision_core.annotate_order(decisions)
+        self.assertEqual(decisions[1]["depth"], 0, "a report is not an issue decision: nothing waits under it")
+        self.assertEqual(decisions[0].get("mark"), None)
 
 
 class TestAuthorityModulesGuard(unittest.TestCase):

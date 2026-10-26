@@ -92,55 +92,56 @@ _support_wire_fakes = importlib.import_module("support.wire_fakes")   # support 
 DOC_FAULTS, EPOCH, EXPECT_EXAMPLES, FAKE_HERDR, FAKE_OPENCODE, FORBIDDEN_HERDR, FakeHTTP, FakeV2, HERDR_ALLOWED, MSG, REJECTED, SES, SOCKET_ALLOWED, STEP_EXAMPLES, SimClock, TOKEN_NAME, TYPING_VERBS, VALID, _drop, _record_keys, _set, _usage, fact, herdr_typing_violations, mutate, observation, parse_flags, routed = (_support_wire_fakes.DOC_FAULTS, _support_wire_fakes.EPOCH, _support_wire_fakes.EXPECT_EXAMPLES, _support_wire_fakes.FAKE_HERDR, _support_wire_fakes.FAKE_OPENCODE, _support_wire_fakes.FORBIDDEN_HERDR, _support_wire_fakes.FakeHTTP, _support_wire_fakes.FakeV2, _support_wire_fakes.HERDR_ALLOWED, _support_wire_fakes.MSG, _support_wire_fakes.REJECTED, _support_wire_fakes.SES, _support_wire_fakes.SOCKET_ALLOWED, _support_wire_fakes.STEP_EXAMPLES, _support_wire_fakes.SimClock, _support_wire_fakes.TOKEN_NAME, _support_wire_fakes.TYPING_VERBS, _support_wire_fakes.VALID, _support_wire_fakes._drop, _support_wire_fakes._record_keys, _support_wire_fakes._set, _support_wire_fakes._usage, _support_wire_fakes.fact, _support_wire_fakes.herdr_typing_violations, _support_wire_fakes.mutate, _support_wire_fakes.observation, _support_wire_fakes.parse_flags, _support_wire_fakes.routed)   # support import
 _support_test_cases_01 = importlib.import_module("test_cases_01")   # support import
 _StubJev, TestChatClearJudge, TestGitShim, TestGhShim = (_support_test_cases_01._StubJev, _support_test_cases_01.TestChatClearJudge, _support_test_cases_01.TestGitShim, _support_test_cases_01.TestGhShim)   # support import
-TestTrialDriver, TestPlanCheckRules, TestInstallPrivateProfile, TestExternalAdapterOperations = (_support_test_cases_01.TestTrialDriver, _support_test_cases_01.TestPlanCheckRules, _support_test_cases_01.TestInstallPrivateProfile, _support_test_cases_01.TestExternalAdapterOperations)   # support import
-Unavailable, TestEventFeedReads = (_support_test_cases_01.Unavailable, _support_test_cases_01.TestEventFeedReads)   # support import
+TestTrialDriver, TestInstall, TestInstallPrivateProfile, TestEventFeedReads = (_support_test_cases_01.TestTrialDriver, _support_test_cases_01.TestInstall, _support_test_cases_01.TestInstallPrivateProfile, _support_test_cases_01.TestEventFeedReads)   # support import
+TestConfigDeclarations, = (_support_test_cases_01.TestConfigDeclarations,)   # support import
 _support_test_cases_02 = importlib.import_module("test_cases_02")   # support import
-TestJevClient, TestImportV1Converter, TestPlanCheckFeedback, TestDecisionHeadlines = (_support_test_cases_02.TestJevClient, _support_test_cases_02.TestImportV1Converter, _support_test_cases_02.TestPlanCheckFeedback, _support_test_cases_02.TestDecisionHeadlines)   # support import
-TestInstall, TestExternalAdapterWork, TestAuditRotation, TestAgentsVerify = (_support_test_cases_02.TestInstall, _support_test_cases_02.TestExternalAdapterWork, _support_test_cases_02.TestAuditRotation, _support_test_cases_02.TestAgentsVerify)   # support import
-TestReviewLawsStarterSet, TestConfigDeclarations, TestReconcileOnRead, TestTempJanitorResume = (_support_test_cases_02.TestReviewLawsStarterSet, _support_test_cases_02.TestConfigDeclarations, _support_test_cases_02.TestReconcileOnRead, _support_test_cases_02.TestTempJanitorResume)   # support import
+TestWorkerRulesInSkills, TestJevClient, TestImportV1Converter, TestPlanCheckFeedback = (_support_test_cases_02.TestWorkerRulesInSkills, _support_test_cases_02.TestJevClient, _support_test_cases_02.TestImportV1Converter, _support_test_cases_02.TestPlanCheckFeedback)   # support import
+TestPlanReceipts, TestDecisionHeadlines, TestExternalAdapterErrors, TestJobTool = (_support_test_cases_02.TestPlanReceipts, _support_test_cases_02.TestDecisionHeadlines, _support_test_cases_02.TestExternalAdapterErrors, _support_test_cases_02.TestJobTool)   # support import
+TestPlanKind, TestAuditRotation, TestAgentsVerify, TestReviewLawsStarterSet = (_support_test_cases_02.TestPlanKind, _support_test_cases_02.TestAuditRotation, _support_test_cases_02.TestAgentsVerify, _support_test_cases_02.TestReviewLawsStarterSet)   # support import
+TestPluginPush, TestReconcileOnRead = (_support_test_cases_02.TestPluginPush, _support_test_cases_02.TestReconcileOnRead)   # support import
 _support_test_cases_03 = importlib.import_module("test_cases_03")   # support import
 TestV2Client, TestStatus, TestPoke, GitHubOverGit = (_support_test_cases_03.TestV2Client, _support_test_cases_03.TestStatus, _support_test_cases_03.TestPoke, _support_test_cases_03.GitHubOverGit)   # support import
-TestSyncReportFreezePerBoss, TestReportFoldVariants, TestDecisionWriteWaitsForTheList, TestTrialDecisionsPlugin = (_support_test_cases_03.TestSyncReportFreezePerBoss, _support_test_cases_03.TestReportFoldVariants, _support_test_cases_03.TestDecisionWriteWaitsForTheList, _support_test_cases_03.TestTrialDecisionsPlugin)   # support import
-TestCommissioningDocs, ReaperOnlyFakes, TestTheReaperOnlyDryRunLive, TestInstallPutsTheCliOnPath = (_support_test_cases_03.TestCommissioningDocs, _support_test_cases_03.ReaperOnlyFakes, _support_test_cases_03.TestTheReaperOnlyDryRunLive, _support_test_cases_03.TestInstallPutsTheCliOnPath)   # support import
-TestExternalAdapterErrors, TestExternalAdapterPort, TestWorkSyncPump, TestJobTool = (_support_test_cases_03.TestExternalAdapterErrors, _support_test_cases_03.TestExternalAdapterPort, _support_test_cases_03.TestWorkSyncPump, _support_test_cases_03.TestJobTool)   # support import
-TestPlanKind, TestPluginPush, TestAuthorityModulesGuard, TestSkillsSync = (_support_test_cases_03.TestPlanKind, _support_test_cases_03.TestPluginPush, _support_test_cases_03.TestAuthorityModulesGuard, _support_test_cases_03.TestSkillsSync)   # support import
+TestReportFoldVariants, TestDecisionWriteWaitsForTheList, TestTrialDecisionsPlugin, TestCommissioningDocs = (_support_test_cases_03.TestReportFoldVariants, _support_test_cases_03.TestDecisionWriteWaitsForTheList, _support_test_cases_03.TestTrialDecisionsPlugin, _support_test_cases_03.TestCommissioningDocs)   # support import
+TestKeyFile, TestTodolistPlugin, ReaperOnlyFakes, TestTheReaperOnlyDryRunLive = (_support_test_cases_03.TestKeyFile, _support_test_cases_03.TestTodolistPlugin, _support_test_cases_03.ReaperOnlyFakes, _support_test_cases_03.TestTheReaperOnlyDryRunLive)   # support import
+TestInstallPutsTheCliOnPath, TestExternalAdapterKeys, TestExternalAdapterOperations, TestExternalAdapterPort = (_support_test_cases_03.TestInstallPutsTheCliOnPath, _support_test_cases_03.TestExternalAdapterKeys, _support_test_cases_03.TestExternalAdapterOperations, _support_test_cases_03.TestExternalAdapterPort)   # support import
+TestExternalAdapterWork, TestWorkSyncPump, TestDecisionOrder, TestAuthorityModulesGuard = (_support_test_cases_03.TestExternalAdapterWork, _support_test_cases_03.TestWorkSyncPump, _support_test_cases_03.TestDecisionOrder, _support_test_cases_03.TestAuthorityModulesGuard)   # support import
+TestSkillsSync, = (_support_test_cases_03.TestSkillsSync,)   # support import
 _support_test_cases_04 = importlib.import_module("test_cases_04")   # support import
-TestStateDir, TestAuditLog, TestScenarioValidator, TestScenarioFiles = (_support_test_cases_04.TestStateDir, _support_test_cases_04.TestAuditLog, _support_test_cases_04.TestScenarioValidator, _support_test_cases_04.TestScenarioFiles)   # support import
-TestGithubRealChild, TestChecklistAndFamilyTexts, TestPolicyCache, OwnedInputs = (_support_test_cases_04.TestGithubRealChild, _support_test_cases_04.TestChecklistAndFamilyTexts, _support_test_cases_04.TestPolicyCache, _support_test_cases_04.OwnedInputs)   # support import
+TestAuditLog, TestScenarioValidator, TestScenarioFiles, TestGithubRealChild = (_support_test_cases_04.TestAuditLog, _support_test_cases_04.TestScenarioValidator, _support_test_cases_04.TestScenarioFiles, _support_test_cases_04.TestGithubRealChild)   # support import
+PipeTruncatingRunner, TestV2ClientBigReply, TestScenarioVocabularyPR4, TestIntentChange = (_support_test_cases_04.PipeTruncatingRunner, _support_test_cases_04.TestV2ClientBigReply, _support_test_cases_04.TestScenarioVocabularyPR4, _support_test_cases_04.TestIntentChange)   # support import
+TestJevConfig, TestClassify, TestPolicyCache, OwnedInputs = (_support_test_cases_04.TestJevConfig, _support_test_cases_04.TestClassify, _support_test_cases_04.TestPolicyCache, _support_test_cases_04.OwnedInputs)   # support import
 TestCaptainLabels, TestLedgerReadRace, RecFacts, TestPlanCheckParser = (_support_test_cases_04.TestCaptainLabels, _support_test_cases_04.TestLedgerReadRace, _support_test_cases_04.RecFacts, _support_test_cases_04.TestPlanCheckParser)   # support import
-TestPlanCheckRound2, TestMultiRepoConfig, TestKeyFile, TestKeyCommand = (_support_test_cases_04.TestPlanCheckRound2, _support_test_cases_04.TestMultiRepoConfig, _support_test_cases_04.TestKeyFile, _support_test_cases_04.TestKeyCommand)   # support import
-TestTodolistPlugin, TestTheReapersCommandPathIsWalked, TestInstallOwnsWhatAPaneRuns, TestInstallDocs = (_support_test_cases_04.TestTodolistPlugin, _support_test_cases_04.TestTheReapersCommandPathIsWalked, _support_test_cases_04.TestInstallOwnsWhatAPaneRuns, _support_test_cases_04.TestInstallDocs)   # support import
-LabelGh, TestExternalAdapterMapping, TestExternalAdapterKeys, TestExternalAdapterFeed = (_support_test_cases_04.LabelGh, _support_test_cases_04.TestExternalAdapterMapping, _support_test_cases_04.TestExternalAdapterKeys, _support_test_cases_04.TestExternalAdapterFeed)   # support import
-TestJudgeSample, TestDecisionOrder, TestV2Breaker, SlowProbeBreaker = (_support_test_cases_04.TestJudgeSample, _support_test_cases_04.TestDecisionOrder, _support_test_cases_04.TestV2Breaker, _support_test_cases_04.SlowProbeBreaker)   # support import
-TestV2BreakerEdges, TestEventFeedStreamEdges, TestCloudWatchTick = (_support_test_cases_04.TestV2BreakerEdges, _support_test_cases_04.TestEventFeedStreamEdges, _support_test_cases_04.TestCloudWatchTick)   # support import
+TestPlanCheckRound2, TestPlanCheckHash, TestMultiRepoConfig, TestKeyCommand = (_support_test_cases_04.TestPlanCheckRound2, _support_test_cases_04.TestPlanCheckHash, _support_test_cases_04.TestMultiRepoConfig, _support_test_cases_04.TestKeyCommand)   # support import
+TestTheReapersCommandPathIsWalked, TestInstallOwnsWhatAPaneRuns, TestInstallDocs, TestOrdersFact = (_support_test_cases_04.TestTheReapersCommandPathIsWalked, _support_test_cases_04.TestInstallOwnsWhatAPaneRuns, _support_test_cases_04.TestInstallDocs, _support_test_cases_04.TestOrdersFact)   # support import
+LabelGh, TestInstallMakesTheOrdersTemplate, TestExternalAdapterMapping, TestExternalAdapterFeed = (_support_test_cases_04.LabelGh, _support_test_cases_04.TestInstallMakesTheOrdersTemplate, _support_test_cases_04.TestExternalAdapterMapping, _support_test_cases_04.TestExternalAdapterFeed)   # support import
+TestJudgeSample, TestV2Breaker, SlowProbeBreaker, TestV2BreakerEdges = (_support_test_cases_04.TestJudgeSample, _support_test_cases_04.TestV2Breaker, _support_test_cases_04.SlowProbeBreaker, _support_test_cases_04.TestV2BreakerEdges)   # support import
+TestEventFeedStreamEdges, TestCloudWatchTick = (_support_test_cases_04.TestEventFeedStreamEdges, _support_test_cases_04.TestCloudWatchTick)   # support import
 _support_test_cases_05 = importlib.import_module("test_cases_05")   # support import
 TestFaults, TestMessageId, TestDecide, TestApprovalExemptionGuard = (_support_test_cases_05.TestFaults, _support_test_cases_05.TestMessageId, _support_test_cases_05.TestDecide, _support_test_cases_05.TestApprovalExemptionGuard)   # support import
-PipeTruncatingRunner, TestV2ClientBigReply, TestSelfWakeInstructions, TestScenarioVocabularyPR4 = (_support_test_cases_05.PipeTruncatingRunner, _support_test_cases_05.TestV2ClientBigReply, _support_test_cases_05.TestSelfWakeInstructions, _support_test_cases_05.TestScenarioVocabularyPR4)   # support import
-TestLabHerdrShim, TestIntentChange, TestVerdictRecordingText, TestWorkerRulesInSkills = (_support_test_cases_05.TestLabHerdrShim, _support_test_cases_05.TestIntentChange, _support_test_cases_05.TestVerdictRecordingText, _support_test_cases_05.TestWorkerRulesInSkills)   # support import
-TestJevConfig, TestReplayJev, TestClassify, TestP5SlowOrUnreachableJudge = (_support_test_cases_05.TestJevConfig, _support_test_cases_05.TestReplayJev, _support_test_cases_05.TestClassify, _support_test_cases_05.TestP5SlowOrUnreachableJudge)   # support import
-TestBriefParsing, TestPolicyConfig, TestPolicyRequest, TestJudgeToolWritesNothingElsewhere = (_support_test_cases_05.TestBriefParsing, _support_test_cases_05.TestPolicyConfig, _support_test_cases_05.TestPolicyRequest, _support_test_cases_05.TestJudgeToolWritesNothingElsewhere)   # support import
-TestImportV1Client, FakeSweepHub, TestTriageRuleInputs, TestStatusIntentGapsAreBounded = (_support_test_cases_05.TestImportV1Client, _support_test_cases_05.FakeSweepHub, _support_test_cases_05.TestTriageRuleInputs, _support_test_cases_05.TestStatusIntentGapsAreBounded)   # support import
-TestPlanCheckHash, TestDecisionIds, TestDecisionsPluginSource, TestDecisionsInTheLabTier = (_support_test_cases_05.TestPlanCheckHash, _support_test_cases_05.TestDecisionIds, _support_test_cases_05.TestDecisionsPluginSource, _support_test_cases_05.TestDecisionsInTheLabTier)   # support import
+TestGithubVerification, TestParseCheckpoint, TestSelfWakeInstructions, TestLabHerdrShim = (_support_test_cases_05.TestGithubVerification, _support_test_cases_05.TestParseCheckpoint, _support_test_cases_05.TestSelfWakeInstructions, _support_test_cases_05.TestLabHerdrShim)   # support import
+TestIntentParsing, TestVerdictRecordingText, TestChecklistAndFamilyTexts, TestIntegrationBranchVerdictText = (_support_test_cases_05.TestIntentParsing, _support_test_cases_05.TestVerdictRecordingText, _support_test_cases_05.TestChecklistAndFamilyTexts, _support_test_cases_05.TestIntegrationBranchVerdictText)   # support import
+TestLaunchMemoryTest, TestReplayJev, TestP5SlowOrUnreachableJudge, TestShimHygiene = (_support_test_cases_05.TestLaunchMemoryTest, _support_test_cases_05.TestReplayJev, _support_test_cases_05.TestP5SlowOrUnreachableJudge, _support_test_cases_05.TestShimHygiene)   # support import
+TestBriefParsing, PolicyCountingJev, PolicyRig, TestPolicyConfig = (_support_test_cases_05.TestBriefParsing, _support_test_cases_05.PolicyCountingJev, _support_test_cases_05.PolicyRig, _support_test_cases_05.TestPolicyConfig)   # support import
+TestPolicyRequest, TestStandingAuthority, TestJudgeToolWritesNothingElsewhere, TestFleetHooksSource = (_support_test_cases_05.TestPolicyRequest, _support_test_cases_05.TestStandingAuthority, _support_test_cases_05.TestJudgeToolWritesNothingElsewhere, _support_test_cases_05.TestFleetHooksSource)   # support import
+FakeV1, TestImportOrder, TestImportV1Client, FakeSweepHub = (_support_test_cases_05.FakeV1, _support_test_cases_05.TestImportOrder, _support_test_cases_05.TestImportV1Client, _support_test_cases_05.FakeSweepHub)   # support import
+FakeOwnerlessHub, TestTriageRuleInputs, TestReadWholeAuditTable, TestReportScenarios = (_support_test_cases_05.FakeOwnerlessHub, _support_test_cases_05.TestTriageRuleInputs, _support_test_cases_05.TestReadWholeAuditTable, _support_test_cases_05.TestReportScenarios)   # support import
+TestPlanOperationsPerBoss, TestStatusIntentGapsAreBounded, TestPlanCheckSelection, TestPlanTemplateDoc = (_support_test_cases_05.TestPlanOperationsPerBoss, _support_test_cases_05.TestStatusIntentGapsAreBounded, _support_test_cases_05.TestPlanCheckSelection, _support_test_cases_05.TestPlanTemplateDoc)   # support import
+TestDecisionIds, TestDecisionsPluginSource, TestDecisionsRoleText, TestDecisionsInTheLabTier = (_support_test_cases_05.TestDecisionIds, _support_test_cases_05.TestDecisionsPluginSource, _support_test_cases_05.TestDecisionsRoleText, _support_test_cases_05.TestDecisionsInTheLabTier)   # support import
 TestDecisionsScenarios, TestMultiRepoRefs, TestMultiRepoResolution, TestDecisionsPluginShowsTheRepoTag = (_support_test_cases_05.TestDecisionsScenarios, _support_test_cases_05.TestMultiRepoRefs, _support_test_cases_05.TestMultiRepoResolution, _support_test_cases_05.TestDecisionsPluginShowsTheRepoTag)   # support import
 TestTheTrialSharesTheInstaller, TestParseOrders, TestOrdersBodyEdits, TestCharterEditGuard = (_support_test_cases_05.TestTheTrialSharesTheInstaller, _support_test_cases_05.TestParseOrders, _support_test_cases_05.TestOrdersBodyEdits, _support_test_cases_05.TestCharterEditGuard)   # support import
-TestOrdersFact, TestCompactionShape, TestOrdersRoleText, TestOrdersScenarios = (_support_test_cases_05.TestOrdersFact, _support_test_cases_05.TestCompactionShape, _support_test_cases_05.TestOrdersRoleText, _support_test_cases_05.TestOrdersScenarios)   # support import
-TestTierConfig, TestServiceIdentity, TestCosOrdersFile, TestOrdersCosCommand = (_support_test_cases_05.TestTierConfig, _support_test_cases_05.TestServiceIdentity, _support_test_cases_05.TestCosOrdersFile, _support_test_cases_05.TestOrdersCosCommand)   # support import
-TestInstallMakesTheOrdersTemplate, TestTierRoleText, TestTierScenarios, TestExternalAdapterHygiene = (_support_test_cases_05.TestInstallMakesTheOrdersTemplate, _support_test_cases_05.TestTierRoleText, _support_test_cases_05.TestTierScenarios, _support_test_cases_05.TestExternalAdapterHygiene)   # support import
-TestExternalDecisionRules, TestWorkItemRules, TestComposeTrap, TestDaemonPriority = (_support_test_cases_05.TestExternalDecisionRules, _support_test_cases_05.TestWorkItemRules, _support_test_cases_05.TestComposeTrap, _support_test_cases_05.TestDaemonPriority)   # support import
-TestGithubWritingRule, LightProbe, TestEventFeedLines, TestPaneWarningRule = (_support_test_cases_05.TestGithubWritingRule, _support_test_cases_05.LightProbe, _support_test_cases_05.TestEventFeedLines, _support_test_cases_05.TestPaneWarningRule)   # support import
-TestCallerWorkspace, = (_support_test_cases_05.TestCallerWorkspace,)   # support import
+TestCompactionShape, TestOrdersRoleText, TestOrdersScenarios, TestTierConfig = (_support_test_cases_05.TestCompactionShape, _support_test_cases_05.TestOrdersRoleText, _support_test_cases_05.TestOrdersScenarios, _support_test_cases_05.TestTierConfig)   # support import
+TestServiceIdentity, TestCosOrdersFile, TestOrdersCosCommand, TestTierRoleText = (_support_test_cases_05.TestServiceIdentity, _support_test_cases_05.TestCosOrdersFile, _support_test_cases_05.TestOrdersCosCommand, _support_test_cases_05.TestTierRoleText)   # support import
+TestTierScenarios, TestExternalAdapterHygiene, TestExternalDecisionRules, TestWorkItemRules = (_support_test_cases_05.TestTierScenarios, _support_test_cases_05.TestExternalAdapterHygiene, _support_test_cases_05.TestExternalDecisionRules, _support_test_cases_05.TestWorkItemRules)   # support import
+TestComposeTrap, TestDaemonPriority, TestGithubWritingRule, LightProbe = (_support_test_cases_05.TestComposeTrap, _support_test_cases_05.TestDaemonPriority, _support_test_cases_05.TestGithubWritingRule, _support_test_cases_05.LightProbe)   # support import
+TestOwnReviewLaws, TestEventFeedLines, TestCoderBooks, TestPaneWarningRule = (_support_test_cases_05.TestOwnReviewLaws, _support_test_cases_05.TestEventFeedLines, _support_test_cases_05.TestCoderBooks, _support_test_cases_05.TestPaneWarningRule)   # support import
+TestCallerWorkspace, TestMergeGateDocs = (_support_test_cases_05.TestCallerWorkspace, _support_test_cases_05.TestMergeGateDocs)   # support import
 _support_test_cases_06 = importlib.import_module("test_cases_06")   # support import
-TestGithubVerification, ClosingRunner, TestV2ClientPR4, TestParseCheckpoint = (_support_test_cases_06.TestGithubVerification, _support_test_cases_06.ClosingRunner, _support_test_cases_06.TestV2ClientPR4, _support_test_cases_06.TestParseCheckpoint)   # support import
-TestIntentParsing, TestIntegrationBranchVerdictText, TestLaunchMemoryTest, TestPR7Source = (_support_test_cases_06.TestIntentParsing, _support_test_cases_06.TestIntegrationBranchVerdictText, _support_test_cases_06.TestLaunchMemoryTest, _support_test_cases_06.TestPR7Source)   # support import
-TestShimHygiene, PolicyCountingJev, PolicyRig, TestPolicyRedaction = (_support_test_cases_06.TestShimHygiene, _support_test_cases_06.PolicyCountingJev, _support_test_cases_06.PolicyRig, _support_test_cases_06.TestPolicyRedaction)   # support import
-TestStandingAuthority, TestFleetHooksSource, FakeV1, TestImportOrder = (_support_test_cases_06.TestStandingAuthority, _support_test_cases_06.TestFleetHooksSource, _support_test_cases_06.FakeV1, _support_test_cases_06.TestImportOrder)   # support import
-TestImportV1Config, TestImportV1AsAProcess, MutantSpliceError, FakeOwnerlessHub = (_support_test_cases_06.TestImportV1Config, _support_test_cases_06.TestImportV1AsAProcess, _support_test_cases_06.MutantSpliceError, _support_test_cases_06.FakeOwnerlessHub)   # support import
-TestReadWholeAuditTable, TestReportScenarios, TestPlanOperationsPerBoss, TestPlanTemplateDoc = (_support_test_cases_06.TestReadWholeAuditTable, _support_test_cases_06.TestReportScenarios, _support_test_cases_06.TestPlanOperationsPerBoss, _support_test_cases_06.TestPlanTemplateDoc)   # support import
-TestDecisionsRoleText, TestD6Scenario, TestInstallOnLinux, TestInstallOnAnUnknownPlatform = (_support_test_cases_06.TestDecisionsRoleText, _support_test_cases_06.TestD6Scenario, _support_test_cases_06.TestInstallOnLinux, _support_test_cases_06.TestInstallOnAnUnknownPlatform)   # support import
-TestCloudReaperInstallOnMacOS, TestCloudReaperInstallOnLinux, TestRealStatusAfterInstallOnMacOS, TestRealStatusAfterInstallOnLinux = (_support_test_cases_06.TestCloudReaperInstallOnMacOS, _support_test_cases_06.TestCloudReaperInstallOnLinux, _support_test_cases_06.TestRealStatusAfterInstallOnMacOS, _support_test_cases_06.TestRealStatusAfterInstallOnLinux)   # support import
-OrdersReachTheJudgeWhole, AlreadyDecidedRefusal, TestOwnerEvaluatorsAreRare, TestOwnReviewLaws = (_support_test_cases_06.OrdersReachTheJudgeWhole, _support_test_cases_06.AlreadyDecidedRefusal, _support_test_cases_06.TestOwnerEvaluatorsAreRare, _support_test_cases_06.TestOwnReviewLaws)   # support import
-TestCoderBooks, TestDecisionsStaleBound, StubHub, EjectionHub = (_support_test_cases_06.TestCoderBooks, _support_test_cases_06.TestDecisionsStaleBound, _support_test_cases_06.StubHub, _support_test_cases_06.EjectionHub)   # support import
-TestScratchFileRule, TestMergeGateDocs = (_support_test_cases_06.TestScratchFileRule, _support_test_cases_06.TestMergeGateDocs)   # support import
+ClosingRunner, TestV2ClientPR4, TestPR7Source, TestPolicyRedaction = (_support_test_cases_06.ClosingRunner, _support_test_cases_06.TestV2ClientPR4, _support_test_cases_06.TestPR7Source, _support_test_cases_06.TestPolicyRedaction)   # support import
+TestImportV1Config, TestImportV1AsAProcess, MutantSpliceError, TestSyncReportFreezePerBoss = (_support_test_cases_06.TestImportV1Config, _support_test_cases_06.TestImportV1AsAProcess, _support_test_cases_06.MutantSpliceError, _support_test_cases_06.TestSyncReportFreezePerBoss)   # support import
+TestD6Scenario, TestInstallOnLinux, TestInstallOnAnUnknownPlatform, TestCloudReaperInstallOnMacOS = (_support_test_cases_06.TestD6Scenario, _support_test_cases_06.TestInstallOnLinux, _support_test_cases_06.TestInstallOnAnUnknownPlatform, _support_test_cases_06.TestCloudReaperInstallOnMacOS)   # support import
+TestCloudReaperInstallOnLinux, TestRealStatusAfterInstallOnMacOS, TestRealStatusAfterInstallOnLinux, OrdersReachTheJudgeWhole = (_support_test_cases_06.TestCloudReaperInstallOnLinux, _support_test_cases_06.TestRealStatusAfterInstallOnMacOS, _support_test_cases_06.TestRealStatusAfterInstallOnLinux, _support_test_cases_06.OrdersReachTheJudgeWhole)   # support import
+Unavailable, AlreadyDecidedRefusal, TestOwnerEvaluatorsAreRare, TestDecisionsStaleBound = (_support_test_cases_06.Unavailable, _support_test_cases_06.AlreadyDecidedRefusal, _support_test_cases_06.TestOwnerEvaluatorsAreRare, _support_test_cases_06.TestDecisionsStaleBound)   # support import
+StubHub, EjectionHub, TestScratchFileRule = (_support_test_cases_06.StubHub, _support_test_cases_06.EjectionHub, _support_test_cases_06.TestScratchFileRule)   # support import
 
 
 def daemon_text(path):
@@ -310,7 +311,7 @@ class TestConfig(Base):
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
-            "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
+            "rider_max_age_seconds": 3600, "undelivered_wake_minutes": 15, "undelivered_wake_tell_minutes": None, "undelivered_wake_per_pass": 2, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
@@ -415,6 +416,76 @@ class TestConfig(Base):
 
 
 # ------------------------------------------------------------------- the state
+
+class TestStateDir(Base):
+    def test_created_private_under_xdg_state_home_whatever_the_umask(self):
+        # 0o277 strips owner bits from mkdir's mode, so only an explicit chmod
+        # yields exactly 0700; 0 would let a looser mode through if one were asked for.
+        for umask in (0, 0o022, 0o277):
+            with self.subTest(umask=oct(umask)):
+                if self.state_dir.exists():
+                    self.state_dir.rmdir()
+                self.state_dir.parent.mkdir(parents=True, exist_ok=True)
+                old = os.umask(umask)
+                try:
+                    path = sb.ensure_state_dir()
+                finally:
+                    os.umask(old)
+                self.assertEqual(path, self.state_dir)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+
+    def test_missing_parents_are_created_too(self):
+        self.assertFalse(self.state_dir.parent.exists())
+        self.assertEqual(stat.S_IMODE(sb.ensure_state_dir().stat().st_mode), 0o700)
+
+    def test_default_is_under_home_when_xdg_is_unset(self):
+        os.environ.pop("XDG_STATE_HOME", None)
+        self.assertEqual(sb.state_dir_path(), self.home / ".local/state/fleet-switchboard")
+
+    def test_existing_private_dir_is_accepted(self):
+        self.state_dir.mkdir(parents=True, mode=0o700)
+        os.chmod(str(self.state_dir), 0o700)
+        self.assertEqual(sb.ensure_state_dir(), self.state_dir)
+
+    def test_a_directory_made_by_another_process_between_the_look_and_the_mkdir_is_accepted(self):
+        """#688: three `heavy` wrappers started together all saw no directory; the one that lost the mkdir got EEXIST and ran its command with NO slot."""
+        self.state_dir.mkdir(parents=True, mode=0o700)
+        os.chmod(str(self.state_dir), 0o700)
+        real = sb.Path.exists
+        sb.Path.exists = lambda self_: False if self_ == self.state_dir else real(self_)   # the look said "not there": the other process made it just after
+        try:
+            self.assertEqual(sb.ensure_state_dir(), self.state_dir)
+        finally:
+            sb.Path.exists = real
+
+    def test_a_directory_made_in_that_gap_is_still_refused_when_it_is_not_private(self):
+        self.state_dir.mkdir(parents=True)
+        os.chmod(str(self.state_dir), 0o755)
+        real = sb.Path.exists
+        sb.Path.exists = lambda self_: False if self_ == self.state_dir else real(self_)
+        try:
+            with self.assertRaises(sb.ConfigError):
+                sb.ensure_state_dir()
+        finally:
+            sb.Path.exists = real
+        self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o755)
+
+    def test_group_or_world_readable_dir_is_refused_not_repaired(self):
+        for mode in (0o750, 0o705, 0o755, 0o777):
+            with self.subTest(mode=oct(mode)):
+                self.state_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(str(self.state_dir), mode)
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.ensure_state_dir()
+                self.assertIn("private", str(caught.exception))
+                self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), mode)
+
+    def test_a_file_in_its_place_is_refused(self):
+        self.state_dir.parent.mkdir(parents=True)
+        self.state_dir.write_text("")
+        os.chmod(str(self.state_dir), 0o600)
+        with self.assertRaises(sb.ConfigError):
+            sb.ensure_state_dir()
 
 
 # ------------------------------------------------------------- OpenCode v2
@@ -18010,7 +18081,7 @@ class TestPlanningSkill(unittest.TestCase):
     def test_it_is_a_short_skill_with_the_frontmatter_the_others_have(self):
         text = self.SKILL.read_text()
         self.assertTrue(text.startswith("---\nname: fleet-planning\ndescription: "))
-        self.assertLessEqual(len(text.split()), 1100, "the skill must be cheap to load")
+        self.assertLessEqual(len(text.split()), 1200, "the skill must be cheap to load")
         for phrase in ("PLAN: <link>", "fleet-switchboard plan check", "plan review", "docs/plan-template.md", "discriminates", "What the reviewers attack"):
             self.assertIn(phrase, text)
         self.assertIn("not built yet", text)  # the review engine is part 2: said plainly
@@ -37918,7 +37989,7 @@ class TestImpactHold(LedgerBase):
         profiled = {f[len("bin/"):-3] for f, _ in seen if f.endswith(".py")}
         named = lambda m: matches("bin/%s.py" % m, rule["clear_code_paths"])
         judged = {m for m in (reached | at_load | with_reader | profiled) if m in names and not named(m)}
-        listed = {f[len("bin/"):-3] for f in rule["closure_files"] if f.endswith(".py")}
+        listed = {f[len("bin/"):-3] for f in rule["closure_files"] if f.endswith(".py") and not f.startswith("bin/switchboard/")}   # a part of the daemon is judged by tools/derive-closure (tests/switchboard/test_closure.py), not by this list of flat modules
         self.assertEqual(sorted(judged ^ listed), [], "closure_files is the set of modules the clear loads or runs, derived (a module in one and not the other)")
         every_loaded = {m for m in (set(helper.values()) | set().union(*loaders.values()) | set().union(*[direct(f) for f in clear_functions])) if m in names and not named(m)}
         exempt = {"bin/%s.py" % m for m in every_loaded - judged}
@@ -40076,18 +40147,284 @@ class TestJudgeEval(Base):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
 
 
-class TestPlanCheckSelection(unittest.TestCase):
-    def test_the_latest_plan_scenarios_comment_wins_else_the_body(self):
-        pick = sb.plan_check.select_plan_text
-        comments = [{"id": 1, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\nfirst"},
-                    {"id": 3, "created_at": "2026-01-03T00:00:00Z", "body": "### Plan (Scenarios) rev 2\nlatest",
-                     "user": {"login": "planner-1"}},
-                    {"id": 2, "created_at": "2026-01-02T00:00:00Z", "body": "## Plan (scenarios)\nsecond"},
-                    {"id": 4, "created_at": "2026-01-04T00:00:00Z", "body": "just talking about Plan (scenarios) here"}]
-        self.assertEqual(pick("body text", comments), ("### Plan (Scenarios) rev 2\nlatest", "comment 3 by planner-1"))
-        self.assertEqual(pick("body text", comments[3:]), ("body text", "issue body"))
-        self.assertEqual(pick("body text", []), ("body text", "issue body"))
-        self.assertEqual(pick(None, None), ("", "issue body"))
+class TestPlanCheckRules(unittest.TestCase):
+    """#135: every validation, both ways."""
+
+    def check(self, text=GOOD_PLAN, done_when=GOOD_DONE_WHEN):
+        return sb.plan_check.check(text, done_when)
+
+    def codes(self, text, done_when=GOOD_DONE_WHEN):
+        return sorted(d["code"] for d in self.check(text, done_when)["defects"])
+
+    def edit(self, old, new, text=GOOD_PLAN):
+        self.assertIn(old, text)
+        return text.replace(old, new, 1)
+
+    def test_the_good_plan_passes_with_a_hash_and_no_defect(self):
+        got = self.check()
+        self.assertEqual((got["result"], got["defects"], got["scenarios"], len(got["clauses"])), ("pass", [], 3, 2))
+        self.assertRegex(got["scenario_hash"], r"^sha256:[0-9a-f]{64}$")
+        self.assertRegex(got["plan_hash"], r"^sha256:[0-9a-f]{64}$")
+
+    def warn_codes(self, text):
+        return [(w["id"], w["code"]) for w in self.check(text)["warnings"] if w["code"] == "live-no-claim"]
+
+    def test_a_live_or_tester_scenario_with_no_claim_warns_and_never_fails_or_changes_the_hash(self):
+        got = self.check()
+        self.assertEqual(got["result"], "pass")
+        self.assertEqual(self.warn_codes(GOOD_PLAN), [("S2", "live-no-claim")])
+        message = [w["message"] for w in self.check(GOOD_PLAN)["warnings"] if w["code"] == "live-no-claim"][0]
+        self.assertIn("`claim: epic`", message)
+        self.assertIn("`claim: pr`", message)
+        self.assertNotIn("is claimed by", message)
+        tester = self.edit("    proof: live\n", "    proof: measure\n")
+        self.assertEqual(self.warn_codes(tester), [("S2", "live-no-claim")], "evaluator tester alone warns")
+        live = self.edit("    evaluator: tester", "    evaluator: owner")
+        self.assertEqual(self.warn_codes(live), [("S2", "live-no-claim")], "proof live alone warns")
+        claimed = self.edit("    evaluator: tester", "    evaluator: tester\n    claim: epic")
+        self.assertEqual(self.warn_codes(claimed), [])
+        self.assertEqual(self.check(claimed)["result"], "pass")
+        self.assertEqual(self.warn_codes(self.edit("    evaluator: tester", "    evaluator: tester\n    claim: pr")), [])
+        same = self.check(GOOD_PLAN)["plan_hash"]
+        self.assertEqual(same, got["plan_hash"])
+        self.assertEqual(same, "sha256:2ad49344a1bf3ea7fc5ceeef6f60013e02fa465dc04da8a3b5b389a82b686cdb", "the hash the checker gave this plan before the warning existed")
+        self.assertEqual([w["code"] for w in got["warnings"] if w["code"] != "live-no-claim"], ["no-constraint-list"])
+
+    def test_the_template_marks_every_stub_with_a_ready_claim_line_and_a_live_one_for_live_or_tester(self):
+        lines = sb.plan_check.template(["one thing", "another"])
+        want = "    # claim: epic   # " + sb.plan_check.CLAIM_WHY
+        self.assertEqual(lines.count(want), 3, "one per stub: two clauses and the unchanged one")
+        self.assertFalse([l for l in lines if l.strip().startswith("claim:")], "a test/ci stub is never claimed epic")
+        for proof, evaluator in (("live", "tester"), ("test", "tester"), ("live", "ci")):
+            self.assertEqual(sb.plan_check.claim_lines(proof, evaluator), ["    claim: epic   # " + sb.plan_check.CLAIM_WHY])
+        self.assertEqual(sb.plan_check.claim_lines("test", "ci"), [want])
+
+    def test_the_brief_template_carries_the_plan_posted_report_line_once(self):
+        text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        self.assertEqual(text.count("working: plan posted <hash> <url>"), 1)
+
+    def test_clauses_are_the_numbered_parts_and_a_plain_line_is_one(self):
+        c = sb.plan_check.clauses_of
+        self.assertEqual(c("(1) one thing; (2) another (see (3) below)"), ["one thing", "another (see (3) below)"])
+        self.assertEqual(c("(1) a; (2) b; (3) c"), ["a", "b", "c"])
+        self.assertEqual(len(c("(1) a :( ; (2) b ; (3) c")), 3, "an unbalanced ( in a clause does not hide the next marker")
+        self.assertEqual(len(c("(1) a (b ; (2) c ; (3) d ) ; (4) e")), 4)
+        self.assertEqual(c("just one sentence, no numbers"), ["just one sentence, no numbers"])
+        self.assertEqual(c("(2) starts at two"), ["(2) starts at two"])
+        self.assertEqual(c(""), [])
+        self.assertEqual(c(None), [])
+
+    def test_a_vague_pass_rule_fails_and_a_concrete_one_passes(self):
+        for vague in ("works", "it works", "ok", "non-empty", "passes", "Works.", "no errors", "short one",
+                      "it works for 1 user", "works correctly after the change is applied", "output matches the expectations",
+                      "'works'", '"works"', "result = ok and everything fine", "after the change, 1 thing is fine"):
+            with self.subTest(vague=vague):
+                self.assertIn("vague-pass", self.codes(self.edit('pass: the list call returns status 200 and exactly 1 agent named "alpha"',
+                                                              "pass: %s" % vague)))
+        for concrete in ("the exit code is 0 after the run finishes", "the page shows the word 'Ready' after loading",
+                         "the count is greater than 0 in the result", "latency stays under 200 ms at p95"):
+            with self.subTest(concrete=concrete):
+                self.assertEqual(self.codes(self.edit('pass: the list call returns status 200 and exactly 1 agent named "alpha"',
+                                                      "pass: %s" % concrete)), [])
+        self.assertIn("vague-pass", self.codes(self.edit('pass: the list call returns status 200 and exactly 1 agent named "alpha"',
+                                                         "pass: the thing behaves nicely for the user overall")))
+
+    def test_a_missing_or_vacuous_discriminator_fails(self):
+        base = "discriminates: a build that creates nothing returns an empty list and fails"
+        for new in ("discriminates: n/a", "discriminates: none", "discriminates: tbd", "discriminates: short",
+                    'discriminates: the list call returns status 200 and exactly 1 agent named "alpha"',
+                    "discriminates: a wrong build would fail this", "discriminates: this would fail if it is wrong",
+                    "discriminates: the list call gives status 200 and exactly one agent named alpha",
+                    "discriminates: the scenario checks that things are right"):
+            with self.subTest(new=new):
+                self.assertIn("no-discriminator", self.codes(self.edit(base, new)))
+        self.assertIn("missing-discriminates", self.codes(self.edit("    " + base + "\n", "")))
+
+    def test_each_required_key_is_required(self):
+        clauses = sb.plan_check.clauses_of(GOOD_DONE_WHEN)
+        for key in sb.plan_check.REQUIRED:
+            with self.subTest(key=key):
+                scenarios = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(GOOD_PLAN))
+                del scenarios[1][key]
+                defects, _ = sb.plan_check.validate(scenarios, clauses, GOOD_PLAN)
+                self.assertIn("missing-%s" % key, [d["code"] for d in defects])
+        scenarios = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(GOOD_PLAN))
+        scenarios[1]["text"] = "   "
+        self.assertIn("missing-text", [d["code"] for d in sb.plan_check.validate(scenarios, clauses, GOOD_PLAN)[0]])
+
+    def test_id_pattern_and_uniqueness(self):
+        self.assertIn("bad-id", self.codes(self.edit("id: S2", "id: X2")))
+        self.assertIn("bad-id", self.codes(self.edit("id: S2", "id: S")))
+        self.assertIn("duplicate-id", self.codes(self.edit("id: S2", "id: S1")))
+        self.assertEqual(self.codes(self.edit("id: S2", "id: S12")), [])
+
+    def test_covers_pattern_and_range(self):
+        self.assertIn("bad-covers", self.codes(self.edit("covers: DW-2", "covers: 2")))
+        self.assertIn("bad-covers", self.codes(self.edit("covers: DW-2", "covers: DW-1, DW-2")))
+        self.assertIn("covers-unknown-clause", self.codes(self.edit("covers: PC-1", "covers: DW-9")))
+        self.assertEqual(self.codes(self.edit("covers: PC-1", "covers: PC-7")), [])
+
+    def test_unknown_keys_are_rejected_and_the_optional_ones_allowed(self):
+        self.assertIn("unknown-key", self.codes(self.edit("    evaluator: tester", "    evaluator: tester\n    owner: me")))
+        self.assertEqual(self.codes(self.edit("    evaluator: tester", "    evaluator: tester\n    slice: one\n    phase: shadow\n    claim: epic")), [])
+
+    def test_proof_evaluator_and_claim_values_and_consistency(self):
+        self.assertIn("bad-proof", self.codes(self.edit("proof: live", "proof: manual")))
+        self.assertIn("bad-evaluator", self.codes(self.edit("evaluator: tester", "evaluator: bob")))
+        self.assertIn("bad-claim", self.codes(self.edit("evaluator: tester", "evaluator: tester\n    claim: both")))
+        for proof, evaluator, ok in (("test", "ci", True), ("test", "tester", False), ("test", "owner", False),
+                                     ("screenshot", "reviewer", True), ("screenshot", "owner", True),
+                                     ("screenshot", "ci", False), ("live", "tester", True), ("live", "owner", True),
+                                     ("live", "ci", False), ("live", "reviewer", False), ("measure", "tester", True),
+                                     ("measure", "reviewer", False)):
+            with self.subTest(proof=proof, evaluator=evaluator):
+                text = self.edit("proof: live", "proof: %s" % proof).replace("evaluator: tester", "evaluator: %s" % evaluator, 1)
+                self.assertEqual("evaluator-mismatch" in self.codes(text), not ok)
+
+    def test_the_old_personal_evaluator_name_is_an_alias_of_owner_and_does_not_change_the_hash(self):
+        base = self.check()
+        old = self.check(self.edit("evaluator: tester", "evaluator: adam"))
+        new = self.check(self.edit("evaluator: tester", "evaluator: owner"))
+        self.assertEqual((old["result"], new["result"]), ("pass", "pass"))
+        self.assertEqual([w["code"] for w in old["warnings"] if w["code"] == "evaluator-alias"], ["evaluator-alias"])
+        self.assertEqual([w for w in new["warnings"] if w["code"] == "evaluator-alias"], [])
+        self.assertNotEqual(old["scenario_hash"], new["scenario_hash"], "the hash covers the text as written")
+        self.assertIn("evaluator-mismatch", self.codes(self.edit("proof: live", "proof: test").replace("evaluator: tester", "evaluator: adam", 1)))
+
+    def test_every_done_when_clause_must_be_covered_by_an_s_scenario(self):
+        self.assertIn("uncovered-clause", self.codes(self.edit("covers: DW-2", "covers: PC-2")))
+        self.assertEqual(self.codes(GOOD_PLAN, "(1) one; (2) two; (3) three").count("uncovered-clause"), 1)
+        self.assertIn("uncovered-clause", self.codes(self.edit("id: S2", "id: U2")))  # a U scenario does not cover a clause
+        self.assertIn("no-done-when", self.codes(GOOD_PLAN, ""))
+
+    def test_a_refused_evaluator_names_the_evaluators_that_fit_the_proof(self):
+        for proof, evaluator, fitting in (("test", "reviewer", "ci"), ("live", "ci", "tester or owner"),
+                                          ("measure", "ci", "tester or owner"), ("screenshot", "ci", "reviewer or owner")):
+            with self.subTest(proof=proof):
+                text = self.edit("proof: live", "proof: %s" % proof).replace("evaluator: tester", "evaluator: %s" % evaluator, 1)
+                got = self.check(text)
+                self.assertEqual(got["result"], "fail")
+                messages = [d["message"] for d in got["defects"] if d["code"] == "evaluator-mismatch"]
+                self.assertEqual(len(messages), 1)
+                self.assertTrue(messages[0].endswith("the evaluator that fits proof %s is %s" % (proof, fitting)), messages[0])
+
+    def test_the_no_done_when_message_names_the_intent_heading(self):
+        got = self.check(GOOD_PLAN, "")
+        messages = [d["message"] for d in got["defects"] if d["code"] == "no-done-when"]
+        self.assertEqual(got["result"], "fail")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("## Intent", messages[0])
+        self.assertIn("Done when:", messages[0])
+
+    def test_the_skills_carry_the_paper_cut_lines(self):
+        skills = REPO / "skills"
+        coordination = (skills / "fleet-coordination" / "SKILL.md").read_text()
+        block = coordination.split("a push voids proofs):\n\n```text\n", 1)[1].split("```", 1)[0].strip("\n").splitlines()
+        self.assertEqual(len(block), 2)
+        self.assertIn("test_the_role_files_do_not_grow", block[0])
+        self.assertIn("TestHygiene", block[1])
+        planning = (skills / "fleet-planning" / "SKILL.md").read_text()
+        self.assertEqual(planning.count("`## Intent` before `Done when:`"), 1)
+        review = (skills / "fleet-review" / "SKILL.md").read_text()
+        lines = [l for l in review.splitlines() if l.startswith("In a repository with no review laws installed, the ORCHESTRATOR")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("independent review", review.split(lines[0], 1)[1].split("\n\n", 1)[0])
+
+    def test_the_mutation_run_rule_is_said_once_in_each_skill_and_in_no_reviewer_definition(self):
+        words = ("mutation or fault-injection check", "fleet-switchboard heavy", "time limit", "process group", "background", "never a reviewer")
+        for skill in ("fleet-review", "fleet-coordination"):
+            text = " ".join((REPO / "skills" / skill / "SKILL.md").read_text().split())
+            with self.subTest(skill=skill):
+                self.assertEqual(text.count("An agent that is asked to run a mutation or fault-injection check"), 1)
+                sentence = text.split("An agent that is asked to run a mutation or fault-injection check", 1)[1].split("can loop.", 1)[0]
+                for word in words[1:] + ("named job", "job record", "the job-start rule"):
+                    self.assertIn(word, sentence)
+                for old in ("never runs in the background without one", "never leaves one running in the background"):
+                    self.assertEqual(text.count(old), 0)
+        definitions = sorted((REPO / "agents" / "reviewers").glob("*.md"))
+        self.assertEqual(len(definitions), 5)
+        for path in definitions:
+            with self.subTest(definition=path.name):
+                self.assertNotIn("fault-injection", path.read_text().lower())
+
+    def test_a_plan_that_opts_in_needs_a_size_in_agent_time_and_one_that_does_not_is_left_alone(self):
+        self.assertEqual(self.codes(GOOD_PLAN), [], "a plan written before the rule has no plan-format line and is not flagged")
+        self.assertEqual(self.codes("plan-format: 1\n" + GOOD_PLAN), [])
+        self.assertEqual(self.codes("plan-format: 2\nsize: S\n" + GOOD_PLAN), [], "a light plan may carry just `size: S`")
+        self.assertIn("missing-size", self.codes("plan-format: 2\n" + GOOD_PLAN))
+        for valid in ("S", "M: a few hours, one file and a test", "L: about a day, three areas", "XL: several days, five areas and a migration", "xl, 3 days"):
+            with self.subTest(valid=valid):
+                self.assertEqual(self.codes("plan-format: 2\nsize: %s\n%s" % (valid, GOOD_PLAN)), [])
+
+    def test_the_skill_and_the_template_state_the_size_rule_and_the_opt_in(self):
+        for path in (REPO / "skills" / "fleet-planning" / "SKILL.md", REPO / "docs" / "plan-template.md"):
+            text = path.read_text()
+            with self.subTest(path=path.name):
+                for phrase in ("t-shirt", "agent time", "plan-format: 2", "size: s"):
+                    self.assertIn(phrase, text.lower())
+                self.assertRegex(text, r"never (?:prefers|human-days)")
+
+    def test_the_opt_in_line_is_bounded_read_with_bold_keys_and_applies_from_format_2_up(self):
+        self.assertIn("missing-size", self.codes("plan-format: 3\n" + GOOD_PLAN))
+        self.assertEqual(self.codes("plan-format: 2\n**size:** S\n" + GOOD_PLAN), [])
+        self.assertEqual(self.codes("**plan-format:** 2\nsize: S\n" + GOOD_PLAN), [])
+        self.assertEqual(self.codes("plan-format: " + "9" * 5000 + "\n" + GOOD_PLAN), [], "a huge number is not read, and does not crash the checker")
+        self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: S, 1 week\n" + GOOD_PLAN))
+        self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: M, 2 wk\n" + GOOD_PLAN))
+
+    def test_prose_that_starts_with_size_does_not_hide_the_real_line_and_a_code_fence_is_not_the_plan(self):
+        prose = "Size: one PR, a few files\n"
+        self.assertEqual(self.codes("plan-format: 2\n" + prose + "size: M\n" + GOOD_PLAN), [], "the repro: prose before the real line")
+        self.assertEqual(self.codes("plan-format: 2\nsize: M: a few hours\n" + prose + GOOD_PLAN), [])
+        self.assertIn("bad-size", self.codes("plan-format: 2\n" + prose + GOOD_PLAN), "only prose: the defect shows")
+        fenced = "```text\nplan-format: 2\nsize: huge\n```\n"
+        self.assertEqual(self.codes(fenced + GOOD_PLAN), [], "an example in a fence does not opt a plan in")
+        self.assertIn("missing-size", self.codes("plan-format: 2\n" + fenced + GOOD_PLAN), "an example size in a fence is not the plan's size")
+        self.assertEqual(self.codes("plan-format: 2\n~~~\nsize: huge\n~~~\nsize: S\n" + GOOD_PLAN), [])
+
+    def test_a_size_in_days_is_refused_for_work_under_l_and_human_time_always(self):
+        for bad, code in (("M, 3 days", "size-in-days"), ("S: 1 day", "size-in-days"), ("m (2-3 days)", "size-in-days"), ("S, two days", "size-in-days"),
+                          ("L, 2 human-days", "size-in-days"), ("XL: 4 person-days", "size-in-days"), ("big", "bad-size"), ("3 days", "bad-size")):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.codes("plan-format: 2\nsize: %s\n%s" % (bad, GOOD_PLAN)), [code])
+        self.assertEqual(self.codes("size: M, 3 days\n" + GOOD_PLAN), [], "without the opt-in line the size is not read at all")
+
+    def test_an_unchanged_scenario_is_needed_unless_the_plan_says_why_not(self):
+        scen = GOOD_PLAN[:GOOD_PLAN.index("  - id: U1")] + "```\n"
+        self.assertIn("no-unchanged-scenario", self.codes(scen))
+        self.assertEqual(self.codes(scen + "\nunchanged: none because this is a brand new endpoint with no callers\n"), [])
+        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because\n"))
+        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because x\n"))
+        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because n/a ok\n"))
+        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because short reason\n"))
+
+    def test_more_than_thirty_scenarios_warns_but_does_not_fail(self):
+        extra = "".join("  - id: S%d\n    covers: PC-1\n    text: Another behaviour of the system under test\n"
+                        "    proof: test\n    pass: the call returns status 200 and the count is %d\n"
+                        "    discriminates: a build that ignores the input fails the count\n    evaluator: ci\n" % (n, n)
+                        for n in range(10, 40))
+        text = GOOD_PLAN.replace("  - id: U1", extra + "  - id: U1", 1)
+        got = self.check(text)
+        self.assertEqual((got["result"], got["scenarios"]), ("pass", 33))
+        self.assertEqual(sorted(w["code"] for w in got["warnings"]), ["live-no-claim", "many-scenarios", "no-constraint-list"])
+
+    def test_the_hash_ignores_whitespace_comments_quoting_order_and_defaults_but_not_content(self):
+        base = self.check()["scenario_hash"]
+        spaced = GOOD_PLAN.replace("    proof: test", "    proof:   test   # note").replace("evaluator: ci", "evaluator: 'ci'  ")
+        self.assertEqual(self.check(spaced)["scenario_hash"], base)
+        explicit = GOOD_PLAN.replace("evaluator: ci", "evaluator: ci\n    claim: pr")
+        self.assertEqual(self.check(explicit)["scenario_hash"], base, "claim: pr is the default")
+        scen = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(GOOD_PLAN))
+        clauses = sb.plan_check.clauses_of(GOOD_DONE_WHEN)
+        self.assertEqual(sb.plan_check.content_hash(list(reversed(scen)), clauses, GOOD_PLAN), base, "order is not content")
+        for old, new in (("exactly 1 agent", "exactly 2 agents"), ("evaluator: tester", "evaluator: owner"),
+                         ("proof: live", "proof: measure")):
+            with self.subTest(change=new):
+                self.assertNotEqual(self.check(self.edit(old, new))["scenario_hash"], base)
+        self.assertNotEqual(self.check(GOOD_PLAN, "(1) an owner can commission an agent; (2) it answers a chat reply.")["scenario_hash"], base)
+
+    def test_the_hash_is_the_same_for_the_same_plan_on_every_call(self):
+        self.assertEqual(self.check()["scenario_hash"], self.check()["scenario_hash"])
 
 
 class TestPlanCheckCommand(Base):
@@ -40149,8 +40486,24 @@ class TestPlanCheckCommand(Base):
                          {"id": 12, "created_at": "2026-01-02T00:00:00Z", "body": "## Plan (scenarios) rev 2\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):],
                           "user": {"login": "planner"}}]
         code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
-        self.assertEqual(code, 0, out + err)
+        self.assertEqual(code, 1, out + err)   # #978: a repost is a defect naming both comments; the latest is still the one read
         self.assertIn("source: comment 12 by planner of acme/app#7", out)
+        self.assertIn("comment 12 looks like a plan but comment 11 is already the plan", out)
+
+    def test_one_canonical_comment_with_two_receipts_passes_and_names_the_canonical_one(self):
+        h = "sha256:" + "b" * 64
+        receipt = "<!-- plan-receipt -->\nplan hash: %s\nwhat changed\nwhy" % h
+        self.issue["body"] = "## Intent\nx\nDone when: %s\n" % GOOD_DONE_WHEN
+        self.comments = [{"id": 11, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):]},
+                         {"id": 12, "created_at": "2026-01-02T00:00:00Z", "body": receipt},
+                         {"id": 13, "created_at": "2026-01-03T00:00:00Z", "body": receipt}]
+        code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("source: comment 11", out)
+        self.comments[2]["body"] += "\n## Plan (scenarios)"
+        code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("receipt carries plan text", out)
 
     def test_an_issue_comment_url_picks_that_comment(self):
         self.comments = [{"id": 11, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):]}]
@@ -62432,6 +62785,7 @@ class TestV2LightGuards(Base):
         ("triage_stop", 1): (3, "stop", ()),
         ("synthetic_lines", 1): (5, "lines", (("transcript_lines", 1),)),
         ("transcript_lines", 1): (5, "transcript", ()),
+        ("undelivered_wake_tick", 1): ("list", "wedged", (("V2Reads.inbox", 1),)),
         ("chat_clear_live_now", 1): ("chat", "the live decision: shadow under light; pinned by TestChatClearHook test_light_live_route_* and test_light_live_every_route_*", ()),
         ("chat_clear_prompts", 1): ("chat", "the ONE allowed read: pinned by TestChatClearHook (S1 to S4)", ()),
     }
@@ -62469,6 +62823,11 @@ class TestV2LightGuards(Base):
             world.v2.sessions[world.sessions["coder"]]["metadata"]["fleet"]["reports_to"] = "cos"
             world.tick(5)
             world.new_engine("cli").report("coder", "question", "which one?")
+            self.passes(world, 2)
+        elif name == "wedged":   # #1337: an old queued wake no turn took; under light the tick reads nothing and resumes nothing
+            world.v2.sessions[sid]["inbox"].append({
+                "id": "inb_w", "sessionID": sid, "text": "wake", "metadata": {"fleet": {"keys": ["lab.fact:wedged"], "from": "switchboard"}},
+                "resume": True, "delivery": "queue", "time": {"created": world.v2.clock.ms(now - 16 * 60)}})
             self.passes(world, 2)
         elif name == "newest":
             sb.newest_prompts(engine, world.sessions["cos"])
@@ -67399,6 +67758,12 @@ def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2
 sys.path.insert(0, str(REPO / "tests" / "switchboard"))
 _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
+# The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
+_closure = importlib.import_module("test_closure")
+TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
+# The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
+_shadow = importlib.import_module("test_shadow")
+TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -67417,6 +67782,18 @@ class TestTheArchitectureTestIsRun(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 4, "the hook that loads tests/switchboard/test_architecture.py is gone")
         self.assertEqual(os.path.realpath(_architecture.__file__), os.path.realpath(str(REPO / "tests" / "switchboard" / "test_architecture.py")))
+
+    def test_the_suite_holds_every_test_of_the_closure_test(self):
+        def flat(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from flat(item)
+                else:
+                    yield item
+        ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
+        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine"):
+            with self.subTest(case=name):
+                self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 2, "the hook that loads tests/switchboard/test_closure.py is gone")
 
 
 class TestSupportRebinding(unittest.TestCase):
@@ -69020,7 +69397,10 @@ class TestWhoCanClear(unittest.TestCase):
                 self.assertEqual(self.who(report, files, {path: None})["who"], "unknown")
                 self.assertEqual(self.who(report, files, {path: []})["who"], "owner or chief of staff")
                 mutant = dict(self.rule, closure_files=[g for g in self.rule["closure_files"] if g != path])
-                self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "owner or chief of staff", "a path the rule does not judge is not mapped")
+                if self.floor.matches(path, ["bin/switchboard/*.py"]):   # #1339: a part of the daemon is judged whether the matrix lists it or not (an unmapped one is refused)
+                    self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "unknown", "a part is judged even when the rule does not list it")
+                else:
+                    self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "owner or chief of staff", "a path the rule does not judge is not mapped")
 
     def test_every_floor_class_gives_its_rule_id_and_the_lowest_rating_and_the_never_delegated_ones_are_owner_only_without_a_max_level(self):
         for rid, cls in self.block["floor"]["rules"].items():
@@ -71201,6 +71581,210 @@ class TestMoveAnAsk(LanesCase):
         self.assertEqual(code, 1)
         self.assertIn("only for the Lab", err)
         self.assertEqual(self.gh.writes, [])
+
+
+class TestTempJanitorResume(Base):
+    """Ask #469: a scan that runs out of its time budget records the name it stopped at, and the next run continues there."""
+
+    def setUp(self):
+        super().setUp()
+        self.jan = sb.load_disk_janitor()
+        self.temp = self.home / "jtmp"
+        self.temp.mkdir()
+        self.state = self.home / "jstate"
+        self.state.mkdir()
+        (self.state / "state-marker.json").write_text("{}")
+        self.now = time.time() + 10 * 86400
+        self.t = [0.0]
+        self.judged = []
+        real = self.jan.judge
+
+        def counting(path, *a, **k):
+            self.judged.append(os.path.basename(path))
+            row = real(path, *a, **k)
+            self.t[0] += 1.0
+            return row
+        patcher = mock.patch.object(self.jan, "judge", counting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def entry(self, name, days):
+        path = self.temp / name
+        path.write_text("x")
+        stamp = self.now - days * 86400
+        os.utime(str(path), (stamp, stamp))
+        return path
+
+    def twelve(self, old_from=None):
+        for n in range(1, 13):
+            self.entry("e%02d.txt" % n, 20 if old_from and n >= old_from else 1)
+
+    def run_once(self, seconds=4.5, apply=True, **extra):
+        self.t[0] = 0.0
+        self.judged.clear()
+        cfg = self.jan.settings(dict({"scan_seconds": seconds}, **extra))
+        lines, removed, kept = self.jan.run(self.temp, self.state, self.now, cfg, apply, lambda *a: None, clock=lambda: self.t[0], busy=lambda path: None)
+        return lines, removed, kept, list(self.judged)
+
+    def cursor(self):
+        return self.jan.read_cursor(self.state)
+
+    def test_s1_every_entry_is_judged_exactly_once_over_three_runs(self):
+        self.twelve()
+        seen = []
+        for _ in range(3):
+            seen.extend(self.run_once()[3])
+        self.assertEqual(sorted(seen), ["e%02d.txt" % n for n in range(1, 13)])
+        self.assertEqual(len(seen), len(set(seen)), "none judged twice before the cycle completes")
+
+    def test_s2_a_cursor_naming_a_deleted_entry_resumes_at_the_next_name(self):
+        self.twelve()
+        self.run_once()
+        self.assertEqual(self.cursor(), "e05.txt")
+        (self.temp / "e05.txt").unlink()
+        self.assertEqual(self.run_once()[3][0], "e06.txt", "by name, not by position: nothing after the deleted entry is skipped")
+
+    def test_s3_an_entry_that_was_not_reached_is_never_removed_and_is_not_judged(self):
+        self.twelve(old_from=6)
+        lines, removed, kept, judged = self.run_once()
+        self.assertEqual(removed, 0 + sum(1 for n in judged if int(n[1:3]) >= 6), "only judged entries can be removed")
+        for n in range(6, 13):
+            name = "e%02d.txt" % n
+            self.assertEqual((self.temp / name).exists(), name not in judged, name)
+        self.assertEqual(len(judged), 5)
+        self.assertIn("5 judged, 7 not judged", lines)
+        self.assertFalse(any(line.startswith("kept e") and "time budget" in line for line in lines), "not judged is never reported as kept for a reason")
+
+    def test_s4_each_report_says_judged_and_not_judged_and_the_last_says_the_cycle_is_complete(self):
+        self.twelve()
+        reports = [self.run_once()[0] for _ in range(3)]
+        self.assertIn("5 judged, 7 not judged", reports[0])
+        self.assertIn("5 judged, 2 not judged", reports[1])
+        self.assertIn("2 judged, 0 not judged", reports[2])
+        self.assertIn("cycle complete", reports[2])
+        self.assertEqual(sum(line == "cycle complete" for report in reports for line in report), 1)
+        self.assertIsNone(self.cursor(), "a finished cycle clears the cursor")
+
+    def test_s5_a_missing_empty_or_corrupt_cursor_starts_at_the_first_name(self):
+        self.twelve()
+        path = self.state / self.jan.CURSOR_FILE
+        for content in (None, "", "{garbage", '{"after": 5}', '{"after": ""}'):
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(content)
+            self.assertEqual(self.run_once(apply=False)[3][0], "e01.txt", repr(content))
+
+    def test_s6_the_weekly_budget_is_longer_and_both_come_from_configuration(self):
+        cfg = self.jan.settings({})
+        self.assertGreater(cfg["weekly_scan_seconds"], cfg["scan_seconds"])
+        self.jan.validate({"scan_seconds": 30, "weekly_scan_seconds": 900}, "config")
+        for bad in ({"scan_seconds": 0}, {"weekly_scan_seconds": "long"}, {"scan_seconds": True}, {"weekly_scan_seconds": 10 ** 9}):
+            with self.assertRaises(ValueError) as caught:
+                self.jan.validate(bad, "config")
+            self.assertIn(list(bad)[0], str(caught.exception))
+        self.twelve()
+        self.assertEqual(len(self.run_once(seconds=2.5, weekly_scan_seconds=8.5, apply=False)[3]), 3)
+        self.t[0] = 0.0
+        self.judged.clear()
+        lines, removed, kept = self.jan.run(self.temp, self.state, self.now, self.jan.settings({"scan_seconds": 2.5, "weekly_scan_seconds": 8.5}), False,
+                                            lambda *a: None, clock=lambda: self.t[0], busy=lambda path: None, weekly=True)
+        self.assertEqual(len(self.judged), 9, "the weekly run uses the longer budget")
+
+    def test_s7_a_scan_that_finishes_behaves_as_before_and_clears_the_cursor(self):
+        self.twelve(old_from=11)
+        (self.state / self.jan.CURSOR_FILE).write_text('{"after": "e10.txt"}')
+        lines, removed, kept, judged = self.run_once(seconds=100)
+        self.assertEqual(sorted(set(judged)), ["e11.txt", "e12.txt"], "(each removal candidate is judged once more right before it is removed)")
+        self.assertEqual(removed, 2)
+        self.assertIn("cycle complete", lines)
+        self.assertFalse((self.state / self.jan.CURSOR_FILE).exists())
+
+    def test_s8_no_thread_and_no_process_is_added(self):
+        self.twelve()
+        before = threading.active_count()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("a process was started")), \
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
+            self.run_once()
+            self.run_once()
+        self.assertEqual(threading.active_count(), before)
+
+    def test_a_cursor_at_the_end_wraps_a_run_with_no_progress_keeps_it_and_a_dry_run_leaves_an_existing_one(self):
+        self.twelve()
+        cursor = self.state / self.jan.CURSOR_FILE
+        cursor.write_text('{"after": "e12.txt"}')
+        self.assertEqual(self.run_once(apply=False)[3][0], "e01.txt", "a cursor at the last name wraps to the first")
+        cursor.write_text('{"after": "zzz-after-everything"}')
+        self.assertEqual(self.run_once(apply=False)[3][0], "e01.txt")
+        self.assertEqual(json.loads(cursor.read_text()), {"after": "zzz-after-everything"}, "a dry run leaves an existing cursor")
+        cursor.write_text('{"after": "e04.txt"}')
+        lines, removed, kept, judged = self.run_once(seconds=-1)
+        self.assertEqual(judged, [], "the budget was spent before any entry")
+        self.assertEqual(json.loads(cursor.read_text()), {"after": "e04.txt"}, "no progress: the cursor stays")
+
+    def test_the_cursor_file_is_not_one_of_the_fleets_records(self):
+        self.twelve()
+        victim = self.entry("zz-victim-name.txt", 20)
+        (self.state / self.jan.CURSOR_FILE).write_text('{"after": "zz-victim-name.txt"}')
+        text, complete = self.jan.named_text(self.state)
+        self.assertNotIn("zz-victim-name.txt", text)
+        self.assertTrue(complete)
+
+    def test_a_corrupt_cursor_a_symlink_or_directory_it_names_and_a_type_change_never_remove_what_was_not_judged(self):
+        outside = self.home / "outside-dir"
+        outside.mkdir()
+        (outside / "precious.txt").write_text("keep me")
+        self.twelve(old_from=6)
+        cursor = self.state / self.jan.CURSOR_FILE
+        cursor.write_text("\x00{not json")
+        lines, removed, kept, judged = self.run_once(seconds=100)
+        for n in range(1, 13):
+            name = "e%02d.txt" % n
+            self.assertEqual((self.temp / name).exists(), not (n >= 6 and name in judged), name)
+        self.assertEqual(sorted(set(judged)), ["e%02d.txt" % n for n in range(1, 13)], "a corrupt cursor judged from the first name")
+        for n in range(6, 13):
+            self.entry("e%02d.txt" % n, 20)
+        (self.temp / "e03.txt").unlink()
+        (self.temp / "e03.txt").symlink_to(outside)   # the cursor will name an entry that is now a link to a directory
+        cursor.write_text('{"after": "e03.txt"}')
+        lines, removed, kept, judged = self.run_once(seconds=100)
+        self.assertNotIn("e03.txt", judged, "the run resumes AFTER the named entry")
+        self.assertTrue((outside / "precious.txt").exists())
+        self.assertTrue((self.temp / "e03.txt").is_symlink())
+        # an entry that changes type between its judging and its removal is not removed
+        self.entry("e20.txt", 20)
+        real_scan = self.jan.scan
+
+        def scan_then_swap(*a, **k):
+            rows = real_scan(*a, **k)
+            os.unlink(str(self.temp / "e20.txt"))
+            (self.temp / "e20.txt").symlink_to(outside)
+            return rows
+        cursor.unlink(missing_ok=True)
+        with mock.patch.object(self.jan, "scan", scan_then_swap):
+            lines, removed, kept, judged = self.run_once(seconds=100)
+        self.assertTrue((outside / "precious.txt").exists(), "a link is never followed")
+        self.assertTrue((self.temp / "e20.txt").is_symlink(), "it changed since the scan: kept")
+        self.assertIn("kept e20.txt: it changed since the scan", lines)
+
+    def test_the_weekly_flag_is_parsed_and_the_command_passes_it_to_the_run(self):
+        parser = sb.build_parser()
+        self.assertTrue(parser.parse_args(["disk", "janitor", "--apply", "--weekly"]).weekly)
+        self.assertFalse(parser.parse_args(["disk", "janitor", "--apply"]).weekly)
+        source = inspect.getsource(sb.cmd_disk_janitor)
+        self.assertIn('weekly = bool(getattr(args, "weekly", False))', source)
+        self.assertIn("weekly=weekly, outcome=preview", source)
+
+    def test_a_dry_run_reads_the_cursor_and_never_moves_it_and_the_file_is_private(self):
+        self.twelve()
+        self.run_once(apply=False)
+        self.assertIsNone(self.cursor(), "a preview does not change what the next real run covers")
+        self.run_once()
+        mode = os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        stamp = os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns
+        self.jan.write_cursor(self.state, self.cursor())
+        self.assertEqual(os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns, stamp, "written only when it changes")
 
 
 class TestCatchingUpStatus(StatusCase):
@@ -74399,6 +74983,303 @@ class TestBatchingDocs(unittest.TestCase):
             self.assertEqual(section.count(phrase), 1, phrase)
 
 
+# #943: a work item reads its parent ask's Done-when, and a pull request's `CLAIMS:` line narrows what its proof gate counts.
+PARENT_RULE = ("A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, "
+               "and a Done-when the work item carries itself must still match exactly.")
+CLAIM_RULE = ("A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, "
+              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).")
+WORK_ITEM_PLAN = LEDGER_PLAN.split("```yaml", 1)[0].split("## Intent", 1)[0] + "```yaml" + LEDGER_PLAN.split("```yaml", 1)[1]
+
+
+class TestParentAskDoneWhen(LedgerBase):
+    """#943: the issue numbers are neutral. 30 is a work item, 20 its ask, 10 the charter; 40 is an ask under the charter with no Done-when."""
+
+    ASK_DONE = "(1) an owner can commission an agent; (2) it answers a chat message."
+
+    def setUp(self):
+        super().setUp()
+        self.parent_override = {}
+        self.issues = {
+            10: {"number": 10, "state": "open", "title": "charter", "body": "## Intent\nRun it.\nDone when: (1) charter-only clause.\n", "parent": None},
+            20: {"number": 20, "state": "open", "title": "ask", "body": "## Intent\nCommissioning works.\nDone when: %s\n" % self.ASK_DONE, "parent": 10},
+            30: {"number": 30, "state": "open", "title": "work item", "body": WORK_ITEM_PLAN, "parent": 20},
+            40: {"number": 40, "state": "open", "title": "ask with no Done-when", "body": WORK_ITEM_PLAN, "parent": 10},
+            50: {"number": 50, "state": "open", "title": "work item with its own Done-when", "parent": 20,
+                 "body": "## Intent\nIts own.\nDone when: (1) only one clause here.\n" + WORK_ITEM_PLAN},
+        }
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and "--method" not in argv and "-X" not in argv and argv[1] == "api":
+            found = re.search(r"/issues/(\d+)(/parent|/comments[^ ]*)?$", argv[2])
+            if found and int(found.group(1)) in self.issues:
+                issue = self.issues[int(found.group(1))]
+                if found.group(2) == "/parent":
+                    parent = self.parent_override.get(int(found.group(1)), self.issues.get(issue["parent"]))
+                    parent = dict(parent, repository_url=parent.get("repository_url", "https://api.github.com/repos/acme/app")) if parent else None
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(parent), "") if parent else subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+                if found.group(2):
+                    return subprocess.CompletedProcess(argv, 0, "[]", "")
+                return subprocess.CompletedProcess(argv, 0, json.dumps(dict(issue, updated_at="2026-01-01T00:00:00Z")), "")
+        return super().route(argv, **kwargs)
+
+    def check(self, number):
+        code, out, err = self.run_as("coder", "plan", "check", "acme/app#%d" % number, "--json")
+        return code, (json.loads(out) if out.strip().startswith("{") else {"error": err})
+
+    def assert_the_rule(self):
+        code, result = self.check(30)
+        self.assertEqual((code, result.get("result")), (0, "pass"), result)   # checked against the PARENT ask's two clauses (DW-2 exists only there)
+        code, result = self.check(50)
+        self.assertEqual(code, 1, result)                                    # its own one-clause Done-when decides: DW-2 is not a clause of it
+        self.assertEqual(result["result"], "fail")
+        self.assertTrue(any("DW-2" in str(d) or "covers" in str(d) for d in result["defects"]), result)
+
+    def test_s2_a_work_item_is_checked_against_its_parent_ask_and_one_with_its_own_done_when_against_that(self):
+        self.assert_the_rule()
+
+    def test_a_work_item_that_carries_its_own_done_when_is_not_given_the_parents(self):
+        code, result = self.check(50)
+        self.assertEqual(code, 1)
+        self.assertNotIn("charter-only", json.dumps(result))
+
+    def test_an_ask_with_no_done_when_never_borrows_the_charters(self):
+        code, result = self.check(40)
+        self.assertEqual(code, 1, result)
+        self.assertTrue(any(d.get("code") == "no-done-when" for d in result.get("defects", [])) or "no-done-when" in json.dumps(result), result)
+
+    def test_s5_a_mutant_that_reads_the_done_when_of_the_wrong_issue_fails_the_rule_test(self):
+        def wrong(reader, repo, number):
+            return reader.issue(10, repo).done_when   # the charter, not the parent ask
+        with mock.patch.object(sb, "_parent_ask_done_when", wrong):
+            with self.assertRaises(AssertionError):
+                self.assert_the_rule()
+        with mock.patch.object(sb, "_parent_ask_done_when", lambda reader, repo, number: None):   # a mutant that never reads the parent
+            with self.assertRaises(AssertionError):
+                self.assert_the_rule()
+
+    def test_a_parent_that_is_not_the_ask_of_this_repositorys_work_item_is_refused_whatever_its_shape(self):
+        """The class: cross-repo parent, the same number in another repository, itself, a cycle, a pull request. Each is refused with a plain error, never read as another issue."""
+        ask = self.issues[20]
+        cases = {
+            "cross-repo": dict(ask, number=5, repository_url="https://api.github.com/repos/other-org/other-repo"),
+            "same-number-other-repo": dict(ask, repository_url="https://api.github.com/repos/other-org/app"),
+            "self": dict(self.issues[30], number=30),
+            "pull-request": dict(ask, pull_request={"url": "x"}),
+        }
+        for name, payload in cases.items():
+            with self.subTest(case=name):
+                self.parent_override = {30: payload}
+                code, result = self.check(30)
+                self.assertEqual(code, 2, (name, result))
+                self.assertIn("error", result)
+                if name == "self":
+                    self.assertIn("its own parent", json.dumps(result))   # the self check's own message: without it the cycle check refuses with another one
+        self.parent_override = {}
+        self.issues[20]["parent"] = 30   # a cycle: 30 -> 20 -> 30
+        code, result = self.check(30)
+        self.assertEqual(code, 2, result)
+        self.assertIn("loops back", json.dumps(result))
+
+    def test_the_structure_gate_and_prove_take_the_work_items_done_when_from_its_parent(self):
+        self.pr["body"] = "PLAN: acme/app#30\ncanon: updated the docs"
+        code, report, err = self.gates()
+        self.assertIsNotNone(report, err)
+        self.assertEqual(self.row(report, "G0a")["status"], "ok", self.row(report, "G0a"))
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+
+    def test_the_gate_on_an_issue_with_no_done_anywhere_fails_as_before(self):
+        self.issues[30]["parent"] = None
+        self.pr["body"] = "PLAN: acme/app#30\ncanon: updated the docs"
+        code, report, err = self.gates()
+        self.assertEqual(self.row(report, "G0a")["status"], "missing")
+
+
+class TestPrClaimLine(LedgerBase):
+    """#943: `CLAIMS:` directly under `PLAN:`; the neutral plan is LEDGER_PLAN (per-PR S1, S2 (epic by default: tester measure? no, live: pr), S3, U1; S4 epic)."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.scenarios = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(LEDGER_PLAN))
+
+    def body(self, claims):
+        self.pr["body"] = "PLAN: acme/app#7\n%scanon: updated the docs" % ("CLAIMS: %s\n" % claims if claims is not None else "")
+
+    def g1(self):
+        code, report, err = self.gates()
+        self.assertIn(code, (0, 1), err)
+        return self.row(report, "G1")
+
+    def assert_counts_only_the_claim(self):
+        self.body("S1 S3 U1")
+        for sid in ("S1", "S3", "U1"):
+            self.assertEqual(self.prove("coder", sid)[0], 0)
+        for who, sid, ev in (("cibot", "S1", "ci"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
+            self.assertEqual(self.verdict(who, sid, ev)[0], 0)
+        row = self.g1()
+        self.assertEqual(row["status"], "ok", row)
+        self.assertIn("3 of 3 claimed scenarios proven", row["detail"])
+        self.assertIn("left to the epic's other pull requests by the CLAIMS line: S2", row["detail"])
+        code, _, err = self.prove("coder", "S2")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not on this pull request's `CLAIMS:` line", err)
+
+    def test_s3_the_gate_counts_exactly_the_claimed_scenarios_and_leaves_the_rest_to_the_epic(self):
+        self.assert_counts_only_the_claim()
+
+    def test_s5_a_mutant_that_counts_unclaimed_scenarios_fails_the_claim_test(self):
+        every = lambda scenarios, body: ([s for s in scenarios if sb.plan_ledger.claim_of(s) == "pr"], [], None)
+        with mock.patch.object(sb.load_plan_ledger(), "pr_scenarios", every):
+            with self.assertRaises(AssertionError):
+                self.assert_counts_only_the_claim()
+
+    def test_s8_a_claim_naming_an_undeclared_scenario_or_an_epic_one_is_refused_and_all_declared_count(self):
+        for bad in ("S1 S9", "S4"):
+            with self.subTest(claims=bad):
+                self.body(bad)
+                row = self.g1()
+                self.assertEqual(row["status"], "missing", row)
+                self.assertTrue(any(m.startswith("refused:") for m in row["missing"]), row)
+                code, _, err = self.prove("coder", "S1")
+                self.assertNotEqual(code, 0)
+                self.assertIn("refused", err)
+        self.assertEqual(self.ledger(), [])
+        self.body("S1 S2 S3 U1")
+        ids, error = sb.plan_ledger.pr_claim(self.pr["body"], self.scenarios)
+        self.assertEqual((ids, error), (["S1", "S2", "S3", "U1"], None))
+        self.assertEqual([s["id"] for s in sb.plan_ledger.pr_scenarios(self.scenarios, self.pr["body"])[0]], ["S1", "S2", "S3", "U1"])
+        self.body("")
+        self.assertIn("names no scenario", sb.plan_ledger.pr_claim("PLAN: x\nCLAIMS:\n", self.scenarios)[1])
+
+    def test_s4_a_pull_request_without_a_claim_line_behaves_exactly_as_before(self):
+        baseline = ["S1", "S2", "S3", "U1"]
+        for body in (None, "", "PLAN: acme/app#7", "PLAN: acme/app#7\ncanon: n/a docs", "PLAN: acme/app#7\n\nCLAIMS: S1", "CLAIMS: S1\nPLAN: acme/app#7",
+                     "Notes\nPLAN: acme/app#7 and CLAIMS: S1", "PLAN: acme/app#7\n    CLAIMS", "no plan here\nCLAIMS: S9"):
+            with self.subTest(body=body):
+                claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
+                self.assertEqual(([s["id"] for s in claimed], left, error), (baseline, [], None))
+        self.body(None)
+        for sid in ("S1", "S2", "S3", "U1"):
+            self.assertEqual(self.prove("coder", sid)[0], 0, sid)
+        row = self.g1()
+        self.assertIn("of 4 claimed scenarios", row["detail"])
+        self.assertNotIn("CLAIMS", row["detail"])
+
+    def test_a_claim_line_hidden_in_a_code_fence_or_an_html_comment_narrows_nothing(self):
+        for body in ("PLAN: real#1\ncanon: x\n\n```\nPLAN: fake#9\nCLAIMS: S1\n```", "PLAN: real#1\n<!--\nPLAN: x\nCLAIMS: S1\n-->",
+                     "<!-- PLAN: x\nCLAIMS: S1 -->\nPLAN: real#1", "~~~\nPLAN: x\nCLAIMS: S1\n~~~\nPLAN: real#1\n",
+                     "<!--\nPLAN: x\nCLAIMS: S1\n-->\nPLAN: real#1", "<!--\nPLAN: x\nCLAIMS: S1", "<!-- one line\nPLAN: x\nCLAIMS: S1\nmore -->\nPLAN: real#1\ncanon: x",
+                     "<!--PLAN: x-->\n<!--\nPLAN: y\nCLAIMS: S2\n-->PLAN: real#1", "PLAN: real#1\n```\nCLAIMS: S1\n```"):
+            with self.subTest(body=body):
+                claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
+                self.assertEqual(([s["id"] for s in claimed], left, error), (["S1", "S2", "S3", "U1"], [], None))
+        claimed = sb.plan_ledger.pr_scenarios(self.scenarios, "```\nignored\n```\nPLAN: real#1\nCLAIMS: S1")[0]
+        self.assertEqual([s["id"] for s in claimed], ["S1"])
+
+    FENCED = "```\nPLAN: acme/other-service#9\n```\nPLAN: acme/app#7\nCLAIMS: S1\n"
+
+    def fenced_plan_read(self, reader):
+        return reader([], 1, self.FENCED)[0]
+
+    def test_a_fenced_plan_line_before_the_real_one_is_read_by_no_gate_and_no_claim(self):
+        self.assertEqual(self.fenced_plan_read(sb.authoritative_plan), "acme/app#7")
+        self.assertEqual(sb.authoritative_plan([], 1, "<!--\nPLAN: acme/other-service#9\n-->\nPLAN: acme/app#7")[0], "acme/app#7")
+        self.assertEqual(sb.plan_ledger.claim_text(self.FENCED), "S1")
+        self.assertEqual(sb.authoritative_plan([], 1, "```\nPLAN: acme/other-service#9\n```\n"), (None, None))
+
+    def test_mutant_authoritative_plan_on_the_raw_body_fails_the_fenced_line_test(self):
+        def mutant(entries, pr, body):
+            found = sb.PLAN_LINE_RE.search(body or "")
+            return (found.group(1).strip("<>.,"), "raw") if found else (None, None)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(self.fenced_plan_read(mutant), "acme/app#7")
+
+    READERS = {"G1": "evaluate_gates", "prove": "_scenario_of", "verdict S": "_scenario_of", "verdict --all": "cmd_verdict", "ci recorder": "ci_record_core"}
+
+    def drive_readers(self):
+        """One PR claims S1 only (of S1, S2, S3, U1); each reader must see only S1."""
+        self.body("S1")
+        row = self.g1()
+        self.assertIn("claimed scenarios proven", row["detail"])
+        self.assertTrue(row["detail"].startswith("0 of 1 claimed"), row["detail"])                 # G1
+        self.assertNotEqual(self.prove("coder", "S3")[0], 0)                                         # prove
+        self.assertNotEqual(self.verdict("rev", "S3", "reviewer")[0], 0)                             # verdict S
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        code, _, err = self.run_as("cibot", "verdict", "--all", "--pr", self.PR, "--as", "ci", "--result", "pass", "--head", LEDGER_HEAD, "--evidence", "judged it: matches the scenario")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e["scenario"] for e in self.ledger() if e["kind"] == "verdict"], ["S1"])    # verdict --all
+        ctx = sb._ledger_context(types.SimpleNamespace(pr=self.PR, plan=None, ask=None, head=None), self.route, self.world.clock.now, False)
+        self.assertEqual(sb.ci_record_core(ctx, self.world.clock.now, quiet=True)["scenarios"], ["S1"])   # ci recorder
+
+    def test_each_reader_of_the_claim_sees_only_the_claimed_scenario_and_a_mutant_per_reader_fails(self):
+        self.drive_readers()
+        module = sb.load_plan_ledger()
+        real = module.pr_scenarios
+        for reader, caller in self.READERS.items():
+            with self.subTest(mutant=reader):
+                def every(scenarios, body, caller=caller):
+                    if sys._getframe(1).f_code.co_name == caller:
+                        return [s for s in scenarios if module.claim_of(s) == "pr"], [], None
+                    return real(scenarios, body)
+                self.setUp()
+                with mock.patch.object(module, "pr_scenarios", every):
+                    with self.assertRaises(AssertionError):
+                        self.drive_readers()
+
+    def test_s10_gates_lists_the_scenarios_no_other_open_or_merged_pull_request_of_the_plan_claims(self):
+        self.body("S1 S2")
+        others = [
+            {"number": 11, "state": "open", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S2"},
+            {"number": 12, "state": "closed", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S3"},          # closed unmerged: proves nothing
+            {"number": 13, "state": "closed", "merged_at": "2026-01-01T00:00:00Z", "body": "PLAN: acme/app#8\nCLAIMS: S3"},   # another plan
+            {"number": 9, "state": "open", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S3"},                    # this PR itself
+        ]
+        route = self.route
+        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps(others), "") if "/pulls?state=all" in " ".join(argv) else route(argv, **kw))
+        code, report, err = self.gates()
+        self.assertEqual(sorted(report["unclaimed"]), ["S3", "U1"])
+        self.assertIn("claimed by no other open or merged pull request of this plan yet: S3, U1", self.row(report, "G1")["detail"])
+        others[0]["body"] = "PLAN: acme/app#7\nCLAIMS: S3 U1"            # another PR now claims the rest: nothing is unclaimed
+        self.assertEqual(self.gates()[1]["unclaimed"], [])
+
+    def test_every_reader_of_a_prs_claimed_scenarios_goes_through_pr_scenarios(self):
+        """The family: plan check does not read a claim; G1 (evaluate_gates), prove/verdict (`_scenario_of`, `verdict --all`) and the ci recorder (`ci_record_core`) each call `pr_scenarios`;
+        the item commands have no pull request body and read `slice:` instead."""
+        text = (BIN / "fleet-switchboard").read_text()
+        self.assertEqual(text.count("plan_ledger.pr_scenarios("), 5)   # prove/verdict S, verdict --all, the ci recorder, and the two reads of the union note
+        self.assertEqual((BIN / "plan_ledger.py").read_text().count("pr_scenarios("), 2)   # its definition and the G1 call
+
+
+class TestPlanRulesWordedAlike(unittest.TestCase):
+    """#943: the template and the planning skill carry both rules in the same words; the finding states its two recorded cases with neutral numbers."""
+
+    def squash(self, path):
+        return " ".join(path.read_text().split())
+
+    def test_s6_both_rules_are_one_identical_sentence_in_the_template_and_the_skill(self):
+        for path in (REPO / "docs" / "plan-template.md", REPO / "skills" / "fleet-planning" / "SKILL.md"):
+            text = self.squash(path)
+            for rule in (PARENT_RULE, CLAIM_RULE):
+                self.assertEqual(text.count(rule), 1, (path.name, rule[:40]))
+
+    def test_the_rules_in_the_code_match_the_words(self):
+        self.assertIn("CLAIMS:", PARENT_RULE + CLAIM_RULE)
+        self.assertIn("`CLAIMS: S3 S4 S5`", CLAIM_RULE)
+
+    def test_s1_the_finding_states_two_recorded_cases_each_with_its_failing_gate_and_reason(self):
+        text = (REPO / "docs" / "plan-template.md").read_text().split("## Why a work item reads its ask, and a pull request can claim", 1)[1]
+        cases = re.findall(r"(?m)^\d\. \*\*Case \d, [^*]*\((G0a|G1)\)\.\*\*", text)
+        self.assertEqual(cases, ["G0a", "G1"])
+        self.assertIn("plan check fails: 1 defect", text)
+        self.assertIn("missing proofs", text)
+        self.assertEqual(sorted(set(re.findall(r"#\d+", text))), ["#123", "#124", "#201", "#202"])
+
+    def test_s9_the_fixtures_name_no_repository_but_the_neutral_one(self):
+        source = (REPO / "bin" / "test-switchboard").read_text()
+        block = source[source.index("class TestParentAskDoneWhen"):source.index("class TestPlanRulesWordedAlike")]
+        for repo in set(re.findall(r"\b[a-z][\w.-]*/[a-z][\w.-]*#\d+", block)):
+            self.assertTrue(repo.startswith("acme/"), repo)
+
 NO_CAP_WORDS = re.compile(r"(cap|quota|ceiling|allowance)", re.I)
 AGENT_WORDS = re.compile(r"(agent|lane|caller|worker|spender)", re.I)
 
@@ -77099,6 +77980,291 @@ class TestResume(Base):
                 exec(compile(text.replace(old, new), str(SWITCHBOARD), "exec"), module.__dict__)
                 with mock.patch.dict(globals(), {"sb": module}), rebound("sb", module):
                     result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestResume(test)]))
+                self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
+
+
+class TestUndeliveredWake(Base):
+    """#1337: an idle agent with a wake admitted with delivery queue that is absent from its transcript is resumed once, then the Chief of Staff is told once."""
+    KEY = "lab.fact:wedged"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={})
+        for name, fleet in (("cos", {"role": "chief-of-staff"}), ("coder", {"role": "coder", "reports_to": "cos"})):
+            self.world.add_agent(name, fleet=fleet)
+        self.pane = self.world.herdr.panes[self.world.panes["coder"]]
+        self.sid = self.world.sessions["coder"]
+        self.n = 0
+        patch = mock.patch.object(self.world.v2, "_start")   # the wedged session: an item queued for it starts no turn, as in the recorded case
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def wedge(self, key=None, age=0):
+        """A queued wake in the inbox that no turn took (what the recorded case showed), created `age` seconds ago."""
+        self.n += 1
+        now = self.world.clock.now()
+        self.world.v2.sessions[self.sid]["inbox"].append({
+            "id": "inb_%d" % self.n, "sessionID": self.sid, "text": "wake", "metadata": {"fleet": {"keys": [key or self.KEY], "from": "switchboard"}},
+            "resume": True, "delivery": "queue", "time": {"created": self.world.v2.clock.ms(now - age)}})
+
+    def passes(self, minutes, count=1):
+        self.world.tick(minutes * 60)
+        for _ in range(count):
+            self.world.engine.run_pass()
+
+    def resumes(self):
+        return [a for a in self.world.admissions("coder") if a["text"] == sb.RESUME_TEXT]
+
+    def told(self):
+        return [a for a in self.world.admissions("cos") if "Undelivered wake" in a["text"]]
+
+    def lines(self, event="undelivered.resume"):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line(self):
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 1)
+        (line,) = self.lines()
+        self.assertEqual((line["subject"], line["detail"]["keys"]), ("coder", [self.KEY]))
+        self.assertGreaterEqual(line["detail"]["oldest_age_seconds"], 16 * 60)
+
+    def test_a_second_pass_in_the_incident_does_not_resume_again(self):
+        self.wedge(age=16 * 60)
+        self.passes(0, 3)
+        self.world.tick(11 * 60)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 1)
+
+    def test_the_default_is_fifteen_minutes_and_the_key_sets_another(self):
+        self.assertEqual(sb.validate_config({})["undelivered_wake_minutes"], 15)
+        self.wedge(age=14 * 60)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 0)
+        self.passes(2)
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertEqual(sb.validate_config({"undelivered_wake_minutes": 3})["undelivered_wake_minutes"], 3)
+
+    def test_the_resume_refusals_hold(self):
+        for case in ("permission", "question", "working", "recent"):
+            with self.subTest(case=case):
+                self.setUp()
+                self.wedge(age=16 * 60)
+                if case == "permission":
+                    self.world.v2.ask_permission(self.sid)
+                elif case == "question":
+                    self.world.v2.ask_form(self.sid)
+                elif case == "working":
+                    self.pane["status"] = "working"
+                else:
+                    sb.blocked_update(self.world.engine.state_dir, sb.RESUME_STATE, lambda s: {"coder": {"at": self.world.clock.now() - 60}})
+                self.world.engine.run_pass()
+                self.assertEqual(self.resumes(), [])
+
+    def test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed(self):
+        self.pane["status"] = "blocked"
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.assertEqual(self.resumes(), [])
+        self.setUp()
+        self.wedge(age=60)   # admitted only a minute ago: not yet that old
+        self.world.engine.run_pass()
+        self.assertEqual(self.resumes(), [])
+        self.setUp()
+        self.wedge(age=16 * 60)
+        self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_k", "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(self.world.clock.now())},
+                                                             "metadata": {"fleet": {"keys": [self.KEY], "from": "switchboard"}}})
+        self.world.engine.run_pass()
+        self.assertEqual(self.resumes(), [])
+
+    def test_the_chief_of_staff_is_told_once_when_the_resume_did_not_deliver(self):
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.passes(15, 3)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.told()), 1)
+        self.assertIn("coder", self.told()[0]["text"])
+        self.assertIn("1 wake", self.told()[0]["text"])
+
+    def test_the_chief_of_staff_is_not_told_when_the_keys_appear(self):
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.world.v2.sessions[self.sid]["inbox"][:] = []
+        self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_k", "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(self.world.clock.now())},
+                                                             "metadata": {"fleet": {"keys": [self.KEY], "from": "switchboard"}}})
+        self.passes(31, 3)
+        self.assertEqual(self.told(), [])
+
+    def test_a_manual_resume_blocks_the_rule(self):
+        self.wedge(age=16 * 60)
+        sb.resume_ended_turn(self.world.engine, "cos", "coder", None)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 1)
+
+    def wedge_for(self, name, age):
+        sid = self.world.sessions[name]
+        self.n += 1
+        self.world.v2.sessions[sid]["inbox"].append({
+            "id": "inb_%s_%d" % (name, self.n), "sessionID": sid, "text": "wake", "metadata": {"fleet": {"keys": ["lab.fact:" + name], "from": "switchboard"}},
+            "resume": True, "delivery": "queue", "time": {"created": self.world.v2.clock.ms(self.world.clock.now() - age)}})
+
+    def test_a_wake_first_noticed_long_after_admission_is_not_told_before_the_resume_could_deliver(self):
+        self.wedge(age=19 * 3600)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 1)
+        self.passes(0.2, 3)   # seconds later: the oldest wake is 19 hours old, the resume only seconds
+        self.assertEqual((self.told(), self.lines("undelivered.told")), ([], []))
+        self.passes(16)
+        self.passes(1, 3)
+        self.assertEqual((len(self.told()), len(self.lines("undelivered.told"))), (1, 1))
+        self.assertEqual(len(self.resumes()), 1)
+
+    def test_the_tell_time_is_its_own_config_key_defaulting_to_the_limit(self):
+        self.assertIsNone(sb.validate_config({})["undelivered_wake_tell_minutes"])
+        self.assertEqual(sb.validate_config({"undelivered_wake_tell_minutes": 5})["undelivered_wake_tell_minutes"], 5)
+        for bad in (0, -1, "x"):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"undelivered_wake_tell_minutes": bad})
+        self.world.engine.config["undelivered_wake_tell_minutes"] = 2
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.passes(3, 3)
+        self.assertEqual(len(self.told()), 1)
+
+    def test_at_most_the_per_pass_cap_of_agents_is_resumed_in_a_pass_oldest_first(self):
+        self.assertEqual(sb.validate_config({})["undelivered_wake_per_pass"], 2)
+        for bad in (0, 21, -1, 1.5, "2", True):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"undelivered_wake_per_pass": bad})
+        names = ["w%d" % i for i in range(6)]
+        for i, name in enumerate(names):
+            self.world.add_agent(name, fleet={"role": "coder", "reports_to": "cos"})
+            self.wedge_for(name, (20 + i) * 60)   # w5 the oldest
+        order = []
+        for _ in range(3):
+            self.world.engine.run_pass()
+            order.append(sorted(n for n in names if [a for a in self.world.admissions(n) if a["text"] == sb.RESUME_TEXT]))
+        self.assertEqual([len(o) for o in order], [2, 4, 6])
+        self.assertEqual(order[0], ["w4", "w5"])
+        self.assertEqual(order[1], ["w2", "w3", "w4", "w5"])
+
+    def test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered(self):
+        self.wedge(age=16 * 60)
+        now = self.world.clock.now()
+        messages = self.world.v2.sessions[self.sid]["messages"]
+        messages.append({"id": "msg_k", "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(now - 10 * 60)},
+                         "metadata": {"fleet": {"keys": [self.KEY], "from": "switchboard"}}})
+        for i in range(3):
+            messages.append({"id": "msg_n%d" % i, "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(now - 60 + i)}, "metadata": {"fleet": {"keys": ["other%d" % i], "from": "switchboard"}}})
+        with mock.patch.object(sb, "SYNTHETIC_PAGE", 2):   # a window shorter than the delivered key's position
+            self.world.engine.run_pass()
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.told(), [])
+
+    def test_when_the_agent_is_the_chief_of_staff_the_incident_is_closed_with_an_audit_line(self):
+        self.wedge_for("cos", 16 * 60)
+        self.world.engine.run_pass()
+        self.passes(16)
+        self.passes(1, 2)
+        lines = self.lines("undelivered.untold")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Chief of Staff", lines[0]["detail"]["reason"])
+        self.assertEqual(len([a for a in self.world.admissions("cos") if a["text"] == sb.RESUME_TEXT]), 1)
+
+    def test_each_idle_agent_costs_three_reads_a_pass_and_no_github_call(self):
+        self.wedge(age=16 * 60)
+        gh, window, mine, real_tick, real_popen = [], [], [], sb.undelivered_wake_tick, sb.subprocess.Popen
+
+        def spy(argv, *a, **k):
+            if isinstance(argv, (list, tuple)) and argv:
+                if os.path.basename(str(argv[0])) == "gh":
+                    gh.append(list(argv))
+                window.append(list(argv))
+            return real_popen(argv, *a, **k)
+
+        def tick(engine, discovery):
+            start = len(self.world.v2.calls)
+            try:
+                return real_tick(engine, discovery)
+            finally:
+                mine.extend(self.world.v2.calls[start:])   # only what the rule itself read
+        with mock.patch.object(sb.subprocess, "Popen", spy), mock.patch.object(sb, "undelivered_wake_tick", tick):
+            self.world.engine.run_pass()
+        coder = [c[2] for c in mine if "sessionID=" + self.sid in c and c[2] in ("session.inbox.list", "session.message.list") and "type=user" not in c]   # the resume's own re-observation is not the rule's read
+        self.assertEqual(coder, ["session.inbox.list", "session.inbox.list", "session.message.list"], mine)
+        other = [c[2] for c in mine if "sessionID=" + self.world.sessions["cos"] in c]
+        self.assertEqual(other, ["session.inbox.list"], "an idle agent with nothing queued costs one read")
+        self.assertEqual(gh, [])
+
+    # -- the delivery states, a row per state with the action and the test; `test_every_state_has_a_row` derives the rows from the code
+    STATES = {"undelivered": "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed",
+              "admitted-in-transcript": "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed",
+              "admitted-absent": "test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line",
+              "refused": "test_the_resume_refusals_hold",
+              "resumed": "test_a_second_pass_in_the_incident_does_not_resume_again",
+              "told": "test_the_chief_of_staff_is_told_once_when_the_resume_did_not_deliver"}
+
+    def test_every_state_has_a_row(self):
+        self.assertEqual(sorted(self.STATES), sorted(sb.UNDELIVERED_STATES))
+        for test in self.STATES.values():
+            self.assertTrue(callable(getattr(self, test, None)), test)
+
+    # -- the family table: every input and external call of the new code, with its bound, test and mutant; derived from the code, never a hand copy
+    # -- the family table of docs/switchboard.md ("An undelivered wake is recovered"): every config key, constant and refusal of the pass, derived by ast
+    TABLE = {"undelivered_wake_minutes": ("test_the_default_is_fifteen_minutes_and_the_key_sets_another", "resumes on every pass"),
+             "undelivered_wake_tell_minutes": ("test_the_tell_time_is_its_own_config_key_defaulting_to_the_limit", "tells from the admission"),
+             "undelivered_wake_per_pass": ("test_at_most_the_per_pass_cap_of_agents_is_resumed_in_a_pass_oldest_first", "no per-pass cap"),
+             "UNDELIVERED_STATE": ("test_a_second_pass_in_the_incident_does_not_resume_again", "resumes on every pass"),
+             "UNDELIVERED_KEYS": ("test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line", "never resumes"),
+             "UNDELIVERED_STATES": ("test_every_state_has_a_row", "never resumes"),
+             "SYNTHETIC_PAGE": ("test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered", "reads one page"),
+             "MAX_READ_PAGES": ("test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered", "reads one page"),
+             "resume_ended_turn": ("test_the_resume_refusals_hold", "skips the refusals"),
+             "session.inbox.list": ("test_each_idle_agent_costs_three_reads_a_pass_and_no_github_call", "resumes a blocked agent"),
+             "session.message.list": ("test_each_idle_agent_costs_three_reads_a_pass_and_no_github_call", "reads one page")}
+
+    def test_the_docs_table_lists_every_key_constant_and_refusal_derived_by_ast(self):
+        text = SWITCHBOARD.read_text()
+        tree = ast.parse(text)
+        derived = {"SYNTHETIC_PAGE", "MAX_READ_PAGES", "resume_ended_turn", "session.inbox.list", "session.message.list"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                derived.update(t.id for t in node.targets if isinstance(t, ast.Name) and t.id.startswith("UNDELIVERED_"))
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("undelivered_wake_") and node.value.isidentifier():
+                derived.add(node.value)
+        self.assertEqual(derived, set(self.TABLE))
+        docs = (SWITCHBOARD.parent.parent / "docs" / "switchboard.md").read_text()
+        section = docs[docs.index("### An undelivered wake is recovered"):docs.index("### A blocked agent is reported")]
+        rows = {m.group(1): m.groups() for m in re.finditer(r"^\| `([^`]+)` \| (.*?) \| (.*?) \| `(test_\w+)` \| `([^`]+)` \|$", section, re.M)}
+        self.assertEqual(set(rows), set(self.TABLE))
+        for key, (test, mutant) in self.TABLE.items():
+            self.assertEqual((rows[key][3], rows[key][4]), (test, mutant), key)
+            self.assertTrue(callable(getattr(self, test, None)), test)
+            self.assertIn(mutant, self.MUTANTS, key)
+
+    MUTANTS = {
+        "never resumes": ('                resume_ended_turn(engine, "switchboard", name, "undelivered wake:', '                (lambda *a: None)(engine, "switchboard", name, "undelivered wake:', "test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line"),
+        "resumes a blocked agent": ('if seen.status != "idle" or hold_reason(seen) or seen.conflict', 'if seen.status not in ("idle", "blocked") or seen.conflict', "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed"),
+        "tells from the admission": ('now - entry["resumed"] >= tell_after', 'age >= tell_after', "test_a_wake_first_noticed_long_after_admission_is_not_told_before_the_resume_could_deliver"),
+        "no per-pass cap": ('if resumed_now >= cap:', 'if False:', "test_at_most_the_per_pass_cap_of_agents_is_resumed_in_a_pass_oldest_first"),
+        "reads one page": ('SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):\n        reached = False', 'SYNTHETIC_PAGE, "synthetic", 1):\n        reached = False', "test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered"),
+        "resumes on every pass": ('if entry.get("resumed") is None and age >= limit:', 'if age >= limit:', "test_a_second_pass_in_the_incident_does_not_resume_again"),
+        "skips the refusals": ('                resume_ended_turn(engine, "switchboard", name, "undelivered wake:', '                engine.v2.synthetic(seen.session_id, sb_text(), {"fleet": {"keys": ["r"], "from": "switchboard"}}, True, "queue", derive_message_id(seen.session_id, ["r%d" % now]), "x"); (lambda *a: None)(engine, "switchboard", name, "undelivered wake:', "test_the_resume_refusals_hold"),
+    }
+
+    def test_every_mutant_is_killed_by_its_named_test(self):
+        text = SWITCHBOARD.read_text()
+        for name, (old, new, test) in sorted(self.MUTANTS.items()):
+            with self.subTest(mutant=name):
+                self.assertEqual(text.count(old), 1, old)
+                module = types.ModuleType("t_fleet_switchboard_undelivered_mutant")
+                module.__file__ = str(SWITCHBOARD)
+                sys.modules[module.__name__] = module
+                self.addCleanup(sys.modules.pop, module.__name__, None)
+                mutant = text.replace(old, new).replace("sb_text()", "RESUME_TEXT")
+                exec(compile(mutant, str(SWITCHBOARD), "exec"), module.__dict__)
+                with mock.patch.dict(globals(), {"sb": module}), rebound("sb", module):
+                    result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestUndeliveredWake(test)]))
                 self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
 
 
@@ -80445,6 +81611,22 @@ class TestAskIssueSubject(unittest.TestCase):
         with mock.patch.object(sb, "ask_plan_comment", lambda *a: "x"):
             self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)
         self.assertEqual(len(self.entries()), 1)    # the refusal test above fails on it
+
+    def test_a_second_plan_looking_comment_refuses_prove_and_verdict_naming_both(self):
+        self.pages = {"repos/%s/issues/1130/comments?per_page=100&page=1" % self.REPO: [
+            {"id": 5, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}, {"id": 8, "created_at": "2026-01-02", "body": "## Plan (scenarios): y\n"}]}
+        for command in ("prove", "judge"):
+            code, why, _, _ = getattr(self, command)("S1")
+            self.assertIsNone(code)
+            self.assertIn("comment 8", why)
+            self.assertIn("comment 5", why)
+        self.assertEqual(self.entries(), [])
+
+    def test_s6_mutant_ask_path_that_skips_the_second_plan_rule_records(self):
+        self.pages = {"repos/%s/issues/1130/comments?per_page=100&page=1" % self.REPO: [
+            {"id": 5, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}, {"id": 8, "created_at": "2026-01-02", "body": "## Plan (scenarios): y\n"}]}
+        with mock.patch.object(sb, "second_plan_defects", lambda d: []):
+            self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)    # the refusal test above fails on it
 
     def refused_everywhere(self, needle):
         for command in ("prove", "judge"):

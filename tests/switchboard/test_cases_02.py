@@ -47,12 +47,53 @@ import urllib.parse
 from unittest import mock
 from support.core import Base
 from support.fake_jev import FakeOpener, JEV_SETTINGS, KEY_VALUE, choice_answer, http_error, jev_reply, noul_answers
-from support.installs_and_keys import DECISIONS_PLUGIN, InstallCase, PR16_KEY, PR16_NOTICE, tree_of
+from support.installs_and_keys import DECISIONS_PLUGIN
 from support.loader import captured, class_source, sb
-from support.orders_and_adapters import EA, ExternalAdapterCase
+from support.orders_and_adapters import EA, ExternalAdapterCase, FakeDoorServer, fake_mapping
 from support.paths import BIN, REPO
 from support.policy_and_import import V1_CHILD, V1_MAIN, V1_MAIN_ID, convert, v1_export
+from support.service_and_merge import feed_line
 from support.wire_fakes import EPOCH
+
+
+class TestWorkerRulesInSkills(unittest.TestCase):
+    """#719: the message cap, the daemon-recorded ci verdict and the plan check wordings, each said once."""
+    CAP = "`send` messages are capped (about 3000 characters in practice, 4000 hard): put long text in a file made under `mktemp -d` and pass it as `\"$(cat <file>)\"`."
+    CI = "The daemon records the `ci` verdict itself about five minutes after CI is green at the head, so read `fleet-switchboard gates <pr>` and do not ask for `gates ci-record`, which stays for a hurry."
+    LIST = "## Wordings `plan check` accepts"
+    SHAPES = ("every declared `DW`/`PC` is covered by a scenario", "`discriminates` names a concrete wrong build (a stub that returns an empty list)",
+              "`pass` has an observable number or status", "the declared clauses joined equal the ask's Done-when", "check a slice with `--ask <its own work item>`")
+
+    def read(self, skill):
+        return (REPO / "skills" / skill / "SKILL.md").read_text()
+
+    def test_the_message_cap_sentence_is_in_the_coordination_skill_once(self):
+        self.assertEqual(self.read("fleet-coordination").count(self.CAP), 1)
+
+    def test_the_ci_verdict_sentence_is_in_the_skills_once_overall(self):
+        self.assertEqual(sum(self.read(s).count(self.CI) for s in ("fleet-coordination", "fleet-planning")), 1)
+
+    def test_the_plan_check_wording_list_is_in_the_planning_skill_once_with_its_five_shapes(self):
+        text = self.read("fleet-planning")
+        self.assertEqual(text.count(self.LIST), 1)
+        section = text.split(self.LIST, 1)[1].split("\n## ", 1)[0]
+        for shape in self.SHAPES:
+            self.assertEqual(section.count(shape), 1, shape)
+
+    RERUN = "`gh run rerun --failed` reuses the run's old merge ref, so a fix that landed on the base branch afterwards does not reach the pull request; closing and reopening it (head unchanged) recomputes the merge ref and starts fresh CI, and for a held pull request the orchestrator that owns it says so first, because the owner's clear is bound to the head, which does not change. A run's logs may be readable while it is in progress, once a job has uploaded its logs, through the jobs logs API (`gh api repos/<repo>/actions/jobs/<id>/logs`, add `--allow-escape-sequences`; it answers 404 before that), because `gh run view --log-failed` waits for the run to end."
+
+    def test_the_rerun_and_in_progress_logs_paragraph_is_in_the_coordination_skill_exactly_once(self):
+        self.assertEqual(self.read("fleet-coordination").count(self.RERUN), 1)
+        skill = self.read("fleet-coordination")
+        for word in ("rerun --failed", "old merge ref", "reopening", "bound to the head", "actions/jobs", "log-failed"):
+            self.assertIn(word, skill)
+
+    def test_the_rerun_paragraph_names_roles_never_agents_or_people(self):
+        self.assertNotRegex(self.read("fleet-coordination").split("`gh run rerun --failed`",1)[1].split("\n\n",1)[0], r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+    def test_the_texts_name_roles_never_agents_or_people(self):
+        for text in (self.CAP, self.CI, self.LIST) + self.SHAPES:
+            self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
 class TestJevClient(Base):
@@ -557,6 +598,124 @@ class TestPlanCheckFeedback(unittest.TestCase):
         self.assertEqual(len(result["defects"]), 8, "the data (--json) has every defect")
 
 
+class TestPlanReceipts(unittest.TestCase):
+    """#978: one canonical plan comment edited in place, a short receipt per revision, a repost reported, the three documents pinned."""
+    H = "sha256:" + "a" * 64
+    PLAN = "## Plan (scenarios)\nplan-format: 2\n"
+
+    def receipt(self, cid, extra="", day=5):
+        return {"id": cid, "created_at": "2026-01-0%dT00:00:00Z" % day, "body": "<!-- plan-receipt -->\nplan hash: %s\nwhy it changed\nand what%s" % (self.H, extra)}
+
+    def plan(self, cid, day=1):
+        return {"id": cid, "created_at": "2026-01-0%dT00:00:00Z" % day, "body": self.PLAN}
+
+    def test_one_canonical_comment_with_two_receipts_passes_and_is_the_one_used(self):
+        comments = [self.plan(10), self.receipt(11, day=2), self.receipt(12, day=3)]
+        self.assertEqual(sb.plan_check.plan_comment_defects(comments), [])
+        self.assertEqual(sb.plan_check.select_plan_text("b", comments)[1], "comment 10")
+
+    def test_a_receipt_that_quotes_the_plan_heading_is_not_a_plan(self):
+        quoting = {"id": 13, "created_at": "2026-01-09T00:00:00Z", "body": "<!-- plan-receipt -->\nplan hash: %s\n## Plan (scenarios)\nx" % self.H}
+        self.assertEqual(sb.plan_check.select_plan_text("b", [self.plan(10), quoting])[1], "comment 10")
+
+    def test_a_reposted_plan_is_reported_naming_both_comments(self):
+        defects = sb.plan_check.plan_comment_defects([self.plan(10), self.plan(20, day=4)])
+        self.assertEqual([d["code"] for d in defects], ["second-plan-comment"])
+        self.assertIn("20", defects[0]["message"])
+        self.assertIn("10", defects[0]["message"])
+
+    def test_a_receipt_that_carries_plan_text_is_reported(self):
+        for extra in ("\n## Plan (scenarios)", "\nplan-format: 2", "\nscenarios:\n  - id: S1", "\n```yaml\nx\n```"):
+            with self.subTest(extra=extra):
+                defects = sb.plan_check.plan_comment_defects([self.plan(10), self.receipt(11, extra)])
+                self.assertEqual([d["code"] for d in defects], ["bad-receipt"])
+                self.assertIn("receipt carries plan text", defects[0]["message"])
+
+    def test_a_malformed_receipt_is_reported(self):
+        bad = {"id": 14, "created_at": "2026-01-09T00:00:00Z", "body": "<!-- plan-receipt -->\nno hash here\nreason"}
+        self.assertEqual([d["code"] for d in sb.plan_check.plan_comment_defects([bad])], ["bad-receipt"])
+
+    def test_no_receipts_and_one_plan_is_as_before(self):
+        self.assertEqual(sb.plan_check.plan_comment_defects([self.plan(10)]), [])
+        self.assertEqual(sb.plan_check.plan_comment_defects([]), [])
+
+    class Reader:
+        def __init__(inner, comments):
+            inner.comments = comments
+
+        def _api(inner, path, repo):
+            return inner.comments if path.split("?")[0].endswith("/comments") else {"body": ""}
+
+    def test_the_defects_reach_the_result_of_load_plan(self):
+        for comments, ok in (([self.plan(10), self.receipt(11)], True), ([self.plan(10), self.plan(20, day=4)], False)):
+            defects = sb.fetch_plan(self.Reader(comments), "o/r", 1)[3]
+            self.assertEqual(not defects, ok)
+
+    def test_an_explicit_comment_id_still_reports_a_second_plan_naming_both(self):
+        for explicit in (10, 20):
+            defects = sb.fetch_plan(self.Reader([self.plan(10), self.plan(20, day=4)]), "o/r", 1, explicit)[3]
+            self.assertEqual([d["code"] for d in defects], ["second-plan-comment"])
+            self.assertIn("comment 20", defects[0]["message"])
+            self.assertIn("comment 10", defects[0]["message"])
+
+    def test_no_module_global_holds_the_defects(self):
+        self.assertFalse(hasattr(sb, "PLAN_COMMENT_DEFECTS"))
+
+    def test_the_route_lookup_reports_a_second_plan_as_a_defect(self):
+        t = TestPlanKind()
+        hub = t.hub([self.plan(10), self.plan(20, day=4)])[0]
+        self.assertEqual(t.kind(hub), "defect")
+        self.assertEqual(t.kind(t.hub([self.plan(10), self.receipt(11)])[0]), "plan")
+
+    def test_mutant_route_lookup_that_skips_the_rule_fails(self):
+        t = TestPlanKind()
+        with mock.patch.object(sb, "second_plan_defects", lambda d: []):
+            self.assertEqual(t.kind(t.hub([self.plan(10), self.plan(20, day=4)])[0]), "plan")   # the test above fails on it
+
+    def documents(self):
+        texts = {"skill": (REPO / "skills" / "fleet-planning" / "SKILL.md").read_text(), "template": (REPO / "docs" / "plan-template.md").read_text()}
+        texts["brief"] = sb.load_plan_review().lane_brief("L1", "ref", "h", "plan", "intent", "dw")
+        return texts
+
+    def pinned(self, texts):
+        return all(sb.plan_check.PLAN_RULE in t for t in texts.values())
+
+    def test_the_three_documents_say_the_rule_once_in_the_same_words(self):
+        texts = self.documents()
+        self.assertTrue(self.pinned(texts))
+        for name, text in texts.items():
+            self.assertEqual(text.count(sb.plan_check.PLAN_RULE), 1, name)
+        self.assertEqual(sb.load_plan_review().PLAN_RULE, sb.plan_check.PLAN_RULE)
+
+    def test_the_pin_fails_when_the_sentence_is_removed_from_any_one_document(self):
+        for name in ("skill", "template", "brief"):
+            with self.subTest(removed=name):
+                texts = self.documents()
+                texts[name] = texts[name].replace(sb.plan_check.PLAN_RULE, "")
+                self.assertFalse(self.pinned(texts))
+
+    def test_a_mutant_that_treats_a_receipt_as_a_plan_is_caught(self):
+        quoting = self.receipt(13, "\n## Plan (scenarios)")
+        comments = [self.plan(10), quoting]
+        self.assertEqual([d["code"] for d in sb.plan_check.plan_comment_defects(comments)], ["bad-receipt"])
+        original = sb.load_plan_check().is_receipt
+        sb.load_plan_check().is_receipt = lambda comment: False   # the mutant: a receipt is not recognised, so its text is never held to the receipt rule
+        try:
+            self.assertEqual(sb.plan_check.plan_comment_defects(comments), [])
+        finally:
+            sb.load_plan_check().is_receipt = original
+
+    def test_a_mutant_that_ignores_a_second_plan_comment_is_caught(self):
+        comments = [self.plan(10), self.plan(20, day=4)]
+        original = sb.load_plan_check()._is_plan_comment
+        sb.load_plan_check()._is_plan_comment = lambda comment: comment.get("id") == 10
+        try:
+            self.assertEqual(sb.plan_check.plan_comment_defects(comments), [])   # the mutant sees no repost
+        finally:
+            sb.load_plan_check()._is_plan_comment = original
+        self.assertEqual(len(sb.plan_check.plan_comment_defects(comments)), 1)
+
+
 class TestDecisionHeadlines(unittest.TestCase):
     """The readable headline and the folding of a report into the issue it is about (no process, no network)."""
 
@@ -717,340 +876,420 @@ class TestDecisionHeadlines(unittest.TestCase):
         self.assertEqual(both[0]["id"], alone[0]["id"])
 
 
-class TestInstall(InstallCase):
-    def full(self, *flags, **kw):
-        return self.install("--opencode", self.machine.binary, *flags, **kw)
+class TestExternalAdapterErrors(ExternalAdapterCase):
+    def test_http_statuses_map_to_the_hierarchy_and_4xx_is_not_retried(self):
+        cases = ((401, "cred", EA.CredentialError), (403, "off", EA.DisabledError), (404, "nf", EA.NotFound),
+                 (400, "bad", EA.InvalidRequest), (415, "media", EA.InvalidRequest), (409, "clash", EA.Conflict),
+                 (422, "odd", EA.InvalidRequest), (409, "decided", EA.AlreadyDecided))
+        adapter = self.adapter("http")
+        for status, code, cls in cases:
+            self.slept.clear()
+            before = len(self.server.requests)
+            self.server.fail_next("raise", status, {"code": code, "message": "m"})
+            with self.assertRaises(cls) as ctx:
+                self.push(adapter, self.decision(), "k-%d" % status)
+            self.assertIs(type(ctx.exception), cls)
+            self.assertEqual(self.slept, [], status)
+            self.assertEqual(len(self.server.requests), before)  # the injected reply is the one and only call
 
-    def test_a_full_install_does_every_step_and_says_so(self):
-        out, error = self.full()
-        self.assertIsNone(error)
-        steps = self.statuses(out)
-        for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
-                     "decisions plugin", "todolist plugin", "herdr plugin", "service", "daemon"):
-            self.assertIn(name, steps, "%s: no line in\n%s" % (name, out))
-        self.assertEqual(steps["config"], ["done"])
-        self.assertIn("STATUS", out, "the last step prints status")
+    def test_a_4xx_is_asked_once(self):
+        adapter = self.adapter("http")
+        for status in (400, 401, 403, 404, 409):
+            self.server.fail_next("raise", status, {"code": "z", "message": "m"}, count=10)
+            with self.assertRaises(EA.AdapterError):
+                self.push(adapter, self.decision(), "k")
+            self.assertEqual(len([1 for i in self.server.inject if i["count"] == 9]), 1, status)
+            self.server.inject.clear()
 
-    def test_it_writes_the_config_the_pieces_and_the_service(self):
-        self.full()
-        config = json.loads(self.config_file.read_text())
-        wrapper = self.wrapper
-        self.assertEqual((config["opencode"], config["opencode_executable"]), (str(wrapper), self.machine.binary))
-        self.assertEqual((config["github_repos"], config["jev"], config["policy"]),
-                         ([], {"model": sb.JEV_MODEL}, {"enabled": True}))
-        self.assertNotIn("intent_repo", config)
-        sb.validate_config(config)
-        self.assertTrue(os.access(str(wrapper), os.X_OK))
-        for name in sb.KIT_AGENTS:
-            text = (self.profile / "agents" / (name + ".md")).read_text()
-            self.assertIn(sb.STANDARD_MODEL, text)
-            self.assertNotIn("__PROVIDER__", text)
-        for skill in sb.kit_skill_names(REPO):
-            self.assertTrue((self.home / "xdg-data" / "fleet-switchboard" / "skills" / skill / "SKILL.md").is_file())
-        self.assertEqual((self.profile / "plugins" / "fleet-hooks.js").read_text(),
-                         (REPO / "plugins" / "fleet-hooks" / "index.js").read_text())
-        self.assertEqual(json.loads((self.profile / "cli.json").read_text())["plugins"], ["./fleet-decisions"])
-        self.assertTrue((self.profile / "fleet-decisions" / "tui.tsx").is_file())
-        self.assertIn(str(self.home / "xdg-data" / "fleet-switchboard" / "skills"),
-                      json.loads((self.profile / "opencode.json").read_text())["skills"]["paths"])
-        self.assertTrue(self.service_path().is_file())
+    def test_429_honours_retry_after_then_succeeds(self):
+        adapter = self.adapter("http")
+        self.server.fail_next("raise", 429, {"code": "slow", "message": "later"}, {"Retry-After": "2"})
+        self.assertTrue(self.push(adapter, self.decision(), "k-1").startswith("it-"))
+        self.assertEqual(self.slept, [2.0])
 
-    def test_the_wrapper_sets_the_plugins_environment_and_holds_no_secret(self):
-        os.environ["OPENROUTER_API_KEY"] = PR16_KEY
-        self.full()
-        text = self.wrapper.read_text()
-        for needle in ("FLEET_SWITCHBOARD_BIN=", "FLEET_SWITCHBOARD_SHIMS=", "FLEET_SWITCHBOARD_STATE=", "exec "):
-            self.assertIn(needle, text)
-        self.assertIn(self.machine.binary, text)
-        self.assertNotIn(PR16_KEY, text)
+    def test_a_long_retry_after_is_reported_not_slept(self):
+        adapter = self.adapter("http")
+        self.server.fail_next("raise", 429, {"code": "slow", "message": "later"}, {"Retry-After": "60"})
+        with self.assertRaises(EA.RateLimited) as ctx:
+            self.push(adapter, self.decision(), "k-1")
+        self.assertEqual(ctx.exception.retry_after, 60.0)
+        self.assertEqual(self.slept, [])
+        self.server.fail_next("raise", 429, {"code": "slow", "message": "later", "retry_after_s": 7})
+        with self.assertRaises(EA.RateLimited) as ctx:
+            self.push(adapter, self.decision(), "k-2")
+        self.assertEqual(ctx.exception.retry_after, 7.0)  # no header: the mapped body field
+        self.server.fail_next("raise", 429, {"code": "x", "message": "later"}, count=10)
+        with self.assertRaises(EA.RateLimited) as ctx:
+            self.push(adapter, self.decision(), "k-3")
+        self.assertEqual(ctx.exception.retry_after, 1.0)  # neither: the default (short: slept, then given up)
+        self.assertEqual(self.slept, [1.0, 1.0])
 
-    def test_a_second_run_changes_nothing_and_every_step_says_already_done(self):
-        self.full()
-        before, calls = tree_of(self.home), len(self.machine.calls)
-        out, error = self.full()
-        self.assertIsNone(error)
-        steps = self.statuses(out)
-        for name, words in steps.items():
-            if name != "daemon":
-                self.assertEqual(words, ["already done"], "%s on the second run:\n%s" % (name, out))
-        self.assertEqual(tree_of(self.home), before)
-        mutating = [c for c in self.machine.calls[calls:] if c[:3] in (["herdr", "plugin", "link"],) or c[:2] == ["launchctl", "bootstrap"]]
-        self.assertEqual(mutating, [])
+    def test_5xx_is_retried_with_a_doubling_delay_and_a_cap(self):
+        adapter = self.adapter("http")
+        self.server.fail_next("raise", 503, count=2)
+        self.assertTrue(self.push(adapter, self.decision(), "k-1").startswith("it-"))
+        self.assertEqual(self.slept, [0.5, 1.0])
+        self.slept.clear()
+        self.server.fail_next("raise", 500, count=10)
+        with self.assertRaises(EA.Unavailable):
+            self.push(adapter, self.decision(), "k-2")
+        self.assertEqual(self.slept, [0.5, 1.0])  # three attempts, two waits
+        self.slept.clear()
+        many = self.adapter("http", retry={"attempts": 5})
+        self.server.inject.clear()
+        self.server.fail_next("raise", 500, count=10)
+        with self.assertRaises(EA.Unavailable):
+            self.push(many, self.decision(), "k-3")
+        self.assertEqual(self.slept, [0.5, 1.0, 1.5, 1.5])  # capped at max_delay
 
-    def test_dry_run_prints_every_step_and_writes_nothing(self):
-        before = tree_of(self.home)
-        out, error = self.full("--dry-run")
-        self.assertIsNone(error)
-        self.assertEqual(tree_of(self.home), before)
-        steps = self.statuses(out)
-        for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
-                     "decisions plugin", "todolist plugin", "herdr plugin", "service"):
-            self.assertIn(name, steps, name)
-        self.assertEqual(steps["todolist plugin"], ["would be done"])
-        self.assertFalse((self.profile / "opencode-todolist").exists())
-        self.assertEqual(steps["config"], ["would be done"])
-        run = [c for c in self.machine.calls if c[:3] == ["herdr", "plugin", "link"] or c[0] in ("launchctl",) and c[1] != "print"]
-        self.assertEqual(run, [], "a dry run starts and loads nothing")
-        self.assertEqual(self.daemons.spawned, [])
+    def test_a_timeout_a_dropped_connection_and_a_closed_port_are_unavailable_and_retried(self):
+        data = fake_mapping(self.server.url, "http", timeouts={"request": 0.3}, retry={"attempts": 2})
+        adapter = EA.McpRestAdapter(data, sleep=self.slept.append, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
+        self.server.delay = 1.0
+        with self.assertRaises(EA.Unavailable):
+            self.push(adapter, self.decision(), "k-1")
+        self.assertEqual(self.slept, [0.5])
+        self.server.delay = 0
+        self.server.down = True
+        with self.assertRaises(EA.Unavailable):
+            self.push(adapter, self.decision(), "k-2")
+        self.server.down = False
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        data["base_url"] = "http://127.0.0.1:%d" % port
+        self.slept.clear()
+        with self.assertRaises(EA.Unavailable):
+            self.push(EA.McpRestAdapter(data, sleep=self.slept.append,
+                                        environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY}), self.decision(), "k-3")
+        self.assertEqual(self.slept, [0.5])
 
-    def test_dry_run_on_an_installed_machine_says_already_done(self):
-        self.full()
-        out, _ = self.full("--dry-run")
-        for name, words in self.statuses(out).items():
-            if name != "daemon":
-                self.assertEqual(words, ["already done"], name)
-
-    def test_uninstall_reverses_the_pieces_the_link_and_the_service_and_leaves_the_rest(self):
-        self.full()
-        self.config_file.write_text(self.config_file.read_text())
-        (self.state_dir / "audit.jsonl").write_text("{}\n")
-        out, error = self.install("--uninstall")
-        self.assertIsNone(error)
-        self.assertFalse(self.service_path().exists())
-        self.assertFalse(self.machine.linked)
-        self.assertFalse(self.machine.loaded)
-        for name in sb.KIT_AGENTS:
-            self.assertFalse((self.profile / "agents" / (name + ".md")).exists())
-        self.assertFalse((self.profile / "plugins" / "fleet-hooks.js").exists())
-        self.assertFalse((self.profile / "fleet-decisions").exists())
-        self.assertFalse((self.profile / "cli.json").exists())
-        self.assertFalse((self.profile / "opencode.json").exists())
-        self.assertFalse((self.home / "xdg-data" / "fleet-switchboard" / "skills").exists())
-        self.assertFalse(self.wrapper.exists())
-        self.assertTrue(self.config_file.exists(), "config is left alone")
-        self.assertTrue((self.state_dir / "audit.jsonl").exists(), "state is left alone")
-        again, _ = self.install("--uninstall")
-        for name, words in self.statuses(again).items():
-            self.assertNotEqual(words, ["done"], "a second uninstall finds nothing to do: %s" % name)
-
-    def test_a_dry_run_of_uninstall_says_what_it_would_remove_and_removes_nothing(self):
-        self.full()
-        before, calls = tree_of(self.home), len(self.machine.calls)
-        out, error = self.install("--uninstall", "--dry-run")
-        self.assertIsNone(error)
-        self.assertEqual(tree_of(self.home), before)
-        self.assertTrue(self.machine.linked and self.machine.loaded)
-        self.assertEqual([c for c in self.machine.calls[calls:] if c[:3] == ["herdr", "plugin", "unlink"]
-                          or c[:2] == ["launchctl", "bootout"]], [])
-        steps = self.statuses(out)
-        for name in ("agents", "skills", "fleet-hooks plugin", "decisions plugin", "todolist plugin", "wrapper", "service"):
-            self.assertEqual(steps[name][-1], "would be done", name)
-
-    def test_uninstall_keeps_what_the_user_added_or_edited(self):
-        self.full()
-        (self.profile / "cli.json").write_text(json.dumps({"plugins": ["./fleet-decisions", "./mine"], "theme": "x"}))
-        (self.profile / "agents" / "coder.md").write_text("my own coder\n")
-        (self.profile / "opencode.json").write_text(json.dumps(
-            {"model": "m", "provider": {"p": 1}, "skills": {"paths": [str(self.home / "xdg-data" / "fleet-switchboard" / "skills"), "/mine"]}}))
-        self.install("--uninstall")
-        self.assertEqual(json.loads((self.profile / "cli.json").read_text()), {"plugins": ["./mine"], "theme": "x"})
-        self.assertEqual((self.profile / "agents" / "coder.md").read_text(), "my own coder\n")
-        self.assertEqual(json.loads((self.profile / "opencode.json").read_text()),
-                         {"model": "m", "provider": {"p": 1}, "skills": {"paths": ["/mine"]}})
-
-    def test_the_users_config_keys_keep_their_values_and_their_order(self):
-        mine = '{\n  "poll_seconds": 7,\n  "herdr": "herdr",\n  "jev": {"model": "mine/model"},\n  "github_repos": ["acme/api"]\n}\n'
-        self.write_config(mine)
-        self.full()
-        config = json.loads(self.config_file.read_text(), object_pairs_hook=list)
-        self.assertEqual([k for k, _ in config][:4], ["poll_seconds", "herdr", "jev", "github_repos"])
-        found = dict(config)
-        self.assertEqual((found["poll_seconds"], found["jev"], found["github_repos"]),
-                         (7, [("model", "mine/model")], ["acme/api"]))
-        self.assertIn("opencode", found)
-
-    def test_a_config_with_every_key_is_not_rewritten(self):
-        self.full()
-        mtime = self.config_file.stat().st_mtime_ns
-        text = self.config_file.read_text()
-        time.sleep(0.01)
-        self.full()
-        self.assertEqual((self.config_file.read_text(), self.config_file.stat().st_mtime_ns), (text, mtime))
-
-    def test_an_invalid_config_is_refused_and_not_overwritten(self):
-        self.write_config("{not json")
-        out, error = self.full()
-        self.assertIn("config", error)
-        self.assertEqual(self.config_file.read_text(), "{not json")
-
-    def test_a_v1_binary_is_refused_with_how_to_get_v2_and_nothing_is_written(self):
-        self.machine.version = "1.4.2"
-        before = tree_of(self.home)
-        out, error = self.full()
-        self.assertIn("v1", error)
-        self.assertIn("npm install --prefix", error)
-        self.assertIn("%s@%s" % (sb.V2_PACKAGE, sb.V2_VERSION), error)
-        self.assertEqual(tree_of(self.home), before)
-
-    def test_a_bare_name_and_a_missing_binary_are_refused(self):
-        out, error = self.install("--opencode", "opencode")
-        self.assertIn("absolute", error)
-        out, error = self.install("--opencode", str(self.home / "nowhere" / "opencode"))
-        self.assertIn("no OpenCode v2 found", error)
-
-    def test_the_binary_may_be_found_in_a_known_place(self):
-        known = self.home / "xdg-data" / "fleet-switchboard" / "v2" / "node_modules" / "@opencode" / "cli" / "bin" / "opencode.exe"
-        known.parent.mkdir(parents=True)
-        known.write_text("#!/bin/sh\n")
-        self.machine.binary = str(known)
-        out, error = self.install()
-        self.assertIsNone(error, error)
-        self.assertEqual(json.loads(self.config_file.read_text())["opencode_executable"], str(known))
-
-    def test_the_flags_skip_the_service_and_the_link_and_say_so(self):
-        out, error = self.full("--no-service", "--no-herdr-link")
-        steps = self.statuses(out)
-        self.assertEqual(steps["service"], ["skipped (--no-service)"])
-        self.assertEqual(steps["herdr plugin"], ["skipped (--no-herdr-link)"])
-        self.assertFalse(self.service_path().exists())
-        self.assertEqual([c for c in self.machine.calls if c[:3] == ["herdr", "plugin", "link"]], [])
-        self.assertEqual(self.machine.commands("launchctl"), [])
-
-    def test_the_link_says_exactly_what_it_will_do_before_it_does_it(self):
-        out, error = self.full()
-        text = out[out.index("herdr plugin"):]
-        for needle in ("plugin link", str(REPO / "herdr"), "every pane", "ensure", "poke", "unlink"):
-            self.assertIn(needle, text)
-        self.assertLess(out.index("every pane"), out.index("done linked"), "the notice comes before the act")
-
-    def test_a_failed_link_stops_the_install_naming_why(self):
-        self.machine.fail = {"plugin link": 1}
-        out, error = self.full()
-        self.assertIn("plugin link", error)
-        self.assertEqual(self.machine.commands("launchctl"), [])
-
-    def test_no_secret_is_printed_or_written_anywhere_but_the_key_file(self):
-        os.environ["OPENROUTER_API_KEY"] = PR16_KEY
-        out, error = self.full()
-        self.assertNotIn(PR16_KEY, out + str(error))
-        for path, content in tree_of(self.home).items():
-            if content is not None:
-                self.assertNotIn(PR16_KEY.encode(), content, path)
-        for call in self.machine.calls:
-            self.assertNotIn(PR16_KEY, " ".join(call))
-
-    def test_the_last_step_runs_ensure_and_then_status(self):
-        out, error = self.full(status="THE STATUS\n")
-        self.assertEqual(len(self.daemons.spawned), 1)
-        self.assertTrue(out.rstrip().endswith("THE STATUS"))
-
-    def test_the_real_status_after_an_install_names_the_missing_key_first(self):
-        out = io.StringIO()
-        installer = sb.Installer(self.machine, self.daemons, time.time, "darwin", REPO, out=out)
-        installer.install(self.machine.binary)
-        self.assertIn(PR16_NOTICE, out.getvalue())
-        self.assertLess(out.getvalue().index(PR16_NOTICE), out.getvalue().index("fleet-switchboard 0.1.0"))
-        self.assertIn("service    installed", out.getvalue())
-
-    def test_the_cli_runs_install_and_returns_its_exit_code(self):
-        os.environ["XDG_DATA_HOME"] = str(self.home / "xdg-data")
-        with captured() as (out, err):
-            code = sb.main(["install", "--opencode", self.machine.binary, "--no-service", "--no-herdr-link", "--dry-run"],
-                           runner=self.machine, now=time.time, spawn=self.daemons)
-        self.assertEqual(code, 0, err.getvalue())
-        self.assertIn("would be done", out.getvalue())
-        with captured() as (out, err):
-            code = sb.main(["install", "--opencode", "bare"], runner=self.machine, now=time.time, spawn=self.daemons)
-        self.assertEqual(code, 1)
-        self.assertIn("absolute", err.getvalue())
-
-
-class TestExternalAdapterWork(ExternalAdapterCase):
-    def test_put_is_idempotent_and_goes_over_http_only(self):
+    def test_tool_channel_refusals_map_by_code(self):
         adapter = self.adapter("tool")
-        first = adapter.work.put("w-1", "Build the thing", kind="assignment", state="running", doer="coder")
-        self.assertTrue(first["recorded"])
-        self.assertEqual(first["item"]["state"], "going")
-        again = adapter.work.put("w-1", "Build the thing", kind="assignment", state="running", doer="coder")
-        self.assertFalse(again["recorded"])
-        self.assertEqual(self.server.count("work_put", "tool"), 0)
-        self.assertEqual(self.server.count("work_put", "http"), 2)
-        self.assertEqual(adapter.work.get("w-1")["item"]["title"], "Build the thing")
-        self.assertEqual(len(adapter.work.list()), 1)
+        for code, cls in (("off", EA.DisabledError), ("decided", EA.AlreadyDecided), ("clash", EA.Conflict),
+                          ("slow", EA.RateLimited), ("nf", EA.InvalidRequest), ("bad", EA.InvalidRequest)):
+            self.slept.clear()
+            self.server.fail_next("raise", 400, {"code": code, "message": "refused: %s" % code, "retry_after_s": 90},
+                                  level="result")
+            with self.assertRaises(cls) as ctx:
+                self.push(adapter, self.decision(), "k-" + code)
+            self.assertIs(type(ctx.exception), cls)
+            self.assertEqual(self.slept, [])
+
+    def test_tool_channel_credential_and_schema_failures(self):
+        adapter = self.adapter("tool")
+        self.server.fail_next("raise", 401, {"code": "cred", "message": "no"}, level="http")
+        with self.assertRaises(EA.CredentialError):
+            self.push(adapter, self.decision(), "k-1")
+        self.server.fail_next("raise", 503, level="http")
+        self.assertTrue(self.push(adapter, self.decision(), "k-2").startswith("it-"))  # retried
+        # schema failures arrive as text, not JSON
+        with self.assertRaises(EA.InvalidRequest) as ctx:
+            adapter.door.mcp.call_tool("item_raise", {"bad_schema": 1})
+        self.assertIn("validation", str(ctx.exception))
         with self.assertRaises(EA.InvalidRequest):
-            adapter.work.put("w-2", "t", unmapped_field=1)
-        with self.assertRaises(EA.Unsupported):
-            adapter.door.call("work_put", {}, ident="w", force="tool")
+            adapter.door.mcp.call_tool("no_such_tool", {})
 
-    def test_a_waiting_or_blocked_state_carries_a_reason_where_the_mapping_names_one(self):
-        adapter = self.adapter()
-        adapter.work.put("w-8", "t", state="awaiting", progress="needs a review")
-        self.assertEqual(self.server.tasks[("seat-1", "w-8")]["why_state"], "needs a review")
-        adapter.work.put("w-7", "t", state="blocked")
-        self.assertEqual(self.server.tasks[("seat-1", "w-7")]["why_state"], "blocked")
-        adapter.work.put("w-6", "t", state="running", progress="going")
-        self.assertNotIn("why_state", self.server.tasks[("seat-1", "w-6")])
-        self.clock_now[0], self.server.now = 100, 1100.0
-        adapter.work.patch("w-6", state="blocked")
-        self.assertEqual(self.server.tasks[("seat-1", "w-6")]["why_state"], "going", "the last progress line")
-        adapter.work.put("w-5", "t", state="awaiting", state_reason="given")
-        self.assertEqual(self.server.tasks[("seat-1", "w-5")]["why_state"], "given")
+    def test_the_tool_session_sse_and_expiry(self):
+        adapter = self.adapter("tool")
+        self.assertEqual(adapter.door.mcp.list_tools()[:2], ["seats_list", "item_raise"])
+        self.assertEqual(adapter.door.mcp.session, "sess-1")
+        self.push(adapter, self.decision(), "k-1")
+        self.assertEqual(self.server.sid, 1)  # one session for all of it
+        self.server.sessions.clear()  # the server forgot it
+        self.push(adapter, self.decision(), "k-2")
+        self.assertEqual(self.server.sid, 2)
+        self.server.session_miss = 400   # some servers answer a session they forgot with a 400
+        self.server.sessions.clear()
+        self.push(adapter, self.decision(), "k-2b")
+        self.assertEqual(self.server.sid, 3)
+        with self.assertRaises(EA.InvalidRequest):   # a real 400 with a good session is asked once, not looped
+            self.server.fail_next("raise", 400, {"code": "bad", "message": "m"}, count=2)
+            self.push(adapter, self.decision(), "k-2c")
+        self.assertEqual(self.server.sid, 4)
+        self.server.session_miss = 404
+        self.server.sse = True
+        fresh = self.adapter("tool")
+        self.assertTrue(self.push(fresh, self.decision(), "k-3").startswith("it-"))
+        self.assertEqual(fresh.pull_normalised(None)[1], 0)
 
-    def test_an_empty_line_is_not_sent(self):
-        adapter = self.adapter()
-        first = adapter.work.put("w-9", "t", state="running", progress="", doer="  ")
-        self.assertTrue(first["recorded"])
-        self.assertNotIn("progress", self.server.tasks[("seat-1", "w-9")])
-        self.assertEqual(adapter.work.patch("w-9", progress=" "), {"sent": False, "unchanged": True})
+    def test_a_list_of_messages_is_joined(self):
+        adapter = self.adapter("tool")
+        self.server.fail_next("raise", 400, {"code": "bad", "message": ["first", "second"]}, level="result")
+        with self.assertRaises(EA.InvalidRequest) as ctx:
+            self.push(adapter, self.decision(), "k-1")
+        self.assertIn("first; second", str(ctx.exception))
 
-    def test_updates_are_coalesced_and_the_last_state_wins(self):
-        adapter = self.adapter()
-        adapter.work.put("w-1", "t", state="running")
-        self.server.now, self.clock_now[0] = 1000.0, 0.0
-        first = adapter.work.patch("w-1", progress="a")
-        self.assertEqual((first["sent"], first["deferred"]), (False, True))  # the put just recorded: wait
-        self.clock_now[0] = 30
-        adapter.work.patch("w-1", progress="b")
-        second = adapter.work.patch("w-1", progress="c", doer="d")
-        self.assertAlmostEqual(second["due_in"], 30)
-        self.assertEqual(self.server.count("work_patch"), 0)
-        self.server.now, self.clock_now[0] = 1061.0, 61
-        self.assertEqual(adapter.work.flush()["w-1"]["sent"], True)
-        self.assertEqual(self.server.count("work_patch"), 1)
-        task = self.server.tasks[("seat-1", "w-1")]
-        self.assertEqual((task["progress"], task["doer"]), ({"text": "c"}, "d"))  # b was never sent
-        again = adapter.work.patch("w-1", progress="c")
-        self.assertEqual(again, {"sent": False, "unchanged": True})
-        self.assertEqual(adapter.work.flush(), {})
+    def test_a_redirect_is_never_followed(self):
+        adapter = self.adapter("http")
+        self.server.fail_next("raise", 302, {"code": "x", "message": "moved"}, {"Location": "http://127.0.0.1:1/"})
+        with self.assertRaises(EA.InvalidRequest):
+            self.push(adapter, self.decision(), "k-1")
 
-    def test_a_rate_limit_defers_and_keeps_the_pending_state(self):
-        adapter = self.adapter()
-        adapter.work.put("w-1", "t")
-        self.clock_now[0] = 100  # our clock says it is due, the server's says it is not
-        self.server.now = 1010.0
-        result = adapter.work.patch("w-1", progress="x")
-        self.assertEqual((result["sent"], result["deferred"], result["due_in"]), (False, True, 60.0))
-        self.assertEqual(self.slept, [])  # not slept: reported
-        self.assertEqual(adapter.work.flush(), {})  # still deferred by the wait
-        self.clock_now[0], self.server.now = 161, 1100.0
-        self.assertTrue(adapter.work.flush()["w-1"]["sent"])
-        self.assertEqual(self.server.tasks[("seat-1", "w-1")]["progress"], {"text": "x"})
 
-    def test_finish_is_final_and_idempotent(self):
-        adapter = self.adapter()
-        adapter.work.put("w-1", "t")
-        adapter.work.patch("w-1", progress="pending")
-        done = adapter.work.finish("w-1", "done", "all good")
-        self.assertEqual(done["item"]["end"], {"state": "ok", "said": "all good"})
-        self.assertNotIn("w-1", adapter.work.items)  # pending dropped
-        adapter.work.finish("w-1", "done", "all good")  # the same outcome again is fine
-        with self.assertRaises(EA.Conflict):
-            adapter.work.finish("w-1", "failed", "no")
-        self.server.now = 5000.0
-        with self.assertRaises(EA.Conflict):
-            adapter.door.call("work_patch", {"progress": "late"}, ident="w-1", force="http")
+class TestJobTool(unittest.TestCase):
+    """`job start` / `job status`: detached long runs, told apart by evidence. Real short processes; each test waits on the process it started
+    (no polling of a clock), so a loaded machine only makes it slower."""
 
-    def test_work_errors_map_like_the_rest(self):
-        adapter = self.adapter()
-        self.server.disabled = True
-        with self.assertRaises(EA.DisabledError):
-            adapter.work.put("w-1", "t")
-        self.server.disabled = False
-        with self.assertRaises(EA.NotFound):
-            adapter.work.get("never")
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.root), True)
+        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.root)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.procs, self.pids = {}, []
+        self.addCleanup(self.reap)
 
-    def test_the_interval_is_at_least_a_minute(self):
-        self.assertEqual(self.adapter().work.interval, 60.0)
+    def reap(self):
+        for pid in self.pids:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        for proc in self.procs.values():
+            try:
+                proc.wait(timeout=10)
+            except subprocess.SubprocessError:
+                pass
+
+    def spawn(self, argv, **kwargs):
+        proc = subprocess.Popen(argv, **kwargs)
+        self.last = proc
+        return proc
+
+    def job(self, *argv, spawn=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.dict(os.environ):
+            code = sb.main(["job", *argv], spawn=spawn or self.spawn)
+        return code, out.getvalue().strip(), err.getvalue()
+
+    def started(self, name, *command):
+        code, out, err = self.job("start", name, "--", *command)
+        self.assertEqual(code, 0, err)
+        self.procs[name] = self.last
+        record = sb.job_read(name, self.root)
+        self.pids.append(record["pid"])
+        return record
+
+    def settled(self, name, want):
+        """Wait for the job's own process (the wrapper), then read its state: no polling."""
+        self.procs[name].wait(timeout=60)
+        state = sb.job_state(sb.job_read(name, self.root), self.root)
+        self.assertEqual(state[0], want)
+        return state
+
+    def test_a_finished_job_reads_its_exit_code_and_its_result_file(self):
+        self.started("suite", "sh", "-c", "echo hello; exit 3")
+        self.assertEqual(self.settled("suite", "finished"), ("finished", 3))
+        code, out, err = self.job("status", "suite")
+        self.assertEqual(code, 1, "a non-zero exit is not success")
+        self.assertRegex(out, r"^finished: suite exit code 3 after it started \d+s ago; result .*out\.log$")
+        self.assertEqual((self.root / "suite" / "out.log").read_text(), "hello\n")
+
+    def test_a_job_that_exits_zero_reads_finished_and_status_succeeds(self):
+        self.started("ok", "sh", "-c", "exit 0")
+        self.settled("ok", "finished")
+        self.assertEqual(self.job("status", "ok")[0], 0)
+
+    def test_a_killed_job_reads_dead_with_no_exit_code(self):
+        record = self.started("long", "sleep", "60")
+        code, out, err = self.job("status", "long")
+        self.assertEqual((code, out.split(":")[0]), (0, "alive"))
+        os.killpg(record["pid"], signal.SIGKILL)   # the whole group: what a restart does
+        self.assertEqual(self.settled("long", "dead"), ("dead", None))
+        code, out, err = self.job("status", "long")
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"^dead: long was killed \(no exit code\); it started \d+s ago; what it printed is in .*out\.log$")
+        self.assertFalse((self.root / "long" / "exit").exists())
+
+    def test_a_pid_reused_by_another_process_is_not_the_job(self):
+        self.started("reuse", "sleep", "60")
+        job = sb.job_read("reuse", self.root)
+        job["token"] = "Thu Jan  1 00:00:00 1970"   # the recorded start time is not this process's
+        (self.root / "reuse" / "job.json").write_text(json.dumps(job))
+        self.assertEqual(sb.job_state(sb.job_read("reuse", self.root), self.root)[0], "dead")
+
+    def test_a_record_with_no_pid_reads_unknown(self):
+        self.assertEqual(sb.job_state({"name": "x"}, self.root), ("unknown", None))
+
+    def test_a_name_still_alive_is_refused_and_a_dead_or_finished_one_is_replaced_with_its_markers_cleared(self):
+        self.started("again", "sleep", "60")
+        code, out, err = self.job("start", "again", "--", "true")
+        self.assertEqual(code, 1)
+        self.assertIn("is still running", err)
+        record = self.started("dead", "sleep", "60")
+        os.killpg(record["pid"], signal.SIGKILL)
+        self.settled("dead", "dead")
+        self.job("status", "dead")   # collected
+        self.assertTrue((self.root / "dead" / "collected").exists())
+        self.started("dead", "sh", "-c", "exit 2")
+        self.assertEqual(self.settled("dead", "finished"), ("finished", 2))
+        self.assertFalse((self.root / "dead" / "collected").exists(), "a new run starts uncollected")
+
+    def test_a_command_that_cannot_start_is_said_and_leaves_no_record(self):
+        def refuse(argv, **kwargs):
+            raise OSError(errno.ENOENT, "No such file or directory")
+        code, out, err = self.job("start", "nope", "--", "x", spawn=refuse)
+        self.assertEqual(code, 1)
+        self.assertIn("cannot start x", err)
+        self.assertIsNone(sb.job_read("nope", self.root))
+
+    def test_a_bad_name_no_command_and_an_unknown_job_are_refused(self):
+        self.assertEqual(self.job("start", "Bad Name", "--", "true")[0], 2)
+        self.assertEqual(self.job("start", "x", "--")[0], 2)
+        code, out, err = self.job("status", "nope")
+        self.assertEqual(code, 1)
+        self.assertIn("no job named nope", err)
+
+    def test_asking_after_it_died_collects_it_so_nobody_else_is_told(self):
+        record = self.started("c", "sleep", "60")
+        os.killpg(record["pid"], signal.SIGKILL)
+        self.settled("c", "dead")
+        self.assertFalse((self.root / "c" / "collected").exists())
+        self.job("status", "c")
+        self.assertTrue((self.root / "c" / "collected").exists())
+
+    def test_a_jobs_dir_that_is_not_private_is_refused_and_not_believed(self):
+        os.chmod(str(self.root), 0o755)
+        code, out, err = self.job("start", "x", "--", "true")
+        self.assertEqual(code, 1)
+        self.assertIn("not a private directory", err)
+        self.assertFalse(sb.job_private(self.root))
+        os.chmod(str(self.root), 0o700)
+        self.assertTrue(sb.job_private(self.root))
+
+    def test_a_record_is_written_whole_or_not_at_all(self):
+        target = self.root / "f"
+        sb.job_write_atomic(target, "one")
+        with mock.patch.object(sb.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                sb.job_write_atomic(target, "two")
+        self.assertEqual(target.read_text(), "one", "the old file is intact")
+        self.assertEqual([p.name for p in self.root.iterdir()], ["f"], "no temp file is left")
+
+    def test_the_starter_is_established_from_its_own_session_and_otherwise_nobody(self):
+        with mock.patch.object(sb, "build_engine", return_value=(types.SimpleNamespace(herdr=None, v2=None), None, None)), \
+                mock.patch.object(sb, "session_identity", return_value={"name": "coder"}), mock.patch.dict(os.environ, {sb.SESSION_ENV: "ses_example1"}):
+            self.assertEqual(sb.job_starter(None, time.time), ("ses_example1", "coder"))
+        with mock.patch.object(sb, "build_engine", side_effect=sb.ConfigError("no config")):
+            self.assertEqual(sb.job_starter(None, time.time), (None, None))
+
+
+class TestPlanKind(unittest.TestCase):
+    """#1094: GitHubHub.plan_kind: plan / noplan / unknown, one cached read per issue, no write."""
+
+    def hub(self, answers):
+        import types
+        calls, t = [], [0.0]
+
+        def gh_api(path, paginate=True, timeout=None, **kw):
+            calls.append(path)
+            a = answers(path) if callable(answers) else answers
+            if isinstance(a, Exception):
+                raise a
+            return [a]
+        hub = types.SimpleNamespace(lock=threading.RLock(), _cache={}, now=lambda: t[0], gh_api=gh_api,
+                                    config={"call_timeout_seconds": 5})
+        return hub, calls, t
+
+    def kind(self, hub, n=1):
+        return sb.GitHubHub.plan_kind(hub, "acme/api", n)
+
+    def test_the_three_kinds(self):
+        plan = [{"id": 1, "created_at": "2026-01-01", "body": "## Plan (scenarios)\n\nx"}]
+        self.assertEqual(self.kind(self.hub(plan)[0]), "plan")
+        self.assertEqual(self.kind(self.hub([{"id": 1, "body": "hello"}])[0]), "noplan")
+        self.assertEqual(self.kind(self.hub(sb.GitHubUnavailable("down"))[0]), "unknown")
+        self.assertEqual(self.kind(self.hub({"not": "a list"})[0]), "unknown")
+
+    def test_a_second_refresh_within_the_ttl_adds_no_read(self):
+        hub, calls, t = self.hub([])
+        for n in range(1, 6):
+            self.kind(hub, n)
+        self.assertEqual(len(calls), 5)
+        for n in range(1, 6):
+            self.kind(hub, n)
+        self.assertEqual(len(calls), 5, "no read of the second refresh")
+        t[0] += sb.GITHUB_LOOKUP_TTL + 1
+        self.kind(hub, 1)
+        self.assertEqual(len(calls), 6)
+        self.assertTrue(all(c.startswith("repos/") and "comments" in c for c in calls))
+
+    def test_a_full_page_never_reads_noplan_and_a_plan_on_it_is_unknown(self):
+        full = [{"id": i, "created_at": "2026-01-01", "body": "x"} for i in range(100)]
+        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
+        full[3]["body"] = "## Plan (scenarios)\n\nx"
+        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
+        self.assertEqual(self.kind(self.hub(full[:99])[0]), "plan")
+
+    def test_a_plan_in_the_body_reads_noplan(self):
+        body = "## Plan (scenarios)\n\nx"
+
+        def answers(path):
+            return {"body": body} if path.endswith("/issues/1") else [{"id": 1, "body": "hi"}]
+        hub, calls, t = self.hub(answers)
+        self.assertEqual(self.kind(hub), "noplan")   # the ask says a plan COMMENT; a plan-looking BODY does not count
+
+    def test_every_row_is_read_over_several_refreshes(self):
+        hub, calls, t = self.hub([])
+        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
+        records = [{"repo": "acme/api", "number": n} for n in range(60)]
+        for _ in range(7):
+            sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
+        self.assertEqual(len(calls), 60)
+        kinds = sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
+        self.assertEqual(set(kinds.values()), {"noplan"})
+
+    def test_never_read_rows_are_served_before_retries(self):
+        bad = set(range(11))
+
+        def answers(path):
+            n = int(path.split("/issues/")[1].split("/")[0])
+            return sb.GitHubUnavailable("x") if n in bad else []
+        hub, calls, t = self.hub(answers)
+        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
+        records = [{"repo": "acme/api", "number": n} for n in range(11)]
+        sb.GitHubHub.plan_kinds(hub, records, [10])
+        t[0] += sb.GITHUB_LOOKUP_RETRY + 1
+        records += [{"repo": "acme/api", "number": n} for n in range(100, 105)]
+        calls.clear()
+        kinds = sb.GitHubHub.plan_kinds(hub, records, [10])
+        for n in range(100, 105):
+            self.assertEqual(kinds[("acme/api", n)], "noplan")
+
+    def test_one_page_one_call_no_pagination(self):
+        hub, calls, t = self.hub([])
+        seen = []
+        orig = hub.gh_api
+        hub.gh_api = lambda path, paginate=True, **kw: (seen.append(paginate), orig(path, paginate=paginate, **kw))[1]
+        self.kind(hub)
+        self.assertEqual(seen, [False])
+        self.assertIn("per_page=100", calls[0])
+
+    def test_a_failed_read_is_retried_after_the_short_ttl_not_the_full_one(self):
+        for err in (sb.GitHubUnavailable("403"), sb.GitHubUnavailable("404"), TimeoutError("t")):
+            hub, calls, t = self.hub(err)
+            self.assertEqual(self.kind(hub), "unknown")
+            self.kind(hub)
+            self.assertEqual(len(calls), 1)
+            t[0] += sb.GITHUB_LOOKUP_RETRY + 1
+            self.kind(hub)
+            self.assertEqual(len(calls), 2, "retried after the short ttl")
+
+    def test_a_refresh_makes_at_most_the_cap_of_reads(self):
+        hub, calls, t = self.hub([])
+        budget = [sb.PLAN_KIND_READS_PER_REFRESH]
+        kinds = [sb.GitHubHub.plan_kind(hub, "acme/api", n, budget) for n in range(60)]
+        self.assertEqual(len(calls), sb.PLAN_KIND_READS_PER_REFRESH)
+        self.assertEqual(kinds.count("unknown"), 60 - sb.PLAN_KIND_READS_PER_REFRESH)
+        self.assertEqual(sb.PLAN_KIND_READS_PER_REFRESH, 10)
+
+    def test_the_cache_is_bounded(self):
+        hub, calls, t = self.hub([])
+        for n in range(sb.PLAN_KIND_CACHE_MAX + 50):
+            self.kind(hub, n)
+        self.assertLessEqual(len(hub._cache), sb.PLAN_KIND_CACHE_MAX)
 
 
 class TestAuditRotation(unittest.TestCase):
@@ -1666,188 +1905,158 @@ class TestReviewLawsStarterSet(Base):
         self.assertIn("review-laws install", (REPO / "docs" / "switchboard.md").read_text())
 
 
-class TestConfigDeclarations(Base):
-    """#437 slice 2: a module declares its own configuration key, default and validator; the shared code reads the declarations from the bin directory only."""
+class TestPluginPush(unittest.TestCase):
+    """#290 slice 6: the plugin's pushes. The receiver only MARKS a session; the pass thread makes the one bounded read."""
+    SESSION = "ses_alpha"
 
-    FIXTURE = ('CONFIG_KEY = "fixture_key"\nCONFIG_DEFAULT = {"n": 1}\n\n\n'
-               'def validate(raw, source):\n    if not isinstance(raw, dict):\n        raise ValueError("fixture: bad value")\n')
+    class Stub:
+        def __init__(self):
+            self.calls = []
 
-    def bin(self, must=None, **files):
-        directory = Path(tempfile.mkdtemp(prefix="decl-"))
-        floor = mock.patch.object(sb, "CONFIG_MUST_DECLARE", must or {})
-        floor.start()
-        self.addCleanup(floor.stop)
-        self.addCleanup(shutil.rmtree, directory, True)
-        for name, text in files.items():
-            (directory / name).write_text(text)
-        patcher = mock.patch.object(sb, "CONFIG_DECLARATIONS_DIR", str(directory))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return directory
+        def message_list(self, session, limit=None, order=None, type=None, cursor=None):
+            self.calls.append((session, limit, type))
+            return []
 
-    def warnings(self):
-        seen = []
-        patcher = mock.patch.object(sb, "warn_unknown_config", lambda message, section="", names=(), known=(): seen.append(list(names)))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return seen
+        def __getattr__(self, name):   # any other call (a write, a send) is a failure of the test
+            raise AssertionError("the push must cause no call but a bounded read: %s" % name)
 
-    def test_s1_a_declared_key_is_known_defaulted_and_needs_no_shared_line(self):
-        self.bin(**{"fixture_mod.py": self.FIXTURE})
-        seen = self.warnings()
-        self.assertEqual(sb.validate_config({})["fixture_key"], {"n": 1}, "the declared default is applied when the key is absent")
-        self.assertEqual(sb.validate_config({"fixture_key": {"n": 5}})["fixture_key"], {"n": 5})
-        self.assertEqual(seen, [], "no unknown-key warning for a declared key")
-        self.assertIn("fixture_key", sb.config_known_keys())
-        self.assertNotIn("fixture_key", sb.TOP_LEVEL_EXTRA_KEYS)
-        self.assertNotIn("fixture_key", sb.DEFAULTS)
+    def setUp(self):
+        self.now, self.audits = [1000.0], []
+        audit = types.SimpleNamespace(append=lambda actor, name, subject, detail: self.audits.append((name, detail)))
+        self.feed = sb.EventFeed(None, audit, lambda: self.now[0])
+        self.feed.connected, self.feed.needs_resync = True, False
+        self.receiver = sb.EventReceiver(self.feed, audit, lambda: self.now[0], known=lambda: {self.SESSION, "ses_beta"})
 
-    def test_s2_the_declared_validator_runs_and_its_message_is_the_error(self):
-        self.bin(**{"fixture_mod.py": self.FIXTURE})
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.validate_config({"fixture_key": "nope"})
-        self.assertEqual(str(caught.exception), "fixture: bad value")
+    def message(self, **fields):
+        body = {"v": 1, "kind": "event", "event": "prompt", "sessionID": self.SESSION, "at": 1000000}
+        body.update(fields)
+        return json.dumps(body).encode()
 
-    def test_s4_a_key_declared_twice_or_owned_by_the_shared_defaults_is_refused_naming_both(self):
-        self.bin(**{"one.py": self.FIXTURE, "two.py": self.FIXTURE})
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.config_declarations()
-        self.assertIn("one.py", str(caught.exception))
-        self.assertIn("two.py", str(caught.exception))
-        self.bin(**{"shared.py": 'CONFIG_KEY = "poll_seconds"\n'})
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.config_declarations()
-        self.assertIn("shared.py", str(caught.exception))
-        self.assertIn("shared defaults", str(caught.exception))
+    def test_s9_a_good_message_marks_only_that_session_and_the_next_pass_reads_it_once(self):
+        engine = types.SimpleNamespace(v2=self.Stub())
+        self.assertTrue(self.receiver.handle(self.message()))
+        self.assertEqual(engine.v2.calls, [], "the receiver reads nothing")
+        self.assertEqual(list(self.feed.seen), [self.SESSION])
+        self.feed.tick(engine, [self.SESSION, "ses_beta"])
+        self.assertEqual(engine.v2.calls, [(self.SESSION, sb.FEED_PAGE, "assistant")], "one bounded read, for that session only")
+        self.feed.tick(engine, [self.SESSION, "ses_beta"])
+        self.assertEqual(len(engine.v2.calls), 1, "read once: nothing new was pushed")
 
-    def test_s5_only_py_files_directly_in_the_bin_directory_are_read(self):
-        directory = self.bin(**{"real.py": 'CONFIG_KEY = "real_key"\n', "backup.py.bak": 'CONFIG_KEY = "bak_key"\n', "notes.txt": 'CONFIG_KEY = "txt_key"\n'})
-        (directory / "sub").mkdir()
-        (directory / "sub" / "deep.py").write_text('CONFIG_KEY = "deep_key"\n')
-        outside = Path(tempfile.mkdtemp(prefix="outside-"))
-        self.addCleanup(shutil.rmtree, outside, True)
-        (outside / "out.py").write_text('CONFIG_KEY = "outside_key"\n')
-        (directory / "link.py").symlink_to(outside / "out.py")
-        self.assertEqual(sb.config_declarations(), {"real_key": "real"}, "0 decoys: a subdirectory, a backup, a text file and a symlink are not read")
+    def test_s10_seven_kinds_of_bad_message_touch_nothing_and_are_counted(self):
+        bad = [self.message(pad="x" * 3000), self.message(v=2), self.message(event="nonsense"), self.message(sessionID="not a session"),
+               self.message(text="a prompt"), b"this is not json", bytes(range(128, 200))]
+        for raw in bad:
+            self.assertFalse(self.receiver.handle(raw))
+        self.assertEqual((self.feed.seen, self.receiver.status()["ignored"]), ({}, 7))
+        self.assertFalse(self.receiver.handle(self.message(sessionID="ses_stranger")), "a valid id of no agent of this fleet proves nothing")
 
-    def test_s6_shared_keys_stay_shared_and_an_undeclared_key_still_warns(self):
-        self.bin(**{"fixture_mod.py": self.FIXTURE})
-        seen = self.warnings()
-        sb.validate_config({"reds": None, "heavy": None, "nowhere_key": 1})
-        self.assertEqual(seen, [["nowhere_key"]])
+    def test_s11_a_burst_is_limited_counted_audited_once_and_never_queued(self):
+        for _ in range(100):
+            self.receiver.handle(self.message())
+        status = self.receiver.status()
+        self.assertEqual((status["accepted"], status["rate_limited"]), (sb.PLUGIN_SESSION_PER_SECOND, 100 - sb.PLUGIN_SESSION_PER_SECOND))
+        self.assertEqual([n for n, _ in self.audits].count("event.rate_limited"), 1)
+        self.now[0] += 2
+        self.assertTrue(self.receiver.handle(self.message()), "the next second starts clean: nothing was queued")
 
-    def test_the_listing_is_cached_until_a_file_changes_and_a_caller_cannot_change_the_cache(self):
-        directory = self.bin(**{"one.py": 'CONFIG_KEY = "one_key"\n'})
-        first = sb.config_declarations()
-        first["tampered"] = "x"
-        self.assertEqual(sb.config_declarations(), {"one_key": "one"}, "the returned dict is a copy")
-        (directory / "two.py").write_text('CONFIG_KEY = "two_key"\n')
-        self.assertEqual(sb.config_declarations(), {"one_key": "one", "two_key": "two"}, "a new file is seen")
-        (directory / "one.py").write_text('CONFIG_KEY = "uno_key"  # renamed\n')
-        self.assertEqual(sb.config_declarations(), {"uno_key": "one", "two_key": "two"}, "an edited file is seen")
+    def test_s15_an_event_limited_away_is_still_found_by_the_reconciliation_and_said_to_be_missed(self):
+        engine = types.SimpleNamespace(v2=types.SimpleNamespace(calls=[], message_list=lambda *a, **k: [{"id": "msg_new"}]))
+        self.feed.need("test")
+        self.feed.handle(feed_line("session.step.ended", session=self.SESSION, assistantMessageID="msg_old"))
+        for _ in range(sb.PLUGIN_SESSION_PER_SECOND + 5):
+            self.receiver.handle(self.message())
+        self.assertEqual(self.receiver.status()["rate_limited"], 5, "the last pushes were limited away")
+        self.feed.seen[self.SESSION]["read"] = self.now[0] + 1   # the pushed read already happened: only the reconciliation is left to find it
+        self.now[0] += sb.FEED_RECONCILE_SECONDS + 2
+        self.feed.tick(engine, [self.SESSION])
+        self.assertEqual([n for n, _ in self.audits].count("event.missed"), 1)
 
-    def test_an_unreadable_file_or_directory_fails_the_whole_configuration_naming_it(self):
-        directory = self.bin(**{"locked.py": 'CONFIG_KEY = "locked_key"\n'})
-        real_open = open
-        def deny(path, *args, **kwargs):
-            if str(path).endswith("locked.py"):
-                raise PermissionError(13, "Permission denied")
-            return real_open(path, *args, **kwargs)
-        with mock.patch("builtins.open", deny), self.assertRaises(sb.ConfigError) as caught:
-            sb.config_declarations()
-        self.assertIn("locked.py", str(caught.exception))
-        with mock.patch.object(sb, "CONFIG_DECLARATIONS_DIR", str(directory / "missing")), self.assertRaises(sb.ConfigError) as caught:
-            sb.config_declarations()
-        self.assertIn("cannot be read", str(caught.exception))
+    def test_a_push_is_read_while_the_stream_is_down_at_most_four_sessions_a_pass_and_a_failed_read_is_tried_again(self):
+        sessions = ["ses_%02d" % n for n in range(6)]
+        self.receiver.known = lambda: set(sessions)
+        self.feed.connected = False   # the stream is down and nobody registered as a consumer
+        for session in sessions:
+            self.receiver.handle(self.message(sessionID=session))
+        engine = types.SimpleNamespace(v2=self.Stub())
+        self.feed.tick(engine, sessions)
+        self.assertEqual(len(engine.v2.calls), sb.FEED_PUSHED_PER_PASS)
+        self.feed.tick(engine, sessions)
+        self.assertEqual(sorted(c[0] for c in engine.v2.calls), sessions, "the other two the next pass; none twice")
 
-    def test_a_declaring_module_must_hold_its_key_and_a_validate(self):
-        self.bin(**{"novalidate.py": 'CONFIG_KEY = "nv_key"\n'})
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.validate_config({})
-        self.assertIn("novalidate.py", str(caught.exception))
-        self.assertIn("no validate", str(caught.exception))
-        self.bin(**{"liar.py": 'CONFIG_KEY = "doc_key"\nif True:\n    CONFIG_KEY = "other_key"\ndef validate(raw, source):\n    pass\n'})
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.validate_config({})
-        self.assertIn("liar.py", str(caught.exception))
-        self.assertIn("'doc_key'", str(caught.exception))
+        class Failing:
+            calls = 0
 
-    def test_a_validator_that_fails_any_other_way_is_a_broken_module(self):
-        self.bin(**{"crash.py": 'CONFIG_KEY = "crash_key"\ndef validate(raw, source):\n    raise KeyError("boom")\n'})
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.validate_config({})
-        self.assertIn("crash.py", str(caught.exception))
-        self.assertIn("no configuration is loaded", str(caught.exception))
+            def message_list(self, *a, **k):
+                Failing.calls += 1
+                raise sb.V2Error("backoff", None, "skipped")
+        self.now[0] += 1
+        self.receiver.handle(self.message(sessionID="ses_00"))
+        self.feed.tick(types.SimpleNamespace(v2=Failing()), sessions)
+        self.feed.tick(types.SimpleNamespace(v2=Failing()), sessions)
+        self.assertEqual(Failing.calls, 2, "a failed read is tried again, and counted")
+        self.assertEqual(self.feed.status()["read_errors"], 2)
 
-    def test_the_declaration_line_has_its_edges(self):
-        big = "#" * 1000000 + '\nCONFIG_KEY = "late_key"\n'
-        self.bin(**{"commented.py": 'CONFIG_KEY = "ok_key"   # a comment\n', "single.py": "CONFIG_KEY = 'sq_key'\n", "spaced.py": 'CONFIG_KEY   =   "sp_key"\n',
-                    "tabbed.py": 'CONFIG_KEY\t=\t"tb_key"\n', "typed.py": 'CONFIG_KEY: str = "ty_key"\n', "late.py": big,
-                    "nested.py": 'if True:\n    CONFIG_KEY = "nested_key"\n', "text.py": '# CONFIG_KEY = "text_key"\nx = "CONFIG_KEY = \'str_key\'"\n'})
-        self.assertEqual(sb.config_declarations(), {"ok_key": "commented", "sq_key": "single", "sp_key": "spaced", "tb_key": "tabbed", "ty_key": "typed"},
-                         "quotes, spacing, a tab and an annotation do not matter; a nested statement, a comment, a string and a line past the 1 MB read are not declarations")
+    def test_under_v2_light_a_push_causes_no_read(self):
+        engine = types.SimpleNamespace(v2=self.Stub(), light=True, feed=self.feed, discovery=types.SimpleNamespace(agents={"a": types.SimpleNamespace(session_id=self.SESSION)}))
+        self.receiver.handle(self.message())
+        sb.feed_tick(engine)
+        self.assertEqual(engine.v2.calls, [], "the owner's hotfix switch stops every optional history read, a pushed one too")
 
-    def test_a_key_of_the_wrong_form_is_refused_naming_the_file(self):
-        for text in ('CONFIG_KEY = "Upper"\n', 'CONFIG_KEY = "1key"\n', 'CONFIG_KEY = 3\n'):
-            with self.subTest(text):
-                self.bin(**{"badform.py": text})
-                with self.assertRaises(sb.ConfigError) as caught:
-                    sb.config_declarations()
-                self.assertIn("badform.py", str(caught.exception))
+    def test_s16_with_no_pushes_ten_simulated_minutes_for_twenty_idle_agents_cost_at_most_fifty_calls(self):
+        engine = types.SimpleNamespace(v2=self.Stub())
+        self.feed.need("test")
+        sessions = ["ses_%02d" % n for n in range(20)]
+        for _ in range(120):
+            self.now[0] += 5
+            self.feed.tick(engine, sessions)
+        self.assertLessEqual(len(engine.v2.calls), 50)
 
-    def test_a_required_key_whose_declaration_is_not_found_refuses_the_whole_configuration(self):
-        must = {"excluded_repos": "repo_exclusion"}
-        validate = 'def validate(raw, source):\n    pass\n'
-        good = {"single quotes": "CONFIG_KEY = 'excluded_repos'\n", "extra spaces": 'CONFIG_KEY    =    "excluded_repos"\n', "a tab": 'CONFIG_KEY\t=\t"excluded_repos"\n'}
-        for what, line in good.items():
-            with self.subTest(what):
-                self.bin(must=must, **{"repo_exclusion.py": line + validate})
-                self.assertEqual(sb.validate_config({}).get("excluded_repos"), None)
-        bad = {"commented out": '# CONFIG_KEY = "excluded_repos"\n' + validate, "truncated": 'CONFIG_KEY = "excl', "a renamed key": 'CONFIG_KEY = "excluded_repo"\n' + validate,
-               "inside a string": 'x = """\nCONFIG_KEY = "excluded_repos"\n"""\n' + validate, "empty module": ""}
-        for what, text in bad.items():
-            with self.subTest(what):
-                self.bin(must=must, **{"repo_exclusion.py": text})
-                with self.assertRaises(sb.ConfigError) as caught:
-                    sb.validate_config({"excluded_repos": ["acme/api"]})
-                self.assertIn("repo_exclusion.py", str(caught.exception))
-                self.assertIn("excluded_repos", str(caught.exception))
-        self.bin(must=must)
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.validate_config({})
-        self.assertIn("repo_exclusion.py", str(caught.exception), "the module is missing")
+    def test_u4_no_text_of_a_message_reaches_the_audit_or_the_status(self):
+        self.receiver.handle(self.message(text="SENTINEL-PROMPT-TEXT"))
+        for _ in range(40):
+            self.receiver.handle(self.message(event="idle"))
+        self.assertNotIn("SENTINEL-PROMPT-TEXT", repr(self.audits) + repr(self.receiver.status()) + repr(self.feed.status()) + repr(self.feed.seen))
 
-    def test_the_real_floor_names_the_two_moved_keys_and_the_real_modules_meet_it(self):
-        self.assertEqual(sb.CONFIG_MUST_DECLARE, {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard", "temp_janitor": "disk_janitor",
-                                                  "chat_clear": "chat_clear", "impact_floor": "impact_floor"})
-        self.assertEqual({k: sb.config_declarations()[k] for k in sb.CONFIG_MUST_DECLARE}, sb.CONFIG_MUST_DECLARE)
+    def test_u5_a_pushed_claim_causes_no_write(self):
+        engine = types.SimpleNamespace(v2=self.Stub())   # any call but message_list raises
+        self.receiver.handle(self.message(id="msg_claimed", person=True))
+        self.feed.tick(engine, [self.SESSION])
+        self.assertEqual(len(engine.v2.calls), 1)
 
-    def test_s7_the_moved_keys_are_known_through_their_declarations(self):
-        self.assertTrue({"spotlight_guard", "excluded_repos"} <= set(sb.config_known_keys()))
-        self.assertFalse({"spotlight_guard", "excluded_repos"} & sb.TOP_LEVEL_EXTRA_KEYS)
-        declared = sb.config_declarations()
-        self.assertEqual((declared["excluded_repos"], declared["spotlight_guard"]), ("repo_exclusion", "spotlight_guard"))
+    def test_the_socket_carries_pushes_to_the_receiver_without_a_reply_and_judge_requests_as_before(self):
+        state = Path(tempfile.mkdtemp(prefix="sbp"))
+        self.addCleanup(shutil.rmtree, state, True)
+        arrived = threading.Event()
 
-    def test_a_declaring_module_that_cannot_load_fails_the_whole_configuration_naming_its_file(self):
-        self.bin(**{"broken.py": 'CONFIG_KEY = "broken_key"\nthis is not python\n', "fine.py": 'x = (\n'})
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.validate_config({})
-        self.assertIn("broken.py", str(caught.exception))
-        self.assertNotIn("fine.py", str(caught.exception), "only a declaring module fails the load")
-        self.assertIn("no configuration is loaded", str(caught.exception))
+        def on_event(raw):
+            self.receiver.handle(raw)
+            arrived.set()
+        server = sb.JudgeServer(state, lambda text: sb.policy_reply("deny", "judged"), on_event).start()
+        self.addCleanup(server.stop)
+        reply = sb.ask_judge_daemon(state, json.dumps({"sessionID": self.SESSION, "tool": "shell", "arguments": "ls", "outcome": "allow"}), 2)
+        self.assertEqual(reply["outcome"], "deny", "a judge request is answered as before")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        with sb.in_directory(state):
+            sock.connect(sb.POLICY_SOCKET)
+        sock.sendall(self.message() + b"\n")   # no shutdown(SHUT_WR): the server ends at the newline and may close first, and macOS then refuses it (ENOTCONN)
+        self.assertEqual(sock.recv(100), b"", "a push gets no reply")
+        sock.close()
+        self.assertTrue(arrived.wait(5), "the receiver was reached")   # the wait is only a failure bound
+        self.assertEqual(self.receiver.status()["accepted"], 1)
 
-    def test_a_module_that_does_not_declare_is_never_imported(self):
-        self.bin(**{"fine.py": 'raise RuntimeError("imported")\n', "decl.py": self.FIXTURE})
-        self.assertEqual(sb.validate_config({})["fixture_key"], {"n": 1})
-
-    def test_the_moved_keys_validate_as_before_and_a_bad_value_keeps_its_message(self):
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.validate_config({"excluded_repos": "acme/api"})
-        self.assertIn("'excluded_repos' must be a list", str(caught.exception))
-        with self.assertRaises(sb.ConfigError) as caught:
-            sb.validate_config({"spotlight_guard": {"folders": 3}})
-        self.assertIn("spotlight_guard", str(caught.exception))
-        self.assertNotIn("excluded_repos", sb.validate_config({}), "an absent key with no default adds nothing")
+    def test_the_socket_is_bound_for_pushes_when_the_judge_is_off_and_only_when_a_feed_runs(self):
+        state = Path(tempfile.mkdtemp(prefix="sbp"))
+        self.addCleanup(shutil.rmtree, state, True)
+        config = {"policy": {"enabled": False}, "v2_plugin_events": "auto"}
+        self.assertIsNone(sb.start_judge_server(config, state, None, time.time, types.SimpleNamespace(feed=None, audit=None)))
+        engine = types.SimpleNamespace(feed=self.feed, audit=None)
+        server = sb.start_judge_server(config, state, None, time.time, engine)
+        self.addCleanup(server.stop)
+        self.assertTrue((state / sb.POLICY_SOCKET).exists())
+        self.assertIsNotNone(engine.event_receiver)
+        server.stop()
+        self.assertIsNone(sb.start_judge_server(dict(config, v2_plugin_events="off"), state, None, time.time, engine), "off: the gate is the only signal")
 
 
 class TestReconcileOnRead(unittest.TestCase):
@@ -2073,207 +2282,3 @@ class TestReconcileOnRead(unittest.TestCase):
         for view, text in self.views().items():
             with self.subTest(view=view):
                 self.assertNotIn("dead", text.lower())
-
-
-class TestTempJanitorResume(Base):
-    """Ask #469: a scan that runs out of its time budget records the name it stopped at, and the next run continues there."""
-
-    def setUp(self):
-        super().setUp()
-        self.jan = sb.load_disk_janitor()
-        self.temp = self.home / "jtmp"
-        self.temp.mkdir()
-        self.state = self.home / "jstate"
-        self.state.mkdir()
-        (self.state / "state-marker.json").write_text("{}")
-        self.now = time.time() + 10 * 86400
-        self.t = [0.0]
-        self.judged = []
-        real = self.jan.judge
-
-        def counting(path, *a, **k):
-            self.judged.append(os.path.basename(path))
-            row = real(path, *a, **k)
-            self.t[0] += 1.0
-            return row
-        patcher = mock.patch.object(self.jan, "judge", counting)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def entry(self, name, days):
-        path = self.temp / name
-        path.write_text("x")
-        stamp = self.now - days * 86400
-        os.utime(str(path), (stamp, stamp))
-        return path
-
-    def twelve(self, old_from=None):
-        for n in range(1, 13):
-            self.entry("e%02d.txt" % n, 20 if old_from and n >= old_from else 1)
-
-    def run_once(self, seconds=4.5, apply=True, **extra):
-        self.t[0] = 0.0
-        self.judged.clear()
-        cfg = self.jan.settings(dict({"scan_seconds": seconds}, **extra))
-        lines, removed, kept = self.jan.run(self.temp, self.state, self.now, cfg, apply, lambda *a: None, clock=lambda: self.t[0], busy=lambda path: None)
-        return lines, removed, kept, list(self.judged)
-
-    def cursor(self):
-        return self.jan.read_cursor(self.state)
-
-    def test_s1_every_entry_is_judged_exactly_once_over_three_runs(self):
-        self.twelve()
-        seen = []
-        for _ in range(3):
-            seen.extend(self.run_once()[3])
-        self.assertEqual(sorted(seen), ["e%02d.txt" % n for n in range(1, 13)])
-        self.assertEqual(len(seen), len(set(seen)), "none judged twice before the cycle completes")
-
-    def test_s2_a_cursor_naming_a_deleted_entry_resumes_at_the_next_name(self):
-        self.twelve()
-        self.run_once()
-        self.assertEqual(self.cursor(), "e05.txt")
-        (self.temp / "e05.txt").unlink()
-        self.assertEqual(self.run_once()[3][0], "e06.txt", "by name, not by position: nothing after the deleted entry is skipped")
-
-    def test_s3_an_entry_that_was_not_reached_is_never_removed_and_is_not_judged(self):
-        self.twelve(old_from=6)
-        lines, removed, kept, judged = self.run_once()
-        self.assertEqual(removed, 0 + sum(1 for n in judged if int(n[1:3]) >= 6), "only judged entries can be removed")
-        for n in range(6, 13):
-            name = "e%02d.txt" % n
-            self.assertEqual((self.temp / name).exists(), name not in judged, name)
-        self.assertEqual(len(judged), 5)
-        self.assertIn("5 judged, 7 not judged", lines)
-        self.assertFalse(any(line.startswith("kept e") and "time budget" in line for line in lines), "not judged is never reported as kept for a reason")
-
-    def test_s4_each_report_says_judged_and_not_judged_and_the_last_says_the_cycle_is_complete(self):
-        self.twelve()
-        reports = [self.run_once()[0] for _ in range(3)]
-        self.assertIn("5 judged, 7 not judged", reports[0])
-        self.assertIn("5 judged, 2 not judged", reports[1])
-        self.assertIn("2 judged, 0 not judged", reports[2])
-        self.assertIn("cycle complete", reports[2])
-        self.assertEqual(sum(line == "cycle complete" for report in reports for line in report), 1)
-        self.assertIsNone(self.cursor(), "a finished cycle clears the cursor")
-
-    def test_s5_a_missing_empty_or_corrupt_cursor_starts_at_the_first_name(self):
-        self.twelve()
-        path = self.state / self.jan.CURSOR_FILE
-        for content in (None, "", "{garbage", '{"after": 5}', '{"after": ""}'):
-            if content is None:
-                path.unlink(missing_ok=True)
-            else:
-                path.write_text(content)
-            self.assertEqual(self.run_once(apply=False)[3][0], "e01.txt", repr(content))
-
-    def test_s6_the_weekly_budget_is_longer_and_both_come_from_configuration(self):
-        cfg = self.jan.settings({})
-        self.assertGreater(cfg["weekly_scan_seconds"], cfg["scan_seconds"])
-        self.jan.validate({"scan_seconds": 30, "weekly_scan_seconds": 900}, "config")
-        for bad in ({"scan_seconds": 0}, {"weekly_scan_seconds": "long"}, {"scan_seconds": True}, {"weekly_scan_seconds": 10 ** 9}):
-            with self.assertRaises(ValueError) as caught:
-                self.jan.validate(bad, "config")
-            self.assertIn(list(bad)[0], str(caught.exception))
-        self.twelve()
-        self.assertEqual(len(self.run_once(seconds=2.5, weekly_scan_seconds=8.5, apply=False)[3]), 3)
-        self.t[0] = 0.0
-        self.judged.clear()
-        lines, removed, kept = self.jan.run(self.temp, self.state, self.now, self.jan.settings({"scan_seconds": 2.5, "weekly_scan_seconds": 8.5}), False,
-                                            lambda *a: None, clock=lambda: self.t[0], busy=lambda path: None, weekly=True)
-        self.assertEqual(len(self.judged), 9, "the weekly run uses the longer budget")
-
-    def test_s7_a_scan_that_finishes_behaves_as_before_and_clears_the_cursor(self):
-        self.twelve(old_from=11)
-        (self.state / self.jan.CURSOR_FILE).write_text('{"after": "e10.txt"}')
-        lines, removed, kept, judged = self.run_once(seconds=100)
-        self.assertEqual(sorted(set(judged)), ["e11.txt", "e12.txt"], "(each removal candidate is judged once more right before it is removed)")
-        self.assertEqual(removed, 2)
-        self.assertIn("cycle complete", lines)
-        self.assertFalse((self.state / self.jan.CURSOR_FILE).exists())
-
-    def test_s8_no_thread_and_no_process_is_added(self):
-        self.twelve()
-        before = threading.active_count()
-        with mock.patch.object(subprocess, "run", side_effect=AssertionError("a process was started")), \
-                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
-            self.run_once()
-            self.run_once()
-        self.assertEqual(threading.active_count(), before)
-
-    def test_a_cursor_at_the_end_wraps_a_run_with_no_progress_keeps_it_and_a_dry_run_leaves_an_existing_one(self):
-        self.twelve()
-        cursor = self.state / self.jan.CURSOR_FILE
-        cursor.write_text('{"after": "e12.txt"}')
-        self.assertEqual(self.run_once(apply=False)[3][0], "e01.txt", "a cursor at the last name wraps to the first")
-        cursor.write_text('{"after": "zzz-after-everything"}')
-        self.assertEqual(self.run_once(apply=False)[3][0], "e01.txt")
-        self.assertEqual(json.loads(cursor.read_text()), {"after": "zzz-after-everything"}, "a dry run leaves an existing cursor")
-        cursor.write_text('{"after": "e04.txt"}')
-        lines, removed, kept, judged = self.run_once(seconds=-1)
-        self.assertEqual(judged, [], "the budget was spent before any entry")
-        self.assertEqual(json.loads(cursor.read_text()), {"after": "e04.txt"}, "no progress: the cursor stays")
-
-    def test_the_cursor_file_is_not_one_of_the_fleets_records(self):
-        self.twelve()
-        victim = self.entry("zz-victim-name.txt", 20)
-        (self.state / self.jan.CURSOR_FILE).write_text('{"after": "zz-victim-name.txt"}')
-        text, complete = self.jan.named_text(self.state)
-        self.assertNotIn("zz-victim-name.txt", text)
-        self.assertTrue(complete)
-
-    def test_a_corrupt_cursor_a_symlink_or_directory_it_names_and_a_type_change_never_remove_what_was_not_judged(self):
-        outside = self.home / "outside-dir"
-        outside.mkdir()
-        (outside / "precious.txt").write_text("keep me")
-        self.twelve(old_from=6)
-        cursor = self.state / self.jan.CURSOR_FILE
-        cursor.write_text("\x00{not json")
-        lines, removed, kept, judged = self.run_once(seconds=100)
-        for n in range(1, 13):
-            name = "e%02d.txt" % n
-            self.assertEqual((self.temp / name).exists(), not (n >= 6 and name in judged), name)
-        self.assertEqual(sorted(set(judged)), ["e%02d.txt" % n for n in range(1, 13)], "a corrupt cursor judged from the first name")
-        for n in range(6, 13):
-            self.entry("e%02d.txt" % n, 20)
-        (self.temp / "e03.txt").unlink()
-        (self.temp / "e03.txt").symlink_to(outside)   # the cursor will name an entry that is now a link to a directory
-        cursor.write_text('{"after": "e03.txt"}')
-        lines, removed, kept, judged = self.run_once(seconds=100)
-        self.assertNotIn("e03.txt", judged, "the run resumes AFTER the named entry")
-        self.assertTrue((outside / "precious.txt").exists())
-        self.assertTrue((self.temp / "e03.txt").is_symlink())
-        # an entry that changes type between its judging and its removal is not removed
-        self.entry("e20.txt", 20)
-        real_scan = self.jan.scan
-
-        def scan_then_swap(*a, **k):
-            rows = real_scan(*a, **k)
-            os.unlink(str(self.temp / "e20.txt"))
-            (self.temp / "e20.txt").symlink_to(outside)
-            return rows
-        cursor.unlink(missing_ok=True)
-        with mock.patch.object(self.jan, "scan", scan_then_swap):
-            lines, removed, kept, judged = self.run_once(seconds=100)
-        self.assertTrue((outside / "precious.txt").exists(), "a link is never followed")
-        self.assertTrue((self.temp / "e20.txt").is_symlink(), "it changed since the scan: kept")
-        self.assertIn("kept e20.txt: it changed since the scan", lines)
-
-    def test_the_weekly_flag_is_parsed_and_the_command_passes_it_to_the_run(self):
-        parser = sb.build_parser()
-        self.assertTrue(parser.parse_args(["disk", "janitor", "--apply", "--weekly"]).weekly)
-        self.assertFalse(parser.parse_args(["disk", "janitor", "--apply"]).weekly)
-        source = inspect.getsource(sb.cmd_disk_janitor)
-        self.assertIn('weekly = bool(getattr(args, "weekly", False))', source)
-        self.assertIn("weekly=weekly, outcome=preview", source)
-
-    def test_a_dry_run_reads_the_cursor_and_never_moves_it_and_the_file_is_private(self):
-        self.twelve()
-        self.run_once(apply=False)
-        self.assertIsNone(self.cursor(), "a preview does not change what the next real run covers")
-        self.run_once()
-        mode = os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mode & 0o777
-        self.assertEqual(mode, 0o600)
-        stamp = os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns
-        self.jan.write_cursor(self.state, self.cursor())
-        self.assertEqual(os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns, stamp, "written only when it changes")

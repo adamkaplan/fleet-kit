@@ -47,9 +47,8 @@ import urllib.parse
 from unittest import mock
 from support.core import Base, SAFE_PATH
 from support.fake_jev import FAKE_SB_SOURCE, GIT_SHIM, SHIM, SHIM_LOOKUP_SECONDS, write_fake_env
-from support.installs_and_keys import GOOD_DONE_WHEN, GOOD_PLAN, InstallCase, tree_of
+from support.installs_and_keys import InstallCase, PR16_KEY, PR16_NOTICE, tree_of
 from support.loader import captured, sb
-from support.orders_and_adapters import EA, ExternalAdapterCase, FakeDoorServer, fake_mapping
 from support.paths import BIN, REPO
 from support.policy_and_import import TRIAL
 from support.service_and_merge import feed_line
@@ -1356,284 +1355,242 @@ class TestTrialDriver(Base):
         self.assertNotEqual(TRIAL.SERVICE_PORT, 49374)
 
 
-class TestPlanCheckRules(unittest.TestCase):
-    """#135: every validation, both ways."""
+class TestInstall(InstallCase):
+    def full(self, *flags, **kw):
+        return self.install("--opencode", self.machine.binary, *flags, **kw)
 
-    def check(self, text=GOOD_PLAN, done_when=GOOD_DONE_WHEN):
-        return sb.plan_check.check(text, done_when)
+    def test_a_full_install_does_every_step_and_says_so(self):
+        out, error = self.full()
+        self.assertIsNone(error)
+        steps = self.statuses(out)
+        for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
+                     "decisions plugin", "todolist plugin", "herdr plugin", "service", "daemon"):
+            self.assertIn(name, steps, "%s: no line in\n%s" % (name, out))
+        self.assertEqual(steps["config"], ["done"])
+        self.assertIn("STATUS", out, "the last step prints status")
 
-    def codes(self, text, done_when=GOOD_DONE_WHEN):
-        return sorted(d["code"] for d in self.check(text, done_when)["defects"])
+    def test_it_writes_the_config_the_pieces_and_the_service(self):
+        self.full()
+        config = json.loads(self.config_file.read_text())
+        wrapper = self.wrapper
+        self.assertEqual((config["opencode"], config["opencode_executable"]), (str(wrapper), self.machine.binary))
+        self.assertEqual((config["github_repos"], config["jev"], config["policy"]),
+                         ([], {"model": sb.JEV_MODEL}, {"enabled": True}))
+        self.assertNotIn("intent_repo", config)
+        sb.validate_config(config)
+        self.assertTrue(os.access(str(wrapper), os.X_OK))
+        for name in sb.KIT_AGENTS:
+            text = (self.profile / "agents" / (name + ".md")).read_text()
+            self.assertIn(sb.STANDARD_MODEL, text)
+            self.assertNotIn("__PROVIDER__", text)
+        for skill in sb.kit_skill_names(REPO):
+            self.assertTrue((self.home / "xdg-data" / "fleet-switchboard" / "skills" / skill / "SKILL.md").is_file())
+        self.assertEqual((self.profile / "plugins" / "fleet-hooks.js").read_text(),
+                         (REPO / "plugins" / "fleet-hooks" / "index.js").read_text())
+        self.assertEqual(json.loads((self.profile / "cli.json").read_text())["plugins"], ["./fleet-decisions"])
+        self.assertTrue((self.profile / "fleet-decisions" / "tui.tsx").is_file())
+        self.assertIn(str(self.home / "xdg-data" / "fleet-switchboard" / "skills"),
+                      json.loads((self.profile / "opencode.json").read_text())["skills"]["paths"])
+        self.assertTrue(self.service_path().is_file())
 
-    def edit(self, old, new, text=GOOD_PLAN):
-        self.assertIn(old, text)
-        return text.replace(old, new, 1)
+    def test_the_wrapper_sets_the_plugins_environment_and_holds_no_secret(self):
+        os.environ["OPENROUTER_API_KEY"] = PR16_KEY
+        self.full()
+        text = self.wrapper.read_text()
+        for needle in ("FLEET_SWITCHBOARD_BIN=", "FLEET_SWITCHBOARD_SHIMS=", "FLEET_SWITCHBOARD_STATE=", "exec "):
+            self.assertIn(needle, text)
+        self.assertIn(self.machine.binary, text)
+        self.assertNotIn(PR16_KEY, text)
 
-    def test_the_good_plan_passes_with_a_hash_and_no_defect(self):
-        got = self.check()
-        self.assertEqual((got["result"], got["defects"], got["scenarios"], len(got["clauses"])), ("pass", [], 3, 2))
-        self.assertRegex(got["scenario_hash"], r"^sha256:[0-9a-f]{64}$")
-        self.assertRegex(got["plan_hash"], r"^sha256:[0-9a-f]{64}$")
+    def test_a_second_run_changes_nothing_and_every_step_says_already_done(self):
+        self.full()
+        before, calls = tree_of(self.home), len(self.machine.calls)
+        out, error = self.full()
+        self.assertIsNone(error)
+        steps = self.statuses(out)
+        for name, words in steps.items():
+            if name != "daemon":
+                self.assertEqual(words, ["already done"], "%s on the second run:\n%s" % (name, out))
+        self.assertEqual(tree_of(self.home), before)
+        mutating = [c for c in self.machine.calls[calls:] if c[:3] in (["herdr", "plugin", "link"],) or c[:2] == ["launchctl", "bootstrap"]]
+        self.assertEqual(mutating, [])
 
-    def warn_codes(self, text):
-        return [(w["id"], w["code"]) for w in self.check(text)["warnings"] if w["code"] == "live-no-claim"]
+    def test_dry_run_prints_every_step_and_writes_nothing(self):
+        before = tree_of(self.home)
+        out, error = self.full("--dry-run")
+        self.assertIsNone(error)
+        self.assertEqual(tree_of(self.home), before)
+        steps = self.statuses(out)
+        for name in ("opencode v2", "config", "wrapper", "agents", "skills", "skills path", "fleet-hooks plugin",
+                     "decisions plugin", "todolist plugin", "herdr plugin", "service"):
+            self.assertIn(name, steps, name)
+        self.assertEqual(steps["todolist plugin"], ["would be done"])
+        self.assertFalse((self.profile / "opencode-todolist").exists())
+        self.assertEqual(steps["config"], ["would be done"])
+        run = [c for c in self.machine.calls if c[:3] == ["herdr", "plugin", "link"] or c[0] in ("launchctl",) and c[1] != "print"]
+        self.assertEqual(run, [], "a dry run starts and loads nothing")
+        self.assertEqual(self.daemons.spawned, [])
 
-    def test_a_live_or_tester_scenario_with_no_claim_warns_and_never_fails_or_changes_the_hash(self):
-        got = self.check()
-        self.assertEqual(got["result"], "pass")
-        self.assertEqual(self.warn_codes(GOOD_PLAN), [("S2", "live-no-claim")])
-        message = [w["message"] for w in self.check(GOOD_PLAN)["warnings"] if w["code"] == "live-no-claim"][0]
-        self.assertIn("`claim: epic`", message)
-        self.assertIn("`claim: pr`", message)
-        self.assertNotIn("is claimed by", message)
-        tester = self.edit("    proof: live\n", "    proof: measure\n")
-        self.assertEqual(self.warn_codes(tester), [("S2", "live-no-claim")], "evaluator tester alone warns")
-        live = self.edit("    evaluator: tester", "    evaluator: owner")
-        self.assertEqual(self.warn_codes(live), [("S2", "live-no-claim")], "proof live alone warns")
-        claimed = self.edit("    evaluator: tester", "    evaluator: tester\n    claim: epic")
-        self.assertEqual(self.warn_codes(claimed), [])
-        self.assertEqual(self.check(claimed)["result"], "pass")
-        self.assertEqual(self.warn_codes(self.edit("    evaluator: tester", "    evaluator: tester\n    claim: pr")), [])
-        same = self.check(GOOD_PLAN)["plan_hash"]
-        self.assertEqual(same, got["plan_hash"])
-        self.assertEqual(same, "sha256:2ad49344a1bf3ea7fc5ceeef6f60013e02fa465dc04da8a3b5b389a82b686cdb", "the hash the checker gave this plan before the warning existed")
-        self.assertEqual([w["code"] for w in got["warnings"] if w["code"] != "live-no-claim"], ["no-constraint-list"])
+    def test_dry_run_on_an_installed_machine_says_already_done(self):
+        self.full()
+        out, _ = self.full("--dry-run")
+        for name, words in self.statuses(out).items():
+            if name != "daemon":
+                self.assertEqual(words, ["already done"], name)
 
-    def test_the_template_marks_every_stub_with_a_ready_claim_line_and_a_live_one_for_live_or_tester(self):
-        lines = sb.plan_check.template(["one thing", "another"])
-        want = "    # claim: epic   # " + sb.plan_check.CLAIM_WHY
-        self.assertEqual(lines.count(want), 3, "one per stub: two clauses and the unchanged one")
-        self.assertFalse([l for l in lines if l.strip().startswith("claim:")], "a test/ci stub is never claimed epic")
-        for proof, evaluator in (("live", "tester"), ("test", "tester"), ("live", "ci")):
-            self.assertEqual(sb.plan_check.claim_lines(proof, evaluator), ["    claim: epic   # " + sb.plan_check.CLAIM_WHY])
-        self.assertEqual(sb.plan_check.claim_lines("test", "ci"), [want])
+    def test_uninstall_reverses_the_pieces_the_link_and_the_service_and_leaves_the_rest(self):
+        self.full()
+        self.config_file.write_text(self.config_file.read_text())
+        (self.state_dir / "audit.jsonl").write_text("{}\n")
+        out, error = self.install("--uninstall")
+        self.assertIsNone(error)
+        self.assertFalse(self.service_path().exists())
+        self.assertFalse(self.machine.linked)
+        self.assertFalse(self.machine.loaded)
+        for name in sb.KIT_AGENTS:
+            self.assertFalse((self.profile / "agents" / (name + ".md")).exists())
+        self.assertFalse((self.profile / "plugins" / "fleet-hooks.js").exists())
+        self.assertFalse((self.profile / "fleet-decisions").exists())
+        self.assertFalse((self.profile / "cli.json").exists())
+        self.assertFalse((self.profile / "opencode.json").exists())
+        self.assertFalse((self.home / "xdg-data" / "fleet-switchboard" / "skills").exists())
+        self.assertFalse(self.wrapper.exists())
+        self.assertTrue(self.config_file.exists(), "config is left alone")
+        self.assertTrue((self.state_dir / "audit.jsonl").exists(), "state is left alone")
+        again, _ = self.install("--uninstall")
+        for name, words in self.statuses(again).items():
+            self.assertNotEqual(words, ["done"], "a second uninstall finds nothing to do: %s" % name)
 
-    def test_the_brief_template_carries_the_plan_posted_report_line_once(self):
-        text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
-        self.assertEqual(text.count("working: plan posted <hash> <url>"), 1)
+    def test_a_dry_run_of_uninstall_says_what_it_would_remove_and_removes_nothing(self):
+        self.full()
+        before, calls = tree_of(self.home), len(self.machine.calls)
+        out, error = self.install("--uninstall", "--dry-run")
+        self.assertIsNone(error)
+        self.assertEqual(tree_of(self.home), before)
+        self.assertTrue(self.machine.linked and self.machine.loaded)
+        self.assertEqual([c for c in self.machine.calls[calls:] if c[:3] == ["herdr", "plugin", "unlink"]
+                          or c[:2] == ["launchctl", "bootout"]], [])
+        steps = self.statuses(out)
+        for name in ("agents", "skills", "fleet-hooks plugin", "decisions plugin", "todolist plugin", "wrapper", "service"):
+            self.assertEqual(steps[name][-1], "would be done", name)
 
-    def test_clauses_are_the_numbered_parts_and_a_plain_line_is_one(self):
-        c = sb.plan_check.clauses_of
-        self.assertEqual(c("(1) one thing; (2) another (see (3) below)"), ["one thing", "another (see (3) below)"])
-        self.assertEqual(c("(1) a; (2) b; (3) c"), ["a", "b", "c"])
-        self.assertEqual(len(c("(1) a :( ; (2) b ; (3) c")), 3, "an unbalanced ( in a clause does not hide the next marker")
-        self.assertEqual(len(c("(1) a (b ; (2) c ; (3) d ) ; (4) e")), 4)
-        self.assertEqual(c("just one sentence, no numbers"), ["just one sentence, no numbers"])
-        self.assertEqual(c("(2) starts at two"), ["(2) starts at two"])
-        self.assertEqual(c(""), [])
-        self.assertEqual(c(None), [])
+    def test_uninstall_keeps_what_the_user_added_or_edited(self):
+        self.full()
+        (self.profile / "cli.json").write_text(json.dumps({"plugins": ["./fleet-decisions", "./mine"], "theme": "x"}))
+        (self.profile / "agents" / "coder.md").write_text("my own coder\n")
+        (self.profile / "opencode.json").write_text(json.dumps(
+            {"model": "m", "provider": {"p": 1}, "skills": {"paths": [str(self.home / "xdg-data" / "fleet-switchboard" / "skills"), "/mine"]}}))
+        self.install("--uninstall")
+        self.assertEqual(json.loads((self.profile / "cli.json").read_text()), {"plugins": ["./mine"], "theme": "x"})
+        self.assertEqual((self.profile / "agents" / "coder.md").read_text(), "my own coder\n")
+        self.assertEqual(json.loads((self.profile / "opencode.json").read_text()),
+                         {"model": "m", "provider": {"p": 1}, "skills": {"paths": ["/mine"]}})
 
-    def test_a_vague_pass_rule_fails_and_a_concrete_one_passes(self):
-        for vague in ("works", "it works", "ok", "non-empty", "passes", "Works.", "no errors", "short one",
-                      "it works for 1 user", "works correctly after the change is applied", "output matches the expectations",
-                      "'works'", '"works"', "result = ok and everything fine", "after the change, 1 thing is fine"):
-            with self.subTest(vague=vague):
-                self.assertIn("vague-pass", self.codes(self.edit('pass: the list call returns status 200 and exactly 1 agent named "alpha"',
-                                                              "pass: %s" % vague)))
-        for concrete in ("the exit code is 0 after the run finishes", "the page shows the word 'Ready' after loading",
-                         "the count is greater than 0 in the result", "latency stays under 200 ms at p95"):
-            with self.subTest(concrete=concrete):
-                self.assertEqual(self.codes(self.edit('pass: the list call returns status 200 and exactly 1 agent named "alpha"',
-                                                      "pass: %s" % concrete)), [])
-        self.assertIn("vague-pass", self.codes(self.edit('pass: the list call returns status 200 and exactly 1 agent named "alpha"',
-                                                         "pass: the thing behaves nicely for the user overall")))
+    def test_the_users_config_keys_keep_their_values_and_their_order(self):
+        mine = '{\n  "poll_seconds": 7,\n  "herdr": "herdr",\n  "jev": {"model": "mine/model"},\n  "github_repos": ["acme/api"]\n}\n'
+        self.write_config(mine)
+        self.full()
+        config = json.loads(self.config_file.read_text(), object_pairs_hook=list)
+        self.assertEqual([k for k, _ in config][:4], ["poll_seconds", "herdr", "jev", "github_repos"])
+        found = dict(config)
+        self.assertEqual((found["poll_seconds"], found["jev"], found["github_repos"]),
+                         (7, [("model", "mine/model")], ["acme/api"]))
+        self.assertIn("opencode", found)
 
-    def test_a_missing_or_vacuous_discriminator_fails(self):
-        base = "discriminates: a build that creates nothing returns an empty list and fails"
-        for new in ("discriminates: n/a", "discriminates: none", "discriminates: tbd", "discriminates: short",
-                    'discriminates: the list call returns status 200 and exactly 1 agent named "alpha"',
-                    "discriminates: a wrong build would fail this", "discriminates: this would fail if it is wrong",
-                    "discriminates: the list call gives status 200 and exactly one agent named alpha",
-                    "discriminates: the scenario checks that things are right"):
-            with self.subTest(new=new):
-                self.assertIn("no-discriminator", self.codes(self.edit(base, new)))
-        self.assertIn("missing-discriminates", self.codes(self.edit("    " + base + "\n", "")))
+    def test_a_config_with_every_key_is_not_rewritten(self):
+        self.full()
+        mtime = self.config_file.stat().st_mtime_ns
+        text = self.config_file.read_text()
+        time.sleep(0.01)
+        self.full()
+        self.assertEqual((self.config_file.read_text(), self.config_file.stat().st_mtime_ns), (text, mtime))
 
-    def test_each_required_key_is_required(self):
-        clauses = sb.plan_check.clauses_of(GOOD_DONE_WHEN)
-        for key in sb.plan_check.REQUIRED:
-            with self.subTest(key=key):
-                scenarios = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(GOOD_PLAN))
-                del scenarios[1][key]
-                defects, _ = sb.plan_check.validate(scenarios, clauses, GOOD_PLAN)
-                self.assertIn("missing-%s" % key, [d["code"] for d in defects])
-        scenarios = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(GOOD_PLAN))
-        scenarios[1]["text"] = "   "
-        self.assertIn("missing-text", [d["code"] for d in sb.plan_check.validate(scenarios, clauses, GOOD_PLAN)[0]])
+    def test_an_invalid_config_is_refused_and_not_overwritten(self):
+        self.write_config("{not json")
+        out, error = self.full()
+        self.assertIn("config", error)
+        self.assertEqual(self.config_file.read_text(), "{not json")
 
-    def test_id_pattern_and_uniqueness(self):
-        self.assertIn("bad-id", self.codes(self.edit("id: S2", "id: X2")))
-        self.assertIn("bad-id", self.codes(self.edit("id: S2", "id: S")))
-        self.assertIn("duplicate-id", self.codes(self.edit("id: S2", "id: S1")))
-        self.assertEqual(self.codes(self.edit("id: S2", "id: S12")), [])
+    def test_a_v1_binary_is_refused_with_how_to_get_v2_and_nothing_is_written(self):
+        self.machine.version = "1.4.2"
+        before = tree_of(self.home)
+        out, error = self.full()
+        self.assertIn("v1", error)
+        self.assertIn("npm install --prefix", error)
+        self.assertIn("%s@%s" % (sb.V2_PACKAGE, sb.V2_VERSION), error)
+        self.assertEqual(tree_of(self.home), before)
 
-    def test_covers_pattern_and_range(self):
-        self.assertIn("bad-covers", self.codes(self.edit("covers: DW-2", "covers: 2")))
-        self.assertIn("bad-covers", self.codes(self.edit("covers: DW-2", "covers: DW-1, DW-2")))
-        self.assertIn("covers-unknown-clause", self.codes(self.edit("covers: PC-1", "covers: DW-9")))
-        self.assertEqual(self.codes(self.edit("covers: PC-1", "covers: PC-7")), [])
+    def test_a_bare_name_and_a_missing_binary_are_refused(self):
+        out, error = self.install("--opencode", "opencode")
+        self.assertIn("absolute", error)
+        out, error = self.install("--opencode", str(self.home / "nowhere" / "opencode"))
+        self.assertIn("no OpenCode v2 found", error)
 
-    def test_unknown_keys_are_rejected_and_the_optional_ones_allowed(self):
-        self.assertIn("unknown-key", self.codes(self.edit("    evaluator: tester", "    evaluator: tester\n    owner: me")))
-        self.assertEqual(self.codes(self.edit("    evaluator: tester", "    evaluator: tester\n    slice: one\n    phase: shadow\n    claim: epic")), [])
+    def test_the_binary_may_be_found_in_a_known_place(self):
+        known = self.home / "xdg-data" / "fleet-switchboard" / "v2" / "node_modules" / "@opencode" / "cli" / "bin" / "opencode.exe"
+        known.parent.mkdir(parents=True)
+        known.write_text("#!/bin/sh\n")
+        self.machine.binary = str(known)
+        out, error = self.install()
+        self.assertIsNone(error, error)
+        self.assertEqual(json.loads(self.config_file.read_text())["opencode_executable"], str(known))
 
-    def test_proof_evaluator_and_claim_values_and_consistency(self):
-        self.assertIn("bad-proof", self.codes(self.edit("proof: live", "proof: manual")))
-        self.assertIn("bad-evaluator", self.codes(self.edit("evaluator: tester", "evaluator: bob")))
-        self.assertIn("bad-claim", self.codes(self.edit("evaluator: tester", "evaluator: tester\n    claim: both")))
-        for proof, evaluator, ok in (("test", "ci", True), ("test", "tester", False), ("test", "owner", False),
-                                     ("screenshot", "reviewer", True), ("screenshot", "owner", True),
-                                     ("screenshot", "ci", False), ("live", "tester", True), ("live", "owner", True),
-                                     ("live", "ci", False), ("live", "reviewer", False), ("measure", "tester", True),
-                                     ("measure", "reviewer", False)):
-            with self.subTest(proof=proof, evaluator=evaluator):
-                text = self.edit("proof: live", "proof: %s" % proof).replace("evaluator: tester", "evaluator: %s" % evaluator, 1)
-                self.assertEqual("evaluator-mismatch" in self.codes(text), not ok)
+    def test_the_flags_skip_the_service_and_the_link_and_say_so(self):
+        out, error = self.full("--no-service", "--no-herdr-link")
+        steps = self.statuses(out)
+        self.assertEqual(steps["service"], ["skipped (--no-service)"])
+        self.assertEqual(steps["herdr plugin"], ["skipped (--no-herdr-link)"])
+        self.assertFalse(self.service_path().exists())
+        self.assertEqual([c for c in self.machine.calls if c[:3] == ["herdr", "plugin", "link"]], [])
+        self.assertEqual(self.machine.commands("launchctl"), [])
 
-    def test_the_old_personal_evaluator_name_is_an_alias_of_owner_and_does_not_change_the_hash(self):
-        base = self.check()
-        old = self.check(self.edit("evaluator: tester", "evaluator: adam"))
-        new = self.check(self.edit("evaluator: tester", "evaluator: owner"))
-        self.assertEqual((old["result"], new["result"]), ("pass", "pass"))
-        self.assertEqual([w["code"] for w in old["warnings"] if w["code"] == "evaluator-alias"], ["evaluator-alias"])
-        self.assertEqual([w for w in new["warnings"] if w["code"] == "evaluator-alias"], [])
-        self.assertNotEqual(old["scenario_hash"], new["scenario_hash"], "the hash covers the text as written")
-        self.assertIn("evaluator-mismatch", self.codes(self.edit("proof: live", "proof: test").replace("evaluator: tester", "evaluator: adam", 1)))
+    def test_the_link_says_exactly_what_it_will_do_before_it_does_it(self):
+        out, error = self.full()
+        text = out[out.index("herdr plugin"):]
+        for needle in ("plugin link", str(REPO / "herdr"), "every pane", "ensure", "poke", "unlink"):
+            self.assertIn(needle, text)
+        self.assertLess(out.index("every pane"), out.index("done linked"), "the notice comes before the act")
 
-    def test_every_done_when_clause_must_be_covered_by_an_s_scenario(self):
-        self.assertIn("uncovered-clause", self.codes(self.edit("covers: DW-2", "covers: PC-2")))
-        self.assertEqual(self.codes(GOOD_PLAN, "(1) one; (2) two; (3) three").count("uncovered-clause"), 1)
-        self.assertIn("uncovered-clause", self.codes(self.edit("id: S2", "id: U2")))  # a U scenario does not cover a clause
-        self.assertIn("no-done-when", self.codes(GOOD_PLAN, ""))
+    def test_a_failed_link_stops_the_install_naming_why(self):
+        self.machine.fail = {"plugin link": 1}
+        out, error = self.full()
+        self.assertIn("plugin link", error)
+        self.assertEqual(self.machine.commands("launchctl"), [])
 
-    def test_a_refused_evaluator_names_the_evaluators_that_fit_the_proof(self):
-        for proof, evaluator, fitting in (("test", "reviewer", "ci"), ("live", "ci", "tester or owner"),
-                                          ("measure", "ci", "tester or owner"), ("screenshot", "ci", "reviewer or owner")):
-            with self.subTest(proof=proof):
-                text = self.edit("proof: live", "proof: %s" % proof).replace("evaluator: tester", "evaluator: %s" % evaluator, 1)
-                got = self.check(text)
-                self.assertEqual(got["result"], "fail")
-                messages = [d["message"] for d in got["defects"] if d["code"] == "evaluator-mismatch"]
-                self.assertEqual(len(messages), 1)
-                self.assertTrue(messages[0].endswith("the evaluator that fits proof %s is %s" % (proof, fitting)), messages[0])
+    def test_no_secret_is_printed_or_written_anywhere_but_the_key_file(self):
+        os.environ["OPENROUTER_API_KEY"] = PR16_KEY
+        out, error = self.full()
+        self.assertNotIn(PR16_KEY, out + str(error))
+        for path, content in tree_of(self.home).items():
+            if content is not None:
+                self.assertNotIn(PR16_KEY.encode(), content, path)
+        for call in self.machine.calls:
+            self.assertNotIn(PR16_KEY, " ".join(call))
 
-    def test_the_no_done_when_message_names_the_intent_heading(self):
-        got = self.check(GOOD_PLAN, "")
-        messages = [d["message"] for d in got["defects"] if d["code"] == "no-done-when"]
-        self.assertEqual(got["result"], "fail")
-        self.assertEqual(len(messages), 1)
-        self.assertIn("## Intent", messages[0])
-        self.assertIn("Done when:", messages[0])
+    def test_the_last_step_runs_ensure_and_then_status(self):
+        out, error = self.full(status="THE STATUS\n")
+        self.assertEqual(len(self.daemons.spawned), 1)
+        self.assertTrue(out.rstrip().endswith("THE STATUS"))
 
-    def test_the_skills_carry_the_paper_cut_lines(self):
-        skills = REPO / "skills"
-        coordination = (skills / "fleet-coordination" / "SKILL.md").read_text()
-        block = coordination.split("a push voids proofs):\n\n```text\n", 1)[1].split("```", 1)[0].strip("\n").splitlines()
-        self.assertEqual(len(block), 2)
-        self.assertIn("test_the_role_files_do_not_grow", block[0])
-        self.assertIn("TestHygiene", block[1])
-        planning = (skills / "fleet-planning" / "SKILL.md").read_text()
-        self.assertEqual(planning.count("`## Intent` before `Done when:`"), 1)
-        review = (skills / "fleet-review" / "SKILL.md").read_text()
-        lines = [l for l in review.splitlines() if l.startswith("In a repository with no review laws installed, the ORCHESTRATOR")]
-        self.assertEqual(len(lines), 1)
-        self.assertIn("independent review", review.split(lines[0], 1)[1].split("\n\n", 1)[0])
+    def test_the_real_status_after_an_install_names_the_missing_key_first(self):
+        out = io.StringIO()
+        installer = sb.Installer(self.machine, self.daemons, time.time, "darwin", REPO, out=out)
+        installer.install(self.machine.binary)
+        self.assertIn(PR16_NOTICE, out.getvalue())
+        self.assertLess(out.getvalue().index(PR16_NOTICE), out.getvalue().index("fleet-switchboard 0.1.0"))
+        self.assertIn("service    installed", out.getvalue())
 
-    def test_the_mutation_run_rule_is_said_once_in_each_skill_and_in_no_reviewer_definition(self):
-        words = ("mutation or fault-injection check", "fleet-switchboard heavy", "time limit", "process group", "background", "never a reviewer")
-        for skill in ("fleet-review", "fleet-coordination"):
-            text = " ".join((REPO / "skills" / skill / "SKILL.md").read_text().split())
-            with self.subTest(skill=skill):
-                self.assertEqual(text.count("An agent that is asked to run a mutation or fault-injection check"), 1)
-                sentence = text.split("An agent that is asked to run a mutation or fault-injection check", 1)[1].split("can loop.", 1)[0]
-                for word in words[1:] + ("named job", "job record", "the job-start rule"):
-                    self.assertIn(word, sentence)
-                for old in ("never runs in the background without one", "never leaves one running in the background"):
-                    self.assertEqual(text.count(old), 0)
-        definitions = sorted((REPO / "agents" / "reviewers").glob("*.md"))
-        self.assertEqual(len(definitions), 5)
-        for path in definitions:
-            with self.subTest(definition=path.name):
-                self.assertNotIn("fault-injection", path.read_text().lower())
-
-    def test_a_plan_that_opts_in_needs_a_size_in_agent_time_and_one_that_does_not_is_left_alone(self):
-        self.assertEqual(self.codes(GOOD_PLAN), [], "a plan written before the rule has no plan-format line and is not flagged")
-        self.assertEqual(self.codes("plan-format: 1\n" + GOOD_PLAN), [])
-        self.assertEqual(self.codes("plan-format: 2\nsize: S\n" + GOOD_PLAN), [], "a light plan may carry just `size: S`")
-        self.assertIn("missing-size", self.codes("plan-format: 2\n" + GOOD_PLAN))
-        for valid in ("S", "M: a few hours, one file and a test", "L: about a day, three areas", "XL: several days, five areas and a migration", "xl, 3 days"):
-            with self.subTest(valid=valid):
-                self.assertEqual(self.codes("plan-format: 2\nsize: %s\n%s" % (valid, GOOD_PLAN)), [])
-
-    def test_the_skill_and_the_template_state_the_size_rule_and_the_opt_in(self):
-        for path in (REPO / "skills" / "fleet-planning" / "SKILL.md", REPO / "docs" / "plan-template.md"):
-            text = path.read_text()
-            with self.subTest(path=path.name):
-                for phrase in ("t-shirt", "agent time", "plan-format: 2", "size: s"):
-                    self.assertIn(phrase, text.lower())
-                self.assertRegex(text, r"never (?:prefers|human-days)")
-
-    def test_the_opt_in_line_is_bounded_read_with_bold_keys_and_applies_from_format_2_up(self):
-        self.assertIn("missing-size", self.codes("plan-format: 3\n" + GOOD_PLAN))
-        self.assertEqual(self.codes("plan-format: 2\n**size:** S\n" + GOOD_PLAN), [])
-        self.assertEqual(self.codes("**plan-format:** 2\nsize: S\n" + GOOD_PLAN), [])
-        self.assertEqual(self.codes("plan-format: " + "9" * 5000 + "\n" + GOOD_PLAN), [], "a huge number is not read, and does not crash the checker")
-        self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: S, 1 week\n" + GOOD_PLAN))
-        self.assertIn("size-in-days", self.codes("plan-format: 2\nsize: M, 2 wk\n" + GOOD_PLAN))
-
-    def test_prose_that_starts_with_size_does_not_hide_the_real_line_and_a_code_fence_is_not_the_plan(self):
-        prose = "Size: one PR, a few files\n"
-        self.assertEqual(self.codes("plan-format: 2\n" + prose + "size: M\n" + GOOD_PLAN), [], "the repro: prose before the real line")
-        self.assertEqual(self.codes("plan-format: 2\nsize: M: a few hours\n" + prose + GOOD_PLAN), [])
-        self.assertIn("bad-size", self.codes("plan-format: 2\n" + prose + GOOD_PLAN), "only prose: the defect shows")
-        fenced = "```text\nplan-format: 2\nsize: huge\n```\n"
-        self.assertEqual(self.codes(fenced + GOOD_PLAN), [], "an example in a fence does not opt a plan in")
-        self.assertIn("missing-size", self.codes("plan-format: 2\n" + fenced + GOOD_PLAN), "an example size in a fence is not the plan's size")
-        self.assertEqual(self.codes("plan-format: 2\n~~~\nsize: huge\n~~~\nsize: S\n" + GOOD_PLAN), [])
-
-    def test_a_size_in_days_is_refused_for_work_under_l_and_human_time_always(self):
-        for bad, code in (("M, 3 days", "size-in-days"), ("S: 1 day", "size-in-days"), ("m (2-3 days)", "size-in-days"), ("S, two days", "size-in-days"),
-                          ("L, 2 human-days", "size-in-days"), ("XL: 4 person-days", "size-in-days"), ("big", "bad-size"), ("3 days", "bad-size")):
-            with self.subTest(bad=bad):
-                self.assertEqual(self.codes("plan-format: 2\nsize: %s\n%s" % (bad, GOOD_PLAN)), [code])
-        self.assertEqual(self.codes("size: M, 3 days\n" + GOOD_PLAN), [], "without the opt-in line the size is not read at all")
-
-    def test_an_unchanged_scenario_is_needed_unless_the_plan_says_why_not(self):
-        scen = GOOD_PLAN[:GOOD_PLAN.index("  - id: U1")] + "```\n"
-        self.assertIn("no-unchanged-scenario", self.codes(scen))
-        self.assertEqual(self.codes(scen + "\nunchanged: none because this is a brand new endpoint with no callers\n"), [])
-        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because\n"))
-        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because x\n"))
-        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because n/a ok\n"))
-        self.assertIn("no-unchanged-scenario", self.codes(scen + "\nunchanged: none because short reason\n"))
-
-    def test_more_than_thirty_scenarios_warns_but_does_not_fail(self):
-        extra = "".join("  - id: S%d\n    covers: PC-1\n    text: Another behaviour of the system under test\n"
-                        "    proof: test\n    pass: the call returns status 200 and the count is %d\n"
-                        "    discriminates: a build that ignores the input fails the count\n    evaluator: ci\n" % (n, n)
-                        for n in range(10, 40))
-        text = GOOD_PLAN.replace("  - id: U1", extra + "  - id: U1", 1)
-        got = self.check(text)
-        self.assertEqual((got["result"], got["scenarios"]), ("pass", 33))
-        self.assertEqual(sorted(w["code"] for w in got["warnings"]), ["live-no-claim", "many-scenarios", "no-constraint-list"])
-
-    def test_the_hash_ignores_whitespace_comments_quoting_order_and_defaults_but_not_content(self):
-        base = self.check()["scenario_hash"]
-        spaced = GOOD_PLAN.replace("    proof: test", "    proof:   test   # note").replace("evaluator: ci", "evaluator: 'ci'  ")
-        self.assertEqual(self.check(spaced)["scenario_hash"], base)
-        explicit = GOOD_PLAN.replace("evaluator: ci", "evaluator: ci\n    claim: pr")
-        self.assertEqual(self.check(explicit)["scenario_hash"], base, "claim: pr is the default")
-        scen = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(GOOD_PLAN))
-        clauses = sb.plan_check.clauses_of(GOOD_DONE_WHEN)
-        self.assertEqual(sb.plan_check.content_hash(list(reversed(scen)), clauses, GOOD_PLAN), base, "order is not content")
-        for old, new in (("exactly 1 agent", "exactly 2 agents"), ("evaluator: tester", "evaluator: owner"),
-                         ("proof: live", "proof: measure")):
-            with self.subTest(change=new):
-                self.assertNotEqual(self.check(self.edit(old, new))["scenario_hash"], base)
-        self.assertNotEqual(self.check(GOOD_PLAN, "(1) an owner can commission an agent; (2) it answers a chat reply.")["scenario_hash"], base)
-
-    def test_the_hash_is_the_same_for_the_same_plan_on_every_call(self):
-        self.assertEqual(self.check()["scenario_hash"], self.check()["scenario_hash"])
+    def test_the_cli_runs_install_and_returns_its_exit_code(self):
+        os.environ["XDG_DATA_HOME"] = str(self.home / "xdg-data")
+        with captured() as (out, err):
+            code = sb.main(["install", "--opencode", self.machine.binary, "--no-service", "--no-herdr-link", "--dry-run"],
+                           runner=self.machine, now=time.time, spawn=self.daemons)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("would be done", out.getvalue())
+        with captured() as (out, err):
+            code = sb.main(["install", "--opencode", "bare"], runner=self.machine, now=time.time, spawn=self.daemons)
+        self.assertEqual(code, 1)
+        self.assertIn("absolute", err.getvalue())
 
 
 class TestInstallPrivateProfile(InstallCase):
@@ -1883,151 +1840,6 @@ class TestInstallPrivateProfile(InstallCase):
         self.assertTrue(callable(sb.ensure_home_link) and callable(sb.herdr_integration_status))
 
 
-class TestExternalAdapterOperations(ExternalAdapterCase):
-    def each_channel(self):
-        for channel in ("tool", "http"):
-            self.setUp()
-            yield channel
-            self.server.close()
-
-    def test_raise_maps_the_decision_over_both_channels(self):
-        for channel in self.each_channel():
-            adapter = self.adapter(channel)
-            ident = self.push(adapter, self.decision(), "decision-key-1")
-            sent = [a for c, o, a in self.server.requests if o == "raise"][0]
-            self.assertEqual(self.server.log[-1], (channel, "raise"))
-            self.assertEqual(sent["label"], "routine", channel)
-            self.assertEqual(sent["floor"], "minor")
-            self.assertEqual(sent["seat"], "seat-1")
-            self.assertEqual(sent["body"], "Ship it?\n\nThe build is green.\n\nref: dk:decision-key-1")
-            self.assertEqual(sent["advice"], "yes")
-            self.assertEqual(sent["choices"], [{"name": "approve", "key": "c1"},
-                                               {"name": "hold", "price": "a day", "key": "c2"}])
-            self.assertEqual(str(uuid.UUID(sent["op_id"])), sent["op_id"])
-            self.assertEqual(self.server.items[ident]["floor"], "minor")
-
-    def test_the_floor_follows_the_tier_and_a_hint_may_only_raise_it(self):
-        adapter = self.adapter("http")
-        for tier, hint, floor in (("orchestrator", None, "minor"), ("cos", None, "major"), ("human", None, "sealed"),
-                                  ("orchestrator", "moderate", "middling"), ("cos", "low", "major")):
-            self.push(adapter, self.decision(tier=tier, consequence=hint), "k-%s-%s" % (tier, hint))
-            self.assertEqual(self.server.requests[-1][2]["floor"], floor)
-        with self.assertRaises(EA.InvalidRequest):
-            self.push(adapter, self.decision(tier="nobody"), "k-x")
-
-    def test_options_with_their_own_ids_and_optional_fields(self):
-        adapter = self.adapter("tool")
-        self.push(adapter, self.decision(options=[{"label": "a", "id": "mine-1", "recommended": True}],
-                                   grounds="g", stakes="s", evidence=[{"text": "t", "link": "http://127.0.0.1/e"}]),
-                     "k-o")
-        sent = self.server.requests[-1][2]
-        self.assertEqual(sent["choices"], [{"name": "a", "preferred": True, "key": "mine-1"}])
-        self.assertEqual((sent["because"], sent["stakes"]), ("g", "s"))
-        self.assertEqual(sent["refs"], [{"note": "t", "href": "http://127.0.0.1/e"}])
-
-    def test_a_recommendation_is_required_or_defaulted(self):
-        adapter = self.adapter("http")
-        self.push(adapter, self.decision(recommendation=None), "k-d")
-        self.assertEqual(self.server.requests[-1][2]["advice"], "proceed")
-        data = fake_mapping(self.server.url, "http")
-        data.pop("defaults")
-        bare = EA.McpRestAdapter(data, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
-        with self.assertRaises(EA.InvalidRequest):
-            self.push(bare, self.decision(recommendation=None), "k-e")
-
-    def test_revise_withdraw_and_acted_over_both_channels(self):
-        for channel in self.each_channel():
-            adapter = self.adapter(channel)
-            ident = self.push(adapter, self.decision(), "k-1")
-            self.assertEqual(self.push(adapter, {"op": "revise", "external_id": ident, "body": "new words"}, "k-r"), ident)
-            self.assertEqual(self.server.items[ident]["body"], "new words\n\nref: dk:k-r")
-            self.assertEqual(self.server.log[-1], (channel, "revise"))
-            self.server.items[ident]["answer"] = {"answer_id": "a-1"}
-            self.assertEqual(adapter.acted(ident, "a-1", "done", "did it", "k-a"), ident)
-            self.assertEqual(self.server.requests[-1][2]["result"], "did")
-            with self.assertRaises(EA.Conflict):
-                adapter.acted(ident, "not-an-answer", "done")
-            second = self.push(adapter, self.decision(), "k-2")
-            self.push(adapter, {"external_id": second, "status": "withdrawn", "reason": "gone"}, "k-w")
-            self.assertEqual(self.server.items[second]["withdrawn"], {"why": "gone"})
-            self.assertEqual(self.server.log[-1], (channel, "withdraw"))
-            self.push(adapter, {"op": "withdraw", "external_id": second}, "k-w")  # idempotent
-
-    def test_revise_and_withdraw_after_a_decision_are_refused(self):
-        adapter = self.adapter("tool")
-        ident = self.push(adapter, self.decision(), "k-1")
-        self.server.items[ident].update(state="closed", answer={"answer_id": "a-1"})
-        with self.assertRaises(EA.AlreadyDecided):
-            self.push(adapter, {"op": "revise", "external_id": ident, "body": "late"}, "k-r")
-        with self.assertRaises(EA.AlreadyDecided):
-            self.push(adapter, {"op": "withdraw", "external_id": ident}, "k-w")
-        with self.assertRaises(EA.InvalidRequest):
-            self.push(adapter, {"op": "revise", "external_id": ident}, "k-r2")
-
-    def test_status_without_a_mapping_for_it_is_a_local_only_no_op_not_an_error(self):
-        adapter = self.adapter()
-        self.assertNotIn("status", adapter.capabilities)
-        before = len(self.server.log)
-        self.assertEqual(self.push(adapter, {"op": "status", "external_id": "x", "status": "s"}, "k"), "x")
-        self.assertEqual(len(self.server.log), before, "nothing was sent: the engine must not retry it forever")
-
-    def test_idempotent_replay_and_conflict(self):
-        for channel in self.each_channel():
-            adapter = self.adapter(channel)
-            first = self.push(adapter, self.decision(), "same-key")
-            self.assertEqual(self.push(adapter, self.decision(), "same-key"), first)
-            self.assertEqual(len(self.server.items), 1)
-            with self.assertRaises(EA.Conflict):
-                self.push(adapter, self.decision(body="a different body"), "same-key")
-            other = self.push(adapter, self.decision(), "another-key")
-            self.assertNotEqual(other, first)
-            # a key that already is a UUID is kept as it is
-            ident = str(uuid.uuid4())
-            self.push(adapter, self.decision(), ident)
-            self.assertEqual(self.server.requests[-1][2]["op_id"], ident)
-
-    def test_lookup_finds_an_item_by_its_decision_key(self):
-        adapter = self.adapter("http")
-        first = self.push(adapter, self.decision(), "k-1")
-        self.assertEqual(adapter.lookup("dk:k-1"), {"external_id": first, "revision": 1})
-        self.assertIsNone(adapter.lookup("dk:never-raised"))
-        self.assertIsNone(adapter.lookup("dk:k"))  # a prefix of a key is not the key
-        self.server.items[first]["withdrawn"] = {"why": "x"}
-        self.assertIsNone(adapter.lookup("dk:k-1"))
-        bare = fake_mapping(self.server.url, "http")
-        bare["options"] = {"id_prefix": "c"}
-        self.assertIsNone(EA.McpRestAdapter(bare, environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY}).lookup("dk:k-1"))
-
-    def test_read_items_are_normalised(self):
-        adapter = self.adapter("tool")
-        ident = self.push(adapter, self.decision(), "k-1")
-        self.server.items[ident].update(state="closed", answer=self.answer_fields(), ask_back=None)
-        found = adapter.read_items()
-        self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["external_id"], ident)
-        self.assertEqual(found[0]["status"], "decided")
-        self.assertEqual(found[0]["answer"]["option_id"], "k1")
-        self.assertEqual(found[0]["answer"]["by"]["role"], "human")
-
-    def test_health(self):
-        adapter = self.adapter("http")
-        self.assertIsNone(adapter.health())
-        self.server.disabled = True
-        self.assertIn("disabled", adapter.health())
-        self.server.disabled = False
-        self.server.down = True
-        self.assertIn("request failed", adapter.health())
-        self.server.down = False
-        data = fake_mapping(self.server.url)
-        data["key_source"] = "env:NOT_SET_ANYWHERE"
-        self.assertIn("not set", EA.McpRestAdapter(data, environ={}).health())
-
-
-class Unavailable(Exception):
-    permanent = False
-    retry_after = 3
-
-
 class TestEventFeedReads(unittest.TestCase):
     class Stub:
         def __init__(self, pages=None, fail=False):
@@ -2273,3 +2085,187 @@ class TestEventFeedReads(unittest.TestCase):
             engine.feed.connected = False
             sb.record_v2_calls(engine)
             self.assertIn("events: DOWN: old reads", sb.v2_calls_status(tmp, 1000.0))
+
+
+class TestConfigDeclarations(Base):
+    """#437 slice 2: a module declares its own configuration key, default and validator; the shared code reads the declarations from the bin directory only."""
+
+    FIXTURE = ('CONFIG_KEY = "fixture_key"\nCONFIG_DEFAULT = {"n": 1}\n\n\n'
+               'def validate(raw, source):\n    if not isinstance(raw, dict):\n        raise ValueError("fixture: bad value")\n')
+
+    def bin(self, must=None, **files):
+        directory = Path(tempfile.mkdtemp(prefix="decl-"))
+        floor = mock.patch.object(sb, "CONFIG_MUST_DECLARE", must or {})
+        floor.start()
+        self.addCleanup(floor.stop)
+        self.addCleanup(shutil.rmtree, directory, True)
+        for name, text in files.items():
+            (directory / name).write_text(text)
+        patcher = mock.patch.object(sb, "CONFIG_DECLARATIONS_DIR", str(directory))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return directory
+
+    def warnings(self):
+        seen = []
+        patcher = mock.patch.object(sb, "warn_unknown_config", lambda message, section="", names=(), known=(): seen.append(list(names)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return seen
+
+    def test_s1_a_declared_key_is_known_defaulted_and_needs_no_shared_line(self):
+        self.bin(**{"fixture_mod.py": self.FIXTURE})
+        seen = self.warnings()
+        self.assertEqual(sb.validate_config({})["fixture_key"], {"n": 1}, "the declared default is applied when the key is absent")
+        self.assertEqual(sb.validate_config({"fixture_key": {"n": 5}})["fixture_key"], {"n": 5})
+        self.assertEqual(seen, [], "no unknown-key warning for a declared key")
+        self.assertIn("fixture_key", sb.config_known_keys())
+        self.assertNotIn("fixture_key", sb.TOP_LEVEL_EXTRA_KEYS)
+        self.assertNotIn("fixture_key", sb.DEFAULTS)
+
+    def test_s2_the_declared_validator_runs_and_its_message_is_the_error(self):
+        self.bin(**{"fixture_mod.py": self.FIXTURE})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"fixture_key": "nope"})
+        self.assertEqual(str(caught.exception), "fixture: bad value")
+
+    def test_s4_a_key_declared_twice_or_owned_by_the_shared_defaults_is_refused_naming_both(self):
+        self.bin(**{"one.py": self.FIXTURE, "two.py": self.FIXTURE})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.config_declarations()
+        self.assertIn("one.py", str(caught.exception))
+        self.assertIn("two.py", str(caught.exception))
+        self.bin(**{"shared.py": 'CONFIG_KEY = "poll_seconds"\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.config_declarations()
+        self.assertIn("shared.py", str(caught.exception))
+        self.assertIn("shared defaults", str(caught.exception))
+
+    def test_s5_only_py_files_directly_in_the_bin_directory_are_read(self):
+        directory = self.bin(**{"real.py": 'CONFIG_KEY = "real_key"\n', "backup.py.bak": 'CONFIG_KEY = "bak_key"\n', "notes.txt": 'CONFIG_KEY = "txt_key"\n'})
+        (directory / "sub").mkdir()
+        (directory / "sub" / "deep.py").write_text('CONFIG_KEY = "deep_key"\n')
+        outside = Path(tempfile.mkdtemp(prefix="outside-"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        (outside / "out.py").write_text('CONFIG_KEY = "outside_key"\n')
+        (directory / "link.py").symlink_to(outside / "out.py")
+        self.assertEqual(sb.config_declarations(), {"real_key": "real"}, "0 decoys: a subdirectory, a backup, a text file and a symlink are not read")
+
+    def test_s6_shared_keys_stay_shared_and_an_undeclared_key_still_warns(self):
+        self.bin(**{"fixture_mod.py": self.FIXTURE})
+        seen = self.warnings()
+        sb.validate_config({"reds": None, "heavy": None, "nowhere_key": 1})
+        self.assertEqual(seen, [["nowhere_key"]])
+
+    def test_the_listing_is_cached_until_a_file_changes_and_a_caller_cannot_change_the_cache(self):
+        directory = self.bin(**{"one.py": 'CONFIG_KEY = "one_key"\n'})
+        first = sb.config_declarations()
+        first["tampered"] = "x"
+        self.assertEqual(sb.config_declarations(), {"one_key": "one"}, "the returned dict is a copy")
+        (directory / "two.py").write_text('CONFIG_KEY = "two_key"\n')
+        self.assertEqual(sb.config_declarations(), {"one_key": "one", "two_key": "two"}, "a new file is seen")
+        (directory / "one.py").write_text('CONFIG_KEY = "uno_key"  # renamed\n')
+        self.assertEqual(sb.config_declarations(), {"uno_key": "one", "two_key": "two"}, "an edited file is seen")
+
+    def test_an_unreadable_file_or_directory_fails_the_whole_configuration_naming_it(self):
+        directory = self.bin(**{"locked.py": 'CONFIG_KEY = "locked_key"\n'})
+        real_open = open
+        def deny(path, *args, **kwargs):
+            if str(path).endswith("locked.py"):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, *args, **kwargs)
+        with mock.patch("builtins.open", deny), self.assertRaises(sb.ConfigError) as caught:
+            sb.config_declarations()
+        self.assertIn("locked.py", str(caught.exception))
+        with mock.patch.object(sb, "CONFIG_DECLARATIONS_DIR", str(directory / "missing")), self.assertRaises(sb.ConfigError) as caught:
+            sb.config_declarations()
+        self.assertIn("cannot be read", str(caught.exception))
+
+    def test_a_declaring_module_must_hold_its_key_and_a_validate(self):
+        self.bin(**{"novalidate.py": 'CONFIG_KEY = "nv_key"\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("novalidate.py", str(caught.exception))
+        self.assertIn("no validate", str(caught.exception))
+        self.bin(**{"liar.py": 'CONFIG_KEY = "doc_key"\nif True:\n    CONFIG_KEY = "other_key"\ndef validate(raw, source):\n    pass\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("liar.py", str(caught.exception))
+        self.assertIn("'doc_key'", str(caught.exception))
+
+    def test_a_validator_that_fails_any_other_way_is_a_broken_module(self):
+        self.bin(**{"crash.py": 'CONFIG_KEY = "crash_key"\ndef validate(raw, source):\n    raise KeyError("boom")\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("crash.py", str(caught.exception))
+        self.assertIn("no configuration is loaded", str(caught.exception))
+
+    def test_the_declaration_line_has_its_edges(self):
+        big = "#" * 1000000 + '\nCONFIG_KEY = "late_key"\n'
+        self.bin(**{"commented.py": 'CONFIG_KEY = "ok_key"   # a comment\n', "single.py": "CONFIG_KEY = 'sq_key'\n", "spaced.py": 'CONFIG_KEY   =   "sp_key"\n',
+                    "tabbed.py": 'CONFIG_KEY\t=\t"tb_key"\n', "typed.py": 'CONFIG_KEY: str = "ty_key"\n', "late.py": big,
+                    "nested.py": 'if True:\n    CONFIG_KEY = "nested_key"\n', "text.py": '# CONFIG_KEY = "text_key"\nx = "CONFIG_KEY = \'str_key\'"\n'})
+        self.assertEqual(sb.config_declarations(), {"ok_key": "commented", "sq_key": "single", "sp_key": "spaced", "tb_key": "tabbed", "ty_key": "typed"},
+                         "quotes, spacing, a tab and an annotation do not matter; a nested statement, a comment, a string and a line past the 1 MB read are not declarations")
+
+    def test_a_key_of_the_wrong_form_is_refused_naming_the_file(self):
+        for text in ('CONFIG_KEY = "Upper"\n', 'CONFIG_KEY = "1key"\n', 'CONFIG_KEY = 3\n'):
+            with self.subTest(text):
+                self.bin(**{"badform.py": text})
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.config_declarations()
+                self.assertIn("badform.py", str(caught.exception))
+
+    def test_a_required_key_whose_declaration_is_not_found_refuses_the_whole_configuration(self):
+        must = {"excluded_repos": "repo_exclusion"}
+        validate = 'def validate(raw, source):\n    pass\n'
+        good = {"single quotes": "CONFIG_KEY = 'excluded_repos'\n", "extra spaces": 'CONFIG_KEY    =    "excluded_repos"\n', "a tab": 'CONFIG_KEY\t=\t"excluded_repos"\n'}
+        for what, line in good.items():
+            with self.subTest(what):
+                self.bin(must=must, **{"repo_exclusion.py": line + validate})
+                self.assertEqual(sb.validate_config({}).get("excluded_repos"), None)
+        bad = {"commented out": '# CONFIG_KEY = "excluded_repos"\n' + validate, "truncated": 'CONFIG_KEY = "excl', "a renamed key": 'CONFIG_KEY = "excluded_repo"\n' + validate,
+               "inside a string": 'x = """\nCONFIG_KEY = "excluded_repos"\n"""\n' + validate, "empty module": ""}
+        for what, text in bad.items():
+            with self.subTest(what):
+                self.bin(must=must, **{"repo_exclusion.py": text})
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.validate_config({"excluded_repos": ["acme/api"]})
+                self.assertIn("repo_exclusion.py", str(caught.exception))
+                self.assertIn("excluded_repos", str(caught.exception))
+        self.bin(must=must)
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("repo_exclusion.py", str(caught.exception), "the module is missing")
+
+    def test_the_real_floor_names_the_two_moved_keys_and_the_real_modules_meet_it(self):
+        self.assertEqual(sb.CONFIG_MUST_DECLARE, {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard", "temp_janitor": "disk_janitor",
+                                                  "chat_clear": "chat_clear", "impact_floor": "impact_floor"})
+        self.assertEqual({k: sb.config_declarations()[k] for k in sb.CONFIG_MUST_DECLARE}, sb.CONFIG_MUST_DECLARE)
+
+    def test_s7_the_moved_keys_are_known_through_their_declarations(self):
+        self.assertTrue({"spotlight_guard", "excluded_repos"} <= set(sb.config_known_keys()))
+        self.assertFalse({"spotlight_guard", "excluded_repos"} & sb.TOP_LEVEL_EXTRA_KEYS)
+        declared = sb.config_declarations()
+        self.assertEqual((declared["excluded_repos"], declared["spotlight_guard"]), ("repo_exclusion", "spotlight_guard"))
+
+    def test_a_declaring_module_that_cannot_load_fails_the_whole_configuration_naming_its_file(self):
+        self.bin(**{"broken.py": 'CONFIG_KEY = "broken_key"\nthis is not python\n', "fine.py": 'x = (\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("broken.py", str(caught.exception))
+        self.assertNotIn("fine.py", str(caught.exception), "only a declaring module fails the load")
+        self.assertIn("no configuration is loaded", str(caught.exception))
+
+    def test_a_module_that_does_not_declare_is_never_imported(self):
+        self.bin(**{"fine.py": 'raise RuntimeError("imported")\n', "decl.py": self.FIXTURE})
+        self.assertEqual(sb.validate_config({})["fixture_key"], {"n": 1})
+
+    def test_the_moved_keys_validate_as_before_and_a_bad_value_keeps_its_message(self):
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"excluded_repos": "acme/api"})
+        self.assertIn("'excluded_repos' must be a list", str(caught.exception))
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"spotlight_guard": {"folders": 3}})
+        self.assertIn("spotlight_guard", str(caught.exception))
+        self.assertNotIn("excluded_repos", sb.validate_config({}), "an absent key with no default adds nothing")
