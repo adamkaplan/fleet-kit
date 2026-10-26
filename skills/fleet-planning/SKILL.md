@@ -6,8 +6,8 @@ description: How to write a plan before work starts, check it, and get it challe
 # Planning
 
 A plan says **what** the work must achieve and how anyone will know, never gratuitous **how**. It is written before
-work, checked, challenged, and approved. Every rule and check is in
-`docs/plan-template.md` (read it on a failed check).
+work starts, checked by a command, challenged by independent reviewers, and approved. Every rule and check is in
+`docs/plan-template.md` (read it when a check fails).
 
 ## When a plan is required
 
@@ -19,8 +19,8 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 ## The method, in order
 
 1. **Done-when**: copy the ask's clauses, numbered `(1) ... (2) ...`. They are the authority; never reword them.
-   A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
-   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). Note that every per-pull-request scenario must be claimed by some pull request: the last merge of an ask is refused while one stays unclaimed (only a logged `CU` waiver passes).
+   A work item with no Done-when takes its parent ask's: `plan check` and the structure gate (G0a) read it there; one the item carries itself must still match exactly.
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
 2. **Clauses to scenarios**: every clause needs at least one behaviour scenario (`S`); behaviour that must NOT change is a
    `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
    screenshot | review`; `review` quotes text; this check is a net: the plan's reviewer is the guard), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
@@ -51,14 +51,14 @@ detail) plus **one detail comment** whose first line is a heading containing `Pl
 
 ## Challenge it
 
-When available: a `plan review` command launches independent read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff). The tier is computed from the ask or epic the plan serves, not
-chosen per item. Up to three rounds; then a standing objection goes to the Chief of Staff, then the owner.
+When available: a `plan review` command launches independent read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
+chosen per item. Up to three rounds; an objection standing after that goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
 - **Requirements and coverage**: a Done-when clause with no scenario; vague words; a missing unchanged-behaviour scenario.
-- **Scenario adversary**: a bad build that passes every scenario (an empty or stubbed implementation);
-  an undecidable pass rule; an evaluator who cannot record it.
+- **Scenario adversary**: a bad build that passes every scenario (an empty or stubbed implementation); a pass rule nobody
+  can decide; an evaluator who cannot record the proof.
 - **Risk and security**: no rollback or a half-applied state; a contract change; a held-PR area; who can forge a verdict.
 - **Scope and what-not-how**: a step that dictates the design; no out-of-scope; creep; overlap with another plan.
 - **Cost and sequencing**: a smaller plan that meets the same Done-when; order and parallelism; an integration branch that
@@ -101,6 +101,6 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, or "add a `c
 
 Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
-open. The order does not matter: a coder's only extra step is `prove`. A push voids every proof and
-verdict. A logged Chief of Staff waiver may cover a hotfix; the plan is then due within a day.
+open. The order does not matter (a `ci` verdict recorded before your `prove` counts once the proof exists): a coder's only extra step is `prove`. A push voids every proof and
+verdict. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
 `CARRIES: #N`: see plan-template.

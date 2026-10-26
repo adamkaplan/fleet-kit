@@ -22,7 +22,7 @@ constraint (`PC-n`) with its reason.
 Recorded as an issue, or a section of one, **in the repo the work concerns**. Required:
 
 1. **Done-when**: the ask's clauses, copied, numbered `(1) ... (2) ...` as in the ask.
-   A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
+   A work item with no Done-when takes its parent ask's: `plan check` and the structure gate (G0a) read it there; one the item carries itself must still match exactly.
    A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). Note that every per-pull-request scenario must be claimed by some pull request: the last merge of an ask is refused while one stays unclaimed (only a logged `CU` waiver passes).
 2. **Scenarios**: the yaml block below, including unchanged (U) ones.
 3. **Constraints** (`PC-n`): what must hold, and why.

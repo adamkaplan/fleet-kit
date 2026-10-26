@@ -86248,8 +86248,8 @@ class TestBatchingDocs(unittest.TestCase):
 
 
 # #943: a work item reads its parent ask's Done-when, and a pull request's `CLAIMS:` line narrows what its proof gate counts.
-PARENT_RULE = ("A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, "
-               "and a Done-when the work item carries itself must still match exactly.")
+PARENT_RULE = ("A work item with no Done-when takes its parent ask's: `plan check` and the structure gate (G0a) read it there; "
+               "one the item carries itself must still match exactly.")
 CLAIM_RULE = ("A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, "
               "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge).")
 WORK_ITEM_PLAN = LEDGER_PLAN.split("```yaml", 1)[0].split("## Intent", 1)[0] + "```yaml" + LEDGER_PLAN.split("```yaml", 1)[1]
@@ -86793,6 +86793,16 @@ class TestClaimUnionAtLastMerge(LedgerBase):
         for how in ("raise", "fail"):
             self.assertIsNone(self.unjudged(how, "S1"), how)
             self.assertIsNone(self.unjudged(how, None), how)
+
+    def test_l2_a_huge_claims_line_is_stored_clipped_and_a_mutant_that_stores_it_whole_fails(self):
+        def clause():
+            line = sb.plan_ledger.claim_line(self.PR, "a" * 40, "PLAN: acme/app#7\nCLAIMS: " + "S1 " * 100000)
+            self.assertLessEqual(len(line["claim_text"]), 1000)
+            self.assertEqual(sb.plan_ledger.claim_line(self.PR, "a" * 40, "PLAN: acme/app#7\nCLAIMS: S1 S2")["claim_text"], "S1 S2")
+        clause()
+        with mock.patch.object(sb.plan_ledger, "CLAIM_TEXT_LIMIT", 10 ** 9):
+            with self.assertRaises(AssertionError):
+                clause()
 
     def test_s5_a_mutant_that_ignores_the_union_fails_the_clause_tests(self):
         ledger = sb.load_plan_ledger()
