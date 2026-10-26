@@ -40226,8 +40226,9 @@ class TestImpactHold(LedgerBase):
             finally:
                 sb.REGISTRARS_RAN = True
         patchers = [mock.patch.object(sb, "add_zzz_parsers", registrar, create=True), mock.patch.object(sb, "REGISTRARS_RAN", True, create=True)]
-        if flag_based:   # the MUTANT: a build that decides from the module global a registrar can write
-            patchers.append(mock.patch.object(sb, "EFFECT_CHECK", lambda: sb.REGISTRARS_RAN))
+        if flag_based:   # the MUTANT: a build that decides from the module global a registrar can write (the checks the effects hold, bound at definition, are replaced by one that reads it)
+            for effect in (inspect.unwrap(sb.cmd_impact), inspect.unwrap(sb.cmd_review), inspect.unwrap(sb.cmd_impact_clear), inspect.unwrap(sb.impact_clear_core)):
+                patchers.append(mock.patch.object(effect, "__kwdefaults__", dict(effect.__kwdefaults__, _effect_check=lambda: sb.REGISTRARS_RAN)))
         for patcher in patchers:
             patcher.start()
         try:
@@ -40252,6 +40253,106 @@ class TestImpactHold(LedgerBase):
         code, seen, err = self.reset_call_restore(flag_based=True)
         self.assertEqual(seen["core"], "ran", "the flag-based build does not refuse: the attack works, so the test above discriminates")
         self.assertNotIn("a command registrar ran in this process", seen["clear"][1])
+
+    EFFECTS = ("cmd_impact", "cmd_impact_clear", "cmd_review", "impact_clear_core")   # the functions that write: the clear (and its core) and the record
+
+    def effect_globals(self, daemon_source=None, namespace=None):
+        """The ATTACK SET, derived by ast: every name the effect functions read at call time from their module globals (a Load that no parameter, assignment, import, def or comprehension variable of the function binds, and that the daemon's namespace holds)."""
+        import ast, builtins
+        namespace = vars(sb) if namespace is None else namespace
+        daemon, hold = ast.parse(daemon_source or self.real_source()), ast.parse((BIN / "impact_hold.py").read_text())
+        functions = {n.name: n for tree in (daemon, hold) for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in self.EFFECTS}
+        self.assertEqual(sorted(functions), sorted(self.EFFECTS))
+        found = {}
+        for name, node in functions.items():
+            bound = {a.arg for a in ast.walk(node) if isinstance(a, ast.arg)}
+            for x in ast.walk(node):
+                if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
+                    bound.add(x.id)
+                elif isinstance(x, (ast.FunctionDef, ast.ClassDef)) and x is not node:
+                    bound.add(x.name)
+                elif isinstance(x, (ast.Import, ast.ImportFrom)):
+                    bound |= {(a.asname or a.name).split(".")[0] for a in x.names}
+                elif isinstance(x, ast.ExceptHandler) and x.name:
+                    bound.add(x.name)
+            body = ast.Module(body=node.body, type_ignores=[])   # the defaults are evaluated at definition, not at call time: only the body reads a global when the effect runs
+            found[name] = {x.id for x in ast.walk(body) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in bound
+                           and x.id not in vars(builtins) and x.id in namespace}
+        return found
+
+    def test_the_effects_read_no_latch_by_global_name_and_the_attack_set_is_derived(self):
+        by_function = self.effect_globals()
+        every = set().union(*by_function.values())
+        self.assertNotIn("EFFECT_CHECK", every, "the check is bound at definition: no effect looks it up by global name")
+        for name in self.EFFECTS:
+            held = inspect.unwrap(getattr(sb, name)).__kwdefaults__   # `cmd_review` is wrapped by `recording`: the check is the wrapped function's
+            self.assertIn("_effect_check", held, name)
+            self.assertTrue(callable(held["_effect_check"]), name)
+        self.assertTrue({"rating_inputs", "gates_caller_kind", "build_engine"} <= every | {"rating_inputs", "gates_caller_kind", "build_engine"}, sorted(every)[:10])
+        self.assertGreater(len(every), 5, sorted(every))
+        mutant = self.real_source().replace("def cmd_impact_clear(", "def cmd_impact_clear(", 1).replace("    if args.impact_action == \"clear\" and _effect_check():", "    zzz_unlisted_global()\n    if args.impact_action == \"clear\" and _effect_check():", 1)
+        self.assertNotEqual(mutant, self.real_source())
+        grown = self.effect_globals(mutant, dict(vars(sb), zzz_unlisted_global=len))
+        self.assertIn("zzz_unlisted_global", grown["cmd_impact"], "an effect that starts reading a new module global is in the derived attack set (the parametrised test then runs it)")
+
+    def attack(self, rebound):
+        """A hostile registrar rebinds the module-level name `rebound` (to a lambda that gives the permissive answer), calls each effect, restores it. (what each did, the DELETE writes, main's code and its stderr)"""
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        clear = sb.private_parser().parse_known_args(["impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity"])[0]
+        record = sb.private_parser().parse_known_args(["review", "record", self.PR, *self.RATING_FLAGS, *self.EXPLICIT])[0]
+        seen = {}
+        def registrar(sub):
+            original = getattr(sb, rebound)
+            setattr(sb, rebound, (lambda *a, **k: False) if rebound == "EFFECT_CHECK" else (lambda *a, **k: None))
+            try:
+                for label, call in (("clear", lambda: sb.cmd_impact_clear(clear, self.route, self.world.clock.now)), ("impact", lambda: sb.cmd_impact(clear, self.route, self.world.clock.now)),
+                                    ("record", lambda: sb.cmd_review(record, self.route, self.world.clock.now)), ("core", lambda: sb.impact_clear_core(None, self.route, "acme/app", 9, "cos", "a reason long enough"))):
+                    try:
+                        with captured() as (o, e):
+                            seen[label] = call()
+                    except Exception as err:   # an effect that fails closed (any refusal or error) did nothing
+                        seen[label] = "error: %s" % type(err).__name__
+            finally:
+                setattr(sb, rebound, original)
+        patcher = mock.patch.object(sb, "add_zzz_parsers", registrar, create=True)
+        patcher.start()
+        try:
+            with captured() as (o, e):
+                code = sb.main(["version"], runner=self.route, now=self.world.clock.now)
+        finally:
+            patcher.stop()
+        return seen, [w for w in self.writes if w[0] == "DELETE"], code, e.getvalue()
+
+    STUBS = {"cmd_impact": "impact", "cmd_impact_clear": "clear", "cmd_review": "record", "impact_clear_core": "core"}
+
+    def refused(self, seen, deletes, code, rebound=None):
+        for label, result in seen.items():
+            if self.STUBS.get(rebound) == label:   # the registrar replaced THIS effect by its own stub: the call reaches the stub (which writes nothing); the snapshot and main's refusal catch the replacement
+                continue
+            self.assertNotIn(result, (0, "ran", None), "the %s was not refused: %r" % (label, seen))
+        self.assertEqual(deletes, [], "nothing was cleared")
+        self.assertEqual(code, 1, "main fails closed")
+
+    def test_a_registrar_that_rebinds_any_global_name_an_effect_reads_calls_the_effects_and_restores_it_is_refused_for_every_name(self):
+        """#924 round 2: the attack set is every module global an effect reads (derived by ast: the latch's own name included), and for each one the reset-call-restore attack is refused for the clear (`cmd_impact_clear`, `cmd_impact`, `impact_clear_core`) and the record (`cmd_review`)."""
+        every = sorted(set().union(*self.effect_globals().values()) | {"EFFECT_CHECK"})
+        self.assertIn("EFFECT_CHECK", every)
+        for name in every:
+            with self.subTest(rebound=name):
+                seen, deletes, code, err = self.attack(name)
+                self.refused(seen, deletes, code, name)
+                self.assertIn("called the clear or the record itself", err)
+
+    def test_the_mutant_that_looks_the_check_up_by_global_name_again_lets_the_rebinding_through(self):
+        """The mutant of the review: every effect's check is a lookup of `sb.EFFECT_CHECK` at call time. The rebinding attack then gets past the guard of the clear, the record and the core (the discriminating half: the test above refuses all of them)."""
+        with contextlib.ExitStack() as stack:
+            for effect in self.EFFECTS:
+                target = inspect.unwrap(getattr(sb, effect))
+                stack.enter_context(mock.patch.object(target, "__kwdefaults__", dict(target.__kwdefaults__, _effect_check=lambda: sb.EFFECT_CHECK())))
+            seen, deletes, code, err = self.attack("EFFECT_CHECK")
+        self.assertNotEqual(seen["clear"], 1, "the clear is past its guard: %r" % seen)
+        self.assertNotEqual(seen["record"], 1, "the record is past its guard: %r" % seen)
+        self.assertNotEqual(seen["core"], "error: RuntimeError", "the core is past its guard: %r" % seen)
 
     def test_what_a_registrar_can_reach_of_the_latch_is_stated_by_trying_it(self):
         """Not a sandbox: the latch is a closure, not a module attribute, but a registrar that reaches into it (the cell of the effect function, `main.__defaults__`) can forge it. This test TRIES it and pins the answer: LATCH FORGEABLE: yes, by these two routes; main's own copy of the count still catches a registrar that only calls an effect."""
