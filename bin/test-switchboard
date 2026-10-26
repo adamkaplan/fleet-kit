@@ -93149,7 +93149,7 @@ class TestTriageStandingLine(unittest.TestCase):
     NEXT_STEP = "Next step (triage, 25 Oct): keep with the lane until 2026-10-30."
 
     def comment(self, body, at="2026-10-26T07:55:00Z"):
-        return sb.triage_comment_facts([{"created_at": at, "body": body}])
+        return sb.triage_comment_facts([{"created_at": at, "user": {"login": "bot"}, "body": body}])
 
     def judge(self, number, comments, now=None, waiting=None):
         item = sb.triage_norm(tri_issue(self.NOW, number, created=20, updated=10, assignees=["bot"]))
@@ -93164,6 +93164,42 @@ class TestTriageStandingLine(unittest.TestCase):
         self.assertEqual(sb.standing_line("Next: do it", posted), ("none", None))
         self.assertEqual(sb.standing_line("Standing line (x): until 31 Feb", posted), ("none", None))
         self.assertIsNone(sb.standing_line("the change is in batch 6, awaiting batch", posted))   # only a heading line counts
+
+    def test_the_first_date_not_past_decides_and_a_past_year_less_date_never_rolls_forward(self):
+        at = sb.parse_iso("2026-10-26T07:55:00Z")
+        day = lambda text: sb.standing_line(text, at)
+        self.assertEqual(day("Standing line (26 Oct 07:55Z): merged 24 Oct, close by 29 Oct."), ("date", sb.parse_iso("2026-10-30T00:00:00Z")))
+        self.assertEqual(day("Next step (triage, 25 Oct): keep with the lane. started 3 Oct ... Date: 28 Oct"), ("date", sb.parse_iso("2026-10-29T00:00:00Z")))
+        self.assertEqual(day("Standing line (26 Oct 07:55Z): merged 24 Oct, closed 3 Oct."), ("none", None))   # all past: not next year
+        self.assertEqual(day("Standing line (26 Oct 07:55Z): merged 24 Oct 2026, close by 2026-10-27."), ("date", sb.parse_iso("2026-10-28T00:00:00Z")))
+        self.assertEqual(day("Standing line (26 Oct 07:55Z): next check 26 Oct."), ("date", sb.parse_iso("2026-10-27T00:00:00Z")))   # the comment's own day is not past
+        self.assertEqual(day("Standing line (26 Oct 07:55Z): next check 30 Dec."), ("none", None))   # a year-less date over 60 days ahead
+        december = sb.parse_iso("2026-12-28T10:00:00Z")   # year end: a January date is next year's
+        self.assertEqual(sb.standing_line("Standing line (28 Dec): check 5 Jan.", december), ("date", sb.parse_iso("2027-01-06T00:00:00Z")))
+        self.assertEqual(sb.standing_line("Standing line (28 Dec): check 3 Dec.", december), ("none", None))
+        self.assertEqual(sb.standing_line("Standing line (28 Dec): check 5 Apr.", december), ("none", None))
+
+    def test_the_real_lines_of_the_day_with_their_past_dates(self):
+        batch = ("Standing line (26 Oct 07:55Z): the change is in batch 6 (pull request #1325: ready). It is merged 24 Oct and the live check follows, close by 28 Oct. "
+                 "No further triage lines until then.")
+        step = "Next step (triage, 25 Oct): keep with the lane while the plan is reviewed. Date: 28 Oct"
+        posted = sb.parse_iso("2026-10-26T07:55:00Z")
+        self.assertEqual(sb.standing_line(batch, posted), ("date", sb.parse_iso("2026-10-29T00:00:00Z")))
+        self.assertEqual(sb.standing_line(step, sb.parse_iso("2026-10-25T09:00:00Z")), ("date", sb.parse_iso("2026-10-29T00:00:00Z")))
+        for text in (batch, step):
+            self.assertNotIn("T12", self.judge(130, self.comment(text, at="2026-10-26T07:55:00Z")))
+
+    def test_a_quoted_old_line_is_not_read(self):
+        self.assertIn("T12", self.judge(130, self.comment("> Standing line (20 Oct): check 28 Oct.\n\nnoted")))
+
+    def test_only_a_fleet_login_or_the_issue_author_silences(self):
+        def facts(user):
+            return sb.triage_comment_facts([{"created_at": "2026-10-26T07:55:00Z", "user": {"login": user}, "body": self.LINE_DATED}])
+        self.assertEqual(facts("Bot")[0]["author"], "bot")
+        self.assertNotIn("T12", self.judge(130, facts("bot")))
+        self.assertIn("T12", self.judge(130, facts("stranger")))
+        self.assertIn("T3", self.judge(10, facts("stranger")))
+        self.assertIn("T12", self.judge(130, sb.triage_comment_facts([{"created_at": "2026-10-26T07:55:00Z", "body": self.LINE_DATED}])))   # no author read: not trusted
 
     def test_s2_the_batch_shape_before_the_date_silences_t12(self):
         self.assertNotIn("T12", self.judge(130, self.comment(self.LINE_BATCH)))

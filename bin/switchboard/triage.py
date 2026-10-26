@@ -82,9 +82,13 @@ TRIAGE_STANDING_DMY_RE = re.compile(r"\b([0-9]{1,2})(?:st|nd|rd|th)?[ \t]+" + _M
 TRIAGE_STANDING_MDY_RE = re.compile(r"\b" + _MON + r"[ \t]+([0-9]{1,2})(?:st|nd|rd|th)?\b(?:,?[ \t]+([0-9]{4})\b)?", re.I)
 
 
+TRIAGE_STANDING_YEARLESS_DAYS = 60   # a year-less wait date further ahead than this is not read
+
+
 def _standing_day(text, at):
-    """The first date in `text` as the epoch second of its UTC start, or None when there is none; "bad" when one is written but impossible.
-    A date with no year is the next one on or after `at` (the comment's own time)."""
+    """The FIRST date in `text` that is not in the past (on or after the comment's own day `at`), as the epoch second of its UTC start; None when there is no date;
+    "bad" when one is impossible, when every date is past, or when a year-less one is more than 60 days ahead. A year-less date before the comment's day is past (never
+    next year's), except a December comment naming a date within 60 days after the new year."""
     found = []
     for m in TRIAGE_STANDING_ISO_RE.finditer(text):
         found.append((m.start(), int(m.group(1)), int(m.group(2)), int(m.group(3)), True))
@@ -94,15 +98,26 @@ def _standing_day(text, at):
         found.append((m.start(), m.group(3), _MONTHS.index(m.group(1).lower()[:3]) + 1, int(m.group(2)), None))
     if not found:
         return None
-    _pos, year, month, day, full = min(found, key=lambda f: f[0])
-    base = datetime.fromtimestamp(at, timezone.utc).year
-    try:
-        if year is None:
-            day_at = datetime(base, month, day, tzinfo=timezone.utc).timestamp()
-            year = base if day_at + 86400.0 > at else base + 1
-        return datetime(int(year), month, day, tzinfo=timezone.utc).timestamp()
-    except (ValueError, OverflowError):
-        return "bad"
+    at_day = datetime.fromtimestamp(at, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    base = at_day.year
+    for _pos, year, month, day, _full in sorted(found, key=lambda f: f[0]):
+        try:
+            if year is not None:
+                when = datetime(int(year), month, day, tzinfo=timezone.utc)
+                if when < at_day:
+                    continue   # written with its year and already past: not a wait
+                return when.timestamp()
+            when = datetime(base, month, day, tzinfo=timezone.utc)
+            if when < at_day:   # a year-less date before the comment's own day is PAST, never next year's, except a December comment naming a January date
+                when = datetime(base + 1, month, day, tzinfo=timezone.utc)
+                if at_day.month != 12 or when.timestamp() > at_day.timestamp() + TRIAGE_STANDING_YEARLESS_DAYS * 86400.0:
+                    continue
+            if when.timestamp() > at_day.timestamp() + TRIAGE_STANDING_YEARLESS_DAYS * 86400.0:
+                return "bad"   # a year-less date more than 60 days ahead is not read as a wait
+            return when.timestamp()
+        except (ValueError, OverflowError):
+            return "bad"
+    return "bad"   # every date was past
 
 
 def standing_line(text, at):
@@ -124,13 +139,13 @@ def standing_line(text, at):
     return ("none", None)
 
 
-def triage_standing_silent(item, comments, now, merged_batch=False):
+def triage_standing_silent(item, comments, now, merged_batch=False, trusted=frozenset()):
     """True while the latest standing line of an item (its body, then its comments, the latest wins) keeps T3 and T12 quiet: a date that ends after `now` and within
     PARKED_MAX_DAYS, or "awaiting batch" with no later comment, within PARKED_MAX_DAYS of the line, and not after the batch reached the default branch."""
     latest = item.get("standing")   # (posted, state) from the body
     newer = False
     for c in comments or ():
-        if c.get("standing") is not None:
+        if c.get("standing") is not None and (c.get("author") in trusted or c.get("author") == item.get("author")):   # only a fleet login or the issue's author can silence
             latest, newer = (c["at"], c["standing"]), False
         else:
             newer = True
@@ -399,13 +414,13 @@ def triage_body_standing(body, created):
 
 
 def triage_comment_facts(records):
-    """[{"at", "next", "review"}] oldest first from comment records; no text kept."""
+    """[{"at", "next", "standing", "author", "review"}] oldest first from comment records; no text kept."""
     found = []
     for c in records:
         at = parse_iso(c.get("created_at")) if isinstance(c, dict) else None
         text = SWEEP_QUOTED_RE.sub(" ", c.get("body") or "") if at is not None and isinstance(c.get("body"), str) else ""
         if at is not None:
-            found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "standing": standing_line(text, at), "review": triage_says_reviewed(text)})
+            found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "standing": standing_line(text, at), "author": (_login_of(c.get("user")) or "").lower(), "review": triage_says_reviewed(text)})
     return sorted(found, key=lambda c: c["at"])
 
 
@@ -502,7 +517,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
         awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
         parked = triage_parked_now(item, now) and not awaiting  # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever. It never exempts an owner-wait; T5 and the captain PRs are other rules
         if comments is not None and not item["section"] and not awaiting and not item["next_body"] and not parked \
-                and not item["open_sub"] and not any(c["next"] for c in comments) and not triage_standing_silent(item, comments, now) \
+                and not item["open_sub"] and not any(c["next"] for c in comments) and not triage_standing_silent(item, comments, now, trusted=ours_logins) \
                 and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
             found["T3"] = {"quiet_days": round(age_updated, 2), "ask": ask}
         if ask and any("blocked" in str(l).lower() for l in item["labels"]) and age_updated >= sla["t8_days"]:
@@ -527,7 +542,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found.pop("T1", None)
             found.pop("T11", None)
             if not (item["open_sub"] or item["pending_text"] or number in (pending or ()) or triage_awaits_live(item)
-                    or (comments is not None and triage_standing_silent(item, comments, now, merged_batch=waiting is not None and number not in waiting))):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
+                    or (comments is not None and triage_standing_silent(item, comments, now, merged_batch=waiting is not None and number not in waiting, trusted=ours_logins))):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
                 found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
                 ours = ours or link["by"] in ours_logins
     elif not item["draft"] and comments is not None and ours and not captain_skip:
