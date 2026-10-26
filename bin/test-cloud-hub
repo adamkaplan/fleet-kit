@@ -1042,10 +1042,17 @@ class TestDecisionsAge(unittest.TestCase):
             'body["age_seconds"] = age', 'body["age_seconds"] = 0')
         self.fails(load(mac), check)
 
-    def test_s22_never_negative(self):
+    def test_s22_future_mtime_is_unreadable(self):
+        """CHANGED PIN (cos approved): was "never negative" (a future mtime read age 0). A clock step, copy or remount must not make an
+        old list read fresh: an mtime more than 60 s ahead of the hub clock is unreadable (503); within 60 s it reads age 0."""
         with Hub(load()) as hub:
-            _aged(hub, self.OK, -500)    # mtime in the future
-            self.assertEqual(hub.call("GET", "/decisions")[1]["age_seconds"], 0)
+            _aged(hub, self.OK, -120)
+            status, body = hub.call("GET", "/decisions")
+            self.assertEqual((status, body.get("error")), (503, "decisions unreadable"))
+            self.assertNotIn(str(hub.decisions), json.dumps(body))
+            _aged(hub, self.OK, -30)
+            status, body = hub.call("GET", "/decisions")
+            self.assertEqual((status, body["age_seconds"]), (200, 0))
 
     def test_s23_absent_is_503(self):
         with Hub(load()) as hub:
