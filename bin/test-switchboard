@@ -259,7 +259,7 @@ class TestConfig(Base):
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
-            "rider_max_age_seconds": 3600, "undelivered_wake_minutes": 15, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
+            "rider_max_age_seconds": 3600, "undelivered_wake_minutes": 15, "undelivered_wake_tell_minutes": None, "undelivered_wake_per_pass": 2, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
@@ -89098,6 +89098,101 @@ class TestUndeliveredWake(Base):
         self.world.engine.run_pass()
         self.assertEqual(len(self.resumes()), 1)
 
+    def wedge_for(self, name, age):
+        sid = self.world.sessions[name]
+        self.n += 1
+        self.world.v2.sessions[sid]["inbox"].append({
+            "id": "inb_%s_%d" % (name, self.n), "sessionID": sid, "text": "wake", "metadata": {"fleet": {"keys": ["lab.fact:" + name], "from": "switchboard"}},
+            "resume": True, "delivery": "queue", "time": {"created": self.world.v2.clock.ms(self.world.clock.now() - age)}})
+
+    def test_a_wake_first_noticed_long_after_admission_is_not_told_before_the_resume_could_deliver(self):
+        self.wedge(age=19 * 3600)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 1)
+        self.passes(0.2, 3)   # seconds later: the oldest wake is 19 hours old, the resume only seconds
+        self.assertEqual((self.told(), self.lines("undelivered.told")), ([], []))
+        self.passes(16)
+        self.passes(1, 3)
+        self.assertEqual((len(self.told()), len(self.lines("undelivered.told"))), (1, 1))
+        self.assertEqual(len(self.resumes()), 1)
+
+    def test_the_tell_time_is_its_own_config_key_defaulting_to_the_limit(self):
+        self.assertIsNone(sb.validate_config({})["undelivered_wake_tell_minutes"])
+        self.assertEqual(sb.validate_config({"undelivered_wake_tell_minutes": 5})["undelivered_wake_tell_minutes"], 5)
+        for bad in (0, -1, "x"):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"undelivered_wake_tell_minutes": bad})
+        self.world.engine.config["undelivered_wake_tell_minutes"] = 2
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.passes(3, 3)
+        self.assertEqual(len(self.told()), 1)
+
+    def test_at_most_the_per_pass_cap_of_agents_is_resumed_in_a_pass_oldest_first(self):
+        self.assertEqual(sb.validate_config({})["undelivered_wake_per_pass"], 2)
+        for bad in (0, 21, -1, 1.5, "2", True):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"undelivered_wake_per_pass": bad})
+        names = ["w%d" % i for i in range(6)]
+        for i, name in enumerate(names):
+            self.world.add_agent(name, fleet={"role": "coder", "reports_to": "cos"})
+            self.wedge_for(name, (20 + i) * 60)   # w5 the oldest
+        order = []
+        for _ in range(3):
+            self.world.engine.run_pass()
+            order.append(sorted(n for n in names if [a for a in self.world.admissions(n) if a["text"] == sb.RESUME_TEXT]))
+        self.assertEqual([len(o) for o in order], [2, 4, 6])
+        self.assertEqual(order[0], ["w4", "w5"])
+        self.assertEqual(order[1], ["w2", "w3", "w4", "w5"])
+
+    def test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered(self):
+        self.wedge(age=16 * 60)
+        now = self.world.clock.now()
+        messages = self.world.v2.sessions[self.sid]["messages"]
+        messages.append({"id": "msg_k", "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(now - 10 * 60)},
+                         "metadata": {"fleet": {"keys": [self.KEY], "from": "switchboard"}}})
+        for i in range(3):
+            messages.append({"id": "msg_n%d" % i, "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(now - 60 + i)}, "metadata": {"fleet": {"keys": ["other%d" % i], "from": "switchboard"}}})
+        with mock.patch.object(sb, "SYNTHETIC_PAGE", 2):   # a window shorter than the delivered key's position
+            self.world.engine.run_pass()
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.told(), [])
+
+    def test_when_the_agent_is_the_chief_of_staff_the_incident_is_closed_with_an_audit_line(self):
+        self.wedge_for("cos", 16 * 60)
+        self.world.engine.run_pass()
+        self.passes(16)
+        self.passes(1, 2)
+        lines = self.lines("undelivered.untold")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Chief of Staff", lines[0]["detail"]["reason"])
+        self.assertEqual(len([a for a in self.world.admissions("cos") if a["text"] == sb.RESUME_TEXT]), 1)
+
+    def test_each_idle_agent_costs_three_reads_a_pass_and_no_github_call(self):
+        self.wedge(age=16 * 60)
+        gh, window, mine, real_tick, real_popen = [], [], [], sb.undelivered_wake_tick, sb.subprocess.Popen
+
+        def spy(argv, *a, **k):
+            if isinstance(argv, (list, tuple)) and argv:
+                if os.path.basename(str(argv[0])) == "gh":
+                    gh.append(list(argv))
+                window.append(list(argv))
+            return real_popen(argv, *a, **k)
+
+        def tick(engine, discovery):
+            start = len(self.world.v2.calls)
+            try:
+                return real_tick(engine, discovery)
+            finally:
+                mine.extend(self.world.v2.calls[start:])   # only what the rule itself read
+        with mock.patch.object(sb.subprocess, "Popen", spy), mock.patch.object(sb, "undelivered_wake_tick", tick):
+            self.world.engine.run_pass()
+        coder = [c[2] for c in mine if "sessionID=" + self.sid in c and c[2] in ("session.inbox.list", "session.message.list") and "type=user" not in c]   # the resume's own re-observation is not the rule's read
+        self.assertEqual(coder, ["session.inbox.list", "session.inbox.list", "session.message.list"], mine)
+        other = [c[2] for c in mine if "sessionID=" + self.world.sessions["cos"] in c]
+        self.assertEqual(other, ["session.inbox.list"], "an idle agent with nothing queued costs one read")
+        self.assertEqual(gh, [])
+
     # -- the delivery states, a row per state with the action and the test; `test_every_state_has_a_row` derives the rows from the code
     STATES = {"undelivered": "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed",
               "admitted-in-transcript": "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed",
@@ -89112,26 +89207,44 @@ class TestUndeliveredWake(Base):
             self.assertTrue(callable(getattr(self, test, None)), test)
 
     # -- the family table: every input and external call of the new code, with its bound, test and mutant; derived from the code, never a hand copy
-    FAMILY = {"session.inbox.list": ("undelivered_wakes: a time outside 2000..now or a non-string key is dropped", "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed"),
-              "session.message.list": ("undelivered_wakes: the newest SYNTHETIC_PAGE messages; a failed read skips the agent", "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed"),
-              "resume_ended_turn": ("undelivered_wake_tick: the four refusals and the 10-minute record", "test_the_resume_refusals_hold"),
-              "add_repeat_reminder": ("undelivered_wake_tick: once per incident", "test_the_chief_of_staff_is_told_once_when_the_resume_did_not_deliver")}
+    # -- the family table of docs/switchboard.md ("An undelivered wake is recovered"): every config key, constant and refusal of the pass, derived by ast
+    TABLE = {"undelivered_wake_minutes": ("test_the_default_is_fifteen_minutes_and_the_key_sets_another", "resumes on every pass"),
+             "undelivered_wake_tell_minutes": ("test_the_tell_time_is_its_own_config_key_defaulting_to_the_limit", "tells from the admission"),
+             "undelivered_wake_per_pass": ("test_at_most_the_per_pass_cap_of_agents_is_resumed_in_a_pass_oldest_first", "no per-pass cap"),
+             "UNDELIVERED_STATE": ("test_a_second_pass_in_the_incident_does_not_resume_again", "resumes on every pass"),
+             "UNDELIVERED_KEYS": ("test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line", "never resumes"),
+             "UNDELIVERED_STATES": ("test_every_state_has_a_row", "never resumes"),
+             "SYNTHETIC_PAGE": ("test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered", "reads one page"),
+             "MAX_READ_PAGES": ("test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered", "reads one page"),
+             "resume_ended_turn": ("test_the_resume_refusals_hold", "skips the refusals"),
+             "session.inbox.list": ("test_each_idle_agent_costs_three_reads_a_pass_and_no_github_call", "resumes a blocked agent"),
+             "session.message.list": ("test_each_idle_agent_costs_three_reads_a_pass_and_no_github_call", "reads one page")}
 
-    def test_every_external_call_of_the_new_code_has_a_row(self):
-        tree = ast.parse(SWITCHBOARD.read_text())
-        calls = set()
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name in ("undelivered_wakes", "undelivered_wake_tick"):
-                for sub in ast.walk(node):
-                    if isinstance(sub, ast.Call):
-                        f = sub.func
-                        calls.add(f.id if isinstance(f, ast.Name) else f.attr)
-        derived = {"inbox": "session.inbox.list", "message_list": "session.message.list", "resume_ended_turn": "resume_ended_turn", "add_repeat_reminder": "add_repeat_reminder"}
-        self.assertEqual({derived[c] for c in calls if c in derived}, set(self.FAMILY))
+    def test_the_docs_table_lists_every_key_constant_and_refusal_derived_by_ast(self):
+        text = SWITCHBOARD.read_text()
+        tree = ast.parse(text)
+        derived = {"SYNTHETIC_PAGE", "MAX_READ_PAGES", "resume_ended_turn", "session.inbox.list", "session.message.list"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                derived.update(t.id for t in node.targets if isinstance(t, ast.Name) and t.id.startswith("UNDELIVERED_"))
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("undelivered_wake_") and node.value.isidentifier():
+                derived.add(node.value)
+        self.assertEqual(derived, set(self.TABLE))
+        docs = (SWITCHBOARD.parent.parent / "docs" / "switchboard.md").read_text()
+        section = docs[docs.index("### An undelivered wake is recovered"):docs.index("### A blocked agent is reported")]
+        rows = {m.group(1): m.groups() for m in re.finditer(r"^\| `([^`]+)` \| (.*?) \| (.*?) \| `(test_\w+)` \| `([^`]+)` \|$", section, re.M)}
+        self.assertEqual(set(rows), set(self.TABLE))
+        for key, (test, mutant) in self.TABLE.items():
+            self.assertEqual((rows[key][3], rows[key][4]), (test, mutant), key)
+            self.assertTrue(callable(getattr(self, test, None)), test)
+            self.assertIn(mutant, self.MUTANTS, key)
 
     MUTANTS = {
         "never resumes": ('                resume_ended_turn(engine, "switchboard", name, "undelivered wake:', '                (lambda *a: None)(engine, "switchboard", name, "undelivered wake:', "test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line"),
         "resumes a blocked agent": ('if seen.status != "idle" or hold_reason(seen) or seen.conflict', 'if seen.status not in ("idle", "blocked") or seen.conflict', "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed"),
+        "tells from the admission": ('now - entry["resumed"] >= tell_after', 'age >= tell_after', "test_a_wake_first_noticed_long_after_admission_is_not_told_before_the_resume_could_deliver"),
+        "no per-pass cap": ('if resumed_now >= cap:', 'if False:', "test_at_most_the_per_pass_cap_of_agents_is_resumed_in_a_pass_oldest_first"),
+        "reads one page": ('SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):\n        reached = False', 'SYNTHETIC_PAGE, "synthetic", 1):\n        reached = False', "test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered"),
         "resumes on every pass": ('if entry.get("resumed") is None and age >= limit:', 'if age >= limit:', "test_a_second_pass_in_the_incident_does_not_resume_again"),
         "skips the refusals": ('                resume_ended_turn(engine, "switchboard", name, "undelivered wake:', '                engine.v2.synthetic(seen.session_id, sb_text(), {"fleet": {"keys": ["r"], "from": "switchboard"}}, True, "queue", derive_message_id(seen.session_id, ["r%d" % now]), "x"); (lambda *a: None)(engine, "switchboard", name, "undelivered wake:', "test_the_resume_refusals_hold"),
     }

@@ -390,6 +390,8 @@ DEFAULTS = {
     "review_window_minutes": 60,  # #816: an open pull request younger than this, or one with a review requested, is a worker legitimately waiting
     "stalled_working_hours": 2,   # #811: a coder or tester that only reports `working` while nothing it owns moves wakes its boss once after this long
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
+    "undelivered_wake_tell_minutes": None,  # #1337: minutes after the resume before the Chief of Staff is told; None = the same as undelivered_wake_minutes
+    "undelivered_wake_per_pass": 2,  # #1337: at most this many agents are resumed by the rule in one pass (1..20), oldest wake first
     "undelivered_wake_minutes": 15,  # #1337: a wake admitted with delivery queue and still absent from the transcript this long is resumed once (the notice to the Chief of Staff follows at twice this)
     "rider_max_age_seconds": 3600,  # PR 13: a rider older than this is dropped, and an older stop is not triaged
     "report_triage": None,          # PR 13: None means REPORT_TRIAGE_DEFAULTS (the `report_owed` question's settings)
@@ -680,6 +682,12 @@ def validate_config(raw, source="config"):
                 "worker_lookback_hours", "stalled_working_hours", "review_window_minutes", "rider_max_age_seconds", "undelivered_wake_minutes"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
+    tell = config["undelivered_wake_tell_minutes"]
+    if tell is not None and (not _is_number(tell) or tell <= 0):
+        raise ConfigError("%s: 'undelivered_wake_tell_minutes' must be a positive number (or absent), got %r" % (source, tell))
+    per_pass = config["undelivered_wake_per_pass"]
+    if not isinstance(per_pass, int) or isinstance(per_pass, bool) or not 1 <= per_pass <= 20:
+        raise ConfigError("%s: 'undelivered_wake_per_pass' must be a whole number from 1 to 20, got %r" % (source, per_pass))
     if not isinstance(config["herdr_log"], str) or not config["herdr_log"].strip():
         raise ConfigError("%s: 'herdr_log' must be a non-empty path, got %r" % (source, config["herdr_log"]))
     if not _is_number(config["pane_exit_burst_seconds"]) or not 0 < config["pane_exit_burst_seconds"] <= 3600:
@@ -10343,14 +10351,13 @@ def ended_turn_text(name, resumed):
 # transcript it calls `resume_ended_turn` once per incident; after twice that time with the keys still absent the Chief of Staff is told once.
 
 UNDELIVERED_STATE = "undelivered-wake.json"   # {agent: {"session", "since", "keys", "resumed", "told"}}: one incident per agent (an ordinary state row)
-UNDELIVERED_TELL_FACTOR = 2                   # the second time is this many times the configured one
 UNDELIVERED_KEYS = 20                         # keys named in a line, then "and N more"
 UNDELIVERED_STATES = ("undelivered", "admitted-in-transcript", "admitted-absent", "refused", "resumed", "told")   # the delivery states; the completeness test derives its cases from this
 
 
-def undelivered_wakes(engine, seen, now, fresh=False):
-    """[(key, created)] of the switchboard wakes queued in `seen`'s inbox whose keys are not in its transcript; [] when nothing is read. Inputs are
-    untrusted: a time outside 2000..now is dropped, a non-string key is dropped (`_fleet_keys`), and only the newest SYNTHETIC_PAGE messages are read."""
+def queued_wakes(engine, seen, now, fresh=False):
+    """{key: created} of the switchboard wakes queued in `seen`'s inbox (one read). Inputs are untrusted: a time outside 2000..now is dropped, a
+    non-string key is dropped (`_fleet_keys`), resume: and orders: keys are not wakes."""
     inbox = engine.reads.inbox(seen.session_id, now, fresh=fresh)   # a remembered read finds nothing to do for free; a candidate is read again fresh
     found = {}
     for item in inbox if isinstance(inbox, list) else []:
@@ -10363,34 +10370,63 @@ def undelivered_wakes(engine, seen, now, fresh=False):
         for key in _fleet_keys(item)[:200]:
             if not key.startswith(("resume:", "orders:")):
                 found[key] = min(created, found.get(key, created))
+    return found
+
+
+def transcript_keys(engine, seen, since):
+    """The keys in the agent's synthetic messages back to `since` (the oldest wake's admission), read page by page like `delivered_keys`, at most
+    MAX_READ_PAGES pages. The sent-keys ledger is NOT consulted: it counts a key at ADMISSION, which is the very thing this rule doubts. The
+    remaining false positive: a delivered key buried under more than MAX_READ_PAGES * SYNTHETIC_PAGE newer synthetic messages reads as absent."""
+    have = set()
+    for page, more in engine.v2.message_pages(seen.session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
+        reached = False
+        for message in page:
+            if not isinstance(message, dict):
+                continue
+            created = _created(message)
+            have.update(_fleet_keys(message))
+            if created is not None and created < since:
+                reached = True
+        if reached or len(page) < SYNTHETIC_PAGE or more is False:
+            break
+    return have
+
+
+def undelivered_wakes(engine, seen, now, fresh=False):
+    """[(key, created)] of the switchboard wakes queued in `seen`'s inbox whose keys are not in its transcript; [] when nothing is read."""
+    found = queued_wakes(engine, seen, now, fresh=fresh)
     if not found:
         return []
-    have = set()
-    for message in engine.v2.message_list(seen.session_id, limit=SYNTHETIC_PAGE, type="synthetic") or []:
-        have.update(_fleet_keys(message) if isinstance(message, dict) else [])
+    have = transcript_keys(engine, seen, min(found.values()))
     return sorted(((k, t) for k, t in found.items() if k not in have), key=lambda row: (row[1], row[0]))
 
 
 def undelivered_wake_tick(engine, discovery):
-    """The end of a pass: resume an idle agent whose admitted wake is absent from its transcript past `undelivered_wake_minutes` (once per incident),
-    and tell the Chief of Staff once when it is still absent after twice that. Returns [(agent, "resume" | "told")]. A working or blocked agent, one
-    with an unreadable inbox or transcript, and a wake not yet that old are left alone."""
+    """The end of a pass: resume an idle agent whose admitted wake is absent from its transcript past `undelivered_wake_minutes` (once per incident,
+    at most `undelivered_wake_per_pass` agents a pass, oldest first), and tell the Chief of Staff once when it is still absent `undelivered_wake_tell_minutes`
+    after the RESUME. Returns [(agent, "resume" | "told")]. A working or blocked agent, one with an unreadable inbox or transcript, and a wake not yet
+    that old are left alone."""
     if discovery is None or engine.state_dir is None or engine.light:
         return []
     limit = engine.config["undelivered_wake_minutes"] * 60
+    tell_after = (engine.config["undelivered_wake_tell_minutes"] or engine.config["undelivered_wake_minutes"]) * 60
+    cap = engine.config["undelivered_wake_per_pass"]
     now, done = engine.now(), []
     state = blocked_update(engine.state_dir, UNDELIVERED_STATE, lambda _: None)
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
     changed = False
+    candidates = []
     for name, seen in sorted(discovery.agents.items()):
         if seen.status != "idle" or hold_reason(seen) or seen.conflict or seen.problem:
-            if name in state and seen.status != "idle":
-                pass   # a working agent keeps its incident: the keys decide when it ends
             continue
         try:
-            rows = undelivered_wakes(engine, seen, now)
-            if rows and now - rows[0][1] >= limit or (rows and name in state):
-                rows = undelivered_wakes(engine, seen, now, fresh=True)   # a write or a notice follows: judged on a fresh read
+            found = queued_wakes(engine, seen, now)   # read 1: from memory when remembered
+            rows = []
+            if found and (now - min(found.values()) >= limit or name in state):
+                found = queued_wakes(engine, seen, now, fresh=True)   # read 2: a write or a notice follows, so judged on a fresh read
+                if found:
+                    have = transcript_keys(engine, seen, min(found.values()))   # read 3: one page unless a long history needs more
+                    rows = sorted(((k, t) for k, t in found.items() if k not in have), key=lambda row: (row[1], row[0]))
         except Exception:
             continue   # unreadable: skipped, never resumed
         entry = state.get(name)
@@ -10399,13 +10435,21 @@ def undelivered_wake_tick(engine, discovery):
                 del state[name]   # the keys appeared: the incident ends
                 changed = True
             continue
+        candidates.append((rows[0][1], name, seen, rows))
+    resumed_now = 0
+    for _, name, seen, rows in sorted(candidates, key=lambda c: (c[0], c[1])):
+        entry = state.get(name)
         age = now - rows[0][1]
         if not isinstance(entry, dict) or entry.get("session") != seen.session_id:
-            entry = state[name] = {"session": seen.session_id, "since": rows[0][1], "keys": [], "resumed": None, "told": False}
+            entry = state[name] = {"session": seen.session_id, "since": rows[0][1], "keys": [], "resumed": None, "told": False, "age": 0}
             changed = True
-        entry["keys"] = [k for k, _ in rows][:UNDELIVERED_KEYS]
-        keys_text = ", ".join(_one_line(k, 80) for k in entry["keys"])
+        keys = [k for k, _ in rows][:UNDELIVERED_KEYS]
+        if entry.get("keys") != keys or entry.get("age") != int(age // 60):
+            entry["keys"], entry["age"] = keys, int(age // 60)   # minutes: a write only when something changed
+            changed = True
         if entry.get("resumed") is None and age >= limit:
+            if resumed_now >= cap:
+                continue   # the per-pass cap: the next pass takes the next ones
             try:
                 resume_ended_turn(engine, "switchboard", name, "undelivered wake: %d key(s), the oldest %d minutes old, absent from the transcript" % (len(rows), age // 60), discovery)
             except Exception:
@@ -10413,18 +10457,26 @@ def undelivered_wake_tick(engine, discovery):
             else:
                 entry["resumed"] = now
                 changed = True
+                resumed_now += 1
                 done.append((name, "resume"))
                 if engine.audit is not None:
                     engine.audit.append(engine.actor, "undelivered.resume", name, {"oldest_age_seconds": int(age), "keys": entry["keys"], "count": len(rows)})
-        elif entry.get("resumed") is not None and not entry.get("told") and age >= limit * UNDELIVERED_TELL_FACTOR and cos and cos != name:
-            text = "Undelivered wake: %s has %d wake(s) still not in its transcript after %d minutes (a resume was sent once)." % (_one_line(name, 80), len(rows), age // 60)
-            add_repeat_reminder(engine.state_dir, cos, now, now, text, "undelivered-wake", name, "undelivered|%s" % entry["since"], first=True,
-                                answered_at=last_send_at(engine.state_dir, cos, name))
-            entry["told"] = True
-            changed = True
-            done.append((name, "told"))
-            if engine.audit is not None:
-                engine.audit.append(engine.actor, "undelivered.told", name, {"told": [cos], "oldest_age_seconds": int(age), "count": len(rows), "keys": entry["keys"]})
+        elif entry.get("resumed") is not None and not entry.get("told") and now - entry["resumed"] >= tell_after:
+            if cos and cos != name:
+                text = "Undelivered wake: %s has %d wake(s) still not in its transcript, the oldest %d minutes old (a resume was sent once)." % (_one_line(name, 80), len(rows), age // 60)
+                add_repeat_reminder(engine.state_dir, cos, now, now, text, "undelivered-wake", name, "undelivered|%s" % entry["since"], first=True,
+                                    answered_at=last_send_at(engine.state_dir, cos, name))
+                entry["told"] = True
+                changed = True
+                done.append((name, "told"))
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "undelivered.told", name, {"told": [cos], "oldest_age_seconds": int(age), "count": len(rows), "keys": entry["keys"]})
+            else:
+                entry["told"] = True   # the incident is closed: it ends when the keys appear, never resumed again
+                changed = True
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "undelivered.untold", name, {"reason": "the agent is the Chief of Staff" if cos == name else "no Chief of Staff in discovery",
+                                                                                   "oldest_age_seconds": int(age), "count": len(rows), "keys": entry["keys"]})
     for name in sorted(set(state) - set(discovery.agents)):
         del state[name]
         changed = True
