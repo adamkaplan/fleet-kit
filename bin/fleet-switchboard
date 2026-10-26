@@ -14610,6 +14610,8 @@ def parse_intent(body):
 class IntentError(Exception):
     """GitHub could not answer. reason: "not_found", "unavailable" or "gh"."""
 
+    status = None   # the HTTP status of a failed gh call, set where gh's own first line gave one (#967)
+
     def __init__(self, reason, detail=None):
         self.reason = reason
         super().__init__("%s: %s" % (reason, detail) if detail else reason)
@@ -16810,9 +16812,10 @@ def agent_block_states(engine, repo, matrix, paths, base, head):
     return states
 
 
-def pr_floor_report(engine, repo, number, rated_pairs=()):
+def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
-    `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold."""
+    `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold. `paged` (a dict, #967) gets the paged file list ("files") or why it could not be read ("error", a
+    FileListError) when the floor had to read it, so a caller that needs the same list does not read it a second time."""
     raw = read_pr_json(engine, repo, number, "files,baseRefOid")
     files = [f for f in (raw.get("files") if isinstance(raw.get("files"), list) else []) if isinstance(f, dict)]
     globs, exclude, force = impact_floor.floor_for(repo, engine.config)
@@ -16826,6 +16829,31 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             renamed.append(item.get("path"))   # `gh pr view` does not say where it came from
     total = raw.get("changedFiles") if isinstance(raw.get("changedFiles"), int) else len(files)
     complete = len(files) >= total and not raw.get("truncated")
+    list_problem = None
+    if not complete or renamed:   # #967: `gh pr view` lists 100 files at most and no source path of a rename: the paged list has both. Read it ONLY then; a failed read keeps the list as it was (held) and says why
+        module = load_module("delegated_clear")
+        try:
+            listed, pull = module.read_pr_files(impact_carry_get(engine, engine.gh_runner or subprocess.run, repo), repo, number)
+            seen_head = ((pull.get("head") or {}).get("sha") if isinstance(pull.get("head"), dict) else None)
+            if isinstance(raw.get("headRefOid"), str) and isinstance(seen_head, str) and seen_head != raw["headRefOid"]:
+                raise module.FileListError("head_moved", raw["headRefOid"][:8], seen_head[:8])   # the paged list belongs to another head than this report's (#967 M2 low)
+            if paged is not None:
+                paged["files"] = listed
+            files = [{"path": f.get("filename"), "previous_filename": f.get("previous_filename"), "changeType": str(f.get("status") or "").upper()} for f in listed if isinstance(f.get("filename"), str)]
+            paths, renamed = [], []
+            for item in files:
+                paths.append(item["path"])
+                if isinstance(item["previous_filename"], str) and item["previous_filename"]:
+                    paths.append(item["previous_filename"])
+                elif item["changeType"] in ("RENAMED", "COPIED"):
+                    renamed.append(item["path"])
+            total, complete = len(files), True
+            if renamed:
+                list_problem = module.FILE_REFUSALS["no_source"] % (len(renamed), ", ".join(renamed[:3]))
+        except module.FileListError as err:
+            if paged is not None:
+                paged["error"] = err
+            list_problem = ("GitHub listed %d of %d changed files" % (len(files), total) if not complete else module.FILE_REFUSALS["no_source"] % (len(renamed), ", ".join(renamed[:3]))) + "; the paged list could not be read: %s" % err
     hit = impact_floor.floor_paths(paths, globs, exclude, force)
     unknown = None
     if globs and not complete:
@@ -16855,7 +16883,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             decision = "hold"
     rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
-            "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
+            "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "list_problem": list_problem,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
             "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True,
@@ -25779,6 +25807,9 @@ class DecisionError(Exception):
     """A decision command that is refused, and why. Nothing was changed."""
 
 
+GH_ERROR_MAX = 1 << 20   # characters of a failed gh call's own text kept in its error: the audit line's own physical bound
+
+
 def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=False):
     """One write through gh with the repo's own account, its token only in the child's environment. The
     configured `gh`, `gh api <path> --method M [--input -]`. IntentError when it fails (a 404 is quiet when
@@ -25799,10 +25830,14 @@ def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=Fa
     except OSError as err:
         raise IntentError("unavailable", "cannot run %s: %s" % (engine.config["gh"], err.strerror or err)) from None
     if done.returncode != 0:
-        detail = _one_line(done.stderr) or _one_line(done.stdout) or "exit %d" % done.returncode
+        detail = _one_line(done.stderr, GH_ERROR_MAX) or _one_line(done.stdout, GH_ERROR_MAX) or "exit %d" % done.returncode   # #967: the failure's own words, whole (the clear's refusal shows them)
         if tolerate_missing and ("404" in detail or "Not Found" in detail):
             return done
-        raise IntentError("gh", accounts.scrub(detail) if accounts is not None else detail)
+        failure = IntentError("gh", accounts.scrub(detail) if accounts is not None else detail)
+        first = ((done.stderr or "").strip().splitlines() or [""])[0]   # #967: the status is read from gh's OWN first line only, never from a body that may quote "HTTP 404"
+        found = re.search(r"\(HTTP (\d{3})\)\s*$", first)
+        failure.status = int(found.group(1)) if found else None
+        raise failure
     return done
 
 
