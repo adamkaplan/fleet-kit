@@ -93861,26 +93861,38 @@ class TestNoPaneToJudge(StandInPids, Base):
 
 
 # ---- #1215: the test files of the impact brief are collected by THIS runner (CI runs `bin/test-switchboard`; a file no runner executes does not count)
-def _collect_brief_tests():
+def _load_brief_tests(name):
+    """The test module of the impact brief, loaded by path; every TestCase it defines is named below (an explicit binding, not a write to this module's globals), and the check after them fails when one is missing."""
     sys.path.insert(0, str(REPO))   # `tests.*` and the bin modules they import
     sys.path.insert(0, str(BIN))
-    for name in ("test_substance_decider", "test_brief_clear", "test_brief_advisory", "test_brief_integration", "test_brief_fix"):
+    if name == "test-impact-brief":
+        loader = importlib.machinery.SourceFileLoader("brief_test_impact_brief", str(BIN / name))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+    else:
         spec = importlib.util.spec_from_file_location("brief_" + name, REPO / "tests" / (name + ".py"))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for attr, value in sorted(vars(module).items()):
-            if isinstance(value, type) and issubclass(value, unittest.TestCase) and value.__module__ == module.__name__:
-                globals()["Brief_%s_%s" % (name, attr)] = value
-    loader = importlib.machinery.SourceFileLoader("brief_test_impact_brief", str(BIN / "test-impact-brief"))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    for attr, value in sorted(vars(module).items()):
-        if isinstance(value, type) and issubclass(value, unittest.TestCase) and value.__module__ == module.__name__:
-            globals()["Brief_impact_brief_%s" % attr] = value
+    return module
 
 
-_collect_brief_tests()
+_brief_modules = {name: _load_brief_tests(name) for name in ("test_substance_decider", "test_brief_clear", "test_brief_advisory", "test_brief_integration", "test_brief_fix", "test-impact-brief")}
+Brief_test_substance_decider_Decider = _brief_modules["test_substance_decider"].Decider
+Brief_test_brief_clear_TestBriefBoundClear, Brief_test_brief_clear_TestMutants = _brief_modules["test_brief_clear"].TestBriefBoundClear, _brief_modules["test_brief_clear"].TestMutants
+Brief_test_brief_advisory_TestAdvisoryAndRows, Brief_test_brief_advisory_TestDocsAndHygiene, Brief_test_brief_advisory_TestG6bRationale = (
+    _brief_modules["test_brief_advisory"].TestAdvisoryAndRows, _brief_modules["test_brief_advisory"].TestDocsAndHygiene, _brief_modules["test_brief_advisory"].TestG6bRationale)
+Brief_test_brief_integration_TestDocsAndNames, Brief_test_brief_integration_TestMutants, Brief_test_brief_integration_TestRealBriefToDecider, Brief_test_brief_integration_TestTablesDerivedFromTheCode = (
+    _brief_modules["test_brief_integration"].TestDocsAndNames, _brief_modules["test_brief_integration"].TestMutants, _brief_modules["test_brief_integration"].TestRealBriefToDecider,
+    _brief_modules["test_brief_integration"].TestTablesDerivedFromTheCode)
+Brief_test_brief_fix_TestClassifyRoots, Brief_test_brief_fix_TestDeletionsAndClasses, Brief_test_brief_fix_TestDocs, Brief_test_brief_fix_TestMutants, Brief_test_brief_fix_TestTablesDerivedFromTheCode = (
+    _brief_modules["test_brief_fix"].TestClassifyRoots, _brief_modules["test_brief_fix"].TestDeletionsAndClasses, _brief_modules["test_brief_fix"].TestDocs,
+    _brief_modules["test_brief_fix"].TestMutants, _brief_modules["test_brief_fix"].TestTablesDerivedFromTheCode)
+Brief_impact_brief_BriefTests, Brief_impact_brief_MutantTests = _brief_modules["test-impact-brief"].BriefTests, _brief_modules["test-impact-brief"].MutantTests
+for _name, _module in _brief_modules.items():   # a TestCase added to one of these files and not bound above would silently drop out of CI
+    _held = {v for k, v in globals().items() if k.startswith("Brief_")}
+    _defined = {v for v in vars(_module).values() if isinstance(v, type) and issubclass(v, unittest.TestCase) and v.__module__ == _module.__name__}
+    assert _defined <= _held, "%s: a TestCase is not bound in bin/test-switchboard: %s" % (_name, sorted(c.__name__ for c in _defined - _held))
 
 
 class TestArchTools(unittest.TestCase):
