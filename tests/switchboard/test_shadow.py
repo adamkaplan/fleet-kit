@@ -229,7 +229,7 @@ class TestShadowGlue(unittest.TestCase):
 
     def test_an_unreadable_unlisted_part_is_refused_and_a_listed_one_is_unmapped_as_before(self):
         got = self.run_map("bin/switchboard/answer_delivery.py", BASE, BASE, readable=False)
-        self.assertTrue(got and "judge.py" in got[0] and "cannot be read" in got[0], got)
+        self.assertTrue(got and "answer_delivery.py" in got[0] and "cannot be read" in got[0], got)
         self.assertIsNone(self.run_map("bin/switchboard/audit.py", BASE, BASE, readable=False), "a listed part that cannot be read stays unmapped (the clear refuses it as unreadable)")
 
     def test_the_entry_keeps_its_recorded_baseline_reasons_exactly(self):
