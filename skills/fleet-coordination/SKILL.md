@@ -34,6 +34,23 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
+
+## Builder checklist
+
+The mistakes that cost the most review rounds and the most lost work. Meet them in the first push.
+
+- (a) A table in the documentation of every input and every outside call of the new code; each row names its test and its run-by-hand mutant.
+- (b) Code that reads a directory other programs write uses the one shared safe reader (opens without blocking, refuses links, accepts only regular files, bounds the count, the size and the time). The one shared reader of a single file is `read_record_file(path, max_bytes)` in `bin/cloud_worker.py` ("The ONE safe read of a file in the cloud record directory"): it opens with `O_NONBLOCK` and `O_NOFOLLOW`, accepts only a regular file and bounds the size. It does not scan a directory: the count and the time are bounded by the scan that calls it, `live_cloud_by_lane` in `bin/fleet-switchboard` (files, records and seconds), and by `read_records_bounded` in `bin/cloud_worker.py` (records, files and seconds; it reads each file with its own `_read_one`). Name the reader you use by its real module and function, and do not invent one.
+- (c) A test that checks a completeness claim derives its list from the code's syntax tree (`ast`), never a regular expression, and has a test that adds a new case in a differently spelled form and must fail.
+- (d) The body of a held pull request is in the owner format from the first push.
+- (e) A cloud builder opens its pull request as a draft at its first push, then updates it: the pod's git token expires after about an hour and a late open fails.
+- (f) A merger pod pushes the merge commit the minute it exists and runs the test classes after it, so a finished merge is never left unpushed when the pod ends.
+- (g) A guard or scan test states its closed rule and its known-limits list in its first version, and fails closed: anything not proven harmless is a site. Reviewers judge the rule and the limits: a spelling inside the stated limits is a Low, a spelling that escapes a rule claimed closed is a High.
+- (h) Any change to `.github/workflows/*` is built by a local job, never a cloud pod: a pod's git token has no workflows permission, so the push is refused and the pod cannot be retired.
+- (i) Compare failure messages, not only test names, between the branch and a clean tree, and keep new strings and comments clear of the added-lines scans (`TestGitShim` in `bin/test-switchboard` and `TestEverySite` in `cloud/launcher/tests/test_stub_cleanup.py`): no literal ampersand, `nohup` or spawn text, no git-config variable names, no renamed import to pass a scan.
+- (j) Push the first version by minute 20, run slow suites afterwards in the background with a timeout, and say which git version the tests ran on: tests that depend on git behaviour are verified on a recent git.
+
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
 
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
