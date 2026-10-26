@@ -412,7 +412,10 @@
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
-        "bin/switchboard/jev.py"
+        "bin/switchboard/jev.py",
+        "bin/switchboard/caches.py",
+        "bin/switchboard/profile_pieces.py",
+        "bin/switchboard/installer.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -610,6 +613,17 @@
           "jev_key_file",
           "locate_jev_key",
           "validate_jev_config"
+        ],
+        "bin/switchboard/caches.py": [
+          "BoundedFileCache",
+          "_audit_tail",
+          "_valid_context"
+        ],
+        "bin/switchboard/profile_pieces.py": [
+          "InstallError"
+        ],
+        "bin/switchboard/installer.py": [
+          "reaper_only_conflict"
         ]
       },
       "dynamic_actions": [
