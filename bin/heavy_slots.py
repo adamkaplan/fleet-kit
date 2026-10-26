@@ -158,6 +158,7 @@ KINDS = (
     ("e2e", 3600, _is_e2e),
     ("focused", 1800, _is_focused),
     ("full", 5400, _is_full),
+    ("quick", 600, lambda program, rest, short: False),   # the quick slot's ceiling (#1045): a row of THIS table; classify never returns it, run_quick takes it by name
     ("other", 3600, lambda program, rest, short: True),
 )
 KIND_DEFAULTS = {kind: seconds for kind, seconds, _match in KINDS}
@@ -1094,7 +1095,7 @@ def _stop_orphan(state_dir, index, info, out, clock, watchdog, start_of, decided
 
 
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
-        which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None, worktree=None):
+        which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None, worktree=None, started_flag=None):
     """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
     A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling of the run's KIND (see `classify`, `resolve_ceiling`: `ceiling` is the run's own
     request, else FLEET_HEAVY_MAX_SECONDS; `ceiling_config` the config's `heavy` value; `on_stop(phase, info, holder, lane)` is called with "decided" before a time stop and "told" after it (also for an orphan this wrapper finds while it waits)); `watchdog` is a dict of Watchdog keyword arguments and `line` one of Line's (tests).
@@ -1176,6 +1177,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             if now - started >= wait_max:
                 out.write("heavy: no slot after %d s (%d of %d busy: %s): the command was not run\n" % (int(now - started), slots, slots, _describe(holders(state_dir, slots))))
                 out.flush()
+                noslot_marker(environ, out)
                 return EXIT_TEMPFAIL
             if now >= next_report:
                 try:
@@ -1197,6 +1199,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         if queue is not None and not (queue.leave() or queue.leave()):   # it has its slot (or none will come): out of the line at once; one more try before it says so
             out.write("heavy: could not leave the waiting order: the others pass this caller's ticket once its slot shows as held\n")
         env = dict(environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")   # #1050: a suite's git never opens a credential dialog
+        env.pop(NOSLOT_NONCE_ENV, None)   # the wrapper keeps the nonce to itself: a command that prints its environment cannot forge the "not run" marker line
         mem_mb = ceilings(environ)[0]
         max_seconds = resolve_ceiling(kind, environ, ceiling, ceiling_config)
         if fd is not None and short and index == EXPRESS:   # the express slot's own time ceiling (an environment value may only make it shorter)
@@ -1213,6 +1216,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         except OSError as err:
             out.write("heavy: cannot run %s: %s\n" % (command[0], err.strerror or err))
             return EXIT_NOT_FOUND
+        if started_flag is not None:
+            started_flag["started"] = True   # the command was started: whatever status comes back is its own (a 75 is then a real 75, never "no slot")
         if fd is not None:
             _record(fd, name, child["p"].pid, command[0], clock(), dict(extra, cstart=_start_of(child["p"].pid)))
         if got["signal"] is not None:   # it arrived between taking the slot and the start: the command gets it too
@@ -1274,3 +1279,97 @@ def wrap_argv(argv, environ, python, switchboard, script, err=None, state_dir=No
         err.write("heavy: no slot machinery here (%s): running without a slot\n" % (error.strerror or error))
         return None
     return [python, switchboard, "heavy", "--name", os.path.basename(script), "--", python, script] + list(argv)
+
+
+# ---- the quick slots (#1045): a small separate allowance for ONE focused test file or class, so a one-file check never waits behind a full-suite run.
+QUICK_SLOTS = 4          # the cap: at most this many quick runs at once, on their own locks and their own line (a directory of their own in the state directory)
+QUICK_DIR = "quick"
+
+
+def real_slot_dir(state_dir, name):
+    """A slot directory of ours: made 0700 when absent, and REFUSED (OSError) when the entry there is a symlink or anything but a real directory (lstat, never followed)."""
+    import stat
+    path = os.path.join(str(state_dir), name)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError(errno.ENOTDIR, "%s is not a real directory (a symlink or a file): refused" % path)
+    if info.st_uid != os.getuid():
+        raise OSError(errno.EPERM, "%s is not owned by this user: refused" % path)
+    return path
+
+
+def quick_dir(state_dir):
+    return real_slot_dir(state_dir, QUICK_DIR)
+
+
+def quick_status(state_dir):
+    """`quick slots 1/4 (ceiling 10 min)`: read only (a missing directory reads as none held)."""
+    path = os.path.join(str(state_dir), QUICK_DIR)
+    try:
+        held = len(holders(path, QUICK_SLOTS)) if stat.S_ISDIR(os.lstat(path).st_mode) else 0   # lstat: a symlink reads as none held
+    except OSError:
+        held = 0
+    return "quick slots %d/%d (ceiling %d min)" % (held, QUICK_SLOTS, KIND_DEFAULTS["quick"] // 60)
+
+
+def run_quick(command, state_dir, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, **keywords):
+    """Run ONE focused command in a quick slot. A command that is not focused (a whole suite, an e2e run) is refused with 64 and never takes a quick slot. The quick slots
+    have their own locks and their own waiting line, so a run holding every ordinary slot (or queued for one) never delays it; at most QUICK_SLOTS run at once and each is
+    stopped after the "quick" row of KIND_DEFAULTS (10 min)."""
+    out = sys.stderr if out is None else out
+    kind = classify(command)
+    if kind != "focused":
+        out.write("heavy: refused: a quick slot is for ONE focused test file or class; this run is %s (use an ordinary slot: no --quick)\n" % kind)
+        return EXIT_USAGE
+    environ = dict(os.environ if environ is None else environ)
+    environ[TIME_ENV] = str(KIND_DEFAULTS["quick"])
+    try:
+        out.write("heavy: quick slot: %s\n" % quick_status(state_dir))
+    except OSError:
+        pass
+    return run(command, quick_dir(state_dir), QUICK_SLOTS, wait_max, name, environ=environ, out=out, ceiling=KIND_DEFAULTS["quick"],
+               ceiling_config={"slots": QUICK_SLOTS, "ceilings": {"max": KIND_DEFAULTS["quick"]}}, **keywords)
+
+
+# ---- the reserved slots of a `heavy --changed` run (#1045, clause 7): the diff-derived focused run (several classes, several suites) is never queued behind full-suite runs.
+CHANGED_SLOTS = 2        # reserved: on their own locks and their own waiting line (a directory of their own in the state directory), so a queue of full-suite runs never delays it
+CHANGED_DIR = "changed"
+CHANGED_WAIT_MAX = 120   # the bound of the wait for a reserved slot, in seconds; a longer --wait-max is cut to it
+EXIT_NO_FOCUSED_SLOT = 3
+NO_FOCUSED_SLOT = "no focused slot free"
+NOSLOT_NONCE_ENV = "FLEET_HEAVY_NOSLOT_NONCE"   # set by the caller of a --changed slot: the marker line carries it, so only a real refusal reads as "not run" (no exit code does)
+
+
+def noslot_marker(environ, out):
+    """Write the marker line that says THIS command was not run for want of a slot (or was refused): the caller reads the line, never an exit status a command may also exit with."""
+    nonce = environ.get(NOSLOT_NONCE_ENV)
+    if nonce:
+        out.write("heavy: [noslot %s]\n" % nonce)
+        out.flush()
+
+
+def changed_dir(state_dir):
+    return real_slot_dir(state_dir, CHANGED_DIR)
+
+
+def run_changed(command, state_dir, wait_max=CHANGED_WAIT_MAX, name=None, environ=None, out=None, **keywords):
+    """Run one command of a `heavy --changed` run in a reserved slot. At most CHANGED_SLOTS run at once; the wait is at most CHANGED_WAIT_MAX seconds, and when every reserved
+    slot is still taken the run is NOT started: the line `heavy: no focused slot free ...` names it and the status is 3 (never a silent timeout)."""
+    out = sys.stderr if out is None else out
+    environ = dict(os.environ if environ is None else environ)
+    wait = min(CHANGED_WAIT_MAX if wait_max is None else wait_max, CHANGED_WAIT_MAX)
+    ceiling = keywords.pop("ceiling", None) or KIND_DEFAULTS["focused"]   # the focused row of the per-kind table: no ceiling of its own
+    environ[TIME_ENV] = str(ceiling)
+    flag = {}
+    code = run(command, changed_dir(state_dir), CHANGED_SLOTS, wait, name, environ=environ, out=out, ceiling=ceiling,
+               ceiling_config={"slots": CHANGED_SLOTS, "ceilings": {"max": ceiling}}, started_flag=flag, **keywords)
+    if code == EXIT_TEMPFAIL and not flag.get("started"):   # a command that itself exits 75 is a real result
+        noslot_marker(environ, out)
+        out.write("heavy: %s: all %d reserved --changed slots are taken after %d s: the command was not run (exit %d)\n" % (NO_FOCUSED_SLOT, CHANGED_SLOTS, wait, EXIT_NO_FOCUSED_SLOT))
+        out.flush()
+        return EXIT_NO_FOCUSED_SLOT
+    return code

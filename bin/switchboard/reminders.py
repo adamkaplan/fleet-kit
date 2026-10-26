@@ -33,7 +33,7 @@ def reminders_lock(state_dir):
 def read_reminders(state_dir):
     path = Path(state_dir) / REMINDERS
     try:
-        raw = json.loads(path.read_text())
+        raw = load_module("record_json").parse_bounded(path.read_text())
     except FileNotFoundError:
         return []
     except (OSError, ValueError) as err:
@@ -121,7 +121,7 @@ def read_record_file(path, cap=RECORD_CAP):
     finally:
         os.close(fd)
     try:
-        return json.loads(data.decode("utf-8"))
+        return load_module("record_json").parse_bounded(data.decode("utf-8"))
     except (ValueError, UnicodeError):
         return None
 
@@ -198,6 +198,7 @@ def add_repeat_reminder(state_dir, to, at, created, text, kind, subject, state, 
 # function -> (kind, repeat key, window, test). docs/switchboard.md carries the same table; a test derives the senders from the source.
 FINDING_TABLE = {
     "blocked_tick": ("Blocked agent", "agent, recipient, event, held, refused, kind, reason", "6 hours; first report and end line at once", "test_tell_holds_a_repeat_and_passes_the_first_report"),
+    "undelivered_wake_tick": ("Undelivered wake", "agent, incident (own state)", "once per incident", "test_the_chief_of_staff_is_told_once_when_the_resume_did_not_deliver"),
     "load_tick": ("load alert", "lane, severity and reasons", "6 hours; merged into the wake message", "test_load_alert_is_keyed_by_the_data_not_the_text"),
     "friction_tick": ("friction wake", "slot (own state)", "per slot", "test_one_wake_per_orchestrator_per_day_not_for_cos_or_coders"),
     "cmd_budget_notice": ("budget notice", "account (own claim)", "1 hour", "test_s2_the_top_spenders_orchestrator_gets_one_message_with_the_agent_and_the_numbers_and_a_second_call_sends_none"),

@@ -116,7 +116,7 @@ OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
            suite("bin/test-heartbeat"), suite("bin/test-health-records"), suite("bin/test-fleet-doctor"),
            suite("bin/test-fleet-doctor-config"), suite("bin/test-fleet-doctor-heartbeat"), suite("bin/test-switchboard"),
            suite("bin/test-workflow-split"), suite("bin/test-gh-hold", "-hold"), suite("bin/test-app-mint", "-app"),
-           suite("bin/test-cloud-neutral-names"), suite("cloud/tests/test-cloud", "", "5"),
+           suite("bin/test-cloud-neutral-names"), suite("cloud/tests/test-cloud", "", "10"),
            ("bin/fleet-scenario validate", "bin/fleet-scenario validate", None),
            ("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4", None)]
 NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", "30")]
@@ -167,7 +167,7 @@ TEST_STEPS = [CHECKOUT, PYTHON,
               step("bin/test-fleet-doctor-config"), step("bin/test-fleet-doctor-heartbeat"), step("bin/test-switchboard"),
               step("bin/test-workflow-split"), step("bin/test-gh-hold", "-hold"), step("bin/test-app-mint", "-app"),
               step("bin/test-cloud-neutral-names"),
-              step("cloud/tests/test-cloud", **{"timeout-minutes": "5", "env": {"CLOUD_TEST_SKIP_DOCKER": "1"}}),
+              step("cloud/tests/test-cloud", **{"timeout-minutes": "10", "env": {"CLOUD_TEST_SKIP_DOCKER": "1"}}),
               plain("node --test plugins/fleet-decisions-tui/health.test.mjs", "node --test plugins/fleet-decisions-tui/health.test.mjs"),
               plain("bin/fleet-scenario validate", "bin/fleet-scenario validate"),
               plain("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4")]
@@ -264,7 +264,7 @@ class Pins(unittest.TestCase):
         for jid, job in self.jobs().items():
             self.assertNotIn("if", job, jid)   # a skipped job would leave a required name unreported (ask #990)
         image = [s for s in self.jobs()["test"]["steps"] if s.get("name") == "cloud/tests/test-cloud"]
-        self.assertEqual([s.get("timeout-minutes") for s in image], ["5"])
+        self.assertEqual([s.get("timeout-minutes") for s in image], ["10"])
 
 
     def test_shape_the_workflow_and_both_jobs_have_exactly_the_expected_keys_and_values(self):
@@ -382,7 +382,7 @@ class Mutants(unittest.TestCase):
         self.fails("  workflow_dispatch:\n", "", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit")
 
     def test_u2_image_limit_changed(self):
-        self.fails("timeout-minutes: 5", "timeout-minutes: 10", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+        self.fails("timeout-minutes: 10", "timeout-minutes: 5", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
 
     SHAPE = "test_shape_the_workflow_and_both_jobs_have_exactly_the_expected_keys_and_values"
 

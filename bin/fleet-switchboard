@@ -390,6 +390,9 @@ DEFAULTS = {
     "review_window_minutes": 60,  # #816: an open pull request younger than this, or one with a review requested, is a worker legitimately waiting
     "stalled_working_hours": 2,   # #811: a coder or tester that only reports `working` while nothing it owns moves wakes its boss once after this long
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
+    "undelivered_wake_tell_minutes": None,  # #1337: minutes after the resume before the Chief of Staff is told; None = the same as undelivered_wake_minutes
+    "undelivered_wake_per_pass": 2,  # #1337: at most this many agents are resumed by the rule in one pass (1..20), oldest wake first
+    "undelivered_wake_minutes": 15,  # #1337: a wake admitted with delivery queue and still absent from the transcript this long is resumed once (the notice to the Chief of Staff follows at twice this)
     "rider_max_age_seconds": 3600,  # PR 13: a rider older than this is dropped, and an older stop is not triaged
     "report_triage": None,          # PR 13: None means REPORT_TRIAGE_DEFAULTS (the `report_owed` question's settings)
     # GitHub events (PR 5)
@@ -676,9 +679,15 @@ def validate_config(raw, source="config"):
     if not _is_number(config["clear_remind_minutes"]) or config["clear_remind_minutes"] <= 0:
         raise ConfigError("%r must be a number above 0, got %r" % ("clear_remind_minutes", config["clear_remind_minutes"]))
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
-                "worker_lookback_hours", "stalled_working_hours", "review_window_minutes", "rider_max_age_seconds"):
+                "worker_lookback_hours", "stalled_working_hours", "review_window_minutes", "rider_max_age_seconds", "undelivered_wake_minutes"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
+    tell = config["undelivered_wake_tell_minutes"]
+    if tell is not None and (not _is_number(tell) or tell <= 0):
+        raise ConfigError("%s: 'undelivered_wake_tell_minutes' must be a positive number (or absent), got %r" % (source, tell))
+    per_pass = config["undelivered_wake_per_pass"]
+    if not isinstance(per_pass, int) or isinstance(per_pass, bool) or not 1 <= per_pass <= 20:
+        raise ConfigError("%s: 'undelivered_wake_per_pass' must be a whole number from 1 to 20, got %r" % (source, per_pass))
     if not isinstance(config["herdr_log"], str) or not config["herdr_log"].strip():
         raise ConfigError("%s: 'herdr_log' must be a non-empty path, got %r" % (source, config["herdr_log"]))
     if not _is_number(config["pane_exit_burst_seconds"]) or not 0 < config["pane_exit_burst_seconds"] <= 3600:
@@ -3171,6 +3180,10 @@ class Switchboard:
             blocked_tick(self, discovery, held)
         except Exception as err:
             self._failed("blocked-alert", "blocked-alert", err, report)
+        try:
+            undelivered_wake_tick(self, discovery)
+        except Exception as err:
+            self._failed("undelivered-wake", "undelivered-wake", err, report)
         finish_pass(self, discovery, report)
         if self.reads.deferred:   # the budget kept what was remembered for this many reads this pass: said, once per change of the count
             self._note("v2_reads.deferred", None, {"reads": self.reads.deferred})
@@ -10389,6 +10402,146 @@ def ended_turn_text(name, resumed):
             "the Chief of Staff may resume it with `%s %s`, which is audited and sends nothing while it works or has anything open" % (RESUME_COMMAND, name))
 
 
+# ---- an undelivered wake is recovered (#1337, docs/switchboard.md, "An undelivered wake is recovered"). `Switchboard.deliver` counts a key delivered once v2
+# ADMITTED it (`_acknowledge`), so a wake queued for an idle session that never starts a turn is never planned again. This pass reads the inbox (the
+# queue: items the session has not taken), and for an idle agent whose queued wake is older than `undelivered_wake_minutes` and absent from the
+# transcript it calls `resume_ended_turn` once per incident; after twice that time with the keys still absent the Chief of Staff is told once.
+
+UNDELIVERED_STATE = "undelivered-wake.json"   # {agent: {"session", "since", "keys", "resumed", "told"}}: one incident per agent (an ordinary state row)
+UNDELIVERED_KEYS = 20                         # keys named in a line, then "and N more"
+UNDELIVERED_STATES = ("undelivered", "admitted-in-transcript", "admitted-absent", "refused", "resumed", "told")   # the delivery states; the completeness test derives its cases from this
+
+
+def queued_wakes(engine, seen, now, fresh=False):
+    """{key: created} of the switchboard wakes queued in `seen`'s inbox (one read). Inputs are untrusted: a time outside 2000..now is dropped, a
+    non-string key is dropped (`_fleet_keys`), resume: and orders: keys are not wakes."""
+    inbox = engine.reads.inbox(seen.session_id, now, fresh=fresh)   # a remembered read finds nothing to do for free; a candidate is read again fresh
+    found = {}
+    for item in inbox if isinstance(inbox, list) else []:
+        meta = _fleet_meta(item) if isinstance(item, dict) else None
+        if not meta or meta.get("from") != "switchboard" or item.get("delivery") != "queue":
+            continue   # v2's inbox record carries no `resume`: the queue delivery and the daemon's own metadata are what is known
+        created = _created(item)
+        if created is None or not 946684800 <= created <= now:
+            continue
+        for key in _fleet_keys(item)[:200]:
+            if not key.startswith(("resume:", "orders:")):
+                found[key] = min(created, found.get(key, created))
+    return found
+
+
+def transcript_keys(engine, seen, since):
+    """The keys in the agent's synthetic messages back to `since` (the oldest wake's admission), read page by page like `delivered_keys`, at most
+    MAX_READ_PAGES pages. The sent-keys ledger is NOT consulted: it counts a key at ADMISSION, which is the very thing this rule doubts. The
+    remaining false positive: a delivered key buried under more than MAX_READ_PAGES * SYNTHETIC_PAGE newer synthetic messages reads as absent."""
+    have = set()
+    for page, more in engine.v2.message_pages(seen.session_id, SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):
+        reached = False
+        for message in page:
+            if not isinstance(message, dict):
+                continue
+            created = _created(message)
+            have.update(_fleet_keys(message))
+            if created is not None and created < since:
+                reached = True
+        if reached or len(page) < SYNTHETIC_PAGE or more is False:
+            break
+    return have
+
+
+def undelivered_wakes(engine, seen, now, fresh=False):
+    """[(key, created)] of the switchboard wakes queued in `seen`'s inbox whose keys are not in its transcript; [] when nothing is read."""
+    found = queued_wakes(engine, seen, now, fresh=fresh)
+    if not found:
+        return []
+    have = transcript_keys(engine, seen, min(found.values()))
+    return sorted(((k, t) for k, t in found.items() if k not in have), key=lambda row: (row[1], row[0]))
+
+
+def undelivered_wake_tick(engine, discovery):
+    """The end of a pass: resume an idle agent whose admitted wake is absent from its transcript past `undelivered_wake_minutes` (once per incident,
+    at most `undelivered_wake_per_pass` agents a pass, oldest first), and tell the Chief of Staff once when it is still absent `undelivered_wake_tell_minutes`
+    after the RESUME. Returns [(agent, "resume" | "told")]. A working or blocked agent, one with an unreadable inbox or transcript, and a wake not yet
+    that old are left alone."""
+    if discovery is None or engine.state_dir is None or engine.light:
+        return []
+    limit = engine.config["undelivered_wake_minutes"] * 60
+    tell_after = (engine.config["undelivered_wake_tell_minutes"] or engine.config["undelivered_wake_minutes"]) * 60
+    cap = engine.config["undelivered_wake_per_pass"]
+    now, done = engine.now(), []
+    state = blocked_update(engine.state_dir, UNDELIVERED_STATE, lambda _: None)
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
+    changed = False
+    candidates = []
+    for name, seen in sorted(discovery.agents.items()):
+        if seen.status != "idle" or hold_reason(seen) or seen.conflict or seen.problem:
+            continue
+        try:
+            found = queued_wakes(engine, seen, now)   # read 1: from memory when remembered
+            rows = []
+            if found and (now - min(found.values()) >= limit or name in state):
+                found = queued_wakes(engine, seen, now, fresh=True)   # read 2: a write or a notice follows, so judged on a fresh read
+                if found:
+                    have = transcript_keys(engine, seen, min(found.values()))   # read 3: one page unless a long history needs more
+                    rows = sorted(((k, t) for k, t in found.items() if k not in have), key=lambda row: (row[1], row[0]))
+        except Exception:
+            continue   # unreadable: skipped, never resumed
+        entry = state.get(name)
+        if not rows:
+            if entry is not None:
+                del state[name]   # the keys appeared: the incident ends
+                changed = True
+            continue
+        candidates.append((rows[0][1], name, seen, rows))
+    resumed_now = 0
+    for _, name, seen, rows in sorted(candidates, key=lambda c: (c[0], c[1])):
+        entry = state.get(name)
+        age = now - rows[0][1]
+        if not isinstance(entry, dict) or entry.get("session") != seen.session_id:
+            entry = state[name] = {"session": seen.session_id, "since": rows[0][1], "keys": [], "resumed": None, "told": False, "age": 0}
+            changed = True
+        keys = [k for k, _ in rows][:UNDELIVERED_KEYS]
+        if entry.get("keys") != keys or entry.get("age") != int(age // 60):
+            entry["keys"], entry["age"] = keys, int(age // 60)   # minutes: a write only when something changed
+            changed = True
+        if entry.get("resumed") is None and age >= limit:
+            if resumed_now >= cap:
+                continue   # the per-pass cap: the next pass takes the next ones
+            try:
+                resume_ended_turn(engine, "switchboard", name, "undelivered wake: %d key(s), the oldest %d minutes old, absent from the transcript" % (len(rows), age // 60), discovery)
+            except Exception:
+                pass   # a refusal is final for this pass; the incident stays open and is retried only when no resume is recorded
+            else:
+                entry["resumed"] = now
+                changed = True
+                resumed_now += 1
+                done.append((name, "resume"))
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "undelivered.resume", name, {"oldest_age_seconds": int(age), "keys": entry["keys"], "count": len(rows)})
+        elif entry.get("resumed") is not None and not entry.get("told") and now - entry["resumed"] >= tell_after:
+            if cos and cos != name:
+                text = "Undelivered wake: %s has %d wake(s) still not in its transcript, the oldest %d minutes old (a resume was sent once)." % (_one_line(name, 80), len(rows), age // 60)
+                add_repeat_reminder(engine.state_dir, cos, now, now, text, "undelivered-wake", name, "undelivered|%s" % entry["since"], first=True,
+                                    answered_at=last_send_at(engine.state_dir, cos, name))
+                entry["told"] = True
+                changed = True
+                done.append((name, "told"))
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "undelivered.told", name, {"told": [cos], "oldest_age_seconds": int(age), "count": len(rows), "keys": entry["keys"]})
+            else:
+                entry["told"] = True   # the incident is closed: it ends when the keys appear, never resumed again
+                changed = True
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "undelivered.untold", name, {"reason": "the agent is the Chief of Staff" if cos == name else "no Chief of Staff in discovery",
+                                                                                   "oldest_age_seconds": int(age), "count": len(rows), "keys": entry["keys"]})
+    for name in sorted(set(state) - set(discovery.agents)):
+        del state[name]
+        changed = True
+    if changed:
+        blocked_update(engine.state_dir, UNDELIVERED_STATE, lambda _: state)
+    return done
+
+
 # ---- a long block is reported (docs/switchboard.md, "A blocked agent is reported"). `hold_reason` holds a message for an agent
 # the terminal shows as blocked: nothing is typed into a prompt, and that is right. The missing part was the report. Once per
 # block (repeated at most every `repeat_minutes`, closed with one final line) its boss and the Chief of Staff are told. It reads
@@ -11918,7 +12071,7 @@ class GitHubHub:
         return out
 
     def plan_kind(self, repo, number, budget=None):
-        """"plan", "noplan" or "unknown" for an issue: whether a comment of it is the plan comment (the reading `plan check` uses,
+        """"plan", "noplan", "defect" (a second plan-looking comment: the one rule of plan_comment_choice) or "unknown" for an issue: whether a comment of it is the plan comment (the reading `plan check` uses,
         plan_check.select_plan_text; it does not check the author, the latest heading comment counts whoever wrote it; a plan in the
         issue BODY reads "noplan": the ask says a plan COMMENT). One read of the first 100 comments, cached for GITHUB_LOOKUP_TTL; a failed
         read is remembered for GITHUB_LOOKUP_RETRY and says "unknown". A full page (100) with no plan found reads "unknown" (the plan may
@@ -11941,7 +12094,8 @@ class GitHubHub:
                                 timeout=min(self.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT))
             comments = pages[0] if pages and isinstance(pages[0], list) else None
             if comments is not None and len(comments) < 100:
-                kind = "plan" if plan_check.select_plan_text("", comments)[1] != "issue body" else "noplan"
+                text, source, defects = plan_comment_choice("", comments)
+                kind = "defect" if second_plan_defects(defects) else ("plan" if source != "issue body" else "noplan")
                 ttl = GITHUB_LOOKUP_TTL
         except Exception:
             pass
@@ -15154,8 +15308,20 @@ def parse_plan_source(text, default_repo=None):
     return repo, int(found.group(2)), None
 
 
+def plan_comment_choice(body, comments):
+    """(text, source, defects): the ONE rule every reader of an issue's plan applies: the plan select_plan_text picks, with the comment-level
+    defects (a second plan-looking comment naming both ids, a bad receipt) RETURNED beside it, never kept in a global."""
+    text, source = plan_check.select_plan_text(body, comments)
+    return text, source, plan_check.plan_comment_defects(comments)
+
+
+def second_plan_defects(defects):
+    return [d for d in defects if d.get("code") == "second-plan-comment"]
+
+
 def fetch_plan(reader, repo, number, comment_id=None):
-    """(text, source label, done_when of the issue) read from GitHub with GETs only. `reader` has `_api(path, repo)`."""
+    """(text, source label, done_when of the issue, comment-level defects) read from GitHub with GETs only. `reader` has `_api(path, repo)`.
+    The defects are computed from every comment of the issue also when `comment_id` names one: naming a comment does not skip the report."""
     try:
         issue = reader._api("repos/%s/issues/%d" % (repo, number), repo)
         comments = []
@@ -15169,14 +15335,54 @@ def fetch_plan(reader, repo, number, comment_id=None):
     except IntentError as err:
         raise PlanInputError("cannot read %s#%d: %s" % (repo, number, err)) from None
     body = issue.get("body") if isinstance(issue, dict) and isinstance(issue.get("body"), str) else ""
+    defects = plan_check.plan_comment_defects(comments)
     if comment_id is not None:
         picked = [c for c in comments if isinstance(c, dict) and c.get("id") == comment_id]
         if not picked:
             raise PlanInputError("%s#%d has no comment %d" % (repo, number, comment_id))
         text, source = picked[0].get("body") or "", "comment %d%s" % (comment_id, plan_check.comment_author(picked[0]))
     else:
-        text, source = plan_check.select_plan_text(body, comments)
-    return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1]
+        text, source, defects = plan_comment_choice(body, comments)
+    return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1], defects
+
+
+def _parent_ask_done_when(reader, repo, number):
+    """The Done-when of the ASK that is the native sub-issue parent of issue `number` of `repo`, or None. Like `IntentReader.ask_of`, a parent counts as the ask only
+    when it has a parent of its own (the charter): the issue under a charter is itself the ask, and a charter's Done-when is never borrowed. Anything that is not
+    "the ask of this repository's work item" is REFUSED (PlanInputError), never read as another issue: a parent in another repository (the parent's repository comes
+    from the API payload, the reader's `parent()` keeps only the number), a pull request, the issue itself, and a cycle."""
+    where = "%s#%d" % (repo, number)
+
+    def parent_payload(of):
+        try:
+            found = reader._api("repos/%s/issues/%d/parent" % (repo, of), repo)
+        except IntentError as err:
+            if err.reason == "not_found":
+                return None
+            raise
+        if not isinstance(found, dict) or not isinstance(found.get("number"), int):
+            raise PlanInputError("the parent of %s#%d did not come back as an issue" % (repo, of))
+        if found.get("pull_request"):
+            raise PlanInputError("the parent of %s#%d is a pull request, not an ask" % (repo, of))
+        url = str(found.get("repository_url") or "").lower().rstrip("/")
+        if not url.endswith("/repos/" + repo.lower()):
+            raise PlanInputError("the parent of %s#%d (#%d) is in another repository (%s): a plan reads the Done-when of an ask of its own repository only"
+                                 % (repo, of, found["number"], url.rsplit("/repos/", 1)[-1] or "unknown"))
+        return found
+    try:
+        parent = parent_payload(number)
+        if parent is None:
+            return None
+        if parent["number"] == number:
+            raise PlanInputError("%s is its own parent" % where)
+        grand = parent_payload(parent["number"])
+        if grand is None:
+            return None
+        if grand["number"] in (number, parent["number"]):
+            raise PlanInputError("the parent chain of %s loops back on itself" % where)
+        return reader.issue(parent["number"], repo).done_when
+    except IntentError as err:
+        raise PlanInputError("cannot read the parent ask of %s: %s" % (where, err)) from None
 
 
 def load_plan(args, runner, now):
@@ -15188,6 +15394,7 @@ def load_plan(args, runner, now):
         raise PlanInputError("the plan checker (bin/plan_check.py) cannot be loaded: %s" % _one_line(str(err), 150)) from None
     done_when = args.done_when
     plan_own = None
+    comment_defects = []
     if args.file:
         if args.source:
             raise PlanInputError("give a plan source or --file, not both")
@@ -15209,7 +15416,7 @@ def load_plan(args, runner, now):
         repo, number, comment_id = parse_plan_source(args.source, config.get("intent_repo"))
         reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"],
                               accounts=GhAccounts(config, runner, now))
-        text, source, issue_done = fetch_plan(reader, repo, number, comment_id)
+        text, source, issue_done, comment_defects = fetch_plan(reader, repo, number, comment_id)
         if args.ask and not done_when:
             ask_repo, ask_number, _ = parse_plan_source(args.ask, repo)
             done_when = reader.issue(ask_number, ask_repo).done_when  # the ask is the authority
@@ -15218,9 +15425,15 @@ def load_plan(args, runner, now):
             plan_own = issue_done if issue_done and issue_done != done_when else None
         else:
             done_when = issue_done
+            if not done_when:   # a work item states no Done-when of its own: its ask's is the authority (the sub-issue parent, never a "Work item of" line)
+                done_when = _parent_ask_done_when(reader, repo, number)
     if args.ask and args.file and not args.done_when:
         raise PlanInputError("--ask needs a plan read from GitHub; for --file give --done-when TEXT")
-    return text, source, plan_check.check(text, done_when, plan_own)
+    result = plan_check.check(text, done_when, plan_own)
+    if comment_defects:
+        result["defects"] = list(result["defects"]) + list(comment_defects)
+        result["result"] = "fail"
+    return text, source, result
 
 
 def cmd_plan_check(args, runner, now):
@@ -15414,7 +15627,7 @@ def pr_picture(engine, repo, number, state):
 def authoritative_plan(entries, pr, body):
     """(source, where) of the plan a PR is under, which its writer does not choose: the `PLAN:` line of the PR body, else
     the plan of the PR's FIRST ledger entry. (None, None) when neither exists yet."""
-    found = PLAN_LINE_RE.search(body or "")
+    found = PLAN_LINE_RE.search(plan_ledger.visible_body(body))
     if found:
         return found.group(1).strip("<>.,"), "the PR body's PLAN: line"
     for entry in entries:
@@ -15475,7 +15688,7 @@ def ask_refusal(issue, ref):
 
 
 def ask_plan_comment(engine, repo, number):
-    """The newest plan comment (a heading `Plan (scenarios)`) of the issue `repo#number`, or None. GETs only; a page that cannot be read is no plan."""
+    """The newest plan comment (a heading `Plan (scenarios)`) of the issue `repo#number`, or None; a second plan-looking comment raises LedgerCommandError naming both. GETs only; a page that cannot be read is no plan."""
     comments = []
     try:
         for page in range(1, PLAN_COMMENT_PAGES + 1):
@@ -15487,7 +15700,9 @@ def ask_plan_comment(engine, repo, number):
                 break
     except (IntentError, AttributeError):
         return None
-    text, source = plan_check.select_plan_text("", comments)
+    text, source, defects = plan_comment_choice("", comments)
+    if second_plan_defects(defects):
+        raise LedgerCommandError("refused: %s#%d: %s, nothing was recorded" % (repo, number, second_plan_defects(defects)[0]["message"]))
     return text if source != "issue body" else None
 
 
@@ -15628,6 +15843,11 @@ def _scenario_of(ctx, sid):
         raise LedgerCommandError("the plan has no scenario %s (it has %s)" % (sid, ", ".join(x.get("id", "?") for x in ctx.plan["scenarios_parsed"][:12])))
     if plan_ledger.claim_of(found) != "pr":
         raise LedgerCommandError("%s is claimed at the epic, not per PR: it is proven at the epic's integrated head" % sid)
+    mine, left, why = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], (ctx.facts or {}).get("body"))
+    if why:
+        raise LedgerCommandError("refused: " + why)
+    if found not in mine:
+        raise LedgerCommandError("%s is not on this pull request's `CLAIMS:` line: it stays claimed by the epic's other pull requests" % sid)
     return found
 
 
@@ -15744,8 +15964,10 @@ def cmd_verdict(args, runner, now):
         if args.scenario:
             raise LedgerCommandError("--all takes no scenario id: it records every scenario the plan names for --as %s" % args.evaluator)
         _plan_usable(ctx)
-        targets = [x for x in ctx.plan["scenarios_parsed"]
-                   if plan_ledger.claim_of(x) == "pr" and plan_ledger.evaluator_of(x) == args.evaluator]
+        mine, _, why = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], (ctx.facts or {}).get("body"))
+        if why:
+            raise LedgerCommandError("refused: " + why)
+        targets = [x for x in mine if plan_ledger.evaluator_of(x) == args.evaluator]
         if not targets:
             raise LedgerCommandError("no per-PR scenario of this plan is judged by %s: nothing was recorded" % args.evaluator)
         named = args.evaluator
@@ -15959,6 +16181,25 @@ def read_open_overlap(engine, repo, runner):
     return cache[repo]
 
 
+def gates_suites_finding(runner, ctx):
+    """#1045: the gates FINDING (information, never a block, never changes the verdict): the pull request changes a path and names none of the suites that exercise it.
+    Read only; the suites are derived from the checkout this command runs in, and any trouble reading gives no finding."""
+    try:
+        ps = load_module("path_suites")
+        top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        done = runner(["gh", "pr", "diff", str(ctx.number), "--repo", ctx.repo, "--name-only"], capture_output=True, text=True)
+        if top.returncode != 0 or done.returncode != 0:
+            return None
+        root, changed = top.stdout.strip(), [p for p in done.stdout.split("\n") if p.strip()]
+        by, notes = ps.bounded_suites(root, changed, runner)
+        line = ps.gate_finding(changed[:ps.MAX_PATHS], by, str((ctx.facts or {}).get("body") or ""))
+        if notes:
+            line = (line or "finding: the suites that exercise the changed paths could not all be derived") + " [note: %s]" % "; ".join(notes)
+        return line
+    except Exception:
+        return None
+
+
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
@@ -15988,13 +16229,17 @@ def cmd_gates(args, runner, now):
     carry_refused = (ctx.facts.get("carries") or {}).get("refusal")
     report["impact_rating"] = gate_impact_rating(ctx.state, ctx.pr, ctx.facts.get("head"))   # #892: output text only; no gate reads it
     gates_carried_note(report, ctx)
+    claim_union_note(report, ctx, runner, now)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
+    suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
     if args.json:
+        if suites_finding:
+            report["suites_finding"] = suites_finding
         if isinstance(ctx.facts, dict) and rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")):
             report["rating_block"] = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head"))
         if shares:
@@ -16004,6 +16249,8 @@ def cmd_gates(args, runner, now):
         lines = plan_ledger.render_gates(report, ctx.pr)
         if shares:
             lines.append(shares)
+        if suites_finding:
+            lines.append(suites_finding)
         if ctx.unreadable:
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
@@ -16414,7 +16661,7 @@ def register_item_tester(engine, state, args, repo, launched_by, done, now):
             if not load_module("item_verdicts").sha_ok(pin):
                 why = "the default branch tip of %s could not be read" % repo
         if why is None:
-            link = PLAN_LINE_RE.search(issue["body"] or "")
+            link = PLAN_LINE_RE.search(plan_ledger.visible_body(issue["body"]))
             stored = plan_ledger.append_entry(state, {"kind": "item_tester", "pr": item, "item": item, "tester": args.name, "session": done.get("session"),
                                                       "orchestrator": launched_by, "head": pin, "plan_ref": link.group(1).strip("<>.,") if link else None, "by": launched_by}, now())
             _gates_audit(engine, "plan.item.register", item, {"item": item, "tester": args.name, "session": done.get("session"), "orchestrator": launched_by,
@@ -17542,6 +17789,41 @@ def cmd_gates_stats(args, runner, now):
     return EXIT_OK
 
 
+def claim_union_note(report, ctx, runner, now):
+    """A pull request whose `CLAIMS:` line leaves scenarios to the epic's other pull requests: `gates` LISTS the ones no other OPEN or MERGED pull request under the same plan claims yet
+    (a pull request with no claim line claims every per-PR scenario). Reads GitHub with GETs only, CLI only; a failed read is said, never silent. It enforces nothing: the union gate at the
+    ask's last merge is a follow-up."""
+    try:
+        if ctx.plan is None or ctx.plan.get("result") != "pass":
+            return
+        mine = (ctx.facts or {}).get("body")
+        _, left, error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], mine)
+        row = next((r for r in report["gates"] if r["gate"] == "G1"), None)
+        if error or not left or row is None:
+            return
+        repo = ctx.pr.rsplit("#", 1)[0]
+        reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
+        listed = reader._api("repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100" % repo, repo)
+        if not isinstance(listed, list):
+            raise ValueError("the pull request list did not come back as a list")
+        covered = set()
+        for other in listed:
+            if not isinstance(other, dict) or other.get("number") == ctx.number:
+                continue
+            if other.get("state") != "open" and not other.get("merged_at"):
+                continue   # closed without a merge: it proves nothing
+            link = plan_ledger.PLAN_LINK_RE.search(plan_ledger.visible_body(other.get("body")))
+            if not link or not _same_plan(link.group(1).strip("<>.,"), ctx.source, ctx.config.get("intent_repo")):
+                continue
+            claimed, _, other_error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], other.get("body"))
+            if not other_error:
+                covered.update(x["id"] for x in claimed)
+        missing = [x["id"] for x in left if x["id"] not in covered]
+        report["unclaimed"] = missing
+        row["detail"] = (row.get("detail") or "") + "; claimed by no other open or merged pull request of this plan yet: %s" % (", ".join(missing) if missing else "none")
+    except Exception as err:   # said, never silent
+        report["unclaimed_error"] = _one_line("%s: %s" % (type(err).__name__, err), 160)
+
 CARRY_COMPARE_FILE_CAP = 300   # GitHub lists at most 300 files of a compare: a named file beyond the cap would read as untouched
 CARRY_TOO_LARGE = "the diff is too large to judge (GitHub lists at most 300 files of a compare, so a file may be missing): nothing carried"
 CARRY_NOT_DESCENDANT = "the new head is not a descendant of the old head (compare status %s: a force-push or rewind; the compare does not show changes only in the old head): nothing carried"
@@ -18130,7 +18412,10 @@ def ci_record_core(ctx, now, quiet=False):
     out.update(head=head, ci=ci)
     if ctx.plan is None or ctx.plan["result"] != "pass":
         return dict(out, status="no-plan", why="no passing plan for the PR (%s)" % (ctx.plan_problem or "run `plan check`"))
-    wanted = [x for x in ctx.plan["scenarios_parsed"] if plan_ledger.claim_of(x) == "pr" and plan_ledger.evaluator_of(x) == "ci"]
+    mine, _, why = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], (ctx.facts or {}).get("body"))
+    if why:
+        return dict(out, status="no-plan", why="the claim line is refused: " + why)
+    wanted = [x for x in mine if plan_ledger.evaluator_of(x) == "ci"]
     out["scenarios"] = [x["id"] for x in wanted]
     detail = {"head": head, "ci": ci, "scenarios": out["scenarios"], "at": int(now())}
     if not head:
@@ -20432,6 +20717,8 @@ def heavy_stop_reporter(module, config, make_engine, actor):
 
 def cmd_heavy(args, runner=subprocess.run, now=time.time):
     """`heavy [--slots N] [--wait-max S] [--ceiling S] -- <command...>`: run the command in a CPU slot (ask #34); its exit status is ours."""
+    if getattr(args, "changed", False) or getattr(args, "list", False):
+        return cmd_heavy_changed(args, runner, now)
     module = load_heavy_slots()
     command = list(args.command)
     if command[:1] == ["--"]:
@@ -20454,11 +20741,111 @@ def cmd_heavy(args, runner=subprocess.run, now=time.time):
         sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
         state = None
     reporter = heavy_stop_reporter(module, heavy_config, lambda: build_engine(runner, now, "cli")[0], "heavy") if state is not None else None
+    if getattr(args, "changed_slot", False):   # #1045 clause 7: a command of a --changed run, in a reserved slot, a bounded wait and a named refusal (exit 3)
+        if state is None:
+            sys.stderr.write("heavy: refused: no state directory for a reserved slot\n")
+            module.noslot_marker(os.environ, sys.stderr)
+            return module.EXIT_USAGE
+        try:
+            return module.run_changed(command, state, args.wait_max, args.name, on_stop=reporter, ceiling=getattr(args, "ceiling", None))
+        except OSError as err:   # the reserved slot directory is not a real directory (a symlink): refused by name, the command is not run
+            sys.stderr.write("heavy: refused: %s\n" % _one_line(str(err), 200))
+            module.noslot_marker(os.environ, sys.stderr)
+            return module.EXIT_USAGE
+    if getattr(args, "quick", False):   # #1045: ONE focused file or class, in a quick slot of its own; a full-suite run is refused
+        if state is None:
+            sys.stderr.write("heavy: refused: no state directory for a quick slot\n")
+            return module.EXIT_USAGE
+        try:
+            return module.run_quick(command, state, 300 if args.wait_max is None else args.wait_max, args.name, on_stop=reporter, short=bool(getattr(args, "short", False)))
+        except OSError as err:   # the quick slot directory is not a real directory (a symlink): refused by name
+            sys.stderr.write("heavy: refused: %s\n" % _one_line(str(err), 200))
+            return module.EXIT_USAGE
     return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name,
                       short=bool(getattr(args, "short", False)), ceiling=getattr(args, "ceiling", None), ceiling_config=heavy_config, on_stop=reporter)
 
 
 cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon start, no error mapping
+
+
+def _changed_plan(args, runner):
+    """(root, base, paths, rows, none) for `heavy --changed`: read only."""
+    ps = load_module("path_suites")
+    top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if top.returncode != 0:
+        raise ps.PathSuitesError("not inside a git work tree")
+    root = top.stdout.strip()
+    base = args.base or ps.default_base(root, runner)
+    if not base:
+        raise ps.PathSuitesError("no base branch found: give --base")
+    sha = ps.resolve_base(root, base, runner)   # a name that is not a commit (or starts with `-`) is refused here; the git commands below get the sha
+    paths = None
+    if args.pr:
+        number = str(args.pr).strip().split("#")[-1]
+        if not re.fullmatch(r"[0-9]{1,9}", number):
+            raise ps.PathSuitesError("--pr %r: the number after '#' must be digits" % str(args.pr)[:60])
+        theirs = runner(["gh", "pr", "view", number, "--json", "headRefOid", "-q", ".headRefOid"], cwd=root, capture_output=True, text=True)
+        mine = runner(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True)
+        if theirs.returncode != 0 or (theirs.stdout or "").strip() != (mine.stdout or "").strip() or not (mine.stdout or "").strip():
+            raise ps.PathSuitesError("--pr %s: the checked-out HEAD is not the pull request's head (or its head could not be read): check out the pull request's branch" % number)
+        done = runner(["gh", "pr", "diff", number, "--name-only"], cwd=root, capture_output=True, text=True)
+        if done.returncode == 0 and done.stdout.strip():
+            paths = sorted(p for p in done.stdout.split("\n") if p.strip())
+    if paths is None:
+        paths = ps.changed_paths(root, sha, runner)
+    if len(paths) > ps.MAX_CHANGED:
+        raise ps.PathSuitesError("%d changed paths is more than the %d `heavy --changed` derives for: run the suites by hand, or give a narrower --base" % (len(paths), ps.MAX_CHANGED))
+    rows, none = ps.plan(root, paths, runner=runner, added=ps.added_paths(root, sha, runner))
+    return ps, root, base, paths, rows, none
+
+
+def cmd_heavy_changed(args, runner=subprocess.run, now=time.time):
+    """`heavy --changed [--list]` (#1045): the suites and classes that exercise the changed paths, run through the heavy slots on a LOCAL MERGE of the base into the head
+    (a temporary detached worktree, removed afterwards; the branch and the checkout are never touched). `--list` runs nothing."""
+    try:
+        ps, root, base, paths, rows, none = _changed_plan(args, runner)
+    except Exception as err:
+        sys.stderr.write("%s: heavy --changed: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    if not paths:
+        print("heavy --changed: no changed paths against %s" % base)
+        return EXIT_OK
+    print(ps.render(rows, none))
+    if args.list:
+        print("(--list: nothing was run; --changed runs these on a merge of %s into the head)" % base)
+        return EXIT_OK
+    if not rows:
+        print("heavy --changed: no suite exercises the changed paths: nothing to run")
+        return EXIT_OK
+    failed, refused = [], []
+    with ps.Merged(root, base, runner) as merged:
+        if merged.problem:
+            print("FAIL: %s" % merged.problem)
+            return EXIT_ERROR
+        guards = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS}
+        for suite, classes, command, why in rows:
+            gone = ps.guard_missing(merged.path, guards[tuple(command)]) if tuple(command) in guards and why and all(w.startswith("bin/") for w in why) else ""
+            if gone:
+                failed.append(suite)
+                print("CANNOT RUN %s: %s (%s): %s" % (suite, " ".join(command), "new-bin-file guard", gone))
+                continue
+            argv = [sys.executable, os.path.abspath(__file__), "heavy", "--changed-slot", "--wait-max", str(args.wait_max if args.wait_max is not None else 120)]
+            argv += (["--ceiling", str(args.ceiling)] if args.ceiling else []) + ["--"] + command
+            nonce = secrets.token_hex(8)   # the child says "not run" with a line that carries this, never with an exit status a command may also exit with
+            done = runner(argv, cwd=merged.path, capture_output=True, text=True, env=dict(os.environ, **{"FLEET_HEAVY_NOSLOT_NONCE": nonce}))
+            if "[noslot %s]" % nonce in (done.stderr or ""):
+                refused.append(suite)
+                why = [l for l in (done.stderr or "").splitlines() if l.startswith("heavy: ") and "[noslot" not in l]
+                print("NOSLOT %s: not run (%s)" % (suite, _one_line(why[-1][7:], 100) if why else "no focused slot was free"))
+            elif done.returncode != 0:
+                failed.append(suite)
+                print("FAIL %s: exit %d after the merge of %s into the head" % (suite, done.returncode, base))
+                sys.stderr.write("".join("%s: %s\n" % (suite, line) for line in ((done.stdout or "") + (done.stderr or "")).splitlines()[-15:]))
+            else:
+                print("PASS %s (on the merge of %s into the head)" % (suite, base))
+    if refused:
+        print("refused: no slot for %d suite%s, which did not run: %s" % (len(refused), "" if len(refused) == 1 else "s", ", ".join(refused)))
+    return EXIT_ERROR if failed else (3 if refused else EXIT_OK)   # 3: no focused slot free (clause 7)
 
 
 def add_heavy_parsers(sub):
@@ -20471,6 +20858,13 @@ def add_heavy_parsers(sub):
     heavy.add_argument("--short", action="store_true", help="The command is short: when the ordinary slots are busy it may use the one express slot, and the wrapper stops it after 120 seconds (exit 124)")
     heavy.add_argument("--ceiling", help="Ask for a longer (or shorter) time ceiling in seconds than the kind of command's default, up to the hard maximum (14400); 0 reads as the maximum, an unreadable value as the default")
     heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
+    heavy.add_argument("--changed-slot", action="store_true", dest="changed_slot", help="A command of a --changed run: take one of the reserved slots (never queued behind full-suite runs); waits at most 120 s, then exits 3 with `no focused slot free`")
+    heavy.add_argument("--quick", action="store_true", help="ONE focused test file or class: take a quick slot of its own (cap 4, ceiling 10 min), never queued behind a full-suite run; a full-suite run is refused")
+    heavy.add_argument("--changed", action="store_true", help="Derive the suites and classes that exercise the changed paths and run them on a local merge of the base into the head (see --list, --base, --pr)")
+    heavy.add_argument("--list", action="store_true", help="With --changed: print the suites and the exact commands and run nothing; says when a path is exercised by no suite")
+    heavy.add_argument("--base", help="With --changed: the base branch to merge (default: origin's default branch)")
+    heavy.add_argument("--pr", help="With --changed: the pull request whose changed paths are read (its branch must be the checked-out head)")
+    heavy.add_argument("--brief", action="store_true", help="With --list: print only the list for a brief or a review request")
     heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 
 
@@ -20610,6 +21004,55 @@ def cmd_preflight_pr(args, runner, now):
     root = top.stdout.strip()
     for line in preflight_body_warnings(runner):
         print(line)   # advisory: never changes the exit status
+    if getattr(args, "merged", False):   # #1045: the same classes on a local merge of the base into the head (a temporary worktree, removed afterwards)
+        ps = load_module("path_suites")
+        base = ps.default_base(root, runner)
+        if not base:
+            sys.stderr.write("%s: preflight-pr --merged: no base branch found\n" % PROG)
+            return EXIT_USAGE
+        try:
+            added = ps.added_paths(root, base, runner)
+        except ps.PathSuitesError as err:
+            added = []
+            print("NOTE: the files this branch adds under bin/ could not be listed (%s): the new-bin-file guards are not run" % err)
+        with ps.Merged(root, base, runner) as merged:
+            if merged.problem:
+                print("FAIL: %s" % merged.problem)
+                return EXIT_ERROR
+            args.merged = False
+            code = cmd_preflight_pr_in(args, runner, now, merged.path)
+            return EXIT_ERROR if run_new_bin_guards(ps, runner, merged.path, added, now) and code == EXIT_OK else code
+    return cmd_preflight_pr_in(args, runner, now, root)
+
+
+def run_new_bin_guards(ps, runner, root, added, now):
+    """#1045: a change that ADDS a file under bin/ must pass the four guards of path_suites.NEW_BIN_GUARDS: each runs under `heavy` in `root`, one PASS or FAIL line each;
+    a guard that is not in the tree is said plainly (CANNOT RUN) and counts as a failure. Returns the number that did not pass."""
+    rows = ps.guard_rows(added)
+    if not rows:
+        return 0
+    print("preflight-pr: new file under bin/ (%s): the %d guards every new bin file must pass" % (", ".join(added), len(rows)))
+    guards, failed = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS}, 0
+    for _suite, _classes, command, _why in rows:
+        guard = guards[tuple(command)]
+        gone = ps.guard_missing(root, guard)
+        if gone:
+            failed += 1
+            print("CANNOT RUN %s: %s: %s" % (guard[0], " ".join(command), gone))
+            continue
+        started = now()
+        sys.stderr.write("preflight-pr: %s: waiting for a slot, then running\n" % guard[0])
+        nonce = secrets.token_hex(8)
+        done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, capture_output=True, text=True, env=dict(os.environ, FLEET_HEAVY_NOSLOT_NONCE=nonce))
+        verdict = "PASS" if done.returncode == 0 else ("NOSLOT" if "[noslot %s]" % nonce in (done.stderr or "") else "FAIL")   # the marker line, never a 75 a command may exit with
+        if done.returncode != 0:
+            sys.stderr.write("".join(("%s: %s\n" % (guard[0], line)) for line in ((done.stdout or "") + (done.stderr or "")).splitlines()[-15:]))
+        failed += verdict != "PASS"
+        print("%s %s (%ds): %s" % (verdict, guard[0], max(0, int(now() - started)), " ".join(command)))
+    return failed
+
+
+def cmd_preflight_pr_in(args, runner, now, root):
     changed = preflight_changed(runner, root)
     failed = 0
     with tempfile.TemporaryDirectory(prefix="preflight-") as work:
@@ -20624,7 +21067,8 @@ def cmd_preflight_pr(args, runner, now):
                 if job:
                     commands.remove((skipped,))
                     print("preflight-pr: %s: skipped, CI runs it for this pull request (job %s)" % (shown, job))
-            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling), **NO_CREDENTIAL_DIALOG_ENV)   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
+            nonce = secrets.token_hex(8)
+            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling), FLEET_HEAVY_NOSLOT_NONCE=nonce, **NO_CREDENTIAL_DIALOG_ENV)   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
                 scratch = os.path.join(work, ("tok_" + "x" * PREFLIGHT_TOKEN_LENGTH)[:PREFLIGHT_TOKEN_LENGTH])
@@ -20643,7 +21087,7 @@ def cmd_preflight_pr(args, runner, now):
                 if done.returncode == 64 and "heavy: refused: a full-suite job is already queued or running" in (done.stderr or ""):   # heavy's refusal (a test that itself exits 64 is a failure)
                     verdict, tail = "FAIL", "refused: a full-suite job is already queued or running in this worktree (the tests did not run)"
                     break
-                if done.returncode == 75:
+                if "[noslot %s]" % nonce in (done.stderr or ""):
                     verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"
                     break
                 if done.returncode != 0:
@@ -20659,10 +21103,12 @@ cmd_preflight_pr.direct = True   # only runs tests: no daemon start, no GitHub, 
 
 
 def add_preflight_pr_parsers(sub):
-    sub.add_parser("preflight-pr", help="Run the CI-critical focused test classes coders skip, under `heavy`: one PASS or FAIL line each, exit 1 when any fails",
+    pre = sub.add_parser("preflight-pr", help="Run the CI-critical focused test classes coders skip, under `heavy`: one PASS or FAIL line each, exit 1 when any fails",
                    description="Runs, each under the `heavy` wrapper and a time ceiling: the command-surface snapshot class, the hygiene and role-file classes, "
                                "bin/check-public-names and, when files under cloud/ changed against the base, the cloud suites with TMPDIR a 49-character "
-                               "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict.")
+                               "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict. "
+                               "With --merged the same classes run on a local merge of the base into the head (a temporary worktree, removed afterwards).")
+    pre.add_argument("--merged", action="store_true", help="Run on a local merge of the current base into the head, so a change green alone and red against the moved base is found before the push")
 
 
 def add_disk_parsers(sub):
