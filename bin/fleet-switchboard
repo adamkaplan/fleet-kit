@@ -3000,10 +3000,10 @@ class Switchboard:
         ack_keys = list(keys)
         keys = keys + ["%s#part%d" % pair for pair in part_keys]   # a part has its own id; its fact key is acknowledged only with the LAST part
         message_id = derive_message_id(observation.session_id, keys)
-        for fact in carried:   # a cut line or a refused remainder goes to the audit in full, named
-            if self.audit is not None and (getattr(fact, "cut_lines", None) or getattr(fact, "refused", "")):
-                self.audit.append(self.actor, "finding-refused" if fact.refused else "finding-line-cut", plan.recipient,
-                                  {"key": fact.key, "kind": fact.kind, "lines": [l[:100000] for l in fact.cut_lines][:20], "refused": fact.refused[:1000000]})
+        for fact in carried:   # a refused remainder goes to the audit in full, named
+            if self.audit is not None and getattr(fact, "refused", ""):
+                self.audit.append(self.actor, "finding-refused", plan.recipient,
+                                  {"key": fact.key, "kind": fact.kind, "refused": fact.refused[:1000000]})
         resume = plan.action == "wake" or interrupt
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
         busy = resume and not interrupt and steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None))

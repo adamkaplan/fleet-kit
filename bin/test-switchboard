@@ -2075,6 +2075,33 @@ class TestCompose(unittest.TestCase):
             joined = got.replace(" (line continues)", "").replace("(line continues) ", "")
             self.assertEqual(sum(joined.count(body[i:i + 40]) >= 1 for i in range(0, size - 40, 40)), len(range(0, size - 40, 40)), size)
 
+    def test_a_long_line_is_delivered_in_exact_content_and_order_1302(self):
+        for size in (4001, 12000):
+            body = "".join(chr(97 + (i * 7 + i // 13) % 26) for i in range(size))
+            texts, acked = self.whole_run("sweep", body)
+            self.assertTrue(acked, size)
+            pieces = []
+            for t in texts:
+                lines = t.split("\n")
+                at = [i for i, l in enumerate(lines) if l.startswith("- sweep")][0]
+                piece = lines[at + 1].strip()   # the item's header, then the one body line (the first line's header copy is cut to 200 characters)
+                piece = piece.replace("(part %d of %d) " % (len(pieces) + 1, len(texts)), "", 1)
+                if piece.startswith("(line continues) "):
+                    piece = piece[len("(line continues) "):]
+                if piece.endswith(" (line continues)"):
+                    piece = piece[:-len(" (line continues)")]
+                pieces.append(piece)
+            self.assertEqual("".join(pieces), body, size)
+
+    def test_a_part_over_a_tiny_cap_is_cut_visibly_1302(self):
+        one = fact("sweep:big", kind="sweep", summary="\n".join("line %03d %s" % (n, "q" * 50) for n in range(300)))
+        probe = fact("p", kind="sweep", summary="(part 99 of 99)\n")
+        fixed = len(sb.compose("platform", [probe], cap=10 ** 9)[0])
+        for cap in (fixed + 60, fixed + 120, fixed + 250):   # the budget floor of 200 makes the part longer than the cap
+            text, carried = sb.finding_part("platform", one, [], cap, None, None, None, {})
+            self.assertLessEqual(len(text), cap)
+            self.assertIn(sb.PART_TRUNCATED, text, cap)
+
     def test_one_megabyte_is_bounded_and_the_rest_refused_named_1302(self):
         body = "\n".join("x" * 99 for _ in range(10500))
         texts, acked = self.whole_run("sweep", body)

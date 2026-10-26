@@ -204,13 +204,14 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
 
 FINDING_MAX_PARTS = 50   # a finding is carried over at most this many messages; beyond it the rest is refused (named, audited), never dropped silently
 LINE_CONTINUES = "(line continues)"
+PART_TRUNCATED = "(truncated)"
 
 
 def finding_parts(fact, budget):
     """The summary of one finding as chunks of WHOLE lines, each at most `budget` characters (a longer line is split over chunks with a
     continuation mark: nothing is cut). Pure and deterministic: the same fact gives the same chunks, so the
-    continuation is derived from how many parts were delivered. Returns (chunks, refused_text, cut_lines)."""
-    lines, cut = [], []
+    continuation is derived from how many parts were delivered. Returns (chunks, refused_text)."""
+    lines = []
     for line in fact.summary.strip().split("\n"):
         line = "".join(c if c.isprintable() else " " for c in line).rstrip()
         if len(line) > budget:   # #1302: a long line is split, never cut: a mark ends each piece and begins the next
@@ -233,7 +234,7 @@ def finding_parts(fact, budget):
     if len(chunks) > FINDING_MAX_PARTS:
         refused = "\n".join(chunks[FINDING_MAX_PARTS:])
         chunks = chunks[:FINDING_MAX_PARTS]
-    return chunks, refused, cut
+    return chunks, refused
 
 
 def finding_part(recipient, fact, rest, cap, section, repos, delivered, resume):
@@ -244,29 +245,24 @@ def finding_part(recipient, fact, rest, cap, section, repos, delivered, resume):
     probe.summary = "(part 99 of 99)\n"
     fixed = len(compose(recipient, [probe], 10 ** 9, section, repos, delivered, None)[0])
     budget = max(200, cap - fixed - 400)   # the header repeats the first 200 characters; the item indents every line; room for the part label and the refusal note
-    chunks, refused, cut = finding_parts(fact, budget)
+    chunks, refused = finding_parts(fact, budget)
     if len(chunks) < 2:
-        if not cut:
-            return None
-        marker = "\n[cut at %d characters]" % cap   # one line over the cap: the only cut, marked; the full line goes to the audit
-        whole = copy.copy(fact)
-        whole.cut_lines = cut
-        text = compose(recipient, [whole], 10 ** 9, section, repos, delivered, None)[0]
-        return text[:cap - len(marker)] + marker, [whole]
+        return None
     n = len(chunks)
     index = min(done, n - 1)
     short = copy.copy(fact)
     last = index == n - 1
     tail = "\n(%d characters of this finding past the %d-part limit were refused; the full text is in the audit)" % (len(refused), FINDING_MAX_PARTS) if refused and last else ""
     short.summary = "(part %d of %d)\n%s%s" % (index + 1, n, chunks[index], tail)
-    if len(short.summary) + fixed > cap:
-        short.summary = short.summary[:max(0, cap - fixed - 1)]
+    if len(short.summary) + fixed > cap:   # reachable only when the cap is tiny (the budget floor is 200): the cut is marked, never silent
+        keep = max(0, cap - fixed - len(PART_TRUNCATED))
+        short.summary = short.summary[:keep] + PART_TRUNCATED
     if not last:
         short.partial = (index + 1, n)
-    short.cut_lines, short.refused = (cut, refused) if index == 0 else ([], "")
+    short.refused = refused if index == 0 else ""
     text, carried = compose(recipient, [short], 10 ** 9, section, repos, delivered, None)
     if len(text) > cap:
-        text = text[:cap - 1]
+        text = text[:cap - len(PART_TRUNCATED)] + PART_TRUNCATED   # marked, never silent
     return text, [short]
 
 
