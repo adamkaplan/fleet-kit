@@ -204,7 +204,6 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
 
 FINDING_MAX_PARTS = 50   # a finding is carried over at most this many messages; beyond it the rest is refused (named, audited), never dropped silently
 LINE_CONTINUES = "(line continues)"
-FINDING_REFUSED = []     # (key, kind, text refused): the daemon writes each to the audit as 'finding-refused' and empties this list
 
 
 def finding_parts(fact, budget):
