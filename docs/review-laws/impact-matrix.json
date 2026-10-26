@@ -390,6 +390,7 @@
         "bin/plan_review.py",
         "bin/pr_events.py",
         "bin/queue_ejections.py",
+        "bin/record_json.py",
         "bin/reassign.py",
         "bin/red_ci.py",
         "bin/reds.py",
