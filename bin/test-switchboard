@@ -86796,11 +86796,11 @@ class TestClaimUnionAtLastMerge(LedgerBase):
 
     def test_l2_a_huge_claims_line_is_stored_clipped_and_a_mutant_that_stores_it_whole_fails(self):
         def clause():
-            line = sb.plan_ledger.claim_line(self.PR, "a" * 40, "PLAN: acme/app#7\nCLAIMS: " + "S1 " * 100000)
+            line = sb.load_plan_ledger().claim_line(self.PR, "a" * 40, "PLAN: acme/app#7\nCLAIMS: " + "S1 " * 100000)
             self.assertLessEqual(len(line["claim_text"]), 1000)
             self.assertEqual(sb.plan_ledger.claim_line(self.PR, "a" * 40, "PLAN: acme/app#7\nCLAIMS: S1 S2")["claim_text"], "S1 S2")
         clause()
-        with mock.patch.object(sb.plan_ledger, "CLAIM_TEXT_LIMIT", 10 ** 9):
+        with mock.patch.object(sb.load_plan_ledger(), "CLAIM_TEXT_LIMIT", 10 ** 9):
             with self.assertRaises(AssertionError):
                 clause()
 
