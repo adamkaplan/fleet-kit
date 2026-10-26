@@ -1095,7 +1095,7 @@ def _stop_orphan(state_dir, index, info, out, clock, watchdog, start_of, decided
 
 
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
-        which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None, worktree=None):
+        which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None, worktree=None, started_flag=None):
     """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
     A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling of the run's KIND (see `classify`, `resolve_ceiling`: `ceiling` is the run's own
     request, else FLEET_HEAVY_MAX_SECONDS; `ceiling_config` the config's `heavy` value; `on_stop(phase, info, holder, lane)` is called with "decided" before a time stop and "told" after it (also for an orphan this wrapper finds while it waits)); `watchdog` is a dict of Watchdog keyword arguments and `line` one of Line's (tests).
@@ -1177,6 +1177,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             if now - started >= wait_max:
                 out.write("heavy: no slot after %d s (%d of %d busy: %s): the command was not run\n" % (int(now - started), slots, slots, _describe(holders(state_dir, slots))))
                 out.flush()
+                noslot_marker(environ, out)
                 return EXIT_TEMPFAIL
             if now >= next_report:
                 try:
@@ -1214,6 +1215,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         except OSError as err:
             out.write("heavy: cannot run %s: %s\n" % (command[0], err.strerror or err))
             return EXIT_NOT_FOUND
+        if started_flag is not None:
+            started_flag["started"] = True   # the command was started: whatever status comes back is its own (a 75 is then a real 75, never "no slot")
         if fd is not None:
             _record(fd, name, child["p"].pid, command[0], clock(), dict(extra, cstart=_start_of(child["p"].pid)))
         if got["signal"] is not None:   # it arrived between taking the slot and the start: the command gets it too
@@ -1282,16 +1285,33 @@ QUICK_SLOTS = 4          # the cap: at most this many quick runs at once, on the
 QUICK_DIR = "quick"
 
 
-def quick_dir(state_dir):
-    path = os.path.join(str(state_dir), QUICK_DIR)
-    os.makedirs(path, mode=0o700, exist_ok=True)
+def real_slot_dir(state_dir, name):
+    """A slot directory of ours: made 0700 when absent, and REFUSED (OSError) when the entry there is a symlink or anything but a real directory (lstat, never followed)."""
+    import stat
+    path = os.path.join(str(state_dir), name)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError(errno.ENOTDIR, "%s is not a real directory (a symlink or a file): refused" % path)
+    if info.st_uid != os.getuid():
+        raise OSError(errno.EPERM, "%s is not owned by this user: refused" % path)
     return path
+
+
+def quick_dir(state_dir):
+    return real_slot_dir(state_dir, QUICK_DIR)
 
 
 def quick_status(state_dir):
     """`quick slots 1/4 (ceiling 10 min)`: read only (a missing directory reads as none held)."""
     path = os.path.join(str(state_dir), QUICK_DIR)
-    held = len(holders(path, QUICK_SLOTS)) if os.path.isdir(path) else 0
+    try:
+        held = len(holders(path, QUICK_SLOTS)) if stat.S_ISDIR(os.lstat(path).st_mode) else 0   # lstat: a symlink reads as none held
+    except OSError:
+        held = 0
     return "quick slots %d/%d (ceiling %d min)" % (held, QUICK_SLOTS, KIND_DEFAULTS["quick"] // 60)
 
 
@@ -1320,12 +1340,19 @@ CHANGED_DIR = "changed"
 CHANGED_WAIT_MAX = 120   # the bound of the wait for a reserved slot, in seconds; a longer --wait-max is cut to it
 EXIT_NO_FOCUSED_SLOT = 3
 NO_FOCUSED_SLOT = "no focused slot free"
+NOSLOT_NONCE_ENV = "FLEET_HEAVY_NOSLOT_NONCE"   # set by the caller of a --changed slot: the marker line carries it, so only a real refusal reads as "not run" (no exit code does)
+
+
+def noslot_marker(environ, out):
+    """Write the marker line that says THIS command was not run for want of a slot (or was refused): the caller reads the line, never an exit status a command may also exit with."""
+    nonce = environ.get(NOSLOT_NONCE_ENV)
+    if nonce:
+        out.write("heavy: [noslot %s]\n" % nonce)
+        out.flush()
 
 
 def changed_dir(state_dir):
-    path = os.path.join(str(state_dir), CHANGED_DIR)
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    return path
+    return real_slot_dir(state_dir, CHANGED_DIR)
 
 
 def run_changed(command, state_dir, wait_max=CHANGED_WAIT_MAX, name=None, environ=None, out=None, **keywords):
@@ -1336,9 +1363,11 @@ def run_changed(command, state_dir, wait_max=CHANGED_WAIT_MAX, name=None, enviro
     wait = min(CHANGED_WAIT_MAX if wait_max is None else wait_max, CHANGED_WAIT_MAX)
     ceiling = keywords.pop("ceiling", None) or KIND_DEFAULTS["focused"]   # the focused row of the per-kind table: no ceiling of its own
     environ[TIME_ENV] = str(ceiling)
+    flag = {}
     code = run(command, changed_dir(state_dir), CHANGED_SLOTS, wait, name, environ=environ, out=out, ceiling=ceiling,
-               ceiling_config={"slots": CHANGED_SLOTS, "ceilings": {"max": ceiling}}, **keywords)
-    if code == EXIT_TEMPFAIL:
+               ceiling_config={"slots": CHANGED_SLOTS, "ceilings": {"max": ceiling}}, started_flag=flag, **keywords)
+    if code == EXIT_TEMPFAIL and not flag.get("started"):   # a command that itself exits 75 is a real result
+        noslot_marker(environ, out)
         out.write("heavy: %s: all %d reserved --changed slots are taken after %d s: the command was not run (exit %d)\n" % (NO_FOCUSED_SLOT, CHANGED_SLOTS, wait, EXIT_NO_FOCUSED_SLOT))
         out.flush()
         return EXIT_NO_FOCUSED_SLOT

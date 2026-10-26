@@ -323,7 +323,7 @@ class TestChangedRunHasAReservedSlot(unittest.TestCase):
         self.assertEqual(module.CHANGED_WAIT_MAX, 120)
         clock = {"now": 1000.0}
         out = io.StringIO()
-        code = module.run_changed(["/bin/true"], os.path.join(state, "fleet-switchboard"), wait_max=99999, environ=dict(e), out=out,
+        code = module.run_changed([__import__("shutil").which("true")], os.path.join(state, "fleet-switchboard"), wait_max=99999, environ=dict(e), out=out,
                                   clock=lambda: clock["now"], sleep=lambda s: clock.__setitem__("now", clock["now"] + max(s, 1)))
         self.assertEqual(code, 3)
         self.assertLessEqual(clock["now"] - 1000.0, 125)
@@ -426,6 +426,194 @@ class TestReadOnly(unittest.TestCase):
         run_switchboard(root, "heavy", "--changed", "--base", "main")
         self.assertEqual(tree_digest(root), before)
         self.assertIsNone(other.poll())
+
+
+class SpyRunner:
+    """subprocess.run that records every argv and can fail one command (by a word it holds)."""
+    def __init__(self, fail_on=None):
+        self.calls, self.fail_on = [], fail_on
+
+    def __call__(self, argv, **kw):
+        self.calls.append(list(argv))
+        if self.fail_on and all(w in argv for w in self.fail_on):
+            return subprocess.CompletedProcess(argv, 1, "", "forced failure")
+        return subprocess.run(argv, **kw)
+
+
+def holders_left(tmp):
+    return sorted(n for n in os.listdir(tmp) if n.startswith("merged-run-"))
+
+
+class TestMergedHardening(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ps-tmp-")
+        self.patch = mock.patch.object(tempfile, "tempdir", self.tmp)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def test_a_failed_worktree_add_leaves_no_holder_directory(self):
+        root = merged_fixture()
+        spy = SpyRunner(fail_on=["worktree", "add"])
+        with self.assertRaises(ps.PathSuitesError):
+            with ps.Merged(root, "main", spy):
+                self.fail("must not enter")
+        self.assertEqual(holders_left(self.tmp), [])
+
+    def test_the_removal_is_never_forced_and_leaves_nothing_after_a_normal_run(self):
+        root = merged_fixture()
+        spy = SpyRunner()
+        with ps.Merged(root, "main", spy) as merged:
+            self.assertIsNone(merged.problem)
+        self.assertFalse([c for c in spy.calls if "--force" in c or "-f" in c and "worktree" in c])
+        self.assertTrue([c for c in spy.calls if c[:3] == ["git", "worktree", "remove"]])
+        self.assertEqual(holders_left(self.tmp), [])
+        self.assertEqual(leftovers(root)[0], 0)
+
+    def test_a_tree_that_will_not_remove_without_force_is_reported_and_left_then_a_stale_sweep_clears_it(self):
+        root = merged_fixture()
+        spy = SpyRunner()
+        import io
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            with ps.Merged(root, "main", spy) as merged:
+                write(merged.path, "lib/calc.py", "VERSION = 99\n")   # a modified tracked file: a plain remove refuses
+                path = merged.path
+        self.assertEqual(merged.leftover, path)
+        self.assertTrue(os.path.isdir(path))
+        self.assertIn(path, err.getvalue())
+        self.assertFalse([c for c in spy.calls if "--force" in c])
+        ps.sweep_stale(root, age=3600)          # fresh: kept
+        self.assertTrue(os.path.isdir(path))
+        ps.sweep_stale(root, now=time.time() + 2 * ps.SWEEP_AGE)   # stale: its holder is removed, its entry pruned
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(leftovers(root)[0], 0)
+
+    def test_a_hostile_base_is_refused_before_any_git_merge(self):
+        root = merged_fixture()
+        for base in ("-x", "--no-ff", "--upstream=foo", "nonexistent-ref", "main\nx"):
+            spy = SpyRunner()
+            with ps.Merged(root, base, spy) as merged:
+                self.assertTrue(merged.problem, base)
+                self.assertIsNone(merged.path)
+            self.assertFalse([c for c in spy.calls if "merge" in c[:5] and "--no-edit" in c], base)
+        self.assertEqual(holders_left(self.tmp), [])
+        done = run_switchboard(root, "heavy", "--changed", "--base", "-x")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("Traceback", done.stderr)
+
+    def test_the_merge_gets_a_40_hex_sha_not_the_name(self):
+        root = merged_fixture()
+        spy = SpyRunner()
+        with ps.Merged(root, "main", spy):
+            pass
+        merge = [c for c in spy.calls if "--no-ff" in c][0]
+        self.assertRegex(merge[-1], r"^[0-9a-f]{40}$")
+
+
+def fake_gh(head, files="lib/calc.py\n"):
+    """A directory with a `gh` that answers `pr view` with `head` and `pr diff` with `files`; returns the PATH value."""
+    d = tempfile.mkdtemp(prefix="ps-gh-")
+    write(d, "gh", "#!/bin/sh\ncase \"$2\" in\n  view) echo %s ;;\n  diff) printf '%%s' '%s' ;;\nesac\n" % (head, files.replace("\n", "\\n").replace("'", "")), 0o755)
+    return d + os.pathsep + os.environ["PATH"]
+
+
+class TestPrFlag(unittest.TestCase):
+    def test_a_hostile_pr_value_is_refused(self):
+        root = merged_fixture()
+        for bad in ("acme/widget#-x", "#1;rm", "12abc", "--help"):
+            done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main", "--pr=" + bad)
+            self.assertNotEqual(done.returncode, 0, bad)
+            self.assertIn("digits", done.stderr, bad)
+
+    def test_a_head_that_is_not_the_pull_requests_head_is_refused(self):
+        root = merged_fixture()
+        path = fake_gh("0" * 40)
+        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main", "--pr", "acme/widget#7", env={"PATH": path})
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn("not the pull request's head", done.stderr)
+
+    def test_the_pull_requests_own_head_is_read(self):
+        root = merged_fixture()
+        path = fake_gh(git(root, "rev-parse", "HEAD").stdout.strip())
+        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main", "--pr", "7", env={"PATH": path})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("lib/calc.py", done.stdout + done.stderr)
+
+
+class TestBounds(unittest.TestCase):
+    def test_a_diff_of_10000_files_is_refused_by_name_in_bounded_time(self):
+        root = fixture()
+        git(root, "checkout", "-q", "-b", "feature")
+        os.makedirs(os.path.join(root, "many"))
+        for i in range(10000):
+            Path(root, "many", "f%d.txt" % i).write_text("x")
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "many")
+        started = time.time()
+        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn("10000 changed paths is more than the %d" % ps.MAX_CHANGED, done.stderr)
+        self.assertLess(time.time() - started, 60)
+
+    def test_the_gates_read_is_capped_in_paths_and_in_bytes_with_a_named_note(self):
+        root = fixture()
+        changed = ["lib/calc.py"] + ["x/f%d.py" % i for i in range(ps.MAX_PATHS + 50)]
+        by, notes = ps.bounded_suites(root, changed)
+        self.assertTrue(any("first %d of %d changed paths" % (ps.MAX_PATHS, len(changed)) in n for n in notes), notes)
+        with mock.patch.object(ps, "READ_BUDGET", 10):
+            by, notes = ps.bounded_suites(root, ["lib/calc.py"])
+        self.assertTrue(any("reading stopped" in n for n in notes), notes)
+
+    def test_a_star_glob_row_maps_nothing_and_is_named_by_the_check(self):
+        root = fixture()
+        write(root, "tools/path-suites.json", json.dumps({"rows": [{"glob": "*", "suites": ["bin/test-by-import"], "reason": "all"}]}))
+        self.assertEqual(ps.load_manual(root), [])
+        self.assertEqual(ps.suites_for(root, "docs/notes.md"), {})
+        self.assertTrue([p for p in ps.check_manual(root) if "no literal character" in p])
+
+
+class TestSlotDirectories(unittest.TestCase):
+    def test_a_symlinked_slot_directory_is_refused(self):
+        for make in (heavy_slots.quick_dir, heavy_slots.changed_dir):
+            state, elsewhere = tempfile.mkdtemp(prefix="ps-st-"), tempfile.mkdtemp(prefix="ps-else-")
+            name = "quick" if make is heavy_slots.quick_dir else "changed"
+            os.symlink(elsewhere, os.path.join(state, name))
+            with self.assertRaises(OSError):
+                make(state)
+            self.assertEqual(os.listdir(elsewhere), [])
+
+    def test_a_real_directory_is_made_once_and_reused(self):
+        state = tempfile.mkdtemp(prefix="ps-st-")
+        self.assertEqual(heavy_slots.changed_dir(state), heavy_slots.changed_dir(state))
+
+    def test_the_cli_refuses_a_symlinked_reserved_directory_and_does_not_run_the_command(self):
+        root = fixture()
+        state, elsewhere = tempfile.mkdtemp(prefix="ps-st-"), tempfile.mkdtemp(prefix="ps-else-")
+        fleet = os.path.join(state, "fleet-switchboard")
+        os.makedirs(fleet, mode=0o700)
+        os.symlink(elsewhere, os.path.join(fleet, "changed"))
+        e = dict(os.environ, HOME=state, XDG_STATE_HOME=state, FLEET_SWITCHBOARD_NO_DAEMON="1", FLEET_HEAVY_NOSLOT_NONCE="abc")
+        for k in ("FLEET_HEAVY", "CI"):
+            e.pop(k, None)
+        done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed-slot", "--", "touch", "ran"], cwd=root, capture_output=True, text=True, env=e, timeout=60)
+        self.assertEqual(done.returncode, 64, done.stdout + done.stderr)
+        self.assertIn("not a real directory", done.stderr)
+        self.assertFalse(Path(root, "ran").exists())
+
+
+class TestRealExitCodesAreResults(unittest.TestCase):
+    def test_a_suite_that_exits_3_or_75_is_a_failure_not_a_not_run(self):
+        for code in (3, 75, 64):
+            root = fixture()
+            git(root, "checkout", "-q", "-b", "feature")
+            write(root, "bin/test-by-command", "#!/bin/sh\necho refused >&2\nexit %d\n" % code, 0o755)   # even a message that says "refused"
+            write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return b + a\n")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "x")
+            done = run_switchboard(root, "heavy", "--changed", "--base", "main")
+            self.assertIn("FAIL bin/test-by-command: exit %d" % code, done.stdout, (code, done.stdout, done.stderr))
+            self.assertNotIn("NOSLOT bin/test-by-command", done.stdout)
+            self.assertEqual(done.returncode, 1)
 
 
 if __name__ == "__main__":

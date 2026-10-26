@@ -15911,11 +15911,12 @@ def gates_suites_finding(runner, ctx):
         done = runner(["gh", "pr", "diff", str(ctx.number), "--repo", ctx.repo, "--name-only"], capture_output=True, text=True)
         if top.returncode != 0 or done.returncode != 0:
             return None
-        root, changed = top.stdout.strip(), [p for p in done.stdout.split("\n") if p.strip()][:200]
-        files = ps.tracked(root, runner)
-        texts = {}
-        by = {p: ps.suites_for(root, p, files, texts, runner) for p in changed if p in files and not ps.is_suite(p)}
-        return ps.gate_finding(changed, by, str((ctx.facts or {}).get("body") or ""))
+        root, changed = top.stdout.strip(), [p for p in done.stdout.split("\n") if p.strip()]
+        by, notes = ps.bounded_suites(root, changed, runner)
+        line = ps.gate_finding(changed[:ps.MAX_PATHS], by, str((ctx.facts or {}).get("body") or ""))
+        if notes:
+            line = (line or "finding: the suites that exercise the changed paths could not all be derived") + " [note: %s]" % "; ".join(notes)
+        return line
     except Exception:
         return None
 
@@ -20425,13 +20426,23 @@ def cmd_heavy(args, runner=subprocess.run, now=time.time):
     if getattr(args, "changed_slot", False):   # #1045 clause 7: a command of a --changed run, in a reserved slot, a bounded wait and a named refusal (exit 3)
         if state is None:
             sys.stderr.write("heavy: refused: no state directory for a reserved slot\n")
+            module.noslot_marker(os.environ, sys.stderr)
             return module.EXIT_USAGE
-        return module.run_changed(command, state, args.wait_max, args.name, on_stop=reporter, ceiling=getattr(args, "ceiling", None))
+        try:
+            return module.run_changed(command, state, args.wait_max, args.name, on_stop=reporter, ceiling=getattr(args, "ceiling", None))
+        except OSError as err:   # the reserved slot directory is not a real directory (a symlink): refused by name, the command is not run
+            sys.stderr.write("heavy: refused: %s\n" % _one_line(str(err), 200))
+            module.noslot_marker(os.environ, sys.stderr)
+            return module.EXIT_USAGE
     if getattr(args, "quick", False):   # #1045: ONE focused file or class, in a quick slot of its own; a full-suite run is refused
         if state is None:
             sys.stderr.write("heavy: refused: no state directory for a quick slot\n")
             return module.EXIT_USAGE
-        return module.run_quick(command, state, 300 if args.wait_max is None else args.wait_max, args.name, on_stop=reporter, short=bool(getattr(args, "short", False)))
+        try:
+            return module.run_quick(command, state, 300 if args.wait_max is None else args.wait_max, args.name, on_stop=reporter, short=bool(getattr(args, "short", False)))
+        except OSError as err:   # the quick slot directory is not a real directory (a symlink): refused by name
+            sys.stderr.write("heavy: refused: %s\n" % _one_line(str(err), 200))
+            return module.EXIT_USAGE
     return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name,
                       short=bool(getattr(args, "short", False)), ceiling=getattr(args, "ceiling", None), ceiling_config=heavy_config, on_stop=reporter)
 
@@ -20449,14 +20460,24 @@ def _changed_plan(args, runner):
     base = args.base or ps.default_base(root, runner)
     if not base:
         raise ps.PathSuitesError("no base branch found: give --base")
+    sha = ps.resolve_base(root, base, runner)   # a name that is not a commit (or starts with `-`) is refused here; the git commands below get the sha
     paths = None
     if args.pr:
-        done = runner(["gh", "pr", "diff", str(args.pr).split("#")[-1], "--name-only"], cwd=root, capture_output=True, text=True)
+        number = str(args.pr).strip().split("#")[-1]
+        if not re.fullmatch(r"[0-9]{1,9}", number):
+            raise ps.PathSuitesError("--pr %r: the number after '#' must be digits" % str(args.pr)[:60])
+        theirs = runner(["gh", "pr", "view", number, "--json", "headRefOid", "-q", ".headRefOid"], cwd=root, capture_output=True, text=True)
+        mine = runner(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True)
+        if theirs.returncode != 0 or (theirs.stdout or "").strip() != (mine.stdout or "").strip() or not (mine.stdout or "").strip():
+            raise ps.PathSuitesError("--pr %s: the checked-out HEAD is not the pull request's head (or its head could not be read): check out the pull request's branch" % number)
+        done = runner(["gh", "pr", "diff", number, "--name-only"], cwd=root, capture_output=True, text=True)
         if done.returncode == 0 and done.stdout.strip():
             paths = sorted(p for p in done.stdout.split("\n") if p.strip())
     if paths is None:
-        paths = ps.changed_paths(root, base, runner)
-    rows, none = ps.plan(root, paths, runner=runner, added=ps.added_paths(root, base, runner))
+        paths = ps.changed_paths(root, sha, runner)
+    if len(paths) > ps.MAX_CHANGED:
+        raise ps.PathSuitesError("%d changed paths is more than the %d `heavy --changed` derives for: run the suites by hand, or give a narrower --base" % (len(paths), ps.MAX_CHANGED))
+    rows, none = ps.plan(root, paths, runner=runner, added=ps.added_paths(root, sha, runner))
     return ps, root, base, paths, rows, none
 
 
@@ -20492,10 +20513,12 @@ def cmd_heavy_changed(args, runner=subprocess.run, now=time.time):
                 continue
             argv = [sys.executable, os.path.abspath(__file__), "heavy", "--changed-slot", "--wait-max", str(args.wait_max if args.wait_max is not None else 120)]
             argv += (["--ceiling", str(args.ceiling)] if args.ceiling else []) + ["--"] + command
-            done = runner(argv, cwd=merged.path, capture_output=True, text=True)
-            if done.returncode in (75, 64, 3) and ("refused" in (done.stderr or "") or done.returncode in (75, 3)):
+            nonce = secrets.token_hex(8)   # the child says "not run" with a line that carries this, never with an exit status a command may also exit with
+            done = runner(argv, cwd=merged.path, capture_output=True, text=True, env=dict(os.environ, **{"FLEET_HEAVY_NOSLOT_NONCE": nonce}))
+            if "[noslot %s]" % nonce in (done.stderr or ""):
                 refused.append(suite)
-                print("NOSLOT %s: not run (%s)" % (suite, "no focused slot free: every reserved --changed slot was taken" if done.returncode == 3 else "no heavy slot came in time" if done.returncode == 75 else _one_line((done.stderr or "").strip(), 100)))
+                why = [l for l in (done.stderr or "").splitlines() if l.startswith("heavy: ") and "[noslot" not in l]
+                print("NOSLOT %s: not run (%s)" % (suite, _one_line(why[-1][7:], 100) if why else "no focused slot was free"))
             elif done.returncode != 0:
                 failed.append(suite)
                 print("FAIL %s: exit %d after the merge of %s into the head" % (suite, done.returncode, base))
@@ -20698,8 +20721,9 @@ def run_new_bin_guards(ps, runner, root, added, now):
             continue
         started = now()
         sys.stderr.write("preflight-pr: %s: waiting for a slot, then running\n" % guard[0])
-        done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, capture_output=True, text=True)
-        verdict = "PASS" if done.returncode == 0 else ("NOSLOT" if done.returncode == 75 else "FAIL")
+        nonce = secrets.token_hex(8)
+        done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, capture_output=True, text=True, env=dict(os.environ, FLEET_HEAVY_NOSLOT_NONCE=nonce))
+        verdict = "PASS" if done.returncode == 0 else ("NOSLOT" if "[noslot %s]" % nonce in (done.stderr or "") else "FAIL")   # the marker line, never a 75 a command may exit with
         if done.returncode != 0:
             sys.stderr.write("".join(("%s: %s\n" % (guard[0], line)) for line in ((done.stdout or "") + (done.stderr or "")).splitlines()[-15:]))
         failed += verdict != "PASS"
@@ -20722,7 +20746,8 @@ def cmd_preflight_pr_in(args, runner, now, root):
                 if job:
                     commands.remove((skipped,))
                     print("preflight-pr: %s: skipped, CI runs it for this pull request (job %s)" % (shown, job))
-            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling), **NO_CREDENTIAL_DIALOG_ENV)   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
+            nonce = secrets.token_hex(8)
+            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling), FLEET_HEAVY_NOSLOT_NONCE=nonce, **NO_CREDENTIAL_DIALOG_ENV)   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
                 scratch = os.path.join(work, ("tok_" + "x" * PREFLIGHT_TOKEN_LENGTH)[:PREFLIGHT_TOKEN_LENGTH])
@@ -20741,7 +20766,7 @@ def cmd_preflight_pr_in(args, runner, now, root):
                 if done.returncode == 64 and "heavy: refused: a full-suite job is already queued or running" in (done.stderr or ""):   # heavy's refusal (a test that itself exits 64 is a failure)
                     verdict, tail = "FAIL", "refused: a full-suite job is already queued or running in this worktree (the tests did not run)"
                     break
-                if done.returncode == 75:
+                if "[noslot %s]" % nonce in (done.stderr or ""):
                     verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"
                     break
                 if done.returncode != 0:

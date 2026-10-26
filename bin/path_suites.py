@@ -20,6 +20,10 @@ HEADER = "suites that exercise your change"
 HOPS = 1
 HUB_MAX = 3   # a source named by more suites than this is a hub (a command line, a shared helper): it is not followed, or one change would name every suite
 READ_MAX = 4 * 1024 * 1024
+MAX_PATHS = 200                     # the gates finding reads at most this many changed paths (a named note says so above it)
+READ_BUDGET = 48 * 1024 * 1024      # and at most this many bytes of suite and source text per call (a named note says so when it stops)
+MAX_CHANGED = 500                   # `heavy --changed` refuses a diff of more paths than this: derive from a narrower change
+MANUAL_SUITES_MAX = 20              # a hand-kept row names at most this many suites; a glob with no literal character (`*`) maps everything and is ignored
 SOURCE_SUFFIXES = (".py", ".mjs", ".js", ".sh")
 SKIP_DIRS = ("node_modules/", ".git/", "scenarios/", "__pycache__/")
 SUITE_PATTERNS = ("bin/test-*", "bin/test_*.py", "cloud/tests/test-*", "*.test.mjs", "*/test_*.py", "test_*.py")
@@ -55,6 +59,12 @@ def tracked(root, runner=subprocess.run):
 
 def is_suite(path):
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in SUITE_PATTERNS) and not path.endswith((".json", ".md"))
+
+
+class Texts(dict):
+    """The cache of file texts of one derivation, with the bytes read so far: past READ_BUDGET a file reads as empty and `skipped` counts it (a named note, never silent)."""
+    spent = 0
+    skipped = 0
 
 
 def _read(root, path):
@@ -99,11 +109,17 @@ def class_blocks(text):
 def derive(root, path, files=None, texts=None, runner=subprocess.run):
     """{suite path: [classes]} for one changed path, by search of the suites' sources. An empty class list means the suite names the path outside any class: the whole suite."""
     files = tracked(root, runner) if files is None else files
-    texts = {} if texts is None else texts
+    texts = Texts() if texts is None else texts
 
     def text(p):
         if p not in texts:
-            texts[p] = _read(root, p)
+            if isinstance(texts, Texts) and texts.spent >= READ_BUDGET:
+                texts.skipped += 1
+                texts[p] = ""
+            else:
+                texts[p] = _read(root, p)
+                if isinstance(texts, Texts):
+                    texts.spent += len(texts[p])
         return texts[p]
     suites = [p for p in files if is_suite(p)]
     sources = [p for p in files if p not in suites and (p.endswith(SOURCE_SUFFIXES) or not os.path.splitext(p)[1])]
@@ -141,7 +157,14 @@ def load_manual(root):
             rows = json.load(handle).get("rows", [])
     except (OSError, ValueError):
         return []
-    return [r for r in rows if isinstance(r, dict) and isinstance(r.get("glob"), str)]
+    return [r for r in rows if isinstance(r, dict) and isinstance(r.get("glob"), str) and broad_glob(r["glob"]) is None]
+
+
+def broad_glob(glob):
+    """None for a usable glob; else the sentence why not: a glob with no literal character (`*`, `**/*`) maps every path to its suites."""
+    if not glob.strip("*?[]/ "):
+        return "the glob %r has no literal character: it would map every path (ignored)" % glob
+    return None
 
 
 def _glob(path, pattern):
@@ -154,7 +177,7 @@ def suites_for(root, path, files=None, texts=None, runner=subprocess.run):
     found = derive(root, path, files, texts, runner)
     for row in load_manual(root):
         if _glob(path, row["glob"]):
-            for s in row.get("suites", []):
+            for s in row.get("suites", [])[:MANUAL_SUITES_MAX]:
                 found.setdefault(s, [])
     return found
 
@@ -162,7 +185,12 @@ def suites_for(root, path, files=None, texts=None, runner=subprocess.run):
 def check_manual(root, runner=subprocess.run):
     """Problems of the hand-kept rows: a missing reason, a suite that does not exist, a derived suite the row misses. [] is a pass."""
     files = tracked(root, runner)
-    texts, problems = {}, []
+    texts, problems = Texts(), []
+    try:
+        with open(os.path.join(root, MANUAL), encoding="utf-8") as handle:
+            problems += [broad_glob(r["glob"]) for r in json.load(handle).get("rows", []) if isinstance(r, dict) and isinstance(r.get("glob"), str) and broad_glob(r["glob"])]
+    except (OSError, ValueError):
+        pass
     for row in load_manual(root):
         glob = row["glob"]
         if not str(row.get("reason", "")).strip():
@@ -294,18 +322,74 @@ def changed_paths(root, base, runner=subprocess.run):
     return sorted(p for p in (set(diff.stdout.split("\n")) | set(other.stdout.split("\n"))) if p and "__pycache__" not in p and not p.endswith(".pyc"))
 
 
+SWEEP_AGE = 24 * 3600   # a merged-run worktree older than this (a crash or a kill left it) is removed by the next merged run's startup sweep
+SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def resolve_base(root, base, runner=subprocess.run):
+    """The 40-hex commit sha of `base`, or PathSuitesError. A name that starts with `-` is refused (it would be read as an option); the name is resolved with
+    `rev-parse --verify --end-of-options`, and callers use the sha, never the name."""
+    if not isinstance(base, str) or not base.strip() or base.startswith("-") or any(c in base for c in "\0\n"):
+        raise PathSuitesError("not a usable base name: %r" % (str(base)[:60],))
+    done = runner(["git", "rev-parse", "--verify", "--quiet", "--end-of-options", base + "^{commit}"], cwd=root, capture_output=True, text=True)
+    sha = (done.stdout or "").strip()
+    if done.returncode != 0 or not SHA.fullmatch(sha):
+        raise PathSuitesError("the base %r is not a commit of this repository" % (base[:60],))
+    return sha
+
+
+def sweep_stale(root, runner=subprocess.run, now=None, age=SWEEP_AGE):
+    """Startup sweep: prune the administrative entries whose directory is gone, and remove a stale `merged-run-*` holder (older than `age` seconds) that a crash left,
+    then prune again. Only holders this module made (a `merged-run-` directory, under the temporary directory, holding a `tree`) are ever deleted; never forced, never a branch."""
+    import shutil
+    import time
+    now = time.time() if now is None else now
+    _git(root, "worktree", "prune", runner=runner)
+    listing = _git(root, "worktree", "list", "--porcelain", runner=runner)
+    tmp = os.path.realpath(tempfile.gettempdir())
+    for line in (listing.stdout or "").split("\n"):
+        if not line.startswith("worktree "):
+            continue
+        tree = line[len("worktree "):]
+        holder = os.path.dirname(tree)
+        if os.path.basename(tree) != "tree" or not os.path.basename(holder).startswith("merged-run-") or os.path.dirname(os.path.realpath(holder)) != tmp:
+            continue
+        try:
+            if now - os.lstat(holder).st_mtime > age:
+                shutil.rmtree(holder, ignore_errors=True)
+        except OSError:
+            continue
+    _git(root, "worktree", "prune", runner=runner)
+
+
 class Merged:
-    """Context manager: a detached temporary worktree holding HEAD (and the working tree's uncommitted changes as one commit there) with `base` merged in. `.path` is the
-    worktree, `.problem` the sentence when the merge could not be made (a conflict). Removed on exit, with its administrative entry; no branch is ever created."""
+    """Context manager: a detached temporary worktree holding HEAD (and the working tree's uncommitted TRACKED changes as one commit there; an untracked file is not carried) with `base`
+    merged in (the base is resolved to a commit sha first). `.path` is the worktree, `.problem` the sentence when the merge could not be made (a conflict, a bad base), `.leftover` the
+    path when the worktree could not be removed. Removed on exit, with its administrative entry, by a plain `git worktree remove` (never --force: a leftover is reported and left;
+    the next merged run's sweep clears a stale one); no branch is ever created."""
     IDENT = ["-c", "user.name=fleet-merged-run", "-c", "user.email=merged-run@example.invalid", "-c", "commit.gpgsign=false"]
 
     def __init__(self, root, base, runner=subprocess.run):
-        self.root, self.base, self.runner, self.path, self.problem, self.holder = root, base, runner, None, None, None
+        self.root, self.base, self.runner, self.path, self.problem, self.holder, self.leftover = root, base, runner, None, None, None, None
 
     def __enter__(self):
+        try:
+            sha = resolve_base(self.root, self.base, self.runner)
+        except PathSuitesError as err:
+            self.problem = str(err)
+            return self
+        try:
+            return self._enter(sha)
+        except BaseException:
+            self.__exit__()
+            raise
+
+    def _enter(self, sha):
+        sweep_stale(self.root, self.runner)
         self.holder = tempfile.mkdtemp(prefix="merged-run-")
-        self.path = os.path.join(self.holder, "tree")
-        _git(self.root, "worktree", "add", "--detach", self.path, "HEAD", runner=self.runner, check=True)
+        tree = os.path.join(self.holder, "tree")
+        _git(self.root, "worktree", "add", "--detach", tree, "HEAD", runner=self.runner, check=True)
+        self.path = tree
         dirty = self.runner(["git", "diff", "--binary", "HEAD"], cwd=self.root, capture_output=True)
         if dirty.stdout:
             applied = self.runner(["git", "apply", "--index", "-"], cwd=self.path, input=dirty.stdout, capture_output=True)
@@ -313,20 +397,41 @@ class Merged:
                 self.problem = "the uncommitted changes could not be applied in the temporary worktree"
                 return self
             self.runner(["git"] + self.IDENT + ["commit", "-q", "-m", "working tree"], cwd=self.path, capture_output=True, text=True)
-        done = self.runner(["git"] + self.IDENT + ["merge", "--no-edit", "--no-ff", self.base], cwd=self.path, capture_output=True, text=True)
+        done = self.runner(["git"] + self.IDENT + ["merge", "--no-edit", "--no-ff", sha], cwd=self.path, capture_output=True, text=True)
         if done.returncode != 0:
             self.problem = "conflict after the merge of %s into the head: %s" % (self.base, " ".join((done.stdout or "").split())[:160])
             self.runner(["git", "merge", "--abort"], cwd=self.path, capture_output=True, text=True)
         return self
 
     def __exit__(self, *exc):
+        import shutil
         if self.path:
-            self.runner(["git", "worktree", "remove", "--force", self.path], cwd=self.root, capture_output=True, text=True)
+            self.runner(["git", "clean", "-fdxq"], cwd=self.path, capture_output=True, text=True)   # our own scratch tree: build droppings (bytecode) must not make the plain remove refuse
+            gone = self.runner(["git", "worktree", "remove", self.path], cwd=self.root, capture_output=True, text=True)
+            if gone.returncode != 0:
+                self.leftover = self.path
+                import sys
+                sys.stderr.write("merged run: the temporary worktree %s could not be removed without force (%s): it is left there; the next merged run's sweep removes it after a day\n"
+                                 % (self.path, " ".join((gone.stderr or "").split())[:120]))
+                return False
             self.runner(["git", "worktree", "prune"], cwd=self.root, capture_output=True, text=True)
         if self.holder:
-            import shutil
-            shutil.rmtree(self.holder, ignore_errors=True)
+            shutil.rmtree(self.holder, ignore_errors=True)   # the holder only: it holds nothing once the tree is removed (or when `worktree add` failed)
         return False
+
+
+def bounded_suites(root, changed, runner=subprocess.run):
+    """({path: {suite: classes}}, [notes]) for the gates finding: at most MAX_PATHS paths and READ_BUDGET bytes are read; above either, a named note says what was left."""
+    notes = []
+    if len(changed) > MAX_PATHS:
+        notes.append("only the first %d of %d changed paths were looked at" % (MAX_PATHS, len(changed)))
+        changed = changed[:MAX_PATHS]
+    files = tracked(root, runner)
+    texts = Texts()
+    by = {p: suites_for(root, p, files, texts, runner) for p in changed if p in files and not is_suite(p)}
+    if texts.skipped:
+        notes.append("reading stopped at %d MB: %d files were not read" % (READ_BUDGET // (1024 * 1024), texts.skipped))
+    return by, notes
 
 
 def gate_finding(changed, suites_by_path, body):
