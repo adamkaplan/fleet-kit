@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""arch-test-move: move whole test classes out of bin/test-switchboard into tests/switchboard/test_<name>.py, byte for byte.
+
+    arch-test-move --source bin/test-switchboard --plan PLAN.json --out-dir tests/switchboard [--write]
+
+PLAN.json maps a file name (`v2` makes `test_v2.py`) to the list of top-level class names to move into it. The class text moves unchanged (the comment lines
+directly above it go with it); the new file gets the standard-library import block of the source, one `from support.<module> import names` for every name
+the classes use that a support module defines (`REPO` and `BIN` come from `support.paths`), and nothing else. The names the moved classes use that neither
+the standard library, the builtins, a support module nor another class of the same file provides are an error: the tool stops and names them (a class never
+imports the test file). The source gets, for every new file, explicit assignments of the class names (`A, B = (_support_<file>.A, _support_<file>.B)`, tagged
+`# support import`), so every moved class is still found by `bin/test-switchboard`. Without --write it only reports what it would move, with sizes.
+"""
+import argparse
+import ast
+import builtins
+import glob
+import json
+import os
+import symtable
+import sys
+
+
+def defined(node):
+    if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
+        return {node.name}
+    names = set()
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    return names
+
+
+def used_globals(table):
+    used = set()
+    def walk(t):
+        for symbol in t.get_symbols():
+            if symbol.is_referenced() and (symbol.is_global() or (t is table and not (symbol.is_assigned() or symbol.is_imported()))):
+                used.add(symbol.get_name())
+        for child in t.get_children():
+            walk(child)
+    walk(table)
+    return used
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--source", required=True)
+    ap.add_argument("--plan", required=True)
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--support-dir", default=None, help="default: <out-dir>/support")
+    ap.add_argument("--write", action="store_true")
+    args = ap.parse_args(argv)
+    text = open(args.source, encoding="utf-8").read()
+    lines = text.split("\n")
+    tree = ast.parse(text)
+    table = symtable.symtable(text, args.source, "exec")
+    scopes = {(c.get_name(), c.get_lineno()): c for c in table.get_children()}
+    plan = json.load(open(args.plan))
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    support_dir = args.support_dir or os.path.join(args.out_dir, "support")
+    where = {}   # a name -> the support module that defines it
+    for path in sorted(glob.glob(os.path.join(support_dir, "*.py"))):
+        module = os.path.basename(path)[:-3]
+        if module == "__init__":
+            continue
+        for node in ast.parse(open(path, encoding="utf-8").read()).body:
+            for name in defined(node):
+                where.setdefault(name, module)
+    header = []
+    for node in tree.body:
+        if node.lineno >= 60 and not isinstance(node, (ast.Import, ast.ImportFrom)):
+            break
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            header.append("\n".join(lines[node.lineno - 1:node.end_lineno]))
+    std = set()
+    import_text = {}   # name -> the top-level import statement of the source that binds it (an import below the header is still the one a moved class needs)
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for a in node.names:
+                std.add((a.asname or a.name).split(".")[0])
+                import_text.setdefault((a.asname or a.name).split(".")[0], "\n".join(lines[node.lineno - 1:node.end_lineno]))
+    builtin = set(dir(builtins))
+    moved_all = {c for names in plan.values() for c in names}
+    kept_defs = set()
+    for node in tree.body:
+        if not (isinstance(node, ast.ClassDef) and node.name in moved_all):
+            kept_defs |= defined(node)
+    problems, outputs, back, spans = [], {}, {}, []
+    for file, names in plan.items():
+        members = set(names)
+        needs, chunks, used_in_file = {}, [], set()
+        for name in names:
+            node = classes.get(name)
+            if node is None:
+                problems.append("no top-level class %s" % name)
+                continue
+            first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+            while first > 1 and lines[first - 2].lstrip().startswith("#"):
+                first -= 1
+            scope = scopes.get((name, node.lineno))
+            for used in sorted(used_globals(scope) | {ast.unparse(b).split(".")[0] for b in node.bases}):
+                used_in_file.add(used)
+                if used in builtin or used in std or used in members or used == name:
+                    continue
+                if used in ("REPO", "BIN"):
+                    needs.setdefault("paths", set()).add(used)
+                elif used in where:
+                    needs.setdefault(where[used], set()).add(used)
+                elif used in kept_defs or used in moved_all:
+                    problems.append("%s uses %s, which stays in the test file (or moves to another file): a moved class cannot import the test file" % (name, used))
+            chunks.append("\n".join(lines[first - 1:node.end_lineno]))
+            spans.append((first, node.end_lineno))
+        header_names = set()
+        for h in header:
+            header_names |= {(a.asname or a.name).split(".")[0] for stmt in ast.parse(h).body for a in stmt.names}
+        extra = sorted({import_text[u] for u in used_in_file if u in import_text and u not in header_names})
+        head = ['"""Test classes moved out of bin/test-switchboard (text unchanged): %s."""' % file, "\n".join(header + extra)]
+        for module in sorted(needs):
+            head.append("from support.%s import %s" % (module, ", ".join(sorted(needs[module]))))
+        outputs[file] = "\n".join(head[:2]) + "\n" + "\n".join(head[2:]) + "\n\n\n" + "\n\n\n".join(chunks) + "\n"
+        back[file] = names
+        print("%-24s %5d lines, %4d KB, %3d classes" % ("test_%s.py" % file, outputs[file].count("\n"), len(outputs[file]) // 1000, len(names)))
+    if problems:
+        print("\n".join(sorted(set(problems))))
+        return 1
+    print("moved: %d lines, %d KB" % (sum(e - s + 1 for s, e in spans), sum(len("\n".join(lines[s - 1:e])) for s, e in spans) // 1000))
+    if not args.write:
+        return 0
+    drop = set()
+    for s, e in spans:
+        drop.update(range(s - 1, e))
+    anchor = max(i for i, line in enumerate(lines) if line.rstrip().endswith("# support import") and i < 400)
+    inserted = []
+    for file, names in back.items():
+        inserted.append('_support_test_%s = importlib.import_module("test_%s")   # support import' % (file, file))
+        for i in range(0, len(names), 4):
+            part = names[i:i + 4]
+            inserted.append("%s = (%s)   # support import" % (", ".join(part) + ("," if len(part) == 1 else ""), ", ".join("_support_test_%s.%s" % (file, n) for n in part) + ("," if len(part) == 1 else "")))
+    kept = []
+    for i, line in enumerate(lines):
+        if i in drop:
+            continue
+        kept.append(line)
+        if i == anchor:
+            kept += inserted
+    cleaned = []
+    for line in kept:
+        if line == "" and len(cleaned) >= 2 and cleaned[-1] == "" and cleaned[-2] == "":
+            continue
+        cleaned.append(line)
+    os.makedirs(args.out_dir, exist_ok=True)
+    for file, content in outputs.items():
+        open(os.path.join(args.out_dir, "test_%s.py" % file), "w", encoding="utf-8").write(content)
+    open(args.source, "w", encoding="utf-8").write("\n".join(cleaned))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
