@@ -412,7 +412,13 @@
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
-        "bin/switchboard/jev.py"
+        "bin/switchboard/jev.py",
+        "bin/switchboard/faults.py",
+        "bin/switchboard/policy_questions.py",
+        "bin/switchboard/worktree_lifecycle.py",
+        "bin/switchboard/review_laws.py",
+        "bin/switchboard/job_runs.py",
+        "bin/switchboard/standing_authority.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -610,6 +616,68 @@
           "jev_key_file",
           "locate_jev_key",
           "validate_jev_config"
+        ],
+        "bin/switchboard/faults.py": [
+          "FaultError",
+          "SimulatedCrash",
+          "active_faults",
+          "fault"
+        ],
+        "bin/switchboard/policy_questions.py": [
+          "_ask_of"
+        ],
+        "bin/switchboard/worktree_lifecycle.py": [
+          "_git",
+          "_unregister_worktree",
+          "read_worktrees",
+          "reclaim_for_agent",
+          "reclaim_worktree",
+          "validate_worktree_config",
+          "worktree_config",
+          "worktree_facts",
+          "worktree_in_use",
+          "worktree_session_in_use",
+          "worktree_session_index",
+          "worktree_sweep"
+        ],
+        "bin/switchboard/review_laws.py": [
+          "_private_parse",
+          "_review_pr",
+          "block_table_text",
+          "local_review_overlay",
+          "parse_files_read_row",
+          "parse_review_block",
+          "pr_changed_bounds",
+          "pr_changed_paths",
+          "rating_inputs",
+          "record_inputs",
+          "review_laws_text",
+          "whole_read_problem"
+        ],
+        "bin/switchboard/job_runs.py": [
+          "JobFacts",
+          "_checked_policy_thresholds",
+          "boot_time",
+          "job_age",
+          "job_end_reason",
+          "job_last_seen",
+          "job_paths",
+          "job_private",
+          "job_process_token",
+          "job_read",
+          "job_record_end",
+          "job_state",
+          "jobs_dir",
+          "redact_command_text",
+          "validate_policy_config"
+        ],
+        "bin/switchboard/standing_authority.py": [
+          "_legacy_authority",
+          "_orders_section",
+          "fetch_charter_body",
+          "fetch_orders",
+          "parse_orders",
+          "section_orders"
         ]
       },
       "dynamic_actions": [
