@@ -4,7 +4,9 @@
     bin/test-path-suites
 
 The last line printed is `RESULT: PASS` or `RESULT: FAIL`."""
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -683,6 +686,51 @@ class TestGuardMissingIsTiedToTheClass(unittest.TestCase):
         write(root, "bin/test-x", "class TestA(object):\n    def test_one(self): pass\n\nclass TestB(object):\n    def test_two(self): pass\n")
         self.assertEqual(ps.guard_missing(root, ("g", "bin/test-x", "TestA", "test_one", "w")), "")
         self.assertIn("test_two", ps.guard_missing(root, ("g", "bin/test-x", "TestA", "test_two", "w")))
+
+
+class TestPreflightGuardsNotRunMarker(unittest.TestCase):
+    """The not-run marker of `run_new_bin_guards` is the nonce line, never an exit status 75 a guard may exit with; a branch whose added files cannot be listed says so."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("sb_guards_marker", str(SWITCHBOARD))
+        cls.sb = importlib.util.module_from_spec(importlib.util.spec_from_loader("sb_guards_marker", loader))
+        loader.exec_module(cls.sb)
+
+    def verdicts(self, marker):
+        def runner(argv, **kwargs):
+            done = mock.Mock(returncode=75, stdout="", stderr="")
+            if marker:
+                done.stderr = "heavy: [noslot %s]\n" % kwargs["env"]["FLEET_HEAVY_NOSLOT_NONCE"]
+            return done
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), mock.patch.object(ps, "guard_missing", lambda root, guard: ""):
+            failed = self.sb.run_new_bin_guards(ps, runner, "/work/repo", ["bin/new-tool"], time.time)
+        return failed, [line.split()[0] for line in out.getvalue().splitlines() if line.split()[0] in ("PASS", "FAIL", "NOSLOT")]
+
+    def test_a_guard_that_exits_75_without_the_marker_is_a_failure_and_with_it_not_run(self):
+        failed, words = self.verdicts(marker=False)
+        self.assertEqual((failed, set(words)), (4, {"FAIL"}))
+        failed, words = self.verdicts(marker=True)
+        self.assertEqual((failed, set(words)), (4, {"NOSLOT"}))
+
+    def test_added_files_that_cannot_be_listed_are_said_not_silently_dropped(self):
+        def broken(*a, **k):
+            raise ps.PathSuitesError("no common ancestor of HEAD and main")
+
+        class Problem:
+            problem = "stop here"
+            path = None
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout="/work/repo\n", stderr=""))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(ps, "added_paths", broken), mock.patch.object(ps, "default_base", lambda *a: "main"), mock.patch.object(ps, "Merged", Problem):
+            self.sb.cmd_preflight_pr(types.SimpleNamespace(merged=True), runner, time.time)
+        self.assertIn("NOTE: the files this branch adds under bin/ could not be listed (no common ancestor of HEAD and main)", out.getvalue())
 
 
 class TestRealExitCodesAreResults(unittest.TestCase):

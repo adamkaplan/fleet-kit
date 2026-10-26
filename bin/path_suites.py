@@ -238,6 +238,8 @@ def guard_missing(root, guard):
         body = _read(root, path)
         if not re.search(r"(?m)^class %s\b" % re.escape(cls), body):
             return "class %s is not defined in %s" % (cls, path)
+        # Known limits (a closed rule): the block runs from the class line to the next top-level `class` line, so a class nested at column 0 inside a string, or a `def NAME`
+        # written inside a string or comment of the block, still counts; the guard table names real classes and tests, and a CI run of the guard is the proof.
         block = re.search(r"(?ms)^class %s\b.*?(?=^class |\Z)" % re.escape(cls), body)
         if test and not re.search(r"def %s\b" % re.escape(test), block.group(0)):
             return "test %s is not defined in %s" % (test, path)
@@ -339,7 +341,7 @@ def resolve_base(root, base, runner=subprocess.run):
     return sha
 
 
-PID_FILE = "pid"   # the holder of a merged run holds the pid (and start time) of the process that owns it: a live owner is never swept, however old the holder is
+PID_FILE = "pid"   # the holder of a merged run holds the pid (the pid alone, no start time) of the process that owns it: a live owner is never swept, however old the holder is
 
 
 def _owner_alive(holder):
