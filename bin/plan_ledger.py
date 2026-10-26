@@ -36,6 +36,7 @@ KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS + CLAIM_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
+CLAIM_TEXT_LIMIT = 1000   # a `claim` ledger line keeps at most this much of a CLAIMS line (#976)
 EVALUATOR_ALIASES = {"adam": "owner"}
 
 # THE bound of every wait of a recording command (`prove`, `verdict`, `review record`): the ledger lock, each GitHub read, the agent registry. One
@@ -533,12 +534,14 @@ def claim_union(scenarios, this_body, others):
 
 def claim_line(pr, head, body):
     """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""
-    return {"kind": "claim", "pr": pr, "head": head, "claim_text": claim_text(body)}
+    text = claim_text(body)
+    return {"kind": "claim", "pr": pr, "head": head, "claim_text": None if text is None else clip(text, CLAIM_TEXT_LIMIT)}   # a refused claim covers nothing, so a clipped one is never wider
 
 
-def recorded_claim(entries, pr):
-    """(found, claim_text) from the NEWEST `claim` line of `pr`; found is False when none was recorded."""
-    for entry in reversed(entries):
+def recorded_claim(entries, pr, first=False):
+    """(found, claim_text) from the NEWEST `claim` line of `pr`, or the FIRST with `first` (a merged pull request: the claim as it was recorded, never a later rewrite);
+    found is False when none was recorded."""
+    for entry in (entries if first else reversed(entries)):
         if entry.get("kind") == "claim" and entry.get("pr") == pr:
             return True, entry.get("claim_text")
     return False, None
