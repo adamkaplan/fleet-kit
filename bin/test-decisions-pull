@@ -749,6 +749,43 @@ def check_interleaved_pulls_cannot_lower_the_generation(module):   # panel 5
         assert json.loads(held.read_text())["generation"] == 9, "a lower generation overwrote a higher one"
 
 
+def _hold_lock(state):
+    import fcntl
+    fd = os.open(state, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def check_held_lock_skips_within_the_bound_and_writes_nothing(module):
+    import threading
+    with tempfile.TemporaryDirectory() as state:
+        held = fresh_file(state, "OLD\n", age=5)
+        before = (held.read_bytes(), held.stat().st_mtime_ns)
+        fd = _hold_lock(state)
+        out, err = {}, io.StringIO()
+        def run():
+            start = time.monotonic()
+            out["r"] = pull_quiet(module, state, good(), NOW, err=err, age=5)
+            out["t"] = time.monotonic() - start
+        thread = threading.Thread(target=run, daemon=True)
+        try:
+            thread.start()
+            thread.join(8)
+            assert not thread.is_alive(), "the pull hangs on a held lock"
+        finally:
+            os.close(fd)
+        assert out["r"] == "untouched" and out["t"] < 4, out
+        assert "lock" in err.getvalue() and len(err.getvalue().splitlines()) == 1, err.getvalue()
+        assert (held.read_bytes(), held.stat().st_mtime_ns) == before, "the held file changed without the lock"
+
+
+def check_free_lock_writes(module):
+    with tempfile.TemporaryDirectory() as state:
+        fresh_file(state, "OLD\n", age=5)
+        assert pull_quiet(module, state, good(), NOW, age=5) == "wrote"
+        assert json.loads((Path(state) / "decisions.json").read_text())["generation"] == 7
+
+
 def held_with(state, **kw):
     """A held file written by the pull itself, with the given keys removed (value None in kw removes the key)."""
     body = {k: v for k, v in body_with(**kw).items() if not (k in kw and kw[k] is _ABSENT)}
@@ -808,7 +845,8 @@ ALL = [check_shape_is_the_daemons, check_unknown_keys_are_dropped, check_write_i
        check_plain_file_body_age_seconds_is_ignored, check_plain_file_source_uses_the_age_command,
        check_unusable_held_pid_is_judged_by_generation_alone, check_pid_change_with_higher_generation_is_written,
        check_same_pid_restart_at_generation_one, check_response_age_edges_and_one_fetch, check_written_at_formats,
-       check_interleaved_pulls_cannot_lower_the_generation]
+       check_interleaved_pulls_cannot_lower_the_generation, check_held_lock_skips_within_the_bound_and_writes_nothing,
+       check_free_lock_writes]
 
 
 class RealCode(unittest.TestCase):
@@ -1130,7 +1168,13 @@ class Mutants(unittest.TestCase):
         self.failing(check_same_pid_restart_at_generation_one, mutant("new < held[\"generation\"] and not reset_generation and", "False and"))
 
     def test_m31_no_lock(self):
-        self.failing(check_interleaved_pulls_cannot_lower_the_generation, mutant("        fcntl.flock(lock, fcntl.LOCK_EX) ", "        pass "))
+        self.failing(check_interleaved_pulls_cannot_lower_the_generation, mutant("                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB) ", "                pass "))
+
+    def test_m33_blocking_flock_hangs_on_a_held_lock(self):
+        self.failing(check_held_lock_skips_within_the_bound_and_writes_nothing, mutant("fcntl.LOCK_EX | fcntl.LOCK_NB", "fcntl.LOCK_EX"))
+
+    def test_m34_skip_writes_without_the_lock(self):
+        self.failing(check_held_lock_skips_within_the_bound_and_writes_nothing, mutant("            return UNTOUCHED\n        held", "            pass\n        held"))
 
     def test_m32_written_at_strict_format(self):
         self.failing(check_written_at_formats, load(SOURCE.replace("when = datetime.datetime.fromisoformat(text)", "when = datetime.datetime.strptime(text, '%Y-%m-%dT%H:%M:%S+00:00')")))

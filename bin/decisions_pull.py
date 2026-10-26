@@ -31,7 +31,7 @@ measured on the source's own clock, and it arrives in ONE of two ways. The daemo
   * A lower generation is accepted when `daemon_pid` differs from the held file's (a restarted daemon); with the same pid it is a stale replay
     and is refused (file aged). TRUST MODEL: the source is trusted for generation order. A body with no `daemon_pid` is accepted at a lower
     generation (no pid proves no replay), and a source that changes its `daemon_pid` defeats the ordering by design; this guards against an
-    honest stale replay, not a hostile source. The check and the write run under one flock on the state directory,
+    honest stale replay, not a hostile source. The check and the write run under one flock on the state directory (taken without blocking, retried for about 2 s, else the pull skips the refresh),
     so two pulls cannot interleave and let a lower generation overwrite a higher one. Recovery: `--reset-generation` accepts any in-bound generation once; deleting decisions.json does the same.
 
 The source is a command that prints the file (for example `kubectl exec switchboard-0 -- cat <state>/decisions.json`), given after `--`.
@@ -71,6 +71,9 @@ MAX_AGE_SECONDS = 86400              # an age above a day is not believed: unrea
 FUTURE_TOLERANCE = 60                # written_at further ahead of this clock than this is not trusted
 MAX_GENERATION = 2 ** 31 - 1         # a larger generation is garbage (it could block every later pull)
 KEPT_KEYS = ("generation", "written_at", "daemon_pid", "decisions", "errors", "provisional")
+
+LOCK_TRIES = 8                       # the lock is taken without blocking, this many times,
+LOCK_WAIT = 0.25                     # this many seconds apart (about 2 s in all); then the pull skips this refresh
 
 WROTE, STALED, UNTOUCHED = "wrote", "marked-stale", "untouched"
 
@@ -343,7 +346,17 @@ def pull(state_dir, fetch, now=None, err=None, age=None, reset_generation=False)
         return stale("written_at is in the future; body not trusted")
     lock = os.open(str(path.parent), os.O_RDONLY)             # the state directory itself is the lock: no extra file
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)                     # the check and the write are one step
+        for attempt in range(LOCK_TRIES):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)   # the check and the write are one step; never a hang
+                break
+            except BlockingIOError:
+                if attempt < LOCK_TRIES - 1:
+                    time.sleep(LOCK_WAIT)
+        else:
+            say(err, "could not take the lock on the state directory within about %d s (another pull holds it); skipped this refresh, %s untouched"
+                % (round(LOCK_TRIES * LOCK_WAIT), DECISIONS_FILE))
+            return UNTOUCHED
         held = held_body(path)
         new = body.get("generation")
         if held is not None and new is not None and new < held["generation"] and not reset_generation and same_daemon(held, body):
