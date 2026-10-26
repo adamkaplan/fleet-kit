@@ -31,6 +31,12 @@ rebuilt from another record.
 | `bin/reassign.py:237` | `boss-resolution` | `reassign` resolves the current boss for consent | nobody | `reassign` | derived |
 | `bin/fleet-switchboard:2385` | `discovery.agents` | the agents of the newest `discover()`: name, session, pane, role, charter, repo, workspace, cwd, reports_to | `Engine.discover` (each pass and on demand) | the whole daemon: fact routing, status, pane pass, decisions, chiefs lookup, badges, toasts | primary (the live list), derived from herdr and the v2 service |
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
+| `bin/switchboard/job_runs.py:348` | `discovery.agents` | the agents of the newest `discover()`: a dead job's starter is found among them by session and name | nobody | `JobFacts` | derived (reader) |
+| `bin/switchboard/job_runs.py:350` | `boss-resolution` | the starter's boss, by `boss_name` over the discovery | nobody | `JobFacts` | derived (reader) |
+| `bin/switchboard/policy_questions.py:124` | `discovery.agents` | the discovered agents, read for the judge's questions about sessions and names | nobody | `ask_of` and the policy questions | derived (reader) |
+| `bin/switchboard/work_moves.py:16` | `discovery.agents` | the sender found among the discovered agents | nobody | `move` | derived (reader) |
+| `bin/switchboard/worktree_lifecycle.py:304` | `discovery.agents` | the newest discovery, read to say who asks a reclaim | nobody | `reclaim-worktrees` | derived (reader) |
+| `bin/switchboard/worktree_lifecycle.py:164` | `pane-health.json` | named in a comment only: the agents a worktree sweep treats as known are those of the pane-health registry and the last discovery | nobody | `worktree_session_in_use` (through `known_agent`) | derived (reader) |
 | `bin/switchboard/judge.py:53` | `discovery.agents` | the judge's own sessions: the session ids of the discovered agents | nobody | the policy judge's socket | derived (reader) |
 | `bin/switchboard/decisions_a.py:209` | `discovery.agents` | the decisions list reads the discovered agents to find each worker's boss | nobody | the Decisions list | derived (reader) |
 | `bin/switchboard/decisions_b.py:457` | `discovery.agents` | the external-decision host reads the newest discovery | nobody | external decision sync | derived (reader) |
