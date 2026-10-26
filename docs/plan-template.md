@@ -17,11 +17,19 @@ constraint (`PC-n`) with its reason.
 | the reply arrives within 5 s | use a background queue with a 2 s poll |
 | existing projects are listed exactly as before | do not touch `list()` |
 
+## One plan comment
+
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+
+**Receipts.** A receipt is the line `<!-- plan-receipt -->`, then `plan hash: sha256:<the new hash>`, then two to four lines of what changed and why. It carries no plan text; `plan check` reports a receipt that quotes the plan, and a second comment that looks like a plan.
+
 ## Sections of a plan
 
 Recorded as an issue, or a section of one, **in the repo the work concerns**. Required:
 
 1. **Done-when**: the ask's clauses, copied, numbered `(1) ... (2) ...` as in the ask.
+   A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).
 2. **Scenarios**: the yaml block below, including unchanged (U) ones.
 3. **Constraints** (`PC-n`): what must hold, and why.
 4. **Out of scope**.
@@ -47,7 +55,7 @@ scenarios:
   - id: S1            # S = behaviour, U = unchanged behaviour that must still hold; unique
     covers: DW-1      # a Done-when clause (DW-n) or a plan constraint (PC-n)
     text: Given a project with no agents, when an owner commissions one, then it is listed
-    proof: test       # test | live | measure | screenshot
+    proof: test       # test | live | measure | screenshot | review (a reviewer's read of text; example: proof: review, evaluator: reviewer, pass: count equals 1 quote of the line it read)
     pass: the list call returns status 200 and exactly 1 agent named "alpha"
     discriminates: a build that creates nothing returns an empty list and fails this
     evaluator: ci     # ci | tester | reviewer | owner
@@ -70,11 +78,12 @@ Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 | `covers` | not exactly one `DW-<n>` or `PC-<n>`; or a `DW-n` beyond the ask's Done-when clauses. **`DW-n` is the ask's clause n; `PC-n` is a plan constraint** (a `PC-<n>: ...` line in the plan's constraints section). If the plan lists its constraints, every `PC-n` must be covered by a scenario and a scenario may only cover a listed one (`uncovered-constraint`, `covers-unknown-constraint`); with no list it is a warning. **`U<n>` scenarios are unchanged-behaviour scenarios**: they say what must still hold, and they do not count towards covering a Done-when clause |
 | `text` | missing or under 10 characters |
 | `proof`, `evaluator` | not one of the listed values |
-| proof and evaluator agree | `test` needs `ci`; `screenshot` needs `reviewer` or `owner`; `live` and `measure` need `tester` or `owner` |
+| proof and evaluator agree | `test` needs `ci`; `screenshot` needs `reviewer` or `owner`; `review` needs `reviewer`; `live` and `measure` need `tester` or `owner` |
 | `pass` | missing, under 15 characters, a vague phrase (`works`, `ok`, `it works`, `passes`, ...), or **no concrete observable**. An observable is a status or exit code (`status 200`, `exit code 0`), a value with a unit or a threshold (`within 5 s`, `exactly 1 agent`, `under 200 ms`), a quoted EXPECTED value that is not itself a vague word (`"alpha"`; `"works"` is not), an identifier compared to a value (`count = 3`), or a strong comparison (`byte-identical to the stored fixture`). Zero, or an exact number, of ANY noun (`sends 0 accepts`, `received 0 responses`, `exactly 3 retries`: the number, up to two words, then a noun); a status class (`a 4xx`, `5xx`); `byte equal`, `byte for byte` and `byte-identical`; a count (including zero: `0 occurrences of X in the tree`), `n of n` with equal numbers (`10 of 10 files contain Y`; `3 of 4 people like it` is not one), identical-to-a-named-thing (`identical per file to the baseline`) and a named identifier compared to a value (`count of Z equals 3`) are observables. Hedges (`maybe`, `somehow`, `or so`, `yes fine`, `seems`) fail whatever else the rule says. A bare digit, `=`, `after` or `before` is not enough: `it works for 1 user` and `result = ok and everything fine` fail |
 | `discriminates` | missing; `n/a`/`none`/`tbd`; under 10 characters; a meta phrase that only says a wrong build fails (`a wrong build would fail this`); no concrete wrong build or negative case (a stub, an empty result, a missing step, a number, a quoted value); or about 80 percent or more of its words are the pass rule's (the pass rule reworded). A wrong build is recognised by structure: `a build that <does X> ... <an observable outcome>` (`a build that skips the dedupe step finds two rows for one key`), not by a list of verbs. Sharing 60 to 80 percent of the pass rule's words only warns (`discriminates-overlap`): a wrong build is often the right one with one thing changed. Whether the named wrong build is the right one is for the plan review (G0b) |
 | evaluator alias | `adam` (an older plan's spelling) is still accepted as `owner`, with a warning to rename it; it is hashed as written |
-| evaluator consistency | the evaluator must be able to record the proof: `test` needs `ci`; `screenshot` needs `reviewer` or `owner`; `live` and `measure` need `tester` or `owner`. (A rule of this checker, written here because plan v3.3 does not state it.) |
+| `review` for code | a `review` scenario that names code behaviour by a keyword (returns, refuses, sends, deletes, fails, never, ...) is refused: use `test`. This check is a net: the plan's reviewer is the guard, and the verb list is final (not widened further). The net is NOT complete: a code scenario in other words slips through, and the plan's reviewer (G0b) is the guard for what it misses; a few prose scenarios using such a word are refused wrongly, which only pushes toward `test` |
+| evaluator consistency | the evaluator must be able to record the proof: `test` needs `ci`; `screenshot` needs `reviewer` or `owner`; `review` needs `reviewer`; `live` and `measure` need `tester` or `owner`. (A rule of this checker, written here because plan v3.3 does not state it.) |
 | coverage | a Done-when clause `DW-n` that no **S** scenario covers |
 | unchanged | no **U** scenario, unless the plan says `unchanged: none because <reason>` with a real reason (at least 20 characters and three meaningful words: not `n/a ok`) |
 | Done-when | `--ask` (or `--done-when`) is the **authority** for the clauses. If the plan states its own Done-when it must be the same clauses: fewer or different ones fail (`done-when-differs`). A plan can never weaken coverage |
@@ -190,7 +199,18 @@ scenarios:
 **3. An uncovered Done-when clause.** With `Done when: (1) ... (2) ...`, a plan whose scenarios only say `covers: DW-1`
 fails with `DW-2 is not covered by any S scenario`. Every clause needs a scenario that proves it.
 
+## A pull request that carries another (`CARRIES`)
+
+Use `CARRIES: #N` as a standing line of the pull request body only for a dependency that cannot merge first: the pull request holds the other pull request's commits. The body names both pull requests (its own `PLAN:` line, and `CARRIES: #N` for the other, whose own plan is read too). The gates then require both plans, read each against the scenarios its own commits prove, reuse the dependency's recorded proofs, verdicts and strict read for the commits identical to the dependency's head (by commit, never by name), and ask fresh ones only for the pull request's own commits. The owner's clear is recorded at the head that carries the commits, names both pull requests, and never carries to a later head. When the dependency has merged, merge the default branch into the carrying pull request once: it is then read as an ordinary pull request and needs no `CARRIES` line. A line naming a pull request that is closed unmerged, or whose commits are not in the branch, is refused with the reason. One dependency only: a second `CARRIES` line, a line that is not exactly `CARRIES: #N` (several numbers, another repository, trailing text) and a pull request that names itself are refused with the reason; a `CARRIES` line inside a fenced code block is ignored. The dependency's own clear is never reused for the carrier. A clear recorded with names for a dependency that later merges still needs a new clear for the ordinary read.
+
 ## The order of the evidence does not matter
 
 A proof (`prove`) and a verdict count when both exist at the same head and plan hash, in either order; the daemon records the `ci` verdict
 itself within minutes of green checks. A push voids every proof and verdict, so after one they are made again.
+
+## Why a work item reads its ask, and a pull request can claim
+
+Two recorded cases (numbers are neutral) led to the two rules after the Done-when item above.
+
+1. **Case 1, the structure gate (G0a).** Work item `#124` belongs to ask `#123` and had no Done-when of its own, because the Done-when lives on the ask. The gate read the Done-when of the issue the plan is on, found none, and failed with `plan check fails: 1 defect` until the ask's Done-when was pasted into the work item. `plan check --ask` already read another issue's Done-when, but the gate did not use it.
+2. **Case 2, the proof gate (G1).** Ask `#123` shipped in two pull requests, `#201` and `#202`, under one plan that had no way to say which scenarios each proves. The first pull request showed the second's scenarios as missing proofs until the ask was split into two work items.

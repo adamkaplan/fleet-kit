@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""arch-part-cut: cut whole top-level sections out of bin/fleet-switchboard into part files, byte for byte.
+
+    arch-part-cut --entry bin/fleet-switchboard --manifest bin/fleet-switchboard.parts --parts-dir bin/switchboard \\
+                  NAME:FIRST:LAST [NAME:FIRST:LAST ...] [--write]
+
+Each NAME:FIRST:LAST names a part and the 1-based lines it takes from the entry (FIRST is the section's first comment line, LAST a line of its
+last statement or after it). Every cut must sit on statement boundaries: a top-level statement is wholly inside the range or wholly outside,
+else the tool stops. The text is copied unchanged (trailing blank lines trimmed, one blank line left between the neighbours), the part is
+appended to the manifest after the last listed part, and the lines leave the entry. A name is lower-case letters, digits and underscores (no path); a part
+that already exists, listed or not, is never overwritten. Every name, range, boundary, existing file and the manifest are checked before the first write: a
+refusal leaves nothing written. The parts are written first, then the entry, then the manifest; a crash in between (a full disk) can leave new parts that no
+manifest lists, and a rerun then refuses their names: delete them by hand and cut again. Without --write it only reports sizes.
+"""
+import argparse
+import ast
+import os
+import re
+import sys
+import tempfile
+
+
+NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")   # importable: no leading digit
+
+
+def refuse(message):
+    sys.exit("arch-part-cut: refused, nothing written: %s" % message)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--entry", required=True)
+    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--parts-dir", required=True)
+    ap.add_argument("cuts", nargs="+")
+    ap.add_argument("--write", action="store_true")
+    args = ap.parse_args(argv)
+    # Everything is read and checked first (names, ranges, boundaries, existing files, the manifest): a refusal leaves nothing written.
+    try:
+        text = open(args.entry, encoding="utf-8").read()
+        lines = text.split("\n")
+        tree = ast.parse(text)
+        manifest_text = open(args.manifest, encoding="utf-8").read()
+    except (OSError, SyntaxError, UnicodeDecodeError) as err:
+        refuse("cannot read the entry %s or the manifest %s: %s" % (args.entry, args.manifest, err))
+    parts_dir = os.path.realpath(args.parts_dir)
+    if not os.path.isdir(parts_dir):
+        refuse("the parts directory %s does not exist" % args.parts_dir)
+    manifest_dir = os.path.dirname(os.path.realpath(args.manifest))
+    if os.path.islink(args.parts_dir.rstrip("/") or "/"):
+        refuse("the parts directory %s is a symlink" % args.parts_dir)
+    if os.path.commonpath([parts_dir, manifest_dir]) != manifest_dir:
+        refuse("the parts directory %s is not under the manifest's directory" % args.parts_dir)
+    on_disk = {entry.lower() for entry in os.listdir(parts_dir)}
+    listed = {line.strip() for line in manifest_text.splitlines() if line.strip() and not line.lstrip().startswith("#")}
+    cuts, seen, claimed = [], set(), set()
+    for spec in args.cuts:
+        fields = spec.split(":")
+        if len(fields) != 3:
+            refuse("%r is not NAME:FIRST:LAST" % spec)
+        name = fields[0]
+        if not NAME_RE.fullmatch(name):   # fullmatch: `$` would let a trailing newline through
+            refuse("part name %r: a name is lower-case letters, digits and underscores only, not starting with a digit (no path)" % name)
+        if name in seen:
+            refuse("a part name is given twice: %s" % name)
+        seen.add(name)
+        try:
+            first, last = int(fields[1]), int(fields[2])
+        except ValueError:
+            refuse("%s: FIRST and LAST are line numbers" % name)
+        if not (1 <= first <= last <= len(lines)):
+            refuse("%s: lines %d-%d are not inside the entry (1-%d)" % (name, first, last, len(lines)))
+        target = os.path.join(parts_dir, name + ".py")
+        if os.path.dirname(os.path.realpath(target)) != parts_dir:
+            refuse("%s: the part would be written outside %s" % (name, args.parts_dir))
+        entry_name = os.path.relpath(target, manifest_dir).replace(os.sep, "/")
+        if entry_name in listed or os.path.lexists(target) or (name + ".py").lower() in on_disk:
+            refuse("%s: a part of that name already exists (%s%s): a cut never overwrites a part" % (name, entry_name, ", listed in the manifest" if entry_name in listed else ""))
+        while lines[last - 1].strip() == "" and last > first:
+            last -= 1
+        if claimed & set(range(first, last + 1)):
+            refuse("%s: lines %d-%d overlap another cut" % (name, first, last))
+        claimed |= set(range(first, last + 1))
+        for node in tree.body:
+            top = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])   # a decorator is part of the statement
+            inside = first <= top and node.end_lineno <= last
+            outside = node.end_lineno < first or top > last
+            if not (inside or outside):
+                refuse("%s: statement at line %d-%d is cut by %d-%d" % (name, top, node.end_lineno, first, last))
+        cuts.append((name, first, last, target, entry_name))
+        print("%-14s lines %d-%d (%d lines)" % (name, first, last, last - first + 1))
+    if not args.write:
+        return 0
+    drop = set()
+    for _name, first, last, _target, _entry_name in cuts:
+        drop.update(range(first - 1, last))
+    kept = []
+    for i, line in enumerate(lines):
+        if i in drop:
+            continue
+        if line == "" and len(kept) >= 2 and kept[-1] == "" and kept[-2] == "":
+            continue
+        kept.append(line)
+    manifest = manifest_text if manifest_text.endswith("\n") or not manifest_text else manifest_text + "\n"
+    for _name, _f, _l, _target, entry_name in cuts:
+        manifest += entry_name + "\n"
+    for name, first, last, target, _entry_name in cuts:   # the parts first, then the entry, the manifest last; each through a temporary file
+        replace_file(target, "\n".join(lines[first - 1:last]) + "\n")
+    replace_file(args.entry, "\n".join(kept))
+    replace_file(args.manifest, manifest)
+    return 0
+
+
+def replace_file(path, content):
+    """Write `content` to `path` through a temporary file beside it, so a crash never leaves a half-written file."""
+    handle = tempfile.NamedTemporaryFile("w", dir=os.path.dirname(os.path.realpath(path)), delete=False, encoding="utf-8")
+    try:
+        handle.write(content)
+        handle.close()
+        if os.path.exists(path):
+            os.chmod(handle.name, os.stat(path).st_mode & 0o7777)
+        os.replace(handle.name, path)
+    finally:
+        if os.path.exists(handle.name):
+            os.unlink(handle.name)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
