@@ -13,6 +13,11 @@ def entries():
         return [l for l in f.read().split("\n") if l]
 
 
+def slurp(path):
+    with open(path) as f:
+        return f.read()
+
+
 def git(cwd, *a):
     return subprocess.run(("git",) + a, cwd=cwd, capture_output=True, text=True)
 
@@ -105,11 +110,38 @@ class Guards(Scratch):
 
     def test_h1_unlisted_bin_script_fails(self):
         self.fails(self.tree(["test_a.py"], tests=("test_a.py",), bins=("test-cloud-extra",)),
-                   "NOT RUN: bin/test-cloud-extra is neither chained nor in BIN_EXCEPTIONS")
+                   "NOT RUN: bin/test-cloud-extra is in no chain list entry and not in BIN_EXCEPTIONS")
 
     def test_m2_last_line_not_fixed_fails(self):
         d = self.tree([], tests=("test_a.py",), raw=FIXED_LAST + "\ncloud/launcher/tests/test_a.py\n")
         self.fails(d, "the last line of bin/test-cloud-launcher.chain must be " + FIXED_LAST)
+
+    def test_m2_same_named_worker_test_does_not_satisfy_a_launcher_test(self):
+        d = self.tree([], tests=("test_x.py",), raw="cloud/worker/tests/test_x.py\n" + FIXED_LAST + "\n")
+        self.fails(d, "NOT RUN: test_x.py is neither chained nor in EXCEPTIONS")
+
+    def test_m3_cost_script_keeps_the_old_message(self):
+        d = self.tree(["test_a.py"], tests=("test_a.py",), bins=("test-cloud-cost-new",))
+        self.fails(d, "NOT RUN: bin/test-cloud-cost-new is not chained")
+
+    def test_m3_old_messages_equal_the_integration_script_byte_for_byte(self):
+        old = git(ROOT, "show", "origin/integration:bin/test-cloud-launcher")
+        if old.returncode != 0:
+            self.skipTest("origin/integration is not available")
+        new = slurp(SCRIPT)
+        for lit in ('echo "NOT RUN: $n is neither chained nor in EXCEPTIONS"; echo "RESULT: FAIL"; exit 1',
+                    'echo "NOT RUN: bin/$n is not chained"; echo "RESULT: FAIL"; exit 1'):
+            self.assertIn(lit, old.stdout)
+            self.assertIn(lit, new)
+
+    def test_low_symlink_entry_refused(self):
+        d = self.tree([], tests=())
+        with open(os.path.join(d, "target.py"), "w") as f:
+            f.write("pass\n")
+        os.symlink(os.path.join(d, "target.py"), os.path.join(d, "cloud/launcher/tests/test_link.py"))
+        with open(os.path.join(d, "bin", "test-cloud-launcher.chain"), "w") as f:
+            f.write("cloud/launcher/tests/test_link.py\n" + FIXED_LAST + "\n")
+        self.fails(d, "NOT RUN: entry is a symlink")
 
     def test_low_duplicate_entry_fails_and_runs_nothing(self):
         d = self.tree(["test_a.py", "test_a.py"], tests=("test_a.py",))
@@ -134,13 +166,13 @@ class Guards(Scratch):
         log = tempfile.mkdtemp(prefix="chain-log-"); self.addCleanup(shutil.rmtree, log, True)
         p = subprocess.run([os.path.join(d, "bin", "test-cloud-launcher"), "ARGX"], cwd=d, env=dict(os.environ, CHAIN_LOG=log), capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stdout)
-        self.assertEqual(open(os.path.join(log, "test_driver.py")).read(), "ARGX")
-        self.assertEqual(open(os.path.join(log, "test_other.py")).read(), "")
+        self.assertEqual(slurp(os.path.join(log, "test_driver.py")), "ARGX")
+        self.assertEqual(slurp(os.path.join(log, "test_other.py")), "")
 
 
 class RealTree(unittest.TestCase):
     def test_s7_every_test_file_listed_or_excepted_and_every_entry_exists(self):
-        text = open(SCRIPT).read()
+        text = slurp(SCRIPT)
         exc = text.split("EXCEPTIONS=")[1].split("\n")[0]
         listed = entries()
         unlisted = [n for n in sorted(os.listdir(HERE)) if n.startswith("test_") and n.endswith(".py")
@@ -153,6 +185,29 @@ class RealTree(unittest.TestCase):
         for b in ("bin/test-cloud-cost-report",):
             self.assertEqual(listed.count(b), 1, b)
 
+    @staticmethod
+    def uncovered(bins, listed, exc, workflow_text):
+        names = [e.split(":")[0] for e in exc.split()]
+        return [b for b in bins if "bin/" + b not in listed and b not in names and ("bin/" + b) not in workflow_text]
+
+    def test_h1_every_cloud_bin_script_is_chained_excepted_or_a_workflow_step(self):
+        # What the old test_h1 pinned: each relay-family script (and the cost report) is run, listed exactly once in the list.
+        # This derives the set from the files: bin/test-cloud-*, the list, BIN_EXCEPTIONS, and every workflow file.
+        bins = sorted(n for n in os.listdir(os.path.join(ROOT, "bin")) if n.startswith("test-cloud-") and not n.endswith(".chain"))
+        exc = slurp(SCRIPT).split("BIN_EXCEPTIONS=")[1].split("\n")[0].strip('"')
+        wfdir = os.path.join(ROOT, ".github", "workflows")
+        wf = "".join(slurp(os.path.join(wfdir, n)) for n in sorted(os.listdir(wfdir)) if n.endswith((".yml", ".yaml")))
+        listed = entries()
+        self.assertGreater(len(bins), 5)
+        self.assertEqual(self.uncovered(bins, listed, exc, wf), [])
+        for b in ("test-cloud-hub", "test-cloud-relay", "test-cloud-hub-relay", "test-cloud-relay-daemon"):
+            self.assertIn(b, bins)
+            self.assertNotIn(b + ":own-ci-step", exc)
+        # mutant: a new script in none of the three places is caught (assert the mutation applied)
+        mutated = bins + ["test-cloud-zz-new"]
+        self.assertEqual(len(mutated), len(bins) + 1)
+        self.assertEqual(self.uncovered(mutated, listed, exc, wf), ["test-cloud-zz-new"])
+
     def test_s4_the_old_commands_are_each_one_entry(self):
         listed = entries()
         self.assertEqual(len(listed), len(set(listed)))
@@ -161,10 +216,10 @@ class RealTree(unittest.TestCase):
         self.assertGreater(len(listed), 40)
 
     def test_s1_s12_the_cause_and_the_how_to_are_documented(self):
-        doc = open(os.path.join(ROOT, "cloud", "launcher", "README.md")).read()
+        doc = slurp(os.path.join(ROOT, "cloud", "launcher", "README.md"))
         self.assertIn("ONE shell line of more than forty commands", doc)
         self.assertIn("add one line to bin/test-cloud-launcher.chain at its alphabetical place", doc)
-        self.assertIn("ONE shell line of more than forty commands", open(SCRIPT).read().replace("\n# ", " "))
+        self.assertIn("ONE shell line of more than forty commands", slurp(SCRIPT).replace("\n# ", " "))
 
 
 class Merge(unittest.TestCase):
@@ -184,7 +239,7 @@ class Merge(unittest.TestCase):
                 f.write(edit(base_text))
             git(d, "commit", "-qam", br)
         git(d, "checkout", "-q", "a")
-        return git(d, "merge", "--no-edit", "b").returncode, open(path).read()
+        return git(d, "merge", "--no-edit", "b").returncode, slurp(path)
 
     def test_s9_real_list_form_merges_clean(self):
         base = "".join(e + "\n" for e in entries())
@@ -205,6 +260,7 @@ class Merge(unittest.TestCase):
         self.assertNotEqual(rc, 0)  # residual risk: inserts at the same place conflict
 
     def test_s10_mutant_single_line_form_conflicts(self):
+        self.assertGreater(len(entries()), 40)  # the real list, not a synthetic string
         base = "if " + " && ".join("python3 " + e for e in entries()) + "; then echo RESULT: PASS; fi\n"
         add_a = lambda t: t.replace("; then", " && python3 cloud/launcher/tests/test_new_a.py; then")
         add_b = lambda t: t.replace("; then", " && python3 cloud/launcher/tests/test_new_z.py; then")

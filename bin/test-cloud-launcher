@@ -11,19 +11,25 @@ EXCEPTIONS="test_cloud_pod_deadline.py:slow(26s),not-yet-chained test_cloud_stop
 for f in cloud/launcher/tests/test_*.py; do
   [ -e "$f" ] || continue
   n=$(basename "$f")
-  grep -q "tests/$n\$" "$LIST" && continue
+  grep -qx "cloud/launcher/tests/$n" "$LIST" && continue
   case " $EXCEPTIONS " in *" $n:"*) continue ;; esac
   echo "NOT RUN: $n is neither chained nor in EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
 done
-# Every bin/test-cloud-* script must be listed in $LIST or named here with a reason.
-BIN_EXCEPTIONS="test-cloud-hub:own-ci-step test-cloud-hub-relay:own-ci-step test-cloud-relay:own-ci-step test-cloud-relay-daemon:own-ci-step test-cloud-channel:not-yet-chained test-cloud-channel-server:not-yet-chained test-cloud-cli:not-yet-chained test-cloud-client:not-yet-chained test-cloud-launcher:this-script test-cloud-neutral-names:not-yet-chained test-cloud-way-back:not-yet-chained test-cloud-worker:not-yet-chained"
+for f in bin/test-cloud-cost-*; do
+  [ -e "$f" ] || continue
+  n=$(basename "$f")
+  grep -qx "bin/$n" "$LIST" && continue
+  echo "NOT RUN: bin/$n is not chained"; echo "RESULT: FAIL"; exit 1
+done
+# Every bin/test-cloud-* script must be listed in $LIST or named here with a reason (a third, wider check).
+BIN_EXCEPTIONS="test-cloud-hub:not-yet-chained(#1311) test-cloud-hub-relay:not-yet-chained(#1311) test-cloud-relay:not-yet-chained(#1311) test-cloud-relay-daemon:not-yet-chained(#1311) test-cloud-channel:not-yet-chained test-cloud-channel-server:not-yet-chained test-cloud-cli:not-yet-chained test-cloud-client:not-yet-chained test-cloud-launcher:this-script test-cloud-neutral-names:not-yet-chained test-cloud-way-back:not-yet-chained test-cloud-worker:not-yet-chained"
 for f in bin/test-cloud-*; do
   [ -e "$f" ] || continue
   n=$(basename "$f")
   case "$n" in *.chain) continue ;; esac
   grep -qx "bin/$n" "$LIST" && continue
   case " $BIN_EXCEPTIONS " in *" $n:"*) continue ;; esac
-  echo "NOT RUN: bin/$n is neither chained nor in BIN_EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
+  echo "NOT RUN: bin/$n is in no chain list entry and not in BIN_EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
 done
 last=$(grep -v '^[[:space:]]*$' "$LIST" | tail -n 1)
 if [ -n "$last" ] && [ "$last" != "cloud/worker/tests/test_cloud_prepush_preflight.py" ]; then
@@ -36,6 +42,7 @@ while IFS= read -r e; do
   case "$e" in
     /*|..|../*|*/../*) echo "NOT RUN: entry outside the repository: $e"; echo "RESULT: FAIL"; exit 1 ;;
   esac
+  [ -L "$e" ] && { echo "NOT RUN: entry is a symlink: $e"; echo "RESULT: FAIL"; exit 1; }
   case "$seen" in *" $e "*) echo "NOT RUN: duplicate entry $e in $LIST"; echo "RESULT: FAIL"; exit 1 ;; esac
   seen="$seen$e "
   [ -f "$e" ] || { echo "NOT RUN: $e is listed in $LIST but does not exist"; echo "RESULT: FAIL"; exit 1; }
