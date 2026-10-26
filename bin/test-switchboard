@@ -86613,7 +86613,7 @@ class FakePullFiles:
     def view(self):
         """what `gh pr view --json files,...` says: at most 100 files, a rename without its source"""
         shown = [{"path": f["filename"] if isinstance(f, dict) else "x", "additions": 1, "deletions": 1, "changeType": f["status"].upper() if isinstance(f, dict) else "MODIFIED"} for f in self.files[:100]]
-        return {"headRefOid": self.HEAD, "baseRefOid": "b" * 40, "changedFiles": self.count, "files": shown}
+        return dict({"headRefOid": self.HEAD, "baseRefOid": "b" * 40, "changedFiles": self.count, "files": shown}, **({"statusCheckRollup": self.rollup} if getattr(self, "rollup", None) else {}))   # `rollup` is set only by a clear that must show CI to its brief (#1215)
 
     def fault(self, key):
         queue = self.faults.get(key) or []
@@ -87141,13 +87141,13 @@ class TestPullFileListRead(LedgerBase):
             def runner(argv, **kw):
                 return subprocess.CompletedProcess(argv, 1, "", "gh: " + LONG) if "DELETE" in argv else inner(argv, **kw)
             self.runner = self.engine.gh_runner = runner
-            return self.run_clear()
+            return self.run_clear(with_brief=True)
 
         def state_aside():
             self.serve(FakePullFiles.make(38))
             (self.world.state / sb.IMPACT_STATE_FILE).write_text("{not json")
             with mock.patch.object(os, "rename", side_effect=OSError(13, LONG)):
-                return self.run_clear()
+                return self.run_clear(with_brief=True)
         w = 'load_module("delegated_clear").whole_line(str(err))'
         return {
             "the floor or its rule cannot be read": (view_fails, ("hold", 'its rule cannot be read (%s): refused" % module.whole_line(str(err))', 'its rule cannot be read (%s): refused" % _one_line(str(err), 140)'), "audit"),
@@ -87488,7 +87488,7 @@ class TestPullFileListRead(LedgerBase):
 
     # ---- (4) the same line reaches the audit
 
-    def run_clear(self, entry_extra=None, orders=None):
+    def run_clear(self, entry_extra=None, orders=None, with_brief=False):
         self.extra_config["delegated_clear"] = {"orders": [dict({"number": 17, "sha256": sb.load_module("delegated_clear").order_hash("order text")}, **(entry_extra or {}))], "charter": 40}
         self.configure()
         if "cos" not in self.world.sessions:
@@ -87498,8 +87498,13 @@ class TestPullFileListRead(LedgerBase):
             patcher.start()
             self.addCleanup(patcher.stop)
         os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        flags = []
+        if with_brief:   # #1215: a Chief of Staff clear carries the brief the REAL floor builds for this pull request (setup only)
+            self.github.rollup = [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]   # the brief shows CI: a fixture with none is "not shown" and the brief then escalates
+            brief = sb.pr_floor_report(self.engine, self.REPO, 9)["brief"]
+            flags = ["--brief-digest", brief["digest"], "--brief-text", brief["text"]]
         with captured() as (out, err), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None):
-            code = sb.main(["impact", "clear", "%s#9" % self.REPO, "--under-order", "17", "--reason", "the review confirms nothing touches credentials"],
+            code = sb.main(["impact", "clear", "%s#9" % self.REPO, "--under-order", "17", "--reason", "the review confirms nothing touches credentials"] + flags,
                            runner=self.runner, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
 
