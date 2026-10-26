@@ -1,8 +1,4 @@
 bin/test-cloud-cost-report
-bin/test-cloud-hub
-bin/test-cloud-hub-relay
-bin/test-cloud-relay
-bin/test-cloud-relay-daemon
 cloud/launcher/tests/test_app_token.py
 cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_cloud_allowlist.py
@@ -41,12 +37,16 @@ cloud/launcher/tests/test_vault_check_pins.py
 cloud/worker/tests/test_cloud_prepush.py
 cloud/worker/tests/test_cloud_prepush_hardening.py
 cloud/worker/tests/test_cw_gh_comments.py
+cloud/worker/tests/test_dockerfile_agent.py
+cloud/worker/tests/test_dockerfile_node.py
 cloud/worker/tests/test_entrypoint_question.py
 cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
 cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
 cloud/worker/tests/test_question_denied.py
+cloud/worker/tests/test_root_scanner.py
+cloud/worker/tests/test_scan_allowlist_node.py
 cloud/worker/tests/test_stack_pull.py
 cloud/worker/tests/test_stack_up.py
 cloud/worker/tests/test_cloud_prepush_preflight.py

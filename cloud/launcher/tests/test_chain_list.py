@@ -148,9 +148,9 @@ class RealTree(unittest.TestCase):
         self.assertEqual(unlisted, [])
         self.assertEqual([e for e in listed if not os.path.isfile(os.path.join(ROOT, e))], [])
 
-    def test_h1_the_relay_family_scripts_are_listed_once(self):
+    def test_h1_the_cost_report_script_is_listed_once(self):
         listed = entries()
-        for b in ("bin/test-cloud-hub", "bin/test-cloud-relay", "bin/test-cloud-hub-relay", "bin/test-cloud-relay-daemon", "bin/test-cloud-cost-report"):
+        for b in ("bin/test-cloud-cost-report",):
             self.assertEqual(listed.count(b), 1, b)
 
     def test_s4_the_old_commands_are_each_one_entry(self):

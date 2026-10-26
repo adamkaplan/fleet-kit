@@ -16,7 +16,7 @@ for f in cloud/launcher/tests/test_*.py; do
   echo "NOT RUN: $n is neither chained nor in EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
 done
 # Every bin/test-cloud-* script must be listed in $LIST or named here with a reason.
-BIN_EXCEPTIONS="test-cloud-channel:not-yet-chained test-cloud-channel-server:not-yet-chained test-cloud-cli:not-yet-chained test-cloud-client:not-yet-chained test-cloud-launcher:this-script test-cloud-neutral-names:not-yet-chained test-cloud-way-back:not-yet-chained test-cloud-worker:not-yet-chained"
+BIN_EXCEPTIONS="test-cloud-hub:own-ci-step test-cloud-hub-relay:own-ci-step test-cloud-relay:own-ci-step test-cloud-relay-daemon:own-ci-step test-cloud-channel:not-yet-chained test-cloud-channel-server:not-yet-chained test-cloud-cli:not-yet-chained test-cloud-client:not-yet-chained test-cloud-launcher:this-script test-cloud-neutral-names:not-yet-chained test-cloud-way-back:not-yet-chained test-cloud-worker:not-yet-chained"
 for f in bin/test-cloud-*; do
   [ -e "$f" ] || continue
   n=$(basename "$f")
