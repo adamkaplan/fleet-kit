@@ -6,7 +6,7 @@ description: How to write a plan before work starts, check it, and get it challe
 # Planning
 
 A plan says **what** the work must achieve and how anyone will know, never gratuitous **how**. It is written before
-work starts, checked by a command, challenged by independent reviewers, and approved. Every rule and check is in
+work starts, checked by a command, challenged by reviewers, and approved. Every rule and check is in
 `docs/plan-template.md` (read it when a check fails).
 
 ## When a plan is required
@@ -21,19 +21,19 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 1. **Done-when**: copy the ask's clauses, numbered `(1) ... (2) ...`. They are the authority; never reword them.
 2. **Clauses to scenarios**: every clause needs at least one behaviour scenario (`S`); behaviour that must NOT change is a
    `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
-   screenshot | review`; `review` quotes text; this check is a net: the plan's reviewer is the guard), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
+   screenshot | review`; `review` quotes text; a net, the reviewer is the guard), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
    **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
    **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
+   An uncovered Done-when clause gets a new `S` scenario; never edit, reword or delete the clause.
 3. **Constraints** (`PC-n`): what must hold and why (a shared contract, a security rule, a held path). Nothing else is a
    constraint.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
    tier**, and **the integration-branch decision** (stay on main, or `integration/<epic-slug>`).
    **Size** is a T-shirt in AGENT time, never human-days: S under 1 hour, M a few hours, L about a day, XL several days, each with what makes it that
-   size. Never prefer the smaller option merely because it is less work when a larger one
-   simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may carry just `size: S`).
+   size. Never pick the smaller option for less work when a larger one simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may carry `size: S`).
 
 ## Check it
 
@@ -45,7 +45,7 @@ issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; forma
 
 Put it in the repo the work concerns. **A short issue body** (the one-paragraph outcome, the Done-when, the link to the
 detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
-`scenarios:` yaml block. Revise by posting a new such comment (the latest counts). One plan per ask; sections for work items.
+`scenarios:` yaml block. Revise by posting a new one (the latest counts). One plan per ask; sections for work items.
 
 ## Challenge it
 

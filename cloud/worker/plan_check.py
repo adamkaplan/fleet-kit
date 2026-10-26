@@ -730,7 +730,7 @@ def validate(scenarios, clauses, text=""):
         tag = "DW-%d" % number
         covering = [s for s in scenarios if _normal(s.get("covers", "")) == tag and _normal(s.get("id", "")).startswith("S")]
         if not covering:
-            bad("-", "uncovered-clause", "%s is not covered by any S scenario: %s" % (tag, clauses[number - 1][:80]))
+            bad("-", "uncovered-clause", "%s is not covered by any S scenario: add an S scenario that covers %s; never edit the clause (%s)" % (tag, tag, clauses[number - 1][:80]))
     if not clauses:
         bad("-", "no-done-when", "the ask has no Done-when to cover: coverage cannot be checked (the issue body needs a \"## Intent\" heading, then a line starting \"Done when:\" under it)")
     if not any(_normal(s.get("id", "")).startswith("U") for s in scenarios):

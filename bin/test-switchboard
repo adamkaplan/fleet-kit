@@ -44855,6 +44855,13 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertIn("uncovered-clause", self.codes(self.edit("id: S2", "id: U2")))  # a U scenario does not cover a clause
         self.assertIn("no-done-when", self.codes(GOOD_PLAN, ""))
 
+    def test_an_uncovered_clause_names_the_fix(self):
+        fix = "add an S scenario that covers DW-2; never edit the clause"
+        got = [d["message"] for d in self.check(self.edit("covers: DW-2", "covers: PC-2"))["defects"] if d["code"] == "uncovered-clause"]
+        self.assertEqual(len(got), 1, got)
+        self.assertTrue(got[0].startswith("DW-2 is not covered by any S scenario: "), got)
+        self.assertIn(fix, got[0])
+
     def test_a_refused_evaluator_names_the_evaluators_that_fit_the_proof(self):
         for proof, evaluator, fitting in (("test", "reviewer", "ci"), ("live", "ci", "tester or owner"),
                                           ("measure", "ci", "tester or owner"), ("screenshot", "ci", "reviewer or owner")):
