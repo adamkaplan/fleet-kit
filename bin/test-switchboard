@@ -259,7 +259,7 @@ class TestConfig(Base):
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
-            "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
+            "rider_max_age_seconds": 3600, "undelivered_wake_minutes": 15, "undelivered_wake_tell_minutes": None, "undelivered_wake_per_pass": 2, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
@@ -19691,7 +19691,7 @@ class TestPlanningSkill(unittest.TestCase):
     def test_it_is_a_short_skill_with_the_frontmatter_the_others_have(self):
         text = self.SKILL.read_text()
         self.assertTrue(text.startswith("---\nname: fleet-planning\ndescription: "))
-        self.assertLessEqual(len(text.split()), 1100, "the skill must be cheap to load")
+        self.assertLessEqual(len(text.split()), 1200, "the skill must be cheap to load")
         for phrase in ("PLAN: <link>", "fleet-switchboard plan check", "plan review", "docs/plan-template.md", "discriminates", "What the reviewers attack"):
             self.assertIn(phrase, text)
         self.assertIn("not built yet", text)  # the review engine is part 2: said plainly
@@ -42183,7 +42183,7 @@ class TestImpactHold(LedgerBase):
         profiled = {f[len("bin/"):-3] for f, _ in seen if f.endswith(".py")}
         named = lambda m: matches("bin/%s.py" % m, rule["clear_code_paths"])
         judged = {m for m in (reached | at_load | with_reader | profiled) if m in names and not named(m)}
-        listed = {f[len("bin/"):-3] for f in rule["closure_files"] if f.endswith(".py")}
+        listed = {f[len("bin/"):-3] for f in rule["closure_files"] if f.endswith(".py") and not f.startswith("bin/switchboard/")}   # a part of the daemon is judged by tools/derive-closure (tests/switchboard/test_closure.py), not by this list of flat modules
         self.assertEqual(sorted(judged ^ listed), [], "closure_files is the set of modules the clear loads or runs, derived (a module in one and not the other)")
         every_loaded = {m for m in (set(helper.values()) | set().union(*loaders.values()) | set().union(*[direct(f) for f in clear_functions])) if m in names and not named(m)}
         exempt = {"bin/%s.py" % m for m in every_loaded - judged}
@@ -44999,6 +44999,124 @@ class TestPlanCheckSelection(unittest.TestCase):
         self.assertEqual(pick(None, None), ("", "issue body"))
 
 
+class TestPlanReceipts(unittest.TestCase):
+    """#978: one canonical plan comment edited in place, a short receipt per revision, a repost reported, the three documents pinned."""
+    H = "sha256:" + "a" * 64
+    PLAN = "## Plan (scenarios)\nplan-format: 2\n"
+
+    def receipt(self, cid, extra="", day=5):
+        return {"id": cid, "created_at": "2026-01-0%dT00:00:00Z" % day, "body": "<!-- plan-receipt -->\nplan hash: %s\nwhy it changed\nand what%s" % (self.H, extra)}
+
+    def plan(self, cid, day=1):
+        return {"id": cid, "created_at": "2026-01-0%dT00:00:00Z" % day, "body": self.PLAN}
+
+    def test_one_canonical_comment_with_two_receipts_passes_and_is_the_one_used(self):
+        comments = [self.plan(10), self.receipt(11, day=2), self.receipt(12, day=3)]
+        self.assertEqual(sb.plan_check.plan_comment_defects(comments), [])
+        self.assertEqual(sb.plan_check.select_plan_text("b", comments)[1], "comment 10")
+
+    def test_a_receipt_that_quotes_the_plan_heading_is_not_a_plan(self):
+        quoting = {"id": 13, "created_at": "2026-01-09T00:00:00Z", "body": "<!-- plan-receipt -->\nplan hash: %s\n## Plan (scenarios)\nx" % self.H}
+        self.assertEqual(sb.plan_check.select_plan_text("b", [self.plan(10), quoting])[1], "comment 10")
+
+    def test_a_reposted_plan_is_reported_naming_both_comments(self):
+        defects = sb.plan_check.plan_comment_defects([self.plan(10), self.plan(20, day=4)])
+        self.assertEqual([d["code"] for d in defects], ["second-plan-comment"])
+        self.assertIn("20", defects[0]["message"])
+        self.assertIn("10", defects[0]["message"])
+
+    def test_a_receipt_that_carries_plan_text_is_reported(self):
+        for extra in ("\n## Plan (scenarios)", "\nplan-format: 2", "\nscenarios:\n  - id: S1", "\n```yaml\nx\n```"):
+            with self.subTest(extra=extra):
+                defects = sb.plan_check.plan_comment_defects([self.plan(10), self.receipt(11, extra)])
+                self.assertEqual([d["code"] for d in defects], ["bad-receipt"])
+                self.assertIn("receipt carries plan text", defects[0]["message"])
+
+    def test_a_malformed_receipt_is_reported(self):
+        bad = {"id": 14, "created_at": "2026-01-09T00:00:00Z", "body": "<!-- plan-receipt -->\nno hash here\nreason"}
+        self.assertEqual([d["code"] for d in sb.plan_check.plan_comment_defects([bad])], ["bad-receipt"])
+
+    def test_no_receipts_and_one_plan_is_as_before(self):
+        self.assertEqual(sb.plan_check.plan_comment_defects([self.plan(10)]), [])
+        self.assertEqual(sb.plan_check.plan_comment_defects([]), [])
+
+    class Reader:
+        def __init__(inner, comments):
+            inner.comments = comments
+
+        def _api(inner, path, repo):
+            return inner.comments if path.split("?")[0].endswith("/comments") else {"body": ""}
+
+    def test_the_defects_reach_the_result_of_load_plan(self):
+        for comments, ok in (([self.plan(10), self.receipt(11)], True), ([self.plan(10), self.plan(20, day=4)], False)):
+            defects = sb.fetch_plan(self.Reader(comments), "o/r", 1)[3]
+            self.assertEqual(not defects, ok)
+
+    def test_an_explicit_comment_id_still_reports_a_second_plan_naming_both(self):
+        for explicit in (10, 20):
+            defects = sb.fetch_plan(self.Reader([self.plan(10), self.plan(20, day=4)]), "o/r", 1, explicit)[3]
+            self.assertEqual([d["code"] for d in defects], ["second-plan-comment"])
+            self.assertIn("comment 20", defects[0]["message"])
+            self.assertIn("comment 10", defects[0]["message"])
+
+    def test_no_module_global_holds_the_defects(self):
+        self.assertFalse(hasattr(sb, "PLAN_COMMENT_DEFECTS"))
+
+    def test_the_route_lookup_reports_a_second_plan_as_a_defect(self):
+        t = TestPlanKind()
+        hub = t.hub([self.plan(10), self.plan(20, day=4)])[0]
+        self.assertEqual(t.kind(hub), "defect")
+        self.assertEqual(t.kind(t.hub([self.plan(10), self.receipt(11)])[0]), "plan")
+
+    def test_mutant_route_lookup_that_skips_the_rule_fails(self):
+        t = TestPlanKind()
+        with mock.patch.object(sb, "second_plan_defects", lambda d: []):
+            self.assertEqual(t.kind(t.hub([self.plan(10), self.plan(20, day=4)])[0]), "plan")   # the test above fails on it
+
+    def documents(self):
+        texts = {"skill": (REPO / "skills" / "fleet-planning" / "SKILL.md").read_text(), "template": (REPO / "docs" / "plan-template.md").read_text()}
+        texts["brief"] = sb.load_plan_review().lane_brief("L1", "ref", "h", "plan", "intent", "dw")
+        return texts
+
+    def pinned(self, texts):
+        return all(sb.plan_check.PLAN_RULE in t for t in texts.values())
+
+    def test_the_three_documents_say_the_rule_once_in_the_same_words(self):
+        texts = self.documents()
+        self.assertTrue(self.pinned(texts))
+        for name, text in texts.items():
+            self.assertEqual(text.count(sb.plan_check.PLAN_RULE), 1, name)
+        self.assertEqual(sb.load_plan_review().PLAN_RULE, sb.plan_check.PLAN_RULE)
+
+    def test_the_pin_fails_when_the_sentence_is_removed_from_any_one_document(self):
+        for name in ("skill", "template", "brief"):
+            with self.subTest(removed=name):
+                texts = self.documents()
+                texts[name] = texts[name].replace(sb.plan_check.PLAN_RULE, "")
+                self.assertFalse(self.pinned(texts))
+
+    def test_a_mutant_that_treats_a_receipt_as_a_plan_is_caught(self):
+        quoting = self.receipt(13, "\n## Plan (scenarios)")
+        comments = [self.plan(10), quoting]
+        self.assertEqual([d["code"] for d in sb.plan_check.plan_comment_defects(comments)], ["bad-receipt"])
+        original = sb.load_plan_check().is_receipt
+        sb.load_plan_check().is_receipt = lambda comment: False   # the mutant: a receipt is not recognised, so its text is never held to the receipt rule
+        try:
+            self.assertEqual(sb.plan_check.plan_comment_defects(comments), [])
+        finally:
+            sb.load_plan_check().is_receipt = original
+
+    def test_a_mutant_that_ignores_a_second_plan_comment_is_caught(self):
+        comments = [self.plan(10), self.plan(20, day=4)]
+        original = sb.load_plan_check()._is_plan_comment
+        sb.load_plan_check()._is_plan_comment = lambda comment: comment.get("id") == 10
+        try:
+            self.assertEqual(sb.plan_check.plan_comment_defects(comments), [])   # the mutant sees no repost
+        finally:
+            sb.load_plan_check()._is_plan_comment = original
+        self.assertEqual(len(sb.plan_check.plan_comment_defects(comments)), 1)
+
+
 class TestPlanCheckCommand(Base):
     """#135: the command: exit codes, the issue reader (injected), --file, --json. GETs only."""
 
@@ -45058,8 +45176,24 @@ class TestPlanCheckCommand(Base):
                          {"id": 12, "created_at": "2026-01-02T00:00:00Z", "body": "## Plan (scenarios) rev 2\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):],
                           "user": {"login": "planner"}}]
         code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
-        self.assertEqual(code, 0, out + err)
+        self.assertEqual(code, 1, out + err)   # #978: a repost is a defect naming both comments; the latest is still the one read
         self.assertIn("source: comment 12 by planner of acme/app#7", out)
+        self.assertIn("comment 12 looks like a plan but comment 11 is already the plan", out)
+
+    def test_one_canonical_comment_with_two_receipts_passes_and_names_the_canonical_one(self):
+        h = "sha256:" + "b" * 64
+        receipt = "<!-- plan-receipt -->\nplan hash: %s\nwhat changed\nwhy" % h
+        self.issue["body"] = "## Intent\nx\nDone when: %s\n" % GOOD_DONE_WHEN
+        self.comments = [{"id": 11, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):]},
+                         {"id": 12, "created_at": "2026-01-02T00:00:00Z", "body": receipt},
+                         {"id": 13, "created_at": "2026-01-03T00:00:00Z", "body": receipt}]
+        code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("source: comment 11", out)
+        self.comments[2]["body"] += "\n## Plan (scenarios)"
+        code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("receipt carries plan text", out)
 
     def test_an_issue_comment_url_picks_that_comment(self):
         self.comments = [{"id": 11, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):]}]
@@ -72150,6 +72284,7 @@ class TestV2LightGuards(Base):
         ("triage_stop", 1): (3, "stop", ()),
         ("synthetic_lines", 1): (5, "lines", (("transcript_lines", 1),)),
         ("transcript_lines", 1): (5, "transcript", ()),
+        ("undelivered_wake_tick", 1): ("list", "wedged", (("V2Reads.inbox", 1),)),
         ("chat_clear_live_now", 1): ("chat", "the live decision: shadow under light; pinned by TestChatClearHook test_light_live_route_* and test_light_live_every_route_*", ()),
         ("chat_clear_prompts", 1): ("chat", "the ONE allowed read: pinned by TestChatClearHook (S1 to S4)", ()),
     }
@@ -72187,6 +72322,11 @@ class TestV2LightGuards(Base):
             world.v2.sessions[world.sessions["coder"]]["metadata"]["fleet"]["reports_to"] = "cos"
             world.tick(5)
             world.new_engine("cli").report("coder", "question", "which one?")
+            self.passes(world, 2)
+        elif name == "wedged":   # #1337: an old queued wake no turn took; under light the tick reads nothing and resumes nothing
+            world.v2.sessions[sid]["inbox"].append({
+                "id": "inb_w", "sessionID": sid, "text": "wake", "metadata": {"fleet": {"keys": ["lab.fact:wedged"], "from": "switchboard"}},
+                "resume": True, "delivery": "queue", "time": {"created": world.v2.clock.ms(now - 16 * 60)}})
             self.passes(world, 2)
         elif name == "newest":
             sb.newest_prompts(engine, world.sessions["cos"])
@@ -78215,6 +78355,12 @@ def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2
 sys.path.insert(0, str(REPO / "tests" / "switchboard"))
 _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
+# The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
+_closure = importlib.import_module("test_closure")
+TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
+# The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
+_shadow = importlib.import_module("test_shadow")
+TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -78233,6 +78379,18 @@ class TestTheArchitectureTestIsRun(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 4, "the hook that loads tests/switchboard/test_architecture.py is gone")
         self.assertEqual(os.path.realpath(_architecture.__file__), os.path.realpath(str(REPO / "tests" / "switchboard" / "test_architecture.py")))
+
+    def test_the_suite_holds_every_test_of_the_closure_test(self):
+        def flat(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from flat(item)
+                else:
+                    yield item
+        ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
+        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine"):
+            with self.subTest(case=name):
+                self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 2, "the hook that loads tests/switchboard/test_closure.py is gone")
 
 
 class TestSupportRebinding(unittest.TestCase):
@@ -80410,7 +80568,10 @@ class TestWhoCanClear(unittest.TestCase):
                 self.assertEqual(self.who(report, files, {path: None})["who"], "unknown")
                 self.assertEqual(self.who(report, files, {path: []})["who"], "owner or chief of staff")
                 mutant = dict(self.rule, closure_files=[g for g in self.rule["closure_files"] if g != path])
-                self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "owner or chief of staff", "a path the rule does not judge is not mapped")
+                if self.floor.matches(path, ["bin/switchboard/*.py"]):   # #1339: a part of the daemon is judged whether the matrix lists it or not (an unmapped one is refused)
+                    self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "unknown", "a part is judged even when the rule does not list it")
+                else:
+                    self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "owner or chief of staff", "a path the rule does not judge is not mapped")
 
     def test_every_floor_class_gives_its_rule_id_and_the_lowest_rating_and_the_never_delegated_ones_are_owner_only_without_a_max_level(self):
         for rid, cls in self.block["floor"]["rules"].items():
@@ -86233,6 +86394,303 @@ class TestBatchingDocs(unittest.TestCase):
             self.assertEqual(section.count(phrase), 1, phrase)
 
 
+# #943: a work item reads its parent ask's Done-when, and a pull request's `CLAIMS:` line narrows what its proof gate counts.
+PARENT_RULE = ("A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, "
+               "and a Done-when the work item carries itself must still match exactly.")
+CLAIM_RULE = ("A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, "
+              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).")
+WORK_ITEM_PLAN = LEDGER_PLAN.split("```yaml", 1)[0].split("## Intent", 1)[0] + "```yaml" + LEDGER_PLAN.split("```yaml", 1)[1]
+
+
+class TestParentAskDoneWhen(LedgerBase):
+    """#943: the issue numbers are neutral. 30 is a work item, 20 its ask, 10 the charter; 40 is an ask under the charter with no Done-when."""
+
+    ASK_DONE = "(1) an owner can commission an agent; (2) it answers a chat message."
+
+    def setUp(self):
+        super().setUp()
+        self.parent_override = {}
+        self.issues = {
+            10: {"number": 10, "state": "open", "title": "charter", "body": "## Intent\nRun it.\nDone when: (1) charter-only clause.\n", "parent": None},
+            20: {"number": 20, "state": "open", "title": "ask", "body": "## Intent\nCommissioning works.\nDone when: %s\n" % self.ASK_DONE, "parent": 10},
+            30: {"number": 30, "state": "open", "title": "work item", "body": WORK_ITEM_PLAN, "parent": 20},
+            40: {"number": 40, "state": "open", "title": "ask with no Done-when", "body": WORK_ITEM_PLAN, "parent": 10},
+            50: {"number": 50, "state": "open", "title": "work item with its own Done-when", "parent": 20,
+                 "body": "## Intent\nIts own.\nDone when: (1) only one clause here.\n" + WORK_ITEM_PLAN},
+        }
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and "--method" not in argv and "-X" not in argv and argv[1] == "api":
+            found = re.search(r"/issues/(\d+)(/parent|/comments[^ ]*)?$", argv[2])
+            if found and int(found.group(1)) in self.issues:
+                issue = self.issues[int(found.group(1))]
+                if found.group(2) == "/parent":
+                    parent = self.parent_override.get(int(found.group(1)), self.issues.get(issue["parent"]))
+                    parent = dict(parent, repository_url=parent.get("repository_url", "https://api.github.com/repos/acme/app")) if parent else None
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(parent), "") if parent else subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+                if found.group(2):
+                    return subprocess.CompletedProcess(argv, 0, "[]", "")
+                return subprocess.CompletedProcess(argv, 0, json.dumps(dict(issue, updated_at="2026-01-01T00:00:00Z")), "")
+        return super().route(argv, **kwargs)
+
+    def check(self, number):
+        code, out, err = self.run_as("coder", "plan", "check", "acme/app#%d" % number, "--json")
+        return code, (json.loads(out) if out.strip().startswith("{") else {"error": err})
+
+    def assert_the_rule(self):
+        code, result = self.check(30)
+        self.assertEqual((code, result.get("result")), (0, "pass"), result)   # checked against the PARENT ask's two clauses (DW-2 exists only there)
+        code, result = self.check(50)
+        self.assertEqual(code, 1, result)                                    # its own one-clause Done-when decides: DW-2 is not a clause of it
+        self.assertEqual(result["result"], "fail")
+        self.assertTrue(any("DW-2" in str(d) or "covers" in str(d) for d in result["defects"]), result)
+
+    def test_s2_a_work_item_is_checked_against_its_parent_ask_and_one_with_its_own_done_when_against_that(self):
+        self.assert_the_rule()
+
+    def test_a_work_item_that_carries_its_own_done_when_is_not_given_the_parents(self):
+        code, result = self.check(50)
+        self.assertEqual(code, 1)
+        self.assertNotIn("charter-only", json.dumps(result))
+
+    def test_an_ask_with_no_done_when_never_borrows_the_charters(self):
+        code, result = self.check(40)
+        self.assertEqual(code, 1, result)
+        self.assertTrue(any(d.get("code") == "no-done-when" for d in result.get("defects", [])) or "no-done-when" in json.dumps(result), result)
+
+    def test_s5_a_mutant_that_reads_the_done_when_of_the_wrong_issue_fails_the_rule_test(self):
+        def wrong(reader, repo, number):
+            return reader.issue(10, repo).done_when   # the charter, not the parent ask
+        with mock.patch.object(sb, "_parent_ask_done_when", wrong):
+            with self.assertRaises(AssertionError):
+                self.assert_the_rule()
+        with mock.patch.object(sb, "_parent_ask_done_when", lambda reader, repo, number: None):   # a mutant that never reads the parent
+            with self.assertRaises(AssertionError):
+                self.assert_the_rule()
+
+    def test_a_parent_that_is_not_the_ask_of_this_repositorys_work_item_is_refused_whatever_its_shape(self):
+        """The class: cross-repo parent, the same number in another repository, itself, a cycle, a pull request. Each is refused with a plain error, never read as another issue."""
+        ask = self.issues[20]
+        cases = {
+            "cross-repo": dict(ask, number=5, repository_url="https://api.github.com/repos/other-org/other-repo"),
+            "same-number-other-repo": dict(ask, repository_url="https://api.github.com/repos/other-org/app"),
+            "self": dict(self.issues[30], number=30),
+            "pull-request": dict(ask, pull_request={"url": "x"}),
+        }
+        for name, payload in cases.items():
+            with self.subTest(case=name):
+                self.parent_override = {30: payload}
+                code, result = self.check(30)
+                self.assertEqual(code, 2, (name, result))
+                self.assertIn("error", result)
+                if name == "self":
+                    self.assertIn("its own parent", json.dumps(result))   # the self check's own message: without it the cycle check refuses with another one
+        self.parent_override = {}
+        self.issues[20]["parent"] = 30   # a cycle: 30 -> 20 -> 30
+        code, result = self.check(30)
+        self.assertEqual(code, 2, result)
+        self.assertIn("loops back", json.dumps(result))
+
+    def test_the_structure_gate_and_prove_take_the_work_items_done_when_from_its_parent(self):
+        self.pr["body"] = "PLAN: acme/app#30\ncanon: updated the docs"
+        code, report, err = self.gates()
+        self.assertIsNotNone(report, err)
+        self.assertEqual(self.row(report, "G0a")["status"], "ok", self.row(report, "G0a"))
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+
+    def test_the_gate_on_an_issue_with_no_done_anywhere_fails_as_before(self):
+        self.issues[30]["parent"] = None
+        self.pr["body"] = "PLAN: acme/app#30\ncanon: updated the docs"
+        code, report, err = self.gates()
+        self.assertEqual(self.row(report, "G0a")["status"], "missing")
+
+
+class TestPrClaimLine(LedgerBase):
+    """#943: `CLAIMS:` directly under `PLAN:`; the neutral plan is LEDGER_PLAN (per-PR S1, S2 (epic by default: tester measure? no, live: pr), S3, U1; S4 epic)."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.scenarios = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(LEDGER_PLAN))
+
+    def body(self, claims):
+        self.pr["body"] = "PLAN: acme/app#7\n%scanon: updated the docs" % ("CLAIMS: %s\n" % claims if claims is not None else "")
+
+    def g1(self):
+        code, report, err = self.gates()
+        self.assertIn(code, (0, 1), err)
+        return self.row(report, "G1")
+
+    def assert_counts_only_the_claim(self):
+        self.body("S1 S3 U1")
+        for sid in ("S1", "S3", "U1"):
+            self.assertEqual(self.prove("coder", sid)[0], 0)
+        for who, sid, ev in (("cibot", "S1", "ci"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
+            self.assertEqual(self.verdict(who, sid, ev)[0], 0)
+        row = self.g1()
+        self.assertEqual(row["status"], "ok", row)
+        self.assertIn("3 of 3 claimed scenarios proven", row["detail"])
+        self.assertIn("left to the epic's other pull requests by the CLAIMS line: S2", row["detail"])
+        code, _, err = self.prove("coder", "S2")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not on this pull request's `CLAIMS:` line", err)
+
+    def test_s3_the_gate_counts_exactly_the_claimed_scenarios_and_leaves_the_rest_to_the_epic(self):
+        self.assert_counts_only_the_claim()
+
+    def test_s5_a_mutant_that_counts_unclaimed_scenarios_fails_the_claim_test(self):
+        every = lambda scenarios, body: ([s for s in scenarios if sb.plan_ledger.claim_of(s) == "pr"], [], None)
+        with mock.patch.object(sb.load_plan_ledger(), "pr_scenarios", every):
+            with self.assertRaises(AssertionError):
+                self.assert_counts_only_the_claim()
+
+    def test_s8_a_claim_naming_an_undeclared_scenario_or_an_epic_one_is_refused_and_all_declared_count(self):
+        for bad in ("S1 S9", "S4"):
+            with self.subTest(claims=bad):
+                self.body(bad)
+                row = self.g1()
+                self.assertEqual(row["status"], "missing", row)
+                self.assertTrue(any(m.startswith("refused:") for m in row["missing"]), row)
+                code, _, err = self.prove("coder", "S1")
+                self.assertNotEqual(code, 0)
+                self.assertIn("refused", err)
+        self.assertEqual(self.ledger(), [])
+        self.body("S1 S2 S3 U1")
+        ids, error = sb.plan_ledger.pr_claim(self.pr["body"], self.scenarios)
+        self.assertEqual((ids, error), (["S1", "S2", "S3", "U1"], None))
+        self.assertEqual([s["id"] for s in sb.plan_ledger.pr_scenarios(self.scenarios, self.pr["body"])[0]], ["S1", "S2", "S3", "U1"])
+        self.body("")
+        self.assertIn("names no scenario", sb.plan_ledger.pr_claim("PLAN: x\nCLAIMS:\n", self.scenarios)[1])
+
+    def test_s4_a_pull_request_without_a_claim_line_behaves_exactly_as_before(self):
+        baseline = ["S1", "S2", "S3", "U1"]
+        for body in (None, "", "PLAN: acme/app#7", "PLAN: acme/app#7\ncanon: n/a docs", "PLAN: acme/app#7\n\nCLAIMS: S1", "CLAIMS: S1\nPLAN: acme/app#7",
+                     "Notes\nPLAN: acme/app#7 and CLAIMS: S1", "PLAN: acme/app#7\n    CLAIMS", "no plan here\nCLAIMS: S9"):
+            with self.subTest(body=body):
+                claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
+                self.assertEqual(([s["id"] for s in claimed], left, error), (baseline, [], None))
+        self.body(None)
+        for sid in ("S1", "S2", "S3", "U1"):
+            self.assertEqual(self.prove("coder", sid)[0], 0, sid)
+        row = self.g1()
+        self.assertIn("of 4 claimed scenarios", row["detail"])
+        self.assertNotIn("CLAIMS", row["detail"])
+
+    def test_a_claim_line_hidden_in_a_code_fence_or_an_html_comment_narrows_nothing(self):
+        for body in ("PLAN: real#1\ncanon: x\n\n```\nPLAN: fake#9\nCLAIMS: S1\n```", "PLAN: real#1\n<!--\nPLAN: x\nCLAIMS: S1\n-->",
+                     "<!-- PLAN: x\nCLAIMS: S1 -->\nPLAN: real#1", "~~~\nPLAN: x\nCLAIMS: S1\n~~~\nPLAN: real#1\n",
+                     "<!--\nPLAN: x\nCLAIMS: S1\n-->\nPLAN: real#1", "<!--\nPLAN: x\nCLAIMS: S1", "<!-- one line\nPLAN: x\nCLAIMS: S1\nmore -->\nPLAN: real#1\ncanon: x",
+                     "<!--PLAN: x-->\n<!--\nPLAN: y\nCLAIMS: S2\n-->PLAN: real#1", "PLAN: real#1\n```\nCLAIMS: S1\n```"):
+            with self.subTest(body=body):
+                claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
+                self.assertEqual(([s["id"] for s in claimed], left, error), (["S1", "S2", "S3", "U1"], [], None))
+        claimed = sb.plan_ledger.pr_scenarios(self.scenarios, "```\nignored\n```\nPLAN: real#1\nCLAIMS: S1")[0]
+        self.assertEqual([s["id"] for s in claimed], ["S1"])
+
+    FENCED = "```\nPLAN: acme/other-service#9\n```\nPLAN: acme/app#7\nCLAIMS: S1\n"
+
+    def fenced_plan_read(self, reader):
+        return reader([], 1, self.FENCED)[0]
+
+    def test_a_fenced_plan_line_before_the_real_one_is_read_by_no_gate_and_no_claim(self):
+        self.assertEqual(self.fenced_plan_read(sb.authoritative_plan), "acme/app#7")
+        self.assertEqual(sb.authoritative_plan([], 1, "<!--\nPLAN: acme/other-service#9\n-->\nPLAN: acme/app#7")[0], "acme/app#7")
+        self.assertEqual(sb.plan_ledger.claim_text(self.FENCED), "S1")
+        self.assertEqual(sb.authoritative_plan([], 1, "```\nPLAN: acme/other-service#9\n```\n"), (None, None))
+
+    def test_mutant_authoritative_plan_on_the_raw_body_fails_the_fenced_line_test(self):
+        def mutant(entries, pr, body):
+            found = sb.PLAN_LINE_RE.search(body or "")
+            return (found.group(1).strip("<>.,"), "raw") if found else (None, None)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(self.fenced_plan_read(mutant), "acme/app#7")
+
+    READERS = {"G1": "evaluate_gates", "prove": "_scenario_of", "verdict S": "_scenario_of", "verdict --all": "cmd_verdict", "ci recorder": "ci_record_core"}
+
+    def drive_readers(self):
+        """One PR claims S1 only (of S1, S2, S3, U1); each reader must see only S1."""
+        self.body("S1")
+        row = self.g1()
+        self.assertIn("claimed scenarios proven", row["detail"])
+        self.assertTrue(row["detail"].startswith("0 of 1 claimed"), row["detail"])                 # G1
+        self.assertNotEqual(self.prove("coder", "S3")[0], 0)                                         # prove
+        self.assertNotEqual(self.verdict("rev", "S3", "reviewer")[0], 0)                             # verdict S
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        code, _, err = self.run_as("cibot", "verdict", "--all", "--pr", self.PR, "--as", "ci", "--result", "pass", "--head", LEDGER_HEAD, "--evidence", "judged it: matches the scenario")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e["scenario"] for e in self.ledger() if e["kind"] == "verdict"], ["S1"])    # verdict --all
+        ctx = sb._ledger_context(types.SimpleNamespace(pr=self.PR, plan=None, ask=None, head=None), self.route, self.world.clock.now, False)
+        self.assertEqual(sb.ci_record_core(ctx, self.world.clock.now, quiet=True)["scenarios"], ["S1"])   # ci recorder
+
+    def test_each_reader_of_the_claim_sees_only_the_claimed_scenario_and_a_mutant_per_reader_fails(self):
+        self.drive_readers()
+        module = sb.load_plan_ledger()
+        real = module.pr_scenarios
+        for reader, caller in self.READERS.items():
+            with self.subTest(mutant=reader):
+                def every(scenarios, body, caller=caller):
+                    if sys._getframe(1).f_code.co_name == caller:
+                        return [s for s in scenarios if module.claim_of(s) == "pr"], [], None
+                    return real(scenarios, body)
+                self.setUp()
+                with mock.patch.object(module, "pr_scenarios", every):
+                    with self.assertRaises(AssertionError):
+                        self.drive_readers()
+
+    def test_s10_gates_lists_the_scenarios_no_other_open_or_merged_pull_request_of_the_plan_claims(self):
+        self.body("S1 S2")
+        others = [
+            {"number": 11, "state": "open", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S2"},
+            {"number": 12, "state": "closed", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S3"},          # closed unmerged: proves nothing
+            {"number": 13, "state": "closed", "merged_at": "2026-01-01T00:00:00Z", "body": "PLAN: acme/app#8\nCLAIMS: S3"},   # another plan
+            {"number": 9, "state": "open", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S3"},                    # this PR itself
+        ]
+        route = self.route
+        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps(others), "") if "/pulls?state=all" in " ".join(argv) else route(argv, **kw))
+        code, report, err = self.gates()
+        self.assertEqual(sorted(report["unclaimed"]), ["S3", "U1"])
+        self.assertIn("claimed by no other open or merged pull request of this plan yet: S3, U1", self.row(report, "G1")["detail"])
+        others[0]["body"] = "PLAN: acme/app#7\nCLAIMS: S3 U1"            # another PR now claims the rest: nothing is unclaimed
+        self.assertEqual(self.gates()[1]["unclaimed"], [])
+
+    def test_every_reader_of_a_prs_claimed_scenarios_goes_through_pr_scenarios(self):
+        """The family: plan check does not read a claim; G1 (evaluate_gates), prove/verdict (`_scenario_of`, `verdict --all`) and the ci recorder (`ci_record_core`) each call `pr_scenarios`;
+        the item commands have no pull request body and read `slice:` instead."""
+        text = (BIN / "fleet-switchboard").read_text()
+        self.assertEqual(text.count("plan_ledger.pr_scenarios("), 5)   # prove/verdict S, verdict --all, the ci recorder, and the two reads of the union note
+        self.assertEqual((BIN / "plan_ledger.py").read_text().count("pr_scenarios("), 2)   # its definition and the G1 call
+
+
+class TestPlanRulesWordedAlike(unittest.TestCase):
+    """#943: the template and the planning skill carry both rules in the same words; the finding states its two recorded cases with neutral numbers."""
+
+    def squash(self, path):
+        return " ".join(path.read_text().split())
+
+    def test_s6_both_rules_are_one_identical_sentence_in_the_template_and_the_skill(self):
+        for path in (REPO / "docs" / "plan-template.md", REPO / "skills" / "fleet-planning" / "SKILL.md"):
+            text = self.squash(path)
+            for rule in (PARENT_RULE, CLAIM_RULE):
+                self.assertEqual(text.count(rule), 1, (path.name, rule[:40]))
+
+    def test_the_rules_in_the_code_match_the_words(self):
+        self.assertIn("CLAIMS:", PARENT_RULE + CLAIM_RULE)
+        self.assertIn("`CLAIMS: S3 S4 S5`", CLAIM_RULE)
+
+    def test_s1_the_finding_states_two_recorded_cases_each_with_its_failing_gate_and_reason(self):
+        text = (REPO / "docs" / "plan-template.md").read_text().split("## Why a work item reads its ask, and a pull request can claim", 1)[1]
+        cases = re.findall(r"(?m)^\d\. \*\*Case \d, [^*]*\((G0a|G1)\)\.\*\*", text)
+        self.assertEqual(cases, ["G0a", "G1"])
+        self.assertIn("plan check fails: 1 defect", text)
+        self.assertIn("missing proofs", text)
+        self.assertEqual(sorted(set(re.findall(r"#\d+", text))), ["#123", "#124", "#201", "#202"])
+
+    def test_s9_the_fixtures_name_no_repository_but_the_neutral_one(self):
+        source = (REPO / "bin" / "test-switchboard").read_text()
+        block = source[source.index("class TestParentAskDoneWhen"):source.index("class TestPlanRulesWordedAlike")]
+        for repo in set(re.findall(r"\b[a-z][\w.-]*/[a-z][\w.-]*#\d+", block)):
+            self.assertTrue(repo.startswith("acme/"), repo)
+
 NO_CAP_WORDS = re.compile(r"(cap|quota|ceiling|allowance)", re.I)
 AGENT_WORDS = re.compile(r"(agent|lane|caller|worker|spender)", re.I)
 
@@ -88957,6 +89415,291 @@ class TestResume(Base):
                 exec(compile(text.replace(old, new), str(SWITCHBOARD), "exec"), module.__dict__)
                 with mock.patch.dict(globals(), {"sb": module}), rebound("sb", module):
                     result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestResume(test)]))
+                self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
+
+
+class TestUndeliveredWake(Base):
+    """#1337: an idle agent with a wake admitted with delivery queue that is absent from its transcript is resumed once, then the Chief of Staff is told once."""
+    KEY = "lab.fact:wedged"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={})
+        for name, fleet in (("cos", {"role": "chief-of-staff"}), ("coder", {"role": "coder", "reports_to": "cos"})):
+            self.world.add_agent(name, fleet=fleet)
+        self.pane = self.world.herdr.panes[self.world.panes["coder"]]
+        self.sid = self.world.sessions["coder"]
+        self.n = 0
+        patch = mock.patch.object(self.world.v2, "_start")   # the wedged session: an item queued for it starts no turn, as in the recorded case
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def wedge(self, key=None, age=0):
+        """A queued wake in the inbox that no turn took (what the recorded case showed), created `age` seconds ago."""
+        self.n += 1
+        now = self.world.clock.now()
+        self.world.v2.sessions[self.sid]["inbox"].append({
+            "id": "inb_%d" % self.n, "sessionID": self.sid, "text": "wake", "metadata": {"fleet": {"keys": [key or self.KEY], "from": "switchboard"}},
+            "resume": True, "delivery": "queue", "time": {"created": self.world.v2.clock.ms(now - age)}})
+
+    def passes(self, minutes, count=1):
+        self.world.tick(minutes * 60)
+        for _ in range(count):
+            self.world.engine.run_pass()
+
+    def resumes(self):
+        return [a for a in self.world.admissions("coder") if a["text"] == sb.RESUME_TEXT]
+
+    def told(self):
+        return [a for a in self.world.admissions("cos") if "Undelivered wake" in a["text"]]
+
+    def lines(self, event="undelivered.resume"):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line(self):
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 1)
+        (line,) = self.lines()
+        self.assertEqual((line["subject"], line["detail"]["keys"]), ("coder", [self.KEY]))
+        self.assertGreaterEqual(line["detail"]["oldest_age_seconds"], 16 * 60)
+
+    def test_a_second_pass_in_the_incident_does_not_resume_again(self):
+        self.wedge(age=16 * 60)
+        self.passes(0, 3)
+        self.world.tick(11 * 60)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 1)
+
+    def test_the_default_is_fifteen_minutes_and_the_key_sets_another(self):
+        self.assertEqual(sb.validate_config({})["undelivered_wake_minutes"], 15)
+        self.wedge(age=14 * 60)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 0)
+        self.passes(2)
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertEqual(sb.validate_config({"undelivered_wake_minutes": 3})["undelivered_wake_minutes"], 3)
+
+    def test_the_resume_refusals_hold(self):
+        for case in ("permission", "question", "working", "recent"):
+            with self.subTest(case=case):
+                self.setUp()
+                self.wedge(age=16 * 60)
+                if case == "permission":
+                    self.world.v2.ask_permission(self.sid)
+                elif case == "question":
+                    self.world.v2.ask_form(self.sid)
+                elif case == "working":
+                    self.pane["status"] = "working"
+                else:
+                    sb.blocked_update(self.world.engine.state_dir, sb.RESUME_STATE, lambda s: {"coder": {"at": self.world.clock.now() - 60}})
+                self.world.engine.run_pass()
+                self.assertEqual(self.resumes(), [])
+
+    def test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed(self):
+        self.pane["status"] = "blocked"
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.assertEqual(self.resumes(), [])
+        self.setUp()
+        self.wedge(age=60)   # admitted only a minute ago: not yet that old
+        self.world.engine.run_pass()
+        self.assertEqual(self.resumes(), [])
+        self.setUp()
+        self.wedge(age=16 * 60)
+        self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_k", "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(self.world.clock.now())},
+                                                             "metadata": {"fleet": {"keys": [self.KEY], "from": "switchboard"}}})
+        self.world.engine.run_pass()
+        self.assertEqual(self.resumes(), [])
+
+    def test_the_chief_of_staff_is_told_once_when_the_resume_did_not_deliver(self):
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.passes(15, 3)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.told()), 1)
+        self.assertIn("coder", self.told()[0]["text"])
+        self.assertIn("1 wake", self.told()[0]["text"])
+
+    def test_the_chief_of_staff_is_not_told_when_the_keys_appear(self):
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.world.v2.sessions[self.sid]["inbox"][:] = []
+        self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_k", "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(self.world.clock.now())},
+                                                             "metadata": {"fleet": {"keys": [self.KEY], "from": "switchboard"}}})
+        self.passes(31, 3)
+        self.assertEqual(self.told(), [])
+
+    def test_a_manual_resume_blocks_the_rule(self):
+        self.wedge(age=16 * 60)
+        sb.resume_ended_turn(self.world.engine, "cos", "coder", None)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 1)
+
+    def wedge_for(self, name, age):
+        sid = self.world.sessions[name]
+        self.n += 1
+        self.world.v2.sessions[sid]["inbox"].append({
+            "id": "inb_%s_%d" % (name, self.n), "sessionID": sid, "text": "wake", "metadata": {"fleet": {"keys": ["lab.fact:" + name], "from": "switchboard"}},
+            "resume": True, "delivery": "queue", "time": {"created": self.world.v2.clock.ms(self.world.clock.now() - age)}})
+
+    def test_a_wake_first_noticed_long_after_admission_is_not_told_before_the_resume_could_deliver(self):
+        self.wedge(age=19 * 3600)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.resumes()), 1)
+        self.passes(0.2, 3)   # seconds later: the oldest wake is 19 hours old, the resume only seconds
+        self.assertEqual((self.told(), self.lines("undelivered.told")), ([], []))
+        self.passes(16)
+        self.passes(1, 3)
+        self.assertEqual((len(self.told()), len(self.lines("undelivered.told"))), (1, 1))
+        self.assertEqual(len(self.resumes()), 1)
+
+    def test_the_tell_time_is_its_own_config_key_defaulting_to_the_limit(self):
+        self.assertIsNone(sb.validate_config({})["undelivered_wake_tell_minutes"])
+        self.assertEqual(sb.validate_config({"undelivered_wake_tell_minutes": 5})["undelivered_wake_tell_minutes"], 5)
+        for bad in (0, -1, "x"):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"undelivered_wake_tell_minutes": bad})
+        self.world.engine.config["undelivered_wake_tell_minutes"] = 2
+        self.wedge(age=16 * 60)
+        self.world.engine.run_pass()
+        self.passes(3, 3)
+        self.assertEqual(len(self.told()), 1)
+
+    def test_at_most_the_per_pass_cap_of_agents_is_resumed_in_a_pass_oldest_first(self):
+        self.assertEqual(sb.validate_config({})["undelivered_wake_per_pass"], 2)
+        for bad in (0, 21, -1, 1.5, "2", True):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"undelivered_wake_per_pass": bad})
+        names = ["w%d" % i for i in range(6)]
+        for i, name in enumerate(names):
+            self.world.add_agent(name, fleet={"role": "coder", "reports_to": "cos"})
+            self.wedge_for(name, (20 + i) * 60)   # w5 the oldest
+        order = []
+        for _ in range(3):
+            self.world.engine.run_pass()
+            order.append(sorted(n for n in names if [a for a in self.world.admissions(n) if a["text"] == sb.RESUME_TEXT]))
+        self.assertEqual([len(o) for o in order], [2, 4, 6])
+        self.assertEqual(order[0], ["w4", "w5"])
+        self.assertEqual(order[1], ["w2", "w3", "w4", "w5"])
+
+    def test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered(self):
+        self.wedge(age=16 * 60)
+        now = self.world.clock.now()
+        messages = self.world.v2.sessions[self.sid]["messages"]
+        messages.append({"id": "msg_k", "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(now - 10 * 60)},
+                         "metadata": {"fleet": {"keys": [self.KEY], "from": "switchboard"}}})
+        for i in range(3):
+            messages.append({"id": "msg_n%d" % i, "type": "synthetic", "text": "t", "time": {"created": self.world.v2.clock.ms(now - 60 + i)}, "metadata": {"fleet": {"keys": ["other%d" % i], "from": "switchboard"}}})
+        with mock.patch.object(sb, "SYNTHETIC_PAGE", 2):   # a window shorter than the delivered key's position
+            self.world.engine.run_pass()
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.told(), [])
+
+    def test_when_the_agent_is_the_chief_of_staff_the_incident_is_closed_with_an_audit_line(self):
+        self.wedge_for("cos", 16 * 60)
+        self.world.engine.run_pass()
+        self.passes(16)
+        self.passes(1, 2)
+        lines = self.lines("undelivered.untold")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Chief of Staff", lines[0]["detail"]["reason"])
+        self.assertEqual(len([a for a in self.world.admissions("cos") if a["text"] == sb.RESUME_TEXT]), 1)
+
+    def test_each_idle_agent_costs_three_reads_a_pass_and_no_github_call(self):
+        self.wedge(age=16 * 60)
+        gh, window, mine, real_tick, real_popen = [], [], [], sb.undelivered_wake_tick, sb.subprocess.Popen
+
+        def spy(argv, *a, **k):
+            if isinstance(argv, (list, tuple)) and argv:
+                if os.path.basename(str(argv[0])) == "gh":
+                    gh.append(list(argv))
+                window.append(list(argv))
+            return real_popen(argv, *a, **k)
+
+        def tick(engine, discovery):
+            start = len(self.world.v2.calls)
+            try:
+                return real_tick(engine, discovery)
+            finally:
+                mine.extend(self.world.v2.calls[start:])   # only what the rule itself read
+        with mock.patch.object(sb.subprocess, "Popen", spy), mock.patch.object(sb, "undelivered_wake_tick", tick):
+            self.world.engine.run_pass()
+        coder = [c[2] for c in mine if "sessionID=" + self.sid in c and c[2] in ("session.inbox.list", "session.message.list") and "type=user" not in c]   # the resume's own re-observation is not the rule's read
+        self.assertEqual(coder, ["session.inbox.list", "session.inbox.list", "session.message.list"], mine)
+        other = [c[2] for c in mine if "sessionID=" + self.world.sessions["cos"] in c]
+        self.assertEqual(other, ["session.inbox.list"], "an idle agent with nothing queued costs one read")
+        self.assertEqual(gh, [])
+
+    # -- the delivery states, a row per state with the action and the test; `test_every_state_has_a_row` derives the rows from the code
+    STATES = {"undelivered": "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed",
+              "admitted-in-transcript": "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed",
+              "admitted-absent": "test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line",
+              "refused": "test_the_resume_refusals_hold",
+              "resumed": "test_a_second_pass_in_the_incident_does_not_resume_again",
+              "told": "test_the_chief_of_staff_is_told_once_when_the_resume_did_not_deliver"}
+
+    def test_every_state_has_a_row(self):
+        self.assertEqual(sorted(self.STATES), sorted(sb.UNDELIVERED_STATES))
+        for test in self.STATES.values():
+            self.assertTrue(callable(getattr(self, test, None)), test)
+
+    # -- the family table: every input and external call of the new code, with its bound, test and mutant; derived from the code, never a hand copy
+    # -- the family table of docs/switchboard.md ("An undelivered wake is recovered"): every config key, constant and refusal of the pass, derived by ast
+    TABLE = {"undelivered_wake_minutes": ("test_the_default_is_fifteen_minutes_and_the_key_sets_another", "resumes on every pass"),
+             "undelivered_wake_tell_minutes": ("test_the_tell_time_is_its_own_config_key_defaulting_to_the_limit", "tells from the admission"),
+             "undelivered_wake_per_pass": ("test_at_most_the_per_pass_cap_of_agents_is_resumed_in_a_pass_oldest_first", "no per-pass cap"),
+             "UNDELIVERED_STATE": ("test_a_second_pass_in_the_incident_does_not_resume_again", "resumes on every pass"),
+             "UNDELIVERED_KEYS": ("test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line", "never resumes"),
+             "UNDELIVERED_STATES": ("test_every_state_has_a_row", "never resumes"),
+             "SYNTHETIC_PAGE": ("test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered", "reads one page"),
+             "MAX_READ_PAGES": ("test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered", "reads one page"),
+             "resume_ended_turn": ("test_the_resume_refusals_hold", "skips the refusals"),
+             "session.inbox.list": ("test_each_idle_agent_costs_three_reads_a_pass_and_no_github_call", "resumes a blocked agent"),
+             "session.message.list": ("test_each_idle_agent_costs_three_reads_a_pass_and_no_github_call", "reads one page")}
+
+    def test_the_docs_table_lists_every_key_constant_and_refusal_derived_by_ast(self):
+        text = SWITCHBOARD.read_text()
+        tree = ast.parse(text)
+        derived = {"SYNTHETIC_PAGE", "MAX_READ_PAGES", "resume_ended_turn", "session.inbox.list", "session.message.list"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                derived.update(t.id for t in node.targets if isinstance(t, ast.Name) and t.id.startswith("UNDELIVERED_"))
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("undelivered_wake_") and node.value.isidentifier():
+                derived.add(node.value)
+        self.assertEqual(derived, set(self.TABLE))
+        docs = (SWITCHBOARD.parent.parent / "docs" / "switchboard.md").read_text()
+        section = docs[docs.index("### An undelivered wake is recovered"):docs.index("### A blocked agent is reported")]
+        rows = {m.group(1): m.groups() for m in re.finditer(r"^\| `([^`]+)` \| (.*?) \| (.*?) \| `(test_\w+)` \| `([^`]+)` \|$", section, re.M)}
+        self.assertEqual(set(rows), set(self.TABLE))
+        for key, (test, mutant) in self.TABLE.items():
+            self.assertEqual((rows[key][3], rows[key][4]), (test, mutant), key)
+            self.assertTrue(callable(getattr(self, test, None)), test)
+            self.assertIn(mutant, self.MUTANTS, key)
+
+    MUTANTS = {
+        "never resumes": ('                resume_ended_turn(engine, "switchboard", name, "undelivered wake:', '                (lambda *a: None)(engine, "switchboard", name, "undelivered wake:', "test_an_idle_agent_with_an_old_admitted_wake_is_resumed_once_with_one_audit_line"),
+        "resumes a blocked agent": ('if seen.status != "idle" or hold_reason(seen) or seen.conflict', 'if seen.status not in ("idle", "blocked") or seen.conflict', "test_a_blocked_agent_a_delivered_wake_and_a_young_wake_are_not_resumed"),
+        "tells from the admission": ('now - entry["resumed"] >= tell_after', 'age >= tell_after', "test_a_wake_first_noticed_long_after_admission_is_not_told_before_the_resume_could_deliver"),
+        "no per-pass cap": ('if resumed_now >= cap:', 'if False:', "test_at_most_the_per_pass_cap_of_agents_is_resumed_in_a_pass_oldest_first"),
+        "reads one page": ('SYNTHETIC_PAGE, "synthetic", MAX_READ_PAGES):\n        reached = False', 'SYNTHETIC_PAGE, "synthetic", 1):\n        reached = False', "test_a_delivered_key_beyond_the_first_page_is_not_counted_undelivered"),
+        "resumes on every pass": ('if entry.get("resumed") is None and age >= limit:', 'if age >= limit:', "test_a_second_pass_in_the_incident_does_not_resume_again"),
+        "skips the refusals": ('                resume_ended_turn(engine, "switchboard", name, "undelivered wake:', '                engine.v2.synthetic(seen.session_id, sb_text(), {"fleet": {"keys": ["r"], "from": "switchboard"}}, True, "queue", derive_message_id(seen.session_id, ["r%d" % now]), "x"); (lambda *a: None)(engine, "switchboard", name, "undelivered wake:', "test_the_resume_refusals_hold"),
+    }
+
+    def test_every_mutant_is_killed_by_its_named_test(self):
+        text = SWITCHBOARD.read_text()
+        for name, (old, new, test) in sorted(self.MUTANTS.items()):
+            with self.subTest(mutant=name):
+                self.assertEqual(text.count(old), 1, old)
+                module = types.ModuleType("t_fleet_switchboard_undelivered_mutant")
+                module.__file__ = str(SWITCHBOARD)
+                sys.modules[module.__name__] = module
+                self.addCleanup(sys.modules.pop, module.__name__, None)
+                mutant = text.replace(old, new).replace("sb_text()", "RESUME_TEXT")
+                exec(compile(mutant, str(SWITCHBOARD), "exec"), module.__dict__)
+                with mock.patch.dict(globals(), {"sb": module}), rebound("sb", module):
+                    result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestUndeliveredWake(test)]))
                 self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
 
 
@@ -92380,6 +93123,22 @@ class TestAskIssueSubject(unittest.TestCase):
         with mock.patch.object(sb, "ask_plan_comment", lambda *a: "x"):
             self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)
         self.assertEqual(len(self.entries()), 1)    # the refusal test above fails on it
+
+    def test_a_second_plan_looking_comment_refuses_prove_and_verdict_naming_both(self):
+        self.pages = {"repos/%s/issues/1130/comments?per_page=100&page=1" % self.REPO: [
+            {"id": 5, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}, {"id": 8, "created_at": "2026-01-02", "body": "## Plan (scenarios): y\n"}]}
+        for command in ("prove", "judge"):
+            code, why, _, _ = getattr(self, command)("S1")
+            self.assertIsNone(code)
+            self.assertIn("comment 8", why)
+            self.assertIn("comment 5", why)
+        self.assertEqual(self.entries(), [])
+
+    def test_s6_mutant_ask_path_that_skips_the_second_plan_rule_records(self):
+        self.pages = {"repos/%s/issues/1130/comments?per_page=100&page=1" % self.REPO: [
+            {"id": 5, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}, {"id": 8, "created_at": "2026-01-02", "body": "## Plan (scenarios): y\n"}]}
+        with mock.patch.object(sb, "second_plan_defects", lambda d: []):
+            self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)    # the refusal test above fails on it
 
     def refused_everywhere(self, needle):
         for command in ("prove", "judge"):
