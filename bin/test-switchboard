@@ -9271,7 +9271,7 @@ class TestAgentRegistryInventory(unittest.TestCase):
     interface spec has its sections and its freeze line."""
     DOC = REPO / "docs" / "agent-registry.md"
     RECORDS = {
-        "pane-health.json": r"pane-health\.json|PANE_HEALTH_FILE|PANE_FILE|read_pane_health|write_pane_health|pane_health_pass|pane_health_status",
+        "pane-health.json": r"pane-health\.json|pane-health registry|PANE_HEALTH_FILE|PANE_FILE|read_pane_health|write_pane_health|pane_health_pass|pane_health_status",
         "retired.json": r"retired\.json|RETIRED_FILE|read_retired|known_agent",
         "last-reports.json": r"last-reports\.json|LAST_REPORT_FILE|record_last_report",
         "boss-overrides.json": r"boss-overrides\.json|\.overlay\(",
@@ -16093,7 +16093,7 @@ class TestOneCharter(CharterRig, Base):
 
     READERS = {   # (file, function) -> "kind: reason". registry: decides who owns a charter and reads the registry's charter (#969); writer / display: writes or shows the registry row; own: reads ONE agent's own launch context and enumerates no other agent
         # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
-        ("bin/fleet-switchboard", "guard"): "registry: the charter set guard, on the registry lock's own read",
+        ("bin/switchboard/work_moves.py", "guard"): "registry: the charter set guard, on the registry lock's own read",
         ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
         ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/fleet-switchboard", "plan_wake_route"): "registry: the orchestrator a plan wakes",
         ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
@@ -16103,7 +16103,7 @@ class TestOneCharter(CharterRig, Base):
         ("bin/registry.py", "orchestrator_charters"): "registry: the one reading", ("bin/registry.py", "duplicate_charters"): "registry: duplicates", ("bin/registry.py", "set_charter"): "writer: the audited setter",
         ("bin/registry.py", "change"): "writer: the registry's own writer", ("bin/fleet-switchboard", "registry_charter"): "writer: the pass's rule over the registry row",
         ("bin/fleet-switchboard", "pane_health_pass"): "writer: writes the registry row through registry_charter", ("bin/switchboard/agents_verify.py", "charters_report"): "display: both records, read-only",
-        ("bin/switchboard/agents_verify.py", "cmd_agents_charters"): "display: the report", ("bin/fleet-switchboard", "cmd_charter"): "writer: the audited command",
+        ("bin/switchboard/agents_verify.py", "cmd_agents_charters"): "display: the report", ("bin/switchboard/work_moves.py", "cmd_charter"): "writer: the audited command",
         ("bin/fleet-switchboard", "record_launch_charter"): "writer: a launch writes the registry row (first sight; a relaunch under the name is a new launch)",
         ("bin/impact_hold.py", "clear_lane"): "display: carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "display: words the notice line",
         ("bin/switchboard/handoff.py", "seam_applies"): "set: is this issue number known as a charter",
@@ -24345,7 +24345,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
         """The policy section: its part files, and the statements of it that stay in the entry (S2 keeps the ones the clear's closure reads), between the DEFAULTS line and the next section."""
         entry = switchboard_source()
         kept = entry[entry.index('DEFAULTS["policy"] = None'):entry.index("# PR 10: move a v1 session")]
-        return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path.name in ("judge_request.py", "judge.py")])   # the policy judge's own parts: another part (plan review, which launches lanes) is not the policy section
+        return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path.name in ("judge_request.py", "judge.py", "standing_authority.py")])   # the policy judge's own parts: another part (plan review, which launches lanes) is not the policy section
 
     def test_no_herdr_and_no_github_write_is_reachable_from_the_section(self):
         tree = ast.parse(self.section())
@@ -91723,7 +91723,7 @@ class TestAssembler(unittest.TestCase):
         self.assertEqual(lines[0], "fleet-switchboard")
 
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py", "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard", *[str(f.relative_to(BIN)) for f in SWITCHBOARD_SOURCE_FILES if f != SWITCHBOARD], "part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -91772,7 +91772,7 @@ class TestAssembler(unittest.TestCase):
         self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py"])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", *[str(f.relative_to(BIN)) for f in SWITCHBOARD_SOURCE_FILES if f != SWITCHBOARD]])
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
 
@@ -94009,7 +94009,6 @@ fleet-switchboard:github_status
 fleet-switchboard:handle
 fleet-switchboard:health_watched_repos
 fleet-switchboard:janitor_agent_roots
-fleet-switchboard:job_read
 fleet-switchboard:json
 fleet-switchboard:lab_facts
 fleet-switchboard:launch_memory_check
@@ -94110,6 +94109,7 @@ switchboard/handoff.py:post_ask_comment
 switchboard/import_v1.py:read_v1_export
 switchboard/jev.py:_load
 switchboard/jev.py:_post
+switchboard/job_runs.py:job_read
 switchboard/judge.py:ask_judge_daemon
 switchboard/judge.py:looks_like_plugin_event
 switchboard/judge.py:parse_plugin_event

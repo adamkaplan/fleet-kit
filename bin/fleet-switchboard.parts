@@ -19,3 +19,12 @@ switchboard/audit.py
 switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
+switchboard/faults.py
+switchboard/shadow_classifier.py
+switchboard/worktree_lifecycle.py
+switchboard/verification.py
+switchboard/judge_rule.py
+switchboard/review_laws.py
+switchboard/job_runs.py
+switchboard/standing_authority.py
+switchboard/work_moves.py
