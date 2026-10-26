@@ -363,9 +363,148 @@ class TestConfig(Base):
                 self.assertIn(needle, str(caught.exception))
 
 
+# ------------------------------------------------- every test class isolates, or says why not (#1322)
+
+# THE one exceptions table: a unittest.TestCase that is not derived from Base (which isolates HOME and the XDG directories) is listed here with a one-line reason.
+# A class in the first group that builds a World or a rig fails the test below: it must derive from Base.
+NOT_ISOLATED_BY_BASE = {
+    "builds no World, rig or state path: it reads source text, parses strings or runs pure functions": (
+    "TestAgentCredentialsDoc", "TestAgentDefinitions", "TestAgentRegistry", "TestAgentRegistryInventory", "TestAgentsVerify",
+    "TestAlertConfig", "TestApprovalExemptionGuard", "TestArchTools", "TestArchitectureSafetyNet", "TestAskIssueSubject", "TestAssembler",
+    "TestAuditRotation", "TestAuthorityModulesGuard", "TestBatchingDocs", "TestBellMigration", "TestBriefParsing", "TestCallerWorkspace",
+    "TestCharterEditGuard", "TestChatClearJudge", "TestChatClearOffers", "TestChecklistAndFamilyTexts", "TestChiefOfStaffNativePermissions",
+    "TestClassify", "TestClearCarry", "TestClearCodePathsAlwaysHeld", "TestCommissioningDocs", "TestCompactionShape", "TestCompose",
+    "TestConflictCarry", "TestCosDelegatedClearPermission", "TestCosTriageAllowRule", "TestDecisionBaselineIds", "TestDecisionHeadlines",
+    "TestDecisionIds", "TestDecisionOrder", "TestDecisionsPanelOrder", "TestDecisionsPluginSource", "TestDecisionsRoleText",
+    "TestDecisionsStaleBound", "TestDecisionsStyledPanel", "TestDeployFromMainSentence", "TestEventFeedLines", "TestEventFeedReads",
+    "TestExternalAdapterHygiene", "TestExternalDecisionConfig", "TestExternalDecisionRules", "TestFleetHooksSource", "TestFocusedLocalRuns",
+    "TestGithubWritingRule", "TestHeavyCeilings", "TestHeavyQueueLogic", "TestHeavyWatchdog", "TestHeldSummaryFlowchart", "TestHygiene",
+    "TestImpactFloorPure", "TestImportOrder", "TestImportSchemaChecker", "TestImportV1Converter", "TestInstallDocs",
+    "TestIntegrationBranchVerdictText", "TestIntentChange", "TestIntentParsing", "TestItemVerdicts", "TestJobEndRecord", "TestJobFacts",
+    "TestJobTool", "TestJudgeSample", "TestJudgeToolWritesNothingElsewhere", "TestLatestRunOfWorkflow", "TestLaunchMemoryTest", "TestLedgerReadRace",
+    "TestMadeUpPids", "TestMergeGateDocs", "TestMessageId", "TestMessageTimes", "TestNewestCiRuns", "TestOneVocabulary", "TestOrdersBodyEdits",
+    "TestOrdersFact", "TestOrdersRoleText", "TestOwnMeasurementTester", "TestOwnReviewLaws", "TestOwnerClearModule", "TestOwnerEvaluatorsAreRare",
+    "TestOwnerHoldRule", "TestPR10Source", "TestPR4Catalog", "TestPR7Source", "TestPR8Source", "TestPaneWarningRule", "TestParseCheckpoint",
+    "TestParseOrders", "TestPlanCheckFeedback", "TestPlanCheckHash", "TestPlanCheckParser", "TestPlanCheckRound2", "TestPlanCheckRules",
+    "TestPlanCheckSelection", "TestPlanKind", "TestPlanOperationsPerBoss", "TestPlanReviewCore", "TestPlanTemplateDoc", "TestPlanningSkill",
+    "TestPluginPush", "TestPolicyRedaction", "TestPolicyRequest", "TestPreflightPr", "TestReadCheckRuns1237", "TestReadWholeAuditTable",
+    "TestReconcileOnRead", "TestRegistryEndpoint", "TestReportFoldVariants", "TestScenarioValidator", "TestScratchFileRule", "TestSelfRegisteringCli",
+    "TestSelfWakeInstructions", "TestServiceIdentity", "TestShimHygiene", "TestStandingAuthority", "TestStatusIntentGapsAreBounded",
+    "TestSupportRebinding", "TestSyncReportFreezePerBoss", "TestTheArchitectureTestIsRun", "TestTierRoleText", "TestTriageRuleInputs",
+    "TestVerdictRecordingText", "TestWhoCanClear", "TestWorkItemRules", "TestWorkSyncPump", "TestWorkerRulesInSkills", "WorkflowPlanPins",
+    ),
+    "makes its own temporary directory (a tempfile.mkdtemp or a patched environment) and never reads the real one": (
+    "TestEveryTestClassIsolates",
+    "TestCloudWatchBounds", "TestCloudWatchTick", "TestCutoverRunbook", "TestHeavyFifo", "TestHeavyWaitRecord", "TestRoutineLocal", "TestSkillsSync",
+    "TestStructuralRuleInReviewing",
+    ),
+}
+
+
+ISOLATION_BUILDERS = ("World(", "GithubRig(", "CharterRig(", "FarmRig(", "ensure_state_dir(", "state_dir_path(", "config_path(")
+
+
+class TestEveryTestClassIsolates(unittest.TestCase):
+    """The ast of this file: every TestCase class derives (through any chain in this file) from Base or is in NOT_ISOLATED_BY_BASE."""
+
+    @staticmethod
+    def classes():
+        tree = ast.parse(Path(__file__).read_text())
+        return {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}   # top level: a class nested in a test is that test's own fixture
+
+    @classmethod
+    def reaches(cls, node, target, table, seen=()):
+        for base in (ast.unparse(b) for b in node.bases):
+            if base in target or (base in table and base not in seen and cls.reaches(table[base], target, table, seen + (node.name,))):
+                return True
+        return False
+
+    @classmethod
+    def offenders(cls):
+        table = cls.classes()
+        listed = {name: reason for reason, names in NOT_ISOLATED_BY_BASE.items() for name in names}
+        bad = []
+        for name, node in table.items():
+            if name == "Base" or not cls.reaches(node, ("unittest.TestCase", "TestCase"), table) or cls.reaches(node, ("Base",), table):
+                continue
+            if name not in listed:
+                bad.append(name)
+            elif listed[name].startswith("builds no") and any(b in ast.unparse(node) for b in ISOLATION_BUILDERS):
+                bad.append(name)
+        return sorted(bad)
+
+    def test_no_test_class_is_neither_isolated_nor_listed(self):
+        self.assertEqual(self.offenders(), [])
+
+    def test_the_table_lists_no_class_that_does_not_exist_or_derives_from_base(self):
+        table = self.classes()
+        for reason, names in NOT_ISOLATED_BY_BASE.items():
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertIn(name, table)
+                    self.assertFalse(self.reaches(table[name], ("Base",), table), name + " derives from Base: drop it from the table")
+                    self.assertTrue(self.reaches(table[name], ("unittest.TestCase", "TestCase"), table), name + " is not a TestCase")
+
+    def test_a_plain_testcase_that_builds_a_world_is_found(self):
+        # the mutant: the recorded case, a plain TestCase that builds a rig
+        src = "class Plain(unittest.TestCase):\n    def test_x(self):\n        GithubRig(self)\n"
+        node = ast.parse(src).body[0]
+        self.assertTrue(any(b in ast.unparse(node) for b in ISOLATION_BUILDERS))
+        self.assertFalse(self.reaches(node, ("Base",), {"Plain": node}))
+        self.assertNotIn("Plain", [n for names in NOT_ISOLATED_BY_BASE.values() for n in names])
+
+    def test_world_and_rig_refuse_state_none_outside_base(self):
+        class Plain(unittest.TestCase):
+            def runTest(self):
+                pass
+        for build, named in ((lambda t: World(t), "World(state=None)"), (lambda t: GithubRig(t), "GithubRig in")):   # the rig's own refusal, not the World it would build
+            with self.subTest(named=named):
+                with self.assertRaises(sb.RealStateRefused) as caught:
+                    build(Plain())
+                self.assertIn(named, str(caught.exception))
+
+
 # ------------------------------------------------------------------- the state
 
 class TestStateDir(Base):
+    def real_home(self):
+        """A pretend real account: the guard's real locations come from here, so no real directory is touched."""
+        real = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(real), True)
+        patcher = mock.patch.object(sb, "_real_locations", lambda: ({os.path.realpath(str(real / sb.PROG))}, {os.path.realpath(str(real / "config"))},
+                                                                      {os.path.realpath(str(real / sb.PROG / "audit.jsonl"))}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return real
+
+    def test_the_real_state_directory_is_refused_for_none_and_for_the_real_path_and_creates_nothing(self):
+        real = self.real_home()
+        os.environ["XDG_STATE_HOME"] = str(real)   # so that the default state directory resolves to the pretend real one
+        for argument in (None, real / sb.PROG):
+            with self.subTest(argument=argument):
+                with self.assertRaises(sb.RealStateRefused):
+                    sb.ensure_state_dir(argument)
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_the_real_config_directory_and_audit_path_and_a_symlink_to_the_state_are_refused(self):
+        real = self.real_home()
+        (real / sb.PROG).mkdir()
+        link = real / "link"
+        link.symlink_to(real / sb.PROG)
+        for path, kind in ((real / "config", "config"), (real / sb.PROG / "audit.jsonl", "audit"), (link, "state")):
+            with self.subTest(kind=kind):
+                with self.assertRaises(sb.RealStateRefused):
+                    sb.refuse_real_location(path, kind)
+
+    def test_without_the_marker_nothing_is_refused_and_a_temporary_path_is_fine(self):
+        real = self.real_home()
+        with mock.patch.dict(os.environ):
+            os.environ.pop(sb.UNDER_TEST_ENV)
+            self.assertEqual(sb.refuse_real_location(real / sb.PROG, "state"), real / sb.PROG)
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(other), True)
+        self.assertEqual(sb.refuse_real_location(other / "x", "state"), other / "x")
+
     def test_created_private_under_xdg_state_home_whatever_the_umask(self):
         # 0o277 strips owner bits from mkdir's mode, so only an explicit chmod
         # yields exactly 0700; 0 would let a looser mode through if one were asked for.
