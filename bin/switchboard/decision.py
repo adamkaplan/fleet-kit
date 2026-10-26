@@ -203,20 +203,23 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
 
 
 FINDING_MAX_PARTS = 50   # a finding is carried over at most this many messages; beyond it the rest is refused (named, audited), never dropped silently
-LINE_CUT_MARK = " \u2026[line cut]"
+LINE_CONTINUES = "(line continues)"
 FINDING_REFUSED = []     # (key, kind, text refused): the daemon writes each to the audit as 'finding-refused' and empties this list
 
 
 def finding_parts(fact, budget):
-    """The summary of one finding as chunks of WHOLE lines, each at most `budget` characters (a single longer line is cut with a visible
-    mark: the only case that shortens; the daemon audits the full line). Pure and deterministic: the same fact gives the same chunks, so the
+    """The summary of one finding as chunks of WHOLE lines, each at most `budget` characters (a longer line is split over chunks with a
+    continuation mark: nothing is cut). Pure and deterministic: the same fact gives the same chunks, so the
     continuation is derived from how many parts were delivered. Returns (chunks, refused_text, cut_lines)."""
     lines, cut = [], []
     for line in fact.summary.strip().split("\n"):
         line = "".join(c if c.isprintable() else " " for c in line).rstrip()
-        if len(line) > budget:
-            cut.append(line)
-            line = line[:budget - len(LINE_CUT_MARK)] + LINE_CUT_MARK
+        if len(line) > budget:   # #1302: a long line is split, never cut: a mark ends each piece and begins the next
+            width = budget - 2 * len(LINE_CONTINUES) - 2
+            pieces = [line[i:i + width] for i in range(0, len(line), width)]
+            for n, piece in enumerate(pieces):
+                lines.append(("%s " % LINE_CONTINUES if n else "") + piece + (" %s" % LINE_CONTINUES if n < len(pieces) - 1 else ""))
+            continue
         lines.append(line)
     chunks, now, size = [], [], 0
     for line in lines:
