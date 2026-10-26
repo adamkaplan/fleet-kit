@@ -291,8 +291,13 @@ def daemon_roots(rule):
     return sorted(set(rule["closure_roots"]) | set(rule.get("rating_roots") or []))
 
 
+def _clean(text):
+    """A reason is one printable line: a path comes from a pull request, so a control character in it (an escape, a newline) is replaced, never carried into a posted reason. The ONE place: `_item`."""
+    return "".join(c if c.isprintable() else "?" for c in text) if isinstance(text, str) else text
+
+
 def _item(kind, text, paths=(), **extra):
-    return dict({"kind": kind, "text": text, "paths": list(paths)}, **extra)
+    return dict({"kind": kind, "text": _clean(text), "paths": [_clean(p) for p in paths]}, **extra)
 
 
 def refusal_items(rule, report, files, matches=None, closure=None, scored=None):
@@ -761,8 +766,7 @@ def shadow_refusals(base_src, head_src, names, filename):
         added = bound_names(ast.parse(head_src)) - bound_names(ast.parse(base_src))
     except (SyntaxError, ValueError):
         return ["%s does not parse before or after the change: refused" % filename[:80]]
-    shown = "".join(c if c.isprintable() else "?" for c in filename[:80])   # a path is text from a pull request: no control characters in a reason
-    return sorted("it adds %s in %s, a name of the clear's closure (a second definition of it could take its place): refused" % (name, shown)
+    return sorted("it adds %s in %s, a name of the clear's closure (a second definition of it could take its place): refused" % (name, _clean(filename[:80]))   # cleaned here too: the reason is also returned by delegated_clear_map
                   for name in set(names) & added)
 
 

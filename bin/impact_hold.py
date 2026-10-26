@@ -1079,7 +1079,7 @@ def delegated_clear_checks(engine, runner, now, kind, number):
 def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
     """[reasons] for ONE changed file of the daemon's own (`closure_refusals` over its text before and after and its patch), or None when it cannot be read or mapped. The text comes from the
     git blobs API (the contents API refuses a file this large): the head's blob id is the file's own `sha`, the base's is the file's own `sha` at the base commit. #661."""
-    unread = None if impact_floor.matches(item["filename"], rule.get("closure_files") or []) or item["filename"] == rule.get("daemon_file") else ["%s cannot be read, so an added closure name cannot be ruled out: refused" % str(item["filename"])[:80]]   # a part the closure does not list: unreadable is refused here (the clear's mapper skips a path it does not judge)
+    unread = None if impact_floor.matches(item["filename"], rule.get("closure_files") or []) or item["filename"] == rule.get("daemon_file") else ["%s cannot be read, so an added closure name cannot be ruled out: refused" % "".join(c if c.isprintable() else "?" for c in str(item["filename"])[:80])]   # a part the closure does not list: unreadable is refused here (the clear's mapper skips a path it does not judge)
     try:
         if not isinstance(base_sha, str) or not base_sha:
             return unread   # no merge-base: nothing to read the old text from

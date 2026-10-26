@@ -13,7 +13,10 @@ import base64
 import difflib
 import importlib.util
 import json
+import shutil
 import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -202,6 +205,27 @@ class TestShadowGlue(unittest.TestCase):
             got = self.hold.delegated_clear_map(None, None, "o/r", {"filename": "bin/switchboard/judge.py", "sha": "BLOBHEAD", "patch": "x"}, None, RULE)
         self.assertTrue(got and "cannot be read" in got[0], got)
 
+    def test_a_real_move_between_two_existing_parts_is_refused_on_the_receiving_file_and_a_non_closure_move_is_not(self):
+        import ast as _ast
+
+        def move(giving, receiving, name):
+            source, target = (REPO / giving).read_text(), (REPO / receiving).read_text()
+            node = next(n for n in _ast.parse(source).body if getattr(n, "name", None) == name)
+            lines = source.split("\n")
+            first = min([node.lineno] + [d.lineno for d in node.decorator_list]) - 1
+            cut = "\n".join(lines[first:node.end_lineno])
+            return (source, "\n".join(lines[:first] + lines[node.end_lineno:])), (target, target.rstrip("\n") + "\n\n\n" + cut + "\n")
+        for giving, receiving, name in (("bin/switchboard/decisions_a.py", "bin/switchboard/decisions_b.py", "parse_bare_pr_ref"), ("bin/switchboard/audit.py", "bin/switchboard/decision.py", "redact")):
+            with self.subTest(move=name):
+                self.assertIn(name, self.names)
+                (g0, g1), (r0, r1) = move(giving, receiving, name)
+                self.assertTrue(any(name in r for r in self.run_map(giving, g0, g1)), "the giving file changes a closure definition")
+                got = self.run_map(receiving, r0, r1)
+                self.assertTrue(any("it adds %s in %s" % (name, receiving) in r for r in got), got)   # the stated over-refusal: it stays the owner's own clear
+        (g0, g1), (r0, r1) = move("bin/switchboard/facts.py", "bin/switchboard/reminders.py", "disk_status_line")
+        self.assertNotIn("disk_status_line", self.names)
+        self.assertEqual((self.run_map("bin/switchboard/facts.py", g0, g1), self.run_map("bin/switchboard/reminders.py", r0, r1)), ([], []))
+
     def test_an_unreadable_unlisted_part_is_refused_and_a_listed_one_is_unmapped_as_before(self):
         got = self.run_map("bin/switchboard/judge.py", BASE, BASE, readable=False)
         self.assertTrue(got and "judge.py" in got[0] and "cannot be read" in got[0], got)
@@ -225,34 +249,84 @@ class TestShadowGlue(unittest.TestCase):
             self.assertTrue(any(other in r for r in self.run_map(entry, base, added)), "when the old check says nothing the added name is what the entry says")
 
 
+class FakeGitHub:
+    """What `delegated_clear_inputs` reads, as plain data: the files of one pull request (a status each), the pull, the compare and the blobs. The real function runs on it."""
+
+    def __init__(self, files):
+        self.files, self.blobs = files, {}
+
+    def get(self, path):
+        if "/pulls/7/files" in path:
+            return [{k: v for k, v in f.items() if k not in ("base", "head")} for f in self.files]
+        if path.endswith("/pulls/7"):
+            return {"head": {"sha": "H1"}, "base": {"sha": "B1"}}
+        if "/compare/" in path:
+            return {"merge_base_commit": {"sha": "MB"}}
+        raise AssertionError("unexpected read: " + path)
+
+    def blob(self, engine, runner, repo, path):   # `_gh_json`, the blobs API
+        if "/contents/" in path:
+            return {"type": "file", "sha": "BLOBBASE:" + path.split("/contents/")[1].split("?")[0]}
+        key = path.split("/git/blobs/", 1)[1]
+        kind, name = key.split(":", 1)
+        text = next(f["base" if kind == "BLOBBASE" else "head"] for f in self.files if f["filename"] == name)
+        return {"encoding": "base64", "content": base64.b64encode(text.encode()).decode()}
+
+
+def inputs_for(testcase, hold, module, files):
+    """The REAL `delegated_clear_inputs` on a fake GitHub: (the refusals of the real `refusals` over what it returned, the inputs)."""
+    github = FakeGitHub(files)
+    state = Path(tempfile.mkdtemp(prefix="shadow-state-"))
+    testcase.addCleanup(shutil.rmtree, str(state), True)
+    engine = types.SimpleNamespace(state_dir=state)
+    report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "head": "H1", "changed_paths": [f["filename"] for f in files]}
+    with mock.patch.object(hold, "impact_carry_get", lambda e, r, repo: github.get, create=True), mock.patch.object(hold, "_gh_json", github.blob):
+        got, why = hold.delegated_clear_inputs(engine, None, "o/r", 7, False, report)
+    testcase.assertIsNone(why, why)
+    return module.refusals(got["rule"], got["report"], got["files"], impact_floor.matches, got["closure"]), got
+
+
+def entry_pair():
+    base = "def boss_name(a):\n    return a\n"
+    return base, "def boss_name(a):\n    return a + 1\n"
+
+
+def file_row(kind, status):
+    if kind == "entry":
+        base, head = entry_pair()
+        path = RULE["daemon_file"]
+    else:
+        base, head = BASE, BASE + BINDERS["def"]
+        path = {"listed": "bin/switchboard/audit.py", "unlisted": "bin/switchboard/judge.py"}[kind]
+    row = {"filename": path, "base": base, "head": head, "patch": diff(base, head), "sha": "BLOBHEAD:" + path}
+    if status is not None:
+        row["status"] = status
+    return row
+
+
 class TestShadowStatuses(unittest.TestCase):
-    """The real `refusals` (the clear's one rule), fed as `delegated_clear_inputs` feeds it: a map only for a file whose status is `modified`. Any other status of a part or of the entry is unmapped and REFUSED
+    """The REAL `delegated_clear_inputs` (on a fake GitHub) feeds the real `refusals`: a map is built only for a file whose status is `modified`. Any other status of a part or of the entry is unmapped and REFUSED
     ('cannot be mapped'), never skipped: a listed part, an unlisted part and the entry alike."""
-    FILES = {"listed": "bin/switchboard/audit.py", "unlisted": "bin/switchboard/judge.py", "entry": RULE["daemon_file"]}
     STATUSES = ("changed", "unchanged", None, "renamed", "copied", "removed", "added", "modified")
-    REPORT = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "changed_paths": []}
 
     def setUp(self):
         self.m = load("delegated_clear_statuses", REPO / "bin" / "delegated_clear.py")
-
-    def refused(self, module, path, status, closure_map):
-        item = {"filename": path}
-        if status is not None:
-            item["status"] = status
-        report = dict(self.REPORT, changed_paths=[path])
-        closure = {path: closure_map} if status == "modified" else {}   # what delegated_clear_inputs maps
-        return module.refusals(RULE, report, [item], impact_floor.matches, closure)
+        self.hold = load("impact_hold_statuses", REPO / "bin" / "impact_hold.py")
+        self.hold.impact_floor = impact_floor
+        self.hold.load_module = lambda name: self.m
 
     def test_every_status_of_a_listed_part_an_unlisted_part_and_the_entry(self):
-        self.assertFalse(impact_floor.matches(self.FILES["unlisted"], RULE["closure_files"]))
-        for kind, path in self.FILES.items():
+        self.assertFalse(impact_floor.matches("bin/switchboard/judge.py", RULE["closure_files"]))
+        for kind in ("listed", "unlisted", "entry"):
             for status in self.STATUSES:
                 with self.subTest(file=kind, status=status):
-                    got = self.refused(self.m, path, status, [])
+                    got, inputs = inputs_for(self, self.hold, self.m, [file_row(kind, status)])
+                    path = file_row(kind, status)["filename"]
                     if status == "modified":
-                        self.assertEqual(got, [], "a mapped file with no reason is judged normally and passes this rule")
-                        self.assertTrue(self.refused(self.m, path, status, ["it adds boss_name in %s, a name of the clear's closure: refused" % path]), "and a mapped reason is carried")
+                        self.assertIn(path, inputs["closure"], "the real function maps a modified file")
+                        self.assertTrue(any(NAME in r for r in got), "a mapped file is judged: %s" % got)
                     else:
+                        self.assertNotIn(path, inputs["closure"], "and maps nothing else")
                         self.assertTrue(any("cannot be mapped" in r for r in got), got)
 
     def test_a_mutant_that_restores_the_skip_lets_the_unmapped_unlisted_part_through(self):
@@ -266,18 +340,69 @@ class TestShadowStatuses(unittest.TestCase):
         exec(compile(mutant, "delegated_clear_mutant", "exec"), module.__dict__)
         for status in ("changed", "unchanged", None):
             with self.subTest(status=status):
-                self.assertEqual(self.refused(module, self.FILES["unlisted"], status, []), [], "the old skip passes it")
-                self.assertTrue(self.refused(self.m, self.FILES["unlisted"], status, []), "the rule refuses it")
-
-    def test_a_control_character_in_a_path_is_not_carried_into_the_reason(self):
-        got = self.m.shadow_refusals("x = 1\n", "boss_name = 1\n", {"boss_name"}, "bin/switchboard/a\x1b[31m\nb.py")
-        self.assertEqual(len(got), 1)
-        self.assertTrue(got[0].isprintable(), repr(got[0]))
-        self.assertIn("boss_name", got[0])
+                got, _ = inputs_for(self, self.hold, module, [file_row("unlisted", status)])
+                self.assertEqual(got, [], "the old skip passes it")
+                self.assertTrue(inputs_for(self, self.hold, self.m, [file_row("unlisted", status)])[0], "the rule refuses it")
 
     def test_the_part_glob_matches_a_dotfile_and_not_a_subdirectory(self):   # stated: the parts directory is flat (derive-closure fails closed on any other file there)
         self.assertTrue(impact_floor.matches("bin/switchboard/.x.py", ["bin/switchboard/*.py"]))
         self.assertFalse(impact_floor.matches("bin/switchboard/sub/x.py", ["bin/switchboard/*.py"]))
+
+
+class TestReasonsAreOneCleanLine(unittest.TestCase):
+    """A path comes from a pull request: a control character in it (an escape, a newline) must not reach ANY reason, so it cannot forge a line in a posted one. One place cleans (`_item`); one row per reason kind,
+    through the real `refusals`."""
+    DIRTY = "a\x1b[31m\nb.py"
+
+    def setUp(self):
+        self.m = load("delegated_clear_clean", REPO / "bin" / "delegated_clear.py")
+        self.hold = load("impact_hold_clean", REPO / "bin" / "impact_hold.py")
+        self.hold.impact_floor = impact_floor
+        self.hold.load_module = lambda name: self.m
+
+    def reasons(self, files, closure=None):
+        report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "changed_paths": [f["filename"] for f in files]}
+        return self.m.refusals(RULE, report, files, impact_floor.matches, closure or {})
+
+    def assertOneCleanLine(self, got, kind):
+        self.assertTrue(got, kind)
+        for reason in got:
+            self.assertTrue(reason.isprintable(), "%s: %r" % (kind, reason))   # no escape, no newline
+            self.assertIn("b.py", reason, kind)
+
+    def test_every_reason_kind_that_names_a_path_is_one_clean_line(self):
+        part, hook, newbin = "bin/switchboard/" + self.DIRTY, "plugins/fleet-hooks/" + self.DIRTY, "bin/" + self.DIRTY
+        shadow_from_map = self.m.shadow_refusals("x = 1\n", NAME + " = 1\n", {NAME}, part)
+        kinds = {
+            "cannot be mapped": self.reasons([{"filename": part, "status": "changed"}]),
+            "machinery": self.reasons([{"filename": hook, "status": "modified"}]),
+            "new-file": self.reasons([{"filename": newbin, "status": "added"}]),
+            "shadow": self.reasons([{"filename": part, "status": "modified"}], {part: shadow_from_map}),
+            "closure (a reason handed in raw)": self.reasons([{"filename": part, "status": "modified"}], {part: ["it changes f in %s, part of the clear" % part]}),
+        }
+        for kind, got in kinds.items():
+            with self.subTest(kind=kind):
+                self.assertOneCleanLine(got, kind)
+
+    def test_the_unread_reason_of_delegated_clear_map_is_clean_and_passes_through_refusals(self):
+        part = "bin/switchboard/" + self.DIRTY
+        item = {"filename": part, "sha": "BLOBHEAD", "patch": "x"}
+        with mock.patch.object(self.hold, "_gh_json", side_effect=RuntimeError("unreadable")):
+            unread = self.hold.delegated_clear_map(None, None, "o/r", item, "BASE", RULE)
+        self.assertTrue(unread and all(r.isprintable() for r in unread), unread)
+        self.assertOneCleanLine(self.reasons([{"filename": part, "status": "modified"}], {part: unread}), "unread")
+
+    def test_a_mutant_that_cleans_nothing_fails_the_row(self):
+        source = (REPO / "bin" / "delegated_clear.py").read_text()
+        old = 'return "".join(c if c.isprintable() else "?" for c in text) if isinstance(text, str) else text'
+        self.assertIn(old, source)
+        spec = importlib.util.spec_from_loader("delegated_clear_dirty", loader=None)
+        module = importlib.util.module_from_spec(spec)
+        module.__dict__["__file__"] = str(REPO / "bin" / "delegated_clear.py")
+        exec(compile(source.replace(old, "return text", 1), "delegated_clear_dirty", "exec"), module.__dict__)
+        report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "changed_paths": []}
+        got = module.refusals(RULE, report, [{"filename": "bin/switchboard/" + self.DIRTY, "status": "changed"}], impact_floor.matches, {})
+        self.assertFalse(all(r.isprintable() for r in got), "without the cleaning the escape reaches the reason")
 
 
 if __name__ == "__main__":
