@@ -54,7 +54,6 @@ BINDERS = {
     "from import as": "\n\nfrom os import path as boss_name\n",
     "for target": "\n\nfor boss_name in range(3):\n    pass\n",
     "for tuple target": "\n\nfor (i, boss_name) in enumerate([1]):\n    pass\n",
-    "async for target": "\n\nasync def f():\n    async for boss_name in g():\n        pass\n\n\nboss_name = 1\n",
     "with as": "\n\nwith open('x') as boss_name:\n    pass\n",
     "with as tuple": "\n\nwith a as (boss_name, other):\n    pass\n",
     "except as": "\n\ntry:\n    pass\nexcept Exception as boss_name:\n    pass\n",
@@ -68,6 +67,19 @@ BINDERS = {
     "match as": "\n\nmatch value:\n    case 1 as boss_name:\n        pass\n",
     "match mapping rest": "\n\nmatch value:\n    case {'a': 1, **boss_name}:\n        pass\n",
     "del": "\n\ndel boss_name\n",
+    "walrus in a lambda default": "\n\nh = lambda a=(boss_name := 1): a\n",
+    "walrus in a return annotation": "\n\ndef g() -> (boss_name := int):\n    pass\n",
+    "walrus in an argument annotation": "\n\ndef g(a: (boss_name := int)):\n    pass\n",
+    "walrus in a keyword-only default": "\n\ndef g(*, a=(boss_name := 1)):\n    pass\n",
+    "walrus in a class keyword": "\n\nclass K(Base, flag=(boss_name := 1)):\n    pass\n",
+    "walrus in an except type": "\n\ntry:\n    pass\nexcept (boss_name := Exception):\n    pass\n",
+    "except star as": "\n\ntry:\n    pass\nexcept* Exception as boss_name:\n    pass\n",
+    "match class pattern capture": "\n\nmatch value:\n    case K(a=boss_name):\n        pass\n",
+    "match guard walrus": "\n\nmatch value:\n    case _ if (boss_name := 1):\n        pass\n",
+    "walrus in a with item": "\n\nwith (boss_name := a):\n    pass\n",
+    "walrus in a for iterable": "\n\nfor i in (boss_name := [1]):\n    pass\n",
+    "walrus in an assert": "\n\nassert (boss_name := 1)\n",
+    "walrus in a call argument": "\n\nprint((boss_name := 1))\n",
     "def under if True": "\n\nif True:\n    def boss_name(a, b):\n        return a\n",
     "def under else": "\n\nif False:\n    pass\nelse:\n    def boss_name(a, b):\n        return a\n",
     "def under try": "\n\ntry:\n    def boss_name(a, b):\n        return a\nexcept Exception:\n    pass\n",
@@ -91,6 +103,9 @@ NOT_BOUND = {
     "a subscript store": "\n\ntable['boss_name'] = 1\n",
     "a read": "\n\nvalue = boss_name\n",
     "a string": "\n\ntext = 'boss_name'\n",
+    "a walrus in a lambda body": "\n\nh = lambda: (boss_name := 1)\n",
+    "an async for target in a function": "\n\nasync def g():\n    async for boss_name in h():\n        pass\n",
+    "a walrus in a function body": "\n\ndef g():\n    return (boss_name := 1)\n",
     "a name outside the closure": "\n\ndef not_a_closure_name_zz(a):\n    return a\n",
 }
 
@@ -120,14 +135,14 @@ class TestShadowRule(unittest.TestCase):
             with self.subTest(form=label):
                 self.assertEqual(self.m.shadow_refusals(BASE, BASE + add, self.names, "bin/switchboard/judge.py"), [])
 
-    def test_the_two_bypasses_the_first_version_missed(self):
-        for add in ("\n\nimport os as boss_name\n", "\n\nif True:\n    def boss_name(a, b):\n        return a\n"):
+    def test_the_bypasses_the_reviews_found_are_named_regression_markers(self):
+        for add in (BINDERS["import as"], BINDERS["def under if True"], BINDERS["walrus in a lambda default"], BINDERS["walrus in a return annotation"], BINDERS["walrus in an except type"]):
             self.assertTrue(self.m.shadow_refusals(BASE, BASE + add, self.names, "bin/switchboard/judge.py"), add)
 
     def test_a_name_already_bound_is_not_added_and_a_syntax_error_is_refused(self):
         had = BASE + "\ndef boss_name(a):\n    return a\n"
         self.assertEqual(self.m.shadow_refusals(had, had.replace("return a", "return 2"), self.names, "bin/switchboard/x.py"), [])
-        self.assertEqual(self.m.shadow_refusals(had, had + "\nif True:\n    boss_name = 3\n", self.names, "bin/switchboard/x.py"), [], "bound before: nothing added")
+        self.assertEqual(self.m.shadow_refusals(had, had + "\nif True:\n    boss_name = 3\n", self.names, "bin/switchboard/x.py"), [], "bound before: a second binding is not an addition (stated: the first one was already there; a listed part and the entry are still judged by closure_refusals)")
         self.assertTrue(self.m.shadow_refusals(BASE, "def (", self.names, "bin/switchboard/x.py"))
         self.assertTrue(self.m.shadow_refusals("def (", BASE, self.names, "bin/switchboard/x.py"))
 
@@ -181,6 +196,11 @@ class TestShadowGlue(unittest.TestCase):
     def test_an_outside_name_and_an_edit_of_a_non_closure_function_are_not_refused(self):
         self.assertEqual(self.run_map("bin/switchboard/judge.py", BASE, BASE + NOT_BOUND["a name outside the closure"]), [])
         self.assertEqual(self.run_map("bin/switchboard/audit.py", BASE, BASE + NOT_BOUND["a name outside the closure"]), [])
+
+    def test_a_missing_merge_base_is_an_unreadable_part_too(self):
+        with mock.patch.object(self.hold, "_gh_json", side_effect=AssertionError("nothing is read without a merge-base")):
+            got = self.hold.delegated_clear_map(None, None, "o/r", {"filename": "bin/switchboard/judge.py", "sha": "BLOBHEAD", "patch": "x"}, None, RULE)
+        self.assertTrue(got and "cannot be read" in got[0], got)
 
     def test_an_unreadable_unlisted_part_is_refused_and_a_listed_one_is_unmapped_as_before(self):
         got = self.run_map("bin/switchboard/judge.py", BASE, BASE, readable=False)

@@ -690,16 +690,20 @@ def shadow_names(rule):
 
 
 _MATCH_KINDS = tuple(getattr(ast, n) for n in ("MatchAs", "MatchStar", "MatchMapping") if hasattr(ast, n))
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
 def _store_names(node):
-    """The names an expression or target binds when it runs: Name targets (nested tuples and lists, starred), walrus targets, and the captures of a pattern. A lambda body is a function body: not entered."""
+    """The names an expression, target, argument list or pattern binds when it runs: every Name stored or deleted, every walrus target and every pattern capture, found by walking ALL its children
+    (not a list of fields). A lambda's BODY and a comprehension's loop variables are their own scope (not entered; a walrus inside a comprehension binds in the enclosing scope), but a lambda's
+    defaults and annotations run now and are walked."""
     found, todo = set(), [node]
     while todo:
         x = todo.pop()
         if isinstance(x, ast.Lambda):
+            todo.append(x.args)
             continue
-        if isinstance(x, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):   # a comprehension's loop variables are its own; a walrus inside it binds in the enclosing scope
+        if isinstance(x, _COMPREHENSIONS):
             found.update(n.target.id for n in ast.walk(x) if isinstance(n, ast.NamedExpr))
             continue
         if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
@@ -716,59 +720,34 @@ def _store_names(node):
 
 def bound_names(tree):
     """THE CLOSED RULE of the shadow check (#1339): the names a file BINDS at module level are every name bound by ANY statement that runs when the file is imported, found by walking the module
-    body through the if/try/for/while/with/match blocks and NOT into function or class bodies: def and class names; the targets of Assign, AnnAssign and AugAssign (nested and starred); the aliases
-    of Import and ImportFrom (the alias, or the first dotted segment); for and with-as targets; except-as names; walrus targets (also in a decorator, a default or a condition); the captures of a
-    match pattern; names deleted by `del`; and every name a `global` declaration names anywhere in the file (how a function binds a module name). LIMITS, stated: `exec`/`eval`, writes through
-    `globals()`/`vars()`/`setattr` on the module, bindings made by a call (`globals().update(...)`) and `from x import *` are not followed (the last is counted by tools/derive-closure's duplicate check)."""
+    body through its blocks (if/try/for/while/with/match, every field of them: tests, targets, handler types, patterns, guards, bodies) and NOT into function or class bodies. Everything of a def or
+    class that runs at definition counts (its name, decorators, argument defaults and annotations, return annotation, bases and keywords). Bound are: def and class names; Assign, AnnAssign and
+    AugAssign targets (nested, starred); Import and ImportFrom aliases (the alias, or the first dotted segment); for, with and except targets; walrus targets anywhere that runs; match captures; names
+    deleted by `del`; and every name a `global` declaration names anywhere in the file (how a function binds a module name). The walk takes every child of a statement, so a position nobody listed is
+    still read. LIMITS, stated: `exec`/`eval`, writes through `globals()`/`vars()`/`setattr` on the module, bindings made by a call (`globals().update(...)`) and `from x import *` are not followed."""
     found = set()
 
-    def stmts(body):
-        for node in body:
-            if isinstance(node, DEF_KINDS):
-                found.add(node.name)
-                for part in list(node.decorator_list) + ([node.args] if not isinstance(node, ast.ClassDef) else list(node.bases) + list(node.keywords)):   # run at import: a walrus there binds
+    def visit(node):
+        if isinstance(node, DEF_KINDS):
+            found.add(node.name)
+            for part in list(node.decorator_list) + ([node.args, node.returns] if not isinstance(node, ast.ClassDef) else list(node.bases) + list(node.keywords)):
+                if part is not None:
                     found.update(_store_names(part))
-                continue
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                found.update((a.asname or a.name).split(".")[0] for a in node.names if a.name != "*")
-                continue
-            if isinstance(node, ast.Delete):
-                for target in node.targets:
-                    found.update(_store_names(target))
-                continue
-            if isinstance(node, (ast.If, ast.While)):
-                found.update(_store_names(node.test))
-                stmts(node.body)
-                stmts(node.orelse)
-            elif isinstance(node, (ast.For, ast.AsyncFor)):
-                found.update(_store_names(node.target))
-                found.update(_store_names(node.iter))
-                stmts(node.body)
-                stmts(node.orelse)
-            elif isinstance(node, (ast.With, ast.AsyncWith)):
-                for item in node.items:
-                    found.update(_store_names(item.context_expr))
-                    if item.optional_vars is not None:
-                        found.update(_store_names(item.optional_vars))
-                stmts(node.body)
-            elif isinstance(node, (ast.Try, getattr(ast, "TryStar", ast.Try))):
-                stmts(node.body)
-                for handler in node.handlers:
-                    if handler.name:
-                        found.add(handler.name)
-                    stmts(handler.body)
-                stmts(node.orelse)
-                stmts(node.finalbody)
-            elif hasattr(ast, "Match") and isinstance(node, ast.Match):
-                found.update(_store_names(node.subject))
-                for case in node.cases:
-                    found.update(_store_names(case.pattern))
-                    if case.guard is not None:
-                        found.update(_store_names(case.guard))
-                    stmts(case.body)
-            else:   # Assign, AnnAssign, AugAssign, Expr, Return..: every Name they store, and every walrus in them
-                found.update(_store_names(node))
-    stmts(tree.body)
+            return
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            found.update((a.asname or a.name).split(".")[0] for a in node.names if a.name != "*")
+            return
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            found.add(node.name)
+        for _field, value in ast.iter_fields(node):
+            for item in (value if isinstance(value, list) else [value]):
+                if isinstance(item, (ast.stmt, ast.ExceptHandler)) or (hasattr(ast, "match_case") and isinstance(item, ast.match_case)):
+                    visit(item)
+                elif isinstance(item, ast.AST):
+                    found.update(_store_names(item))   # a test, target, iterable, context manager, handler type, pattern or guard
+
+    for statement in tree.body:
+        visit(statement)
     for node in ast.walk(tree):
         if isinstance(node, ast.Global):
             found.update(node.names)
