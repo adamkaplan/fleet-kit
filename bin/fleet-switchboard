@@ -23851,7 +23851,7 @@ def strip_service_env_entries(text):
     with its value element. Nothing else is touched: a line that merely mentions such a name (a PATH, a comment, UnsetEnvironment=) stays."""
     names = "|".join(re.escape(n) for n in SERVICE_STRIP_ENV)
     text = re.sub(r'(?m)^[ \t]*Environment=["\']?(?:%s)=[^\n]*\n' % names, "", text)
-    return re.sub(r"(?m)^[ \t]*<key>(?:%s)</key>[ \t]*\n[ \t]*<[a-z]+(?:/>|>[^\n]*</[a-z]+>)[ \t]*\n" % names, "", text)
+    return re.sub(r"(?m)^[ \t]*<key>(?:%s)</key>[ \t]*\n\s*<[a-z]+(?:/>|>[^<]*</[a-z]+>)[ \t]*\n" % names, "", text)
 
 
 def reaper_file_path(kind):

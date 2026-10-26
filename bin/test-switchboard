@@ -3410,6 +3410,48 @@ class TestServiceEnvironmentHoldsNoPane(StandInPids, Base):
 
     # -- R-TEST-1: the daemon's own run path
 
+    def test_the_launchd_value_may_span_lines_and_still_goes_with_its_key(self):
+        for n in sb.SERVICE_STRIP_ENV:
+            with self.subTest(name=n):
+                one = "a\n\t<key>%s</key>\n\t<string>x</string>\nb\n" % n
+                many = "a\n\t<key>%s</key>\n\t<string>\n\t\tx\n\t</string>\nb\n" % n
+                self.assertEqual((sb.strip_service_env_entries(one), sb.strip_service_env_entries(many)), ("a\nb\n", "a\nb\n"))
+        keep = "<key>PATH</key>\n<string>\n/bin\n</string>\n"
+        self.assertEqual(sb.strip_service_env_entries(keep), keep)
+
+    def test_a_real_process_started_by_cmd_run_holds_none_of_the_six_names(self):
+        """Real subprocess (R-TEST-1): cmd_run in a fresh interpreter; the environment its child sees, not a stub's."""
+        script = ("import importlib.machinery, importlib.util, json, os, subprocess, sys, types\n"
+                  "l = importlib.machinery.SourceFileLoader('sbx', %r); spec = importlib.util.spec_from_loader('sbx', l)\n"
+                  "sb = importlib.util.module_from_spec(spec); sys.modules['sbx'] = sb; l.exec_module(sb)\n"
+                  "def stop(*a, **k):\n"
+                  "    out = subprocess.run(['env'], capture_output=True, text=True).stdout\n"
+                  "    print(json.dumps(sorted(x.split('=')[0] for x in out.splitlines() if '=' in x)))\n"
+                  "    raise SystemExit(0)\n"
+                  "sb.build_engine = stop\n"
+                  "sb.cmd_run(types.SimpleNamespace(once=False, standby=False, json=False, poll=None), None, None, None)\n") % str(REPO / "bin" / "fleet-switchboard")
+        env = dict(self.callers_env(), HOME=tempfile.mkdtemp())
+        done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=60)
+        names = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual([n for n in sb.SERVICE_STRIP_ENV if n in names], [], done.stderr[-300:])
+        self.assertIn(sb.KEPT_SOCKET_ENV, names)
+
+    def test_service_herdr_env_reads_a_real_process_with_ps_eww(self):
+        """Real subprocess: a child that holds HERDR_PANE_ID is named; a clean one is not."""
+        state = Path(tempfile.mkdtemp())
+        (state / "opencode").mkdir()
+        results = {}
+        for label, extra in (("dirty", {"HERDR_PANE_ID": "w1:p2"}), ("clean", {})):
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], env=dict({"PATH": os.environ.get("PATH", "/usr/bin:/bin")}, **extra))
+            try:
+                time.sleep(0.7)   # the interpreter has started: ps shows the environment of the process, not of the forking parent. (A system binary such as sleep hides its own)
+                (state / "opencode" / "service.json").write_text(json.dumps({"pid": child.pid}))
+                results[label] = sb.service_herdr_env(subprocess.run, {"XDG_STATE_HOME": str(state)})
+            finally:
+                child.kill()
+                child.wait()
+        self.assertEqual(results, {"dirty": ["HERDR_PANE_ID"], "clean": []})
+
     def run_daemon_env(self):
         """cmd_run (not --once) with all six names set; the environment build_engine sees."""
         seen = {}
