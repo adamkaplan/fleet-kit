@@ -86251,7 +86251,7 @@ class TestBatchingDocs(unittest.TestCase):
 PARENT_RULE = ("A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, "
                "and a Done-when the work item carries itself must still match exactly.")
 CLAIM_RULE = ("A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, "
-              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).")
+              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge).")
 WORK_ITEM_PLAN = LEDGER_PLAN.split("```yaml", 1)[0].split("## Intent", 1)[0] + "```yaml" + LEDGER_PLAN.split("```yaml", 1)[1]
 
 
@@ -86668,6 +86668,30 @@ class TestClaimUnionAtLastMerge(LedgerBase):
         with mock.patch.object(sb, "PEER_PAGES", 1):
             with self.assertRaises(AssertionError):
                 clause()
+
+    def unjudged(self, how, claims):
+        """claim_union_refusal when the context cannot be read (how=raise) or its plan is not `pass` (how=fail)."""
+        self.body(claims)
+        real = sb._ledger_context
+        def ctx(*a, **k):
+            if how == "raise":
+                raise RuntimeError("boom")
+            got = real(*a, **k)
+            got.plan = dict(got.plan, result="fail")
+            return got
+        with mock.patch.object(sb, "_ledger_context", ctx):
+            return sb.claim_union_refusal(types.SimpleNamespace(pr=self.PR), self.route, self.world.clock.now)
+
+    def test_m2_an_unreadable_or_not_pass_plan_refuses_a_claiming_pull_request_and_passes_one_without(self):
+        for how, why in (("raise", "the plan could not be read"), ("fail", "the plan check is not pass")):
+            got = self.unjudged(how, "S1")
+            self.assertIn("claim union could not be judged: " + why, got or "", how)
+            self.assertIsNone(self.unjudged(how, None), how)
+
+    def test_m2_a_mutant_that_passes_a_claiming_pull_request_on_those_paths_fails(self):
+        with mock.patch.object(sb, "_unjudged", lambda *a, **k: None):
+            with self.assertRaises(AssertionError):
+                self.test_m2_an_unreadable_or_not_pass_plan_refuses_a_claiming_pull_request_and_passes_one_without()
 
     def test_m4_a_list_error_refuses_a_pull_request_with_a_claim_line_and_passes_one_without(self):
         self.body("S1")

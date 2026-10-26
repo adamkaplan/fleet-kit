@@ -8745,7 +8745,7 @@ def held_merge_order_hints(decisions, runner, now):
         if len(waited) < 2:
             continue
         try:
-            engine = build_engine(runner, now, "cli", writable=False)[0]
+            engine, state, _ = build_engine(runner, now, "cli", writable=False)
             listing = read_open_overlap(engine, repo, runner)
             if listing:
                 hints.extend(("%s: " % repo if len(by_repo) > 1 else "") + h for h in overlap_waiting_order(listing, sorted(waited.items())))
@@ -17599,15 +17599,32 @@ def record_claim(ctx, now):
         pass
 
 
+def _unjudged(who, runner, now, why, ctx=None):
+    """The plan could not be read or is not `pass`: a pull request WITH a claim line is refused (fail closed); one with NO claim line gets None (it claims every per-PR scenario,
+    so the union is covered whatever the plan says). The body is read from ctx when there is one, else fetched; a body that cannot be read counts as a claim line."""
+    try:
+        body = (ctx.facts or {}).get("body") if ctx is not None else None
+        if ctx is None:   # the context itself failed: read the body on its own
+            engine, state, _ = build_engine(runner, now, "cli", writable=False)
+            repo, number, _ = _ledger_pr(types.SimpleNamespace(pr=who.pr, plan=None, ask=None))
+            body = pr_picture(engine, repo, number, state)[1]
+        has_claim = plan_ledger.claim_text(body) is not None
+    except Exception:
+        has_claim = True
+    if not has_claim:
+        return None
+    return "merge of %s refused: claim union could not be judged: %s; the gate fails closed for a pull request with a claim line" % (who.pr, why)
+
+
 def claim_union_refusal(args, runner, now):
     """#976: the refusal line for the LAST merge of an ask whose claims leave a per-pull-request scenario uncovered, else None. A plan nobody narrows, a merge that is not the
     ask's last, a pull request with no readable plan and a logged `CU` waiver at the head all give None. A list that cannot be read refuses only a pull request that itself has a claim line."""
     try:
         ctx = _ledger_context(types.SimpleNamespace(pr=args.pr, plan=None, ask=None), runner, now, False)
     except Exception:
-        return None
+        return _unjudged(args, runner, now, "the plan could not be read")
     if ctx.plan is None or ctx.plan.get("result") != "pass":
-        return None
+        return _unjudged(ctx, runner, now, "the plan check is not pass", ctx)
     body = (ctx.facts or {}).get("body")
     scenarios = ctx.plan["scenarios_parsed"]
     try:
