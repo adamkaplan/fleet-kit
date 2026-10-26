@@ -12748,9 +12748,7 @@ class TestShimReadCache(Base):
         return target / "gh"
 
     def test_mutants_honouring_the_marker_in_count_call_and_the_cache_fail_these_cases(self):   # #1216
-        global SHIM
         marker = {"FLEET_SWITCHBOARD_OWN_GH": "1"}
-        saved = SHIM
         for func in ("count_call", "cached_read"):
             with self.subTest(func=func):
                 (self.state / "agent-calls.jsonl").unlink() if (self.state / "agent-calls.jsonl").exists() else None
@@ -12763,11 +12761,9 @@ class TestShimReadCache(Base):
                 (self.state / "agent-calls.jsonl").unlink()
                 shutil.rmtree(str(self.state / "gh-read-cache"), True)
                 self.log.write_text("")
-                SHIM = self.marker_mutant(func)
-                try:
+                mutant = self.marker_mutant(func)
+                with mock.patch.dict(globals(), {"SHIM": mutant}), rebound("SHIM", mutant):
                     self.run_shim("api", self.PATH, env=marker); self.run_shim("api", self.PATH, env=marker)
-                finally:
-                    SHIM = saved
                 spooled = (self.state / "agent-calls.jsonl").read_text().splitlines() if (self.state / "agent-calls.jsonl").exists() else []
                 self.assertNotEqual((len(spooled), len(self.network())), real, "the mutant differs: the case above fails it")
 
@@ -22181,13 +22177,11 @@ class TestGhShimGateProbe(Base):
             with self.subTest(func=func):
                 real = self.run_shim_result_code(run)
                 self.assertEqual(real, 10, "the real shim refuses")
-                global SHIM
-                saved = SHIM
-                SHIM = self.mutant_shim(func)
+                mutant = self.mutant_shim(func)
                 try:
-                    self.assertNotEqual(self.run_shim_result_code(run), 10, "the mutant lets the merge run")
+                    with mock.patch.dict(globals(), {"SHIM": mutant}), rebound("SHIM", mutant):
+                        self.assertNotEqual(self.run_shim_result_code(run), 10, "the mutant lets the merge run")
                 finally:
-                    SHIM = saved
                     shutil.rmtree(self.home / "mutant-shims", ignore_errors=True)
 
     def run_shim_result_code(self, run):
@@ -31180,15 +31174,11 @@ class TestIdentityCheck(ReportBase):
 
     def with_mutant_shim(self, func, run):
         """`run()` with the module's SHIM pointing at a copy of the shim directory whose `func` honours the marker again."""
-        global SHIM
         target = Path(self.home) / ("mutant-" + func)
         shutil.copytree(SHIM.parent, target)
         (target / "gh").write_text(marker_mutant_source(func))
-        saved, SHIM = SHIM, target / "gh"
-        try:
+        with mock.patch.dict(globals(), {"SHIM": target / "gh"}), rebound("SHIM", target / "gh"):
             return run()
-        finally:
-            SHIM = saved
 
     def test_s9_each_probe_mutant_that_honours_the_marker_again_fails_its_case_through_the_real_shim(self):   # #1216: read_scope, read_account_env, account_env
         marker = {"FLEET_SWITCHBOARD_OWN_GH": "1"}
