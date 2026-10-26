@@ -44,7 +44,7 @@ DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch 
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss"}
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret"}
 LAUNCHER_SHAPES = ("XS", "S", "M")   # the launcher's SHAPES keys; the launcher's own default (XS, or S with --stack) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
@@ -150,7 +150,7 @@ def _write_private(path, text):
 
 def _read_private(path, limit):
     """The text of a private regular file (ours, mode 0600, not a symlink), at most `limit` bytes; OSError/ValueError otherwise."""
-    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)   # O_NONBLOCK: a FIFO in the record directory must not block the open
     with os.fdopen(fd, "rb") as handle:
         found = os.fstat(handle.fileno())
         if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
@@ -161,13 +161,92 @@ def _read_private(path, limit):
     return raw.decode("utf-8")
 
 
+WATCH_MAX_DEPTH = 64        # the deepest [ / { nesting a cloud record may have (a real record is about 5 deep)
+
+
+class TooDeep(ValueError):
+    """The text nests deeper than WATCH_MAX_DEPTH."""
+
+
+def nesting_too_deep(text, limit=None):
+    """True when `text` nests [ or { deeper than the limit. One iterative pass, O(n), no recursion; brackets inside JSON strings do not count
+    (backslash escapes honoured). Never depends on the interpreter's recursion limit."""
+    limit = WATCH_MAX_DEPTH if limit is None else limit
+    depth, in_string, escaped = 0, False, False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "[" or ch == "{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif ch == "]" or ch == "}":
+            depth -= 1
+    return False
+
+
+def parse_bounded(text):
+    """json.loads of untrusted text with the same depth limit on every Python (the ONE parse of a record the daemon did not write)."""
+    if nesting_too_deep(text):
+        raise TooDeep("nested deeper than %d" % WATCH_MAX_DEPTH)
+    try:
+        return json.loads(text)
+    except RecursionError:   # defence in depth
+        raise TooDeep("recursion limit") from None
+
+
+def read_record_file(path, max_bytes):
+    """The ONE safe read of a file in the cloud record directory (#1097, the family of #1073): (record dict, None) or (None, kind). Never blocks (O_NONBLOCK,
+    so a FIFO cannot hang the open), never follows a symlink (O_NOFOLLOW), reads only a regular file (fstat), at most max_bytes. Never raises.
+    kind: not_regular, too_large, not_utf8, not_json, wrong_shape."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None, "not_regular"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "not_regular"
+        raw = b""
+        while len(raw) <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return None, "not_regular"
+    finally:
+        os.close(fd)
+    if len(raw) > max_bytes:
+        return None, "too_large"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "not_utf8"
+    try:
+        record = parse_bounded(text)
+    except TooDeep:
+        return None, "too_deep"
+    except ValueError:
+        return None, "not_json"
+    if not isinstance(record, dict):
+        return None, "wrong_shape"
+    return record, None
+
+
 def load_record(state, name):
     """The worker's record, or None when there is none. A record that exists but is unusable raises CloudError (never read as 'not a cloud worker')."""
     path = record_path(state, name)
     if not path.exists() and not path.is_symlink():
         return None
     try:
-        record = json.loads(_read_private(path, RECORD_MAX))
+        record = parse_bounded(_read_private(path, RECORD_MAX))
     except (OSError, ValueError) as err:
         raise CloudError("the record of %s cannot be read (%s)" % (name, _one(str(err), 80))) from None
     if not isinstance(record, dict) or record.get("worker") != name or any(not isinstance(record.get(k), str) for k in ("url", "runtime_id")):
@@ -206,6 +285,92 @@ def list_records(state):
             if record is not None:
                 found.append(record)
     return found
+
+
+WATCH_MAX_RECORDS = 50      # the most valid records one pass reads
+WATCH_MAX_BYTES = 65536     # the most bytes read from one record
+WATCH_MAX_FILES = 200       # the most files one pass examines, valid or not
+WATCH_SECONDS = 1.0         # the most monotonic time one pass spends
+SKIP_KINDS = ("bad_name", "not_regular", "symlink", "too_large", "not_utf8", "not_json", "wrong_shape", "too_deep")
+
+
+def _read_one(path, max_bytes):
+    """One record file: (record, None) or (None, skip kind). Never blocks: O_NONBLOCK (a FIFO with no writer opens at once), O_NOFOLLOW, regular files only."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError as err:
+        import errno
+        return None, ("symlink" if err.errno == errno.ELOOP else "not_regular")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "not_regular"
+        raw = b""
+        while len(raw) <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return None, "not_regular"
+    finally:
+        os.close(fd)
+    if len(raw) > max_bytes:
+        return None, "too_large"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "not_utf8"
+    try:
+        record = parse_bounded(text)
+    except TooDeep:
+        return None, "too_deep"
+    except ValueError:
+        return None, "not_json"
+    if not isinstance(record, dict):
+        return None, "wrong_shape"
+    return record, None
+
+
+def read_records_bounded(state, max_records=WATCH_MAX_RECORDS, max_bytes=WATCH_MAX_BYTES, max_files=WATCH_MAX_FILES,
+                         seconds=WATCH_SECONDS, cursor=None, clock=None):
+    """The cloud record directory read for the per-pass watch. Read-only; never raises on a bad file, never blocks on one.
+    {"records": [...], "skipped": n, "skips": {kind: n}, "capped": bool, "bound": None|"records"|"files"|"time", "cursor": last name examined}.
+    The start rotates: reading resumes after `cursor`, so every record gets a turn."""
+    import time as _time
+    clock = clock or _time.monotonic
+    base = Path(state) / CLOUD_DIR
+    out = {"records": [], "skipped": 0, "skips": {k: 0 for k in SKIP_KINDS}, "capped": False, "bound": None, "cursor": cursor}
+    if not base.is_dir():
+        return out
+    names = sorted(n for n in os.listdir(str(base)) if n.endswith(".json"))
+    if cursor is not None:
+        after = [n for n in names if n > cursor]
+        names = after + [n for n in names if n <= cursor]
+    deadline = clock() + seconds
+    examined = 0
+    for name in names:
+        if len(out["records"]) >= max_records:
+            out["bound"] = "records"
+        elif examined >= max_files:
+            out["bound"] = "files"
+        elif clock() > deadline:
+            out["bound"] = "time"
+        if out["bound"]:
+            out["capped"] = True
+            break
+        examined += 1
+        out["cursor"] = name
+        kind = None
+        if not valid_name(name[:-5]):
+            kind = "bad_name"
+        else:
+            record, kind = _read_one(str(base / name), max_bytes)
+        if kind:
+            out["skips"][kind] += 1
+            out["skipped"] += 1
+        else:
+            out["records"].append(record)
+    return out
 
 
 def _reserved(name):
@@ -417,13 +582,16 @@ def launcher_argv():
                   "or put `%s` on the PATH; nothing was called" % (LAUNCHER_ENV, own, _checkout_launcher_problem(str(own)), DEFAULT_LAUNCHER))
 
 
+STACK_MODEL_KEY_LIMIT = 16384   # bytes: a model API key is far smaller
+
+
 def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None, cluster=None, secrets=()):
     """Run `cloud-worker <command> <worker> <options> --json`. Returns (exit code, parsed JSON or None, one-line stderr). A launcher that is missing
     or too slow is a CloudError with a plain reason. `cluster` (a Cluster) gives the launcher its login: a token FILE in the cluster's private
     directory, never a value in an argument or the environment. `secrets` [(name, value)] go to the launcher as per-run secrets through
     inherited pipes (`--run-secret-fd NAME=N`): a value is never in an argument, the environment or a file. `runner` is kept for the callers'
     signature; the launcher is started here so that an interrupt reaches IT (it cleans up what it made) before the interrupt goes on."""
-    argv = launcher_argv() + [command, worker] + list(options) + ["--json"]
+    argv = launcher_argv() + [command] + ([worker] if worker else []) + list(options) + ["--json"]
     pass_fds, feeds = [], []
     try:
         if password_fd is not None:
@@ -436,7 +604,7 @@ def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, pa
             feeds.append((read_end, write_end, value))
         env = cluster.env() if cluster is not None else None
         try:
-            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      pass_fds=tuple(pass_fds), env=env, start_new_session=True)
         except OSError as err:
             raise CloudError("cannot run the launcher %s: %s" % (argv[0], err.strerror or err)) from None
@@ -447,28 +615,61 @@ def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, pa
     for read_end, write_end, value in feeds:
         _close_quietly(read_end)
         threading.Thread(target=_feed, args=(write_end, value), daemon=True).start()
+    # the launcher's output is read by two threads, each keeping at most LAUNCHER_OUTPUT_LIMIT bytes (the rest is read and dropped, so the child
+    # never blocks on a full pipe and memory stays bounded); an output over the limit is a bad read, never a partial parse
+    kept = {"out": [b"", False], "err": [b"", False]}
+    readers = [threading.Thread(target=_read_capped, args=(stream, kept[key]), daemon=True)
+               for key, stream in (("out", child.stdout), ("err", child.stderr))]
+    for reader in readers:
+        reader.start()
     try:
-        out, err = child.communicate(timeout=timeout)
+        child.wait(timeout=timeout)
+        for reader in readers:
+            reader.join(timeout=10)
     except subprocess.TimeoutExpired:
         _kill_group(child)
-        child.communicate()
+        child.wait()
         raise CloudError("the launcher did not finish %s within %s s" % (command, timeout)) from None
     except BaseException:
         old = _ignore_signals()
         try:
             child.send_signal(signal.SIGINT)   # the launcher removes what it made, and says so
-            child.communicate(timeout=180)
+            child.wait(timeout=180)
         except BaseException:
             _kill_group(child)
         finally:
             _restore_signals(old)
         raise
+    out, err = kept["out"][0].decode("utf-8", "replace"), kept["err"][0].decode("utf-8", "replace")
+    if kept["out"][1]:
+        raise CloudError("the launcher's output for %s was over %d bytes: not read" % (command, LAUNCHER_OUTPUT_LIMIT))
     try:
         body = json.loads(out) if (out or "").strip() else None
     except ValueError:
         body = None
     clean = cluster.clean if cluster is not None else (lambda text, limit=300: _scrub_lib()(text, (), limit))
     return child.returncode, body if isinstance(body, dict) else None, _one(clean(err or "", 2000))
+
+
+LAUNCHER_OUTPUT_LIMIT = 4000000   # bytes of the launcher's stdout (a snapshot of a large cluster is far below it)
+
+
+def _read_capped(stream, slot, limit=None):
+    """Read `stream` to its end into slot[0], keeping at most the limit; slot[1] says the limit was passed. The rest is read and dropped."""
+    limit = LAUNCHER_OUTPUT_LIMIT if limit is None else limit
+    chunks, size = [], 0
+    try:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            if size <= limit:
+                chunks.append(chunk)
+            size += len(chunk)
+    except (OSError, ValueError):
+        pass
+    data = b"".join(chunks)
+    slot[0], slot[1] = data[:limit], size > limit
 
 
 def _close_quietly(*fds):
@@ -736,9 +937,17 @@ def cluster_token(env=None, now=None, recovery=None):
     Refusal that names the vault pre-check; no other credential or context is ever tried. With `recovery` (launch only), a vault read refused for
     the firewall runs the vault access check once and reads once more. The route itself is the launcher's own function (the reaper's refresh
     runs the same one): this is the thin caller that keeps the wording and the recovery."""
+    return _cluster_token_bounded(env, now, recovery, TOKEN_CMD_SECONDS)
+
+
+def _cluster_token_bounded(env, now, recovery, timeout):
+    """The same mint as `cluster_token`, with `timeout` bounding each command of it (the status summary's bound; the launch entry passes the default)."""
     env = dict(os.environ if env is None else env)
     try:
-        return _lib().cluster_token(env, duration=_duration(env), capture=_capture, now=now, recovery=recovery)
+        def capture(argv, env=None, feed=None):
+            seconds = timeout() if callable(timeout) else timeout   # a callable gives what is LEFT of a whole-run deadline, read at each command
+            return None if seconds <= 0 else _capture(argv, env=env, feed=feed, timeout=seconds)   # None is the route's "could not run or too slow"
+        return _lib().cluster_token(env, duration=_duration(env), capture=capture, now=now, recovery=recovery)
     except _lib().ClusterLogin as err:
         raise Refusal(_token_refusal(err)) from None
 
@@ -836,8 +1045,9 @@ class Cluster:
     place it touches disk: the launcher's tokenFile mechanism needs a file), and removes the directory on every way out: normal end, failure,
     SIGINT, SIGTERM, SIGHUP and SIGQUIT. A stale directory of a killed command is swept at the start of every command. No token is kept between commands."""
 
-    def __init__(self, recovery=None):
+    def __init__(self, recovery=None, timeout=TOKEN_CMD_SECONDS):   # `timeout`: seconds per command of the mint, or a callable (see _cluster_token_bounded)
         self.recovery = recovery
+        self.timeout = timeout
         self.known = set()
         self.dir = None
         self.kubeconfig = None
@@ -858,7 +1068,7 @@ class Cluster:
                 raise Refusal("CW_CLOUD_SERVER is not set: no cluster to reach; nothing was changed")
             root = private_root()
             sweep_stale(root)
-            token = cluster_token(recovery=self.recovery)
+            token = _cluster_token_bounded(None, None, self.recovery, self.timeout)
             self.add(token)
             self.dir = tempfile.mkdtemp(prefix="cmd-%d-" % os.getpid(), dir=str(root))
             self.server = server
@@ -1017,6 +1227,33 @@ def model_entry():
         raise Refusal(str(err)) from None
 
 
+def stack_model_secret(env=None):
+    """The stack-only model credential of a `--stack` launch: (secret NAME, value), or None when CW_STACK_MODEL_SECRET is unset. The value is read from
+    the vault (`az keyvault secret show`, the settings file's vault) into memory only, trimmed, size-capped; a missing, empty, over-cap or unreadable
+    secret is a Refusal naming the secret's NAME (never a value). Called BEFORE any cluster call, so a refusal leaves nothing made."""
+    env = dict(os.environ if env is None else env)
+    name = (env.get("CW_STACK_MODEL_SECRET") or "").strip()
+    if not name:
+        return None
+    sub, vault = (env.get("CW_VAULT_SUBSCRIPTION") or "").strip(), (env.get("CW_VAULT_NAME") or "").strip()
+    why = None
+    ran = None
+    if not sub or not vault:
+        why = "CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME are not set"
+    else:
+        ran = _capture(["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
+                       env={k: v for k, v in env.items() if k not in CLUSTER_DROP}, limit=STACK_MODEL_KEY_LIMIT + 1)
+        if ran is None or ran[0] != 0:
+            why = "could not be read from the vault"
+        elif len(ran[1]) > STACK_MODEL_KEY_LIMIT:
+            why = "is over the %d byte cap" % STACK_MODEL_KEY_LIMIT
+        elif not ran[1].strip():
+            why = "is empty"
+    if why:
+        raise Refusal("the stack model secret %s %s; nothing was created" % (name, why))
+    return name, ran[1].strip()
+
+
 def git_token(repo, cluster):
     """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does."""
     raw = os.environ.get("CW_GIT_TOKEN_CMD")
@@ -1096,13 +1333,16 @@ def _launch(args, runner, now, reserve):
             options += [CREATE_OPTION[key], str(value)]
     if args.agent == "orchestrator":   # only on request: a worker launch hands the launcher exactly what it always did
         options += [CREATE_OPTION["agent"], args.agent, CREATE_OPTION["boss"], args.reports_to]
-    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip())   # the hub setting
+    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip() or args.agent == "orchestrator")   # the hub setting, or an orchestrator (the launcher registers its entry always: it needs the session)
     if hub and args.agent != "orchestrator":   # a worker joins the hub too: the launcher reads the setting itself, it only needs the boss
         options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
         options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
+    stack_model = stack_model_secret() if getattr(args, "stack", False) else None   # before any cluster call; without --stack the setting is ignored
+    if stack_model:
+        options += [CREATE_OPTION["stack_model_secret"], stack_model[0]]
     launcher_argv()   # a launcher that cannot be found refuses here (exit 2), before the vault, the cluster or the launcher is touched
     recovery = VaultRecovery(cloud_dir(state) / VAULT_LOCK_NAME, lambda detail: _audit(engine, "cloud.vault_check", name, detail))
     with Cluster(recovery) as cluster:
@@ -1110,11 +1350,15 @@ def _launch(args, runner, now, reserve):
         cluster.add(model)
         token = git_token(repo, cluster)
         cluster.add(token)
+        run_secrets = [("model-auth", model), ("git-token", token)]
+        if stack_model:
+            cluster.add(stack_model[1])
+            run_secrets.append(("stack-model-key", stack_model[1]))
         read_fd, write_fd = os.pipe()
         try:
             try:
                 code, body, note = run_launcher(runner, "create", name, options, LAUNCH_SECONDS, password_fd=write_fd, cluster=cluster,
-                                                secrets=[("model-auth", model), ("git-token", token)])
+                                                secrets=run_secrets)
             except CloudError as err:
                 _stop_after_failure(engine, runner, name, run_id, "launch: the launcher did not finish", cluster)   # a pod made just before the cut is stopped too
                 raise LaunchError(str(err)) from None
@@ -1126,7 +1370,7 @@ def _launch(args, runner, now, reserve):
             finally:
                 if write_fd is not None:
                     os.close(write_fd)
-            del model, token
+            del model, token, run_secrets
             if code != 0:
                 _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160)})
                 raise LaunchError("the cloud worker was not created: %s" % _reason(code, note))
@@ -1143,6 +1387,8 @@ def _launch(args, runner, now, reserve):
             _write_private(password_path(state, name), password + "\n")
             record["auth_ref"] = "file:" + str(password_path(state, name))   # the switchboard's own copy: its path never comes from the launcher
             record["repo"], record["branch"] = repo, branch
+            if stack_model:
+                record["stack_model_secret"], record["stack_model_key"] = stack_model[0], "delivered"   # the name and that it was delivered; nothing else
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
             if args.reports_to:
                 record["reports_to"] = args.reports_to
@@ -1330,19 +1576,130 @@ def _ended(record, clock=None):
     return when.timestamp() < (time.time() if clock is None else clock)
 
 
+# ---------------------------------------------------------------- the one cluster read (the status summary)
+
+SNAPSHOT_SECONDS = 30   # the bound of the WHOLE cloud summary read, ONE monotonic deadline: each step (the vault read, the token create, the launcher
+#                         run) gets what is left of it, so the login and the launcher together never pass it (a step that starts after it refuses)
+
+
+def _safe(value, default="Unknown"):
+    """A cluster-supplied word that is printed (a pool, a size, a phase): the launcher's `safe_value` rule, applied again here (defence in depth)."""
+    return _lib().safe_value(value) if value else default
+
+
+def _cluster_snapshot(runner, cluster, timeout):
+    """ONE read of the cluster: the launcher's read-only `snapshot` command (the pods of the namespace and, when the login may list them, the
+    nodes). A failure is a CloudError with one line of reason: the caller says it, never hides it."""
+    code, body, note = run_launcher(runner, "snapshot", "", (), timeout, cluster=cluster)
+    if code != 0:
+        raise CloudError("the cluster was not read (%s)" % _reason(code, note))
+    if not isinstance(body, dict):
+        raise CloudError("the cluster was not read (the launcher printed no snapshot)")
+    return body
+
+
+def _pod_known(record):
+    """INVARIANT: a cloud worker record's runtime_id is `pod/<name>` (the form the launch writes; `tunnel` reads the same one). A record with any
+    other form cannot be matched to a pod by name, so its pod is UNKNOWN: it is never called ended or gone, and `cloud-clear` never removes it."""
+    return bool(POD_RE.fullmatch(record.get("runtime_id") or ""))
+
+
+def _pod_of(record, snapshot):
+    """The pod of the snapshot that belongs to the record (by the record's pod name and by the worker annotation), or None when there is none.
+    Only for a record with `_pod_known`: for any other, None would read as gone, so the callers check that first."""
+    runtime = (record.get("runtime_id") or "").strip()
+    name = runtime.rsplit("/", 1)[-1] if "/" in runtime else runtime
+    worker = record.get("worker")
+    for pod in ((snapshot or {}).get("pods") or []):
+        if not isinstance(pod, dict):
+            continue
+        if (pod.get("name") and pod.get("name") == name) or (pod.get("worker") and worker and pod.get("worker") == worker):
+            return pod
+    return None
+
+
+def _age(seconds):
+    """A span of time as one short word: 5d3h, 3h12m, 40m."""
+    seconds = max(0, int(seconds))
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        return "%dd%dh" % (days, hours)
+    if hours:
+        return "%dh%dm" % (hours, rest // 60)
+    return "%dm" % (rest // 60)
+
+
+def _node_age(node, now):
+    """The node's age in seconds, or None when its creation time is not readable."""
+    try:
+        when = datetime.datetime.strptime(str(node.get("created")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    return max(0, int(now - when.timestamp()))
+
+
+def _pods_by_phase(snapshot):
+    """The pods of the snapshot by phase."""
+    phases = {}
+    for pod in ((snapshot or {}).get("pods") or []):
+        phase = _safe(pod.get("phase")) if isinstance(pod, dict) else "Unknown"
+        phases[phase] = phases.get(phase, 0) + 1
+    return phases
+
+
+def _summary_line(snapshot, now):
+    """The ONE cloud summary line: the nodes by pool and size with their ages, and the pods of the namespace by phase. When the login may not
+    LIST the nodes, the node count comes from the POD PLACEMENT (the distinct node names of the pods) and the line says so: it cannot see the
+    idle nodes."""
+    pods = (snapshot or {}).get("pods") or []
+    phases = _pods_by_phase(snapshot)
+    order = ("Running", "Pending", "Succeeded", "Failed", "Unknown")   # the phases in the order the line shows them
+    pod_text = ", ".join("%s %d" % (phase, phases[phase]) for phase in sorted(phases, key=lambda p: (order.index(p) if p in order else len(order), p)))
+    if (snapshot or {}).get("nodes_read"):
+        groups = {}
+        for node in (snapshot.get("nodes") or []):
+            groups.setdefault(_safe(node.get("pool"), "unknown"), {}).setdefault(_safe(node.get("size"), "unknown"), []).append(node)
+        parts = []
+        for pool in sorted(groups):
+            sizes = groups[pool]
+            total = sum(len(v) for v in sizes.values())
+            ages = [a for a in (_node_age(node, now) for node in [n for v in sizes.values() for n in v]) if a is not None]
+            oldest = _age(max(ages)) if ages else "unknown"
+            parts.append("%s %d x %s, oldest %s" % (pool, total, ", ".join("%d x %s" % (len(sizes[s]), s) for s in sorted(sizes)), oldest))
+        nodes_text = "nodes %d (%s)" % (len(snapshot.get("nodes") or []), "; ".join(parts)) if parts else "nodes 0"
+    else:
+        names = {pod.get("node") for pod in pods if isinstance(pod, dict) and pod.get("node")}
+        nodes_text = ("nodes at least %d carry workers (from pod placement; pool, size and age need list on nodes; idle nodes are not visible)"
+                      % len(names))
+    return "cloud: %s; pods %d (%s)" % (nodes_text, len(pods), pod_text)
+
+
 def status_lines(runner, state, timeout=STATUS_SECONDS):
-    """(lines, rows) for `status`: per cloud worker its record and, from the launcher's read-only `status`, phase and cost, and whether the worker
-    answers through a tunnel that exists only for that probe. One cluster token serves the whole command. A trouble is said on the line, never raised."""
+    """(lines, rows) for `status`: ONE cloud summary line from ONE cluster read, then per cloud worker its record and, from the launcher's
+    read-only `status`, phase and cost, and whether the worker answers through a tunnel that exists only for that probe. A record whose hard
+    deadline has passed and whose pod is gone is ENDED (the deadline is the time it ended); a record whose pod still stands says so. A trouble is
+    said on the line, never raised."""
     records = list_records(state)
     lines, rows = [], []
-    cluster = None
+    cluster, snapshot, reason = None, None, None
+    started = time.monotonic()
+    deadline = started + SNAPSHOT_SECONDS   # ONE deadline for the whole read: the login's commands and the launcher run share it
+    left = lambda: deadline - time.monotonic()
     try:
-        # one mint per `status` command, and none when no record needs a probe (a broken record, or a worker past its hard deadline)
-        if any("problem" not in r and not _ended(r) for r in records):
-            try:
-                cluster = Cluster().__enter__()
-            except CloudError as err:
-                cluster, lines = None, ["      cloud workers: no cluster reached (%s)" % _one(str(err), 300)]
+        # the summary line is printed with or without records: a cleared fleet still shows what the cluster holds, or why it is not read
+        try:
+            cluster = Cluster(timeout=left).__enter__()
+            if left() <= 0:
+                raise CloudError("the read ran out of its %d s" % SNAPSHOT_SECONDS)
+            snapshot = _cluster_snapshot(runner, cluster, max(1, int(left())))
+        except CloudError as err:
+            reason = _one(str(err), 300)
+        if snapshot is None:
+            lines.append("      cloud: cluster not read (%s) after %d s; nodes and pods unknown"
+                         % (reason or "the launcher read nothing", int(time.monotonic() - started)))
+        else:
+            lines.append("      " + _summary_line(snapshot, time.time()))
         for record in records:
             row = {"worker": record["worker"]}
             if "problem" in record:
@@ -1352,9 +1709,26 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
                 continue
             row.update({key: record.get(key) for key in ("runtime_id", "idle_deadline", "hard_deadline", "session")})
             if _ended(record):
-                row["launcher_status"] = "ended"
+                pod = _pod_of(record, snapshot) if snapshot is not None else None
+                if snapshot is not None and not _pod_known(record):   # its pod cannot be told: never "ended"
+                    row["launcher_status"] = "pod unknown"
+                    lines.append("      cloud %s: %s, past its hard deadline %s (pod unknown: the runtime id is not pod/<name>)"
+                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
+                elif snapshot is None:   # the cluster was not read: such a record is NEVER called ended
+                    row["launcher_status"] = "no cluster reached"
+                    lines.append("      cloud %s: %s, past its hard deadline %s (not queried; no cluster reached)"
+                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
+                elif pod is None:
+                    row["launcher_status"] = "ended"
+                    row["ended_at"] = record.get("hard_deadline")
+                    lines.append("      cloud %s: %s, ended at %s (no pod), past its hard deadline"
+                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
+                else:
+                    row["launcher_status"] = "past its hard deadline"
+                    row["phase"] = pod.get("phase")
+                    lines.append("      cloud %s: %s, pod still present past its hard deadline %s (phase %s)"
+                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline"), _safe(pod.get("phase"), "?")))
                 rows.append(row)
-                lines.append("      cloud %s: %s, past its hard deadline %s (not queried)" % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
                 continue
             if cluster is None:
                 row["launcher_status"] = "no cluster reached"
@@ -1367,14 +1741,14 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
                 code, body, note = -1, None, str(err)
             if code == 0 and body is not None:
                 row.update({key: body.get(key) for key in ("phase", "idle_since", "cost_estimate_usd")})
-                extra = "phase %s, about $%s so far" % (body.get("phase", "?"), body.get("cost_estimate_usd", "?"))
+                extra = "phase %s, about $%s so far" % (_safe(body.get("phase"), "?"), body.get("cost_estimate_usd", "?"))
             else:
                 row["launcher_status"] = _reason(code, note)
                 extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
             row["answers"] = _answers(state, cluster, record, timeout)
             rows.append(row)
             lines.append("      cloud %s: %s, %s; %s; stops at %s" % (record["worker"], record["runtime_id"], extra,
-                                                                 "answers" if row["answers"] else "does not answer", record.get("hard_deadline") or "?"))
+                                                                     "answers" if row["answers"] else "does not answer", record.get("hard_deadline") or "?"))
     finally:
         if cluster is not None:
             cluster.close()
@@ -1404,6 +1778,12 @@ def status_extra(runner):
 
 # ---------------------------------------------------------------- retire
 
+def _may_retire(kind, record):
+    """THE caller rule of a cloud worker's removal, factored ONCE: the operator (a person at a shell), the Chief of Staff, or the worker's own
+    boss. `retire` and `cloud-clear` both use this one function; neither keeps a copy of it."""
+    return kind[0] == "person" or (kind[0] == "agent" and ((len(kind) > 2 and kind[2] == "chief-of-staff") or kind[1] == record.get("reports_to")))
+
+
 @refusals
 def cmd_retire(args, runner, now, record):
     """`retire NAME` for a cloud worker: `stop` (the end hook runs, the pod and its scratch volume go), then the record goes. A stop that exits 1
@@ -1411,8 +1791,7 @@ def cmd_retire(args, runner, now, record):
     LaunchError = H["LaunchError"]
     engine, state, _ = H["build_engine"](runner, now, "cli")
     kind = H["gates_caller_kind"](runner, now)
-    allowed = kind[0] == "person" or (kind[0] == "agent" and ((len(kind) > 2 and kind[2] == "chief-of-staff") or kind[1] == record.get("reports_to")))
-    if not allowed:
+    if not _may_retire(kind, record):
         _audit(engine, "cloud.retire_refused", args.name, {"why": _one(str(kind[1]), 120)})
         raise LaunchError("refused: only the operator, the Chief of Staff or %s's own boss may retire it" % args.name)
     if args.undo:
@@ -1442,4 +1821,47 @@ def cmd_retire(args, runner, now, record):
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     print("%s is retired: its pod and scratch volume are deleted%s" % (
         args.name, "; work was pushed to branch %s" % wip if pushed and wip else "; nothing needed pushing" if pushed is False else ""))
+    return H["EXIT_OK"]
+
+
+# ---------------------------------------------------------------- cloud-clear: the records whose pod is gone
+
+@refusals
+def cmd_cloud_clear(args, runner, now):
+    """`cloud-clear [--dry-run]`: every cloud worker record whose pod is gone AND whose hard deadline has passed is removed (the record and its
+    password file), and every one it removes is named. A record with a pod, or one not past its deadline, is never touched. It refuses when the
+    cluster could not be read: it never removes a record it cannot prove is gone. The caller rule is `retire`'s (the operator, the Chief of Staff
+    or the worker's own boss)."""
+    engine, state, _ = H["build_engine"](runner, now, "cli")
+    kind = H["gates_caller_kind"](runner, now)
+    records = [r for r in list_records(state) if "problem" not in r]
+    if not records:
+        print("no cloud worker records")
+        return H["EXIT_OK"]
+    try:
+        with Cluster(timeout=SNAPSHOT_SECONDS) as cluster:
+            snapshot = _cluster_snapshot(runner, cluster, SNAPSHOT_SECONDS)
+    except CloudError as err:
+        raise H["LaunchError"]("the cluster could not be read (%s); nothing was cleared" % _one(str(err), 200)) from None
+    dry_run = bool(getattr(args, "dry_run", False))
+    cleared = 0
+    for record in records:
+        name = record["worker"]
+        if not _ended(record):   # not past its hard deadline: it may still be working
+            continue
+        if _pod_of(record, snapshot) is not None or not _pod_known(record):   # its pod still stands, or cannot be told: the record stays
+            continue
+        if not _may_retire(kind, record):
+            print("skipped %s (not your worker)" % name)
+            continue
+        if dry_run:
+            print("would clear %s (pod gone, deadline %s)" % (name, record.get("hard_deadline")))
+            continue
+        remove_record(state, name)
+        _audit(engine, "cloud.cleared", name, {"runtime_id": record.get("runtime_id"), "hard_deadline": record.get("hard_deadline")})
+        _registry_note(engine, "retire", state, name, "cleared: the pod is gone and the hard deadline has passed")
+        print("cleared %s (pod gone, deadline %s)" % (name, record.get("hard_deadline")))
+        cleared += 1
+    if not cleared and not dry_run:
+        print("nothing to clear")
     return H["EXIT_OK"]
