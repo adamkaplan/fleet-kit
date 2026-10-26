@@ -371,7 +371,7 @@ def serving_waits(asks, held, links, reminders, names, now, stalled_hours):
 def figures(name, info, rows, now, cfg):
     """One orchestrator's figures. `info`: asks [{repo, number, first_seen}] or None (unreadable), busy, idle, messages, decisions."""
     out = {"name": name, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "decisions": info["decisions"],
-           "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
+           "cloud": info.get("cloud") or 0, "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
            "waiting_owner": None, "waiting_cos": None, "waiting_live": None, "parked": None, "charter_moves_1h": None,
            "waiting_owner_pr": None, "waiting_time": None}
     asks = info.get("asks")
@@ -794,6 +794,7 @@ def _refresh_asks(ctx, state, now, rows=()):
     state["unattributed"] = unattributed
     counts, nobody, notices = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
     state["decision_counts"], state["decisions_unattributed"], state["pr_notices"] = counts, nobody, notices
+    state["cloud_unplaced"] = int(getattr(ctx, "cloud_unplaced", 0) or 0)   # #1097: live cloud workers whose boss is not an orchestrator lane (or has none)
     held = held_prs(ctx.state_dir)
     state["held_links"] = {k: sorted(v) for k, v in resolve_held_links(ctx, state, budget, held, now, problems).items()}
     state["reads"] = budget.to_state()
@@ -838,7 +839,7 @@ def tick(ctx):
             serving = serving_waits(asks, held, state.get("held_links") or {}, reminders, names, now, ctx.cfg["stalled_hours"])
             asks = [dict(a, via_pr=serving[(a["repo"], a["number"])]) if serving.get((a["repo"], a["number"])) in ("owner_pr", "cos_pr")
                     else dict(a, timed=True) if serving.get((a["repo"], a["number"])) == "time" else a for a in asks]
-        fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],
+        fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "cloud": info.get("cloud") or 0,
                              "decisions": None if waiting is None else waiting.get(name, 0),
                              "charter": (state.get("charter_of") or {}).get(name), "repo": info.get("repo")}, rows, now, ctx.cfg)
         latest[name] = fig
@@ -849,13 +850,15 @@ def tick(ctx):
             for gone in sorted(history)[:-HISTORY_DAYS]:
                 del history[gone]
         mine = old if isinstance(old, dict) and old.get("day") == day else {"day": day, "hours": {}}
-        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_owner_pr", "waiting_time", "waiting_cos", "waiting_live", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_owner_pr", "waiting_time", "waiting_cos", "waiting_live", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "cloud", "messages", "decisions", "oldest_stall_hours")}
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
         if hold_back:
             text, episodes[name] = None, before   # nothing judged: the episode memory is exactly as it was
         if text and ctx.cfg["enabled"] and ctx.cos:
+            severity, reasons = crossing(fig, ctx.cfg)
+            ctx.alert = {"agent": name, "state": "%s|%s" % (severity, ",".join(sorted(reasons)))}   # what the alert is ABOUT, for the daemon's repeat rule
             ctx.wake(text)
             sent.append((name, text))
         elif text:
@@ -886,11 +889,13 @@ def status_lines(state_dir, now):
     out = waiting + ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
     for name in sorted(latest):
         f = latest[name]
-        out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, waiting live %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
+        out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, waiting live %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle%s" % (
             name, num(f["open_asks"]), num(f["stalled"]), num(f.get("waiting_owner")), num(f.get("parked")), num(f.get("waiting_cos")), num(f.get("waiting_live")),
-            num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+            num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"], (" +%d\u2601 cloud" % f["cloud"]) if f.get("cloud") else ""))
         if f.get("waiting_owner_pr") or f.get("waiting_time"):
             out[-1] += "; " + waiting_phrase(f)
+    if state.get("cloud_unplaced"):
+        out.append("  %d live cloud worker(s) with no orchestrator lane (no boss, or a boss that is not an orchestrator)" % state["cloud_unplaced"])
     if state.get("decisions_unattributed"):
         out.append("  %d decision(s) not attributed (the parent of their issue could not be read, or no orchestrator's charter is on its chain)" % state["decisions_unattributed"])
     if state.get("pr_notices"):

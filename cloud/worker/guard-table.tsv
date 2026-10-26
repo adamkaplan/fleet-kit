@@ -24,3 +24,11 @@ api-write-flags-input	denied	gh	GET	--input	api write flag	api repos/acme-org/wi
 api-write-flags-graphql	denied	gh	GET	graphql	api write flag	api graphql
 # ---- ask 1166 rows: add below this line ----
 # ---- ask 1200 rows: add below this line ----
+pr-edit-body-file	allowed	gh	PATCH	repos/OWNER/NAME/pulls/N (body only)		pr edit 7 --body-file /tmp/f
+pr-edit-inline-body	denied	gh	PATCH	pr edit N --body	pr edit with an inline body	pr edit 7 --body x
+pr-edit-other-option	denied	gh	PATCH	pr edit N with any option but --body-file	pr edit with another option	pr edit 7 --title x
+pr-edit-other-number	denied	gh	PATCH	pr edit N, N not the pod's own pull request	editing a pull request that is not the pod's own	pr edit 8 --body-file /tmp/f
+pr-edit-url-other-repo	denied	gh	PATCH	pr edit URL or --repo	editing a pull request by URL or in another repository	pr edit https://github.com/other-org/other-repo/pull/7 --body-file /tmp/f
+pr-edit-api	denied	gh	PATCH	repos/OWNER/NAME/pulls/N	writing a pull request through the raw API	api -X PATCH repos/acme-org/widget-service/pulls/7
+pr-edit-no-hold-line	denied	gh	PATCH	client only: the new body drops or changes the line MERGE: captain	a body without the hold line	pr edit 7 --body-file /tmp/nohold
+pr-edit-read-failed	denied	gh	PATCH	client only: the read of the pull request failed	the pull request could not be read	pr edit 10 --body-file /tmp/f

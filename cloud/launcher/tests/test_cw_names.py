@@ -33,9 +33,9 @@ OLD = re.compile(P, re.I)
 # The channel's interface names, set by the switchboard, and byte-identical copies of its own files: the ONLY places the old prefix may stay.
 # The names are stripped before the scan; the copies (exact paths) are skipped whole. The word planted in any other file still fails.
 CHANNEL_NAMES = tuple(P.upper() + x for x in ("_AGENT_NAME", "_BOSS", "_CLOUD_CHANNEL_URL", "_CLOUD_TOKEN_FILE"))
-CHANNEL_NAMES += tuple(P.upper() + x for x in ("_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS"))   # the hub manifest's own names
+CHANNEL_NAMES += tuple(P.upper() + x for x in ("_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS", "_CLOUD_AGENT_NAMESPACE"))   # the hub manifest's own names
 CHANNEL_COPIES = ("cloud/worker/bin/cloud_cli.py", "cloud/worker/bin/cloud_client.py", "cloud/worker/bin/cloud_hub.py",
-                  "cloud/worker/bin/cloud_channel.py", "cloud/worker/bin/cloud_channel_server.py", "cloud/worker/agents/orchestrator.md")
+                  "cloud/worker/bin/cloud_channel.py", "cloud/worker/bin/cloud_channel_server.py", "cloud/worker/bin/cloud_relay.py", "cloud/worker/agents/orchestrator.md")
 
 
 def old_name_in(rel, text):
@@ -102,9 +102,10 @@ class S5Names(base.Base):
             rel = "cloud/k8s/cloud-hub.yaml"
             self.assertFalse(old_name_in(rel, text))
             self.assertFalse(old_name_in(rel, " ".join(P.upper() + x for x in (
-                "_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS"))))
+                "_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS", "_CLOUD_AGENT_NAMESPACE"))))
             self.assertTrue(old_name_in(rel, text + "\n" + P.upper() + "_CLOUD_HUB_OTHER: x\n"))
             self.assertTrue(old_name_in(rel, text + "\n# the " + P + " word\n"))
+            self.assertTrue(old_name_in(rel, text + "\n# the " + P + " word\n" + P.upper() + "_CLOUD_AGENT_NAMESPACE: x\n"))
 
     def test_table_maps_only_to_cw_names(self):
         for old, new in NAMES.items():

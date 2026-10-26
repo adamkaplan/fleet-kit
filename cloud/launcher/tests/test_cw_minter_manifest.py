@@ -152,13 +152,26 @@ class Mutants(unittest.TestCase):
 
 
 class Runner(unittest.TestCase):
-    def test_this_file_is_chained_last_and_never_an_exception(self):
+    NAME = os.path.basename(__file__)
+
+    def chain_problems(self, text):
+        out = []
+        if "tests/%s" % self.NAME not in text:
+            out.append("not chained")
+        if self.NAME + ":" in text.split("EXCEPTIONS=")[1].split("\n")[0]:
+            out.append("listed in EXCEPTIONS")
+        return out
+
+    def test_this_file_is_chained_and_never_an_exception(self):
         with open(os.path.join(ROOT, "bin", "test-cloud-launcher")) as f:
             text = f.read()
-        self.assertIn("tests/%s" % os.path.basename(__file__), text)
-        self.assertNotIn(os.path.basename(__file__) + ":", text.split("EXCEPTIONS=")[1].split("\n")[0])
-        chain = re.findall(r"tests/(test_\w+\.py)", text.split("done\n", 1)[1])
-        self.assertEqual(chain[-1], os.path.basename(__file__))
+        self.assertEqual(self.chain_problems(text), [])
+        unchained = text.replace("tests/%s" % self.NAME, "tests/gone.py")
+        self.assertNotEqual(unchained, text)
+        self.assertIn("not chained", self.chain_problems(unchained))
+        listed = text.replace('EXCEPTIONS="', 'EXCEPTIONS="%s:x ' % self.NAME, 1)
+        self.assertNotEqual(listed, text)
+        self.assertIn("listed in EXCEPTIONS", self.chain_problems(listed))
 
 
 if __name__ == "__main__":

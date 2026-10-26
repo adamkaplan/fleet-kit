@@ -343,12 +343,28 @@ def _held_defects(body):
     else:
         rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in section(HELD_TABLE) if l.strip().startswith("|")]
         head = [_ascii_lower(c) for c in rows[0]] if rows else []
-        data = [r for r in rows[2:]] if len(rows) >= 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in rows[1]) else None
-        if head != ["before", "after"] or data is None:
-            problems.append("`%s`: the table needs a Before and an After column (a header row, a separator row, then the rows)" % HELD_TABLE)
+        sep_cells = len(rows) >= 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in rows[1])
+        has_sep = sep_cells and len(rows[1]) == len(head)
+        data = rows[2:] if has_sep else []
+        dup = next((n for n in ("before", "after") if head.count(n) > 1), None)
+        fenced = not rows and any(l.strip().startswith("|") for l in lines[at + pos[HELD_TABLE]:at + top_end])
+        if fenced:
+            problems.append("`%s`: the table is inside a code fence, it must be plain text" % HELD_TABLE)
+        elif "before" not in head:
+            problems.append("`%s`: the table has no Before column" % HELD_TABLE)
+        elif "after" not in head:
+            problems.append("`%s`: the table has no After column" % HELD_TABLE)
+        elif dup:
+            problems.append("`%s`: the table has a duplicate %s column" % (HELD_TABLE, dup.capitalize()))
+        elif sep_cells and not has_sep:
+            problems.append("`%s`: separator row has %d columns, the header has %d" % (HELD_TABLE, len(rows[1]), len(head)))
+        elif not has_sep:
+            problems.append("`%s`: the table has no separator row" % HELD_TABLE)
+        elif not data:
+            problems.append("`%s`: the table has no data row" % HELD_TABLE)
         elif not 2 <= len(data) <= 4:
             problems.append("`%s`: the table has %d rows, it is 2 to 4" % (HELD_TABLE, len(data)))
-        elif any(len(r) != 2 or any(words(c) < 3 or _HELD_PLACEHOLDER_RE.search(c) for c in r) for r in data):
+        elif any(len(r) != len(head) or any(words(r[i]) < 3 or _HELD_PLACEHOLDER_RE.search(r[i]) for i in (head.index("before"), head.index("after"))) for r in data):
             problems.append("`%s`: every table cell is a plain sentence (at least 3 word characters, no <placeholder>)" % HELD_TABLE)
     if HELD_EXAMPLE not in pos:
         problems.append("the held PR needs an `%s` section: one concrete case in a few lines" % HELD_EXAMPLE)

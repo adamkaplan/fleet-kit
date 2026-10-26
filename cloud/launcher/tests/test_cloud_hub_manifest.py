@@ -64,7 +64,7 @@ class T(unittest.TestCase):
         self.assertEqual(c["command"], ["python3", "/usr/local/bin/cloud_hub.py"])
         self.assertNotRegex(self.text, r"sha256:[0-9a-f]{64}")
         env = {e["name"]: e["value"] for e in c["env"]}
-        self.assertEqual(set(env), {"FLEET_CLOUD_CHANNEL_LISTEN", "FLEET_CLOUD_HUB_AGENTS", "FLEET_CLOUD_HUB_SECRETS", "FLEET_CLOUD_HUB_DECISIONS"})
+        self.assertEqual(set(env), {"FLEET_CLOUD_CHANNEL_LISTEN", "FLEET_CLOUD_HUB_AGENTS", "FLEET_CLOUD_HUB_SECRETS", "FLEET_CLOUD_HUB_DECISIONS", "FLEET_CLOUD_AGENT_NAMESPACE"})
         self.assertEqual(env["FLEET_CLOUD_HUB_DECISIONS"], "/var/hub/decisions.json")
         self.assertIs(c["securityContext"]["readOnlyRootFilesystem"], True)
         self.assertIs(c["securityContext"]["allowPrivilegeEscalation"], False)
@@ -229,6 +229,53 @@ class Docs(unittest.TestCase):
     def test_mutant_svc_short_form_fails(self):
         mut = self.sec.replace(".svc.cluster.local", ".svc")
         self.assertTrue(docs_problems(mut))
+
+
+def namespace_setting_problems(docs, channel_doc, quickstart):
+    """The places that must name FLEET_CLOUD_AGENT_NAMESPACE with the manifest's own namespace as its value."""
+    dep = [d for d in docs if d["kind"] == "Deployment"][0]
+    env = {e["name"]: e.get("value") for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
+    ns = dep["metadata"]["namespace"]
+    bad = []
+    if env.get("FLEET_CLOUD_AGENT_NAMESPACE") != ns:
+        bad.append("manifest")
+    for label, text in (("channel doc", channel_doc), ("quickstart", quickstart)):
+        if not re.search(r"FLEET_CLOUD_AGENT_NAMESPACE`[^.]{0,40}`%s`" % re.escape(ns), text):
+            bad.append(label)
+    return bad
+
+
+class NamespaceSetting(unittest.TestCase):
+    def setUp(self):
+        with open(PATH) as fh:
+            self.docs = parse(fh.read())
+        root = os.path.join(HERE, "..", "..", "..", "docs")
+        with open(os.path.join(root, "cloud-channel.md")) as fh:
+            self.channel = fh.read()
+        with open(os.path.join(root, "cloud-operator-quickstart.md")) as fh:
+            self.quick = fh.read()
+
+    def test_namespace_setting_documented(self):
+        self.assertEqual(namespace_setting_problems(self.docs, self.channel, self.quick), [])
+
+    def test_namespace_setting_matches_manifest_namespace(self):
+        for d in self.docs:
+            if d["kind"] == "Deployment":
+                env = d["spec"]["template"]["spec"]["containers"][0]["env"]
+                self.assertEqual({e["name"]: e["value"] for e in env}["FLEET_CLOUD_AGENT_NAMESPACE"], d["metadata"]["namespace"])
+        wrong = copy.deepcopy(self.docs)
+        removed = copy.deepcopy(self.docs)
+        for docs, change in ((wrong, "set"), (removed, "drop")):
+            for d in docs:
+                if d["kind"] == "Deployment":
+                    c = d["spec"]["template"]["spec"]["containers"][0]
+                    if change == "set":
+                        for e in c["env"]:
+                            if e["name"] == "FLEET_CLOUD_AGENT_NAMESPACE":
+                                e["value"] = "other-" + "agents"
+                    else:
+                        c["env"] = [e for e in c["env"] if e["name"] != "FLEET_CLOUD_AGENT_NAMESPACE"]
+            self.assertEqual(namespace_setting_problems(docs, self.channel, self.quick), ["manifest"], change)
 
 
 if __name__ == "__main__":
