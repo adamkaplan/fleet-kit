@@ -1,5 +1,6 @@
 # The parts of the daemon, in the order they run, relative to this file. The line naming the entry is the entry's own code.
 fleet-switchboard
+switchboard/observing.py
 switchboard/v2_transport.py
 switchboard/facts.py
 switchboard/judge_request.py
@@ -19,3 +20,14 @@ switchboard/audit.py
 switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
+switchboard/docker_reaper.py
+switchboard/workers_report.py
+switchboard/batch_decision.py
+switchboard/sweep.py
+switchboard/plan_notice.py
+switchboard/disk_prune.py
+switchboard/heavy_budget.py
+switchboard/config_reload.py
+switchboard/daemon_restart.py
+switchboard/labels_ensure.py
+switchboard/orders_cos.py
