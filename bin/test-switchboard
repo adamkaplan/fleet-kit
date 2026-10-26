@@ -94095,6 +94095,7 @@ fleet-switchboard:github_calls_status
 fleet-switchboard:github_status
 fleet-switchboard:handle
 fleet-switchboard:health_watched_repos
+fleet-switchboard:issue_is_ask
 fleet-switchboard:janitor_agent_roots
 fleet-switchboard:job_read
 fleet-switchboard:json
@@ -94102,6 +94103,7 @@ fleet-switchboard:lab_facts
 fleet-switchboard:launch_memory_check
 fleet-switchboard:load_config
 fleet-switchboard:pane_exit_audit_tail
+fleet-switchboard:preflight_body_warnings
 fleet-switchboard:pr_state_read
 fleet-switchboard:pull_state
 fleet-switchboard:read_decisions_file
