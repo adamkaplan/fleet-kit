@@ -63,6 +63,7 @@ MOVED = ('rating_at',
          'closure_read',
          'closure_hold',
          '_printable',
+         '_judged_key',
          '_gh_json',
          'impact_plan',
          'cmd_impact_hold',
@@ -1088,7 +1089,7 @@ def delegated_clear_map(engine, runner, repo, item, base_sha, rule, derived=None
         derived = derived if derived is not None else module.closure_for(rule, matches=impact_floor.matches)
     except Exception:
         return None   # the closure cannot be derived: the file cannot be mapped (refused, held)
-    judged = item["filename"] in derived.files
+    judged = impact_floor.matches(item["filename"], sorted(derived.files))
     unread = None if judged else ["%s cannot be read, so an added closure name cannot be ruled out: refused" % _printable(item["filename"])]   # a part the closure does not judge: unreadable is refused here (the clear's mapper skips a path it does not judge)
     try:
         if not isinstance(base_sha, str) or not base_sha:
@@ -1107,10 +1108,15 @@ def delegated_clear_map(engine, runner, repo, item, base_sha, rule, derived=None
             return found or module.shadow_refusals(base, head, names, item["filename"])   # the entry's own definitions are judged above; the added name is the only thing left to say
         if not judged:   # a part the closure does not judge: only a name added under a closure name is looked at (#1339)
             return module.shadow_refusals(base, head, names, item["filename"])
-        found = module.closure_refusals(base, head, item["patch"], list(derived.files[item["filename"]]["roots"]), set(), True)   # any other file the clear loads: its import-time code and the definitions the clear runs
+        found = module.closure_refusals(base, head, item["patch"], list(derived.files[_judged_key(derived, item["filename"])]["roots"]), set(), True)   # any other file the clear loads: its import-time code and the definitions the clear runs
         return sorted(set(found) | set(module.shadow_refusals(base, head, names, item["filename"])))
     except Exception:
         return unread
+
+
+def _judged_key(derived, filename):
+    """The derived file a changed path names (the floor's matcher reads `./bin/x` and `BIN/X` as the file they name)."""
+    return next(f for f in sorted(derived.files) if impact_floor.matches(filename, [f]))
 
 
 def _printable(text):
@@ -1154,7 +1160,7 @@ def closure_read(engine, runner, repo, number, head, rule, take=False):
             return None, {}, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(head)[:8], str(after)[:8])
         listed = rule.get("clear_code_paths") or []
         for item in files:   # a changed file the closure judges: each changed LINE is mapped to its definition by the ast of the file it belongs to
-            if isinstance(item.get("filename"), str) and (item["filename"] in derived.files or impact_floor.matches(item["filename"], ["bin/switchboard/*.py"])) and not impact_floor.matches(item["filename"], listed) and item.get("status") == "modified":
+            if isinstance(item.get("filename"), str) and (impact_floor.matches(item["filename"], sorted(derived.files)) or impact_floor.matches(item["filename"], ["bin/switchboard/*.py"])) and not impact_floor.matches(item["filename"], listed) and item.get("status") == "modified":
                 closure[item["filename"]] = module.cached_map(module.map_key(engine.state_dir, repo, item, base_sha, rule),
                                                               lambda: delegated_clear_map(engine, runner, repo, item, base_sha, rule), take)   # the line the daemon posts hands what it read to the clear, once
     return files, closure, None
@@ -1174,7 +1180,7 @@ def closure_hold(engine, repo, number, head, paths, matrix):
         derived = module.closure_for(rule, matches=impact_floor.matches)
     except Exception as err:
         return None, "the clear's closure cannot be derived (%s): held" % _one_line(str(err), 140)
-    if not any(isinstance(p, str) and not impact_floor.matches(p, listed) and (p in derived.files or impact_floor.matches(p, ["bin/switchboard/*.py"])) for p in paths):
+    if not any(isinstance(p, str) and not impact_floor.matches(p, listed) and (impact_floor.matches(p, sorted(derived.files)) or impact_floor.matches(p, ["bin/switchboard/*.py"])) for p in paths):
         return [], None
     files, closure, why = closure_read(engine, engine.gh_runner or subprocess.run, repo, number, head, rule, False)
     if why:

@@ -389,6 +389,8 @@ def cached_map(key, compute, take):
     if take:
         kept = MAP_CACHE.pop(key, None)
         return list(kept) if kept is not None else compute()
+    if key in MAP_CACHE:   # content-addressed, so a kept answer is the answer: the owner hold and the line read a file once between them
+        return list(MAP_CACHE[key])
     got = compute()
     if got is not None:
         if len(MAP_CACHE) >= MAP_CACHE_MAX:
@@ -565,6 +567,15 @@ def _is_dunder(name):
     return name.startswith("__") and name.endswith("__")
 
 
+def _prefixes(node):
+    """The constant text a computed name starts with (`"cmd_" + action`, an f-string): the leftmost string constant, three characters or more."""
+    while isinstance(node, ast.BinOp):
+        node = node.left
+    if isinstance(node, ast.JoinedStr) and node.values:
+        node = node.values[0]
+    return [node.value] if isinstance(node, ast.Constant) and isinstance(node.value, str) and len(node.value) >= 3 else []
+
+
 def closure(tree, roots, dynamic_actions=()):
     """(def names, global names, referenced names, {class: methods}) reachable from `roots` by NAME: every module-level definition a closure definition refers to (a call, a value, a default, a
     decorator, a base class) and every module-level binding it reads (its right-hand side, to a fixed point). A CLASS the closure refers to brings its own statements (bases, decorators, class
@@ -574,7 +585,7 @@ def closure(tree, roots, dynamic_actions=()):
     `add_<action>_parsers`. Any OTHER dynamic edge (getattr, globals(), importlib, eval...) is a stated limit: a test lists the ones on the path from `main`."""
     defs, binds = _index(tree)
     roots = list(defs) if "*" in roots else list(roots)   # `*`: every function of the module (a module the clear runs and no recording says which)
-    seen, globals_, refs, members, todo = set(), set(), set(), {}, list(roots)
+    seen, globals_, refs, members, todo, prefixes = set(), set(), set(), {}, list(roots), set()
 
     def walk(nodes):
         while nodes:
@@ -590,8 +601,12 @@ def closure(tree, roots, dynamic_actions=()):
                     refs.add(x.attr)
                 elif isinstance(x, ast.Constant) and x.value == "cmd_":
                     todo.extend("cmd_" + a.replace("-", "_") for a in dynamic_actions)
-                if isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE":
-                    todo.extend("add_%s_parsers" % a.replace("-", "_") for a in dynamic_actions)
+                if isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE":   # the parser is built from EVERY registrar the name pattern finds (a real clear's run executes them all: the trace pin showed it)
+                    todo.extend(n for n in defs if re.fullmatch(r"add_[a-z0-9_]+_parsers", n))
+                elif isinstance(x, ast.Call) and getattr(x.func, "id", "") == "getattr" and len(x.args) > 1 and not isinstance(x.args[1], ast.Constant):   # a computed name: every definition that starts with the constant text it is built from
+                    for prefix in _prefixes(x.args[1]):
+                        prefixes.add(prefix)
+                        todo.extend(n for n in defs if n.startswith(prefix))
 
     walk([n for r in roots if r in binds and r not in globals_ and not globals_.add(r) for n in binds[r]])   # a root that is a binding is read too
     while True:
@@ -609,7 +624,7 @@ def closure(tree, roots, dynamic_actions=()):
         grew = False
         for name in sorted(members):   # a method the closure reads by name (or a special method) is run
             for method in defs[name].body:
-                if isinstance(method, DEF_KINDS) and method.name not in members[name] and (method.name in refs or _is_dunder(method.name)):
+                if isinstance(method, DEF_KINDS) and method.name not in members[name] and (method.name in refs or _is_dunder(method.name) or any(method.name.startswith(p) for p in prefixes)):
                     members[name].add(method.name)
                     walk([method])
                     grew = True
@@ -887,7 +902,7 @@ def _names_read(node, universe):
 
 
 def _clear_modules(tree):
-    """The flat modules the daemon binds into its own namespace at import (`load_module("<name>").bind(globals())` in a module-level statement): their functions run with the daemon's globals, so the daemon
+    """The flat modules the daemon binds into its own namespace at import (a `.bind(globals())` call on a loaded module, in a module-level statement): their functions run with the daemon's globals, so the daemon
     names they read are the clear's own starting names."""
     found = []
     for node in _module_statements(tree):
@@ -931,7 +946,7 @@ def derive_closure(rule, sources, flat, matches):
     universe = set(defs_all) | set(binds_all)
     modules = _clear_modules(whole)
     if not modules:
-        raise ClosureError("the daemon binds no module of its own clear code (`load_module(<name>).bind(globals())`): the starting names cannot be derived")
+        raise ClosureError("the daemon binds no module of its own clear code (a `.bind(globals())` call at import): the starting names cannot be derived")
     roots = set()
     for name in modules:
         path = "bin/%s.py" % name
@@ -969,7 +984,7 @@ def derive_closure(rule, sources, flat, matches):
 
 
 def _flat_modules(rule, out, trees, sources, flat, whole, defs_all, binds_all, bound, refs, matches):
-    """The flat modules the clear loads or runs, and their roots, DERIVED: a module is judged when a closure definition or binding reaches its loader (`load_module("x")`, a name of the daemon's loader table or a function
+    """The flat modules the clear loads or runs, and their roots, DERIVED: a module is judged when a closure definition or binding reaches its loader (a call of the daemon's loader with a constant name, a name of the daemon's loader table or a function
     that returns one), a statement the daemon runs at import (or a class it defines) loads it, it declares a config reader, or another module the clear runs loads or imports it. A module the clear code itself is
     (`clear_code_paths`) is held whole and is not listed here. The roots of a judged module are the names of its definitions that any code the clear runs reads (as a name or an attribute), to a fixed point."""
     names = {p[len("bin/"):-3]: p for p in flat}

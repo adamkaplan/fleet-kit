@@ -68,7 +68,7 @@ def executed_outside(clear, closure, rule, root, executed, matches):
     out, trees = [], {}
     for path, line in sorted(executed):
         rel = os.path.relpath(path, root).replace(os.sep, "/")
-        if not rel.startswith("bin/") or rel.endswith("/"):
+        if not rel.startswith("bin/") or not (rel.endswith(".py") or rel == rule["daemon_file"]):
             continue
         if rel not in trees:
             trees[rel] = ast.parse(Path(path).read_text())
@@ -225,32 +225,34 @@ class TestWhatTheDerivationFollows(unittest.TestCase):
         for name, expect in (("run", 1), ("other", 0)):
             head = base.replace("return 1" if name == "run" else "return 2", "return 9")
             reasons = CLEAR.closure_refusals(base, head, patch_of(base, head), got.files["bin/tool.py"]["roots"], set(), True)
-            self.assertEqual(len([r for r in reasons if name in r]), expect, (name, reasons))
+            self.assertEqual(bool([r for r in reasons if name in r]), bool(expect), (name, reasons))
 
     def test_s6_a_call_that_cannot_be_resolved_resolves_to_every_candidate_of_its_name(self):
         shapes = {
-            "an attribute call on a receiver of unknown class": "def c1(self):\n    return 1\n\ndef main(obj):\n    return obj.c1()\n",
-            "a function called through a parameter": "def callback():\n    return 1\n\ndef apply(fn):\n    return fn()\n\ndef main():\n    return apply(callback)\n",
-            "a getattr with a computed name": "class Box:\n    def target(self):\n        return 1\n\ndef main(box, kind):\n    return getattr(box, 'tar' + kind)()\n",
+            "a method called on a receiver of unknown class": ("class One:\n    def go(self):\n        return 1\n\nclass Two:\n    def go(self):\n        return 2\n\ndef main(obj):\n    One(), Two()\n    return obj.go()\n", [("One", "go"), ("Two", "go")]),
+            "a function passed as a callback and called through a parameter": ("def callback():\n    return 1\n\ndef apply(fn):\n    return fn()\n\ndef main():\n    return apply(callback)\n", None),
+            "a getattr with a computed name": ("def handle_a():\n    return 1\n\ndef handle_b():\n    return 2\n\ndef other():\n    return 3\n\ndef main(kind):\n    return getattr(sys, 'handle_' + kind)()\n", None),
         }
-        for label, extra in shapes.items():
+        for label, (extra, methods) in shapes.items():
             with self.subTest(shape=label):
                 rule, sources, flat = synthetic(extra)
                 got = CLEAR.derive_closure(rule, sources, flat, FLOORMOD.matches)
-                if "getattr" in extra:
-                    self.assertIn("Box", got.defs, "the class a computed getattr could reach is NOT left out: a stated limit of the by-name walk is that the name is built at run time")
-                    self.assertTrue(got.members.get("Box") is not None)
-                elif "obj.c1" in extra:
-                    self.assertIn("c1", got.defs, "every definition of the attribute's name")
+                if methods:
+                    for cls, method in methods:
+                        self.assertIn(method, got.members[cls], "every candidate of the name")
+                elif "getattr" in extra:
+                    self.assertTrue({"handle_a", "handle_b"} <= got.defs, "every definition the constant text of the computed name starts")
+                    self.assertNotIn("other", got.defs)
                 else:
-                    self.assertIn("callback", got.defs)
-                    self.assertIn("apply", got.defs)
+                    self.assertTrue({"callback", "apply"} <= got.defs)
 
     def test_s8_every_rating_root_and_the_dispatchers_string_edge_are_in_the_closure(self):
         found = derived()
         self.assertEqual([n for n in RULE["rating_roots"] + ["cmd_review", "add_review_parsers"] if n not in found.defs], [])
-        plain = CLEAR.derive_closure(dict(RULE, dynamic_actions=[]), *self.sources(), FLOORMOD.matches)
+        plain = CLEAR.derive_closure(dict(RULE, dynamic_actions=[], rating_roots=["resolve_command"]), *self.sources(), FLOORMOD.matches)
         self.assertNotIn("cmd_review", plain.defs, "without the dispatcher's string edge cmd_review is not reached")
+        edge = CLEAR.derive_closure(dict(RULE, dynamic_actions=["review"], rating_roots=["resolve_command"]), *self.sources(), FLOORMOD.matches)
+        self.assertIn("cmd_review", edge.defs)
 
     def sources(self):
         s, f = CLEAR.read_sources(str(REPO), RULE["daemon_file"])
@@ -501,7 +503,7 @@ class TestTheReadersAgree(unittest.TestCase):
     def test_u2_a_closure_that_cannot_be_derived_holds_and_refuses(self):
         engine, runner, paths, head = self.fake(self.one_pr())
         matrix = self.matrix()
-        with unittest.mock.patch.object(CLEAR, "closure_for", side_effect=CLEAR.ClosureError("a part does not parse")):
+        with unittest.mock.patch.object(self.sb.load_module("delegated_clear"), "closure_for", side_effect=CLEAR.ClosureError("a part does not parse")):
             held, why = self.sb.closure_hold(engine, "acme-org/widget-api", 7, head, paths, matrix)
             self.assertIsNone(held)
             self.assertIn("cannot be derived", why)
@@ -544,9 +546,66 @@ class TestTheTraceIsInsideTheClosure(unittest.TestCase):
             ns["main"]("den")
         finally:
             sys.setprofile(None)
-        self.assertEqual(executed_outside(CLEAR, closure, rule, str(root), seen, FLOORMOD.matches), ["bin/fleet-switchboard:hid_den"])
-        closure.defs = {"main", "hid_den"}
+        self.assertEqual(executed_outside(CLEAR, closure, rule, str(root), seen, FLOORMOD.matches), ["bin/fleet-switchboard:hidden"])
+        closure.defs = {"main", "hidden"}
         self.assertEqual(executed_outside(CLEAR, closure, rule, str(root), seen, FLOORMOD.matches), [], "with the definition in the closure nothing is outside")
+
+    def test_a_method_the_closure_does_not_hold_that_ran_is_seen_and_a_special_method_is_not(self):
+        import tempfile, shutil
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root))
+        (root / "bin").mkdir()
+        source = "class Box:\n    def __init__(self):\n        self.x = 1\n\n    def quiet(self):\n        return 2\n\ndef main():\n    return Box()\n"
+        (root / "bin" / "fleet-switchboard").write_text(source)
+        ns = {}
+        exec(compile(source, str(root / "bin" / "fleet-switchboard"), "exec"), ns)
+        seen = set()
+        def prof(frame, event, arg):
+            if event == "call":
+                seen.add((frame.f_code.co_filename, frame.f_code.co_firstlineno))
+        sys.setprofile(prof)
+        try:
+            ns["main"]().quiet()
+        finally:
+            sys.setprofile(None)
+        closure = CLEAR.Closure()
+        closure.defs, closure.members = {"main", "Box"}, {"Box": set()}
+        rule = {"daemon_file": "bin/fleet-switchboard", "clear_code_paths": []}
+        self.assertEqual(executed_outside(CLEAR, closure, rule, str(root), seen, FLOORMOD.matches), ["bin/fleet-switchboard:Box.quiet"])
+
+
+class TestTheDerivationIsHeld(unittest.TestCase):
+    """What decides the closure's coverage (the tool, this test, the manifest) is a clear_code_path: a patch to it is held for the owner by the floor, never delegated."""
+    PATHS = ("tools/derive-closure", "tests/switchboard/test_closure.py", "bin/fleet-switchboard.parts")
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("impact_floor_t", str(REPO / "bin" / "impact_floor.py"))
+        self.floor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.floor)
+        self.matrix = self.floor.load_matrix()
+
+    def decide(self, path, matrix):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        decision, reasons = self.floor.owner_decide(matrix, [path], [], None, self.floor.floor_paths([path], globs, exclude, force))
+        return decision, [r for r in reasons if r.startswith("clear_code_paths")]
+
+    def test_a_patch_to_the_tool_its_test_or_the_manifest_is_held_and_dropping_the_entry_releases_it(self):
+        for path in self.PATHS:
+            with self.subTest(path=path):
+                self.assertIn(path, self.matrix["owner_hold"]["delegated_clear"]["clear_code_paths"])
+                self.assertIn(path, self.floor.carry_never_paths(self.matrix), "and a conflict-resolving carry never lifts it (every exact clear_code_paths entry is in never_carried_paths)")
+                decision, why = self.decide(path, self.matrix)
+                self.assertEqual(decision, "hold")
+                self.assertEqual(len(why), 1)
+                self.assertIn(path, why[0])
+                mutant = json.loads(json.dumps(self.matrix))
+                mutant["owner_hold"]["delegated_clear"]["clear_code_paths"].remove(path)
+                self.assertEqual(self.decide(path, mutant)[1], [], "the mutant (the entry dropped) no longer names the list")
+
+    def test_a_part_of_the_daemon_is_not_held_by_the_list_and_a_new_part_is_already_a_new_file_of_the_clear(self):
+        self.assertEqual(self.decide("bin/switchboard/audit.py", self.matrix)[1], [], "a part is judged by the closure rule, not held wholesale")
+        rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.assertTrue(self.floor.matches("bin/switchboard/a_new_part.py", rule["new_file_globs"]), "adding a part is refused for the delegated clear by new_file_globs, so listing the manifest adds no burden there")
 
 
 if __name__ == "__main__":

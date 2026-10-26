@@ -43233,7 +43233,7 @@ class TestImpactHold(LedgerBase):
         daemon = ast.parse(self.real_source())
         defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
         dynamic = rule["dynamic_actions"]
-        self.assertEqual(dynamic, ["review"])
+        self.assertEqual(dynamic, ["impact", "review"])   # `impact`: the clear's own command is dispatched by string too (the trace pin showed cmd_impact runs)
         targets = {"cmd_review", "parse_review_block", "add_review_parsers"}
         from_main = module.closure(daemon, ["main"], dynamic)[0]
         def edges(node):   # the DIRECT edges of a definition: the names it uses, and the two string edges for the named actions
@@ -43269,7 +43269,7 @@ class TestImpactHold(LedgerBase):
         plain = module.closure(daemon, ["resolve_command"], ())[0]
         self.assertNotIn("cmd_review", plain)
         self.assertIn("cmd_review", module.closure(daemon, ["resolve_command"], dynamic)[0])
-        self.assertNotIn("add_review_parsers", module.closure(daemon, ["command_registrars"], ())[0])
+        self.assertIn("add_review_parsers", module.closure(daemon, ["command_registrars"], ())[0], "the parser is built from every registrar the name pattern finds")
         self.assertIn("add_review_parsers", module.closure(daemon, ["command_registrars"], dynamic)[0])
         # one case for each root: an edit under it is refused (the dispatcher edits Medium round 3 named, too)
         for name in ("build_parser", "dispatch", "resolve_command", "call_command", "command_registrars", "main"):
@@ -78383,7 +78383,7 @@ _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
 # The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
 _closure = importlib.import_module("test_closure")
-TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
+TestTheOneClosure, TestWhatTheDerivationFollows, TestEveryMember, TestTheReadersAgree, TestTheTraceIsInsideTheClosure, TestTheDerivationIsHeld = _closure.TestTheOneClosure, _closure.TestWhatTheDerivationFollows, _closure.TestEveryMember, _closure.TestTheReadersAgree, _closure.TestTheTraceIsInsideTheClosure, _closure.TestTheDerivationIsHeld
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
@@ -78414,7 +78414,7 @@ class TestTheArchitectureTestIsRun(unittest.TestCase):
                 else:
                     yield item
         ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
-        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine"):
+        for name in ("TestTheOneClosure", "TestWhatTheDerivationFollows", "TestEveryMember", "TestTheReadersAgree", "TestTheTraceIsInsideTheClosure", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine"):
             with self.subTest(case=name):
                 self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 2, "the hook that loads tests/switchboard/test_closure.py is gone")
 

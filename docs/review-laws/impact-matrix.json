@@ -376,6 +376,7 @@
       ],
       "daemon_file": "bin/fleet-switchboard",
       "dynamic_actions": [
+        "impact",
         "review"
       ],
       "rating_roots": [

@@ -133,6 +133,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `cloud_worker.py` | `-` | size | 2,000 | grew past the limit in a merged change; to be split |
+| `impact_hold.py` | `-` | size | 1,600 | the clear's one read of the closure (`closure_read`, `closure_hold`) lives with the clear code that binds into the daemon; to be split with the clear code |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/alert_labels.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -215,6 +216,11 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cpu_guard.py` | `slots_text:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cpu_guard.py` | `slots_text:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `cpu_guard.py` | `slots_text:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `delegated_clear.py` | `_clear_modules:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `delegated_clear.py` | `_flat_modules:load_module(string)` | 2 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `delegated_clear.py` | `closure_for:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `delegated_clear.py` | `closure_for:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `delegated_clear.py` | `closure_for:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `external_adapter.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `external_adapter.py` | `_load_core:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |

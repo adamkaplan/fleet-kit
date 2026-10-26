@@ -239,11 +239,12 @@ class TestShadowGlue(unittest.TestCase):
         roots = self.m.daemon_roots(RULE)
         baseline = self.m.closure_refusals(base, head, diff(base, head), roots, set(RULE["clear_entry_points"]), False, list(RULE.get("dynamic_actions") or []))
         self.assertTrue(baseline)
-        self.assertEqual(self.run_map(entry, base, head), baseline)
+        self.assertEqual(self.run_map(entry, base, head), self.m.closure_refusals(base, head, diff(base, head), roots, set(RULE["clear_entry_points"]), False, list(RULE.get("dynamic_actions") or []), self.m.known_of(DERIVED)))
         other = "redact"
         self.assertIn(other, self.names)
         added = base + "\n%s = 1\n" % other   # an added closure name: the baseline (computed here the same way) decides first
         recorded = self.m.closure_refusals(base, added, diff(base, added), roots, set(RULE["clear_entry_points"]), False, list(RULE.get("dynamic_actions") or []))
+        recorded = recorded or self.m.closure_refusals(base, added, diff(base, added), roots, set(RULE["clear_entry_points"]), False, list(RULE.get("dynamic_actions") or []), self.m.known_of(DERIVED))   # the whole closure knows `redact` (it is defined in a part)
         expected = recorded or self.m.shadow_refusals(base, added, self.names, entry)
         self.assertEqual(self.run_map(entry, base, added), expected)
         with mock.patch.object(self.m, "closure_refusals", lambda *args, **kw: []):
