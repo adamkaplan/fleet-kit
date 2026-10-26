@@ -4712,6 +4712,8 @@ creation in a later slice). A PR URL of a fork is another repo: not listed, not 
 (`FLEET_SWITCHBOARD_OWN_GH=1`) are never probed, so the check cannot recurse into itself. Signing and the account environment are
 unchanged.
 
+**A work item's parent ask and a pull request's `CLAIMS:` line (#943).** Known limits. A parent ask edited after approval is not detected: its Done-when is a live read, with no hash. `claim_union_note` reads only the first 100 pull requests of the repository, and it is a warning only. A merged sibling's body can be edited later, so what it claimed can change. The other pull requests' claims are listed, not enforced: #976 adds the check at the ask's last merge. The plan is read from the visible body only: a `PLAN:` line in a code fence or an HTML comment is read by no gate and not by the claim.
+
 ## `launch` checks the plan: shadow only (#107, slice 3c)
 
 `fleet-switchboard launch` now checks, before it creates the agent, that the assignment's brief links a plan that has been
