@@ -968,7 +968,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
     is refused when the PR's head is any other. `verify(raw)` (the chat clear's) is run on the PR this call just read, before anything is written, and raises NoticeError to refuse:
     the check and the effect use ONE read. `via` is said in the audit line. The head-bound clear state is recorded for any clear, even one that removes no impact label: it only
     stops the daemon adding its impact hold for that head. Nothing here ever ADDS a label."""
-    if REGISTRARS_RAN:   # #924: a command registrar is running (it calls this itself): refused before anything is read or written
+    if EFFECT_CHECK():   # #924: a command registrar is running (it calls this itself): refused before anything is read or written
         raise RuntimeError("a command registrar ran in this process: an impact clear is refused")
     pr = "%s#%d" % (repo, number)
     if engine.audit is None:   # a clear is a logged act: with no audit sink it is refused, loudly, before anything changes
@@ -1198,7 +1198,7 @@ def clear_who(engine, runner, repo, number, report=None):
 
 def cmd_impact_clear(args, runner, now):
     """`impact clear <repo#N> --reason TEXT`: the owner's own terminal only (the Chief of Staff cannot: G6 is never waivable by it)."""
-    if REGISTRARS_RAN:   # #924: a command registrar is running (it calls this itself): refused at the point of effect, before anything is read
+    if EFFECT_CHECK():   # #924: a command registrar is running (it calls this itself): refused at the point of effect, before anything is read
         sys.stderr.write("%s: impact clear: refused: a command registrar ran in this process\n" % PROG)
         return EXIT_ERROR
     kind = gates_caller_kind(runner, now)

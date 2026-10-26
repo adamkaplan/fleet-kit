@@ -43135,9 +43135,8 @@ class TestImpactHold(LedgerBase):
         derived = lambda names: set(module.closure(tree, names, rule["dynamic_actions"])[0])
         closure = derived(module.daemon_roots(rule))
         self.assertEqual(sorted(traced - closure), [], "the derived closure must contain every definition the clear and the record really run")
-        for dropped in sorted(traced & closure)[:]:   # the mutant: the closure without one traced definition is smaller than the trace, and the same comparison fails
-            with self.subTest(mutant_drops=dropped):
-                self.assertEqual(sorted(traced - (closure - {dropped})), [dropped], "a closure that dropped %s is smaller than the trace and must fail" % dropped)
+        # The limit, stated (#924): this pin traces ONE delegated clear and ONE record with explicit flags (no refusal, dismiss, revoke, owner-clear, --block or error branch). The superset claim covers the traced paths; the static derivation
+        # (the names the clear's code reads, by walking it) covers every other branch.
 
     def test_no_spelling_of_the_clear_or_the_record_runs_in_a_process_where_a_registrar_ran(self):
         """#924 rev 4, the spelling table: for each spelling of the two commands (derived by running the real full parser over it), the outcome is a direct run with no registrar called, a usage error, or the refusal, never the command after a registrar."""
@@ -43199,7 +43198,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual((code, entry), (1, None), err)
         self.assertIn("a command registrar ran in this process", err)
         def reset(sub):
-            sb.REGISTRARS_RAN = False
+            sb.REGISTRARS_RAN = False   # a module attribute nothing reads any more: the guard does not rest on it
         patcher = mock.patch.object(sb, "add_zzz_parsers", reset, create=True)
         patcher.start()
         try:
@@ -43207,8 +43206,8 @@ class TestImpactHold(LedgerBase):
         finally:
             patcher.stop()
         self.assertEqual(code, 1, err)
-        self.assertIn("replaced code", err)
-        self.assertFalse(sb.REGISTRARS_RAN, "main puts the flag back whatever happens")
+        self.assertIn("a command registrar ran in this process", err)   # resetting a module attribute changes nothing: the guard does not rest on it
+        self.assertFalse(hasattr(sb, "_WINDOW"), "main alone holds the window")
 
     def test_a_registrar_that_calls_the_clear_the_clears_core_or_the_record_itself_is_refused_at_the_point_of_effect(self):
         """#924, the review's probe: a registrar (here one standing in for `add_core_parsers`) builds the namespace of `impact clear` and CALLS the handlers itself during `main(["version"])`. Each must refuse (the flag is True while registrars run), write nothing, and the same calls after
@@ -43227,7 +43226,7 @@ class TestImpactHold(LedgerBase):
                 seen["impact_clear_core"] = "ran"
             except RuntimeError as err:
                 seen["impact_clear_core"] = str(err)
-            seen["flag"] = sb.REGISTRARS_RAN
+            seen["window"] = sb.EFFECT_CHECK
         patcher = mock.patch.object(sb, "add_zzz_parsers", registrar, create=True)
         patcher.start()
         try:
@@ -43235,12 +43234,13 @@ class TestImpactHold(LedgerBase):
                 code = sb.main(["version"], runner=self.route, now=self.world.clock.now)
         finally:
             patcher.stop()
-        self.assertEqual(code, 0, e.getvalue())
-        self.assertEqual((seen["cmd_impact_clear"][0], seen["cmd_impact"], seen["cmd_review"], seen["flag"]), (1, 1, 1, True))
+        self.assertEqual(code, 1, "main fails closed after a registrar called an effect")
+        self.assertIn("called the clear or the record itself", e.getvalue())
+        self.assertEqual((seen["cmd_impact_clear"][0], seen["cmd_impact"], seen["cmd_review"]), (1, 1, 1))
         self.assertIn("a command registrar ran in this process", seen["cmd_impact_clear"][1])
         self.assertIn("a command registrar ran in this process", seen["impact_clear_core"])
         self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], "nothing was cleared")
-        self.assertFalse(sb.REGISTRARS_RAN, "the flag is down again after main")
+        self.assertFalse(sb.EFFECT_CHECK(), "the window is closed again after main")
 
     def guard_readers(self, daemon_source, hold_source, name):
         """The functions of the daemon file and of impact_hold.py that REFUSE on the module-level guard `name`: an `if` whose test reads it and whose body returns or raises. Derived by walking the code."""
@@ -43255,21 +43255,104 @@ class TestImpactHold(LedgerBase):
                         found.add(node.name)
         return found
 
-    def test_every_module_level_guard_main_writes_has_a_reader_that_refuses_and_a_mutant_that_deletes_the_reads_is_caught(self):
-        """Derived: a name `main` declares global (a guard it writes) and nothing reads is a flag with no effect (the finding of the review of #924)."""
+    def test_no_guard_the_effects_read_is_a_module_global_main_writes(self):
+        """Derived (the review of c77a44d4): `main` writes no module-level name (no `global` statement), and the refusing functions read the latch, a closure, not a flag. A build that brings back a module flag `main` sets is caught."""
         import ast, re as regex
-        daemon, hold = self.real_source(), (BIN / "impact_hold.py").read_text()
+        daemon = self.real_source()
         main = next(n for n in ast.parse(daemon).body if isinstance(n, ast.FunctionDef) and n.name == "main")
-        written = {name for g in ast.walk(main) if isinstance(g, ast.Global) for name in g.names}
-        self.assertIn("REGISTRARS_RAN", written)
-        for name in sorted(written):
-            with self.subTest(guard=name):
-                readers = self.guard_readers(daemon, hold, name)
-                self.assertTrue({"cmd_impact", "cmd_review", "cmd_impact_clear", "impact_clear_core"} <= readers, "%s is written by main and read by %s" % (name, sorted(readers)))
-                mutant_daemon = regex.sub(r"\n    if %s and [^\n]*\n(?:        [^\n]*\n)+" % name, "\n", daemon)
-                mutant_hold = regex.sub(r"\n    if %s:[^\n]*\n(?:        [^\n]*\n)+" % name, "\n", hold)
-                self.assertNotEqual((mutant_daemon, mutant_hold), (daemon, hold))
-                self.assertEqual(self.guard_readers(mutant_daemon, mutant_hold, name), set(), "with the reads deleted the guard has no reader: this test sees it")
+        self.assertEqual({name for g in ast.walk(main) if isinstance(g, ast.Global) for name in g.names}, set(), "main holds no global a registrar can write around")
+        self.assertNotIn("REGISTRARS_RAN", daemon + (BIN / "impact_hold.py").read_text())
+        readers = self.guard_readers(daemon, (BIN / "impact_hold.py").read_text(), "EFFECT_CHECK")
+        self.assertTrue({"cmd_impact", "cmd_review", "cmd_impact_clear", "impact_clear_core"} <= readers, sorted(readers))
+        reset_mutant = regex.sub(r"\n    if args\.review_cmd == \"record\" and EFFECT_CHECK\(\):[^\n]*\n(?:        [^\n]*\n)+", "\n", daemon)
+        self.assertNotEqual(reset_mutant, daemon)
+        self.assertNotIn("cmd_review", self.guard_readers(reset_mutant, "", "EFFECT_CHECK"), "with the read deleted the record has no refusal: this test sees it")
+
+    def reset_call_restore(self, flag_based=False):
+        """A hostile registrar sets the module flag False, calls each effect, then sets it back to True. Returns what each call did."""
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        clear = sb.private_parser().parse_known_args(["impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity"])[0]
+        record = sb.private_parser().parse_known_args(["review", "record", self.PR, *self.RATING_FLAGS, *self.EXPLICIT])[0]
+        seen = {}
+        def registrar(sub):
+            sb.REGISTRARS_RAN = False
+            try:
+                with captured() as (o, e):
+                    seen["clear"] = (sb.cmd_impact_clear(clear, self.route, self.world.clock.now), e.getvalue())
+                    seen["record"] = (sb.cmd_review(record, self.route, self.world.clock.now), e.getvalue())
+                try:
+                    sb.impact_clear_core(None, self.route, "acme/app", 9, "cos", "a reason long enough")
+                    seen["core"] = "ran"
+                except RuntimeError as err:
+                    seen["core"] = str(err)
+                except AttributeError:   # past the guard, at `engine.audit` of the None engine (the review's probe)
+                    seen["core"] = "ran"
+            finally:
+                sb.REGISTRARS_RAN = True
+        patchers = [mock.patch.object(sb, "add_zzz_parsers", registrar, create=True), mock.patch.object(sb, "REGISTRARS_RAN", True, create=True)]
+        if flag_based:   # the MUTANT: a build that decides from the module global a registrar can write
+            patchers.append(mock.patch.object(sb, "EFFECT_CHECK", lambda: sb.REGISTRARS_RAN))
+        for patcher in patchers:
+            patcher.start()
+        try:
+            with captured() as (o, e):
+                code = sb.main(["version"], runner=self.route, now=self.world.clock.now)
+        finally:
+            for patcher in reversed(patchers):
+                patcher.stop()
+        return code, seen, e.getvalue()
+
+    def test_a_registrar_that_resets_a_module_flag_calls_the_clear_and_the_record_and_restores_it_is_refused(self):
+        code, seen, err = self.reset_call_restore()
+        self.assertEqual((seen["clear"][0], seen["record"][0]), (1, 1), seen)
+        self.assertIn("a command registrar ran in this process", seen["clear"][1])
+        self.assertIn("a command registrar ran in this process", seen["core"])
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
+        self.assertEqual(code, 1, "main itself fails closed when an effect was called while the registrars ran")
+        self.assertIn("called the clear or the record itself", err)
+
+    def test_the_mutant_that_decides_from_the_module_global_lets_the_reset_call_restore_through(self):
+        """The mutant of the High (c77a44d4): the effects read a module flag. The same attack is NOT refused at the point of effect (the core is reached), which is what the previous test would catch."""
+        code, seen, err = self.reset_call_restore(flag_based=True)
+        self.assertEqual(seen["core"], "ran", "the flag-based build does not refuse: the attack works, so the test above discriminates")
+        self.assertNotIn("a command registrar ran in this process", seen["clear"][1])
+
+    def test_what_a_registrar_can_reach_of_the_latch_is_stated_by_trying_it(self):
+        """Not a sandbox: the latch is a closure, not a module attribute, but a registrar that reaches into it (the cell of the effect function, `main.__defaults__`) can forge it. This test TRIES it and pins the answer: LATCH FORGEABLE: yes, by these two routes; main's own copy of the count still catches a registrar that only calls an effect."""
+        cell = next(c for c in sb.EFFECT_CHECK.__closure__ if isinstance(c.cell_contents, dict))
+        self.assertTrue({"open", "calls"} <= set(cell.cell_contents), "the cell is reachable from the function")
+        window = sb.main.__defaults__[-1]
+        self.assertTrue(callable(window), "the window is reachable from main's defaults")
+        saved = dict(cell.cell_contents)
+        try:
+            cell.cell_contents["open"] = True
+            self.assertTrue(sb.EFFECT_CHECK(), "a registrar that writes the cell forges the answer")
+        finally:
+            cell.cell_contents.update(saved)
+
+    def test_a_hostile_default_or_replaced_subparser_on_the_clear_under_the_real_build_parser_with_the_direct_route_off_is_refused(self):
+        """The clear-side tests above run the direct route's parser; here `main` takes the NORMAL route (the pre-dispatch off) with the real `build_parser` wrapped by a hostile `set_defaults(reason=...)` and a replaced `impact` subparser: the clear is refused and nothing is written."""
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        self.no_direct_route()
+        real = sb.build_parser
+        def sets_reason():
+            parser = real()
+            (top,) = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
+            top.choices["impact"].set_defaults(reason="a hostile reason that is long enough to pass")
+            return parser
+        def replaced_impact():
+            parser = real()
+            (top,) = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
+            fresh = argparse.ArgumentParser().add_subparsers(dest="action")
+            sb.add_impact_parsers(fresh)
+            top.choices["impact"] = fresh.choices["impact"]
+            return parser
+        for label, builder in (("set_defaults(reason)", sets_reason), ("replaced subparser", replaced_impact)):
+            with self.subTest(label), mock.patch.object(sb, "build_parser", builder):
+                code, out, err = self.under()
+            self.assertEqual(code, 1, err)
+            self.assertIn("a command registrar ran in this process", err)
+            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
 
     def test_the_handlers_themselves_refuse_while_a_registrar_ran(self):
         """The point of effect (#924): `cmd_impact` (clear) and `cmd_review` (record) read the process flag, so a route that reached them in a process where a registrar ran stops there, whatever main did."""
@@ -43277,7 +43360,10 @@ class TestImpactHold(LedgerBase):
         clear = sb.private_parser().parse_known_args(["impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity"])[0]
         record = sb.private_parser().parse_known_args(["review", "record", self.PR, *self.RATING_FLAGS, *self.EXPLICIT])[0]
         for label, handler, args in (("impact clear", sb.cmd_impact, clear), ("review record", sb.cmd_review, record)):
-            with self.subTest(label), mock.patch.object(sb, "REGISTRARS_RAN", True), captured() as (o, e):
+            with self.subTest(label), captured() as (o, e):
+                # the window is opened by main alone: opened here through main's own handle
+                window = sb.main.__defaults__[-1]; window(True)
+                self.addCleanup(window, False)
                 self.assertEqual(handler(args, self.route, self.world.clock.now), 1)
                 self.assertIn("a command registrar ran in this process", e.getvalue())
         self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
