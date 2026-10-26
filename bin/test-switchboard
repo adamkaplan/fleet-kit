@@ -80557,7 +80557,8 @@ class TestClearLine(TestImpactHold):
         self.set_files("migrations/0002.sql", "bin/fleet-switchboard")
         reads = []
         counted = lambda engine, runner, repo, item, base_sha, rule: (reads.append(base_sha), ["it changes f, part of the clear (head file)"])[1]
-        with mock.patch.object(sb, "delegated_clear_map", counted):
+        # the owner hold (#940) reads the mapper on its own, once for each `pr_floor_report`, by design and not through the line-to-clear hand-over; this test counts the hand-over only, so the hold's own read is left out here (it is pinned by TestImpactHold)
+        with mock.patch.object(sb, "delegated_clear_map", counted), mock.patch.object(sb, "clear_closure_hold", lambda *a, **k: []):
             self.passes()
             engine = self.engine_cached
             self.assertEqual(len(self.posts()), 1)
