@@ -42,6 +42,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `dead_hint.py` | 0 | what is known about a dead agent and what to do about it (pure text) | |
 | `merged_labels.py` | 0 | a merged pull request does not keep its hold | |
 | `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
+| `record_json.py` | 0 | the one bounded-depth parse of untrusted record JSON, shared by every reader of it (#1314) | |
 | `red_ci.py` | 0 | which check conclusions are red, green or say nothing, and the once-per-key memory (pure table) | |
 | `path_walk.py` | 0 | one walk up from a trusted path, shared by the cloud launcher and the installer | |
 | `repo_exclusion.py` | 0 | repositories the owner keeps out of the fleet's view are never watched or read | |
@@ -90,6 +91,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `launch_testers.py` | 5 | testers from the launch record | |
 | `merge_gate.py` | 5 | the fleet's own merge queue | |
 | `orders_copy.py` | 5 | `orders copy`: a charter's standing orders copied to another charter | |
+| `path_suites.py` | 5 | which test suites exercise a changed path, and the local merge `heavy --changed` runs them on | |
 | `plan_check.py` | 5 | the mechanical check of a plan's scenarios | |
 | `plan_ledger.py` | 5 | the evidence ledger and the gates view of plan-driven development | |
 | `plan_review.py` | 5 | the plan review engine's pure core | |
@@ -173,7 +175,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 26 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 27 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/pr_explain.py` | `fleet-switchboard` | namespace | 9 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/reminders.py` | `fleet-switchboard` | namespace | 24 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/reminders.py` | `fleet-switchboard` | namespace | 25 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; two reads of untrusted JSON now go through `load_module("record_json")`, one name of the entry more (#1314) |
 
 ## Dynamic imports not followed
 
@@ -191,6 +193,9 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 
 | Unit | Site | Count | What |
 |---|---|---|---|
+| `agent_presence.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `agent_presence.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `agent_presence.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `agent_reconcile.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `agent_reconcile.py` | `_load_registry:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `agent_reconcile.py` | `_load_registry:importlib` | 2 | uses the module object (a call, an attribute, an argument) |

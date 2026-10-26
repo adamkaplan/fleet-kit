@@ -19555,6 +19555,62 @@ class TestSelfRegisteringCli(unittest.TestCase):
         self.assertIn("alphabetical by function name", (REPO / "docs" / "switchboard.md").read_text())
 
 
+class TestBuilderChecklist(unittest.TestCase):
+    """#1283: the coordination skill carries the ten builder checklist items and the brief template names the checklist."""
+    ITEMS = {
+        "a": "every input and every outside call of the new code; each row names its test and its run-by-hand mutant",
+        "b": "uses the one shared safe reader",
+        "c": "derives its list from the code's syntax tree",
+        "d": "is in the owner format from the first push",
+        "e": "opens its pull request as a draft at its first push",
+        "f": "pushes the merge commit the minute it exists",
+        "g": "states its closed rule and its known-limits list in its first version",
+        "h": "is built by a local job, never a cloud pod",
+        "i": "Compare failure messages, not only test names",
+        "j": "say which git version the tests ran on",
+    }
+    RULES = {
+        "b": "(opens without blocking, refuses links, accepts only regular files, bounds the count, the size and the time)",
+        "i": "and keep new strings and comments clear of the added-lines scans",
+        "e": "the pod's git token expires after about an hour and a late open fails",
+    }
+    BRIEF = "Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line."
+
+    def text(self):
+        return " ".join((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().split())
+
+    def problems(self, text):
+        found = [k for k, v in self.ITEMS.items() if text.count("- (%s) " % k) != 1 or v not in text]
+        found += ["rule " + k for k, v in self.RULES.items() if v not in text]
+        if self.BRIEF not in text or "## Builder checklist" not in text:
+            found.append("brief")
+        return found
+
+    def test_the_skill_carries_the_ten_items_and_the_brief_sentence(self):
+        self.assertEqual(self.problems(self.text()), [])
+        self.assertEqual(len(self.ITEMS), 10)   # 10 of 10 markers
+
+    def test_a_mutant_that_removes_each_item_or_the_brief_sentence_fails(self):
+        text = self.text()
+        for key in self.ITEMS:
+            with self.subTest(item=key):
+                self.assertEqual(self.problems(text.replace(self.ITEMS[key], "")), [key])
+        self.assertEqual(self.problems(text.replace(self.BRIEF, "")), ["brief"])
+        for key, rule in self.RULES.items():   # three more mutants: strip the unpinned rule of (b), (i), (e)
+            with self.subTest(rule=key):
+                self.assertEqual(self.problems(text.replace(rule, "")), ["rule " + key])
+
+    def test_item_b_names_no_invented_reader(self):
+        import ast
+        text = self.text()
+        self.assertIn("`read_record_file(path, max_bytes)` in `bin/cloud_worker.py`", text)
+        self.assertNotIn("has no such shared module", text)
+        tree = ast.parse((REPO / "bin" / "cloud_worker.py").read_text())
+        found = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "read_record_file"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual([a.arg for a in found[0].args.args], ["path", "max_bytes"])
+
+
 class TestOwnMeasurementTester(unittest.TestCase):
     """An orchestrator that measured a scenario itself re-measures through a tester of its lane, never a waiver."""
     PLANNING = "**Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself."
@@ -64643,7 +64699,7 @@ class TestHeavyWaitRecord(StandInPids, unittest.TestCase):
     LOOK = 5   # fake seconds between the watcher's looks
 
     # THE family: one row per kind the code knows (derived below), in each slot it may be given: the ordinary slot, and the express slot for a command declared short.
-    COMMANDS = {"full": ["python3", "/nowhere/test-fake"], "focused": ["python3", "/nowhere/test-fake", "-k", "x"], "e2e": ["sh", "-c", "true", "e2e"], "other": ["sh", "-c", "true"]}
+    COMMANDS = {"full": ["python3", "/nowhere/test-fake"], "focused": ["python3", "/nowhere/test-fake", "-k", "x"], "e2e": ["sh", "-c", "true", "e2e"], "other": ["sh", "-c", "true"], "quick": ["python3", "/nowhere/test-fake", "-k", "x"]}
     SLOTS = (0, "express")
 
     def setUp(self):
@@ -64734,7 +64790,8 @@ class TestHeavyWaitRecord(StandInPids, unittest.TestCase):
     def test_the_family_has_a_row_for_every_kind_the_code_knows(self):
         self.assertEqual(set(self.COMMANDS), {kind for kind, _s, _m in self.hs.KINDS}, "a kind with no command here (or one the code no longer has)")
         for kind, command in self.COMMANDS.items():
-            self.assertEqual(self.hs.classify(command), kind)
+            self.assertEqual(self.hs.classify(command), "focused" if kind == "quick" else kind)   # classify never returns "quick": run_quick takes that row by name, for a command classify calls focused
+        self.assertNotIn("quick", {self.hs.classify(c) for c in self.COMMANDS.values()}, "classify never returns the quick kind")
         self.assertEqual(set(self.SLOTS), {0, self.hs.EXPRESS}, "the slots the code has: an ordinary one and the express one")
 
     def test_s2_a_run_that_waited_past_its_ceiling_and_then_ran_less_is_not_stopped(self):
@@ -68013,6 +68070,7 @@ class TestHeavyCeilings(StandInPids, unittest.TestCase):
         ("other", ["ls"], 3600),
     )
     RUNNABLE = {"full": ["python3", "/nowhere/test-fake"], "focused": ["python3", "/nowhere/test-fake", "-k", "x"], "e2e": ["sh", "-c", "true", "e2e"], "other": ["sh", "-c", "true"]}   # commands that exist, for run()
+    NAMED = {"quick": 600}   # kinds classify() never returns: run_quick takes the row by name (#1045); the quick slot's own 10 min ceiling is why it is below the 1800 floor of FAMILY
     CLASSIFY = (
         (["bin/test-switchboard"], "full"), (["bin/test-switchboard", "-k", "x"], "focused"), (["tests/test_a.py"], "focused"),
         (["python3", "-m", "unittest", "a.b"], "focused"), (["playwright", "test"], "e2e"), (["bin/run-e2e.sh"], "e2e"),
@@ -68068,8 +68126,12 @@ class TestHeavyCeilings(StandInPids, unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.hs.classify(command), kind)
         self.assertEqual(self.hs.classify(["bin/test-switchboard"], short=True), "focused", "--short declares a short run")
-        self.assertEqual({row[0] for row in self.FAMILY}, {kind for kind, _s, _m in self.hs.KINDS}, "a kind with no row here, or a row with no kind")
-        self.assertEqual({kind for _c, kind in self.CLASSIFY}, {kind for kind, _s, _m in self.hs.KINDS}, "a kind no command above reads as")
+        every = {kind for kind, _s, _m in self.hs.KINDS}
+        self.assertEqual({row[0] for row in self.FAMILY} | set(self.NAMED), every, "a kind with no row here, or a row with no kind")
+        self.assertEqual({kind for _c, kind in self.CLASSIFY} | set(self.NAMED), every, "a kind no command above reads as (or takes by name)")
+        for kind, seconds in self.NAMED.items():
+            self.assertEqual(self.hs.KIND_DEFAULTS[kind], seconds, "the named kind's ceiling")
+            self.assertNotIn(kind, {self.hs.classify(command) for command, _k in self.CLASSIFY}, "a named kind is never read from a command")
         for kind, command, _default in self.FAMILY:
             self.assertEqual(self.hs.classify(command), kind)
             self.assertEqual(self.hs.classify(self.RUNNABLE[kind]), kind)
@@ -85001,7 +85063,8 @@ class TestPreflightPr(unittest.TestCase):
             calls.append((list(argv), kwargs))
             done = mock.Mock(returncode=0, stdout="/work/repo\n" if argv[:2] == ["git", "rev-parse"] else "abc\n" if argv[:2] == ["git", "merge-base"] else "", stderr="")
             if "heavy" in argv:
-                done.returncode = 75   # all slots held: heavy gave up waiting
+                done.returncode = 75   # all slots held: heavy gave up waiting, and says so with the marker line that carries the caller's own nonce (an exit status alone is a result)
+                done.stderr = "heavy: [noslot %s]\n" % kwargs["env"]["FLEET_HEAVY_NOSLOT_NONCE"]
             return done
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -85223,7 +85286,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
                         self.assertEqual(code, 0)
 
     def test_the_table_covers_every_kind_of_the_one_classifier(self):
-        kinds = {kind for kind, _s, _m in self.hs.KINDS}
+        kinds = {kind for kind, _s, _m in self.hs.KINDS} - {"quick"}   # "quick" is a ceiling row taken by name (run_quick); the classifier never returns it
         probes = {"full": [], "focused": ["-k", "x"], "e2e": ["playwright", "test"], "other": ["ls"]}
         self.assertEqual(set(probes), kinds, "a kind with no probe")
         for kind, rest in probes.items():
@@ -85307,7 +85370,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
         self.assertNotIn("refused", text)
 
     def test_s7_the_only_ceilings_are_the_per_kind_table(self):
-        self.assertEqual(self.hs.KIND_DEFAULTS, {"e2e": 3600, "focused": 1800, "full": 5400, "other": 3600})
+        self.assertEqual(self.hs.KIND_DEFAULTS, {"e2e": 3600, "focused": 1800, "full": 5400, "quick": 600, "other": 3600})
         names = sorted(name for name in vars(self.hs) if re.search(r"(CEIL|SECONDS|MAX_SECONDS|HARD_MAX)", name) and name.isupper())
         self.assertEqual(names, ["DEFAULT_MAX_SECONDS", "EXPRESS_SECONDS", "HARD_MAX_SECONDS", "KILL_GRACE_SECONDS", "POLL_SECONDS", "SWEEP_SECONDS", "WAIT_REPORT_SECONDS", "WATCH_SECONDS"])
 
@@ -94805,6 +94868,420 @@ class TestArchTools(unittest.TestCase):
             self.assertIn(line, done.stdout)
         same = self.split_check([root / "before.py"], [root / "before.py"])
         self.assertEqual(same.returncode, 0, same.stdout)
+
+
+class TestRecordJsonReaders(unittest.TestCase):
+    """#1314: every reader of untrusted record JSON uses the shared bounded-depth parse (bin/record_json.py); the readers are DERIVED from the source."""
+    BIN = REPO / "bin"
+    # readers of record text and the shared helpers: each must call parse_bounded (the helpers ARE the parse)
+    READERS = {"agent_presence.py:read_record": "agent_presence", "switchboard/reminders.py:read_reminders": "reminders",
+               "switchboard/reminders.py:read_record_file": "reminders"}
+    HELPERS = {"record_json.py:parse_bounded", "cloud_worker.py:parse_bounded"}
+    # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
+    EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
+    # path_suites.py:check_manual and load_manual read the repository's OWN checked-in manual (tools/path-suites.json), a trusted repo file, not untrusted record text
+    EXEMPT = """
+agent_calls.py:_read_json
+agent_calls.py:_spool_lines
+agent_calls.py:parse_usage
+chat_clear.py:_load
+chat_clear.py:read_seen
+ci_runs.py:_read_run
+cloud_channel_server.py:do_POST
+cloud_cli.py:post
+cloud_cost_report.py:read_lines
+cloud_hub.py:_read_json
+cloud_hub.py:kube_http
+cloud_relay.py:loads_strict
+cloud_relay_daemon.py:_read
+cloud_way_back_check.py:main
+cloud_worker.py:run_launcher
+cpu_guard.py:load_episode
+decision_sync.py:_read_json
+decisions_pull.py:parse
+delegated_clear.py:score_block
+disk_janitor.py:_without_own_events
+disk_janitor.py:read_cursor
+external_adapter.py:attempt
+external_adapter.py:call_tool
+external_adapter.py:classify
+external_adapter.py:load
+external_adapter.py:parse_key_source
+external_adapter.py:rpc
+external_adapter.py:sse_messages
+fleet-heartbeat:call
+fleet-heartbeat:load_config
+fleet-scenario:read
+fleet-switchboard:__init__
+fleet-switchboard:_api
+fleet-switchboard:_audit_tail
+fleet-switchboard:_call
+fleet-switchboard:_docker_inspect
+fleet-switchboard:_fresh
+fleet-switchboard:_last
+fleet-switchboard:_load_markers
+fleet-switchboard:_read_json_object
+fleet-switchboard:_review_api
+fleet-switchboard:_write_gates_config
+fleet-switchboard:anonymous_volumes
+fleet-switchboard:catching_up_lines
+fleet-switchboard:charter_pane_update
+fleet-switchboard:ci_record_status_line
+fleet-switchboard:cmd_review_measure
+fleet-switchboard:daemon_record_of
+fleet-switchboard:daemon_snapshot
+fleet-switchboard:gates_state
+fleet-switchboard:get
+fleet-switchboard:github_calls_status
+fleet-switchboard:github_status
+fleet-switchboard:handle
+fleet-switchboard:health_watched_repos
+fleet-switchboard:janitor_agent_roots
+fleet-switchboard:job_read
+fleet-switchboard:json
+fleet-switchboard:lab_facts
+fleet-switchboard:launch_memory_check
+fleet-switchboard:load_config
+fleet-switchboard:pane_exit_audit_tail
+fleet-switchboard:pr_state_read
+fleet-switchboard:pull_state
+fleet-switchboard:read_decisions_file
+fleet-switchboard:read_friction_state
+fleet-switchboard:read_janitor_record
+fleet-switchboard:read_open_items
+fleet-switchboard:read_open_overlap
+fleet-switchboard:read_pane_health
+fleet-switchboard:read_pr_json
+fleet-switchboard:read_pr_notices
+fleet-switchboard:read_ref_state
+fleet-switchboard:read_report_riders
+fleet-switchboard:receive
+fleet-switchboard:stopped_news_summary
+fleet-switchboard:sweep_summary
+fleet-switchboard:unix_socket_call
+fleet-switchboard:update_daemon_record
+fleet-switchboard:v2_calls_status
+fleet-switchboard:v2_link_status_line
+fleet_health.py:_audit_events
+fleet_health.py:_read_state
+fleet_health.py:audit_moves
+fleet_health.py:decision_items
+fleet_health.py:held_prs
+fleet_health.py:mark_stale
+fleet_health.py:read_moves
+fleet_health.py:stale_since
+fleet_health.py:tick
+health_records.py:read_tool_file
+heartbeat-ack:atomic_write
+heartbeat-ack:read_state_document
+heavy_slots.py:_read
+heavy_slots.py:_read_info
+heavy_slots.py:_reported
+impact_floor.py:load_matrix
+impact_hold.py:_gh_json
+impact_hold.py:_pending_read
+impact_hold.py:read_impact_state
+judge-eval:cmd_run
+judge-eval:cmd_sweep
+judge-eval:read_jsonl
+judge-sample:read_verdicts
+merge_gate.py:pass_and_merge
+merge_gate.py:read_json
+path_suites.py:check_manual
+path_suites.py:load_manual
+plan_ledger.py:_read_head
+plan_ledger.py:cos_rules
+plan_ledger.py:read_ledger
+pr_reading.py:_json
+proof-switchboard:api
+proof-switchboard:audit
+proof-switchboard:cmd_lab_status
+proof-switchboard:cmd_session
+proof-switchboard:do_POST
+proof-switchboard:herdr
+proof-switchboard:launch
+proof-switchboard:model_requests
+proof-switchboard:new_lab_pane
+proof-switchboard:pane_text
+proof-switchboard:parse_script
+proof-switchboard:run_pass
+proof-switchboard:settings
+proof-switchboard:shim_log
+queue_ejections.py:read_failure
+reassign.py:read_overrides
+reassign.py:read_overrides_strict
+reds.py:get
+reds.py:parse_artifact
+registry.py:_old_retired
+registry.py:_parse
+registry.py:_small
+registry.py:fold_old
+repo_exclusion.py:_commands
+repo_exclusion.py:az_without_subscription
+review_checkout.py:remove
+spotlight_guard.py:load
+switchboard-trial:latest_session
+switchboard-trial:launch
+switchboard-trial:launched
+switchboard-trial:observation
+switchboard-trial:resume
+switchboard-trial:settings
+switchboard/agents_verify.py:agent_definition
+switchboard/agents_verify.py:agents_found
+switchboard/alert_labels.py:__init__
+switchboard/answer_delivery.py:cmd_decision_batch
+switchboard/decisions_a.py:read_batch_notes
+switchboard/decisions_a.py:read_escalated
+switchboard/decisions_b.py:read_order_notices
+switchboard/decisions_b.py:sync_for
+switchboard/engine.py:load
+switchboard/facts.py:_load
+switchboard/handoff.py:post_ask_comment
+switchboard/import_v1.py:read_v1_export
+switchboard/jev.py:_load
+switchboard/jev.py:_post
+switchboard/judge.py:ask_judge_daemon
+switchboard/judge.py:looks_like_plugin_event
+switchboard/judge.py:parse_plugin_event
+switchboard/judge_request.py:_guess_configured
+switchboard/judge_request.py:parse_policy_request
+switchboard/triage.py:triage_summary
+switchboard/v2_transport.py:_decode
+switchboard/v2_transport.py:_read_file
+triage-sample:read_findings
+triage-sample:summarise
+triage_digest.py:read_json
+work_sync.py:_read_json
+""".split()
+
+    @staticmethod
+    def scan(root):
+        """{"file:function"} of every json.loads, json.load and `from json import loads` call in the python sources under root (tests excluded)."""
+        import ast
+        out = set()
+        for f in sorted(Path(root).rglob("*")):
+            if not f.is_file() or f.name.startswith(("test-", "test_")) or "__pycache__" in f.parts:
+                continue
+            try:
+                text = f.read_text()
+            except (OSError, UnicodeError):
+                continue
+            if not (f.suffix == ".py" or text.startswith(("#!/usr/bin/env python", "#!/usr/bin/python"))):
+                continue
+            try:
+                tree = ast.parse(text)
+            except (SyntaxError, ValueError):
+                continue
+            names = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "json" for a in n.names if a.name in ("loads", "load")}
+            def walk(node, fn):
+                for c in ast.iter_child_nodes(node):
+                    nf = c.name if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+                    if isinstance(c, ast.Call):
+                        x = c.func
+                        if (isinstance(x, ast.Attribute) and x.attr in ("loads", "load") and isinstance(x.value, ast.Name) and x.value.id in ("json", "_json")) \
+                                or (isinstance(x, ast.Name) and x.id in names):
+                            out.add("%s:%s" % (f.relative_to(root).as_posix(), fn or "<module>"))
+                    walk(c, nf)
+            walk(tree, None)
+        return out
+
+    def missing(self, root):
+        known = set(self.EXEMPT) | self.HELPERS
+        return sorted(self.scan(root) - known)
+
+    def test_every_json_reader_in_bin_is_in_the_table(self):
+        self.assertEqual(self.missing(self.BIN), [])
+
+    def test_the_table_has_no_stale_entry(self):
+        self.assertEqual(sorted((set(self.EXEMPT) | self.HELPERS) - self.scan(self.BIN)), [])
+
+    def test_a_planted_third_reader_is_named(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        shutil.copytree(str(self.BIN), str(tmp / "bin"), ignore=shutil.ignore_patterns("test-*", "__pycache__"))
+        (tmp / "bin" / "planted_reader.py").write_text("import json\n\ndef read_planted(path):\n    return json.loads(open(path).read())\n")
+        self.assertEqual(self.missing(tmp / "bin"), ["planted_reader.py:read_planted"])
+
+    def test_the_covered_readers_are_derived_and_call_the_shared_parse(self):
+        import ast
+        for key, module in self.READERS.items():
+            path, fn = key.split(":")
+            tree = ast.parse((self.BIN / path).read_text())
+            node = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == fn][0]
+            calls = {c.func.attr if isinstance(c.func, ast.Attribute) else getattr(c.func, "id", "") for c in ast.walk(node) if isinstance(c, ast.Call)}
+            self.assertIn("parse_bounded", calls, key)
+            self.assertNotIn("loads", calls, key)
+        # and no raw json.loads stays in them (the scan finds none there)
+        self.assertEqual(set(self.READERS) & self.scan(self.BIN), set())
+
+    def deep(self, n):
+        return "[" * n + "]" * n
+
+    def nested(self, n):
+        return '{"reminders": [], "k": %s}' % self.deep(n - 1)   # an object holding n-1 more levels: n in all
+
+    def presence(self, state, text):
+        ap = sb.load_agent_presence()
+        d = Path(state) / ap.RECORD_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / "w.json"
+        f.write_text(text)
+        os.chmod(str(f), 0o600)
+        return ap.read_record(state, "w")
+
+    def good_record(self, depth_extra):
+        return '{"kind": "local", "worker": "w", "session": "ses_1", "x": %s}' % (self.deep(depth_extra) if depth_extra else "0")
+
+    def reminders_read(self, state, text):
+        (Path(state) / "reminders.json").write_text(text)
+        try:
+            return ("ok", sb.read_reminders(state))
+        except sb.ReminderError as err:
+            return ("refused", str(err))
+
+    def with_limit(self, limit, fn):
+        old = sys.getrecursionlimit()
+        sys.setrecursionlimit(limit)
+        try:
+            return fn()
+        finally:
+            sys.setrecursionlimit(old)
+
+    def tmpdir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
+
+    # the record cap of agent_presence is 8192 bytes, so its deepest file is 4000 levels (the reminders reader takes 30000)
+    def test_s2_deep_file_is_refused_by_load_record_without_raising(self):
+        st = self.tmpdir()
+        self.assertEqual(self.presence(st, self.good_record(4000)), (None, "is not readable JSON"))
+
+    def test_s3_deep_file_is_refused_by_the_reminders_readers_without_raising(self):
+        st = self.tmpdir()
+        got = self.reminders_read(st, '{"reminders": %s}' % self.deep(30000))
+        self.assertEqual(got[0], "refused")
+        self.assertIn("nested deeper than", got[1])
+        f = Path(st) / "reminder-repeats.json"
+        f.write_text(self.deep(30000))
+        self.assertIsNone(sb.read_record_file(f))
+
+    def test_s4_the_refusal_is_the_same_at_a_low_and_the_default_recursion_limit(self):
+        st = self.tmpdir()
+        a = {self.with_limit(lim, lambda: self.presence(st, self.good_record(4000))) for lim in (200, sys.getrecursionlimit())}
+        self.assertEqual(len(a), 1)
+        b = {self.with_limit(lim, lambda: self.reminders_read(st, '{"reminders": %s}' % self.deep(30000))) for lim in (200, sys.getrecursionlimit())}
+        self.assertEqual(len(b), 1)
+
+    def test_s5_load_record_parses_at_the_limit_and_refuses_one_deeper(self):
+        st = self.tmpdir()
+        limit = sb.load_module("record_json").RECORD_MAX_DEPTH
+        ok = self.presence(st, '{"kind": "local", "worker": "w", "session": "ses_1", "x": %s}' % self.deep(limit - 1))
+        self.assertIsNone(ok[1])
+        self.assertEqual(self.presence(st, '{"kind": "local", "worker": "w", "session": "ses_1", "x": %s}' % self.deep(limit)), (None, "is not readable JSON"))
+
+    def test_s6_reminders_reader_parses_at_the_limit_and_refuses_one_deeper(self):
+        st = self.tmpdir()
+        limit = sb.load_module("record_json").RECORD_MAX_DEPTH
+        self.assertEqual(self.reminders_read(st, '{"reminders": [], "x": %s}' % self.deep(limit - 1)), ("ok", []))
+        self.assertEqual(self.reminders_read(st, '{"reminders": [], "x": %s}' % self.deep(limit))[0], "refused")
+        f = Path(st) / "reminder-repeats.json"
+        f.write_text(self.deep(limit))
+        self.assertEqual(sb.read_record_file(f), json.loads(self.deep(limit)))
+        f.write_text(self.deep(limit + 1))
+        self.assertIsNone(sb.read_record_file(f))
+
+    def test_the_limit_equals_the_cloud_readers_limit(self):
+        self.assertEqual(sb.load_module("record_json").RECORD_MAX_DEPTH, sb.load_module("cloud_worker").WATCH_MAX_DEPTH)
+
+    def mutate(self, rel, old, new):
+        text = (self.BIN / rel).read_text()
+        self.assertIn(old, text)
+        return text.replace(old, new)
+
+    def test_s9_mutants_the_scan_removed_from_each_reader_are_caught(self):
+        """Run by hand too: replace parse_bounded by json.loads at the reader and the deep-file tests fail."""
+        for rel, old in (("agent_presence.py", "_record_json.parse_bounded("), ("switchboard/reminders.py", 'load_module("record_json").parse_bounded(')):
+            text = self.mutate(rel, old, "json.loads(")
+            self.assertNotIn("parse_bounded", text.replace("def parse_bounded", "")) if False else None
+            self.assertIn("json.loads(", text)
+            # the derived scan sees the plain loads in the reader function and it is not in the table
+            tmp = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, str(tmp), True)
+            shutil.copytree(str(self.BIN), str(tmp / "bin"), ignore=shutil.ignore_patterns("test-*", "__pycache__"))
+            (tmp / "bin" / rel).write_text(text)
+            self.assertTrue(self.missing(tmp / "bin"), rel)
+
+    def test_docs_name_every_reader_and_the_bounded_depth_parse(self):
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        section = docs[docs.index("### Depth limit of untrusted record parses"):docs.index("## The assembler")]
+        for name in list(self.READERS) + ["record_json.py", "RECORD_MAX_DEPTH", "bounded-depth", "TestRecordJsonReaders"]:
+            self.assertIn(name.split(":")[-1], section)
+
+
+class TestScanDriftGuard(unittest.TestCase):
+    """#1314: bin/record_json.py copies the cloud_worker depth scan; both scans must give the SAME RESULT on the same inputs."""
+    BATTERY = {
+        "nested_strings": '{"a": "[[[{{{", "b": ["x", "{"]}',
+        "escaped_quote": '{"a": "q\\"' + "[" * 70 + '", "b": [1]}',
+        "escaped_backslash_deep": '"\\\\"' + "[" * 70,
+        "escaped_backslash": '{"a": "path\\\\", "b": [[[1]]]}',
+        "escaped_backslash_then_quote": '["\\\\"][[[[',
+        "brackets_in_string": '"' + "[" * 200 + '"',
+        "unbalanced_closers": "]]]}}}" + "[" * 64,
+        "unbalanced_closers_then_deep": "}" * 10 + "[" * 70,
+        "unbalanced_openers": "[" * 30,
+        "unbalanced_openers_over": "{" * 100,
+        "exactly_64": "[" * 64 + "]" * 64,
+        "exactly_65": "[" * 65 + "]" * 65,
+        "exactly_64_objects": '{"a":' * 64 + "1" + "}" * 64,
+        "exactly_65_objects": '{"a":' * 65 + "1" + "}" * 65,
+        "deep_30000": "[" * 30000 + "]" * 30000,
+        "all_bracket_64k": "[" * 65536,
+        "all_bracket_64k_mixed": "[{" * 32768,
+        "empty": "",
+        "whitespace": " \t\r\n  ",
+        "scalar": "42",
+        "scalar_string": '"x"',
+        "object_in_arrays": "[" * 40 + '{"a":' * 30 + "1" + "}" * 30 + "]" * 40,
+        "arrays_in_objects": '{"a":' * 40 + "[" * 30 + "]" * 30 + "}" * 40,
+        "object_in_arrays_over": "[" * 40 + '{"a":' * 30 + "1" + "}" * 30 + "]" * 40 + "[" * 30,
+        "non_ascii": '{"k\u00e9y": "\u2603[[[\U0001F600", "z": ["\u00fc"]}',
+        "non_ascii_deep": "\u00e9" + "[" * 65,
+    }
+
+    @staticmethod
+    def scans(record_src=None):
+        rj = sb.load_module("record_json")
+        cw = sb.load_module("cloud_worker")
+        return rj.nesting_too_deep, cw.nesting_too_deep
+
+    def compare(self, a, b):
+        return {n: (a(t), b(t)) for n, t in self.BATTERY.items() if a(t) != b(t)}
+
+    def test_both_scans_agree_on_the_battery(self):
+        a, b = self.scans()
+        for name, text in self.BATTERY.items():
+            with self.subTest(name):
+                self.assertEqual(a(text), b(text), name)
+
+    def test_battery_expectations(self):
+        a, b = self.scans()
+        for name, want in (("exactly_64", False), ("exactly_65", True), ("deep_30000", True), ("empty", False),
+                           ("whitespace", False), ("scalar", False), ("unbalanced_closers", False), ("brackets_in_string", False)):
+            self.assertIs(a(self.BATTERY[name]), want, name)
+            self.assertIs(b(self.BATTERY[name]), want, name)
+
+    def test_mutants_make_the_guard_fail(self):
+        src = (REPO / "bin" / "record_json.py").read_text()
+        _, b = self.scans()
+        for old, new in (('elif ch == "[" or ch == "{":', 'elif ch == "[":'),
+                         ('elif ch == "\\\\":\n                escaped = True', 'elif False:\n                escaped = True'),
+                         ('elif ch == "]" or ch == "}":\n            depth -= 1', 'elif False:\n            depth -= 1')):
+            self.assertIn(old, src)
+            ns = {}
+            exec(compile(src.replace(old, new), "mutant", "exec"), ns)
+            self.assertTrue(self.compare(ns["nesting_too_deep"], b), old)
 
 
 if __name__ == "__main__":
