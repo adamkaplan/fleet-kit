@@ -1,0 +1,4 @@
+{
+ "command": "cloud-clear",
+ "help": "usage: fleet-switchboard cloud-clear [-h] [--dry-run] options: -h, --help show this help message and exit --dry-run Say what would be cleared; remove nothing"
+}

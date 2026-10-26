@@ -18,7 +18,7 @@ MAX_SCENARIOS = 200         # a hard limit; the guidance is about 30
 GUIDANCE_SCENARIOS = 30       # per slice, or in total when no scenario has a slice
 GUIDANCE_TOTAL_WITH_SLICES = 80
 
-PROOFS = ("test", "live", "measure", "screenshot")
+PROOFS = ("test", "live", "measure", "screenshot", "review")
 EVALUATORS = ("ci", "tester", "reviewer", "owner")
 # An older plan wrote the owner's evaluator under a personal name; it is still accepted as `owner` (a plan approved with it
 # keeps passing, and its hash, which covers the text as written, does not change), with a warning to rename it.
@@ -29,7 +29,9 @@ OPTIONAL = ("claim", "slice", "phase")
 KNOWN = REQUIRED + OPTIONAL
 # proof -> the evaluators that can record it
 PROOF_EVALUATORS = {"test": ("ci",), "screenshot": ("reviewer", "owner"), "live": ("tester", "owner"),
-                    "measure": ("tester", "owner")}
+                    "measure": ("tester", "owner"), "review": ("reviewer",)}
+# A `review` proof is a reviewer's read of text. A scenario whose subject is code behaviour a test can show is refused: use `test`.
+REVIEW_CODE_RE = re.compile(r"\b(?:exit status|exit code|stdout|stderr|returns?|raises?|throws?|function|endpoint|api call|code behaviou?r|runs? the (?:command|code|tests?)|refus(?:es|ed|e)|rejects?|rejected|prints?|printed|logs?|logged|exits?|exited|blocks?|blocked|allows?|allowed|writes?|written|contains?|non-zero|nonzero|mode 0[0-7]+|accepts?|accepted|sends?|sent|queued|names|removed|denies|denied|deletes?|deleted|emits?|creates?|created|posts?|fails|failed|stops?|aborts?|aborted|never|echoed)\b", re.IGNORECASE)
 
 ID_RE = re.compile(r"^[SU][0-9]+[a-z]?$")
 COVERS_RE = re.compile(r"^(DW|PC)-([0-9]+)$")
@@ -69,19 +71,71 @@ class PlanFormatError(ValueError):
 
 # ----------------------------------------------------------------------------------- finding the plan
 
+PLAN_RULE = ("A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed "
+             "and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.")
+RECEIPT_MARKER = "<!-- plan-receipt -->"   # the first line of a receipt: the only thing that makes a comment a receipt
+RECEIPT_HASH_RE = re.compile(r"^plan hash: sha256:[0-9a-f]{64}$")
+RECEIPT_MAX_LINES = 6   # the marker, the hash line and the two to four lines of reason
+
+
+def _first_line(comment):
+    return next((line.strip() for line in comment["body"].splitlines() if line.strip()), "")
+
+
+def is_receipt(comment):
+    return isinstance(comment.get("body"), str) and _first_line(comment) == RECEIPT_MARKER
+
+
+def _is_plan_comment(comment):
+    return isinstance(comment.get("body"), str) and not is_receipt(comment) and bool(HEADING_RE.match(_first_line(comment)))
+
+
+def _ordered(comments):
+    return sorted((c for c in comments or [] if isinstance(c, dict) and isinstance(c.get("body"), str)),
+                  key=lambda c: (str(c.get("created_at") or ""), c.get("id") if isinstance(c.get("id"), int) else 0))
+
+
 def select_plan_text(body, comments):
-    """(text, source): the LATEST comment whose first non-empty line is a heading containing `Plan (scenarios)`, else
-    the issue body. `comments` is a list of {"id", "created_at", "body"}; source is "comment <id>" or "issue body"."""
+    """(text, source): the LATEST plan comment (a comment whose first non-empty line is a heading containing `Plan (scenarios)`
+    and that is not a receipt), else the issue body. `comments` is a list of {"id", "created_at", "body"}; source is
+    "comment <id>" or "issue body"."""
     chosen = None
-    ordered = sorted((c for c in comments or [] if isinstance(c, dict) and isinstance(c.get("body"), str)),
-                     key=lambda c: (str(c.get("created_at") or ""), c.get("id") if isinstance(c.get("id"), int) else 0))
-    for comment in ordered:
-        first = next((line for line in comment["body"].splitlines() if line.strip()), "")
-        if HEADING_RE.match(first):
+    for comment in _ordered(comments):
+        if _is_plan_comment(comment):
             chosen = comment
     if chosen is not None:
         return chosen["body"], "comment %s%s" % (chosen.get("id"), comment_author(chosen))
     return body or "", "issue body"
+
+
+def receipt_problem(comment):
+    """Why a receipt is malformed (None when it is well formed): a receipt is the marker line, `plan hash: sha256:...`, then a short
+    reason, and carries no plan text."""
+    lines = [l for l in comment["body"].splitlines() if l.strip()]
+    text = comment["body"]
+    if any(HEADING_RE.match(l) for l in lines) or re.search(r"(?m)^\s*(?:plan-format:|scenarios:)", text) or "```" in text:
+        return "receipt carries plan text"
+    if len(lines) < 3 or not RECEIPT_HASH_RE.match(lines[1].strip()):
+        return "receipt is not the marker line, a `plan hash: sha256:<64 hex>` line and a short reason"
+    if len(lines) > RECEIPT_MAX_LINES:
+        return "receipt is longer than the marker, the hash and four lines of reason"
+    return None
+
+
+def plan_comment_defects(comments):
+    """The defects of the comments of an issue as plan comments: a second plan comment (naming both) and a malformed receipt."""
+    defects = []
+    ordered = _ordered(comments)
+    plans = [c for c in ordered if _is_plan_comment(c)]
+    for extra in plans[1:]:
+        defects.append({"id": "-", "code": "second-plan-comment",
+                        "message": "comment %s looks like a plan but comment %s is already the plan: a plan is ONE canonical comment, "
+                                   "edited in place; put the revision in comment %s and add a receipt" % (extra.get("id"), plans[0].get("id"), plans[0].get("id"))})
+    for comment in ordered:
+        problem = receipt_problem(comment) if is_receipt(comment) else None
+        if problem:
+            defects.append({"id": "-", "code": "bad-receipt", "message": "comment %s: %s" % (comment.get("id"), problem)})
+    return defects
 
 
 def comment_author(comment):
@@ -695,6 +749,8 @@ def validate(scenarios, clauses, text=""):
         proof, evaluator = _normal(scenario.get("proof", "")), _normal(scenario.get("evaluator", ""))
         if proof and proof not in PROOFS:
             bad(ident, "bad-proof", "proof %r must be one of %s" % (proof, "|".join(PROOFS)))
+        if proof == "review" and REVIEW_CODE_RE.search(_normal(scenario.get("text", "")) + " " + _normal(scenario.get("pass", ""))):
+            bad(ident, "review-for-code", "proof review is a reviewer's read of text, not of code behaviour a test can show: use test")
         if evaluator in EVALUATOR_ALIASES:
             warnings.append({"id": ident, "code": "evaluator-alias", "message": "%s: evaluator %r is a deprecated alias of "
                              "%r: rename it" % (ident, evaluator, EVALUATOR_ALIASES[evaluator])})
@@ -900,6 +956,7 @@ EXPLAIN = {
     "bad-evaluator": ("`evaluator` is one of " + "|".join(EVALUATORS), "pick who records the proof"),
     "evaluator-mismatch": ("the evaluator must be able to record the proof: test needs ci, screenshot needs reviewer or owner, live and measure need tester or owner", "change the evaluator or the proof"),
     "live-no-claim": ("a live or tester scenario should say who claims it with a `claim` line (a warning only)", "add `claim: epic` (needs the installed system) or `claim: pr`"),
+    "review-for-code": ("proof `review` is a reviewer's read of text, not of code behaviour a test can show", "use `proof: test` for code behaviour"),
     "bad-claim": ("`claim` is `pr` (default) or `epic`", "remove it or use one of the two"),
     "vague-pass": ("`pass` must be an observable a stranger can decide: a status or exit code, a count or threshold, a quoted value, or a named comparison", "for example `exit status is 0`, `exactly 3 items`, `shows \"Ready\"`"),
     "no-discriminator": ("`discriminates` names the specific wrong build that would FAIL this scenario", "write `a build that <does X> <observable wrong outcome>`"),
@@ -912,6 +969,8 @@ EXPLAIN = {
     "bad-size": ("a size starts with S, M, L or XL", "write for example `size: S (one file, tests)`"),
     "size-in-days": ("size is a T-shirt in AGENT time, never days of human work", "drop the days; say what makes it that size"),
     "declared-clauses-mismatch": ("a `clauses:` block must reproduce the ask's Done-when, never merge or drop clauses", "copy the clauses from the ask, in order; the message shows the first one that differs"),
+    "second-plan-comment": ("a plan is ONE canonical comment on the issue, edited in place", "move the revision into the canonical comment and add a receipt"),
+    "bad-receipt": ("a receipt is the marker line, `plan hash: sha256:<hash>` and two to four lines of reason, and carries no plan text", "cut the plan text; say what changed and why"),
     "done-when-differs": ("a plan that states its own Done-when must state the ask's", "copy the Done-when from the ask"),
     "evaluator-alias": ("`adam` is an old spelling of `owner`", "write `owner`"),
     "discriminates-overlap": ("`discriminates` reuses most words of `pass`: it should name a wrong build", "name what the wrong build does"),

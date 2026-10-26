@@ -1451,25 +1451,51 @@ def tagged_blockers(reviews, head):
     return sorted("%s: CHANGES REQUESTED (Review of %s)" % (k, v[1][:8]) for k, v in latest.items() if v[0] == "CHANGES REQUESTED")
 
 
+REVIEW_RULE_MODULE = [None]
+
+
+class ReviewRuleUnreadable(Exception):
+    """shims/review_rule.py could not be loaded or used: the merge is REFUSED (never skipped), or a copy of this shim without its sibling would lose the guardrail.
+    args = (path, cause)."""
+
+
+def review_rule_load():
+    """The rule module, loaded once. ANY failure (missing file, syntax error, import error, a SystemExit or other BaseException at import, no `review_blockers`) raises ReviewRuleUnreadable(path, cause)."""
+    if REVIEW_RULE_MODULE[0] is None:
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review_rule.py")
+        if not os.path.isfile(path):
+            raise ReviewRuleUnreadable(path, "missing")
+        try:
+            spec = importlib.util.spec_from_file_location("review_rule", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except SyntaxError:
+            raise ReviewRuleUnreadable(path, "syntax error")
+        except ImportError:
+            raise ReviewRuleUnreadable(path, "import error")
+        except SystemExit:
+            raise ReviewRuleUnreadable(path, "exit at import")
+        except BaseException as err:
+            raise ReviewRuleUnreadable(path, "load error (%s)" % type(err).__name__)
+        if not callable(getattr(module, "review_blockers", None)):
+            raise ReviewRuleUnreadable(path, "no function review_blockers")
+        REVIEW_RULE_MODULE[0] = module
+    return REVIEW_RULE_MODULE[0]
+
+
 def review_blockers(reviews, head="", decision=""):
-    """The reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED or DISMISSED; a plain comment is not decisive) is CHANGES_REQUESTED AND
-    still blocks this head: it is at the PR's current head (its commit oid equals `head`), or its commit or the head is not known, or GitHub's
-    `decision` (reviewDecision) is CHANGES_REQUESTED. A changes-requested review at an OLDER head is superseded by that reviewer's newer review of any
-    kind (a comment included; this rule only) unless GitHub's decision still says CHANGES_REQUESTED; one at the CURRENT head is cleared only by that
-    reviewer's later approval or dismissal, never by a comment, because several agents can share one login. Where GitHub gives no decision (no required
-    reviews) an old-head review does not block: this is a guardrail, GitHub's branch protection is the boundary. `tagged_blockers` is separate."""
-    latest = {}
-    for review in reviews if isinstance(reviews, list) else []:
-        if not isinstance(review, dict):
-            continue
-        author = ((review.get("author") or {}).get("login")) if isinstance(review.get("author"), dict) else None
-        state = str(review.get("state") or "").upper()
-        if author and state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
-            commit = review.get("commit") if isinstance(review.get("commit"), dict) else {}
-            latest[author] = (state, commit.get("oid") if isinstance(commit.get("oid"), str) else "")
-    blocked = str(decision or "").upper() == "CHANGES_REQUESTED"
-    return sorted(who for who, (state, oid) in latest.items()
-                  if state == "CHANGES_REQUESTED" and (blocked or not oid or not head or oid.lower() == head.lower()))
+    """The ONE rule lives in review_rule.py beside this file (shared with `fleet-switchboard gates`). The load AND the call are guarded: any failure or a result that is not a list of str raises ReviewRuleUnreadable, which `review_probe` turns into a REFUSAL."""
+    module = review_rule_load()
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review_rule.py")
+    try:
+        got = module.review_blockers(reviews, head, decision)
+    except SystemExit:
+        raise ReviewRuleUnreadable(path, "exit in review_blockers")
+    except BaseException as err:
+        raise ReviewRuleUnreadable(path, "raised in review_blockers (%s)" % type(err).__name__)
+    if not isinstance(got, list) or not all(isinstance(x, str) for x in got):
+        raise ReviewRuleUnreadable(path, "wrong return type from review_blockers")
+    return got
 
 
 def review_probe(args, found, reason, lookup, gh):
@@ -1483,6 +1509,7 @@ def review_probe(args, found, reason, lookup, gh):
     try:
         if len(args) < 2 or args[0] != "pr" or args[1] != "merge":
             return None
+        review_rule_load()   # FIRST, before any skip path: an unloadable rule refuses a merge whatever else happens
         parsed = gate_parse(args)
         if parsed is None:
             sys.stderr.write("gh: review check skipped (the merge command shape was not understood)\n")
@@ -1534,6 +1561,9 @@ def review_probe(args, found, reason, lookup, gh):
         why = ("--over-review needs a reason of at least 10 characters" if found else
                "resolve them, or pass --over-review '<reason of at least 10 characters>' (it is logged)")
         return "gh: merge of %s#%d refused: blocking review(s): %s. %s" % (repo, number, names, why)
+    except ReviewRuleUnreadable as err:
+        path, cause = (list(err.args) + ["unknown"])[:2]
+        return "gh: review rule unreadable: %s: %s: merge refused" % (gate_clean(os.path.basename(str(path))), gate_clean(cause))
     except Exception:
         sys.stderr.write("gh: review check skipped (an unexpected error): not checked\n")
         return None

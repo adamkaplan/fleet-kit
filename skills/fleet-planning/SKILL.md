@@ -16,12 +16,20 @@ workspace's plan. No plan, no assignment. A tiny work item under an already-revi
 Who approves: a work item's plan, its orchestrator (the Chief of Staff if it touches a held-PR area); an ask's, the Chief of
 Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
+## One plan comment
+
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+
+Receipt format: `docs/plan-template.md`.
+
 ## The method, in order
 
 1. **Done-when**: copy the ask's clauses, numbered `(1) ... (2) ...`. They are the authority; never reword them.
+   A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).
 2. **Clauses to scenarios**: every clause needs at least one behaviour scenario (`S`); behaviour that must NOT change is a
    `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
-   screenshot`), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
+   screenshot | review`; `review` quotes text; this check is a net: the plan's reviewer is the guard), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
    **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
@@ -49,9 +57,8 @@ detail) plus **one detail comment** whose first line is a heading containing `Pl
 
 ## Challenge it
 
-When available: a `plan review` command launches independent read-only reviewers and records their verdicts (not built yet:
-until then ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
-chosen per item. Expect up to three rounds; an objection still standing after round three goes to the Chief of Staff, then the owner.
+When available: a `plan review` command launches independent read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
+chosen per item. Up to three rounds; an objection standing after that goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
@@ -100,6 +107,6 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, or "add a `c
 
 Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
-open. The order does not matter (a `ci` verdict recorded before your `prove` counts once the proof exists at the same head, and
-the daemon records `ci` verdicts itself within minutes of green checks): a coder's only extra step is `prove`. A push voids every proof and
+open. The order does not matter (a `ci` verdict recorded before your `prove` counts once the proof exists): a coder's only extra step is `prove`. A push voids every proof and
 verdict. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
+`CARRIES: #N`: see plan-template.

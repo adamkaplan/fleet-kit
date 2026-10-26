@@ -112,9 +112,9 @@ if command == "create":
     if unknown:
         sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
         sys.exit(2)
-    shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "S"
-    if shape not in ("S", "M"):
-        sys.stderr.write("error: shape must be S or M\\n")
+    shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "XS"
+    if shape not in ("XS", "S", "M"):
+        sys.stderr.write("error: shape must be XS, S or M\\n")
         sys.exit(2)
 if command == "create":
     for item in argv:
@@ -506,6 +506,23 @@ class TestCloudWorkerEndpoint(Base):
         code, out, err = self.main("send", "coder7", "hi")
         self.assertEqual(code, 1)
         self.assertEqual(len(self.remote.requests), before)
+
+    def test_a_fifo_or_symlink_record_does_not_hang_the_store_reader(self):
+        """#1097 family: load_record (_read_private) must not block on a FIFO nor follow a symlink."""
+        import signal as _sig
+        cw = sb.load_module("cloud_worker")
+        d = self.state / "cloud"; d.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(str(d / "ff.json"))
+        os.symlink(str(d / "nothing"), str(d / "ll.json"))
+        def boom(*a):
+            raise AssertionError("blocked")
+        old = _sig.signal(_sig.SIGALRM, boom); _sig.alarm(3)
+        try:
+            for n in ("ff", "ll"):
+                with self.assertRaises(cw.CloudError):
+                    cw.load_record(self.state, n)
+        finally:
+            _sig.alarm(0); _sig.signal(_sig.SIGALRM, old)
 
     def test_a_launcher_that_fails_creates_nothing(self):
         with mock.patch.dict(os.environ, {"FLEET_CLOUD_WORKER_BIN": "/bin/false"}):
@@ -1186,18 +1203,20 @@ class TestStopAndStatus(Base):
         self.assertEqual(self.launch()[0], 1)   # the second is refused for the record, and the reservation was released
         self.assertFalse(sb.load_module("cloud_worker").bind(sb.__dict__)._reserved("coder7"))
 
-    def test_status_mints_no_token_for_a_worker_past_its_hard_deadline(self):
+    def test_status_probes_no_worker_past_its_hard_deadline(self):
+        # #1056: the status run reads the cluster ONCE for the summary (one login, whatever the number of workers), so a worker past its
+        # hard deadline is no longer "no login at all"; what it must still never get is a PER-RECORD probe (a launcher status of its own).
         self.assertEqual(self.launch()[0], 0)
         path = self.state / "cloud" / "coder7.json"
         record = json.loads(path.read_text())
         record["hard_deadline"] = "2000-01-01T00:00:00Z"
         path.write_text(json.dumps(record))
         os.chmod(str(path), 0o600)
-        mints = lambda: len([c for c in self.jsonl("kubectl.log") if "token" in c["args"] and "create" in c["args"]])
-        before = mints()
+        probes = lambda: len([c for c in self.stub_calls() if c[0] == "status"])
+        before = probes()
         code, out, err = self.main("status")
         self.assertIn("past its hard deadline", out + err)
-        self.assertEqual(mints(), before)
+        self.assertEqual(probes(), before)
 
 
 class TestLaunchRunsThePreflight(Base):
