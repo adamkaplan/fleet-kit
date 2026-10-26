@@ -1187,6 +1187,12 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
     if scored is not None and info is not None:
         info["score"] = scored["level"]
         info["runs"] = scored.get("runs") or []
+    if brief is not None and not (brief[0] and brief[1]):   # #981 first: a clear with no brief to bind (a list that cannot be read whole has none) names the real reason of the rules; only a clean one is then refused for the missing brief
+        found = module.causes_of(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored)
+        if found:
+            if info is not None:
+                info["causes"] = found
+            return None, "; ".join(c["text"] for c in found)
     if brief is not None:   # #1215: the brief-bound clear; `brief` = (digest, text, reasons). The floor's own brief at THIS head, from the module of slice A
         floor = floor_brief(engine, repo, report, got["files"])
         info["floor_brief"] = floor
