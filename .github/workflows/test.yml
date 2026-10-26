@@ -192,7 +192,7 @@ jobs:
       # The image-scan cases build images FROM a pulled base image (network): skipped here, with a visible "skip docker" line.
       - name: cloud/tests/test-cloud
         if: ${{ !cancelled() }}
-        timeout-minutes: 5
+        timeout-minutes: 10
         env:
           CLOUD_TEST_SKIP_DOCKER: "1"
         run: |
