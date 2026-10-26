@@ -681,34 +681,109 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
 
 
 def shadow_names(rule):
-    """The names of the clear's closure the matrix lists: `closure_roots` and every `module_roots` list (`*` is not a name). The matrix is the only source: a binding the closure reads that is
-    not one of these names is NOT known here (a stated limit, #1339)."""
-    names = set(rule.get("closure_roots") or [])
+    """The names of the clear's closure the matrix carries: the daemon's roots (`closure_roots` and `rating_roots`) and every `module_roots` list (`*` is not a name). The matrix is the only
+    source: a binding the closure reads that is not one of these names is NOT known here (a stated limit, #1339; CI's `tools/derive-closure --check` lists the part that holds it)."""
+    names = {r for r in daemon_roots(rule) if isinstance(r, str) and r != "*"}
     for roots in (rule.get("module_roots") or {}).values():
         names |= {r for r in roots if isinstance(r, str) and r != "*"}
     return names
 
 
-def _top_names(tree):
-    """{name: how many top-level statements bind it} (a plain `import x` is not counted: it binds the module, it does not define a closure name by a body)."""
-    count = {}
-    for node in tree.body:
-        if isinstance(node, ast.Import):
+_MATCH_KINDS = tuple(getattr(ast, n) for n in ("MatchAs", "MatchStar", "MatchMapping") if hasattr(ast, n))
+
+
+def _store_names(node):
+    """The names an expression or target binds when it runs: Name targets (nested tuples and lists, starred), walrus targets, and the captures of a pattern. A lambda body is a function body: not entered."""
+    found, todo = set(), [node]
+    while todo:
+        x = todo.pop()
+        if isinstance(x, ast.Lambda):
             continue
-        for name in _bound_names(node):
-            count[name] = count.get(name, 0) + 1
-    return count
+        if isinstance(x, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):   # a comprehension's loop variables are its own; a walrus inside it binds in the enclosing scope
+            found.update(n.target.id for n in ast.walk(x) if isinstance(n, ast.NamedExpr))
+            continue
+        if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
+            found.add(x.id)
+        elif isinstance(x, ast.NamedExpr):
+            found.add(x.target.id)
+        elif _MATCH_KINDS and isinstance(x, _MATCH_KINDS):
+            for attr in ("name", "rest"):
+                if isinstance(getattr(x, attr, None), str):
+                    found.add(getattr(x, attr))
+        todo.extend(ast.iter_child_nodes(x))
+    return found
+
+
+def bound_names(tree):
+    """THE CLOSED RULE of the shadow check (#1339): the names a file BINDS at module level are every name bound by ANY statement that runs when the file is imported, found by walking the module
+    body through the if/try/for/while/with/match blocks and NOT into function or class bodies: def and class names; the targets of Assign, AnnAssign and AugAssign (nested and starred); the aliases
+    of Import and ImportFrom (the alias, or the first dotted segment); for and with-as targets; except-as names; walrus targets (also in a decorator, a default or a condition); the captures of a
+    match pattern; names deleted by `del`; and every name a `global` declaration names anywhere in the file (how a function binds a module name). LIMITS, stated: `exec`/`eval`, writes through
+    `globals()`/`vars()`/`setattr` on the module, bindings made by a call (`globals().update(...)`) and `from x import *` are not followed (the last is counted by tools/derive-closure's duplicate check)."""
+    found = set()
+
+    def stmts(body):
+        for node in body:
+            if isinstance(node, DEF_KINDS):
+                found.add(node.name)
+                for part in list(node.decorator_list) + ([node.args] if not isinstance(node, ast.ClassDef) else list(node.bases) + list(node.keywords)):   # run at import: a walrus there binds
+                    found.update(_store_names(part))
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                found.update((a.asname or a.name).split(".")[0] for a in node.names if a.name != "*")
+                continue
+            if isinstance(node, ast.Delete):
+                for target in node.targets:
+                    found.update(_store_names(target))
+                continue
+            if isinstance(node, (ast.If, ast.While)):
+                found.update(_store_names(node.test))
+                stmts(node.body)
+                stmts(node.orelse)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                found.update(_store_names(node.target))
+                found.update(_store_names(node.iter))
+                stmts(node.body)
+                stmts(node.orelse)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    found.update(_store_names(item.context_expr))
+                    if item.optional_vars is not None:
+                        found.update(_store_names(item.optional_vars))
+                stmts(node.body)
+            elif isinstance(node, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+                stmts(node.body)
+                for handler in node.handlers:
+                    if handler.name:
+                        found.add(handler.name)
+                    stmts(handler.body)
+                stmts(node.orelse)
+                stmts(node.finalbody)
+            elif hasattr(ast, "Match") and isinstance(node, ast.Match):
+                found.update(_store_names(node.subject))
+                for case in node.cases:
+                    found.update(_store_names(case.pattern))
+                    if case.guard is not None:
+                        found.update(_store_names(case.guard))
+                    stmts(case.body)
+            else:   # Assign, AnnAssign, AugAssign, Expr, Return..: every Name they store, and every walrus in them
+                found.update(_store_names(node))
+    stmts(tree.body)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            found.update(node.names)
+    return found
 
 
 def shadow_refusals(base_src, head_src, names, filename):
-    """[reasons] a change ADDS, in `filename`, a top-level definition or module-level binding whose name is in `names` (the clear's closure): the assembled daemon is one namespace, so a second
-    definition of a closure name in another file could take the place of the one the clear judged. Added = bound more times in the head than in the base. A file that does not parse: refused."""
+    """[reasons] a change ADDS, in `filename`, a bound name (`bound_names`: the head's set minus the base's) that is in `names`, the clear's closure: the assembled daemon is one namespace, so a second
+    binding of a closure name in another file (or a nested one in the same file) could take the place of the one the clear judged. A file that does not parse before or after the change: refused."""
     try:
-        before, after = _top_names(ast.parse(base_src)), _top_names(ast.parse(head_src))
+        added = bound_names(ast.parse(head_src)) - bound_names(ast.parse(base_src))
     except (SyntaxError, ValueError):
         return ["%s does not parse before or after the change: refused" % filename[:80]]
     return sorted("it adds %s in %s, a name of the clear's closure (a second definition of it could take its place): refused" % (name, filename[:80])
-                  for name in names if after.get(name, 0) > before.get(name, 0))
+                  for name in set(names) & added)
 
 
 def decode_blob(answer):
