@@ -64508,7 +64508,7 @@ class TestHeavyWaitRecord(StandInPids, unittest.TestCase):
     LOOK = 5   # fake seconds between the watcher's looks
 
     # THE family: one row per kind the code knows (derived below), in each slot it may be given: the ordinary slot, and the express slot for a command declared short.
-    COMMANDS = {"full": ["python3", "/nowhere/test-fake"], "focused": ["python3", "/nowhere/test-fake", "-k", "x"], "e2e": ["sh", "-c", "true", "e2e"], "other": ["sh", "-c", "true"]}
+    COMMANDS = {"full": ["python3", "/nowhere/test-fake"], "focused": ["python3", "/nowhere/test-fake", "-k", "x"], "e2e": ["sh", "-c", "true", "e2e"], "other": ["sh", "-c", "true"], "quick": ["python3", "/nowhere/test-fake", "-k", "x"]}
     SLOTS = (0, "express")
 
     def setUp(self):
@@ -64599,7 +64599,7 @@ class TestHeavyWaitRecord(StandInPids, unittest.TestCase):
     def test_the_family_has_a_row_for_every_kind_the_code_knows(self):
         self.assertEqual(set(self.COMMANDS), {kind for kind, _s, _m in self.hs.KINDS}, "a kind with no command here (or one the code no longer has)")
         for kind, command in self.COMMANDS.items():
-            self.assertEqual(self.hs.classify(command), kind)
+            self.assertEqual(self.hs.classify(command), "focused" if kind == "quick" else kind)   # classify never returns "quick": run_quick takes that row by name, for a command classify calls focused
         self.assertEqual(set(self.SLOTS), {0, self.hs.EXPRESS}, "the slots the code has: an ordinary one and the express one")
 
     def test_s2_a_run_that_waited_past_its_ceiling_and_then_ran_less_is_not_stopped(self):
@@ -84859,7 +84859,8 @@ class TestPreflightPr(unittest.TestCase):
             calls.append((list(argv), kwargs))
             done = mock.Mock(returncode=0, stdout="/work/repo\n" if argv[:2] == ["git", "rev-parse"] else "abc\n" if argv[:2] == ["git", "merge-base"] else "", stderr="")
             if "heavy" in argv:
-                done.returncode = 75   # all slots held: heavy gave up waiting
+                done.returncode = 75   # all slots held: heavy gave up waiting, and says so with the marker line that carries the caller's own nonce (an exit status alone is a result)
+                done.stderr = "heavy: [noslot %s]\n" % kwargs["env"]["FLEET_HEAVY_NOSLOT_NONCE"]
             return done
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
