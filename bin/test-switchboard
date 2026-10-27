@@ -7134,6 +7134,246 @@ for _path in sc.scenario_files(sc.DEFAULT_DIR):
 GITHUB_STEPS = ("comment", "kill-forwarder", "occupy-hook", "awaiting")
 
 
+DELIVERY_FIXTURE = REPO / "tests" / "switchboard" / "fixtures" / "delivery_measure.json"
+IDLE_CASES = ("idle_after_normal_turn", "idle_after_provider_error")
+
+
+def delivery_fixture():
+    return json.loads(DELIVERY_FIXTURE.read_text())
+
+
+def measured_table(fixture, override=None):
+    """{(case, form): turn started?} of the fixture's rows, with `override` ({(case, form): bool}) changed on a copy: the mutants of the fake."""
+    table = {(row["case"], row["form"]): bool(row["turn_started"]) for row in fixture["rows"]}
+    table.update(override or {})
+    return table
+
+
+def derived_forms():
+    """Every way one message is delivered, from the client's own table: each delivery with resume true and false, and a plain prompt."""
+    return [d + "_resume" if resume else d for d in sb.V2Client.DELIVERIES for resume in (True, False)] + ["prompt"]
+
+
+class TestMeasuredDelivery(Base):
+    """#1345: the answers measured on a real OpenCode v2 (tests/switchboard/fixtures/delivery_measure.json, the table of docs/switchboard.md) are the source. A fake v2 built from them reproduces each row, the
+    daemon's wake to an idle agent is checked against them, and every set (forms, cases, rows) is derived from the table, never listed by hand."""
+
+    def setUp(self):
+        super().setUp()
+        self.fixture = delivery_fixture()
+        self.world = World(self, agents=("platform",))
+        self.client = sb.V2Client(FAKE_OPENCODE, {}, self.world.v2, 5)
+
+    # -- the fake replays each row
+    def replay(self, table, case, form):
+        """Put a fresh session of the fake (built from `table`) in `case`, deliver one message in `form` through the daemon's client, and say whether it reached the model: (reached, turn started at once)."""
+        v2 = self.world.v2
+        v2.measured = table
+        sid = v2.create_session({"fleet": {"name": "m-%s-%s" % (case, form), "role": "coder"}})
+        if case == "working":
+            v2.start_turn(sid, "task", fleet=True, lasts=60, steps=3)
+            self.world.tick(5)
+        else:
+            v2.start_turn(sid, "setup", fleet=False)
+            self.world.tick(1)
+            if case == "idle_after_provider_error":
+                v2.sessions[sid]["outcome"] = "failed"
+        key = "measure:%s:%s" % (case, form)
+        meta = {"fleet": {"keys": [key], "from": "switchboard"}}
+        delivery, resume = sb_form_args(form)
+        before = len(v2.model_calls)
+        if form == "prompt":
+            self.client.prompt(sid, "text", meta)
+        else:
+            self.client.synthetic(sid, "text", meta, resume, delivery, sb.derive_message_id(sid, [key]))
+        at_once = any(c["session"] == sid and key in [k for i in c["inputs"] for k in i["keys"]] for c in v2.model_calls[before:])
+        self.world.tick(120)   # a working session reaches the model at its next step or after its last reply
+        reached = any(c["session"] == sid and key in [k for i in c["inputs"] for k in i["keys"]] for c in v2.model_calls[before:])
+        return reached, at_once
+
+    def mismatches(self, table):
+        """The rows the fake built from `table` does not reproduce (an idle row: a turn started at once; a working row: the message reached the model)."""
+        wrong = []
+        for row in self.fixture["rows"]:
+            reached, at_once = self.replay(table, row["case"], row["form"])
+            seen = reached if row["case"] == "working" else at_once
+            if seen != row["turn_started"]:
+                wrong.append((row["case"], row["form"]))
+        return wrong
+
+    def test_the_fake_reproduces_every_measured_row(self):
+        self.assertEqual(self.mismatches(measured_table(self.fixture)), [])
+
+    def test_the_fake_has_an_idle_session_that_ignores_a_queued_item_and_one_that_starts_a_turn_from_it(self):
+        table = measured_table(self.fixture)
+        for case in IDLE_CASES:
+            self.assertEqual(self.replay(table, case, "queue"), (False, False), case)        # ignores a queued item (no resume): it waits in the inbox
+            self.assertEqual(self.replay(table, case, "queue_resume"), (True, True), case)   # starts a turn from it
+
+    def test_mutant_the_fake_ignoring_a_form_is_caught_for_every_row(self):
+        """Each row of the table, flipped alone: a fake that ignores a form that starts a turn (or starts one for a form that does not) fails the replay at exactly that row."""
+        table = measured_table(self.fixture)
+        for key, answer in sorted(table.items()):
+            with self.subTest(key=key):
+                self.assertEqual(self.mismatches(measured_table(self.fixture, {key: not answer})), [key])
+
+    def test_mutant_a_fake_that_starts_a_turn_from_every_item_is_caught(self):
+        every = {key: True for key in measured_table(self.fixture)}
+        self.assertNotEqual(self.mismatches(every), [])
+        none = {key: False for key in measured_table(self.fixture)}
+        self.assertNotEqual(self.mismatches(none), [])
+
+    # -- the daemon's wake to an idle session
+    def idle_wake(self, case, rewrite=None):
+        """A wake to the one agent, idle in `case`, through the real pass. Returns (the form the daemon admitted it in, whether a turn started from it, how often the safety net ran)."""
+        v2 = self.world.v2
+        v2.measured = measured_table(self.fixture)
+        sid = self.world.sessions["platform"]
+        v2.start_turn(sid, "task", fleet=True)   # a turn of the fleet's own (nobody typed): the session is idle after it and not engaged, so the plan is a wake
+        self.world.tick(1)
+        if case == "idle_after_provider_error":
+            v2.sessions[sid]["outcome"] = "failed"
+        self.world.fact("platform", "lab.fact:1")
+        self.world.tick(90)   # not engaged any more: the plan is a wake
+        net = []
+        real_net = sb.undelivered_wake_tick
+        spy = lambda engine, discovery: (net.append(1), real_net(engine, discovery))[1]
+        before = len(v2.model_calls)
+        patches = [mock.patch.object(sb, "undelivered_wake_tick", spy)]
+        if rewrite is not None:
+            real = sb.V2Client.synthetic
+            patches.append(mock.patch.object(sb.V2Client, "synthetic", lambda client, session, text, meta, resume, delivery, mid, description=None: real(
+                client, session, text, meta, *rewrite(resume, delivery), mid, description)))
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            self.world.engine.run_pass()
+        (admitted,) = self.world.admissions("platform")
+        used = FakeV2.form_of(admitted["delivery"], admitted["resume"])
+        started = any(c["phase"] == "turn_start" and admitted["id"] in [i["id"] for i in c["inputs"]] for c in v2.model_calls[before:])
+        return used, started, len(net)
+
+    def check_wake(self, case, rewrite=None):
+        """The rule: the wake to an idle session goes in a form the table says starts a turn in that case, and a turn did start, with the net called once."""
+        used, started, net = self.idle_wake(case, rewrite)
+        table = measured_table(self.fixture)
+        self.assertTrue(table[(case, used)], "%s: the wake went as %s, which the table says starts no turn" % (case, used))
+        self.assertTrue(started, "%s: no turn started from the wake (%s)" % (case, used))
+        self.assertEqual(net, 1)
+        return used
+
+    def test_the_daemon_wakes_an_idle_session_in_a_form_that_starts_a_turn_in_each_idle_case(self):
+        used = {}
+        for case in IDLE_CASES:
+            self.setUp()   # a fresh world for each case
+            used[case] = self.check_wake(case)
+        self.assertEqual(len(used), 2)   # both idle cases have a named delivery
+        self.assertEqual(set(used.values()), {"queue_resume"})   # what the daemon sends today: queue with resume, and the table says it starts a turn in both
+
+    def test_mutant_the_wrong_delivery_for_an_idle_agent_is_caught_for_every_form_that_starts_no_turn(self):
+        """Derived from the table: every form that starts no turn on an idle session, sent for the wake instead, fails the rule."""
+        table = measured_table(self.fixture)
+        wrong = sorted({form for (case, form), started in table.items() if case in IDLE_CASES and not started})
+        self.assertEqual(wrong, ["queue", "steer"])
+        for form in wrong:
+            for case in IDLE_CASES:
+                with self.subTest(form=form, case=case):
+                    self.setUp()
+                    delivery, resume = sb_form_args(form)
+                    with self.assertRaises(AssertionError):
+                        self.check_wake(case, lambda r, d, delivery=delivery, resume=resume: (resume, delivery))
+
+    # -- completeness
+    def test_the_table_is_complete_over_the_delivery_forms_and_cases(self):
+        forms = derived_forms()
+        self.assertEqual(sorted(self.fixture["forms"]), sorted(forms))
+        self.assertEqual(sorted(sb_form_arg_names()), sorted(forms))
+        cases = sorted({row["case"] for row in self.fixture["rows"]})
+        self.assertEqual(sorted(self.fixture["cases"]), cases)
+        self.assertEqual(sorted((r["case"], r["form"]) for r in self.fixture["rows"]), sorted((c, f) for c in cases for f in forms))   # exactly one row per case and form
+        self.assertEqual(len(self.fixture["rows"]), len(cases) * len(forms))
+        for row in self.fixture["rows"]:
+            self.assertIsInstance(row["turn_started"], bool)
+            self.assertEqual(isinstance(row["ms"], int) and row["ms"] >= 0, row["turn_started"], row)   # a time in ms exactly when a turn started
+        self.assertTrue(self.fixture["v2_version"])
+        self.assertEqual(self.fixture["sessions"]["left"], 0)
+        self.assertEqual(self.fixture["sessions"]["created"], self.fixture["sessions"]["removed"])
+
+    def test_the_replay_covers_every_derived_form(self):
+        """Not a hand list: the forms the replay drove are collected from the replay itself."""
+        driven = set()
+        real = self.replay
+        def spy(table, case, form):
+            driven.add((case, form))
+            return real(table, case, form)
+        self.replay = spy
+        self.assertEqual(self.mismatches(measured_table(self.fixture)), [])
+        self.assertEqual(driven, {(c, f) for c in self.fixture["cases"] for f in derived_forms()})
+
+    def test_the_fixture_holds_no_secret_and_no_session_id(self):
+        text = DELIVERY_FIXTURE.read_text()
+        self.assertEqual(re.findall(r"ses_[A-Za-z0-9]{10,}", text), [])
+        self.assertEqual(re.findall(r"(?i)token|secret|password|bearer|api[_-]?key", text), [])
+
+    # -- the measurement helper (the live run is opt-in: it needs the Mac's opencode and takes a few minutes)
+    def test_the_helper_removes_its_session_through_the_service_even_when_a_cell_fails(self):
+        helper = importlib.import_module("support.delivery_measure")
+        removed, created = [], []
+        class Client:
+            def session_create(client, agent, title, directory, metadata):
+                created.append(title)
+                return {"id": "ses_throwaway"}
+            def prompt(client, *a, **k):
+                raise RuntimeError("the service went away")
+            def session_remove(client, sid):
+                removed.append(sid)
+        run = helper.Measurement.__new__(helper.Measurement)
+        run.client, run.sb, run.created, run.removed, run.nonce, run.agent, run.workdir, run.wait = Client(), sb, [], [], "abcd1234", None, REPO, 1
+        with self.assertRaises(RuntimeError):
+            run.cell(1, "idle_after_normal_turn", "queue")
+        self.assertEqual(removed, ["ses_throwaway"])
+        self.assertTrue(all(title.startswith(helper.TITLE_PREFIX) for title in created))   # named so it is never mistaken for a fleet agent
+
+    @unittest.skipUnless(os.access(os.environ.get("FLEET_KIT_LIVE_DELIVERY_MEASURE", ""), os.X_OK), "live: set FLEET_KIT_LIVE_DELIVERY_MEASURE to the path of an opencode v2 binary (it runs in a throwaway profile)")
+    def test_live_the_measurement_runs_in_a_throwaway_profile_and_leaves_nothing(self):
+        helper = importlib.import_module("support.delivery_measure")
+        with mock.patch.dict(os.environ, {sb.ALLOW_REAL_V2_ENV: "1"}):   # this one test means to run the real binary, inside the helper's own throwaway profile; restored after
+            result = helper.measure(os.environ["FLEET_KIT_LIVE_DELIVERY_MEASURE"])
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(len(result["rows"]), len(helper.CASES) * len(helper.FORMS))
+        self.assertEqual(result["sessions_left"], 0)
+        self.assertEqual(result["sessions_created"], result["sessions_removed"])
+
+    # -- the docs
+    DOC_ROW = re.compile(r"^\| `(?P<case>[a-z_]+)` \| `(?P<form>[a-z_]+)` \| (?P<started>yes|no) \| (?P<ms>[0-9]+|-) \|$")
+
+    def test_the_table_in_the_docs_equals_the_fixture(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("### Which delivery starts a turn (#1345)"):]
+        section = section[:section.index("\n### ", 10)]
+        rows = [m.groupdict() for m in map(self.DOC_ROW.match, section.splitlines()) if m]
+        docs = [(r["case"], r["form"], r["started"] == "yes", None if r["ms"] == "-" else int(r["ms"])) for r in rows]
+        fixture = [(r["case"], r["form"], r["turn_started"], r["ms"]) for r in self.fixture["rows"]]
+        self.assertEqual(docs, fixture)
+        self.assertIn(self.fixture["v2_version"], section)   # the measured version is named
+
+    def test_the_docs_say_the_completeness_test_is_derived_from_the_table_and_name_the_mutants(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("### Which delivery starts a turn (#1345)"):]
+        section = section[:section.index("\n### ", 10)]
+        for word in ("completeness", "mutant", "derives the forms", "ended-turn state"):
+            self.assertIn(word, section)
+
+
+def sb_form_args(form):
+    """(delivery, resume) of a form name, from the measurement helper's own table."""
+    return importlib.import_module("support.delivery_measure").FORM_ARGS[form]
+
+
+def sb_form_arg_names():
+    return list(importlib.import_module("support.delivery_measure").FORM_ARGS)
+
+
 class FakeProc:
     """A forwarder child: alive until it exits or is told to stop."""
 
@@ -14813,6 +15053,10 @@ class CharterRig:
             self.addCleanup(patcher.stop)
 
 
+    def expected_repo(self):
+        """The repo the guard must read for the orchestrator being set (orch-b in these tests): its registry row's repo, else the rig's."""
+        return ((self.registry.read(self.world.state)["agents"].get("orch-b") or {}).get("repo")) or self.REPO
+
     def orchestrator(self, name, charter=None, issue=None, registry=True):
         """A running orchestrator whose live SESSION metadata says `charter` and `issue`; its registry row (the first-seen fill the pass makes) holds the metadata charter unless `registry` is a value or False."""
         fleet = {"role": "orchestrator", "repo": self.REPO}
@@ -15218,6 +15462,68 @@ class TestCharterSetGuard(CharterRig, Base):
         code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.cmd_reads, [("parent", 3, self.REPO), ("invalidate", 3, self.REPO), ("issue", 3, self.REPO)])
+
+    GUARD_MUTANTS = {   # #1345: the guard's two reads and its cache step, each changed once in the REAL source of cmd_charter: name -> (old text, new text)
+        "the parent read ignores the repo": ("engine.intents.parent(value, repo0, strict=True)", "engine.intents.parent(value, None, strict=True)"),
+        "the parent read asks another repo": ("engine.intents.parent(value, repo0, strict=True)", "engine.intents.parent(value, 'other-org/elsewhere', strict=True)"),
+        "the label read ignores the repo": ("record = engine.intents.issue(value, repo0)", "record = engine.intents.issue(value, None)"),
+        "the label read asks another repo": ("record = engine.intents.issue(value, repo0)", "record = engine.intents.issue(value, 'other-org/elsewhere')"),
+        "the label read is served from the cache": ("engine.intents.invalidate(value, repo0)", "pass"),
+        "the invalidation forgets another repo": ("engine.intents.invalidate(value, repo0)", "engine.intents.invalidate(value, 'other-org/elsewhere')"),
+    }
+
+    ROW_REPO = "acme-org/billing-service"
+
+    def mutated_charter(self, old, new):
+        source = textwrap.dedent(inspect.getsource(sb.cmd_charter))
+        self.assertEqual(source.count(old), 1, old)   # the mutant is one change of one place, and the place is still there
+        scope = dict(vars(sb))
+        exec(compile(source.replace(old, new), "<mutant of cmd_charter>", "exec"), scope)
+        scope["cmd_charter"].ensure_on_use = True
+        return scope["cmd_charter"]
+
+    def cached_label_set(self, mutant=None):
+        """One `charter set orch-b 3` through the REAL reader and its REAL cache, the label gone upstream but still CACHED (as an earlier read of the same engine leaves it): the real `parent` read seeds the
+        issue cache with the label the way an earlier read would. Returns (exit code, stderr). The unmutated guard forgets the cached label first, reads afresh and refuses."""
+        self.orchestrator("orch-b", registry=None)
+        self.registry.upsert(self.world.state, "orch-b", dict(self.row("orch-b"), charter=None, repo=self.ROW_REPO))   # the row's repo is NOT the reader's default: a read that drops the repo lands elsewhere
+        stale = {"number": 3, "labels": [{"name": sb.orchestrator_label()}]}
+        upstream = {"number": 3, "labels": [{"name": "bug"}]}
+        def api(reader, path, repo=None):
+            if repo != self.ROW_REPO:   # the fake takes and checks the repo it is asked about
+                raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
+            if path.endswith("/parent"):
+                raise self.NOPARENT
+            return upstream
+        def parent(reader, number, repo=None, **kw):
+            found = REAL_INTENT_PARENT(reader, number, repo, **kw)
+            seeded = sb.IssueIntent.from_api(stale)
+            seeded.repo = repo
+            reader._cache[("issue", repo, number)] = (reader.now(), seeded, None)   # the earlier read: cached, and a ttl long enough that it would be served
+            return found
+        patches = [mock.patch.object(sb.IntentReader, "issue", REAL_INTENT_ISSUE), mock.patch.object(sb.IntentReader, "parent", parent), mock.patch.object(sb.IntentReader, "_api", api)]
+        if mutant is not None:
+            patches.append(mock.patch.object(sb, "cmd_charter", mutant))
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        return code, err
+
+    def test_the_label_is_never_served_stale_from_the_cache(self):
+        code, err = self.cached_label_set()
+        self.assertEqual(code, 2, err)   # the label was removed after the cached read: the guard sees it gone
+        self.assertIn("is not a charter", err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+
+    def test_every_guard_mutant_is_refused_by_the_strict_fakes_or_the_cache_test(self):
+        """The 3 mutants the batch readers found alive (a read of the wrong repo, a read without the repo, a cached label) and their siblings: each is one change of the real source of cmd_charter and each must change the outcome."""
+        survivors = []
+        for name, (old, new) in sorted(self.GUARD_MUTANTS.items()):
+            code, err = self.cached_label_set(self.mutated_charter(old, new))
+            if (code, "is not a charter" in err) == (2, True):   # the unmutated guard's answer: a refusal for the missing label
+                survivors.append(name)
+        self.assertEqual(survivors, [])
 
     def test_changing_a_set_charter_needs_replace(self):
         self.orchestrator("orch-b", registry=3)
