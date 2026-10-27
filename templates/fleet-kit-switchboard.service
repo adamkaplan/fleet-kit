@@ -33,6 +33,8 @@ Environment="HOME=__HOME__"
 Environment="PATH=__PATH__"
 Environment="XDG_CONFIG_HOME=__CONFIG_HOME__"
 Environment="XDG_STATE_HOME=__STATE_HOME__"
+# The OpenCode service this daemon starts must not inherit a pane (#1066).
+UnsetEnvironment=HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_ENV HERDR_BIN_PATH HERDR_SOCKET_PATH
 
 Restart=always
 RestartSec=30

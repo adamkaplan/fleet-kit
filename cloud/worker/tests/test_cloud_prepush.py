@@ -214,7 +214,7 @@ class Prepush(unittest.TestCase):
         self.assertEqual(refused, 3, "3 of 3 mutants refused")
 
     def test_s12_chained(self):
-        self.assertIn("cloud/worker/tests/test_cloud_prepush.py", open(os.path.join(ROOT, "bin", "test-cloud-launcher")).read())
+        self.assertIn("cloud/worker/tests/test_cloud_prepush.py", open(os.path.join(ROOT, "bin", "test-cloud-launcher.chain")).read())
 
     def test_docs_s1_s13_u2(self):
         n = 0

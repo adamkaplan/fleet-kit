@@ -320,7 +320,7 @@ class Plain(Base):
         code, out, _ = self.run_cli(["send", "p", "x"], FLEET_CLOUD_CHANNEL_URL="http:///x")
         self.assertEqual(code, 2)
         self.assertIn("http or https URL", out)
-        source = hmutate(" or not parts.netloc", "")
+        source = hmutate(" or not parts.netloc:", ":")
         code, out, _ = self.run_cli(["send", "p", "x"], source=source, FLEET_CLOUD_CHANNEL_URL="http:///x")
         self.assertNotIn("http or https URL", out)
 
@@ -357,7 +357,7 @@ class Pins(unittest.TestCase):
     def test_default_token_path_is_pinned(self):
         self.assertEqual(load().cloud_client.TOKEN_PATH, "/var/run/secrets/tokens/fleet-switchboard")
         self.assertEqual(self.run_main()[2][0][1], "/var/run/secrets/tokens/fleet-switchboard")
-        source = hmutate("env.get(\"FLEET_CLOUD_TOKEN_FILE\") or cloud_client.TOKEN_PATH", "env.get(\"FLEET_CLOUD_TOKEN_FILE\") or '/elsewhere'")
+        source = hmutate("env.get(\"FLEET_CLOUD_TOKEN_FILE\") or cloud_client.TOKEN_PATH\n    post = post or make_post(url)", "env.get(\"FLEET_CLOUD_TOKEN_FILE\") or '/elsewhere'\n    post = post or make_post(url)")
         self.assertNotEqual(self.run_main(source=source)[2][0][1], "/var/run/secrets/tokens/fleet-switchboard")
 
     def test_timeout_is_ten_seconds(self):
@@ -458,4 +458,6 @@ class Wire(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    result = unittest.main(exit=False).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)

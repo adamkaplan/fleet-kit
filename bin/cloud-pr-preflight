@@ -23,6 +23,7 @@ except ImportError:  # a lone copy: the full mode works; quick mode fails loudly
 
 TEST_DIRS = ("cloud/launcher/tests", "cloud/worker/tests")
 CHAIN = "bin/test-cloud-launcher"
+CHAIN_LIST = "bin/test-cloud-launcher.chain"  # the list of chained tests, one entry per line
 # files allowed to time out, with the reason (a timeout on any other file fails the command)
 TIMEOUT_ALLOW = {
     "test_cloud_pod_deadline.py": "slow (about 26s) and not chained",
@@ -172,6 +173,10 @@ def main():
         print("== 1. completeness scan (%s) ==" % CHAIN)
         try:
             chain = open(os.path.join(root, CHAIN)).read()
+            try:
+                chain += "\n" + open(os.path.join(root, CHAIN_LIST)).read()
+            except OSError:
+                pass  # an old-form script names its tests inside itself
         except OSError:
             chain = ""
             print("NOT RUN: %s is missing" % CHAIN); failed = True
