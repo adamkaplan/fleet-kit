@@ -23,7 +23,7 @@ class RealTree(unittest.TestCase):
     def test_every_parallel_entry_uses_its_own_temporary_directory_and_no_fixed_port(self):
         for e in parallel():
             src = base.slurp(os.path.join(base.ROOT, e))
-            self.assertRegex(src, r"mkdtemp|TemporaryDirectory|tempfile|stub_support|import Base|base\.Base", e)
+            self.assertRegex(src, r"mkdtemp|TemporaryDirectory|tempfile|stub_support|import Base|import test_|from test_|base\.Base", e)
             self.assertNotRegex(src, r"bind\(\(\"[0-9.]+\", [1-9]", e)
 
 
