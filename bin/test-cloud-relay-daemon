@@ -1446,6 +1446,97 @@ class OneWallClock(unittest.TestCase):
         self.assertIsNone(err)   # the mutant parses the cut body as complete
 
 
+class TotalDeadlineTestsDecideByObservation(unittest.TestCase):
+    """#1417: the two total-deadline tests must not compare a measured duration with a bound below 10 seconds (a lower or an upper
+    bound on a measured duration depends on the machine's speed). The scan reads the source of the tests; its mutant checks run it on
+    the OLD text of the two tests, which it must flag."""
+
+    NAMES = ("test_a_trickling_hub_is_cut_at_the_total_deadline", "test_mutant_without_the_total_deadline_is_caught")
+    CLOCKS = ("monotonic", "time", "perf_counter")
+    OLD = {
+        "test_a_trickling_hub_is_cut_at_the_total_deadline": """
+def test_a_trickling_hub_is_cut_at_the_total_deadline(self):
+    t0 = time.monotonic()
+    with self.assertRaises(TimeoutError):
+        fetch()
+    self.assertLess(time.monotonic() - t0, 2.5)
+""",
+        "test_mutant_without_the_total_deadline_is_caught": """
+def test_mutant_without_the_total_deadline_is_caught(self):
+    t0 = time.monotonic()
+    with self.assertRaises(Exception):
+        fetch()
+    self.assertGreater(time.monotonic() - t0, 2.5)
+""",
+    }
+
+    @classmethod
+    def source_of(cls, text, name):
+        import ast
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.get_source_segment(text, node)
+        raise AssertionError("test not found: " + name)
+
+    @classmethod
+    def small_bound_comparisons(cls, src):
+        """Count the comparisons (operators or assert helpers) of an elapsed time with a number below 10."""
+        import ast
+        tree = ast.parse(__import__("textwrap").dedent(src))
+
+        def reads_clock(n):
+            return any(isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in cls.CLOCKS for x in ast.walk(n)) or \
+                any(isinstance(x, ast.Name) and x.id in ("elapsed", "took") for x in ast.walk(n))
+
+        def small(n):
+            return any(isinstance(x, ast.Constant) and isinstance(x.value, (int, float)) and not isinstance(x.value, bool) and x.value < 10
+                       for x in ast.walk(n))
+        count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                parts = [node.left] + list(node.comparators)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr.startswith("assert") and node.func.attr not in ("assertRaises", "assertIsNone", "assertIsNotNone"):
+                parts = list(node.args)
+            else:
+                continue
+            if any(reads_clock(x) for x in parts) and any(small(x) for x in parts):
+                count += 1
+        return count
+
+    def own_text(self):
+        return Path(__file__).read_text()
+
+    def test_the_two_tests_have_no_small_bound_on_a_measured_duration(self):
+        text = self.own_text()
+        for name in self.NAMES:
+            self.assertEqual(self.small_bound_comparisons(self.source_of(text, name)), 0, name)
+
+    def test_the_two_tests_decide_by_whether_the_stub_was_still_writing(self):
+        text = self.own_text()
+        for name in self.NAMES:
+            src = self.source_of(text, name)
+            self.assertIn("finished", src, name)
+            self.assertIn("is_set()", src, name)
+
+    def test_the_mutant_test_names_its_cause(self):
+        text = self.own_text()
+        head = text[:text.index("def test_mutant_without_the_total_deadline_is_caught")].rsplit("\n\n", 1)[-1]
+        self.assertIn("a lower bound on a measured duration", head)
+        self.assertIn("2.27", head)
+
+    def test_the_scan_finds_the_old_comparisons(self):
+        for name, old in self.OLD.items():
+            self.assertEqual(self.small_bound_comparisons(old), 1, name)
+
+    def test_a_build_that_only_lowers_the_bound_is_still_found(self):
+        for name, old in self.OLD.items():
+            self.assertEqual(self.small_bound_comparisons(old.replace("2.5", "2.0")), 1, name)
+
+    def test_a_bound_of_ten_seconds_or_more_is_allowed(self):
+        old = self.OLD[self.NAMES[0]].replace("2.5", "10.0")
+        self.assertEqual(self.small_bound_comparisons(old), 0)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False).result
     print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
