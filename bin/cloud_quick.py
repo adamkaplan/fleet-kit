@@ -82,10 +82,23 @@ def selector_resolves(root, pair):
     rel, sel = pair
     if sel is None:  # a whole script with no class (bin/test-cloud-neutral-names)
         return os.path.isfile(os.path.join(root, rel))
-    try:
-        with open(os.path.join(root, rel), errors="replace") as f:
-            text = f.read()
-    except OSError:
+    text = ""
+    # bin/test-switchboard imports its classes from tests/switchboard/test_cases_NN.py and runs a selector over them (#1366):
+    # the class is found in the script or in those files. A selector found in none of them still fails.
+    files = [os.path.join(root, rel)]
+    if rel == "bin/test-switchboard":
+        d = os.path.join(root, "tests", "switchboard")
+        try:
+            files += [os.path.join(d, n) for n in sorted(os.listdir(d)) if re.match(r"test_cases_\d+\.py$", n)]
+        except OSError:
+            pass
+    for path in files:
+        try:
+            with open(path, errors="replace") as f:
+                text += f.read() + "\n"
+        except OSError:
+            continue
+    if not text:
         return False
     parts = sel.split(".")
     if not re.search(r"^class %s\b" % re.escape(parts[0]), text, re.M):
