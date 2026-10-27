@@ -10912,6 +10912,186 @@ class TestRemindCLI(PR4Base):
         self.assertEqual(out.strip(), item["id"])
         self.assertIn("reminder.add", [e["event"] for e in self.world.audit()])
 
+    # ---- #1355: a text over the message cap is refused, or carried in full from a file, in parts
+    def text_file(self, text):
+        path = os.path.join(tempfile.mkdtemp(prefix="remind-file-"), "text.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), True)
+        return path
+
+    def arm_from_file(self, text, *extra):
+        code, out, err = self.main("remind", "platform", "1m", "--from", "coder", "--text-file", self.text_file(text), *extra)
+        self.assertEqual(code, 0, err)
+        return out.strip()
+
+    def deliver_all(self, leave=None):
+        """Run passes until the reminder is delivered: the texts of every message, in order, with the events (send / acknowledgement) between them."""
+        events, texts = [], []
+        real_send, real_ack = self.world.engine.v2.synthetic, sb.Switchboard._acknowledge
+        def send(session_id, text, *args, **kwargs):
+            texts.append(text)
+            events.append("send")
+            return real_send(session_id, text, *args, **kwargs)
+        def ack(engine, keys):
+            mine = [k for k in keys if re.fullmatch(r"reminder:[0-9a-f]+", k)]   # a part has its own id (`#partN`): not the key
+            if mine:
+                events.append(("ack", mine))
+            return real_ack(engine, keys)
+        with mock.patch.object(self.world.engine.v2, "synthetic", send), mock.patch.object(sb.Switchboard, "_acknowledge", ack):
+            self.world.tick(61)   # due, and not late enough for the note
+            for _ in range(40):
+                self.world.engine.run_pass()
+                self.world.tick(5)
+                if leave is not None and len(texts) >= leave:
+                    break
+        return texts, events
+
+    @staticmethod
+    def body_of(texts):
+        """The reminder text re-joined from the delivered messages, exactly: the header and the `(part i of n)` label are removed, an indented line loses its indent, and a line split over parts
+        (`(line continues)` at the end of one piece and the start of the next) is joined back with nothing between."""
+        pieces = []
+        for text in texts:
+            found = re.search(r"\n- reminder from \w+: (?:\(part \d+ of \d+\)\n)?", text)
+            body = text[found.end():] if found else re.sub(r"^\[switchboard\] .*?\): ", "", text, count=1, flags=re.S)
+            pieces.append("\n".join(l[2:] if l.startswith("  ") else l for l in body.split("\n")))
+        out = pieces[0]
+        for piece in pieces[1:]:
+            if out.endswith(" " + sb.LINE_CONTINUES) and piece.startswith(sb.LINE_CONTINUES + " "):
+                out = out[:-len(" " + sb.LINE_CONTINUES)] + piece[len(sb.LINE_CONTINUES + " "):]
+            else:
+                out += "\n" + piece
+        return out
+
+    def test_1355_s2_a_text_over_the_cap_with_no_file_is_refused_and_nothing_is_armed(self):
+        for size in (4001, 4100, 12000):
+            code, out, err = self.main("remind", "platform", "1m", "--from", "coder", "w" * size)
+            self.assertNotEqual(code, 0, size)
+            self.assertIn("--text-file", err)
+            self.assertIn(str(size), err)
+            self.assertEqual(out, "")
+            self.assertEqual(sb.read_reminders(self.world.state), [])
+            self.assertNotIn("reminder.add", [e["event"] for e in self.world.audit()])   # U2: no audit line for a refused text
+
+    def test_1355_u1_texts_up_to_the_cap_are_armed_as_before(self):
+        for size in (3900, 4000):
+            code, out, err = self.main("remind", "platform", "1m", "--from", "coder", "w" * size)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(sb.read_reminders(self.world.state)[-1]["text"], "w" * size)
+            self.assertNotIn("delivered in parts", err)
+
+    def test_1355_s3_a_file_of_12000_characters_is_armed_whole_and_delivered_in_parts_under_the_cap(self):
+        lines = ["line %04d %s" % (n, "k" * 60) for n in range(160)]
+        text = "\n".join(lines)
+        self.assertGreater(len(text), 11000)
+        self.arm_from_file(text)
+        (item,) = sb.read_reminders(self.world.state)
+        self.assertEqual(item["text"], text)   # armed by value, in full
+        self.assertEqual([e["event"] for e in self.world.audit()].count("reminder.add"), 1)
+        texts, events = self.deliver_all()
+        self.assertGreaterEqual(len(texts), 3)
+        for part in texts:
+            self.assertLess(len(part), 4000)
+            self.assertNotIn("[cut at", part)
+        self.assertEqual(self.body_of(texts), text)   # every line once, in order, byte for byte
+
+    def test_1355_s4_the_key_is_acknowledged_after_the_last_part_only(self):
+        self.arm_from_file("\n".join("line %04d %s" % (n, "k" * 60) for n in range(160)))
+        (item,) = sb.read_reminders(self.world.state)
+        texts, events = self.deliver_all()
+        self.assertGreaterEqual(len(texts), 3)
+        acks = [i for i, e in enumerate(events) if e != "send" and "reminder:" + item["id"] in e[1]]
+        self.assertEqual(len(acks), 1)
+        self.assertEqual(events[:acks[0]].count("send"), len(texts))   # every part sent before the one acknowledgement
+        self.assertEqual(events[acks[0] + 1:], [])
+
+    def test_1355_s4_after_part_one_and_part_two_nothing_is_acknowledged(self):
+        self.arm_from_file("\n".join("line %04d %s" % (n, "k" * 60) for n in range(160)))
+        for stop in (1, 2):
+            texts, events = self.deliver_all(leave=1)
+            self.assertEqual(len(texts), 1)
+            self.assertIn("(part %d of" % stop, texts[0])
+            self.assertEqual([e for e in events if e != "send"], [], "part %d" % stop)   # no key acknowledged yet
+        texts, events = self.deliver_all()
+        self.assertIn("(part 3 of", texts[0])
+        self.assertEqual(len([e for e in events if e != "send"]), 1)   # the key, after the last part
+
+    def test_1355_s5_a_restart_between_part_one_and_two_resumes_with_part_two(self):
+        self.arm_from_file("\n".join("line %04d %s" % (n, "k" * 60) for n in range(160)))
+        first, _ = self.deliver_all(leave=1)
+        self.assertEqual(len(first), 1)
+        self.assertIn("(part 1 of", first[0])
+        self.world.engine = self.world.new_engine()   # a restart: only the files on disk survive
+        rest, _ = self.deliver_all()
+        self.assertIn("(part 2 of", rest[0])
+        self.assertEqual(sum("(part 1 of" in t for t in first + rest), 1)
+
+    def test_1355_s6_sizes_and_multibyte_reproduce_the_text_exactly(self):
+        def words(n, tail):
+            return "\n".join("%04d %s" % (i, tail * 40) for i in range(n))
+        cases = (("3500", "a" * 3500, 1), ("3900", "a" * 3900, 1), ("4001", "b" * 4001, 2), ("12000", "c" * 12000, 3),
+                 ("multibyte", words(80, "\u00e9\u4e2d\U0001f600"), 2))
+        for label, text, least in cases:
+            with self.subTest(label=label):
+                self.world.engine = self.world.new_engine()
+                sb.write_reminders(self.world.state, [])
+                self.arm_from_file(text)
+                texts, events = self.deliver_all()
+                if label == "3500":
+                    self.assertEqual(len(texts), 1)   # a text that fits with its header is one ordinary message
+                elif label == "3900":
+                    self.assertLessEqual(len(texts), 2)   # the cap counts the message with its header: 3,900 characters and the header do not fit in one
+                elif label == "4001":
+                    self.assertEqual(len(texts), 2, label)
+                else:
+                    self.assertGreaterEqual(len(texts), least)
+                for part in texts:
+                    self.assertLess(len(part), 4000)
+                    self.assertNotIn("[cut at", part)
+                self.assertEqual(self.body_of(texts), text)
+
+    def test_1355_s7_the_two_mutants_each_fail_a_test(self):
+        real = sb.finding_part
+        def acknowledges_first(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if result is not None:
+                for carried in result[1]:
+                    carried.partial = None   # the key is acknowledged with part 1
+            return result
+        mutants = {"cut silently": (lambda *a, **k: None, self.test_1355_s3_a_file_of_12000_characters_is_armed_whole_and_delivered_in_parts_under_the_cap),
+                   "acknowledged before the last part": (acknowledges_first, self.test_1355_s4_the_key_is_acknowledged_after_the_last_part_only)}
+        for label, (mutant, test) in mutants.items():
+            with self.subTest(mutant=label):
+                with mock.patch.dict(sb.compose.__globals__, {"finding_part": mutant}):
+                    with self.assertRaises(AssertionError):
+                        test()
+
+    def test_1355_a_file_that_cannot_be_used_is_refused_and_nothing_is_armed(self):
+        folder = tempfile.mkdtemp(prefix="remind-file-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        binary = os.path.join(folder, "b.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\xff\xfe\x00 not utf-8")
+        for why, path in (("missing", os.path.join(folder, "none.txt")), ("empty", self.text_file("  \n")), ("not utf-8", binary),
+                          ("a directory", folder), ("too long", self.text_file("x" * (sb.TEXT_FILE_MAX + 1)))):
+            with self.subTest(why=why):
+                code, out, err = self.main("remind", "platform", "1m", "--from", "coder", "--text-file", path)
+                self.assertNotEqual(code, 0)
+                self.assertIn("nothing armed", err)
+                self.assertEqual(sb.read_reminders(self.world.state), [])
+        code, _, err = self.main("remind", "platform", "1m", "--from", "coder", "--text-file", self.text_file("a"), "also words")
+        self.assertEqual(code, 2)
+        self.assertEqual(sb.read_reminders(self.world.state), [])
+
+    def test_1355_a_late_long_reminder_is_not_cut_by_its_note(self):
+        text = "\n".join("line %04d %s" % (n, "k" * 60) for n in range(80))
+        self.arm_from_file(text)
+        self.world.tick(60 + 7 * 60)
+        (fact,) = self.source(sb.ReminderFacts)()
+        self.assertTrue(fact.summary.startswith(text))
+        self.assertTrue(fact.summary.endswith(" (late by 7 min)"))
+
     def test_remind_identifies_the_caller_by_its_pane(self):
         os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]
         code, _, err = self.main("remind", "platform", "1h", "later")

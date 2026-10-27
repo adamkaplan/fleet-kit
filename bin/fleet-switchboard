@@ -21543,6 +21543,8 @@ def build_parser():
     remind.add_argument("name", nargs="?", help="The recipient's fleet name")
     remind.add_argument("when", nargs="?", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
     remind.add_argument("text", nargs="*", help="The reminder")
+    remind.add_argument("--text-file", metavar="F", default=None, help="Read the text from this UTF-8 file: a text over 4,000 characters is delivered in full, in parts "
+                        "(on the command line it is refused)")
     remind.add_argument("--list", dest="list_mine", action="store_true", help="Show your own pending reminders (id, time, recipient, issue, text)")
     remind.add_argument("--cancel", metavar="ID", help="Cancel one of your pending reminders by its id (see --list)")
     remind.add_argument("--key", default=None, help="Name the purpose: arming again with the same key replaces your pending reminder of that key.")
