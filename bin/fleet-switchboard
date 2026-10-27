@@ -9429,7 +9429,7 @@ def cloud_branch_tick(engine, discovery):
             continue
         boss = _cloud_boss(record.get("reports_to"))
         lane = resolve_boss(discovery, boss) if boss else None
-        if lane not in discovery.agents or not cloud_record_live(record, worker, retired, last_reports, now):
+        if lane not in discovery.agents or not cloud_record_live(record=record, worker=worker, retired=retired, last_reports=last_reports, now=now):
             continue   # another lane's record (no lane registered here to tell) or a worker that is retired, ended or gone: never read
         eligible.append((worker, repo, branch, lane, record.get("launch_head")))
     eligible.sort()
