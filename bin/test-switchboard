@@ -14718,12 +14718,12 @@ class CharterRig:
         self.cmd_reads = []
         def cmd_parent(reader, number, repo=None, **kw):
             self.cmd_reads.append(("parent", number, repo))
-            if repo != self.REPO:   # #1275, #1345: the fake takes and CHECKS the repo it is asked about (a call without it, or for another repo, fails)
+            if repo != self.expected_repo():   # #1275, #1345: the fake takes and CHECKS the repo it is asked about (a call without it, or for another repo, fails)
                 raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return self.cmd_parents[number]
         def cmd_issue(reader, number, repo=None):
             self.cmd_reads.append(("issue", number, repo))
-            if repo != self.REPO:
+            if repo != self.expected_repo():
                 raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
         real_invalidate = sb.IntentReader.invalidate
@@ -14735,6 +14735,10 @@ class CharterRig:
             patcher.start()
             self.addCleanup(patcher.stop)
 
+
+    def expected_repo(self):
+        """The repo the guard must read for the orchestrator being set (orch-b in these tests): its registry row's repo, else the rig's."""
+        return ((self.registry.read(self.world.state)["agents"].get("orch-b") or {}).get("repo")) or self.REPO
 
     def orchestrator(self, name, charter=None, issue=None, registry=True):
         """A running orchestrator whose live SESSION metadata says `charter` and `issue`; its registry row (the first-seen fill the pass makes) holds the metadata charter unless `registry` is a value or False."""
