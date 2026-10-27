@@ -1089,6 +1089,8 @@ class TheRunner(unittest.TestCase):
         runner = os.path.join(ROOT, "bin", "test-cloud-launcher")
         with open(runner) as f:
             text = f.read()
+        with open(runner + ".chain") as f:
+            text += "\n" + f.read()
         self.assertIn("tests/%s" % os.path.basename(__file__), text)
         exceptions = text.split("EXCEPTIONS=")[1].split("\n")[0]
         missing = []

@@ -133,8 +133,8 @@ def _stack_shape_differs(pod):
 # here (and to the frozen fixture tests/fixtures/stack_pod.json) allows them.
 STACK_METADATA_KEYS = {"name", "labels", "annotations"}
 STACK_SPEC_KEYS = {"restartPolicy", "activeDeadlineSeconds", "serviceAccountName", "automountServiceAccountToken", "securityContext", "containers", "volumes",
-                   "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector", "hostname", "subdomain"}
-STACK_CONTAINER_KEYS = {"name", "image", "securityContext", "env", "resources", "readinessProbe", "volumeMounts"}
+                   "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector", "hostname", "subdomain", "terminationGracePeriodSeconds"}
+STACK_CONTAINER_KEYS = {"name", "image", "securityContext", "env", "resources", "readinessProbe", "volumeMounts", "lifecycle"}
 STACK_VOLUMES = {"tokens": {"name": "tokens", "emptyDir": {"medium": "Memory"}}, "scratch": {"name": "scratch", "emptyDir": {}}}
 STACK_MOUNT_PATHS = {"pw": "/run/cw", "tokens": "/run/cw-tmp", "scratch": "/work"}
 # The stack registry puller (ask #1022): a stack pod made with the three registry settings uses its own service account and ONE extra volume, a projected
@@ -179,6 +179,22 @@ def _has_puller_volume(pod):
     return any(v.get("name") == PULLER_VOLUME_NAME for v in pod.get("spec", {}).get("volumes", []))
 
 
+# The pre-stop hook (ask #1142): the pod pushes its own unpushed work before it ends. The budget is the hook's whole life and
+# stays strictly below the grace, so the agent keeps about 15 s of its own SIGTERM time.
+POD_TERMINATION_GRACE_SECONDS = 60
+PRESTOP_BUDGET_SECONDS = 45
+PRESTOP_LIFECYCLE = {"preStop": {"exec": {"command": ["/usr/local/bin/cw-prestop", str(PRESTOP_BUDGET_SECONDS)]}}}
+# The one read-only recovery route for work a hook could not push (a constant string).
+RECOVERY_ROUTE = ("recover read-only: the work is still in /work/repo of the kept pod; see the pod's own output line "
+                  "(cw-prestop: not pushed) and the run record")
+
+
+def _prestop_differs(pod):
+    spec = pod.get("spec", {})
+    return (spec.get("terminationGracePeriodSeconds") != POD_TERMINATION_GRACE_SECONDS
+            or any(k.get("lifecycle") != PRESTOP_LIFECYCLE for k in spec.get("containers", [])))
+
+
 def _stack_rest_differs(pod):
     if not _is_stack(pod):
         return False
@@ -218,6 +234,7 @@ FORBIDDEN_POD_FIELDS = {
     "stack security context differs from STACK_SECURITY_CONTEXT": _stack_context_differs,
     "stack pod shape differs": _stack_shape_differs,
     "stack pod has a field or object outside the stack allow-list": _stack_rest_differs,
+    "pre-stop lifecycle or termination grace differs from the launcher's": _prestop_differs,
     "service-account token": _service_account_token,
 }
 
@@ -1622,6 +1639,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
         "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
+                 "terminationGracePeriodSeconds": POD_TERMINATION_GRACE_SECONDS,
                  "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
                   "automountServiceAccountToken": False,
                   "securityContext": copy.deepcopy(POD_SECURITY_CONTEXT),
@@ -1629,6 +1647,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                                  "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}, "env": [{"name": k, "value": v} for k, v in e.items()],
                                  "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}},
                                  "readinessProbe": {"tcpSocket": {"port": 4096}},
+                                 "lifecycle": copy.deepcopy(PRESTOP_LIFECYCLE),
                                  "volumeMounts": [{"name": "pw", "mountPath": "/run/cw", "readOnly": True},
                                                   {"name": "tokens", "mountPath": "/run/cw-tmp"},
                                                   {"name": "scratch", "mountPath": "/work"}]}],
@@ -2103,7 +2122,7 @@ class Launcher:
             self._hook_record(info, dict(view, ran=True))
             if view["error"]:
                 note = self._mark(name, uid, kept="true")  # the pod is kept: the commit is not safe yet
-                raise CloudError("end hook could not push, pod kept: %s%s" % (view["error"], "; " + note if note else ""), EXIT_HOOK)
+                raise CloudError("end hook could not push, pod kept: %s%s; %s" % (view["error"], "; " + note if note else "", RECOVERY_ROUTE), EXIT_HOOK)
             note = ""
             try:
                 note = self._mark(name, uid, hook_ran="true")
