@@ -118,6 +118,58 @@ class Parallel(base.Scratch):
         self.assertEqual(ran, [])
 
 
+class Completeness(unittest.TestCase):
+    """Every chain entry is a row in BOTH tables or is named in the 'Not yet measured' line (and never both)."""
+    @staticmethod
+    def parts(sec):
+        mac, ub = sec.split("### macOS (per entry)")[1].split("### Ubuntu (per entry)")
+        rows = [{r.split("`")[1] for r in t.split("\n") if r.startswith("| `")} for t in (mac, ub)]
+        lines = [l for l in sec.split("\n") if l.startswith("Not yet measured:")]
+        assert len(lines) == 1, "the section needs exactly one 'Not yet measured:' line"
+        rest = lines[0].split(":", 1)[1].strip().rstrip(".")
+        return rows[0], rows[1], ([] if rest == "none" else re.findall(r"`([^`]+)`", rest))
+
+    @classmethod
+    def problems(cls, sec, chain):
+        mac, ub, nym = cls.parts(sec)
+        chain, out = set(chain), []
+        if mac != ub:
+            out.append("the two tables differ: %s" % sorted(mac ^ ub))
+        for e in sorted(mac | ub | set(nym)):
+            if e not in chain:
+                out.append("%s is not in the chain" % e)
+        for e in sorted(set(nym).intersection(mac | ub)):
+            out.append("%s is in a table and in the Not yet measured line" % e)
+        for e in sorted(chain - mac - ub - set(nym)):
+            out.append("%s is neither a row nor named as not yet measured" % e)
+        return out
+
+    def real(self):
+        doc = base.slurp(os.path.join(base.ROOT, "cloud", "launcher", "README.md"))
+        return doc.split("## Chain times (ask #1390)")[1].split("\n## ")[0]
+
+    def test_s9_the_real_section_covers_every_chain_entry_once(self):
+        self.assertEqual(self.problems(self.real(), base.entries()), [])
+
+    def _mutant(self, fn, expect):
+        sec = self.real()
+        out = fn(sec)
+        self.assertNotEqual(out, sec, "the mutation did not apply")
+        got = self.problems(out, base.entries())
+        self.assertTrue(any(expect in g for g in got), got)
+
+    def test_s10_mutant_an_entry_removed_from_the_tables_and_not_named_is_refused(self):
+        e = sorted(base.entries())[0]
+        self._mutant(lambda s: "\n".join(l for l in s.split("\n") if not l.startswith("| `%s`" % e)), e)
+
+    def test_s10_mutant_an_entry_in_a_table_and_in_the_line_is_refused(self):
+        e = sorted(base.entries())[0]
+        self._mutant(lambda s: s.replace("Not yet measured: none", "Not yet measured: `%s`" % e), e)
+
+    def test_s10_mutant_a_name_in_the_line_that_is_not_in_the_chain_is_refused(self):
+        self._mutant(lambda s: s.replace("Not yet measured: none", "Not yet measured: `cloud/launcher/tests/test_gone.py`"), "test_gone.py")
+
+
 class Docs(unittest.TestCase):
     def section(self):
         doc = base.slurp(os.path.join(base.ROOT, "cloud", "launcher", "README.md"))
