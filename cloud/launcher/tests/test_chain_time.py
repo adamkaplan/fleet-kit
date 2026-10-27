@@ -182,7 +182,12 @@ class Docs(unittest.TestCase):
         for table in (mac, ub):
             rows = [l for l in table.split("\n") if l.startswith("| `")]
             self.assertGreaterEqual(len(rows), 40)
-            self.assertEqual({r.split("`")[1] for r in rows}, set(base.entries()))
+            names = {r.split("`")[1] for r in rows}
+            self.assertLessEqual(names, set(base.entries()))
+        mac_rows, ub_rows, not_yet = Completeness.parts(sec)
+        self.assertEqual(mac_rows | set(not_yet), set(base.entries()))
+        self.assertEqual(ub_rows | set(not_yet), set(base.entries()))
+        self.assertFalse((mac_rows | ub_rows).intersection(not_yet))
 
     def test_the_five_slowest_per_system_are_named_and_match_the_tables(self):
         sec = self.section()
