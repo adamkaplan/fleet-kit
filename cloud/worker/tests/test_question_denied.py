@@ -58,7 +58,8 @@ def permission_block(data):
     """The front matter's rules (ask #1286 protects them); comment lines and the prose below are not part of the pin."""
     parts = data.split(b"---\n", 2)
     assert len(parts) == 3, "no front matter"
-    return [l for l in parts[1].splitlines() if not l.lstrip().startswith(b"#")]
+    lines = [l for l in parts[1].splitlines() if not l.lstrip().startswith(b"#")]
+    return lines[lines.index(b"permission:"):]
 
 
 def loud_skip(test, what):
@@ -138,23 +139,29 @@ class T(unittest.TestCase):
         refused += 1
         self.assertEqual(refused, 5)
 
-    def test_s3_image_definition_unchanged(self):
-        with open(os.path.join(ROOT, "agents/opencode/orchestrator.md"), "rb") as a, open(os.path.join(ROOT, ORCH_REL), "rb") as b:
-            img = b.read()
-            self.assertEqual(a.read(), img)
-        ref, data = base_file(ORCH_REL)
-        if ref is None:
-            loud_skip(self, "the base orchestrator definition")
-        self.assertEqual(permission_block(img), permission_block(data))
+    PERMISSION_PIN = [b"permission:", b"  edit: deny", b"  read: allow", b"  question: allow", b"  todowrite: allow", b"  bash: allow", b"  external_directory: allow"]
+
+    def test_s3_permission_block_pinned(self):
+        """Guard 1 (ask #1286): the whole permission block of both copies is pinned exactly; only comment lines are exempt."""
+        for rel in ("agents/opencode/orchestrator.md", ORCH_REL):
+            with open(os.path.join(ROOT, rel), "rb") as f:
+                self.assertEqual(permission_block(f.read()), self.PERMISSION_PIN, rel)
 
     def test_s3_permission_block_mutants_refused(self):
-        base = open(os.path.join(ROOT, ORCH_REL), "rb").read()
-        self.assertIn(b"  question: allow\n", base)
-        for old, new in ((b"  question: allow\n", b"  question: deny\n"), (b"  read: allow\n", b"  read: ask\n"), (b"  bash: allow\n", b"  bash: ask\n")):
+        with open(os.path.join(ROOT, ORCH_REL), "rb") as f:
+            base = f.read()
+        for old, new in ((b"  question: allow\n", b"  question: deny\n"), (b"  edit: deny\n", b"  edit: allow\n"), (b"  bash: allow\n", b"  bash: ask\n")):
             m = base.replace(old, new)
             self.assertNotEqual(m, base)
-            self.assertNotEqual(permission_block(m), permission_block(base), old)
-        self.assertEqual(permission_block(base + b"more prose\n"), permission_block(base))
+            self.assertNotEqual(permission_block(m), self.PERMISSION_PIN, old)
+
+    def test_s3_image_definition_equals_recorded_copy(self):
+        """Guard 2: both copies equal the recorded copy byte for byte; a change to the definition updates the recorded copy in the same pull request."""
+        with open(os.path.join(ROOT, "cloud/worker/tests/golden/orchestrator.md"), "rb") as f:
+            gold = f.read()
+        for rel in ("agents/opencode/orchestrator.md", ORCH_REL):
+            with open(os.path.join(ROOT, rel), "rb") as f:
+                self.assertEqual(f.read(), gold, rel)
 
     def test_no_orchestrator_block_in_config(self):
         self.assertEqual(sorted(load()["agent"]), ["worker"])
