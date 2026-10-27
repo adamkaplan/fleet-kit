@@ -3254,9 +3254,9 @@ class TestSteerToWorking(Base):
                                now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
             return code, out.getvalue(), err.getvalue()
         before = len(self.world.v2.__dict__.get("sent", [])) if hasattr(self.world.v2, "sent") else 0
-        code, out, err = send("x" * 6000)
+        code, out, err = send("x" * 3990)
         self.assertEqual(code, sb.EXIT_USAGE)
-        self.assertIn("message is 6000 characters", err)
+        self.assertIn("message is 3990 characters", err)
         self.assertIn("nothing was sent", err)
         self.assertEqual(out, "")
         allowed = int(re.search(r"allowed text for this message is (\d+) characters", err).group(1))
