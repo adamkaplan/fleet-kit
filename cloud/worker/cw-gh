@@ -458,7 +458,7 @@ def pr_diff(args):
     repo = repo_of(opts)
     n = number_of(repo, pos)
     if opts.get("names"):
-        page = 1   # the pod's client cannot import bin/pr_files.py: it follows the pages to GitHub's maximum of 3000 files (#1098)
+        page = 1   # the pod has no access to the shared reader (bin/delegated_clear.py), so its client follows the pages itself to GitHub's maximum of 3000 files (#1098)
         while page <= 30:
             batch = get_json("/repos/%s/pulls/%d/files?per_page=100&page=%d" % (repo, n, page))
             for f in batch:
