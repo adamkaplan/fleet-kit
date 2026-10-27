@@ -6022,6 +6022,9 @@ PATH that is not the shim. A resolved gh that would be the shim (a configured ab
 makes the daemon **refuse to start** with `no real gh behind the shim`: with no marker, every own call through the shim would be re-identified (its token swapped), counted,
 gate-probed and audited as an agent's. The shim is told from a real gh by its docstring signature (`SHIM_HEAD`, the first 400 bytes of `shims/gh`); a test pins it against the real file.
 
+- **What `FLEET_SWITCHBOARD_OWN_GH` no longer does:** the shim reads it nowhere, so it no longer skips the review probe, the gate probe, the audit line, the call count or the read scope.
+- **What `FLEET_SWITCHBOARD_OWN_GH` still does:** nothing in a call; every remaining use in the switchboard is a removal. The daemon and the pane environment builder still remove it (the pane one names it with an empty value) from the environment they hand to children and agents, so an agent never inherits it. A value in a caller's environment is ignored, not an error.
+
 **Limits (#1216).** A *relative* configured `gh` (`./gh`) is resolved against the daemon's working directory and checked against the shim the same way as an absolute one. A `gh` found by a bare name other than `gh` is used as given and not checked. **A shim linked into one of the fixed directories the shim's own `whoami` runs with** (`/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`, `ENV_PATH`), with the real gh outside them: the shim's identity lookup then finds the shim, not the real gh, and the configuration is **refused**, so an agent's writes **fail closed** (`account lookup failed`) rather than run with the wrong token. Put the real gh in one of those directories, or set `FLEET_REAL_GH`.
 
 **What the #949 budget numbers miss.** The shim's per-account call file (`agent-calls.jsonl`, the agent-shell column of the hourly record and of the top-spender ranking) never
