@@ -34,7 +34,7 @@ def facts(path="tests/t.py", cls="tests", head=HEAD, **over):
 
 def clear(brief, floor=None, path="tests/t.py", cls="tests", scored=None, reasons="read the diff; tests only", files=()):
     floor = floor if floor is not None else brief
-    report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {cls: [path]} if cls in MATRIX["owner_hold"]["top_tier_classes"] else {}, "changed_paths": [path], "head": floor["head"], "pr": "o/r#1"}
+    report = {"owner_decision": "hold", "registrar_reasons": [], "complete": True, "top_tier_hits": {cls: [path]} if cls in MATRIX["owner_hold"]["top_tier_classes"] else {}, "changed_paths": [path], "head": floor["head"], "pr": "o/r#1"}
     out = dc.substance_refusals(RULE, report, list(files), lambda p, g: p in g, {}, scored, floor, brief["digest"] if brief else "", brief["text"] if brief else "", reasons)
     if not out:
         classes = {path: cls}
@@ -72,7 +72,7 @@ class TestRealBriefToDecider(unittest.TestCase):
         f["files"][0].update(additions=0, deletions=0)   # the diff adds and removes no line (PC-9: a deletion is material): nothing widened
         b = ib.build_brief(f)
         self.assertEqual(b["decider"], "chief_of_staff", b["text"])
-        self.assertTrue(dc.refusals(RULE, {"owner_decision": "hold", "complete": True, "top_tier_hits": {"credentials": ["cloud/launcher/token_mint.py"]}, "changed_paths": ["cloud/launcher/token_mint.py"], "head": HEAD}, [], lambda p, g: p in g, {}, None))
+        self.assertTrue(dc.refusals(RULE, {"owner_decision": "hold", "registrar_reasons": [], "complete": True, "top_tier_hits": {"credentials": ["cloud/launcher/token_mint.py"]}, "changed_paths": ["cloud/launcher/token_mint.py"], "head": HEAD}, [], lambda p, g: p in g, {}, None))
         self.assertEqual(clear(b, path="cloud/launcher/token_mint.py", cls="credentials"), [])
 
     def test_s8_s27_the_same_label_and_class_differ_by_the_brief(self):
@@ -97,7 +97,7 @@ class TestRealBriefToDecider(unittest.TestCase):
 
     def test_s15_a_machinery_path_needs_the_two_reads(self):
         b = ib.build_brief(facts("bin/impact_hold.py", "code"))
-        rep = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "changed_paths": ["bin/impact_hold.py"], "head": HEAD}
+        rep = {"owner_decision": "hold", "registrar_reasons": [], "complete": True, "top_tier_hits": {}, "changed_paths": ["bin/impact_hold.py"], "head": HEAD}
         one = dc.substance_refusals(RULE, rep, [{"filename": "bin/impact_hold.py", "status": "modified"}], lambda p, g: p in g or any(p == x for x in g), {}, None, b, b["digest"], b["text"], "read it")
         self.assertTrue(any("2 required" in r for r in one), one)
 
@@ -204,7 +204,7 @@ class TestMutants(unittest.TestCase):
         mod.__dict__["__file__"] = str(BIN / "delegated_clear.py")
         exec(compile(mutated, "dc_mut.py", "exec"), mod.__dict__)
         b = ib.build_brief(facts("bin/impact_hold.py", "code"))
-        rep = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "changed_paths": ["bin/impact_hold.py"], "head": HEAD}
+        rep = {"owner_decision": "hold", "registrar_reasons": [], "complete": True, "top_tier_hits": {}, "changed_paths": ["bin/impact_hold.py"], "head": HEAD}
         args = (RULE, rep, [{"filename": "bin/impact_hold.py", "status": "modified"}], lambda p, g: p in g, {}, None, b, b["digest"], b["text"], "read it")
         self.assertTrue(dc.substance_refusals(*args))
         self.assertEqual(mod.substance_refusals(*args), [], "the mutant clears with no read: TestRealBriefToDecider.test_s15 catches it")
@@ -216,7 +216,7 @@ class TestMutants(unittest.TestCase):
         mod.__dict__["__file__"] = str(BIN / "delegated_clear.py")
         exec(compile(mutated, "dc_mut2.py", "exec"), mod.__dict__)
         b = ib.build_brief(facts("x/c.py", "credentials"))
-        rep = {"owner_decision": "hold", "complete": True, "top_tier_hits": {"credentials": ["x/c.py"]}, "changed_paths": ["x/c.py"], "head": HEAD}
+        rep = {"owner_decision": "hold", "registrar_reasons": [], "complete": True, "top_tier_hits": {"credentials": ["x/c.py"]}, "changed_paths": ["x/c.py"], "head": HEAD}
         args = (RULE, rep, [], lambda p, g: p in g, {}, None, b, b["digest"], b["text"], "read it")
         self.assertTrue(dc.substance_refusals(*args))
         self.assertEqual(mod.substance_refusals(*args), [])

@@ -10,7 +10,7 @@ import delegated_clear as dc  # noqa: E402
 H = "a" * 40
 RULE = {"never_path_classes": ["credentials"], "top_tier_review_classes": ["credentials"], "clear_code_paths": ["bin/impact_hold.py"],
         "new_file_globs": ["bin/*.py"], "closure_files": []}
-REPORT = {"owner_decision": "hold", "complete": True, "top_tier_hits": {"credentials": ["cloud/token_mint.py"]}, "changed_paths": ["cloud/token_mint.py"], "head": H, "pr": "o/r#1"}
+REPORT = {"owner_decision": "hold", "registrar_reasons": [], "complete": True, "top_tier_hits": {"credentials": ["cloud/token_mint.py"]}, "changed_paths": ["cloud/token_mint.py"], "head": H, "pr": "o/r#1"}
 
 
 def match(path, globs):
@@ -80,7 +80,7 @@ class TestBriefBoundClear(unittest.TestCase):
     def test_kind_table_is_complete(self):   # every refusal kind of the code is lifted or kept on purpose
         src = Path(dc.__file__).read_text()
         kinds = set(__import__("re").findall(r'_item\("([a-z-]+)"', src))
-        self.assertEqual(kinds, set(dc.SUBSTANCE_LIFTED) | {"rating", "unreadable"})
+        self.assertEqual(kinds, set(dc.SUBSTANCE_LIFTED) | {"rating", "unreadable", "registrar"})   # registrar (#964) is kept on purpose: it is not lifted by a brief
 
     def test_lifted_kinds_each_drop_only_with_brief(self):   # one mutant per member: a kind kept would refuse the owner-only class
         for kind in dc.SUBSTANCE_LIFTED:
@@ -90,6 +90,27 @@ class TestBriefBoundClear(unittest.TestCase):
 
 class TestMutants(unittest.TestCase):
     """Each mutant is a patched module function; the shipped tests above must fail under it (checked here by running the check the test makes)."""
+
+    def test_a_report_with_no_registrar_answer_is_refused_on_the_brief_path(self):   # the #971 interaction: no answer is never read as clean
+        rep = {k: v for k, v in REPORT.items() if k != "registrar_reasons"}
+        out = refuse(brief(), report=rep)
+        self.assertTrue(any("registrar lint's answer cannot be read" in r for r in out), out)
+        self.assertEqual(refuse(brief()), [])   # with the answer (no finding) the brief clears
+
+    def test_mutant_brief_path_accepts_a_report_with_no_registrar_answer(self):
+        rep = {k: v for k, v in REPORT.items() if k != "registrar_reasons"}
+        real = dc.refusal_items
+
+        def lenient(*a, **k):
+            items, tidy = real(*a, **k)
+            return [i for i in items if "registrar lint's answer cannot be read" not in i["text"]], tidy
+        dc.refusal_items = lenient
+        try:
+            self.assertEqual(refuse(brief(), report=rep), [])   # the mutant accepts: the test above would fail
+        finally:
+            dc.refusal_items = real
+        self.assertTrue(refuse(brief(), report=rep))
+
 
     def test_accept_stale_brief_mutant(self):
         old, new = brief(text="old"), brief(text="new")

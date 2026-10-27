@@ -13,7 +13,7 @@ RULE = {"never_path_classes": [], "top_tier_review_classes": [], "clear_code_pat
 
 
 def checks(complete, files):
-    report = {"owner_decision": "hold", "review_action": "approve", "complete": complete, "top_tier_hits": {}, "changed_paths": [], "head": "a" * 40, "pr": "o/r#1", "unknown": None if complete else "GitHub listed 1 of 3 changed files"}
+    report = {"owner_decision": "hold", "registrar_reasons": [], "review_action": "approve", "complete": complete, "top_tier_hits": {}, "changed_paths": [], "head": "a" * 40, "pr": "o/r#1", "unknown": None if complete else "GitHub listed 1 of 3 changed files"}
     got = {"report": report, "rule": RULE, "files": files, "closure": {}}
     with mock.patch.object(impact_hold, "delegated_clear_inputs", return_value=(got, None)), mock.patch.object(impact_hold, "load_module", lambda name: delegated_clear, create=True), \
             mock.patch.object(impact_hold, "impact_floor", impact_floor, create=True):   # the part runs in the entry's namespace: lend it the two names it reads
@@ -32,7 +32,7 @@ class TestRefusalOrder(unittest.TestCase):
         self.assertIn("no brief", why)
 
     def test_a_brief_with_no_info_dict_does_not_raise(self):
-        report = {"owner_decision": "hold", "review_action": "approve", "complete": True, "top_tier_hits": {}, "changed_paths": [], "head": "a" * 40, "pr": "o/r#1"}
+        report = {"owner_decision": "hold", "registrar_reasons": [], "review_action": "approve", "complete": True, "top_tier_hits": {}, "changed_paths": [], "head": "a" * 40, "pr": "o/r#1"}
         got = {"report": report, "rule": RULE, "files": [], "closure": {}}
         with mock.patch.object(impact_hold, "delegated_clear_inputs", return_value=(got, None)), mock.patch.object(impact_hold, "load_module", lambda name: delegated_clear, create=True), \
                 mock.patch.object(impact_hold, "impact_floor", impact_floor, create=True), mock.patch.object(impact_hold, "floor_brief", lambda *a: None, create=True), \
