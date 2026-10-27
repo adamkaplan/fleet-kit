@@ -86019,6 +86019,16 @@ class TestBigRegistrarFile(unittest.TestCase):
         self.assertEqual(seen, [["gh", "api", "-H", "Accept: application/vnd.github.raw", "repos/acme/app/contents/x?ref=" + self.BASE]])
         self.assertEqual(len(accounts.calls), 1, "the read is counted")
 
+    def test_the_ceiling_counts_bytes_not_characters(self):
+        """3 MiB of a 2-byte character is 3 Mi characters but 6 MiB: over the ceiling. A mutant that counts characters fails this test."""
+        body = ("\u00e9" * (3 * 1024 * 1024)).encode("utf-8")
+        engine = self.engine({self.BASE: ""})
+        orig = engine.intents.runner
+        engine.intents.runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, body, "") if "Accept: application/vnd.github.raw" in argv else orig(argv, **kw)
+        with self.assertRaises(sb.IntentError) as raised:
+            sb._file_text_at(engine, "acme/app", "bin/fleet-switchboard", self.BASE)
+        self.assertIn("is not a readable file at aaaaaaaa", str(raised.exception))
+
 
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
