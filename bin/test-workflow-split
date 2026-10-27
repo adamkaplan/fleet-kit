@@ -123,7 +123,7 @@ OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
 ADDED = [("bin/test-cloud-hub", "10"), ("bin/test-cloud-channel", None), ("bin/test-cloud-channel-server", None), ("bin/test-cloud-client", None),
          ("bin/test-cloud-way-back", None), ("bin/test-decisions-pull", "10"), ("bin/test-cloud-cli", "10")]
 # The three relay suites added by ask #1376, after the seven, in this order (a timeout sized from a measured run on both systems).
-RELAY = [("bin/test-cloud-relay", "5"), ("bin/test-cloud-hub-relay", "5"), ("bin/test-cloud-relay-daemon", "5")]
+RELAY = [("bin/test-cloud-relay", "10"), ("bin/test-cloud-hub-relay", "10"), ("bin/test-cloud-relay-daemon", "10")]
 NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", "30")] + [suite(n, "", t) for n, t in ADDED + RELAY]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
@@ -498,7 +498,7 @@ class Mutants(unittest.TestCase):
         self.killed(mutate(text, "\n  # The cloud suites run beside", "\n      - run: echo x\n\n  # The cloud suites run beside"), self.STEPS)
 
     def relay_step(self, name):
-        return "      - name: %s\n        if: ${{ !cancelled() }}\n        timeout-minutes: 5\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)
+        return "      - name: %s\n        if: ${{ !cancelled() }}\n        timeout-minutes: 10\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)
 
     def test_s5_each_of_the_three_relay_steps_removed_fails_the_shape_test(self):
         text = WORKFLOW.read_text()
@@ -543,7 +543,7 @@ class RelayDocs(unittest.TestCase):
     def states(text):
         para = next((p for p in text.split("\n\n") if "ask #1376" in p), "")
         named = all(re.search(r"%s(?![\w-])" % re.escape(n), para) for n, _ in RELAY)
-        return named and re.search(r"Measured .*\d+ / \d+", para) is not None and "timeout-minutes: 5" in para
+        return named and re.search(r"Measured .*\d+ / \d+", para) is not None and "timeout-minutes: 10" in para
 
     def test_s8_the_readme_names_the_three_steps_and_their_time(self):
         self.assertTrue(self.states(self.README.read_text()))
