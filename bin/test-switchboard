@@ -50421,6 +50421,55 @@ class TestRetireCloseHeadless(StandInPids, Base):
             self.assertEqual(sb.retire_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "other", seen, False), (None, "THE ONE RULE"))
             self.assertEqual(sb.headless_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "hw", target, False), (None, "THE ONE RULE"))
 
+    def gone(self):
+        return mock.patch.object(sb.V2Client, "session_get", mock.Mock(side_effect=sb.V2Error("http", status=404, detail="gone")))
+
+    def test_s13_a_gone_session_of_a_live_worker_is_still_judged_by_the_boss_rule(self):
+        sid = self.hw()
+        self.as_("other")
+        with self.gone():
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("only the operator or the agent's own boss may end a session", err)
+        self.assertNotIn("already ended", out + err)
+        self.assertNotIn("hw", sb.read_retired(self.world.state), "nothing was retired")
+        self.assertEqual(self.removed, [])
+
+    def test_s13_a_non_boss_asking_about_a_retired_worker_with_a_gone_session_gets_the_refusal_not_already_ended(self):
+        sid = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        del self.world.v2.sessions[sid]   # the session is gone from the service
+        self.as_("other")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("other may not end hw's session", err)
+        self.assertNotIn("already ended", out + err)
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertIn("already ended", out, "the boss still learns it")
+        self.assertEqual(self.removed, [])
+
+    def test_s13_a_mutant_that_checks_authority_after_the_gone_shortcut_fails_the_two_refusals(self):
+        import inspect, textwrap
+        src = textwrap.dedent(inspect.getsource(sb.headless_close_problem))
+        check = '    why = close_authority_problem(runner, now, name, boss, "end", "session")\n    if why:\n        return None, why\n'
+        self.assertIn(check, src)
+        mutant = src.replace(check, "", 1).replace("    try:\n        info = engine.v2.session_get(sid)", "    try:\n        info = engine.v2.session_get(sid)", 1)
+        tail = "    except Exception as err:\n        return None, \"session %s cannot be read now (%s): nothing was ended\" % (sid, _one_line(str(err), 80))\n"
+        self.assertIn(tail, mutant)
+        mutant = mutant.replace(tail, tail + check, 1)
+        self.assertNotEqual(mutant, src, "the mutant is applied")
+        scope = dict(sb.__dict__)
+        exec(mutant, scope)
+        self.hw()
+        self.as_("other")
+        with mock.patch.object(sb, "headless_close_problem", scope["headless_close_problem"]), self.gone():
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        refused = code == 1 and "may not end hw's session" in err and "already ended" not in out + err
+        self.assertFalse(refused, "the mutant must fail the refusal of the two tests above: %r" % (out + err))
+
     def test_s13_an_agent_cannot_end_its_own_session(self):
         sid = self.hw()
         self.as_("boss")

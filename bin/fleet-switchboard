@@ -6276,13 +6276,13 @@ def headless_target(engine, discovery, name):
     if not isinstance(kept, dict) or not isinstance(kept.get("session"), str):
         return None
     sid = entry.get("session") or kept["session"]
-    boss = None
+    boss = kept.get("boss") if isinstance(kept.get("boss"), str) and NAME_RE.match(kept["boss"]) else None   # kept at the retirement: the session may be gone
     try:
         stored = _fleet_meta(engine.v2.session_get(sid)) or {}
         stored = load_module("reassign").overlay(engine.state_dir, stored, sid) if stored else stored
-        boss = resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None
+        boss = (resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None) or boss
     except Exception:
-        boss = None
+        pass
     return sid, boss, False
 
 
@@ -6303,6 +6303,9 @@ def headless_close_problem(engine, runner, now, discovery, name, target, force):
     What: no turn in progress and no activity within `retire_idle_minutes` (unless --force), and never while a registered
     worktree of the worker holds uncommitted or unpushed work (also with --force). Every unreadable fact is a refusal."""
     sid, boss, _ = target
+    why = close_authority_problem(runner, now, name, boss, "end", "session")
+    if why:
+        return None, why
     try:
         info = engine.v2.session_get(sid)
     except V2Error as err:
@@ -6311,9 +6314,6 @@ def headless_close_problem(engine, runner, now, discovery, name, target, force):
         return None, "session %s cannot be read now (%s): nothing was ended" % (sid, _one_line(str(err), 80))
     except Exception as err:
         return None, "session %s cannot be read now (%s): nothing was ended" % (sid, _one_line(str(err), 80))
-    why = close_authority_problem(runner, now, name, boss, "end", "session")
-    if why:
-        return None, why
     if not force:
         try:
             active = engine.v2.session_active()
@@ -6450,6 +6450,10 @@ def cmd_retire(args, runner, now):
                 print(restored)
             return EXIT_OK
         headless_kept = headless_record_to_free(state, name)
+        if headless_kept is not None:   # the boss is kept with the retirement: once the session is gone it cannot be read from it, and the boss rule must still judge the close
+            live = headless_target(engine, discovery, name)
+            if live is not None and live[2] and live[1]:
+                headless_kept = dict(headless_kept, boss=live[1])
         headless_lost = seen is None and not known and headless_kept is not None   # a headless record with no session: the worker is lost, not unknown
         if seen is None and not known and not headless_lost:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
