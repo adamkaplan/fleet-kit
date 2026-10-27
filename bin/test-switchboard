@@ -83776,6 +83776,20 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
     BARE_GH_SOURCES = (["bin/fleet-switchboard"] + sorted("bin/switchboard/" + n.name for n in (REPO / "bin" / "switchboard").glob("*.py"))
                        + sorted("bin/" + n.name for n in (REPO / "bin").glob("*.py")))
     SUBPROCESS_CALLS = {"run", "Popen", "call", "check_call", "check_output", "runner", "_runner", "run_cmd"}
+    # THE ALLOW-LIST (#1330): the two agent-facing reads that name the bare "gh" ON PURPOSE. Keyed (path, enclosing function) -> (the argv the bare call carries after "gh", the reason).
+    # LIMIT: an allow-list NARROWS what this guard checks on a credential path: inside these two functions a bare "gh" is no longer flagged, so the guard says nothing about any other
+    # call they add; test_every_allowed_bare_gh_entry_exists pins each entry to a real function whose bare call is the one named, and a third site anywhere else still fails the scan.
+    ALLOWED_BARE_GH = {
+        ("bin/fleet-switchboard", "issue_is_ask"): (("api",), "agent-facing: the shim must see this call"),
+        ("bin/fleet-switchboard", "preflight_body_warnings"): (("pr", "view"), "agent-facing: the shim must see this call"),
+    }
+
+    @staticmethod
+    def enclosing_function(tree, line):
+        """The name of the innermost function whose span holds `line`, or None."""
+        spans = [(n.end_lineno - n.lineno, n.name) for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.lineno <= line <= n.end_lineno]
+        return min(spans)[1] if spans else None
 
     @classmethod
     def bare_gh_sites(cls, sources):
@@ -83789,8 +83803,11 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         config["gh"] (own_gh_path) and by the behaviour tests around it, which this scan does not replace."""
         found = []
         for path, text in sources.items():
-            for node in ast.walk(ast.parse(text)):
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
                 if isinstance(node, ast.List) and node.elts and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == "gh":
+                    if (path, cls.enclosing_function(tree, node.lineno)) in cls.ALLOWED_BARE_GH:
+                        continue
                     found.append((path, node.lineno))
                 elif isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                     fn = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
@@ -83804,6 +83821,28 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         sources = {p: (REPO / p).read_text() for p in self.BARE_GH_SOURCES}
         self.assertGreater(len(sources), 5, "the scan must see bin/switchboard/*.py too")
         self.assertEqual(self.bare_gh_sites(sources), [], "a command whose first argv element is the literal 'gh' (path, line): use config['gh'] (the real gh by path)")
+
+    def test_every_allowed_bare_gh_entry_exists(self):
+        """Each allow-list entry names a function found in the scanned sources whose bare gh list is the one the entry names, with a reason; a rename or a deleted function fails here."""
+        self.assertEqual(sorted(self.ALLOWED_BARE_GH), [("bin/fleet-switchboard", "issue_is_ask"), ("bin/fleet-switchboard", "preflight_body_warnings")])
+        for (path, name), (argv, reason) in sorted(self.ALLOWED_BARE_GH.items()):
+            self.assertIn(path, self.BARE_GH_SOURCES)
+            self.assertTrue(reason)
+            tree = ast.parse((REPO / path).read_text())
+            funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
+            self.assertEqual(len(funcs), 1, "the allowed function %s is not in %s" % (name, path))
+            lists = [n for n in ast.walk(funcs[0]) if isinstance(n, ast.List) and n.elts and isinstance(n.elts[0], ast.Constant) and n.elts[0].value == "gh"]
+            self.assertEqual(len(lists), 1, "%s must hold exactly one bare gh call" % name)
+            self.assertEqual(tuple(e.value for e in lists[0].elts[1:1 + len(argv)] if isinstance(e, ast.Constant)), argv)
+
+    def test_a_third_bare_gh_site_still_fails_the_scan(self):
+        """The hand mutant: a bare gh planted in a temp copy of a scanned source, outside the allow-list, is flagged (and one in an allowed function's neighbour too)."""
+        sources = {p: (REPO / p).read_text() for p in self.BARE_GH_SOURCES}
+        self.assertEqual(self.bare_gh_sites(sources), [])
+        planted = dict(sources, **{"bin/switchboard/audit.py": sources["bin/switchboard/audit.py"] + '\n\ndef third_site(runner):\n    return runner(["gh", "api", "user"])\n'})
+        self.assertEqual(len(self.bare_gh_sites(planted)), 1)
+        neighbour = sources["bin/fleet-switchboard"] + '\n\ndef issue_is_ask_again(runner):\n    return runner(["gh", "api", "user"])\n'
+        self.assertEqual(len(self.bare_gh_sites(dict(sources, **{"bin/fleet-switchboard": neighbour}))), 1)
 
     def test_a_mutant_that_re_adds_a_bare_gh_site_fails_the_scan(self):
         sources = {p: (REPO / p).read_text() for p in self.BARE_GH_SOURCES}
