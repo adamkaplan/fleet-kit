@@ -5822,6 +5822,7 @@ BOSS_READ_SITES = {
     "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
+    "bin/fleet-switchboard:cloud_branch_tick": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, to name the lane that is told",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
 }
 
@@ -9349,6 +9350,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("cloud-watch", "cloud-watch", err, report)
     try:
+        cloud_branch_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("cloud-branch", "cloud-branch", err, report)
+    try:
         publish_decisions(engine)
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
@@ -9361,6 +9366,126 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("health-records", "health-records", err, report)
     schedule_judge_warm(engine, discovery)
+
+
+BRANCH_READS_PER_PASS = 20     # #1407: the most branch-head reads one pass makes (the rest wait for the next pass, round robin)
+BRANCH_PASS_SECONDS = 5.0      # the most monotonic time one pass spends on them
+BRANCH_READ_TIMEOUT = 5        # the timeout of one read
+BRANCH_HEADS_FILE = "cloud-heads.json"
+BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
+BRANCH_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _branch_heads_read(state_dir):
+    try:
+        body = json.loads((Path(state_dir) / BRANCH_HEADS_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _branch_heads_write(state_dir, heads):
+    path = Path(state_dir) / BRANCH_HEADS_FILE
+    temp = path.with_name(BRANCH_HEADS_FILE + ".tmp")
+    temp.write_text(json.dumps(heads, sort_keys=True))
+    os.replace(str(temp), str(path))
+
+
+def _branch_head(engine, repo, branch):
+    """(head, None) for a branch that exists, ("absent", None) for one that does not (yet), (None, why) for a read that failed. One bounded GET of the
+    ref through the repository's own account (counted, conditional, paused while the account is limited); nothing is written."""
+    try:
+        done = engine.accounts.read(engine.accounts.runner, "repos/%s/git/ref/heads/%s" % (repo, branch), repo, BRANCH_READ_TIMEOUT)
+    except (GhRateLimited, AccountError, OSError, subprocess.SubprocessError) as err:
+        return None, _one_line(type(err).__name__, 40)
+    if done.returncode != 0:
+        if "404" in (done.stderr or ""):
+            return "absent", None
+        return None, "gh exit %s" % done.returncode
+    try:
+        sha = json.loads(done.stdout or "")["object"]["sha"]
+    except (ValueError, KeyError, TypeError):
+        return None, "unreadable answer"
+    return (sha, None) if isinstance(sha, str) and BRANCH_SHA_RE.fullmatch(sha) else (None, "unreadable answer")
+
+
+def cloud_branch_tick(engine, discovery):
+    """#1407: a cloud pod has no switchboard command and its push raises no event, so ONE bounded read per pass of the head of the branch of each live
+    cloud worker whose lane is registered here (round robin, at most BRANCH_READS_PER_PASS reads and BRANCH_PASS_SECONDS), and ONE message to the
+    launching lane per new head: `pod NAME pushed BRANCH head XXXXXXXX`. Never a token or commit content. Read-only on the remote; below the daemon's
+    low-budget line an account's branches are not read. Returns the messages made."""
+    result = getattr(engine, "cloud_watch", None)
+    if discovery is None or discovery.problems or not result or engine.state_dir is None or getattr(engine, "accounts", None) is None:
+        return []
+    listed = registry_read(engine.state_dir)
+    if not listed["whole"]:
+        return []
+    retired, last_reports, now = listed["retired"], _read_small(engine.state_dir, LAST_REPORT_FILE), engine.now()
+    eligible = []
+    for record in result["records"]:
+        worker, repo, branch = record.get("worker"), record.get("repo"), record.get("branch")
+        if not (isinstance(worker, str) and isinstance(repo, str) and isinstance(branch, str) and re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo)
+                and BRANCH_NAME_RE.fullmatch(branch) and not branch.startswith("-") and ".." not in branch):
+            continue
+        boss = _cloud_boss(record.get("reports_to"))
+        lane = resolve_boss(discovery, boss) if boss else None
+        if lane not in discovery.agents or not cloud_record_live(record, worker, retired, last_reports, now):
+            continue   # another lane's record (no lane registered here to tell) or a worker that is retired, ended or gone: never read
+        eligible.append((worker, repo, branch, lane, record.get("launch_head")))
+    eligible.sort()
+    heads = _branch_heads_read(engine.state_dir)
+    cursor = getattr(engine, "_branch_cursor", None)
+    if cursor is not None:
+        eligible = [e for e in eligible if e[0] > cursor] + [e for e in eligible if e[0] <= cursor]
+    clock = getattr(engine, "branch_clock", None) or time.monotonic
+    deadline, reads, cut, skipped, failed, told, changed = clock() + BRANCH_PASS_SECONDS, 0, None, set(), 0, [], False
+    for worker, repo, branch, lane, launch_head in eligible:
+        if reads >= BRANCH_READS_PER_PASS:
+            cut = "reads"
+            break
+        if clock() > deadline:
+            cut = "time"
+            break
+        account = engine.accounts.describe(repo)
+        if account in skipped or agent_calls.low_budget(str(engine.state_dir), account, now) is not None:
+            skipped.add(account)
+            continue
+        reads += 1
+        engine._branch_cursor = worker
+        head, why = _branch_head(engine, repo, branch)
+        entry = heads.get(worker) if isinstance(heads.get(worker), dict) else {}
+        if head is None:
+            failed += 1
+            continue
+        if head == "absent":
+            if entry.get("head") is None and not entry.get("absent"):
+                heads[worker], changed = {"absent": True}, True
+            continue
+        if entry.get("head") == head:
+            continue
+        first_equal = entry.get("head") is None and not entry.get("absent") and (launch_head is None or launch_head == head)   # the head the launch left (none recorded: the first one seen is it)
+        heads[worker], changed = {"head": head}, True
+        if first_equal:
+            continue
+        text = "pod %s pushed %s head %s" % (_one_line(worker, 60), _one_line(branch, 100), head[:8])
+        add_reminder(engine.state_dir, lane, now, now, text)
+        told.append(text)
+    if not result.get("capped"):
+        names = {r.get("worker") for r in result["records"]}
+        pruned = {k: v for k, v in heads.items() if k in names}
+        changed = changed or pruned != heads
+        heads = pruned
+    if changed:
+        _branch_heads_write(engine.state_dir, heads)
+    if engine.audit is not None:
+        if cut:
+            engine.audit.append(engine.actor, "cloud-branch.capped", "cloud-branch", {"bound": cut, "reads": reads, "waiting": len(eligible) - reads - len(skipped)})
+        if skipped:
+            engine.audit.append(engine.actor, "cloud-branch.skipped_budget", "cloud-branch", {"accounts": sorted(skipped)})
+        if failed:
+            engine.audit.append(engine.actor, "cloud-branch.unreadable", "cloud-branch", {"branches": failed})
+    return told
+
 
 
 # ---- #117: the "waiting on the person" sweep. Deterministic (no model), over what the hub can read in a few bounded,

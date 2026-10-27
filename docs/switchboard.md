@@ -6009,6 +6009,22 @@ Now every reader of record JSON uses the shared bounded-depth parse `parse_bound
 
 `TestRecordJsonReaders` derives the list of readers from the source (every `json.loads`, `json.load` and `from json import loads` call in `bin/`, found with `ast`) and fails when a reader is in neither the covered set nor its table of exempt sites (daemon-written state, command output, request bodies, log lines), and when a table entry is stale.
 
+## Cloud branch heads (ask #1407)
+
+Cause: a cloud pod has no switchboard command, and its push raises no event for the lane that launched it. Planner pushes sat unseen for six to nine hours, twice, until the lane looked at the branch by hand, and a builder's push was noticed only when the lane remembered to read the remote.
+
+What the daemon does now: `cloud_branch_tick`, the step after `cloud_watch_tick` in `finish_pass`, makes ONE bounded read of the head of the branch of each live cloud worker whose launching lane is registered here (a record whose lane is not registered here, or that is retired, ended or cleared, is never read). It uses the repository's own read access (the same counted, conditional account read as every other hub read): no new credential, no new permission, nothing written. It tells the launching lane once per new head, with one message:
+
+```text
+pod NAME pushed BRANCH head XXXXXXXX
+```
+
+The message means that the worker's branch moved to a head that starts with those eight characters; it never carries a token or the content of a commit. It pairs with the pod status line of the sibling ask #1397: the status line says what a pod is doing now, this message says that its branch moved.
+
+Rules: the first head seen is recorded without a message when it equals the head the launch recorded (a record without one: the first head seen is taken as the head the launch left); a head already told is not told again; a branch that does not exist yet gives no message and no error, and its later appearance is told; a remote that cannot be read gives ONE audit line per pass (`cloud-branch.unreadable`) and no message. The heads seen are kept in `cloud-heads.json` in the state directory.
+
+Limits: at most 20 reads and 5 s per pass, each read with a 5 s timeout. Unread branches wait for the next pass (round robin) and ONE audit line (`cloud-branch.capped`) says a limit cut the pass. Budget: an account whose fresh reading is below the low-budget line (`agent_calls.low_budget`, the line `status` shows) is not read (0 reads, ONE audit line `cloud-branch.skipped_budget`); a stale or missing reading counts as above the line. Worst case reads per hour: 20 per pass at the default `poll_seconds` of 5 is 720 passes an hour, 14400 reads (a read answered 304 Not Modified costs nothing against the limit).
+
 ## The assembler (#1092, slice S1)
 
 `bin/fleet-switchboard` builds the daemon's one module namespace from the manifest `bin/fleet-switchboard.parts`: one part path per line, relative to the entry's real path (symlinks resolved), `#` for comments.
