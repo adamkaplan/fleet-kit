@@ -945,6 +945,10 @@ class HubReadAndTransport(unittest.TestCase):
         mod = load_backend_module("if inflight and inflight[0].is_alive():", "if False:")
         self.assertGreater(self._threads_hanging(mod), 2)
 
+    # Cause of the failure on a loaded runner (ask #1406): the scenario once set the product's wall-clock
+    # deadline READ_DEADLINE to 0.4 seconds for the whole run, so the plain request ran under the shortened
+    # deadline and a slow loopback GET was cut with a timeout. The product default of 30 seconds is unchanged;
+    # now only the post that must be cut runs under 0.4 seconds.
     def _late_post_scenario(self, mod):
         import json
         import threading
@@ -1451,6 +1455,29 @@ class OneWallClock(unittest.TestCase):
                                   extra=(("if declared and declared.isdigit() and len(raw)", "if False and len(raw)"), ("if left <= 0:", "if False:"), ("worker.join(READ_DEADLINE)", "worker.join()")))
         _, err = self.timed(mod, self.serve_padded(), 1.0)
         self.assertIsNone(err)   # the mutant parses the cut body as complete
+
+
+class TestLatePostNoWallClock(unittest.TestCase):
+    def scenario_source(self):
+        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
+        start = text.index("    def _late_post_scenario")
+        return text[start:text.index("    def test_late_post_after_the_cut", start)]
+
+    def test_short_deadline_is_set_only_around_the_cut_post(self):
+        src = self.scenario_source()
+        sets = [l for l in src.splitlines() if "READ_DEADLINE = 0.4" in l]
+        self.assertEqual(len(sets), 1)
+        self.assertLess(src.index("READ_DEADLINE = 0.4"), src.index("post(req"))
+        self.assertLess(src.index("PassCut"), src.index("READ_DEADLINE = old"))
+        self.assertLess(src.index("READ_DEADLINE = old"), src.index("gate.set()   # the late"))
+
+    def test_no_fixed_sleep_remains_in_the_scenario(self):
+        self.assertEqual(self.scenario_source().count("time.sleep" + "("), 0)
+
+    def test_the_comment_names_the_cause(self):
+        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
+        self.assertIn("the plain request ran under the shortened deadline", text)
+        self.assertIn("30 seconds", text)
 
 
 if __name__ == "__main__":
