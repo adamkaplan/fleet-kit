@@ -243,7 +243,7 @@ jobs:
 
       - name: bin/test-cloud-launcher
         if: ${{ !cancelled() }}
-        timeout-minutes: 30
+        timeout-minutes: 29
         run: |
           bin/test-cloud-launcher 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"

@@ -26,7 +26,7 @@ BIN_EXCEPTIONS="test-cloud-hub:own-ci-step test-cloud-hub-relay:own-ci-step test
 for f in bin/test-cloud-*; do
   [ -e "$f" ] || continue
   n=$(basename "$f")
-  case "$n" in *.chain) continue ;; esac
+  case "$n" in *.chain|*.parallel) continue ;; esac
   grep -qx "bin/$n" "$LIST" && continue
   case " $BIN_EXCEPTIONS " in *" $n:"*) continue ;; esac
   echo "NOT RUN: bin/$n is in no chain list entry and not in BIN_EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
@@ -51,18 +51,55 @@ done < "$LIST"
 if [ "$count" -eq 0 ]; then echo "NOT RUN: the chain list holds no entry"; echo "RESULT: FAIL"; exit 1; fi
 # Arguments ("$@") go only to the entries that took them in the old one-line chain; the others run without arguments.
 ARGS_ENTRIES=" test_cloud_worker.py test_cloud_stack.py test_cloud_stack_wait.py test_cw_names.py test_cloud_k1.py test_driver.py test_run_record.py test_cloud_allowlist.py test_cloud_settings.py test_cloud_preflight_wired.py "
-ran=0
-while IFS= read -r e; do
-  [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
+# The PARALLEL list ($PAR, entries also in $LIST) runs in 3 lanes beside the serial loop (#1390): each entry uses its own temporary directory, binds no fixed port, and writes to its own output file, replayed whole after the run.
+PAR=bin/test-cloud-launcher.parallel
+[ -f "$PAR" ] || PAR=/dev/null   # no parallel list: every entry runs serially
+OUT=$(mktemp -d) || exit 1
+trap 'rm -rf "$OUT"' EXIT
+run_entry() { # $1 = entry; runs it with the arguments it took in the old chain; prints its own RUN and TIME lines
+  e=$1; shift
   case "$ARGS_ENTRIES" in *" $(basename "$e") "*) a=1 ;; *) a=0 ;; esac
   echo "RUN $e"
   t0=$(date +%s)
   case "$e" in
     *.py) if [ $a = 1 ]; then python3 "$e" "$@"; else python3 "$e"; fi ;;
     *) if [ $a = 1 ]; then "$e" "$@"; else "$e"; fi ;;
-  esac || { echo "FAILED: $e"; echo "RESULT: FAIL"; exit 1; }
+  esac || { echo "FAILED: $e"; return 1; }
   echo "TIME $e $(( $(date +%s) - t0 ))s"
+}
+is_parallel() { grep -qx "$1" "$PAR"; }
+while IFS= read -r e; do
+  [ -n "$e" ] || continue
+  grep -qx "$e" "$LIST" || { echo "NOT RUN: parallel entry $e is not in $LIST"; echo "RESULT: FAIL"; exit 1; }
+done < "$PAR"
+lane() { # $1 = lane number: every 3rd entry of $PAR, one after the other, output in $OUT/<entry>.out, status in $OUT/<entry>.rc
+  l=$1; shift; n=0
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    n=$((n + 1))
+    [ $(( (n - 1) % 3 )) = "$l" ] || continue
+    f=$(printf %s "$e" | tr / _)
+    run_entry "$e" "$@" > "$OUT/$f.out" 2>&1
+    echo $? > "$OUT/$f.rc"
+  done < "$PAR"
+}
+pids=""
+for l in 0 1 2; do lane "$l" "$@" & pids="$pids $!"; done
+ran=0
+fail=0
+while IFS= read -r e; do
+  [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
+  is_parallel "$e" && continue
+  run_entry "$e" "$@" || { echo "RESULT: FAIL"; kill $pids 2>/dev/null; exit 1; }
   ran=$((ran + 1))
 done < "$LIST"
+wait
+while IFS= read -r e; do
+  [ -n "$e" ] || continue
+  f=$(printf %s "$e" | tr / _)
+  cat "$OUT/$f.out"
+  [ "$(cat "$OUT/$f.rc" 2>/dev/null)" = 0 ] || { echo "RESULT: FAIL"; exit 1; }
+  ran=$((ran + 1))
+done < "$PAR"
 echo "ran $ran entries"
 echo "RESULT: PASS"

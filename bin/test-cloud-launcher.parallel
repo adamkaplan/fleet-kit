@@ -1,0 +1,9 @@
+cloud/launcher/tests/test_run_record.py
+cloud/launcher/tests/test_git_token_renewal.py
+cloud/launcher/tests/test_driver.py
+cloud/launcher/tests/test_cloud_stack_wait.py
+cloud/launcher/tests/test_cloud_quick_bounds.py
+cloud/launcher/tests/test_stub_cleanup.py
+cloud/launcher/tests/test_cloud_stack.py
+cloud/launcher/tests/test_cloud_quick_scans_run.py
+cloud/launcher/tests/test_app_token.py
