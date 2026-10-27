@@ -227,8 +227,8 @@ class Environment(unittest.TestCase):
 
 class Wiring(unittest.TestCase):
     def test_chained_last_and_docs(self):
-        chain = open(os.path.join(ROOT, "bin", "test-cloud-launcher")).read()
-        self.assertIn("python3 cloud/worker/tests/test_cloud_prepush_preflight.py; then", chain)
+        entries = open(os.path.join(ROOT, "bin", "test-cloud-launcher.chain")).read().split("\n")
+        self.assertEqual(entries[-2:], ["cloud/worker/tests/test_cloud_prepush_preflight.py", ""])
         for rel in ("cloud/README.md", "cloud/worker/agents/worker.md"):
             t = open(os.path.join(ROOT, rel)).read()
             self.assertIn("bin/cloud-prepush", t, rel)
