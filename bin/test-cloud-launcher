@@ -1,12 +1,65 @@
 #!/bin/sh
 # test-cloud-launcher: offline tests for the cloud-worker launcher (fake kubectl, fake clock). Prints RESULT: PASS.
+# The chain is the list file bin/test-cloud-launcher.chain, ONE entry per line (a path), sorted, with one fixed last line.
+# (It used to be ONE shell line of more than forty commands joined by &&; every member appended to it and every pair conflicted.)
+# To add a test: add one line to bin/test-cloud-launcher.chain at its alphabetical place, ABOVE the fixed last line (even if it sorts after it).
 cd "$(dirname "$0")/.." || exit 1
-# Completeness check: every test_*.py must be named below, or listed here with a reason.
+LIST=bin/test-cloud-launcher.chain
+# Completeness check: every test_*.py must be listed in $LIST, or named here with a reason; every listed entry must exist.
 EXCEPTIONS="test_cloud_pod_deadline.py:slow(26s),not-yet-chained test_cloud_stop_nonce.py:slow(57s),not-yet-chained test_reaper_record_family.py:did-not-finish-in-120s,not-yet-chained"
+[ -f "$LIST" ] || { echo "NOT RUN: $LIST is missing"; echo "RESULT: FAIL"; exit 1; }
 for f in cloud/launcher/tests/test_*.py; do
+  [ -e "$f" ] || continue
   n=$(basename "$f")
-  grep -q "tests/$n" "$0" && continue
+  grep -qx "cloud/launcher/tests/$n" "$LIST" && continue
   case " $EXCEPTIONS " in *" $n:"*) continue ;; esac
   echo "NOT RUN: $n is neither chained nor in EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
 done
-if python3 cloud/launcher/tests/test_cloud_worker.py "$@" && python3 cloud/launcher/tests/test_cloud_stack.py "$@" && python3 cloud/launcher/tests/test_cloud_stack_wait.py "$@" && python3 cloud/launcher/tests/test_cw_names.py "$@" && python3 cloud/launcher/tests/test_cloud_k1.py "$@" && python3 cloud/launcher/tests/test_driver.py "$@" && python3 cloud/launcher/tests/test_run_record.py "$@" && python3 cloud/launcher/tests/test_cloud_allowlist.py "$@" && python3 cloud/launcher/tests/test_cloud_settings.py "$@" && python3 cloud/launcher/tests/test_cloud_preflight_wired.py "$@" && python3 cloud/launcher/tests/test_cloud_docs_wording.py && python3 cloud/launcher/tests/test_reaper_managed.py && python3 cloud/launcher/tests/test_app_token.py && python3 cloud/launcher/tests/test_git_token_renewal.py && python3 cloud/launcher/tests/test_cloud_pod_replaced.py && python3 cloud/launcher/tests/test_token_read_at_call.py && python3 cloud/launcher/tests/test_preflight.py && python3 cloud/launcher/tests/test_issues_read.py && python3 cloud/launcher/tests/test_model_credential.py; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; exit 1; fi
+for f in bin/test-cloud-cost-*; do
+  [ -e "$f" ] || continue
+  n=$(basename "$f")
+  grep -qx "bin/$n" "$LIST" && continue
+  echo "NOT RUN: bin/$n is not chained"; echo "RESULT: FAIL"; exit 1
+done
+# Every bin/test-cloud-* script must be listed in $LIST or named here with a reason (a third, wider check).
+BIN_EXCEPTIONS="test-cloud-hub:own-ci-step test-cloud-hub-relay:own-ci-step test-cloud-relay:own-ci-step test-cloud-relay-daemon:own-ci-step test-cloud-channel:own-ci-step test-cloud-channel-server:own-ci-step test-cloud-cli:own-ci-step test-cloud-client:own-ci-step test-cloud-launcher:this-script test-cloud-neutral-names:own-ci-step test-cloud-way-back:own-ci-step test-cloud-worker:own-ci-step"
+for f in bin/test-cloud-*; do
+  [ -e "$f" ] || continue
+  n=$(basename "$f")
+  case "$n" in *.chain) continue ;; esac
+  grep -qx "bin/$n" "$LIST" && continue
+  case " $BIN_EXCEPTIONS " in *" $n:"*) continue ;; esac
+  echo "NOT RUN: bin/$n is in no chain list entry and not in BIN_EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
+done
+last=$(grep -v '^[[:space:]]*$' "$LIST" | tail -n 1)
+if [ -n "$last" ] && [ "$last" != "cloud/worker/tests/test_cloud_prepush_preflight.py" ]; then
+  echo "NOT RUN: the last line of $LIST must be cloud/worker/tests/test_cloud_prepush_preflight.py (found $last); add new entries above it"; echo "RESULT: FAIL"; exit 1
+fi
+count=0
+seen=" "
+while IFS= read -r e; do
+  [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
+  case "$e" in
+    /*|..|../*|*/../*) echo "NOT RUN: entry outside the repository: $e"; echo "RESULT: FAIL"; exit 1 ;;
+  esac
+  [ -L "$e" ] && { echo "NOT RUN: entry is a symlink: $e"; echo "RESULT: FAIL"; exit 1; }
+  case "$seen" in *" $e "*) echo "NOT RUN: duplicate entry $e in $LIST"; echo "RESULT: FAIL"; exit 1 ;; esac
+  seen="$seen$e "
+  [ -f "$e" ] || { echo "NOT RUN: $e is listed in $LIST but does not exist"; echo "RESULT: FAIL"; exit 1; }
+  count=$((count + 1))
+done < "$LIST"
+if [ "$count" -eq 0 ]; then echo "NOT RUN: the chain list holds no entry"; echo "RESULT: FAIL"; exit 1; fi
+# Arguments ("$@") go only to the entries that took them in the old one-line chain; the others run without arguments.
+ARGS_ENTRIES=" test_cloud_worker.py test_cloud_stack.py test_cloud_stack_wait.py test_cw_names.py test_cloud_k1.py test_driver.py test_run_record.py test_cloud_allowlist.py test_cloud_settings.py test_cloud_preflight_wired.py "
+ran=0
+while IFS= read -r e; do
+  [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
+  case "$ARGS_ENTRIES" in *" $(basename "$e") "*) a=1 ;; *) a=0 ;; esac
+  case "$e" in
+    *.py) if [ $a = 1 ]; then python3 "$e" "$@"; else python3 "$e"; fi ;;
+    *) if [ $a = 1 ]; then "$e" "$@"; else "$e"; fi ;;
+  esac || { echo "FAILED: $e"; echo "RESULT: FAIL"; exit 1; }
+  ran=$((ran + 1))
+done < "$LIST"
+echo "ran $ran entries"
+echo "RESULT: PASS"
