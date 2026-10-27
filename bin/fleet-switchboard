@@ -3015,6 +3015,21 @@ class Switchboard:
                 note_unreachable(self, plan.recipient, fresh, why)
                 return {"sent": False, "action": again.action, "reason": again.reason}
             observation = fresh
+        source = next((s for s in self.sources if isinstance(s, ReminderFacts)), None)
+        if source is not None and any(str(f.key).startswith("reminder:") for f in plan.pending):
+            # #1401: a reminder superseded by a re-arm or cancelled after it became a fact is not delivered; the drop names both reminders
+            kept_facts = []
+            for fact in plan.pending:
+                replaced = source.recheck_delivery(fact)
+                if replaced is None:
+                    kept_facts.append(fact)
+                elif self.audit is not None:
+                    self.audit.append(self.actor, "reminder.drop_in_flight", plan.recipient,
+                                      {"dropped": fact.key[len("reminder:"):], "kept": replaced})
+            if len(kept_facts) != len(plan.pending):
+                plan.pending = kept_facts
+                if not kept_facts:
+                    return {"sent": False, "action": "dropped", "reason": "every reminder on its way was superseded or cancelled"}
         repos = self.repos_in_play()
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
             self.intents.discard_told()
@@ -22644,6 +22659,7 @@ def build_parser():
     remind.add_argument("text", nargs="*", help="The reminder")
     remind.add_argument("--list", dest="list_mine", action="store_true", help="Show your own pending reminders (id, time, recipient, issue, text)")
     remind.add_argument("--cancel", metavar="ID", help="Cancel one of your pending reminders by its id (see --list)")
+    remind.add_argument("--cancel-key", metavar="KEY", help="Cancel every waiting reminder of yours with this key (a chain armed with --key); a delivered one is not recalled")
     remind.add_argument("--key", default=None, help="Name the purpose: arming again with the same key replaces your pending reminder of that key.")
     remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed "
                         "(by default a reminder about an issue is dropped, unsent, once the issue is closed)")
@@ -23295,7 +23311,7 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     try:
         args, extra = parser.parse_known_args(list(raw))
         args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
-        if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
+        if extra and args.action == "remind" and not (args.list_mine or args.cancel or getattr(args, "cancel_key", None)) and not any(word.startswith("-") for word in extra):
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))

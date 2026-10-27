@@ -10507,6 +10507,86 @@ class TestReminders(PR4Base):
             self.assertTrue(fact.summary.endswith("\u2026 (late by %d min)" % (7 + (n - 4000) * 0)) or "\u2026 (late by" in fact.summary)
             sb.write_reminders(self.world.state, [])
 
+    # ---- #1401: cancel a chain by owner and key; a copy on its way is re-checked at the delivery step
+
+    def cancel_key(self, sender="a", key="k"):
+        state = self.world.state
+        return sb.cancel_chain(state, sender, key)
+
+    def audit_events(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), self.world.route, self.world.clock.now, lambda s: None)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_cancelling_a_chain_drops_the_pending_and_fired_copies_and_writes_one_audit_line(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        base = self.keyed(delay=10)
+        sb.write_reminders(self.world.state, [dict(base, id=i, at=EPOCH + at) for i, at in (("p1", 5000), ("f1", 1), ("f2", 2))])
+        self.world.tick(100)
+        code, out, err = self.run_cli("remind", "--cancel-key", "k", "--from", "a")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([r for r in sb.read_reminders(self.world.state) if r.get("from") == "a" and r.get("key") == "k"], [])
+        self.assertEqual(len(self.audit_events("reminder.cancelled")), 1)
+
+    def test_a_delivered_copy_is_not_recalled_and_a_second_cancel_writes_no_second_line(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        sent = self.keyed(delay=10)
+        self.world.tick(10)
+        self.assertEqual(len(self.world.engine.run_pass()["sent"]), 1)   # delivered and pruned
+        self.keyed(delay=600)
+        code, _, err = self.run_cli("remind", "--cancel-key", "k", "--from", "a")
+        self.assertEqual(code, 0, err)
+        code, _, _ = self.run_cli("remind", "--cancel-key", "k", "--from", "a")
+        self.assertEqual(code, 2)
+        self.assertEqual(len(self.audit_events("reminder.cancelled")), 1)
+        self.assertEqual(len(self.world.admissions("platform")), 1, "no retraction is sent")
+        self.assertEqual(self.world.admissions("platform")[0]["keys"], ["reminder:" + sent["id"]])
+
+    def deliver_with(self, race):
+        """Run a pass in which `race` lands after the reminder became a fact and before it is delivered."""
+        real = self.world.engine.reobserve
+
+        def raced(previous, now):
+            race()
+            return real(previous, now)
+
+        with mock.patch.object(self.world.engine, "reobserve", raced):
+            return self.world.engine.run_pass()
+
+    def test_an_in_flight_copy_superseded_by_a_re_arm_is_not_delivered_and_the_audit_names_both(self):
+        old = self.keyed(delay=10)
+        self.world.tick(10)
+        new = []
+        report = self.deliver_with(lambda: new.append(sb.add_reminder(self.world.state, "platform", self.world.clock.now(), self.world.clock.now() + 1, "again", sender="a", key="k")))
+        self.assertEqual([m for m in self.world.admissions("platform") if "reminder:" + old["id"] in m["keys"]], [])
+        (line,) = self.audit_events("reminder.drop_in_flight")
+        self.assertEqual((line["detail"]["dropped"], line["detail"]["kept"]), (old["id"], new[0]["id"]))
+        self.assertEqual(report["sent"], [])
+
+    def test_an_in_flight_copy_cancelled_before_delivery_is_not_delivered_and_one_line_names_it(self):
+        old = self.keyed(delay=10)
+        self.world.tick(10)
+        self.deliver_with(lambda: self.cancel_key())
+        self.assertEqual(self.world.admissions("platform"), [])
+        lines = [e for e in self.world.audit() if old["id"] in json.dumps(e)]
+        self.assertEqual([e["event"] for e in lines if e["event"].startswith("reminder.drop")], ["reminder.drop_in_flight"])
+        self.assertEqual(lines[-1]["detail"]["kept"], "cancelled")
+
+    def test_another_owner_and_another_key_are_neither_cancelled_nor_dropped(self):
+        self.keyed("b", delay=10)
+        self.keyed("a", key="j", delay=10)
+        mine = self.keyed("a", delay=10)
+        self.world.tick(10)
+        self.deliver_with(lambda: self.cancel_key())
+        keys = sorted(k for m in self.world.admissions("platform") for k in m["keys"])
+        self.assertEqual(len(keys), 2)
+        self.assertNotIn("reminder:" + mine["id"], keys)
+        self.assertEqual(self.audit_events("reminder.drop_in_flight")[0]["detail"]["dropped"], mine["id"])
+        self.assertEqual(len(self.audit_events("reminder.drop_in_flight")), 1)
+
     def test_every_path_that_removes_or_skips_a_reminder_is_in_the_docs_table(self):
         here = os.path.dirname(os.path.abspath(__file__))
         src = open(os.path.join(here, "switchboard", "reminders.py")).read()
