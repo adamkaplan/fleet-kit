@@ -12,7 +12,9 @@ import re
 import subprocess
 import sys
 import time
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,7 +24,24 @@ import test_cloud_status_summary as S  # noqa: E402  (the fake cluster, the reco
 sb, CLOUD, ALIVE = S.sb, S.CLOUD, S.ALIVE
 ROOT = S.KIT
 CLOUD.bind(sb.__dict__)   # the module is bound to the switchboard once here, so any class runs alone (#1397 root of the order dependence)
-WRITE_VERBS = ("create", "patch", "delete", "label", "exec", "apply", "port-forward", "replace", "scale")
+READ_VERBS = ("get", "describe", "logs", "top", "version", "api-resources", "cluster-info", "config", "auth")   # what a read-only command may ask the cluster
+WRITE_VERBS = ("create", "patch", "delete", "label", "annotate", "exec", "apply", "port-forward", "replace", "scale", "cp", "run", "edit", "set",
+               "rollout", "drain", "cordon", "uncordon", "taint", "expose", "autoscale")
+GLOBAL_FLAGS_WITH_VALUE = ("--kubeconfig", "--context", "-n", "--namespace", "--cluster", "--user", "--server", "-s", "--token", "--request-timeout")
+
+
+def kube_verb(call):
+    """The verb of one recorded kubectl call: the first word that is not a global flag or its value (the call starts with `--kubeconfig PATH`)."""
+    i = 0
+    while i < len(call):
+        word = call[i]
+        if word in GLOBAL_FLAGS_WITH_VALUE:
+            i += 2
+        elif word.startswith("-"):
+            i += 1
+        else:
+            return word
+    return None
 TOKEN = "ghp_" + "Ab3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0dF3gH6"
 PASSWORD = "Zq7-planted-passphrase"
 ENV_VALUE = "INTERNAL_HOST=vault-7.corp.example"
@@ -100,7 +119,10 @@ class Base(S.Base):
         """0 messages sent, 0 files written (the state directory is byte for byte as it was), 0 cluster changes."""
         self.assertEqual(self.v2.writes, [])
         self.assertEqual(self.tree(), self.files_before)
-        writes = [c for c in self.kube_calls() if c and c[0] in WRITE_VERBS]
+        calls = self.kube_calls()
+        verbs = [kube_verb(c) for c in calls]
+        self.assertTrue(all(verbs), "no real verb read from %r" % (calls,))   # a check that cannot see a verb is not a check
+        writes = [c for c, verb in zip(calls, verbs) if verb not in READ_VERBS]
         self.assertEqual(writes, [], writes)
 
 
@@ -345,6 +367,49 @@ class TestRefusal(Base):
         self.assertEqual(code, 1)
         self.assertIn("not a cloud worker", err)
 
+    def test_s5_the_status_command_issues_get_calls_only_and_the_check_sees_them(self):
+        self.worker()
+        code, out, err = self.status_line()
+        self.assertEqual(code, 0, err)
+        verbs = [kube_verb(c) for c in self.kube_calls()]
+        self.assertGreaterEqual(len(verbs), 1)   # the check below has something to look at
+        self.assertEqual(set(verbs), {"get"}, verbs)
+        self.assertEqual(kube_verb(["--kubeconfig", "/x/config", "--context", "cw", "-n", "cw", "patch", "pod", "p"]), "patch")
+
+    def test_s5_a_status_path_that_issues_one_write_call_fails_the_check(self):
+        """The mutant: the read of the pod is followed by one `patch` (then one `delete`) of the pod; the read-only check must fail, mutation applied."""
+        for verb in ("patch", "delete"):
+            with self.subTest(verb):
+                self.setUp()
+                self.worker()
+                applied = []
+                real = CLOUD._cluster_snapshot
+
+                def snapshot_then_write(runner, cluster, timeout, verb=verb, real=real):
+                    found = real(runner, cluster, timeout)
+                    applied.append(verb)
+                    subprocess.run([os.environ["CW_KUBECTL"], "--kubeconfig", cluster.kubeconfig, "--context", "cw", "-n", "cw", verb, "pod", "cw-coder7"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=cluster.env())
+                    return found
+                with mock.patch.object(CLOUD, "_cluster_snapshot", snapshot_then_write):
+                    self.status_line()
+                self.assertEqual(applied, [verb])
+                with self.assertRaises(AssertionError):
+                    self.assert_read_only()
+
+    def test_s5_the_transient_login_is_gone_afterwards_and_the_state_directory_stays_private(self):
+        """The command logs in with a token file and a kubeconfig in a private directory under the temporary directory (removed on every way out), and
+        sets the cloud directory of the state to mode 0700 (the same shared code as the other cloud commands)."""
+        self.worker()
+        root = Path(tempfile.gettempdir()) / ("cwtok-%d" % os.getuid())
+        before = sorted(root.glob("cmd-*")) if root.exists() else []
+        os.chmod(str(self.state_dir / "cloud"), 0o755)
+        code, out, err = self.status_line()
+        self.assertEqual(code, 0, err)
+        after = sorted(root.glob("cmd-*")) if root.exists() else []
+        self.assertEqual(after, before, "a transient login directory is left behind")
+        self.assertEqual(os.stat(str(self.state_dir / "cloud")).st_mode & 0o777, 0o700)
+
     def test_s5_the_plain_status_command_is_unchanged(self):
         self.worker()
         code, out, err = self.run_command("status")
@@ -459,6 +524,88 @@ class TestHostile(Base):
                 out = CLOUD.redact_error(text)
                 self.assertEqual(leaked(secret, out), [], out)
                 self.assertNotIn("\n", out)
+
+
+# ---- the second round (ask #1397): a table of hostile texts, every one through the real `status NAME` path. Every secret is built from plain parts here.
+V40 = "".join(("aEhWzjRci8hI", "pQ3mN7vXk2Ld", "Yt5sBw9ZcF1gHe4u", "Xo6Jr0Kq"))        # 44 characters, mixed letters and digits
+V34 = "".join(("Mv4Hq8Zs1Wd", "Lc7Tn2Bx9Rf", "Pj5Ge3Ya6K"))                            # 31 characters
+V30 = "".join(("Qe9Rt3Yu7Io", "Pa1Sd5Fg8Hj", "Kl2Zx6Cv"))                              # 29 characters
+TOK = "gh" + "p_" + "yvok5" + "QwErTy" + "UiOp3Zx9Cv" + "BnM1aS"                         # a token shape, assembled at run time only
+READABLE = "Error: could not open /x/y: File exists"
+BREAKS = (("LF", "\n"), ("CR", "\r"), ("CRLF", "\r\n"), ("NEL", "\u0085"), ("LS", "\u2028"), ("PS", "\u2029"), ("VT", "\x0b"), ("FF", "\x0c"))
+PAD = "ab " * 2000
+
+
+def table():
+    """(label, text, planted secrets) for each hostile case: the 8 shapes found by the independent proof, and variations of each."""
+    cases = []
+    for name, brk in BREAKS:   # (1) a line break of any kind between the marker and its value
+        for kind, value in (("short", SEVEN), ("40", V40), ("token", TOK)):
+            cases.append(("marker %s value, %s" % (name, kind), "Error: login failed" + brk + "password:" + brk + value, [value]))
+    for chain in ("password: password: ", "password: token: ", "token: secret=", "auth: password: ", "Authorization: Bearer ", "password password: ",
+                  "password: \r\npassword: \r\n", "secret: key: auth: "):   # (2) a doubled keyword, or a chain of them
+        for kind, value in (("short", SEVEN), ("40", V40)):
+            cases.append(("chain %r, %s" % (chain, kind), "Error: bad " + chain + value, [value]))
+    for offset in (3000, 3985, 3990, 3994, 3999, 4000, 4005, 4100):   # (3) the secret sits on the last line, at or around character 4000
+        for kind, value in (("token", TOK), ("40", V40)):
+            cases.append(("last line at %d, %s" % (offset, kind), "Error: boom\n" + PAD[:offset] + "\n" + value, [value]))
+    for secret in (V30, V34, V40):   # (4) an unmarked secret wrapped into two halves
+        for name, brk in BREAKS[:3]:
+            half = len(secret) // 2
+            cases.append(("wrapped %d by %s" % (len(secret), name), "Error: bad " + secret[:half] + brk + secret[half:], [secret]))
+    for marker in ("pass\u200bword: ", "tok\u200ben: ", "pa\u200bss\u200bword=", "sec\u2060ret: ", "pass\u00adword: ", "tok\ufeffen: ", "pass\u200dword = "):   # (5)
+        for kind, value in (("short", SEVEN), ("40", V40)):
+            cases.append(("split keyword %r, %s" % (marker, kind), "Error: " + marker + value, [value]))
+    for kind, text, secret in HOSTILE:   # the earlier round, kept
+        cases.append(("earlier: " + kind, text, [secret]))
+    cases.append(("a 100000 character line then a secret", "x" * 100000 + " password: " + SEVEN, [SEVEN]))
+    cases.append(("value after a keyword-colon-keyword on the next line", "token:\nsecret:\n" + SEVEN, [SEVEN]))
+    cases.append(("all of it at once", PAD + "\r\nAuthorization:\r\nBearer\r\n" + TOK, [TOK]))
+    return cases
+
+
+class TestDenyByDefault(Base):
+    """S2, second round: 0 planted pieces of 6 or more characters in the printed line, every case a plain readable error still prints readable."""
+
+    def printed(self, text):
+        self.worker()
+        self.v2.messages = [message(1798365852000, "", error=text)]
+        code, out, err = self.status_line()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(out.splitlines()), 1, out)
+        return out
+
+    def test_the_table_has_at_least_sixty_cases(self):
+        self.assertGreaterEqual(len(table()), 60)
+
+    def test_s2_no_planted_piece_of_six_characters_in_any_case_through_status(self):
+        failures = []
+        for label, text, secrets in table():
+            self.setUp()
+            line = self.printed(text)
+            shown = [piece for secret in secrets for piece in leaked(secret, line)]
+            if shown or len(line.split("; last error ", 1)[1]) > 160:
+                failures.append((label, shown[:2]))
+        self.assertEqual(failures, [], "%d of %d cases leak" % (len(failures), len(table())))
+
+    def test_s2_a_plain_readable_error_still_prints_readable_in_every_case(self):
+        line = self.printed(READABLE)
+        self.assertIn(READABLE, line)
+        for plain in ("ERROR: connection refused by the proxy", "Error: ImagePullBackOff for image registry.example/widget:1.4", "Error: pull refused: 403 Forbidden for pod coder7",
+                      "Error: quota exceeded: 429 Too Many Requests, retry in 30 s", "Traceback: ValueError: bad input in /app/run.py line 42"):
+            with self.subTest(plain):
+                self.setUp()
+                self.assertIn(plain.split(": ", 1)[1][:20], self.printed(plain))
+
+    def test_s2_a_plain_last_line_after_a_plain_first_line_prints_as_it_is(self):
+        self.assertEqual(CLOUD.redact_error("Error: step failed\n" + READABLE), READABLE)
+
+    def test_a_100000_character_line_is_handled_in_linear_time(self):
+        for text in ("a" * 100000, "ab " * 40000, "password: " * 10000, "a1" * 50000 + " token", "=" * 100000, "x://" + "u:" * 50000, "A" * 99990 + "\r\n" * 5):
+            began = time.monotonic()
+            out = CLOUD.redact_error(text)
+            self.assertLess(time.monotonic() - began, 5, text[:20])
+            self.assertLessEqual(len(out), 160)
 
 
 class Clock:
