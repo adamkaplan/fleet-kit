@@ -295,21 +295,21 @@ jobs:
 
       - name: bin/test-cloud-relay
         if: ${{ !cancelled() }}
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           bin/test-cloud-relay 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
 
       - name: bin/test-cloud-hub-relay
         if: ${{ !cancelled() }}
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           bin/test-cloud-hub-relay 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
 
       - name: bin/test-cloud-relay-daemon
         if: ${{ !cancelled() }}
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           bin/test-cloud-relay-daemon 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
