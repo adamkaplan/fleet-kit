@@ -29839,6 +29839,35 @@ class TestRedCi(Base):
         self.feed(self.run_rec("failure", "h1", pr=7), self.run_rec("failure", "h1", pr=8))
         self.assertEqual(self.unowned(), [])
 
+    @contextlib.contextmanager
+    def mutant(self, owner, name, old, new):
+        """Run with `owner.name` rebuilt from its source with `old` replaced by `new`; the old text must be present (else the mutation did not apply)."""
+        source = textwrap.dedent(inspect.getsource(getattr(owner, name)))
+        self.assertIn(old, source, "the mutation did not apply to %s" % name)
+        original = getattr(owner, name)
+        exec(compile(source.replace(old, new, 1), "<mutant %s>" % name, "exec"), vars(owner))
+        try:
+            yield
+        finally:
+            setattr(owner, name, original)
+
+    def test_unowned_mutant_key_without_the_head_misses_a_new_head(self):   # #1378: applied by hand too; S7 fails under it
+        with self.mutant(sb.load_module("red_ci"), "unowned_key", 'clean(head, 64).replace(":", "_")', '""'):
+            self.present(1304, "aaa111")
+            self.feed(self.run_rec("failure", "aaa111", pr=1304))
+            self.present(1304, "bbb222")
+            self.feed(self.run_rec("failure", "bbb222", pr=1304))
+            self.assertEqual(len(self.unowned()), 1)   # the real key gives 2 (test_unowned_new_head_alerts_once_more)
+
+    def test_unowned_mutant_without_the_state_check_alerts_a_closed_pr(self):   # #1378: applied by hand too; S5 fails under it
+        old = 'pr.get("state") == "open" and not pr.get("merged") and '
+        with self.mutant(sb, "red_ci_runs", old, ""):
+            self.present(55, "h1", state="closed")
+            self.present(56, "h2", state="closed", merged=True)   # #7 is owned by a worker: 55 and 56 are unowned
+            self.feed(self.run_rec("failure", "h1", pr=55))
+            self.feed(self.run_rec("failure", "h2", pr=56))
+            self.assertEqual(len(self.unowned()), 2)   # the real code gives none (test_unowned_closed_or_merged_is_silent)
+
     def test_unowned_unreadable_present_state_is_silent(self):   # S6
         self.prs = {}
         self.feed(self.run_rec("failure", "h1", pr=7))
