@@ -20533,7 +20533,7 @@ class TestPR8Source(unittest.TestCase):
             seen = {}
             for node in ast.parse(daemon_text(BIN / name)).body:
                 names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
-                    t.id for t in (node.targets if isinstance(node, ast.Assign) else []) if isinstance(t, ast.Name)]   # a `del name` is not a second definition
+                    t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
                 for each in names:
                     self.assertNotIn(each, seen, "%s defines %s twice (lines %s and %s)" % (name, each, seen.get(each), node.lineno))
                     seen[each] = node.lineno
