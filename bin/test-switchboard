@@ -2759,11 +2759,11 @@ class TestEngineCLI(Base):
         os.environ[sb.LAB_ENV] = "1"
         self.assertEqual(self.main("send", "platform", "--from", "coder", "hi")[0], 0)
 
-    def test_a_held_send_says_why_and_sends_nothing(self):
+    def test_a_held_send_is_queued_and_a_gone_agent_is_refused(self):
         self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
         code, out, err = self.main("send", "platform", "--from", "coder", "hi")
-        self.assertEqual((code, out), (sb.EXIT_HELD, ""))
-        self.assertIn("blocked", err)
+        self.assertEqual(code, 0, err)   # a message to a held pane is queued (see TestHoldQueue): nothing is written to the pane yet
+        self.assertIn("queued (the pane is on hold)", err)
         self.assertEqual(self.world.v2.writes, [])
         self.assertEqual(self.main("send", "nobody", "--from", "coder", "hi")[0], sb.EXIT_HELD)
 
