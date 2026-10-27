@@ -840,23 +840,44 @@ class LiveHead(Fixture):
 
     def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
         import threading
-        import time
+        gates = [threading.Event(), threading.Event()]   # released by the test: one per live-head call
+        entered = [threading.Event(), threading.Event()]
+        calls = []
 
-        def slow(pr):   # every call is slow: a call made under the flock would hold every other writer for this long
-            time.sleep(0.7)
+        def slow(pr):   # a call is held until the test releases it: a call made under the flock would hold every other writer
+            n = min(len(calls), 1)
+            calls.append(n)
+            entered[n].set()
+            gates[n].wait(10)   # safety only: the test releases it
             return HEAD
         self.backend.live_head = slow
         t = threading.Thread(target=lambda: self.run_one(CODER, "prove", **PROVE))
         t.start()
-        worst, end = 0.0, time.monotonic() + 1.6
-        while time.monotonic() < end:
-            t0 = time.monotonic()
-            plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
-                kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e"))
-            worst = max(worst, time.monotonic() - t0)
-            time.sleep(0.05)
+        self.addCleanup(t.join, 10)
+        self.addCleanup(lambda: [g.set() for g in gates])
+
+        def other_writer_completes_while(gate):
+            done = threading.Event()
+
+            def write():
+                plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
+                    kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e"))
+                done.set()
+            w = threading.Thread(target=write)
+            w.start()
+            self.assertTrue(done.wait(5), "a writer waited for the slow live head")
+            self.assertFalse(gate.is_set())   # it finished while the head was still held
+            w.join(10)
+        self.assertTrue(entered[0].wait(5))
+        other_writer_completes_while(gates[0])
+        gates[0].set()
+        end = time.monotonic() + 5
+        while t.is_alive() and not entered[1].is_set() and time.monotonic() < end:
+            t.join(0.01)
+        if entered[1].is_set():   # a second call (only a build that reads the head under the flock makes one)
+            other_writer_completes_while(gates[1])
+        gates[1].set()
         t.join(10)
-        self.assertLess(worst, 0.3)   # no writer waited for GitHub
 
     def test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing(self):
         import time
