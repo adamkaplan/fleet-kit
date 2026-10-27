@@ -272,6 +272,7 @@ Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-
 | `bin/test-cloud-neutral-names` | yes | the neutral-names scan; about 4 s. The preflight's own full mode does not run it (it is not under the test directories); the full check reaches it only from CI's workflow, so the quick set is a superset of the preflight's full mode there |
 | `bin/test-switchboard` | no | every other method: a pod cannot finish it; CI runs it |
 <!-- scan-table:end -->
+- A `bin/test-switchboard` selector is looked up by class and method name in the script and in the `tests/switchboard/test_cases_NN.py` files it imports its classes from, so it survives a move between them; a class found in none of them does not resolve, and the tests that check the quick list (`test_cloud_quick_guards.py`, `test_cloud_preflight_quick.py`, `test_cloud_quick_selector.py`) fail. The check is the tests', not a run-time one.
 - `CLOUD_PREPUSH_PREFLIGHT=full` asks `bin/cloud-prepush` for the full mode; `quick` (the default) is printed as `preflight mode: quick`; any other value is refused with exit 2. Continuous integration stays the full check.
 <!-- preflight-modes:end -->
 
