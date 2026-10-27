@@ -5406,6 +5406,19 @@ A headless worker (no terminal) that is blocked on a permission request or a que
 
 `fleet-switchboard watch NAME [--workspace W]` opens a terminal (a new herdr tab) on the headless worker's EXISTING session. It creates no session and sends no prompt, so closing the terminal leaves the worker running: the worker is a headless worker again at the next read, on the same session and with the same record. It is refused (exit 1, nothing opened, the refusal audited as `headless.watch_refused`) for a worker that already has a terminal (the message names its pane), a name that is not known, and a retired worker. The caller rule is `reattach`'s: the operator, the Chief of Staff or the worker's own boss. The workspace is `--workspace`, else the caller's own herdr workspace. Success is audited `headless.watched`. It uses the same terminal-opening path as `reattach`, which now leaves a headless worker alone (it has no pane to release).
 
+### How a pane is bound to an agent (#1066)
+
+An agent is recorded in a pane only when the pane's **foreground process** runs that agent's session (`opencode ... -s <session>`): the evidence the pane's health check already used. The terminal multiplexer's own agent report is never enough alone, because its OpenCode integration can name the wrong session for a pane (for example after a cloud launch created a session in the same project).
+
+- **Disagreement.** When the report names session B for a pane whose process runs session A, discovery binds A, records nothing for B, keeps A alive, and writes one `fleetpane.report_disagrees` audit line naming both sessions (once per change, not every pass).
+- **A live pane is never rebound.** The registry refuses to bind a pane held by a live agent (not dead, not detached) to another agent, and the refusal (`fleetpane.bind_refused`) names both. This covers discovery, a launch and the charter record a launch writes.
+- **A cloud worker has no pane.** The registry refuses a pane for a cloud worker, and discovery skips a local session that carries a cloud worker's name.
+- **Dead or detached needs the process too.** A pane whose process runs the agent's session is never declared dead because the multiplexer's list omits it. A process list that cannot be read holds delivery with "cannot read"; nothing is guessed.
+- **Repair.** The next pass puts wrong records right: a local row for a name that has a cloud record becomes the cloud row again with no pane (`fleetpane.cloud_repaired`), and a pane judged by its process returns to alive. No record is edited by hand.
+- **The service holds no pane.** The daemon, and the OpenCode service it starts, run without `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `HERDR_ENV`, `HERDR_BIN_PATH` and `HERDR_SOCKET_PATH` (the daemon keeps the socket path under `FLEET_SWITCHBOARD_HERDR_SOCKET`); the installed unit strips them too. `status` reports a running service that carries any, with the command that restarts it clean. Nothing restarts the service by itself.
+
+Limit: a pane whose process runs a fresh `opencode` with no session named gives no evidence against the report, so the report stands for it and the health check judges it as before.
+
 ### The control plane: detached and dead panes, and `reattach` (#130)
 
 The Chief of Staff repairs a dead or detached agent through the switchboard, never by typing into a pane. The daemon (`pane_health_pass`, after discovery, one look per agent per 60 s, at most 20 per pass, reads only) judges

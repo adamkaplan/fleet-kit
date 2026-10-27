@@ -1086,6 +1086,8 @@ def herdr_socket_path(environ=None):
     environ = os.environ if environ is None else environ
     if environ.get("HERDR_SOCKET_PATH"):
         return environ["HERDR_SOCKET_PATH"]
+    if environ.get(KEPT_SOCKET_ENV):
+        return environ[KEPT_SOCKET_ENV]
     base = environ.get("XDG_CONFIG_HOME")
     root = Path(base) if base and os.path.isabs(base) else Path.home() / ".config"
     return str(root / "herdr" / "herdr.sock")
@@ -1145,9 +1147,13 @@ class HerdrClient:
 
     def _call(self, *args):
         argv = [self.binary, *args]
+        extra = {}
+        kept = self.socket_path or os.environ.get(KEPT_SOCKET_ENV)
+        if kept and not os.environ.get("HERDR_SOCKET_PATH"):
+            extra["env"] = {**os.environ, "HERDR_SOCKET_PATH": kept}   # #1066: the daemon's own env holds none; the CLI must still find the custom socket
         try:
             result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
-                                 stdin=subprocess.DEVNULL)
+                                 stdin=subprocess.DEVNULL, **extra)
         except subprocess.TimeoutExpired:
             raise HerdrError("timeout", "herdr did not answer within %ss" % self.timeout) from None
         except OSError as err:
@@ -2621,6 +2627,44 @@ class Switchboard:
             observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
         return observation
 
+    def pane_truth(self, entry):
+        """#1066: the agent entry the PANE'S OWN PROCESS supports. A pane is bound to a session only when its foreground process runs it
+        (`runs_session`, the evidence the health check uses); the multiplexer's agent report alone is never enough. When the report names
+        session B and the process runs session A, A is the agent of the pane, B gets no pane, and one audit line names both. A process list
+        that cannot be read changes nothing here: `check_program` holds it with its reason. None: nothing may be bound for this entry."""
+        pane, reported = entry.get("pane_id"), agent_session(entry)
+        if not pane or reported is None:
+            return entry
+        try:
+            processes = self.herdr.pane_process_info(pane)
+        except HerdrError:
+            return entry
+        sessions = own_sessions(processes, self.executable)   # the sessions of the AGENT'S OWN program, in a fixed order: never a wrapper's or a `grep -s ses_x`'s
+        if len(sessions) > 1:
+            self._note("fleetpane.report_ambiguous", pane, {"pane": pane, "reported": reported, "process_runs": sorted(sessions),
+                                                           "why": "the pane's processes name more than one session: nothing is bound to it"})
+            return None
+        if not sessions:   # no session on any process line (a fresh agent without -s, a shell): the report is trusted, but NEVER for a cloud session
+            if self.is_cloud_session(reported):
+                self._note("fleetpane.report_refused", pane, {"pane": pane, "reported": reported, "why": "a cloud session has no pane: the report is not trusted"})
+                return None
+            return entry
+        if sessions[0] == reported:
+            return entry
+        self._note("fleetpane.report_disagrees", pane, {"pane": pane, "reported": reported, "process_runs": sessions[0],
+                                                   "why": "the multiplexer reports one session, the pane's process runs another: the report is not trusted"})
+        return dict(entry, agent_session=sessions[0], agent_status=None)
+
+    def is_cloud_session(self, session_id):
+        """True when the registry holds a row of a kind with no pane (a cloud worker) for this session."""
+        if self.state_dir is None:
+            return False
+        try:
+            rows = load_module("registry").read(self.state_dir)["agents"]
+        except Exception:
+            return False
+        return any(isinstance(r, dict) and r.get("session") == session_id and (r.get("kind") or "local") == "cloud" for r in rows.values())
+
     def check_program(self, observation):
         """The restart hazard: after a herdr restart a pane may be a shell, and
         herdr resumes the agent by typing `opencode` into it, which can start
@@ -2664,6 +2708,9 @@ class Switchboard:
                 return found
         found.entries = [entry for entry in entries if isinstance(entry, dict)]
         for entry in sorted(found.entries, key=lambda e: self.reads.stale_first(agent_session(e) or "")):   # the stalest first: the read budget is shared out in turn
+            entry = self.pane_truth(entry)
+            if entry is None:
+                continue
             try:
                 observation = self._observe_entry(entry, now)
             except V2Error as err:
@@ -2770,9 +2817,11 @@ class Switchboard:
             entry = self.herdr.agent_get(previous.pane)
         except HerdrError as err:
             return None, "pane %s of %s cannot be read: %s" % (previous.pane, previous.name, err)
+        entry = dict(entry, pane_id=entry.get("pane_id") or previous.pane)
+        if agent_session(entry) != previous.session_id:
+            entry = self.pane_truth(entry) or {}   # the report may be wrong: the pane's process decides (#1066)
         if agent_session(entry) != previous.session_id:
             return None, "pane %s no longer shows %s's session" % (previous.pane, previous.name)
-        entry = dict(entry, pane_id=entry.get("pane_id") or previous.pane)
         try:
             fresh = self._observe_entry(entry, now, fresh=True)   # a read before a write is never from memory (invariant 4)
         except V2Error as err:
@@ -3769,12 +3818,27 @@ OWN_GH_ENV = "FLEET_SWITCHBOARD_OWN_GH"   # set in every switchboard process: it
                                           # the gh shim leaves such a call's token alone and never re-identifies it
 
 
+# #1066: the OpenCode service is started lazily by whatever process first needs it, and it inherits that process's environment. A service that carries a
+# pane's herdr variables makes herdr's OpenCode integration report the pane of whoever started it for every session it runs. So the daemon, and with it the
+# service it starts, never holds any of these. The daemon still needs herdr's socket: it is carried under another name.
+SERVICE_STRIP_ENV = ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_ENV", "HERDR_BIN_PATH", "HERDR_SOCKET_PATH")
+KEPT_SOCKET_ENV = "FLEET_SWITCHBOARD_HERDR_SOCKET"
+
+
+def service_environment(environ):
+    """`environ` for a process that may start the OpenCode service: no HERDR_* name of SERVICE_STRIP_ENV (the socket path moves to KEPT_SOCKET_ENV)."""
+    out = {name: value for name, value in environ.items() if name not in SERVICE_STRIP_ENV and not name.startswith("HERDR_PLUGIN_")}
+    if environ.get("HERDR_SOCKET_PATH") and not out.get(KEPT_SOCKET_ENV):
+        out[KEPT_SOCKET_ENV] = environ["HERDR_SOCKET_PATH"]
+    return out
+
+
 def daemon_environment(environ):
     """The environment for a daemon started from a hook: herdr's server env minus the hook's own pane (whatever pane you
     had focused) and every other name of a caller (session, role, repo): started from an agent's shell, it would otherwise
     BE that agent to the gh shim, which would swap the token of each of the daemon's own gh calls."""
-    return {name: value for name, value in environ.items()
-            if not name.startswith("HERDR_PLUGIN_") and name not in CALLER_ENV_NAMES}
+    return service_environment({name: value for name, value in environ.items()
+                                if not name.startswith("HERDR_PLUGIN_") and name not in CALLER_ENV_NAMES})
 
 
 def spawn_daemon(state_dir, spawn=subprocess.Popen):
@@ -4400,6 +4464,7 @@ RETIRED_SHOW_DAYS = 7                    # a retired agent is listed once in `st
 PANE_HEALTH_FILE = "pane-health.json"
 PANE_CHECK_SECONDS = 60      # a pane is looked at again after this
 PANE_CHECKS_PER_PASS = 20    # `herdr pane get` + `pane read` pairs one pass may make
+PANE_HELD_PASSES = 20         # a pane gone from the list but held alive by its process this many passes in a row is said once
 PANE_MISSING_PASSES = 3      # a known agent absent from the herdr list this many passes in a row is DEAD (herdr restarts blink)
 PANE_ATTACHED, PANE_DETACHED, PANE_DEAD, PANE_UNKNOWN = "attached", "detached", "dead", "unknown"
 
@@ -4416,12 +4481,31 @@ def _shown_text(title, visible):
     return ("%s\n%s" % (title or "", visible or "")).lower()
 
 
-def runs_session(processes, session_id):
-    """True when a foreground process of the pane is `opencode ... -s <session_id>` (or --session): POSITIVE evidence the pane IS that session."""
+SESSION_ARG = r"(?:^|\s)(?:-s|--session)(?:\s+|=)(%s)(?:\s|$)"
+
+
+def own_sessions(processes, executable):
+    """The DISTINCT sessions named (`-s`/`--session`) by the foreground processes whose program is `executable`, in the order of the list. A process of
+    another program (`grep -s ses_x`) names none."""
+    out = []
+    for p in processes:
+        cmdline = str(p.get("cmdline") or "")
+        if not runs_program(cmdline, executable):
+            continue
+        m = re.search(SESSION_ARG % r"ses_\S+?", cmdline)
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def runs_session(processes, session_id, executable=None):
+    """True when a foreground process of the pane is `opencode ... -s <session_id>` (or --session): POSITIVE evidence the pane IS that session.
+    With `executable`, only a process of that program counts."""
     if not session_id:
         return False
-    pattern = re.compile(r"(?:^|\s)(?:-s|--session)(?:\s+|=)%s(?:\s|$)" % re.escape(session_id))
-    return any(pattern.search(str(p.get("cmdline") or "")) for p in processes)
+    pattern = re.compile(SESSION_ARG % re.escape(session_id))
+    return any(pattern.search(str(p.get("cmdline") or "")) for p in processes
+               if executable is None or runs_program(p.get("cmdline"), executable))
 
 
 def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()):
@@ -4805,6 +4889,19 @@ def bell_migration(engine, registry, now):
         engine.audit.append(engine.actor, "registry.bell_migrated", None, {"agents": got["changed"]})
 
 
+def live_cloud_record(state_dir, name, retired, now):
+    """#1066: True when `cloud/NAME.json` is the record of a LIVE cloud worker (`cloud_record_live`). A local agent that reuses the name of a finished
+    cloud worker is not a cloud worker: its pane and state are left alone."""
+    path = Path(state_dir) / "cloud" / (name + ".json")
+    try:
+        record, _kind = load_module("cloud_worker").read_record_file(path, CLOUD_LOAD_MAX_BYTES)
+    except (OSError, ValueError):
+        return False
+    if record is None or record.get("worker") != name:
+        return False
+    return cloud_record_live(record, name, retired, _read_small(state_dir, LAST_REPORT_FILE), now)
+
+
 def pane_health_pass(engine, now):
     """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
     audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
@@ -4826,6 +4923,18 @@ def pane_health_pass(engine, now):
     agents = {n: {k: v for k, v in row.items() if k in registry.AGENT_FIELDS} for n, row in reg["agents"].items()
               if isinstance(row, dict) and (row.get("kind") or "local") == "local" and not registry.no_pane_to_judge(row)}   # the agent list is the registry's; a row with no pane to judge (#1181) is never in it
     registered = {n: row for n, row in reg["agents"].items() if isinstance(row, dict)}
+    for name, row in sorted(registered.items()):   # #1066: a cloud worker recorded as a local agent with a pane (the wrong record of a past pass) is put right by this pass
+        if (row.get("kind") or "local") == "local" and live_cloud_record(engine.state_dir, name, reg["retired"], now):
+            fixed = dict(row, kind="cloud", pane=None, workspace=None, cwd=None, state="working")
+            got = registry.upsert(engine.state_dir, name, fixed, now=now)
+            if got["problem"]:
+                engine._note("fleetpane.error", name, {"error": "cloud record not repaired: %s" % _one_line(got["problem"], 100)})
+                continue
+            registered[name] = fixed
+            for table in (agents, states, missing):
+                table.pop(name, None)
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "fleetpane.cloud_repaired", name, {"was_pane": row.get("pane"), "why": "a cloud worker has no pane"})
     retired = reg["retired"]
     retired_whole = True
     names = list(discovery.agents)
@@ -4840,7 +4949,10 @@ def pane_health_pass(engine, now):
             continue
         if not obs.pane or not obs.session_id:
             continue
+        if (registered.get(name) or {}).get("kind", "local") != "local":
+            continue         # a cloud worker has no pane (#1066): a local session of its name gets none
         missing.pop(name, None)
+        engine.__dict__.setdefault("pane_held", {}).pop(name, None)
         if name in retired and retired[name].get("session") == obs.session_id:
             states.pop(name, None)       # a retired agent is not judged; it stays listed under its own heading
             continue
@@ -4884,6 +4996,19 @@ def pane_health_pass(engine, now):
             states.pop(name, None)
             continue
         missing[name] = int(missing.get(name, 0)) + 1
+        if missing[name] >= PANE_MISSING_PASSES and agents[name].get("pane") and agents[name].get("session"):
+            try:   # #1066: a pane whose process runs the agent's session is never dead, whatever the multiplexer's list says
+                if runs_session(engine.herdr.pane_process_info(agents[name]["pane"]), agents[name]["session"], engine.executable):
+                    missing[name] = PANE_MISSING_PASSES - 1
+                    held = engine.__dict__.setdefault("pane_held", {})
+                    held[name] = held.get(name, 0) + 1
+                    if held[name] > PANE_HELD_PASSES:   # a lingering process keeps the agent alive: said once, still held (never declared dead on a process alone)
+                        engine._note("fleetpane.missing_held", name, {"pane": agents[name]["pane"], "passes": PANE_HELD_PASSES,
+                                                                      "why": "herdr no longer lists the pane but its process still runs the session"})
+                    continue
+                engine.__dict__.setdefault("pane_held", {}).pop(name, None)
+            except HerdrError:
+                pass
         if missing[name] >= PANE_MISSING_PASSES and (states.get(name) or {}).get("state") != PANE_DEAD:
             last = _read_small(engine.state_dir, LAST_REPORT_FILE).get(name) or {}
             lookback = engine.config.get("worker_lookback_hours", 24) * 3600
@@ -4930,7 +5055,9 @@ def pane_health_pass(engine, now):
         if old is not None and all(old.get(k) == new.get(k) for k in registry.CHANGE_FIELDS):
             continue
         got = registry.upsert(engine.state_dir, name, new, now=now)
-        if got["problem"] and not got["problem"].endswith("is retired for this session"):
+        if got["problem"] and (got["problem"].startswith("pane ") or "has no pane" in got["problem"]):
+            engine._note("fleetpane.bind_refused", name, {"why": _one_line(got["problem"], 160)})   # #1066: the refusal names both agents
+        elif got["problem"] and not got["problem"].endswith("is retired for this session"):
             engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
     # No removal from the registry here: a dead agent leaves it only when a view reads it (reconcile_on_read, #919), never on a pass.
     try:
@@ -12965,6 +13092,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["policy"] = policy_liveness(config, state_dir_path(), working, now())
     report["daemon"] = daemon_report(state_dir_path()) if state_ok else {"running": False, "pid": None, "key_source": None}
     report["service"] = service_report(platform)
+    report["service"]["herdr_env"] = service_herdr_env(runner)   # #1066: read only; the switchboard never restarts the service by itself
     report["key"] = key_report(config if config_ok else None, report["daemon"], report["service"])   # PR 16
     report["plugin"] = plugin_report(config, runner) if config_ok else {"state": "unknown", "detail": "config unusable"}
     report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr", "skills"))
@@ -13341,8 +13469,11 @@ def enable_conditional_reads(engine):
 
 def cmd_run(args, runner, now, wait):
     if not args.once:   # the daemon: whoever started it, it is nobody's agent (see CALLER_ENV_NAMES)
-        for name in CALLER_ENV_NAMES:
+        kept = service_environment(dict(os.environ))   # the daemon's own environment, and so the service's, holds no herdr variable (#1066)
+        for name in CALLER_ENV_NAMES + SERVICE_STRIP_ENV:
             os.environ.pop(name, None)
+        if kept.get(KEPT_SOCKET_ENV):
+            os.environ[KEPT_SOCKET_ENV] = kept[KEPT_SOCKET_ENV]
     signature = config_signature(config_path())  # taken before the read: an edit in between is seen as a change
     engine, state, config = build_engine(runner, now, "daemon")
     enable_conditional_reads(engine)   # the daemon's reads keep ETags (a 304 is free); a one-shot command reads plainly
@@ -22246,6 +22377,22 @@ def _cloud_when(text):
         return None
 
 
+def cloud_record_live(record, worker, retired, last_reports, now):
+    """The ONE liveness test of a cloud worker's record (#1097, #1066): not retired, no final report, not past its hard deadline (a record WITHOUT a valid
+    one is no evidence of life), and a last_report_at, if present, neither future-dated nor older than CLOUD_LOAD_STALE_SECONDS. An ended record stays on
+    disk until cloud-clear, so a file's existence proves nothing."""
+    if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+        return False
+    ends = _cloud_when(record.get("hard_deadline"))
+    if ends is None or ends < now:
+        return False
+    if "last_report_at" in record:
+        seen = _cloud_when(record.get("last_report_at"))
+        if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
+            return False
+    return True
+
+
 def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None, clock=None):
     """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded scan, no GitHub read, no process). A worker
     that is retired, made its final report, or is past its hard deadline is not counted; a record WITHOUT a valid hard_deadline (no evidence of liveness)
@@ -22284,15 +22431,8 @@ def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, 
                 record, _kind = reader(base / fname, CLOUD_LOAD_MAX_BYTES)
                 if record is None or record.get("worker") != worker:
                     continue
-                if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+                if not cloud_record_live(record, worker, retired, last_reports, now):
                     continue
-                ends = _cloud_when(record.get("hard_deadline"))
-                if ends is None or ends < now:
-                    continue   # no valid hard deadline is no evidence of life; a past one is an ended pod
-                if "last_report_at" in record:
-                    seen = _cloud_when(record.get("last_report_at"))
-                    if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
-                        continue   # a future-dated report is not fresh (a forged or skewed clock cannot keep a record live)
                 boss = _cloud_boss(record.get("reports_to"))
                 lane = resolve_boss(discovery, boss) if boss else CLOUD_NO_BOSS_LANE
                 counts[lane] = counts.get(lane, 0) + 1
@@ -23027,6 +23167,26 @@ def service_file_path(kind):
     return None
 
 
+def service_herdr_env(runner, environ=None):
+    """The SERVICE_STRIP_ENV names the running OpenCode service carries in its environment: [] when none or when it cannot be told (never a guess).
+    Reads the service's process id from its service file and its environment with `ps eww` (the same user's process); changes nothing."""
+    environ = os.environ if environ is None else environ
+    try:
+        info = load_module("record_json").parse_bounded(v2_service_file(environ).read_text())   # too deeply nested reads as no variables (#1066)
+        pid = int(info.get("pid"))
+        done = runner(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+        text = done.stdout or ""
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+        return []
+    return [n for n in SERVICE_STRIP_ENV if re.search(r"(?:^|\s)%s=" % n, text)]
+
+
+def service_clean_restart_command(config=None):
+    """The one command that restarts the OpenCode service with none of the herdr variables (printed by `status`, never run by it)."""
+    exe = (config or {}).get("opencode") or "opencode"
+    return "env %s %s service restart" % (" ".join("-u " + n for n in SERVICE_STRIP_ENV), exe)
+
+
 def service_report(platform=None):
     kind = service_kind(platform)
     path = service_file_path(kind)
@@ -23045,6 +23205,10 @@ def format_install_lines(report):
     lines.append("      %-10s %s" % ("service", ("installed (%s)" % service["path"]) if service["installed"]
                                     else "not installed (`%s install` adds it)" % PROG if service["kind"]
                                     else "no service manager on this platform"))
+    leaked = service.get("herdr_env") or []
+    if leaked:
+        lines.append("      %-10s the OpenCode service carries %s: it can report the wrong pane for a session. Restart it clean (nothing restarts it for you): `%s`" % (
+            "service", ", ".join(leaked), service_clean_restart_command()))
     return lines
 
 
@@ -23699,10 +23863,18 @@ def uninstall_decisions_plugin(config_dir, kit_root=KIT_ROOT):
 def render_service(kind, values, kit_root=KIT_ROOT):
     """The LaunchAgent or the systemd user unit, from its template in templates/, placeholders filled in."""
     name = SERVICE_LABEL + ".plist" if kind == "launchd" else SERVICE_UNIT
-    text = (Path(kit_root) / "templates" / name).read_text()
+    text = strip_service_env_entries((Path(kit_root) / "templates" / name).read_text())   # the template's own text only: a value filled in below is never judged
     for placeholder, value in values.items():
         text = text.replace(placeholder, xml_escape(value) if kind == "launchd" else value.replace("%", "%%"))
     return text
+
+
+def strip_service_env_entries(text):
+    """`text` without the environment ENTRIES named exactly by SERVICE_STRIP_ENV: a systemd `Environment="NAME=..."` line, or a launchd `<key>NAME</key>`
+    with its value element. Nothing else is touched: a line that merely mentions such a name (a PATH, a comment, UnsetEnvironment=) stays."""
+    names = "|".join(re.escape(n) for n in SERVICE_STRIP_ENV)
+    text = re.sub(r'(?m)^[ \t]*Environment=["\']?(?:%s)=[^\n]*\n' % names, "", text)
+    return re.sub(r"(?m)^[ \t]*<key>(?:%s)</key>[ \t]*\n\s*<[a-z]+(?:/>|>[^<]*</[a-z]+>)[ \t]*\n" % names, "", text)
 
 
 def reaper_file_path(kind):
