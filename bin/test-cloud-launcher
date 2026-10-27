@@ -55,10 +55,13 @@ ran=0
 while IFS= read -r e; do
   [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
   case "$ARGS_ENTRIES" in *" $(basename "$e") "*) a=1 ;; *) a=0 ;; esac
+  echo "RUN $e"
+  t0=$(date +%s)
   case "$e" in
     *.py) if [ $a = 1 ]; then python3 "$e" "$@"; else python3 "$e"; fi ;;
     *) if [ $a = 1 ]; then "$e" "$@"; else "$e"; fi ;;
   esac || { echo "FAILED: $e"; echo "RESULT: FAIL"; exit 1; }
+  echo "TIME $e $(( $(date +%s) - t0 ))s"
   ran=$((ran + 1))
 done < "$LIST"
 echo "ran $ran entries"
