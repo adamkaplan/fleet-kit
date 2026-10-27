@@ -19960,10 +19960,22 @@ def _review_caller(runner, now):
     return kind[1]
 
 
-def _review_api(engine, runner, now, repo, path, method=None, payload=None):
-    """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`)."""
+def _review_api(engine, runner, now, repo, path, method=None, payload=None, fresh=False):
+    """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`). `fresh` runs the GET straight through the runner: never the conditional-read cache."""
     config = engine.config
     reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    if method is None and fresh:
+        try:
+            env = reader.env_for(repo)
+            done = runner([config["gh"], "api", path], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=reader.timeout, **({"env": env} if env is not None else {}))
+        except (OSError, subprocess.SubprocessError, IntentError) as err:
+            return False, None, _one_line(str(err), 200)
+        if done.returncode != 0:
+            return False, None, reader.accounts.scrub(_one_line(done.stderr or done.stdout or "", 200)) or "exit %d" % done.returncode
+        try:
+            return True, json.loads(done.stdout or "null"), ""
+        except ValueError:
+            return False, None, "GitHub answered a success that is not JSON (not trusted)"
     if method is None:
         try:
             return True, reader._api(path, repo), ""
@@ -19986,11 +19998,11 @@ def _review_api(engine, runner, now, repo, path, method=None, payload=None):
 REVIEW_PAGE_LIMIT = 50   # pages of 100: a list longer than this is not read whole, and the caller refuses
 
 
-def _review_pages(engine, runner, now, repo, path):
+def _review_pages(engine, runner, now, repo, path, fresh=False):
     """(ok, all items, one-line detail) of a Reviews-API list read page by page to the LAST page (a short page ends it); a failed page, a page that is not a list, or more than REVIEW_PAGE_LIMIT pages fails the whole read."""
     items = []
     for page in range(1, REVIEW_PAGE_LIMIT + 1):
-        ok, got, why = _review_api(engine, runner, now, repo, "%s?per_page=100&page=%d" % (path, page))
+        ok, got, why = _review_api(engine, runner, now, repo, "%s?per_page=100&page=%d" % (path, page), fresh=fresh)
         if not ok or not isinstance(got, list):
             return False, None, why or "page %d is not a list" % page
         items.extend(got)
@@ -20012,6 +20024,29 @@ def review_forged_marker(text):
     """True when `text` holds fleet-switchboard `from=` marker text in ANY form: normalised (HTML entities decoded, NFKC, case folded, every character that is not a letter or digit dropped) so spacing, case, entities, zero-width characters and an HTML comment around it change nothing."""
     plain = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", html.unescape(html.unescape(text))).casefold())
     return "fleetswitchboardfrom" in plain
+
+
+def review_is_own_account(author, mine):
+    """True when the pull request's author is the poster's own GitHub account (both read; an unreadable one is never equal)."""
+    return isinstance(author, str) and isinstance(mine, str) and bool(author) and author.casefold() == mine.casefold()
+
+
+def review_earlier(listed, head, name):
+    """The first review `name` already posted at `head` (its marker, its commit), else None."""
+    return next((r for r in (listed or []) if isinstance(r, dict) and r.get("commit_id") == head and review_is_own(r, name)), None)
+
+
+def review_again(args):
+    """True when the caller asked for a second review at one head (`--again`)."""
+    return bool(getattr(args, "again", False))
+
+
+def review_refusal_text(why, head, word):
+    """GitHub's own reason (one capped line) and, for the own-account refusal, the next step."""
+    text = "GitHub refused the review: %s" % _one_line(why, 200)
+    if REVIEW_OWN_REFUSAL.search(why):
+        text += "; this pull request is authored by your own account: post with `--verdict comment`; keep the first line `Review of %s: %s`" % (head, word)
+    return text + " (nothing was posted)"
 
 
 def cmd_review_post(args, runner, now):
@@ -20042,20 +20077,28 @@ def cmd_review_post(args, runner, now):
         if problem:
             raise ReviewError(problem)
         word, event = REVIEW_POST_VERDICTS[args.verdict]
-        body = "Review of %s: %s\n\n%s\n\n%s" % (head, word, text, fleet_mark(name))
         path = review_post_path(repo, number)
-        ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        if not review_again(args):   # one review per reader per head (fresh read, never cached); an unreadable list does not block
+            ok, listed, _why = _review_pages(engine, runner, now, repo, path, fresh=True)
+            earlier = review_earlier(listed, head, name) if ok else None
+            if earlier is not None:
+                raise ReviewError("refused: %s already posted review %s at this head (%s): a second review at one head needs --again (nothing was posted)" % (name, earlier.get("id"), head[:12]))
+        body = "Review of %s: %s\n\n%s\n\n%s" % (head, word, text, fleet_mark(name))
         notice = ""
-        if not ok and event != "COMMENT" and REVIEW_OWN_REFUSAL.search(why):   # the same account's own pull request: a comment-type review, never an issue comment
-            event, notice = "COMMENT", "GitHub refused %s on this account's own pull request: posted as a comment-type review instead" % word
-            ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        if event != "COMMENT":   # the pull request's author is the poster's own account: GitHub refuses approve and request-changes there, so a comment review carries the verdict word
+            ok, me, _why = _review_api(engine, runner, now, repo, "user", fresh=True)
+            author = (raw.get("author") or {}).get("login") if isinstance(raw.get("author"), dict) else None
+            mine = me.get("login") if ok and isinstance(me, dict) else None
+            if review_is_own_account(author, mine):
+                event, notice = "COMMENT", "this pull request is authored by your own account: posted as a comment review (GitHub refuses %s here); the first line keeps `Review of %s: %s`" % (word, head, word)
+        ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
         if not ok:
-            raise ReviewError("GitHub refused the review: %s (nothing was posted)" % why)
+            raise ReviewError(review_refusal_text(why, head, word))
         if engine.audit is not None:
             engine.audit.append(engine.actor, "review.post", ref, {"who": name, "verdict": args.verdict, "event": event, "head": head[:12], "body": plan_ledger.clip(body, 400)})
         if notice:
             print("note: " + notice)
-        print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name))
+        print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name) + (" (posted as a comment)" if notice else ""))
         return EXIT_OK
     except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
         review_refusal_audit(seen.get("engine"), "review.post.refused", seen.get("ref"), seen.get("name"), seen.get("head"), str(err), verdict=args.verdict) if seen.get("name") and seen.get("ref") else None
@@ -20607,6 +20650,7 @@ def add_review_parsers(sub):
     post.add_argument("--head", required=True, help="The FULL head sha judged (it must be the PR's current head)")
     post.add_argument("--verdict", required=True, help="approve | request-changes | comment")
     post.add_argument("--body-file", dest="body_file", required=True, help="File holding the review's text")
+    post.add_argument("--again", action="store_true", help="Post although you already reviewed this head (the refusal names the earlier review)")
     dismiss = rsub.add_parser("dismiss", allow_abbrev=False, help="Dismiss your OWN CHANGES_REQUESTED review after the fix (re-reads the cited line at the current head)")
     dismiss.add_argument("pr", help="owner/repo#N or the PR's URL")
     dismiss.add_argument("--review", required=True, type=int, help="The review's id")
