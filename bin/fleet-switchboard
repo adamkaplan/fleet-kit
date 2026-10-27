@@ -14194,8 +14194,15 @@ def launch_brief_mismatch(args, engine, repo, brief):
             raise module.HeadUnreadable("PR #%d was not found" % number) from None
         except NoticeError as err:
             raise module.HeadUnreadable(_one_line(str(err), 120)) from None
+        except Exception as err:   # never raise out of the launch: an unreadable head is the plan's refusal as unverified
+            raise module.HeadUnreadable("the read failed: %s" % _one_line(str(err) or type(err).__name__, 120)) from None
+        if not isinstance(raw, dict):
+            raise module.HeadUnreadable("the read returned no pull request")
         return raw.get("headRefOid")
-    why = module.check(brief, int(args.issue), repo, read_head)
+    try:
+        why = module.check(brief or "", int(args.issue), repo, read_head)
+    except Exception as err:   # the check itself must not escape the launch: refuse, named
+        why = "the brief could not be checked (%s): retry, or pass --allow-brief-mismatch REASON" % _one_line(str(err) or type(err).__name__, 120)
     override = getattr(args, "allow_brief_mismatch", None)
     if override is not None and (not override.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", override)):
         return "--allow-brief-mismatch needs a reason: non-empty text on one line"
