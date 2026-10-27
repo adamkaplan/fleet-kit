@@ -172,6 +172,7 @@ HELPER_MODULES = {   # the old `load_<module>()` names: each returns `load_modul
     "load_health_records": "health_records",
     "load_reds": "reds",
     "load_impact_floor": "impact_floor",
+    "load_impact_brief": "impact_brief",
     "load_plan_review": "plan_review",
     "load_external_adapter": "external_adapter",
     "load_decision_sync": "decision_sync",
@@ -8366,6 +8367,70 @@ def pr_body_refs(body):
         if ref not in out and ref[1] > 0:
             out.append(ref)
     return out[:10]
+
+
+CLOSING_REF = r"(?:https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d{1,7}|(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\d{1,7})(?![0-9])"
+CLOSING_WORD_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?[ \t]+(" + CLOSING_REF + r"(?:[ \t]*(?:,|&|and)[ \t]*" + CLOSING_REF + ")*)")
+CLOSING_ONE_RE = re.compile(r"(?:https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/|([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#)(\d{1,7})")
+
+
+def closing_keyword_issues(body):
+    """[[repo or None, number]] each issue a pull request body would close on merge: a closing keyword and a number (or a list of them, or an issue URL), outside fenced code, inline code, quoted lines (`>`) and HTML comments, in order, without repeats."""
+    text = re.sub(r"<!--.*?(?:-->|\Z)", " ", body if isinstance(body, str) else "", flags=re.S)
+    kept, fence = [], None
+    for line in text.splitlines():
+        mark = re.match(r"[ \t]{0,3}(`{3,}|~{3,})", line)
+        if fence is None and mark:
+            fence = mark.group(1)
+        elif fence is not None:
+            if mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence):
+                fence = None
+        elif not line.lstrip().startswith(">"):
+            kept.append(re.sub(r"`[^`]*`", " ", line))
+    out = []
+    for match in CLOSING_WORD_RE.finditer("\n".join(kept)):
+        for one in CLOSING_ONE_RE.finditer(match.group(1)):
+            ref = [one.group(1) or one.group(2), int(one.group(3))]
+            if ref not in out:
+                out.append(ref)
+    return out
+
+
+PREFLIGHT_GH_TIMEOUT = 20   # seconds: a hung gh must not delay preflight-pr; a timeout is quiet
+
+
+def closing_warnings(body, repo, is_ask):
+    """One warning line per issue of `body` that is an ask (`is_ask(repo, number)` True). Only text: the caller never blocks on it."""
+    return ["warning: this pull request body would close %s#%d, an ask, on merge: write `Refs #%d` instead (an ask is closed by its owner, not by one scenario's pull request; `Closes` only where the plan says so)"
+            % (found_repo or repo, number, number)
+            for found_repo, number in closing_keyword_issues(body) if is_ask(found_repo or repo, number)]
+
+
+def issue_is_ask(runner, repo, number):
+    """True when the issue has a parent that is not a charter, read with ONE gh call. Any read error or odd answer is False (quiet)."""
+    try:
+        done = runner(["gh", "api", "repos/%s/issues/%d/parent" % (repo, number)], capture_output=True, text=True, timeout=PREFLIGHT_GH_TIMEOUT)
+        if done.returncode != 0:
+            return False
+        data = load_module("record_json").parse_bounded(done.stdout)
+        return isinstance(data, dict) and isinstance(data.get("number"), int) and not IssueIntent.from_api(data).charter
+    except Exception:
+        return False
+
+
+def preflight_body_warnings(runner):
+    """The warning lines for the body of this branch's pull request; [] on any read error."""
+    try:
+        done = runner(["gh", "pr", "view", "--json", "body,url"], capture_output=True, text=True, timeout=PREFLIGHT_GH_TIMEOUT)
+        if done.returncode != 0:
+            return []
+        data = load_module("record_json").parse_bounded(done.stdout)
+        match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/", str(data.get("url")))
+        if not match:
+            return []
+        return closing_warnings(data.get("body"), match.group(1), lambda repo, number: issue_is_ask(runner, repo, number))
+    except Exception:
+        return []
 
 
 def pr_facts_from(data):
@@ -17194,7 +17259,12 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
         if review:
             decision = "hold"
     rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
-    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
+    brief_module = load_module("impact_brief")   # slice A hook (#1215): the brief is built from the same diff read; display only, no decision reads it yet
+    report_base = {"top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "owner_paths": ((matrix.get("owner_hold") or {}).get("substance_decider") or {}).get("owner_only_paths") or {},
+                   "ci": pr_ci_of(raw.get("statusCheckRollup")), "unknown": unknown, "head": raw.get("headRefOid"), "base": raw.get("baseRefOid"), "complete": complete,
+                   "reads": [{"by": e.get("by"), "verdict": e.get("verdict"), "head": e.get("head")} for e in rating_entries], "rating": ({"class": record[1]} if record and record[1] else None)}
+    brief = brief_module.build_brief(brief_module.facts_from_report(files, report_base))
+    return {"brief": brief, "pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "list_problem": list_problem,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
@@ -17340,6 +17410,8 @@ def cmd_impact_floor(args, runner, now):
             print("  incomplete: GitHub gave %s of %s changed files, so a path outside those may be a top tier path; this is not a verdict of \"not held\"" % (read, total))
         if blind and owner != "hold":
             print("  rename: the source path of %s was not seen, and it may have been a top tier path; this is not a verdict of \"not held\"" % ", ".join(blind[:3]))
+        if isinstance(report.get("brief"), dict):
+            print(report["brief"]["text"], end="")   # #1215: the one-screen brief; advice only, no decision changes
         print("  path floor (older advisory, not the owner's rule): %s" % report["decision"].upper().replace("-", " "))
         for reason in report["reasons"]:
             print("  %s" % reason)
@@ -20353,6 +20425,21 @@ def add_review_parsers(sub):
     measure.add_argument("--json", action="store_true", help="Machine-readable rows")
 
 
+_BRIEF_ADVISORY = []   # the loaded module, once (it was reloaded on every call)
+
+
+def _brief_advisory():
+    """Slice D (#1215): the pure brief rules, loaded from bin/brief_advisory.py beside this file (loaded once, then cached)."""
+    if _BRIEF_ADVISORY:
+        return _BRIEF_ADVISORY[0]
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("brief_advisory", os.path.join(os.path.dirname(os.path.realpath(__file__)), "brief_advisory.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _BRIEF_ADVISORY.append(mod)
+    return mod
+
+
 def add_impact_parsers(sub):
     impact = sub.add_parser("impact", help="The impact hold's deterministic floor (#179, advisory: writes nothing)")
     impact_sub = impact.add_subparsers(dest="impact_action", required=True)
@@ -20373,6 +20460,8 @@ def add_impact_parsers(sub):
     clear = impact_sub.add_parser("clear", help="The owner's own terminal: clear a false impact hold for this head, with a reason (the Chief of Staff only under a standing order of the owner's, with --under-order)")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     clear.add_argument("--under-order", type=int, dest="under_order", metavar="N", help="The Chief of Staff only: clear under the owner's standing order N (it must be listed under delegated_clear in the configuration); recorded as her act under that order")
+    clear.add_argument("--brief-digest", dest="brief_digest", help="The Chief of Staff only (#1215): the digest of the impact brief the floor printed at this head; a clear without it, or with a stale one, is refused")
+    clear.add_argument("--brief-text", dest="brief_text", help="The Chief of Staff only (#1215): the text of that brief, recorded with its digest and the reasons in the audit line")
     clear.add_argument("--reason", required=True, help="Why the hold is false (at least 10 characters), logged")
     clear.add_argument("--revoke", action="store_true", help="Take the clear back (and any carry of it): the PR is held again at the daemon's next pass")
 
@@ -21288,6 +21377,8 @@ def cmd_preflight_pr(args, runner, now):
         sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
         return EXIT_USAGE
     root = top.stdout.strip()
+    for line in preflight_body_warnings(runner):
+        print(line)   # advisory: never changes the exit status
     if getattr(args, "merged", False):   # #1045: the same classes on a local merge of the base into the head (a temporary worktree, removed afterwards)
         ps = load_module("path_suites")
         base = ps.default_base(root, runner)
