@@ -678,7 +678,6 @@
         "OWNER_HOLD_KEY",
         "PROG",
         "Path",
-        "EFFECT_CHECK",
         "_PLAN_ISSUE_RE",
         "_PLAN_REF_SHORT",
         "_audit_tail",

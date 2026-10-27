@@ -15547,6 +15547,35 @@ def make_effect_latch():
 EFFECT_CHECK, _WINDOW = make_effect_latch()   # `_WINDOW` is removed below, once `main` has taken it as its own default
 
 
+def make_effect_guard(check):
+    """The refusal of an effect at its FIRST statement (#924, round 4). `check` is the latch's check; here it becomes the closure cell of the wrapper every guarded effect is built as, and it is never a parameter of an effect and never read from a module name. `effect_guard(when, refuse)(effect)` returns the effect that binds its call to the real signature (so an unknown keyword, `_effect_check=` included, is a TypeError before anything runs), asks `check()` when `when(arguments)` says the call is the guarded form, and returns `refuse(arguments)` instead of running it. A replaced HELPER the effect calls is safe only because this refusal runs before the effect's body names any. Built once, just below; the maker is deleted, so no module name builds a guard around a check of the caller's choosing."""
+    def guard(when, refuse):
+        def decorate(effect):
+            signature = inspect.signature(effect)
+
+            @functools.wraps(effect)
+            def guarded_effect(*args, **kwargs):
+                arguments = signature.bind(*args, **kwargs).arguments
+                if when(arguments) and check():
+                    return refuse(arguments)
+                return effect(*args, **kwargs)
+            return guarded_effect
+        return decorate
+    return guard
+
+
+effect_guard = make_effect_guard(EFFECT_CHECK)
+del make_effect_guard
+
+
+def refused_command(what):
+    """The refusal of a command effect while a registrar ran: one line on stderr, a failing exit."""
+    def refuse(arguments):
+        sys.stderr.write("%s: %s: refused: a command registrar ran in this process\n" % (PROG, what))
+        return EXIT_ERROR
+    return refuse
+
+
 def recording(kind, applies=None):
     """Mark a command function as a recording command of `kind` (`proof`, `verdict`, `review_record`), run under `run_recording`. `applies(args)`
     says which of its forms record (`review` records only for `review record`). Marked functions are the ONE list: `RECORDING_COMMANDS` is read from them."""
@@ -16908,11 +16937,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
             "base": raw.get("baseRefOid")}
 
 
-def cmd_impact(args, runner, now, *, _effect_check=EFFECT_CHECK):  # #924: the check is bound HERE, at definition: rebinding the module-level name changes nothing
+@effect_guard(lambda arguments: arguments["args"].impact_action == "clear", refused_command("impact clear"))   # #924: at the point of effect: the clear never runs in a process where a registrar ran
+def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
-    if args.impact_action == "clear" and _effect_check():   # #924: at the point of effect too: the clear never runs in a process where a registrar ran
-        sys.stderr.write("%s: impact clear: refused: a command registrar ran in this process\n" % PROG)
-        return EXIT_ERROR
     return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated, "matrix": cmd_impact_matrix}[args.impact_action](args, runner, now)
 
 
@@ -19622,13 +19649,11 @@ def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decisi
 
 
 @recording("review_record", applies=is_review_record)
-def cmd_review(args, runner, now, *, _effect_check=EFFECT_CHECK):  # #924: bound at definition (see `cmd_impact`)
+@effect_guard(lambda arguments: arguments["args"].review_cmd == "record", refused_command("review record"))   # #924: the record is never written in a process where a registrar ran
+def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit, and ends with one line (#1049):
     `recorded #<id> ...`, `already recorded #<id> ...` or `not recorded: <reason>`."""
-    if args.review_cmd == "record" and _effect_check():   # #924: at the point of effect too: the record is never written in a process where a registrar ran
-        sys.stderr.write("%s: review record: refused: a command registrar ran in this process\n" % PROG)
-        return EXIT_ERROR
     if args.review_cmd == "measure":
         return cmd_review_measure(args, runner, now)
     if args.review_cmd == "checkout":
@@ -22567,7 +22592,7 @@ cmd_reassign.ensure_on_use = True   # the daemon is alive when it runs
 # the module is bound to this file's globals, so its functions are found here under their old names. A missing or unloadable module stops the daemon (never a
 # switchboard that runs without the rule).
 try:
-    load_module("impact_hold").bind(globals())
+    load_module("impact_hold").bind(globals(), EFFECT_CHECK)   # ONCE per namespace: the check is the effects' closure cell, never read from this namespace
 except Exception as _err:
     raise SystemExit("fleet-switchboard: the clear, hold and gate module (impact_hold) could not be loaded, so nothing runs without it: %s: %s" % (type(_err).__name__, _err))
 
