@@ -69306,7 +69306,7 @@ class TestCloudLoad(Base):
         helper = source[source.index("def cloud_record_live"):source.index("def live_cloud_by_lane")]
         for line in ('seen is None or seen > now or', 'if ends is None or ends < now:'):
             self.assertIn(line, helper)
-        self.assertEqual(source.count("cloud_record_live(record, "), 2)   # the load count and the pane health repair each call it
+        self.assertEqual(source.count("cloud_record_live(record, "), 3)   # the def and two calls: the load count and the pane health repair each call it
 
     def test_a_future_dated_last_report_is_not_fresh(self):
         self.rec("f", last_report_at="2998-01-01T00:00:00Z")
