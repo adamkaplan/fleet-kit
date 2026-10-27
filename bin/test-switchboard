@@ -85923,6 +85923,70 @@ class TestScanDriftGuard(unittest.TestCase):
             self.assertTrue(self.compare(ns["nesting_too_deep"], b), old)
 
 
+class TestBigRegistrarFile(unittest.TestCase):
+    """#964 S23: the daemon file is over 1 MB, so the JSON contents API serves no content (encoding "none"); the floor reads it through the raw media type and still holds a registrar change and still fails closed."""
+
+    BASE, HEAD = "a" * 40, "b" * 40
+
+    def setUp(self):
+        self.dc = sb.load_module("delegated_clear")
+        self.matrix = sb.impact_floor.load_matrix()
+        self.rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.src = (BIN / "fleet-switchboard").read_text()
+        self.calls, self.raw_fails = [], False
+
+    def engine(self, heads):
+        def runner(argv, **kw):
+            self.calls.append(list(argv))
+            path = argv[-1]
+            ref = path.rsplit("ref=", 1)[1]
+            if "Accept: application/vnd.github.raw" in argv:
+                if self.raw_fails:
+                    return subprocess.CompletedProcess(argv, 1, "", "HTTP 500")
+                return subprocess.CompletedProcess(argv, 0, heads[ref], "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"type": "file", "encoding": "none", "content": "", "size": 1589963}), "")
+        reader = sb.IntentReader("gh", "acme/app", runner=runner)
+        return types.SimpleNamespace(intents=reader)
+
+    def states(self, head_src, **kw):
+        engine = self.engine({self.BASE: self.src, self.HEAD: head_src})
+        return sb.registrar_states(engine, "acme/app", self.matrix, ["bin/fleet-switchboard"], self.BASE, self.HEAD)
+
+    def test_an_ordinary_edit_of_the_big_file_is_not_held_and_costs_four_calls(self):
+        got = self.states(self.src + "\n\ndef helper_zzz():\n    return 1\n")
+        self.assertIsNone(got["why"], got)
+        self.assertEqual(got["findings"], [])
+        self.assertEqual(len(self.calls), 4, "a JSON read and a raw read for the base and for the head")
+
+    def test_a_registrar_change_in_the_big_file_is_held(self):
+        got = self.states(self.src + "\n\ndef add_zzz_parsers(sub):\n    import os\n    os.system('x')\n")
+        self.assertIsNone(got["why"], got)
+        self.assertTrue(got["findings"], got)
+
+    def test_a_read_that_really_fails_still_holds_with_the_same_reason(self):
+        self.raw_fails = True
+        got = self.states(self.src)
+        self.assertIn("bin/fleet-switchboard is not a readable file at aaaaaaaa", got["why"])
+
+    def test_a_file_over_the_ceiling_is_refused_unread(self):
+        reader = sb.IntentReader("gh", "acme/app", runner=lambda argv, **kw: self.calls.append(argv) or subprocess.CompletedProcess(argv, 0, json.dumps({"type": "file", "encoding": "none", "content": "", "size": 6 * 1024 * 1024}), ""))
+        with self.assertRaises(sb.IntentError) as raised:
+            sb._file_text_at(types.SimpleNamespace(intents=reader), "acme/app", "bin/x", self.BASE)
+        self.assertIn("is not a readable file at aaaaaaaa", str(raised.exception))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_one_raw_read_for_each_path_and_ref(self):
+        engine = self.engine({self.BASE: self.src, self.HEAD: self.src})
+        for _ in range(3):
+            sb._file_text_at(engine, "acme/app", "bin/fleet-switchboard", self.BASE)
+        self.assertEqual(sum(1 for c in self.calls if "-H" in c), 1)
+
+    def test_a_mutant_that_reads_only_the_json_contents_fails_these_tests(self):
+        with mock.patch.object(sb.IntentReader, "_api_raw_text", side_effect=sb.IntentError("gh", "mutant: no raw read")):
+            got = self.states(self.src)
+        self.assertIsNotNone(got["why"], "with the raw read gone the big file is unreadable (the defect the tests above catch)")
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
