@@ -540,11 +540,25 @@ class TestHostileBodies(unittest.TestCase):
                 self.assertEqual(hub.call("POST", "/relay/result/" + rid, raw=raw, who="daemon")[0], 400, name)
             self.assertEqual(hub.call("GET", "/relay/pending", who="daemon")[0], 200)   # the server still answers
 
+    def with_parser_recursion_error(self, hub_mod):
+        """Status of a POST whose parse raises RecursionError (injected: independent of the Python's json depth limit)."""
+        def boom(text):
+            raise RecursionError("injected")
+        real = cloud_hub.cloud_relay.loads_strict
+        cloud_hub.cloud_relay.loads_strict = boom
+        try:
+            with Hub(wait=0.05, hub_mod=hub_mod) as hub:
+                return hub.call("POST", "/relay", raw=b"{}")[0]
+        finally:
+            cloud_hub.cloud_relay.loads_strict = real
+
+    def test_parser_recursion_error_is_400_on_real_code(self):
+        self.assertEqual(self.with_parser_recursion_error(cloud_hub), 400)
+
     def test_mutant_recursion_error_not_caught_is_seen(self):
         mod = mutant(cloud_hub, "except (ValueError, RecursionError):", "except ValueError:")
-        with Hub(wait=0.05, hub_mod=mod) as hub:
-            with self.assertRaises(Exception):   # the handler thread dies: no answer
-                self.assertEqual(hub.call("POST", "/relay", raw=self.BODIES["nested"])[0], 400)
+        with self.assertRaises(Exception):   # the handler thread dies: no answer
+            self.assertEqual(self.with_parser_recursion_error(mod), 400)
 
     def test_mutant_duplicate_keys_accepted_is_seen(self):
         mod = mutant(cloud_relay, "raise ValueError(\"duplicate key\")", "pass")
@@ -596,4 +610,6 @@ class TestRefusalMutants(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    result = unittest.main(exit=False).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)
