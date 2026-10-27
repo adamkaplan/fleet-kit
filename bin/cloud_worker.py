@@ -1801,9 +1801,12 @@ READ_FAIL = "state not read"
 _clock = time.monotonic   # the wait's clock and pause: a test swaps them for a fake clock, so no test waits for real
 _sleep = time.sleep
 _SECRET_WORD = r"(?:pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|credential|private[_-]?key|auth|bearer)"
-_KEYWORD_VALUE = re.compile(r"\b(%s\w*)\b[ \t]*[:=]?[ \t]*(?:\"[^\"]*\"|'[^']*'|\S+)" % _SECRET_WORD, re.I)
-_ASSIGNMENT = re.compile(r"""(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1([ \t]*[=:][ \t]*)("[^"]*"|'[^']*'|\S+)""")
-_LONG_RUN = re.compile(r"[A-Za-z0-9_+/=.-]{16,}")
+_NL = "~NL~"   # a line break during the redaction: a plain word, so no rule needs a real line break and a marker may sit on an earlier line than its value
+_GAP = r"(?:[ \t]|%s)*" % _NL
+_KEYWORD_VALUE = re.compile(r"\b(%s\w*)\b%s[:=]?%s(?:\"[^\"]*\"|'[^']*'|(?!%s)\S+)" % (_SECRET_WORD, _GAP, _GAP, _NL), re.I)
+_MARKED_VALUE = re.compile(r"(\[redacted\])%s([:=])%s(?:\"[^\"]*\"|'[^']*'|(?!%s)\S+)" % (_GAP, _GAP, _NL))   # a keyword the scrub already cut out still marks the value after it
+_ASSIGNMENT = re.compile(r"""(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1([ \t]*[=:]%s)("[^"]*"|'[^']*'|(?!%s)\S+)""" % (_GAP, _NL))
+_LONG_RUN = re.compile(r"[A-Za-z0-9_+/=.?-]{16,}")   # `?` is what the scrub makes of a zero-width or control character inside a run
 _SECRET_ENV_NAME = re.compile(r"(?:KEY|TOKEN|SECRET|PASS|CRED|AUTH)", re.I)
 
 
@@ -1831,22 +1834,31 @@ def _redact_assignments(text):
 
 
 def _run_sub(found):
-    run = found.group(0)
+    run = found.group(0).replace("?", "")   # a run cut by an odd character counts as the one run it was
     mixed = re.search(r"[A-Za-z]", run) and re.search(r"[0-9]", run)
     return "[redacted]" if (mixed or len(run) >= 32) else run
 
 
 def redact_error(text, known=()):
-    """The error line that `status` prints, made safe BEFORE it is cut (so a cut never leaves a piece of a value): the launcher's own scrub (this run's
-    known secrets and any 8+ character piece of one, token and credential shapes, control characters), then (1) every value after `NAME=`, after a
-    quoted name and after a name that is capitalised or holds a secret word (password, token, key, secret, auth, bearer), (2) the word after such a
-    keyword, (3) every long run of letters and digits (16+ with both, 32+ of any), then the cut at ERROR_LINE_MAX. Nothing is added back."""
+    """The error line that `status` prints, made safe BEFORE it is cut and BEFORE a line is chosen (so neither a cut nor a line break can hide a
+    value from a rule): over the WHOLE text, line breaks become a plain word and the launcher's own scrub runs (this run's known secrets and any 8+
+    character piece of one, token and credential shapes; control, line-separator and zero-width characters become `?`, which stays part of a value
+    or a run), then (1) every value after `NAME=`, after a quoted name and after a name that is capitalised or holds a secret word (password, token,
+    key, secret, auth, bearer), (2) the word after such a keyword, even on the next line, (3) every long run of letters and digits (16+ with both,
+    32+ of any, counted without the `?`). Only then the last line is taken and cut at ERROR_LINE_MAX. Nothing is added back. Known limit: an unmarked
+    short value (under 16 mixed or under 32 letters-only characters) that no keyword precedes cannot be told from text and prints."""
     lib = _lib()
-    text = lib.scrub(str(text or "").strip().splitlines()[-1] if str(text or "").strip() else "", known, 4000)
+    text = str(text or "").strip()[:4000]
+    if not text:
+        return ""
+    text = text.replace("\n", " %s " % _NL)
+    text = lib.scrub(text, known, 8000)
     text = _redact_assignments(text)
     text = _KEYWORD_VALUE.sub(lambda m: m.group(1) + " [redacted]", text)
+    text = _MARKED_VALUE.sub(lambda m: m.group(1) + m.group(2) + " [redacted]", text)
     text = _LONG_RUN.sub(_run_sub, text)
-    return " ".join(text.split())[:ERROR_LINE_MAX]
+    lines = [" ".join(line.split()) for line in text.split(_NL)]
+    return ([line for line in lines if line] or [""])[-1][:ERROR_LINE_MAX]
 
 
 def _known_secrets(state, record, cluster):

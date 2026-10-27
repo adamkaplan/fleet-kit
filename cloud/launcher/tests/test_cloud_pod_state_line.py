@@ -21,6 +21,7 @@ import test_cloud_status_summary as S  # noqa: E402  (the fake cluster, the reco
 
 sb, CLOUD, ALIVE = S.sb, S.CLOUD, S.ALIVE
 ROOT = S.KIT
+CLOUD.bind(sb.__dict__)   # the module is bound to the switchboard once here, so any class runs alone (#1397 root of the order dependence)
 WRITE_VERBS = ("create", "patch", "delete", "label", "exec", "apply", "port-forward", "replace", "scale")
 TOKEN = "ghp_" + "Ab3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0dF3gH6"
 PASSWORD = "Zq7-planted-passphrase"
@@ -401,6 +402,152 @@ class TestDocuments(unittest.TestCase):
         text = read(DOCS[0])
         for phrase in ("160 characters", "no state read within 60 s", "read only", "another lane's worker is refused"):
             self.assertIn(phrase, text)
+
+
+def leaked(secret, line, width=6):
+    """The pieces of `secret` of `width` or more characters that the printed line still holds."""
+    return [secret[i:i + width] for i in range(0, len(secret) - width + 1) if secret[i:i + width] in line]
+
+
+def joined(*parts):
+    return "".join(parts)
+
+
+# every value below is synthetic and built from plain parts: no complete token shape sits in this file
+SEVEN = "hunter" + "2"
+TAIL = "q7planted" + "tail"
+HALF_A, HALF_B = "k3Zx9Qw2Lm8Vb5N", "c1Rt7Yu4Ih6Gf0X"
+BLOB = __import__("base64").b64encode(b"planted-synthetic-secret-value-0001").decode()
+QUERY = "planted" + "Query" + "9x7Zk2"
+HOSTILE = (
+    ("marker on an earlier line", "Error: password:\n" + SEVEN, SEVEN),
+    ("marker on an earlier line, longer gap", "Error: login failed\npassword:\n\n" + SEVEN, SEVEN),
+    ("carriage return inside the value", "Error: password=" + SEVEN + "Z\r" + TAIL, TAIL),
+    ("vertical tab inside the value", "Error: password=" + SEVEN + "Z\x0b" + TAIL, TAIL),
+    ("line separator inside the value", "Error: password=" + SEVEN + "Z\u2028" + TAIL, TAIL),
+    ("unmarked long secret cut by a zero-width space", "Error: bad " + HALF_A + "\u200b" + HALF_B, HALF_A + HALF_B),
+    ("unmarked long secret cut by an escape character", "Error: bad " + HALF_A + "\x1b" + HALF_B, HALF_A + HALF_B),
+    ("base64 blob split by a line break", "Error: bad " + BLOB[:20] + "\n" + BLOB[20:], BLOB),
+    ("token in a URL query", "Error: GET https://host.example/path?token=" + QUERY + "&x=1 failed", QUERY),
+    ("value after Authorization on the previous line", "Error: Authorization:\nBearer " + QUERY, QUERY),
+    ("doubled keyword", "Error: password password: " + QUERY, QUERY),
+)
+
+
+class TestHostile(Base):
+    """S2 again, through the real `status NAME` path: 0 planted pieces of 6 or more characters, whatever separates the value from its marker."""
+
+    def printed(self, text):
+        self.worker()
+        self.v2.messages = [message(1798365852000, "", error=text)]
+        code, out, err = self.status_line()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(out.splitlines()), 1, out)
+        return out
+
+    def test_s2_every_hostile_case_leaves_no_planted_piece(self):
+        for kind, text, secret in HOSTILE:
+            with self.subTest(kind):
+                self.setUp()
+                line = self.printed(text)
+                self.assertEqual(leaked(secret, line), [], line)
+                self.assertLessEqual(len(line.split("; last error ", 1)[1]), 160)
+
+    def test_redact_error_directly_each_case(self):
+        for kind, text, secret in HOSTILE:
+            with self.subTest(kind):
+                out = CLOUD.redact_error(text)
+                self.assertEqual(leaked(secret, out), [], out)
+                self.assertNotIn("\n", out)
+
+
+class Clock:
+    """A fake clock: a pause moves it, nothing waits for real; a pause past the allowed bound is recorded as an overrun and refused."""
+
+    def __init__(self, limit=70):
+        self.start = self.now = 1000.0
+        self.limit, self.overrun, self.pauses = limit, False, []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.pauses.append(seconds)
+        self.now += max(seconds, 0.001)
+        if self.now - self.start > self.limit:
+            self.overrun = True
+            raise RuntimeError("the fake clock ran past the bound")
+
+
+_loader = __import__("importlib.machinery").machinery.SourceFileLoader("cw_test_cloud_worker_mod_1397", os.path.join(ROOT, "bin", "test-cloud-worker"))
+_spec = __import__("importlib.util").util.spec_from_loader("cw_test_cloud_worker_mod_1397", _loader)
+tcw = __import__("importlib.util").util.module_from_spec(_spec)
+sys.modules["cw_test_cloud_worker_mod_1397"] = tcw
+_loader.exec_module(tcw)
+
+
+class TestLaunchCommand(tcw.Base):
+    """S4 through the real `launch --cloud` path (the real cmd_launch with the existing fake cluster tools and fake agent service of the cloud tests)."""
+
+    def setUp(self):
+        self.addCleanup(CLOUD.bind, sb.__dict__)   # the cloud module is shared by both switchboard copies: this file's own is bound again afterwards
+        super().setUp()
+        self.cw = tcw.sb.load_module("cloud_worker")
+        self.clock = Clock()
+        self.calls, self.v2 = [], FakeV2(messages=[])
+        pods = {"pods": [{"name": "coder7-7f9c", "worker": "coder7", "phase": "Running"}]}
+        real = self.cw.launch_state_line
+
+        def watched(runner, state, cluster, record, name, v2, accepted=None, seconds=60):
+            self.calls.append(len(self.remote.messages))   # the brief had reached the pod when the line was asked for
+            return real(runner, state, cluster, record, name, self.v2, accepted, seconds if self.seconds is None else self.seconds)
+        self.seconds = None
+        for target, name, value in ((self.cw, "_cluster_snapshot", lambda *a, **k: pods), (self.cw, "launch_state_line", watched),
+                                    (self.cw, "_clock", self.clock), (self.cw, "_sleep", self.clock.sleep)):
+            patch = mock.patch.object(target, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def go(self):
+        began = time.monotonic()
+        code, out, err = self.launch()
+        return code, out, err, time.monotonic() - began
+
+    def check_bounded(self):
+        self.assertFalse(self.clock.overrun, "the wait ran past its bound")
+        self.assertLessEqual(self.clock.now - self.clock.start, 65)
+
+    def test_s4_the_answering_pod_prints_its_line_once_after_the_brief(self):
+        code, out, err, _ = self.go()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(out.strip().splitlines()), 1)
+        self.assertEqual(json.loads(out)["name"], "coder7")
+        self.assertEqual(err.count("cloud coder7: running; last tool call or message "), 1, err)
+        self.assertEqual(len(self.calls), 1)
+        self.assertGreaterEqual(self.calls[0], 1)   # after the brief was accepted
+        self.assertEqual(self.clock.pauses, [])
+
+    def test_s4_a_silent_pod_says_so_ends_normally_and_waits_only_on_the_fake_clock(self):
+        def silent(*a, **k):
+            raise tcw.sb.V2Unreachable("no answer")
+        self.v2.permission_list = silent
+        code, out, err, real = self.go()
+        self.assertEqual(code, 0, err)   # the launch's normal exit status
+        self.assertEqual(err.count("cloud coder7: no state read within 60 s"), 1, err)
+        self.assertEqual(len(out.strip().splitlines()), 1)
+        self.assertEqual(len(self.calls), 1)
+        self.assertGreaterEqual(self.clock.now - self.clock.start, 60)
+        self.check_bounded()
+        self.assertLess(real, 5, "the test took real seconds")
+
+    def test_s4_a_launch_that_waits_without_a_bound_fails_the_same_checks(self):
+        def silent(*a, **k):
+            raise tcw.sb.V2Unreachable("no answer")
+        self.v2.permission_list = silent
+        self.seconds = 10 ** 6   # the mutant: no bound that matters
+        self.go()
+        with self.assertRaises(AssertionError):
+            self.check_bounded()
 
 
 if __name__ == "__main__":
