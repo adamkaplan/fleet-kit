@@ -1,0 +1,1452 @@
+#!/usr/bin/env python3
+"""test-cloud-relay-daemon: offline tests for bin/cloud_relay_daemon.py (#1225 slice B) with a fake hub and a temp ledger.
+
+    bin/test-cloud-relay-daemon
+
+Two kinds of mutant test, kept apart:
+  * test-cloud-relay's FakeDaemon mutants (writes_on_refusal, skip_author, role_from_request, global_callids, stamp_live_head,
+    gates_write, no_holder, pr_issue) are switches in a hand-written harness. They test the HARNESS (that its assertions can fail), not the
+    real Executor.
+  * class RealRuleMutants below monkeypatches the REAL rule in cloud_relay_daemon / plan_ledger, runs the same refusal check the
+    guarding test makes, and asserts that check then FAILS (the guarding test catches the mutant). Real rule -> guarding real test:
+      head re-check (_same_head, inside append)  -> test_stale_head, test_head_moves_inside_decision
+      prove holder (backend.holder_of check)     -> test_proof_from_non_holder_403
+      author exclusion (plan_ledger.authors_of / may_record_verdict) -> test_author_verdict_403, test_github_author_verdict_403
+      evaluator role (backend.evaluators registry) -> test_non_evaluator_403
+      PR-issue link (backend.pr_issues check)    -> test_pr_not_linked_to_the_pods_issue_refused_for_all_three
+      call-id scope per pod (Index key)          -> test_same_call_id_two_pods
+"""
+import contextlib
+import json
+import threading
+import types
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import cloud_relay_daemon as relay  # noqa: E402
+import plan_ledger  # noqa: E402
+
+PR, REPO, HEAD = "acme-org/widget-service#7", "acme-org/widget-service", "a" * 40
+CODER, TESTER = "widget-api-coder", "widget-api-tester"
+
+
+class FakeBackend:
+    def __init__(self):
+        self.head, self.audits, self.reported = HEAD, [], []
+        self.author, self.senders = None, ()
+
+    def live_head(self, pr):
+        return self.head
+
+    def plan(self, pr):
+        return {"source": "acme-org/widget-service#1", "hash": "sha256:" + "b" * 64,
+                "scenarios": {"S1": {"evaluator": "tester", "claim": "pr"}}}
+
+    def pr_facts(self, pr):
+        return {"author": self.author, "notice_senders": self.senders}
+
+    def evaluators(self, evaluator):
+        return [TESTER]
+
+    def holder_of(self, repo, issue):
+        return CODER
+
+    def pr_issues(self, pr):
+        return {1}
+
+    def gates(self, pr):
+        return {"ready": False}
+
+    def report(self, pod, args):
+        self.reported.append((pod, args))
+
+    def audit(self, kind, pr, detail):
+        self.audits.append((kind, detail))
+        self.audit_prs = getattr(self, "audit_prs", []) + [pr]
+
+
+class FakeHub:
+    """Speaks the contract: pending (oldest first, max 10) and result."""
+    def __init__(self):
+        self.queue, self.results = [], {}
+        self.n = 0
+
+    def submit(self, pod, command, issue=1, repo=REPO, pr=PR, head=HEAD, cid=None, **args):
+        self.n += 1
+        call = {"call_id": cid or "c%d" % self.n, "command": command, "pr": pr, "args": args}
+        if head:
+            call["head"] = head
+        rid = "%032x" % self.n
+        self.queue.append({"id": rid, "pod": pod, "repo": repo, "issue": issue, "call": call})
+        return rid
+
+    def fetch(self):
+        return {"requests": list(self.queue[:10])}
+
+    def post(self, rid, body):
+        self.results[rid] = body
+        self.queue = [q for q in self.queue if not isinstance(q, dict) or q.get("id") != rid]
+
+
+PROVE = dict(scenario="S1", result="pass", evidence="ran it")
+VERDICT = dict(scenario="S1", result="pass", evidence="saw it")
+
+
+class Fixture(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = self.tmp.name
+        self.backend, self.hub = FakeBackend(), FakeHub()
+        self.ex = self.fresh()
+
+    def fresh(self):
+        return relay.Executor(self.state, self.backend, lambda: 1000)
+
+    def run_one(self, *a, ex=None, **k):
+        rid = self.hub.submit(*a, **k)
+        relay.pass_once(ex or self.ex, self.hub.fetch, self.hub.post)
+        return self.hub.results[rid]
+
+    def raw(self):
+        p = Path(self.state) / plan_ledger.LEDGER_FILE
+        return p.read_bytes() if p.exists() else b""
+
+    def entries(self):
+        got, problem = plan_ledger.read_ledger(self.state)
+        self.assertIsNone(problem)
+        return got
+
+    def proved(self):
+        return self.run_one(CODER, "prove", **PROVE)
+
+    def refused(self, status, phrase, *a, **k):
+        before = self.raw()
+        audits = len(self.backend.audits)
+        got = self.run_one(*a, **k)
+        self.assertEqual(got["status"], status, got)
+        self.assertIn(phrase, got["reason"])
+        self.assertIsNone(got["record"])
+        self.assertEqual(self.raw(), before)
+        self.assertEqual(len(self.backend.audits), audits + 1)
+
+
+
+class Case(Fixture):
+    def test_prove_and_verdict_chain(self):
+        a = self.proved()
+        b = self.run_one(TESTER, "verdict", **VERDICT)
+        self.assertEqual((a["status"], b["status"]), (200, 200))
+        es = self.entries()
+        self.assertEqual([(e["kind"], e["by"], e["head"]) for e in es], [("proof", CODER, HEAD), ("verdict", TESTER, HEAD)])
+        self.assertEqual(es[1]["prev"], es[0]["hash"])
+        self.assertEqual(b["record"], {"seq": 2, "hash": es[1]["hash"]})
+
+    def test_gates_writes_audit_only(self):
+        got = self.run_one(CODER, "gates", head=None)
+        self.assertEqual(got["status"], 200)
+        self.assertEqual(self.entries(), [])
+        self.assertEqual([k for k, _ in self.backend.audits], ["gates"])
+
+    def test_report_delivered_once(self):
+        got = self.run_one(CODER, "report", head=None, state="done", text="x", cid="same")
+        again = self.run_one(CODER, "report", head=None, state="done", text="x", cid="same")
+        self.assertEqual((got["status"], again["status"], len(self.backend.reported)), (200, 200, 1))
+
+    def test_replay_same_record_also_fresh_process(self):
+        first = self.run_one(CODER, "prove", cid="X", **PROVE)
+        before = self.raw()
+        for ex in (self.ex, self.fresh()):
+            again = self.run_one(CODER, "prove", cid="X", ex=ex, **PROVE)
+            self.assertEqual(again["record"], first["record"])
+        self.assertEqual(self.raw(), before)
+        (Path(self.state) / relay.INDEX_FILE).unlink()   # even the index file lost: the entry remembers
+        again = self.run_one(CODER, "prove", cid="X", ex=self.fresh(), **PROVE)
+        self.assertEqual(again["record"], first["record"])
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_same_call_id_two_pods(self):
+        a = self.run_one(CODER, "prove", cid="X", **PROVE)
+        self.backend.holder_of = lambda r, i: "other"
+        b = self.run_one("other", "prove", cid="X", **PROVE)
+        self.assertNotEqual(a["record"]["seq"], b["record"]["seq"])
+
+    def test_stale_head(self):
+        self.proved()
+        self.backend.head = "c" * 40
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.refused(409, "stale head", TESTER, "verdict", **VERDICT)
+
+    def test_head_moves_inside_decision(self):
+        calls, plan = [], self.backend.plan
+
+        def moving_plan(pr):   # the head is right while the request is checked and moves before the write's own look
+            calls.append(pr)
+            out = plan(pr)
+            if len(calls) == 1:
+                self.backend.head = "c" * 40
+            return out
+        self.backend.plan = moving_plan
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.entries(), [])
+        self.assertEqual(self.raw(), b"")
+
+    def test_author_verdict_403(self):
+        self.proved()
+        self.backend.evaluators = lambda e: [CODER, TESTER]
+        self.refused(403, "author cannot record a verdict on its own work", CODER, "verdict", **VERDICT)
+
+    def test_github_author_verdict_403(self):
+        self.proved()
+        self.backend.author = TESTER
+        self.refused(403, "author cannot record a verdict on its own work", TESTER, "verdict", **VERDICT)
+
+    def test_non_evaluator_403(self):
+        self.proved()
+        self.refused(403, "not registered to record tester verdicts", "stranger", "verdict", **VERDICT)
+
+    def test_proof_from_non_holder_403(self):
+        self.refused(403, "proof only from the pod holding the work item", TESTER, "prove", **PROVE)
+
+    def test_wrong_repo_and_bad_requests(self):
+        self.refused(400, "needs the head", CODER, "prove", head=HEAD[:7], **PROVE)   # a prefix is not the live sha
+        self.refused(403, "bound repo", CODER, "prove", repo="acme-org/other", **PROVE)
+        self.refused(400, "not one of", CODER, "notice", head=None)
+        self.refused(400, "needs the head", CODER, "prove", head=None, **PROVE)
+        self.refused(400, "call_id", CODER, "prove", cid="bad id\x7f", **PROVE)
+
+    def test_verdict_without_known_writer_403(self):
+        self.refused(403, "no writer", TESTER, "verdict", **VERDICT)
+
+    # ---- finding 1: replay index
+    def test_report_replay_is_not_a_400_and_not_indexed(self):
+        self.run_one(CODER, "report", head=None, state="done", text="x", cid="R")
+        self.assertEqual([v for v in relay.Index(self.state)._read().values() if "seq" in v], [])   # no null seq or hash is ever indexed
+        again = self.run_one(CODER, "report", head=None, state="done", text="x", cid="R")
+        self.assertEqual(again["status"], 200)
+        self.assertIsNone(again["record"])
+
+    def test_prove_reusing_a_gates_or_report_call_id_writes(self):
+        self.run_one(CODER, "gates", head=None, cid="G")
+        self.run_one(CODER, "report", head=None, state="d", text="x", cid="R")
+        for cid in ("G", "R"):
+            got = self.run_one(CODER, "prove", cid=cid, **PROVE)
+            self.assertEqual((got["status"], got["record"]["seq"]), (200, len(self.entries())), got)
+        self.assertEqual(len(self.entries()), 2)
+
+    def test_call_id_reused_for_another_call_is_409(self):
+        self.proved()
+        self.backend.evaluators = lambda e: [CODER, TESTER]
+        for kw in (dict(command="verdict", pod=CODER), dict(command="prove", head="d" * 40, pod=CODER)):
+            before = self.raw()
+            pod, cmd = kw.pop("pod"), kw.pop("command")
+            got = self.run_one(pod, cmd, cid=self.last_cid(), **dict(PROVE, **kw))
+            self.assertEqual(got["status"], 409, got)
+            self.assertIn("call_id reused for a different call", got["reason"])
+            self.assertEqual(self.raw(), before)
+        for ex in (self.ex, self.fresh()):   # also when only the entry remembers (no index file)
+            (Path(self.state) / relay.INDEX_FILE).unlink(missing_ok=True)
+            got = self.run_one(CODER, "prove", cid=self.last_cid(), ex=ex, **dict(PROVE, head="d" * 40))
+            self.assertEqual(got["status"], 409, got)
+
+    def last_cid(self):
+        return self.entries()[0]["call_id"]
+
+    def test_verdict_replay_same_record(self):
+        self.proved()
+        first = self.run_one(TESTER, "verdict", cid="V", **VERDICT)
+        for ex in (self.ex, self.fresh()):
+            again = self.run_one(TESTER, "verdict", cid="V", ex=ex, **VERDICT)
+            self.assertEqual(again["record"], first["record"])
+        self.assertEqual(len(self.entries()), 2)
+
+    def test_replay_inside_build_when_the_index_is_gone(self):
+        first = self.run_one(CODER, "prove", cid="X", **PROVE)
+        (Path(self.state) / relay.INDEX_FILE).unlink()
+        again = self.run_one(CODER, "prove", cid="X", **PROVE)
+        self.assertEqual((again["status"], again["record"]), (200, first["record"]))
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(set(relay.Index(self.state)._read()["%s\nX" % CODER]), {"seq", "hash", "command", "pr", "head", "args"})
+
+    def test_replay_with_different_args_is_409_and_writes_nothing(self):
+        self.proved()
+        self.run_one(CODER, "prove", cid="R", **PROVE)
+        self.run_one(TESTER, "verdict", cid="RV", **VERDICT)
+        for who, cmd, base in ((CODER, "prove", PROVE), (TESTER, "verdict", VERDICT)):
+            cid = "R" if cmd == "prove" else "RV"
+            for change in ({"evidence": "other words"}, {"result": "fail"}, {"scenario": "S2"}):
+                before, audits = self.raw(), len(self.backend.audits)
+                got = self.run_one(who, cmd, cid=cid, **dict(base, **change))
+                self.assertEqual((got["status"], got["reason"], got["record"]), (409, "call_id reused for a different call", None))
+                self.assertEqual(self.raw(), before)
+            same = self.run_one(who, cmd, cid=cid, **base)
+            self.assertEqual((same["status"], same["reason"]), (200, "replay: already recorded"))
+
+    def test_replay_with_different_args_after_the_index_is_gone_is_409(self):
+        first = self.run_one(CODER, "prove", cid="X", **PROVE)
+        (Path(self.state) / relay.INDEX_FILE).unlink()
+        before = self.raw()
+        got = self.run_one(CODER, "prove", cid="X", **dict(PROVE, evidence="different"))
+        self.assertEqual((got["status"], got["record"]), (409, None))
+        self.assertEqual(self.raw(), before)
+
+    def test_non_dict_entry_does_not_abort_the_batch(self):
+        rid = self.hub.submit(CODER, "prove", **PROVE)
+        self.hub.queue.insert(0, "junk")
+        self.hub.queue.insert(0, None)
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 1)
+        self.assertEqual(self.hub.results[rid]["status"], 200)
+
+    def test_verdict_rechecks_the_roles_inside_the_append(self):
+        """The tester becomes a writer (records a proof) between the first role check and the append: the in-build re-check refuses."""
+        self.proved()
+        real, calls = self.backend.evaluators, []
+
+        def racing(name):
+            calls.append(name)
+            if len(calls) == 1:   # right after the first (pre-lock) check passed, the tester's own proof lands on the chain
+                proof = {k: v for k, v in self.entries()[0].items() if k not in ("seq", "ts", "prev", "hash")}
+                plan_ledger.append_checked(self.state, 1000, lambda entries, seq: dict(proof, by=TESTER, call_id="race"))
+            return real(name)
+        self.backend.evaluators = racing
+        before = len(self.entries())
+        got = self.run_one(TESTER, "verdict", cid="RC", **VERDICT)
+        self.assertEqual(got["status"], 403, got)
+        self.assertIn("author cannot record a verdict on its own work", got["reason"])
+        self.assertEqual(len(self.entries()), before + 1)   # only the racing proof; no verdict
+        self.assertEqual([e["kind"] for e in self.entries()], ["proof", "proof"])
+
+    # ---- finding 2: index file
+    def test_index_is_pruned_and_uses_unique_tmp_names(self):
+        old = relay.INDEX_MAX
+        relay.INDEX_MAX = 3
+        self.addCleanup(setattr, relay, "INDEX_MAX", old)
+        idx = relay.Index(self.state)
+        for i in range(6):
+            idx.put("p", "c%d" % i, {"seq": i, "hash": "h"})
+        self.assertEqual(sorted(idx._read()), ["p\nc3", "p\nc4", "p\nc5"])
+        self.assertEqual([p.name for p in Path(self.state).iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_index_concurrent_puts_lose_nothing(self):
+        import threading
+        idx = relay.Index(self.state)
+        ts = [threading.Thread(target=lambda i=i: idx.put("p", "c%d" % i, {"seq": i, "hash": "h"})) for i in range(20)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(len(idx._read()), 20)
+
+    # ---- finding 3, 8: pass_once and pass_if_configured
+    def test_pass_once_survives_a_raising_backend(self):
+        a = self.hub.submit(CODER, "gates", head=None)
+        b = self.hub.submit(CODER, "report", head=None, state="d", text="x")
+        orig = self.backend.gates
+
+        def boom(pr):
+            raise RuntimeError("github down")
+        self.backend.gates = boom
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 2)
+        self.assertEqual(self.hub.results[a]["status"], 500)
+        self.assertEqual(self.hub.results[a]["reason"], "relay failed")
+        self.assertNotIn("github down", json.dumps(self.hub.results))
+        self.assertTrue(any(k == "relay.failed" and "github down" in d["error"] for k, d in self.backend.audits))
+        self.assertEqual(self.hub.results[b]["status"], 200)
+        self.backend.gates = orig
+
+    def test_pass_once_takes_at_most_ten_and_skips_no_id(self):
+        self.hub.queue.append({"pod": CODER, "repo": REPO, "issue": 1, "call": {}})
+        ids = [self.hub.submit(CODER, "gates", head=None) for _ in range(12)]
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 9)   # the id-less one takes a slot of the 10
+        self.assertEqual(len(self.hub.results), 9)
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 3)
+        self.assertEqual(set(self.hub.results), set(ids))
+
+    def test_pass_once_refuses_ids_that_are_not_hub_ids(self):
+        for bad in ("../x", "a?b", "r1", "A" * 32, "0" * 31, "0" * 32 + "/"):
+            self.hub.queue.append({"id": bad, "pod": CODER, "repo": REPO, "issue": 1, "call": {}})
+        posted = []
+        self.assertEqual(relay.pass_once(self.ex, lambda: {"requests": list(self.hub.queue)}, lambda r, b: posted.append(r)), 0)
+        self.assertEqual(posted, [])
+
+    def test_pass_if_configured_never_raises(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ={}), 0)
+        self.assertEqual(notes, [])
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent/token"}
+        self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env), 0)
+        self.assertEqual(notes[0][0], "relay.pass_failed")
+
+    # ---- finding 5, 8: link to the pod's issue; the remaining refusals
+    def test_pr_not_linked_to_the_pods_issue_refused_for_all_three(self):
+        self.proved()
+        for pod, cmd, kw in ((CODER, "prove", PROVE), (TESTER, "verdict", VERDICT), (CODER, "gates", {})):
+            self.refused(403, "pr not linked to the pod's issue", pod, cmd, issue=2, head=None if cmd == "gates" else HEAD, **kw)
+
+    def test_recheck_of_the_verdict_rule_inside_build(self):
+        self.proved()
+        calls = []
+
+        def evaluators(e):   # registered at the first look, no longer by the time of the write
+            calls.append(e)
+            return [TESTER] if len(calls) == 1 else []
+        self.backend.evaluators = evaluators
+        self.refused(403, "registered to record tester verdicts", TESTER, "verdict", **VERDICT)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_scenario_result_evidence_epic_and_evaluator_refusals(self):
+        self.proved()
+        self.refused(400, "no such scenario", CODER, "prove", scenario="S9", result="pass", evidence="x")
+        self.refused(400, "result must be", CODER, "prove", scenario="S1", result="maybe", evidence="x")
+        self.refused(400, "evidence is required", CODER, "prove", scenario="S1", result="pass", evidence="  ")
+        self.refused(400, "judged by tester", TESTER, "verdict", evaluator="reader", **VERDICT)
+        plan = self.backend.plan
+        self.backend.plan = lambda pr: dict(plan(pr), scenarios={"S1": {"evaluator": "tester", "claim": "epic"}})
+        self.refused(400, "claimed at the epic", CODER, "prove", **PROVE)
+
+
+    def test_report_ignores_pod_issue_and_everything(self):
+        rid = self.hub.submit(CODER, "report", head=None, state="withdrawn", text="x", cid="R1")
+        self.hub.queue[0]["call"]["args"].update(issue="other/repo#99", everything=True)
+        relay.pass_once(self.ex, self.hub.fetch, self.hub.post)
+        self.assertEqual(self.hub.results[rid]["status"], 200)
+        (pod, args), = self.backend.reported
+        self.assertEqual(args, {"state": "withdrawn", "text": "x", "issue": 1})
+
+    def test_report_for_unlinked_pr_refused_and_writes_nothing(self):
+        self.refused(403, "pr not linked", CODER, "report", issue=2, head=None, state="done", text="x")
+        self.assertEqual(self.backend.reported, [])
+
+    def test_report_text_control_characters_stripped(self):
+        self.run_one(CODER, "report", head=None, state="done", text="a\x1b[31mb\x00\nc\u0085d", cid="R2")
+        self.assertEqual(self.backend.reported[0][1]["text"], "a [31mb c d")
+
+    def test_report_replay_with_other_text_is_409(self):
+        self.run_one(CODER, "report", head=None, state="done", text="x", cid="R3")
+        got = self.run_one(CODER, "report", head=None, state="done", text="y", cid="R3")
+        self.assertEqual(got["status"], 409)
+        self.assertEqual(len(self.backend.reported), 1)
+
+    def test_needs_head_is_the_hubs(self):
+        self.assertIs(relay.NEEDS_HEAD, relay.cloud_relay.NEEDS_HEAD)
+
+    def test_token_file_over_cap_refused(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        tok = Path(self.state) / "tok"
+        tok.write_text("x" * (relay.TOKEN_CAP + 1))
+        tok.chmod(0o600)
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(tok)}
+        self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env), 0)
+        self.assertIn("token file over", notes[0][2]["error"])
+
+    def serve(self, handler_body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                handler_body(self)
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d" % srv.server_port
+
+    def test_pending_answer_over_cap_refused(self):
+        old = relay.PENDING_CAP
+        relay.PENDING_CAP = 100
+        self.addCleanup(setattr, relay, "PENDING_CAP", old)
+
+        def body(h):
+            data = b'{"requests": [], "pad": "' + b"x" * 200 + b'"}'
+            h.send_response(200)
+            h.send_header("Content-Length", str(len(data)))
+            h.end_headers()
+            h.wfile.write(data)
+        fetch, _ = relay.http_transport(self.serve(body), "tok")
+        with self.assertRaises(ValueError):
+            fetch()
+
+    def test_redirect_is_not_followed(self):
+        seen = []
+        target = self.serve(lambda h: (seen.append(h.headers.get("Authorization")), h.send_response(200), h.end_headers()))
+
+        def body(h):
+            h.send_response(302)
+            h.send_header("Location", target + "/x")
+            h.end_headers()
+        fetch, _ = relay.http_transport(self.serve(body), "tok")
+        with self.assertRaises(Exception):
+            fetch()
+        self.assertEqual(seen, [])
+
+    def test_plain_http_to_public_host_refused(self):
+        with self.assertRaises(ValueError):
+            relay.http_transport("http://hub.example.com", "tok")
+        relay.http_transport("https://hub.example.com", "tok")
+        relay.http_transport("http://hub.fleet.svc", "tok")
+
+
+class RealRuleMutants(unittest.TestCase):
+    """Each test removes or inverts ONE real rule (monkeypatched in the real code) and shows the guarding test then fails."""
+
+    def caught(self, guard, prep=None):
+        """Run the guarding test of Case with the mutant in place; it must fail. `prep(case)` mutates a backend, it runs after setUp."""
+        case = Case(guard)
+        case.setUp()
+        if prep:
+            prep(case)
+        try:
+            with self.assertRaises(AssertionError, msg="the mutant survived %s" % guard):
+                getattr(case, guard)()
+        finally:
+            case.doCleanups()
+            case.tmp.cleanup()
+
+    def patch(self, owner, name, value):
+        old = getattr(owner, name)
+        setattr(owner, name, value)
+        self.addCleanup(setattr, owner, name, old)
+        return old
+
+    def test_unmutated_guards_pass(self):   # the same guards, run for real, so a mutant test cannot pass through a broken guard
+        for guard in ("test_stale_head", "test_head_moves_inside_decision", "test_proof_from_non_holder_403", "test_author_verdict_403",
+                      "test_github_author_verdict_403", "test_non_evaluator_403",
+                      "test_pr_not_linked_to_the_pods_issue_refused_for_all_three", "test_same_call_id_two_pods",
+                      "test_replay_with_different_args_is_409_and_writes_nothing",
+                      "test_replay_with_different_args_after_the_index_is_gone_is_409"):
+            case = Case(guard)
+            case.setUp()
+            getattr(case, guard)()
+            case.tmp.cleanup()
+
+    def test_mutant_head_recheck_removed(self):
+        self.patch(relay, "_same_head", lambda known, given: True)
+        self.caught("test_stale_head")
+        self.caught("test_head_moves_inside_decision")
+
+    def test_mutant_holder_check_removed(self):
+        self.patch(relay.Executor, "_check_holder", lambda ex, pod, req: None)
+        self.caught("test_proof_from_non_holder_403")
+
+    def test_mutant_author_exclusion_removed(self):
+        self.patch(plan_ledger, "authors_of", lambda *a, **k: set())
+        self.caught("test_author_verdict_403")
+        self.caught("test_github_author_verdict_403")
+
+    def test_mutant_evaluator_role_check_removed(self):
+        self.patch(plan_ledger, "may_record_verdict", lambda *a, **k: (True, ""))
+        self.caught("test_non_evaluator_403")
+
+    def test_mutant_pr_issue_link_removed(self):
+        self.patch(relay.Executor, "_check_linked", lambda ex, pr, req: None)
+        self.caught("test_pr_not_linked_to_the_pods_issue_refused_for_all_three")
+
+    def test_mutant_args_digest_ignored(self):
+        same = relay._same_call
+        self.patch(relay, "_same_call", lambda known, command, pr, head, digest=None: same(dict(known, args=digest) if "args" in known else known, command, pr, head, digest))
+        self.caught("test_replay_with_different_args_is_409_and_writes_nothing")
+
+    def test_mutant_replay_in_build_ignores_args(self):
+        self.patch(plan_ledger, "clip", lambda text, *a: "ran it")   # the replay's evidence comparison collapses
+        self.caught("test_replay_with_different_args_after_the_index_is_gone_is_409")
+
+    def test_mutant_in_build_verdict_recheck_removed(self):
+        """The REAL source with the re-check's refusal removed (not a monkeypatch of a helper)."""
+        mod = load_backend_module("                if not ok2:\n                    raise Refuse(403, \"refused: %s\" % why2)\n", "                pass\n")
+        case = Case("test_verdict_rechecks_the_roles_inside_the_append")
+        case.setUp()
+        case.fresh = lambda: mod.Executor(case.state, case.backend, lambda: 1000)
+        case.ex = case.fresh()
+        try:
+            with self.assertRaises(AssertionError):
+                case.test_verdict_rechecks_the_roles_inside_the_append()
+        finally:
+            case.doCleanups()
+            case.tmp.cleanup()
+
+    def test_mutant_call_id_global_not_per_pod(self):
+        key = lambda pod: "any" if "\n" not in pod else pod
+        get, put = relay.Index.get, relay.Index.put
+        self.patch(relay.Index, "get", lambda self, pod, cid: get(self, key(pod), cid))
+        self.patch(relay.Index, "put", lambda self, pod, cid, rec: put(self, key(pod), cid, rec))
+        self.caught("test_same_call_id_two_pods")
+
+
+def load_backend_module(old=None, new=None, extra=()):
+    """The real cloud_relay_daemon source, optionally with ONE replacement (a mutant of the real code), as a fresh module."""
+    import types
+    src = (BIN / "cloud_relay_daemon.py").read_text()
+    if old is not None:
+        assert src.count(old) == 1, old
+        src = src.replace(old, new)
+    for o, n in extra:   # more replacements of the same mutant (a deadline kept in two places)
+        assert src.count(o) == 1, o
+        src = src.replace(o, n)
+    mod = types.ModuleType("cloud_relay_daemon_mut")
+    mod.__file__ = str(BIN / "cloud_relay_daemon.py")
+    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    return mod
+
+
+class RealBackend(unittest.TestCase):
+    """SwitchboardBackend itself, over a stub host (its _ledger_context) and stub parts (engine, state, config)."""
+    REPO = "acme-org/widget-service"
+
+    def backend(self, body="", source="", config=None, mod=relay):
+        import types
+        ctx = types.SimpleNamespace(repo=self.REPO, facts={"body": body}, source=source)
+        host = types.SimpleNamespace(_ledger_context=lambda *a, **k: ctx)
+        return mod.SwitchboardBackend(host, (None, "/nowhere", {} if config is None else config), None, lambda: 1)
+
+    def test_pr_issues_closing_keywords(self):
+        for body, want in (("Closes #7", {7}), ("fixes acme-org/widget-service#7", {7}), ("Resolved: #9 and fixes #3", {9, 3}),
+                           ("fixes other/repo#7", set()), ("closes#7", set()), ("see #7", set()), ("", set()), (None, set())):
+            self.assertEqual(self.backend(body).pr_issues(PR), want, body)
+
+    def test_pr_issues_plan_source_issue(self):
+        self.assertEqual(self.backend("", self.REPO + "#12").pr_issues(PR), {12})
+        self.assertEqual(self.backend("Closes #7", self.REPO + "#12").pr_issues(PR), {7, 12})
+        self.assertEqual(self.backend("", "other/repo#12").pr_issues(PR), set())
+        self.assertEqual(self.backend("", "docs/plan.md").pr_issues(PR), set())
+
+    def test_holder_and_evaluators_fail_closed(self):
+        b = self.backend(config={"relay_holders": {self.REPO + "#7": "widget-api-coder"}, "plan_evaluators": {"tester": ["widget-api-tester"]}})
+        self.assertEqual(b.holder_of(self.REPO, 7), "widget-api-coder")
+        self.assertIsNone(b.holder_of(self.REPO, 8))
+        self.assertEqual(b.evaluators("tester"), ["widget-api-tester"])
+        self.assertEqual(b.evaluators("nobody"), [])
+        for config in ({}, {"relay_holders": None}, {"relay_holders": {}}):
+            self.assertIsNone(self.backend(config=config).holder_of(self.REPO, 7))
+        self.assertEqual(self.backend(config={}).evaluators("tester"), [])
+
+    def test_mutants_of_the_real_regex_and_repo_check_are_caught(self):
+        for old, new in ((r"\s*:?\s+(?:(", r"\s*:?\s*(?:("),
+                         ("if m.group(1) in (None, repo):", "if True:"),
+                         ("if m and m.group(1) == repo:", "if m:")):
+            mod = load_backend_module(old, new)
+            with self.assertRaises(AssertionError, msg=old):
+                for name in ("test_pr_issues_closing_keywords", "test_pr_issues_plan_source_issue"):
+                    case = RealBackend(name)
+                    case.backend = lambda *a, _m=mod, _b=RealBackend.backend, _c=case, **k: _b(_c, *a, mod=_m, **k)
+                    getattr(case, name)()
+        mod = load_backend_module('.get("%s#%s" % (repo, issue))', '.get("%s#%s" % (repo, issue), "widget-api-coder")')
+        with self.assertRaises(AssertionError):
+            case = RealBackend("test_holder_and_evaluators_fail_closed")
+            case.backend = lambda *a, _b=RealBackend.backend, **k: _b(case, *a, mod=mod, **k)
+            case.test_holder_and_evaluators_fail_closed()
+
+
+class ReplyHygiene(Fixture):
+    def test_plan_and_ledger_errors_are_fixed_reasons_with_detail_in_audit(self):
+        self.proved()
+        self.refused(400, "no such scenario", CODER, "prove", scenario="S9<script>", result="pass", evidence="x")
+        got = self.hub.results[max(self.hub.results, key=lambda r: int(r[1:]))]
+        self.assertNotIn("S9", got["reason"])
+        self.assertIn("S9", json.dumps(self.backend.audits[-1][1]))
+        self.backend.plan = lambda pr: (_ for _ in ()).throw(relay.Refuse(400, "the plan is not usable", "plan secret detail"))
+        self.refused(400, "the plan is not usable", CODER, "prove", **PROVE)
+        self.assertNotIn("secret detail", json.dumps(self.hub.results))
+        self.assertIn("secret detail", json.dumps(self.backend.audits[-1][1]))
+
+    def test_ledger_error_reason_is_fixed(self):
+        def boom(*a, **k):
+            raise plan_ledger.LedgerError("/private/path broke")
+        old = plan_ledger.append_checked
+        plan_ledger.append_checked = boom
+        self.addCleanup(setattr, plan_ledger, "append_checked", old)
+        got = self.run_one(CODER, "prove", **PROVE)
+        self.assertEqual((got["status"], got["reason"]), (409, "the ledger refused the write"))
+        self.assertIn("/private/path", json.dumps(self.backend.audits[-1][1]))
+
+    def test_every_reason_is_clipped_under_the_hub_limit(self):
+        self.backend.gates = lambda pr: {"ready": False, "pad": "x" * 5000}
+        rid = self.hub.submit(CODER, "gates", head=None)
+        relay.pass_once(self.ex, self.hub.fetch, self.hub.post)
+        self.assertLess(len(self.hub.results[rid]["reason"]), 2000)
+        self.assertEqual(json.loads(self.hub.results[rid]["reason"])["truncated"], True)
+        self.refused(400, "not one of", CODER, "x" * 5000, head=None)
+        self.assertLess(len(max((r["reason"] for r in self.hub.results.values()), key=len)), 2000)
+
+    def test_token_file_read_failure_records_only_the_class_name(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent/secret-path/token"}
+        relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env)
+        self.assertEqual(notes[0][2], {"error": "FileNotFoundError"})
+
+    def test_index_lock_is_mode_0600_and_oversized_index_is_ignored(self):
+        idx = relay.Index(self.state)
+        idx.put("p", "c", {"seq": 1, "hash": "h"})
+        self.assertEqual((Path(self.state) / (relay.INDEX_FILE + ".lock")).stat().st_mode & 0o777, 0o600)
+        old = relay.INDEX_READ_CAP
+        relay.INDEX_READ_CAP = 10
+        self.addCleanup(setattr, relay, "INDEX_READ_CAP", old)
+        self.assertEqual(idx._read(), {})
+
+class Crash(BaseException):
+    """Stands for a killed daemon: not an Exception, so pass_once does not catch it."""
+
+
+def make_mutant_executor(case, old, new):
+    mod = load_backend_module(old, new)
+    case.ex = mod.Executor(case.state, case.backend, lambda: 1000)
+    case.fresh = lambda: mod.Executor(case.state, case.backend, lambda: 1000)
+    return mod
+
+
+class ReportOnce(Fixture):
+    """MEDIUM 1: report is claimed (pending) BEFORE delivery, then delivered, then marked done: exactly one record, never two."""
+    REPORT = dict(head=None, state="done", text="x", cid="R1")
+
+    def replay(self):
+        return self.run_one(CODER, "report", ex=self.fresh(), **self.REPORT)
+
+    def crash_report(self):
+        def boom(pod, args):
+            raise Crash()
+        self.backend.report = boom
+        with self.assertRaises(Crash):
+            self.run_one(CODER, "report", **self.REPORT)
+        del self.backend.report
+
+    def test_crash_between_claim_and_delivery_never_delivers_twice(self):
+        self.crash_report()
+        got = self.replay()
+        self.assertEqual((got["status"], self.backend.reported), (409, []))
+        self.assertIn("lost or still pending: resend with a NEW call_id", got["reason"])
+
+    def test_crash_between_delivery_and_done_never_delivers_twice(self):
+        ex = self.ex
+        ex.reports.put = lambda *a: (_ for _ in ()).throw(Crash())
+        with self.assertRaises(Crash):
+            self.run_one(CODER, "report", ex=ex, **self.REPORT)
+        self.assertEqual(len(self.backend.reported), 1)
+        got = self.replay()
+        self.assertEqual((got["status"], len(self.backend.reported)), (409, 1))
+
+    def test_index_failure_after_delivery_does_not_redeliver(self):
+        self.ex.reports.put = lambda *a: (_ for _ in ()).throw(OSError("disk full"))
+        self.assertEqual(self.run_one(CODER, "report", **self.REPORT)["status"], 500)
+        self.assertEqual(self.replay()["status"], 409)
+        self.assertEqual(len(self.backend.reported), 1)
+
+    def test_done_replay_is_200_and_a_different_call_is_409(self):
+        self.assertEqual(self.run_one(CODER, "report", **self.REPORT)["reason"], "reported")
+        self.assertEqual(self.replay()["reason"], "replay: already reported")
+        self.assertEqual(self.run_one(CODER, "report", ex=self.fresh(), **dict(self.REPORT, text="y"))["status"], 409)
+        self.assertEqual(len(self.backend.reported), 1)
+
+    def test_two_concurrent_passes_deliver_once(self):
+        import threading
+        import time
+        real = self.backend.report
+        self.backend.report = lambda pod, args: (time.sleep(0.2), real(pod, args))
+        rids = [self.hub.submit(CODER, "report", **self.REPORT) for _ in range(1)]
+        req = self.hub.queue[0]
+        exes = [self.fresh() for _ in range(6)]   # six passes, each its own Executor (as six processes would be)
+        out = []
+        ts = [threading.Thread(target=lambda e=e: out.append(e.handle(dict(req))[0])) for e in exes]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(len(self.backend.reported), 1)
+        self.assertEqual(sorted(out), [200] + [409] * 5)
+
+    def test_a_pruned_prove_index_does_not_redeliver(self):
+        self.run_one(CODER, "report", **self.REPORT)
+        old = relay.INDEX_MAX
+        relay.INDEX_MAX = 2
+        self.addCleanup(setattr, relay, "INDEX_MAX", old)
+        for i in range(5):   # flood the prove/verdict index past its cap: the report claims live in their own file
+            self.ex.index.put("p", "c%d" % i, {"seq": i, "hash": "h"})
+        (Path(self.state) / relay.INDEX_FILE).unlink()
+        self.assertEqual(self.replay()["reason"], "replay: already reported")
+        self.assertEqual(len(self.backend.reported), 1)
+
+    def test_a_damaged_claim_file_refuses_and_does_not_deliver(self):
+        (Path(self.state) / relay.REPORT_FILE).write_text("{not json")
+        self.assertEqual(self.run_one(CODER, "report", **self.REPORT)["status"], 500)
+        self.assertEqual(self.backend.reported, [])
+
+    def test_mutant_deliver_before_claim_is_caught(self):
+        """The old order (look, deliver, then write) is the real code with the claim replaced by a plain read."""
+        for guard in ("test_crash_between_delivery_and_done_never_delivers_twice", "test_two_concurrent_passes_deliver_once",
+                      "test_crash_between_claim_and_delivery_never_delivers_twice"):
+            case = ReportOnce(guard)
+            case.setUp()
+            make_mutant_executor(case, 'seen = self.reports.claim(pod, cid, dict(mine, state="pending"))', "seen = self.reports.get(pod, cid)")
+            try:
+                with self.assertRaises(AssertionError, msg=guard):
+                    getattr(case, guard)()
+            finally:
+                case.doCleanups()
+                case.tmp.cleanup()
+
+    def test_unmutated_guards_pass(self):
+        for guard in ("test_crash_between_delivery_and_done_never_delivers_twice", "test_two_concurrent_passes_deliver_once",
+                      "test_crash_between_claim_and_delivery_never_delivers_twice"):
+            case = ReportOnce(guard)
+            case.setUp()
+            getattr(case, guard)()
+            case.tmp.cleanup()
+
+
+class LiveHead(Fixture):
+    """MEDIUM 2b: live_head is read before the ledger flock; the bounded in-lock re-check still refuses a head that moved."""
+
+    def lock_free(self):
+        import fcntl
+        fd = os.open(str(Path(self.state) / plan_ledger.LEDGER_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+    def test_the_first_read_is_made_without_the_ledger_flock(self):
+        seen = []
+        real = self.backend.live_head
+        self.backend.live_head = lambda pr: (seen.append(self.lock_free()), real(pr))[1]
+        self.assertEqual(self.run_one(CODER, "prove", **PROVE)["status"], 200)
+        self.assertTrue(seen[0], seen)
+
+    def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
+        import threading
+        import time
+
+        def slow(pr):   # every call is slow: a call made under the flock would hold every other writer for this long
+            time.sleep(0.7)
+            return HEAD
+        self.backend.live_head = slow
+        t = threading.Thread(target=lambda: self.run_one(CODER, "prove", **PROVE))
+        t.start()
+        worst, end = 0.0, time.monotonic() + 1.6
+        while time.monotonic() < end:
+            t0 = time.monotonic()
+            plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
+                kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e"))
+            worst = max(worst, time.monotonic() - t0)
+            time.sleep(0.05)
+        t.join(10)
+        self.assertLess(worst, 0.3)   # no writer waited for GitHub
+
+    def test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing(self):
+        import time
+        old = relay.HEAD_TIMEOUT
+        relay.HEAD_TIMEOUT = 0.2
+        self.addCleanup(setattr, relay, "HEAD_TIMEOUT", old)
+        self.backend.live_head = lambda pr: (time.sleep(2), HEAD)[1]
+        t0 = time.monotonic()
+        self.refused(504, "could not be read in time", CODER, "prove", **PROVE)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(self.raw(), b"")
+
+    def test_a_different_live_head_is_refused(self):
+        self.backend.head = "c" * 40
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.assertEqual(self.raw(), b"")
+
+    def test_mutants_are_caught(self):
+        for guard, old, new in (("test_a_slow_live_head_does_not_block_another_ledger_writer", "if not _same_head(first, head):   # the ONLY", "first = b.live_head(pr)\n            if not _same_head(first, head):   # the ONLY"),
+                                ("test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)", "b.live_head(pr)")):
+            case = LiveHead(guard)
+            case.setUp()
+            make_mutant_executor(case, old, new)
+            try:
+                with self.assertRaises(AssertionError, msg=guard):
+                    getattr(case, guard)()
+            finally:
+                case.doCleanups()
+                case.tmp.cleanup()
+
+
+class HubReadAndTransport(unittest.TestCase):
+    """MEDIUM 2a, L1 (daemon side), L6 and L7: a hostile hub."""
+
+    def _serve(self, handler_body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    handler_body(self)
+                except OSError:
+                    pass
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d" % srv.server_port
+
+    def _hang_connect(self, mod):
+        """Every connect waits on a gate (a hanging DNS/connect), then really connects. Returns the gate."""
+        import http.client
+        import threading
+        gate = threading.Event()
+        real = http.client.HTTPConnection.connect
+
+        def slow(conn):
+            gate.wait(20)
+            return real(conn)
+        http.client.HTTPConnection.connect = slow
+        self.addCleanup(setattr, http.client.HTTPConnection, "connect", real)
+        self.addCleanup(gate.set)
+        return gate
+
+    def _threads_hanging(self, mod):
+        import threading
+        before = threading.active_count()
+        self._hang_connect(mod)
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.3
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        fetch, _ = mod.http_transport("http://127.0.0.1:9", "tok")
+        for _ in range(4):
+            with self.assertRaises(mod.PassCut):
+                fetch()
+        return threading.active_count() - before
+
+    def test_repeated_cut_passes_keep_one_worker_thread(self):
+        self.assertLessEqual(self._threads_hanging(relay), 2)   # one worker (+ at most its watchdog Timer), never one more per pass
+
+    def test_mutant_without_the_in_flight_check_is_caught(self):
+        mod = load_backend_module("if inflight and inflight[0].is_alive():", "if False:")
+        self.assertGreater(self._threads_hanging(mod), 2)
+
+    def _late_post_scenario(self, mod):
+        import json
+        import threading
+        import http.server
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        hub = FakeHub()
+        hub.submit(CODER, "prove", cid="late", **PROVE)
+        req = hub.queue[0]
+        posts = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                data = json.dumps({"requests": [req]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):
+                posts.append(self.path)
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        import http.client
+        gate = threading.Event()
+        real = http.client.HTTPConnection.connect
+        slow_for = {"post": True}
+        http.client.HTTPConnection.connect = lambda conn: (gate.wait(20) if slow_for["post"] and slow_for.get("armed") else None, real(conn))[1]
+        self.addCleanup(setattr, http.client.HTTPConnection, "connect", real)
+        self.addCleanup(gate.set)
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.4
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        fetch, post = mod.http_transport("http://127.0.0.1:%d" % srv.server_port, "tok")
+        ex = relay.Executor(tmp.name, FakeBackend(), lambda: 1000)
+        slow_for["armed"] = True   # only the POST connect hangs: the GET below is made with the gate open first
+        gate.set()
+        pending = fetch()
+        gate.clear()
+        status, reason, record = ex.handle(pending["requests"][0])   # pass 1 executes: one ledger record
+        with self.assertRaises(mod.PassCut):
+            post(req["id"], {"status": status, "reason": reason, "record": record})   # the POST connect hangs: cut
+        gate.set()   # the late thread now completes after the cut
+        import time
+        time.sleep(0.5)
+        slow_for["armed"] = False
+        status2, _, record2 = ex.handle(fetch()["requests"][0])   # next pass: the same request is a replay
+        post(req["id"], {"status": status2, "reason": "", "record": record2})
+        entries, _ = plan_ledger.read_ledger(tmp.name)
+        return len(entries), len(posts)
+
+    def test_late_post_after_the_cut_is_not_made_and_the_replay_writes_one_record(self):
+        self.assertEqual(self._late_post_scenario(relay), (1, 1))
+
+    def test_mutant_without_the_cancel_check_is_caught(self):
+        mod = load_backend_module("if cancel is not None and cancel.is_set():", "if False:")
+        self.assertEqual(self._late_post_scenario(mod), (1, 2))   # the late thread also posted
+
+    def test_a_trickling_hub_is_cut_at_the_total_deadline(self):
+        import time
+        old = relay.READ_DEADLINE
+        relay.READ_DEADLINE = 1.0
+        self.addCleanup(setattr, relay, "READ_DEADLINE", old)
+
+        def trickle(h):
+            h.send_response(200)
+            h.send_header("Content-Length", "100000")
+            h.end_headers()
+            for _ in range(200):   # a byte every 0.2 s: every single read succeeds well inside the 20 s socket timeout
+                h.wfile.write(b" ")
+                h.wfile.flush()
+                time.sleep(0.2)
+        fetch, _ = relay.http_transport(self._serve(trickle), "tok")
+        t0 = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            fetch()
+        self.assertLess(time.monotonic() - t0, 2.5)
+
+    def test_mutant_without_the_total_deadline_is_caught(self):
+        mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
+        old, mod.READ_DEADLINE = relay.READ_DEADLINE, 1.0
+        import time
+
+        def trickle(h):
+            h.send_response(200)
+            h.send_header("Content-Length", "100000")
+            h.end_headers()
+            for _ in range(15):
+                h.wfile.write(b" ")
+                h.wfile.flush()
+                time.sleep(0.2)
+        fetch, _ = mod.http_transport(self._serve(trickle), "tok")
+        t0 = time.monotonic()
+        with self.assertRaises(Exception):
+            fetch()   # it ends only when the stub stops (ValueError from the empty JSON), after 3 s: not at the deadline
+        self.assertGreater(time.monotonic() - t0, 2.5)
+
+    def test_endless_stream_without_a_length_is_cut(self):
+        def endless(h):
+            h.send_response(200)
+            h.end_headers()
+            while True:
+                h.wfile.write(b" " * 4096)
+        old = relay.PENDING_CAP
+        relay.PENDING_CAP = 100000
+        self.addCleanup(setattr, relay, "PENDING_CAP", old)
+        fetch, _ = relay.http_transport(self._serve(endless), "tok")
+        with self.assertRaises(ValueError):
+            fetch()
+
+    def test_oversize_body_is_refused(self):
+        def big(h):
+            data = b"[" + b"1," * (relay.PENDING_CAP // 2 + 10) + b"1]"
+            h.send_response(200)
+            h.send_header("Content-Length", str(len(data)))
+            h.end_headers()
+            h.wfile.write(data)
+        fetch, _ = relay.http_transport(self._serve(big), "tok")
+        with self.assertRaises(ValueError):
+            fetch()
+
+    def test_nested_nan_and_duplicate_json_are_refused_not_fatal(self):
+        for raw in (b"[" * 40000, b'{"requests": [], "n": NaN}', b'{"requests": [], "requests": []}'):
+            def body(h, raw=raw):
+                h.send_response(200)
+                h.send_header("Content-Length", str(len(raw)))
+                h.end_headers()
+                h.wfile.write(raw)
+            fetch, _ = relay.http_transport(self._serve(body), "tok")
+            with self.assertRaises((ValueError, RecursionError)):
+                fetch()
+
+    def test_the_same_request_over_and_over_writes_once(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        backend, hub = FakeBackend(), FakeHub()
+        ex = relay.Executor(tmp.name, backend, lambda: 1000)
+        hub.submit(CODER, "prove", cid="same", **PROVE)
+        req = hub.queue[0]
+        for _ in range(5):
+            hub.queue = [req]
+            relay.pass_once(ex, hub.fetch, hub.post)
+        entries, _ = plan_ledger.read_ledger(tmp.name)
+        self.assertEqual(len(entries), 1)
+
+    def test_a_token_file_readable_by_group_or_other_is_refused(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        with tempfile.TemporaryDirectory() as d:
+            tok = Path(d) / "tok"
+            tok.write_text("abc")
+            env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(tok)}
+            for mode in (0o644, 0o640, 0o604):
+                tok.chmod(mode)
+                notes.clear()
+                self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env), 0)
+                self.assertIn("not private to this user", notes[0][2]["error"], oct(mode))
+            tok.chmod(0o600)
+            notes.clear()
+            relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env)
+            self.assertNotIn("not private", str(notes))
+
+    def test_mutant_token_mode_unchecked_is_caught(self):
+        mod = load_backend_module("loose = info.st_mode & 0o077 or info.st_uid != os.geteuid()", "loose = 0")
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        with tempfile.TemporaryDirectory() as d:
+            tok = Path(d) / "tok"
+            tok.write_text("abc")
+            tok.chmod(0o644)
+            mod.pass_if_configured(Engine(), None, None, lambda: 1, environ={"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(tok)})
+            self.assertNotIn("not private to this user", str(notes))
+
+
+class DaemonRefusalMutants(Fixture):
+    """L4 (daemon side): the repo check and the command allow-list each have a refusal test and a mutant of the real code; L5 clipping."""
+
+    def refusal_checks(self):
+        self.refused(403, "bound repo", CODER, "prove", repo="acme-org/other", **PROVE)
+        self.refused(400, "not one of", CODER, "merge", head=None)
+
+    def test_refusals(self):
+        self.refusal_checks()
+
+    def test_mutant_repo_check_removed(self):
+        make_mutant_executor(self, 'if m.group(1) != req.get("repo"):', "if False:")
+        with self.assertRaises(AssertionError):
+            self.refused(403, "bound repo", CODER, "prove", repo="acme-org/other", **PROVE)
+
+    def test_mutant_command_allow_list_removed(self):
+        make_mutant_executor(self, "if command not in COMMANDS:", "if False:")
+        with self.assertRaises(AssertionError):
+            self.refused(400, "not one of", CODER, "merge", head=None)
+
+    def test_audit_line_is_intended_and_pod_and_pr_are_clipped(self):
+        before = self.raw()
+        got = self.run_one("p\x07" + "x" * 500, "merge", head=None, pr="y" * 500)
+        self.assertEqual(got["status"], 400)
+        kind, detail = self.backend.audits[-1]
+        self.assertEqual(kind, "relay.refused")
+        self.assertLessEqual(len(detail["by"]), 80)
+        self.assertLessEqual(len(self.backend.audit_prs[-1]), 80)
+        self.assertNotIn("\x07", detail["by"])
+        self.assertEqual(self.raw(), before)
+
+
+class Round2(Fixture):
+    """Last push of #1225: total deadline incl. headers, pass budget, named pending reason, token file open, audit clip, in-lock head."""
+
+    def serve(self, handler):
+        return HubReadAndTransport._serve(self, handler)
+
+    @staticmethod
+    def header_trickle(h):
+        import time
+        for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 60:   # one byte per 0.2 s: every socket read succeeds
+            h.wfile.write(bytes([byte]))
+            h.wfile.flush()
+            time.sleep(0.2)
+
+    def timed_fetch(self, mod):
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 1.0
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        fetch, _ = mod.http_transport(self.serve(self.header_trickle), "tok")
+        t0 = time.monotonic()
+        try:
+            fetch()
+        except Exception as err:
+            return time.monotonic() - t0, err
+        return time.monotonic() - t0, None
+
+    def test_trickling_headers_are_cut_at_the_total_deadline(self):
+        took, err = self.timed_fetch(relay)
+        self.assertIsInstance(err, TimeoutError)
+        self.assertLess(took, 2.0)
+
+    def test_mutant_without_the_watchdog_is_caught(self):
+        mod = load_backend_module("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)", extra=(("worker.join(READ_DEADLINE)", "worker.join()"),))
+        took, _ = self.timed_fetch(mod)
+        self.assertGreater(took, 2.0)
+
+    def test_pass_budget_leaves_later_requests_pending(self):
+        t = [0.0]
+        rids = [self.hub.submit(CODER, "gates", head=None) for _ in range(5)]
+        orig = self.hub.post
+
+        def slow_post(rid, body):
+            t[0] += 30.0   # every answer takes 30 s of the pass
+            orig(rid, body)
+        done = relay.pass_once(self.ex, self.hub.fetch, slow_post, budget=60.0, clock=lambda: t[0])
+        self.assertEqual(done, 2)
+        self.assertEqual([q["id"] for q in self.hub.queue], rids[2:])   # still pending for the next pass
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 3)
+
+    def test_mutant_without_the_pass_budget_is_caught(self):
+        mod = load_backend_module("if clock() - start >= budget:", "if False:")
+        t = [0.0]
+        for _ in range(5):
+            self.hub.submit(CODER, "gates", head=None)
+
+        def slow_post(rid, body):
+            t[0] += 30.0
+            self.hub.post(rid, body)
+        done = mod.pass_once(self.ex, self.hub.fetch, slow_post, budget=60.0, clock=lambda: t[0])
+        self.assertEqual(done, 5)   # the budget is ignored: the guarding test (done == 2) fails
+
+    def test_pending_claim_names_the_reason(self):
+        def boom(pod, args):
+            raise ValueError("bad state")
+        self.backend.report = boom
+        self.assertEqual(self.run_one(CODER, "report", head=None, state="done", text="x", cid="R9")["status"], 500)
+        del self.backend.report
+        got = self.run_one(CODER, "report", head=None, state="done", text="x", cid="R9")
+        self.assertEqual(got["status"], 409)
+        self.assertIn("lost or still pending: resend with a NEW call_id", got["reason"])
+        self.assertEqual(self.backend.reported, [])
+
+    def test_mutant_unnamed_pending_reason_is_caught(self):
+        mod = load_backend_module("twice: lost or still pending: resend with a NEW call_id", "twice")
+        self.ex = mod.Executor(self.state, self.backend, lambda: 1000)
+        self.backend.report = lambda pod, args: (_ for _ in ()).throw(ValueError("x"))
+        self.run_one(CODER, "report", head=None, state="done", text="x", cid="R9")
+        del self.backend.report
+        got = self.run_one(CODER, "report", head=None, state="done", text="x", cid="R9")
+        self.assertNotIn("resend with a NEW call_id", got["reason"])
+
+    def test_report_claimed_audit_clips_by(self):
+        pod = "p" * 300
+        self.backend.report = lambda pod, args: (_ for _ in ()).throw(ValueError("x"))
+        self.run_one(pod, "report", head=None, state="done", text="x", cid="R8")
+        del self.backend.report
+        self.run_one(pod, "report", head=None, state="done", text="x", cid="R8")
+        kind, detail = [a for a in self.backend.audits if a[0] == "report.claimed"][0]
+        self.assertLessEqual(len(detail["by"]), 80)
+
+    def test_mutant_unclipped_by_is_caught(self):
+        mod = load_backend_module('{"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})\n                    raise Refuse(409, PENDING_REASON', '{"by": pod, "call_id": clean_text(cid, 64)})\n                    raise Refuse(409, PENDING_REASON')
+        self.ex = mod.Executor(self.state, self.backend, lambda: 1000)
+        with self.assertRaises(AssertionError):
+            self.test_report_claimed_audit_clips_by()
+
+    def test_the_in_lock_head_compare_is_the_guard(self):
+        self.backend.head = "c" * 40
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.assertEqual(self.raw(), b"")
+
+    def test_mutant_in_lock_head_compare_removed_is_caught(self):
+        make_mutant_executor(self, "if not _same_head(first, head):   # the ONLY", "if False:   # the ONLY")
+        with self.assertRaises(AssertionError):
+            self.test_the_in_lock_head_compare_is_the_guard()
+
+    # ---- token file open
+    def run_token(self, mod, path):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        import threading
+        box = []
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(path)}
+        th = threading.Thread(target=lambda: box.append(mod.pass_if_configured(Engine(), None, None, lambda: 1, environ=env)), daemon=True)
+        th.start()
+        th.join(3)
+        return (not th.is_alive()), notes
+
+    def test_fifo_token_returns_quickly_and_is_refused(self):
+        fifo = Path(self.state) / "fifo"
+        os.mkfifo(str(fifo), 0o600)
+        finished, notes = self.run_token(relay, fifo)
+        self.assertTrue(finished, "a FIFO blocked the daemon")
+        self.assertIn("not a regular file", notes[0][2]["error"])
+
+    def test_directory_token_names_its_reason(self):
+        d = Path(self.state) / "adir"
+        d.mkdir()
+        finished, notes = self.run_token(relay, d)
+        self.assertTrue(finished)
+        self.assertIn("directory / not a regular file", notes[0][2]["error"])
+
+    def test_mutant_directory_token_only_class_name_is_caught(self):
+        mod = load_backend_module("if not stat.S_ISREG(info.st_mode):", "if False:")
+        d = Path(self.state) / "adir2"
+        d.mkdir()
+        _, notes = self.run_token(mod, d)
+        self.assertNotIn("directory / not a regular file", str(notes))
+
+    def test_symlinked_token_is_refused(self):
+        real = Path(self.state) / "real"
+        real.write_text("abc")
+        real.chmod(0o600)
+        link = Path(self.state) / "link"
+        link.symlink_to(real)
+        finished, notes = self.run_token(relay, link)
+        self.assertTrue(finished)
+        self.assertIn("symbolic link", notes[0][2]["error"])
+
+    def test_mutant_open_without_nonblock_nofollow_is_caught(self):
+        mod = load_backend_module("os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW", "os.O_RDONLY")
+        fifo = Path(self.state) / "fifo2"
+        os.mkfifo(str(fifo), 0o600)
+        finished, _ = self.run_token(mod, fifo)
+        self.assertFalse(finished)   # the mutant hangs on a FIFO: the guard above fails
+        real = Path(self.state) / "real2"
+        real.write_text("abc")
+        real.chmod(0o600)
+        link = Path(self.state) / "link2"
+        link.symlink_to(real)
+        finished, notes = self.run_token(mod, link)
+        self.assertNotIn("symbolic link", str(notes))
+
+
+class OneWallClock(unittest.TestCase):
+    """The deadline covers DNS and every connect attempt (a worker thread joined at it), and a cut body is never a complete parse."""
+
+    def setUp(self):
+        import socket
+        self.socket = socket
+        self.real_gai = socket.getaddrinfo
+        self.addCleanup(setattr, socket, "getaddrinfo", self.real_gai)
+
+    def timed(self, mod, url, deadline):
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, deadline
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        fetch, _ = mod.http_transport(url, "tok")
+        t0 = time.monotonic()
+        try:
+            fetch()
+        except Exception as err:
+            return time.monotonic() - t0, err
+        return time.monotonic() - t0, None
+
+    def slow_dns(self):
+        def gai(*a, **k):
+            time.sleep(10)
+            return self.real_gai(*a, **k)
+        self.socket.getaddrinfo = gai
+        return "http://127.0.0.1:9"
+
+    def full_backlog(self, n=4):
+        """Deterministic n dead addresses: each attempt sleeps its whole timeout, then times out (no kernel backlog)."""
+        socket = self.socket
+        self.addCleanup(setattr, socket, "create_connection", socket.create_connection)
+
+        def dead(address, timeout=None, *a, **k):
+            for _ in range(n):
+                time.sleep(timeout if timeout is not None else 2.0)
+            raise TimeoutError("timed out")
+        socket.create_connection = dead
+        return "http://localhost:9"
+
+    def test_slow_dns_is_cut_at_the_deadline(self):
+        took, err = self.timed(relay, self.slow_dns(), 1.0)
+        self.assertIsInstance(err, relay.PassCut)
+        self.assertLess(took, 2.0)
+
+    def test_mutant_without_the_thread_cut_is_caught_by_dns(self):
+        mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
+        took, _ = self.timed(mod, self.slow_dns(), 1.0)
+        self.assertGreater(took, 5.0)
+
+    def test_four_dead_addresses_share_one_deadline(self):
+        took, err = self.timed(relay, self.full_backlog(), 2.0)
+        self.assertIsInstance(err, TimeoutError)
+        self.assertLess(took, 3.5)
+
+    def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
+        mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
+        took, _ = self.timed(mod, self.full_backlog(), 2.0)
+        self.assertGreater(took, 5.0)
+
+    def test_pass_records_the_cut(self):
+        notes = []
+        backend = types.SimpleNamespace(audit=lambda *a: notes.append(a))
+        def fetch():
+            raise relay.PassCut("relay pass cut")
+        self.assertEqual(relay.pass_once(types.SimpleNamespace(backend=backend), fetch, None), 0)
+        self.assertEqual(notes[0][0], "relay.pass_cut")
+
+    def serve_padded(self):
+        import http.server
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    body = b'{"requests": []}'
+                    self.send_response(200)
+                    self.send_header("Content-Length", "1000")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                    for _ in range(40):
+                        time.sleep(0.1)
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                except OSError:
+                    pass
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d" % srv.server_port
+
+    def test_a_cut_body_is_never_a_complete_parse(self):
+        took, err = self.timed(relay, self.serve_padded(), 1.0)
+        self.assertIsNotNone(err)
+
+    def test_mutant_without_the_length_check_is_caught(self):
+        mod = load_backend_module("if time.monotonic() >= end and (not declared", "if False and (not declared",
+                                  extra=(("if declared and declared.isdigit() and len(raw)", "if False and len(raw)"), ("if left <= 0:", "if False:"), ("worker.join(READ_DEADLINE)", "worker.join()")))
+        _, err = self.timed(mod, self.serve_padded(), 1.0)
+        self.assertIsNone(err)   # the mutant parses the cut body as complete
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)

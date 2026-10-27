@@ -1,0 +1,34 @@
+# THE ONE TABLE of what the pod's shell guard (guard.sh and the deny/allow patterns of opencode-worker.json) and the pod's small
+# client (cw-gh) allow and deny for `gh api` and `gh issue view`. Tab separated: id, allowed|denied, tool, verb or method,
+# path pattern, refusal topic (denied rows), example (the words after `gh`).
+# The agreement test (tests/test_guard_table.py) runs EVERY row through the guard layer and through the client: they must agree.
+# It is a convenience, never the boundary: the token's scope and the repository's rules are.
+# Later asks add ONLY their own rows in their own section below (ask 1166: issue writes; ask 1200: pr edit body). Do not edit existing rows.
+# ---- ask 1083 rows ----
+issue-comments-read	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments		api repos/acme-org/widget-service/issues/7/comments
+issue-comments-list-form	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments?QUERY		api repos/acme-org/widget-service/issues/7/comments?per_page=5
+pull-reviews-read	allowed	gh	GET	repos/OWNER/NAME/pulls/N/reviews		api repos/acme-org/widget-service/pulls/7/reviews
+pull-comments-read	allowed	gh	GET	repos/OWNER/NAME/pulls/N/comments		api repos/acme-org/widget-service/pulls/7/comments
+api-jq-filter	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments --jq|-q		api repos/acme-org/widget-service/issues/7/comments --jq .[0].body
+api-jq-filter-short	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments -q		api repos/acme-org/widget-service/issues/7/comments -q .[0].body
+issues-other-path	denied	gh	GET	repos/OWNER/NAME/issues/N	not in the table: issues paths other than N/comments	api repos/acme-org/widget-service/issues/7
+issues-labels-path	denied	gh	GET	repos/OWNER/NAME/issues/N/labels	not in the table: issues paths other than N/comments	api repos/acme-org/widget-service/issues/7/labels
+issues-write-post	denied	gh	POST	repos/OWNER/NAME/issues/N/comments	writing issues	api -X POST repos/acme-org/widget-service/issues/7/comments
+issues-write-patch	denied	gh	PATCH	repos/OWNER/NAME/issues/N	writing issues	api -X PATCH repos/acme-org/widget-service/issues/7
+issues-write-delete	denied	gh	DELETE	repos/OWNER/NAME/issues/N/comments	writing issues	api -X DELETE repos/acme-org/widget-service/issues/7/comments
+pull-merge	denied	gh	PUT	repos/OWNER/NAME/pulls/N/merge	merging a pull request	api -X PUT repos/acme-org/widget-service/pulls/7/merge
+pull-review-write	denied	gh	POST	repos/OWNER/NAME/pulls/N/reviews	approving or dismissing a pull request review	api -X POST repos/acme-org/widget-service/pulls/7/reviews
+api-write-flags-f	denied	gh	GET	-f	api write flag	api repos/acme-org/widget-service/issues/7/comments -f a=b
+api-write-flags-F	denied	gh	GET	-F	api write flag	api repos/acme-org/widget-service/issues/7/comments -F a=b
+api-write-flags-input	denied	gh	GET	--input	api write flag	api repos/acme-org/widget-service/issues/7/comments --input f
+api-write-flags-graphql	denied	gh	GET	graphql	api write flag	api graphql
+# ---- ask 1166 rows: add below this line ----
+# ---- ask 1200 rows: add below this line ----
+pr-edit-body-file	allowed	gh	PATCH	repos/OWNER/NAME/pulls/N (body only)		pr edit 7 --body-file /tmp/f
+pr-edit-inline-body	denied	gh	PATCH	pr edit N --body	pr edit with an inline body	pr edit 7 --body x
+pr-edit-other-option	denied	gh	PATCH	pr edit N with any option but --body-file	pr edit with another option	pr edit 7 --title x
+pr-edit-other-number	denied	gh	PATCH	pr edit N, N not the pod's own pull request	editing a pull request that is not the pod's own	pr edit 8 --body-file /tmp/f
+pr-edit-url-other-repo	denied	gh	PATCH	pr edit URL or --repo	editing a pull request by URL or in another repository	pr edit https://github.com/other-org/other-repo/pull/7 --body-file /tmp/f
+pr-edit-api	denied	gh	PATCH	repos/OWNER/NAME/pulls/N	writing a pull request through the raw API	api -X PATCH repos/acme-org/widget-service/pulls/7
+pr-edit-no-hold-line	denied	gh	PATCH	client only: the new body drops or changes the line MERGE: captain	a body without the hold line	pr edit 7 --body-file /tmp/nohold
+pr-edit-read-failed	denied	gh	PATCH	client only: the read of the pull request failed	the pull request could not be read	pr edit 10 --body-file /tmp/f
