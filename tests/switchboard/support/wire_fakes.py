@@ -106,7 +106,8 @@ DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue"
               "config-read-once", "catch-up-blocks-pass",  # PR 16, reload and the slow catch-up
               "catch-up-on-fresh-start", "full-window-every-time",  # PR 16, forward only
               "orders-start-only", "orders-wake", "anyone-can-order", "orders-never-judged",  # PR 17
-              "tier-flat", "cos-orders-unfed", "anyone-edits-cos-orders", "answer-unjudged")  # PR 18
+              "tier-flat", "cos-orders-unfed", "anyone-edits-cos-orders", "answer-unjudged",  # PR 18
+              "no-sent-time", "deliver-stale-alert", "keep-old-digest")  # #1402
 
 
 VALID = {
