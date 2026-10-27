@@ -14734,7 +14734,7 @@ class GhAccounts:
 
     # -- reads: counted, conditional (ETag) and paused while the account is rate limited
 
-    def read(self, runner, path, repo, timeout, paginate=False, **run_kwargs):
+    def read(self, runner, path, repo, timeout, paginate=False, extra_flags=(), **run_kwargs):
         """One `gh api <path>` GET with the repo's account. Returns a CompletedProcess like the runner's, its stdout the BODY only:
 
           - a read GitHub answered `304 Not Modified` to (we send the ETag we hold) is answered from memory and costs nothing against the limit;
@@ -14755,20 +14755,22 @@ class GhAccounts:
             if until is not None:
                 raise GhRateLimited(account, until)
             cached = None if paginate else self.etags.get((account, path))
-        use_head = self.conditional and not paginate
-        flags = ["--paginate"] if paginate else (["-i"] + (["-H", "If-None-Match: " + cached[0]] if cached else []) if use_head else [])
+        use_head = self.conditional and not paginate and not extra_flags   # a raw read of a file is not conditional
+        flags = list(extra_flags) if extra_flags else ["--paginate"] if paginate else (["-i"] + (["-H", "If-None-Match: " + cached[0]] if cached else []) if use_head else [])
         argv = [self.config["gh"], "api"] + flags + [path]   # the path stays last
         env = self.env_for(repo) if repo else None
         if env is not None:
             run_kwargs["env"] = env
-        done = runner(argv, capture_output=True, text=True, timeout=timeout, **run_kwargs)
+        done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
         status, headers, body = _split_http(done.stdout) if use_head else (None, {}, done.stdout)
         with self.lock:
             self.calls.append((now, account, _endpoint_of(path), status == 304))
             while self.calls and self.calls[0][0] < now - 600:
                 self.calls.popleft()
         if status is None:
-            if done.returncode != 0 and _says_rate_limited(done.stderr, done.stdout):   # a plain read: no header block, but gh says it in words
+            # With text=False (a raw read) use_head is false, so the 304 and '' branches below are unreachable for it: only this branch answers it.
+            # stdout and stderr are BYTES then; _says_rate_limited searches with a str pattern, so decode both for the check (done itself stays bytes).
+            if done.returncode != 0 and _says_rate_limited(*[t.decode("utf-8", "replace") if isinstance(t, (bytes, bytearray)) else t for t in (done.stderr, done.stdout)]):   # a plain read: no header block, but gh says it in words
                 self._pause(account, now + GH_LIMIT_DEFAULT_PAUSE, 0)
             return done
         if status == 304 and cached is not None:
@@ -15091,6 +15093,44 @@ class IntentReader:
             return json.loads(result.stdout)
         except ValueError:
             raise IntentError("gh", "gh returned non-JSON: %s" % _one_line(result.stdout, 120)) from None
+
+    def _api_raw_text(self, path, repo=None, max_bytes=None):
+        """The body of `gh api -H 'Accept: application/vnd.github.raw' <path>` as text: the contents endpoint serves a file of up to 100 MB this way (the JSON
+        form carries none over 1 MB). Same account, exclusion, count and timeout as `_api`; one gh call. Raises IntentError."""
+        config = self.config if self.config is not None else getattr(self.accounts, "config", None)
+        if config is not None and load_module("repo_exclusion").is_excluded(config, repo or self.repo):
+            raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))
+        flags = ["-H", "Accept: application/vnd.github.raw"]
+        env = self.env_for(repo)
+        extra = {"env": env} if env is not None else {}
+        try:
+            if self.accounts is not None and repo:
+                result = self.accounts.read(self.runner, path, repo, self.timeout, extra_flags=flags, stdin=subprocess.DEVNULL, text=False)
+            else:
+                result = self.runner([self.gh, "api"] + flags + [path], capture_output=True, text=False, timeout=self.timeout, stdin=subprocess.DEVNULL, **extra)
+        except GhRateLimited as err:
+            raise IntentError("unavailable", str(err)) from None
+        except AccountError as err:
+            raise IntentError("gh", str(err)) from None
+        except subprocess.TimeoutExpired:
+            raise IntentError("unavailable", "gh did not answer within %ss" % self.timeout) from None
+        except OSError as err:
+            raise IntentError("unavailable", "cannot run %s: %s" % (self.gh, err.strerror or err)) from None
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr
+            detail = _one_line(stderr) or "exit %d" % result.returncode
+            if self.accounts is not None:
+                detail = self.accounts.scrub(detail)
+            raise IntentError("not_found" if re.search(r"\b404\b|Not Found", detail) else "gh", detail)
+        out = result.stdout
+        if not isinstance(out, bytes):   # a runner that answered text: count its bytes as encoded
+            out = str(out or "").encode("utf-8")
+        if max_bytes is not None and len(out) > max_bytes:
+            raise IntentError("too_big", "the body is over %d bytes" % max_bytes)
+        try:
+            return out.decode("utf-8")
+        except UnicodeError:
+            raise IntentError("not_text", "the body is not UTF-8 text") from None
 
     def _api_bytes(self, path, repo=None, limit=None):
         """The raw bytes `gh api <path>` prints (an archive), through the same account and exclusion rule as `_api`. `limit` bounds the bytes kept."""
@@ -17120,6 +17160,9 @@ def gate_impact_rating(state_dir, pr, head):
         return {"problem": _one_line("%s: %s" % (type(err).__name__, err), 100)}
 
 
+FILE_TEXT_MAX_BYTES = 5 * 1024 * 1024   # the largest registrar file read whole
+
+
 def _file_text_at(engine, repo, path, ref):
     """The text of `path` at `ref`: the string, "" is a real empty file, or None when the path does not exist there (a 404). Raises IntentError for any
     other failure (the caller says unreadable and holds)."""
@@ -17132,8 +17175,27 @@ def _file_text_at(engine, repo, path, ref):
         if err.reason == "not_found":
             return None
         raise
+    unreadable = IntentError("gh", "%s is not a readable file at %s" % (path, str(ref)[:8]))
+    if isinstance(data, dict) and data.get("type") in (None, "file") and (data.get("encoding") == "none" or (data.get("content") == "" and (data.get("size") or 0) > 0)):
+        # the JSON contents answer carries no content over 1 MB: read it raw (bounded, one cached read for each (repo, path, ref))
+        size = data.get("size")
+        if not isinstance(size, int) or size > FILE_TEXT_MAX_BYTES:
+            raise unreadable
+        cache = reader.__dict__.setdefault("_raw_files", {})
+        key = (repo, path, str(ref))
+        if key not in cache:
+            try:
+                text = reader._api_raw_text("repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path, safe="/"), ref), repo, max_bytes=FILE_TEXT_MAX_BYTES)
+            except IntentError as err:
+                if err.reason == "not_text":
+                    raise IntentError("gh", "%s is not text at %s" % (path, str(ref)[:8])) from None
+                raise unreadable from None
+            if len(cache) >= 8:
+                cache.pop(next(iter(cache)))
+            cache[key] = text
+        return cache[key]
     if not isinstance(data, dict) or data.get("type") not in (None, "file") or data.get("encoding") != "base64" or not isinstance(data.get("content"), str):
-        raise IntentError("gh", "%s is not a readable file at %s" % (path, str(ref)[:8]))
+        raise unreadable
     try:
         return base64.b64decode(data["content"]).decode("utf-8")
     except (ValueError, UnicodeError):

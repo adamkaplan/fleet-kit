@@ -86547,6 +86547,143 @@ class TestScanDriftGuard(unittest.TestCase):
             self.assertTrue(self.compare(ns["nesting_too_deep"], b), old)
 
 
+class TestBigRegistrarFile(unittest.TestCase):
+    """#964 S23: the daemon file is over 1 MB, so the JSON contents API serves no content (encoding "none"); the floor reads it through the raw media type and still holds a registrar change and still fails closed."""
+
+    BASE, HEAD = "a" * 40, "b" * 40
+
+    def setUp(self):
+        self.dc = sb.load_module("delegated_clear")
+        self.matrix = sb.impact_floor.load_matrix()
+        self.rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.src = (BIN / "fleet-switchboard").read_text()
+        self.calls, self.raw_fails = [], False
+
+    def engine(self, heads):
+        def runner(argv, **kw):
+            self.calls.append(list(argv))
+            path = argv[-1]
+            ref = path.rsplit("ref=", 1)[1]
+            if "Accept: application/vnd.github.raw" in argv:
+                if self.raw_fails:
+                    return subprocess.CompletedProcess(argv, 1, "", "HTTP 500")
+                return subprocess.CompletedProcess(argv, 0, heads[ref], "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"type": "file", "encoding": "none", "content": "", "size": 1589963}), "")
+        reader = sb.IntentReader("gh", "acme/app", runner=runner)
+        return types.SimpleNamespace(intents=reader)
+
+    def states(self, head_src, **kw):
+        engine = self.engine({self.BASE: self.src, self.HEAD: head_src})
+        return sb.registrar_states(engine, "acme/app", self.matrix, ["bin/fleet-switchboard"], self.BASE, self.HEAD)
+
+    def test_an_ordinary_edit_of_the_big_file_is_not_held_and_costs_four_calls(self):
+        got = self.states(self.src + "\n\ndef helper_zzz():\n    return 1\n")
+        self.assertIsNone(got["why"], got)
+        self.assertEqual(got["findings"], [])
+        self.assertEqual(len(self.calls), 4, "a JSON read and a raw read for the base and for the head")
+
+    def test_a_registrar_change_in_the_big_file_is_held(self):
+        got = self.states(self.src + "\n\ndef add_zzz_parsers(sub):\n    import os\n    os.system('x')\n")
+        self.assertIsNone(got["why"], got)
+        self.assertTrue(got["findings"], got)
+
+    def test_a_read_that_really_fails_still_holds_with_the_same_reason(self):
+        self.raw_fails = True
+        got = self.states(self.src)
+        self.assertIn("bin/fleet-switchboard is not a readable file at aaaaaaaa", got["why"])
+
+    def test_a_file_over_the_ceiling_is_refused_unread(self):
+        reader = sb.IntentReader("gh", "acme/app", runner=lambda argv, **kw: self.calls.append(argv) or subprocess.CompletedProcess(argv, 0, json.dumps({"type": "file", "encoding": "none", "content": "", "size": 6 * 1024 * 1024}), ""))
+        with self.assertRaises(sb.IntentError) as raised:
+            sb._file_text_at(types.SimpleNamespace(intents=reader), "acme/app", "bin/x", self.BASE)
+        self.assertIn("is not a readable file at aaaaaaaa", str(raised.exception))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_one_raw_read_for_each_path_and_ref(self):
+        engine = self.engine({self.BASE: self.src, self.HEAD: self.src})
+        for _ in range(3):
+            sb._file_text_at(engine, "acme/app", "bin/fleet-switchboard", self.BASE)
+        self.assertEqual(sum(1 for c in self.calls if "-H" in c), 1)
+
+    def test_a_mutant_that_reads_only_the_json_contents_fails_these_tests(self):
+        with mock.patch.object(sb.IntentReader, "_api_raw_text", side_effect=sb.IntentError("gh", "mutant: no raw read")):
+            got = self.states(self.src)
+        self.assertIsNotNone(got["why"], "with the raw read gone the big file is unreadable (the defect the tests above catch)")
+
+    def test_a_big_file_that_is_not_utf8_holds_with_the_unreadable_text_for_both_callers(self):
+        """A mutant that does not convert the decode error lets UnicodeDecodeError escape agent_block_states: this test fails it."""
+        engine = self.engine({self.BASE: "x", self.HEAD: "x"})
+        bad = b"\xff\xfe" + b"a" * 100
+        orig = engine.intents.runner
+        def runner(argv, **kw):
+            if "Accept: application/vnd.github.raw" in argv:
+                return subprocess.CompletedProcess(argv, 0, bad, "")
+            return orig(argv, **kw)
+        engine.intents.runner = runner
+        got = sb.registrar_states(engine, "acme/app", self.matrix, ["bin/fleet-switchboard"], self.BASE, self.HEAD)
+        self.assertIn("is not text at aaaaaaaa", got["why"])
+        states = sb.agent_block_states(engine, "acme/app", self.matrix, ["agents/x.md"], self.BASE, self.HEAD)
+        self.assertEqual(states.get("agents/x.md"), "unreadable", states)
+
+    def test_a_size_zero_file_makes_no_raw_call(self):
+        """A mutant that goes raw for size 0 makes a second call: this test fails it."""
+        reader = sb.IntentReader("gh", "acme/app", runner=lambda argv, **kw: self.calls.append(argv) or subprocess.CompletedProcess(argv, 0, json.dumps({"type": "file", "encoding": "base64", "content": "", "size": 0}), ""))
+        self.assertEqual(sb._file_text_at(types.SimpleNamespace(intents=reader), "acme/app", "bin/x", self.BASE), "")
+        self.assertEqual(len(self.calls), 1, "one JSON read and no raw read")
+
+    def test_a_raw_read_through_the_accounts_path_is_counted_and_not_conditional(self):
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {}}, lambda *a, **k: None, lambda: 1.0, environ={})
+        accounts.conditional = True
+        seen = []
+        def runner(argv, **kw):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "raw body", "")
+        done = accounts.read(runner, "repos/acme/app/contents/x?ref=" + self.BASE, "acme/app", 5, extra_flags=["-H", "Accept: application/vnd.github.raw"])
+        self.assertEqual(done.stdout, "raw body")
+        self.assertEqual(seen, [["gh", "api", "-H", "Accept: application/vnd.github.raw", "repos/acme/app/contents/x?ref=" + self.BASE]])
+        self.assertEqual(len(accounts.calls), 1, "the read is counted")
+
+    def _failed_raw_read(self, stderr):
+        """A raw read through accounts.read whose runner is honest: it must be asked for text=False and answers BYTES."""
+        now = [1000.0]
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {}}, lambda *a, **k: None, lambda: now[0], environ={})
+        asked = []
+        def runner(argv, **kw):
+            asked.append(kw.get("text"))
+            return subprocess.CompletedProcess(argv, 1, b"", stderr)
+        reader = sb.IntentReader("gh", "acme/app", runner=runner, accounts=accounts)
+        with self.assertRaises(sb.IntentError) as raised:
+            reader._api_raw_text("repos/acme/app/contents/x?ref=" + self.BASE, repo="acme/app")
+        self.assertEqual(asked, [False], "the runner was asked for bytes")
+        return raised.exception, accounts
+
+    def test_a_failed_raw_read_with_bytes_stderr_is_an_intent_error_not_a_type_error(self):
+        """A mutant that drops the decode before _says_rate_limited raises TypeError (bytes with a str pattern): these three tests fail it."""
+        err, accounts = self._failed_raw_read(b"gh: Not Found (HTTP 404)")
+        self.assertIn("404", str(err))
+        self.assertEqual(accounts.paused, {})
+
+    def test_a_failed_raw_read_that_says_rate_limit_in_bytes_pauses_the_account(self):
+        err, accounts = self._failed_raw_read(b"gh: API rate limit exceeded for user ID 1 (HTTP 403)")
+        self.assertIn("rate limit", str(err))
+        self.assertTrue(accounts.paused, "the pause is recorded")
+
+    def test_a_failed_raw_read_with_non_utf8_stderr_is_an_intent_error(self):
+        err, accounts = self._failed_raw_read(b"gh: bad \xff\xfe bytes (HTTP 500)")
+        self.assertIn("500", str(err))
+        self.assertEqual(accounts.paused, {})
+
+    def test_the_ceiling_counts_bytes_not_characters(self):
+        """3 MiB of a 2-byte character is 3 Mi characters but 6 MiB: over the ceiling. A mutant that counts characters fails this test."""
+        body = ("\u00e9" * (3 * 1024 * 1024)).encode("utf-8")
+        engine = self.engine({self.BASE: ""})
+        orig = engine.intents.runner
+        engine.intents.runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, body, "") if "Accept: application/vnd.github.raw" in argv else orig(argv, **kw)
+        with self.assertRaises(sb.IntentError) as raised:
+            sb._file_text_at(engine, "acme/app", "bin/fleet-switchboard", self.BASE)
+        self.assertIn("is not a readable file at aaaaaaaa", str(raised.exception))
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
