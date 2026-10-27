@@ -610,4 +610,6 @@ class TestRefusalMutants(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    result = unittest.main(exit=False).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)
