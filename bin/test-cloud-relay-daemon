@@ -946,9 +946,9 @@ class HubReadAndTransport(unittest.TestCase):
         self.assertGreater(self._threads_hanging(mod), 2)
 
     # Cause of the failure on a loaded runner (ask #1406): the scenario once set the product's wall-clock
-    # deadline READ_DEADLINE to 0.4 seconds for the whole run, so the plain request ran under the shortened
-    # deadline and a slow loopback GET was cut with a timeout. The product default of 30 seconds is unchanged;
-    # now only the post that must be cut runs under 0.4 seconds.
+    # deadline READ_DEADLINE to 0.4 seconds for the whole run, so
+    # the plain request ran under the shortened deadline and a slow loopback GET was cut with a timeout.
+    # The product default of 30 seconds is unchanged; now only the post that must be cut runs under 0.4 seconds.
     def _late_post_scenario(self, mod):
         import json
         import threading
@@ -1474,11 +1474,35 @@ class TestLatePostNoWallClock(unittest.TestCase):
     def test_no_fixed_sleep_remains_in_the_scenario(self):
         self.assertEqual(self.scenario_source().count("time.sleep" + "("), 0)
 
-    def test_the_comment_names_the_cause(self):
-        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
-        self.assertIn("the plain request ran under the shortened deadline", text)
-        self.assertIn("30 seconds", text)
+    @staticmethod
+    def comment_block_above_scenario(text):
+        lines = text.split("\n")
+        at = [i for i, l in enumerate(lines) if l.lstrip().startswith("def _late_post_scenario")]
+        if not at:
+            return ""
+        block, i = [], at[0] - 1
+        while i >= 0 and lines[i].lstrip().startswith("#"):
+            block.insert(0, lines[i])
+            i -= 1
+        return "\n".join(block)
 
+    def comment_names_the_cause(self, text):
+        block = self.comment_block_above_scenario(text)
+        return ("the plain request ran under the shortened deadline" in block) and ("30 seconds" in block)
+
+    def own_text(self):
+        return open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
+
+    def test_the_comment_names_the_cause(self):
+        self.assertTrue(self.comment_names_the_cause(self.own_text()))
+
+    def test_the_comment_check_is_not_vacuous(self):
+        text = self.own_text()
+        block = self.comment_block_above_scenario(text)
+        self.assertNotEqual(block, "")
+        scratch = text.replace(block + "\n", "")
+        self.assertNotEqual(scratch, text)   # the mutation applied
+        self.assertFalse(self.comment_names_the_cause(scratch))
 
 if __name__ == "__main__":
     result = unittest.main(exit=False).result
