@@ -763,6 +763,7 @@
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
         "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
+        "bin/launch_brief_check.py": "loaded only by `launch_brief_mismatch`, the launch-time reader of the brief (#1350), which the clear cannot reach",
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
