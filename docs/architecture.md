@@ -133,6 +133,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `cloud_worker.py` | `-` | size | 2,000 | grew past the limit in a merged change; to be split |
+| `delegated_clear.py` | `-` | size | 1,800 | the registrar lint lives with the clear it protects; a follow-up slice moves it to its own part and lowers the ceiling |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/alert_labels.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -215,6 +216,19 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cpu_guard.py` | `slots_text:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cpu_guard.py` | `slots_text:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `cpu_guard.py` | `slots_text:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `delegated_clear.py` | `<module>:__builtins__(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `<module>:__import__(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `<module>:builtins(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `<module>:compile(string)` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `<module>:eval(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `<module>:exec(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `<module>:import_module(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `_literal_compile:compile(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `_registrar_unit.unsafe:builtins` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `_registrar_unit:__builtins__(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `_registrar_unit:__import__(string)` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `_registrar_unit:builtins` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `delegated_clear.py` | `_registrar_unit:import_module(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
 | `external_adapter.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `external_adapter.py` | `_load_core:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
