@@ -401,11 +401,12 @@ def declared_clauses(text):
     """[clause text] from the plan's own `clauses:` block (a fenced yaml block, `DW-<n>: text` lines numbered from 1), or
     None when the plan has none. A Done-when written as one sentence with several clauses cannot be split reliably, so the
     plan declares them and `verify_declared` checks they say what the ask says. Raises PlanFormatError."""
-    found = []
-    for _, inner in fenced_blocks(text):
+    found, starts = [], []
+    for start, inner in fenced_blocks(text):
         first = next((l for l in inner if l.strip() and not l.lstrip().startswith("#")), None)
         if first is not None and first.strip() == "clauses:":
             found.append(inner)
+            starts.append(start)
     if not found:
         return None
     if len(found) > 1:
@@ -426,7 +427,8 @@ def declared_clauses(text):
         if found_key and (key_indent is None or indent == key_indent):
             key_indent = indent if key_indent is None else key_indent
             if int(found_key.group(1)) != len(out) + 1:
-                raise PlanFormatError("clauses line %d: DW-%s is out of order: number the clauses 1, 2, 3 ..." % (number, found_key.group(1)))
+                raise PlanFormatError("clauses line %d (plan line %d): DW-%s is out of order, expected DW-%d: %r: number the clauses 1, 2, 3 ..."
+                                      % (number, starts[0] + number, found_key.group(1), len(out) + 1, " ".join((found_key.group(2) or "").split())[:80]))
             out.append(_scalar(_strip_comment(found_key.group(2) or ""), "clauses line %d" % number))
         elif key_indent is not None and indent > key_indent and out:
             out[-1] = (out[-1] + " " + _strip_comment(body)).strip()   # a continuation line
