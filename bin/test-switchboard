@@ -7257,10 +7257,11 @@ class TestMeasuredDelivery(Base):
         self.assertEqual(removed, ["ses_throwaway"])
         self.assertTrue(all(title.startswith(helper.TITLE_PREFIX) for title in created))   # named so it is never mistaken for a fleet agent
 
-    @unittest.skipUnless(os.environ.get("FLEET_KIT_LIVE_DELIVERY_MEASURE") == "1", "live: set FLEET_KIT_LIVE_DELIVERY_MEASURE=1 (needs opencode v2 on this machine)")
+    @unittest.skipUnless(os.access(os.environ.get("FLEET_KIT_LIVE_DELIVERY_MEASURE", ""), os.X_OK), "live: set FLEET_KIT_LIVE_DELIVERY_MEASURE to the path of an opencode v2 binary (it runs in a throwaway profile)")
     def test_live_the_measurement_runs_in_a_throwaway_profile_and_leaves_nothing(self):
         helper = importlib.import_module("support.delivery_measure")
-        result = helper.measure(shutil.which("opencode"))
+        with mock.patch.dict(os.environ, {sb.ALLOW_REAL_V2_ENV: "1"}):   # this one test means to run the real binary, inside the helper's own throwaway profile; restored after
+            result = helper.measure(os.environ["FLEET_KIT_LIVE_DELIVERY_MEASURE"])
         self.assertEqual(result["problems"], [])
         self.assertEqual(len(result["rows"]), len(helper.CASES) * len(helper.FORMS))
         self.assertEqual(result["sessions_left"], 0)
