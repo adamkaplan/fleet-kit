@@ -8240,27 +8240,34 @@ def pr_body_refs(body):
     return out[:10]
 
 
-CLOSING_WORD_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?[ \t]+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(\d{1,7})(?![0-9])")
+CLOSING_REF = r"(?:https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d{1,7}|(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\d{1,7})(?![0-9])"
+CLOSING_WORD_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?[ \t]+(" + CLOSING_REF + r"(?:[ \t]*(?:,|&|and)[ \t]*" + CLOSING_REF + ")*)")
+CLOSING_ONE_RE = re.compile(r"(?:https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/|([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#)(\d{1,7})")
 
 
 def closing_keyword_issues(body):
-    """[[repo or None, number]] each issue a pull request body would close on merge: a closing keyword and a number, outside fenced code and inline code, in order, without repeats."""
+    """[[repo or None, number]] each issue a pull request body would close on merge: a closing keyword and a number (or a list of them, or an issue URL), outside fenced code, inline code, quoted lines (`>`) and HTML comments, in order, without repeats."""
+    text = re.sub(r"<!--.*?(?:-->|\Z)", " ", body if isinstance(body, str) else "", flags=re.S)
     kept, fence = [], None
-    for line in (body if isinstance(body, str) else "").splitlines():
+    for line in text.splitlines():
         mark = re.match(r"[ \t]{0,3}(`{3,}|~{3,})", line)
         if fence is None and mark:
             fence = mark.group(1)
         elif fence is not None:
             if mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence):
                 fence = None
-        else:
+        elif not line.lstrip().startswith(">"):
             kept.append(re.sub(r"`[^`]*`", " ", line))
     out = []
     for match in CLOSING_WORD_RE.finditer("\n".join(kept)):
-        ref = [match.group(1), int(match.group(2))]
-        if ref not in out:
-            out.append(ref)
+        for one in CLOSING_ONE_RE.finditer(match.group(1)):
+            ref = [one.group(1) or one.group(2), int(one.group(3))]
+            if ref not in out:
+                out.append(ref)
     return out
+
+
+PREFLIGHT_GH_TIMEOUT = 20   # seconds: a hung gh must not delay preflight-pr; a timeout is quiet
 
 
 def closing_warnings(body, repo, is_ask):
@@ -8273,10 +8280,10 @@ def closing_warnings(body, repo, is_ask):
 def issue_is_ask(runner, repo, number):
     """True when the issue has a parent that is not a charter, read with ONE gh call. Any read error or odd answer is False (quiet)."""
     try:
-        done = runner(["gh", "api", "repos/%s/issues/%d/parent" % (repo, number)], capture_output=True, text=True)
+        done = runner(["gh", "api", "repos/%s/issues/%d/parent" % (repo, number)], capture_output=True, text=True, timeout=PREFLIGHT_GH_TIMEOUT)
         if done.returncode != 0:
             return False
-        data = json.loads(done.stdout)
+        data = load_module("record_json").parse_bounded(done.stdout)
         return isinstance(data, dict) and isinstance(data.get("number"), int) and not IssueIntent.from_api(data).charter
     except Exception:
         return False
@@ -8285,10 +8292,10 @@ def issue_is_ask(runner, repo, number):
 def preflight_body_warnings(runner):
     """The warning lines for the body of this branch's pull request; [] on any read error."""
     try:
-        done = runner(["gh", "pr", "view", "--json", "body,url"], capture_output=True, text=True)
+        done = runner(["gh", "pr", "view", "--json", "body,url"], capture_output=True, text=True, timeout=PREFLIGHT_GH_TIMEOUT)
         if done.returncode != 0:
             return []
-        data = json.loads(done.stdout)
+        data = load_module("record_json").parse_bounded(done.stdout)
         match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/", str(data.get("url")))
         if not match:
             return []

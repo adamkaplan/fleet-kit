@@ -85019,7 +85019,7 @@ class TestDeployFromMainSentence(unittest.TestCase):
 class TestClosingKeywordWarning(unittest.TestCase):
     """#1197: `preflight-pr` warns, never blocks, when the body closes an ask. The REAL `cmd_preflight_pr` runs with a faked runner.
     CLOSED rule (guard): the warning path makes only reads: every `gh` call it builds is `gh pr view` or `gh api` (no write verb).
-    Known limits: a work item with a live check and no parent is not an ask here; a keyword in a quote or comment counts; the set of reads is read from the syntax tree of the two helpers only."""
+    Known limits: a work item with a live check and no parent is not an ask here; a plain work item under an ordinary parent counts as an ask; the set of reads is read from the syntax tree of the two helpers only."""
     URL = "https://github.com/o/r/pull/9"
 
     def run_body(self, body, asks=(), unreadable=False):
@@ -85068,6 +85068,42 @@ class TestClosingKeywordWarning(unittest.TestCase):
     def test_a_keyword_inside_code_is_silent(self):
         body = "```\nCloses #5\n```\nand `Fixes #5` here\n~~~sh\nResolves #5\n~~~"
         self.assertEqual(self.run_body(body, asks=(5,)), (0, []))
+
+    def test_a_quoted_line_and_an_html_comment_are_silent_but_a_keyword_outside_both_warns(self):
+        self.assertEqual(self.run_body("> Closes #5", asks=(5,)), (0, []))
+        self.assertEqual(self.run_body("  > quoted\n>Fixes #5", asks=(5,)), (0, []))
+        self.assertEqual(self.run_body("<!-- Closes #5 -->", asks=(5,)), (0, []))
+        self.assertEqual(self.run_body("<!--\nCloses #5\n-->", asks=(5,)), (0, []))
+        self.assertEqual(self.run_body("<!-- never closed\nCloses #5", asks=(5,)), (0, []))
+        code, warned = self.run_body("> Closes #6\n<!-- Closes #7 -->\nCloses #5", asks=(5, 6, 7))
+        self.assertEqual((code, len(warned), "#5" in warned[0]), (0, 1, True))
+
+    def test_mutant_without_the_quote_and_comment_strip_fails_the_silent_cases(self):
+        real = sb.closing_keyword_issues
+        with mock.patch.object(sb, "closing_keyword_issues", lambda body: real(str(body).replace("<!--", "").replace("-->", "").replace(">", ""))):
+            with self.assertRaises(AssertionError):
+                self.test_a_quoted_line_and_an_html_comment_are_silent_but_a_keyword_outside_both_warns()
+
+    def test_a_list_of_numbers_and_an_issue_url_warn_for_each(self):
+        code, warned = self.run_body("Closes #5, #6 and #7", asks=(5, 6, 7))
+        self.assertEqual([[n in w for n in ("#5", "#6", "#7")] for w in warned], [[True, False, False], [False, True, False], [False, False, True]])
+        code, warned = self.run_body("Closes https://github.com/o/r/issues/5", asks=(5,))
+        self.assertEqual((code, len(warned), "o/r#5" in warned[0]), (0, 1, True))
+        code, warned = self.run_body("Fixes https://github.com/x/y/issues/5, o2/p#6", asks=(5, 6))
+        self.assertEqual([("x/y#5" in warned[0]), ("o2/p#6" in warned[1])], [True, True])
+
+    def test_a_hung_or_slow_gh_is_quiet_and_every_call_has_a_timeout(self):
+        seen = []
+
+        def runner(argv, **kwargs):
+            seen.append((argv[:2], kwargs.get("timeout")))
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        self.assertFalse(sb.issue_is_ask(runner, "o/r", 5))
+        self.assertEqual(sb.preflight_body_warnings(runner), [])
+        self.assertEqual(len(seen), 2)
+        for argv, timeout in seen:
+            self.assertIsInstance(timeout, (int, float), argv)
+            self.assertGreater(timeout, 0)
 
     def test_an_unreadable_body_is_silent(self):
         self.assertEqual(self.run_body("Closes #5", asks=(5,), unreadable=True), (0, []))
@@ -94095,7 +94131,6 @@ fleet-switchboard:github_calls_status
 fleet-switchboard:github_status
 fleet-switchboard:handle
 fleet-switchboard:health_watched_repos
-fleet-switchboard:issue_is_ask
 fleet-switchboard:janitor_agent_roots
 fleet-switchboard:job_read
 fleet-switchboard:json
@@ -94103,7 +94138,6 @@ fleet-switchboard:lab_facts
 fleet-switchboard:launch_memory_check
 fleet-switchboard:load_config
 fleet-switchboard:pane_exit_audit_tail
-fleet-switchboard:preflight_body_warnings
 fleet-switchboard:pr_state_read
 fleet-switchboard:pull_state
 fleet-switchboard:read_decisions_file
