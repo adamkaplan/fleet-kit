@@ -1147,9 +1147,13 @@ class HerdrClient:
 
     def _call(self, *args):
         argv = [self.binary, *args]
+        extra = {}
+        kept = self.socket_path or os.environ.get(KEPT_SOCKET_ENV)
+        if kept and not os.environ.get("HERDR_SOCKET_PATH"):
+            extra["env"] = {**os.environ, "HERDR_SOCKET_PATH": kept}   # #1066: the daemon's own env holds none; the CLI must still find the custom socket
         try:
             result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
-                                 stdin=subprocess.DEVNULL)
+                                 stdin=subprocess.DEVNULL, **extra)
         except subprocess.TimeoutExpired:
             raise HerdrError("timeout", "herdr did not answer within %ss" % self.timeout) from None
         except OSError as err:

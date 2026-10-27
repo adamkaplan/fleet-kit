@@ -526,6 +526,15 @@ class TestHerdrClient(Base):
                 self.assertEqual(runner.argv, ["/opt/herdr"] + tail)
                 self.assertEqual(runner.kwargs["stdin"], subprocess.DEVNULL)
 
+    def test_S19_the_cli_call_carries_the_kept_socket_and_the_service_env_stays_clean(self):
+        client, runner = self.client()
+        with mock.patch.dict(os.environ, {sb.KEPT_SOCKET_ENV: "/x/custom.sock"}):
+            os.environ.pop("HERDR_SOCKET_PATH", None)
+            client.agent_list()
+            service = sb.daemon_environment(dict(os.environ))
+        self.assertEqual(runner.kwargs["env"]["HERDR_SOCKET_PATH"], "/x/custom.sock")
+        self.assertEqual([n for n in service if n.startswith("HERDR_")], [])
+
     def test_the_strict_fake_refuses_the_old_argv_shapes(self):
         world = World(self, agents=("platform",))
         pane = world.panes["platform"]
