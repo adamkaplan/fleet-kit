@@ -67031,9 +67031,9 @@ class TestPlanReviewCore(unittest.TestCase):
         self.assertEqual(plan_review.path_hits(["./shims/gh", "shims/x/y", "docs/shims.md", "plugins/fleet-hooks/a/b.js"], self.HELD),
                          ["./shims/gh", "plugins/fleet-hooks/a/b.js", "shims/x/y"])
         self.assertEqual(plan_review.path_hits(["bin/plan_ledger.pyc", "bin/x/plan_ledger.py"], self.HELD), [])
-        dots = [".github/workflows/ci.yml", ".env", ".opencode/agents/x.md", "./.env", "/.github/a", "github/workflows/x", "docs/.env.md"]
+        dots = [".github/workflows/ci.yml", ".env", "agents/x.md", "./.env", "/.github/a", "github/workflows/x", "docs/.env.md"]
         self.assertEqual(plan_review.path_hits(dots, [".github/**", ".env", ".opencode/**"]),
-                         sorted(["./.env", "/.github/a", ".env", ".github/workflows/ci.yml", ".opencode/agents/x.md"]))
+                         sorted(["./.env", "/.github/a", ".env", ".github/workflows/ci.yml", "agents/x.md"]))
         self.assertEqual(plan_review.path_hits(["a/.github/x", ".hidden"], ["**/.github/**", ".hidden"]), [".hidden", "a/.github/x"])
         self.assertNotIn("areas", inspect.signature(plan_review.compute_tier).parameters, "no parameter for the planner's prose")
 
@@ -85985,6 +85985,21 @@ class TestBigRegistrarFile(unittest.TestCase):
         with mock.patch.object(sb.IntentReader, "_api_raw_text", side_effect=sb.IntentError("gh", "mutant: no raw read")):
             got = self.states(self.src)
         self.assertIsNotNone(got["why"], "with the raw read gone the big file is unreadable (the defect the tests above catch)")
+
+    def test_a_big_file_that_is_not_utf8_holds_with_the_unreadable_text_for_both_callers(self):
+        """A mutant that does not convert the decode error lets UnicodeDecodeError escape agent_block_states: this test fails it."""
+        engine = self.engine({self.BASE: "x", self.HEAD: "x"})
+        bad = b"\xff\xfe" + b"a" * 100
+        orig = engine.intents.runner
+        def runner(argv, **kw):
+            if "Accept: application/vnd.github.raw" in argv:
+                return subprocess.CompletedProcess(argv, 0, bad, "")
+            return orig(argv, **kw)
+        engine.intents.runner = runner
+        got = sb.registrar_states(engine, "acme/app", self.matrix, ["bin/fleet-switchboard"], self.BASE, self.HEAD)
+        self.assertIn("is not text at aaaaaaaa", got["why"])
+        states = sb.agent_block_states(engine, "acme/app", self.matrix, ["agents/x.md"], self.BASE, self.HEAD)
+        self.assertEqual(states.get("agents/x.md"), "unreadable", states)
 
 
 if __name__ == "__main__":

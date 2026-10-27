@@ -15011,7 +15011,12 @@ class IntentReader:
                 detail = self.accounts.scrub(detail)
             raise IntentError("not_found" if re.search(r"\b404\b|Not Found", detail) else "gh", detail)
         out = result.stdout
-        return out.decode("utf-8") if isinstance(out, bytes) else str(out or "")
+        if not isinstance(out, bytes):
+            return str(out or "")
+        try:
+            return out.decode("utf-8")
+        except UnicodeError:
+            raise IntentError("not_text", "the body is not UTF-8 text") from None
 
     def _api_bytes(self, path, repo=None, limit=None):
         """The raw bytes `gh api <path>` prints (an archive), through the same account and exclusion rule as `_api`. `limit` bounds the bytes kept."""
@@ -17067,7 +17072,9 @@ def _file_text_at(engine, repo, path, ref):
         if key not in cache:
             try:
                 text = reader._api_raw_text("repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path, safe="/"), ref), repo)
-            except IntentError:
+            except IntentError as err:
+                if err.reason == "not_text":
+                    raise IntentError("gh", "%s is not text at %s" % (path, str(ref)[:8])) from None
                 raise unreadable from None
             if len(text) > FILE_TEXT_MAX_BYTES:
                 raise unreadable
