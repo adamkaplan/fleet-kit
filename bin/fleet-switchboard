@@ -20142,7 +20142,7 @@ def cmd_review_checkout(args, runner, now):
     rc = load_module("review_checkout")
     try:
         if args.remove:
-            if args.pr or args.head:
+            if args.pr or args.head or args.sparse:
                 raise ReviewError("--remove takes only the directory")
             try:
                 removed = rc.remove(args.remove, os.getcwd())
@@ -20178,13 +20178,17 @@ def cmd_review_checkout(args, runner, now):
             except impact_floor.MatrixError as err:
                 matrix_text = None
                 sys.stderr.write("%s: review checkout: the impact matrix cannot be read, so impact-matrix.txt is not written to the checkout: %s\n" % (PROG, _one_line(str(err), 160)))
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            sparse_result = {}
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
         except (rc.Unsafe, rc.Problem) as err:
             raise ReviewError("refused, nothing left behind: %s" % err) from None
         print(path)
+        if args.sparse:
+            print("sparse checkout: %d files written, %d files of the head tree not written; directories cut at %d files: %d (see %s)" % (
+                sparse_result["written"], sparse_result["not_written"], rc.SPARSE_DIR_FILES, len(sparse_result["cut"]), rc.SPARSE_FILE))
         return EXIT_OK
     except (ReviewError, ConfigError, IdentityUncertain, CallerError) as err:
         sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 400)))
@@ -20367,6 +20371,7 @@ def add_review_parsers(sub):
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
     checkout.add_argument("--head", help="The commit to materialise (default: the PR's head, read once at the start)")
+    checkout.add_argument("--sparse", action="store_true", help="For a repository over the 5000-file limit: write only the files the PR changes and the other files directly in their directories (at most 200 per directory); every limit and rule is unchanged, and the result says it is sparse")
     checkout.add_argument("--remove", metavar="DIR", help="Remove a directory this command made (restores the permissions it set; anything else is refused)")
     measure = rsub.add_parser("measure", help="Read-only: per merged PR, time to green CI, review rounds, findings, escaped defects; baseline and after medians")
     measure.add_argument("repo", help="owner/repo")
