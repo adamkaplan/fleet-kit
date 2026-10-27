@@ -69069,8 +69069,10 @@ class TestCloudLoad(Base):
         import re as _re
         source = SWITCHBOARD.read_text()
         body = _re.search(r"def live_cloud_by_lane.*?\n\n\n", source, _re.S).group(0)
-        self.assertIn(old, body)
+        helper = _re.search(r"def cloud_record_live.*?\n\n\n", source, _re.S).group(0)   # #1066: the shared liveness helper holds the liveness lines
+        self.assertIn(old, body + helper)
         scope = dict(vars(sb))
+        exec(helper.replace(old, new), scope)
         exec(body.replace(old, new), scope)
         return scope["live_cloud_by_lane"]
 
