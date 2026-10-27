@@ -15,6 +15,7 @@ cloud/launcher/tests/test_cloud_shapes.py
 cloud/launcher/tests/test_cloud_stack.py
 cloud/launcher/tests/test_cloud_stack_wait.py
 cloud/launcher/tests/test_cloud_status_summary.py
+cloud/launcher/tests/test_cloud_tests_write_tmp.py
 cloud/launcher/tests/test_cloud_worker.py
 cloud/launcher/tests/test_cluster_token_refresh.py
 cloud/launcher/tests/test_cw_minter_manifest.py
@@ -33,6 +34,7 @@ cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
 cloud/launcher/tests/test_stub_cleanup.py
 cloud/launcher/tests/test_token_read_at_call.py
+cloud/launcher/tests/test_untracked_report.py
 cloud/launcher/tests/test_vault_check_pins.py
 cloud/worker/tests/test_cloud_prepush.py
 cloud/worker/tests/test_cloud_prepush_hardening.py

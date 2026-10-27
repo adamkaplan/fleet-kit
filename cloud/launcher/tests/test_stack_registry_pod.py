@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,8 +29,11 @@ class S2Shape(unittest.TestCase):
     def test_equals_the_fixture_and_is_clean(self):   # S2
         got = json.dumps({"stack_registry": build_reg()}, indent=2, sort_keys=True) + "\n"
         if os.environ.get("CW_WRITE_STACK_FIXTURE"):
-            with open(FIXTURE, "w") as f:
+            # ask #1289: a test never writes under the repository root; the regenerated copy goes to the temporary directory, to be copied by hand
+            regenerated = os.path.join(tempfile.gettempdir(), os.path.basename(FIXTURE))
+            with open(regenerated, "w") as f:
                 f.write(got)
+            self.skipTest("regenerated fixture written to %s: copy it over %s and run again" % (regenerated, FIXTURE))
         with open(FIXTURE) as f:
             self.assertEqual(got, f.read())
         self.assertEqual(cw.forbidden_pod_fields(build_reg()), [])
