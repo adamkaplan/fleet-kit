@@ -67031,9 +67031,9 @@ class TestPlanReviewCore(unittest.TestCase):
         self.assertEqual(plan_review.path_hits(["./shims/gh", "shims/x/y", "docs/shims.md", "plugins/fleet-hooks/a/b.js"], self.HELD),
                          ["./shims/gh", "plugins/fleet-hooks/a/b.js", "shims/x/y"])
         self.assertEqual(plan_review.path_hits(["bin/plan_ledger.pyc", "bin/x/plan_ledger.py"], self.HELD), [])
-        dots = [".github/workflows/ci.yml", ".env", "agents/x.md", "./.env", "/.github/a", "github/workflows/x", "docs/.env.md"]
+        dots = [".github/workflows/ci.yml", ".env", ".opencode/agents/x.md", "./.env", "/.github/a", "github/workflows/x", "docs/.env.md"]
         self.assertEqual(plan_review.path_hits(dots, [".github/**", ".env", ".opencode/**"]),
-                         sorted(["./.env", "/.github/a", ".env", ".github/workflows/ci.yml", "agents/x.md"]))
+                         sorted(["./.env", "/.github/a", ".env", ".github/workflows/ci.yml", ".opencode/agents/x.md"]))
         self.assertEqual(plan_review.path_hits(["a/.github/x", ".hidden"], ["**/.github/**", ".hidden"]), [".hidden", "a/.github/x"])
         self.assertNotIn("areas", inspect.signature(plan_review.compute_tier).parameters, "no parameter for the planner's prose")
 
