@@ -403,6 +403,7 @@
         "bin/disk_janitor.py",
         "bin/fleet_health.py",
         "bin/heavy_slots.py",
+        "bin/hold_queue.py",
         "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
@@ -474,6 +475,9 @@
         ],
         "bin/heavy_slots.py": [
           "settings"
+        ],
+        "bin/hold_queue.py": [
+          "*"
         ],
         "bin/item_verdicts.py": [
           "registrations",
