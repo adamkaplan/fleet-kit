@@ -3753,6 +3753,56 @@ def wait_for_poke(sock, timeout):
     return bool(ready)
 
 
+# #1380: the installed tree is the default branch, clean (bin/installed_guard.py). A command refuses on a bad tree (main); the daemon stops its
+# work, alerts by a standalone script, and resumes by itself when the tree is good. Nothing here changes the tree.
+INSTALLED_TREE_ALERT_ENV = "FLEET_SWITCHBOARD_ALERT_NOTIFIER"   # a program that shows the desktop notification (tests); default: the platform's own
+
+
+def installed_tree_refusal(action, state_dir=None, root=None, runner=subprocess.run):
+    """The one line a command is refused with when the installed tree is not the default branch, clean; else None. Only a tree `install` recorded is judged."""
+    state = Path(state_dir) if state_dir is not None else state_dir_path()
+    if not (state / "installed-tree.json").is_file():
+        return None   # a worktree, a CI checkout or a tree install never recorded: nothing to judge
+    try:
+        return load_module("installed_guard").entry_refusal(action, state, KIT_ROOT if root is None else root, runner)
+    except Exception as err:   # the guard itself is broken: the tree cannot be trusted, and the commands that move it still run
+        return None if action in ("install", "upgrade", "doctor") else "%s: refused: the installed-tree guard could not run (%s)" % (PROG, _one_line(str(err), 160))
+
+
+def installed_tree_problem(state_dir, root=None, runner=subprocess.run):
+    """What is wrong with the installed tree, one line, or None (good, or not recorded). The daemon calls this on every pass."""
+    refused = installed_tree_refusal("run", state_dir, root, runner)
+    return refused[len(PROG) + 2:] if refused and refused.startswith(PROG + ": ") else refused
+
+
+def installed_tree_alert(state_dir, line, now, herdr=None, runner=subprocess.run):
+    """Run the standalone alert script (the copy in the state directory, which needs nothing from the tree); it alerts at once the first time and
+    again only after a day. Returns what the script printed, or None when it could not run."""
+    script = Path(state_dir) / "guard" / "guard_alert.py"
+    if not script.is_file():
+        script = Path(__file__).resolve().parent / "guard_alert.py"
+    argv = [sys.executable, str(script), "--state", str(state_dir), "--text", line, "--cos", COS_NAME, "--now", repr(float(now()))]
+    found = shutil.which(herdr) if herdr else None
+    if found:
+        argv += ["--herdr", os.path.abspath(found)]
+    if os.environ.get(INSTALLED_TREE_ALERT_ENV):
+        argv += ["--notifier", os.environ[INSTALLED_TREE_ALERT_ENV]]
+    try:
+        done = runner(argv, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        return done.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def installed_tree_clear(state_dir, runner=subprocess.run):
+    script = Path(state_dir) / "guard" / "guard_alert.py"
+    if (Path(state_dir) / "installed-tree-alert.json").is_file() and script.is_file():
+        try:
+            runner([sys.executable, str(script), "--state", str(state_dir), "--text", "", "--clear"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 DAEMON_RECORD = "daemon.json"  # what the running daemon says about itself: its pid, and where its key came from
 
 
@@ -3784,8 +3834,14 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                 if watch is not None and on_reload is not None and watch.check() == "reload":
                     on_reload(watch)  # does not return when the daemon re-executes itself
                 try:
-                    engine.run_pass()
-                    load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
+                    bad = installed_tree_problem(state_dir)   # #1380: at the start and on every pass
+                    if bad is None:
+                        installed_tree_clear(state_dir)
+                        engine.run_pass()
+                        load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
+                    else:   # no verdict, merge or message is decided or delivered; only this re-check goes on
+                        engine._note("installed_tree.stopped", None, {"problem": bad})
+                        installed_tree_alert(state_dir, bad, engine.now, getattr(getattr(engine, "herdr", None), "binary", None))
                 except Exception as err:
                     engine._failed(None, "pass", err, {"errors": []})
                 done += 1
@@ -23307,6 +23363,10 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
         sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
         return EXIT_ERROR
+    refused = installed_tree_refusal(getattr(args, "action", None))   # #1380: before anything else runs, and for every command but the ones that move the tree
+    if refused:
+        sys.stderr.write(refused + "\n")
+        return EXIT_ERROR
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
 
 
@@ -24945,6 +25005,16 @@ class Installer:
             return "stale"
         return "other"
 
+    def step_installed_tree(self):
+        """#1380: record which tree is the installed one, copy the two standalone guard scripts out of it and write the hooks that record a move of its HEAD."""
+        try:
+            steps = load_module("installed_guard").install(self.kit_root, ensure_state_dir() if not self.dry else state_dir_path(), self.kit_root / "bin",
+                                                           sys.executable, dry_run=self.dry, run=self.runner)
+        except (OSError, subprocess.SubprocessError) as err:
+            return self.say("installed tree", "skipped (%s)" % _one_line(str(err), 120))
+        for step, status, detail in steps:
+            self.say(step, ("would be " + status) if self.dry and status == "done" else status, detail)
+
     def step_cli_link(self):
         target = self.cli_target()
         candidates = self.cli_candidates()
@@ -25227,6 +25297,7 @@ class Installer:
         else:
             self.say("herdr plugin", "skipped (--no-herdr-link)")
         self.step_cli_link()
+        self.step_installed_tree()
         if not with_service:
             self.say("service", "skipped (--no-service)")
         elif self.kind is None:

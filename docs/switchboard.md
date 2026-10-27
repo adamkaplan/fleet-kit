@@ -5913,7 +5913,7 @@ Its ask stays open, with a comment naming the batch pull request. Its live-check
 
 1. A change is planned and reviewed as usual, and its pull request is opened into `integration` (`gh pr create --base integration`); CI runs on it. A top-tier change is held for the owner and cleared on its own pull request (`impact clear <repo#N> --reason ...`).
 2. After the independent review passes at the head and the gates read `gates <repo#N>`, the change merges into `integration` (`gh pr merge <N>`) unless a batch is out of draft (ready); then it waits.
-3. After every direct merge to the default branch: `git fetch origin`, `git checkout integration`, `git merge origin/<default>` (never a rebase), push.
+3. After every direct merge to the default branch, in a worktree or a clone of your own that is not the installed tree (see "The installed tree is the default branch, clean"): `git fetch origin`, `git checkout integration`, `git merge origin/<default>` (never a rebase), push.
 4. At the day's hour the Chief of Staff's lane opens the batch pull request (`gh pr create --base <default> --head integration --draft`), with the body template below, one row per change.
 5. It re-syncs (step 3), refreshes the table, runs the independent review of the batch at its head, then marks it ready (`gh pr ready <N>`, and a title that says `ready for the owner's clear`) and tells the owner (`fleet-switchboard notice pr <repo#N>`).
 6. The owner clears at the exact head and the batch merges. The lane merges the default branch into `integration` (step 3), and the owning orchestrators close the asks that were carried.
@@ -6172,3 +6172,27 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## The installed tree is the default branch, clean (#1380)
+
+The tree the fleet's commands and the daemon run from (the checkout `fleet-switchboard install` was run from) must be the default branch, clean, so no command, verdict or merge gate is computed by code from an unmerged branch.
+
+### What happened (26 to 27 Oct)
+
+- The installed checkout left the default branch at 19:09Z, when a scratch loop of an orchestrator ran a checkout of the integration branch with that tree as its working directory.
+- It was then fast-forwarded to the integration branch three times (21:37Z, 23:06Z, 03:43Z) by a `git merge origin/integration` run from another session whose working directory was that tree. The commands ran integration code for about nine hours.
+- It was found by a floor verdict that no installed code could give.
+- Who can run git there: every session whose working directory is the tree (an orchestrator or the Chief of Staff started in it), and the person.
+- Which step could do it: no code of `bin/`, `cloud/`, `shims/` or `plugins/` runs a checkout, a switch, a merge or a pull of a branch (`review checkout` writes a tree elsewhere). The candidate was the sync step of the batching steps above ("After every direct merge..."), which names `git checkout integration` and `git merge origin/<default>` without saying where: run with the installed tree as the working directory it does exactly this. The step now says it is done in a worktree or a clone that is not the installed tree, and a test (`TestAdviceNamesAWorktree`) holds every such line of `docs/`, `skills/` and `agents/` to that.
+
+### What the guard allows
+
+The installed tree is allowed when it is on the default branch, at a commit that is an ancestor of (or equal to) the remote default branch (`origin/<default>`), and has no uncommitted change to a tracked file (an untracked file is not judged). A detached head is allowed only at such an ancestor. When `origin/<default>` is not fetched yet (a fresh clone), a clean tree on the default branch is allowed with the one-line note "ancestry unverified". The guard reads only (`git status`, `git rev-parse`, `git merge-base`: at most three calls, no fetch, no network, no write).
+
+It judges only the tree `install` recorded (`installed-tree.json` in the state directory): a worktree, a CI checkout or a test tree is never refused. Every command refuses with one line naming the branch, the commit and the dirty paths, with exit status 1, before it does anything else. The commands the operator moves the tree with are exempt: `install`, `upgrade` and `doctor`.
+
+The daemon checks at its start and on every pass. On a bad tree it stays alive but decides and delivers nothing (no verdict, merge or message), re-checks on each pass and resumes by itself when the tree is good. The first alert goes at once, a repeat after a day, through a standalone script the install copied into the state directory (`guard/guard_alert.py`, standard library only, nothing from the tree): an audit line, a herdr toast addressed to the Chief of Staff, a desktop notification for the person on every alert, and a line in `installed-tree-alerts.txt`.
+
+### How the operator moves the tree
+
+Save your work, put the tree back on the default branch and fast-forward it to `origin/<default>` yourself in a terminal of your own (no agent does this), and run `fleet-switchboard install` again: it records the tree and its default branch, copies the two guard scripts and writes the `post-checkout` and `post-merge` hooks in the tree's `.git/hooks` (a hook that is not ours is left alone). Each hook appends one `installed_tree.head_moved` line to the audit with the old and new commit and the chain of ancestor processes (pid, parent pid, command line), so the next move names who made it.
