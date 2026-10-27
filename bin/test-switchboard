@@ -20839,7 +20839,7 @@ class TestHandoff(HandoffCase):
         # (#1123) plus ONE site in `_review_api`, the shared helper of `review post` and `review dismiss`: their writes (a review, a dismissal) are deliberate and the only ones added;
         # the reader code (IntentReader, checked above, and checkout/measure) stays read-only
         self.assertEqual(source.count('"--method"'), 4)
-        self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 3)   # post (twice: the verdict and the fallback) and the dismissal: each goes through the helper
+        self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 2)   # the post (the verdict and its own-account fallback share one call site, the event is a variable) and the dismissal: each goes through the helper
 
 
 class TestForegroundScenarios(Base):
@@ -66347,7 +66347,8 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.posted, self.issue_comments, self.dismissed = [], [], []
         self.reviews, self.inline, self.files, self.refuse_own = [], {}, {}, False
         self.reads, self.fail_read, self.raw_ok = [], None, None
-        self.pr = dict(self.pr, headRefOid=self.HEAD, reviewDecision="")
+        self.poster, self.fail_user = "poster", False   # the account the fake token belongs to
+        self.pr = dict(self.pr, headRefOid=self.HEAD, reviewDecision="", author={"login": "someone-else"})
         self.audit_path = self.world.audit_path
         self.audit_path.write_text("")
 
@@ -66362,6 +66363,8 @@ class TestReviewPostAndDismiss(LedgerBase):
                 self.issue_comments.append(sent)
                 return done(0, {})
             if path.endswith("/pulls/9/reviews"):
+                if not path.startswith("repos/acme/app/"):
+                    return done(1, {}, "gh: Not Found (HTTP 404)")   # the fake checks the repo it is asked about
                 if self.refuse_own and sent["event"] != "COMMENT":
                     return done(1, {}, "gh: Unprocessable Entity: Can not approve your own pull request (HTTP 422)")
                 self.posted.append(sent)
@@ -66379,7 +66382,11 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.reads.append(path)
         paged = re.search(r"\?per_page=100&page=(\d+)$", path)
         page = (int(paged.group(1)) - 1) * 100 if paged else 0
+        if path == "user":
+            return done(1, {}, "gh: boom (HTTP 500)") if self.fail_user else done(0, {"login": self.poster})
         if re.search(r"/pulls/9/reviews\?per_page=100&page=\d+$", path):
+            if not path.startswith("repos/acme/app/"):
+                return done(1, {}, "gh: Not Found (HTTP 404)")   # the fake checks the repo it is asked about
             return done(*self.fail_read) if self.fail_read and self.fail_read[2] == "reviews" else done(0, self.reviews[page:page + 100])
         found = re.search(r"/pulls/9/reviews/(\d+)(/comments)?", path)
         if found:
@@ -66497,18 +66504,77 @@ class TestReviewPostAndDismiss(LedgerBase):
         code, out, err = self.dismiss(77, "the key is %s" % self.SECRETS[0])
         self.assertNotIn(self.SECRETS[0], out + err)
 
-    def test_on_the_same_accounts_own_pull_request_it_falls_back_to_a_comment_type_review_and_says_so(self):
-        for verdict in ("approve", "request-changes"):
-            with self.subTest(verdict=verdict):
-                self.reset()
-                self.refuse_own = True
+    # -- the own-account case, the second review at one head, and the refusal text (#1344)
+
+    def own(self):
+        self.pr["author"] = {"login": self.poster}
+
+    def check_own_account(self):
+        self.reset()
+        for verdict, (word, event) in sb.REVIEW_POST_VERDICTS.items():
+            for mine in (True, False):
+                self.posted.clear()
+                self.reviews.clear()
+                self.pr["author"] = {"login": self.poster if mine else "someone-else"}
                 code, out, err = self.post(verdict=verdict)
                 self.assertEqual(code, 0, err)
                 self.assertEqual(len(self.posted), 1)
-                self.assertEqual(self.posted[0]["event"], "COMMENT")   # U5: the Reviews API's comment event
-                self.assertEqual(self.issue_comments, [])
-                self.assertIn("comment-type review", out)
-                self.assertTrue(self.posted[0]["body"].endswith(sb.fleet_mark("rdr1")))
+                sent = self.posted[0]
+                self.assertEqual(sent["event"], "COMMENT" if mine else event, (verdict, mine))
+                self.assertEqual(sent["body"].splitlines()[0], "Review of %s: %s" % (self.HEAD, word))
+                self.assertEqual("posted as a comment" in out, mine and event != "COMMENT", out)
+
+    def check_refusal_reason(self):
+        self.reset()
+        self.refuse_own, self.fail_user = True, True   # the author cannot be read: GitHub's refusal is all there is
+        code, out, err = self.post()
+        self.assertEqual((code, self.posted), (2, []))
+        self.assertIn("can not approve your own pull request", err.lower())
+        self.assertIn("post with `--verdict comment`", err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+
+    def check_one_review_per_head(self):
+        self.reset()
+        self.reviews.append({"id": 321, "user": {"login": "shared"}, "state": "COMMENTED", "commit_id": self.HEAD,
+                             "body": "Review of %s: COMMENT\n\nx\n\n%s" % (self.HEAD, sb.fleet_mark("rdr1"))})
+        code, out, err = self.post()
+        self.assertEqual((code, self.posted), (2, []))
+        self.assertIn("321", err)
+        code, out, err = self.run_as("rdr1", "review", "post", self.PR, "--head", self.HEAD, "--verdict", "approve", "--body-file", self.body_file(), "--again")
+        self.assertEqual((code, len(self.posted)), (0, 1), err)
+
+    def test_the_own_account_case_is_posted_as_a_comment_review_for_every_verdict_form(self):
+        self.check_own_account()
+
+    def test_the_refusal_prints_githubs_reason_as_one_line_and_the_next_step(self):
+        self.check_refusal_reason()
+
+    def test_a_second_review_at_one_head_needs_again_and_the_refusal_names_the_earlier_one(self):
+        self.check_one_review_per_head()
+
+    def test_a_review_at_another_head_or_by_another_reader_is_not_a_second_review(self):
+        self.reset()
+        self.reviews.append({"id": 5, "user": {"login": "shared"}, "state": "COMMENTED", "commit_id": self.OLD, "body": "x\n\n" + sb.fleet_mark("rdr1")})
+        self.reviews.append({"id": 6, "user": {"login": "shared"}, "state": "COMMENTED", "commit_id": self.HEAD, "body": "x\n\n" + sb.fleet_mark("rdr2")})
+        self.assertEqual(self.post()[0], 0)
+
+    def test_the_new_reads_are_never_cached_and_name_the_repo(self):
+        self.reset()
+        self.post()
+        self.assertIn("user", self.reads)
+        self.assertTrue(any(r.startswith("repos/acme/app/pulls/9/reviews?") for r in self.reads), self.reads)
+
+    def test_the_mutant_that_drops_the_reason_fails(self):
+        self.mutant_fails(self.check_refusal_reason, review_refusal_text=lambda why, head, word: "GitHub refused (nothing was posted)")
+
+    def test_the_mutant_that_posts_the_own_account_case_as_approve_fails(self):
+        self.mutant_fails(self.check_own_account, review_is_own_account=lambda author, mine: False)
+
+    def test_the_mutant_that_accepts_a_second_review_at_one_head_fails(self):
+        self.mutant_fails(self.check_one_review_per_head, review_earlier=lambda listed, head, name: None)
+
+    def test_the_mutant_that_ignores_again_fails(self):
+        self.mutant_fails(self.check_one_review_per_head, review_again=lambda args: False)
 
     def test_the_caller_must_be_a_registered_reader_or_reviewer_and_is_named_by_its_registered_name(self):
         self.reset()
