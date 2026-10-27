@@ -2,7 +2,12 @@
 """cw-end-hook: runs inside the pod before anything is deleted (contract section 5).
 
 Commits uncommitted work to a WIP commit (secret-looking files left out and reported), pushes HEAD to
-<worker>/wip when it is on no remote branch, and prints one JSON line: {pushed, wip_branch, skipped, error}.
+<worker>/wip when it is on no remote branch, and prints one JSON line: {pushed, wip_branch, skipped, untracked, untracked_more, error}.
+Cause of the untracked keys (ask #1289): the status list is staged whole (every untracked file but the secret-looking ones), and the
+line before that change names only the skipped secret-looking paths, so a stray untracked file (a test's leftover, a scratch file) was saved to the
+wip branch without a word. `untracked` now lists the untracked paths that were saved (sorted, at most MAX_UNTRACKED, never content);
+`untracked_more` counts the rest. A pod cannot know a declared set of files, so the line names all untracked paths saved; a
+secret-looking path is never listed there, only under `skipped`.
 A push failure prints `error` and exits 1, so the launcher keeps the pod.
 """
 import fnmatch
@@ -148,10 +153,22 @@ def config_refusal(workdir, repo, ctx):
             raise ConfigRefused(shown)
 
 
+MAX_UNTRACKED = 10
+
+
+def untracked_report(status_entries):
+    """The untracked (`??`) paths among the status entries that the save stages (secret-looking ones are not), sorted: the first
+    MAX_UNTRACKED and the count of the rest. Names only, never content. Taken from the same list that decides the save."""
+    names = sorted(e[3:] for e in status_entries if e.startswith("?? ") and not is_secret(e[3:]))
+    return {"untracked": names[:MAX_UNTRACKED], "untracked_more": max(0, len(names) - MAX_UNTRACKED)}
+
+
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
     url = HOST_URL + "%s.git" % repo if prestop else None
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout
-    paths = [e[3:] for e in status.split("\0") if len(e) > 3]
+    entries = [e for e in status.split("\0") if len(e) > 3]
+    paths = [e[3:] for e in entries]
+    extra = untracked_report(entries)
     skipped = sorted(p for p in paths if is_secret(p))
     if paths:
         keep = [p for p in paths if not is_secret(p)]
@@ -167,14 +184,14 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
         git(workdir, "fetch", "--prune", "origin")
     contained = git(workdir, "branch", "-r", "--contains", "HEAD", ctx=ctx).stdout.strip()
     if contained:
-        return {"pushed": False, "wip_branch": None, "skipped": skipped}
+        return {"pushed": False, "wip_branch": None, "skipped": skipped, **extra}
     branch = "%s/wip" % worker
     # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
         git(workdir, "push", "--no-verify", url, "HEAD:refs/heads/" + branch, ctx=ctx)
     else:
         git(workdir, "push", "--force-with-lease", "origin", "HEAD:refs/heads/" + branch)
-    return {"pushed": True, "wip_branch": branch, "skipped": skipped}
+    return {"pushed": True, "wip_branch": branch, "skipped": skipped, **extra}
 
 
 MAX_NAMES = 50
@@ -253,7 +270,8 @@ def prestop_main():
         trusted = True
         res = run(workdir, worker, prestop=True, repo=repo, ctx=ctx)
         if res["pushed"]:
-            print("cw-prestop: saved work to %s" % res["wip_branch"])
+            print("cw-prestop: saved work to %s; %s" % (res["wip_branch"], json.dumps(
+                {"untracked": res["untracked"], "untracked_more": res["untracked_more"]})))
         return 0
     except OriginElsewhere:
         return report(workdir, "origin points elsewhere", ctx)
