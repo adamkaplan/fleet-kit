@@ -277,7 +277,7 @@ def measure(binary, wait=8):
             "sessions_created": len(run.created), "sessions_removed": len(run.removed), "sessions_left": left, "problems": problems}
 
 
-def main(argv=None):
+def run_measurement(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", help="write the result JSON here")
     parser.add_argument("--wait", type=int, default=8, help="seconds to wait for a turn to start")
@@ -292,4 +292,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_measurement())
