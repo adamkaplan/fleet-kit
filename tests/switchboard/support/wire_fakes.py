@@ -724,7 +724,7 @@ class FakeV2:
         if s["turn"] is not None and self.measured is not None and not self.measured[("working", self.form_of(body["delivery"], body["resume"]))]:
             return copy.deepcopy(record)   # measured: this form never reaches the model of a working session (admitted, never delivered)
         s["inbox"].append(item)
-        if s["turn"] is None and body["resume"]:
+        if s["turn"] is None and self.starts_turn(s, body["delivery"], body["resume"]):
             self._start(s, at, self.wake_lasts, 1, items=[item])
         return copy.deepcopy(record)
 

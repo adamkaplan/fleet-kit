@@ -15035,12 +15035,12 @@ class CharterRig:
         self.cmd_reads = []
         def cmd_parent(reader, number, repo=None, **kw):
             self.cmd_reads.append(("parent", number, repo))
-            if not repo:   # #1275: the fake honours the repo argument (a call without it fails)
+            if repo != self.expected_repo():   # #1275, #1345: the fake takes and CHECKS the repo it is asked about (a call without it, or for another repo, fails)
                 raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return self.cmd_parents[number]
         def cmd_issue(reader, number, repo=None):
             self.cmd_reads.append(("issue", number, repo))
-            if not repo:
+            if repo != self.expected_repo():
                 raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
         real_invalidate = sb.IntentReader.invalidate
