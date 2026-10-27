@@ -60,6 +60,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `agent_reconcile.py` | 2 | what a view does with an agent that has no live data | |
 | `endpoint_liveness.py` | 2 | the liveness of an agent row that has no pane to judge (on demand only) | |
 | `health_records.py` | 2 | health recorders: what the daemon has already read, turned into records | |
+| `hold_queue.py` | 2 | the queue of messages sent to a pane on hold, kept in order and bounded until the hold ends | |
 | `pr_events.py` | 2 | `pr-state` read from the forwarder's webhook events | |
 | `pr_reading.py` | 2 | the one reading of a pull request that `merge-gate` and the clear packet share | |
 | `registry.py` | 2 | the one agent registry (interface frozen in `docs/agent-registry.md`) | |

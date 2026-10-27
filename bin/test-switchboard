@@ -2759,11 +2759,11 @@ class TestEngineCLI(Base):
         os.environ[sb.LAB_ENV] = "1"
         self.assertEqual(self.main("send", "platform", "--from", "coder", "hi")[0], 0)
 
-    def test_a_held_send_says_why_and_sends_nothing(self):
+    def test_a_held_send_is_queued_and_a_gone_agent_is_refused(self):
         self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
         code, out, err = self.main("send", "platform", "--from", "coder", "hi")
-        self.assertEqual((code, out), (sb.EXIT_HELD, ""))
-        self.assertIn("blocked", err)
+        self.assertEqual(code, 0, err)   # a message to a held pane is queued (see TestHoldQueue): nothing is written to the pane yet
+        self.assertIn("queued (the pane is on hold)", err)
         self.assertEqual(self.world.v2.writes, [])
         self.assertEqual(self.main("send", "nobody", "--from", "coder", "hi")[0], sb.EXIT_HELD)
 
@@ -87476,6 +87476,206 @@ class TestBigRegistrarFile(unittest.TestCase):
         with self.assertRaises(sb.IntentError) as raised:
             sb._file_text_at(engine, "acme/app", "bin/fleet-switchboard", self.BASE)
         self.assertIn("is not a readable file at aaaaaaaa", str(raised.exception))
+
+
+
+class TestHoldQueue(Base):
+    """A message sent to a pane on hold is queued in the recipient's own queue and delivered, in the order sent and once, when the hold ends."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ[sb.LAB_ENV] = "1"
+        self.pane = self.world.herdr.panes[self.world.panes["platform"]]
+
+    def main(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def send(self, text, to="platform"):
+        return self.main("send", to, "--from", "coder", text)
+
+    def queued(self, to="platform"):
+        return sb.load_module("hold_queue").waiting(self.world.state, to)
+
+    def release(self, passes=1):
+        out = []
+        for _ in range(passes):
+            out.extend(self.world.engine.release_held(self.world.engine.discover(self.world.clock.now())))
+        return out
+
+    def texts(self):
+        return [a["text"] for a in self.world.admissions("platform")]
+
+    def test_a_message_to_a_blocked_pane_is_queued_and_the_sender_is_told(self):
+        self.pane["status"] = "blocked"
+        code, out, err = self.send("first")
+        self.assertEqual(code, 0, err)
+        self.assertIn("queued (the pane is on hold)", err)
+        self.assertEqual([i["text"] for i in self.queued()], ["first"])
+        self.assertEqual(self.world.v2.writes, [])
+
+    def test_a_gone_and_a_retired_recipient_are_refused_with_their_reason_and_nothing_is_queued(self):
+        code, _, err = self.send("hi", to="nobody")
+        self.assertEqual(code, sb.EXIT_HELD)
+        self.assertIn("not found", err)
+        self.pane["status"] = "blocked"
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"platform": {"session": self.world.sessions["platform"], "at": self.world.clock.now(), "by": "x", "reason": "done"}})
+        code, _, err = self.send("hi")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertEqual(self.queued("nobody") + self.queued("platform"), [])
+        self.assertEqual(sb.load_module("hold_queue").recipients(self.world.state), [])
+
+    def test_a_pane_claimed_by_two_sessions_is_refused_not_queued(self):
+        other = self.world.v2.create_session({"fleet": {"name": "platform", "role": "coder"}})
+        self.world.herdr.add(self.world.herdr.new_pane_id(), other)
+        code, _, err = self.send("hi")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertEqual(self.queued(), [])
+
+    def test_three_messages_are_delivered_in_the_order_sent_and_none_twice(self):
+        self.pane["status"] = "blocked"
+        for text in ("A", "B", "C"):
+            self.assertEqual(self.send(text)[0], 0)
+            self.world.tick(5)
+        self.assertEqual(self.release(), [])   # still held: nothing is delivered
+        self.pane["status"] = "idle"
+        delivered = self.release(passes=2)
+        self.assertEqual(len(delivered), 3)
+        sent = [t for t in self.texts()]
+        order = [l for text in sent for l in "ABC" if "send from coder: %s" % l in text or text.rstrip().endswith(": " + l)]
+        self.assertEqual(",".join(order), "A,B,C", sent)
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(self.queued(), [])
+
+    def test_the_order_is_the_sent_time_not_the_order_of_writing(self):
+        queue = sb.load_module("hold_queue")
+        now = self.world.clock.now()
+        for key, at, text in (("send:coder:k2", now - 10, "B"), ("send:coder:k1", now - 20, "A"), ("send:coder:k3", now - 5, "C")):
+            self.assertTrue(queue.enqueue(self.world.state, "platform", key, "coder", text, at)[0])
+        self.release()
+        self.assertEqual([k for a in self.world.admissions("platform") for k in a["keys"]], ["send:coder:k1", "send:coder:k2", "send:coder:k3"])
+
+    def test_only_a_message_older_than_a_day_carries_its_sent_time(self):
+        queue = sb.load_module("hold_queue")
+        now = self.world.clock.now()
+        queue.enqueue(self.world.state, "platform", "send:coder:old", "coder", "old one", now - 25 * 3600)
+        queue.enqueue(self.world.state, "platform", "send:coder:new", "coder", "new one", now - 3600)
+        self.release()
+        marked = [t for t in self.texts() if "sent 2026-" in t or "sent 20" in t]
+        self.assertEqual(len(marked), 1, self.texts())
+        self.assertIn("old one", marked[0])
+        self.assertRegex(marked[0], r"sent \d{4}-\d\d-\d\d \d\d:\d\dZ")
+
+    def test_a_queue_at_its_bound_refuses_the_next_and_keeps_every_earlier_one(self):
+        self.pane["status"] = "blocked"
+        queue = sb.load_module("hold_queue")
+        with mock.patch.object(queue, "MAX_MESSAGES", 2):
+            self.assertEqual(self.send("one")[0], 0)
+            self.assertEqual(self.send("two")[0], 0)
+            code, _, err = self.send("three")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("none is dropped", err)
+        self.assertEqual([i["text"] for i in self.queued()], ["one", "two"])
+
+    def test_a_message_over_the_size_cap_is_refused_and_nothing_is_queued(self):
+        self.pane["status"] = "blocked"
+        code, _, err = self.send("x" * 3001)
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertEqual(self.queued(), [])
+
+    def test_the_queue_file_is_private_and_a_held_report_is_still_refused(self):
+        self.pane["status"] = "blocked"
+        self.send("secret")
+        (path,) = [p for p in Path(self.world.state).glob("hold-queue-*.json")]
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        code, _, err = self.main("report", "done", "--from", "platform", "x")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len(self.queued("coder")), 0)
+
+    def test_an_idle_pane_still_receives_at_once_and_nothing_is_queued(self):
+        code, _, err = self.send("now")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(self.queued(), [])
+
+    def test_a_second_daemon_pass_after_the_release_delivers_nothing_more(self):
+        self.pane["status"] = "blocked"
+        self.send("A")
+        self.pane["status"] = "idle"
+        self.world.engine.run_pass()
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(self.queued(), [], "a delivered message leaves the queue: it is not offered again")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "hold.released"]), 1)
+
+    # -- the mutants: each is a copy of the daemon with one change, and the named test must fail on it
+
+    MUTANTS = {
+        "a held pane's message is dropped": ([("queue.enqueue(self.state_dir, fact.recipient, fact.key, fact.sender, fact.summary, now, fact.issue, fact.repo)", "(True, 1)")],
+                                             "test_a_message_to_a_blocked_pane_is_queued_and_the_sender_is_told"),
+        "delivery out of order": ([("for item in queue.waiting(self.state_dir, name):", "for item in reversed(queue.waiting(self.state_dir, name)):")],
+                                  "test_three_messages_are_delivered_in_the_order_sent_and_none_twice"),
+        "delivered twice": ([("                queue.done(self.state_dir, name, item[\"key\"])\n                out.append", "                out.append"),
+                             ("                    plan = self.plan(name, [fact], discovery, now)\n", "                    plan = decide(name, [fact], discovery.agents[name], now, 0, 0)\n")],
+                            "test_a_second_daemon_pass_after_the_release_delivers_nothing_more"),
+        "a gone pane accepted": ([("if self.state_dir is None or observation is None or observation.conflict or hold_reason(observation) is None:\n            return None", "if self.state_dir is None:\n            return None"),
+                                  ("fact.recipient, observation.session_id):", "fact.recipient, getattr(observation, \"session_id\", None)):"),
+                                  ("if queue_held and fact.kind == \"send\":", "if queue_held and fact.kind == \"send\" or True:")],
+                                 "test_a_gone_and_a_retired_recipient_are_refused_with_their_reason_and_nothing_is_queued"),
+    }
+
+    def test_every_mutant_is_killed_by_its_named_test(self):
+        text = SWITCHBOARD.read_text()
+        for name, (edits, test) in sorted(self.MUTANTS.items()):
+            with self.subTest(mutant=name):
+                mutant = text
+                for old, new in edits:
+                    self.assertEqual(mutant.count(old), 1, old)
+                    mutant = mutant.replace(old, new)
+                module = types.ModuleType("t_fleet_switchboard_holdq_mutant")
+                module.__file__ = str(SWITCHBOARD)
+                sys.modules[module.__name__] = module
+                self.addCleanup(sys.modules.pop, module.__name__, None)
+                exec(compile(mutant, str(SWITCHBOARD), "exec"), module.__dict__)
+                with mock.patch.dict(globals(), {"sb": module}), rebound("sb", module):
+                    result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestHoldQueue(test)]))
+                self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
+
+
+class TestHoldQueueIdleAfterProviderError(Base):
+    """An agent idle after a turn that ended on a provider error, with queued messages admitted at the end of its hold, is resumed once (#1337 covers it)."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={})
+        for name, fleet in (("cos", {"role": "chief-of-staff"}), ("coder", {"role": "coder", "reports_to": "cos"})):
+            self.world.add_agent(name, fleet=fleet)
+        self.pane = self.world.herdr.panes[self.world.panes["coder"]]
+        self.sid = self.world.sessions["coder"]
+        patch = mock.patch.object(self.world.v2, "_start")   # the turn that ended on the error starts nothing: as in the recorded case
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_it_is_resumed_once_with_one_audit_line_after_three_passes(self):
+        self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_err1", "type": "assistant", "error": {"type": "provider", "message": "HTTP 499 client closed request"}})
+        self.pane["status"] = "blocked"
+        queue = sb.load_module("hold_queue")
+        self.assertTrue(queue.enqueue(self.world.state, "coder", "send:cos:one", "cos", "please look", self.world.clock.now())[0])
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("coder")), 0, "held: nothing is delivered")
+        self.pane["status"] = "idle"   # the hold ends; the error left no turn to take the queued message
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.world.admissions("coder")), 1)
+        self.world.tick(16 * 60)
+        for _ in range(3):
+            self.world.engine.run_pass()
+        resumes = [a for a in self.world.admissions("coder") if a["text"] == sb.RESUME_TEXT]
+        self.assertEqual(len(resumes), 1)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "undelivered.resume"]), 1)
 
 
 if __name__ == "__main__":
