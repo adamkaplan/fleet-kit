@@ -14718,12 +14718,12 @@ class CharterRig:
         self.cmd_reads = []
         def cmd_parent(reader, number, repo=None, **kw):
             self.cmd_reads.append(("parent", number, repo))
-            if not repo:   # #1275: the fake honours the repo argument (a call without it fails)
+            if repo != self.REPO:   # #1275, #1345: the fake takes and CHECKS the repo it is asked about (a call without it, or for another repo, fails)
                 raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return self.cmd_parents[number]
         def cmd_issue(reader, number, repo=None):
             self.cmd_reads.append(("issue", number, repo))
-            if not repo:
+            if repo != self.REPO:
                 raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
         real_invalidate = sb.IntentReader.invalidate
@@ -15141,6 +15141,68 @@ class TestCharterSetGuard(CharterRig, Base):
         code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.cmd_reads, [("parent", 3, self.REPO), ("invalidate", 3, self.REPO), ("issue", 3, self.REPO)])
+
+    GUARD_MUTANTS = {   # #1345: the guard's two reads and its cache step, each changed once in the REAL source of cmd_charter: name -> (old text, new text)
+        "the parent read ignores the repo": ("engine.intents.parent(value, repo0, strict=True)", "engine.intents.parent(value, None, strict=True)"),
+        "the parent read asks another repo": ("engine.intents.parent(value, repo0, strict=True)", "engine.intents.parent(value, 'other-org/elsewhere', strict=True)"),
+        "the label read ignores the repo": ("record = engine.intents.issue(value, repo0)", "record = engine.intents.issue(value, None)"),
+        "the label read asks another repo": ("record = engine.intents.issue(value, repo0)", "record = engine.intents.issue(value, 'other-org/elsewhere')"),
+        "the label read is served from the cache": ("engine.intents.invalidate(value, repo0)", "pass"),
+        "the invalidation forgets another repo": ("engine.intents.invalidate(value, repo0)", "engine.intents.invalidate(value, 'other-org/elsewhere')"),
+    }
+
+    ROW_REPO = "acme-org/billing-service"
+
+    def mutated_charter(self, old, new):
+        source = textwrap.dedent(inspect.getsource(sb.cmd_charter))
+        self.assertEqual(source.count(old), 1, old)   # the mutant is one change of one place, and the place is still there
+        scope = dict(vars(sb))
+        exec(compile(source.replace(old, new), "<mutant of cmd_charter>", "exec"), scope)
+        scope["cmd_charter"].ensure_on_use = True
+        return scope["cmd_charter"]
+
+    def cached_label_set(self, mutant=None):
+        """One `charter set orch-b 3` through the REAL reader and its REAL cache, the label gone upstream but still CACHED (as an earlier read of the same engine leaves it): the real `parent` read seeds the
+        issue cache with the label the way an earlier read would. Returns (exit code, stderr). The unmutated guard forgets the cached label first, reads afresh and refuses."""
+        self.orchestrator("orch-b", registry=None)
+        self.registry.upsert(self.world.state, "orch-b", dict(self.row("orch-b"), charter=None, repo=self.ROW_REPO))   # the row's repo is NOT the reader's default: a read that drops the repo lands elsewhere
+        stale = {"number": 3, "labels": [{"name": sb.orchestrator_label()}]}
+        upstream = {"number": 3, "labels": [{"name": "bug"}]}
+        def api(reader, path, repo=None):
+            if repo != self.ROW_REPO:   # the fake takes and checks the repo it is asked about
+                raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
+            if path.endswith("/parent"):
+                raise self.NOPARENT
+            return upstream
+        def parent(reader, number, repo=None, **kw):
+            found = REAL_INTENT_PARENT(reader, number, repo, **kw)
+            seeded = sb.IssueIntent.from_api(stale)
+            seeded.repo = repo
+            reader._cache[("issue", repo, number)] = (reader.now(), seeded, None)   # the earlier read: cached, and a ttl long enough that it would be served
+            return found
+        patches = [mock.patch.object(sb.IntentReader, "issue", REAL_INTENT_ISSUE), mock.patch.object(sb.IntentReader, "parent", parent), mock.patch.object(sb.IntentReader, "_api", api)]
+        if mutant is not None:
+            patches.append(mock.patch.object(sb, "cmd_charter", mutant))
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        return code, err
+
+    def test_the_label_is_never_served_stale_from_the_cache(self):
+        code, err = self.cached_label_set()
+        self.assertEqual(code, 2, err)   # the label was removed after the cached read: the guard sees it gone
+        self.assertIn("is not a charter", err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+
+    def test_every_guard_mutant_is_refused_by_the_strict_fakes_or_the_cache_test(self):
+        """The 3 mutants the batch readers found alive (a read of the wrong repo, a read without the repo, a cached label) and their siblings: each is one change of the real source of cmd_charter and each must change the outcome."""
+        survivors = []
+        for name, (old, new) in sorted(self.GUARD_MUTANTS.items()):
+            code, err = self.cached_label_set(self.mutated_charter(old, new))
+            if (code, "is not a charter" in err) == (2, True):   # the unmutated guard's answer: a refusal for the missing label
+                survivors.append(name)
+        self.assertEqual(survivors, [])
 
     def test_changing_a_set_charter_needs_replace(self):
         self.orchestrator("orch-b", registry=3)
