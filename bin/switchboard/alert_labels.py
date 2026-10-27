@@ -194,8 +194,12 @@ def red_ci_tell(engine, state, key, repo, text, names, now, capped=True):
     return True
 
 
+def k_unowned(key):
+    return key.startswith("pr-unowned:")
+
+
 def red_ci_save(engine, state, now):
-    keep = {k: at for k, at in sorted(state.told.items(), key=lambda kv: kv[1])[-ALERT_MEMORY_MAX:]}
+    keep = {k: at for k, at in sorted(state.told.items(), key=lambda kv: (k_unowned(kv[0]), kv[1]))[-ALERT_MEMORY_MAX:]}   # #1378: run-keyed churn evicts first; an unowned alert of a live head is kept
     lines = {k: {n: v[0] for n, v in [(f.rsplit(":", 1)[1], state.facts[f]) for f in state.facts if f.startswith("red-ci:%s:" % k)]} for k in keep if now - keep[k] < RED_CI_KEEP}
     try:
         _write_small(engine.state_dir, RED_CI_FILE, {"told": keep, "branch": state.branch, "lines": lines})
@@ -218,8 +222,10 @@ def red_ci_latest(repo, runs):
     return [r for r in runs if not (isinstance(r, dict) and isinstance(r.get("id"), int)) or r["id"] in kept]
 
 
-def red_ci_runs(engine, repo, runs, now):
-    """Judge the workflow runs the catch-up read of `repo`. Never raises."""
+def red_ci_runs(engine, repo, runs, now, pr_read=None):
+    """Judge the workflow runs the catch-up read of `repo`. Never raises.
+    `pr_read(number)` is the pull request's PRESENT record ({"state", "merged", "head": {"sha"}}) or None; the unowned alert (#1378) is told only for an open pull request at the run's head,
+    and never when the record cannot be read."""
     try:
         if engine is None or engine.state_dir is None:
             return
@@ -231,6 +237,7 @@ def red_ci_runs(engine, repo, runs, now):
         agents = discovery.agents if discovery else {}
         newest = None
         runs = red_ci_latest(repo, runs)
+        present = {}
         current = {}   # pull request number -> (created_at, head) of its newest run: a red run at an older head is not told
         for run in runs:
             if isinstance(run, dict) and isinstance(run.get("head_sha"), str):
@@ -255,8 +262,21 @@ def red_ci_runs(engine, repo, runs, now):
                         continue   # the pull request moved on: only the current head is told
                     owner = pick_owner(agents, [number], repo)
                     if owner is None:
+                        ukey = module.unowned_key(repo, number, head, name)
+                        if ukey in state.told:
+                            continue
+                        if number not in present:
+                            try:
+                                present[number] = pr_read(number) if pr_read else None   # one read per pull request per pass
+                            except Exception:
+                                present[number] = None
+                        pr = present[number]
+                        sha = ((pr or {}).get("head") or {}).get("sha") if isinstance(pr, dict) else None
+                        if not (isinstance(pr, dict) and pr.get("state") == "open" and not pr.get("merged") and sha == head):
+                            engine._note("red_ci.unowned_skipped", repo, {"pr": number, "head": module.clean(head, 64)})
+                            continue   # closed, merged, moved on or unreadable: never told on a guess
                         engine._note("red_ci.unowned", repo, {"pr": number, "head": module.clean(head, 64)})
-                        changed |= red_ci_tell(engine, state, "pr-unowned:%s#%d:%s:%s:%s" % (repo, number, module.clean(head, 64).replace(":", "_"), run["id"], attempt), repo,
+                        changed |= red_ci_tell(engine, state, ukey, repo,
                                                module.unowned_line(repo, number, name, url, head), red_ci_receivers(engine, repo, True, False), now)
                         continue
                     if _is_orchestrator(agents[owner]):
