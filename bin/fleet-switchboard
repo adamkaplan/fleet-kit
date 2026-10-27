@@ -16219,12 +16219,25 @@ def _plan_usable(ctx):
         raise LedgerCommandError("the plan fails `plan check` (%d defect(s)): fix it first, nothing was recorded" % len(ctx.plan["defects"]))
 
 
+class EpicClaimed(LedgerCommandError):
+    """(#1383) A scenario claimed at the epic: the per-pull-request commands refuse it naming the epic command; an ask issue or a work item routes it to `epic_prove` / `epic_verdict`."""
+
+    def __init__(self, scenario, text):
+        super().__init__(text)
+        self.scenario = scenario
+
+
 def _scenario_of(ctx, sid):
     _plan_usable(ctx)
     found = next((x for x in ctx.plan["scenarios_parsed"] if x.get("id") == sid), None)
     if found is None:
         raise LedgerCommandError("the plan has no scenario %s (it has %s)" % (sid, ", ".join(x.get("id", "?") for x in ctx.plan["scenarios_parsed"][:12])))
-    if plan_ledger.claim_of(found) != "pr":
+    kind = plan_ledger.claim_of(found)
+    if kind == "epic":
+        raise EpicClaimed(found, "%s is claimed at the epic, not per PR: record it on the ask issue or work item that owns the plan, at the default branch's head: "
+                                 "`prove %s --pr <owner/repo#N of the ask issue>` or `item-prove %s --item <owner/repo#N of the work item>` (and `verdict`, `item-verdict`), once every pull request of the plan has merged"
+                          % (sid, sid, sid))
+    if kind != "pr":
         raise LedgerCommandError("%s is claimed at the epic, not per PR: it is proven at the epic's integrated head" % sid)
     mine, left, why = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], (ctx.facts or {}).get("body"))
     if why:
@@ -16232,6 +16245,235 @@ def _scenario_of(ctx, sid):
     if found not in mine:
         raise LedgerCommandError("%s is not on this pull request's `CLAIMS:` line: it stays claimed by the epic's other pull requests" % sid)
     return found
+
+
+# ---------------------------------------------------------------- an epic-claimed scenario, recorded on its owning issue at the default branch's head (#1383)
+# The rules are `plan_ledger.epic_state` (pure). This is the reading (GET only: the default branch's head, the bounded plan-link search of #976 through `plan_listing`, the compare through `compare_files`)
+# and the writing. Every read that decides a record fails closed: a refusal writes no row and no audit line.
+
+EPIC_SUBJECTS = ("ask issue", "work item")   # the subject kinds that own an epic record; a pull request never does
+
+
+def epic_subject(ctx):
+    """`ask issue`, `work item`, or None (a pull request: it never records an epic scenario)."""
+    if getattr(ctx, "ask_issue", False):
+        return "ask issue"
+    if getattr(ctx, "item", None):
+        return "work item"
+    return None
+
+
+def _epic_same_plan(default_repo):
+    def same(link, source):
+        try:
+            return parse_plan_source(link, default_repo)[:2] == parse_plan_source(source, default_repo)[:2]
+        except PlanInputError:
+            return link == source
+    return same
+
+
+def epic_get(ctx, runner):
+    return impact_carry_get(ctx.engine, runner, ctx.repo)
+
+
+def epic_default_head(get, repo):
+    """(default branch name, its head sha). Raises when either cannot be read."""
+    info = get("repos/%s" % repo)
+    default = info.get("default_branch") if isinstance(info, dict) else None
+    if not isinstance(default, str) or not default:
+        raise ValueError("the default branch of %s could not be read" % repo)
+    tip = get("repos/%s/commits/%s" % (repo, urllib.parse.quote(default, safe="")))
+    sha = tip.get("sha") if isinstance(tip, dict) else None
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("the head of the default branch %s could not be read" % default)
+    return default, sha
+
+
+def epic_claimants(ctx, runner, now, get):
+    """([(number, merge commit)] of the merged pull requests that link the plan, [numbers] of the open ones), by the bounded plan-link search of #976 (`plan_listing`). A pull request closed without a merge proves
+    nothing. A merged one with no readable 40-character merge commit raises: the head cannot be judged."""
+    merged, opened = [], []
+    for other in plan_listing(ctx, runner, now, _epic_same_plan(ctx.config.get("intent_repo"))):
+        if other.get("state") == "open":
+            opened.append(other.get("number"))
+        elif other.get("merged_at"):
+            pull = get("repos/%s/pulls/%s" % (ctx.repo, other.get("number")))
+            sha = pull.get("merge_commit_sha") if isinstance(pull, dict) else None
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                raise ValueError("the merge commit of pull request #%s could not be read" % other.get("number"))
+            merged.append((other.get("number"), sha))
+    return merged, opened
+
+
+def epic_contains(get, repo, merged):
+    """contains(head) -> (True, None) or (False, why): `head` holds the merge commit of every merged pull request of the plan (GitHub's compare says the merge is behind the head, or the head itself). A compare that fails is (False, ...)."""
+    cache = {}
+
+    def contains(head):
+        if head not in cache:
+            cache[head] = (True, None)
+            for number, sha in merged:
+                try:
+                    got = get("repos/%s/compare/%s...%s" % (repo, sha, head))
+                    inside = isinstance(got, dict) and got.get("status") in ("ahead", "identical")
+                except Exception:
+                    cache[head] = (False, "the compare of the merge of #%s could not be read" % number)
+                    break
+                if not inside:
+                    cache[head] = (False, "%s does not contain the merge of #%s (%s)" % (head[:8], number, sha[:8]))
+                    break
+        return cache[head]
+    return contains
+
+
+def epic_changed(get, repo):
+    def changed(old, new):
+        try:
+            return compare_files(get, repo, old, new)
+        except Exception:   # a compare that cannot be judged (300 files or more, not a descendant, unreadable) counts as stale
+            return None
+    return changed
+
+
+def epic_target(ctx, runner, now, named):
+    """(head, default branch): the commit an epic record is bound to, after every read that decides it: the default branch's head read from GitHub, or the named commit when it is on the default branch;
+    the head must contain the merge of every merged pull request of the plan and no pull request of the plan may be open. Raises LedgerCommandError (nothing written) naming the read or the pull request."""
+    get = epic_get(ctx, runner)
+    record_step("a GitHub read of the default branch of %s" % ctx.repo)
+    try:
+        default, tip = epic_default_head(get, ctx.repo)
+    except Exception as err:
+        raise LedgerCommandError("refused: the default branch's head of %s could not be read (%s): nothing was recorded" % (ctx.repo, _one_line(str(err), 120))) from None
+    head = tip
+    if named:
+        if not re.fullmatch(r"[0-9a-f]{7,40}", named):
+            raise LedgerCommandError("refused: --head %s is not a commit sha: nothing was recorded" % named[:12])
+        try:
+            full = (get("repos/%s/commits/%s" % (ctx.repo, named)) or {}).get("sha")
+            if not isinstance(full, str) or not re.fullmatch(r"[0-9a-f]{40}", full):
+                raise ValueError("no such commit")
+            on_branch = (get("repos/%s/compare/%s...%s" % (ctx.repo, urllib.parse.quote(default, safe=""), full)) or {}).get("status") in ("identical", "behind")
+        except Exception as err:
+            raise LedgerCommandError("refused: the commit %s could not be read on the default branch (%s): nothing was recorded" % (named[:12], _one_line(str(err), 120))) from None
+        if not on_branch:
+            raise LedgerCommandError("refused: %s is not on the default branch %s of %s: an epic record is bound to a commit of the default branch; nothing was recorded" % (full[:8], default, ctx.repo))
+        head = full
+    record_step("the plan-link search of %s" % ctx.source)
+    try:
+        merged, opened = epic_claimants(ctx, runner, now, get)
+    except Exception as err:
+        raise LedgerCommandError("refused: the pull requests of the plan could not be read (%s): nothing was recorded" % _one_line(str(err), 120)) from None
+    if opened:
+        raise LedgerCommandError("refused: pull request %s of the plan %s is still open: an epic scenario is recorded after every pull request of the plan has merged; nothing was recorded"
+                                 % (", ".join("#%s" % n for n in opened[:5]), ctx.source))
+    ok, why = epic_contains(get, ctx.repo, merged)(head)
+    if not ok:
+        raise LedgerCommandError("refused: %s: nothing was recorded" % why)
+    return head, default
+
+
+def epic_authors(ctx):
+    """The writers of the owning issue: who may never judge it. An ask issue: its author and whoever proved on it. A work item: `_item_writers` (an unreadable agent list raises ItemAgentsUnreadable: fail closed)."""
+    authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), (ctx.facts or {}).get("author") if getattr(ctx, "ask_issue", False) else ctx.issue["author"])
+    if epic_subject(ctx) == "work item":
+        authors = authors | set(_item_writers(ctx)[0])
+    return authors
+
+
+def epic_view(ctx, runner, now):
+    """The picture of every epic-claimed scenario of the plan on its owning issue: ([plan_ledger.epic_state rows], default head or None, why or None). Reads GitHub with GETs only. Unreadable reads make a recorded
+    scenario stale (the default branch's head) or unrecorded (the claimants), never recorded."""
+    scenarios = plan_ledger.epic_scenarios(ctx.plan)
+    if not scenarios:
+        return [], None, None
+    get = epic_get(ctx, runner)
+    default_head, why = None, None
+    try:
+        default_head = epic_default_head(get, ctx.repo)[1]
+    except Exception as err:
+        why = "the default branch's head could not be read (%s)" % _one_line(str(err), 100)
+    try:
+        merged, _ = epic_claimants(ctx, runner, now, get)
+        contains = epic_contains(get, ctx.repo, merged)
+    except Exception as err:
+        why = why or "the pull requests of the plan could not be read (%s)" % _one_line(str(err), 100)
+        contains = lambda head: (False, "the pull requests of the plan could not be read")
+    try:
+        authors = epic_authors(ctx)
+    except ItemAgentsUnreadable as err:
+        authors = None
+        why = why or str(err)
+    rows = []
+    for scenario in scenarios:
+        if authors is None:   # the writers cannot be excluded: nothing is read as recorded
+            rows.append(dict(plan_ledger.epic_state(scenario, [], ctx.pr, ctx.plan["plan_hash"], default_head, set(), contains, lambda a, b: None), missing=[why]))
+            continue
+        rows.append(plan_ledger.epic_state(scenario, ctx.entries, ctx.pr, ctx.plan["plan_hash"], default_head, authors, contains, epic_changed(get, ctx.repo)))
+    return rows, default_head, why
+
+
+def epic_prove(ctx, args, runner, now, caller, scenarios):
+    """Record the proof of each epic-claimed scenario in `scenarios` on the owning issue at `epic_target`'s head: [(stored, already)] and the refused count. Every read comes first: a refusal writes nothing."""
+    if epic_subject(ctx) is None or not caller:
+        raise LedgerCommandError("refused: an epic-claimed scenario is recorded on its ask issue or work item, never on a pull request; nothing was recorded")
+    head, _ = epic_target(ctx, runner, now, args.head)
+    evidence = _evidence(args)
+    outcomes = []
+    for scenario in scenarios:
+        entry = {"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
+                 "evidence": evidence, "command": plan_ledger.clip(redact_command_text(getattr(args, "command", None) or "")), "via": plan_ledger.EPIC_VIA,
+                 **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {}),
+                 "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
+        stored, already = _record(ctx, args, now, entry)
+        outcomes.append((stored, already))
+        print("%s proof #%d: %s %s at %s (%s, epic), bound to plan %s" % ("already recorded" if already else "recorded", stored["seq"], scenario["id"], args.result, head[:8], ctx.pr, entry["plan_hash"][:19]))
+    return outcomes, head
+
+
+def epic_verdict(ctx, args, runner, now, scenario):
+    """Record the evaluator's verdict on an epic-claimed scenario of the owning issue: the per-pull-request rules (a verdict by an evaluator the scenario names, registered for it, who is not a writer), at `epic_target`'s head."""
+    if epic_subject(ctx) is None:
+        raise LedgerCommandError("refused: an epic-claimed scenario is recorded on its ask issue or work item, never on a pull request; nothing was recorded")
+    named = plan_ledger.evaluator_of(scenario)
+    if args.evaluator != named:
+        raise LedgerCommandError("scenario %s is judged by %s, not %s: nothing was recorded" % (scenario["id"], named, args.evaluator))
+    record_step("the agent registry (who is calling)")
+    if named == "owner":
+        got = gates_caller_kind(runner, now)
+        caller, ok = "owner", got[0] == "person"
+        why = None if ok else "only the owner, from the owner's own terminal (no agent session), may record `owner` verdicts; %s is %s" % (got[1], "an agent" if got[0] == "agent" else "not known")
+    else:
+        caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
+        try:
+            authors = epic_authors(ctx)
+        except ItemAgentsUnreadable as err:
+            raise LedgerCommandError("refused: %s: nothing was recorded" % err) from None
+        if not authors:
+            raise LedgerCommandError("refused: no writer of %s is known to the switchboard: its author could not be read, so no one can be excluded; nothing was recorded" % ctx.pr)
+        allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
+        if named == "tester":
+            launch, sessions, fleets = launched_testers_for(ctx)
+            allowed = load_launch_testers().evaluators(allowed, launch)
+        ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
+        if ok and named == "tester" and caller in launch:
+            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
+            ok = why is None
+    if not ok:
+        raise LedgerCommandError("refused: %s: nothing was recorded" % why)
+    head, _ = epic_target(ctx, runner, now, args.head)
+    evidence = _evidence(args)
+    problem = plan_ledger.review_evidence_problem(evidence, scenario) if plan_ledger.proof_of(scenario) == "review" else None
+    if problem:
+        raise LedgerCommandError("refused: %s: %s; nothing was recorded" % (scenario["id"], problem))
+    entry = {"kind": "verdict", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
+             "evaluator": named, "evidence": evidence, "via": plan_ledger.EPIC_VIA, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {})}
+    (stored, already), = plan_ledger.append_once(ctx.state, [entry], now())
+    if not already and ctx.engine.audit is not None:
+        ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, {"scenario": scenario["id"], "result": args.result, "seq": stored["seq"], "by": caller, "chain": stored["hash"], "epic": head})
+    print("%s %s verdict #%d: %s %s at %s (%s, epic), bound to plan %s" % ("already recorded" if already else "recorded", named, stored["seq"], scenario["id"], args.result, head[:8], ctx.pr, entry["plan_hash"][:19]))
+    print(recorded_line("%s verdict" % named, ctx.pr, head, [(stored, already)]))
+    return EXIT_OK
+
 
 
 def _head_of(ctx, args):
@@ -16282,10 +16524,17 @@ def cmd_prove(args, runner, now):
     record_step("the agent registry (who is calling)")
     caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
     _plan_usable(ctx)
-    refused, common, outcomes = 0, None, []
+    refused, common, outcomes, epic = 0, None, [], []
     for sid in dict.fromkeys(args.scenario):
         try:
             _scenario_of(ctx, sid)
+        except EpicClaimed as err:   # #1383: an ask issue or a work item records it on itself, at the default branch's head; a pull request refuses it naming that command
+            if epic_subject(ctx) is None:
+                print("not recorded: %s: %s" % (sid, err), file=sys.stderr)
+                refused += 1
+            else:
+                epic.append(err.scenario)
+            continue
         except LedgerCommandError as err:
             print("not recorded: %s: %s" % (sid, err), file=sys.stderr)
             refused += 1
@@ -16310,6 +16559,14 @@ def cmd_prove(args, runner, now):
                                                                     head[:8], ctx.pr, entry["plan_hash"][:19]))
     if outcomes:
         print(recorded_line("proof", ctx.pr, common[0], outcomes))
+    if epic:
+        try:
+            done, epic_head = epic_prove(ctx, args, runner, now, caller, epic)
+            print(recorded_line("epic proof", ctx.pr, epic_head, done))
+        except LedgerCommandError as err:   # the epic reads or rules refused: nothing of the epic scenarios was written
+            for scenario in epic:
+                print("not recorded: %s: %s" % (scenario["id"], err), file=sys.stderr)
+            refused += len(epic)
     if refused:
         print("not recorded: %d of %d scenarios refused (the reasons are above)" % (refused, len(set(args.scenario))), file=sys.stderr)
     return EXIT_PARTIAL if refused else EXIT_OK
@@ -16357,7 +16614,12 @@ def cmd_verdict(args, runner, now):
     else:
         if not args.scenario:
             raise LedgerCommandError("name the scenario (`verdict S1 ...`), or use --all for every scenario judged by --as")
-        scenario = _scenario_of(ctx, args.scenario)
+        try:
+            scenario = _scenario_of(ctx, args.scenario)
+        except EpicClaimed as err:   # #1383: recorded on the owning issue at the default branch's head; a pull request refuses it naming that command
+            if epic_subject(ctx) is None:
+                raise
+            return epic_verdict(ctx, args, runner, now, err.scenario)
         named = plan_ledger.evaluator_of(scenario)
         targets = [scenario]
         if args.evaluator != named:
@@ -16583,6 +16845,24 @@ def gates_suites_finding(runner, ctx):
         return None
 
 
+def epic_gates_note(report, ctx, runner, now):
+    """(#1383) An ask issue's `gates` lists each epic-claimed scenario of its plan as unrecorded, recorded at a head or stale, and the report gains `epic` (rows), `epic_default_head` and, when a read failed, `epic_error`.
+    A pull request, and an ask whose plan has no epic-claimed scenario, change nothing. Returns the rows ([] when none). Read-only."""
+    if epic_subject(ctx) is None or ctx.plan is None or ctx.plan.get("result") != "pass":
+        return []
+    try:
+        rows, default_head, why = epic_view(ctx, runner, now)
+    except Exception as err:   # said, never silent
+        report["epic_error"] = _one_line("%s: %s" % (type(err).__name__, err), 160)
+        return []
+    if rows:
+        report["epic"] = rows
+        report["epic_default_head"] = default_head
+        if why:
+            report["epic_error"] = why
+    return rows
+
+
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
@@ -16618,6 +16898,7 @@ def cmd_gates(args, runner, now):
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
+    epic_rows = epic_gates_note(report, ctx, runner, now)   # #1383: an ask issue lists its epic-claimed scenarios
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
     if args.json:
@@ -16630,6 +16911,8 @@ def cmd_gates(args, runner, now):
         print(json.dumps(report, sort_keys=True))
     else:
         lines = plan_ledger.render_gates(report, ctx.pr)
+        if epic_rows:
+            lines.extend(plan_ledger.epic_lines(epic_rows, report["epic_default_head"]))
         if shares:
             lines.append(shares)
         if suites_finding:
@@ -16663,16 +16946,22 @@ def cmd_gates_ask_close(args, runner, now):
         raise LedgerCommandError("cannot close %s: %s" % (ctx.pr, ctx.plan_problem or "its plan fails `plan check`"))
     head = ctx.facts.get("head")
     authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
-    rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"]]
+    epic_ids = {x["id"] for x in plan_ledger.epic_scenarios(ctx.plan)}   # #1383: an epic-claimed scenario is recorded at the default branch's head, and read there below
+    rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"] if x["id"] not in epic_ids]
+    epic_rows, default_head, epic_why = epic_view(ctx, runner, now)
     open_rows = [r for r in rows if r["status"] != "ok"]
-    if open_rows:
+    open_epic = [r for r in epic_rows if r["status"] != "ok"]
+    total = len(rows) + len(epic_rows)
+    if open_rows or open_epic:
         for r in open_rows:
             print("not judged: %s: %s" % (r["id"], "; ".join(r["missing"] + r["void"])), file=sys.stderr)
-        print("refused: %s stays open: %d of %d scenarios are not proven and judged at plan %s" % (ctx.pr, len(open_rows), len(rows), ctx.plan["plan_hash"][:19]),
-              file=sys.stderr)
+        for r in open_epic:
+            print("not judged: %s (epic-claimed, %s): %s" % (r["id"], r["state"], "; ".join(r["missing"] + r["void"])), file=sys.stderr)
+        print("refused: %s stays open: %d of %d scenarios are not proven and judged at plan %s%s" % (
+            ctx.pr, len(open_rows) + len(open_epic), total, ctx.plan["plan_hash"][:19], "; %d epic-claimed (unrecorded or stale at the default branch's head)" % len(open_epic) if open_epic else ""), file=sys.stderr)
         return EXIT_ERROR
-    print("%s may close: %d of %d scenarios proven and judged at plan %s: %s" % (ctx.pr, len(rows), len(rows), ctx.plan["plan_hash"][:19],
-                                                                          ", ".join(r["id"] for r in rows)))
+    print("%s may close: %d of %d scenarios proven and judged at plan %s: %s" % (ctx.pr, total, total, ctx.plan["plan_hash"][:19],
+                                                                          ", ".join(r["id"] for r in rows + epic_rows)))
     return EXIT_OK
 
 
@@ -16812,12 +17101,21 @@ def cmd_item_prove(args, runner, now):
         raise LedgerCommandError("refused: a proof names who recorded it: run this as a fleet agent")
     _plan_usable(ctx)
     pin = iv.pinned(ctx.entries, ctx.item)
-    if not pin:
+    epic_only = all(any(x.get("id") == sid and plan_ledger.claim_of(x) == "epic" for x in ctx.plan["scenarios_parsed"]) for sid in args.scenario)   # #1383: an epic record is bound to the default branch's head, not to the reference commit
+    if not pin and not epic_only:
         raise LedgerCommandError("%s has no reference commit yet: its orchestrator launches a tester with --issue for it first (that registration pins the commit)" % ctx.item)
-    refused = 0
+    refused, epic = 0, []
     for sid in dict.fromkeys(args.scenario):
         try:
             _item_scenario(ctx, sid)
+        except EpicClaimed as err:   # #1383: recorded on the work item at the default branch's head, not at its reference commit
+            why = load_module("item_verdicts").claim_problem(err.scenario, ctx.number, ctx.plan_own)
+            if why:
+                print("not recorded: %s: %s" % (sid, why), file=sys.stderr)
+                refused += 1
+            else:
+                epic.append(err.scenario)
+            continue
         except LedgerCommandError as err:
             print("not recorded: %s: %s" % (sid, err), file=sys.stderr)
             refused += 1
@@ -16833,6 +17131,13 @@ def cmd_item_prove(args, runner, now):
         stored = plan_ledger.append_entry(ctx.state, entry, now())
         _item_audit(ctx, "plan.item.proof", {"scenario": sid, "result": args.result, "by": caller, "reference_commit": pin, "seq": stored["seq"]})
         print("recorded proof #%d: %s %s at %s (%s)" % (stored["seq"], sid, args.result, pin[:8], ctx.item))
+    if epic:
+        try:
+            epic_prove(ctx, args, runner, now, caller, epic)
+        except LedgerCommandError as err:
+            for scenario in epic:
+                print("not recorded: %s: %s" % (scenario["id"], err), file=sys.stderr)
+            refused += len(epic)
     return EXIT_PARTIAL if refused else EXIT_OK
 
 
@@ -16857,7 +17162,13 @@ def cmd_item_verdict(args, runner, now):
     else:
         if not args.scenario:
             raise LedgerCommandError("name the scenario (`verdict S1 --item ...`), or use --all")
-        scenario = _item_scenario(ctx, args.scenario)
+        try:
+            scenario = _item_scenario(ctx, args.scenario)
+        except EpicClaimed as err:   # #1383: the work item's epic verdict, at the default branch's head, by the per-pull-request evaluator rules
+            why = iv.claim_problem(err.scenario, ctx.number, ctx.plan_own)
+            if why:
+                raise LedgerCommandError(why) from None
+            return epic_verdict(ctx, args, runner, now, err.scenario)
         if plan_ledger.evaluator_of(scenario) != "tester":
             raise LedgerCommandError("scenario %s is judged by %s, not tester: nothing was recorded" % (args.scenario, plan_ledger.evaluator_of(scenario)))
         targets = [scenario]
@@ -16940,6 +17251,7 @@ def cmd_item_gates(args, runner, now):
     except ItemAgentsUnreadable as err:   # fail CLOSED: with the agents unreadable the writer set shrinks, so nothing is read as accepted
         report = {"item": ctx.item, "head": load_module("item_verdicts").pinned(ctx.entries, ctx.item), "plan_hash": ctx.plan["plan_hash"] if ctx.plan else None, "scenarios": [],
                   "rows": [{"gate": "G1", "status": "missing", "missing": ["NOT READY: %s, so the writers of the item cannot be excluded" % err]}], "ready": False}
+    epic_rows = epic_gates_note(report, ctx, runner, now)
     if args.json:
         print(json.dumps(report, sort_keys=True))
     else:
@@ -16947,6 +17259,8 @@ def cmd_item_gates(args, runner, now):
         print("plan hash: %s" % (report["plan_hash"] or "none"))
         for row in report["rows"]:
             print("%-4s %-8s %s" % (row["gate"], row["status"], "; ".join(row["missing"]) or row.get("detail", "")))
+        for line in plan_ledger.epic_lines(epic_rows, report.get("epic_default_head")):
+            print(line)
     return EXIT_OK if report["ready"] else EXIT_ERROR
 
 
@@ -18255,12 +18569,10 @@ class ClaimUnknown(Exception):
     pass
 
 
-def plan_peers(ctx, runner, now, closed=None):
-    """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing; `closed`, a list, is given
-    (number, body) of those). A MERGED sibling's body is the claim RECORDED in the ledger when it was gated (the NEWEST claim line recorded at or before its `merged_at`, the claim in force at the merge: never its current body, which an author can edit, and never a line recorded after the merge):
-    a merged sibling with no recorded claim raises ClaimUnknown. An open one reads its current body. GETs only. The list is GitHub's search for the pull requests whose body holds
-    the plan link (`GET /search/issues?q=repo:R is:pr "<plan>" in:body`), not the whole repository: at most PEER_PAGES pages of 100, with more the read raises
-    `too many pull requests to judge` (fail closed, never a silent truncation). Raises when the list cannot be read."""
+def plan_listing(ctx, runner, now, same=None):
+    """[item] of the pull requests OTHER than this one whose body holds the plan link, each GitHub's search item with `merged_at` added: the ONE bounded search of #976 (`GET /search/issues?q=repo:R is:pr "<plan>" in:body`,
+    at most PEER_PAGES pages of 100; more raises `too many pull requests to judge`, never a silent truncation). `same(link, source)` decides whether a body's PLAN: line is this plan (default `_same_plan`).
+    Raises when the list cannot be read. Shared by `plan_peers` (the claim union) and `epic_claimants` (the epic record, #1383)."""
     repo = ctx.pr.rsplit("#", 1)[0]
     reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
     query = urllib.parse.quote_plus('repo:%s is:pr "%s" in:body' % (repo, ctx.source))
@@ -18275,13 +18587,26 @@ def plan_peers(ctx, runner, now, closed=None):
             break
     else:
         raise ValueError(PEERS_TOO_MANY)
-    peers = []
+    same = same or (lambda link, source: _same_plan(link, source, ctx.config.get("intent_repo")))
+    out = []
     for other in listed:
         if not isinstance(other, dict) or other.get("number") == ctx.number:
             continue
         link = plan_ledger.PLAN_LINK_RE.search(plan_ledger.visible_body(other.get("body")))
-        if not link or not _same_plan(link.group(1).strip("<>.,"), ctx.source, ctx.config.get("intent_repo")):
+        if not link or not same(link.group(1).strip("<>.,"), ctx.source):
             continue
+        out.append(other)
+    return out
+
+
+def plan_peers(ctx, runner, now, closed=None):
+    """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing; `closed`, a list, is given
+    (number, body) of those). A MERGED sibling's body is the claim RECORDED in the ledger when it was gated (the NEWEST claim line recorded at or before its `merged_at`, the claim in force at the merge: never its current body, which an author can edit, and never a line recorded after the merge):
+    a merged sibling with no recorded claim raises ClaimUnknown. An open one reads its current body. GETs only. The list is `plan_listing`: bounded, and with more the read raises
+    `too many pull requests to judge` (fail closed, never a silent truncation). Raises when the list cannot be read."""
+    repo = ctx.pr.rsplit("#", 1)[0]
+    peers = []
+    for other in plan_listing(ctx, runner, now):
         if other.get("state") != "open" and not other.get("merged_at"):
             if closed is not None:
                 closed.append((other.get("number"), other.get("body")))
@@ -18462,15 +18787,24 @@ class _CarryDone(Exception):
     pass
 
 
-def carry_head_facts(get, repo, old_head, new_head):
-    """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
-    "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
+def compare_files(get, repo, old_head, new_head):
+    """The names of the files changed from `old_head` to `new_head` (GitHub's compare through `get`), the ONE reading of a compare that the carry (#1129) and the epic's stale rule (#1383) share.
+    A compare of 300 files or more, a truncated one and one whose new head is not a descendant raise CarryRefused: the diff cannot be judged. A failed read raises."""
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
+    if not isinstance(compared, dict):
+        raise CarryRefused("the compare could not be read")
     files = [f["filename"] for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
     if len(files) >= CARRY_COMPARE_FILE_CAP or compared.get("truncated") or (compared.get("total_files") or 0) >= CARRY_COMPARE_FILE_CAP:
         raise CarryRefused(CARRY_TOO_LARGE)
     if compared.get("status") not in ("ahead", "identical"):
         raise CarryRefused(CARRY_NOT_DESCENDANT % compared.get("status"))
+    return files
+
+
+def carry_head_facts(get, repo, old_head, new_head):
+    """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
+    "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
+    files = compare_files(get, repo, old_head, new_head)
     commit = get("repos/%s/commits/%s" % (repo, new_head))
     parents = [p.get("sha") for p in (commit.get("parents") or []) if isinstance(p, dict)]
     merge = False
