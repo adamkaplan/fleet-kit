@@ -86001,6 +86001,12 @@ class TestBigRegistrarFile(unittest.TestCase):
         states = sb.agent_block_states(engine, "acme/app", self.matrix, ["agents/x.md"], self.BASE, self.HEAD)
         self.assertEqual(states.get("agents/x.md"), "unreadable", states)
 
+    def test_a_size_zero_file_makes_no_raw_call(self):
+        """A mutant that goes raw for size 0 makes a second call: this test fails it."""
+        reader = sb.IntentReader("gh", "acme/app", runner=lambda argv, **kw: self.calls.append(argv) or subprocess.CompletedProcess(argv, 0, json.dumps({"type": "file", "encoding": "base64", "content": "", "size": 0}), ""))
+        self.assertEqual(sb._file_text_at(types.SimpleNamespace(intents=reader), "acme/app", "bin/x", self.BASE), "")
+        self.assertEqual(len(self.calls), 1, "one JSON read and no raw read")
+
 
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
