@@ -15,7 +15,7 @@ GOOD = ("TestGitShim.test_s7_u1_no_file_of_this_change_writes_the_global_git_con
 
 
 def unresolved_all_fail(fn):
-    return [p for p in (("TestNope.test_x"), ("TestGitShim.test_nope"), ("TestNope",)) if fn(ROOT, (SB, p))]
+    return [p for p in ("TestNope.test_x", "TestGitShim.test_nope", "TestNope") if fn(ROOT, (SB, p))]
 
 
 class Selector(unittest.TestCase):
