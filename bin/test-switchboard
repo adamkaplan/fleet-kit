@@ -8124,7 +8124,7 @@ class TestGithubListener(Base):
         self.assertIn("--url=http://127.0.0.1:%d/github" % port, argv)
         self.assertIn("--repo=%s" % GH_REPO, argv)
         self.assertIn("--events=issues,issue_comment,sub_issues,pull_request,pull_request_review,"
-                      "check_suite,workflow_run", argv)
+                      "check_suite,workflow_run,push", argv)
 
     def test_the_source_never_binds_another_address(self):
         source = inspect.getsource(sb.GitHubHub.open_listener)
