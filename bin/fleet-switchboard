@@ -3775,12 +3775,16 @@ def installed_tree_problem(state_dir, root=None, runner=subprocess.run):
     return refused[len(PROG) + 2:] if refused and refused.startswith(PROG + ": ") else refused
 
 
+def installed_tree_script(state_dir):
+    """The alert script: the copy `install` put in the state directory (outside the tree), else the one beside this file."""
+    script = Path(state_dir) / "guard" / "guard_alert.py"
+    return script if script.is_file() else Path(__file__).resolve().parent / "guard_alert.py"
+
+
 def installed_tree_alert(state_dir, line, now, herdr=None, runner=subprocess.run):
     """Run the standalone alert script (the copy in the state directory, which needs nothing from the tree); it alerts at once the first time and
     again only after a day. Returns what the script printed, or None when it could not run."""
-    script = Path(state_dir) / "guard" / "guard_alert.py"
-    if not script.is_file():
-        script = Path(__file__).resolve().parent / "guard_alert.py"
+    script = installed_tree_script(state_dir)
     argv = [sys.executable, str(script), "--state", str(state_dir), "--text", line, "--cos", COS_NAME, "--now", repr(float(now()))]
     found = shutil.which(herdr) if herdr else None
     if found:
@@ -3795,7 +3799,7 @@ def installed_tree_alert(state_dir, line, now, herdr=None, runner=subprocess.run
 
 
 def installed_tree_clear(state_dir, runner=subprocess.run):
-    script = Path(state_dir) / "guard" / "guard_alert.py"
+    script = installed_tree_script(state_dir)
     if (Path(state_dir) / "installed-tree-alert.json").is_file() and script.is_file():
         try:
             runner([sys.executable, str(script), "--state", str(state_dir), "--text", "", "--clear"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)

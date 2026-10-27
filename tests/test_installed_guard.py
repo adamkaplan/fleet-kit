@@ -227,6 +227,9 @@ class TestTheDaemon(TreeCase):
         patch = mock.patch.object(sb, "load_module", wraps=sb.load_module)
         self.load = patch.start()
         self.addCleanup(patch.stop)
+        modules = mock.patch.dict(sys.modules, {sb.__name__: sb})   # run_daemon hands its own module to the relay pass
+        modules.start()
+        self.addCleanup(modules.stop)
         relay = mock.patch.object(sb.load_module("cloud_relay_daemon"), "pass_if_configured", lambda *a, **k: None)
         relay.start()
         self.addCleanup(relay.stop)
