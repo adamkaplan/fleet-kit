@@ -9353,6 +9353,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
     try:
+        publish_cockpit(engine)   # #1423: the Cockpit's fleet feed (cockpit.json), read-only over the files the pass just wrote; never stops the pass
+    except Exception as err:
+        engine._failed("cockpit", "cockpit", err, report)
+    try:
         write_catching_up(engine)
     except Exception as err:
         engine._failed("catching-up", "catching-up", err, report)

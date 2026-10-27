@@ -70821,6 +70821,9 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+# The Cockpit feed test (#1423): the read-only feed of what the fleet needs from a person.
+_cockpit = importlib.import_module("test_cockpit")
+TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -70848,7 +70851,7 @@ class TestTheArchitectureTestIsRun(unittest.TestCase):
                 else:
                     yield item
         ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
-        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine"):
+        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine", "TestFeedShape", "TestIdsAndEtags", "TestCapsAndScrub", "TestDocument", "TestWriting", "TestReadOnly"):
             with self.subTest(case=name):
                 self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 2, "the hook that loads tests/switchboard/test_closure.py is gone")
 
