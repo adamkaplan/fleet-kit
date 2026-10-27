@@ -838,6 +838,9 @@ class LiveHead(Fixture):
         self.assertEqual(self.run_one(CODER, "prove", **PROVE)["status"], 200)
         self.assertTrue(seen[0], seen)
 
+    # The old test read the monotonic clock around the second writer's append and asserted it took under 0.3 s; a busy runner
+    # measured 0.376 s and failed it. This one waits on an event: the slow head sets one when entered and waits on another that
+    # the test sets after the check; the second writer sets a done event, which must be set while the release is still unset.
     def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
         import threading
         gates = [threading.Event(), threading.Event()]   # released by the test: one per live-head call
@@ -1465,6 +1468,24 @@ class OneWallClock(unittest.TestCase):
                                   extra=(("if declared and declared.isdigit() and len(raw)", "if False and len(raw)"), ("if left <= 0:", "if False:"), ("worker.join(READ_DEADLINE)", "worker.join()")))
         _, err = self.timed(mod, self.serve_padded(), 1.0)
         self.assertIsNone(err)   # the mutant parses the cut body as complete
+
+
+class TestNoWallClockBound(unittest.TestCase):
+    """The slow-live-head test shows the property by events, not by a measured duration."""
+
+    def source(self):
+        import inspect
+        return inspect.getsource(LiveHead.test_a_slow_live_head_does_not_block_another_ledger_writer)
+
+    def test_the_comment_says_it_waits_on_an_event(self):
+        text = Path(__file__).read_text()
+        before = text[:text.index("    def test_a_slow_live_head_does_not_block_another_ledger_writer")]
+        self.assertIn("waits on an event", before[-700:])
+
+    def test_no_duration_threshold_and_no_fixed_sleep(self):
+        import re
+        src = self.source()
+        self.assertEqual(re.findall(r"assertLess\(|monotonic\(\)\s*-|time\.sleep\(", src.replace("t.join(0.01)", "")), [])
 
 
 if __name__ == "__main__":
