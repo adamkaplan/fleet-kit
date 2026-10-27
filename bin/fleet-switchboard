@@ -13992,6 +13992,10 @@ def cmd_launch(args, runner, now, socket_call=None):
     if problem:
         raise LaunchError(problem)
     brief = read_brief(args.brief_file, sys.stdin)
+    mismatch = launch_brief_mismatch(args, engine, repo, brief)   # #1350: before anything starts
+    if mismatch:
+        sys.stderr.write("%s: launch: refused: %s; nothing was started\n" % (PROG, mismatch))
+        return EXIT_USAGE
     launch_gate_probe(engine, state, engine.config, args, brief, runner, now)   # #107 slice 3c: shadow only, never refuses
     launched = now()
     created = None
@@ -14174,6 +14178,32 @@ def launch_read_repo(args, repo, accounts, config, use_headless=False):
     if accounts is None or not config.get("gh_users") or not accounts.account_for(given):
         raise LaunchError("--read-repo %s has no gh account: add \"%s\" or \"%s/*\" to gh_users in %s" % (given, given, given.split("/")[0], config_path()))
     return given
+
+
+def launch_brief_mismatch(args, engine, repo, brief):
+    """#1350: why a launch for --issue N must not start on this brief (another issue, a stale or unverifiable head), or None. A reason after
+    --allow-brief-mismatch lets it through, audited."""
+    if args.issue is None:
+        return None
+    module = load_module("launch_brief_check")
+
+    def read_head(where, number):
+        try:
+            raw = read_pr_json(engine, where, number)
+        except NoticeNotFound:
+            raise module.HeadUnreadable("PR #%d was not found" % number) from None
+        except NoticeError as err:
+            raise module.HeadUnreadable(_one_line(str(err), 120)) from None
+        return raw.get("headRefOid")
+    why = module.check(brief, int(args.issue), repo, read_head)
+    override = getattr(args, "allow_brief_mismatch", None)
+    if override is not None and (not override.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", override)):
+        return "--allow-brief-mismatch needs a reason: non-empty text on one line"
+    if why and override is not None:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "launch.brief_mismatch_allowed", args.name, {"reason": override, "mismatch": _one_line(why, 200)})
+        return None
+    return why
 
 
 def launch_repo(args):
@@ -22584,6 +22614,7 @@ def build_parser():
     launch.add_argument("--overdue", metavar="WHEN", help="Wake --reports-to at this time if the worker has not "
                         "reported since the launch (60m, or an ISO time with a zone)")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
+    launch.add_argument("--allow-brief-mismatch", dest="allow_brief_mismatch", metavar="REASON", help="Start although the brief names another issue or a stale PR head than --issue (audited with the reason)")
     launch.add_argument("--memory-ok", dest="memory_ok", metavar="REASON", help="Skip the memory test of a new launch (audited with the reason)")
     launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod, default /work; the pod always runs its own 'worker' agent: --agent is only recorded)")
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
