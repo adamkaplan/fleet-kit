@@ -904,6 +904,19 @@ def _unlink(path):
         pass
 
 
+def _lock_holder_gone(lock):
+    """True when the lock names a process that no longer exists (a killed command). An empty or unreadable lock is not judged gone: its age decides."""
+    try:
+        with open(lock) as f:
+            pid = int(f.read(20).strip())
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 class VaultFlight:
     """ONE vault call in flight at a time. `VaultFlight.enter(env)` raises ClusterLogin("vault-blocked") while a block lasts (its line is `.line`),
     or when a probe after the block's time is already running; otherwise it holds the lock. `done(ran)` records the final answer (a firewall refusal
@@ -929,8 +942,8 @@ class VaultFlight:
                     age = clock() - os.lstat(lock).st_mtime
                 except OSError:
                     continue   # it went away between the two calls: take it
-                if age > vault_lock_stale_seconds():
-                    _unlink(lock)   # a stale lock is ignored
+                if age > vault_lock_stale_seconds() or _lock_holder_gone(lock):
+                    _unlink(lock)   # a stale lock (too old, or its command was killed) is ignored
                     continue
                 if block is not None:
                     raise _vault_blocked(block)   # a probe is running: this command uses the block
@@ -938,6 +951,7 @@ class VaultFlight:
                 continue
             except OSError:
                 return flight   # no state directory: no block can be kept, and the call goes on as before
+            os.write(fd, str(os.getpid()).encode())   # who holds it: a lock of a command that is gone is ignored at once
             os.close(fd)
             flight.lock = lock
             block = read_vault_block(env)   # the holder before us may have just written it

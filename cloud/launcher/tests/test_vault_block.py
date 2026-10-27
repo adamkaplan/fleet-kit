@@ -250,6 +250,17 @@ class Scenarios(Fake):
         self.assertIsNone(self.refused())
         self.assertEqual(self.calls(), 2)
 
+    def test_s3_a_lock_of_a_killed_command_is_ignored_at_once(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        os.makedirs(os.path.dirname(self.lock_path()), exist_ok=True)
+        with open(self.lock_path(), "w") as f:
+            f.write(str(dead.pid))
+        self.mode("ok")
+        self.assertIsNone(self.refused())
+        self.assertEqual(self.calls(), 1)
+        self.assertFalse(os.path.exists(self.lock_path()))
+
     def test_s6_ten_concurrent_commands_make_at_most_one_call(self):
         scenario_s6(self, cw)
 
