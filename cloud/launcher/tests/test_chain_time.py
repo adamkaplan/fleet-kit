@@ -66,5 +66,39 @@ class Parallel(base.Scratch):
         self.assertEqual(ran, [])
 
 
+class Docs(unittest.TestCase):
+    def section(self):
+        doc = base.slurp(os.path.join(base.ROOT, "cloud", "launcher", "README.md"))
+        return doc.split("## Chain times (ask #1390)")[1].split("\n## ")[0]
+
+    def test_the_chain_times_section_states_the_cause_and_has_a_row_per_entry_for_both_systems(self):
+        sec = self.section()
+        self.assertLess(sec.index("Cause:"), sec.index("### macOS"))
+        mac, ub = sec.split("### macOS (per entry)")[1].split("### Ubuntu (per entry)")
+        for table in (mac, ub):
+            rows = [l for l in table.split("\n") if l.startswith("| `")]
+            self.assertGreaterEqual(len(rows), 40)
+            self.assertEqual({r.split("`")[1] for r in rows}, set(base.entries()))
+
+    def test_the_five_slowest_per_system_are_named_and_match_the_tables(self):
+        sec = self.section()
+        for head, marker in (("Slowest five on macOS: ", "### macOS"), ("Slowest five on Ubuntu: ", "### Ubuntu")):
+            names = [n for n in sec.split(head)[1].split("\n")[0].split("`")[1::2]]
+            self.assertEqual(len(names), 5)
+            table = sec.split(marker)[1].split("\n### ")[0]
+            secs = {}
+            for r in table.split("\n"):
+                if r.startswith("| `"):
+                    c = r.split("|")
+                    secs[c[1].strip().strip("`").split("/")[-1]] = int(c[2])
+            self.assertEqual(set(names), {n for n, _ in sorted(secs.items(), key=lambda x: -x[1])[:5]})
+
+    def test_the_document_says_which_entries_run_where_and_names_the_parallel_ones_as_lanes(self):
+        sec = self.section()
+        self.assertIn("Every chain entry still runs on BOTH systems", sec)
+        for e in parallel():
+            self.assertRegex(sec, r"\| `%s` \| \d+ \| parallel \|" % e.replace(".", r"\."))
+
+
 if __name__ == "__main__":
     unittest.main()
