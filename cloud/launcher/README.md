@@ -338,6 +338,24 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
 
+## Chain diagnostics (ask #1414)
+
+Cause: the parallel lanes of `bin/test-cloud-launcher` (ask #1390) left a failing or hung run silent, slow to end and untidy, in three ways:
+
+- The script showed a lane's output only at the end, after the serial loop and a `wait`, so a lane that hung showed nothing until the step's time limit cut the run.
+- When a serial entry failed, the script kills only the lane subshells (the old behaviour): the Python children of the lanes kept running, and the lane output was discarded unread.
+- The script had no trap for an interrupt or a terminate signal, so a cancelled run left the lane children behind.
+
+What it does now:
+
+- **Live lines.** Each lane prints `RUN <entry>` when an entry starts and `TIME <entry> <seconds>` when it ends, to the run's real output as they happen. Every live line carries the entry's name, so interleaved lines stay readable. A failed entry prints `FAILED: <entry>`.
+- **The replay.** An entry's own test output goes to a private file and is replayed whole at the end (its `RUN` line, its output and its `TIME` line), so each entry's `RUN` and `TIME` lines appear twice in a finished log: once live, once in the replay.
+- **A hung lane** looks like a RUN line with no TIME line for that entry in the live lines: that entry started and has not ended.
+- **A serial failure.** The script waits for the lane processes to finish, for at most 300 seconds (the slowest chain entry measured is about 300 seconds), stops the lanes still running after that, replays the lanes' output, and only then prints `RESULT: FAIL` with exit status 1. A failing run can therefore take up to 300 seconds longer to print its result.
+- **A signal.** Every lane (and the serial entry that is running) starts in its own process group. An interrupt or a terminate signal stops every group and exits non-zero (130 and 143).
+
+`cloud/launcher/tests/test_chain_diagnostics.py` runs a copy of the script against a fake tree with fake entries that sleep or fail, with one mutant of the script for each of the three behaviours.
+
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
 a cluster Secret scoped to the pod and mounted at `/run/cw/server-password` (0600); Basic auth, as the local v2

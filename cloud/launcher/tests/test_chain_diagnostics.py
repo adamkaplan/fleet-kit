@@ -1,0 +1,201 @@
+"""Ask #1414: the chain script shows lane output live, waits for and replays the lanes after a serial failure, and stops every lane on a signal.
+Each case runs a COPY of bin/test-cloud-launcher (or a mutant of it) against a fake tree with fake entries. Offline; its own temporary directory; no port."""
+import os, shutil, signal, subprocess, sys, tempfile, time, unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "..", "worker", "tests"))
+import stub_support  # noqa: E402
+import test_chain_list as base  # noqa: E402
+
+TESTS = "cloud/launcher/tests/"
+LANE = "test_lane_slow.py"
+SERIAL_BAD = "test_serial_bad.py"
+SERIAL_SLOW = "test_serial_slow.py"
+
+# The fake entries. DIAG_DIR (an environment variable) is the run's own directory: pid files and the end time.
+FAKES = {
+    LANE: "import os, sys, time\nd = os.environ['DIAG_DIR']\nprint('lane-body-start', flush=True)\nopen(os.path.join(d, 'lane.pid'), 'w').write(str(os.getpid()))\n"
+          "time.sleep(float(os.environ.get('LANE_SECONDS', '3')))\nprint('lane-body-end', flush=True)\nopen(os.path.join(d, 'lane.end'), 'w').write(repr(time.time()))\n",
+    SERIAL_BAD: "import sys, time\ntime.sleep(0.5)\nsys.exit(1)\n",
+    SERIAL_SLOW: "import os, time\nopen(os.path.join(os.environ['DIAG_DIR'], 'serial.pid'), 'w').write(str(os.getpid()))\ntime.sleep(30)\n",
+    "test_ok.py": "pass\n",
+}
+
+
+def real_script():
+    return base.slurp(base.SCRIPT)
+
+
+def mutate(text, old, new):
+    out = text.replace(old, new, 1)
+    assert out != text, "the mutation did not apply: %r" % old
+    return out
+
+
+class Diag(unittest.TestCase):
+    def tree(self, script, serial, lane):
+        """A fake tree: the script text, the serial entries (in order) and the lane entries (the parallel list)."""
+        d = tempfile.mkdtemp(prefix="chain-diag-")
+        self.addCleanup(shutil.rmtree, d, True)
+        self.diag = os.path.join(d, "diag")
+        os.makedirs(self.diag)
+        for sub in ("bin", "cloud/launcher/tests", "cloud/worker/tests"):
+            os.makedirs(os.path.join(d, sub))
+        path = os.path.join(d, "bin", "test-cloud-launcher")
+        with open(path, "w") as f:
+            f.write(script)
+        os.chmod(path, 0o755)
+        for n in set(serial) | set(lane):
+            with open(os.path.join(d, TESTS + n), "w") as f:
+                f.write(FAKES[n])
+        with open(os.path.join(d, base.FIXED_LAST), "w") as f:
+            f.write("pass\n")
+        names = sorted(set(serial) | set(lane))
+        with open(os.path.join(d, "bin", "test-cloud-launcher.chain"), "w") as f:
+            f.write("".join(TESTS + n + "\n" for n in names) + base.FIXED_LAST + "\n")
+        with open(os.path.join(d, "bin", "test-cloud-launcher.parallel"), "w") as f:
+            f.write("".join(TESTS + n + "\n" for n in lane))
+        return d
+
+    def start(self, d):
+        env = dict(os.environ, DIAG_DIR=self.diag)
+        return stub_support.start(self, [os.path.join(d, "bin", "test-cloud-launcher")], cwd=d, env=env,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def wait_file(self, name, seconds=15):
+        path = os.path.join(self.diag, name)
+        end = time.time() + seconds
+        while not self.content(path):
+            self.assertLess(time.time(), end, "%s never appeared" % name)
+            time.sleep(0.05)
+        return self.content(path)
+
+    def content(self, path):
+        try:
+            with open(path) as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def kill_later(self, name):
+        """A fake that outlives a mutant script must not outlive the test."""
+        def kill():
+            path = os.path.join(self.diag, name)
+            if self.content(path):
+                try:
+                    os.kill(int(self.content(path)), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+        self.addCleanup(kill)
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    # S2: the RUN line is printed before the entry ends; every live line names the entry; the replay is whole.
+    def s2(self, script):
+        d = self.tree(script, ["test_ok.py"], [LANE])
+        entry = TESTS + LANE
+        p = self.start(d)
+        live = []
+        while True:
+            line = p.stdout.readline()
+            self.assertTrue(line, "the output ended with no RUN line for the lane entry")
+            live.append(line)
+            if line.startswith("RUN " + entry):
+                break
+        seen = time.time()
+        rest = p.stdout.read()
+        p.wait(timeout=60)
+        self.assertEqual(p.returncode, 0, "".join(live) + rest)
+        end = float(self.wait_file("lane.end"))
+        self.assertLess(seen, end, "the RUN line came after the entry's end: lane output shown only at the end")
+        out = "".join(live) + rest
+        for l in out.split("\n"):
+            if l.startswith(("RUN ", "TIME ", "FAILED")):
+                self.assertIn("cloud/", l, "a live line without an entry name: %r" % l)
+        self.assertIn("RUN %s\nlane-body-start\nlane-body-end\nTIME %s " % (entry, entry), out, "the replay of the lane's output is not whole")
+
+    # S3: a serial failure while a lane runs: the lane's output is replayed before RESULT: FAIL, status 1.
+    def s3(self, script):
+        d = self.tree(script, [SERIAL_BAD], [LANE])
+        self.kill_later("lane.pid")
+        p = self.start(d)
+        out, _ = p.communicate(timeout=120)
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("FAILED: %s%s" % (TESTS, SERIAL_BAD), out)
+        self.assertIn("lane-body-end", out, "the lane's output was not replayed")
+        self.assertLess(out.index("lane-body-end"), out.index("RESULT: FAIL"))
+        self.assertEqual(out.rstrip().split("\n")[-1], "RESULT: FAIL")
+
+    # S4: a signal while a lane and a serial entry sleep: both are gone and the status is not 0.
+    def s4(self, script, sig):
+        d = self.tree(script, [SERIAL_SLOW], [LANE])
+        self.kill_later("lane.pid")
+        self.kill_later("serial.pid")
+        env_seconds = os.environ.get("LANE_SECONDS")
+        os.environ["LANE_SECONDS"] = "30"
+        self.addCleanup(lambda: os.environ.__setitem__("LANE_SECONDS", env_seconds) if env_seconds else os.environ.pop("LANE_SECONDS", None))
+        p = self.start(d)
+        pids = [int(self.wait_file("lane.pid")), int(self.wait_file("serial.pid"))]
+        p.send_signal(sig)
+        p.wait(timeout=60)   # not communicate(): a lane left running holds the output pipe open
+        self.assertNotEqual(p.returncode, 0)
+        end = time.time() + 10
+        while any(self.alive(x) for x in pids) and time.time() < end:
+            time.sleep(0.1)
+        self.assertEqual([x for x in pids if self.alive(x)], [], "a lane or serial process was left running after signal %s" % sig)
+
+    def test_s2_the_run_line_is_live_and_the_replay_is_whole(self):
+        self.s2(real_script())
+
+    def test_s3_a_serial_failure_waits_for_the_lane_and_replays_it_before_result(self):
+        self.s3(real_script())
+
+    def test_s4_an_interrupt_and_a_terminate_leave_no_process(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(sig=sig):
+                self.s4(real_script(), sig)
+
+    # S5: a mutant for each of S2, S3, S4 fails its test.
+    def test_s5_mutant_lane_output_only_at_the_end_fails_s2(self):
+        m = mutate(real_script(), 'note() { echo "$1"; [ -z "$LOGF" ]', 'note() { [ -n "$LOGF" ] || echo "$1"; [ -z "$LOGF" ]')
+        with self.assertRaises(AssertionError):
+            self.s2(m)
+
+    def test_s5_mutant_no_replay_after_a_serial_failure_fails_s3(self):
+        m = mutate(real_script(), "  stop_groups\n  replay\n  echo \"RESULT: FAIL\"", "  stop_groups\n  echo \"RESULT: FAIL\"")
+        with self.assertRaises(AssertionError):
+            self.s3(m)
+
+    def test_s5_mutant_no_trap_fails_s4(self):
+        text = real_script()
+        m = mutate(mutate(text, "trap 'stop_groups; exit 130' INT", ":"), "trap 'stop_groups; exit 143' TERM", ":")
+        with self.assertRaises(AssertionError):
+            self.s4(m, signal.SIGTERM)
+
+
+class Docs(unittest.TestCase):
+    def section(self):
+        doc = base.slurp(os.path.join(base.ROOT, "cloud", "launcher", "README.md"))
+        self.assertIn("## Chain diagnostics (ask #1414)", doc)
+        return doc.split("## Chain diagnostics (ask #1414)")[1].split("\n## ")[0]
+
+    def test_s7_the_readme_says_what_a_hung_lane_looks_like(self):
+        self.assertIn("a RUN line with no TIME line", self.section())
+
+    def test_s1_the_readme_names_the_three_causes(self):
+        sec = self.section()
+        for words in ("only at the end", "kills only the lane subshells", "no trap for an interrupt or a terminate signal"):
+            self.assertIn(words, sec)
+
+    def test_s7_the_readme_states_the_wait_bound(self):
+        self.assertIn("300 seconds", self.section())
+
+
+if __name__ == "__main__":
+    unittest.main()
