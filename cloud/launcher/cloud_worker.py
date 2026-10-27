@@ -809,6 +809,164 @@ def firewall_refused(ran):
     return any(marker in text for marker in FIREWALL_MARKERS)
 
 
+# ---------------------------------------------------------------- the vault block (ask #1427)
+# After the vault's FIREWALL refuses this machine, every command that needs the vault refuses at once, for a set time, and starts no vault call.
+# The block is ONE small private file in the switchboard's state directory: the time, a one-line reason and the retry time (no secret, no address, no
+# vault name). Only a firewall answer creates it: a timeout, a missing secret, a login problem or a malformed answer never does. After the retry time
+# exactly ONE command probes (the lock file below): success removes the block, a refusal renews it. With no block yet, the callers of one moment also
+# take the lock one at a time, so a refusing vault is asked once and the others find the block.
+VAULT_BLOCK_NAME = "vault-block.json"
+VAULT_BLOCK_LOCK_NAME = "vault-block.lock"
+VAULT_BLOCK_SETTING = "CW_VAULT_BLOCK_" + "DURATION"   # written in two parts: its settings row is a separate commit of ask #1427 (the names guard reads string constants)
+VAULT_BLOCK_DEFAULT_MINUTES = 10
+VAULT_BLOCK_REASON = "the vault refused this machine"
+VAULT_BLOCK_POLL_SECONDS = 0.05
+
+
+def vault_block_dir(env):
+    """The switchboard's state directory: $XDG_STATE_HOME (default ~/.local/state) / the switchboard's directory name."""
+    base = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, CONFIG_DIR_NAME)
+
+
+def vault_block_minutes(env):
+    """The block's length in minutes: the setting (1m to 60m, the duration kind), else ten. A value that cannot be read gives the default."""
+    text = (env.get(VAULT_BLOCK_SETTING) or "").strip()
+    found = _DURATION.fullmatch(text) if text else None
+    minutes = int(found.group(1)) * (60 if found.group(2) == "h" else 1) if found else VAULT_BLOCK_DEFAULT_MINUTES
+    return minutes if 1 <= minutes <= 60 else VAULT_BLOCK_DEFAULT_MINUTES
+
+
+def vault_lock_stale_seconds():
+    """A probe lock older than the longest a vault call can last (the read, the access check after a refusal and the second read) is ignored."""
+    return 2 * TOKEN_CMD_SECONDS + VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE
+
+
+def _own_regular(path):
+    try:
+        found = os.lstat(path)
+    except OSError:
+        return None
+    return found if stat.S_ISREG(found.st_mode) and found.st_uid == os.getuid() else None
+
+
+def read_vault_block(env):
+    """(refused_at, retry_at) in epoch seconds, or None when there is no readable block (a damaged or foreign file is no block)."""
+    path = os.path.join(vault_block_dir(env), VAULT_BLOCK_NAME)
+    if _own_regular(path) is None:
+        return None
+    try:
+        with open(path) as f:
+            data = json.loads(f.read(4096))
+        at, retry = float(data["at"]), float(data["retry_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return (at, retry) if math.isfinite(at) and math.isfinite(retry) else None
+
+
+def _stamp(epoch):
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def vault_block_line(block):
+    """The ONE line a blocked command prints: the reason and the retry time (never a value, an address or a name)."""
+    return "%s at %s; no vault call is made until %s (delete the vault-block file in the switchboard state directory to clear it by hand)" % (
+        VAULT_BLOCK_REASON, _stamp(block[0]), _stamp(block[1]))
+
+
+def write_vault_block(env, now):
+    """Write the block by rename (a private temp file in the same directory, then os.replace). Never raises: a block that cannot be written costs only the saving."""
+    directory = vault_block_dir(env)
+    temp = None
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        body = json.dumps({"at": now, "reason": VAULT_BLOCK_REASON, "retry_at": now + 60 * vault_block_minutes(env)}, sort_keys=True)
+        temp = os.path.join(directory, ".%s.%d.%s.tmp" % (VAULT_BLOCK_NAME, os.getpid(), secrets.token_hex(4)))
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        os.replace(temp, os.path.join(directory, VAULT_BLOCK_NAME))
+        temp = None
+    except OSError:
+        pass
+    finally:
+        if temp is not None:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+class VaultFlight:
+    """ONE vault call in flight at a time. `VaultFlight.enter(env)` raises ClusterLogin("vault-blocked") while a block lasts (its line is `.line`),
+    or when a probe after the block's time is already running; otherwise it holds the lock. `done(ran)` records the final answer (a firewall refusal
+    writes or renews the block; a success removes it; anything else changes nothing) and releases the lock."""
+
+    def __init__(self, env, clock):
+        self.env, self.clock, self.lock = env, clock, None
+
+    @classmethod
+    def enter(cls, env, clock=time.time, sleep=time.sleep):
+        flight = cls(env, clock)
+        directory = vault_block_dir(env)
+        lock = os.path.join(directory, VAULT_BLOCK_LOCK_NAME)
+        while True:
+            block = read_vault_block(env)
+            if block is not None and clock() < block[1]:
+                raise _vault_blocked(block)
+            try:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            except FileExistsError:
+                try:
+                    age = clock() - os.lstat(lock).st_mtime
+                except OSError:
+                    continue   # it went away between the two calls: take it
+                if age > vault_lock_stale_seconds():
+                    _unlink(lock)   # a stale lock is ignored
+                    continue
+                if block is not None:
+                    raise _vault_blocked(block)   # a probe is running: this command uses the block
+                sleep(VAULT_BLOCK_POLL_SECONDS)   # no block yet: the call in flight answers first
+                continue
+            except OSError:
+                return flight   # no state directory: no block can be kept, and the call goes on as before
+            os.close(fd)
+            flight.lock = lock
+            block = read_vault_block(env)   # the holder before us may have just written it
+            if block is not None and clock() < block[1]:
+                flight.release()
+                raise _vault_blocked(block)
+            return flight
+
+    def release(self):
+        if self.lock is not None:
+            _unlink(self.lock)
+            self.lock = None
+
+    def done(self, ran):
+        try:
+            if firewall_refused(ran):
+                write_vault_block(self.env, self.clock())
+            elif ran is not None and ran[0] == 0:
+                _unlink(os.path.join(vault_block_dir(self.env), VAULT_BLOCK_NAME))
+        finally:
+            self.release()
+
+
+def _vault_blocked(block):
+    err = ClusterLogin("vault-blocked", firewall=True)
+    err.line = vault_block_line(block)
+    return err
+
+
 def jwt_claims(token):
     """(exp, iat) of a JWT's claims, or None when the text is not a JWT with a readable exp. Never raises."""
     parts = (token or "").split(".")
@@ -953,11 +1111,16 @@ def cluster_token(env, duration, capture=None, now=None, recovery=None, strict=F
                     "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
         def read():
             return capture(argv, env=child_env)
-        ran = read()
-        recovered = False
-        if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
-            ran = recovery(read, env)
-            recovered = True
+        flight = VaultFlight.enter(env)   # BEFORE any vault call: a block (or a probe in flight) refuses here, at once
+        ran = None
+        try:
+            ran = read()
+            recovered = False
+            if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
+                ran = recovery(read, env)
+                recovered = True
+        finally:
+            flight.done(ran)   # AFTER the final answer: a firewall refusal writes or renews the block, a success removes it
         if ran is None or ran[0] != 0 or not ran[1].strip() or len(ran[1]) > 1000000:
             raise ClusterLogin("admin-unreadable", firewall=firewall_refused(ran), recovered=recovered)
         admin_config = ran[1]
@@ -1047,6 +1210,7 @@ REFRESH_REASONS = {
     "az-refused": "no az of the fixed list is a plain executable file that only its owner can write",
     "namespace-refused": "the namespace is not a DNS label (CW_CLOUD_NAMESPACE)",
     "duration-refused": "the requested token life is not a whole number of minutes",
+    "vault-blocked": "the vault refused this machine and a block is in force (the vault-block file of the switchboard state directory)",
 }
 FIREWALL_REASON = "the vault refused this machine"   # the firewall refused this machine: the launch path's own words
 
@@ -3045,6 +3209,14 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None):
         refresher = refresher or ClusterTokenRefresher(env, clock)
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         while True:
+            blocked = read_vault_block(env)
+            if blocked is not None and time.time() < blocked[1]:   # the vault block (ask #1427): no pass, no az process, ONE log line
+                print("cloud-worker: reaper pass skipped: %s" % vault_block_line(blocked), file=sys.stderr)
+                if not a.loop:
+                    why = "end of its pass"
+                    return 0
+                sleep(min(a.loop, REAP_FLOOR_SECONDS))
+                continue
             refresh = refresher.run()
             for line in getattr(refresher, "notices", []):
                 print(line, file=sys.stderr)   # the stdout line of a pass is the JSON report; the notice names a setting, never a value

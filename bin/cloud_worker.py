@@ -919,6 +919,8 @@ class VaultRecovery:
 
 def _token_refusal(err):
     """The refusal of a cluster token that could not be made: the wording of the step that failed, never a value."""
+    if err.kind == "vault-blocked":
+        return "the cluster token could not be obtained: %s" % err.line   # the one line; nothing was called
     if err.kind == "too-long":
         return "the cluster token lives %d seconds, over the 60 minutes allowed (or already expired); refused, nothing was called" % err.lifetime
     why = {"token-command-failed": "the token command failed",
@@ -1241,8 +1243,17 @@ def stack_model_secret(env=None):
     if not sub or not vault:
         why = "CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME are not set"
     else:
-        ran = _capture(["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
-                       env={k: v for k, v in env.items() if k not in CLUSTER_DROP}, limit=STACK_MODEL_KEY_LIMIT + 1)
+        lib = _lib()
+        try:
+            flight = lib.VaultFlight.enter(env)   # a vault block refuses here, before any call
+        except lib.ClusterLogin as err:
+            raise Refusal("the stack model secret %s could not be read: %s; nothing was created" % (name, err.line)) from None
+        ran = None
+        try:
+            ran = _capture(["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault, "--name", name, "--query", "value", "-o", "tsv"],
+                           env={k: v for k, v in env.items() if k not in CLUSTER_DROP}, limit=STACK_MODEL_KEY_LIMIT + 1)
+        finally:
+            flight.done(ran)
         if ran is None or ran[0] != 0:
             why = "could not be read from the vault"
         elif len(ran[1]) > STACK_MODEL_KEY_LIMIT:

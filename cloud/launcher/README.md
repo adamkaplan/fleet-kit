@@ -338,6 +338,20 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
 
+## The vault block (ask #1427)
+
+Cause: when the vault's firewall refused this machine's address, every caller started its own `az keyvault secret show`. The three callers are the cluster launch, each pass of the reaper loop (every minute) and each token mint. Nothing told a later caller that the answer was already known, so about ten vault calls were in flight at once, each took tens of seconds to fail, and the same refusals were repeated for hours.
+
+What the block is: after a firewall refusal (the vault's own `Forbidden` or `ForbiddenByFirewall` answer, and only that: a timeout, a missing secret, a login problem or a malformed answer never creates one) the launcher writes one small private file holding the time, a one-line reason and the retry time. It holds no secret, no address and no vault name. While it lasts, every command that needs the vault (launch, stop, retire, the token mint and the model-secret read of a stack launch) refuses at once with one line that names the reason and the retry time, and starts no `az` call. The reaper loop skips its pass and logs one line.
+
+Where it lives: the file `vault-block.json` in the switchboard's state directory (`$XDG_STATE_HOME/` the switchboard's directory, default `~/.local/state`), mode 0600, written by rename. Beside it, `vault-block.lock` is the probe lock.
+
+How long: ten minutes by default. The setting `CW_VAULT_BLOCK_DURATION` in the launcher's settings file (`cloud.env`) sets it, from 1m to 60m (for example `10m` or `1h`).
+
+After the time: exactly one command probes the vault (it takes the lock file; a lock older than a vault call can last is ignored). A success removes the block and a refusal renews it. A command that arrives during the probe uses the block and starts no call. With no block yet, callers that arrive together take the lock one after another, so a refusing vault is asked once and the others find the block.
+
+How to clear it by hand: delete the file `vault-block.json` in the switchboard state directory (for example when the firewall was opened and waiting is not wanted).
+
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
 a cluster Secret scoped to the pod and mounted at `/run/cw/server-password` (0600); Basic auth, as the local v2
