@@ -442,17 +442,7 @@
           "validate"
         ],
         "bin/ci_runs.py": [
-          "_details_repo",
-          "_identity",
-          "_rank",
-          "_run_id",
-          "_started",
-          "_time",
-          "_unfinished",
-          "_winners",
-          "latest_runs",
-          "newest",
-          "own_repo"
+          "*"
         ],
         "bin/red_ci.py": [
           "*"

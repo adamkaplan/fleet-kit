@@ -31,6 +31,15 @@ class TestRefusalOrder(unittest.TestCase):
         self.assertIsNone(report)
         self.assertIn("no brief", why)
 
+    def test_a_brief_with_no_info_dict_does_not_raise(self):
+        report = {"owner_decision": "hold", "review_action": "approve", "complete": True, "top_tier_hits": {}, "changed_paths": [], "head": "a" * 40, "pr": "o/r#1"}
+        got = {"report": report, "rule": RULE, "files": [], "closure": {}}
+        with mock.patch.object(impact_hold, "delegated_clear_inputs", return_value=(got, None)), mock.patch.object(impact_hold, "load_module", lambda name: delegated_clear, create=True), \
+                mock.patch.object(impact_hold, "impact_floor", impact_floor, create=True), mock.patch.object(impact_hold, "floor_brief", lambda *a: None, create=True), \
+                mock.patch.object(delegated_clear, "substance_refusals", lambda *a: ["refused for the test"]):
+            result = impact_hold.delegated_clear_pr_checks(None, None, "o/r", 1, None, None, ("d", "t", "r"))
+        self.assertEqual(result, (None, "refused for the test"))
+
 
 if __name__ == "__main__":
     unittest.main()

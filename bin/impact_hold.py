@@ -1195,6 +1195,8 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
             return None, "; ".join(c["text"] for c in found)
     if brief is not None:   # #1215: the brief-bound clear; `brief` = (digest, text, reasons). The floor's own brief at THIS head, from the module of slice A
         floor = floor_brief(engine, repo, report, got["files"])
+        if info is None:   # the brief-bound clear keeps the floor's brief for the audit: make the dict rather than raise
+            info = {}
         info["floor_brief"] = floor
         reasons = module.substance_refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored, floor, brief[0], brief[1], brief[2])
         if not reasons and floor is not None and substance_decision(report, floor)[0] != "chief_of_staff":   # the decider and the brief must agree: escalate to the owner

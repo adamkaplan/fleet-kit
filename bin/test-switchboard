@@ -83303,7 +83303,7 @@ def _load_brief_tests(name):
     return module
 
 
-_brief_modules = {name: _load_brief_tests(name) for name in ("test_substance_decider", "test_brief_clear", "test_brief_advisory", "test_brief_integration", "test_brief_fix", "test-impact-brief")}
+_brief_modules = {name: _load_brief_tests(name) for name in ("test_substance_decider", "test_brief_clear", "test_brief_advisory", "test_brief_integration", "test_brief_fix", "test_brief_order", "test-impact-brief")}
 Brief_test_substance_decider_Decider = _brief_modules["test_substance_decider"].Decider
 Brief_test_brief_clear_TestBriefBoundClear, Brief_test_brief_clear_TestMutants = _brief_modules["test_brief_clear"].TestBriefBoundClear, _brief_modules["test_brief_clear"].TestMutants
 Brief_test_brief_advisory_TestAdvisoryAndRows, Brief_test_brief_advisory_TestDocsAndHygiene, Brief_test_brief_advisory_TestG6bRationale = (
@@ -83314,11 +83314,18 @@ Brief_test_brief_integration_TestDocsAndNames, Brief_test_brief_integration_Test
 Brief_test_brief_fix_TestClassifyRoots, Brief_test_brief_fix_TestDeletionsAndClasses, Brief_test_brief_fix_TestDocs, Brief_test_brief_fix_TestMutants, Brief_test_brief_fix_TestTablesDerivedFromTheCode = (
     _brief_modules["test_brief_fix"].TestClassifyRoots, _brief_modules["test_brief_fix"].TestDeletionsAndClasses, _brief_modules["test_brief_fix"].TestDocs,
     _brief_modules["test_brief_fix"].TestMutants, _brief_modules["test_brief_fix"].TestTablesDerivedFromTheCode)
+Brief_test_brief_order_TestRefusalOrder = _brief_modules["test_brief_order"].TestRefusalOrder
 Brief_impact_brief_BriefTests, Brief_impact_brief_MutantTests = _brief_modules["test-impact-brief"].BriefTests, _brief_modules["test-impact-brief"].MutantTests
 for _name, _module in _brief_modules.items():   # a TestCase added to one of these files and not bound above would silently drop out of CI
     _held = {v for k, v in globals().items() if k.startswith("Brief_")}
     _defined = {v for v in vars(_module).values() if isinstance(v, type) and issubclass(v, unittest.TestCase) and v.__module__ == _module.__name__}
     assert _defined <= _held, "%s: a TestCase is not bound in bin/test-switchboard: %s" % (_name, sorted(c.__name__ for c in _defined - _held))
+
+class TestEveryBriefTestFileIsBound(unittest.TestCase):
+    def test_every_tests_test_brief_file_on_disk_is_bound_by_this_runner(self):
+        on_disk = {p.stem for p in (REPO / "tests").glob("test_brief_*.py")}
+        self.assertEqual(on_disk - set(_brief_modules), set(), "a tests/test_brief_*.py file no runner executes")
+
 
 class TestArchTools(unittest.TestCase):
     """The two move tools (S0 of #1092): `arch-split-check` reads the surface of the daemon as its own entry assembles it, and `arch-part-cut` never overwrites a part."""
