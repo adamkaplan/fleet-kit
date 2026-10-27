@@ -20528,15 +20528,95 @@ class TestPR8Source(unittest.TestCase):
     def test_the_engine_still_never_types(self):
         self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
+    @staticmethod
+    def names_defined_twice(text):
+        """[(name, first line, second line)] for each top-level name a def, a class or an assignment defines a second time. A `del name` is not a definition (the daemon deletes its builder once built)."""
+        seen, twice = {}, []
+        for node in ast.parse(text).body:
+            names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
+                t.id for t in (node.targets if isinstance(node, ast.Assign) else []) if isinstance(t, ast.Name)]
+            for each in names:
+                if each in seen:
+                    twice.append((each, seen[each], node.lineno))
+                seen[each] = node.lineno
+        return twice
+
     def test_no_top_level_name_is_defined_twice_in_the_big_files(self):
         for name in ("fleet-switchboard", "test-switchboard", "fleet-scenario", "proof-switchboard"):
-            seen = {}
-            for node in ast.parse(daemon_text(BIN / name)).body:
-                names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
-                    t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
-                for each in names:
-                    self.assertNotIn(each, seen, "%s defines %s twice (lines %s and %s)" % (name, each, seen.get(each), node.lineno))
-                    seen[each] = node.lineno
+            self.assertEqual(self.names_defined_twice(daemon_text(BIN / name)), [], name)
+
+    def test_a_name_defined_twice_still_fails_the_scan_whatever_the_two_definitions_are(self):
+        for label, text in (("def and def", "def f():\n    pass\ndef f():\n    pass\n"), ("def and assign", "def f():\n    pass\nf = 1\n"),
+                            ("assign and def", "f = 1\ndef f():\n    pass\n"), ("assign and assign", "f = 1\nf = 2\n"), ("class and assign", "class f:\n    pass\nf = 2\n"),
+                            ("def, del, def", "def f():\n    pass\ndel f\ndef f():\n    pass\n")):
+            with self.subTest(case=label):
+                self.assertEqual([x[0] for x in self.names_defined_twice(text)], ["f"])
+        self.assertEqual(self.names_defined_twice("def f():\n    pass\ndel f\n"), [], "a del alone is not a second definition")
+
+    def names_the_guard_is_built_from(self):
+        """{name: (the part file, the first top-level statement that reads it after its definition)}, DERIVED from the daemon's source: the names the guard is built from (the arguments of `make_effect_guard(...)` and of `.bind(...)`)
+        and every name of the decorator of an `effect_guard(...)` effect, that the daemon defines at top level. The maker is not one (it is deleted by the daemon itself, and a test elsewhere holds it unreachable)."""
+        trees = {path: ast.parse(path.read_text()) for path in SWITCHBOARD_SOURCE_FILES}
+        defined = {}
+        for path, tree in trees.items():
+            for node in tree.body:
+                for each in ([node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [t.id for t in (node.targets if isinstance(node, ast.Assign) else []) if isinstance(t, ast.Name)]
+                             + [e.id for t in (node.targets if isinstance(node, ast.Assign) else []) if isinstance(t, ast.Tuple) for e in t.elts if isinstance(e, ast.Name)]):
+                    defined.setdefault(each, (path, node.lineno))
+        wanted = set()
+        for tree in trees.values():
+            for node in tree.body:
+                for call in ast.walk(node):
+                    if isinstance(call, ast.Call) and getattr(call.func, "id", getattr(call.func, "attr", "")) in ("make_effect_guard", "bind") and (getattr(call.func, "id", "") == "make_effect_guard" or isinstance(getattr(call.func, "value", None), ast.Call)):   # `load_module("impact_hold").bind(...)`, not a socket's
+                        wanted |= {x.id for a in call.args for x in ast.walk(a) if isinstance(x, ast.Name)}
+                if isinstance(node, ast.FunctionDef):
+                    for decorator in node.decorator_list:
+                        if isinstance(decorator, ast.Call) and getattr(decorator.func, "id", "") == "effect_guard":
+                            wanted |= {x.id for x in ast.walk(decorator) if isinstance(x, ast.Name)}
+        found = {}
+        for name in sorted(wanted - {"make_effect_guard"}):
+            if name not in defined or name in vars(__import__("builtins")):
+                continue
+            where, line = defined[name]
+            for path in SWITCHBOARD_SOURCE_FILES:
+                for node in trees[path].body:
+                    if (path, node.lineno) > (where, line) and SWITCHBOARD_SOURCE_FILES.index(path) >= SWITCHBOARD_SOURCE_FILES.index(where) and any(
+                            isinstance(x, ast.Name) and x.id == name and isinstance(x.ctx, ast.Load) for x in ast.walk(node)) and not (path == where and node.lineno <= line):
+                        found.setdefault(name, (path, min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])))   # a decorated def starts at its first decorator
+                        break
+                if name in found:
+                    break
+        return found
+
+    def daemon_with_line_before_first_use(self, name, where):
+        """A copy of the entry, its manifest and its parts with `del <name>` as a new statement just before the first statement that reads `name` after its definition; loaded by the real loader."""
+        path, lineno = where
+        with tempfile.TemporaryDirectory() as directory:
+            copy_entry(directory)
+            for helper in BIN.glob("*.py"):   # the helper modules the entry loads by path from beside itself
+                shutil.copy(str(helper), str(Path(directory) / helper.name))
+            part = Path(directory) / path.relative_to(BIN)
+            lines = part.read_text().split("\n")
+            if name:
+                lines.insert(lineno - 1, "del %s" % name)
+            part.write_text("\n".join(lines))
+            return _load("t_mutant_%s" % name, Path(directory) / "fleet-switchboard")
+
+    def test_the_names_the_guard_is_built_from_are_derived_from_the_code(self):
+        self.assertTrue({"effect_guard", "EFFECT_CHECK"} <= set(self.names_the_guard_is_built_from()), sorted(self.names_the_guard_is_built_from()))
+
+    def test_a_del_of_a_name_the_guard_is_built_from_stops_the_daemon_from_loading_for_every_such_name(self):
+        """The hostile line: `del <name>` (the effect_guard, the latch's check, anything an effect's decorator reads) injected into the real daemon source before its first use. The daemon must not load (the effect would run unguarded or not at all);
+        the control loads the same copy with no line. A `del` is not a second definition for the scan, so the scan above does not stand for this: this test does."""
+        names = self.names_the_guard_is_built_from()
+        self.assertGreaterEqual(len(names), 2)
+        control = self.daemon_with_line_before_first_use(None, next(iter(names.values())))
+        self.assertTrue(callable(control.effect_guard) if hasattr(control, "effect_guard") else callable(control.cmd_impact), "the copy with no injected line loads")
+        for name, where in sorted(names.items()):
+            with self.subTest(deleted=name):
+                with self.assertRaises((NameError, SystemExit)) as raised:
+                    self.daemon_with_line_before_first_use(name, where)
+                self.assertIn(name, str(raised.exception), "it stops for the deleted name, not for something else")
 
 
 class TestNoticeRace(ActingCase):
