@@ -10629,7 +10629,7 @@ class TestReminders(PR4Base):
                 warn = [l for l in err.getvalue().splitlines() if "4000" in l and "over" in l]
                 self.assertEqual(len(warn), 1 if expect else 0)
                 if expect:
-                    self.assertIn("3 characters over", warn[0])
+                    self.assertIn("4003 characters, over the 4000", warn[0])
 
     def test_every_remind_flag_is_tested_and_documented(self):
         import argparse
@@ -10686,7 +10686,7 @@ class TestReminders(PR4Base):
         self.remind(delay=10, text="y" * 3995)
         self.world.tick(10 + 7 * 60)
         (fact,) = self.reminder_facts()
-        self.assertLessEqual(len(fact.summary), sb.MESSAGE_CAP)
+        self.assertEqual(fact.summary, "y" * 3995 + " (late by 7 min)")   # #1355: never cut here; compose carries it in parts
         self.assertTrue(fact.summary.endswith(" (late by 7 min)"))
 
     def test_late_note_text_is_exact(self):
@@ -10758,8 +10758,7 @@ class TestReminders(PR4Base):
             self.remind(delay=10, text="y" * n)
             self.world.tick(10 + 7 * 60)
             (fact,) = self.reminder_facts()
-            self.assertLessEqual(len(fact.summary), sb.MESSAGE_CAP)
-            self.assertTrue(fact.summary.endswith("\u2026 (late by %d min)" % (7 + (n - 4000) * 0)) or "\u2026 (late by" in fact.summary)
+            self.assertEqual(fact.summary, "y" * n + " (late by 7 min)")   # #1355: the body is never cut by the note; compose carries an over-cap text in parts
             sb.write_reminders(self.world.state, [])
 
     def test_every_path_that_removes_or_skips_a_reminder_is_in_the_docs_table(self):
