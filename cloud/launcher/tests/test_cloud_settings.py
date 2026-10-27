@@ -789,6 +789,82 @@ class Complete(unittest.TestCase):
             with self.subTest(listed=name):
                 self.assertEqual(unaccounted(derived(), listed=set(NOT_SETTINGS) - {name}), [name])
 
+CHANGED_TEST = "test_a_key_in_both_with_a_different_value_is_refused_naming_both_sources_and_no_value"
+
+
+def run_changed_test(setup=None, wrap=None):
+    """Run the real key-in-both test (never a copy of its check) and return its result; `wrap` replaces cw.apply_settings."""
+    cls = type("Probe", (Reader,), {"setUp": setup} if setup else {})
+    result = unittest.TestResult()
+    with mock.patch.object(cw, "apply_settings", wrap(cw.apply_settings)) if wrap else contextlib.nullcontext():
+        cls(CHANGED_TEST).run(result)
+    return result
+
+
+class KeyInBothValueCheck(unittest.TestCase):
+    """#1212: the key-in-both test must not fail on a random temporary directory name, and must still catch a leaked value."""
+
+    def test_s1_the_comment_above_the_changed_test_names_the_cause(self):
+        with open(__file__) as f:
+            lines = f.read().splitlines()
+        at = next(i for i, line in enumerate(lines) if line.startswith("    def " + CHANGED_TEST))
+        comment = []
+        while lines[at - 1 - len(comment)].lstrip().startswith("#"):
+            comment.append(lines[at - 1 - len(comment)])
+        self.assertIn("the refusal text names the temporary file's path", " ".join(comment))
+
+    def test_s2_the_changed_test_passes_against_the_real_product(self):
+        result = run_changed_test()
+        self.assertEqual((result.failures, result.errors), ([], []))
+        self.assertEqual(result.testsRun, 1)
+
+    def _mutant_fails(self, make_text):
+        applied = []
+
+        def wrap(real):
+            def apply_settings(env, path):
+                try:
+                    return real(env, path)
+                except cw.CloudError as e:
+                    (key,) = env
+                    e.args = (make_text(str(e), path, GOOD[key]),) + e.args[1:]
+                    applied.append(GOOD[key] in str(e))
+                    raise
+            return apply_settings
+
+        result = run_changed_test(wrap=wrap)
+        self.assertEqual(applied, [True] * len(GOOD))                  # the mutation was applied to every refusal
+        self.assertEqual(len(result.failures), len(GOOD))              # and the check failed once per setting
+        self.assertEqual(result.errors, [])
+
+    def test_s3_a_mutant_printing_the_value_away_from_the_path_fails(self):
+        self._mutant_fails(lambda err, path, value: err + " value " + value)
+
+    def test_s3_a_mutant_printing_the_value_right_after_the_path_fails(self):
+        self._mutant_fails(lambda err, path, value: err.replace(path, path + value))
+
+    def test_s3_a_mutant_printing_the_value_right_before_the_path_fails(self):
+        self._mutant_fails(lambda err, path, value: err.replace(path, value + path))
+
+    def test_s4_a_path_holding_every_short_fixture_value_does_not_fail(self):
+        def setUp(case):
+            tmp = tempfile.TemporaryDirectory()
+            case.addCleanup(tmp.cleanup)
+            names = [GOOD[k] for k in sorted(GOOD)]
+            case.dir = os.path.realpath(tmp.name)
+            for name in names:                                       # a slash in a value makes it several directories
+                for part in [p for p in name.split("/") if p]:
+                    case.dir = os.path.join(case.dir, part)
+                    os.mkdir(case.dir, 0o700)
+            case.path = os.path.join(case.dir, "cloud.env")
+            for value in GOOD.values():
+                if "//" not in value:
+                    self.assertIn(value, case.path)
+
+        result = run_changed_test(setup=setUp)
+        self.assertEqual((result.failures, result.errors), ([], []))
+        self.assertEqual(result.testsRun, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
