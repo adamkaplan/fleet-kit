@@ -17059,6 +17059,23 @@ def agent_block_states(engine, repo, matrix, paths, base, head):
     return states
 
 
+def registrar_states(engine, repo, matrix, paths, base, head):
+    """#964: None when the daemon file is not among the changed paths (nothing is read), else {"findings": [(registrar, verb, closure name)], "why": None or why it could not be read}: the registrar lint of
+    `delegated_clear.registrar_findings` over the file at the pull request's own base and head. A read that fails is unreadable, never clean."""
+    rule = ((matrix.get("owner_hold") or {}).get("delegated_clear") if isinstance(matrix, dict) else None) or {}
+    daemon_file = rule.get("daemon_file") if isinstance(rule, dict) else None
+    if not isinstance(daemon_file, str) or not any(isinstance(p, str) and impact_floor.canonical(p)[0] == impact_floor.canonical(daemon_file)[0] for p in paths):
+        return None
+    try:
+        if not base or not head:
+            raise IntentError("gh", "the base or head commit is unknown")
+        before, after = _file_text_at(engine, repo, daemon_file, base), _file_text_at(engine, repo, daemon_file, head)
+        found, why = load_module("delegated_clear").registrar_findings(before, after, rule)
+    except Exception as err:   # a read that fails or a lint that crashes is unreadable: a hold, never a crash of the report
+        found, why = None, _one_line("%s: %s" % (type(err).__name__, err), 100)
+    return {"findings": list(found or []), "closure": sorted(getattr(found, "closure", ())), "why": why}
+
+
 def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
     `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold. `paged` (a dict, #967) gets the paged file list ("files") or why it could not be read ("error", a
@@ -17115,7 +17132,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     record, record_problem = (impact_review_record(engine.state_dir, "%s#%d" % (repo, number), head) if engine.state_dir is not None and isinstance(head, str) else (None, None))
     if record_problem:
         record = ("hold", None)   # an unreadable ledger is an unknown rating: it holds
-    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record)
+    registrar = registrar_states(engine, repo, matrix, paths, raw.get("baseRefOid"), head)   # #964: the one reading of what a registrar edit does to the clear's closure (every consumer reads the report)
+    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record, registrar)
     if record_problem:
         owner = (owner[0], owner[1] + ["the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(record_problem), 120)])   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
     if engine.state_dir is not None and isinstance(head, str):
@@ -17133,6 +17151,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "list_problem": list_problem,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
+            "registrar_reasons": impact_floor.registrar_reasons(registrar),   # #964: a registrar edit that touches the clear's closure (or cannot be read) is the owner's own clear, never delegated
             "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True,
             "base": raw.get("baseRefOid")}
 

@@ -119,7 +119,10 @@ OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
            suite("bin/test-cloud-neutral-names"), suite("cloud/tests/test-cloud", "", "10"),
            ("bin/fleet-scenario validate", "bin/fleet-scenario validate", None),
            ("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4", None)]
-NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", "30")]
+# The seven cloud suites added by ask #1301 (hub, channel, channel-server, client, way-back, decisions-pull, cli), in this order after the launcher.
+ADDED = [("bin/test-cloud-hub", "10"), ("bin/test-cloud-channel", None), ("bin/test-cloud-channel-server", None), ("bin/test-cloud-client", None),
+         ("bin/test-cloud-way-back", None), ("bin/test-decisions-pull", "10"), ("bin/test-cloud-cli", "10")]
+NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", "30")] + [suite(n, "", t) for n, t in ADDED]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
 CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
@@ -171,7 +174,8 @@ TEST_STEPS = [CHECKOUT, PYTHON,
               plain("node --test plugins/fleet-decisions-tui/health.test.mjs", "node --test plugins/fleet-decisions-tui/health.test.mjs"),
               plain("bin/fleet-scenario validate", "bin/fleet-scenario validate"),
               plain("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4")]
-CLOUD_STEPS = [CHECKOUT, PYTHON, step("bin/test-cloud-worker"), step("bin/test-cloud-launcher", **{"timeout-minutes": "30"})]
+CLOUD_STEPS = [CHECKOUT, PYTHON, step("bin/test-cloud-worker"), step("bin/test-cloud-launcher", **{"timeout-minutes": "30"})] + [
+    step(n, **({"timeout-minutes": t} if t else {})) for n, t in ADDED]
 STEP_LISTS = {"test": TEST_STEPS, "test-cloud": CLOUD_STEPS}
 # The step schema of GitHub Actions: every key class that can skip, soften, redirect or widen a step.
 STEP_KEYS = {"id": "id: x", "name": "name: x", "if": "if: false", "uses": "uses: x/y@z", "run": "run: echo x", "shell": "shell: sh",
@@ -252,6 +256,12 @@ class Pins(unittest.TestCase):
             self.assertEqual(both.count(name), 1, name)
         for _, run, _ in only_suites(got) + commands(self.jobs()["test-cloud"]):
             self.assertIn("grep -qx 'RESULT: PASS'", run)
+
+    def test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step(self):
+        steps = self.jobs()["test-cloud"]["steps"]
+        for name, _ in ADDED:
+            hits = [x for x in steps if re.search(r"(^|[\s/])%s(\s|$)" % re.escape(name), x.get("run", ""))]
+            self.assertEqual(len(hits), 1, name)
 
     def test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own(self):
         self.assertEqual(self.wf["concurrency"], CONCURRENCY)
@@ -347,6 +357,22 @@ class Mutants(unittest.TestCase):
 
     def test_u3_old_matrix_loses_macos(self):
         self.fails("        include: ${{ fromJSON(needs.plan.outputs.matrix) }}", "        os: [ubuntu-latest]", "test_u3_the_old_job_keeps_its_matrix_runner_and_shell")
+
+    def test_s7_one_of_the_seven_steps_removed(self):
+        step = "      - name: bin/test-cloud-way-back\n        if: ${{ !cancelled() }}\n        run: |\n          bin/test-cloud-way-back 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+        self.assertIn(step, WORKFLOW.read_text())
+        self.fails("\n" + step, "", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+
+    def test_s9_a_suite_whose_name_is_a_prefix_of_another_is_not_counted_by_it(self):
+        channel = "          bin/test-cloud-channel 2>&1 | tee"
+        self.assertIn(channel, WORKFLOW.read_text())
+        # channel-server twice and channel zero fails the exactly-one check
+        self.fails(channel, "          bin/test-cloud-channel-server 2>&1 | tee", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+
+    def test_s9_the_channel_step_removed_alone_fails_the_exactly_one_check(self):
+        step = "      - name: bin/test-cloud-channel\n        if: ${{ !cancelled() }}\n        run: |\n          bin/test-cloud-channel 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+        self.assertIn(step, WORKFLOW.read_text())
+        self.fails("\n" + step, "", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
 
     def test_u1_a_command_edited(self):
         self.fails("bin/test-heartbeat 2>&1", "bin/test-heartbeat -q 2>&1", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
