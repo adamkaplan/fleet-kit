@@ -41940,7 +41940,7 @@ class TestImpactHold(LedgerBase):
         module = sb.load_module("delegated_clear")
         tree = ast.parse(self.real_source())
         self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
-        cleared, code, err = self.traced_daemon_definitions("cos", "impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity")
+        cleared, code, err = self.traced_daemon_definitions("cos", "impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity", "--brief-digest", self.FIXTURE_BRIEF["digest"], "--brief-text", self.FIXTURE_BRIEF["text"])
         self.assertEqual(code, 0, err)
         self.record_pr_setup()
         self.world.add_agent("rev", fleet={"role": "reviewer"}) if "rev" not in self.world.sessions else None
@@ -42585,7 +42585,7 @@ def _hostile_clear_test(index):
     def test(self):
         label, mutator = hostile_parser_cases()[index]
         self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
-        line = ["impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity", *(HOSTILE_EXTRA_ARGV.get(label, []) if "impact clear" in label else [])]
+        line = ["impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity", "--brief-digest", self.FIXTURE_BRIEF["digest"], "--brief-text", self.FIXTURE_BRIEF["text"], *(HOSTILE_EXTRA_ARGV.get(label, []) if "impact clear" in label else [])]
         del HOSTILE_RAN[:]
         os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
         with captured() as (o, e), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):   # the hostile parser REALLY runs; its namespace reaches the real clear
