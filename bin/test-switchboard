@@ -86007,6 +86007,18 @@ class TestBigRegistrarFile(unittest.TestCase):
         self.assertEqual(sb._file_text_at(types.SimpleNamespace(intents=reader), "acme/app", "bin/x", self.BASE), "")
         self.assertEqual(len(self.calls), 1, "one JSON read and no raw read")
 
+    def test_a_raw_read_through_the_accounts_path_is_counted_and_not_conditional(self):
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {}}, lambda *a, **k: None, lambda: 1.0, environ={})
+        accounts.conditional = True
+        seen = []
+        def runner(argv, **kw):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "raw body", "")
+        done = accounts.read(runner, "repos/acme/app/contents/x?ref=" + self.BASE, "acme/app", 5, extra_flags=["-H", "Accept: application/vnd.github.raw"])
+        self.assertEqual(done.stdout, "raw body")
+        self.assertEqual(seen, [["gh", "api", "-H", "Accept: application/vnd.github.raw", "repos/acme/app/contents/x?ref=" + self.BASE]])
+        self.assertEqual(len(accounts.calls), 1, "the read is counted")
+
 
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
