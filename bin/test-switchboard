@@ -40536,9 +40536,9 @@ class TestImpactHold(LedgerBase):
     def test_the_mutant_that_reads_the_namespace_at_bind_time_is_refused_by_the_reset_bind_test(self):
         """MUTANT: a `bind` that takes the check from `namespace['EFFECT_CHECK']` at call time (the old shape) hands the effects the permissive global: the effect `bind` made is NOT refused, so the test above discriminates"""
         source = (BIN / "impact_hold.py").read_text()
-        old = "        guard = make_guard(check)"
+        old = "        guard, here = make_guard(check), globals()"
         self.assertEqual(source.count(old), 1)
-        mutant = source.replace(old, "        guard = make_guard(namespace['EFFECT_CHECK'])").replace("        if not callable(check):", "        if False:")
+        mutant = source.replace(old, "        guard, here = make_guard(namespace['EFFECT_CHECK']), globals()").replace("        if not callable(check):", "        if False:")
         module = types.ModuleType("impact_hold_namespace_reader")
         exec(compile(mutant, "impact_hold_namespace_reader", "exec"), module.__dict__)
         fresh = dict(sb.__dict__, EFFECT_CHECK=lambda: False)
@@ -40550,7 +40550,7 @@ class TestImpactHold(LedgerBase):
                ("cmd_impact_clear", "args"), ("cmd_impact_clear", "runner"), ("cmd_impact_clear", "now"),
                *(("impact_clear_core", p) for p in ("engine", "runner", "repo", "number", "who", "reason", "remove", "head", "via", "verify", "under_order")),
                ("bind", "namespace"), ("bind", "check"), ("_make_bind", "make_guard"), ("_make_guard", "check"), ("make_effect_guard", "check"), ("guard", "when"), ("guard", "refuse"),
-               ("decorate", "effect"), ("guarded_effect", "args"), ("guarded_effect", "kwargs"), ("make_effect_latch", None)}
+               ("decorate", "effect"), ("guarded_effect", "args"), ("guarded_effect", "kwargs"), ("rebuilt", "function"), ("rebuilt", "namespace"), ("make_effect_latch", None)}
 
     def derived_surface(self, daemon_source=None):
         import ast
@@ -40592,7 +40592,7 @@ class TestImpactHold(LedgerBase):
     def test_the_builders_of_an_effect_are_not_reachable_by_name(self):
         """`make_effect_guard` (the entry), `_make_guard` and `_make_bind` (impact_hold) are deleted after their one call: no module name builds a guard around a check of the caller's choosing"""
         hold = sb.load_module("impact_hold")
-        for name in ("make_effect_guard", "_make_guard", "_make_bind", "guard", "decorate", "guarded_effect"):
+        for name in ("make_effect_guard", "_make_guard", "_make_bind", "guard", "decorate", "guarded_effect", "rebuilt"):
             self.assertFalse(hasattr(sb, name) or hasattr(hold, name), name)
 
     PUBLIC_WITH_KWARGS = {("entry", "review_refusal_audit"): "audit data", ("entry", "call_command"): "filters by the handler's own signature", ("entry", "update_daemon_record"): "daemon.json fields",

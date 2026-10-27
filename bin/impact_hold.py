@@ -15,7 +15,7 @@ from inspect import signature as _signature
 import types
 
 def _make_guard(check):
-    """The refusal of an effect at its FIRST statement (#924, round 4): `check` is the latch's check and is the closure cell of the wrapper, never a parameter of an effect and never read from a namespace. See `bind`."""
+    """#924: the refusal of an effect at its FIRST statement. `check` (the latch's) is the closure cell of the wrapper: never a parameter of an effect, never read from a namespace."""
     def guard(when, refuse):
         def decorate(effect):
             signature = _signature(effect)
@@ -1491,29 +1491,30 @@ def release_impact_hold(engine, repo, number, report, record):
 
 
 def _make_bind(make_guard):
-    """#924, round 4. The latch check reaches the two effects of this module ONCE, as the closure cell of the guard `bind` builds around each (`_make_guard`): never a parameter of an effect and never read from the namespace at bind time. `make_guard` is held here and deleted from the module below, so no module name builds a guard around a check of the caller's choosing; and `bind` runs ONCE per namespace (a second call into a namespace it already bound is refused: the record is a closure of this function, not a module attribute). Stated limits: a registrar that reaches the cell (`__closure__`), `main.__defaults__`, `sys.modules`, or execs a second copy of this file can build an effect around a check of its own (it can equally write a clear of its own); a `bind` into a NEW namespace with a check of the caller's choosing builds effects there only and changes nothing of the daemon's; a replaced HELPER the effects call is safe only because the guard refuses before the effect's body names any."""
+    """#924: the latch check reaches the two effects ONCE, as the guard's closure cell (never a parameter, never read from the namespace). `make_guard` is deleted from the module below; `bind` refuses a second call into a namespace. Limits: docs/switchboard.md."""
     bound = []
 
+    def rebuilt(function, namespace):   # the same code, run in `namespace` (the daemon's globals) like every moved function
+        made = types.FunctionType(function.__code__, namespace, function.__name__, function.__defaults__, function.__closure__)
+        made.__kwdefaults__ = dict(function.__kwdefaults__) if function.__kwdefaults__ else None
+        made.__dict__.update(function.__dict__)   # the attributes a command declares (`ledger`, `ensure_on_use`, ...)
+        made.__doc__, made.__module__ = function.__doc__, namespace.get("__name__", function.__module__)
+        return made
+
     def bind(namespace, check):
-        """Rebind every moved function to `namespace` (the daemon's globals), install it there under its own name, and return the names bound. `check` is the latch's check, handed over by the daemon's one call at import and used only as the guard's closure cell; a second call into the same namespace is refused."""
+        """Rebind every moved function to `namespace`, install it there under its own name, and return the names bound; the effects are built around `check`."""
         if any(done is namespace for done in bound):
             raise RuntimeError("impact_hold is already bound to this namespace: a second bind is refused")
         bound.append(namespace)
         if not callable(check):
             raise TypeError("impact_hold.bind needs the latch's check")
-        guard = make_guard(check)
-        here = globals()
+        guard, here = make_guard(check), globals()
         for name in MOVED:
             original = here[name]
             guards = getattr(original, "guard", None)
-            body = original.__wrapped__ if guards else original
-            function = types.FunctionType(body.__code__, namespace, body.__name__, body.__defaults__, body.__closure__)
-            function.__kwdefaults__ = dict(body.__kwdefaults__) if body.__kwdefaults__ else None
-            function.__dict__.update(body.__dict__)   # the attributes a command declares (`ledger`, `ensure_on_use`, ...)
-            function.__doc__ = body.__doc__
-            function.__module__ = namespace.get("__name__", function.__module__)
-            if guards:
-                function = guard(guards[0], namespace[guards[1].__name__])(function)   # the refusal is the namespace's own copy (it names PROG and sys there)
+            function = rebuilt(original.__wrapped__ if guards else original, namespace)
+            if guards:   # the refusal is the namespace's own copy (it names PROG and sys there)
+                function = rebuilt(guard(guards[0], namespace[guards[1].__name__])(function), namespace)
             namespace[name] = function
         return MOVED
     return bind
