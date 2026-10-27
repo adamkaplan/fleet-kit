@@ -1019,25 +1019,31 @@ class HubReadAndTransport(unittest.TestCase):
         old = relay.READ_DEADLINE
         relay.READ_DEADLINE = 1.0
         self.addCleanup(setattr, relay, "READ_DEADLINE", old)
+        finished = threading.Event()
 
         def trickle(h):
             h.send_response(200)
             h.send_header("Content-Length", "100000")
             h.end_headers()
-            for _ in range(200):   # a byte every 0.2 s: every single read succeeds well inside the 20 s socket timeout
+            for _ in range(200):   # a byte every 0.2 s for 40 s: every single read succeeds well inside the 20 s socket timeout
                 h.wfile.write(b" ")
                 h.wfile.flush()
                 time.sleep(0.2)
+            finished.set()
         fetch, _ = relay.http_transport(self._serve(trickle), "tok")
-        t0 = time.monotonic()
         with self.assertRaises(TimeoutError):
             fetch()
-        self.assertLess(time.monotonic() - t0, 2.5)
+        # decided by an observation, not by a measured duration: the real code returns at the 1 s deadline while the 40 s stub is still writing
+        self.assertFalse(finished.is_set())
 
+    # Cause of #1417: this test once compared the measured time of the call with 2.5 s (assertGreater, a lower bound on a measured duration);
+    # on a loaded machine the monotonic clock read 2.27 s for a stub that writes a byte every 0.2 s fifteen times, and the test failed
+    # although nothing was wrong. It now decides by whether the stub had finished writing when the call returned.
     def test_mutant_without_the_total_deadline_is_caught(self):
         mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
         old, mod.READ_DEADLINE = relay.READ_DEADLINE, 1.0
         import time
+        finished = threading.Event()
 
         def trickle(h):
             h.send_response(200)
@@ -1047,11 +1053,11 @@ class HubReadAndTransport(unittest.TestCase):
                 h.wfile.write(b" ")
                 h.wfile.flush()
                 time.sleep(0.2)
+            finished.set()
         fetch, _ = mod.http_transport(self._serve(trickle), "tok")
-        t0 = time.monotonic()
         with self.assertRaises(Exception):
-            fetch()   # it ends only when the stub stops (ValueError from the empty JSON), after 3 s: not at the deadline
-        self.assertGreater(time.monotonic() - t0, 2.5)
+            fetch()   # it ends only when the stub stops (ValueError from the empty JSON): not at the deadline
+        self.assertTrue(finished.is_set())   # the mutant returned only after the stub finished writing
 
     def test_endless_stream_without_a_length_is_cut(self):
         def endless(h):
