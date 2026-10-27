@@ -86019,6 +86019,36 @@ class TestBigRegistrarFile(unittest.TestCase):
         self.assertEqual(seen, [["gh", "api", "-H", "Accept: application/vnd.github.raw", "repos/acme/app/contents/x?ref=" + self.BASE]])
         self.assertEqual(len(accounts.calls), 1, "the read is counted")
 
+    def _failed_raw_read(self, stderr):
+        """A raw read through accounts.read whose runner is honest: it must be asked for text=False and answers BYTES."""
+        now = [1000.0]
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {}}, lambda *a, **k: None, lambda: now[0], environ={})
+        asked = []
+        def runner(argv, **kw):
+            asked.append(kw.get("text"))
+            return subprocess.CompletedProcess(argv, 1, b"", stderr)
+        reader = sb.IntentReader("gh", "acme/app", runner=runner, accounts=accounts)
+        with self.assertRaises(sb.IntentError) as raised:
+            reader._api_raw_text("repos/acme/app/contents/x?ref=" + self.BASE, repo="acme/app")
+        self.assertEqual(asked, [False], "the runner was asked for bytes")
+        return raised.exception, accounts
+
+    def test_a_failed_raw_read_with_bytes_stderr_is_an_intent_error_not_a_type_error(self):
+        """A mutant that drops the decode before _says_rate_limited raises TypeError (bytes with a str pattern): these three tests fail it."""
+        err, accounts = self._failed_raw_read(b"gh: Not Found (HTTP 404)")
+        self.assertIn("404", str(err))
+        self.assertEqual(accounts.paused, {})
+
+    def test_a_failed_raw_read_that_says_rate_limit_in_bytes_pauses_the_account(self):
+        err, accounts = self._failed_raw_read(b"gh: API rate limit exceeded for user ID 1 (HTTP 403)")
+        self.assertIn("rate limit", str(err))
+        self.assertTrue(accounts.paused, "the pause is recorded")
+
+    def test_a_failed_raw_read_with_non_utf8_stderr_is_an_intent_error(self):
+        err, accounts = self._failed_raw_read(b"gh: bad \xff\xfe bytes (HTTP 500)")
+        self.assertIn("500", str(err))
+        self.assertEqual(accounts.paused, {})
+
     def test_the_ceiling_counts_bytes_not_characters(self):
         """3 MiB of a 2-byte character is 3 Mi characters but 6 MiB: over the ceiling. A mutant that counts characters fails this test."""
         body = ("\u00e9" * (3 * 1024 * 1024)).encode("utf-8")

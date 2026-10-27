@@ -14659,7 +14659,9 @@ class GhAccounts:
             while self.calls and self.calls[0][0] < now - 600:
                 self.calls.popleft()
         if status is None:
-            if done.returncode != 0 and _says_rate_limited(done.stderr, done.stdout):   # a plain read: no header block, but gh says it in words
+            # With text=False (a raw read) use_head is false, so the 304 and '' branches below are unreachable for it: only this branch answers it.
+            # stdout and stderr are BYTES then; _says_rate_limited searches with a str pattern, so decode both for the check (done itself stays bytes).
+            if done.returncode != 0 and _says_rate_limited(*[t.decode("utf-8", "replace") if isinstance(t, (bytes, bytearray)) else t for t in (done.stderr, done.stdout)]):   # a plain read: no header block, but gh says it in words
                 self._pause(account, now + GH_LIMIT_DEFAULT_PAUSE, 0)
             return done
         if status == 304 and cached is not None:
