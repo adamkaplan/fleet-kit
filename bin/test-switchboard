@@ -20533,7 +20533,7 @@ class TestPR8Source(unittest.TestCase):
             seen = {}
             for node in ast.parse(daemon_text(BIN / name)).body:
                 names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
-                    t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
+                    t.id for t in (node.targets if isinstance(node, ast.Assign) else []) if isinstance(t, ast.Name)]   # a `del name` is not a second definition
                 for each in names:
                     self.assertNotIn(each, seen, "%s defines %s twice (lines %s and %s)" % (name, each, seen.get(each), node.lineno))
                     seen[each] = node.lineno
@@ -33680,6 +33680,11 @@ class TestCarriesLine(LedgerBase):
         exec(compile(src.replace(old, new, 1), mod.__file__, "exec"), ns)
         if module_name == "impact_hold":   # its functions run in the daemon's globals (bind): the mutant too, and it replaces the daemon's name
             original = ns[function]
+            guards = getattr(original, "guard", None)
+            if guards:   # a guarded effect: the mutant is the effect itself, guarded by the daemon's own latch like `bind` builds it (the module's copy refuses always)
+                inner = types.FunctionType(original.__wrapped__.__code__, vars(sb), original.__name__, original.__wrapped__.__defaults__, original.__wrapped__.__closure__)
+                inner.__kwdefaults__ = original.__wrapped__.__kwdefaults__
+                return sb, sb.effect_guard(guards[0], vars(sb)[guards[1].__name__])(inner)
             return sb, types.FunctionType(original.__code__, vars(sb), original.__name__, original.__defaults__, original.__closure__)
         return mod, ns[function]
 
