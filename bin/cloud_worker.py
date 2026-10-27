@@ -71,6 +71,10 @@ class CloudError(Exception):
     """A cloud-worker step that did not finish; the message says why in one line."""
 
 
+class ServiceSilent(CloudError):
+    """The agent service of a pod did not answer at all (no connection, a timeout): worth trying again; an ANSWER that is an error is not."""
+
+
 def bind(namespace):
     """Receive the switchboard's globals (its classes and helpers). Called by the hook that loads this module."""
     H.clear()
@@ -1410,6 +1414,7 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise LaunchError("%s: %s (the worker %s was created; %s)" % (
                 name, problem, name, "it was stopped and its record dropped" if stopped else "the stop failed: the pod and its record are kept; stop it with `%s retire %s`" % (H["PROG"], name)))
+        accepted = None   # set once the brief is accepted
         fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo)
         try:
             with tunnel(cluster, record) as live:
@@ -1423,6 +1428,7 @@ def _launch(args, runner, now, reserve):
                     if hcode != 0:
                         raise CloudError("the hub entry could not be given the session: %s" % _reason(hcode, hnote))
                 if brief:
+                    accepted = int(time.time() * 1000)   # the time the first message is sent: it is accepted when the call returns
                     v2.prompt(session, SETUP_PREAMBLE % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
         except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
             stopped = _stop_after_failure(engine, runner, name, run_id, "launch failed: %s" % _one(cluster.clean(str(err), 80), 80), cluster)
@@ -1434,8 +1440,19 @@ def _launch(args, runner, now, reserve):
             if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
+        stated = None
+        try:   # the one state line, once: read only, bounded, never a failure of the launch (an interrupt waits until the launch has finished its record)
+            with tunnel(cluster, record) as live:
+                stated = launch_state_line(runner, state, cluster, record, name, remote_v2(state, live, STATE_WAIT_SECONDS), accepted)
+        except KeyboardInterrupt as err:
+            stated = err
+        except Exception:
+            stated = "cloud %s: no state read within %d s" % (name, STATE_WAIT_SECONDS)
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
+    if isinstance(stated, BaseException):
+        raise stated
+    print(stated, file=sys.stderr)   # stderr: stdout stays the one JSON line
     return H["EXIT_OK"]
 
 
@@ -1774,6 +1791,200 @@ def status_extra(runner):
         return status_lines(runner, state)
     except Exception as err:
         return ["      cloud workers: unreadable (%s)" % _one(str(err), 100)], []
+
+
+# ---------------------------------------------------------------- the state line (`status NAME`, and the launch)
+
+STATE_WAIT_SECONDS = 60   # `launch --cloud` waits at most this long for the first session message, then says so and ends normally
+ERROR_LINE_MAX = 160
+READ_FAIL = "state not read"
+_clock = time.monotonic   # the wait's clock and pause: a test swaps them for a fake clock, so no test waits for real
+_sleep = time.sleep
+_SECRET_WORD = r"(?:pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|credential|private[_-]?key|auth|bearer)"
+_KEYWORD_VALUE = re.compile(r"\b(%s\w*)\b[ \t]*[:=]?[ \t]*(?:\"[^\"]*\"|'[^']*'|\S+)" % _SECRET_WORD, re.I)
+_ASSIGNMENT = re.compile(r"""(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1([ \t]*[=:][ \t]*)("[^"]*"|'[^']*'|\S+)""")
+_LONG_RUN = re.compile(r"[A-Za-z0-9_+/=.-]{16,}")
+_SECRET_ENV_NAME = re.compile(r"(?:KEY|TOKEN|SECRET|PASS|CRED|AUTH)", re.I)
+
+
+def _assignment_sub(found):
+    name, sep = found.group(2), found.group(3)
+    if "=" in sep or found.group(1) or re.search(_SECRET_WORD, name, re.I) or ("_" in name and name.isupper()):
+        return "%s%s[redacted]" % (name, sep)   # NAME=value, "name": "value", SECRET_NAME: value: the value never stays
+    return found.group(0)
+
+
+def _redact_assignments(text):
+    """Every `NAME=value` the rule above judges secret, found by walking the text: a pair that is kept does NOT hide the pairs inside its value."""
+    out, pos = [], 0
+    while True:
+        found = _ASSIGNMENT.search(text, pos)
+        if not found:
+            return "".join(out) + text[pos:]
+        replaced = _assignment_sub(found)
+        if replaced == found.group(0):   # kept: go on from the start of its value, so a pair inside the value is still judged
+            out.append(text[pos:found.start(4)])
+            pos = found.start(4)
+        else:
+            out.append(text[pos:found.start()] + replaced)
+            pos = found.end()
+
+
+def _run_sub(found):
+    run = found.group(0)
+    mixed = re.search(r"[A-Za-z]", run) and re.search(r"[0-9]", run)
+    return "[redacted]" if (mixed or len(run) >= 32) else run
+
+
+def redact_error(text, known=()):
+    """The error line that `status` prints, made safe BEFORE it is cut (so a cut never leaves a piece of a value): the launcher's own scrub (this run's
+    known secrets and any 8+ character piece of one, token and credential shapes, control characters), then (1) every value after `NAME=`, after a
+    quoted name and after a name that is capitalised or holds a secret word (password, token, key, secret, auth, bearer), (2) the word after such a
+    keyword, (3) every long run of letters and digits (16+ with both, 32+ of any), then the cut at ERROR_LINE_MAX. Nothing is added back."""
+    lib = _lib()
+    text = lib.scrub(str(text or "").strip().splitlines()[-1] if str(text or "").strip() else "", known, 4000)
+    text = _redact_assignments(text)
+    text = _KEYWORD_VALUE.sub(lambda m: m.group(1) + " [redacted]", text)
+    text = _LONG_RUN.sub(_run_sub, text)
+    return " ".join(text.split())[:ERROR_LINE_MAX]
+
+
+def _known_secrets(state, record, cluster):
+    """The values that must never print: this command's own (the cluster login's), the worker's password (and its other forms), and the values of
+    this process's environment variables whose name says key, token, secret, pass, credential or auth."""
+    known = set(getattr(cluster, "known", ()) or ())
+    try:
+        password = _read_private(password_path(state, record["worker"]), PASSWORD_MAX + 2).strip()
+        if password:
+            known.update(_lib().secret_forms(password))
+    except (OSError, ValueError, CloudError):
+        pass
+    known.update(v for k, v in os.environ.items() if v and len(v.strip()) >= 8 and _SECRET_ENV_NAME.search(k))
+    return known
+
+
+def _message_ms(message):
+    times = message.get("time") if isinstance(message.get("time"), dict) else {}
+    found = [times.get(k) for k in ("completed", "created") if isinstance(times.get(k), (int, float)) and not isinstance(times.get(k), bool)]
+    return max(found) if found else None
+
+
+def _message_error(message):
+    """The last error line of one message, or None: its `error` field (a string, or an object's message or name), else the last line of its text that
+    says error, failed or exception."""
+    err = message.get("error")
+    if isinstance(err, dict):
+        data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        err = err.get("message") or data.get("message") or err.get("name")
+    if isinstance(err, str) and err.strip():
+        return err
+    for line in reversed(str(H["_message_text"](message)).splitlines()):
+        if re.search(r"\b(error|failed|exception|traceback)\b", line, re.I):
+            return line
+    return None
+
+
+def _read_agent(v2, session, messages=20):
+    """(waiting, newest message time in ms or None, the newest error text or None), read from the agent service of the pod: the session's pending
+    permission requests and questions (forms), and, when `messages` is above 0, its newest messages. Reads only."""
+    waiting = bool(v2.permission_list(session)) or bool(v2.form_list(session))
+    found = [m for m in ((v2.message_list(session, limit=messages, order="desc") or []) if messages else []) if isinstance(m, dict)]
+    times = [t for t in (_message_ms(m) for m in found) if t is not None]
+    error = next((e for e in (_message_error(m) for m in found) if e), None)
+    return waiting, (max(times) if times else None), error
+
+
+def _when(ms):
+    if ms is None:
+        return "none yet"
+    try:
+        return datetime.datetime.fromtimestamp(ms / 1000.0, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return "unreadable"
+
+
+def state_line(name, state, row):
+    """THE one line: the state, the time of the last tool call or message, and the last error line (already redacted and cut)."""
+    return "cloud %s: %s; last tool call or message %s; last error %s" % (name, row["state"], _when(row.get("last_ms")), row.get("error") or "none")
+
+
+def read_state(runner, state, cluster, record, timeout, snapshot=None, v2_for=None, messages=20):
+    """{state, last_ms, error}: starting (the pod is Pending, or Running with no session yet), running (a session and no pending prompt), waiting on a
+    prompt (a pending permission request or question on the session) or exited (the pod is Succeeded or Failed, or gone). A pod that cannot be told
+    or read raises CloudError: it is never called running. READ ONLY: no message is sent and nothing is written."""
+    if not _pod_known(record):
+        raise CloudError("the runtime id is not pod/<name>: the pod cannot be told")
+    pod = _pod_of(record, snapshot if snapshot is not None else _cluster_snapshot(runner, cluster, timeout))
+    phase = _safe(pod.get("phase")) if pod else None
+    row = {"state": "exited", "last_ms": None, "error": None}
+    if pod is None or phase in ("Succeeded", "Failed"):
+        return row
+    if phase == "Pending" or not record.get("session"):
+        row["state"] = "starting"
+        return row
+    if phase != "Running":
+        raise CloudError("the pod phase is %s" % phase)
+    try:
+        if v2_for is not None:
+            waiting, last, error = _read_agent(v2_for(), record["session"], messages)
+        else:
+            with tunnel(cluster, record) as live:
+                waiting, last, error = _read_agent(remote_v2(state, live, timeout), record["session"])
+    except (H["V2Unreachable"], OSError) as err:
+        raise ServiceSilent("the agent service did not answer (%s)" % type(err).__name__) from None
+    except H["V2Error"] as err:
+        if err.reason in ("timeout", "unavailable", "backoff"):   # no answer in time: the same as silence
+            raise ServiceSilent("the agent service did not answer (%s)" % err.reason) from None
+        raise CloudError("the agent service refused the read (%s)" % err.reason) from None
+    row.update(state="waiting on a prompt" if waiting else "running", last_ms=last,
+               error=redact_error(error, _known_secrets(state, record, cluster)) if error else None)
+    return row
+
+
+@refusals
+def cmd_state(args, runner, now):
+    """`status NAME` for a cloud worker: ONE line. Only the caller's own worker (the operator, the Chief of Staff or the worker's own boss, the rule of
+    `retire`); another lane's is refused. Read only: no message sent, no file written, no cluster change."""
+    LaunchError = H["LaunchError"]
+    record = route(args.name)
+    if record is None:
+        raise LaunchError("%s is not a cloud worker" % _one(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(args.name)), 60))
+    kind = H["gates_caller_kind"](runner, now)
+    if not _may_retire(kind, record):
+        raise Refusal("refused: only the operator, the Chief of Staff or %s's own boss may read its state" % args.name)
+    _, state, config = H["build_engine"](runner, now, "cli", writable=False)
+    with Cluster() as cluster:
+        try:
+            row = read_state(runner, state, cluster, record, STATUS_SECONDS)
+            line = state_line(args.name, state, row)
+        except CloudError as err:
+            row, line = {"state": READ_FAIL}, "cloud %s: %s (%s)" % (args.name, READ_FAIL, _one(cluster.clean(str(err), 100), 100))
+    print(line)
+    return H["EXIT_OK"] if row["state"] != READ_FAIL else H["EXIT_ERROR"]
+
+
+def launch_state_line(runner, state, cluster, record, name, v2, accepted_ms=None, seconds=STATE_WAIT_SECONDS):
+    """The line `launch --cloud` prints ONCE, after the pod's address is known and its brief was accepted (`accepted_ms`: when the first message of
+    the session was accepted, which is then the time of the last message; the message log itself is not read here). The state read is tried again
+    every 2 s for at most `seconds` (by `_clock`); past that it returns `no state read within N s`. Never raises (but an interrupt): the launch
+    never fails because of this wait. Read only."""
+    end = _clock() + seconds
+    try:   # the pod phase is read ONCE (a cluster read); only the agent service is asked again
+        snapshot = _cluster_snapshot(runner, cluster, min(STATUS_SECONDS, seconds))
+    except Exception as err:
+        return "cloud %s: %s (%s)" % (name, READ_FAIL, _one(cluster.clean(str(err), 100), 100))
+    while True:
+        try:
+            row = read_state(runner, state, cluster, record, STATUS_SECONDS, snapshot=snapshot, v2_for=lambda: v2, messages=0)
+            row["last_ms"] = row["last_ms"] or accepted_ms
+            return state_line(name, state, row)
+        except ServiceSilent:   # the service does not answer yet: try again until the bound
+            pass
+        except Exception as err:   # an answer that is a refusal, or a pod that cannot be told: said now, not waited for
+            return "cloud %s: %s (%s)" % (name, READ_FAIL, _one(cluster.clean(str(err), 100), 100))
+        if _clock() >= end:
+            return "cloud %s: no state read within %d s" % (name, seconds)
+        _sleep(min(2, max(0.0, end - _clock())))
 
 
 # ---------------------------------------------------------------- retire

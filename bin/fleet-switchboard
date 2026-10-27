@@ -13544,6 +13544,12 @@ def format_status(report):
 
 
 def cmd_status(args, runner=subprocess.run, now=time.time):
+    if getattr(args, "name", None):   # `status NAME`: ONE line of state for the caller's own cloud worker (read only); a refusal is exit 2, any other trouble exit 1
+        try:
+            return run_cloud("cmd_state", args, runner, now)
+        except LaunchError as err:
+            sys.stderr.write("%s: %s\n" % (PROG, err))
+            return EXIT_ERROR
     report = collect_status(runner, now)
     try:
         cloud_lines, cloud_rows = load_module("cloud_worker").bind(globals()).status_extra(runner)   # cloud workers (#371): nothing when there are none
@@ -22556,6 +22562,7 @@ def build_parser():
                "State: $XDG_STATE_HOME/%s/ (mode 0700). See docs/switchboard.md." % (PROG, PROG))
     sub = parser.add_subparsers(dest="action", required=True)
     status = sub.add_parser("status", help="Config, clients, and every fleet agent with what is pending for it")
+    status.add_argument("name", nargs="?", help="A cloud worker of yours: print ONE line of its state (starting, running, waiting on a prompt, exited), the time of its last tool call or message and its last error (read only)")
     status.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
     run = sub.add_parser("run", help="The daemon: observe, derive, decide, deliver, every poll seconds")
     run.add_argument("--once", action="store_true", help="One pass, then exit")

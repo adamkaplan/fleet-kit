@@ -558,6 +558,7 @@ Agents the switchboard manages do not use `heartbeat-ack`.
 | herdr sidebar | Status (from herdr's integration) and an unread count per pane |
 | herdr toast | An item held longer than 15 minutes and why; a blocked worker; an Intent change; a switchboard fault |
 | `fleet-switchboard status` | Every fleet agent: session, pane, status, pending and held items with reasons; GitHub watches |
+| `fleet-switchboard status NAME` | One line for your own cloud worker NAME: its state (`starting`, `running`, `waiting on a prompt`, `exited`), the time of its last tool call or message and its last error (redacted, at most 160 characters); read only. See `cloud/launcher/README.md` |
 | `fleet-switchboard audit` | The decision history for one agent or one issue |
 | `fleet-switchboard intents` | Every open ask, one line each with its Done-when (PR 6) |
 

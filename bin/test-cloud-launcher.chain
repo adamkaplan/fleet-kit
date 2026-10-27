@@ -8,6 +8,7 @@ cloud/launcher/tests/test_cloud_hub_manifest.py
 cloud/launcher/tests/test_cloud_hub_network.py
 cloud/launcher/tests/test_cloud_k1.py
 cloud/launcher/tests/test_cloud_pod_replaced.py
+cloud/launcher/tests/test_cloud_pod_state_line.py
 cloud/launcher/tests/test_cloud_pr_preflight.py
 cloud/launcher/tests/test_cloud_preflight_quick.py
 cloud/launcher/tests/test_cloud_preflight_wired.py

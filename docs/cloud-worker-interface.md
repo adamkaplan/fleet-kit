@@ -84,7 +84,7 @@ Owned by the switchboard (slice C), in its state directory, mode 0600 (a JSON fi
 |---|---|
 | launch | `create`, then the existing session create and brief, against `url` instead of the loopback service file |
 | send / wake | the same session API call as local, against `url` with Basic auth from `auth_ref` |
-| read / status / reports | the same reads (and event stream), against `url` |
+| read / status / reports | the same reads (and event stream), against `url`; `status NAME` is the one-line state of section 8 |
 | retire | `stop`; the retire says the WIP branch if work was pushed, and fails with `stop`'s exit 1 reason if not |
 
 Today `V2Http` accepts only a `http` loopback address and one service file. Slice C must generalise it to one
@@ -137,6 +137,17 @@ administrator credential in the vault at the moment of use (`CW_CLUSTER_TOKEN_CM
 is a refusal (exit 2) that names the vault pre-check. Only repositories on `CW_ALLOWED_REPOS` can be launched.
 
 **What the pod is told.** The session is created in `/work` (the scratch volume; `--dir` overrides) with the image's own agent, `worker` (`cloud/worker/agents/worker.md`), unless `--agent orchestrator` is given (#1157): `--agent orchestrator` selects the orchestrator; any other `--agent` value stays the local role name, only recorded, and the pod runs the worker. The launcher's own `create --agent` accepts only `worker` or `orchestrator` and refuses anything else (exit 2) before any cluster call. `orchestrator` needs `--reports-to BOSS`, sets `CW_AGENT=orchestrator` and the names `FLEET_AGENT_NAME`, `FLEET_BOSS`, `FLEET_CLOUD_CHANNEL_URL` (settings row `CW_HUB_CHANNEL_URL`) and `FLEET_CLOUD_TOKEN_FILE` in the pod; see `cloud/README.md`, "The orchestrator agent". The brief is sent after a standard setup preamble: clone the repository into `/work/repo`, switch to the task branch, work only there (the end hook pushes from `/work/repo`). `retire` of a worker whose end hook cannot push keeps the pod and the record; `cloud-worker delete NAME --force` is the explicit last resort and discards the pod's work.
+
+## 8. The state line (`status NAME`, ask #1397)
+
+`status` used to list a cloud worker only by name, its stop time and `launcher status unavailable` when the launcher could not be reached, so a pod stuck on a prompt looked like a running one. What the launcher can read: the pod phase, the agent service's session state and its last message time. `fleet-switchboard status NAME` prints ONE line for a cloud worker of the caller (its own boss, the Chief of Staff or the operator; another lane's worker is refused, exit 2): the state, the time of the last tool call or message, and the last error line, read only (no message sent, no file written, no cluster change). The error line is redacted BEFORE it is cut to 160 characters: the launcher's scrub, then every value after `NAME=`, a quoted name or a secret word, then every long run of letters and digits. `launch --cloud` prints the same line once on stderr, after the pod's address is known, waiting at most 60 s for the first session message; past that it prints `no state read within 60 s` and the launch ends normally.
+
+| State | Read from | What it tells a lane to do |
+|---|---|---|
+| `starting` | the pod is Pending, or Running with no session yet | wait and read again; `retire` and launch again if it stays so past the idle limit |
+| `running` | a session exists and no question or permission request is pending | leave it; `read NAME` shows its work |
+| `waiting on a prompt` | the agent service reports a pending question or permission request on the session | it is stuck until answered: `read NAME` shows what it asks, then `retire NAME` and launch again with the answer in the brief |
+| `exited` | the pod is Succeeded or Failed, or gone | read its report and branch; do not wait; `cloud-clear` removes the record |
 
 ## Why a cloud worker's plan check and name were stuck
 

@@ -186,6 +186,29 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
 
+### Reading a cloud worker's state in one line: `status NAME`
+
+**The problem.** `status` used to list a cloud worker only by name, its stop time and `launcher status unavailable` when the launcher could not be reached. A pod stuck on a question nobody answers looked like a running one, and a finished pod looked the same until its stop time passed. `launch --cloud` printed the pod's address but not whether the pod took its brief.
+
+**What the launcher can read.** The pod phase, the agent service's session state and its last message time: nothing else.
+
+**The line.** `fleet-switchboard status NAME` prints ONE line for a cloud worker of yours:
+
+```text
+cloud coder7: running; last tool call or message 2026-10-27T10:04:12Z; last error none
+```
+
+It holds the state, the time of the last tool call or message (`none yet` when the session has no message), and the last error line of the worker's own message log: the redaction of the launcher's scrub (this command's secrets, token and credential shapes) is applied first, then every value after `NAME=`, after a quoted name or after a word like password, token, key or secret, then every long run of letters and digits, and only then the line is cut to 160 characters, so no secret, password or environment value reaches it. `launch --cloud` prints the same line ONCE on stderr (stdout stays the one JSON line), after the pod's address is known and the first session message is accepted; it waits at most 60 s for that, and if nothing is read it prints `no state read within 60 s`: the launch still ends with its normal exit status. When the state cannot be read the line says `state not read (reason)` and the command exits 1: it never says `running` for what it did not see.
+
+The command is read only (no message is sent, no file is written, nothing in the cluster changes) and works for your own workers only: the operator, the Chief of Staff or the worker's own boss; another lane's worker is refused (exit 2), as `retire` refuses it.
+
+What each state tells a lane to do:
+
+- `starting`: the pod is Pending, or Running with no session yet. Wait and read it again; if it stays `starting` past the idle limit, `retire NAME` and launch again.
+- `running`: a session exists and nothing is pending. Leave it; `read NAME` shows what it is doing, and a last-message time that does not move for a long while is the sign to look.
+- `waiting on a prompt`: the agent service reports a pending question or permission request on the session, so the worker is stuck until someone answers. `read NAME` shows what it asks; this command cannot answer it, so give it the answer in a new brief: `retire NAME` and launch again.
+- `exited`: the pod Succeeded or Failed, or is gone. Read its report and its pushed branch; do not wait for it, and `cloud-clear` removes the record.
+
 ## How a member adds a test to the chain
 
 Cause of the old merge rounds: the whole chain of `bin/test-cloud-launcher` was ONE shell line of more than forty commands joined by `&&`, and every member that added a test appended to that same line, so every pair of concurrent members conflicted on it.
