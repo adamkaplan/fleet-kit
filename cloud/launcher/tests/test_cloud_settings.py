@@ -323,6 +323,8 @@ class Reader(Dir):
         self.assertNotIn("CW_TOOLING_REPO", env)
         self.assertNotIn("CW_GIT_TOKEN_CMD", env)
 
+    # the refusal text names the temporary file's path, and a random directory name can contain a short fixture value
+    # (the two-letter namespace), so the value is looked for in the text with the file's own path removed (#1212).
     def test_a_key_in_both_with_a_different_value_is_refused_naming_both_sources_and_no_value(self):
         for key in GOOD:
             with self.subTest(key):
@@ -332,7 +334,7 @@ class Reader(Dir):
                 self.assertIn(self.path, err)
                 self.assertIn("environment", err)
                 self.assertNotIn("other-value-zz", err)
-                self.assertNotIn(GOOD[key], err)
+                self.assertNotIn(GOOD[key], err.replace(self.path, ""))
 
     def test_a_key_in_both_with_the_same_value_is_accepted(self):
         self.write(body(GOOD))
