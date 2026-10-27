@@ -203,7 +203,7 @@ class RealTree(unittest.TestCase):
         for b in ("test-cloud-hub", "test-cloud-relay", "test-cloud-hub-relay", "test-cloud-relay-daemon"):
             self.assertIn(b, bins)
         for b in ("test-cloud-relay", "test-cloud-hub-relay", "test-cloud-relay-daemon"):
-            self.assertNotIn(b + ":own-ci-step", exc)
+            self.assertIn(b + ":own-ci-step", exc)
         # mutant: a new script in none of the three places is caught (assert the mutation applied)
         mutated = bins + ["test-cloud-zz-new"]
         self.assertEqual(len(mutated), len(bins) + 1)
@@ -230,15 +230,18 @@ class RealTree(unittest.TestCase):
         wf = "".join(slurp(os.path.join(wfdir, n)) for n in sorted(os.listdir(wfdir)) if n.endswith((".yml", ".yaml")))
         self.assertEqual(self.reason_errors(exc, wf), [])
         self.assertIn("own-ci-step", exc)
-        self.assertIn("in-no-ci-step", exc)
+        self.assertNotIn("in-no-ci-step", exc)
         # mutant 1: an excepted script marked not-yet-chained while a workflow step exists
         m1 = exc.replace("test-cloud-hub:own-ci-step", "test-cloud-hub:not-yet-chained(#1311)")
         self.assertNotEqual(m1, exc)
         self.assertEqual(self.reason_errors(m1, wf), ["test-cloud-hub: says not-yet-chained but a workflow step exists"])
-        # mutant 2: own-ci-step claimed for a script no workflow step names
-        m2 = exc.replace("test-cloud-relay:in-no-ci-step(#1376)", "test-cloud-relay:own-ci-step")
+        # mutant 2: the old reason for a relay script, which now has a workflow step
+        m2 = exc.replace("test-cloud-relay:own-ci-step", "test-cloud-relay:in-no-ci-step(#1376)")
         self.assertNotEqual(m2, exc)
-        self.assertEqual(self.reason_errors(m2, wf), ["test-cloud-relay: says own-ci-step but no workflow step names it"])
+        self.assertEqual(self.reason_errors(m2, wf), ["test-cloud-relay: says in-no-ci-step but a workflow step exists"])
+        # mutant 2b: own-ci-step claimed for a script no workflow step names
+        m2b = exc + " test-cloud-zz-new:own-ci-step"
+        self.assertEqual(self.reason_errors(m2b, wf), ["test-cloud-zz-new: says own-ci-step but no workflow step names it"])
         # mutant 3: the workflow step removed from the text
         m3 = wf.replace("- name: bin/test-cloud-hub\n", "- name: removed\n")
         self.assertNotEqual(m3, wf)

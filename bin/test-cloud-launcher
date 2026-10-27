@@ -22,7 +22,7 @@ for f in bin/test-cloud-cost-*; do
   echo "NOT RUN: bin/$n is not chained"; echo "RESULT: FAIL"; exit 1
 done
 # Every bin/test-cloud-* script must be listed in $LIST or named here with a reason (a third, wider check).
-BIN_EXCEPTIONS="test-cloud-hub:own-ci-step test-cloud-hub-relay:in-no-ci-step(#1376) test-cloud-relay:in-no-ci-step(#1376) test-cloud-relay-daemon:in-no-ci-step(#1376) test-cloud-channel:own-ci-step test-cloud-channel-server:own-ci-step test-cloud-cli:own-ci-step test-cloud-client:own-ci-step test-cloud-launcher:this-script test-cloud-neutral-names:own-ci-step test-cloud-way-back:own-ci-step test-cloud-worker:own-ci-step"
+BIN_EXCEPTIONS="test-cloud-hub:own-ci-step test-cloud-hub-relay:own-ci-step test-cloud-relay:own-ci-step test-cloud-relay-daemon:own-ci-step test-cloud-channel:own-ci-step test-cloud-channel-server:own-ci-step test-cloud-cli:own-ci-step test-cloud-client:own-ci-step test-cloud-launcher:this-script test-cloud-neutral-names:own-ci-step test-cloud-way-back:own-ci-step test-cloud-worker:own-ci-step"
 for f in bin/test-cloud-*; do
   [ -e "$f" ] || continue
   n=$(basename "$f")
