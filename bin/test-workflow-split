@@ -123,7 +123,7 @@ OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
 ADDED = [("bin/test-cloud-hub", "10"), ("bin/test-cloud-channel", None), ("bin/test-cloud-channel-server", None), ("bin/test-cloud-client", None),
          ("bin/test-cloud-way-back", None), ("bin/test-decisions-pull", "10"), ("bin/test-cloud-cli", "10")]
 # The three relay suites added by ask #1376, after the seven, in this order (a timeout sized from a measured run on both systems).
-RELAY = [("bin/test-cloud-relay", "15"), ("bin/test-cloud-hub-relay", "15"), ("bin/test-cloud-relay-daemon", "15")]
+RELAY = [("bin/test-cloud-relay", "5"), ("bin/test-cloud-hub-relay", "5"), ("bin/test-cloud-relay-daemon", "5")]
 NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", "30")] + [suite(n, "", t) for n, t in ADDED + RELAY]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
@@ -498,7 +498,7 @@ class Mutants(unittest.TestCase):
         self.killed(mutate(text, "\n  # The cloud suites run beside", "\n      - run: echo x\n\n  # The cloud suites run beside"), self.STEPS)
 
     def relay_step(self, name):
-        return "      - name: %s\n        if: ${{ !cancelled() }}\n        timeout-minutes: 15\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)
+        return "      - name: %s\n        if: ${{ !cancelled() }}\n        timeout-minutes: 5\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)
 
     def test_s5_each_of_the_three_relay_steps_removed_fails_the_shape_test(self):
         text = WORKFLOW.read_text()
@@ -534,8 +534,30 @@ class Mutants(unittest.TestCase):
         self.killed(text[:i] + text[i:].replace("include: ${{ fromJSON(needs.plan.outputs.matrix) }}", "os: [ubuntu-latest, macos-latest, windows-latest]", 1), self.SHAPE)
 
 
+class RelayDocs(unittest.TestCase):
+    """S8: cloud/README.md names the three relay steps and the measured time of each (ask #1376)."""
+
+    README = WORKFLOW.parent.parent.parent / "cloud" / "README.md"
+
+    @staticmethod
+    def states(text):
+        para = next((p for p in text.split("\n\n") if "ask #1376" in p), "")
+        named = all(re.search(r"%s(?![\w-])" % re.escape(n), para) for n, _ in RELAY)
+        return named and re.search(r"Measured .*\d+ / \d+", para) is not None and "timeout-minutes: 5" in para
+
+    def test_s8_the_readme_names_the_three_steps_and_their_time(self):
+        self.assertTrue(self.states(self.README.read_text()))
+
+    def test_s8_a_readme_without_a_step_or_the_time_is_refused(self):
+        text = self.README.read_text()
+        for n, _ in RELAY:
+            self.assertFalse(self.states(text.replace(n + "`", "x`", 1)), n)
+        self.assertFalse(self.states(text.replace("Measured", "Seen")))
+        self.assertFalse(self.states(text.replace("ask #1376", "ask")))
+
+
 if __name__ == "__main__":
     loader = unittest.defaultTestLoader
-    result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite([loader.loadTestsFromTestCase(Pins), loader.loadTestsFromTestCase(Mutants)]))
+    result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite([loader.loadTestsFromTestCase(Pins), loader.loadTestsFromTestCase(Mutants), loader.loadTestsFromTestCase(RelayDocs)]))
     print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
     sys.exit(0 if result.wasSuccessful() else 1)
