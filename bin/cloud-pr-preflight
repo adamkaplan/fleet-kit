@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """cloud-pr-preflight: check a cloud pull request the way CI will, before the push (ask #1195).
 
-Run at the repository root:  bin/cloud-pr-preflight
+Run at the repository root:  bin/cloud-pr-preflight [--quick]
+--quick (ask #1299): section 2 runs only the test files that read a changed file plus the named scans of bin/cloud_quick.py
+(each a file and one selector), on the branch and on the clean base; same three sections and exit codes. Default: every file. CLOUD_PREFLIGHT_MODE=quick is the same as --quick (bin/cloud-prepush sets it).
+A quick run that selects nothing for a non-empty change fails (never clean).
 Offline. Prints three sections; exits 0 when 1 and 2 pass (and no --expect stray file); section 3 only lists edits to justify.
   1. completeness scan of bin/test-cloud-launcher
   2. every test file of cloud/launcher/tests and cloud/worker/tests, one at a time, on the branch and on a clean
@@ -10,10 +13,17 @@ Offline. Prints three sections; exits 0 when 1 and 2 pass (and no --expect stray
   3. existing test files this branch changes against the default branch (listed for you to justify; it does not change the exit status)
 Environment: CLOUD_PREFLIGHT_TIMEOUT (seconds per file, default 120), CLOUD_PREFLIGHT_BASE (default branch ref).
 """
-import glob, os, shutil, signal, subprocess, sys, tarfile, tempfile, io
+import glob, os, shutil, signal, subprocess, sys, tarfile, tempfile, io, time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    import cloud_quick  # noqa: E402  (the shared quick-mode selection, bin/cloud_quick.py)
+except ImportError:  # a lone copy: the full mode works; quick mode fails loudly (never degrades silently)
+    cloud_quick = None
 
 TEST_DIRS = ("cloud/launcher/tests", "cloud/worker/tests")
 CHAIN = "bin/test-cloud-launcher"
+CHAIN_LIST = "bin/test-cloud-launcher.chain"  # the list of chained tests, one entry per line
 # files allowed to time out, with the reason (a timeout on any other file fails the command)
 TIMEOUT_ALLOW = {
     "test_cloud_pod_deadline.py": "slow (about 26s) and not chained",
@@ -54,10 +64,34 @@ def kill_children():
     del CHILD[:]
 
 
-def run_one(root, rel, timeout):
+QUICK_TOTAL_DEFAULT = 240  # seconds for the whole quick run (the pre-push command's own tests still fit in a 300 s pod)
+
+
+def quick_total():
+    """CLOUD_PREFLIGHT_QUICK_TOTAL: a positive whole number of seconds; read only by a quick run. ValueError when invalid."""
+    raw = os.environ.get("CLOUD_PREFLIGHT_QUICK_TOTAL")
+    if raw is None:
+        return QUICK_TOTAL_DEFAULT
+    if not raw.isascii() or not raw.isdigit() or int(raw) < 1:
+        raise ValueError(raw)
+    return int(raw)
+
+
+QUICK_TOTAL = QUICK_TOTAL_DEFAULT
+
+
+def run_one(root, rel, timeout, selector=None):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     try:
-        p = subprocess.Popen([sys.executable, rel], cwd=root, env=env, stdout=subprocess.DEVNULL,
+        cmd = [sys.executable, rel]
+        try:
+            with open(os.path.join(root, rel), "rb") as fh:
+                first = fh.readline()
+            if first.startswith(b"#!") and b"python" not in first:
+                cmd = ["sh", rel]  # a shell script (a shebang that is not python) is run by sh
+        except OSError:
+            pass
+        p = subprocess.Popen(cmd + ([selector] if selector else []), cwd=root, env=env, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
         return 127
@@ -79,18 +113,29 @@ def main():
     for sg in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sg, _on_signal)
     expect = []
+    quick = os.environ.get("CLOUD_PREFLIGHT_MODE") == "quick"
     args = sys.argv[1:]
+    if cloud_quick is None and (quick or "--quick" in args):
+        print("cloud_quick helper missing", file=sys.stderr); return 2
     while args:
         a = args.pop(0)
         if a == "--expect" and args:
             expect.append(args.pop(0))
+        elif a == "--quick":
+            quick = True
         elif a.startswith("--expect="):
             expect.append(a.split("=", 1)[1])
         else:
-            print("usage: cloud-pr-preflight [--expect PATH-PREFIX]..."); return 2
+            print("usage: cloud-pr-preflight [--quick] [--expect PATH-PREFIX]..."); return 2
     rc, root = git("rev-parse", "--show-toplevel")
     if rc:
         print("cloud-pr-preflight: not in a git repository"); return 2
+    global QUICK_TOTAL
+    if quick:
+        try:
+            QUICK_TOTAL = quick_total()
+        except ValueError:
+            print("cloud-pr-preflight: CLOUD_PREFLIGHT_QUICK_TOTAL must be a whole number of seconds (1 or more)"); return 2
     try:
         timeout = int(os.environ.get("CLOUD_PREFLIGHT_TIMEOUT", "120"))
         if timeout < 1:
@@ -128,6 +173,10 @@ def main():
         print("== 1. completeness scan (%s) ==" % CHAIN)
         try:
             chain = open(os.path.join(root, CHAIN)).read()
+            try:
+                chain += "\n" + open(os.path.join(root, CHAIN_LIST)).read()
+            except OSError:
+                pass  # an old-form script names its tests inside itself
         except OSError:
             chain = ""
             print("NOT RUN: %s is missing" % CHAIN); failed = True
@@ -146,14 +195,59 @@ def main():
         failed |= bool(bad)
         print("scan: " + ("FAIL" if bad else "ok"))
 
-        print("\n== 2. every test file, one at a time (timeout %ds each) ==" % timeout)
+        sel_of = {}
+        if quick:
+            rc, out = git("diff", "--name-only", "--no-renames", mb, cwd=root)
+            changed_files = {x for x in out.splitlines() if x}
+            rc, out = git("ls-files", "--others", "--exclude-standard", cwd=root)
+            changed_files |= {x for x in out.splitlines() if x}
+            tracked = git("ls-files", cwd=root)[1].split("\n")
+            every = cloud_quick.readers(root, tracked, changed_files)  # the same reader rule as bin/cloud-prepush
+            reads, cannot = cloud_quick.split_readers(every)  # reads: the readers a quick run can start
+            reason = cloud_quick.not_run_reason(every, changed_files) if changed_files else None
+            picks = cloud_quick.add_scans(root, [(r, None) for r in reads], cloud_quick.SCAN_TESTS)
+            names = []
+            for r, s in picks:
+                key = r if s is None else r + "::" + s
+                sel_of[key] = (r, s)
+                names.append(key)
+            names = sorted(names)
+            print("\n== 2. quick mode: %s, plus the named scans (timeout %ds each) =="
+                  % (cloud_quick.mode_line(len(every), len(changed_files)), timeout))
+            if changed_files and not names:
+                print("NOT RUN: quick mode selected no check for a non-empty change; this is not a clean result")
+            if reason:
+                print("NOT RUN: " + reason)
+            for line in cloud_quick.cannot_lines(every):
+                print(line)
+            failed |= bool(cannot)
+            if changed_files and not reads:
+                print("\nRESULT: FAIL")
+                return 1  # decided from the reader picks alone: no scan is started
+        else:
+            print("\n== 2. every test file, one at a time (timeout %ds each) ==" % timeout)
+            names = sorted(set(tests_in(root)) | base_tests)
         print("%-52s %-9s %-9s %s" % ("file", "branch", "default", "verdict"))
-        names = sorted(set(tests_in(root)) | base_tests)
         verdicts = []
+        t_start = time.monotonic()
         for rel in names:
-            b = run_one(root, rel, timeout) if os.path.exists(os.path.join(root, rel)) else "absent"
-            d = run_one(basedir, rel, timeout) if rel in base_tests else "absent"
-            n = os.path.basename(rel)
+            path, sel = sel_of.get(rel, (rel, None))
+            remaining = QUICK_TOTAL - (time.monotonic() - t_start)
+            if quick and remaining <= 0:
+                print("NOT RUN: quick run exceeded %d s (selected %d files, ran %d; stopped before %s)"
+                      % (QUICK_TOTAL, len(names), len(verdicts), rel))
+                failed = True
+                break
+            if quick and path in cloud_quick.HEAVY:
+                print("%-52s %-9s %-9s %s" % (rel, "-", "-", "skipped: memory-heavy " + path))
+                verdicts.append((rel, "-", "-", "skipped")); failed = True
+                continue
+            tmo = min(timeout, max(1, int(remaining))) if quick else timeout  # clamp to the time left
+            b = run_one(root, path, tmo, sel) if os.path.exists(os.path.join(root, path)) else "absent"
+            if quick:
+                tmo = min(timeout, max(1, int(QUICK_TOTAL - (time.monotonic() - t_start))))
+            d = run_one(basedir, path, tmo, sel) if os.path.exists(os.path.join(basedir, path)) else "absent"
+            n = os.path.basename(path)
             if "timeout" in (b, d):
                 if n in TIMEOUT_ALLOW:
                     v = "not run (allowed: %s)" % TIMEOUT_ALLOW[n]

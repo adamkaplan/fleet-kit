@@ -172,6 +172,7 @@ HELPER_MODULES = {   # the old `load_<module>()` names: each returns `load_modul
     "load_health_records": "health_records",
     "load_reds": "reds",
     "load_impact_floor": "impact_floor",
+    "load_impact_brief": "impact_brief",
     "load_plan_review": "plan_review",
     "load_external_adapter": "external_adapter",
     "load_decision_sync": "decision_sync",
@@ -1086,6 +1087,8 @@ def herdr_socket_path(environ=None):
     environ = os.environ if environ is None else environ
     if environ.get("HERDR_SOCKET_PATH"):
         return environ["HERDR_SOCKET_PATH"]
+    if environ.get(KEPT_SOCKET_ENV):
+        return environ[KEPT_SOCKET_ENV]
     base = environ.get("XDG_CONFIG_HOME")
     root = Path(base) if base and os.path.isabs(base) else Path.home() / ".config"
     return str(root / "herdr" / "herdr.sock")
@@ -1145,9 +1148,13 @@ class HerdrClient:
 
     def _call(self, *args):
         argv = [self.binary, *args]
+        extra = {}
+        kept = self.socket_path or os.environ.get(KEPT_SOCKET_ENV)
+        if kept and not os.environ.get("HERDR_SOCKET_PATH"):
+            extra["env"] = {**os.environ, "HERDR_SOCKET_PATH": kept}   # #1066: the daemon's own env holds none; the CLI must still find the custom socket
         try:
             result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
-                                 stdin=subprocess.DEVNULL)
+                                 stdin=subprocess.DEVNULL, **extra)
         except subprocess.TimeoutExpired:
             raise HerdrError("timeout", "herdr did not answer within %ss" % self.timeout) from None
         except OSError as err:
@@ -2621,6 +2628,44 @@ class Switchboard:
             observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
         return observation
 
+    def pane_truth(self, entry):
+        """#1066: the agent entry the PANE'S OWN PROCESS supports. A pane is bound to a session only when its foreground process runs it
+        (`runs_session`, the evidence the health check uses); the multiplexer's agent report alone is never enough. When the report names
+        session B and the process runs session A, A is the agent of the pane, B gets no pane, and one audit line names both. A process list
+        that cannot be read changes nothing here: `check_program` holds it with its reason. None: nothing may be bound for this entry."""
+        pane, reported = entry.get("pane_id"), agent_session(entry)
+        if not pane or reported is None:
+            return entry
+        try:
+            processes = self.herdr.pane_process_info(pane)
+        except HerdrError:
+            return entry
+        sessions = own_sessions(processes, self.executable)   # the sessions of the AGENT'S OWN program, in a fixed order: never a wrapper's or a `grep -s ses_x`'s
+        if len(sessions) > 1:
+            self._note("fleetpane.report_ambiguous", pane, {"pane": pane, "reported": reported, "process_runs": sorted(sessions),
+                                                           "why": "the pane's processes name more than one session: nothing is bound to it"})
+            return None
+        if not sessions:   # no session on any process line (a fresh agent without -s, a shell): the report is trusted, but NEVER for a cloud session
+            if self.is_cloud_session(reported):
+                self._note("fleetpane.report_refused", pane, {"pane": pane, "reported": reported, "why": "a cloud session has no pane: the report is not trusted"})
+                return None
+            return entry
+        if sessions[0] == reported:
+            return entry
+        self._note("fleetpane.report_disagrees", pane, {"pane": pane, "reported": reported, "process_runs": sessions[0],
+                                                   "why": "the multiplexer reports one session, the pane's process runs another: the report is not trusted"})
+        return dict(entry, agent_session=sessions[0], agent_status=None)
+
+    def is_cloud_session(self, session_id):
+        """True when the registry holds a row of a kind with no pane (a cloud worker) for this session."""
+        if self.state_dir is None:
+            return False
+        try:
+            rows = load_module("registry").read(self.state_dir)["agents"]
+        except Exception:
+            return False
+        return any(isinstance(r, dict) and r.get("session") == session_id and (r.get("kind") or "local") == "cloud" for r in rows.values())
+
     def check_program(self, observation):
         """The restart hazard: after a herdr restart a pane may be a shell, and
         herdr resumes the agent by typing `opencode` into it, which can start
@@ -2664,6 +2709,9 @@ class Switchboard:
                 return found
         found.entries = [entry for entry in entries if isinstance(entry, dict)]
         for entry in sorted(found.entries, key=lambda e: self.reads.stale_first(agent_session(e) or "")):   # the stalest first: the read budget is shared out in turn
+            entry = self.pane_truth(entry)
+            if entry is None:
+                continue
             try:
                 observation = self._observe_entry(entry, now)
             except V2Error as err:
@@ -2770,9 +2818,11 @@ class Switchboard:
             entry = self.herdr.agent_get(previous.pane)
         except HerdrError as err:
             return None, "pane %s of %s cannot be read: %s" % (previous.pane, previous.name, err)
+        entry = dict(entry, pane_id=entry.get("pane_id") or previous.pane)
+        if agent_session(entry) != previous.session_id:
+            entry = self.pane_truth(entry) or {}   # the report may be wrong: the pane's process decides (#1066)
         if agent_session(entry) != previous.session_id:
             return None, "pane %s no longer shows %s's session" % (previous.pane, previous.name)
-        entry = dict(entry, pane_id=entry.get("pane_id") or previous.pane)
         try:
             fresh = self._observe_entry(entry, now, fresh=True)   # a read before a write is never from memory (invariant 4)
         except V2Error as err:
@@ -3804,12 +3854,27 @@ def own_gh_path(name, environ=None):
     return name
 
 
+# #1066: the OpenCode service is started lazily by whatever process first needs it, and it inherits that process's environment. A service that carries a
+# pane's herdr variables makes herdr's OpenCode integration report the pane of whoever started it for every session it runs. So the daemon, and with it the
+# service it starts, never holds any of these. The daemon still needs herdr's socket: it is carried under another name.
+SERVICE_STRIP_ENV = ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_ENV", "HERDR_BIN_PATH", "HERDR_SOCKET_PATH")
+KEPT_SOCKET_ENV = "FLEET_SWITCHBOARD_HERDR_SOCKET"
+
+
+def service_environment(environ):
+    """`environ` for a process that may start the OpenCode service: no HERDR_* name of SERVICE_STRIP_ENV (the socket path moves to KEPT_SOCKET_ENV)."""
+    out = {name: value for name, value in environ.items() if name not in SERVICE_STRIP_ENV and not name.startswith("HERDR_PLUGIN_")}
+    if environ.get("HERDR_SOCKET_PATH") and not out.get(KEPT_SOCKET_ENV):
+        out[KEPT_SOCKET_ENV] = environ["HERDR_SOCKET_PATH"]
+    return out
+
+
 def daemon_environment(environ):
     """The environment for a daemon started from a hook: herdr's server env minus the hook's own pane (whatever pane you
     had focused) and every other name of a caller (session, role, repo): started from an agent's shell, it would otherwise
     BE that agent to the gh shim, which would swap the token of each of the daemon's own gh calls."""
-    return {name: value for name, value in environ.items()
-            if not name.startswith("HERDR_PLUGIN_") and name not in CALLER_ENV_NAMES}
+    return service_environment({name: value for name, value in environ.items()
+                                if not name.startswith("HERDR_PLUGIN_") and name not in CALLER_ENV_NAMES})
 
 
 def spawn_daemon(state_dir, spawn=subprocess.Popen):
@@ -4072,6 +4137,45 @@ def agent_tmp_env(engine, name):
     return {AGENT_TMP_ENV: str(path)}
 
 
+SCRATCH_ENV = "FLEET_SCRATCH"   # #1329 (slice A of #948): the agent's own durable scratch directory
+# The launch kinds, one row each: (kind, has a local side, exports SCRATCH_ENV in its environment, names the path in the brief). A kind added to launch is added here;
+# the completeness test derives its check from this table and from the code, never from a hand copy. Headless tools run in the OpenCode service's environment
+# (no per-worker environment exists), so a headless worker is told the path in its brief only; a cloud worker has no local side.
+LAUNCH_KINDS = (
+    ("pane", True, True, True),
+    ("headless", True, False, True),
+    ("cloud", False, False, False),
+)
+
+
+def agent_scratch_dir(engine, name):
+    """The agent's scratch directory <state>/scratch/<name>, made through job_ensure_root (the one private-directory helper: 0700, ours, lstat so a
+    symlink is refused). An existing directory is reused and never emptied. An unsafe path refuses the launch (LaunchError, one line naming it)."""
+    if engine.state_dir is None:
+        raise LaunchError("no state directory: no scratch directory can be made for %s" % name)
+    if not NAME_RE.fullmatch(name or ""):
+        raise LaunchError("no scratch directory for %r: not a valid agent name" % (name,))
+    base = Path(engine.state_dir)
+    path = base / "scratch" / name
+    try:
+        job_ensure_root(base / "scratch")
+        job_ensure_root(path)
+    except OSError as err:
+        raise LaunchError("the scratch directory %s is not safe (%s): %s was not started" % (path, err.strerror or err, name)) from None
+    return path
+
+
+def agent_scratch_env(engine, name):
+    return {SCRATCH_ENV: str(agent_scratch_dir(engine, name))}
+
+
+def scratch_brief(brief, path):
+    """The brief with one line naming the scratch directory; an empty brief stays empty (nothing is sent)."""
+    if not brief:
+        return brief
+    return "%s\n\nYour private scratch directory (it is kept): %s (also $%s in a terminal worker)." % (brief.rstrip("\n"), path, SCRATCH_ENV)
+
+
 def reclaim_agent_tmp(engine, name, headless=False):
     """At retire: the agent's private TMPDIR is removed when it is EMPTY, else kept and the reason said. Never forced, never recursive. Returns lines.
     A headless worker's directory (#846, made by the plugin) is under the same root and goes by the same rule."""
@@ -4123,6 +4227,8 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     env = launch_base_env(engine.config)
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
+    env.update(agent_scratch_env(engine, name))   # #1329: likewise
+    brief = scratch_brief(brief, env[SCRATCH_ENV])
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is not None:  # PR 15: the agent works as its repo's gh account, and as nobody else
         problem = launch_account_problem(engine.config, accounts, repo)
@@ -4190,6 +4296,8 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
         raise LaunchError("; ".join(problems))
     if engine.state_dir is None:
         raise LaunchError("no state directory: a headless worker needs its record")
+    scratch = agent_scratch_dir(engine, name)   # #1329: before the lock and the session: an unsafe path starts nothing
+    brief = scratch_brief(brief, str(scratch))
     try:
         with agent_lock(engine.state_dir, name):   # the name check, the session create and the record write are ONE step: two launches of one name cannot both pass
             taken = engine.discover(engine.now()).agents.get(name)
@@ -4388,6 +4496,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     repo = fleet.get("repo") or (engine.config.get("intent_repo") if fleet.get("charter") else None)
     env.update(view_env(fleet.get("role"), repo))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767
+    env.update(agent_scratch_env(engine, name))   # #1329
     accounts = getattr(engine, "accounts", None)
     if fleet.get("repo") and accounts is not None:
         try:
@@ -4435,6 +4544,7 @@ RETIRED_SHOW_DAYS = 7                    # a retired agent is listed once in `st
 PANE_HEALTH_FILE = "pane-health.json"
 PANE_CHECK_SECONDS = 60      # a pane is looked at again after this
 PANE_CHECKS_PER_PASS = 20    # `herdr pane get` + `pane read` pairs one pass may make
+PANE_HELD_PASSES = 20         # a pane gone from the list but held alive by its process this many passes in a row is said once
 PANE_MISSING_PASSES = 3      # a known agent absent from the herdr list this many passes in a row is DEAD (herdr restarts blink)
 PANE_ATTACHED, PANE_DETACHED, PANE_DEAD, PANE_UNKNOWN = "attached", "detached", "dead", "unknown"
 
@@ -4451,12 +4561,31 @@ def _shown_text(title, visible):
     return ("%s\n%s" % (title or "", visible or "")).lower()
 
 
-def runs_session(processes, session_id):
-    """True when a foreground process of the pane is `opencode ... -s <session_id>` (or --session): POSITIVE evidence the pane IS that session."""
+SESSION_ARG = r"(?:^|\s)(?:-s|--session)(?:\s+|=)(%s)(?:\s|$)"
+
+
+def own_sessions(processes, executable):
+    """The DISTINCT sessions named (`-s`/`--session`) by the foreground processes whose program is `executable`, in the order of the list. A process of
+    another program (`grep -s ses_x`) names none."""
+    out = []
+    for p in processes:
+        cmdline = str(p.get("cmdline") or "")
+        if not runs_program(cmdline, executable):
+            continue
+        m = re.search(SESSION_ARG % r"ses_\S+?", cmdline)
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def runs_session(processes, session_id, executable=None):
+    """True when a foreground process of the pane is `opencode ... -s <session_id>` (or --session): POSITIVE evidence the pane IS that session.
+    With `executable`, only a process of that program counts."""
     if not session_id:
         return False
-    pattern = re.compile(r"(?:^|\s)(?:-s|--session)(?:\s+|=)%s(?:\s|$)" % re.escape(session_id))
-    return any(pattern.search(str(p.get("cmdline") or "")) for p in processes)
+    pattern = re.compile(SESSION_ARG % re.escape(session_id))
+    return any(pattern.search(str(p.get("cmdline") or "")) for p in processes
+               if executable is None or runs_program(p.get("cmdline"), executable))
 
 
 def pane_state(engine, name, session_id, pane, known_names=(), known_sessions=()):
@@ -4840,6 +4969,19 @@ def bell_migration(engine, registry, now):
         engine.audit.append(engine.actor, "registry.bell_migrated", None, {"agents": got["changed"]})
 
 
+def live_cloud_record(state_dir, name, retired, now):
+    """#1066: True when `cloud/NAME.json` is the record of a LIVE cloud worker (`cloud_record_live`). A local agent that reuses the name of a finished
+    cloud worker is not a cloud worker: its pane and state are left alone."""
+    path = Path(state_dir) / "cloud" / (name + ".json")
+    try:
+        record, _kind = load_module("cloud_worker").read_record_file(path, CLOUD_LOAD_MAX_BYTES)
+    except (OSError, ValueError):
+        return False
+    if record is None or record.get("worker") != name:
+        return False
+    return cloud_record_live(record, name, retired, _read_small(state_dir, LAST_REPORT_FILE), now)
+
+
 def pane_health_pass(engine, now):
     """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
     audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
@@ -4861,6 +5003,18 @@ def pane_health_pass(engine, now):
     agents = {n: {k: v for k, v in row.items() if k in registry.AGENT_FIELDS} for n, row in reg["agents"].items()
               if isinstance(row, dict) and (row.get("kind") or "local") == "local" and not registry.no_pane_to_judge(row)}   # the agent list is the registry's; a row with no pane to judge (#1181) is never in it
     registered = {n: row for n, row in reg["agents"].items() if isinstance(row, dict)}
+    for name, row in sorted(registered.items()):   # #1066: a cloud worker recorded as a local agent with a pane (the wrong record of a past pass) is put right by this pass
+        if (row.get("kind") or "local") == "local" and live_cloud_record(engine.state_dir, name, reg["retired"], now):
+            fixed = dict(row, kind="cloud", pane=None, workspace=None, cwd=None, state="working")
+            got = registry.upsert(engine.state_dir, name, fixed, now=now)
+            if got["problem"]:
+                engine._note("fleetpane.error", name, {"error": "cloud record not repaired: %s" % _one_line(got["problem"], 100)})
+                continue
+            registered[name] = fixed
+            for table in (agents, states, missing):
+                table.pop(name, None)
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "fleetpane.cloud_repaired", name, {"was_pane": row.get("pane"), "why": "a cloud worker has no pane"})
     retired = reg["retired"]
     retired_whole = True
     names = list(discovery.agents)
@@ -4875,7 +5029,10 @@ def pane_health_pass(engine, now):
             continue
         if not obs.pane or not obs.session_id:
             continue
+        if (registered.get(name) or {}).get("kind", "local") != "local":
+            continue         # a cloud worker has no pane (#1066): a local session of its name gets none
         missing.pop(name, None)
+        engine.__dict__.setdefault("pane_held", {}).pop(name, None)
         if name in retired and retired[name].get("session") == obs.session_id:
             states.pop(name, None)       # a retired agent is not judged; it stays listed under its own heading
             continue
@@ -4919,6 +5076,19 @@ def pane_health_pass(engine, now):
             states.pop(name, None)
             continue
         missing[name] = int(missing.get(name, 0)) + 1
+        if missing[name] >= PANE_MISSING_PASSES and agents[name].get("pane") and agents[name].get("session"):
+            try:   # #1066: a pane whose process runs the agent's session is never dead, whatever the multiplexer's list says
+                if runs_session(engine.herdr.pane_process_info(agents[name]["pane"]), agents[name]["session"], engine.executable):
+                    missing[name] = PANE_MISSING_PASSES - 1
+                    held = engine.__dict__.setdefault("pane_held", {})
+                    held[name] = held.get(name, 0) + 1
+                    if held[name] > PANE_HELD_PASSES:   # a lingering process keeps the agent alive: said once, still held (never declared dead on a process alone)
+                        engine._note("fleetpane.missing_held", name, {"pane": agents[name]["pane"], "passes": PANE_HELD_PASSES,
+                                                                      "why": "herdr no longer lists the pane but its process still runs the session"})
+                    continue
+                engine.__dict__.setdefault("pane_held", {}).pop(name, None)
+            except HerdrError:
+                pass
         if missing[name] >= PANE_MISSING_PASSES and (states.get(name) or {}).get("state") != PANE_DEAD:
             last = _read_small(engine.state_dir, LAST_REPORT_FILE).get(name) or {}
             lookback = engine.config.get("worker_lookback_hours", 24) * 3600
@@ -4965,7 +5135,9 @@ def pane_health_pass(engine, now):
         if old is not None and all(old.get(k) == new.get(k) for k in registry.CHANGE_FIELDS):
             continue
         got = registry.upsert(engine.state_dir, name, new, now=now)
-        if got["problem"] and not got["problem"].endswith("is retired for this session"):
+        if got["problem"] and (got["problem"].startswith("pane ") or "has no pane" in got["problem"]):
+            engine._note("fleetpane.bind_refused", name, {"why": _one_line(got["problem"], 160)})   # #1066: the refusal names both agents
+        elif got["problem"] and not got["problem"].endswith("is retired for this session"):
             engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
     # No removal from the registry here: a dead agent leaves it only when a view reads it (reconcile_on_read, #919), never on a pass.
     try:
@@ -8274,6 +8446,70 @@ def pr_body_refs(body):
         if ref not in out and ref[1] > 0:
             out.append(ref)
     return out[:10]
+
+
+CLOSING_REF = r"(?:https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d{1,7}|(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\d{1,7})(?![0-9])"
+CLOSING_WORD_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?[ \t]+(" + CLOSING_REF + r"(?:[ \t]*(?:,|&|and)[ \t]*" + CLOSING_REF + ")*)")
+CLOSING_ONE_RE = re.compile(r"(?:https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/|([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#)(\d{1,7})")
+
+
+def closing_keyword_issues(body):
+    """[[repo or None, number]] each issue a pull request body would close on merge: a closing keyword and a number (or a list of them, or an issue URL), outside fenced code, inline code, quoted lines (`>`) and HTML comments, in order, without repeats."""
+    text = re.sub(r"<!--.*?(?:-->|\Z)", " ", body if isinstance(body, str) else "", flags=re.S)
+    kept, fence = [], None
+    for line in text.splitlines():
+        mark = re.match(r"[ \t]{0,3}(`{3,}|~{3,})", line)
+        if fence is None and mark:
+            fence = mark.group(1)
+        elif fence is not None:
+            if mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence):
+                fence = None
+        elif not line.lstrip().startswith(">"):
+            kept.append(re.sub(r"`[^`]*`", " ", line))
+    out = []
+    for match in CLOSING_WORD_RE.finditer("\n".join(kept)):
+        for one in CLOSING_ONE_RE.finditer(match.group(1)):
+            ref = [one.group(1) or one.group(2), int(one.group(3))]
+            if ref not in out:
+                out.append(ref)
+    return out
+
+
+PREFLIGHT_GH_TIMEOUT = 20   # seconds: a hung gh must not delay preflight-pr; a timeout is quiet
+
+
+def closing_warnings(body, repo, is_ask):
+    """One warning line per issue of `body` that is an ask (`is_ask(repo, number)` True). Only text: the caller never blocks on it."""
+    return ["warning: this pull request body would close %s#%d, an ask, on merge: write `Refs #%d` instead (an ask is closed by its owner, not by one scenario's pull request; `Closes` only where the plan says so)"
+            % (found_repo or repo, number, number)
+            for found_repo, number in closing_keyword_issues(body) if is_ask(found_repo or repo, number)]
+
+
+def issue_is_ask(runner, repo, number):
+    """True when the issue has a parent that is not a charter, read with ONE gh call. Any read error or odd answer is False (quiet)."""
+    try:
+        done = runner(["gh", "api", "repos/%s/issues/%d/parent" % (repo, number)], capture_output=True, text=True, timeout=PREFLIGHT_GH_TIMEOUT)
+        if done.returncode != 0:
+            return False
+        data = load_module("record_json").parse_bounded(done.stdout)
+        return isinstance(data, dict) and isinstance(data.get("number"), int) and not IssueIntent.from_api(data).charter
+    except Exception:
+        return False
+
+
+def preflight_body_warnings(runner):
+    """The warning lines for the body of this branch's pull request; [] on any read error."""
+    try:
+        done = runner(["gh", "pr", "view", "--json", "body,url"], capture_output=True, text=True, timeout=PREFLIGHT_GH_TIMEOUT)
+        if done.returncode != 0:
+            return []
+        data = load_module("record_json").parse_bounded(done.stdout)
+        match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/", str(data.get("url")))
+        if not match:
+            return []
+        return closing_warnings(data.get("body"), match.group(1), lambda repo, number: issue_is_ask(runner, repo, number))
+    except Exception:
+        return []
 
 
 def pr_facts_from(data):
@@ -13006,6 +13242,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["policy"] = policy_liveness(config, state_dir_path(), working, now())
     report["daemon"] = daemon_report(state_dir_path()) if state_ok else {"running": False, "pid": None, "key_source": None}
     report["service"] = service_report(platform)
+    report["service"]["herdr_env"] = service_herdr_env(runner)   # #1066: read only; the switchboard never restarts the service by itself
     report["key"] = key_report(config if config_ok else None, report["daemon"], report["service"])   # PR 16
     report["plugin"] = plugin_report(config, runner) if config_ok else {"state": "unknown", "detail": "config unusable"}
     report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr", "skills"))
@@ -13382,8 +13619,11 @@ def enable_conditional_reads(engine):
 
 def cmd_run(args, runner, now, wait):
     if not args.once:   # the daemon: whoever started it, it is nobody's agent (see CALLER_ENV_NAMES)
-        for name in CALLER_ENV_NAMES:
+        kept = service_environment(dict(os.environ))   # the daemon's own environment, and so the service's, holds no herdr variable (#1066)
+        for name in CALLER_ENV_NAMES + SERVICE_STRIP_ENV:
             os.environ.pop(name, None)
+        if kept.get(KEPT_SOCKET_ENV):
+            os.environ[KEPT_SOCKET_ENV] = kept[KEPT_SOCKET_ENV]
     signature = config_signature(config_path())  # taken before the read: an edit in between is seen as a change
     engine, state, config = build_engine(runner, now, "daemon")
     enable_conditional_reads(engine)   # the daemon's reads keep ETags (a 304 is free); a one-shot command reads plainly
@@ -14535,7 +14775,7 @@ class GhAccounts:
 
     # -- reads: counted, conditional (ETag) and paused while the account is rate limited
 
-    def read(self, runner, path, repo, timeout, paginate=False, **run_kwargs):
+    def read(self, runner, path, repo, timeout, paginate=False, extra_flags=(), **run_kwargs):
         """One `gh api <path>` GET with the repo's account. Returns a CompletedProcess like the runner's, its stdout the BODY only:
 
           - a read GitHub answered `304 Not Modified` to (we send the ETag we hold) is answered from memory and costs nothing against the limit;
@@ -14556,20 +14796,22 @@ class GhAccounts:
             if until is not None:
                 raise GhRateLimited(account, until)
             cached = None if paginate else self.etags.get((account, path))
-        use_head = self.conditional and not paginate
-        flags = ["--paginate"] if paginate else (["-i"] + (["-H", "If-None-Match: " + cached[0]] if cached else []) if use_head else [])
+        use_head = self.conditional and not paginate and not extra_flags   # a raw read of a file is not conditional
+        flags = list(extra_flags) if extra_flags else ["--paginate"] if paginate else (["-i"] + (["-H", "If-None-Match: " + cached[0]] if cached else []) if use_head else [])
         argv = [self.config["gh"], "api"] + flags + [path]   # the path stays last
         env = self.env_for(repo) if repo else None
         if env is not None:
             run_kwargs["env"] = env
-        done = runner(argv, capture_output=True, text=True, timeout=timeout, **run_kwargs)
+        done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
         status, headers, body = _split_http(done.stdout) if use_head else (None, {}, done.stdout)
         with self.lock:
             self.calls.append((now, account, _endpoint_of(path), status == 304))
             while self.calls and self.calls[0][0] < now - 600:
                 self.calls.popleft()
         if status is None:
-            if done.returncode != 0 and _says_rate_limited(done.stderr, done.stdout):   # a plain read: no header block, but gh says it in words
+            # With text=False (a raw read) use_head is false, so the 304 and '' branches below are unreachable for it: only this branch answers it.
+            # stdout and stderr are BYTES then; _says_rate_limited searches with a str pattern, so decode both for the check (done itself stays bytes).
+            if done.returncode != 0 and _says_rate_limited(*[t.decode("utf-8", "replace") if isinstance(t, (bytes, bytearray)) else t for t in (done.stderr, done.stdout)]):   # a plain read: no header block, but gh says it in words
                 self._pause(account, now + GH_LIMIT_DEFAULT_PAUSE, 0)
             return done
         if status == 304 and cached is not None:
@@ -14893,6 +15135,44 @@ class IntentReader:
             return json.loads(result.stdout)
         except ValueError:
             raise IntentError("gh", "gh returned non-JSON: %s" % _one_line(result.stdout, 120)) from None
+
+    def _api_raw_text(self, path, repo=None, max_bytes=None):
+        """The body of `gh api -H 'Accept: application/vnd.github.raw' <path>` as text: the contents endpoint serves a file of up to 100 MB this way (the JSON
+        form carries none over 1 MB). Same account, exclusion, count and timeout as `_api`; one gh call. Raises IntentError."""
+        config = self.config if self.config is not None else getattr(self.accounts, "config", None)
+        if config is not None and load_module("repo_exclusion").is_excluded(config, repo or self.repo):
+            raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))
+        flags = ["-H", "Accept: application/vnd.github.raw"]
+        env = self.env_for(repo)
+        extra = {"env": env} if env is not None else {}
+        try:
+            if self.accounts is not None and repo:
+                result = self.accounts.read(self.runner, path, repo, self.timeout, extra_flags=flags, stdin=subprocess.DEVNULL, text=False)
+            else:
+                result = self.runner([self.gh, "api"] + flags + [path], capture_output=True, text=False, timeout=self.timeout, stdin=subprocess.DEVNULL, **extra)
+        except GhRateLimited as err:
+            raise IntentError("unavailable", str(err)) from None
+        except AccountError as err:
+            raise IntentError("gh", str(err)) from None
+        except subprocess.TimeoutExpired:
+            raise IntentError("unavailable", "gh did not answer within %ss" % self.timeout) from None
+        except OSError as err:
+            raise IntentError("unavailable", "cannot run %s: %s" % (self.gh, err.strerror or err)) from None
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr
+            detail = _one_line(stderr) or "exit %d" % result.returncode
+            if self.accounts is not None:
+                detail = self.accounts.scrub(detail)
+            raise IntentError("not_found" if re.search(r"\b404\b|Not Found", detail) else "gh", detail)
+        out = result.stdout
+        if not isinstance(out, bytes):   # a runner that answered text: count its bytes as encoded
+            out = str(out or "").encode("utf-8")
+        if max_bytes is not None and len(out) > max_bytes:
+            raise IntentError("too_big", "the body is over %d bytes" % max_bytes)
+        try:
+            return out.decode("utf-8")
+        except UnicodeError:
+            raise IntentError("not_text", "the body is not UTF-8 text") from None
 
     def _api_bytes(self, path, repo=None, limit=None):
         """The raw bytes `gh api <path>` prints (an archive), through the same account and exclusion rule as `_api`. `limit` bounds the bytes kept."""
@@ -16922,6 +17202,9 @@ def gate_impact_rating(state_dir, pr, head):
         return {"problem": _one_line("%s: %s" % (type(err).__name__, err), 100)}
 
 
+FILE_TEXT_MAX_BYTES = 5 * 1024 * 1024   # the largest registrar file read whole
+
+
 def _file_text_at(engine, repo, path, ref):
     """The text of `path` at `ref`: the string, "" is a real empty file, or None when the path does not exist there (a 404). Raises IntentError for any
     other failure (the caller says unreadable and holds)."""
@@ -16934,8 +17217,27 @@ def _file_text_at(engine, repo, path, ref):
         if err.reason == "not_found":
             return None
         raise
+    unreadable = IntentError("gh", "%s is not a readable file at %s" % (path, str(ref)[:8]))
+    if isinstance(data, dict) and data.get("type") in (None, "file") and (data.get("encoding") == "none" or (data.get("content") == "" and (data.get("size") or 0) > 0)):
+        # the JSON contents answer carries no content over 1 MB: read it raw (bounded, one cached read for each (repo, path, ref))
+        size = data.get("size")
+        if not isinstance(size, int) or size > FILE_TEXT_MAX_BYTES:
+            raise unreadable
+        cache = reader.__dict__.setdefault("_raw_files", {})
+        key = (repo, path, str(ref))
+        if key not in cache:
+            try:
+                text = reader._api_raw_text("repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path, safe="/"), ref), repo, max_bytes=FILE_TEXT_MAX_BYTES)
+            except IntentError as err:
+                if err.reason == "not_text":
+                    raise IntentError("gh", "%s is not text at %s" % (path, str(ref)[:8])) from None
+                raise unreadable from None
+            if len(cache) >= 8:
+                cache.pop(next(iter(cache)))
+            cache[key] = text
+        return cache[key]
     if not isinstance(data, dict) or data.get("type") not in (None, "file") or data.get("encoding") != "base64" or not isinstance(data.get("content"), str):
-        raise IntentError("gh", "%s is not a readable file at %s" % (path, str(ref)[:8]))
+        raise unreadable
     try:
         return base64.b64decode(data["content"]).decode("utf-8")
     except (ValueError, UnicodeError):
@@ -16968,6 +17270,23 @@ def agent_block_states(engine, repo, matrix, paths, base, head):
         else:
             states[path] = impact_floor.block_state(before, after, keys)
     return states
+
+
+def registrar_states(engine, repo, matrix, paths, base, head):
+    """#964: None when the daemon file is not among the changed paths (nothing is read), else {"findings": [(registrar, verb, closure name)], "why": None or why it could not be read}: the registrar lint of
+    `delegated_clear.registrar_findings` over the file at the pull request's own base and head. A read that fails is unreadable, never clean."""
+    rule = ((matrix.get("owner_hold") or {}).get("delegated_clear") if isinstance(matrix, dict) else None) or {}
+    daemon_file = rule.get("daemon_file") if isinstance(rule, dict) else None
+    if not isinstance(daemon_file, str) or not any(isinstance(p, str) and impact_floor.canonical(p)[0] == impact_floor.canonical(daemon_file)[0] for p in paths):
+        return None
+    try:
+        if not base or not head:
+            raise IntentError("gh", "the base or head commit is unknown")
+        before, after = _file_text_at(engine, repo, daemon_file, base), _file_text_at(engine, repo, daemon_file, head)
+        found, why = load_module("delegated_clear").registrar_findings(before, after, rule)
+    except Exception as err:   # a read that fails or a lint that crashes is unreadable: a hold, never a crash of the report
+        found, why = None, _one_line("%s: %s" % (type(err).__name__, err), 100)
+    return {"findings": list(found or []), "closure": sorted(getattr(found, "closure", ())), "why": why}
 
 
 def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
@@ -17026,7 +17345,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     record, record_problem = (impact_review_record(engine.state_dir, "%s#%d" % (repo, number), head) if engine.state_dir is not None and isinstance(head, str) else (None, None))
     if record_problem:
         record = ("hold", None)   # an unreadable ledger is an unknown rating: it holds
-    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record)
+    registrar = registrar_states(engine, repo, matrix, paths, raw.get("baseRefOid"), head)   # #964: the one reading of what a registrar edit does to the clear's closure (every consumer reads the report)
+    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record, registrar)
     if record_problem:
         owner = (owner[0], owner[1] + ["the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(record_problem), 120)])   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
     if engine.state_dir is not None and isinstance(head, str):
@@ -17040,10 +17360,16 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
         if review:
             decision = "hold"
     rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
-    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
+    brief_module = load_module("impact_brief")   # slice A hook (#1215): the brief is built from the same diff read; display only, no decision reads it yet
+    report_base = {"top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "owner_paths": ((matrix.get("owner_hold") or {}).get("substance_decider") or {}).get("owner_only_paths") or {},
+                   "ci": pr_ci_of(raw.get("statusCheckRollup")), "unknown": unknown, "head": raw.get("headRefOid"), "base": raw.get("baseRefOid"), "complete": complete,
+                   "reads": [{"by": e.get("by"), "verdict": e.get("verdict"), "head": e.get("head")} for e in rating_entries], "rating": ({"class": record[1]} if record and record[1] else None)}
+    brief = brief_module.build_brief(brief_module.facts_from_report(files, report_base))
+    return {"brief": brief, "pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "list_problem": list_problem,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
+            "registrar_reasons": impact_floor.registrar_reasons(registrar),   # #964: a registrar edit that touches the clear's closure (or cannot be read) is the owner's own clear, never delegated
             "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True,
             "base": raw.get("baseRefOid")}
 
@@ -17184,6 +17510,8 @@ def cmd_impact_floor(args, runner, now):
             print("  incomplete: GitHub gave %s of %s changed files, so a path outside those may be a top tier path; this is not a verdict of \"not held\"" % (read, total))
         if blind and owner != "hold":
             print("  rename: the source path of %s was not seen, and it may have been a top tier path; this is not a verdict of \"not held\"" % ", ".join(blind[:3]))
+        if isinstance(report.get("brief"), dict):
+            print(report["brief"]["text"], end="")   # #1215: the one-screen brief; advice only, no decision changes
         print("  path floor (older advisory, not the owner's rule): %s" % report["decision"].upper().replace("-", " "))
         for reason in report["reasons"]:
             print("  %s" % reason)
@@ -19962,7 +20290,7 @@ def cmd_review_checkout(args, runner, now):
     rc = load_module("review_checkout")
     try:
         if args.remove:
-            if args.pr or args.head:
+            if args.pr or args.head or args.sparse:
                 raise ReviewError("--remove takes only the directory")
             try:
                 removed = rc.remove(args.remove, os.getcwd())
@@ -19998,13 +20326,17 @@ def cmd_review_checkout(args, runner, now):
             except impact_floor.MatrixError as err:
                 matrix_text = None
                 sys.stderr.write("%s: review checkout: the impact matrix cannot be read, so impact-matrix.txt is not written to the checkout: %s\n" % (PROG, _one_line(str(err), 160)))
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            sparse_result = {}
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
         except (rc.Unsafe, rc.Problem) as err:
             raise ReviewError("refused, nothing left behind: %s" % err) from None
         print(path)
+        if args.sparse:
+            print("sparse checkout: %d files written, %d files of the head tree not written; directories cut at %d files: %d (see %s)" % (
+                sparse_result["written"], sparse_result["not_written"], rc.SPARSE_DIR_FILES, len(sparse_result["cut"]), rc.SPARSE_FILE))
         return EXIT_OK
     except (ReviewError, ConfigError, IdentityUncertain, CallerError) as err:
         sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 400)))
@@ -20187,6 +20519,7 @@ def add_review_parsers(sub):
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
     checkout.add_argument("--head", help="The commit to materialise (default: the PR's head, read once at the start)")
+    checkout.add_argument("--sparse", action="store_true", help="For a repository over the 5000-file limit: write only the files the PR changes and the other files directly in their directories (at most 200 per directory); every limit and rule is unchanged, and the result says it is sparse")
     checkout.add_argument("--remove", metavar="DIR", help="Remove a directory this command made (restores the permissions it set; anything else is refused)")
     measure = rsub.add_parser("measure", help="Read-only: per merged PR, time to green CI, review rounds, findings, escaped defects; baseline and after medians")
     measure.add_argument("repo", help="owner/repo")
@@ -20194,6 +20527,21 @@ def add_review_parsers(sub):
     measure.add_argument("--scan", type=int, default=MEASURE_SCAN_MAX, help="Merged PRs read (default %d; the escape check looks among them)" % MEASURE_SCAN_MAX)
     measure.add_argument("--split", type=int, help="A merged PR number: the baseline is the --count merged before it, the after is --count from it on")
     measure.add_argument("--json", action="store_true", help="Machine-readable rows")
+
+
+_BRIEF_ADVISORY = []   # the loaded module, once (it was reloaded on every call)
+
+
+def _brief_advisory():
+    """Slice D (#1215): the pure brief rules, loaded from bin/brief_advisory.py beside this file (loaded once, then cached)."""
+    if _BRIEF_ADVISORY:
+        return _BRIEF_ADVISORY[0]
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("brief_advisory", os.path.join(os.path.dirname(os.path.realpath(__file__)), "brief_advisory.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _BRIEF_ADVISORY.append(mod)
+    return mod
 
 
 def add_impact_parsers(sub):
@@ -20216,6 +20564,8 @@ def add_impact_parsers(sub):
     clear = impact_sub.add_parser("clear", help="The owner's own terminal: clear a false impact hold for this head, with a reason (the Chief of Staff only under a standing order of the owner's, with --under-order)")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     clear.add_argument("--under-order", type=int, dest="under_order", metavar="N", help="The Chief of Staff only: clear under the owner's standing order N (it must be listed under delegated_clear in the configuration); recorded as her act under that order")
+    clear.add_argument("--brief-digest", dest="brief_digest", help="The Chief of Staff only (#1215): the digest of the impact brief the floor printed at this head; a clear without it, or with a stale one, is refused")
+    clear.add_argument("--brief-text", dest="brief_text", help="The Chief of Staff only (#1215): the text of that brief, recorded with its digest and the reasons in the audit line")
     clear.add_argument("--reason", required=True, help="Why the hold is false (at least 10 characters), logged")
     clear.add_argument("--revoke", action="store_true", help="Take the clear back (and any carry of it): the PR is held again at the daemon's next pass")
 
@@ -21132,6 +21482,8 @@ def cmd_preflight_pr(args, runner, now):
         sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
         return EXIT_USAGE
     root = top.stdout.strip()
+    for line in preflight_body_warnings(runner):
+        print(line)   # advisory: never changes the exit status
     if getattr(args, "merged", False):   # #1045: the same classes on a local merge of the base into the head (a temporary worktree, removed afterwards)
         ps = load_module("path_suites")
         base = ps.default_base(root, runner)
@@ -22270,6 +22622,22 @@ def _cloud_when(text):
         return None
 
 
+def cloud_record_live(record, worker, retired, last_reports, now):
+    """The ONE liveness test of a cloud worker's record (#1097, #1066): not retired, no final report, not past its hard deadline (a record WITHOUT a valid
+    one is no evidence of life), and a last_report_at, if present, neither future-dated nor older than CLOUD_LOAD_STALE_SECONDS. An ended record stays on
+    disk until cloud-clear, so a file's existence proves nothing."""
+    if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+        return False
+    ends = _cloud_when(record.get("hard_deadline"))
+    if ends is None or ends < now:
+        return False
+    if "last_report_at" in record:
+        seen = _cloud_when(record.get("last_report_at"))
+        if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
+            return False
+    return True
+
+
 def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None, clock=None):
     """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded scan, no GitHub read, no process). A worker
     that is retired, made its final report, or is past its hard deadline is not counted; a record WITHOUT a valid hard_deadline (no evidence of liveness)
@@ -22308,15 +22676,8 @@ def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, 
                 record, _kind = reader(base / fname, CLOUD_LOAD_MAX_BYTES)
                 if record is None or record.get("worker") != worker:
                     continue
-                if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+                if not cloud_record_live(record, worker, retired, last_reports, now):
                     continue
-                ends = _cloud_when(record.get("hard_deadline"))
-                if ends is None or ends < now:
-                    continue   # no valid hard deadline is no evidence of life; a past one is an ended pod
-                if "last_report_at" in record:
-                    seen = _cloud_when(record.get("last_report_at"))
-                    if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
-                        continue   # a future-dated report is not fresh (a forged or skewed clock cannot keep a record live)
                 boss = _cloud_boss(record.get("reports_to"))
                 lane = resolve_boss(discovery, boss) if boss else CLOUD_NO_BOSS_LANE
                 counts[lane] = counts.get(lane, 0) + 1
@@ -23051,6 +23412,26 @@ def service_file_path(kind):
     return None
 
 
+def service_herdr_env(runner, environ=None):
+    """The SERVICE_STRIP_ENV names the running OpenCode service carries in its environment: [] when none or when it cannot be told (never a guess).
+    Reads the service's process id from its service file and its environment with `ps eww` (the same user's process); changes nothing."""
+    environ = os.environ if environ is None else environ
+    try:
+        info = load_module("record_json").parse_bounded(v2_service_file(environ).read_text())   # too deeply nested reads as no variables (#1066)
+        pid = int(info.get("pid"))
+        done = runner(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+        text = done.stdout or ""
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+        return []
+    return [n for n in SERVICE_STRIP_ENV if re.search(r"(?:^|\s)%s=" % n, text)]
+
+
+def service_clean_restart_command(config=None):
+    """The one command that restarts the OpenCode service with none of the herdr variables (printed by `status`, never run by it)."""
+    exe = (config or {}).get("opencode") or "opencode"
+    return "env %s %s service restart" % (" ".join("-u " + n for n in SERVICE_STRIP_ENV), exe)
+
+
 def service_report(platform=None):
     kind = service_kind(platform)
     path = service_file_path(kind)
@@ -23069,6 +23450,10 @@ def format_install_lines(report):
     lines.append("      %-10s %s" % ("service", ("installed (%s)" % service["path"]) if service["installed"]
                                     else "not installed (`%s install` adds it)" % PROG if service["kind"]
                                     else "no service manager on this platform"))
+    leaked = service.get("herdr_env") or []
+    if leaked:
+        lines.append("      %-10s the OpenCode service carries %s: it can report the wrong pane for a session. Restart it clean (nothing restarts it for you): `%s`" % (
+            "service", ", ".join(leaked), service_clean_restart_command()))
     return lines
 
 
@@ -23723,10 +24108,18 @@ def uninstall_decisions_plugin(config_dir, kit_root=KIT_ROOT):
 def render_service(kind, values, kit_root=KIT_ROOT):
     """The LaunchAgent or the systemd user unit, from its template in templates/, placeholders filled in."""
     name = SERVICE_LABEL + ".plist" if kind == "launchd" else SERVICE_UNIT
-    text = (Path(kit_root) / "templates" / name).read_text()
+    text = strip_service_env_entries((Path(kit_root) / "templates" / name).read_text())   # the template's own text only: a value filled in below is never judged
     for placeholder, value in values.items():
         text = text.replace(placeholder, xml_escape(value) if kind == "launchd" else value.replace("%", "%%"))
     return text
+
+
+def strip_service_env_entries(text):
+    """`text` without the environment ENTRIES named exactly by SERVICE_STRIP_ENV: a systemd `Environment="NAME=..."` line, or a launchd `<key>NAME</key>`
+    with its value element. Nothing else is touched: a line that merely mentions such a name (a PATH, a comment, UnsetEnvironment=) stays."""
+    names = "|".join(re.escape(n) for n in SERVICE_STRIP_ENV)
+    text = re.sub(r'(?m)^[ \t]*Environment=["\']?(?:%s)=[^\n]*\n' % names, "", text)
+    return re.sub(r"(?m)^[ \t]*<key>(?:%s)</key>[ \t]*\n\s*<[a-z]+(?:/>|>[^<]*</[a-z]+>)[ \t]*\n" % names, "", text)
 
 
 def reaper_file_path(kind):

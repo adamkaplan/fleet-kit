@@ -165,6 +165,10 @@ class Runner(unittest.TestCase):
     def test_this_file_is_chained_and_never_an_exception(self):
         with open(os.path.join(ROOT, "bin", "test-cloud-launcher")) as f:
             text = f.read()
+        with open(os.path.join(ROOT, "bin", "test-cloud-launcher.chain")) as f:
+            entries = f.read().split("\n")
+        self.assertEqual(entries.count("cloud/launcher/tests/%s" % self.NAME), 1)
+        text += "\n" + "\n".join(entries)
         self.assertEqual(self.chain_problems(text), [])
         unchained = text.replace("tests/%s" % self.NAME, "tests/gone.py")
         self.assertNotEqual(unchained, text)
