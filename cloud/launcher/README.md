@@ -186,6 +186,16 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
 
+## How a member adds a test to the chain
+
+Cause of the old merge rounds: the whole chain of `bin/test-cloud-launcher` was ONE shell line of more than forty commands joined by `&&`, and every member that added a test appended to that same line, so every pair of concurrent members conflicted on it.
+
+The chain is now `bin/test-cloud-launcher.chain`, one path per line, sorted alphabetically, followed by one fixed last line (`cloud/worker/tests/test_cloud_prepush_preflight.py`) that no member edits. To add a test, add one line to bin/test-cloud-launcher.chain at its alphabetical place, above the fixed last line. A new entry that sorts AFTER the fixed last line still goes ABOVE it; the script fails if the last line is anything else. The order is deliberately sorted alphabetically for conflict-freedom, NOT the order of the old one-line chain; it changes which test fails first (the first red stops the run). The list holds the `bin/test-cloud-*` scripts too (the hub, relay and cost scripts), run without arguments.
+
+The script runs each entry once, stops at the first red with `RESULT: FAIL`, and prints `ran N entries` and `RESULT: PASS` otherwise. Arguments given to the script are passed only to the ten entries that took them in the old one-line chain; every other entry runs without arguments. Its checks: every `test_*.py` is listed or named in `EXCEPTIONS` with a reason; every `bin/test-cloud-cost-*` script is listed; every `bin/test-cloud-*` script is listed or named in `BIN_EXCEPTIONS` (`own-ci-step` means a workflow step runs that script. Hub-relay, relay and relay-daemon are workflow steps since ask #1377, so they carry `own-ci-step` too. A test derives the reasons from the workflow files and fails when a reason is untrue); a list entry that is a symlink is refused; every listed entry exists, is not a duplicate and stays inside the repository; the list is not empty (an empty list is a failure, not a pass).
+
+Residual risk: two members adding names that sort next to each other (the same place in the list) still conflict in git (adjacent inserts), and the first member to add in an empty gap next to the fixed last line conflicts with it. Only entries far apart merge cleanly. A test documents this limit.
+
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
 a cluster Secret scoped to the pod and mounted at `/run/cw/server-password` (0600); Basic auth, as the local v2

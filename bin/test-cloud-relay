@@ -711,4 +711,6 @@ for _m in FakeDaemon.MUTANTS + RealDaemon.MUTANTS + HUB_MUTANTS:
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=1)
+    result = unittest.main(exit=False, verbosity=1).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)

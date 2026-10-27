@@ -17,12 +17,18 @@ constraint (`PC-n`) with its reason.
 | the reply arrives within 5 s | use a background queue with a 2 s poll |
 | existing projects are listed exactly as before | do not touch `list()` |
 
+## One plan comment
+
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+
+**Receipts.** A receipt is the line `<!-- plan-receipt -->`, then `plan hash: sha256:<the new hash>`, then two to four lines of what changed and why. It carries no plan text; `plan check` reports a receipt that quotes the plan, and a second comment that looks like a plan.
+
 ## Sections of a plan
 
 Recorded as an issue, or a section of one, **in the repo the work concerns**. Required:
 
 1. **Done-when**: the ask's clauses, copied, numbered `(1) ... (2) ...` as in the ask.
-   A work item with no Done-when takes its parent ask's: `plan check` and the structure gate (G0a) read it there; one the item carries itself must still match exactly.
+   A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
    A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
 2. **Scenarios**: the yaml block below, including unchanged (U) ones.
 3. **Constraints** (`PC-n`): what must hold, and why.

@@ -240,4 +240,6 @@ for c, o, nw in Case.CHECKS:
     add(c[6:], c, o, nw)
 
 if __name__ == "__main__":
-    unittest.main(argv=[sys.argv[0]] + sys.argv[1:])
+    result = unittest.main(argv=[sys.argv[0]] + sys.argv[1:], exit=False).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)
