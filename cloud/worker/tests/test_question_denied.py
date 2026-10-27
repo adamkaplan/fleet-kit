@@ -54,6 +54,13 @@ def base_file(rel, mode="text"):
     return None, None
 
 
+def permission_block(data):
+    """The front matter's rules (ask #1286 protects them); comment lines and the prose below are not part of the pin."""
+    parts = data.split(b"---\n", 2)
+    assert len(parts) == 3, "no front matter"
+    return [l for l in parts[1].splitlines() if not l.lstrip().startswith(b"#")]
+
+
 def loud_skip(test, what):
     msg = "SKIPPED: no origin/integration and no origin/main ref (fallback tried: origin/main); " + what + " not compared"
     print(msg, file=sys.stderr)
@@ -138,7 +145,16 @@ class T(unittest.TestCase):
         ref, data = base_file(ORCH_REL)
         if ref is None:
             loud_skip(self, "the base orchestrator definition")
-        self.assertEqual(img, data)
+        self.assertEqual(permission_block(img), permission_block(data))
+
+    def test_s3_permission_block_mutants_refused(self):
+        base = open(os.path.join(ROOT, ORCH_REL), "rb").read()
+        self.assertIn(b"  question: allow\n", base)
+        for old, new in ((b"  question: allow\n", b"  question: deny\n"), (b"  read: allow\n", b"  read: ask\n"), (b"  bash: allow\n", b"  bash: ask\n")):
+            m = base.replace(old, new)
+            self.assertNotEqual(m, base)
+            self.assertNotEqual(permission_block(m), permission_block(base), old)
+        self.assertEqual(permission_block(base + b"more prose\n"), permission_block(base))
 
     def test_no_orchestrator_block_in_config(self):
         self.assertEqual(sorted(load()["agent"]), ["worker"])
