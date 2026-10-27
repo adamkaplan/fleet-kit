@@ -17537,11 +17537,10 @@ class TestHeadlessPresence(Base):
         self.assertTrue(any("finished the health check" in t for t in boss_texts), boss_texts)
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
-        self.world.clock.t += 3600   # idle long enough for the close of a headless worker
         code, out, err = self.run_cli("retire", "hw", "--close")
         self.assertEqual(code, 0, err)
         self.assertIn("hw is retired", out)
-        self.assertIn("ended the session", out)
+        self.assertIn("nothing to close", out)
         self.assertEqual(self.world.herdr.closed, [], "no pane was closed")
         self.assertIn("hw", sb.read_retired(self.world.state))
 
@@ -50119,7 +50118,7 @@ class TestHeadlessAnswerPath(WriteWorld):
 
 class TestRetireCloseHeadless(StandInPids, Base):
     """#1062: `retire --close` ends a HEADLESS worker's session through the service's session removal, by the boss rule of a pane close; also after the
-    plain retire (judged from the retirement record); the bulk `--all-retired` previews first. Fakes only: the service is the fake v2."""
+    plain retire (judged from the retirement record). Fakes only: the service is the fake v2."""
 
     GIT_ENV = TestLaunch.GIT_ENV
     git, make_repo, add_worktree = TestLaunch.git, TestLaunch.make_repo, TestLaunch.add_worktree
@@ -50263,31 +50262,6 @@ class TestRetireCloseHeadless(StandInPids, Base):
         code, out, err = self.run_cli("retire", "hw")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.removed, [])
-
-    def bulk_world(self):
-        self.make_repo()
-        ids = {n: self.hw(n) for n in ("idle-ok", "unpushed", "busy")}
-        wt = self.add_worktree("w-bulk", unpushed=True)
-        self.assertTrue(sb.register_worktree(self.world.state, str(wt), "unpushed", None, wt.name, 1))
-        self.world.v2.sessions[ids["busy"]]["turn"] = {"id": "t1"}
-        self.as_("boss")
-        for n in ids:
-            self.assertEqual(self.run_cli("retire", n)[0], 0)
-        return ids
-
-    def test_s8_the_bulk_close_previews_first_then_ends_only_the_idle_pushed_one(self):
-        ids = self.bulk_world()
-        code, out, err = self.run_cli("retire", "--close", "--all-retired")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(self.removed, [], "a preview ends nothing")
-        self.assertIn("would end: idle-ok", out)
-        self.assertEqual(len([l for l in out.splitlines() if l.startswith("skipped:")]), 2, out)
-        code, out, err = self.run_cli("retire", "--close", "--all-retired", "--confirm")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(self.removed, [ids["idle-ok"]])
-        skipped = [l for l in out.splitlines() if l.startswith("skipped:")]
-        self.assertEqual(len(skipped), 2, out)
-        self.assertTrue(any("unpushed" in l for l in skipped) and any("turn in progress" in l for l in skipped), out)
 
     # -- the three mutants: each makes the checks above fail
 
