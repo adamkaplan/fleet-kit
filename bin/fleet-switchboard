@@ -9374,9 +9374,21 @@ BRANCH_READS_PER_PASS = 20     # #1407: the most branch-head reads one pass make
 BRANCH_PASS_SECONDS = 5.0      # the most monotonic time one pass spends on them
 BRANCH_READ_TIMEOUT = 5        # the timeout of one read
 BRANCH_HEADS_FILE = "cloud-heads.json"
+BRANCH_ABSENT_EVERY = 30       # a branch never seen is counted in ONE audit line every this many reads of it
 PUSH_CACHE_DELIVERIES = 100    # #1407: the push route reads the record list at most once per this many deliveries
 PUSH_CACHE_SECONDS = 10        # ... and a worker launched since is known within this many seconds
 BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
+BRANCH_REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+
+def _branch_target_ok(repo, branch):
+    """True for an OWNER/NAME and a branch that are safe in a read path: no part is `.` or `..` (or starts with a dot-dot run), no empty or dot segment in the
+    branch, no `%` or character outside the name set, no leading `-`."""
+    if not (isinstance(repo, str) and isinstance(branch, str) and BRANCH_REPO_RE.fullmatch(repo) and BRANCH_NAME_RE.fullmatch(branch)):
+        return False
+    if any(part in (".", "..") or part.startswith("..") for part in repo.split("/")):
+        return False
+    return not branch.startswith("-") and ".." not in branch and all(seg not in ("", ".") for seg in branch.split("/"))
 BRANCH_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -9403,7 +9415,7 @@ def _branch_head(engine, repo, branch):
     except (GhRateLimited, AccountError, OSError, subprocess.SubprocessError) as err:
         return None, _one_line(type(err).__name__, 40)
     if done.returncode != 0:
-        if "404" in (done.stderr or ""):
+        if re.search(r"\(HTTP 404\)", done.stderr or "") or re.match(r"HTTP/[\d.]+ 404\b", done.stdout or ""):   # the real not-found shape, not any text holding 404
             return "absent", None
         return None, "gh exit %s" % done.returncode
     try:
@@ -9440,8 +9452,7 @@ def _cloud_branch_workers(state_dir, discovery, records, now):
     eligible = []
     for record in records:
         worker, repo, branch = record.get("worker"), record.get("repo"), record.get("branch")
-        if not (isinstance(worker, str) and isinstance(repo, str) and isinstance(branch, str) and re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo)
-                and BRANCH_NAME_RE.fullmatch(branch) and not branch.startswith("-") and ".." not in branch):
+        if not (isinstance(worker, str) and _branch_target_ok(repo, branch)):
             continue
         boss = _cloud_boss(record.get("reports_to"))
         lane = resolve_boss(discovery, boss) if boss else None
@@ -9496,6 +9507,10 @@ def cloud_branch_tick(engine, discovery):
     cursor = getattr(engine, "_branch_cursor", None)
     if cursor is not None:
         eligible = [e for e in eligible if e[0] > cursor] + [e for e in eligible if e[0] <= cursor]
+    absent = getattr(engine, "_branch_absent", None)
+    if absent is None:
+        absent = engine._branch_absent = {}
+    absent_due = []
     deadline, reads, cut, skipped, failed, told, changed, updates = clock() + BRANCH_PASS_SECONDS, 0, None, set(), 0, [], False, {}
     for worker, repo, branch, lane, launch_head in eligible:
         if reads >= BRANCH_READS_PER_PASS:
@@ -9517,6 +9532,10 @@ def cloud_branch_tick(engine, discovery):
             failed += 1
             continue
         if head == "absent":
+            if entry.get("head") is None:
+                absent[worker] = absent.get(worker, 0) + 1
+                if absent[worker] % BRANCH_ABSENT_EVERY == 0:
+                    absent_due.append(worker)
             if entry.get("head") is None and not entry.get("absent"):
                 heads[worker], changed = {"absent": True}, True
                 updates[worker] = heads[worker]
@@ -9529,10 +9548,13 @@ def cloud_branch_tick(engine, discovery):
         if first_equal:
             continue
         text = "pod %s pushed %s head %s" % (_one_line(worker, 60), _one_line(branch, 100), head[:8])
+        _branch_heads_merge(engine.state_dir, {worker: heads[worker]})   # the head is recorded BEFORE it is told: a crash between the two never tells twice
         add_reminder(engine.state_dir, lane, now, now, text)
         told.append(text)
     names = {r.get("worker") for r in result["records"]}
     if not result.get("capped"):
+        for gone in [k for k in list(absent) if k not in names]:
+            del absent[gone]
         for gone in [k for k in read_at if k not in names]:   # the per-branch times are kept for the recorded workers only
             del read_at[gone]
     if changed or not result.get("capped"):
@@ -9542,6 +9564,8 @@ def cloud_branch_tick(engine, discovery):
             engine.audit.append(engine.actor, "cloud-branch.capped", "cloud-branch", {"bound": cut, "reads": reads, "waiting": len(eligible) - reads - len(skipped)})
         if skipped:
             engine.audit.append(engine.actor, "cloud-branch.skipped_budget", "cloud-branch", {"accounts": sorted(skipped)})
+        if absent_due:   # a branch that was NEVER seen is not silent forever: one line per BRANCH_ABSENT_EVERY reads of it, all such branches in one line
+            engine.audit.append(engine.actor, "cloud-branch.absent", "cloud-branch", {"branches": len(absent_due), "reads_each": BRANCH_ABSENT_EVERY})
         if failed:
             engine.audit.append(engine.actor, "cloud-branch.unreadable", "cloud-branch", {"branches": failed})
     return told
@@ -12089,6 +12113,8 @@ class GitHubHub:
                                                   and BRANCH_SHA_RE.fullmatch(head) and set(head) != {"0"}):
             return False
         branch = ref[len("refs/heads/"):]
+        if not _branch_target_ok(repo, branch):
+            return False
         with self.lock:
             cached = self._push_cache
             if cached is None or cached[1] >= PUSH_CACHE_DELIVERIES or now - cached[0] >= PUSH_CACHE_SECONDS or now < cached[0]:

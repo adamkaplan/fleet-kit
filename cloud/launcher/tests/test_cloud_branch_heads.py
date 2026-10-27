@@ -514,6 +514,78 @@ class TestVolume(PushBase):
         self.assertEqual(len(self.audit.named("github.push_dropped")), 50)
 
 
+class TestFindings(PushBase):
+    def test_a_repository_or_branch_that_could_reach_another_endpoint_is_never_read_or_matched(self):
+        bad = [("../..", "work/a"), ("./.", "work/a"), (REPO, "work/./a"), (REPO, "work//a"), (REPO, "a%2e%2e/b"), (REPO, "work/%2e"), (REPO, "work/.."),
+               ("a/..x", "work/a"), (REPO, "-dash")]
+        for n, (repo, branch) in enumerate(bad):
+            self.record("w%d" % n, repo=repo, branch=branch, launch_head=sha(1))
+        self.engine.cloud_watch = CLOUD.read_records_bounded(self.state)
+        sb.cloud_branch_tick(self.engine, self.discovery)
+        self.assertEqual(self.remote.reads, [])
+        for repo, branch in bad:
+            self.push(branch, sha(9))
+        self.assertEqual(self.message_texts(), [])
+        self.assertTrue(sb._branch_target_ok(REPO, "work/pod-1.x"))
+
+    def test_a_server_error_that_mentions_404_is_not_read_as_an_absent_branch(self):
+        seen = []
+
+        def runner(argv, **kw):
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 500 request 4040 failed")
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {}}, runner, lambda: NOW, environ={})
+        self.engine.accounts.conditional = True
+        self.record("one", repo=OTHER_REPO)
+        self.run_pass()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(self.audit.named("cloud-branch.unreadable")), 1)
+
+    def test_a_branch_never_seen_is_counted_in_one_audit_line_per_thirty_reads(self):
+        self.record("one", repo=OTHER_REPO)
+        for n in range(1, 60):
+            self.run_pass()
+            self.assertEqual(len(self.audit.named("cloud-branch.absent")), n // 30)
+        self.assertEqual(self.message_texts(), [])
+
+    def test_the_message_is_exactly_the_documented_line_for_a_read_and_a_push(self):
+        self.record("one", repo=OTHER_REPO, launch_head=sha(1))
+        self.record("two", launch_head=sha(1))
+        self.remote.heads["work/one"] = sha(0xab)
+        self.run_pass()
+        self.push("work/two", sha(0xcd))
+        self.assertEqual(sorted(self.message_texts()), ["pod one pushed work/one head abababab", "pod two pushed work/two head cdcdcdcd"])
+
+    def test_a_crash_between_recording_the_head_and_the_message_never_tells_twice(self):
+        self.record("one", repo=OTHER_REPO, launch_head=sha(1))
+        self.record("two", launch_head=sha(1))
+        self.remote.heads["work/one"] = sha(9)
+        real = sb.add_reminder
+
+        def boom(*a, **kw):
+            raise OSError("disk full")
+        sb.add_reminder = boom
+        try:
+            with self.assertRaises(OSError):
+                self.run_pass()
+            self.push("work/two", sha(9))                        # the hub audits the failure and still answers
+            self.assertEqual(len(self.audit.named("github.rejected")), 1)
+        finally:
+            sb.add_reminder = real
+        self.run_pass()
+        self.push("work/two", sha(9))
+        self.assertEqual(self.message_texts(), [])
+
+    def test_a_budget_reading_dated_in_the_future_counts_as_stale(self):
+        for n in range(3):
+            self.record("b%d" % n, repo=OTHER_REPO)
+            self.remote.heads["work/b%d" % n] = sha(n + 1)
+        self.usage(remaining=1, at=NOW + 3600)
+        self.run_pass()
+        self.assertEqual(len(self.remote.reads), 3)
+        self.assertEqual(self.audit.named("cloud-branch.skipped_budget"), [])
+
+
 class TestPushDocs(unittest.TestCase):
     def test_s13_the_docs_name_push_and_say_a_config_with_its_own_list_must_add_it_and_the_fallback_scope(self):
         text = (Path(KIT) / "docs" / "switchboard.md").read_text()
