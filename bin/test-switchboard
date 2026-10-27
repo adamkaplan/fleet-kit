@@ -313,7 +313,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "undelivered_wake_minutes": 15, "undelivered_wake_tell_minutes": None, "undelivered_wake_per_pass": 2, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
+            "owner_logins": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -34503,6 +34503,1277 @@ class TestImpactFloorOwnerDecision(LedgerBase):
         self.assertNotIn("owner_decide(", source, "no second copy of the rule")
 
 
+VERBS = ["add_argument", "add_argument_group", "add_mutually_exclusive_group", "add_parser", "add_subparsers", "set_defaults"]
+FREE_KEYWORDS = ["help", "dest", "metavar", "required", "nargs", "const", "func"]   # pinned equal to the matrix by a test of the allow table
+
+
+class TestRegistrarFloor(LedgerBase):
+    """#964: a registrar that imports, calls or rebinds a name of the clear's closure is held for the owner by the floor, with no rating. The REAL daemon file, the REAL closure and the REAL matrix: both lists are derived
+    from them. In one process a hostile registrar can always undo a guard; this hold and this rating are the control."""
+
+    BASE = "c" * 40
+    cache = None
+
+    def setUp(self):
+        super().setUp()
+        self.dc = sb.load_module("delegated_clear")
+        self.rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        if TestRegistrarFloor.cache is None:   # the real file and its closure, derived once for the class
+            import ast
+            source = (BIN / "fleet-switchboard").read_text()
+            tree = ast.parse(source)
+            reach = self.dc.closure(tree, self.dc.daemon_roots(self.rule), self.rule["dynamic_actions"])
+            TestRegistrarFloor.cache = (source, tree, sorted(reach[0] | reach[1]), sorted(reach[0]), sorted(reach[1]))
+        self.base_src, self.tree, self.names, self.defs, self.bindings = TestRegistrarFloor.cache
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+
+    def head_of(self, body, name="add_zzz_parsers", base=None):
+        return (base if base is not None else self.base_src) + "\n\ndef %s(sub):\n    %s\n" % (name, body.replace("\n", "\n    "))
+
+    def found(self, body, name="add_zzz_parsers", base=None):
+        got, why = self.dc.registrar_findings(base if base is not None else self.base_src, self.head_of(body, name, base), self.rule)
+        self.assertIsNone(why, why)
+        return got
+
+    def found_unit(self, body):
+        """The same lint over a registrar written alone, with the real closure names: [(registrar, verb, name)] (the whole-file route is `found`, used where the diff matters)."""
+        import ast
+        unit = ast.parse("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n").body[0]
+        return [("add_zzz_parsers", v, n) for v, n in self.dc._registrar_unit(unit, set(self.names), set(range(1, 1000)), builtins=set(self.rule["registrar_allow"]["pure_builtins"]), named_helpers=set(self.rule["registrar_allow"]["helpers"]), verbs=VERBS, free_keywords=FREE_KEYWORDS)]
+
+    def pick(self):
+        """One closure definition, one binding and one imported module of the real closure (derived: the first of each, never named here)."""
+        import ast
+        modules = sorted(n for n in self.bindings if any(isinstance(x, (ast.Import, ast.ImportFrom)) and n in {(a.asname or a.name).split(".")[0] for a in x.names} for x in self.tree.body))
+        return self.defs[0], next(n for n in self.bindings if n not in modules), modules[0]
+
+    def hostile_table(self):
+        """{shape: (body, the (verb, name) it must be held for)}, on names derived from the real closure. `None` as a name: any name. One table for the real closure; the fake daemon below carries the one the mutants use."""
+        function, binding, module = self.pick()
+        return {
+            "an import of a closure module": ("import %s" % module, ("imports", module)),
+            "an import of a module outside the closure": ("import gc", ("imports", "gc")),
+            "an import as a closure name": ("import gc as %s" % binding, ("imports", binding)),
+            "a from import": ("from json import dumps as %s" % function, ("imports", function)),
+            "__import__": ("__import__('os')", ("imports", "__import__")),
+            "a call of a closure function": ("%s()" % function, ("calls", function)),
+            "a call through a closure module": ("%s.thing()" % module, ("calls", module)),
+            "a call of a builtin outside the table": ("iter(sub)", ("calls", "iter")),
+            "a call through a module outside the closure": ("gc.get_objects()", ("calls", "gc")),
+            "ctypes": ("ctypes.memmove(0, 0, 0)", ("calls", "ctypes")),
+            "exec": ("exec('x = 1')", ("calls", "exec")),
+            "setattr": ("setattr(sys.modules[__name__], %r, None)" % function, ("calls", "setattr")),
+            "an attribute rebind": ("%s.%s = None" % (module, function), ("rebinds", function)),
+            "an attribute rebind on an object": ("sub2 = []\nsub2.%s = None" % function, ("rebinds", function)),
+            "sys.modules": ("sys.modules[__name__].anything = None", ("rebinds", None)),
+            "an alias": ("m = %s\nm.anything = None" % module, ("uses", module)),
+            "globals()": ("globals()[%r] = None" % function, ("rebinds", function)),
+            "globals() by a name that cannot be read": ("globals()[sub] = None", ("rebinds", None)),
+            "a global statement of a closure name": ("global %s\n%s = None" % (binding, binding), ("rebinds", binding)),
+            "a global statement of another name": ("global zzz_other\nzzz_other = 1", ("rebinds", "zzz_other")),
+            "a delete": ("del %s.%s" % (module, function), ("rebinds", function)),
+            "a loop target": ("for %s.%s in (1,):\n    pass" % (module, function), ("rebinds", function)),
+            "a __dict__ write": ("%s.__dict__.update(a=1)" % module, ("rebinds", None)),
+            "gc: a code object rebound": ("import gc\nfor o in gc.get_objects():\n    o.__code__ = 1", ("rebinds", "__code__")),
+            "gc: a referrer's dict": ("gc.get_referrers(1)[0][%r] = None" % function, ("rebinds", function)),
+            "builtins": ("builtins.open = None", ("rebinds", "open")),
+            "__builtins__": ("__builtins__.open = None", ("rebinds", "__builtins__")),
+            "a frame's f_globals": ("inspect.currentframe().f_globals['k'] = 1", ("rebinds", None)),
+            "a list append then a read": ("box = []\nbox.append(%s)\nbox[0]()" % function, ("uses", function)),
+            "a match subject": ("match %s:\n    case m:\n        m()" % function, ("uses", function)),
+            "a parameter default that reaches a module": ("def inner(p, m=%s):\n    m.x = 1" % module, ("rebinds", None)),
+            "the parser name rebound to a module": ("sub = %s\nsub.system('x')" % module, ("rebinds", "sub")),
+            "a handed parser's choices replaced": ('sub.choices["review"] = sub.add_parser("zzz")', ("rebinds", None)),
+            "a handed parser's command map edited": ('sub._name_parser_map.pop("review")', ("uses", "_name_parser_map")),
+            "another command's parser rewritten": ('sub.choices["impact"].set_defaults(impact_action="floor")', ("uses", "choices")),
+            "a write onto a function reached through an action": ('p = sub.add_parser("zzz")\np._actions[-1].type.mark = 1', ("rebinds", "mark")),
+            "another command's actions rewritten": ('for a in sub.choices["review"]._actions:\n    a.default = "x"', ("uses", "choices")),
+            "a data name rebound to a module": ("s = ''\ns = %s\ns.system('x')" % module, ("calls", "s")),
+            "a data name rebound to a non-closure module": ("s = ''\ns = os\ns.system('x')", ("calls", "s")),
+            "aliases on add_parser": ("sub.add_parser('x', aliases=['review'])", ("calls", "aliases")),
+            "set_defaults on the handed parser": ("sub.set_defaults(a=1)", ("calls", "set_defaults on the handed parser")),
+            "aliases by a ** expansion": ("sub.add_parser('x', **{'aliases': ['review']})", ("calls", "aliases")),
+            "aliases by a ** of a local dict": ("kw = {'aliases': ['review']}\nsub.add_parser('x', **kw)", ("calls", "aliases")),
+            "type=eval with a default string": ("p = sub.add_parser('z')\np.add_argument('--x', default=\"__import__('os').getcwd()\", type=eval)", ("calls", "eval")),
+            "type=exec": ("p = sub.add_parser('z')\np.add_argument('--x', default='1', type=exec)", ("calls", "exec")),
+            "type=compile": ("p = sub.add_parser('z')\np.add_argument('--x', type=compile)", ("calls", "compile")),
+            "type=open": ("p = sub.add_parser('z')\np.add_argument('--x', default='/etc/passwd', type=open)", ("calls", "open")),
+            "type=setattr": ("p = sub.add_parser('z')\np.add_argument('--x', type=setattr)", ("calls", "setattr")),
+            "type=print": ("p = sub.add_parser('z')\np.add_argument('--x', default='a', type=print)", ("calls", "print")),
+            "type= a closure function": ("p = sub.add_parser('z')\np.add_argument('--x', type=%s)" % function, ("calls", function)),
+            "action= a closure function": ("p = sub.add_parser('z')\np.add_argument('--x', action=%s)" % function, ("calls", function)),
+            "action=eval": ("p = sub.add_parser('z')\np.add_argument('--x', action=eval)", ("calls", "eval")),
+            "a call of an element of a local list": ("l = []\nl.append(os.system)\nl[0]('x')", ("calls", "l")),
+            "a call of a loop variable over a list": ("for f in [os.system]:\n    f('x')", ("calls", "f")),
+            "a tuple of callables": ("t = (os.system,)\nt[0]('x')", ("calls", "t")),
+            "a dict of callables": ("d = {'k': os.system}\nd['k']('x')", ("calls", "d")),
+            "a set of callables": ("s = {os.system}\nfor g in s:\n    g('x')", ("calls", "g")),
+            "a walrus": ("(f := os.system)\nf('x')", ("calls", "f")),
+            "a tuple unpack": ("a, = (os.system,)\na('x')", ("calls", "a")),
+            "a comprehension over callables": ("[g('x') for g in (os.system,)]", ("calls", "g")),
+            "a lambda handed a callable": ("(lambda g: g('x'))(os.system)", ("calls", "g")),
+            "a callable as a default argument": ("def inner(g=os.system):\n    g('x')\ninner()", ("calls", "g")),
+            "a function defined in the registrar that reaches a module": ("def inner():\n    os.system('x')\ninner()", ("calls", "os")),
+            "a def rebound to a dangerous callable then called": ("def f():\n    pass\nf = setattr\nf(sub, 'x', 1)", ("calls", "f")),
+            "a lambda rebound to a dangerous callable then called": ("f = lambda: 1\nf = os.system\nf('x')", ("calls", "f")),
+            "a bare read": ("%s" % function, ("uses", function)),
+            "a loop source": ("for f in [%s]:\n    pass" % function, ("uses", function)),
+            "a closure name handed to a foreign call": ("print(%s)" % function, ("uses", function)),
+            "a call inside an argument of its own parser": ("sub.add_parser('x', default=%s())" % function, ("calls", function)),
+        }
+
+    def allowed_table(self):
+        function, binding, module = self.pick()
+        return {
+            "a value of its own parser's method": "t = sub.add_parser('x', type=int, help=%s)\nt.add_argument('--a', default=1, metavar=%s)" % (module, binding),
+            "a nested value of an argument": "t = sub.add_parser('x')\nt.add_argument('--a', choices=(1, 2), help=%s)" % function,
+            "a loop over its own parsers": "a = sub.add_parser('a')\nb = sub.add_parser('b')\nfor p in (a, b):\n    p.add_argument('--x', default=1, help=%s)" % function,
+            "its own parser's actions": "a = sub.add_parser('a')\nfor action in a._actions:\n    action.default = 1",
+            "a constant read of a module": "t = sub.add_parser('x')\nt.add_argument('--a', default=argparse.SUPPRESS)",
+            "a flag with a computed help": "t = sub.add_parser('x')\nt.add_argument('--a', help=('%d' % 1) + 'x')",
+            "a built parser's actions read and set to literals (the ledger registrar)": "v = sub.add_parser('v')\nfor action in v._actions:\n    action.nargs, action.default = '?', None",
+            "a chain of its own parser's methods": "sub.add_parser('x').add_argument('--a')",
+            "a table builtin and a string action": "t = sub.add_parser('x')\nt.add_argument('--a', type=int, default=1, action='store_true')",
+            "set_defaults with a stored function": "t = sub.add_parser('x')\nt.set_defaults(func=%s)" % function,
+            "a type that is a table builtin": "t = sub.add_parser('x')\nt.add_argument('--a', type=int)",
+            "a local dict of safe values": "given = {'default': argparse.SUPPRESS} if sub else {}\nt = sub.add_parser('x')\nt.add_argument('--a', **given)",
+            "set_defaults on a parser it built": "t = sub.add_parser('x')\nt.set_defaults(a=1)",
+            "a name that stays data": "s = ''\ns.join(('a',))",
+            "a literal stored on a parser it built": "t = sub.add_parser('x')\nt.usage = 'u'",
+            "a function it defines itself": "def inner():\n    sub.add_parser('x')\ninner()",
+        }
+
+    def test_the_probe_a_registrar_rebinds_a_closure_name_in_the_process_and_the_floor_holds_the_same_edit(self):
+        """DW-1: the cause shown on the real module. The rebinding works at run time (the guards share the namespace), and the floor holds the diff that carries it."""
+        function, binding, module = self.pick()
+        for name in (function, binding):
+            original = getattr(sb, name)
+            body = "global %s\n%s = F" % (name, name)
+            namespace = sb.__dict__
+            namespace["F"] = object()
+            try:
+                exec("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n", namespace)
+                sb.build_parser()
+                self.assertIs(getattr(sb, name), namespace["F"], "the probe: the registrar rebound %s while the process ran" % name)
+            finally:
+                setattr(sb, name, original)
+                namespace.pop("add_zzz_parsers", None)
+                namespace.pop("F", None)
+            self.assertIn(("add_zzz_parsers", "rebinds", name), self.found(body))
+        self.assertGreaterEqual(len(self.names), 100)
+
+    def test_every_hostile_shape_is_held_with_the_registrar_and_the_name_in_the_reason(self):
+        for label, (body, (verb, name)) in self.hostile_table().items():
+            with self.subTest(label):
+                got = self.found_unit(body)
+                self.assertTrue(any(g[1] == verb and (name is None or g[2] == name) for g in got), (label, got))
+                reasons = sb.impact_floor.registrar_reasons({"findings": got, "closure": self.names, "why": None})
+                self.assertEqual(len(reasons), len(got))
+                for finding, reason in zip(got, reasons):
+                    self.assertIn("registrar add_zzz_parsers %s " % finding[1], reason)
+                    self.assertIn(finding[2], reason)
+                    if finding[2] in self.names:
+                        self.assertIn("closure name %s" % finding[2], reason)
+                    else:
+                        self.assertIn("this shape is not allowed in a registrar", reason)
+
+    def test_a_registrar_that_only_sets_up_its_own_parser_is_not_held(self):
+        for label, body in self.allowed_table().items():
+            with self.subTest(label):
+                self.assertEqual(self.found_unit(body), [], label)
+        self.assertEqual(self.found_unit("decide = 1\ncopy = 2\nthing = sub.add_parser('zzz')"), [], "a local that shares a closure name is not the closure's")
+
+    def test_only_the_lines_the_pull_request_added_count_on_its_own_base_and_head(self):
+        hostile = "global %s\n%s = None" % (self.pick()[1], self.pick()[1])
+        base = self.head_of(hostile)                                           # the hostile line is already in the base
+        self.assertEqual(self.dc.registrar_findings(base, base, self.rule), ([], None), "untouched: not held")
+        other_line = base.replace("def add_zzz_parsers(sub):\n", "def add_zzz_parsers(sub):\n    thing = sub.add_parser('zzz')\n    thing.add_argument('--x')\n")
+        edited = self.dc.registrar_findings(base, other_line, self.rule)   # the NEW rule: any changed line of a function that writes a namespace is held wherever it is called (the old "a different line edited: not held" is dropped)
+        self.assertIsNone(edited[1])
+        self.assertIn(("a changed line of a function that writes a namespace", "calls", "a statement that may write the module's namespace"), edited[0])
+        removed = base.replace("    global %s\n    %s = None\n" % (self.pick()[1], self.pick()[1]), "    sub.add_parser('zzz')\n")
+        self.assertEqual(self.dc.registrar_findings(base, removed, self.rule), ([], None), "a removed hostile line: not held")
+        added = self.dc.registrar_findings(self.base_src, base, self.rule)[0]
+        self.assertEqual({r for r, _, _ in added} - {"a changed line of a function that writes a namespace"}, {"add_zzz_parsers"})   # (the new rule also names the writer function by its own finding)  # the named rebinding and the grammar's own finding (a Global statement is not in the grammar)
+        self.assertIn(("add_zzz_parsers", "rebinds", self.pick()[1]), added)
+
+    def test_a_changed_line_of_a_function_that_is_not_a_registrar_is_held_when_it_writes_a_namespace(self):
+        function, binding, module = self.pick()   # the NEW rule replaces "a function that is not a registrar is not held": the writer is held by what it does, not by its name
+        for name in ("helper_zzz", "cmd_zzz", "add_zzz_parser"):
+            with self.subTest(name):
+                got = self.found("global %s\n%s = None\nimport %s" % (binding, binding, module), name=name)
+                self.assertIn(("a changed line of a function that writes a namespace", "calls", "a statement that may write the module's namespace"), got)
+
+    def test_an_unreadable_diff_holds_and_says_so(self):
+        good = self.base_src
+        for label, (before, after) in {"no base": (None, good), "no head": (good, None), "head that does not parse": (good, good + "\ndef (:\n"),
+                                       "no registrar pattern": (good, good.replace("REGISTRAR_NAME_RE", "REGISTRAR_NAME_RX"))}.items():
+            with self.subTest(label):
+                got, why = self.dc.registrar_findings(before, after, self.rule)
+                self.assertIsNone(got)
+                self.assertTrue(why)
+                reasons = sb.impact_floor.registrar_reasons({"findings": [], "why": why})
+                self.assertEqual(len(reasons), 1)
+                self.assertIn("registrar diff could not be read", reasons[0])
+        self.assertEqual(self.dc.registrar_findings(good, good, {"closure_roots": [], "rating_roots": []})[0], None, "an empty closure cannot tell what a registrar touches: held")
+        self.assertEqual(sb.impact_floor.registrar_reasons(None), [], "the daemon file did not change: nothing to read")
+        self.assertEqual(len(sb.impact_floor.registrar_reasons("garbage")), 1)
+
+    def test_every_member_of_the_closure_is_held_by_every_verb_and_a_mutant_without_it_does_not_hold_the_use(self):
+        """The real closure, member by member: with the member in the set a registrar's import, global rebind and attribute rebind of it is held BY NAME, and so is the bare read of it (the use rule), which only a closure
+        member triggers: with it dropped from the set (the mutant) the read is not held, so each member is pinned."""
+        import ast
+        def run(body, members):
+            unit = ast.parse("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n").body[0]
+            return self.dc._registrar_unit(unit, members, set(range(1, 100)))
+        full = set(self.names)
+        for name in self.names:
+            for body, verb in (("global %s\n%s = None" % (name, name), "rebinds"), ("import %s" % name, "imports"), ("sub2 = []\nsub2.%s = None" % name, "rebinds"), ("keep = %s" % name, "uses")):
+                self.assertIn((verb, name), run(body, full), (name, body))
+            self.assertEqual(run("keep = %s" % name, full - {name}), [], "a mutant without %s does not hold its bare read" % name)
+
+    def test_a_name_added_to_the_closure_and_a_registrar_added_later_are_covered_with_no_second_edit(self):
+        fake = ("import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\ndef newhelper():\n    pass\ndef main():\n    newhelper()\n")
+        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": []}
+        head = fake + "def add_zz_parsers(sub):\n    newhelper()\n"
+        got, why = self.dc.registrar_findings(fake, head, rule)
+        self.assertIsNone(why)
+        self.assertIn(("add_zz_parsers", "calls", "newhelper"), got)
+        grown = fake.replace("def main():\n    newhelper()\n", "def main():\n    newhelper()\n    later()\n") + "def later():\n    pass\n"
+        head2 = grown + "def add_qq_parsers(sub):\n    later()\n"
+        self.assertIn(("add_qq_parsers", "calls", "later"), self.dc.registrar_findings(grown, head2, rule)[0])
+        self.assertIn(("add_zz_parsers", "calls", "other"), self.dc.registrar_findings(fake, fake + "def add_zz_parsers(sub):\n    other()\n", rule)[0], "outside the closure it is still held, by default-deny, and named by what it calls")
+
+    def test_neither_list_is_written_in_the_rule(self):
+        import ast
+        names = set(self.names) | {n.name for n in self.tree.body if isinstance(n, ast.FunctionDef) and re.fullmatch(r"add_[a-z0-9_]+_parsers", n.name)}
+        for module, wanted in ((BIN / "delegated_clear.py", ("registrar_findings", "_registrar_unit", "registrar_pattern", "_root", "_spans", "_own_scope", "_is_data", "_immutable", "_binds_registrar", "_module_statements")), (BIN / "impact_floor.py", ("registrar_reasons",))):
+            tree = ast.parse(module.read_text())
+            for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted):
+                strings = {c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+                self.assertEqual(strings & names - {"REGISTRAR_NAME_RE"}, set(), "%s holds a closure name or a registrar name" % fn.name)   # the one name the daemon file declares its registrars by: the clear's own closure reads it by the same literal
+        for gone in ("NAMESPACE_REACHERS", "NAMESPACE_ATTRIBUTES", "SETTERS", "READ_ONLY_METHODS"):
+            self.assertFalse(hasattr(self.dc, gone), "%s: the lint keeps no list of ways to reach a namespace (default-deny)" % gone)
+
+    def test_no_registrar_of_the_daemon_file_or_a_helper_it_reaches_is_held_today_every_line_counted(self):
+        """The real file with EVERY line counted as added (an empty base): the registrars, their helpers and every binding of a registrar name are read and none is held."""
+        import ast
+        pattern = self.dc.registrar_pattern(self.tree)
+        registrars = [n for n in self.tree.body if isinstance(n, ast.FunctionDef) and pattern.fullmatch(n.name)]
+        self.assertGreaterEqual(len(registrars), 20)
+        got, why = self.dc.registrar_findings("import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\n", self.base_src, self.rule)
+        self.assertIsNone(why)
+        # the one read the rule cannot clear: the loader loop at the top of the file writes `globals()[<variable>]`, a key the lint cannot read, so an edit of that line is held for the owner (it is the clear's own loader)
+        got = [g for g in got if g[0] != "a name of the allow table"]   # (every line counted as added also counts the named helpers' lines: their edit-hold is tested on its own)
+        module_kinds = {"a module-level write into globals()", "a module-level expression statement", "a module-level namespace reach", "a changed line of a function that writes a namespace"}
+        self.assertTrue({g[0] for g in got} <= module_kinds, got)
+        self.assertTrue({"a module-level write into globals()", "a module-level expression statement", "a module-level namespace reach"} <= {g[0] for g in got})   # no REGISTRAR is held; what is held is the daemon file's own module-level statements (the loader, `DEFAULTS.update(...)`, `bind(globals())`, `sys.exit(main())`), and only when a pull request adds one
+        self.assertIn("globals()[_function] = _make_loader(", self.base_src)
+
+    def test_an_upper_case_constant_the_file_never_binds_is_data_but_only_unbound_and_never_called_(self):
+        """The loader puts another module's constants (`ORDERS_HEADING`) in the daemon namespace: `help=... % NAME` is not held (the real add_orders_parsers); a call of it, and a name the registrar or module binds to a non-constant stay held."""
+        head = "def add_a_parsers(sub):\n    p = sub.add_parser('x', description='%%s' %% %s)\n"
+        self.assertEqual(self.reg(head % "ZZZ_HEADING")[0], [])
+        self.assertTrue(self.reg("def add_a_parsers(sub):\n    ZZZ_HEADING()\n")[0], "a call stays held")
+        self.assertTrue(self.reg("ZZZ_HEADING = len('x') and eval\n" + head % "ZZZ_HEADING")[0], "a module binding that is not a constant is held")
+        self.assertTrue(self.reg("def add_a_parsers(sub):\n    ZZZ_HEADING = eval\n    p = sub.add_parser('x', description='%s' % ZZZ_HEADING)\n")[0], "a local binding is held")
+
+    def reg(self, text, base=None):
+        return self.dc.registrar_findings(self.base_src if base is None else base, (self.base_src if base is None else base) + "\n" + text + "\n", self.rule)
+
+    def test_a_registrar_bound_in_any_form_the_daemon_could_pick_up_is_read_or_held(self):
+        function, binding, module = self.pick()
+        hostile = "global %s\n        %s = None" % (binding, binding)
+        forms = {
+            "an async def": ("async def add_a_parsers(sub):\n    " + hostile.replace("        ", "    "), "rebinds"),
+            "a def under an if": ("if True:\n    def add_a_parsers(sub):\n        " + hostile, "rebinds"),
+            "a def under a try": ("try:\n    def add_a_parsers(sub):\n        %s()\nexcept Exception:\n    pass" % function, "calls"),
+            "a class": ("class add_a_parsers:\n    %s()" % function, "calls"),
+            "a lambda": ("add_a_parsers = lambda sub: %s()" % function, "calls"),
+            "an annotated lambda": ("add_a_parsers: object = lambda sub: %s()" % function, "calls"),
+            "a non-lambda value": ("add_a_parsers = make()", "rebinds"),
+            "a tuple target": ("add_a_parsers, other = 1, 2", "rebinds"),
+            "an import under the name": ("from json import dumps as add_a_parsers", "rebinds"),
+            "a write into globals()": ("globals()['add_a_parsers'] = print", "rebinds"),
+            "a write into globals() by a key that cannot be read": ("globals()[input()] = print", "rebinds"),
+        }
+        for label, (text, verb) in forms.items():
+            with self.subTest(label):
+                got, why = self.reg(text)
+                self.assertIsNone(why)
+                self.assertTrue(any(v == verb for _, v, _ in got), (label, got))
+
+    def test_a_helper_a_registrar_calls_is_read_as_part_of_it_and_an_untouched_helper_is_not_held_unless_a_changed_line_names_it(self):
+        function, binding, module = self.pick()
+        helper = "def _zzz_helper():\n    global %s\n    %s = None\n" % (binding, binding)
+        got, why = self.reg(helper + "def add_a_parsers(sub):\n    _zzz_helper()\n")
+        self.assertIn(("add_a_parsers (through _zzz_helper)", "rebinds", binding), got)
+        got, why = self.reg("def add_a_parsers(sub):\n    _zzz_helper2()\ndef _zzz_helper2():\n    _zzz_helper3()\ndef _zzz_helper3():\n    %s()\n" % function)
+        self.assertTrue(any(v == "calls" and "through _zzz_helper3" in r for r, v, _ in got), got)   # transitive
+        base = self.base_src + "\n" + helper + "def add_a_parsers(sub):\n    pass\n"   # a hostile helper already there, no registrar calls it
+        self.assertEqual(self.dc.registrar_findings(base, base, self.rule), ([], None))
+        edited = base.replace("def add_a_parsers(sub):\n    pass\n", "def add_a_parsers(sub):\n    thing = sub.add_parser('a')\n")
+        self.assertEqual(self.dc.registrar_findings(base, edited, self.rule), ([], None), "a different line of the registrar: the helper is not named")
+        calls = base.replace("def add_a_parsers(sub):\n    pass\n", "def add_a_parsers(sub):\n    _zzz_helper()\n")
+        self.assertIn(("add_a_parsers (through _zzz_helper)", "rebinds", binding), self.dc.registrar_findings(base, calls, self.rule)[0], "a changed line now calls the old hostile helper: all of it is read")
+        for label, text in {"a helper bound as a lambda": "zz_h = lambda: %s()\ndef add_a_parsers(sub):\n    zz_h()\n" % function,
+                            "a helper that is a class": "if True:\n    class ZzH:\n        def __call__(self):\n            %s()\ndef add_a_parsers(sub):\n    ZzH()\n" % function}.items():
+            with self.subTest(label):
+                self.assertTrue(any("through" in r for r, v, _ in self.reg(text)[0]), label)
+        for label, text in {"a helper that is a non-lambda binding": "zz_h = make()\ndef add_a_parsers(sub):\n    zz_h()\n", "a helper that is imported": "from somewhere import zz_h\ndef add_a_parsers(sub):\n    zz_h()\n",
+                            "a plain import alias": "import sys as zz_hh\ndef add_a_parsers(sub):\n    zz_hh()\n", "a for target": "for zz_hh in ():\n    pass\ndef add_a_parsers(sub):\n    zz_hh()\n",
+                            "an except name": "try:\n    pass\nexcept Exception as zz_hh:\n    pass\ndef add_a_parsers(sub):\n    zz_hh()\n"}.items():
+            with self.subTest(label):
+                self.assertTrue(any(v == "calls" and "cannot be read" in n for _, v, n in self.reg(text)[0]), label)
+
+    def test_a_pattern_weakened_in_the_head_a_size_over_the_cap_and_a_lambda_are_held_or_read(self):
+        function, binding, module = self.pick()
+        hostile = "def add_a_parsers(sub):\n    %s()\n" % function
+        weakened = (self.base_src + "\n" + hostile).replace("REGISTRAR_NAME_RE = re.compile(r\"add_[a-z0-9_]+_parsers\")", "REGISTRAR_NAME_RE = re.compile(r\"nothing_matches_this\")")
+        self.assertNotEqual(weakened, self.base_src + "\n" + hostile, "the real file spells the pattern as this test expects")
+        got, why = self.dc.registrar_findings(self.base_src, weakened, self.rule)
+        self.assertTrue(any(v == "calls" for _, v, _ in got), "the base's pattern still names the registrar: the weakening does not hide it")
+        dropped = (self.base_src + "\n" + hostile).replace("REGISTRAR_NAME_RE = re.compile(", "REGISTRAR_NAME_RE = (")
+        got, why = self.dc.registrar_findings(self.base_src, dropped, self.rule)
+        self.assertIsNone(got)
+        self.assertIn("pattern", why)
+        with mock.patch.object(self.dc, "REGISTRAR_SOURCE_MAX", 100):
+            got, why = self.dc.registrar_findings(self.base_src, self.base_src, self.rule)
+        self.assertEqual((got, bool(why)), (None, True), "over the size cap: held")
+        got, why = self.reg("add_a_parsers = lambda sub: %s()" % function)
+        self.assertIn(("add_a_parsers", "calls", function), got)
+
+    FORBIDDEN_BUILTINS = ("getattr", "setattr", "delattr", "eval", "exec", "compile", "globals", "locals", "vars", "__import__", "open")
+
+    def test_the_allow_table_names_pure_builtins_only_and_none_of_the_forbidden_ones(self):
+        import builtins as builtins_module
+        allow = self.rule["registrar_allow"]
+        self.assertEqual(set(allow["pure_builtins"]) & set(self.FORBIDDEN_BUILTINS), set(), "a builtin that can reach or rebind another object is in the table")
+        for name in allow["pure_builtins"]:
+            self.assertTrue(hasattr(builtins_module, name), name)
+            self.assertNotIn(name, self.FORBIDDEN_BUILTINS)
+        self.assertEqual(len(allow["pure_builtins"]), len(set(allow["pure_builtins"])), "a member twice")
+        self.assertEqual(sorted(allow), ["free_keywords", "helpers", "meaning", "parser_methods", "pure_builtins"])
+        self.assertEqual(allow["parser_methods"], VERBS, "the verbs this test file writes its rules with are the matrix's")
+        self.assertEqual(allow["free_keywords"], FREE_KEYWORDS)
+        for member in ("type", "action", "default", "choices", "default_factory"):
+            self.assertNotIn(member, allow["free_keywords"], "a keyword argparse applies or runs is not free")
+        for member in ("choices", "_name_parser_map", "_actions", "_defaults", "_registries", "parser_class", "parse_args", "register", "__setattr__"):
+            self.assertNotIn(member, allow["parser_methods"], "a member of the handed parser that reaches other commands is not a verb")
+
+    def test_every_helper_of_the_table_is_a_pure_function_of_the_daemon_file_and_never_an_unprotected_edit(self):
+        import ast
+        allow = self.rule["registrar_allow"]
+        pure = set(allow["pure_builtins"]) | set(allow["helpers"]) | {"super", "ValueError", "argparse", "_ISSUE_REF"}   # what these helpers call today: the table's own names, super, an exception, the argparse error and a compiled pattern
+        definitions = {n.name: n for n in self.tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        for helper in allow["helpers"]:
+            with self.subTest(helper):
+                node = definitions.get(helper)
+                self.assertIsNotNone(node, "a helper of the table is a function or class of the daemon file")
+                own = {a.arg for a in ast.walk(node) if isinstance(a, ast.arg)} | {x.id for x in ast.walk(node) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store)} | {"cls", "self"}
+                for x in ast.walk(node):
+                    self.assertNotIsInstance(x, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal), "a helper imports or declares a global")
+                    if isinstance(x, (ast.Attribute, ast.Subscript)) and isinstance(x.ctx, (ast.Store, ast.Del)):
+                        self.assertIn(self.dc._root(x.value), own, "a helper writes outside its own names: %s" % ast.unparse(x))
+                    if isinstance(x, ast.Call):
+                        root = self.dc._root(x.func)
+                        self.assertTrue(root in own or root in pure or (isinstance(x.func, ast.Attribute) and isinstance(x.func.value, ast.Call) and self.dc._root(x.func.value.func) == "super"), "a helper calls %s" % ast.unparse(x.func))
+                        self.assertNotIn(root, self.FORBIDDEN_BUILTINS)
+                # protected: inside the closure (an edit is the owner's clear by the closure rule), or held by the lint when edited
+                line = node.body[-1].end_lineno
+                lines = self.base_src.split("\n")
+                edited = "\n".join(lines[:line] + ["%sx_edit = 1" % (" " * node.body[-1].col_offset)] + lines[line:])
+                got, why = self.dc.registrar_findings(self.base_src, edited, self.rule)
+                self.assertIsNone(why)
+                self.assertTrue(helper in self.names or ("a named registration helper", "rebinds", helper) in got, "an unprotected helper: %s" % helper)
+
+    def test_every_daemon_file_callable_a_real_registrar_hands_to_its_parser_is_in_the_table(self):
+        """Derived from the real registrars (never listed here): every module-level function or class they refer to, and what those call in turn, is a helper of the table."""
+        import ast
+        allow = self.rule["registrar_allow"]
+        definitions = {n.name: n for n in self.tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        pattern = self.dc.registrar_pattern(self.tree)
+        used, todo = set(), []
+        for node in self.tree.body:
+            if isinstance(node, ast.FunctionDef) and pattern.fullmatch(node.name):
+                local = {a.arg for a in ast.walk(node) if isinstance(a, ast.arg)} | {x.id for x in ast.walk(node) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store)}
+                for call in (c for c in ast.walk(node) if isinstance(c, ast.Call)):   # handed to something: a bare name as an argument or a keyword value (`type=issue_arg`); a function the registrar CALLS is read by the lint as part of it
+                    todo.extend(v.id for v in [a.value if isinstance(a, ast.keyword) else a for a in list(call.args) + list(call.keywords)] if isinstance(v, ast.Name) and v.id in definitions and v.id not in local and not pattern.fullmatch(v.id))
+        first = set(todo)
+        self.assertTrue(first, "the real registrars hand at least one helper to their parser")
+        while todo:
+            name = todo.pop()
+            if name in used:
+                continue
+            used.add(name)
+            todo.extend(x.id for x in ast.walk(definitions[name]) if isinstance(x, ast.Name) and x.id in definitions and x.id != name)
+        self.assertEqual(first - set(allow["helpers"]), set(), "a function a registrar hands to its parser is not in the allow table")
+        self.assertEqual(used - set(allow["helpers"]), set(), "a function the helpers call is not in the allow table")
+
+    def test_a_registrar_split_like_the_one_in_review_is_not_held_and_a_helper_edit_is(self):
+        """S19: a daemon file in which the helpers are OUTSIDE the closure (as after the split), a registrar that hands one to its parser and uses the table's builtins."""
+        fake = ("import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\n_REF = re.compile('x')\n"
+                "class IssueNo(int):\n    def __new__(cls, n):\n        self = super().__new__(cls, n)\n        self.repo = None\n        return self\n"
+                "def parse_ref(text):\n    found = _REF.match(text.strip()) if isinstance(text, str) else None\n    if not found or int(text) < 1:\n        raise ValueError(str(text))\n    return IssueNo(int(text))\n"
+                "def ref_arg(text):\n    return parse_ref(text)\ndef main():\n    return 1\n")
+        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "isinstance", "str"], "helpers": ["IssueNo", "parse_ref", "ref_arg"], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
+        registrar = "def add_x_parsers(sub):\n    t = sub.add_parser('x')\n    t.add_argument('--issue', type=ref_arg, default=int('1'))\n"
+        self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, rule), ([], None))
+        self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, dict(rule, registrar_allow={"pure_builtins": [], "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}))[0] != [], True, "with no table the same edit is held")
+        edited = (fake + registrar).replace("    return IssueNo(int(found.group(1)))" if False else "    return IssueNo(int(text))\n", "    x = 1\n    return IssueNo(int(text))\n")
+        got, why = self.dc.registrar_findings(fake + registrar, edited, rule)
+        self.assertEqual([g[1:] for g in got], [("rebinds", "parse_ref")], got)
+
+    def test_every_member_of_the_allow_table_is_pinned_by_a_mutant_of_the_table(self):
+        """A mutant per member: the registrar that uses the member is held without it and not with it."""
+        fake = "import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\ndef hlp(t):\n    import os\ndef main():\n    return 1\n"
+        allow = self.rule["registrar_allow"]
+        for builtin in allow["pure_builtins"]:
+            with self.subTest(builtin):
+                text = fake + "def add_a_parsers(sub):\n    sub.add_parser('x', help=%s(('a',)))\n" % builtin
+                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [builtin], "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
+                without = dict(with_it, registrar_allow={"pure_builtins": [x for x in allow["pure_builtins"] if x != builtin], "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS})
+                self.assertEqual(self.dc.registrar_findings(fake, text, with_it)[0], [], builtin)
+                self.assertTrue(self.dc.registrar_findings(fake, text, without)[0], "the mutant without %s is not held" % builtin)
+        for helper in allow["helpers"]:
+            with self.subTest(helper):
+                text = fake.replace("def hlp(t):", "def %s(t):" % helper) + "def add_a_parsers(sub):\n    sub.add_parser('x', type=%s)\n" % helper
+                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [], "helpers": [helper], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
+                without = dict(with_it, registrar_allow={"pure_builtins": [], "helpers": [x for x in allow["helpers"] if x != helper], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS})
+                self.assertEqual(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, with_it)[0], [], helper)
+                self.assertTrue(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, without)[0], "the mutant without %s is not held" % helper)
+
+    # ---- the family: every way a name is bound or reaches a call, one hostile row each (derived from the ast module's node classes below)
+    FAMILY = {
+        "assign": "def f():\n    pass\nf = os.system\nf('x')", "augmented assign": "def f():\n    pass\nf += os.system\nf('x')", "annotated assign": "def f():\n    pass\nf: object = os.system\nf('x')",
+        "for target": "def f():\n    pass\nfor f in (os.system,):\n    f('x')", "with target": "def f():\n    pass\nwith os as f:\n    f('x')",
+        "except as": "def f():\n    pass\ntry:\n    pass\nexcept Exception as f:\n    f('x')", "import as": "def f():\n    pass\nimport os as f\nf('x')",
+        "from import as": "def f():\n    pass\nfrom os import system as f\nf('x')", "global": "def f():\n    pass\nglobal f\nf('x')", "del": "def f():\n    pass\ndel f\nf('x')",
+        "walrus": "def f():\n    pass\n(f := os.system)\nf('x')", "comprehension variable": "def f():\n    pass\n[f('x') for f in (os.system,)]",
+        "star unpack": "def f():\n    pass\n*f, = (os.system,)\nf('x')", "tuple unpack": "def f():\n    pass\nf, g = os.system, 1\nf('x')",
+        "match capture": "def f():\n    pass\nmatch os.system:\n    case f:\n        f('x')", "match star": "def f():\n    pass\nmatch sub:\n    case [*f]:\n        f('x')",
+        "class base": "def f():\n    pass\nclass f(os.system):\n    pass", "decorator": "@os.system\ndef f():\n    pass\nf('x')", "decorator on a class": "@os.system\nclass f:\n    pass",
+        "lambda redefinition": "def f():\n    pass\nf = lambda: os.system('x')\nf()", "def redefinition": "def f():\n    pass\ndef f():\n    os.system('x')\nf()",
+        "match mapping rest": "def f():\n    pass\nmatch sub:\n    case {'a': 1, **f}:\n        f('x')", "match as": "def f():\n    pass\nmatch sub:\n    case f:\n        f('x')",
+        "a parser name deleted": "del sub\nsub.add_parser('x')", "a parser name imported": "import os as sub\nsub.system('x')", "a parser name in except as": "try:\n    pass\nexcept Exception as sub:\n    sub.system('x')",
+        "a parser name in a match": "match os:\n    case sub:\n        sub.system('x')", "a parser name global": "global sub\nsub.add_parser('x')",
+    }
+
+    def test_every_way_a_name_is_bound_is_held_one_row_each_and_the_binder_table_is_complete_against_the_ast_module(self):
+        import ast
+        for label, body in self.FAMILY.items():
+            with self.subTest(label):
+                self.assertTrue(self.found_unit(body), label)
+        # the table of string binders is checked against the ast module itself: every node class with a field that carries a name is in it, or in the table of classes that are not binders (with the reason)
+        fields = {"name", "names", "asname", "rest", "arg", "attr", "id", "kwd_attrs"}
+        with_ctx = {n for n, c in vars(ast).items() if isinstance(c, type) and issubclass(c, ast.AST) and "ctx" in getattr(c, "_fields", ())}
+        self.assertEqual(with_ctx, {"Name", "Attribute", "Subscript", "Starred", "List", "Tuple"}, "a node class with a Store or Del context that the lint does not walk: classify it")
+        seen = set()
+        for name, node in vars(ast).items():
+            if isinstance(node, type) and issubclass(node, ast.AST) and node is not ast.AST and fields & set(getattr(node, "_fields", ())):
+                seen.add(name)
+                self.assertTrue(name in self.dc.STRING_BINDERS or name in self.dc.NOT_BINDERS, "an ast node class that carries a name and is in neither table: %s" % name)
+        self.assertTrue({"FunctionDef", "ClassDef", "ExceptHandler", "Import", "Global", "MatchAs"} <= seen)
+        for name in self.dc.STRING_BINDERS:
+            self.assertTrue(not hasattr(ast, name) or name in seen, name)
+
+    REBINDINGS = {   # every form that binds a name a second time, with {V} as the second value; after each, `f('x')` is called
+        "assign": "f = {V}", "augmented assign": "f += {V}", "annotated assign": "f: object = {V}", "assign under an if": "if sub:\n    f = {V}", "for target": "for f in ({V},):\n    pass",
+        "with target": "with {V} as f:\n    pass", "walrus": "(f := {V})", "tuple unpack": "f, g = {V}, 1", "star unpack": "*f, = ({V},)", "class attribute": "class C:\n    f = {V}",
+        "match capture": "match {V}:\n    case f:\n        pass", "decorator": "@{V}\ndef f():\n    pass", "a nested parameter": "def g(f):\n    f('y')\ng({V})", "a second def": "def f():\n    pass",
+        "comprehension variable": "[0 for f in ({V},)]", "except as": "try:\n    pass\nexcept Exception as f:\n    pass", "del": "del f", "import as": "import {V} as f",
+    }
+
+    PARAMETER_KINDS = {   # every kind of parameter of ast.arguments (read from its fields below), named like a table builtin and called
+        "positional": "def add_zzz_parsers(sub, int):\n    int(sub)", "positional-only": "def add_zzz_parsers(sub, int, /):\n    int(sub)", "keyword-only": "def add_zzz_parsers(sub, *, int):\n    int(sub)",
+        "var-positional": "def add_zzz_parsers(sub, *int):\n    int(sub)", "var-keyword": "def add_zzz_parsers(sub, **int):\n    int(sub)",
+        "keyword-only with a non-literal default": "def add_zzz_parsers(sub, *, int=print):\n    int(sub)", "positional with a non-literal default": "def add_zzz_parsers(sub, int=print):\n    int(sub)",
+    }
+
+    def test_every_kind_of_parameter_is_a_binding_and_the_list_is_read_from_the_ast_arguments_node(self):
+        import ast
+        kinds = {"posonlyargs", "args", "vararg", "kwonlyargs", "kwarg"}
+        self.assertEqual(kinds, {f for f in ast.arguments._fields if f not in ("defaults", "kw_defaults")}, "a new kind of parameter in ast.arguments: add a row and read it in the lint")
+        for label, text in self.PARAMETER_KINDS.items():
+            with self.subTest(label):
+                unit = ast.parse(text).body[0]
+                got = self.dc._registrar_unit(unit, set(self.names), set(range(1, 100)), builtins=set(self.rule["registrar_allow"]["pure_builtins"]), named_helpers=set(), verbs=VERBS, free_keywords=FREE_KEYWORDS)
+                self.assertTrue(any(v == "calls" for v, _ in got), (label, got))
+
+    IMPLICIT_CALLS = {   # every position where Python CALLS something with no Call node, one row each (the fields are read from the ast classes in the test below)
+        "decorator_list of a nested def": "@eval\ndef f():\n    pass", "decorator_list of a nested class": "@eval\nclass C:\n    pass", "decorator_list of the registrar itself": None,
+        "bases": "class C(eval):\n    pass", "keywords (metaclass)": "class C(metaclass=eval):\n    pass", "With.items": "with eval as g:\n    pass", "For.iter": "for x in eval:\n    pass",
+        "comprehension.iter": "[0 for x in eval]", "defaults": "def g(a=eval()):\n    pass", "kw_defaults": "def g(*, a=eval()):\n    pass", "a lambda default": "h = lambda a=eval(): a",
+    }
+
+    def test_every_position_where_python_calls_something_without_a_call_node_is_held(self):
+        import ast
+        fields = {"decorator_list", "bases", "keywords", "items", "iter", "defaults", "kw_defaults"}
+        carried = {f for c in vars(ast).values() if isinstance(c, type) and issubclass(c, ast.AST) for f in getattr(c, "_fields", ()) if f in fields}
+        self.assertEqual(carried, fields, "an ast field that holds an implicit call is named in this test and in the lint")
+        for label, body in self.IMPLICIT_CALLS.items():
+            if body is None:
+                continue
+            with self.subTest(label):
+                self.assertTrue(self.found_unit(body), label)
+        for label, text in (("a decorator", "@eval\ndef add_a_parsers(sub):\n    pass\n"), ("a decorator on a class registrar", "@print\nclass add_a_parsers:\n    pass\n")):
+            with self.subTest(label):
+                self.assertTrue(any(v == "calls" for _, v, _ in self.reg(text)[0]), label)
+        self.assertEqual(self.found_unit("t = sub.add_parser('x')\nfor a in t._actions:\n    sub.add_parser('x')\nfor f in ('a', 'b'):\n    sub.add_parser(f)"), [])
+
+    MODULE_FORMS = {   # every statement form that can BIND a module-level name, with {N} the name and {V} the second value: one row each, in a plain position and (where the statement nests) under try*/match/if
+        "assign": "{N} = {V}", "augmented assign": "{N} += {V}", "annotated assign": "{N}: object = {V}", "walrus statement": "({N} := {V})", "walrus in an assignment value": "zz_y = ({N} := {V})",
+        "for target": "for {N} in ({V},):\n    pass", "with target": "with {V} as {N}:\n    pass", "except as": "try:\n    pass\nexcept Exception as {N}:\n    pass", "except* as": "try:\n    pass\nexcept* Exception as {N}:\n    pass",
+        "match capture": "match {V}:\n    case {N}:\n        pass", "match star": "match [{V}]:\n    case [*{N}]:\n        pass", "match mapping rest": "match {{}}:\n    case {{**{N}}}:\n        pass", "import as": "import os as {N}",
+        "from import as": "from os import path as {N}", "a def": "def {N}(*a):\n    pass", "a decorated def": "@print\ndef {N}(*a):\n    pass", "a class": "class {N}:\n    pass", "a walrus in a default": "def zz_f(a=({N} := {V})):\n    pass",
+        "a walrus in a base class": "class ZzC(({N} := {V})):\n    pass", "a walrus in an annotation": "def zz_f(a: ({N} := {V})):\n    pass", "a walrus in a return annotation": "def zz_f() -> ({N} := {V}):\n    pass",
+        "a walrus in a decorator": "@({N} := {V})\ndef zz_f():\n    pass", "a walrus in a lambda default": "zz_l = lambda a=({N} := {V}): a",
+    }
+    NESTINGS = {"plain": ("{S}", ""), "under an if": ("if True:\n{S}", "    "), "under try*": ("try:\n    pass\nexcept* ValueError:\n{S}", "    "), "under a match case": ("match 1:\n    case _:\n{S}", "        ")}
+    HEADER_FORMS = ("a walrus in a default", "a walrus in a base class", "a walrus in an annotation", "a walrus in a return annotation", "a walrus in a decorator", "a walrus in a lambda default")
+
+    def placed(self, form, nesting, name, value="print"):
+        import textwrap
+        statement = self.MODULE_FORMS[form].replace("{N}", name).replace("{V}", value).replace("{{", "{").replace("}}", "}")
+        wrapper, prefix = self.NESTINGS[nesting]
+        return wrapper.replace("{S}", textwrap.indent(statement, prefix) if prefix else statement) + "\n"
+
+    def regfake(self, text):
+        """The registrar lint over the small fake daemon file below (its own closure and allow table): the module-level forms are one per call, so they run on a file that parses in microseconds, not on the real one."""
+        return self.dc.registrar_findings(self.FAKE, self.FAKE + text, self.FAKE_RULE)
+
+    def test_every_module_level_binding_form_is_seen_for_a_registrar_name_a_table_builtin_and_a_helper_in_every_nesting(self):
+        for form in self.MODULE_FORMS:
+            for nesting in self.NESTINGS:
+                if form in ("a def", "a class", "a decorated def"):
+                    continue   # a def or class is READ as a registrar (its body linted), not held as unreadable
+                with self.subTest(form=form, nesting=nesting, what="a registrar name"):
+                    got, why = self.regfake(self.placed(form, nesting, "add_zz_parsers"))
+                    self.assertIsNone(why, self.placed(form, nesting, "add_zz_parsers"))
+                    self.assertTrue(any(r == "add_zz_parsers" for r, _, _ in got), (form, nesting, got))
+                if form in ("import as", "from import as", "match mapping rest", "a def", "a class", "a decorated def"):
+                    continue
+                with self.subTest(form=form, nesting=nesting, what="a table builtin"):
+                    text = self.placed(form, nesting, "int") + "def add_zz_parsers(sub):\n    sub.add_parser('x', help=int('1'))\n"
+                    got, why = self.regfake(text)
+                    self.assertIsNone(why, text)
+                    self.assertTrue(any(g[1:] == ("calls", "int") or g[0] == "a name of the allow table" for g in got), (form, nesting, got))
+
+    def test_a_module_function_rebound_in_any_form_is_not_read_as_the_old_def(self):
+        for form in self.MODULE_FORMS:
+            if form in ("a def", "a decorated def", "a class", "import as", "from import as", "match mapping rest", "except as", "except* as"):
+                continue
+            for nesting in self.NESTINGS:
+                with self.subTest(form=form, nesting=nesting):
+                    text = "def zz_helper(v):\n    return v\n" + self.placed(form, nesting, "zz_helper") + "def add_zz_parsers(sub):\n    zz_helper(sub)\n"
+                    got, why = self.regfake(text)
+                    self.assertIsNone(why, text)
+                    self.assertTrue(any(v == "calls" and "zz_helper" in n for _, v, n in got), (form, nesting, got))
+
+    GRAMMAR_REJECTS = {   # one snippet for every statement or expression class a registrar may NOT contain: each is held, named by its class
+        "Pass": "pass", "Return": "return 1", "Lambda": "f = lambda: 1", "With": "with sub as g:\n    sub.add_parser('x')", "Try": "try:\n    sub.add_parser('x')\nexcept Exception:\n    sub.add_parser('y')",
+        "Match": "match sub:\n    case _:\n        sub.add_parser('x')", "Global": "global zz\nzz = 1", "Nonlocal": "nonlocal zz", "Delete": "del sub", "AugAssign": "n = 1\nn += 1", "AnnAssign": "n: int = 1",
+        "NamedExpr": "(n := 1)", "ListComp": "[x for x in (1,)]", "SetComp": "{x for x in (1,)}", "DictComp": "{x: x for x in (1,)}", "GeneratorExp": "list(x for x in (1,))", "List": "x = [1]", "Set": "x = {1}",
+        "Starred": "x = (*sub,)", "Import": "import os", "ImportFrom": "from os import path", "While": "while sub:\n    sub.add_parser('x')", "Raise": "raise ValueError", "Assert": "assert sub",
+        "ClassDef": "class K:\n    sub.add_parser('x')", "AsyncFunctionDef": "async def f():\n    sub.add_parser('x')", "JoinedStr": "x = f'{sub}'", "BoolOp": "x = sub and sub", "UnaryOp": "x = not sub",
+        "Await": "async def f():\n    await sub", "Yield": "def f():\n    yield sub", "YieldFrom": "def f():\n    yield from sub", "Slice": "x = sub[1:2]", "Break": "for x in ('a',):\n    break", "Continue": "for x in ('a',):\n    continue",
+        "AsyncFor": "async def f():\n    async for x in sub:\n        sub.add_parser('x')", "AsyncWith": "async def f():\n    async with sub as g:\n        sub.add_parser('x')", "TryStar": "try:\n    sub.add_parser('x')\nexcept* Exception:\n    sub.add_parser('y')",
+        "TypeAlias": "type ZzAlias = int", "TemplateStr": "x = t'{sub}'", "Interpolation": "x = t'{sub}'",   # the last three parse only on the Python that has them (3.12, 3.14): the loop below skips a class the running Python lacks
+    }
+
+    def test_the_grammar_is_measured_from_the_real_registrars_and_a_class_outside_it_is_held_by_name_and_a_future_class_is_not_silently_allowed(self):
+        import ast, re
+        grammar, neutral = self.dc.REGISTRAR_GRAMMAR, self.dc.GRAMMAR_NEUTRAL
+        pattern = self.dc.registrar_pattern(self.tree)
+        units = [n for n in self.tree.body if isinstance(n, ast.FunctionDef) and (pattern.fullmatch(n.name) or n.name == "add_decision_list_flags")]
+        self.assertGreaterEqual(len(units), 20)
+        used = {type(x).__name__ for u in units for x in ast.walk(u)}
+        self.assertEqual(used - set(grammar) - set(neutral), set(), "a real registrar uses a node class that is not in the grammar: add it WITH A STATED REASON, never silently")
+        for name, reason in grammar.items():
+            self.assertTrue(isinstance(reason, str) and len(reason) > 5, "every class of the grammar has a stated reason: %s" % name)
+        unused = set(grammar) - used
+        self.assertLessEqual(unused, {"Compare", "Is", "Eq", "Mod", "Add", "Subscript", "BinOp", "IfExp", "Dict", "If", "For", "Tuple"} | set(), "a class of the grammar that no real registrar uses: %s" % sorted(unused))
+        # completeness against the running Python: every statement and expression class is in the grammar, the neutral list or the rejects table, so a class of a future Python fails here instead of being allowed
+        for name, node in vars(ast).items():
+            if isinstance(node, type) and issubclass(node, (ast.stmt, ast.expr)) and node not in (ast.stmt, ast.expr) and not name.startswith("_"):
+                self.assertTrue(name in grammar or name in neutral or name in self.GRAMMAR_REJECTS or name in ("Constant", "Num", "Str", "Bytes", "NameConstant", "Ellipsis", "Name", "Expr", "Assign", "Call", "Attribute", "Tuple", "Subscript", "For", "If", "FunctionDef", "Starred"), "an ast statement or expression class in no table: %s" % name)
+        for name, body in self.GRAMMAR_REJECTS.items():
+            with self.subTest(name):
+                if name in grammar or not hasattr(ast, name):
+                    continue
+                got = self.found_unit(body)
+                self.assertTrue(any(("form %s," % name) in n for _, v, n in got), (name, got))
+
+    MODULE_NAMESPACE_WRITES = {   # a module-level statement that binds a registrar (`command_registrars` collects them out of globals() by name) without a binding form: each is held when added
+        "globals().update": "globals().update({'add_zz_parsers': print})", "globals().setdefault": "globals().setdefault('add_zz_parsers', print)", "setattr on the module": "setattr(sys.modules[__name__], 'add_zz_parsers', print)",
+        "sys.modules __dict__ store": "sys.modules[__name__].__dict__['add_zz_parsers'] = print", "exec of a def": "exec('def add_zz_parsers(sub): pass')", "eval": "eval('1')", "vars().update": "vars().update(add_zz_parsers=print)",
+        "locals().update": "locals().update(add_zz_parsers=print)", "__import__": "__import__('os')", "importlib": "importlib.import_module('os')", "an assignment that exec's": "zz_x = exec('def add_zz_parsers(sub): pass')",
+        "delattr": "delattr(sys.modules[__name__], 'add_zz_parsers')", "a bare compile": "zz_c = compile('1', 'x', 'eval')", "__builtins__": "zz_b = __builtins__", "__dict__": "zz_d = zz_m.__dict__", "modules": "zz_s = sys.modules",
+        "a class body globals().update": "class ZzC:\n    globals().update(add_zz_parsers=print)", "a class body setattr": "class ZzC:\n    setattr(sys.modules[__name__], 'add_zz_parsers', print)", "a class body exec": "class ZzC:\n    exec('1')",
+        "a nested class body exec": "class ZzC:\n    class ZzD:\n        exec('1')", "a function that binds a global, called at import": "def zz_f():\n    global add_zz_parsers\n    add_zz_parsers = print\nzz_r = zz_f()", "getattr of builtins": "zz_g = getattr(builtins, 'glo' + 'bals')",
+        "a frame f_globals": "zz_a = sys._getframe().f_globals", "a gc referrer dunder": "zz_x = gc.get_referrers(1)[0].__class__", "a lambda writer called at import": "zz_f = lambda: globals().update(add_zz_parsers=print)\nzz_r = zz_f()",
+        "a method writer called at import": "class ZzC:\n    def m(self):\n        global add_zz_parsers\n        add_zz_parsers = print\nzz_r = ZzC().m()", "a star import": "from os import *",
+        "a function writer reaching globals called at import": "def zz_f():\n    globals().update(add_zz_parsers=print)\nzz_r = zz_f()",
+        "a bare call": "zz_register(print)", "a bare attribute call": "zz_registry.update(zz_other)", "a conditional namespace write": "globals().update({'add_zz_parsers': print}) if True else None",
+    }
+
+    def test_a_module_level_statement_that_may_write_the_namespace_is_held_when_added_and_not_when_untouched(self):
+        for label, text in self.MODULE_NAMESPACE_WRITES.items():
+            with self.subTest(label):
+                got, why = self.regfake(text + "\n")
+                self.assertIsNone(why)
+                self.assertTrue(any(g[0].startswith("a module-level") or g[0] in ("a star import", "a changed line of a function that writes a namespace") for g in got), (label, got))
+        base = self.FAKE + "globals().setdefault('zz', 1)\n"                           # already there and untouched: not held
+        self.assertEqual(self.dc.registrar_findings(base, base, self.FAKE_RULE), ([], None))
+        self.assertEqual(self.regfake("ZZ_CONST = ('a', 'b')\n"), ([], None), "a literal assignment is not held")
+        self.assertEqual(self.regfake("'a docstring-like constant statement'\n"), ([], None))
+        self.assertEqual(self.regfake("ZZ_RE = re.compile('x')\n"), ([], None), "re.compile is an attribute named like the builtin and reaches no namespace")
+
+    def test_a_mutant_without_any_one_member_of_the_namespace_names_does_not_hold_the_statement_that_names_it(self):
+        for name in sorted(self.dc.NAMESPACE_NAMES):
+            if name.startswith("__") and name.endswith("__") and name != "__import__":
+                continue   # a dunder is held by the dunder rule as well: dropping it from the set changes nothing, by design
+            statement = "zz_x = zz_m.%s\n" % name if name in ("__dict__", "modules") else "zz_x = %s\n" % name
+            with self.subTest(name):
+                got, why = self.dc.registrar_findings(self.FAKE, self.FAKE + statement, self.FAKE_RULE)
+                self.assertTrue(any(g[0] == "a module-level namespace reach" for g in got), (name, got))
+                module = self.mutant_module("NAMESPACE_NAMES = {", "NAMESPACE_NAMES = {")
+                module.NAMESPACE_NAMES = set(module.NAMESPACE_NAMES) - {name}
+                got, why = module.registrar_findings(self.FAKE, self.FAKE + statement, self.FAKE_RULE)
+                self.assertFalse(any(g[0] == "a module-level namespace reach" for g in got), "the mutant without %s still holds it" % name)
+        self.assertEqual(self.regfake("zz_c = re.compile('x')\n"), ([], None), "re.compile is not the builtin compile")
+
+    def test_a_name_bound_twice_and_then_called_is_held_for_every_binding_form_and_every_second_value(self):
+        """The root of the rebinding family: a call is allowed only when its name has exactly ONE binding in the registrar (a def or lambda of its own) or is a table name never bound: so whatever the second binding is, the call is held."""
+        function = self.pick()[0]
+        values = ("eval", "exec", "open", "(lambda x: x)", function, "os")
+        for label, template in self.REBINDINGS.items():
+            for value in values:
+                if label in ("except as", "del") and value != values[0]:
+                    continue   # these two bind no value
+                if label == "import as" and value in ("(lambda x: x)", function):
+                    continue   # an import takes a module name
+                body = "def f():\n    pass\n" + template.replace("{V}", value) + "\nf('x')"
+                if label == "a second def":
+                    body = "def f():\n    pass\ndef f():\n    pass\nf('x')"
+                with self.subTest(form=label, value=value):
+                    self.assertTrue(self.found_unit(body), body)
+        for label, body in (("a def called once", "def f():\n    sub.add_parser('a')\nf()"), ("a lambda called once", "def f():\n    sub.add_parser('a')\nf()"),
+                            ("a table builtin never bound", "sub.add_parser('x', default=int('1'))")):
+            with self.subTest(allowed=label):
+                self.assertEqual(self.found_unit(body), [], label)
+
+    # ---- the mutants: a small daemon file with its own closure, the table run on the REAL lint and on a copy of it with ONE thing changed
+    FAKE = ("import re\nimport json\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\nFIELDS = ('a', 'b')\nHOOKS = []\n"
+            "def fn():\n    return json.dumps(HOOKS)\ndef main():\n    fn()\n    return FIELDS, HOOKS, re, hh\n"
+            "def hh(text):\n    import os\n    return os.fspath(text)\ndef hh2(text):\n    import os\n    return text\nSTATES = FIELDS + FIELDS\n")   # a registration helper OUTSIDE the closure (as on a registrar split), whose body a registrar's lint would hold
+    FAKE_RULE = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "str"], "helpers": ["hh", "hh2"], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
+
+    def table_failures(self, dc):
+        """[row that does not hold] for the table below, run on the lint module `dc` (the real one, or a mutant of it)."""
+        fake, rule, bad = self.FAKE, self.FAKE_RULE, []
+        def run(text, base=None):
+            return dc.registrar_findings(fake if base is None else base, (fake if base is None else base) + text, rule)
+        def has(label, text, want, base=None):
+            try:
+                got, why = run(text, base)
+            except Exception:
+                bad.append(label)
+                return
+            if why or not any(g[1:] == want for g in (got or [])):
+                bad.append(label)
+        def clean(label, text, base=None):
+            try:
+                got, why = run(text, base)
+            except Exception:
+                bad.append(label)
+                return
+            if why or got != []:
+                bad.append(label)
+        def reg(body):
+            return "def add_zz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n"
+        for label, body, want in (
+            ("import of a closure module", "import json", ("imports", "json")), ("import outside", "import gc", ("imports", "gc")), ("__import__", "__import__('os')", ("imports", "__import__")),
+            ("call of closure fn", "fn()", ("calls", "fn")), ("call through module", "json.dumps(1)", ("calls", "json")), ("call of builtin", "len(sub)", ("calls", "len")),
+            ("gc call", "gc.get_objects()", ("calls", "gc")), ("attribute store on module", "json.fn = None", ("rebinds", "fn")), ("attribute store on a local", "box = []\nbox.x = 1", ("rebinds", "x")),
+            ("global closure", "global HOOKS\nHOOKS = None", ("rebinds", "HOOKS")), ("global other", "global zz\nzz = 1", ("rebinds", "zz")), ("dunder", "sub.__dict__", ("rebinds", "__dict__")),
+            ("frame field", "x = sub.f_globals", ("rebinds", "f_globals")), ("__builtins__", "__builtins__.open = None", ("rebinds", "__builtins__")), ("del", "del json.fn", ("rebinds", "fn")),
+            ("use: alias", "g = HOOKS", ("uses", "HOOKS")), ("use: container", "box = []\nbox.append(HOOKS)", ("uses", "HOOKS")), ("use: loop over mutable", "for h in HOOKS:\n    pass", ("uses", "HOOKS")),
+            ("use: foreign call arg", "print(fn)", ("uses", "fn")), ("call inside arg", "sub.add_parser('x', default=fn())", ("calls", "fn")),
+        ):
+            has(label, reg(body), want)
+        for label, body in (
+            ("own parser values", "t = sub.add_parser('x', type=int, help=json)\nt.add_argument('--a', default=re.SUPPRESS, metavar=fn)"), ("loop over own parsers", "a = sub.add_parser('a')\nb = sub.add_parser('b')\nfor p in (a, b):\n    p.add_argument('--x', default=1, help=fn)"),
+            ("own parser actions", "a = sub.add_parser('a')\nfor action in a._actions:\n    action.default = 1"), ("data loop", "t = sub.add_parser('x')\nfor f in FIELDS:\n    t.add_argument('--' + f.replace('_', '-'))"),
+            ("defined function", "def inner():\n    sub.add_parser('x')\ninner()"),
+        ):
+            clean(label, reg(body))
+        try:   # a DELETION-only edit of a named helper holds (the base side)
+            got, why = dc.registrar_findings(fake, fake.replace("    import os\n", ""), rule)
+            if why or ("rebinds", "hh") not in [g[1:] for g in got]:
+                bad.append("a deletion in a helper holds")
+        except Exception:
+            bad.append("a deletion in a helper holds")
+        for label, body in (("with-as", "with local_cm as sub:\n    pass"), ("for", "for sub in other_iterable:\n    pass"), ("walrus", "(sub := other)"),
+                            ("augmented", "sub += other"), ("annotated", "sub: object = other"), ("assign", "sub = other")):
+            has("a parser name rebound by " + label, reg(body), ("rebinds", "sub"))
+        clean("a named helper outside the closure is not read as part of the registrar", reg("sub.add_parser('x', type=hh2)"))
+        clean("a named helper used as a value anywhere is allowed", reg("x = hh"))   # it is pure by its own test and protected by the edit hold: using it runs nothing of the closure
+        has("a lowercase read of a closure name is a use", reg("x = json.dumps"), ("uses", "json"))
+        has("a helper defined again under an if", "if True:\n    def hh(t):\n        pass\n", ("rebinds", "hh"))
+        has("a helper rebound by an assignment", "hh = lambda t: t\n", ("rebinds", "hh"))
+        has("a helper rebound by an import", "from os import path as hh\n", ("rebinds", "hh"))
+        has("a builtin of the table rebound", "int = print\n", ("rebinds", "int"))
+        has("a rebound builtin is no longer allowed", "int = print\n" + reg("sub.add_parser('x', default=int('1'))"), ("calls", "int"))
+        try:   # a decorator added above a named helper is a changed line of it
+            got, why = dc.registrar_findings(fake, fake.replace("def hh(text):", "@deco\ndef hh(text):"), rule)
+            if why or ("rebinds", "hh") not in [g[1:] for g in got]:
+                bad.append("a decorator on a helper holds")
+        except Exception:
+            bad.append("a decorator on a helper holds")
+        for label, body, want in (("handle choices replaced", "sub.choices['review'] = sub.add_parser('z')", ("uses", "choices")), ("handle map edited", "sub._name_parser_map.pop('review')", ("uses", "_name_parser_map")),
+                                  ("another command's parser rewritten", "sub.choices['impact'].set_defaults(a=1)", ("uses", "choices")), ("a non-verb method on the handle", "sub.parse_args([])", ("uses", "parse_args")),
+                                  ("a non-verb method on a built parser", "t = sub.add_parser('x')\nt.parse_args([])", ("calls", "t")),
+                                  ("an alias of the handle is not a parser it built", "t = sub\nt.default = None", ("rebinds", "default")),
+                                  ("a deep store through a built parser", "t = sub.add_parser('x')\nt._actions[0].default = None", ("rebinds", "default")),
+                                  ("a non-literal store on a built parser", "t = sub.add_parser('x')\nt.default = other", ("rebinds", "default"))):
+            has(label, reg(body), want)
+        clean("a built parser's actions read and set to literals", reg("v = sub.add_parser('v')\nfor action in v._actions:\n    action.nargs, action.default = '?', None"))
+        clean("a chain of its own parser's methods", reg("sub.add_parser('x').add_argument('--a')"))
+        for label, body, want in (("type=eval", "p = sub.add_parser('z')\np.add_argument('--x', default='1', type=eval)", ("calls", "eval")), ("type= a closure function", "p = sub.add_parser('z')\np.add_argument('--x', type=fn)", ("calls", "fn")),
+                                  ("action= a name", "p = sub.add_parser('z')\np.add_argument('--x', action=hh)", ("calls", "action")), ("choices= a mutable list", "p = sub.add_parser('z')\np.add_argument('--x', choices=HOOKS)", ("calls", "HOOKS")),
+                                  ("a default that is a closure call", "p = sub.add_parser('z')\np.add_argument('--x', default=fn())", ("calls", "fn"))):
+            has(label, reg(body), want)
+        clean("set_defaults with a stored closure function", reg("t = sub.add_parser('x')\nt.set_defaults(func=fn)"))
+        clean("a keyword that is free", reg("t = sub.add_parser('x')\nt.add_argument('--a', help=fn, metavar=HOOKS, nargs='?', const=json)"))
+        clean("choices of a computed module constant", reg("sub.add_parser('x').add_argument('--a', choices=STATES)"))
+        clean("a local dict of safe values", reg("given = {'default': re.SUPPRESS} if sub else {}\nt = sub.add_parser('x')\nt.add_argument('--a', **given)"))
+        has("a data name rebound to a module", reg("s = ''\ns = json\ns.dumps(1)"), ("calls", "s"))
+        has("aliases by **", reg("sub.add_parser('x', **{'aliases': ['review']})"), ("calls", "aliases"))
+        has("aliases on add_parser", reg("sub.add_parser('x', aliases=['review'])"), ("calls", "aliases"))
+        has("set_defaults on the handed parser", reg("sub.set_defaults(a=1)"), ("calls", "set_defaults on the handed parser"))
+        clean("set_defaults on a parser it built", reg("t = sub.add_parser('x')\nt.set_defaults(a=1)"))
+        clean("a name that stays data", reg("s = ''\ns.join(('a',))"))
+        has("a def rebound then called", reg("def f():\n    pass\nf = int\nf('1')"), ("calls", "f"))
+        has("a lambda rebound then called", reg("f = lambda: 1\nf = json\nf('1')"), ("calls", "f"))
+        has("an async def rebinding a def then called", reg("def f():\n    pass\nasync def f():\n    pass\nf('1')"), ("calls", "f"))
+        clean("a def called", reg("def f():\n    sub.add_parser('a')\nf()"))
+        has("a call of an element of a local list", reg("l = []\nl.append(os.system)\nl[0]('x')"), ("calls", "l"))
+        has("a loop variable over a list", reg("for f in [os.system]:\n    f('x')"), ("calls", "f"))
+        clean("a loop over a tuple of strings", reg("t = sub.add_parser('x')\nfor f in ('a', 'b'):\n    t.add_argument('--' + f.replace('_', '-'))"))
+        for label, body in self.FAMILY.items():   # the same rows on the fake closure: each must still be held
+            try:
+                got, why = dc.registrar_findings(fake, fake + ("def add_zz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n"), rule)
+                if why or not got:
+                    bad.append("family: " + label)
+            except Exception:
+                bad.append("family: " + label)
+        for label, template in self.REBINDINGS.items():   # the family on the fake closure, second value `eval`
+            if label in ("import as",):
+                continue
+            body = "def f():\n    pass\n" + template.replace("{V}", "eval") + "\nf('x')" if label != "a second def" else "def f():\n    pass\ndef f():\n    pass\nf('x')"
+            try:
+                got, why = dc.registrar_findings(fake, fake + ("def add_zz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n"), rule)
+                if why or not any(g[1] == "calls" for g in got):
+                    bad.append("rebinding: " + label)
+            except Exception:
+                bad.append("rebinding: " + label)
+        for label, text in self.PARAMETER_KINDS.items():
+            try:
+                got, why = dc.registrar_findings(fake, fake + text.replace("add_zzz_parsers", "add_zz_parsers"), rule)
+                if why or not any(g[1] == "calls" for g in got):
+                    bad.append("parameter kind: " + label)
+            except Exception:
+                bad.append("parameter kind: " + label)
+        has("a bare decorator", "@eval\ndef add_a_parsers(sub):\n    pass\n", ("calls", "eval"))
+        has("a with item", reg("with eval as g:\n    pass"), ("calls", "eval"))
+        has("a for iterable", reg("for x in eval:\n    pass"), ("calls", "eval"))
+        has("a metaclass", reg("class C(metaclass=eval):\n    pass"), ("calls", "eval"))
+        has("a parameter named like a builtin is the handle", "def add_zz_parsers(sub, int):\n    int(None)\n", ("calls", "int"))
+        has("a parameter named like a helper is the handle", "def add_zz_parsers(sub, hh):\n    hh(None)\n", ("calls", "hh"))
+        has("a table builtin rebound then called", reg("int = json\nsub.add_parser('x', help=int('1'))"), ("calls", "int"))
+        for label, text in (("a walrus", "(int := print)\n"), ("a match capture", "match 1:\n    case int:\n        pass\n"), ("an except* name", "try:\n    pass\nexcept* Exception as int:\n    pass\n"),
+                            ("a with target", "with open('x') as int:\n    pass\n"), ("a for target", "for int in ():\n    pass\n")):
+            try:   # a module-level binding of a builtin of the table by any form: it leaves the table, so a registrar's call of it is held
+                got, why = dc.registrar_findings(fake, fake + text + reg("sub.add_parser('x', help=int('1'))"), rule)
+                if why or not any(g[1:] == ("calls", "int") for g in got):
+                    bad.append("module-level binding: " + label)
+            except Exception:
+                bad.append("module-level binding: " + label)
+        for form in self.MODULE_FORMS:   # every module-level binding form, in every nesting, for a registrar name, a table builtin and a rebound helper (the real-file runs are in the module-level tests; the mutants need them here)
+            for nesting in self.NESTINGS:
+                try:
+                    if form not in ("a def", "a class", "a decorated def"):
+                        got, why = dc.registrar_findings(fake, fake + self.placed(form, nesting, "add_zz_parsers"), rule)
+                        if why or not any(g[0] == "add_zz_parsers" for g in got):
+                            bad.append("module form (registrar): %s / %s" % (form, nesting))
+                    if form not in ("a def", "a class", "a decorated def", "import as", "from import as", "match mapping rest", "except as", "except* as"):
+                        got, why = dc.registrar_findings(fake, fake + "def zz_helper(v):\n    return v\n" + self.placed(form, nesting, "zz_helper") + "def add_zz_parsers(sub):\n    zz_helper(sub)\n", rule)
+                        if why or not any(g[1] == "calls" and "zz_helper" in g[2] for g in got):
+                            bad.append("module form (helper): %s / %s" % (form, nesting))
+                except Exception:
+                    bad.append("module form: %s / %s" % (form, nesting))
+        for label, text in self.MODULE_NAMESPACE_WRITES.items():
+            try:
+                got, why = dc.registrar_findings(fake, fake + text + "\n", rule)
+                if why or not any(g[0].startswith("a module-level") or g[0] in ("a star import", "a changed line of a function that writes a namespace") for g in got):
+                    bad.append("module namespace write: " + label)
+            except Exception:
+                bad.append("module namespace write: " + label)
+        try:
+            got, why = dc.registrar_findings(fake, fake + "ZZ_RE = re.compile('x')\n", rule)
+            if why or got != []:
+                bad.append("re.compile at module level")
+            held = fake + "globals().setdefault('zz', 1)\n"   # already there and untouched
+            if dc.registrar_findings(held, held, rule) != ([], None):
+                bad.append("an untouched module statement")
+        except Exception:
+            bad.append("module statement rows")
+        try:   # a changed line of an EXISTING writer (a function that reaches a namespace) holds wherever it is called; the same file untouched does not
+            writer = fake + "def zz_w():\n    zz_n = 1\n    return globals()\n"
+            got, why = dc.registrar_findings(writer, writer.replace("    zz_n = 1\n", "    zz_n = 2\n"), rule)
+            if why or not any(g[0] == "a changed line of a function that writes a namespace" for g in got):
+                bad.append("a changed line of a writer")
+            if dc.registrar_findings(writer, writer, rule) != ([], None):
+                bad.append("an untouched writer")
+        except Exception:
+            bad.append("writer rows")
+        try:   # an UNTOUCHED writer called by a new import-time line: held by the writer-name rule alone
+            writer = fake + "def zz_f():\n    global add_zz_parsers\n    add_zz_parsers = print\n"
+            got, why = dc.registrar_findings(writer, writer + "zz_r = zz_f()\n", rule)
+            if why or not any(g[0] == "a module-level namespace reach" for g in got):
+                bad.append("an untouched writer called at import")
+        except Exception:
+            bad.append("untouched writer rows")
+        has("a table builtin's keyword argument runs a name outside the table", reg("int(1, key=exit)"), ("calls", "exit"))
+        has("a table builtin's positional argument runs a name outside the table", reg("str(open)"), ("calls", "open"))
+        has("a table builtin's argument read from a dict that holds a name outside the table", reg("d = {'a': exit}\nint(1, key=d['a'])"), ("calls", "a value argparse may run"))
+        clean("a table builtin with a literal argument", reg("int('1')"))
+        try:   # the pattern Python uses is the LAST assignment: a later one that matches a new name is read, and a changed line that binds the name is held
+            later = "REGISTRAR_NAME_RE = re.compile(r'zz_.*')\ndef zz_evil(sub):\n    import os\n"
+            got, why = dc.registrar_findings(fake, fake + later, rule)
+            if not (why or any(g[0] == "zz_evil" for g in (got or []))):
+                bad.append("a later pattern assignment hides a registrar")
+            import ast as _ast
+            if not dc.registrar_pattern(_ast.parse(fake + later)).fullmatch("zz_evil"):
+                bad.append("the pattern read is not the last assignment")
+            if not why:
+                bad.append("a changed line that binds the pattern a second time is not held")
+            if dc.registrar_findings(fake + later, fake + later, rule)[1] is not None:
+                bad.append("an untouched second binding is held")
+        except Exception:
+            bad.append("pattern last-assignment rows")
+        has("a nested parameter named like a builtin", reg("def g(int):\n    int('y')\ng(print)"), ("calls", "int"))
+        clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
+        has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
+        clean("a named helper is not read as part of the registrar", reg("t = sub.add_parser('x')\nt.add_argument('--i', type=hh)\nhh('1')"))
+        try:   # a changed line of a named helper holds; the same edit elsewhere does not
+            got, why = dc.registrar_findings(fake, fake.replace("    import os\n", "    import os\n    x = 1\n", 1), rule)
+            if why or [g[1:] for g in got] != [("rebinds", "hh")]:
+                bad.append("a helper edit holds")
+        except Exception:
+            bad.append("a helper edit holds")
+        try:
+            got, why = dc.registrar_findings(fake, fake, dict(rule, registrar_allow={"pure_builtins": "int", "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}))
+            if got is not None or not why:
+                bad.append("an unreadable table holds")
+        except Exception:
+            bad.append("an unreadable table holds")
+        has("a class is not in the grammar", reg("class K:\n    sub.add_parser('x')\nK()"), ("uses", "the statement or expression form ClassDef, which a registrar may not contain"))
+        clean("a clean readable helper", "def _h(p):\n    p.add_parser('x')\n" + reg("_h(sub)"))
+        has("a default that is not data", "def add_zz_parsers(sub, m=json):\n    pass\n", ("rebinds", "m"))
+        has("a parser name rebound", reg("sub = json\nsub.x = 1"), ("rebinds", "sub"))
+        has("a derived parser name rebound", reg("t = sub.add_parser('x')\nt = json\nt.x = 1"), ("rebinds", "t"))
+        clean("a literal default is data", "def _h(p, suppress=False):\n    p.add_parser('x')\n" + reg("_h(sub)"))
+        has("helper through", "def _h():\n    global HOOKS\n    HOOKS = 1\n" + reg("_h()"), ("rebinds", "HOOKS"))
+        has("helper lambda", "h = lambda: fn()\n" + reg("h()"), ("calls", "fn"))
+        has("helper class", "class H:\n    def __call__(self):\n        fn()\n" + reg("H()"), ("calls", "fn"))
+        has("opaque helper", "h = make()\n" + reg("h()"), ("calls", "a helper that cannot be read (h)"))
+        has("async", "async def add_a_parsers(sub):\n    fn()\n", ("calls", "fn"))
+        has("lambda", "add_a_parsers = lambda sub: fn()\n", ("calls", "fn"))
+        has("unreadable registrar", "add_a_parsers = make()\n", ("rebinds", "a registrar bound in a form that cannot be read"))
+        has("globals write", "globals()['add_a_parsers'] = print\n", ("rebinds", "a registrar bound in a form that cannot be read"))
+        # a new closure name, and a registrar added later
+        try:   # a closure name that the PULL REQUEST adds (the head's closure is united with the base's)
+            head = fake.replace("    fn()\n    return", "    fn()\n    fn2()\n    return") + "def fn2():\n    pass\n" + reg("fn2()")
+            got, why = dc.registrar_findings(fake, head, rule)
+            if why or not any(g[1:] == ("calls", "fn2") for g in got):
+                bad.append("closure grows")
+        except Exception:
+            bad.append("closure grows")
+        grown = fake.replace("    fn()\n    return", "    fn()\n    later()\n    return") + "def later():\n    pass\n"
+        try:   # a closure edge the pull request REMOVES: the base's closure still names it
+            head = grown.replace("    later()\n    return", "    return") + reg("later()")
+            got, why = dc.registrar_findings(grown, head, rule)
+            if why or not any(g[1:] == ("calls", "later") for g in got):
+                bad.append("closure union")
+        except Exception:
+            bad.append("closure union")
+        has("under an if", "if True:\n    def add_a_parsers(sub):\n        fn()\n", ("calls", "fn"))
+        # a pattern weakened in the head still names the registrar the base's pattern matched
+        base = fake + reg("sub.add_parser('x')")
+        head = (base.replace("add_[a-z0-9_]+_parsers", "nothing_matches")) + "def add_zz_parsers(sub):\n    fn()\n"
+        try:
+            got, why = dc.registrar_findings(base, head.replace("def add_zz_parsers(sub):\n    fn()\n", "").replace(reg("sub.add_parser('x')"), reg("sub.add_parser('x')\nfn()")), self.FAKE_RULE)
+            if not any(g[1] == "calls" for g in (got or [])):
+                bad.append("pattern union")
+        except Exception:
+            bad.append("pattern union")
+        # a removed line whose number collides with an untouched hostile line of the head
+        base = fake + "def add_a_parsers(sub):\n    sub.add_parser('a')\ndef add_b_parsers(sub):\n    json.fn = None\n"
+        head = fake + "def add_b_parsers(sub):\n    json.fn = None\n"
+        try:
+            if dc.registrar_findings(base, head, self.FAKE_RULE) != ([], None):
+                bad.append("removed-line collision")
+        except Exception:
+            bad.append("removed-line collision")
+        # a hostile line already there and untouched; the same line added
+        has("added line counted", reg("json.fn = None"), ("rebinds", "fn"))
+        return bad
+
+    def mutant_module(self, old, new):
+        import types
+        path = BIN / "delegated_clear.py"
+        text = path.read_text()
+        self.assertEqual(text.count(old), 1, "the mutant's anchor must be one place in the lint: %r" % old)
+        module = types.ModuleType("delegated_clear_mutant")
+        module.__file__ = str(path)
+        exec(compile(text.replace(old, new), str(path), "exec"), module.__dict__)
+        return module
+
+    MUTANTS = (
+        ("imports are not held", 'note(x, "imports", label(*bound))', "pass"),
+        ("a global statement is not held", 'note(x, "rebinds", label(*x.names))', "pass"),
+        ("a call of anything is not held", 'note(x, "calls", label(callee, fname))', "pass"),
+        ("a store outside the parser is not held", "if id(x) not in literal_stores:", "if False:"),
+        ("a dunder or frame field is not held", 'x.attr.startswith("__") and x.attr.endswith("__") or x.attr.startswith("f_")', "False"),
+        ("__builtins__ is not held", 'x.id in ("__builtins__", "__import__", "__loader__", "__spec__", "__dict__")', "False"),
+        ("the use rule is off", 'note(x, "uses", x.id)', "pass"),
+        ("a value of the own parser is not allowed", "if verb_chain(x):\n                for arg in list(x.args)", "if False:\n                for arg in list(x.args)"),
+        ("an object built from the parser is not its own", "if isinstance(x, ast.Assign) and verb_chain(x.value):\n                sources = x.targets", "if False:\n                sources = x.targets"),
+        ("a loop over the parser's objects is not its own", "elif isinstance(x, (ast.For, ast.comprehension)) and ((isinstance(x.iter, (ast.Tuple, ast.List))", "elif isinstance(x, (ast.For, ast.comprehension)) and ((False and isinstance(x.iter, (ast.Tuple, ast.List))"),
+        ("a call on data is not allowed", "callee in data or", "False or"),
+        ("the removed lines count as added", "added = set(lines[1])", "added = set(lines[0]) | set(lines[1])"),
+        ("the base's closure is not united", "names |= reach[0] | reach[1]", "names |= (reach[0] | reach[1]) if tree is head else set()"),
+        ("the base's registrar pattern is not united", "patterns = [p for p in (registrar_pattern(base), registrar_pattern(head)) if p is not None]", "patterns = [registrar_pattern(head)]"),
+        ("a helper is not followed", "for ref in sorted(refs & set(defs)):", "for ref in []:"),
+        ("an opaque helper is not held", "if isinstance(x.func, ast.Name) and x.func.id in opaque", "if False and isinstance(x.func, ast.Name) and x.func.id in opaque"),
+        ("a named helper is still read as part of a registrar", "        if bound in names or bound in named:\n            continue", "        if bound in names:\n            continue"),
+        ("an edit of a name of the table is not held", "if bound in table and _spans_from_decorators(node, numbers):", "if False:"),
+        ("an unreadable table passes", 'return None, "the registrar allow table of the rule cannot be read"', "pass"),
+        ("a decorator is not part of a helper", "start = min([node.lineno] + [d.lineno for d in getattr(node, \"decorator_list\", [])])\n    return any(n in numbers", "start = node.lineno\n    return any(n in numbers"),
+        ("a rebound builtin stays allowed", "pure_builtins = pure_builtins - rebound", "pass"),
+        ("a deletion in a named helper is not held", "for tree, numbers in ((head, set(lines[1])), (base, set(lines[0]))):", "for tree, numbers in ((head, set(lines[1])),):"),
+        ("a named helper counts as a closure use", "live = set(names) - set(literals) - set(named_helpers)", "live = set(names) - set(literals)"),
+        ("an upper-case attribute read is always a constant", "isinstance(x.ctx, ast.Load) and x.attr.isupper() and isinstance(x.value, ast.Name):", "isinstance(x.ctx, ast.Load) and True and isinstance(x.value, ast.Name):"),
+        ("any method of the handle is a verb", "if not (isinstance(func, ast.Attribute) and func.attr in verbs):", "if not isinstance(func, ast.Attribute):"),
+        ("a member of the handle is not held", "x.attr not in verbs and isinstance(_chain_root(x), ast.Name) and _chain_root(x).id in handle and not x.attr.isupper()", "False"),
+        ("any assignment builds a parser", "if isinstance(x, ast.Assign) and verb_chain(x.value):\n                sources = x.targets", "if isinstance(x, ast.Assign):\n                sources = x.targets"),
+        ("a store through a built parser at any depth", "isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id in built}", "isinstance(t, ast.Attribute) and getattr(_chain_root(t), \"id\", None) in built}"),
+        ("a non-literal store on a built parser is allowed", "and _is_data(x.value, data | set(literals)) for target in x.targets", "for target in x.targets"),
+        ("a built parser's actions are not its own", "or (isinstance(x.iter, ast.Attribute) and isinstance(x.iter.value, ast.Name) and x.iter.value.id in built)):\n                sources = [x.target]   # `for p in", "or False):\n                sources = [x.target]   # `for p in"),
+        ("a chain of verbs is only one call long", "or verb_chain(inner)", "or False"),
+        ("a rebound data name stays data", "if any(v is None or not _is_data(v, (data - {n}) | set(literals)) for v in bindings.get(n, [])):", "if False:"),
+        ("aliases are not held", "if any(k.arg == \"aliases\" or (k.arg is None and names_aliases(k.value)) for k in x.keywords):", "if False:"),
+        ("aliases by ** are not held", "(k.arg is None and names_aliases(k.value))", "False"),
+        ("set_defaults on the handle is not held", "if fname == \"set_defaults\" and isinstance(x.func, ast.Attribute)", "if False and isinstance(x.func, ast.Attribute)"),
+        ("a list is data", "    if isinstance(expr, ast.Tuple):\n        return all(_is_data(e, data) for e in expr.elts)", "    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):\n        return all(_is_data(e, data) for e in expr.elts)"),
+        ("a nested statement is not read for the table", "x = todo.pop()\n        if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):\n            out.append(x.id)", "x = todo.pop()\n        if False:\n            out.append(x.id)"),
+        ("a module walrus in a default is not seen", "header += list(arguments.defaults) + [d for d in arguments.kw_defaults if d is not None]\n                header += [a.annotation", "header += []\n                header += [a.annotation"),
+        ("a module class base is not seen", "header = list(getattr(x, \"decorator_list\", [])) + list(getattr(x, \"bases\", [])) + [k.value for k in getattr(x, \"keywords\", [])]   # all of these", "header = list(getattr(x, \"decorator_list\", [])) + [k.value for k in getattr(x, \"keywords\", [])]   # all of these"),
+        ("a match body is not walked", "        if isinstance(node, ast.Match):\n            for case in node.cases:", "        if False:\n            for case in node.cases:"),
+        ("a registrar bound in another form is not held", "    extra = [(n, None) for n in _bound_here(node) if named(n)]", "    extra = []"),
+        ("a helper bound twice stays a def", "if len(kinds_) == 1 and kinds_[0][0] in (\"def\", \"lambda\"):", "if kinds_[0][0] in (\"def\", \"lambda\"):"),
+        ("the grammar allows every class", "kind in REGISTRAR_GRAMMAR or kind in GRAMMAR_NEUTRAL:", "kind in REGISTRAR_GRAMMAR or kind in GRAMMAR_NEUTRAL or True:"),
+        ("a class body is not an import-time statement", "        if isinstance(node, ast.ClassDef):\n            yield from _import_time_statements(node.body)", "        if False:\n            yield from _import_time_statements(node.body)"),
+        ("a function that binds a global is not tracked", "reach = reach or (isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in writers)", "reach = reach"),
+        ("a changed line of a writer is not held", "        if _spans(node, added):\n            found.append((\"a changed line of a function that writes a namespace\"", "        if False:\n            found.append((\"a changed line of a function that writes a namespace\""),
+        ("a lambda is not a writer", "ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and any(reaches(y)", "ast.FunctionDef, ast.AsyncFunctionDef)) and any(reaches(y)"),
+        ("a star import is not held", "if isinstance(node, ast.ImportFrom) and any(a.name == \"*\" for a in node.names) and _spans(node, added):", "if False:"),
+        ("a frame field is not a reach", "or y.attr.startswith(\"f_\") or", "or False or"),
+        ("a module expression statement is not held", "if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):", "if False:"),
+        ("a module namespace reach is not held", "            if reach:\n                found.append((\"a module-level namespace reach\"", "            if False:\n                found.append((\"a module-level namespace reach\""),
+        ("re.compile is a namespace reach", "y.attr in NAMESPACE_NAMES and y.attr not in NAMESPACE_ATTRIBUTE_EXEMPT", "y.attr in NAMESPACE_NAMES"),
+        ("an untouched module statement is held", "        if not _spans(node, added):                # a bare expression statement", "        if False:                # a bare expression statement"),
+        ("a with item is not read", "elif isinstance(x, (ast.With, ast.AsyncWith)):\n            for item in x.items:", "elif False:\n            for item in x.items:"),
+        ("a for iterable is not read", "elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and not _built_iter(x.iter, built):", "elif False:"),
+        ("a bare decorator of the unit is not read", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n            for expr in list(x.decorator_list)", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x is not unit:\n            for expr in list(x.decorator_list)"),
+        ("a variable parameter is not a binding", "kwonlyargs + [x for x in (arguments.vararg, arguments.kwarg) if x is not None]:\n            kinds.setdefault", "kwonlyargs + []:\n            kinds.setdefault"),
+        ("a keyword-only parameter is not a binding", "arguments.args + arguments.kwonlyargs + [x for x in (arguments.vararg, arguments.kwarg) if x is not None]:\n            kinds.setdefault", "arguments.args + [x for x in (arguments.vararg, arguments.kwarg) if x is not None]:\n            kinds.setdefault"),
+        ("a parameter of the unit is not a binding", "kinds.setdefault(a.arg, []).append(\"param\")", "pass"),
+        ("a decorator is not read", "for expr in list(x.decorator_list) + (list(x.bases) + [k.value for k in x.keywords] if isinstance(x, ast.ClassDef) else []):", "for expr in []:"),
+        ("a parser name rebound in any form is not held", "        if not ok:\n            note(node, \"rebinds\", name)", "        if False:\n            note(node, \"rebinds\", name)"),
+        ("the table's builtins are not read", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(readable) | set(named_helpers)) and x.func.id not in kinds)"),
+        ("the table's helpers are not allowed callees", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(readable) | set(builtins)) and x.func.id not in kinds)"),
+        ("a readable helper is not allowed", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(named_helpers) | set(builtins)) and x.func.id not in kinds)"),
+        ("a nested parameter is not a binding", "if isinstance(x, ast.arg) and id(x) not in own_args:", "if False:"),
+        ("two defs are one function", "len(k) == 1 and k[0] in (\"def\", \"lambda\")", "k and all(v in (\"def\", \"lambda\") for v in k)"),
+        ("a changed line that binds the pattern is not held", "if _pattern_rebound(head, added):", "if False:"),
+        ("the arguments of a table builtin are not checked", "for arg in list(x.args) + [k.value for k in x.keywords]:\n                    bad = unsafe(arg)", "for arg in []:\n                    bad = unsafe(arg)"),
+        ("a rebound table builtin stays callable", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)))"),
+        ("a keyword is always free", "if key in free_keywords:\n                        continue", "if True:\n                        continue"),
+        ("action takes any value", "if key == \"action\" and not (isinstance(value, ast.Constant) and isinstance(value.value, str)):", "if False:"),
+        ("a value argparse may run is not checked", "bad = unsafe(value)\n                    if bad:", "bad = None\n                    if bad:"),
+        ("a local is never resolved through its bindings", "if all(unsafe(v) is None for v in bindings[expr.id]):", "if False:"),
+        ("a computed module constant is not data", "if isinstance(expr, ast.BinOp):\n        return _is_const_expr(expr.left, data) and _is_const_expr(expr.right, data)", "if False:\n        return _is_const_expr(expr.left, data) and _is_const_expr(expr.right, data)"),
+        ("a method of data is not safe", "if isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name) and (callee.value.id in data", "if False and isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name) and (callee.value.id in data"),
+        ("a default that is not data is not held", "for a, default in param_defaults:", "for a, default in []:"),
+        ("a registrar bound under an if is not read", "for node in _module_statements(head.body):\n        for name, unit in _binds_registrar(node, patterns):", "for node in head.body:\n        for name, unit in _binds_registrar(node, patterns):"),
+        ("a registrar bound as a lambda is not read", "isinstance(value, ast.Lambda) and isinstance(target, ast.Name) else None", "False else None"),
+        ("a registrar bound in a form that cannot be read passes", 'found.append((name, "rebinds", "a registrar bound in a form that cannot be read"))', "pass"),
+        ("the module-level namespace write passes", 'found.append(("a module-level write into globals()", "rebinds", "a registrar bound in a form that cannot be read"))', "pass"),
+    )
+
+    def test_a_mutant_without_any_one_member_of_the_binder_table_fails_a_row(self):
+        for key in list(self.dc.STRING_BINDERS):
+            with self.subTest(key):
+                module = self.mutant_module("NOT_BINDERS = {", "NOT_BINDERS = {")
+                module.STRING_BINDERS = {k: v for k, v in module.STRING_BINDERS.items() if k != key}
+                self.assertTrue(self.table_failures(module), "a lint that does not read %s as a binder survives" % key)
+
+    def test_the_table_holds_on_the_real_lint_and_every_mutant_of_it_fails_a_row(self):
+        self.assertEqual(self.table_failures(self.dc), [], "the table holds on the real lint")
+        for label, old, new in self.MUTANTS:
+            with self.subTest(label):
+                self.assertTrue(self.table_failures(self.mutant_module(old, new)), "the mutant survives: %s" % label)
+
+    N = "REGISTRAR_NAME_RE"
+    # one form per member of PATTERN_BINDERS (the node class that binds the name): the text that binds it
+    PATTERN_FORMS = {
+        "Name": ["REGISTRAR_NAME_RE += 'x'", "for REGISTRAR_NAME_RE in (1,):\n    pass", "with open('x') as REGISTRAR_NAME_RE:\n    pass", "(REGISTRAR_NAME_RE := 1)", "del REGISTRAR_NAME_RE", "REGISTRAR_NAME_RE: int = 1", "type REGISTRAR_NAME_RE = int"],
+        "Attribute": ["REGISTRAR_NAME_RE.fullmatch = lambda n: n.startswith('zz_')"], "Subscript": ["REGISTRAR_NAME_RE['a'] = 1"],
+        "Import": ["import os as REGISTRAR_NAME_RE"], "ImportFrom": ["from os import path as REGISTRAR_NAME_RE"],
+        "FunctionDef": ["def REGISTRAR_NAME_RE():\n    pass"], "AsyncFunctionDef": ["async def REGISTRAR_NAME_RE():\n    pass"],
+        "ClassDef": ["class REGISTRAR_NAME_RE:\n    fullmatch = staticmethod(lambda n: n.startswith('zz_'))"],
+        "ExceptHandler": ["try:\n    pass\nexcept Exception as REGISTRAR_NAME_RE:\n    pass"],
+        "MatchAs": ["match 1:\n    case REGISTRAR_NAME_RE:\n        pass"], "MatchStar": ["match [1]:\n    case [*REGISTRAR_NAME_RE]:\n        pass"],
+        "MatchMapping": ["match {}:\n    case {**REGISTRAR_NAME_RE}:\n        pass"],
+        "Global": ["def zz_f():\n    global REGISTRAR_NAME_RE"], "Nonlocal": ["def zz_f():\n    def zz_g():\n        nonlocal REGISTRAR_NAME_RE"],
+        "arg": ["def zz_f(REGISTRAR_NAME_RE):\n    pass"], "TypeVar": ["def zz_f[REGISTRAR_NAME_RE]():\n    pass"], "ParamSpec": ["def zz_f[**REGISTRAR_NAME_RE]():\n    pass"], "TypeVarTuple": ["def zz_f[*REGISTRAR_NAME_RE]():\n    pass"],
+    }
+    PATTERN_BASE = "import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\ndef main():\n    pass\n"
+    PATTERN_IDENT_FIELDS = ("name", "names", "id", "arg", "rest", "asname", "attr")
+
+    def pattern_failures(self, dc):
+        """Rows that fail on module `dc`: every form of every member is a binding node by the table and a changed line of it is held, the exploits of the review are held end to end, and the table covers the running Python."""
+        import ast as _ast
+        bad = []
+        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": []}
+        for kind, texts in self.PATTERN_FORMS.items():
+            for text in texts:
+                head = self.PATTERN_BASE + text + "\n"
+                try:
+                    tree = _ast.parse(head)
+                except SyntaxError:
+                    continue   # a form the running Python cannot parse
+                nodes = [x for x in _ast.walk(tree) if type(x).__name__ == kind and not (kind == "Name" and x.id != self.N) and not (kind in ("Attribute", "Subscript") and isinstance(x.ctx, _ast.Load))]
+                if not nodes or not (kind in dc.PATTERN_BINDERS and any(dc.PATTERN_BINDERS[kind](x) for x in nodes)):
+                    bad.append("table: " + kind)
+                got, why = dc.registrar_findings(self.PATTERN_BASE, head + "def zz_evil(sub):\n    import os\n", rule)
+                if not why:
+                    bad.append("end to end: " + text)
+                added = set(range(len(self.PATTERN_BASE.split("\n")), len(head.split("\n")) + 1))
+                if dc.registrar_pattern(tree) is not None and not dc._pattern_rebound(tree, added):
+                    bad.append("held: " + text)
+        early = "import re\n"   # a binding BEFORE the literal one is not the last (the pattern is read), but a changed line of it is held
+        for kind, texts in self.PATTERN_FORMS.items():
+            for text in texts:
+                head = early + text + "\n" + self.PATTERN_BASE[len(early):]
+                try:
+                    tree = _ast.parse(head)
+                except SyntaxError:
+                    continue
+                if dc.registrar_pattern(tree) is not None and not dc._pattern_rebound(tree, set(range(2, 2 + len(text.split("\n"))))):
+                    bad.append("early binding not held: " + text)
+        for text in ("REGISTRAR_NAME_RE = zz_pattern('x')", "REGISTRAR_NAME_RE = re.compile(zz_text)", "REGISTRAR_NAME_RE = zz_a = re.compile('x')"):
+            try:
+                if dc.registrar_pattern(_ast.parse(self.PATTERN_BASE + text + "\n")) is not None:
+                    bad.append("not a literal compile: " + text)
+            except Exception:
+                bad.append("not a literal compile (error): " + text)
+        if dc.registrar_pattern(_ast.parse(self.PATTERN_BASE + "class REGISTRAR_NAME_RE:\n    pass\n")) is not None:
+            bad.append("the last binding is a class")
+        if dc.registrar_pattern(_ast.parse(self.PATTERN_BASE)) is None:
+            bad.append("the plain pattern is read")
+        for name, node in vars(_ast).items():   # completeness over the running Python: a class with an identifier field is in the table or stated as no binder
+            if isinstance(node, type) and issubclass(node, _ast.AST) and set(node._fields) & set(self.PATTERN_IDENT_FIELDS):
+                if name not in dc.PATTERN_BINDERS and name not in dc.PATTERN_NOT_BINDERS_NAMES:
+                    bad.append("class in no table: " + name)
+        class Future(_ast.AST):
+            _fields = ("name",)
+        if not dc._binds_pattern(Future(name=self.N)) or dc._binds_pattern(Future(name="other")):
+            bad.append("a future class is held by default")
+        return bad
+
+    def test_every_binding_form_of_the_registrar_pattern_is_held_and_the_grammar_is_complete(self):
+        self.assertEqual(self.pattern_failures(self.dc), [])
+        got, why = self.dc.registrar_findings(self.base_src, self.base_src, self.rule)
+        self.assertIsNone(why)
+        self.assertEqual(got, [], "the real registrars give 0 findings")
+        print("registrar findings over the real daemon file: %d" % len(got))
+
+    EVIL = "def zz_evil(sub):\n    import os; os.system(\"x\")\n"
+    MODULE_LEVEL = ('for node in _import_time_statements(head.body):', 'for node in ():')
+    WRITER_LEVEL = ('if _spans(node, added):\n            found.append(("a changed line of a function that writes', 'if False:\n            found.append(("a changed line of a function that writes')
+
+    def rebind_held(self, module, spelling):
+        """True when the REAL owner_decide holds the daemon file text with the spelling and `zz_evil` appended; an exception of a mutant counts as not held."""
+        head = self.base_src + "\n" + spelling + "\n" + self.EVIL
+        try:
+            got, why = module.registrar_findings(self.base_src, head, self.rule)
+        except Exception:
+            return False
+        report = {"findings": got, "closure": self.names, "why": why}
+        decision, reasons = sb.impact_floor.owner_decide(sb.impact_floor.load_matrix(), ["bin/fleet-switchboard"], [], registrar=report)
+        return decision == "hold" and any(r.startswith("registrar ") for r in reasons)
+
+    def pin_layer(self, spelling, *layers):
+        self.assertTrue(self.rebind_held(self.dc, spelling), "held, not 'none, no findings': " + spelling)
+        module = self.mutant_module(*layers[0])
+        module._applied = [layers[0]]
+        for anchor in layers[1:]:
+            module = self.mutant_module_chain(module, *anchor)
+        self.assertFalse(self.rebind_held(module, spelling), "a mutant without the named layer(s) still holds it")
+
+    def mutant_module_chain(self, module, old, new):
+        import types
+        path = BIN / "delegated_clear.py"
+        text = path.read_text()
+        for o, n in list(getattr(module, "_applied", [])) + [(old, new)]:
+            self.assertEqual(text.count(o), 1, o)
+            text = text.replace(o, n)
+        mutant = types.ModuleType("delegated_clear_mutant")
+        mutant.__file__ = str(path)
+        exec(compile(text, str(path), "exec"), mutant.__dict__)
+        mutant._applied = getattr(module, "_applied", []) + [(old, new)]
+        return mutant
+
+    def test_globals_update_of_the_pattern_is_held_by_the_module_level_statement_layer(self):
+        """Held by the module-level default-deny layer of `registrar_findings` (an added expression statement or namespace reach, `_import_time_statements`); the pattern stays '^a$' for _pattern_rebound, so it is NOT that layer."""
+        self.pin_layer('globals().update(REGISTRAR_NAME_RE=__import__("re").compile("^a$"))', self.MODULE_LEVEL)
+
+    def test_exec_of_the_pattern_is_held_by_the_module_level_statement_layer(self):
+        """Held by the module-level default-deny layer (expression statement and namespace reach: `exec` is in NAMESPACE_NAMES)."""
+        self.pin_layer('exec("REGISTRAR_NAME_RE=__import__(\'re\').compile(\'^a$\')")', self.MODULE_LEVEL)
+
+    def test_a_store_through_sys_modules_of_the_pattern_is_held_by_the_module_level_layer(self):
+        """Held by the module-level namespace-reach layer (`modules` is in NAMESPACE_NAMES, and the store is not a plain binding of the pattern for _pattern_rebound)."""
+        self.pin_layer('sys.modules[__name__].REGISTRAR_NAME_RE=__import__("re").compile("^a$")', self.MODULE_LEVEL)
+
+    def test_a_class_built_with_type_that_rebinds_the_pattern_is_held_by_the_writer_and_module_layers(self):
+        """Held by two layers, both removed by the mutant: a changed line of a function (the lambda) that writes a namespace, and the module-level statement layer for the call."""
+        self.pin_layer('type("X", (), {"__init__": lambda self: globals().update(REGISTRAR_NAME_RE=__import__("re").compile("^a$"))})()', self.MODULE_LEVEL, self.WRITER_LEVEL)
+
+    def test_vars_update_of_the_pattern_is_held_by_the_module_level_statement_layer(self):
+        """Held by the module-level default-deny layer (`vars` is in NAMESPACE_NAMES)."""
+        self.pin_layer('vars().update(REGISTRAR_NAME_RE=__import__("re").compile("^a$"))', self.MODULE_LEVEL)
+
+    def test_a_dict_merge_into_globals_is_held_by_the_module_level_layer_or_the_parser(self):
+        """`globals() |= {...}` does not parse (a call is not an assignment target): held by the fail-closed parse layer of `registrar_findings` (SyntaxError is read as unreadable). `globals().__ior__({...})` and `{**globals(), ...}` are held by the module-level layer."""
+        self.assertTrue(self.rebind_held(self.dc, 'globals() |= {"REGISTRAR_" + "NAME_RE": 1}'))
+        module = self.mutant_module("except (SyntaxError, ValueError, KeyError", "except (ValueError, KeyError")
+        self.assertFalse(self.rebind_held(module, 'globals() |= {"REGISTRAR_" + "NAME_RE": 1}'), "a mutant without the parse layer holds it")
+        self.pin_layer('globals().__ior__({"REGISTRAR_" + "NAME_RE": __import__("re").compile("^a$")})', self.MODULE_LEVEL)
+        self.pin_layer('zz_merged = {**globals(), "REGISTRAR_" + "NAME_RE": __import__("re").compile("^a$")}', self.MODULE_LEVEL)
+
+    def test_a_mutant_that_drops_any_one_binding_member_fails(self):
+        for kind in list(self.dc.PATTERN_BINDERS):
+            with self.subTest(kind):
+                module = self.mutant_module("PATTERN_NAME = ", "PATTERN_NAME = ")
+                module.PATTERN_BINDERS = {k: v for k, v in module.PATTERN_BINDERS.items() if k != kind}
+                self.assertTrue(self.pattern_failures(module), "a lint without %s survives" % kind)
+
+    def test_mutants_of_the_pattern_rule_fail(self):
+        for label, old, new in (("the default for an unknown class", "    if kind in PATTERN_NOT_BINDERS_NAMES or not isinstance(x, ast.AST):\n        return False\n    for field in", "    return False\n    for field in"),
+                                ("the last binding is not checked", "    if last is not top[-1] and not any(y is last for y in ast.walk(top[-1].targets[0])):\n        return None\n", ""),
+                                ("a literal compile is not required", "    if not _literal_compile(top[-1]) or len(top[-1].targets) != 1:\n        return None\n", ""),
+                                ("a changed binding is not held", "return any(_spans(b, added) for b in odd) or (len(bindings) > 1 and any(_spans(b, added) for b in bindings))", "return False")):
+            with self.subTest(label):
+                self.assertTrue(self.pattern_failures(self.mutant_module(old, new)), "the mutant survives: " + label)
+
+    HOSTILE = "global %s\n%s = None"
+
+    def serve(self, head_src):
+        self.pr = dict(self.pr, baseRefOid=self.BASE, changedFiles=1, files=[{"path": "bin/fleet-switchboard", "additions": 3, "deletions": 0}])
+        base_src = self.base_src
+        def text(engine, repo, path, ref):
+            return base_src if ref == self.BASE else head_src
+        patcher = mock.patch.object(sb, "_file_text_at", text)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def engine(self):
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner = self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        return engine
+
+    def test_the_cli_the_daemon_the_gate_and_the_delegated_clear_all_read_the_same_hold(self):
+        function, binding, module = self.pick()
+        self.serve(self.head_of(self.HOSTILE % (binding, binding)))
+        shown = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        report = sb.pr_floor_report(self.engine(), "acme/app", 9)
+        self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue(any("registrar add_zzz_parsers rebinds closure name %s" % binding in r for r in report["owner_reasons"]), report["owner_reasons"])
+        self.assertEqual(report["registrar_reasons"], [r for r in report["owner_reasons"] if r.startswith("registrar ")])
+        refused = self.dc.refusals(self.rule, report, [{"filename": "bin/fleet-switchboard", "status": "modified"}], matches=sb.impact_floor.matches, closure={"bin/fleet-switchboard": []})
+        self.assertTrue(any("registrar add_zzz_parsers rebinds" in r and "stays the owner's own clear" in r for r in refused), refused)
+        # the gate reads the same report: G6 sees the hold
+        got = sb.gate_floor_fact(self.engine(), self.world.state, "acme/app", 9, report["head"])
+        self.assertEqual(got["decision"], "hold", got)
+        self.assertTrue(any("registrar add_zzz_parsers" in r for r in got["reasons"]))
+
+    def test_a_flag_only_registrar_edit_and_an_unchanged_daemon_file_do_not_add_a_reason(self):
+        self.serve(self.head_of("thing = sub.add_parser('zzz')\nthing.add_argument('--x', type=issue_arg)"))
+        report = sb.pr_floor_report(self.engine(), "acme/app", 9)
+        self.assertEqual(report["registrar_reasons"], [])
+        self.pr = dict(self.pr, changedFiles=1, files=[{"path": "docs/a.md", "additions": 1, "deletions": 0}])
+        report = sb.pr_floor_report(self.engine(), "acme/app", 9)
+        self.assertEqual(report["registrar_reasons"], [])
+        self.assertEqual(sb.impact_floor.registrar_reasons(None), [])
+
+    def test_an_unreadable_daemon_file_at_the_head_holds(self):
+        self.pr = dict(self.pr, baseRefOid=self.BASE, changedFiles=1, files=[{"path": "bin/fleet-switchboard", "additions": 3, "deletions": 0}])
+        with mock.patch.object(sb, "_file_text_at", side_effect=sb.IntentError("gh", "not readable")):
+            report = sb.pr_floor_report(self.engine(), "acme/app", 9)
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue(any("registrar diff could not be read" in r for r in report["owner_reasons"]))
+
+    def test_the_delegated_clear_refuses_an_unreadable_answer_and_an_absent_one_and_a_clean_one_adds_nothing(self):
+        report = {"owner_decision": "none", "complete": True, "registrar_reasons": "garbage", "review_action": "none"}
+        refused = self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})
+        self.assertTrue(any("registrar lint's answer cannot be read" in r for r in refused), refused)
+        report.pop("registrar_reasons")
+        refused = self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})
+        self.assertTrue(any("registrar lint's answer cannot be read" in r for r in refused), "a report that did not run the lint is refused, never read as clean")
+        report["registrar_reasons"] = []
+        self.assertFalse(any("registrar" in r for r in self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})))
+
+    # ---- the rater's line and the documentation say it in the same words
+    RATER = "A registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives, except the named registration helpers and the pure builtins of one table (every import, call or rebinding of a name of the clear's closure among them) is rated High, whatever its other effects."
+    HOLD = "a registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives, except the named registration helpers and the pure builtins of one table (every import, call or rebinding of a name of the clear's closure among them) is held for the owner"
+    CONTROL = "In one process a hostile registrar can always undo a guard; this hold and this rating are the control."
+
+    def test_the_rater_line_is_in_the_definition_once_and_the_documentation_says_the_rule_and_the_line_in_the_same_words(self):
+        definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertEqual(definition.count(self.RATER), 1)
+        self.assertEqual(docs.count(self.RATER), 1)
+        self.assertEqual(docs.count(self.HOLD), 1)
+        self.assertEqual(docs.count(self.CONTROL), 1)
+        self.assertEqual(sb.impact_floor.REGISTRAR_RULE_TEXT, self.HOLD)
+        for word in ("imports", "writes", "calls", "neither defines nor receives", "closure", "High"):
+            self.assertIn(word, self.RATER)
+
+    def test_the_definition_permission_block_is_the_pinned_one(self):
+        """The front matter (its permission block) as it was when the lines were added, by hash: a literal, never a comparison with a branch (the one-time proof that it equals main's is in the pull request's body)."""
+        import hashlib
+        front = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text().split("\n---\n", 1)[0]
+        self.assertEqual(hashlib.sha256(front.encode()).hexdigest(), "f94f58e5ae55912c10ed936118320e90d280a73f00657113df0ab7439192fa79")
+
+
 class TestImpactFloorCommandAndPass(LedgerBase):
     """`impact floor <pr>` and the daemon's advisory `gate.would_hold`: both read, neither writes a label, comment or ledger entry."""
 
@@ -38406,7 +39677,7 @@ class TestImpactHold(LedgerBase):
     def test_the_spellings_of_a_machinery_path_are_all_refused_and_a_new_bin_file_and_a_rename_are_refused(self):
         module = sb.load_module("delegated_clear")
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
-        good = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": {"authority": ["x"]}, "review_action": "none", "review_class": None, "changed_paths": []}
+        good = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": {"authority": ["x"]}, "review_action": "none", "review_class": None, "changed_paths": [], "registrar_reasons": []}
         import unicodedata
         refused = ["BIN/CHAT_CLEAR.PY", "./bin/chat_clear.py", "bin//chat_clear.py", "docs/../bin/chat_clear.py", "bin/chat_cl\u00e9ar.py".replace("\u00e9", "e"), unicodedata.normalize("NFD", "bin/delegated_clear.py"),
                    "bin/impact_hold.py", "bin/plan_check.py", "bin/plan_ledger.py", "bin/repo_exclusion.py", "shims/gh", "plugins/fleet-hooks/x.mjs", ".github/workflows/ci.yml", "docs/review-laws/impact-matrix.json", "DOCS/REVIEW-LAWS/IMPACT-MATRIX.JSON"]
@@ -38576,7 +39847,7 @@ class TestImpactHold(LedgerBase):
     def test_the_refusals_table_of_the_pure_module(self):
         module = sb.load_module("delegated_clear")
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
-        good = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": {"authority": ["x"]}, "review_action": "none", "review_class": None, "changed_paths": ["x"]}
+        good = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": {"authority": ["x"]}, "review_action": "none", "review_class": None, "changed_paths": ["x"], "registrar_reasons": []}
         files = [{"filename": "docs/x.md", "patch": "@@ -1 +1 @@\n-a\n+b"}]
         self.assertEqual(module.refusals(rule, good, files, *self.floor_matchers()), [])
         cases = (("complete false", dict(good, complete=False)), ("unknown", dict(good, unknown="3 of 9 files")), ("renamed", dict(good, renamed_no_source=["a"])),
@@ -69491,7 +70762,7 @@ class TestWhoCanClear(unittest.TestCase):
 
     def report(self, decision="hold", hits=None, paths=()):
         return {"pr": "acme/app#9", "head": self.H, "owner_decision": decision, "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": hits or {}, "changed_paths": list(paths),
-                "review_action": "none", "review_class": None}
+                "review_action": "none", "review_class": None, "registrar_reasons": []}   # the lint's answer the real report always carries (#964)
 
     @staticmethod
     def file(name, status="modified", previous=None):
@@ -70180,7 +71451,7 @@ class TestClearCodePathsAlwaysHeld(unittest.TestCase):
             self.assertIn("clear_code_paths", reasons[0])
 
     def test_s4_the_clear_still_refuses_every_entry_with_its_current_reason(self):
-        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": [], "registrar_reasons": []}
         for entry, path in self.rows():
             files = [{"filename": path, "previous_filename": None, "status": "modified"}]
             got = self.clear.refusals(self.rule, report, files, self.floor.matches, {}, {"reasons": [], "level": "Low"})
@@ -70193,7 +71464,7 @@ class TestClearCodePathsAlwaysHeld(unittest.TestCase):
         self.assertEqual(self.reason_of("brand/new/a.py", matrix)[0], "hold")
         listed, problem = self.floor.clear_code_paths(matrix)
         self.assertIsNone(problem)
-        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": [], "registrar_reasons": []}
         refused = self.clear.refusals(dict(matrix["owner_hold"]["delegated_clear"], clear_code_paths=listed), report,
                                       [{"filename": "brand/new/a.py", "previous_filename": None, "status": "modified"}], self.floor.matches, {}, {"reasons": [], "level": "Low"})
         self.assertEqual(len(refused), 1, refused)
@@ -75825,6 +77096,8 @@ class TestPullFileListRead(LedgerBase):
             "no_review": lambda: pure({"review_action": None}),
             "review_no_class": lambda: pure({"review_action": "hold", "review_class": None}),
             "review_top_class": lambda: pure({"review_class": "authority"}),
+            "registrar": lambda: pure({"registrar_reasons": ["bin/daemon.py: a registrar calls a name of the clear's closure"]}),
+            "registrar_unreadable": lambda: pure({"registrar_reasons": None}),
             "score": lambda: pure(scored={"level": "High", "reasons": ["the score is High: High is the owner's"]}),
             "files_unreadable": lambda: module.causes_of(rule, {"owner_decision": "none", "complete": True, "review_action": "none"}, None, matches),
             "file_unreadable": lambda: pure(files=[{"status": "modified"}]),
@@ -83541,6 +84814,269 @@ class TestArchTools(unittest.TestCase):
             self.assertIn(line, done.stdout)
         same = self.split_check([root / "before.py"], [root / "before.py"])
         self.assertEqual(same.returncode, 0, same.stdout)
+
+
+class ReviewCommentLineTests(Base):
+    HEAD = "3f2a9c1b7d4e" + "0" * 28
+
+    def handle(self, body, cid=9001, state="open", author="alice", who="bob", action="created", merged=False, issue=True):
+        pr = {"number": 10, "state": state, "user": {"login": author}, "body": "", "pull_request": {"merged_at": "x" if merged else None}}
+        payload = {"action": action, "issue": pr, "comment": {"id": cid, "body": body, "user": {"login": who}}}
+        return [i for i in sb._wh_issue_comment("o/r", payload, 1.0) if i.key.startswith("github.reviewcomment:")]
+
+    def line(self, verdict, who="bob", signed=None):
+        tail = " (signed %s)" % signed if signed else ""
+        return "PR #10 3f2a9c1b7d4e review comment by %s%s: %s (a comment, not a recorded verdict)" % (who, tail, verdict)
+
+    def test_each_verdict_word_in_the_table_is_delivered(self):
+        for word in sb.REVIEW_VERDICTS:
+            items = self.handle("Review of %s: %s\nsecret sentence" % (self.HEAD, word))
+            self.assertEqual([i.summary for i in items], [self.line(word)])
+            self.assertNotIn("secret", items[0].summary)
+
+    def test_no_marker_cloud_bot_is_delivered(self):
+        items = self.handle("Review of %s: APPROVE" % self.HEAD, who="acme-cloud[bot]")
+        self.assertEqual([i.summary for i in items], [self.line("APPROVE", "acme-cloud[bot]")])
+
+    def test_shared_account_with_reader_marker_is_delivered_with_signer(self):
+        body = "Review of %s: CHANGES REQUESTED\n<!-- fleet-switchboard:from=rev-1 -->" % self.HEAD
+        items = self.handle(body, who="alice")   # same login as the PR author
+        self.assertEqual([i.summary for i in items], [self.line("CHANGES REQUESTED", "alice", "rev-1")])
+        self.assertEqual(items[0].review_signer, "rev-1")
+
+    def test_author_lane_marker_is_not_delivered_at_routing(self):
+        agents = {"orch": types.SimpleNamespace(fleet={"role": "orchestrator"}), "w1": types.SimpleNamespace(fleet={"reports_to": "orch"}),
+                  "rev-1": types.SimpleNamespace(fleet={})}
+        self.assertTrue(sb._review_lane_member(agents, "w1", "orch"))
+        self.assertTrue(sb._review_lane_member(agents, "orch", "orch"))
+        self.assertFalse(sb._review_lane_member(agents, "rev-1", "orch"))
+        self.assertFalse(sb._review_lane_member(agents, "ghost", "orch"))
+
+    def test_route_drops_author_lane_and_audits_unowned(self):
+        agents = {"orch": types.SimpleNamespace(fleet={"role": "orchestrator"}), "w1": types.SimpleNamespace(fleet={"reports_to": "orch"})}
+        for signer, owner, expect in (("w1", "orch", False), ("rev-1", "orch", True), ("rev-1", None, False)):
+            item = sb.GitHubItem("github.reviewcomment:1", "github.comment", "x", "o/r", [], [], "bob", 1.0, [10], True)
+            item.review_signer = signer
+            audits = []
+            item.sender = "acme-cloud[bot]"
+            hub = types.SimpleNamespace(queue={item.key: item}, lock=threading.RLock(), _unrouted=set(), _filtered=set(),
+                                        _unrouted_batch=[], _filtered_batch=[], _routed_batch=[], _audit=lambda *a: audits.append(a),
+                                        route_of=lambda *a: (owner, "closing"), _fleet_login=lambda l: True, _unowned_seen=lambda k: False)
+            sb.GitHubHub._route(hub, item, types.SimpleNamespace(problems=[], agents=agents), 1.0)
+            self.assertEqual(item.recipient == "orch", expect)
+            self.assertEqual([a[0] for a in audits], ["github.reviewcomment.unowned"] if owner is None else [])
+
+    def test_unmatching_forms_are_unknown_never_wrong(self):
+        for tail in (" not APPROVE", " do not APPROVE", ": APPROVE.", ": approve", ": CHANGES REQUESTED, not APPROVE", " APPROVE",
+                     ": APPROVE now", ":\tAPPROVE", ": APPROVE\tx", "", ":APPROVE"):
+            items = self.handle("Review of %s%s" % (self.HEAD, tail))
+            self.assertEqual([i.summary for i in items], [self.line("UNKNOWN")], tail)
+
+    def test_trailing_whitespace_is_still_strict(self):
+        self.assertEqual(self.handle("Review of %s: APPROVE \t" % self.HEAD)[0].summary, self.line("APPROVE"))
+
+    def test_not_delivered(self):
+        ok = "Review of %s: APPROVE" % self.HEAD
+        self.assertEqual(self.handle(ok, state="closed"), [])
+        self.assertEqual(self.handle(ok, merged=True), [])
+        self.assertEqual(self.handle("x\n" + ok), [])
+        self.assertEqual(self.handle(" " + ok), [])
+        self.assertEqual(self.handle("\ufeff" + ok), [])
+        self.assertEqual(self.handle(ok.replace("Review", "REVIEW")), [])
+        self.assertEqual(self.handle("Review of %s: APPROVE" % self.HEAD[:39]), [])
+        self.assertEqual(self.handle("Review of %s0: APPROVE" % self.HEAD), [])
+        self.assertEqual(self.handle("Review of %s: APPROVE" % self.HEAD.upper()), [])
+        self.assertEqual(self.handle(ok, action="edited"), [])
+
+    def test_catchup_never_copies_text_and_shares_the_key(self):
+        body = "Review of %s: APPROVE\nsecret sentence" % self.HEAD
+        comment = {"id": 9001, "body": body, "user": {"login": "bob"}, "issue_url": "https://api.github.com/repos/o/r/issues/10"}
+        self.assertIsNone(sb._comment_item("o/r", comment, None, 1.0))   # no PR record: the catch-up loop passes one (see ReviewCommentEndToEndTests)
+        hook = self.handle(body)[0]
+        self.assertEqual(hook.key, "github.reviewcomment:9001")
+        self.assertNotIn("github.comment:9001", [hook.key])
+
+    def test_key_is_by_comment_id(self):
+        a = self.handle("Review of %s: APPROVE" % self.HEAD)[0].key
+        self.assertEqual(a, self.handle("Review of %s: APPROVE" % self.HEAD)[0].key)
+        self.assertNotEqual(a, self.handle("Review of %s: APPROVE" % self.HEAD, cid=9002)[0].key)
+
+    def test_plain_comment_keeps_old_item(self):
+        pr = {"number": 10, "state": "open", "user": {"login": "a"}, "pull_request": {}}
+        items = sb._wh_issue_comment("o/r", {"action": "created", "issue": pr, "comment": {"id": 5, "body": "hi", "user": {"login": "b"}}}, 1.0)
+        self.assertEqual([i.key for i in items], ["github.comment:5"])
+
+
+class ReviewCommentIsolationTests(unittest.TestCase):
+    """Regression (#1287): the review classes must leave os.environ and the patched names as they found them."""
+
+    def test_the_review_classes_leave_the_environment_and_globals_unchanged(self):
+        names = ("memory_sleep", "LAB_ENV")
+        env, glob = dict(os.environ), {n: getattr(sb, n) for n in names}
+        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(c)
+                                   for c in (ReviewCommentLineTests, ReviewCommentEndToEndTests))
+        result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(dict(os.environ), env)
+        self.assertEqual({n: getattr(sb, n) for n in names}, glob)
+
+
+class ReviewCommentEndToEndTests(Base):
+    """Webhook payload / catch-up read -> the real hub routing -> the queue, on the fake GitHub and a real registry-shaped fleet."""
+    HEAD = "3f2a9c1b7d4e" + "0" * 28
+    OK = "Review of %s: CHANGES REQUESTED\nsecret sentence" % HEAD
+
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1}, "w1": {"reports_to": "platform"}},
+                             config={"sweep": False, "triage": False})
+        self.gh, self.hub, self.world = self.rig.gh, self.rig.hub, self.rig.world
+        self.world.clock.t += 7200
+        self.hub.tick()   # start the forwarder: a webhook sent before it exists is lost
+        self.hub.config["github_bot_logins"] = ["acme-cloud[bot]"]
+        self.hub.config["gh_users"] = {"other/repo": "shared"}   # the account the daemon acts as (a key for another repo: the fake gh has no auth)
+        self.gh.issue(12, parent=1)
+        self.gh.pull(20, closes=[12])
+        self.gh.pull(21)   # no lane owns it
+
+    def payload(self, number, body, cid, who, action="created", state="open"):
+        pr = dict(self.gh.pulls[number], pull_request={"url": "x", "merged_at": None}, state=state)
+        comment = {"id": cid, "body": body, "user": {"login": who}, "created_at": self.gh.stamp(), "updated_at": self.gh.stamp(),
+                   "issue_url": "https://api.github.com/repos/%s/issues/%d" % (GH_REPO, number)}
+        return {"action": action, "issue": pr, "comment": comment}
+
+    def post(self, number, body, cid, who="reader", forward=True, **kw):
+        p = self.payload(number, body, cid, who, **kw)
+        self.gh.comments.append(p["comment"])
+        if forward:
+            self.gh.send("issue_comment", p, "d-%d" % cid)
+
+    def after(self):
+        self.rig.pump(120)
+        return [k for k in self.rig.delivered() if k.startswith("github.reviewcomment:")]
+
+    def test_delivered_to_the_owners_orchestrator_as_one_line(self):
+        self.post(20, self.OK, 7001)
+        self.assertEqual(self.after(), ["github.reviewcomment:7001"])
+
+    def test_stranger_with_forged_lane_marker_is_delivered(self):
+        self.post(20, self.OK + "\n<!-- fleet-switchboard:from=w1 -->", 7002, who="stranger")
+        self.assertEqual(self.after(), ["github.reviewcomment:7002"])
+
+    def test_fleet_login_with_lane_marker_is_excluded(self):
+        for cid, who in ((7003, "shared"), (7004, "acme-cloud[bot]")):
+            self.post(20, self.OK + "\n<!-- fleet-switchboard:from=w1 -->", cid, who=who)
+        self.assertEqual(self.after(), [])
+
+    def test_cloud_bot_without_marker_is_delivered(self):
+        self.post(20, self.OK, 7005, who="acme-cloud[bot]")
+        self.assertEqual(self.after(), ["github.reviewcomment:7005"])
+
+    def test_default_config_does_not_trust_a_bot_login_marker(self):
+        self.hub.config["github_bot_logins"] = []
+        self.post(20, self.OK + "\n<!-- fleet-switchboard:from=w1 -->", 7008, who="acme-cloud[bot]")
+        self.assertEqual(self.after(), ["github.reviewcomment:7008"])
+
+    def test_github_bot_logins_is_validated(self):
+        self.assertEqual(sb.validate_config(dict(sb.load_config(), github_bot_logins=["acme-cloud[bot]"]))["github_bot_logins"], ["acme-cloud[bot]"])
+        for bad in ("x", ["a b"], [1], ["a"] * 11):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(sb.load_config(), github_bot_logins=bad))
+
+    def test_unregistered_marker_is_delivered(self):
+        self.post(20, self.OK + "\n<!-- fleet-switchboard:from=ghost -->", 7006, who="shared")
+        self.assertEqual(self.after(), ["github.reviewcomment:7006"])
+
+    def test_orchestrator_marker_is_excluded(self):
+        self.post(20, self.OK + "\n<!-- fleet-switchboard:from=platform -->", 7007, who="shared")
+        self.assertEqual(self.after(), [])
+
+    def test_unowned_is_audited_once_even_after_a_restart(self):
+        before = self.audits("github.reviewcomment.unowned")   # the audit file may be shared between runs: count the change
+        cid = 7008
+        (Path(self.world.state) / sb.REVIEW_UNOWNED_FILE).unlink(missing_ok=True)
+        self.post(21, self.OK, cid)
+        self.assertEqual(self.after(), [])
+        self.assertEqual(self.audits("github.reviewcomment.unowned") - before, 1)
+        self.hub._unowned_seen("x")
+        fresh = sb.GitHubHub(self.world.config, self.world.state, sb.AuditLog(self.world.audit_path), self.gh.runner, self.gh.spawn, self.world.clock.now)
+        self.assertTrue(fresh._unowned_seen("github.reviewcomment:%d" % cid))
+        path = Path(self.world.state) / sb.REVIEW_UNOWNED_FILE
+        path.write_text("{not json")
+        self.assertFalse(fresh._unowned_seen("github.reviewcomment:1"))   # a corrupt file reads as empty
+        path.write_text("[" * 100000 + "]" * 100000)
+        self.assertFalse(fresh._unowned_seen("deep"))   # nested past the bound: empty, no exception
+        self.assertEqual(json.loads(path.read_text()), ["deep"])
+        self.assertTrue(fresh._unowned_seen("deep"))
+        path.write_text(json.dumps(["k%d" % i for i in range(sb.REVIEW_UNOWNED_CAP + 5)]))
+        fresh._unowned_seen("new")
+        self.assertLessEqual(len(json.loads(path.read_text())), sb.REVIEW_UNOWNED_CAP)
+
+    def audits(self, name):
+        path = Path(self.world.audit_path)
+        return sum(1 for line in path.read_text().splitlines() if name in line) if path.exists() else 0
+
+    def test_catch_up_only_delivers_once(self):
+        self.rig.pump(60)   # the first catch-up of a fresh state only sets the read marker: the comment must come after it
+        self.post(20, self.OK, 7010, forward=False)
+        self.gh.kill_forwarder()   # the hub restarts the forwarder and catches up what it missed
+        self.assertEqual(self.after(), ["github.reviewcomment:7010"])
+
+    def test_catch_up_unknown_pr_state_delivers_and_closed_pr_drops(self):
+        self.post(20, self.OK, 7011, forward=False)
+        items, _ = self.hub.catch_up_items(GH_REPO, self.world.clock.now(), since_epoch=self.world.clock.now() - 600)
+        self.assertIn("github.reviewcomment:7011", [i.key for i in items if i])
+        self.gh.pulls[20]["state"] = "closed"
+        items, _ = self.hub.catch_up_items(GH_REPO, self.world.clock.now(), since_epoch=self.world.clock.now() - 600)
+        self.assertNotIn("github.reviewcomment:7011", [i.key for i in items if i])
+
+    def test_webhook_then_catch_up_and_catch_up_then_webhook_are_one(self):
+        self.post(20, self.OK, 7012)
+        self.rig.pump(15)
+        self.gh.kill_forwarder()
+        self.assertEqual(self.after(), ["github.reviewcomment:7012"])
+        self.post(20, self.OK, 7013, forward=False)
+        self.rig.pump(15)
+        self.gh.send("issue_comment", self.payload(20, self.OK, 7013, "reader"), "d-x")
+        self.assertEqual(self.after(), ["github.reviewcomment:7012", "github.reviewcomment:7013"])
+
+    def test_catch_up_makes_no_extra_gh_call_per_comment(self):
+        def count(n):
+            gh = FakeGitHub(self.world.clock)
+            gh.pull(20, closes=[12])
+            for i in range(n):
+                gh.comments.append(self.payload(20, self.OK, 8000 + i, "reader")["comment"])
+            hub = sb.GitHubHub(self.world.config, self.world.state, None, gh.runner, gh.spawn, self.world.clock.now)
+            hub.catch_up_items(GH_REPO, self.world.clock.now(), since_epoch=self.world.clock.now() - 600)
+            return len(gh.api_calls)
+        self.assertEqual(count(50), count(0))
+
+    def test_restart_keeps_the_delivered_key(self):
+        led = sb.SentLedger(self.world.state)
+        led.reserve("s1", ["github.reviewcomment:7020"], 1.0)
+        led.confirm("s1", ["github.reviewcomment:7020"], 1.0)
+        again = sb.SentLedger(self.world.state)   # a new process on the same state dir
+        self.assertFalse(again.reserve("s1", ["github.reviewcomment:7020"], 2.0))
+        self.assertIn("github.reviewcomment:7020", again.known("s1", 0))
+
+    def test_hostile_logins_are_cleaned_and_capped(self):
+        for who in ("a" * 500, "bo\x1b[31mb\nx\x00y"):
+            items = ReviewCommentLineTests.handle(self, self.OK, who=who)
+            self.assertEqual(len(items), 1)
+            self.assertNotRegex(items[0].summary, r"[\x00-\x1f]")
+            self.assertLess(len(items[0].summary), 200)
+
+    def test_every_comment_path_is_in_the_docs_table(self):
+        src = (SWITCHBOARD).read_text()
+        paths = set(re.findall(r"github\.(?:comment|reviewcomment)[:.][a-z]*", src))
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        table = docs.split("### Every path by which a GitHub comment reaches an agent")[1].split("\n## ")[0]
+        for needle in ("_wh_issue_comment", "catch-up", "github.comment:<id>", "github.reviewcomment:<id>", "github.reviewcomment.unowned", "_route"):
+            self.assertIn(needle, table)
+        for name in ("_comment_item", "_review_comment_item", "_wh_issue_comment", "_route", "_unowned_seen"):
+            self.assertIn("def " + name, src)
+            self.assertIn(name if name != "_unowned_seen" else "review-unowned.json", table)
+        self.assertTrue(paths)
 
 
 class TestTriageStandingLine(unittest.TestCase):
