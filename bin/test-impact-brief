@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""test-impact-brief: offline tests for bin/impact_brief.py (#1215 slice A: S2, S3, S4, S5, S24, S26, S27 for the brief print).
+
+Each rule has one mutant: the module's source is changed in one place and the same check must then fail.
+
+    bin/test-impact-brief
+"""
+import re
+import sys
+import types
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+SOURCE = (BIN / "impact_brief.py").read_text()
+HEAD = "a" * 40
+
+
+def load(source=SOURCE):
+    module = types.ModuleType("impact_brief_under_test")
+    exec(compile(source, "impact_brief.py", "exec"), module.__dict__)
+    return module
+
+
+def facts(path="tests/t.py", cls="tests", **over):
+    base = {"files": [{"path": path, "additions": 3, "deletions": 1, "status": "modified"}], "ci": {"state": "green", "head": HEAD},
+            "reads": [{"by": "reader-one", "verdict": "pass", "head": HEAD}], "rating": {"level": "Low"}, "mutants": "4 of 4", "blast": "low",
+            "head": HEAD, "base": "main", "classes": {path: cls}, "body_claim": None}
+    base.update(over)
+    return base
+
+
+class BriefTests(unittest.TestCase):
+    m = load()
+
+    def test_s2_tests_only_chief_of_staff(self):
+        b = self.m.build_brief(facts())
+        lines = b["text"].splitlines()
+        self.assertIn("RECOMMENDED DECIDER: Chief of Staff", lines)
+        self.assertEqual(b["decider"], "chief_of_staff")
+        self.assertLessEqual(len(lines), 24)
+        self.assertEqual(len(re.findall(r"[.!?](\s|$)", b["why"])), 1)
+        self.assertEqual(b["material"], [])
+
+    def test_s3_credentials_owner(self):
+        b = self.m.build_brief(facts("bin/cred.py", "credentials"))
+        self.assertIn("RECOMMENDED DECIDER: owner", b["text"])
+        self.assertIn("credentials or issuance widened", b["text"])
+        self.assertEqual(b["material"], ["credentials_widened"])
+        self.assertEqual(b["loosening"], ["bin/cred.py"])
+
+    def test_s4_unreadable_pieces_not_shown(self):
+        for key in ("ci", "reads", "files", "mutants", "blast", "rating"):
+            soft = key in ("mutants", "blast", "rating")   # a change of tests only is not blocked by these three (they still print "not shown"); a change of code is
+            b = self.m.build_brief(facts("bin/x.py", "code", **{key: None}) if soft else facts(**{key: None}))
+            self.assertEqual(b["decider"], "owner", key)
+            self.assertIn("not shown", b["text"], key)
+        b = self.m.build_brief(facts(ci=None))
+        self.assertEqual(b["pieces"]["ci"], "not shown")
+        self.assertNotIn("green", b["text"])
+
+    def test_s4_ci_of_another_head_not_shown(self):
+        b = self.m.build_brief(facts(ci={"state": "green", "head": "b" * 40}))
+        self.assertEqual(b["pieces"]["ci"], "not shown")
+
+    def test_s5_body_claim_ignored(self):
+        b = self.m.build_brief(facts("bin/cred.py", "credentials", body_claim="tests only"))
+        self.assertEqual(b["decider"], "owner")
+        self.assertIn('CAN DO: "bin/cred.py"', b["text"])
+        self.assertNotIn("tests only", b["text"])
+        self.assertEqual(self.m.build_brief(facts(body_claim="credentials"))["decider"], "chief_of_staff")
+
+    def test_s24_unknown_class_owner(self):
+        b = self.m.build_brief(facts("x/y.dat", "mystery"))
+        self.assertEqual(b["decider"], "owner")
+        self.assertEqual(b["pieces"]["classes"], "not shown")
+
+    def test_s26_deterministic_one_screen(self):
+        many = facts()
+        many["files"] = [{"path": "tests/%s/%s.py" % ("d" * 80, i), "additions": 1, "deletions": 0, "status": "added"} for i in range(40)]
+        many["classes"] = {f["path"]: "tests" for f in many["files"]}
+        one, two = self.m.build_brief(many), self.m.build_brief(dict(many, files=list(reversed(many["files"]))))
+        self.assertEqual(one["text"], two["text"])
+        self.assertEqual(one["digest"], two["digest"])
+        self.assertLessEqual(len(one["text"].splitlines()), 24)
+        self.assertTrue(all(len(l) <= 100 for l in one["text"].splitlines()))
+        self.assertEqual(self.m.render_brief(one), one["text"])
+
+    def test_s27_substance_not_label(self):
+        a = self.m.build_brief(facts("tests/t.py", "tests", rating={"level": "High"}))      # a risky label, no risk in the diff
+        b = self.m.build_brief(facts("bin/cred.py", "credentials", rating={"level": "Low"}))  # a Low label, credentials in the diff
+        self.assertEqual((a["decider"], b["decider"]), ("chief_of_staff", "owner"))
+
+    def test_deletion_only_on_sensitive_path_is_tightening(self):
+        # PC-9(a): removing a refusal IS the loosening: a deletion-only change to a sensitive path is material, the owner's
+        f = facts("bin/cred.py", "credentials")
+        f["files"][0].update(additions=0, deletions=5)
+        b = self.m.build_brief(f)
+        self.assertEqual((b["decider"], b["material"]), ("owner", ["credentials_widened"]))
+        f["files"][0].update(additions=0, deletions=0)   # a change that adds and removes nothing (a mode change) is still tightening only
+        self.assertEqual(self.m.build_brief(f)["decider"], "chief_of_staff")
+
+    def test_owner_only_class(self):
+        f = facts("bin/shim", "merge_shim")
+        f["files"][0].update(additions=0, deletions=0)   # nothing added or removed: only the class makes it the owner's
+        self.assertEqual(self.m.build_brief(f)["decider"], "owner")
+
+    def test_floor_decision_report_unchanged_shape(self):
+        b = self.m.build_brief(facts())
+        self.assertEqual(sorted(b), ["blocking_gaps", "decider", "digest", "head", "loosening", "material", "pieces", "text", "why"])
+        self.assertEqual(tuple(b["pieces"]), self.m.PIECE_NAMES)
+        self.assertEqual(len(b["digest"]), 64)
+
+    def test_tables_complete(self):
+        """Every material name is mapped, every mapped risk is on the fixed list, every class in a table is known, and each risk class escalates."""
+        m = self.m
+        self.assertEqual(set(m.MATERIAL_WORDS), set(m.MATERIAL))
+        self.assertTrue(set(m.CLASS_RISK.values()) <= set(m.MATERIAL))
+        for cls, risk in m.CLASS_RISK.items():
+            self.assertIn(cls, m.KNOWN_CLASSES)
+            self.assertEqual(m.build_brief(facts("p/x", cls))["material"], [risk], cls)
+        for cls in m.OWNER_ONLY_CLASSES:
+            self.assertEqual(m.build_brief(facts("p/x", cls))["decider"], "owner", cls)
+        for cls in list(m.CLASS_GROUND) + list(m.PLAIN_CLASSES):
+            self.assertEqual(m.build_brief(facts("p/x", cls))["decider"], "chief_of_staff", cls)
+        self.assertEqual(set(m.build_brief(facts())["pieces"]), set(m.PIECE_NAMES))
+
+    def test_classify(self):
+        m = self.m
+        self.assertEqual(m.classify("bin/a.py", {"credentials": ["bin/a.py"]}), "credentials")
+        self.assertEqual(m.classify("tests/a.py", {}), "tests")
+        self.assertEqual(m.classify("docs/a.txt", {}), "docs")
+        self.assertEqual(m.classify("bin/a.py", {}), "code")
+
+
+class MutantTests(unittest.TestCase):
+    """One mutant per rule: the source is changed in one place; the named check must then fail."""
+
+    def mutant(self, old, new):
+        self.assertIn(old, SOURCE)
+        return load(SOURCE.replace(old, new, 1))
+
+    def fails(self, old, new, *tests):
+        m = self.mutant(old, new)
+        for name in tests:
+            case = BriefTests(name)
+            case.m = m
+            result = unittest.TestResult()
+            case.run(result)
+            self.assertFalse(result.wasSuccessful(), "mutant survived %s: %s -> %s" % (name, old, new))
+
+    def test_always_owner(self):
+        self.fails('decider, why = "chief_of_staff", "%s, with every piece shown" % ground', 'decider, why = "owner", "%s, with every piece shown" % ground', "test_s2_tests_only_chief_of_staff")
+
+    def test_class_only_credentials_ignored(self):
+        self.fails('"credentials": "credentials_widened", ', "", "test_s3_credentials_owner")
+
+    def test_fill_ci(self):
+        self.fails('return NOT_SHOWN   # a CI result of another head', 'return "green"   # a CI result of another head', "test_s4_unreadable_pieces_not_shown", "test_s4_ci_of_another_head_not_shown")
+
+    def test_ignore_head_of_ci(self):
+        self.fails(' or ci.get("head") != facts.get("head")', "", "test_s4_ci_of_another_head_not_shown")
+
+    def test_trust_body(self):
+        self.fails('    material = [m for m in MATERIAL if m in material]', '    material = [m for m in MATERIAL if m in material and "tests only" != facts.get("body_claim")]', "test_s5_body_claim_ignored")
+
+    def test_unknown_class_as_plain(self):
+        self.fails('out[f["path"]] = cls if cls in KNOWN_CLASSES else None', 'out[f["path"]] = cls', "test_s24_unknown_class_owner")
+
+    def test_missing_piece_fine(self):
+        self.fails("    elif gaps:", "    elif False:", "test_s4_unreadable_pieces_not_shown", "test_s24_unknown_class_owner")
+
+    def test_no_truncation(self):
+        self.fails('text = "\\n".join(_cut(l) for l in lines[:MAX_LINES]) + "\\n"', 'text = "\\n".join(lines) + "\\n"', "test_s26_deterministic_one_screen")
+
+    def test_additions_ignored(self):
+        self.fails('cls in CLASS_RISK and (f["additions"] is None or', 'cls in CLASS_RISK and False and (f["additions"] is None or', "test_s3_credentials_owner")
+
+    def test_owner_only_ignored(self):
+        self.fails("            if cls in OWNER_ONLY_CLASSES:", "            if False:", "test_owner_only_class")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

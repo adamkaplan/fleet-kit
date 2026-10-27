@@ -39064,6 +39064,9 @@ for _name in list(vars(TestImpactRejudge)):   # the subclass reuses the harness,
         setattr(TestImpactReleaseEveryPass, _name, None)
 
 
+REAL_FLOOR_BRIEF = sb.floor_brief   # #1215 PC-9: the real function, for the tests that must not run on the fixture brief
+
+
 class TestImpactHold(LedgerBase):
     """#179 slice L4: the switchboard WRITES the hold (two labels), only when `impact_hold.enabled`, only for repos under `plan_gates`, head-bound
     owner clear, kill switches, idempotent, bounded. A fake gh records every write."""
@@ -39271,7 +39274,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(self.writes, [])
         self.assertEqual(self.events("gate.hold_reapplied"), [])
 
-    HELD_BODY = ("PLAN: acme/app#7\nMERGE: captain\ncanon: n/a internal rule\n\n## Why this needs you\nThis changes the hold rule, so it holds for you.\n\n"
+    HELD_BODY = ("PLAN: acme/app#7\nMERGE: captain\ncanon: n/a internal rule\nRationale: The order of 23 October says the owner decides only what might matter.\n\n## Why this needs you\nThis changes the hold rule, so it holds for you.\n\n"
                  "## What changes for you\n| Before | After |\n|---|---|\n| the hold lapsed at a new head | the hold stands at a new head |\n| a clear stood anywhere | a clear stands for its head |\n\n"
                  "## Example\nYou clear head one; a new commit lands; the labels come back.\n\n## Questions for you\n1. Is this wanted? Recommendation: yes.\n")
 
@@ -39698,14 +39701,26 @@ class TestImpactHold(LedgerBase):
         patcher = mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: (lambda path: (listing if "page=1" in path else []) if "/files" in path else {"merge_base_commit": {"sha": "m" * 40}} if "/compare/" in path else {"head": {"sha": self.pr["headRefOid"]}, "base": {"sha": "b" * 40}, "changed_files": len(listing)}))
         patcher.start()
         self.addCleanup(patcher.stop)
+        brief_patch = mock.patch.object(sb, "floor_brief", lambda engine, repo, report, files: dict(self.FIXTURE_BRIEF))
+        brief_patch.start()
+        self.addCleanup(brief_patch.stop)
 
     TWIN = True
     twin_runs = None
 
-    def under(self, who="cos", order=17, reason="the review confirms nothing touches credentials nor identity"):
+    def brief_of(self, *material):
+        brief = dict(self.FIXTURE_BRIEF, material=list(material), decider="owner" if material else "chief_of_staff", text="IMPACT BRIEF (fixture)\nRECOMMENDED DECIDER: owner")
+        brief["digest"] = hashlib.sha256(brief["text"].encode()).hexdigest()
+        return brief
+
+    def under(self, who="cos", order=17, reason="the review confirms nothing touches credentials nor identity", brief=None):
         if self.twin_runs and reason in ("the review confirms nothing touches credentials nor identity", "the review is clean and the change is a note"):   # #972: the judgement names the runs of the fixture
             reason += ": %s" % ", ".join("#%d=%s" % (seq, level) for seq, _, level in self.twin_runs)
-        return self.run_as(who, "impact", "clear", self.PR, "--under-order", str(order), "--reason", reason)
+        return self.run_as(who, "impact", "clear", self.PR, "--under-order", str(order), "--reason", reason, "--brief-digest", (brief or self.FIXTURE_BRIEF)["digest"], "--brief-text", (brief or self.FIXTURE_BRIEF)["text"])
+
+    FIXTURE_BRIEF = {"text": "IMPACT BRIEF (fixture)\nRECOMMENDED DECIDER: Chief of Staff", "decider": "chief_of_staff", "material": [], "loosening": [], "why": "fixture.",
+                     "pieces": {"files": "1 file(s)", "classes": "code=1", "ci": "green at aaaaaaaa", "reads": "2 independent reads at head (a, b)", "rating": "Low", "mutants": "4 of 4", "blast": "low"}}   # #1215 slice C: the floor's brief at the head (slice A's module is not here)
+    FIXTURE_BRIEF["digest"] = hashlib.sha256(FIXTURE_BRIEF["text"].encode()).hexdigest()
 
     def test_s1_the_chief_of_staff_clears_under_a_listed_order_and_it_is_recorded_as_her_act_under_that_order(self):
         self.delegate()
@@ -39722,6 +39737,28 @@ class TestImpactHold(LedgerBase):
         self.assertIn("may clear held pull requests", detail["order"])
         self.assertIn("nothing touches credentials", detail["reason"])
         self.assertNotEqual(detail["by"], "owner")
+
+    def test_s10_the_audit_line_carries_the_brief_its_hash_the_decider_and_the_reasons(self):   # #1215 S10
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        code, out, err = self.under()
+        self.assertEqual(code, 0, err)
+        (cleared,) = self.events("gate.hold_cleared")
+        detail = cleared["detail"]
+        self.assertEqual((detail["brief_text"], detail["brief_digest"], detail["decider"]), (self.FIXTURE_BRIEF["text"], self.FIXTURE_BRIEF["digest"], "chief_of_staff"))
+        self.assertIn("nothing touches credentials", detail["reasons"])
+
+    def test_s11_s12_a_clear_with_no_brief_or_a_stale_brief_is_refused_and_nothing_is_written(self):   # #1215 S11, S12
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        code, out, err = self.run_as("cos", "impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity")
+        self.assertEqual(code, 2)
+        self.assertIn("no brief", err)
+        stale = self.brief_of()
+        stale["text"], stale["digest"] = "IMPACT BRIEF (an older head)", hashlib.sha256(b"IMPACT BRIEF (an older head)").hexdigest()
+        code, out, err = self.under(brief=stale)
+        self.assertEqual(code, 2)
+        self.assertIn("differs", err)
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
+        self.assertEqual(self.events("gate.hold_cleared"), [])
 
     def test_the_modules_the_clear_loads_or_runs_are_all_judged_and_the_list_is_derived_from_what_runs(self):
         import sys, os, ast
@@ -39885,11 +39922,15 @@ class TestImpactHold(LedgerBase):
             self.files_of_pr(*paths)
             self.passes()
             self.review = (review or ("none", None), None)
-            code, out, err = self.under()
-            self.assertEqual(code, 2, label)
-            self.assertIn("stays the owner's own clear", err, label)
-            self.assertIn(paths[0] if review is None else "credentials", err, label)
-            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], label)
+            if review is None:   # #1215: the ceiling is the brief; a brief that names the credentials widened is the owner's whatever the class
+                with mock.patch.object(sb, "floor_brief", lambda engine, repo, report, files: self.brief_of("credentials_widened")):
+                    code, out, err = self.under(brief=self.brief_of("credentials_widened"))
+                self.assertEqual(code, 2, label)
+                self.assertIn("escalate to the owner", err, label)
+                self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], label)
+            else:   # a review class no longer is a ceiling: the brief decides (it names no material risk here)
+                code, out, err = self.under()
+                self.assertEqual(code, 0, label)
 
     def test_an_independent_review_class_that_is_authority_is_refused_even_when_the_paths_are_only_authority(self):
         self.delegate()
@@ -39898,12 +39939,101 @@ class TestImpactHold(LedgerBase):
         for review in (("hold", "authority"), ("hold", "identity"), ("hold", None)):
             self.review = (review, None)
             code, out, err = self.under()
-            self.assertEqual(code, 2, review)
-            self.assertIn("independent review", err, review)
+            self.assertEqual(code, 0, review)   # #1215: a review class is not a ceiling any more; the brief is
+            self.writes.clear()
         self.review = (None, None)   # no review recorded at this head: unknown is refused
         code, out, err = self.under()
-        self.assertEqual(code, 2)
-        self.assertIn("no independent review is recorded", err)
+        self.assertEqual(code, 0)   # #1215: no review class is no ceiling either: the brief decides
+        self.assertEqual(len([w for w in self.writes if w[0] == "DELETE"]), 1)
+
+    # ---- #1215 PC-9 (d): REAL-PATH assertions. These run the real floor (no mocked brief): the brief is built by `pr_floor_report` from the diff the fake gh lists.
+    def real_floor(self, path, additions=3, deletions=1, review=("none", None), change="MODIFIED", extra_files=(), ci="SUCCESS"):
+        self.delegate()
+        self.floor_pr(path=path)
+        self.files_of_pr(path)
+        self.pr["files"] = [{"path": path, "additions": additions, "deletions": deletions, "changeType": change}] + list(extra_files)
+        self.pr["changedFiles"] = len(self.pr["files"])
+        self.pr["statusCheckRollup"] = [{"name": "ci", "status": "COMPLETED", "conclusion": ci}]
+        self.passes()
+        self.review = (review, None)
+        with mock.patch.object(sb, "floor_brief", REAL_FLOOR_BRIEF):
+            report = sb.pr_floor_report(self.engine_cached, "acme/app", 9)
+        return report
+
+    def real_clear(self, path, **kw):
+        """(code, out, err, brief) of the CoS's clear over the REAL floor brief of that change."""
+        report = self.real_floor(path, **kw)
+        with mock.patch.object(sb, "floor_brief", REAL_FLOOR_BRIEF):
+            code, out, err = self.under(brief=report["brief"])
+        return code, out, err, report["brief"]
+
+    def test_real_path_a_credentials_path_and_an_identity_path_are_refused_by_the_real_brief(self):   # U4: the reworked test_s3 assertion, on the real floor
+        for path in ("shims/gh", "bin/switchboard-trial", "cloud/launcher/token_mint.py"):
+            self.writes.clear()
+            code, out, err, brief = self.real_clear(path)
+            self.assertEqual(code, 2, (path, err))
+            self.assertEqual(brief["decider"], "owner", path)
+            self.assertIn("escalate to the owner", err, path)
+            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], path)
+
+    def test_real_path_review_classes_authority_identity_and_none_on_an_authority_path_are_refused_by_the_real_brief(self):   # U4
+        for review in (("hold", "authority"), ("hold", "identity"), ("hold", None), (None, None)):
+            self.writes.clear()
+            code, out, err, brief = self.real_clear("bin/reassign.py", review=review)
+            self.assertEqual(code, 2, (review, err))
+            self.assertIn("escalate to the owner", err, review)
+            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], review)
+
+    def test_real_path_the_daemon_file_and_the_chat_clear_are_refused_by_the_real_brief(self):   # U4
+        for path in ("bin/fleet-switchboard", "bin/chat_clear.py"):
+            self.writes.clear()
+            code, out, err, brief = self.real_clear(path)
+            self.assertEqual(code, 2, (path, err))
+            self.assertEqual(brief["decider"], "owner", path)
+            self.assertIn("escalate to the owner", err, path)
+            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], path)
+
+    def test_real_path_every_machinery_glob_is_refused_by_the_real_brief(self):   # U4: the reworked machinery-glob loop (it accepted code 0)
+        paths = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]["clear_code_paths"]
+        for glob in paths:
+            path = glob.replace("**", "x.txt").replace("*", "x") if "*" in glob else glob
+            with self.subTest(path=path):
+                self.writes.clear()
+                code, out, err, brief = self.real_clear(path)
+                self.assertEqual(code, 2, (path, err))
+                self.assertEqual(brief["decider"], "owner", path)
+                self.assertEqual(self.deletes(), [])
+                self.ledger_reset()
+
+    def test_s31_the_real_floor_gives_the_chief_of_staff_a_tests_only_change_and_the_owner_a_credentials_change(self):
+        tests_only = self.real_floor("tests/test_x.py", review=("none", None))["brief"]
+        self.assertEqual((tests_only["decider"], tests_only["material"]), ("chief_of_staff", []), tests_only["text"])
+        self.assertIn("CI: green at", tests_only["text"])
+        self.assertEqual(self.real_floor("cloud/launcher/token_mint.py")["brief"]["decider"], "owner")
+        no_ci = self.real_floor("tests/test_x.py", ci="FAILURE")["brief"]
+        self.assertEqual(no_ci["pieces"]["ci"], "red at %s" % LEDGER_HEAD[:8])
+
+    def test_s30_the_clear_machinerys_own_files_are_owner_only_and_their_hold_label_is_kept(self):
+        for path in ("bin/impact_brief.py", "bin/brief_advisory.py", "bin/fleet-switchboard"):
+            with self.subTest(path=path):
+                report = self.real_floor(path, additions=50, deletions=50)
+                brief = report["brief"]
+                self.assertIn("clear_machinery", brief["pieces"]["classes"], path)
+                self.assertEqual((brief["decider"], bool(brief["material"])), ("owner", True), path)
+                if path != "bin/fleet-switchboard":   # the daemon file is not a held path by name (the matrix note): its class and decider are what is read above
+                    self.assertEqual(report["owner_decision"], "hold", path)
+                if report["owner_decision"] == "hold":
+                    what, labels = sb.impact_plan(self.engine_cached, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+                    self.assertIn(what, ("add", "held"), path)
+
+    def test_s32_a_forged_digest_and_text_that_match_each_other_but_not_the_floors_are_refused(self):
+        report = self.real_floor("cloud/launcher/token_mint.py")
+        forged = "IMPACT BRIEF forged\nRECOMMENDED DECIDER: Chief of Staff\n"
+        with mock.patch.object(sb, "floor_brief", REAL_FLOOR_BRIEF):
+            code, out, err = self.under(brief={"digest": hashlib.sha256(forged.encode()).hexdigest(), "text": forged})
+        self.assertEqual(code, 2, err)
+        self.assertIn("differs", err)
+        self.assertEqual(self.events("gate.hold_cleared"), [])
         self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
 
     def test_s4_the_clear_and_hold_machinery_files_and_a_change_to_the_clear_closure_are_refused_other_bin_edits_pass(self):
@@ -39919,7 +40049,7 @@ class TestImpactHold(LedgerBase):
         self.files_of_pr("bin/fleet-switchboard", mapped=["it changes cmd_impact_clear, part of the clear (base file)"])
         code, out, err = self.under()
         self.assertEqual(code, 2)
-        self.assertIn("part of the clear", err, "the daemon file: a changed line in the clear closure")
+        self.assertIn("2 required", err, "the daemon file: a changed line in the clear closure needs the two reads (#1215)")
         self.files_of_pr("bin/fleet-switchboard", mapped=None)
         self.mapped = None
         code, out, err = self.under()
@@ -40007,9 +40137,12 @@ class TestImpactHold(LedgerBase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.passes()
+        brief_patch = mock.patch.object(sb, "floor_brief", lambda engine, repo, report, files: dict(self.FIXTURE_BRIEF))
+        brief_patch.start()
+        self.addCleanup(brief_patch.stop)
         code, out, err = self.under()
         self.assertEqual(code, 2)
-        self.assertIn("bin/chat_clear.py", err)
+        self.assertIn("2 required", err)   # #1215: a clear-code path (here by its source name) needs the two independent reads
 
     def floor_matchers(self):
         return sb.impact_floor.matches, {}
@@ -40721,12 +40854,13 @@ class TestImpactHold(LedgerBase):
         for glob in paths:
             path = glob.replace("**", "x.txt").replace("*", "x") if "*" in glob else glob
             with self.subTest(path=path):
+                self.writes.clear()
                 self.score_config("Serious")
                 self.scored_pr(path)
                 self.rate(*self.cell_of("Low"), reason=" ".join(self.block()["floor"]["rules"]))
                 code, out, err = self.under()
-                self.assertEqual(code, 2)
-                self.assertIn("clear or hold machinery", err)
+                self.assertEqual(code, 2, err)   # #1215: every machinery path is refused: by the owner-only class of the real path list (the brief's decider), the rating floor or the clear-code list
+                self.assertTrue("clear or hold machinery" in err or "below the floor" in err or "escalate to the owner" in err, err)
                 self.assertEqual(self.deletes(), [])
                 self.ledger_reset()
 
@@ -51966,7 +52100,7 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
 class TestHeldTop(DecisionsBase):
     """#604: a PR held for the owner opens with why, what changes (a Before | After table), an example and its questions; one check (held_defects)
     serves pr-explain --check and gate G6b. A Mermaid block in the top part fails; below it, nothing is judged."""
-    OPEN = "MERGE: captain\nPLAN: https://example.test/acme/api/issues/9\n\n"
+    OPEN = "MERGE: captain\nPLAN: https://example.test/acme/api/issues/9\nRationale: The order of 23 October says the owner decides only what might matter.\n\n"
     WHY = "## Why this needs you\n\nIt changes a credential path. The owner decides if it ships.\n\n"
     TABLE = ("## What changes for you\n\n| Before | After |\n|---|---|\n| You get two cards. | You get one card. |\n"
              "| You open a list. | The list opens itself. |\n| You retry by hand. | It retries once. |\n\n")
@@ -52788,9 +52922,9 @@ class TestPrExplainer(DecisionsBase):
         self.pr["body"] = sb.explainer_insert("x", block)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
         self.assertEqual(code, 1, out)   # a held (captain) PR also needs why, its table, an example and its questions (TestHeldTop)
-        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block)
+        self.pr["body"] = sb.explainer_insert("Rationale: The order of 23 October says the owner decides only what might matter.\n\n" + TestHeldTop.TOP + "## For reviewers\n", block)
         self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
-        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block) + "\n" + self.DATAFLOW
+        self.pr["body"] = sb.explainer_insert("Rationale: The order of 23 October says the owner decides only what might matter.\n\n" + TestHeldTop.TOP + "## For reviewers\n", block) + "\n" + self.DATAFLOW
         self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0, "a data-flow diagram below the top is allowed")
 
     def test_check_accepts_a_body_without_a_diagram_and_one_with_a_data_flow_diagram_and_fails_the_summary_flowchart_anywhere(self):
@@ -69929,7 +70063,7 @@ class TestSlice3Modules(Base):
     def test_s1_every_loader_is_generated_and_returns_the_module_load_module_returns(self):
         tree = ast.parse(switchboard_source())
         defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-        self.assertEqual(len(sb.HELPER_MODULES), 22)
+        self.assertEqual(len(sb.HELPER_MODULES), 23)
         self.assertEqual(defined & set(sb.HELPER_MODULES), set(), "0 of the loaders has a def of its own")
         for function, module in sb.HELPER_MODULES.items():
             with self.subTest(function=function):
@@ -76824,7 +76958,7 @@ class FakePullFiles:
     def view(self):
         """what `gh pr view --json files,...` says: at most 100 files, a rename without its source"""
         shown = [{"path": f["filename"] if isinstance(f, dict) else "x", "additions": 1, "deletions": 1, "changeType": f["status"].upper() if isinstance(f, dict) else "MODIFIED"} for f in self.files[:100]]
-        return {"headRefOid": self.HEAD, "baseRefOid": "b" * 40, "changedFiles": self.count, "files": shown}
+        return dict({"headRefOid": self.HEAD, "baseRefOid": "b" * 40, "changedFiles": self.count, "files": shown}, **({"statusCheckRollup": self.rollup} if getattr(self, "rollup", None) else {}))   # `rollup` is set only by a clear that must show CI to its brief (#1215)
 
     def fault(self, key):
         queue = self.faults.get(key) or []
@@ -77352,13 +77486,13 @@ class TestPullFileListRead(LedgerBase):
             def runner(argv, **kw):
                 return subprocess.CompletedProcess(argv, 1, "", "gh: " + LONG) if "DELETE" in argv else inner(argv, **kw)
             self.runner = self.engine.gh_runner = runner
-            return self.run_clear()
+            return self.run_clear(with_brief=True)
 
         def state_aside():
             self.serve(FakePullFiles.make(38))
             (self.world.state / sb.IMPACT_STATE_FILE).write_text("{not json")
             with mock.patch.object(os, "rename", side_effect=OSError(13, LONG)):
-                return self.run_clear()
+                return self.run_clear(with_brief=True)
         w = 'load_module("delegated_clear").whole_line(str(err))'
         return {
             "the floor or its rule cannot be read": (view_fails, ("hold", 'its rule cannot be read (%s): refused" % module.whole_line(str(err))', 'its rule cannot be read (%s): refused" % _one_line(str(err), 140)'), "audit"),
@@ -77701,7 +77835,7 @@ class TestPullFileListRead(LedgerBase):
 
     # ---- (4) the same line reaches the audit
 
-    def run_clear(self, entry_extra=None, orders=None):
+    def run_clear(self, entry_extra=None, orders=None, with_brief=False):
         self.extra_config["delegated_clear"] = {"orders": [dict({"number": 17, "sha256": sb.load_module("delegated_clear").order_hash("order text")}, **(entry_extra or {}))], "charter": 40}
         self.configure()
         if "cos" not in self.world.sessions:
@@ -77711,8 +77845,13 @@ class TestPullFileListRead(LedgerBase):
             patcher.start()
             self.addCleanup(patcher.stop)
         os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        flags = []
+        if with_brief:   # #1215: a Chief of Staff clear carries the brief the REAL floor builds for this pull request (setup only)
+            self.github.rollup = [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]   # the brief shows CI: a fixture with none is "not shown" and the brief then escalates
+            brief = sb.pr_floor_report(self.engine, self.REPO, 9)["brief"]
+            flags = ["--brief-digest", brief["digest"], "--brief-text", brief["text"]]
         with captured() as (out, err), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None):
-            code = sb.main(["impact", "clear", "%s#9" % self.REPO, "--under-order", "17", "--reason", "the review confirms nothing touches credentials"],
+            code = sb.main(["impact", "clear", "%s#9" % self.REPO, "--under-order", "17", "--reason", "the review confirms nothing touches credentials"] + flags,
                            runner=self.runner, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
 
@@ -84905,6 +85044,47 @@ class TestNoPaneToJudge(StandInPids, Base):
         body = section[1].split("\n## ", 1)[0]
         for phrase in ("no_pane_to_judge", "alive", "unknown", "cloud:<agent name>"):
             self.assertIn(phrase, body)
+
+
+# ---- #1215: the test files of the impact brief are collected by THIS runner (CI runs `bin/test-switchboard`; a file no runner executes does not count)
+def _load_brief_tests(name):
+    """The test module of the impact brief, loaded by path; every TestCase it defines is named below (an explicit binding, not a write to this module's globals), and the check after them fails when one is missing."""
+    sys.path.insert(0, str(REPO))   # `tests.*` and the bin modules they import
+    sys.path.insert(0, str(BIN))
+    if name == "test-impact-brief":
+        loader = importlib.machinery.SourceFileLoader("brief_test_impact_brief", str(BIN / name))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+    else:
+        spec = importlib.util.spec_from_file_location("brief_" + name, REPO / "tests" / (name + ".py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    return module
+
+
+_brief_modules = {name: _load_brief_tests(name) for name in ("test_substance_decider", "test_brief_clear", "test_brief_advisory", "test_brief_integration", "test_brief_fix", "test_brief_order", "test-impact-brief")}
+Brief_test_substance_decider_Decider = _brief_modules["test_substance_decider"].Decider
+Brief_test_brief_clear_TestBriefBoundClear, Brief_test_brief_clear_TestMutants = _brief_modules["test_brief_clear"].TestBriefBoundClear, _brief_modules["test_brief_clear"].TestMutants
+Brief_test_brief_advisory_TestAdvisoryAndRows, Brief_test_brief_advisory_TestDocsAndHygiene, Brief_test_brief_advisory_TestG6bRationale = (
+    _brief_modules["test_brief_advisory"].TestAdvisoryAndRows, _brief_modules["test_brief_advisory"].TestDocsAndHygiene, _brief_modules["test_brief_advisory"].TestG6bRationale)
+Brief_test_brief_integration_TestDocsAndNames, Brief_test_brief_integration_TestMutants, Brief_test_brief_integration_TestRealBriefToDecider, Brief_test_brief_integration_TestTablesDerivedFromTheCode = (
+    _brief_modules["test_brief_integration"].TestDocsAndNames, _brief_modules["test_brief_integration"].TestMutants, _brief_modules["test_brief_integration"].TestRealBriefToDecider,
+    _brief_modules["test_brief_integration"].TestTablesDerivedFromTheCode)
+Brief_test_brief_fix_TestClassifyRoots, Brief_test_brief_fix_TestDeletionsAndClasses, Brief_test_brief_fix_TestDocs, Brief_test_brief_fix_TestMutants, Brief_test_brief_fix_TestTablesDerivedFromTheCode = (
+    _brief_modules["test_brief_fix"].TestClassifyRoots, _brief_modules["test_brief_fix"].TestDeletionsAndClasses, _brief_modules["test_brief_fix"].TestDocs,
+    _brief_modules["test_brief_fix"].TestMutants, _brief_modules["test_brief_fix"].TestTablesDerivedFromTheCode)
+Brief_test_brief_order_TestRefusalOrder = _brief_modules["test_brief_order"].TestRefusalOrder
+Brief_impact_brief_BriefTests, Brief_impact_brief_MutantTests = _brief_modules["test-impact-brief"].BriefTests, _brief_modules["test-impact-brief"].MutantTests
+for _name, _module in _brief_modules.items():   # a TestCase added to one of these files and not bound above would silently drop out of CI
+    _held = {v for k, v in globals().items() if k.startswith("Brief_")}
+    _defined = {v for v in vars(_module).values() if isinstance(v, type) and issubclass(v, unittest.TestCase) and v.__module__ == _module.__name__}
+    assert _defined <= _held, "%s: a TestCase is not bound in bin/test-switchboard: %s" % (_name, sorted(c.__name__ for c in _defined - _held))
+
+class TestEveryBriefTestFileIsBound(unittest.TestCase):
+    def test_every_tests_test_brief_file_on_disk_is_bound_by_this_runner(self):
+        on_disk = {p.stem for p in (REPO / "tests").glob("test_brief_*.py")}
+        self.assertEqual(on_disk - set(_brief_modules), set(), "a tests/test_brief_*.py file no runner executes")
 
 
 class TestArchTools(unittest.TestCase):
