@@ -345,7 +345,7 @@ class Mutants(unittest.TestCase):
         self.fails("    name: ${{ matrix.cloud }}\n", "    name: ${{ matrix.name }}\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
 
     def test_s1_launcher_limit_changed(self):
-        self.fails("timeout-minutes: %s" % LAUNCHER_TIMEOUT, "timeout-minutes: 20", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+        self.fails("timeout-minutes: %s" % LAUNCHER_TIMEOUT, "timeout-minutes: 25", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
 
     def test_s7_old_job_given_a_name(self):
         self.fails("    name: ${{ matrix.name }}\n", "    name: unit\n", "test_s7_the_old_job_keeps_its_id_and_check_names")
