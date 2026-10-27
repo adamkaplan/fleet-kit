@@ -29760,7 +29760,7 @@ class TestRedCi(Base):
 
     def feed(self, *runs):
         self.world.tick(1)
-        sb.red_ci_runs(self.engine, self.REPO, list(runs), self.world.clock.now())
+        sb.red_ci_runs(self.engine, self.REPO, list(runs), self.world.clock.now(), lambda n: self.prs.get(n))
 
     prs = {}   # the present record of each pull request; a missing number is an unreadable one
 
@@ -29793,6 +29793,7 @@ class TestRedCi(Base):
         for conclusion, status in (("cancelled", "completed"), ("skipped", "completed"), ("neutral", "completed"), (None, "in_progress")):
             self.feed(self.run_rec(conclusion, "h9", status=status))
         self.feed(self.run_rec("failure", "h9", name="lint"))       # not required
+        self.present(55, "h9")
         self.feed(self.run_rec("failure", "h9", pr=55))             # no worker owns #55: only the Chief of Staff, once
         self.assertEqual(self.lines("orch"), [])
         self.assertEqual(len(self.lines("cos")), 1)
@@ -29997,10 +29998,11 @@ class TestRedCi(Base):
             self.assertRegex(doc, r"`%s`[^\n]*\b%s\b" % (word, {"red": "red", "green": "green", "none": "(silent|none)"}[action]), word)
         self.assertEqual({w for w, a in module.COLOUR.items() if a == "red"}, {"failure", "timed_out", "startup_failure"})
 
-    def test_unowned_note_is_new_for_a_rerun(self):
+    def test_unowned_note_is_not_new_for_a_rerun(self):   # #1378: the key is (PR, head, check), never the run id or the attempt
+        self.present(55, "h9")
         self.feed(self.run_rec("failure", "h9", pr=55, rid=201))
         self.feed(self.run_rec("failure", "h9", pr=55, rid=201, attempt=2))
-        self.assertEqual(len(self.lines("cos")), 2)
+        self.assertEqual(len(self.lines("cos")), 1)
 
     def test_config_warns_on_matrix_job_names_and_validates_default_branches(self):
         err = io.StringIO()
