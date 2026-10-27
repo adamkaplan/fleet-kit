@@ -1,5 +1,5 @@
 """Ask #1308: the chain is one entry per line (S1-S7, S9, S10, S12, U1 shapes). Offline; scratch trees under the temp dir."""
-import os, shutil, subprocess, sys, tempfile, unittest
+import os, re, shutil, subprocess, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
@@ -202,11 +202,47 @@ class RealTree(unittest.TestCase):
         self.assertEqual(self.uncovered(bins, listed, exc, wf), [])
         for b in ("test-cloud-hub", "test-cloud-relay", "test-cloud-hub-relay", "test-cloud-relay-daemon"):
             self.assertIn(b, bins)
+        for b in ("test-cloud-relay", "test-cloud-hub-relay", "test-cloud-relay-daemon"):
             self.assertNotIn(b + ":own-ci-step", exc)
         # mutant: a new script in none of the three places is caught (assert the mutation applied)
         mutated = bins + ["test-cloud-zz-new"]
         self.assertEqual(len(mutated), len(bins) + 1)
         self.assertEqual(self.uncovered(mutated, listed, exc, wf), ["test-cloud-zz-new"])
+
+    @staticmethod
+    def reason_errors(exc, workflow_text):
+        """Each BIN_EXCEPTIONS reason must be true against the workflow files."""
+        out = []
+        for item in exc.split():
+            name, _, reason = item.partition(":")
+            step = re.search(r"^\s*- name: bin/%s\s*$" % re.escape(name), workflow_text, re.M) is not None
+            if reason.startswith("not-yet-chained") and step:
+                out.append(name + ": says not-yet-chained but a workflow step exists")
+            if reason.startswith("in-no-ci-step") and step:
+                out.append(name + ": says in-no-ci-step but a workflow step exists")
+            if reason.startswith("own-ci-step") and not step:
+                out.append(name + ": says own-ci-step but no workflow step names it")
+        return out
+
+    def test_exception_reasons_are_true_against_the_workflow_steps(self):
+        exc = slurp(SCRIPT).split("BIN_EXCEPTIONS=")[1].split("\n")[0].strip('"')
+        wfdir = os.path.join(ROOT, ".github", "workflows")
+        wf = "".join(slurp(os.path.join(wfdir, n)) for n in sorted(os.listdir(wfdir)) if n.endswith((".yml", ".yaml")))
+        self.assertEqual(self.reason_errors(exc, wf), [])
+        self.assertIn("own-ci-step", exc)
+        self.assertIn("in-no-ci-step", exc)
+        # mutant 1: an excepted script marked not-yet-chained while a workflow step exists
+        m1 = exc.replace("test-cloud-hub:own-ci-step", "test-cloud-hub:not-yet-chained(#1311)")
+        self.assertNotEqual(m1, exc)
+        self.assertEqual(self.reason_errors(m1, wf), ["test-cloud-hub: says not-yet-chained but a workflow step exists"])
+        # mutant 2: own-ci-step claimed for a script no workflow step names
+        m2 = exc.replace("test-cloud-relay:in-no-ci-step(#1376)", "test-cloud-relay:own-ci-step")
+        self.assertNotEqual(m2, exc)
+        self.assertEqual(self.reason_errors(m2, wf), ["test-cloud-relay: says own-ci-step but no workflow step names it"])
+        # mutant 3: the workflow step removed from the text
+        m3 = wf.replace("- name: bin/test-cloud-hub\n", "- name: removed\n")
+        self.assertNotEqual(m3, wf)
+        self.assertEqual(self.reason_errors(exc, m3), ["test-cloud-hub: says own-ci-step but no workflow step names it"])
 
     def test_s4_the_old_commands_are_each_one_entry(self):
         listed = entries()
