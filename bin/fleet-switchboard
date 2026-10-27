@@ -23149,7 +23149,7 @@ def service_herdr_env(runner, environ=None):
     Reads the service's process id from its service file and its environment with `ps eww` (the same user's process); changes nothing."""
     environ = os.environ if environ is None else environ
     try:
-        info = json.loads(v2_service_file(environ).read_text())
+        info = load_module("record_json").parse_bounded(v2_service_file(environ).read_text())   # too deeply nested reads as no variables (#1066)
         pid = int(info.get("pid"))
         done = runner(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
         text = done.stdout or ""

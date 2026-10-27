@@ -3516,6 +3516,11 @@ class TestServiceEnvironmentHoldsNoPane(StandInPids, Base):
             with self.subTest(case=label):
                 self.assertEqual(sb.service_herdr_env(runner, env), [])
 
+    def test_S17_a_service_file_nested_deeper_than_the_bound_reads_as_no_variables(self):
+        clean = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "opencode serve HERDR_PANE_ID=w1:p2", "")
+        deep = "[" * 5000 + "]" * 5000
+        self.assertEqual(sb.service_herdr_env(clean, self.service_dir(raw=deep)), [])
+
     def test_a_mutant_that_guesses_on_an_error_path_is_caught(self):
         with mock.patch.object(sb, "SERVICE_STRIP_ENV", ()):
             self.assertEqual(sb.service_herdr_env(lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "x HERDR_PANE_ID=1", ""), self.service_dir({"pid": 1})), [])
