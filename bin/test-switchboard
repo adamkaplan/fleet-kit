@@ -17626,10 +17626,11 @@ class TestHeadlessPresence(Base):
         self.assertTrue(any("finished the health check" in t for t in boss_texts), boss_texts)
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        self.world.clock.t += 3600   # idle long enough for the close of a headless worker
         code, out, err = self.run_cli("retire", "hw", "--close")
         self.assertEqual(code, 0, err)
         self.assertIn("hw is retired", out)
-        self.assertIn("nothing to close", out)
+        self.assertIn("ended the session", out)
         self.assertEqual(self.world.herdr.closed, [], "no pane was closed")
         self.assertIn("hw", sb.read_retired(self.world.state))
 
@@ -86439,7 +86440,7 @@ class TestRecordJsonReaders(unittest.TestCase):
     BIN = REPO / "bin"
     # readers of record text and the shared helpers: each must call parse_bounded (the helpers ARE the parse)
     READERS = {"agent_presence.py:read_record": "agent_presence", "switchboard/reminders.py:read_reminders": "reminders",
-               "switchboard/reminders.py:read_record_file": "reminders"}
+               "switchboard/reminders.py:read_record_file": "reminders", "registry.py:_parse": "registry", "registry.py:_old_retired": "registry"}
     HELPERS = {"record_json.py:parse_bounded", "cloud_worker.py:parse_bounded"}
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
@@ -86576,8 +86577,6 @@ reassign.py:read_overrides
 reassign.py:read_overrides_strict
 reds.py:get
 reds.py:parse_artifact
-registry.py:_old_retired
-registry.py:_parse
 registry.py:_small
 registry.py:fold_old
 repo_exclusion.py:_commands
@@ -86765,7 +86764,8 @@ work_sync.py:_read_json
 
     def test_s9_mutants_the_scan_removed_from_each_reader_are_caught(self):
         """Run by hand too: replace parse_bounded by json.loads at the reader and the deep-file tests fail."""
-        for rel, old in (("agent_presence.py", "_record_json.parse_bounded("), ("switchboard/reminders.py", 'load_module("record_json").parse_bounded(')):
+        for rel, old in (("agent_presence.py", "_record_json.parse_bounded("), ("switchboard/reminders.py", 'load_module("record_json").parse_bounded('),
+                         ("registry.py", "_record_json.parse_bounded(")):
             text = self.mutate(rel, old, "json.loads(")
             self.assertNotIn("parse_bounded", text.replace("def parse_bounded", "")) if False else None
             self.assertIn("json.loads(", text)
