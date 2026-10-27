@@ -17537,10 +17537,11 @@ class TestHeadlessPresence(Base):
         self.assertTrue(any("finished the health check" in t for t in boss_texts), boss_texts)
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        self.world.clock.t += 3600   # idle long enough for the close of a headless worker
         code, out, err = self.run_cli("retire", "hw", "--close")
         self.assertEqual(code, 0, err)
         self.assertIn("hw is retired", out)
-        self.assertIn("nothing to close", out)
+        self.assertIn("ended the session", out)
         self.assertEqual(self.world.herdr.closed, [], "no pane was closed")
         self.assertIn("hw", sb.read_retired(self.world.state))
 
