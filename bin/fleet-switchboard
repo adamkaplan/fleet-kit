@@ -20175,6 +20175,14 @@ def cmd_review(args, runner, now):
             if block_problem and verdict != "incomplete":
                 raise ReviewError("refused: %s (nothing was recorded)" % block_problem)
             listed, listed_problem = pr_changed_paths(raw)
+            if listed is None and verdict != "incomplete" and isinstance(raw.get("files"), list):   # #1098: `gh pr view` lists 100 files at most: the whole list is read through the ONE paged reader (every page up to GitHub's 3000), never judged from the first page
+                module = load_module("delegated_clear")
+                try:
+                    pages = module.read_pr_files(impact_carry_get(engine, runner, repo), repo, number)[0]
+                    raw = dict(raw, files=[{"path": f["filename"], "additions": f.get("additions"), "deletions": f.get("deletions")} for f in pages], changedFiles=len(pages), truncated=False)
+                    listed, listed_problem = pr_changed_paths(raw)
+                except module.FileListError as err:
+                    listed_problem = "%s; the paged list could not be read: %s" % (listed_problem, err)
             if verdict != "incomplete":   # fails toward refusal: a list GitHub did not give whole is never replaced by the block's own
                 if listed is None:
                     raise ReviewError("refused: %s, so the read cannot be checked (nothing was recorded)" % listed_problem)
