@@ -529,6 +529,18 @@ class TestPlanCheckFeedback(unittest.TestCase):
         self.assertIn(repr(" ".join(long_text.split())[:80]), message)
         self.assertNotIn(" ".join(long_text.split())[:81], message)
 
+    def test_a_done_when_value_with_its_label_reads_the_same_as_one_without(self):
+        for clauses in ("a single clause with no number", "(1) first part; (2) second part"):
+            body = "## Intent\nMake it work.\nDone when: " + clauses + "\n\n" + self.SCENARIOS
+            plain = sb.plan_check.check(body, clauses, clauses)
+            labelled = sb.plan_check.check(body, "Done when: " + clauses, "Done when: " + clauses)
+            mixed = sb.plan_check.check(body, "Done when: " + clauses, clauses)
+            with self.subTest(clauses=clauses):
+                for other in (labelled, mixed):
+                    self.assertEqual((other["defects"], other["scenario_hash"], other["plan_hash"], other["clauses"]),
+                                     (plain["defects"], plain["scenario_hash"], plain["plan_hash"], plain["clauses"]))
+                    self.assertNotIn("done-when-differs", [d["code"] for d in other["defects"]])
+
     def test_a_numbered_list_done_when_is_split_one_clause_per_line(self):
         self.assertEqual(sb.plan_check.clauses_of("1. first thing\n2. second thing\n3) third thing"),
                          ["first thing", "second thing", "third thing"])
