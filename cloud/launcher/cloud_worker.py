@@ -2582,9 +2582,10 @@ class Launcher:
         """What the token can reach, asked of GitHub with the token itself (a test replaces this method): the repositories it lists, each as
         {full_name, permissions}. The token goes in one header and nowhere else. Raises on any failure (the caller refuses: fail closed)."""
         import urllib.request
+        import token_mint   # the cloud programs' one opener: it never follows a redirect, so the header stays on api.github.com
         req = urllib.request.Request("https://api.github.com/installation/repositories?per_page=5",
                                      headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "User-Agent": "cw-launcher"})
-        with urllib.request.urlopen(req, timeout=SCOPE_PROBE_SECONDS) as r:
+        with token_mint.open_no_redirect(req, SCOPE_PROBE_SECONDS) as r:
             body = json.loads(r.read(1000000).decode())
         return body["repositories"]
 
