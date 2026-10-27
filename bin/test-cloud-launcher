@@ -51,53 +51,100 @@ done < "$LIST"
 if [ "$count" -eq 0 ]; then echo "NOT RUN: the chain list holds no entry"; echo "RESULT: FAIL"; exit 1; fi
 # Arguments ("$@") go only to the entries that took them in the old one-line chain; the others run without arguments.
 ARGS_ENTRIES=" test_cloud_worker.py test_cloud_stack.py test_cloud_stack_wait.py test_cw_names.py test_cloud_k1.py test_driver.py test_run_record.py test_cloud_allowlist.py test_cloud_settings.py test_cloud_preflight_wired.py "
-# The PARALLEL list ($PAR, entries also in $LIST) runs in 3 lanes beside the serial loop (#1390): each entry uses its own temporary directory, binds no fixed port, and writes to its own output file, replayed whole after the run.
+# The PARALLEL list ($PAR, entries also in $LIST) runs in 3 lanes beside the serial loop (#1390): each entry uses its own temporary directory, binds no fixed port, and writes its test output to its own file, replayed whole after the run.
+# Diagnostics (#1414): a lane prints its RUN and TIME lines to the real output AS THEY HAPPEN (every line names its entry), so a hung lane shows as a RUN line with no TIME line.
+# Every lane (and the serial entry) runs in its own process group (set -m); an interrupt or a terminate signal stops every group and exits non-zero.
+# When a serial entry fails, the script waits for the lanes to finish for at most LANE_WAIT seconds (300; the slowest entry measured is about 300), stops the rest, replays their output, and only then prints RESULT: FAIL (status 1).
+LANE_WAIT=300
 PAR=bin/test-cloud-launcher.parallel
 [ -f "$PAR" ] || PAR=/dev/null   # no parallel list: every entry runs serially
 OUT=$(mktemp -d) || exit 1
+lp0=; lp1=; lp2=; cur=   # the process-group leaders: the three lanes and the running serial entry
+stop_groups() { # stop every group that has not finished (a finished lane left its marker $OUT/lane<n>.done)
+  for l in 0 1 2; do
+    eval "p=\$lp$l"
+    [ -z "$p" ] || [ -e "$OUT/lane$l.done" ] || kill -TERM -- "-$p" 2>/dev/null
+  done
+  [ -z "$cur" ] || kill -TERM -- "-$cur" 2>/dev/null
+}
 trap 'rm -rf "$OUT"' EXIT
-run_entry() { # $1 = entry; runs it with the arguments it took in the old chain; prints its own RUN and TIME lines
+trap 'stop_groups; exit 130' INT
+trap 'stop_groups; exit 143' TERM
+set -m
+LOGF=
+run_entry() { # $1 = entry; runs it with the arguments it took in the old chain; prints its own RUN and TIME lines (and, in a lane, copies them to the entry's file: the replay stays whole)
   e=$1; shift
   case "$ARGS_ENTRIES" in *" $(basename "$e") "*) a=1 ;; *) a=0 ;; esac
-  echo "RUN $e"
+  note() { echo "$1"; [ -z "$LOGF" ] || echo "$1" >> "$LOGF"; }
+  body() {
+    case "$e" in
+      *.py) if [ $a = 1 ]; then python3 "$e" "$@"; else python3 "$e"; fi ;;
+      *) if [ $a = 1 ]; then "$e" "$@"; else "$e"; fi ;;
+    esac
+  }
+  note "RUN $e"
   t0=$(date +%s)
-  case "$e" in
-    *.py) if [ $a = 1 ]; then python3 "$e" "$@"; else python3 "$e"; fi ;;
-    *) if [ $a = 1 ]; then "$e" "$@"; else "$e"; fi ;;
-  esac || { echo "FAILED: $e"; return 1; }
-  echo "TIME $e $(( $(date +%s) - t0 ))s"
+  if [ -n "$LOGF" ]; then body "$@" >> "$LOGF" 2>&1; else body "$@"; fi || { note "FAILED: $e"; return 1; }
+  note "TIME $e $(( $(date +%s) - t0 ))s"
 }
 is_parallel() { grep -qx "$1" "$PAR"; }
 while IFS= read -r e; do
   [ -n "$e" ] || continue
   grep -qx "$e" "$LIST" || { echo "NOT RUN: parallel entry $e is not in $LIST"; echo "RESULT: FAIL"; exit 1; }
 done < "$PAR"
-lane() { # $1 = lane number: every 3rd entry of $PAR, one after the other, output in $OUT/<entry>.out, status in $OUT/<entry>.rc
+lane() { # $1 = lane number: every 3rd entry of $PAR, one after the other, test output in $OUT/<entry>.out, status in $OUT/<entry>.rc
   l=$1; shift; n=0
   while IFS= read -r e; do
     [ -n "$e" ] || continue
     n=$((n + 1))
     [ $(( (n - 1) % 3 )) = "$l" ] || continue
     f=$(printf %s "$e" | tr / _)
-    run_entry "$e" "$@" > "$OUT/$f.out" 2>&1
+    LOGF="$OUT/$f.out"
+    run_entry "$e" "$@" < /dev/null
     echo $? > "$OUT/$f.rc"
+    LOGF=
+  done < "$PAR"
+  : > "$OUT/lane$l.done"
+}
+for l in 0 1 2; do
+  lane "$l" "$@" < /dev/null &
+  eval "lp$l=\$!"
+done
+replay() { # print every parallel entry's own output, whole
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    f=$(printf %s "$e" | tr / _)
+    [ ! -f "$OUT/$f.out" ] || cat "$OUT/$f.out"
   done < "$PAR"
 }
-pids=""
-for l in 0 1 2; do lane "$l" "$@" & pids="$pids $!"; done
 ran=0
 fail=0
 while IFS= read -r e; do
   [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
   is_parallel "$e" && continue
-  run_entry "$e" "$@" || { echo "RESULT: FAIL"; kill $pids 2>/dev/null; exit 1; }
-  ran=$((ran + 1))
+  run_entry "$e" "$@" < /dev/null &
+  cur=$!
+  wait "$cur" && { cur=; ran=$((ran + 1)); continue; }
+  cur=
+  # a serial entry failed: wait (bounded) for the lanes, replay what they wrote, only then say RESULT: FAIL
+  waited=0
+  while [ "$waited" -lt "$LANE_WAIT" ]; do
+    alive=0
+    for l in 0 1 2; do [ -e "$OUT/lane$l.done" ] || alive=1; done
+    [ "$alive" = 0 ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  stop_groups
+  replay
+  echo "RESULT: FAIL"
+  exit 1
 done < "$LIST"
 wait
+replay
 while IFS= read -r e; do
   [ -n "$e" ] || continue
   f=$(printf %s "$e" | tr / _)
-  cat "$OUT/$f.out"
   [ "$(cat "$OUT/$f.rc" 2>/dev/null)" = 0 ] || { echo "RESULT: FAIL"; exit 1; }
   ran=$((ran + 1))
 done < "$PAR"
