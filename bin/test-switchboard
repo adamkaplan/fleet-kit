@@ -78867,6 +78867,27 @@ class TestClaimUnionAtLastMerge(LedgerBase):
         others[0]["state"] = "open"
         self.assertNotIn("closed without a merge", self.row(self.gates()[1], "G1")["detail"])
 
+    def test_m2_the_last_merge_is_refused_when_the_only_claimant_of_s3_was_closed_without_a_merge(self):
+        self.body("S1 S2")
+        why = self.refusal([("closed", "S3")])
+        self.assertIsNotNone(why)
+        self.assertIn("S3", why.split("do not cover")[1].split(";")[0])      # the closed sibling covers nothing
+
+    def test_m2_a_mutant_that_counts_a_closed_unmerged_sibling_as_merged_when_closed_is_none_fails_the_refusal_path(self):
+        real = sb.plan_peers
+        applied = []
+        def mutant(ctx, runner, now, closed=None):
+            if closed is not None:
+                return real(ctx, runner, now, closed)
+            seen = []
+            peers = real(ctx, runner, now, seen)
+            applied.append(len(seen))
+            return peers + [("merged", body) for _, body in seen]      # the closed-unmerged claimant covers its scenarios
+        with mock.patch.object(sb, "plan_peers", mutant):
+            with self.assertRaises(AssertionError):
+                self.test_m2_the_last_merge_is_refused_when_the_only_claimant_of_s3_was_closed_without_a_merge()
+        self.assertEqual(applied, [1])      # the mutation was applied
+
     def test_m2_a_mutant_that_never_says_it_fails(self):
         real = sb.claim_union_note
         self.test_m2_gates_says_when_a_sibling_was_closed_without_a_merge()
