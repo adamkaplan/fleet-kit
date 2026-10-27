@@ -20,6 +20,9 @@ FAKES = {
     SERIAL_BAD: "import sys, time\ntime.sleep(0.5)\nsys.exit(1)\n",
     SERIAL_SLOW: "import os, time\nopen(os.path.join(os.environ['DIAG_DIR'], 'serial.pid'), 'w').write(str(os.getpid()))\ntime.sleep(30)\n",
     "test_ok.py": "pass\n",
+    "test_ok2.py": "pass\n",
+    "test_ok3.py": "pass\n",
+    "test_lane_second.py": "import os\nopen(os.path.join(os.environ['DIAG_DIR'], 'second.started'), 'w').write('x')\n",
 }
 
 
@@ -58,10 +61,16 @@ class Diag(unittest.TestCase):
             f.write("".join(TESTS + n + "\n" for n in lane))
         return d
 
-    def start(self, d):
-        env = dict(os.environ, DIAG_DIR=self.diag)
-        return stub_support.start(self, [os.path.join(d, "bin", "test-cloud-launcher")], cwd=d, env=env,
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    shell = None   # None: the script runs through its own shebang line; else the path of the shell that runs it
+
+    def start(self, d, extra_env=None):
+        env = dict(os.environ, DIAG_DIR=self.diag, **(extra_env or {}))
+        cmd = [os.path.join(d, "bin", "test-cloud-launcher")]
+        if self.shell:
+            cmd = [self.shell] + cmd
+        return stub_support.start(self, cmd, cwd=d, env=env,
+                                  stdin=subprocess.DEVNULL, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),   # a shell cannot trap a signal ignored at its start
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     def wait_file(self, name, seconds=15):
         path = os.path.join(self.diag, name)
@@ -150,6 +159,51 @@ class Diag(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual([x for x in pids if self.alive(x)], [], "a lane or serial process was left running after signal %s" % sig)
 
+    # S6: after a serial failure no lane starts a new entry; an entry in flight that outlives the bound is stopped; nothing is left running.
+    def s6_no_new_entry(self, script):
+        # lane 0 holds the slow entry (1st) and the second entry (4th of the list); the two fillers go to lanes 1 and 2
+        d = self.tree(script, [SERIAL_BAD], [LANE, "test_ok.py", "test_ok2.py", "test_lane_second.py"])
+        self.kill_later("lane.pid")
+        p = self.start(d)
+        out, _ = p.communicate(timeout=120)
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("lane-body-end", out, "the entry in flight was not let finish")
+        time.sleep(1)
+        self.assertFalse(os.path.exists(os.path.join(self.diag, "second.started")), "a lane started a new entry after the serial failure")
+        self.assertEqual(out.rstrip().split("\n")[-1], "RESULT: FAIL")
+
+    def s6_bound(self, script):
+        d = self.tree(script, [SERIAL_BAD], [LANE])
+        self.kill_later("lane.pid")
+        p = self.start(d, {"LANE_SECONDS": "30", "CHAIN_LANE_WAIT": "2"})
+        try:
+            out, _ = p.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("the script did not stop the entry in flight at the bound")
+        self.assertEqual(p.returncode, 1, out)
+        self.assertEqual(out.rstrip().split("\n")[-1], "RESULT: FAIL")
+        pid = int(self.wait_file("lane.pid"))
+        end = time.time() + 5
+        while self.alive(pid) and time.time() < end:
+            time.sleep(0.1)
+        self.assertFalse(self.alive(pid), "the entry in flight was left running")
+
+    def test_s6_a_serial_failure_starts_no_new_lane_entry(self):
+        self.s6_no_new_entry(real_script())
+
+    def test_s6_an_entry_in_flight_is_stopped_at_the_bound(self):
+        self.s6_bound(real_script())
+
+    def test_s6_mutant_a_lane_keeps_starting_entries_fails_the_first(self):
+        m = mutate(real_script(), '    [ ! -e "$OUT/stop" ] || break   # a serial entry failed: start no new entry\n', "")
+        with self.assertRaises(AssertionError):
+            self.s6_no_new_entry(m)
+
+    def test_s6_mutant_the_bound_is_ignored_fails_the_second(self):
+        m = mutate(real_script(), "LANE_WAIT=${CHAIN_LANE_WAIT:-300}", "LANE_WAIT=300")
+        with self.assertRaises(AssertionError):
+            self.s6_bound(m)
+
     def test_s2_the_run_line_is_live_and_the_replay_is_whole(self):
         self.s2(real_script())
 
@@ -195,6 +249,19 @@ class Docs(unittest.TestCase):
 
     def test_s7_the_readme_states_the_wait_bound(self):
         self.assertIn("300 seconds", self.section())
+
+
+DASH = next((c for c in ("/bin/dash", "/usr/bin/dash") if os.path.exists(c)), None)
+
+
+class DashDiag(Diag):
+    """The same cases, the script run by dash (the /bin/sh of the Ubuntu CI leg)."""
+    shell = DASH
+
+
+if DASH is None:
+    print("SKIPPED: no dash on this machine (/bin/dash, /usr/bin/dash): the dash cases do not run", flush=True)
+    del DashDiag
 
 
 if __name__ == "__main__":

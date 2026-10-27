@@ -53,24 +53,39 @@ if [ "$count" -eq 0 ]; then echo "NOT RUN: the chain list holds no entry"; echo 
 ARGS_ENTRIES=" test_cloud_worker.py test_cloud_stack.py test_cloud_stack_wait.py test_cw_names.py test_cloud_k1.py test_driver.py test_run_record.py test_cloud_allowlist.py test_cloud_settings.py test_cloud_preflight_wired.py "
 # The PARALLEL list ($PAR, entries also in $LIST) runs in 3 lanes beside the serial loop (#1390): each entry uses its own temporary directory, binds no fixed port, and writes its test output to its own file, replayed whole after the run.
 # Diagnostics (#1414): a lane prints its RUN and TIME lines to the real output AS THEY HAPPEN (every line names its entry), so a hung lane shows as a RUN line with no TIME line.
-# Every lane (and the serial entry) runs in its own process group (set -m); an interrupt or a terminate signal stops every group and exits non-zero.
-# When a serial entry fails, the script waits for the lanes to finish for at most LANE_WAIT seconds (300; the slowest entry measured is about 300), stops the rest, replays their output, and only then prints RESULT: FAIL (status 1).
-LANE_WAIT=300
+# An interrupt or a terminate signal stops every lane and the serial entry with all their descendants and exits non-zero. A group is NOT used (set -m
+# needs a terminal: under dash with no tty it fails and "kill -- -pgid" reaches nothing); the descendants are found with ps (POSIX) and ended together.
+# (A shell cannot trap a signal that was ignored when it started: an INT sent to a script started with INT ignored does nothing.)
+# When a serial entry fails, no lane starts a NEW entry; the script waits for the entries in flight for at most LANE_WAIT seconds (default 300, the
+# slowest entry measured is about 300; the environment variable CHAIN_LANE_WAIT overrides it, for tests), then stops every lane and its loop, replays
+# their output, and only then prints RESULT: FAIL (status 1). After the exit no lane process is left and nothing writes into the removed directory.
+LANE_WAIT=${CHAIN_LANE_WAIT:-300}
 PAR=bin/test-cloud-launcher.parallel
 [ -f "$PAR" ] || PAR=/dev/null   # no parallel list: every entry runs serially
 OUT=$(mktemp -d) || exit 1
-lp0=; lp1=; lp2=; cur=   # the process-group leaders: the three lanes and the running serial entry
-stop_groups() { # stop every group that has not finished (a finished lane left its marker $OUT/lane<n>.done)
+lp0=; lp1=; lp2=; cur=   # the process ids: the three lanes and the running serial entry
+descendants() { # $1 = pid: print it and every process below it (from one ps listing)
+  ps -A -o pid= -o ppid= | awk -v root="$1" '{ p[NR] = $1; q[NR] = $2 } END { s[root] = 1; do { c = 0; for (i = 1; i <= NR; i++) if ((q[i] in s) && !(p[i] in s)) { s[p[i]] = 1; c = 1 } } while (c); for (k in s) print k }'
+}
+stop_groups() { # stop every lane (loop and entry in flight) and the running serial entry, each with all its descendants
+  : > "$OUT/stop"
+  all=
   for l in 0 1 2; do
     eval "p=\$lp$l"
-    [ -z "$p" ] || [ -e "$OUT/lane$l.done" ] || kill -TERM -- "-$p" 2>/dev/null
+    [ -z "$p" ] || [ -e "$OUT/lane$l.done" ] || all="$all $(descendants "$p")"
   done
-  [ -z "$cur" ] || kill -TERM -- "-$cur" 2>/dev/null
+  [ -z "$cur" ] || all="$all $(descendants "$cur")"
+  # shellcheck disable=SC2086
+  [ -z "$all" ] || kill -TERM $all 2>/dev/null
+  for l in 0 1 2; do
+    eval "p=\$lp$l"
+    [ -z "$p" ] || wait "$p" 2>/dev/null
+  done
+  return 0
 }
-trap 'rm -rf "$OUT"' EXIT
+trap 'rc=$?; trap - EXIT; rm -rf "$OUT"; exit $rc' EXIT
 trap 'stop_groups; exit 130' INT
 trap 'stop_groups; exit 143' TERM
-set -m
 LOGF=
 run_entry() { # $1 = entry; runs it with the arguments it took in the old chain; prints its own RUN and TIME lines (and, in a lane, copies them to the entry's file: the replay stays whole)
   e=$1; shift
@@ -96,6 +111,7 @@ lane() { # $1 = lane number: every 3rd entry of $PAR, one after the other, test 
   l=$1; shift; n=0
   while IFS= read -r e; do
     [ -n "$e" ] || continue
+    [ ! -e "$OUT/stop" ] || break   # a serial entry failed: start no new entry
     n=$((n + 1))
     [ $(( (n - 1) % 3 )) = "$l" ] || continue
     f=$(printf %s "$e" | tr / _)
@@ -126,7 +142,8 @@ while IFS= read -r e; do
   cur=$!
   wait "$cur" && { cur=; ran=$((ran + 1)); continue; }
   cur=
-  # a serial entry failed: wait (bounded) for the lanes, replay what they wrote, only then say RESULT: FAIL
+  : > "$OUT/stop"   # no lane starts a new entry from now on
+  # a serial entry failed: wait (bounded) for the entries in flight, replay what they wrote, only then say RESULT: FAIL
   waited=0
   while [ "$waited" -lt "$LANE_WAIT" ]; do
     alive=0
