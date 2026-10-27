@@ -1368,23 +1368,16 @@ class OneWallClock(unittest.TestCase):
         return "http://127.0.0.1:9"
 
     def full_backlog(self, n=4):
+        """Deterministic n dead addresses: each attempt sleeps its whole timeout, then times out (no kernel backlog)."""
         socket = self.socket
-        srv = socket.socket()
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(0)
-        port = srv.getsockname()[1]
-        fillers = []
-        for _ in range(5):
-            c = socket.socket()
-            c.setblocking(False)
-            with contextlib.suppress(OSError):
-                c.connect(("127.0.0.1", port))
-            fillers.append(c)
-        self.addCleanup(srv.close)
-        self.addCleanup(lambda: [c.close() for c in fillers])
-        real = self.real_gai
-        self.socket.getaddrinfo = lambda host, p, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))] * n
-        return "http://localhost:%d" % port
+        self.addCleanup(setattr, socket, "create_connection", socket.create_connection)
+
+        def dead(address, timeout=None, *a, **k):
+            for _ in range(n):
+                time.sleep(timeout if timeout is not None else 2.0)
+            raise TimeoutError("timed out")
+        socket.create_connection = dead
+        return "http://localhost:9"
 
     def test_slow_dns_is_cut_at_the_deadline(self):
         took, err = self.timed(relay, self.slow_dns(), 1.0)
@@ -1454,4 +1447,6 @@ class OneWallClock(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    result = unittest.main(exit=False).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)
