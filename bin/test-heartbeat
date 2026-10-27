@@ -1101,7 +1101,7 @@ class TestBellFromRegistry(Base):
     def load_source(self, text):
         copy = self.home / "mutant"
         copy.mkdir(exist_ok=True)
-        for sibling in ("heartbeat-ack", "registry.py"):
+        for sibling in ("heartbeat-ack", "registry.py", "record_json.py"):
             if (BIN / sibling).exists():
                 shutil.copy(str(BIN / sibling), str(copy / sibling))
         (copy / "fleet-heartbeat").write_text(text)
