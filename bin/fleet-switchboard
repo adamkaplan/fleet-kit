@@ -412,6 +412,7 @@ DEFAULTS = {
     "cos_orders_file": None,        # PR 18: the Chief of Staff's own standing orders, an absolute path; None means standing-orders.md beside config.json
     # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
     "gh_users": {},
+    "github_bot_logins": [],  # the cloud readers' bot account(s), each a fleet identity besides the `gh_users` accounts (at most 10); none by default
     "intent_live_silence_minutes": 10,  # #367: a live forwarder whose last event (or start) is older than this does not get the long intent trust (0 = always trusted, as before)
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
 }
@@ -10861,6 +10862,10 @@ def _validate_github(config, source):
             raise ConfigError("%s: 'gh_users' names %r and %r, the same repo, with different accounts (%s, %s)" % (source, seen_keys[same][0], key, seen_keys[same][1], account))
         seen_keys.setdefault(same, (key, account))
     config["gh_users"] = dict(users)
+    bots = config["github_bot_logins"]
+    if not isinstance(bots, list) or len(bots) > 10 or not all(isinstance(a, str) and GITHUB_LOGIN_RE.match(a) for a in bots):
+        raise ConfigError("%s: 'github_bot_logins' must be a list of at most 10 GitHub logins, got %r" % (source, bots))
+    config["github_bot_logins"] = list(bots)
     poll = config["github_poll_seconds"]
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
         raise ConfigError("%s: 'github_poll_seconds' must be a number of at least %d (each read of a repo costs "
@@ -10911,6 +10916,7 @@ class GitHubItem:
         # `actionable` is false for news that is not worth an agent's turn (a passing check, a bot's comment) and
         # is delivered only to an owner the old links found; `routed_by` says which link found the owner.
         self.numbers, self.actionable, self.routed_by = list(numbers), actionable, None
+        self.review_signer = None   # the from= marker name of a review comment (`_review_comment_item`)
 
     @property
     def issue(self):
@@ -11071,10 +11077,67 @@ def _pr_numbers(obj):
     return [n for n in (_number(p) for p in (prs if isinstance(prs, list) else [])) if n]
 
 
+REVIEW_COMMENT_RE = re.compile(r"^Review of ([0-9a-f]{40})(?![0-9a-f])")
+REVIEW_STRICT_RE = re.compile(r"^Review of ([0-9a-f]{40}): (APPROVE|CHANGES REQUESTED)\s*$")
+# Verdict words; the line carries the word from this table, never the comment text.
+REVIEW_VERDICTS = ("CHANGES REQUESTED", "APPROVE")
+REVIEW_NAME_CAP = 40
+REVIEW_UNOWNED_FILE, REVIEW_UNOWNED_CAP = "review-unowned.json", 2000
+
+
+def _review_verdict(first_line):
+    """The verdict of a first line: exactly `Review of <40 hex>: <word>` (case-sensitive, trailing whitespace only), else UNKNOWN."""
+    m = REVIEW_STRICT_RE.match(first_line)
+    return m.group(2) if m and m.group(2) in REVIEW_VERDICTS else "UNKNOWN"
+
+
+def _review_lane_member(agents, signer, owner):
+    """True when `signer` is the owner or a worker of the owner's lane: the fleet record's `reports_to` (what `_boss_of` reads; there is no
+    `boss`, `orchestrator` or `lane` key in it). A signer no agent record names (`agents.get` is None) is NOT a member: its comment is delivered."""
+    if signer == owner:
+        return True
+    fleet = (agents.get(signer).fleet if agents.get(signer) is not None else None) or {}
+    return any(fleet.get(k) == owner for k in ("reports_to",))
+
+
+def _review_comment_item(repo, comment, issue, number, cid, now):
+    """A review comment on an open PR (first line `Review of <40 hex>`) as one line, or None. A matching line is
+    delivered as one line or dropped, never copied as text. With no PR data (the catch-up read carries none) it is
+    delivered under the same key `github.reviewcomment:<id>`; the catch-up passes the PR record it already read (or a stub when the pass
+    holds none: an UNKNOWN state is delivered). The author-lane rule needs the registry and is applied when the item is routed (`_route`)."""
+    body = comment.get("body")
+    first = body.split("\n", 1)[0][:300] if isinstance(body, str) else ""
+    m = REVIEW_COMMENT_RE.match(first)
+    if not m or not _is_pr(issue) or str(issue.get("state") or "open") != "open":
+        return None
+    if issue.get("merged") or (issue.get("pull_request") or {}).get("merged_at"):
+        return None
+    login = _login(comment)
+    if not login:
+        return None
+    signer = signed_by_fleet(body)
+    known, lookups = _issue_refs(issue, number)
+    clean = lambda text: _one_line(re.sub(r"[\x00-\x1f\x7f]", "", text), REVIEW_NAME_CAP)   # no control character reaches the line
+    who = clean(login)
+    if signer:
+        who += " (signed %s)" % clean(signer)
+    summary = "PR #%d %s review comment by %s: %s (a comment, not a recorded verdict)" % (
+        number, m.group(1)[:12], who, _review_verdict(first))
+    item = GitHubItem("github.reviewcomment:%d" % cid, "github.comment", summary, repo, known, lookups, login, now,
+                      [number], True)
+    item.review_signer = signer
+    return item
+
+
 def _comment_item(repo, comment, issue, now):
     cid = _id(comment)
     number = _number(issue) or _url_number(comment.get("issue_url"))
-    if cid is None or number is None or signed_by_fleet(comment.get("body")):
+    if cid is None or number is None:
+        return None
+    body = comment.get("body") if isinstance(comment, dict) else None
+    if isinstance(body, str) and REVIEW_COMMENT_RE.match(body.split("\n", 1)[0][:300]):
+        return _review_comment_item(repo, comment, issue, number, cid, now)
+    if signed_by_fleet(body):
         return None
     known, lookups = _issue_refs(issue, number)
     summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(comment.get("body") or "", 400))
@@ -11837,6 +11900,19 @@ class GitHubHub:
             owner, routed_by = self.route_of(item, discovery.agents, now)
         except GitHubUnavailable:
             return
+        if item.key.startswith("github.reviewcomment:"):
+            if owner and item.review_signer and self._fleet_login(item.sender) and _review_lane_member(discovery.agents, item.review_signer, owner):
+                with self.lock:
+                    self.queue.pop(item.key, None)   # the author lane's own review: not delivered
+                return
+            if not owner:
+                with self.lock:
+                    self.queue.pop(item.key, None)
+                seen_once = self._unowned_seen(item.key)
+                if not seen_once:
+                    self._audit("github.reviewcomment.unowned", item.repo, {"key": item.key, "prs": item.numbers[:GITHUB_AUDIT_KEYS],
+                                                                            "note": "no lane owns the pull request; audited once per comment id, no message is sent"})
+                return
         with self.lock:
             if owner and not item.actionable and routed_by != "closing":
                 # PR 52: an owner found by a new link is told what needs it, not every passing check
@@ -11857,6 +11933,34 @@ class GitHubHub:
                         self._unrouted.clear()
                     self._unrouted.add(item.key)
                     self._unrouted_batch.append(item)
+
+    def _fleet_login(self, login):
+        """True when `login` is a fleet identity: a `gh_users` account (the account the daemon acts as) or a `github_bot_logins` account (the cloud readers' bot). A `from=` marker is
+        trusted only from these; from any other login it is ignored (anyone can type a marker)."""
+        users = {str(v).lower() for v in (self.config.get("gh_users") or {}).values()}
+        return str(login or "").lower() in users | {str(b).lower() for b in (self.config.get("github_bot_logins") or [])}
+
+    def _unowned_seen(self, key):
+        """True when the unowned review comment `key` was audited before (kept in `review-unowned.json`: bounded, a corrupt file reads as empty);
+        otherwise records it and returns False."""
+        path = Path(self.state_dir) / REVIEW_UNOWNED_FILE
+        try:
+            seen = load_module("record_json").parse_bounded(path.read_text())   # too deep reads as empty, like a corrupt file (#1314)
+            seen = [k for k in seen if isinstance(k, str)] if isinstance(seen, list) else []
+        except (OSError, ValueError):
+            seen = []
+        if key in seen:
+            return True
+        seen = (seen + [key])[-REVIEW_UNOWNED_CAP:]
+        tmp = path.with_name(REVIEW_UNOWNED_FILE + ".tmp")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps(seen))
+            os.replace(str(tmp), str(path))
+        except OSError:
+            pass
+        return False
 
     def _audit_unrouted(self):
         """One audit line per repo per pass for the items that belong to nobody, not one line each."""
@@ -12349,10 +12453,14 @@ class GitHubHub:
             return isinstance(record.get(field), str) and record[field] >= since
 
         base = "repos/%s/" % repo
+        review_comments = []
         found = read("comments", "comments", base + "issues/comments?since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE))
         for comment in [c for c in found or [] if fresh(c)]:
             number = _url_number(comment.get("issue_url"))
             commented[number] = max(commented.get(number, ""), comment["updated_at"])
+            if REVIEW_COMMENT_RE.match((comment.get("body") or "").split("\n", 1)[0][:300] if isinstance(comment.get("body"), str) else ""):
+                review_comments.append((comment, number))
+                continue
             items.append(_comment_item(repo, comment, None, now))
         for issue in read("issues", "issues", base + "issues?state=all&since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE)) or []:
             if _is_pr(issue) or not fresh(issue):
@@ -12366,6 +12474,14 @@ class GitHubHub:
             pulls.append(pr)
             items.append(_pr_item(repo, pr, now))
             items.append(_pr_conflict(repo, pr, now))
+        by_number = {_number(p): p for p in pulls}
+        for comment, number in review_comments:
+            pr = by_number.get(number)
+            stub = {"number": number, "pull_request": {"merged_at": None}, "state": "open"}   # the state is UNKNOWN when the pass holds no record: delivered
+            if pr is not None:
+                stub.update(state=pr.get("state") or "open", body=pr.get("body"), pull_request={"merged_at": pr.get("merged_at")},
+                            merged=pr.get("merged"))
+            items.append(_comment_item(repo, comment, stub, now))
         for pr in list(pulls):
             number = _number(pr)
             for review in read(("reviews", number), "reviews", base + "pulls/%d/reviews?per_page=100" % number) or []:

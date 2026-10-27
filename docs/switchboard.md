@@ -1259,10 +1259,10 @@ Mutants of this PR, run by hand (killed = a test fails):
 issue decision, a report with an issue number and a batch) and a heads-up row to its PR
 (`https://github.com/<repo>/pull/<number>`); a row with no repo or no number has no link and behaves as before. The
 `id age` line is drawn as an OSC 8 hyperlink (OpenTUI's own link attribute, not text, so no line gets wider), and
-a click on the row copies the link through OSC 52 and shows a toast. In herdr inside iTerm2 that means: hold
+a click on the row copies its short code `repo:#number` (the repository name without its owner, for example `fleet-kit:#935`; never the URL) through OSC 52 and shows a toast. In herdr inside iTerm2 that means: hold
 Ctrl (herdr's own link click) and click the `id age` line to open the issue or PR in the
-browser, or click the row to copy the link. A terminal that ignores OSC 8 shows the same plain text, and one that
-ignores OSC 52 shows the link in the toast to copy by hand. The plugin spawns no process and makes no network
+browser, or click the row to copy the short code. A terminal that ignores OSC 8 shows the same plain text, and one that
+ignores OSC 52 shows the short code in the toast to copy by hand. The plugin spawns no process and makes no network
 call: the terminal opens the link. The URL is built only from the entry's `repo` and `ask` or `number`, each
 matched against a strict pattern, never from a title; control characters in a title or row are dropped.
 
@@ -1540,6 +1540,7 @@ is unchanged.
 | `retire_idle_minutes` | `10` | `retire --close` closes a pane herdr reads as `working` without `--force` only when its session has no turn in progress and no activity for at least this many minutes (a finite number from 1 to 10080, never a boolean; one that is not is refused at load and again at use, where it keeps the refusal; see the `retire` paragraph) |
 | `excluded_repos` | `[]` | Repositories the switchboard never watches and never reads, whatever an agent's metadata or a charter says (matched case-insensitively, `owner/name`; a bad list is refused at load). It is applied where the watched set is derived, so forwarders, the sweep and triage never see them, and every `gh` read of one is refused at the lowest layer (`GhAccounts.read`, plus `read_pr_json`, `read_ref_state`, the intent reader, the hub's environment for a forwarder or a read, `review measure` and the `reds` artifact read), so no process is started for it: the hub's reads, PR notices, intent reads and `reds` all say it is excluded. Writes are not the watchers' and are unchanged (an agent's own `gh` calls, an intent edit). `status` says each one is excluded, once. Agents working in an excluded repository still launch, send, report and retire |
 | `queue_ejections` | absent | The merge queue ejection wake (#584), declared by `bin/queue_ejections.py`: absent for the defaults, or `{"workflow": "ci", "artifact": "failing-tests"}` (either key; plain names). `workflow` is the display name (or file name without extension) of the CI workflow whose `merge_group` runs are watched; `artifact` is the name of the failing-tests artifact those runs upload |
+| `github_bot_logins` | `[]` | At most 10 GitHub bot logins (the cloud readers' account(s), e.g. `acme-cloud[bot]`) trusted for a review comment's `from=` marker |
 | `gh_users` | `{}` | `"owner/repo"` or `"owner/*"` to a `gh` account name |
 | `hold_labels` | `{}` | `"owner/repo"` to `{label, message, allowed_removers}`: the `gh` shim refuses merge, close, approving review, base edit and label removal on a pull request that carries the label (see "The hold label of the `gh` shim") |
 | `app_installations`, `app_key_path` or `app_key_command`, `app_permissions`, `app_api_base` | none | `"owner/repo"` to `{app_id, installation_id}`: the `gh` and `git` shims authenticate that repository with a one-hour installation token minted locally from the App key, never the stored login (see "A GitHub App token per repository"). Never this kit's own repository |
@@ -5966,6 +5967,25 @@ Cause: a review marker (`<!-- fleet-switchboard:from=NAME -->`) was written only
 - `gates` prints `blocking review: <name> CHANGES_REQUESTED at <head> (dismiss with: fleet-switchboard review dismiss ...)` for each LOGIN whose latest decisive review (dismissals count) is CHANGES_REQUESTED while GitHub's reviewDecision says so: the same rule as the merge shim, one function in `shims/review_rule.py`, with a parity test.
 
 The reviewer definitions and the review skill name these commands, not the bare GitHub command. A cloud reader can use them once its token allows it (a separate question for the owner).
+
+## Review comments on a lane's pull request
+
+A new comment on an open pull request whose first line matches `^Review of [0-9a-f]{40}` is delivered to the owning lane's orchestrator as ONE line: `PR #N <12-char head> review comment by <login> (signed <NAME>): <VERDICT> (a comment, not a recorded verdict)`. The verdict is exactly `Review of <40 hex>: APPROVE` or `... : CHANGES REQUESTED` (case-sensitive, trailing whitespace only; table `REVIEW_VERDICTS`); any other line that matches the leading pattern is UNKNOWN, never a wrong verdict. The login (and the `from=` name, omitted when there is no marker) are cleaned and capped; the comment text is never copied, and a matching line is delivered as one line or dropped, never as the old text item. A comment is delivered unless its `from=` marker names the owner or a worker of the owner's lane (a record whose `reports_to` is the owner: the real key of the fleet record) AND the comment's login is a fleet identity (a `gh_users` account, the account the daemon acts as, or a bot account the operator lists in the config key `github_bot_logins` of `config.json`, default none, for example `acme-cloud[bot]`). From any other login the marker is ignored and the comment is delivered, the login shown: anyone can type a marker. No marker means delivered. A marker naming an agent no record knows is delivered (it is no lane member). With no `gh_users` entry the shared account is not known, so its markers are not trusted either: the comment is delivered. A pull request no lane owns writes ONE audit line `github.reviewcomment.unowned` per comment id and sends no message; the "already audited" memory is `review-unowned.json` in the state directory (bounded to 2000 ids, a corrupt file reads as empty), so a restart does not repeat the line. The key is `github.reviewcomment:<comment id>` on the webhook AND the catch-up path. The catch-up loop resolves the pull request from the pull list the same pass already read (no new read): a closed or merged record drops the comment; a pull request the pass holds no record of has an UNKNOWN state and the comment is DELIVERED (a one-line notice is harmless and the key dedups it; the text is never copied). What dedups: the delivered-key ledger `sent-keys.json` (persisted, the newest 400 keys per session; with `v2_light` off the transcript's keys are the record); an edited event is not a new comment. No new GitHub read, no write.
+
+### Every path by which a GitHub comment reaches an agent
+
+| Path | Key | Dedup (persisted?) | Author / marker rule | Drop reasons | Test (mutant) |
+|---|---|---|---|---|---|
+| webhook `_wh_issue_comment` -> `_comment_item`, plain comment | `github.comment:<id>` | delivered-key ledger (persisted) | fleet-signed (marker) dropped | no id/number, signed | `test_plain_comment_keeps_old_item` |
+| webhook `_wh_issue_comment` -> `_review_comment_item`, review line | `github.reviewcomment:<id>` | same ledger | marker trusted only from a fleet login, applied in `_route` | closed/merged, edited, no match, no login | `ReviewCommentLineTests`, `ReviewCommentEndToEndTests` (mutant: trust a marker from anyone) |
+| catch-up loop -> `_comment_item(.., None, ..)`, plain | `github.comment:<id>` | same ledger | fleet-signed dropped | as webhook | `test_catchup_never_copies_text_and_shares_the_key` |
+| catch-up loop -> `_comment_item(.., stub, ..)`, review line | `github.reviewcomment:<id>` (the webhook's key) | same ledger | as the webhook, in `_route` | closed/merged PR record; UNKNOWN state is delivered | `test_catch_up_only_delivers_once`, `test_catch_up_unknown_pr_state_delivers_and_closed_pr_drops` (mutant: catch-up drops) |
+| `_route`, review line, no lane owner | audit `github.reviewcomment.unowned` | `review-unowned.json` (persisted, bounded) | n/a | no message | `test_unowned_is_audited_once_even_after_a_restart` |
+
+| Input | Bound | Test |
+|---|---|---|
+| comment body | first line only, 300 chars, verdict from the table | ReviewCommentLineTests |
+| comment id, PR state, logins | event payload only | ReviewCommentLineTests |
 
 ## Each thing once on the Chief of Staff's wake channel (#1275)
 
