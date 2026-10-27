@@ -12733,7 +12733,10 @@ class GitHubHub:
         for run in found_runs or []:
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
-        red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now)   # #1141: the same runs, no new read
+        def present_pull(number):   # #1378: the pull request's present head and state, read only for an unowned red run not yet told
+            got = [v for v in self.gh_api(base + "pulls/%d" % number, paginate=False) if isinstance(v, dict)]
+            return got[0] if got else None
+        red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now, present_pull)   # #1141: the same runs
         self.last_failed_primary = bool(failed)
         self.last_incomplete = bool(stopped or failed)   # #494: a step is still to do: the caller keeps the cursor and the marker where they are
         items = [item for item in items if item is not None]
