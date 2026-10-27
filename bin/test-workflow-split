@@ -124,7 +124,7 @@ ADDED = [("bin/test-cloud-hub", "10"), ("bin/test-cloud-channel", None), ("bin/t
          ("bin/test-cloud-way-back", None), ("bin/test-decisions-pull", "10"), ("bin/test-cloud-cli", "10")]
 # The three relay suites added by ask #1376, after the seven, in this order (a timeout sized from a measured run on both systems).
 RELAY = [("bin/test-cloud-relay", "10"), ("bin/test-cloud-hub-relay", "10"), ("bin/test-cloud-relay-daemon", "10")]
-LAUNCHER_TIMEOUT = "29"   # the cloud launcher step's timeout-minutes; the one pinned figure (ask #1390)
+LAUNCHER_TIMEOUT = "20"   # the cloud launcher step's timeout-minutes; the one pinned figure (ask #1390)
 NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", LAUNCHER_TIMEOUT)] + [suite(n, "", t) for n, t in ADDED + RELAY]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
