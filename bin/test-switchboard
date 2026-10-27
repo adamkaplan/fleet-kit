@@ -92009,7 +92009,10 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         self.assertNotIn('{OWN_GH_ENV: "1"}', text)
         self.assertNotIn('setdefault(OWN_GH_ENV', text)
 
-    BARE_GH_SOURCES = ["bin/fleet-switchboard"] + sorted("bin/switchboard/" + n.name for n in (REPO / "bin" / "switchboard").glob("*.py"))
+    # The rule: every Python source the daemon can load: the main script, every bin/switchboard/*.py and EVERY bin/*.py (each is a module of load_module(name));
+    # the scripts for humans carry no .py name, so they are not in it.
+    BARE_GH_SOURCES = (["bin/fleet-switchboard"] + sorted("bin/switchboard/" + n.name for n in (REPO / "bin" / "switchboard").glob("*.py"))
+                       + sorted("bin/" + n.name for n in (REPO / "bin").glob("*.py")))
     SUBPROCESS_CALLS = {"run", "Popen", "call", "check_call", "check_output", "runner", "_runner", "run_cmd"}
 
     @classmethod
@@ -92018,8 +92021,9 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
         (1) a LIST literal (a tuple of tool names, as in `for tool in ("gh", "git")`, is not an argv) whose first element is the string constant "gh" (covers `runner(["gh", ...])`, `["gh"] + argv` and a name bound to such a list);
         (2) a call to run/Popen/call/check_call/check_output or a runner whose first positional argument is a string constant that starts with "gh " or is "gh".
         The ONE merge call of `merge-gate --pass --merge` is not an exception: it names `config.get("gh_by_name", ...)`, never the literal, so it is not seen and needs none.
-        KNOWN LIMITS: it cannot see a name built at run time (`"g" + "h"`, a variable holding "gh", `config["gh_by_name"]` itself, an argv read from a file or the
-        environment), a command run through a shell string that is not a plain constant, or a program other than these files; the daemon's own calls are held by
+        KNOWN LIMITS, what it cannot catch: a variable holding "gh" (`g = "gh"; [g, ...]`); a tuple (deliberate: `for tool in ("gh", "git")`); an f-string
+        (JoinedStr) command; `config.get(..., "gh")` (a default); a string built at run time (`"g" + "h"`, an argv read from a file or the environment);
+        `config["gh_by_name"]` itself; a shell string that is not a plain constant; and any source outside BARE_GH_SOURCES; the daemon's own calls are held by
         config["gh"] (own_gh_path) and by the behaviour tests around it, which this scan does not replace."""
         found = []
         for path, text in sources.items():
@@ -92046,6 +92050,11 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
             self.assertIn(old, sources[path])
             mutant = dict(sources, **{path: sources[path].replace(old, new, 1)})
             self.assertEqual(len(self.bare_gh_sites(mutant)), 1, old)
+        self.assertIn("bin/ci_runs.py", sources)
+        old = 'subprocess.run([GH, "api", "repos/%s/actions/runs/%d"'
+        self.assertIn(old, sources["bin/ci_runs.py"])
+        mutant = dict(sources, **{"bin/ci_runs.py": sources["bin/ci_runs.py"].replace(old, old.replace("[GH,", '["gh",'), 1)})
+        self.assertEqual(len(self.bare_gh_sites(mutant)), 1, "a bare gh re-added in bin/ci_runs.py")
         extra = dict(sources, **{"bin/switchboard/audit.py": sources["bin/switchboard/audit.py"] + '\nsubprocess.run("gh pr list")\n'})
         self.assertEqual(len(self.bare_gh_sites(extra)), 1, "a string command in a module under bin/switchboard is seen too")
 
@@ -92060,6 +92069,15 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
             self.assertEqual(sb.own_gh_path("gh", {"PATH": str(realdir)}), str(realdir / "gh"), "the real gh first on PATH is named by its path")
             self.assertEqual(sb.own_gh_path("gh", {"PATH": path, "FLEET_REAL_GH": str(realdir / "gh")}), str(realdir / "gh"))
             self.assertEqual(sb.own_gh_path("/x/gh", {"PATH": path}), "/x/gh")
+
+    def test_the_config_load_hands_the_resolved_gh_to_the_run_identity_reader(self):
+        """#1216: bin/ci_runs.py reads a run through config['gh'] (set at the config load), so a daemon the hook started never reaches the shim by name."""
+        ci = sb.load_module("ci_runs")
+        self.addCleanup(setattr, ci, "GH", ci.GH)
+        ci.GH = None
+        cfg = sb.validate_config({})
+        self.assertEqual(ci.GH, cfg["gh"])
+        self.assertNotEqual(ci.GH, "gh")
 
     REAL_FAKE = "#!/bin/sh\necho \"real $* token=$GH_TOKEN\" >> \"$FAKE_LOG\"\necho '{\"ok\": 1}'\n"
 
@@ -92736,12 +92754,20 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
 
     def test_the_run_read_returns_workflow_id_and_event_or_none(self):
         ci = load_ci_runs()
+        ci.GH = "/real/bin/gh"
+        self.addCleanup(setattr, ci, "GH", None)
         import subprocess as sp
         from unittest import mock
         def fake(out, code=0):
             return mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], code, out, ""))
-        with fake('{"w": 7, "e": "push"}'):
+        with fake('{"w": 7, "e": "push"}') as run:
             self.assertEqual(ci._read_run("o/r", 5), (7, "push"))
+            self.assertEqual(run.call_args.args[0][0], "/real/bin/gh", "#1216: the real gh by path, never the bare name that the shim answers")
+        ci.GH = None
+        with fake('{"w": 7, "e": "push"}') as run:
+            self.assertIsNone(ci._read_run("o/r", 5), "no resolved gh: no read (fails closed), never a bare gh")
+            run.assert_not_called()
+        ci.GH = "/real/bin/gh"
         with fake('{"w": 7, "e": "push"}', 1):
             self.assertIsNone(ci._read_run("o/r", 5))
         with fake('{"w": "7", "e": "push"}'):
@@ -92841,6 +92867,8 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         import subprocess as sp
         from unittest import mock
         ci = load_ci_runs()
+        ci.GH = "/real/bin/gh"
+        self.addCleanup(setattr, ci, "GH", None)
         for exc in (sp.TimeoutExpired("gh", 20), OSError("no gh"), ValueError("x")):
             with mock.patch.object(sp, "run", side_effect=exc):
                 self.assertIsNone(ci._read_run("o/r", 5))

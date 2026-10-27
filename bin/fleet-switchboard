@@ -10871,6 +10871,7 @@ def _validate_github(config, source):
     try:
         config["gh_by_name"] = config["gh"]   # #1216: as configured (`gh`: PATH finds the shim); the one merge call of `merge-gate --pass --merge` goes through it, so the shim gates it
         config["gh"] = own_gh_path(config["gh"])   # #1216: the daemon's own calls name the real gh by path
+        load_module("ci_runs").GH = config["gh"]   # #1216: so does the run-identity read of bin/ci_runs.py
     except ConfigError as err:
         raise ConfigError("%s: %s" % (source, err)) from None
     if not _is_number(config["github_lookback_hours"]) or config["github_lookback_hours"] <= 0:
