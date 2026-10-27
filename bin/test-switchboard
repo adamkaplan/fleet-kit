@@ -50212,6 +50212,307 @@ class TestHeadlessAnswerPath(WriteWorld):
         self.assertEqual(getattr(self.world.v2, "permission_replies", []), [], "no reply reached the service")
 
 
+class TestRetireCloseHeadless(StandInPids, Base):
+    """#1062: `retire --close` ends a HEADLESS worker's session through the service's session removal, by the boss rule of a pane close; also after the
+    plain retire (judged from the retirement record). Fakes only: the service is the fake v2."""
+
+    GIT_ENV = TestLaunch.GIT_ENV
+    git, make_repo, add_worktree = TestLaunch.git, TestLaunch.make_repo, TestLaunch.add_worktree
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss", "other"))
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.engine.state_dir = self.world.state
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        for patch in (mock.patch.object(sb.V2Client, "service_identity", lambda client: 100),
+                      mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None),
+                      mock.patch.dict(os.environ, {}, clear=False)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.removed = []
+        real = sb.V2Client.session_remove
+
+        def counting(client, session_id):
+            self.removed.append(session_id)
+            return real(client, session_id)
+        patch = mock.patch.object(sb.V2Client, "session_remove", counting)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def as_(self, who):
+        if who is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+
+    def hw(self, name="hw", boss="boss"):
+        sid = self.world.v2.create_session({"fleet": {"name": name, "role": "coder", "reports_to": boss, "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, name, sid, None, now=self.world.clock.now())
+        self.world.clock.t += 3600   # long idle by default
+        return sid
+
+    def lines(self, name, event="headless.closed"):
+        return [e for e in self.world.audit() if e["event"] == event and e["subject"] == name]
+
+    def test_s2_a_boss_ends_an_idle_headless_worker_and_one_line_says_so(self):
+        sid = self.hw()
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.removed, [sid])
+        self.assertEqual(len([l for l in out.splitlines() if "ended" in l]), 1, out)
+        self.assertNotIn("nothing to close", out)
+
+    def test_s3_a_non_boss_is_refused_naming_the_rule(self):
+        sid = self.hw()
+        self.as_("other")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("only the operator, or the agent's own boss", err)
+        self.assertEqual(self.removed, [])
+        self.assertIn(sid, self.world.v2.sessions)
+        self.assertNotIn("hw", sb.read_retired(self.world.state), "a refusal changes nothing")
+
+    def test_s4_a_turn_in_progress_or_recent_activity_is_refused_without_force(self):
+        sid = self.hw()
+        self.world.v2.sessions[sid]["turn"] = {"id": "t1"}
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("turn in progress", err)
+        self.assertEqual(self.removed, [])
+        code, out, err = self.run_cli("retire", "hw", "--close", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.removed, [sid])
+
+    def test_s4_activity_within_the_idle_window_is_refused_without_force(self):
+        sid = self.hw()
+        self.world.v2.sessions[sid]["idle"] = self.world.clock.now() - 30
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("retire_idle_minutes", err)
+        self.assertEqual(self.removed, [])
+
+    def test_s5_an_already_retired_worker_is_ended_by_its_recorded_boss_and_a_second_call_changes_nothing(self):
+        sid = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"))
+        self.assertEqual(self.removed, [], "plain retire ends nothing")   # U2
+        self.as_("other")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, "a non-boss is refused after the retirement too")
+        self.assertEqual(self.removed, [])
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.removed, [sid])
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertIn("already ended", out)
+        self.assertEqual(self.removed, [sid])
+        self.assertEqual(len(self.lines("hw")), 1)   # S7
+
+    def test_s6_unpushed_or_uncommitted_work_refuses_even_with_force(self):
+        sid = self.hw()
+        self.make_repo()
+        wt = self.add_worktree("w-hl", unpushed=True)
+        self.assertTrue(sb.register_worktree(self.world.state, str(wt), "hw", None, wt.name, 1))
+        self.as_("boss")
+        for extra in ((), ("--force",)):
+            code, out, err = self.run_cli("retire", "hw", "--close", *extra)
+            self.assertEqual(code, 1)
+            self.assertIn("uncommitted or unpushed work", err)
+        self.assertEqual(self.removed, [])
+
+    def test_s7_the_audit_holds_who_asked_the_session_and_the_reason(self):
+        sid = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        (line,) = self.lines("hw")
+        self.assertEqual((line["detail"]["by"], line["detail"]["session"]), ("boss", sid))
+        self.assertTrue(line["detail"]["reason"])
+
+    def test_the_chief_of_staff_ends_a_direct_report_and_the_operator_any(self):
+        sid = self.hw(boss="chief-of-staff")
+        self.as_("cos")
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        self.assertEqual(self.removed, [sid])
+        other = self.hw("hw2")
+        self.as_(None)
+        self.assertEqual(self.run_cli("retire", "hw2", "--close")[0], 0)
+        self.assertEqual(self.removed, [sid, other])
+
+    def test_u2_a_plain_retire_of_a_headless_worker_ends_nothing(self):
+        self.hw()
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.removed, [])
+
+    # -- #1062 amended plan: S8, S11-S13 (the rule is one function: S12)
+
+    def test_s8_a_live_headless_agent_with_no_known_session_is_refused_without_a_traceback(self):
+        """discovery can show a live headless agent whose session id is unknown: `headless_target` then has nothing to judge (the fake service always
+        names the session, so the shape is made by the one lookup that answers it)."""
+        sid = self.hw()
+        self.as_("boss")
+        with mock.patch.object(sb, "headless_target", lambda engine, discovery, name: None):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out)
+        self.assertIn("no session known for hw", err)
+        self.assertNotIn("Traceback", err + out)
+        self.assertEqual(self.removed, [])
+        self.assertIn(sid, self.world.v2.sessions)
+        self.assertNotIn("hw", sb.read_retired(self.world.state), "nothing was retired")
+        self.assertIsNotNone(self.ap.load_record(self.world.state, "hw"))
+
+    def test_s11_a_failed_delete_after_the_retirement_exits_non_zero_says_not_ended_and_audits_no_closed_line(self):
+        sid = self.hw()
+        self.as_("boss")
+        boom = mock.Mock(side_effect=sb.V2Error("http", status=500, detail="boom"))
+        with mock.patch.object(sb.V2Client, "session_remove", boom):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("NOT ended", out)
+        self.assertIn("hw", sb.read_retired(self.world.state), "the worker is retired either way")
+        self.assertEqual(self.lines("hw"), [], "no headless.closed line for a delete that failed")
+        self.assertIn(sid, self.world.v2.sessions)
+        # the already-retired path says the same thing the same way
+        with mock.patch.object(sb.V2Client, "session_remove", boom):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("NOT ended", out)
+        self.assertEqual(self.lines("hw"), [])
+
+    def source_of(self, name):
+        import ast
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        return {n.name: n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.FunctionDef)}[name], text
+
+    def test_s12_who_may_close_is_defined_once_and_called_by_the_pane_close_and_the_headless_end(self):
+        import ast
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        tree = ast.parse(text)
+        funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        holders = sorted(n for n, f in funcs.items() if "only the operator or the agent's own boss may" in (ast.get_source_segment(text, f) or "").replace("\n", " "))
+        self.assertEqual(holders, ["close_authority_problem"], "the wording of the rule lives in one function")
+        for caller in ("retire_close_problem", "headless_close_problem"):
+            calls = {c.func.id for c in ast.walk(funcs[caller]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            self.assertIn("close_authority_problem", calls, caller)
+            self.assertNotIn("gates_caller_kind", calls, "%s decides who may by itself" % caller)
+
+    def test_s12_a_change_to_the_shared_rule_reaches_both_closes(self):
+        discovery = self.engine.discover(self.world.clock.now())
+        seen = discovery.agents["other"]
+        self.hw()
+        target = sb.headless_target(self.engine, self.engine.discover(self.world.clock.now()), "hw")
+        with mock.patch.object(sb, "close_authority_problem", lambda *a, **k: "THE ONE RULE"):
+            self.assertEqual(sb.retire_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "other", seen, False), (None, "THE ONE RULE"))
+            self.assertEqual(sb.headless_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "hw", target, False), (None, "THE ONE RULE"))
+
+    def test_s13_an_agent_cannot_end_its_own_session(self):
+        sid = self.hw()
+        self.as_("boss")
+        with mock.patch.object(sb, "gates_caller_kind", lambda runner, now: ("agent", "hw", "coder")):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("an agent cannot end its own session", err)
+        self.assertEqual(self.removed, [])
+        self.assertIn(sid, self.world.v2.sessions)
+
+    def test_s13_a_retired_name_reused_by_a_live_agent_judges_the_live_record_and_ends_nothing_through_the_old_retirement(self):
+        old = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        new = self.hw()   # the name is launched again: a live record and a retirement of the same name
+        self.assertNotEqual(old, new)
+        self.assertIn("hw", sb.read_retired(self.world.state))
+        self.as_("other")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, "the live worker's boss rule applies, not the old retirement's")
+        self.assertEqual(self.removed, [])
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        self.assertEqual(self.removed, [new], "only the live session is ended")
+        self.assertIn(old, self.world.v2.sessions, "the old retirement ends nothing")
+
+    def test_s13_an_unreadable_session_or_activity_read_refuses_and_ends_nothing(self):
+        sid = self.hw()
+        self.as_("boss")
+        down = sb.V2Error("exit", detail="down")
+        for method in ("session_active", "session_get"):
+            with mock.patch.object(sb.V2Client, method, mock.Mock(side_effect=down)):
+                code, out, err = self.run_cli("retire", "hw", "--close")
+            self.assertNotEqual(code, 0, method)
+            self.assertEqual(self.removed, [], method)
+        self.assertIn(sid, self.world.v2.sessions)
+        self.assertNotIn("hw", sb.read_retired(self.world.state))
+        real = sb.V2Client.session_get
+        with mock.patch.object(sb.V2Client, "session_get", lambda client, session_id: dict(real(client, session_id), time={})):   # no readable last activity
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("cannot be read", err)
+        self.assertEqual(self.removed, [])
+
+    def test_s13_a_corrupt_hostile_or_too_deeply_nested_registry_is_read_bounded_and_ends_nothing(self):
+        sid = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        reg = Path(self.world.state) / "registry.json"
+        good = reg.read_text()
+        for bad in ("[" * 100000, '{"version": 1, "agents": {}, "retired": %s}' % ("[" * 70 + "]" * 70), "{not json", '{"version": 1, "agents": {}, "retired": []}'):
+            reg.write_text(bad)
+            code, out, err = self.run_cli("retire", "hw", "--close")
+            self.assertNotIn("Traceback", err + out, bad[:20])
+            self.assertNotEqual(code, 0, bad[:20])
+            self.assertEqual(self.removed, [], bad[:20])
+            self.assertIn(sid, self.world.v2.sessions)
+        reg.write_text(good)
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        self.assertEqual(self.removed, [sid])
+
+    # -- the mutants: each mutates the RULE (the source of the shared function) and the check that guards it must fail on an assertion
+
+    def rule_mutant(self, old, new):
+        import types
+        func, text = self.source_of("close_authority_problem")
+        src = __import__("ast").get_source_segment(text, func)
+        self.assertIn(old, src)
+        scope = dict(vars(sb))
+        exec(src.replace(old, new, 1), scope)
+        return mock.patch.object(sb, "close_authority_problem", types.FunctionType(scope["close_authority_problem"].__code__, vars(sb), "close_authority_problem"))
+
+    def test_s9_a_mutant_rule_that_allows_everyone_fails_the_non_boss_check(self):
+        with self.rule_mutant("    kind = gates_caller_kind(runner, now)\n", "    return None\n    kind = gates_caller_kind(runner, now)\n"):
+            with self.assertRaises(AssertionError):
+                self.test_s3_a_non_boss_is_refused_naming_the_rule()
+
+    def test_s9_a_mutant_rule_that_skips_the_boss_check_fails_the_non_boss_check(self):
+        with self.rule_mutant("if boss is None or boss != who:", "if False:"):
+            with self.assertRaises(AssertionError):
+                self.test_s3_a_non_boss_is_refused_naming_the_rule()
+
+    def test_s9_a_mutant_rule_that_skips_the_own_session_check_fails_that_check(self):
+        with self.rule_mutant("if who == name:", "if False:"):
+            with self.assertRaises(AssertionError):
+                self.test_s13_an_agent_cannot_end_its_own_session()
+
+    def test_s9_a_mutant_that_ignores_the_turn_in_progress_fails_the_check(self):
+        with mock.patch.object(sb.V2Client, "session_active", lambda client: {}):
+            with self.assertRaises(AssertionError):
+                self.test_s4_a_turn_in_progress_or_recent_activity_is_refused_without_force()
+
+
 class TestRetireLostHeadless(StandInPids, Base):
     """#678: `retire` of a headless worker whose session is gone (a record on file, nothing discovered): authority, the record, the remembered boss."""
 
