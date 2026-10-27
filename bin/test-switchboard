@@ -39867,7 +39867,7 @@ class TestImpactHold(LedgerBase):
         wanted_roots = sorted({x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[0]) | {x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[1]))
         bind_reads = {x.slice.value for f in ast.walk(hold) if isinstance(f, ast.FunctionDef) and f.name == "bind" for x in ast.walk(f) if isinstance(x, ast.Subscript) and isinstance(x.slice, ast.Constant) and isinstance(x.slice.value, str) and x.slice.value.isupper()}   # #924 round 4: `bind` reads NO daemon name from the namespace by key
         self.assertEqual(bind_reads, set())
-        self.assertEqual(sorted(rule["closure_roots"]), sorted(set(wanted_roots) | {"HELPER_MODULES", "_make_loader", "RepoIssue", "issue_arg", "parse_issue_ref"} | bind_reads)   # the last three: the registrars' argument types, held by the registrar floor (#971) as closure names, "closure_roots is every daemon name the moved clear code reads (bin/impact_hold.py), and the table that generates the daemon's loaders")
+        self.assertEqual(sorted(rule["closure_roots"]), sorted(set(wanted_roots) | {"HELPER_MODULES", "_make_loader", "RepoIssue", "issue_arg", "parse_issue_ref"} | bind_reads), "closure_roots is every daemon name the moved clear code reads (bin/impact_hold.py), and the table that generates the daemon's loaders")
         reach = sb.load_module("delegated_clear").closure(daemon, rule["closure_roots"])[0]
         reached = set()
         for name in reach:
