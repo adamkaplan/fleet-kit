@@ -60,6 +60,10 @@ MOVED = ('rating_at',
          'clear_who',
          'delegated_clear_score',
          'delegated_clear_map',
+         'closure_read',
+         'closure_hold',
+         '_printable',
+         '_judged_key',
          '_gh_json',
          'impact_plan',
          'cmd_impact_hold',
@@ -1076,14 +1080,20 @@ def delegated_clear_checks(engine, runner, now, kind, number):
     return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text), "threshold": threshold}, None
 
 
-def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
-    """[reasons] for ONE changed file of the daemon's own (`closure_refusals` over its text before and after and its patch), or None when it cannot be read or mapped. The text comes from the
-    git blobs API (the contents API refuses a file this large): the head's blob id is the file's own `sha`, the base's is the file's own `sha` at the base commit. #661."""
-    unread = None if impact_floor.matches(item["filename"], rule.get("closure_files") or []) or item["filename"] == rule.get("daemon_file") else ["%s cannot be read, so an added closure name cannot be ruled out: refused" % "".join(c if c.isprintable() else "?" for c in str(item["filename"])[:80])]   # a part the closure does not list: unreadable is refused here (the clear's mapper skips a path it does not judge)
+def delegated_clear_map(engine, runner, repo, item, base_sha, rule, derived=None):
+    """[reasons] for ONE changed file of the clear's closure (`closure_refusals` over its text before and after and its patch), or None when it cannot be read or mapped. The roots are the DERIVED closure's
+    (`derived.files[file]`: the one derivation, #940), never a list of the matrix. The text comes from the git blobs API (the contents API refuses a file this large): the head's blob id is the file's own
+    `sha`, the base's is the file's own `sha` at the base commit. #661."""
+    module = load_module("delegated_clear")
+    try:
+        derived = derived if derived is not None else module.closure_for(rule, matches=impact_floor.matches)
+    except Exception:
+        return None   # the closure cannot be derived: the file cannot be mapped (refused, held)
+    judged = impact_floor.matches(item["filename"], sorted(derived.files))
+    unread = None if judged else ["%s cannot be read, so an added closure name cannot be ruled out: refused" % _printable(item["filename"])]   # a part the closure does not judge: unreadable is refused here (the clear's mapper skips a path it does not judge)
     try:
         if not isinstance(base_sha, str) or not base_sha:
             return unread   # no merge-base: nothing to read the old text from
-        module = load_module("delegated_clear")
         entry = _gh_json(engine, runner, repo, "repos/%s/contents/%s?ref=%s" % (repo, item["filename"], base_sha))
         base_blob = entry["sha"] if isinstance(entry, dict) and entry.get("type") == "file" else None
         if not isinstance(base_blob, str):
@@ -1092,16 +1102,88 @@ def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
         head = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, item["sha"])))
         if base is None or head is None or not isinstance(item.get("patch"), str):
             return unread
-        names, listed = module.shadow_names(rule), impact_floor.matches(item["filename"], rule.get("closure_files") or [])
+        names = module.shadow_names(rule, derived)
         if item["filename"] == rule["daemon_file"]:
-            found = module.closure_refusals(base, head, item["patch"], module.daemon_roots(rule), set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or []))
+            found = module.closure_refusals(base, head, item["patch"], module.daemon_roots(rule, derived), set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or []), module.known_of(derived))
             return found or module.shadow_refusals(base, head, names, item["filename"])   # the entry's own definitions are judged above; the added name is the only thing left to say
-        if not listed:   # a part the closure does not list: only a name added under a closure name is looked at (#1339)
+        if not judged:   # a part the closure does not judge: only a name added under a closure name is looked at (#1339)
             return module.shadow_refusals(base, head, names, item["filename"])
-        found = module.closure_refusals(base, head, item["patch"], list((rule.get("module_roots") or {}).get(item["filename"]) or []), set(), True)   # any other module the clear loads: its import-time code and the functions the clear runs
+        found = module.closure_refusals(base, head, item["patch"], list(derived.files[_judged_key(derived, item["filename"])]["roots"]), set(), True)   # any other file the clear loads: its import-time code and the definitions the clear runs
         return sorted(set(found) | set(module.shadow_refusals(base, head, names, item["filename"])))
     except Exception:
         return unread
+
+
+def _judged_key(derived, filename):
+    """The derived file a changed path names (the floor's matcher reads `./bin/x` and `BIN/X` as the file they name)."""
+    return next(f for f in sorted(derived.files) if impact_floor.matches(filename, [f]))
+
+
+def _printable(text):
+    return "".join(c if c.isprintable() else "?" for c in str(text)[:80])
+
+
+def closure_read(engine, runner, repo, number, head, rule, take=False, paged=None):
+    """(files, closure, causes): the ONE read of what a pull request changes in the clear's closure, called by the refusal (`delegated_clear_inputs`) and by the owner hold (`closure_hold`, from `pr_floor_report`): the same
+    function, so the code the clear refuses to lift is exactly the code held for the owner (#940). `files` is the pull request's changed files from the GitHub API (every page, or None with a cause), `closure` is
+    {file: [reasons] or None} for each changed file the DERIVED closure judges (None: it could not be mapped), `causes` is [] or the cause records of why nothing can be said (the closure cannot be derived, the file
+    list was not read in full, the head moved while it was read). `head` is the head the caller decided on; `paged` (a dict) is the file list the floor already read, if any (#967)."""
+    module = load_module("delegated_clear")
+    try:
+        derived = module.closure_for(rule, matches=impact_floor.matches)
+    except Exception as err:
+        return None, {}, [module.cause("rule_unreadable", "the clear's closure cannot be derived (%s): refused" % module.whole_line(str(err)))]
+    get = impact_carry_get(engine, runner, repo)
+    paged = paged if isinstance(paged, dict) else {}
+    try:
+        files = paged["files"] if "files" in paged else module.read_pr_files(get, repo, number)[0]   # every page, one retry each, or ONE named reason: a failed read is never called a cut list (#967)
+    except module.FileListError as err:
+        return None, {}, [err.cause()]
+    base_sha, closure = None, {}
+    try:
+        pull = module.read_with_retry(get, "repos/%s/pulls/%d" % (repo, number), lambda a: isinstance(a, dict), "the pull request again: ")
+        after, base_sha = (pull.get("head") or {}).get("sha"), (pull.get("base") or {}).get("sha")
+        if after == head and base_sha and any(f.get("status") == "modified" for f in files):   # the files' patches are against the MERGE-BASE, not the base branch's tip: read the blobs at that commit
+            compared = module.read_with_retry(get, "repos/%s/compare/%s...%s?per_page=1" % (repo, base_sha, after), lambda a: isinstance(a, dict), "the comparison with the base: ")
+            base_sha = ((compared or {}).get("merge_base_commit") or {}).get("sha")
+    except module.FileListError as err:
+        return None, {}, [err.cause()]
+    if after != head:
+        return None, {}, [module.FileListError("head_moved", str(head)[:8], str(after)[:8]).cause()]
+    listed = rule.get("clear_code_paths") or []
+    for item in files:   # a changed file the closure judges: each changed LINE is mapped to its definition by the ast of the file it belongs to
+        if isinstance(item.get("filename"), str) and (impact_floor.matches(item["filename"], sorted(derived.files)) or impact_floor.matches(item["filename"], ["bin/switchboard/*.py"])) and not impact_floor.matches(item["filename"], listed) and item.get("status") == "modified":
+            closure[item["filename"]] = module.cached_map(module.map_key(engine.state_dir, repo, item, base_sha, rule),
+                                                          lambda: delegated_clear_map(engine, runner, repo, item, base_sha, rule), take)   # the line the daemon posts hands what it read to the clear, once
+    return files, closure, []
+
+
+def closure_hold(engine, repo, number, head, paths, matrix):
+    """([reasons], None): why a pull request that changes the clear's closure is held for the owner, from `closure_read`, the refusal's own function; ([], None) when no changed path is one the closure judges (nothing is
+    read) or the matrix has no clear rule (the floor judges that itself); (None, why) when it cannot be said (the hold holds). Called by `pr_floor_report`. #940."""
+    module = load_module("delegated_clear")
+    hold = matrix.get("owner_hold") if isinstance(matrix, dict) else None
+    rule = hold.get("delegated_clear") if isinstance(hold, dict) else None
+    listed, problem = impact_floor.clear_code_paths(matrix)
+    if not isinstance(rule, dict) or listed is None or problem:
+        return [], None
+    rule = dict(rule, clear_code_paths=listed)
+    try:
+        derived = module.closure_for(rule, matches=impact_floor.matches)
+    except Exception as err:
+        return None, "the clear's closure cannot be derived (%s): held" % _one_line(str(err), 140)
+    if not any(isinstance(p, str) and not impact_floor.matches(p, listed) and (impact_floor.matches(p, sorted(derived.files)) or impact_floor.matches(p, ["bin/switchboard/*.py"])) for p in paths):
+        return [], None
+    files, closure, found = closure_read(engine, engine.gh_runner or subprocess.run, repo, number, head, rule, False)
+    if found:
+        return None, "; ".join(c["text"] for c in found)
+    reasons = []
+    for name, mapped in sorted(closure.items()):
+        if mapped is None:
+            reasons.append("the change to %s cannot be mapped to the definitions the clear runs: held" % _printable(name))
+        else:
+            reasons.extend("%s: %s" % (_printable(name), reason) for reason in mapped)
+    return reasons, None
 
 
 def _gh_json(engine, runner, repo, path):
@@ -1144,29 +1226,17 @@ def delegated_clear_inputs(engine, runner, repo, number, take=False, report=None
             rule = dict(rule, clear_code_paths=listed)
     except (impact_floor.MatrixError, NoticeError, ValueError) as err:
         return refused([module.cause("rule_unreadable", "the owner-hold decision or its rule cannot be read (%s): refused" % module.whole_line(str(err)))])
-    files, get = [], impact_carry_get(engine, runner, repo)
+    if not isinstance(rule, dict):
+        return refused([module.cause("rule_unreadable", "the owner-hold decision or its rule cannot be read (owner_hold.delegated_clear is missing): refused")])
     if paged.get("error") is not None:
         return refused([paged["error"].cause()])
+    files, closure, found = closure_read(engine, runner, repo, number, report.get("head"), rule, take, paged)   # the ONE read the owner hold also makes (`closure_hold`)
+    if found:
+        return refused(found)
     try:
-        files = paged["files"] if "files" in paged else module.read_pr_files(get, repo, number)[0]   # every page, one retry each, or ONE named reason: a failed read is never called a cut list (#967)
-    except module.FileListError as err:
-        return refused([err.cause()])
-    base_sha, closure = None, {}
-    if files is not None:   # the file list and the decision must be of ONE head: the head read again after the files must still be the one the decision read
-        try:
-            pull = module.read_with_retry(get, "repos/%s/pulls/%d" % (repo, number), lambda a: isinstance(a, dict), "the pull request again: ")
-            after, base_sha = (pull.get("head") or {}).get("sha"), (pull.get("base") or {}).get("sha")
-            if after == report.get("head") and base_sha and any(f.get("status") == "modified" for f in files):   # the files' patches are against the MERGE-BASE, not the base branch's tip: read the blobs at that commit
-                compared = module.read_with_retry(get, "repos/%s/compare/%s...%s?per_page=1" % (repo, base_sha, after), lambda a: isinstance(a, dict), "the comparison with the base: ")
-                base_sha = ((compared or {}).get("merge_base_commit") or {}).get("sha")
-        except module.FileListError as err:
-            return refused([err.cause()])
-        if after != report.get("head"):
-            return refused([module.FileListError("head_moved", str(report.get("head"))[:8], str(after)[:8]).cause()])
-        for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
-            if isinstance(item.get("filename"), str) and (impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) or impact_floor.matches(item["filename"], ["bin/switchboard/*.py"])) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
-                closure[item["filename"]] = load_module("delegated_clear").cached_map(load_module("delegated_clear").map_key(engine.state_dir, repo, item, base_sha, rule),
-                                                                                     lambda: delegated_clear_map(engine, runner, repo, item, base_sha, rule), take)   # the line the daemon posts hands what it read to the clear, once
+        rule = module.with_closure(rule, module.closure_for(rule, matches=impact_floor.matches))
+    except Exception as err:
+        return refused([module.cause("rule_unreadable", "the clear's closure cannot be derived (%s): refused" % module.whole_line(str(err)))])
     return {"report": report, "rule": rule, "files": files, "closure": closure}, None
 
 

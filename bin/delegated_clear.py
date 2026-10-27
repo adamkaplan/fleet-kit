@@ -287,9 +287,12 @@ def level_refusal(block, level, threshold):
     return None
 
 
-def daemon_roots(rule):
-    """The daemon file's roots of the clear closure: `closure_roots` (what the clear command runs) and `rating_roots` (the code that WRITES and PARSES the independent rating the score is read from, #835): a change to a definition reachable from any of them is the owner's own clear."""
-    return sorted(set(rule["closure_roots"]) | set(rule.get("rating_roots") or []))
+def daemon_roots(rule, derived=None):
+    """The daemon file's roots of the clear closure: the roots DERIVED from the code (`derive_closure`: the names the clear's own code reads in the daemon, and the names read by the statements that generate the daemon's
+    own definitions at import) and `rating_roots` (the code that WRITES and PARSES the independent rating the score is read from, #835): a change to a definition reachable from any of them is the owner's own clear.
+    With no `derived` the closure is derived from the code next to this file. The matrix holds no list of closure names (#940)."""
+    derived = derived if derived is not None else closure_for(rule)
+    return sorted(set(derived.roots) | set(rule.get("rating_roots") or []))
 
 
 def _clean(text):
@@ -500,6 +503,11 @@ def refusal_items(rule, report, files, matches=None, closure=None, scored=None):
     `class` (a path class never delegated), `review` (the independent review at this head), `machinery`, `new-file`, `closure`."""
     if not isinstance(rule, dict) or not isinstance(report, dict) or matches is None:
         return [_item("unreadable", "rule_unreadable", "the delegated-clear rule or the owner-hold decision cannot be read", why="the rule or the decision cannot be read")], False
+    if isinstance(rule.get("clear_code_paths"), list) and "closure_files" not in rule:   # the judged files are the derivation's, never the matrix's: a rule that carries none is given them here (the one function)
+        try:
+            rule = with_closure(rule, closure_for(rule))
+        except Exception:
+            return [_item("unreadable", "rule_unreadable", "the clear's closure cannot be derived: refused", why="the clear's closure cannot be derived")], False
     for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files"):
         if not isinstance(rule.get(key), list) or not all(isinstance(x, str) for x in rule[key]):
             return [_item("unreadable", "rule_malformed", "the delegated-clear rule is malformed (%s)" % key, why="the clear rule is malformed")], False
@@ -588,6 +596,8 @@ def cached_map(key, compute, take):
     if take:
         kept = MAP_CACHE.pop(key, None)
         return list(kept) if kept is not None else compute()
+    if key in MAP_CACHE:   # content-addressed, so a kept answer is the answer: the owner hold and the line read a file once between them
+        return list(MAP_CACHE[key])
     got = compute()
     if got is not None:
         if len(MAP_CACHE) >= MAP_CACHE_MAX:
@@ -764,6 +774,15 @@ def _is_dunder(name):
     return name.startswith("__") and name.endswith("__")
 
 
+def _prefixes(node):
+    """The constant text a computed name starts with (`"cmd_" + action`, an f-string): the leftmost string constant, three characters or more."""
+    while isinstance(node, ast.BinOp):
+        node = node.left
+    if isinstance(node, ast.JoinedStr) and node.values:
+        node = node.values[0]
+    return [node.value] if isinstance(node, ast.Constant) and isinstance(node.value, str) and len(node.value) >= 3 else []
+
+
 def closure(tree, roots, dynamic_actions=()):
     """(def names, global names, referenced names, {class: methods}) reachable from `roots` by NAME: every module-level definition a closure definition refers to (a call, a value, a default, a
     decorator, a base class) and every module-level binding it reads (its right-hand side, to a fixed point). A CLASS the closure refers to brings its own statements (bases, decorators, class
@@ -773,7 +792,7 @@ def closure(tree, roots, dynamic_actions=()):
     `add_<action>_parsers`. Any OTHER dynamic edge (getattr, globals(), importlib, eval...) is a stated limit: a test lists the ones on the path from `main`."""
     defs, binds = _index(tree)
     roots = list(defs) if "*" in roots else list(roots)   # `*`: every function of the module (a module the clear runs and no recording says which)
-    seen, globals_, refs, members, todo = set(), set(), set(), {}, list(roots)
+    seen, globals_, refs, members, todo, prefixes = set(), set(), set(), {}, list(roots), set()
 
     def walk(nodes):
         while nodes:
@@ -789,8 +808,12 @@ def closure(tree, roots, dynamic_actions=()):
                     refs.add(x.attr)
                 elif isinstance(x, ast.Constant) and x.value == "cmd_":
                     todo.extend("cmd_" + a.replace("-", "_") for a in dynamic_actions)
-                if isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE":
-                    todo.extend("add_%s_parsers" % a.replace("-", "_") for a in dynamic_actions)
+                if isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE":   # the parser is built from EVERY registrar the name pattern finds (a real clear's run executes them all: the trace pin showed it)
+                    todo.extend(n for n in defs if re.fullmatch(r"add_[a-z0-9_]+_parsers", n))
+                elif isinstance(x, ast.Call) and getattr(x.func, "id", "") == "getattr" and len(x.args) > 1 and not isinstance(x.args[1], ast.Constant):   # a computed name: every definition that starts with the constant text it is built from
+                    for prefix in _prefixes(x.args[1]):
+                        prefixes.add(prefix)
+                        todo.extend(n for n in defs if n.startswith(prefix))
 
     walk([n for r in roots if r in binds and r not in globals_ and not globals_.add(r) for n in binds[r]])   # a root that is a binding is read too
     while True:
@@ -808,7 +831,7 @@ def closure(tree, roots, dynamic_actions=()):
         grew = False
         for name in sorted(members):   # a method the closure reads by name (or a special method) is run
             for method in defs[name].body:
-                if isinstance(method, DEF_KINDS) and method.name not in members[name] and (method.name in refs or _is_dunder(method.name)):
+                if isinstance(method, DEF_KINDS) and method.name not in members[name] and (method.name in refs or _is_dunder(method.name) or any(method.name.startswith(p) for p in prefixes)):
                     members[name].add(method.name)
                     walk([method])
                     grew = True
@@ -842,7 +865,7 @@ def changed_lines(patch):
     return old, new
 
 
-def closure_refusals(base_src, head_src, patch, roots, entry_points, module_level=False, dynamic_actions=()):
+def closure_refusals(base_src, head_src, patch, roots, entry_points, module_level=False, dynamic_actions=(), known=None):
     """[reasons] a change to the daemon file touches the clear closure. `base_src` and `head_src` are the file before and after, `patch` the diff of it, `roots` the clear command's entry points and
     `entry_points` the names a NEW caller of is refused. The closure is computed on BOTH files and united (a pull request that ADDS a call into it counts). The changed lines are mapped to the
     top-level definition they are in by the ast of the file they belong to (removed lines against the base, added lines against the head). Refused: a closure definition changed; a module-level
@@ -857,6 +880,10 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
     base_closure, head_closure = closure(base, roots, dynamic_actions), closure(head, roots, dynamic_actions)
     in_defs, in_globals, in_refs = (base_closure[0] | head_closure[0]), (base_closure[1] | head_closure[1]), (base_closure[2] | head_closure[2])
     in_members = {k: base_closure[3].get(k, set()) | head_closure[3].get(k, set()) for k in set(base_closure[3]) | set(head_closure[3])}
+    if known is not None:   # the ONE closure of the whole assembly (#940): what the entry file's own walk cannot reach because it passes through a part is still in the closure
+        in_defs, in_globals, in_refs = in_defs | known[0], in_globals | known[1], in_refs | known[2]
+        for k, v in known[3].items():
+            in_members[k] = in_members.get(k, set()) | v
     reasons = []
     for side, tree, numbers in (("base", base, lines[0]), ("head", head, lines[1])):
         spans = [(_span(n), n) for n in tree.body]
@@ -892,12 +919,13 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
     return sorted(set(reasons))
 
 
-def shadow_names(rule):
-    """The names of the clear's closure the matrix carries: the daemon's roots (`closure_roots` and `rating_roots`) and every `module_roots` list (`*` is not a name). The matrix is the only
-    source: a binding the closure reads that is not one of these names is NOT known here (a stated limit, #1339; CI's `tools/derive-closure --check` lists the part that holds it)."""
-    names = {r for r in daemon_roots(rule) if isinstance(r, str) and r != "*"}
-    for roots in (rule.get("module_roots") or {}).values():
-        names |= {r for r in roots if isinstance(r, str) and r != "*"}
+def shadow_names(rule, derived=None):
+    """The names of the clear's closure: the daemon's roots (derived roots and `rating_roots`) and every root of a judged file (`*` is not a name). The ONE source is the derivation (`derive_closure`): a name the closure reads
+    is known here without a second list (#940, #1339)."""
+    derived = derived if derived is not None else closure_for(rule)
+    names = {r for r in daemon_roots(rule, derived) if isinstance(r, str) and r != "*"}
+    for info in derived.files.values():
+        names |= {r for r in info["roots"] if isinstance(r, str) and r != "*"}
     return names
 
 
@@ -985,3 +1013,296 @@ def decode_blob(answer):
         return base64.b64decode("".join(answer["content"].split()), validate=True).decode("utf-8")
     except (ValueError, UnicodeError):
         return None
+
+
+# ---- the ONE closure (#940): derived from the code the clear runs, read by the refusal and by the owner hold; no list of names is kept anywhere
+
+PART_NAME = re.compile(r"^switchboard/[A-Za-z0-9_]+\.py$")
+CONFIG_READERS = ("validate", "settings")   # a module's config readers run when the configuration is loaded (a key set or not)
+
+
+class ClosureError(Exception):
+    """The closure cannot be derived (a file that does not parse, a manifest that is not the assembly, a name defined twice): the refusal refuses and the hold holds."""
+
+
+def read_sources(root, daemon_file):
+    """({"bin/<name>": text} of the entry and every part of `bin/fleet-switchboard.parts`, in manifest order; {"bin/<name>.py": text} of every flat module of bin/). The manifest is read as DATA and fails
+    closed (ClosureError naming the entry): an entry that does not exist, is not `switchboard/<name>.py` (a path with `..`, a directory, an absolute path), is listed twice, a file of bin/switchboard/
+    that the manifest does not list (never assembled, so judged nowhere)."""
+    import os
+    bin_dir = os.path.join(root, "bin")
+    daemon = os.path.basename(daemon_file)
+    order, seen = [], set()
+    try:
+        with open(os.path.join(bin_dir, "fleet-switchboard.parts"), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError as err:
+        raise ClosureError("bin/fleet-switchboard.parts cannot be read (%s)" % err)
+    for line in lines:
+        name = line.strip()
+        if not name or name.startswith("#"):
+            continue
+        if name in seen:
+            raise ClosureError("%s: listed twice in bin/fleet-switchboard.parts" % name)
+        seen.add(name)
+        if name != daemon and not PART_NAME.match(name):
+            raise ClosureError("%s: not the entry and not switchboard/<name>.py (a path with '..', a directory or an absolute path is refused)" % name)
+        path = os.path.join(bin_dir, name)
+        if not os.path.isfile(path):
+            raise ClosureError("%s: listed in bin/fleet-switchboard.parts but not a file" % name)
+        if name != daemon and not os.path.realpath(path).startswith(os.path.realpath(os.path.join(bin_dir, "switchboard")) + os.sep):
+            raise ClosureError("%s: resolves outside bin/switchboard/" % name)
+        order.append(name)
+    if daemon not in seen:
+        raise ClosureError("%s: the entry is not listed in bin/fleet-switchboard.parts" % daemon)
+    for dirpath, _dirs, files in os.walk(os.path.join(bin_dir, "switchboard")):
+        for file in sorted(files):
+            if file.endswith(".py"):
+                rel = os.path.relpath(os.path.join(dirpath, file), bin_dir).replace(os.sep, "/")
+                if rel not in seen:
+                    raise ClosureError("%s: a part file that bin/fleet-switchboard.parts does not list (it is never assembled)" % rel)
+    out, flat = {}, {}
+    try:
+        for name in order:
+            with open(os.path.join(bin_dir, name), encoding="utf-8") as handle:
+                out["bin/" + name] = handle.read()
+        for file in sorted(os.listdir(bin_dir)):
+            if file.endswith(".py") and os.path.isfile(os.path.join(bin_dir, file)):
+                with open(os.path.join(bin_dir, file), encoding="utf-8") as handle:
+                    flat["bin/" + file] = handle.read()
+    except (OSError, UnicodeError) as err:
+        raise ClosureError("a file the closure reads cannot be read (%s)" % err)
+    return out, flat
+
+
+def _held(tree):
+    """{name: "definition" | "binding"} the module-level statements of a tree define (an import is a binding too)."""
+    out = {}
+    for node in tree.body:
+        if isinstance(node, DEF_KINDS):
+            out[node.name] = "definition"
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                out.setdefault((alias.asname or alias.name).split(".")[0], "binding")
+        elif isinstance(node, BIND_KINDS):
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                for x in ast.walk(target):
+                    if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                        out.setdefault(x.id, "binding")
+    return out
+
+
+def _module_statements(tree):
+    """Every statement that runs when a module is imported and is not a definition: the module body, and the bodies of if/try/for/while/with blocks (never into a def or a class)."""
+    stack = list(reversed(tree.body))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, DEF_KINDS):
+            continue
+        yield node
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            stack.extend(reversed([c for c in getattr(node, field, []) if isinstance(c, ast.stmt) or isinstance(c, ast.ExceptHandler)]))
+
+
+def _names_read(node, universe):
+    return {x.id for x in ast.walk(node) if isinstance(x, ast.Name)} & universe
+
+
+def _clear_modules(tree):
+    """The flat modules the daemon binds into its own namespace at import (a `.bind(globals())` call on a loaded module, in a module-level statement): their functions run with the daemon's globals, so the daemon
+    names they read are the clear's own starting names."""
+    found = []
+    for node in _module_statements(tree):
+        for x in ast.walk(node):
+            if (isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr == "bind" and len(x.args) == 1 and isinstance(x.args[0], ast.Call) and getattr(x.args[0].func, "id", "") == "globals"
+                    and isinstance(x.func.value, ast.Call) and getattr(x.func.value.func, "id", "") == "load_module" and x.func.value.args and isinstance(x.func.value.args[0], ast.Constant)):
+                found.append(x.func.value.args[0].value)
+    return sorted(set(found))
+
+
+def _generators(tree):
+    """The module-level statements that WRITE the module's namespace through `globals()` (a loop that generates definitions): the names they read are roots too, since the by-name walk cannot see what they define."""
+    return [n for n in _module_statements(tree) if not isinstance(n, (ast.Try, ast.ExceptHandler)) and any(isinstance(x, ast.Call) and getattr(x.func, "id", "") == "globals" for x in ast.walk(n))
+            and not any(isinstance(x, ast.Call) and getattr(x.func, "id", "") == "globals" for x in ast.walk(n) if x is not n and isinstance(x, (ast.Try,)))]
+
+
+class Closure:
+    """The derived closure. `roots`: the derived starting names; `defs`, `binds`: the definitions and module-level bindings of the assembled daemon the clear reaches (with `rating_roots`); `entry_defs`: those of the
+    entry file alone; `plain`: (entry defs, assembled defs, entry bindings, assembled bindings) from the derived roots alone; `files`: {path: {"roots": [...], "module_level": bool}} of every file judged by the closure
+    rule (the entry, each part that holds a definition or a binding the closure reads, each flat module the clear loads or runs); `problems`: why the closure is not decided by the code."""
+    def __init__(self):
+        self.roots, self.defs, self.binds, self.entry_defs, self.plain, self.files, self.problems, self.flat_modules, self.members, self.refs = [], set(), set(), set(), (0, 0, 0, 0), {}, [], [], {}, set()
+
+
+def derive_closure(rule, sources, flat, matches):
+    """The ONE closure, from the code. `sources` is {path: text} of the entry and the parts in manifest order (`read_sources`), `flat` {path: text} of every flat module, `matches` the floor's own path matcher. Nothing
+    is kept: the roots are the daemon names read by the code the daemon binds into its namespace (`_clear_modules`) and by the statements that generate definitions at import (`_generators`); the closure is `closure`, over the
+    assembled daemon, with the dynamic edges of `rule["dynamic_actions"]` and the roots of `rule["rating_roots"]`; the judged files are the parts and flat modules that hold a definition or a binding of it. Raises ClosureError."""
+    out, daemon_file, dynamic = Closure(), rule["daemon_file"], list(rule.get("dynamic_actions") or [])
+    trees = {}
+    for path, text in list(sources.items()) + list(flat.items()):
+        try:
+            trees[path] = ast.parse(text, filename=path)
+        except (SyntaxError, ValueError) as err:
+            raise ClosureError("%s does not parse (%s)" % (path, err))
+    if daemon_file not in sources:
+        raise ClosureError("%s: the entry is not in the assembly" % daemon_file)
+    entry = trees[daemon_file]
+    whole = ast.Module(body=[n for p in sources for n in trees[p].body], type_ignores=[])
+    defs_all, binds_all = _index(whole)
+    universe = set(defs_all) | set(binds_all)
+    modules = _clear_modules(whole)
+    if not modules:
+        raise ClosureError("the daemon binds no module of its own clear code (a `.bind(globals())` call at import): the starting names cannot be derived")
+    roots = set()
+    for name in modules:
+        path = "bin/%s.py" % name
+        if path not in trees:
+            raise ClosureError("%s: bound into the daemon's namespace but not a file" % path)
+        for node in trees[path].body:
+            if isinstance(node, DEF_KINDS):
+                roots |= _names_read(node, universe)
+    for node in _generators(whole):
+        roots |= _names_read(node, universe)
+    out.roots = sorted(roots)
+    daemon_roots_ = sorted(roots | set(rule.get("rating_roots") or []))
+    out.entry_defs = set(closure(entry, daemon_roots_, dynamic)[0])
+    defs, binds, refs, members = closure(whole, daemon_roots_, dynamic)
+    out.defs, out.binds, out.members, out.refs = set(defs), set(binds), {k: set(v) for k, v in members.items()}, set(refs)
+    pe, pw = closure(entry, out.roots, dynamic), closure(whole, out.roots, dynamic)
+    out.plain = (len(pe[0]), len(pw[0]), len(pe[1]), len(pw[1]))
+    owners, per_part = {}, {}
+    for path in sources:
+        for name, kind in _held(trees[path]).items():
+            if name in out.defs or name in out.binds:
+                owners.setdefault(name, []).append(path)
+                if path != daemon_file:
+                    per_part.setdefault(path, {})[name] = kind
+    for name, files in sorted(owners.items()):
+        defined = [f for f in files if _held(trees[f]).get(name) == "definition"]
+        if len(defined) > 1:
+            raise ClosureError("%s: a closure definition defined in more than one file (%s): which one the closure means is not decided by the code" % (name, ", ".join(sorted(defined))))
+    out.files[daemon_file] = {"roots": daemon_roots_, "module_level": False}
+    for path in sources:
+        if path in per_part:
+            out.files[path] = {"roots": sorted(n for n, kind in per_part[path].items() if kind == "definition"), "module_level": True}
+    _flat_modules(rule, out, trees, sources, flat, whole, defs_all, binds_all, modules, refs, matches)
+    return out
+
+
+def _flat_modules(rule, out, trees, sources, flat, whole, defs_all, binds_all, bound, refs, matches):
+    """The flat modules the clear loads or runs, and their roots, DERIVED: a module is judged when a closure definition or binding reaches its loader (a call of the daemon's loader with a constant name, a name of the daemon's loader table or a function
+    that returns one), a statement the daemon runs at import (or a class it defines) loads it, it declares a config reader, or another module the clear runs loads or imports it. A module the clear code itself is
+    (`clear_code_paths`) is held whole and is not listed here. The roots of a judged module are the names of its definitions that any code the clear runs reads (as a name or an attribute), to a fixed point."""
+    names = {p[len("bin/"):-3]: p for p in flat}
+    machinery = {p for p in flat if matches(p, rule.get("clear_code_paths") or [])}
+    helper = {}
+    for node in whole.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "HELPER_MODULES" for t in node.targets) and isinstance(node.value, ast.Dict):
+            helper = {k.value: v.value for k, v in zip(node.value.keys, node.value.values) if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)}
+    direct = lambda node: {x.args[0].value for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "load_module" and x.args and isinstance(x.args[0], ast.Constant)}
+    loaders = {n: direct(nd) for n, nd in defs_all.items() if direct(nd)}
+    loads_of = lambda node: direct(node) | {m for x in ast.walk(node) if isinstance(x, ast.Name) for m in ({helper[x.id]} if x.id in helper else set()) | loaders.get(x.id, set())}
+    reached = set()
+    for name in out.defs:
+        reached |= loads_of(defs_all[name])
+    for name in out.binds:
+        for node in binds_all[name]:
+            reached |= loads_of(node)
+    for node in _module_statements(whole):   # runs at import
+        for x in ast.walk(node):
+            if isinstance(x, ast.Call):
+                called = getattr(x.func, "id", "")
+                if called == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
+                    reached.add(x.args[0].value)
+                reached |= ({helper[called]} if called in helper else set()) | loaders.get(called, set())
+            elif isinstance(x, ast.Import):
+                reached |= {a.name for a in x.names}
+            elif isinstance(x, ast.ImportFrom) and x.module:
+                reached.add(x.module)
+    for node in whole.body:
+        if isinstance(node, ast.ClassDef):   # a facade class loads its module on first use: judged like one loaded at import
+            reached |= loads_of(node)
+    for path, tree in trees.items():
+        if path in flat and any(isinstance(n, ast.FunctionDef) and n.name in CONFIG_READERS for n in tree.body):
+            reached.add(path[len("bin/"):-3])
+    judged = {names[m] for m in reached if m in names}
+    def flat_loads(tree):
+        found = set()
+        for x in ast.walk(tree):
+            if isinstance(x, ast.Import):
+                found |= {a.name.split(".")[0] for a in x.names}
+            elif isinstance(x, ast.ImportFrom) and x.module:
+                found.add(x.module.split(".")[0])
+            elif isinstance(x, ast.Call) and x.args and isinstance(x.args[0], ast.Constant) and isinstance(x.args[0].value, str):
+                found.add(x.args[0].value)
+        return {names[m] for m in found if m in names}
+    todo = sorted(judged | machinery)
+    seen = set(todo)
+    while todo:   # a module the clear runs loads others
+        for path in flat_loads(trees[todo.pop()]):
+            if path not in seen:
+                seen.add(path)
+                todo.append(path)
+    judged = (seen | judged) - machinery
+    read = set(refs)
+    for path in machinery:
+        for x in ast.walk(trees[path]):
+            if isinstance(x, ast.Name):
+                read.add(x.id)
+            elif isinstance(x, ast.Attribute):
+                read.add(x.attr)
+    roots = {path: set() for path in judged}
+    while True:   # the names the code the clear runs reads, to a fixed point (a judged module's own closure reads names too)
+        grew = False
+        for path in sorted(judged):
+            defs_here = {n.name for n in trees[path].body if isinstance(n, DEF_KINDS)}
+            want = (defs_here & read) | (defs_here & set(CONFIG_READERS))
+            if want - roots[path]:
+                roots[path] |= want
+                grew = True
+            reach = closure(trees[path], sorted(roots[path]))
+            if reach[2] - read:
+                read |= reach[2]
+                grew = True
+            if reach[0] - roots[path]:
+                roots[path] |= reach[0]
+                grew = True
+        if not grew:
+            break
+    for path in sorted(judged):
+        out.files[path] = {"roots": sorted(roots[path]), "module_level": True}
+    out.flat_modules = sorted(judged)
+
+
+_CACHE = {}
+
+
+def closure_for(rule, root=None, matches=None):
+    """The derived closure of the code at `root` (the running install: the parent of this file's directory by default), kept while no file it read changed. Raises ClosureError. `matches` is the floor's matcher (the
+    caller passes it: this module holds no second one); with none, the floor's own is read from the file beside this one."""
+    import os
+    root = root or str(Path(__file__).resolve().parent.parent)
+    if matches is None:
+        import importlib.util as _u
+        spec = _u.spec_from_file_location("impact_floor_for_closure", os.path.join(root, "bin", "impact_floor.py"))
+        floor = _u.module_from_spec(spec)
+        spec.loader.exec_module(floor)
+        matches = floor.matches
+    sources, flat = read_sources(root, rule["daemon_file"])
+    key = (root, hashlib.sha256(json.dumps([sorted(sources.items()), sorted(flat.items()), {k: rule.get(k) for k in ("daemon_file", "dynamic_actions", "rating_roots", "clear_code_paths")}], default=str).encode("utf-8")).hexdigest())
+    if key not in _CACHE:
+        if len(_CACHE) >= 4:
+            _CACHE.clear()
+        _CACHE[key] = derive_closure(rule, sources, flat, matches)
+    return _CACHE[key]
+
+
+def known_of(derived):
+    """What the closure of the whole assembly holds, in the shape `closure_refusals` takes as `known`."""
+    return (derived.defs, derived.binds, derived.refs, derived.members)
+
+
+def with_closure(rule, derived):
+    """`rule` with the derived judged files in `closure_files`, the one key `refusals` reads for them: a copy, never written to the matrix."""
+    return dict(rule, closure_files=sorted(derived.files))

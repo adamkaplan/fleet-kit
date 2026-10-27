@@ -471,7 +471,7 @@ def class_is_top_tier(matrix, cls):
     return cls.strip().lower() not in rule[1]
 
 
-def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None):
+def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None, closure=None):
     """The decision under the owner-hold rule. `paths`: every changed path (a deletion and a rename's old path too); `impacts`: [(severity, probability, class)]
     from the independent rating (class may be None); `floor_hit`: the paths that hit the old floor (floor_paths). Returns (decision, reasons):
 
@@ -484,7 +484,9 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None
     `narrow` ({path: "unchanged"|"changed"|"added"|"removed"|"unreadable"}, from the caller's content reads) judges the paths the matrix file's
     `narrow_by_diff` block names: only a changed permission block holds; an added, removed or unreadable one holds; a path with no entry is unread and
     holds; more such paths than the block allows hold without being read. `record` ((action, class) of the independent impact reviewer's record for
-    this head, or None): a hold action of a top tier, missing or unknown class holds, of a class the matrix file names as not top tier asks for a second review."""
+    this head, or None): a hold action of a top tier, missing or unknown class holds, of a class the matrix file names as not top tier asks for a second review.
+    `closure` ((reasons, problem) of the clear's closure as the daemon read it with `closure_hold`, the SAME reading the delegated clear's refusal makes, or None when not read): a change to the code the clear
+    runs holds, with the refusal's own reasons; a closure that could not be read holds (#940)."""
     reasons = []
     if owner_hold_rule(matrix) is None:   # FAIL CLOSED: no usable rule means every change holds for the owner
         reasons.append("owner_hold rule missing or malformed in the impact matrix file: every change holds")
@@ -500,6 +502,12 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None
         machinery = sorted({p for p in paths if isinstance(p, str) and matches(p, listed)})
         if machinery:
             reasons.append("clear_code_paths (the clear and hold machinery, never delegated): %s" % ", ".join(machinery[:5]) + (" ..." if len(machinery) > 5 else ""))
+    if closure is not None:
+        found, why = closure
+        if why:
+            reasons.append(why)
+        for line in found or []:
+            reasons.append("the clear's closure (code the delegated clear runs and refuses to lift): %s" % line)
     hits = top_tier_hits(paths, matrix)
     prose = []   # narrow paths whose permission block did not change: no hold from the path
     narrowed, limit = narrow_paths(matrix, paths)

@@ -1,133 +1,35 @@
 #!/usr/bin/env python3
-"""derive-closure: derive the clear's closure over the assembled daemon (the entry plus every part of bin/fleet-switchboard.parts).
+"""derive-closure: print and check the clear's closure, derived from the code (ask #940).
 
     derive-closure --check [--floor N] [--floor-bindings N] [--root DIR] [--matrix FILE]
-    derive-closure --write [--root DIR] [--matrix FILE]
+    derive-closure --load --since YYYY-MM-DD [--ref REF] [--root DIR]
 
-The closure is the one bin/delegated_clear.py computes (`closure`, from the daemon's roots), over ONE ast.Module made of the module-level
-statements of the entry and of every part, in manifest order. Both halves of it count: the DEFINITIONS (`closure()[0]`) and the module-level
-BINDINGS the closure reads (`closure()[1]`). Every part that holds either is a file of the matrix's `closure_files`, and the closure DEFINITIONS it holds (sorted)
-are `module_roots[part]` (empty for a part that holds only a binding) (a part's own statements run at import for the clear: any top-level statement edit of a listed part is refused, as for any
-other module, so listing the part is what refuses an edit of a binding). The entry's own closure_roots, closure_files row and roots are never touched.
-
-The manifest is read as DATA and fails closed (exit 1, the entry named, nothing written): an entry that does not exist, is not `switchboard/<name>.py`
-(a path with `..`, a directory, an absolute path), is listed twice, or a file of bin/switchboard/ that the manifest does not list (an unlisted part is
-never assembled, so its code would run nowhere and be judged nowhere); and a closure name defined in two files (which of the two the closure means is
-not decided by the code). --write rewrites only the lines of the part entries (the file's formatting is kept), through a temp file in the same
-directory and a rename, and never writes when the derivation failed. --check exits 1 and names the part and the name (missing: in the code, not in
-the matrix; extra: in the matrix, not in the code). Exit 0 ok, 1 differs, 2 the tool could not run (a file it reads is unreadable or the matrix has
-another layout). Standard library only; nothing of the daemon runs.
+The closure is the ONE set `bin/delegated_clear.py` derives (`derive_closure`) from the code of the entry, every part of bin/fleet-switchboard.parts and the bin modules the clear loads or runs: the
+delegated clear's refusal and the owner hold both read it through `closure_read` in bin/impact_hold.py. Nothing of it is kept in the matrix: this tool only READS it. It prints the counts and fails closed
+(exit 1) for: a manifest that is not the assembly, a file that does not parse, a closure name defined in two files, a matrix that still holds a list of derived names (a key the closure replaced), and a
+closure with fewer definitions or bindings than a floor (`--floor`, `--floor-bindings`: they can only grow; they are counted from the derived roots alone, as the pins of tests/switchboard/test_closure.py are).
+Exit 0 ok, 1 differs, 2 the tool could not run (a file it reads is unreadable). Standard library only; nothing of the daemon runs.
 """
 import argparse
-import ast
+import datetime
+import re
+import subprocess
 import importlib.util
 import json
 import os
-import re
 import sys
-import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-PREFIX = "bin/switchboard/"
 MATRIX = "docs/review-laws/impact-matrix.json"
-PART_NAME = re.compile(r"^switchboard/[A-Za-z0-9_]+\.py$")
-DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+RETIRED_KEYS = ("closure_roots", "closure_files", "module_roots", "closure_exempt")   # the lists the one derivation replaced: a matrix that holds one has a second list
 
 
-class Failed(Exception):
-    """The derivation fails closed: a named problem in what the tool reads (exit 1, nothing written)."""
-
-
-def load_clear(root):
-    spec = importlib.util.spec_from_file_location("delegated_clear", os.path.join(root, "bin", "delegated_clear.py"))
+def load_module_from(root, name):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(root, "bin", name + ".py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def manifest(root, daemon_file):
-    """The manifest as data: the names after validation. Raises Failed, naming the entry, for anything that is not a part of the assembly."""
-    daemon = os.path.basename(daemon_file)
-    out, seen = [], set()
-    with open(os.path.join(root, "bin", "fleet-switchboard.parts"), encoding="utf-8") as handle:
-        for line in handle:
-            name = line.strip()
-            if not name or name.startswith("#"):
-                continue
-            if name in seen:
-                raise Failed("%s: listed twice in bin/fleet-switchboard.parts" % name)
-            seen.add(name)
-            if name != daemon and not PART_NAME.match(name):
-                raise Failed("%s: not the entry and not switchboard/<name>.py (a path with '..', a directory or an absolute path is refused)" % name)
-            path = os.path.join(root, "bin", name)
-            if not os.path.isfile(path):
-                raise Failed("%s: listed in bin/fleet-switchboard.parts but not a file" % name)
-            if name != daemon and not os.path.realpath(path).startswith(os.path.realpath(os.path.join(root, "bin", "switchboard")) + os.sep):
-                raise Failed("%s: resolves outside bin/switchboard/" % name)
-            out.append(name)
-    if daemon not in seen:
-        raise Failed("%s: the entry is not listed in bin/fleet-switchboard.parts" % daemon)
-    folder = os.path.join(root, "bin", "switchboard")
-    for dirpath, _dirs, files in os.walk(folder):
-        for file in sorted(files):
-            if file.endswith(".py"):
-                rel = os.path.relpath(os.path.join(dirpath, file), os.path.join(root, "bin")).replace(os.sep, "/")
-                if rel not in seen:
-                    raise Failed("%s: a part file that bin/fleet-switchboard.parts does not list (it is never assembled)" % rel)
-    return out
-
-
-def held_names(tree):
-    """{name: "definition" | "binding"} the module-level statements of a tree define."""
-    out = {}
-    for node in tree.body:
-        if isinstance(node, DEFS):
-            out[node.name] = "definition"
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                out.setdefault((alias.asname or alias.name).split(".")[0], "binding")   # an import is a binding too: `import base64` in a part that a closure definition reads
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                for x in ast.walk(target):
-                    if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
-                        out.setdefault(x.id, "binding")
-    return out
-
-
-def derive(root, rule):
-    """(entry-only closure definitions, assembled definitions, {part path: {name: kind}} for every part holding a closure definition OR a binding the closure reads,
-    parts in order, (entry definitions, assembled definitions, entry bindings, assembled bindings) from closure_roots alone, problems).
-    The roots are the ones the clear uses for the daemon file (`daemon_roots`: closure_roots and rating_roots)."""
-    clear = load_clear(root)
-    roots = clear.daemon_roots(rule)
-    dynamic = list(rule.get("dynamic_actions") or [])
-    trees, parts = {}, []
-    for name in manifest(root, rule["daemon_file"]):
-        rel = "bin/" + name
-        with open(os.path.join(root, "bin", name), encoding="utf-8") as handle:
-            trees[rel] = ast.parse(handle.read(), filename=rel)
-        if rel != rule["daemon_file"]:
-            parts.append(rel)
-    entry = trees[rule["daemon_file"]]
-    whole = ast.Module(body=[n for t in trees.values() for n in t.body], type_ignores=[])
-    entry_defs = clear.closure(entry, roots, dynamic)[0]
-    defs, binds = clear.closure(whole, roots, dynamic)[:2]
-    plain_entry, plain_whole = clear.closure(entry, rule["closure_roots"], dynamic), clear.closure(whole, rule["closure_roots"], dynamic)
-    plain = (len(plain_entry[0]), len(plain_whole[0]), len(plain_entry[1]), len(plain_whole[1]))
-    owners, per_part, problems = {}, {}, []
-    for rel, tree in trees.items():
-        for name, kind in held_names(tree).items():
-            if name in defs or name in binds:
-                owners.setdefault(name, []).append(rel)
-                if rel != rule["daemon_file"]:
-                    per_part.setdefault(rel, {})[name] = kind
-    for name, files in sorted(owners.items()):
-        defined = [f for f in files if held_names(trees[f]).get(name) == "definition"]
-        if len(defined) > 1:
-            problems.append("%s: a closure definition defined in more than one file (%s): which one the closure means is not decided by the code" % (name, ", ".join(sorted(defined))))
-    return set(entry_defs), set(defs), {k: per_part[k] for k in sorted(per_part, key=parts.index)}, parts, plain, problems
 
 
 def load_rule(path):
@@ -135,137 +37,91 @@ def load_rule(path):
         return json.load(handle)["owner_hold"]["delegated_clear"]
 
 
-def differences(rule, per_part):
-    out = []
-    listed = [f for f in rule["closure_files"] if f.startswith(PREFIX)]
-    roots = {k: v for k, v in rule["module_roots"].items() if k.startswith(PREFIX)}
-    for part in sorted(set(per_part) | set(listed) | set(roots)):
-        if part not in per_part:
-            out.append("%s: extra part in the matrix (it holds no closure definition and no binding the closure reads)" % part)
+def derive(root, rule):
+    """The derived closure (a `delegated_clear.Closure`). Raises delegated_clear.ClosureError."""
+    clear, floor = load_module_from(root, "delegated_clear"), load_module_from(root, "impact_floor")
+    return clear.closure_for(rule, root=root, matches=floor.matches), clear.ClosureError
+
+
+def git(root, *args):
+    return subprocess.run(["git", "-C", root] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True).stdout
+
+
+def load(root, since, ref, rule, derived, clear, floor):
+    """The owner's load, read-only: for each pull request merged into `ref` since `since` (a first-parent commit whose subject ends `(#N)`), would the closure hold it? Each changed file the closure judges (and that is not clear
+    machinery) is mapped by `closure_refusals` on the text of the commit's parent and of the commit, with the closure of THIS checkout; `entry alone` maps only the daemon file against the entry points and the rating roots."""
+    rows, listed = [], rule.get("clear_code_paths") or []
+    log = git(root, "log", "--first-parent", "--since=%s" % since, "--format=%H%x09%cs%x09%s", ref).splitlines()
+    for line in log:
+        sha, date, subject = line.split("\t", 2)
+        found = re.search(r"\(#(\d+)\)$", subject)
+        if not found:
             continue
-        if part not in listed:
-            out.append("%s: missing from closure_files" % part)
-        want = {n for n, kind in per_part[part].items() if kind == "definition"}   # a binding needs no root: the part is listed, so any top-level statement of it is refused
-        have = set(roots.get(part) or [])
-        if part not in roots:
-            out.append("%s: missing from module_roots" % part)
-        for name in sorted(want - have):
-            out.append("%s: missing definition %s" % (part, name))
-        for name in sorted(have - want):
-            out.append("%s: extra definition %s" % (part, name))
-    if not out and listed != list(per_part):
-        out.append("closure_files lists the parts in a different order than the manifest (%s): run tools/derive-closure --write" % next(a for a, b in zip(listed, per_part) if a != b))
-    return out
-
-
-class Layout(Exception):
-    """The matrix text is not laid out as the tool expects (exit 2: it cannot splice it)."""
-
-
-def block(lines, opener, closer):
-    start = next((i for i, l in enumerate(lines) if l == opener), None)
-    end = next((i for i in range(start + 1, len(lines)) if lines[i] == closer), None) if start is not None else None
-    if start is None or end is None:
-        raise Layout("the matrix has no %r block laid out as the tool expects" % opener.strip())
-    return start, end
-
-
-def render(text, per_part):
-    """The matrix text with only the part entries replaced."""
-    lines = text.split("\n")
-    start, end = block(lines, '      "closure_files": [', "      ],")
-    entries = [l.rstrip(",") for l in lines[start + 1:end] if PREFIX not in l] + ['        "%s"' % p for p in per_part]
-    lines[start + 1:end] = [e + ("," if k < len(entries) - 1 else "") for k, e in enumerate(entries)]
-    start, end = block(lines, '      "module_roots": {', "      },")
-    chunks, current = [], []
-    for line in lines[start + 1:end]:
-        current.append(line)
-        if line.startswith("        ]"):
-            chunks.append(current)
-            current = []
-    if current:
-        raise Layout("the module_roots block has a line outside an entry")
-    chunks = [c for c in chunks if PREFIX not in c[0]]
-    for part, held in per_part.items():
-        names = sorted(n for n, kind in held.items() if kind == "definition")
-        chunks.append(['        "%s": [' % part] + ['          "%s"%s' % (n, "," if k < len(names) - 1 else "") for k, n in enumerate(names)] + ["        ]"])
-    flat = []
-    for k, c in enumerate(chunks):
-        c = c[:-1] + ["        ]" + ("," if k < len(chunks) - 1 else "")]
-        flat += c
-    lines[start + 1:end] = flat
-    return "\n".join(lines)
-
-
-def write_atomic(path, text):
-    """The matrix is replaced whole or not at all: a temp file in the same directory, flushed to disk, then a rename."""
-    folder = os.path.dirname(os.path.abspath(path))
-    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=folder, prefix=".derive-closure-", suffix=".tmp", delete=False)
-    try:
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(handle.name, os.stat(path).st_mode & 0o7777)
-        os.replace(handle.name, path)
-    except BaseException:
-        try:
-            os.unlink(handle.name)
-        except OSError:
-            pass
-        raise
+        week = datetime.date.fromisoformat(date)
+        monday = (week - datetime.timedelta(days=week.weekday())).isoformat()
+        full, entry = False, False
+        for path in git(root, "diff", "--name-only", sha + "^", sha).splitlines():
+            if path not in derived.files or floor.matches(path, listed):
+                continue
+            try:
+                before, after = git(root, "show", "%s^:%s" % (sha, path)), git(root, "show", "%s:%s" % (sha, path))
+            except subprocess.CalledProcessError:
+                full = True   # added or deleted: cannot be mapped
+                continue
+            patch = "".join(__import__("difflib").unified_diff(before.splitlines(True), after.splitlines(True), "a", "b", n=0))
+            info = derived.files[path]
+            daemon = path == rule["daemon_file"]
+            roots = clear.daemon_roots(rule, derived) if daemon else info["roots"]
+            if clear.closure_refusals(before, after, patch, roots, set(rule["clear_entry_points"]) if daemon else set(), not daemon, list(rule.get("dynamic_actions") or [])):
+                full = True
+            if daemon and clear.closure_refusals(before, after, patch, sorted(set(rule["clear_entry_points"]) | set(rule.get("rating_roots") or [])), set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or [])):
+                entry = True
+        rows.append((monday, found.group(1), full, entry))
+    return rows
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="derive-closure")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
-    mode.add_argument("--write", action="store_true")
+    mode.add_argument("--load", action="store_true", help="read-only: how many pull requests merged since a date the closure would hold, per Monday-week, with the list")
+    ap.add_argument("--since", default=None)
+    ap.add_argument("--ref", default="origin/integration")
     ap.add_argument("--root", default=ROOT)
     ap.add_argument("--matrix", default=None)
-    ap.add_argument("--floor", type=int, default=None, help="--check also fails when the closure from closure_roots over the entry and the parts has fewer definitions than this (a floor: it can only grow)")
+    ap.add_argument("--floor", type=int, default=None, help="--check also fails when the closure from the derived roots over the entry and the parts has fewer definitions than this (a floor: it can only grow)")
     ap.add_argument("--floor-bindings", type=int, default=None, help="the same for the module-level bindings the closure reads")
     args = ap.parse_args(argv)
     matrix = args.matrix or os.path.join(args.root, MATRIX)
     try:
         rule = load_rule(matrix)
-        entry_names, names, per_part, parts, plain, problems = derive(args.root, rule)
-    except Failed as err:
-        print("derive-closure: refused: %s" % err)
-        return 1
-    except (OSError, ValueError, KeyError, SyntaxError) as err:
+        clear = load_module_from(args.root, "delegated_clear")
+        derived, _ = derive(args.root, rule)
+    except Exception as err:
+        if type(err).__name__ == "ClosureError":
+            print("derive-closure: refused: %s" % err)
+            return 1
         print("derive-closure: %s: %s" % (type(err).__name__, err), file=sys.stderr)
         return 2
-    print("closure definitions: %d over the entry and %d parts (entry alone: %d); %d parts hold a definition or a binding of it" % (len(names), len(parts), len(entry_names), len(per_part)))
-    print("from closure_roots alone: definitions %d over the entry, %d over the entry and the parts; bindings %d over the entry, %d over the entry and the parts" % plain)
-    for line in problems:
-        print(line)
-    if problems:
-        return 1   # also for --write: nothing is written from a derivation that failed
-    if args.write:
-        try:
-            with open(matrix, encoding="utf-8") as handle:
-                text = handle.read()
-            out = render(text, per_part)
-            fresh = json.loads(out)["owner_hold"]["delegated_clear"]
-        except Layout as err:
-            print("derive-closure: %s" % err, file=sys.stderr)
+    if args.load:
+        if not args.since:
+            print("derive-closure: --load needs --since YYYY-MM-DD", file=sys.stderr)
             return 2
-        except ValueError as err:
-            print("derive-closure: the rewritten matrix is not JSON (%s): nothing written" % err, file=sys.stderr)
-            return 2
-        left = differences(fresh, per_part)
-        if left:
-            print("derive-closure: the rewritten matrix still differs (%s): nothing written" % left[0], file=sys.stderr)
-            return 2
-        if out != text:
-            write_atomic(matrix, out)
+        rows = load(args.root, args.since, args.ref, rule, derived, clear, load_module_from(args.root, "impact_floor"))
+        for monday in sorted({r[0] for r in rows}):
+            week = [r for r in rows if r[0] == monday]
+            print("week of %s: merged %d, held by the closure %d (entry points and rating path alone: %d)" % (monday, len(week), sum(r[2] for r in week), sum(r[3] for r in week)))
+            print("  held: %s" % (", ".join("#" + r[1] for r in week if r[2]) or "none"))
+        print("total: merged %d, held %d, entry alone %d" % (len(rows), sum(r[2] for r in rows), sum(r[3] for r in rows)))
         return 0
-    diffs = differences(rule, per_part)
-    if args.floor is not None and plain[1] < args.floor:
-        diffs.append("the assembled closure (closure_roots) holds %d definitions, below the floor of %d" % (plain[1], args.floor))
-    if args.floor_bindings is not None and plain[3] < args.floor_bindings:
-        diffs.append("the assembled closure (closure_roots) reads %d bindings, below the floor of %d" % (plain[3], args.floor_bindings))
+    parts = [p for p in derived.files if p != rule["daemon_file"]]
+    print("closure definitions: %d over the entry and the parts (entry alone: %d); %d bindings; %d files judged (%d modules of bin/)" % (len(derived.defs), len(derived.entry_defs), len(derived.binds), len(parts) + 1, len(derived.flat_modules)))
+    print("from the derived roots alone: definitions %d over the entry, %d over the entry and the parts; bindings %d over the entry, %d over the entry and the parts" % derived.plain)
+    diffs = ["the matrix holds %s: the closure is derived from the code, a list of its names is a second list" % key for key in RETIRED_KEYS if key in rule]
+    if args.floor is not None and derived.plain[1] < args.floor:
+        diffs.append("the assembled closure (derived roots) holds %d definitions, below the floor of %d" % (derived.plain[1], args.floor))
+    if args.floor_bindings is not None and derived.plain[3] < args.floor_bindings:
+        diffs.append("the assembled closure (derived roots) reads %d bindings, below the floor of %d" % (derived.plain[3], args.floor_bindings))
     for line in diffs:
         print(line)
     return 1 if diffs else 0

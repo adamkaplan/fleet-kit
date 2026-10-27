@@ -6,8 +6,7 @@ every changed file under bin/switchboard/ and for the entry, listed in the matri
 the function that calls the rule) with a mutant that removes the call, and the entry's reasons compared with the recorded baseline.
 
 LIMITS, stated: `exec`/`eval`, writes through `globals()`/`vars()`/`setattr` on the module, bindings made by a call (`globals().update(...)`) and `from x import *` are not followed; the closure names are
-the ones the matrix carries (`closure_roots`, `rating_roots`, `module_roots`), so a closure-read binding the matrix does not name is not caught by the clear (CI's tools/derive-closure --check lists the part
-that holds it); `delegated_clear_inputs` (which asks for the map of an unlisted part) is not driven here, only the map it calls.
+the ones the one derivation gives (`delegated_clear.derive_closure`: nothing is listed in the matrix, #940); `delegated_clear_inputs` (which asks for the map of an unlisted part) is not driven here, only the map it calls.
 """
 import base64
 import difflib
@@ -34,6 +33,8 @@ def load(name, path):
 
 
 RULE = json.loads((REPO / "docs/review-laws/impact-matrix.json").read_text())["owner_hold"]["delegated_clear"]
+DERIVED = load("delegated_clear_derived", REPO / "bin" / "delegated_clear.py").closure_for(RULE, root=str(REPO), matches=impact_floor.matches)   # the one closure: the judged files and roots are its, never the matrix's
+FILES = sorted(DERIVED.files)
 BASE = "import os\n\n\ndef keep(a):\n    return a\n"
 NAME = "boss_name"
 
@@ -128,7 +129,7 @@ class TestShadowRule(unittest.TestCase):
 
     def test_every_binder_form_adds_the_name_and_is_refused_naming_it_and_the_file(self):
         for label, add in BINDERS.items():
-            for path in ("bin/switchboard/judge.py", "bin/switchboard/audit.py"):   # not listed in the matrix, and listed
+            for path in ("bin/switchboard/answer_delivery.py", "bin/switchboard/audit.py"):   # not listed in the matrix, and listed
                 with self.subTest(form=label, file=path.rsplit("/", 1)[1]):
                     got = self.m.shadow_refusals(BASE, BASE + add, self.names, path)
                     self.assertTrue(any(NAME in r and path in r for r in got), got)
@@ -136,11 +137,11 @@ class TestShadowRule(unittest.TestCase):
     def test_what_does_not_bind_the_name_at_module_level_is_not_refused(self):
         for label, add in NOT_BOUND.items():
             with self.subTest(form=label):
-                self.assertEqual(self.m.shadow_refusals(BASE, BASE + add, self.names, "bin/switchboard/judge.py"), [])
+                self.assertEqual(self.m.shadow_refusals(BASE, BASE + add, self.names, "bin/switchboard/answer_delivery.py"), [])
 
     def test_the_bypasses_the_reviews_found_are_named_regression_markers(self):
         for add in (BINDERS["import as"], BINDERS["def under if True"], BINDERS["walrus in a lambda default"], BINDERS["walrus in a return annotation"], BINDERS["walrus in an except type"]):
-            self.assertTrue(self.m.shadow_refusals(BASE, BASE + add, self.names, "bin/switchboard/judge.py"), add)
+            self.assertTrue(self.m.shadow_refusals(BASE, BASE + add, self.names, "bin/switchboard/answer_delivery.py"), add)
 
     def test_a_name_already_bound_is_not_added_and_a_syntax_error_is_refused(self):
         had = BASE + "\ndef boss_name(a):\n    return a\n"
@@ -152,7 +153,7 @@ class TestShadowRule(unittest.TestCase):
     def test_the_stated_limits_are_not_followed(self):
         for add in ("\n\nglobals().update(boss_name=1)\n", "\n\nexec('boss_name = 1')\n", "\n\nsetattr(sys.modules[__name__], 'boss_name', 1)\n", "\n\nfrom os import *\n"):
             with self.subTest(add=add.strip()[:30]):
-                self.assertEqual(self.m.shadow_refusals(BASE, BASE + add, self.names, "bin/switchboard/judge.py"), [], "a stated limit")
+                self.assertEqual(self.m.shadow_refusals(BASE, BASE + add, self.names, "bin/switchboard/answer_delivery.py"), [], "a stated limit")
 
 
 class TestShadowGlue(unittest.TestCase):
@@ -179,30 +180,30 @@ class TestShadowGlue(unittest.TestCase):
 
     def test_a_listed_part_and_an_unlisted_part_refuse_the_added_name_and_the_old_check_alone_did_not(self):
         add = BINDERS["def"]
-        for path, listed in (("bin/switchboard/audit.py", True), ("bin/switchboard/judge.py", False)):
+        for path, listed in (("bin/switchboard/audit.py", True), ("bin/switchboard/answer_delivery.py", False)):
             with self.subTest(file=path):
-                self.assertEqual(impact_floor.matches(path, RULE["closure_files"]), listed)
+                self.assertEqual(impact_floor.matches(path, FILES), listed)
                 got = self.run_map(path, BASE, BASE + add)
                 self.assertTrue(any(NAME in r and path in r for r in got), got)
-                alone = self.m.closure_refusals(BASE, BASE + add, diff(BASE, BASE + add), RULE["module_roots"].get(path, []), set(), True)
+                alone = self.m.closure_refusals(BASE, BASE + add, diff(BASE, BASE + add), DERIVED.files.get(path, {}).get("roots", []), set(), True)
                 self.assertFalse(any(NAME in r for r in alone), "the check as it was lets the shadow through")
 
     def test_the_glue_applies_the_rule_to_the_two_bypass_forms_in_an_unlisted_part(self):
         for add in (BINDERS["import as"], BINDERS["def under if True"]):
-            self.assertTrue(any(NAME in r for r in self.run_map("bin/switchboard/judge.py", BASE, BASE + add)), add)
+            self.assertTrue(any(NAME in r for r in self.run_map("bin/switchboard/answer_delivery.py", BASE, BASE + add)), add)
 
     def test_a_mutant_that_removes_the_call_leaves_the_plants_unrefused(self):
         with mock.patch.object(self.m, "shadow_refusals", lambda *args: []):
-            self.assertEqual(self.run_map("bin/switchboard/judge.py", BASE, BASE + BINDERS["def"]), [], "without the call nothing refuses it")
+            self.assertEqual(self.run_map("bin/switchboard/answer_delivery.py", BASE, BASE + BINDERS["def"]), [], "without the call nothing refuses it")
             self.assertFalse(any(NAME in r for r in self.run_map("bin/switchboard/audit.py", BASE, BASE + BINDERS["def"])))
 
     def test_an_outside_name_and_an_edit_of_a_non_closure_function_are_not_refused(self):
-        self.assertEqual(self.run_map("bin/switchboard/judge.py", BASE, BASE + NOT_BOUND["a name outside the closure"]), [])
+        self.assertEqual(self.run_map("bin/switchboard/answer_delivery.py", BASE, BASE + NOT_BOUND["a name outside the closure"]), [])
         self.assertEqual(self.run_map("bin/switchboard/audit.py", BASE, BASE + NOT_BOUND["a name outside the closure"]), [])
 
     def test_a_missing_merge_base_is_an_unreadable_part_too(self):
         with mock.patch.object(self.hold, "_gh_json", side_effect=AssertionError("nothing is read without a merge-base")):
-            got = self.hold.delegated_clear_map(None, None, "o/r", {"filename": "bin/switchboard/judge.py", "sha": "BLOBHEAD", "patch": "x"}, None, RULE)
+            got = self.hold.delegated_clear_map(None, None, "o/r", {"filename": "bin/switchboard/answer_delivery.py", "sha": "BLOBHEAD", "patch": "x"}, None, RULE)
         self.assertTrue(got and "cannot be read" in got[0], got)
 
     def test_a_real_move_between_two_existing_parts_is_refused_on_the_receiving_file_and_a_non_closure_move_is_not(self):
@@ -227,8 +228,8 @@ class TestShadowGlue(unittest.TestCase):
         self.assertEqual((self.run_map("bin/switchboard/facts.py", g0, g1), self.run_map("bin/switchboard/reminders.py", r0, r1)), ([], []))
 
     def test_an_unreadable_unlisted_part_is_refused_and_a_listed_one_is_unmapped_as_before(self):
-        got = self.run_map("bin/switchboard/judge.py", BASE, BASE, readable=False)
-        self.assertTrue(got and "judge.py" in got[0] and "cannot be read" in got[0], got)
+        got = self.run_map("bin/switchboard/answer_delivery.py", BASE, BASE, readable=False)
+        self.assertTrue(got and "answer_delivery.py" in got[0] and "cannot be read" in got[0], got)
         self.assertIsNone(self.run_map("bin/switchboard/audit.py", BASE, BASE, readable=False), "a listed part that cannot be read stays unmapped (the clear refuses it as unreadable)")
 
     def test_the_entry_keeps_its_recorded_baseline_reasons_exactly(self):
@@ -238,11 +239,12 @@ class TestShadowGlue(unittest.TestCase):
         roots = self.m.daemon_roots(RULE)
         baseline = self.m.closure_refusals(base, head, diff(base, head), roots, set(RULE["clear_entry_points"]), False, list(RULE.get("dynamic_actions") or []))
         self.assertTrue(baseline)
-        self.assertEqual(self.run_map(entry, base, head), baseline)
+        self.assertEqual(self.run_map(entry, base, head), self.m.closure_refusals(base, head, diff(base, head), roots, set(RULE["clear_entry_points"]), False, list(RULE.get("dynamic_actions") or []), self.m.known_of(DERIVED)))
         other = "redact"
         self.assertIn(other, self.names)
         added = base + "\n%s = 1\n" % other   # an added closure name: the baseline (computed here the same way) decides first
         recorded = self.m.closure_refusals(base, added, diff(base, added), roots, set(RULE["clear_entry_points"]), False, list(RULE.get("dynamic_actions") or []))
+        recorded = recorded or self.m.closure_refusals(base, added, diff(base, added), roots, set(RULE["clear_entry_points"]), False, list(RULE.get("dynamic_actions") or []), self.m.known_of(DERIVED))   # the whole closure knows `redact` (it is defined in a part)
         expected = recorded or self.m.shadow_refusals(base, added, self.names, entry)
         self.assertEqual(self.run_map(entry, base, added), expected)
         with mock.patch.object(self.m, "closure_refusals", lambda *args, **kw: []):
@@ -297,7 +299,7 @@ def file_row(kind, status):
         path = RULE["daemon_file"]
     else:
         base, head = BASE, BASE + BINDERS["def"]
-        path = {"listed": "bin/switchboard/audit.py", "unlisted": "bin/switchboard/judge.py"}[kind]
+        path = {"listed": "bin/switchboard/audit.py", "unlisted": "bin/switchboard/answer_delivery.py"}[kind]
     row = {"filename": path, "base": base, "head": head, "patch": diff(base, head), "sha": "BLOBHEAD:" + path}
     if status is not None:
         row["status"] = status
@@ -316,7 +318,7 @@ class TestShadowStatuses(unittest.TestCase):
         self.hold.load_module = lambda name: self.m
 
     def test_every_status_of_a_listed_part_an_unlisted_part_and_the_entry(self):
-        self.assertFalse(impact_floor.matches("bin/switchboard/judge.py", RULE["closure_files"]))
+        self.assertFalse(impact_floor.matches("bin/switchboard/answer_delivery.py", FILES))
         for kind in ("listed", "unlisted", "entry"):
             for status in self.STATUSES:
                 with self.subTest(file=kind, status=status):
