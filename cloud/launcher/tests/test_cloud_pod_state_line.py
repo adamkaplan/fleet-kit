@@ -468,6 +468,13 @@ class TestDocuments(unittest.TestCase):
         for phrase in ("160 characters", "no state read within 60 s", "read only", "another lane's worker is refused"):
             self.assertIn(phrase, text)
 
+    def test_the_inherent_limit_and_the_local_files_are_in_both_documents(self):
+        for rel in DOCS:
+            text = read(rel)
+            for phrase in ("Known limit: a short value", "a passphrase of several words", "`curl -u`", "transient", "removed when the command ends", "mode `0700`"):
+                with self.subTest(rel=rel, phrase=phrase):
+                    self.assertIn(phrase, text)
+
 
 def leaked(secret, line, width=6):
     """The pieces of `secret` of `width` or more characters that the printed line still holds."""
@@ -546,9 +553,9 @@ def table():
                   "password: \r\npassword: \r\n", "secret: key: auth: "):   # (2) a doubled keyword, or a chain of them
         for kind, value in (("short", SEVEN), ("40", V40)):
             cases.append(("chain %r, %s" % (chain, kind), "Error: bad " + chain + value, [value]))
-    for offset in (3000, 3985, 3990, 3994, 3999, 4000, 4005, 4100):   # (3) the secret sits on the last line, at or around character 4000
+    for offset in (3000, 3985, 3990, 3994, 3999, 4000, 4005, 4100):   # (3) the secret starts at this character, on the last line, around the cut at 4000
         for kind, value in (("token", TOK), ("40", V40)):
-            cases.append(("last line at %d, %s" % (offset, kind), "Error: boom\n" + PAD[:offset] + "\n" + value, [value]))
+            cases.append(("last line at %d, %s" % (offset, kind), "Error: boom\n" + PAD[:offset - 13] + "\n" + value, [value]))
     for secret in (V30, V34, V40):   # (4) an unmarked secret wrapped into two halves
         for name, brk in BREAKS[:3]:
             half = len(secret) // 2
@@ -597,6 +604,21 @@ class TestDenyByDefault(Base):
                 self.setUp()
                 self.assertIn(plain.split(": ", 1)[1][:20], self.printed(plain))
 
+    FIVE = ("Error: pull refused: unauthorized: authentication required for registry.example.internal/widget/api:1.4.2",
+            "Error: push to acme-org/widget-service refused by the guard: branch main is protected (rule R7)",
+            "Error: AgentCrash: unhandled TypeError at run (/app/dist/agent.js:412:19) in session",
+            "Error: quota exceeded: 429 Too Many Requests for model widget-large, retry after 30 s",
+            "Error: ImagePullBackOff: back-off pulling image registry.example.internal/worker:2026.10")
+
+    def test_s2_five_real_shaped_pod_failures_print_as_they_are(self):
+        """The usefulness bar, measured: a pull refused, a push refused by the guard, an agent crash line, a quota message and an image pull that
+        sticks all print unchanged (nothing in them is a secret, so nothing may be taken out)."""
+        for plain in self.FIVE:
+            with self.subTest(plain):
+                self.assertEqual(CLOUD.redact_error(plain), plain)
+                self.setUp()
+                self.assertIn(plain, self.printed(plain))
+
     def test_s2_a_plain_last_line_after_a_plain_first_line_prints_as_it_is(self):
         self.assertEqual(CLOUD.redact_error("Error: step failed\n" + READABLE), READABLE)
 
@@ -606,6 +628,34 @@ class TestDenyByDefault(Base):
             out = CLOUD.redact_error(text)
             self.assertLess(time.monotonic() - began, 5, text[:20])
             self.assertLessEqual(len(out), 160)
+
+JWT_PARTS = ("ey" + "Jhb", "GciOiJIUzI1NiJ9.", "eyJzdWIiOiIxMjM0NTY3ODkw.", "SflKxwRJSMeKKF2QT4fwpM")
+FORMS = {"short": SEVEN, "44": V40, "31": V34, "token": TOK, "jwt": "".join(JWT_PARTS), "sk": "s" + "k-" + "proj" + "AbCdEfGhIjKlMnOpQrSt", "passphrase": PASSWORD}
+CONTEXTS = ("Error: password={}", 'Error: {{"password": "{}"}}', "export API_KEY={}", "Error: https://bob:{}@host.example/x failed", "Error: Authorization: Bearer {}",
+            "Error: Authorization: Basic {}", "Error: --password {} failed", "Error: failed with passwd:{}", "Error: x\npassword\n{}", "Error: PASSWORD\r\n:\r\n{}",
+            "Error: pass:\u200b{}", "Error: token\t{}", 'Error: {{"api_key":"{}","x":1}}', "Error: cookie: session={}; path=/", "Error: pwd = '{}'",
+            'Error: secret: "{}" more', "Error: secret:\n\n\n{}", "Error: key {}", "Error: private: {}", "Error: credential: user {}", "Error: Bearer\n{}",
+            "Error: session\u2028{}", "Error: tok\u200ben:\r\n{}", "Error: password: password: {}")
+
+
+class TestContexts(unittest.TestCase):
+    """S2: every form of a secret (7 forms) in every hostile context (24 contexts), alone and after 40 plain words: 336 texts, 0 pieces of 6 characters."""
+
+    def test_s2_every_form_in_every_context_leaves_no_piece(self):
+        failures = []
+        for (kind, value), context in [(a, b) for a in FORMS.items() for b in CONTEXTS]:
+            for before in ("", "x " * 40):
+                shown = leaked(value, CLOUD.redact_error(before + context.format(value)))
+                if shown:
+                    failures.append((kind, context, shown[:1]))
+        self.assertEqual(failures, [])
+
+    def test_s2_the_known_secrets_of_the_run_never_show_in_any_context(self):
+        known = {ENV_SECRET, PASSWORD}
+        for context in CONTEXTS:
+            for value in known:
+                out = CLOUD.redact_error("Error: " + context.format(value[:5] + "\u200b" + value[5:]), known)
+                self.assertEqual(leaked(value, out), [], out)
 
 
 class Clock:

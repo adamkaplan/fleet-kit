@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from pathlib import Path
 
@@ -1800,65 +1801,198 @@ ERROR_LINE_MAX = 160
 READ_FAIL = "state not read"
 _clock = time.monotonic   # the wait's clock and pause: a test swaps them for a fake clock, so no test waits for real
 _sleep = time.sleep
-_SECRET_WORD = r"(?:pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|credential|private[_-]?key|auth|bearer)"
-_NL = "~NL~"   # a line break during the redaction: a plain word, so no rule needs a real line break and a marker may sit on an earlier line than its value
-_GAP = r"(?:[ \t]|%s)*" % _NL
-_KEYWORD_VALUE = re.compile(r"\b(%s\w*)\b%s[:=]?%s(?:\"[^\"]*\"|'[^']*'|(?!%s)\S+)" % (_SECRET_WORD, _GAP, _GAP, _NL), re.I)
-_MARKED_VALUE = re.compile(r"(\[redacted\])%s([:=])%s(?:\"[^\"]*\"|'[^']*'|(?!%s)\S+)" % (_GAP, _GAP, _NL))   # a keyword the scrub already cut out still marks the value after it
-_ASSIGNMENT = re.compile(r"""(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1([ \t]*[=:]%s)("[^"]*"|'[^']*'|(?!%s)\S+)""" % (_GAP, _NL))
-_LONG_RUN = re.compile(r"[A-Za-z0-9_+/=.?-]{16,}")   # `?` is what the scrub makes of a zero-width or control character inside a run
 _SECRET_ENV_NAME = re.compile(r"(?:KEY|TOKEN|SECRET|PASS|CRED|AUTH)", re.I)
+ERROR_TEXT_MAX = 2000000   # past this the text is not read at all (it prints one fixed phrase): the redaction below is linear, this only bounds its memory
+_BREAK_CHARS = frozenset("\n\r\x0b\x0c\x85\u2028\u2029")   # every kind of line break: LF, CR, VT, FF, NEL, LS, PS
+_STRONG_WORDS = ("password", "passwd", "passphrase", "passcode", "pwd", "secret", "token", "apikey", "credential", "cookie", "bearer", "authorization", "privatekey")
+_WEAK_WORDS = frozenset(("pass", "key", "auth", "session", "private", "sid", "cred", "creds"))   # common words: they mark a value only with a `:` or `=`
+_SKIP_WORDS = frozenset("a an the is are was were be not no limit limits expired expiry invalid missing required refused rejected exceeded denied for has had have of to in "
+                        "from or and must can could cannot failed error errors unauthorized forbidden found empty unset set exists reached refresh needs need this that these those it its your with on at by when so as than".split())
+_ATOM = re.compile(r"[^/\\:=,;?&@#|\"'()\[\]{}<>!*\s]+")
+_LONE_SEP = re.compile(r"[:=]+[\"']?|[-=]+>")
+_END_SEP = re.compile(r"[:=][\"'\])}]*,?$")
 
 
-def _assignment_sub(found):
-    name, sep = found.group(2), found.group(3)
-    if "=" in sep or found.group(1) or re.search(_SECRET_WORD, name, re.I) or ("_" in name and name.isupper()):
-        return "%s%s[redacted]" % (name, sep)   # NAME=value, "name": "value", SECRET_NAME: value: the value never stays
-    return found.group(0)
-
-
-def _redact_assignments(text):
-    """Every `NAME=value` the rule above judges secret, found by walking the text: a pair that is kept does NOT hide the pairs inside its value."""
-    out, pos = [], 0
-    while True:
-        found = _ASSIGNMENT.search(text, pos)
-        if not found:
-            return "".join(out) + text[pos:]
-        replaced = _assignment_sub(found)
-        if replaced == found.group(0):   # kept: go on from the start of its value, so a pair inside the value is still judged
-            out.append(text[pos:found.start(4)])
-            pos = found.start(4)
+def _normalise(text, spaced):
+    """(N, idx): the text as the rules read it, and for each character of N the index of the original character it came from. NFKC; a line break is
+    a plain space (a CR and an LF stay, which the Authorization shape reads); a zero-width, format (bidi included), control or combining character is
+    removed (`spaced` False: a keyword or a secret split by it is whole again) or turned into a space (`spaced` True: two words it separated stay two)."""
+    chars, idx = [], []
+    for i, ch in enumerate(text):
+        if " " <= ch <= "~":
+            piece = ch
+        elif ch in "\r\n":
+            piece = ch
+        elif ch in _BREAK_CHARS or ch.isspace():
+            piece = " "
+        elif unicodedata.category(ch)[0] in "CM":
+            piece = " " if spaced else ""
         else:
-            out.append(text[pos:found.start()] + replaced)
-            pos = found.end()
+            piece = unicodedata.normalize("NFKC", ch)
+        for one in piece:
+            chars.append(" " if one.isspace() and one not in "\r\n" else one)
+            idx.append(i)
+    return "".join(chars), idx
 
 
-def _run_sub(found):
-    run = found.group(0).replace("?", "")   # a run cut by an odd character counts as the one run it was
-    mixed = re.search(r"[A-Za-z]", run) and re.search(r"[0-9]", run)
-    return "[redacted]" if (mixed or len(run) >= 32) else run
+def _value_like(atom):
+    """True for a piece that may be a value: 12+ characters that are not plain words, letters and digits mixed at 8+, or hex at 16+. A plain word is
+    letters only (up to 24); a short number is up to 5 digits; words joined by - _ . stay plain up to 3 parts and 24 characters."""
+    core = atom.strip("-_.+~")
+    if len(core) < 8:
+        return False
+    if re.fullmatch(r"[0-9a-fA-F]{16,}", core):
+        return True
+    if re.fullmatch(r"[a-z0-9-]{1,20}(?:\.[a-z0-9-]{1,20}){1,4}", core) and len(core) <= 40 and not any(_value_like(label) for label in core.split(".")):
+        return False   # a host name
+    parts = [p for p in re.split(r"[-_.]", core) if p]
+    if len(core) <= 24 and len(parts) <= 3 and all((p.isalpha() and len(p) <= 24) or (p.isdigit() and len(p) <= 5) for p in parts):
+        return False
+    if len(core) >= 12:
+        return True
+    return any(c.isdigit() for c in core) and any(c.isalpha() for c in core)
+
+
+def _keyword(token):
+    """(strong, weak, has_sep, ends_sep, attached) for a token that names a secret, else None. A path (it holds a slash and no `=`) names nothing."""
+    if "/" in token and "=" not in token:
+        return None
+    name = re.split(r"[:=]", token, maxsplit=1)[0]
+    low = re.sub(r"[^a-z]", "", name.lower())
+    strong = any(word in low for word in _STRONG_WORDS)
+    weak = bool(_WEAK_WORDS.intersection(re.findall(r"[a-z]+", name.lower())))
+    if not (strong or weak):
+        return None
+    has_sep = len(name) < len(token)
+    return strong, weak, has_sep, bool(_END_SEP.search(token)), bool(re.search(r"[:=][^:=\s]*[A-Za-z0-9]", token))
+
+
+def _mark_variant(text, spaced, lib, grams, mask):
+    """Run every rule on one reading of the text and mark the ORIGINAL positions it redacts. Returns the last original position that holds a visible character."""
+    N, idx = _normalise(text, spaced)
+
+    def mark(a, b):
+        if b > a:
+            low, high = idx[a], idx[b - 1] + 1
+            mask[low:high] = b"\x01" * (high - low)
+
+    for pattern, _ in lib.CREDENTIAL_SHAPES:   # the launcher's own shapes (an Authorization header, a URL's user:password), then its token shapes
+        for found in pattern.finditer(N):
+            mark(found.start(), found.end())
+    for pattern in lib.TOKEN_SHAPES:
+        for found in pattern.finditer(N):
+            mark(found.start(), found.end())
+    if grams:   # any 8+ character piece of a known secret
+        size = lib.MIN_FRAGMENT
+        for i in range(len(N) - size + 1):
+            if N[i:i + size] in grams:
+                j = i + size
+                while j < len(N) and any(N[i:j + 1] in sec for sec in grams[N[i:i + size]]):
+                    j += 1
+                mark(i, j)
+    tokens = [(m.start(), m.end(), m.group()) for m in re.finditer(r"\S+", N)]
+    remaining, sep_mode, scanned, quote = 0, False, 0, None
+    for s, e, t in tokens:
+        if quote:   # a quoted value with spaces in it: every token up to the closing quote
+            mark(s, e)
+            if quote in t:
+                quote = None
+            continue
+        found = _keyword(t)
+        if found:   # (c) after a secret keyword: the value after it, and the next three tokens
+            strong, weak, has_sep, ends_sep, attached = found
+            if attached:
+                mark(s, e)
+            budget = 3 if (strong or has_sep) else 1   # a common word (key, session ...) with no `:` or `=` after it marks one value
+            remaining, sep_mode, scanned = (budget if (ends_sep or not attached) else 0), has_sep, 0
+            continue
+        if remaining:
+            if _LONE_SEP.fullmatch(t):
+                sep_mode = True
+                continue
+            word = re.sub(r"[^a-z]", "", t.lower())
+            if not sep_mode and word in _SKIP_WORDS and scanned < 6:
+                scanned += 1
+                continue
+            mark(s, e)
+            remaining -= 1
+            continue
+        for assigned in re.finditer(r"=([^=&\s]+)", t):   # NAME=value, a query's token=value: the value never stays
+            mark(s + assigned.start(1), s + assigned.end(1))
+            first = assigned.group(1)[0]
+            if first in "\"'" and first not in assigned.group(1)[1:]:
+                quote = first
+        if t.endswith("="):
+            remaining, sep_mode, scanned = 1, True, 0
+    for s, e, t in tokens:   # (d) deny by default: a token that is not a plain word, a short number or a path piece
+        core = t.strip(".,;:!?()[]{}<>\"'")
+        if re.fullmatch(r"[A-Za-z0-9+/=_-]{16,}", core) and not core.startswith(("/", ".", "~")) and (re.search(r"[0-9+=]", core) or len(core) > 24):
+            mark(s, e)
+            continue
+        for atom in _ATOM.finditer(t):
+            if _value_like(atom.group()):
+                mark(s + atom.start(), s + atom.end())
+    line_of, line = [], 0   # a secret wrapped over two lines: the end of one line and the start of the next, read as one piece
+    for ch in N:
+        line_of.append(line)
+        line += ch in "\r\n"
+    for (s1, e1, t1), (s2, e2, t2) in zip(tokens, tokens[1:]):
+        if line_of[s2] != line_of[s1] and re.fullmatch(r"[A-Za-z0-9+/_=-]+", t1) and re.fullmatch(r"[A-Za-z0-9+/_=-]+", t2) and _value_like(t1 + t2):
+            mark(s1, e1)
+            mark(s2, e2)
+    last = len(N)
+    while last and N[last - 1].isspace():
+        last -= 1
+    return idx[last - 1] if last else -1
 
 
 def redact_error(text, known=()):
-    """The error line that `status` prints, made safe BEFORE it is cut and BEFORE a line is chosen (so neither a cut nor a line break can hide a
-    value from a rule): over the WHOLE text, line breaks become a plain word and the launcher's own scrub runs (this run's known secrets and any 8+
-    character piece of one, token and credential shapes; control, line-separator and zero-width characters become `?`, which stays part of a value
-    or a run), then (1) every value after `NAME=`, after a quoted name and after a name that is capitalised or holds a secret word (password, token,
-    key, secret, auth, bearer), (2) the word after such a keyword, even on the next line, (3) every long run of letters and digits (16+ with both,
-    32+ of any, counted without the `?`). Only then the last line is taken and cut at ERROR_LINE_MAX. Nothing is added back. Known limit: an unmarked
-    short value (under 16 mixed or under 32 letters-only characters) that no keyword precedes cannot be told from text and prints."""
-    lib = _lib()
-    text = str(text or "").strip()[:4000]
-    if not text:
+    """The error line that `status` prints, DENY BY DEFAULT. It is made over the WHOLE text, never a cut of it: (a) the text is read twice, with its
+    zero-width, format, control and combining characters removed and turned into spaces (a position redacted in either reading is redacted); (b)
+    every kind of line break is a plain space; (c) the launcher's own shapes (a token, a JWT, an Authorization header, a URL's user:password) and any
+    8+ character piece of this run's known secrets go; (d) the value after a secret keyword (password, token, secret, key, auth, bearer, credential,
+    cookie, session, private ...) and the next three tokens go, and so does every value after `=`; (e) every token that is not a plain word, a short
+    number or a path piece goes when it is 12+ characters, letters and digits mixed at 8+, or hex at 16+. ONLY THEN is the last non-empty line of the
+    ORIGINAL text taken, and it is cut at ERROR_LINE_MAX. It is for a person to see what went wrong, so it may lose words; it never shows a secret
+    or a piece of one. Known limit: a SHORT value that no keyword precedes (under 8 characters, or letters only under 25), a passphrase of several
+    words and a `-p` or `curl -u` form cannot be told from text and print."""
+    text = str(text or "")
+    if not text.strip():
         return ""
-    text = text.replace("\n", " %s " % _NL)
-    text = lib.scrub(text, known, 8000)
-    text = _redact_assignments(text)
-    text = _KEYWORD_VALUE.sub(lambda m: m.group(1) + " [redacted]", text)
-    text = _MARKED_VALUE.sub(lambda m: m.group(1) + m.group(2) + " [redacted]", text)
-    text = _LONG_RUN.sub(_run_sub, text)
-    lines = [" ".join(line.split()) for line in text.split(_NL)]
-    return ([line for line in lines if line] or [""])[-1][:ERROR_LINE_MAX]
+    if len(text) > ERROR_TEXT_MAX:
+        return "[error text too long to show]"
+    lib = _lib()
+    grams = {}
+    for secret in sorted({v for v in known if v and len(v.strip()) >= lib.MIN_FRAGMENT}, key=len, reverse=True):
+        for form in {secret, secret.strip()}:
+            for i in range(len(form) - lib.MIN_FRAGMENT + 1):
+                grams.setdefault(form[i:i + lib.MIN_FRAGMENT], []).append(form)
+    mask = bytearray(len(text))
+    last = max(_mark_variant(text, spaced, lib, grams, mask) for spaced in (False, True))
+    if last < 0:
+        return ""
+    start = last
+    while start > 0 and text[start - 1] not in _BREAK_CHARS:
+        start -= 1
+    end = last + 1
+    while end < len(text) and text[end] not in _BREAK_CHARS:
+        end += 1
+    out, red, space = [], False, False
+    for i in range(start, end):
+        ch = text[i]
+        if ch.isspace():
+            space = bool(out)
+        elif unicodedata.category(ch)[0] in "CM":
+            continue
+        elif mask[i]:
+            if not red:
+                out.append(" [redacted]" if space else "[redacted]")
+                red = True
+            space = False
+        else:
+            out.append((" " + ch) if space else ch)
+            space, red = False, False
+    return "".join(out)[:ERROR_LINE_MAX]
 
 
 def _known_secrets(state, record, cluster):
