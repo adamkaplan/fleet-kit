@@ -497,6 +497,24 @@ class Mutants(unittest.TestCase):
         self.killed(text[:i] + text[i:].replace("    steps:\n", "    steps:\n      - run: echo x\n", 1), self.STEPS)
         self.killed(mutate(text, "\n  # The cloud suites run beside", "\n      - run: echo x\n\n  # The cloud suites run beside"), self.STEPS)
 
+    def relay_step(self, name):
+        return "      - name: %s\n        if: ${{ !cancelled() }}\n        timeout-minutes: 15\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)
+
+    def test_s5_each_of_the_three_relay_steps_removed_fails_the_shape_test(self):
+        text = WORKFLOW.read_text()
+        for name, _ in RELAY:
+            step_ = "\n" + self.relay_step(name)
+            with self.subTest(step=name):
+                self.assertIn(step_, text)
+                self.killed(text.replace(step_, "", 1), self.STEPS, "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+
+    def test_s5_one_relay_step_name_swapped_for_another_fails_the_shape_test(self):
+        text = WORKFLOW.read_text()
+        first, second = RELAY[0][0], RELAY[1][0]
+        self.assertIn("- name: %s\n" % first, text)
+        self.killed(text.replace("- name: %s\n" % first, "- name: %s\n" % second, 1), self.STEPS)
+        self.killed(text.replace("          %s 2>&1" % first, "          %s 2>&1" % second, 1), self.STEPS)
+
     def test_shape_job_permissions_write_all(self):
         self.killed(mutate(WORKFLOW.read_text(), "  test-cloud:\n", "  test-cloud:\n    permissions: write-all\n"), self.SHAPE)
 
