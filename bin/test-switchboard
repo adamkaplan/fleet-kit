@@ -50263,39 +50263,158 @@ class TestRetireCloseHeadless(StandInPids, Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.removed, [])
 
-    # -- the three mutants: each makes the checks above fail
+    # -- #1062 amended plan: S8, S11-S13 (the rule is one function: S12)
 
-    def mutant_fails(self, checks):
-        failed = 0
-        for check in checks:
-            try:
-                check()
-            except AssertionError:
-                failed += 1
-            self.removed.clear()
-        self.assertGreater(failed, 0)
+    def test_s8_a_live_headless_agent_with_no_known_session_is_refused_without_a_traceback(self):
+        """discovery can show a live headless agent whose session id is unknown: `headless_target` then has nothing to judge (the fake service always
+        names the session, so the shape is made by the one lookup that answers it)."""
+        sid = self.hw()
+        self.as_("boss")
+        with mock.patch.object(sb, "headless_target", lambda engine, discovery, name: None):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out)
+        self.assertIn("no session known for hw", err)
+        self.assertNotIn("Traceback", err + out)
+        self.assertEqual(self.removed, [])
+        self.assertIn(sid, self.world.v2.sessions)
+        self.assertNotIn("hw", sb.read_retired(self.world.state), "nothing was retired")
+        self.assertIsNotNone(self.ap.load_record(self.world.state, "hw"))
 
-    def fresh(self):
-        super().setUp()
+    def test_s11_a_failed_delete_after_the_retirement_exits_non_zero_says_not_ended_and_audits_no_closed_line(self):
+        sid = self.hw()
+        self.as_("boss")
+        boom = mock.Mock(side_effect=sb.V2Error("http", status=500, detail="boom"))
+        with mock.patch.object(sb.V2Client, "session_remove", boom):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("NOT ended", out)
+        self.assertIn("hw", sb.read_retired(self.world.state), "the worker is retired either way")
+        self.assertEqual(self.lines("hw"), [], "no headless.closed line for a delete that failed")
+        self.assertIn(sid, self.world.v2.sessions)
+        # the already-retired path says the same thing the same way
+        with mock.patch.object(sb.V2Client, "session_remove", boom):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("NOT ended", out)
+        self.assertEqual(self.lines("hw"), [])
 
-    def test_s9_a_mutant_that_ends_any_session_by_name_fails_the_checks(self):
-        real = sb.headless_close_problem
-        mutant = lambda engine, runner, now, discovery, name, target, force, bulk=False: (target[0], None)
-        with mock.patch.object(sb, "headless_close_problem", mutant):
-            self.mutant_fails([self.test_s3_a_non_boss_is_refused_naming_the_rule])
+    def source_of(self, name):
+        import ast
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        return {n.name: n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.FunctionDef)}[name], text
 
-    def test_s9_a_mutant_that_skips_the_boss_check_fails_the_checks(self):
-        real = sb.headless_target
-        def mutant(engine, discovery, name):
-            got = real(engine, discovery, name)
-            return None if got is None else (got[0], gates_boss(engine), got[2])
-        gates_boss = lambda engine: "other"
-        with mock.patch.object(sb, "headless_target", mutant):
-            self.mutant_fails([self.test_s3_a_non_boss_is_refused_naming_the_rule])
+    def test_s12_who_may_close_is_defined_once_and_called_by_the_pane_close_and_the_headless_end(self):
+        import ast
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        tree = ast.parse(text)
+        funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        holders = sorted(n for n, f in funcs.items() if "only the operator or the agent's own boss may" in (ast.get_source_segment(text, f) or "").replace("\n", " "))
+        self.assertEqual(holders, ["close_authority_problem"], "the wording of the rule lives in one function")
+        for caller in ("retire_close_problem", "headless_close_problem"):
+            calls = {c.func.id for c in ast.walk(funcs[caller]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            self.assertIn("close_authority_problem", calls, caller)
+            self.assertNotIn("gates_caller_kind", calls, "%s decides who may by itself" % caller)
 
-    def test_s9_a_mutant_that_ignores_the_turn_in_progress_fails_the_checks(self):
+    def test_s12_a_change_to_the_shared_rule_reaches_both_closes(self):
+        discovery = self.engine.discover(self.world.clock.now())
+        seen = discovery.agents["other"]
+        self.hw()
+        target = sb.headless_target(self.engine, self.engine.discover(self.world.clock.now()), "hw")
+        with mock.patch.object(sb, "close_authority_problem", lambda *a, **k: "THE ONE RULE"):
+            self.assertEqual(sb.retire_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "other", seen, False), (None, "THE ONE RULE"))
+            self.assertEqual(sb.headless_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "hw", target, False), (None, "THE ONE RULE"))
+
+    def test_s13_an_agent_cannot_end_its_own_session(self):
+        sid = self.hw()
+        self.as_("boss")
+        with mock.patch.object(sb, "gates_caller_kind", lambda runner, now: ("agent", "hw", "coder")):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("an agent cannot end its own session", err)
+        self.assertEqual(self.removed, [])
+        self.assertIn(sid, self.world.v2.sessions)
+
+    def test_s13_a_retired_name_reused_by_a_live_agent_judges_the_live_record_and_ends_nothing_through_the_old_retirement(self):
+        old = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        new = self.hw()   # the name is launched again: a live record and a retirement of the same name
+        self.assertNotEqual(old, new)
+        self.assertIn("hw", sb.read_retired(self.world.state))
+        self.as_("other")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, "the live worker's boss rule applies, not the old retirement's")
+        self.assertEqual(self.removed, [])
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        self.assertEqual(self.removed, [new], "only the live session is ended")
+        self.assertIn(old, self.world.v2.sessions, "the old retirement ends nothing")
+
+    def test_s13_an_unreadable_session_or_activity_read_refuses_and_ends_nothing(self):
+        sid = self.hw()
+        self.as_("boss")
+        down = sb.V2Error("exit", detail="down")
+        for method in ("session_active", "session_get"):
+            with mock.patch.object(sb.V2Client, method, mock.Mock(side_effect=down)):
+                code, out, err = self.run_cli("retire", "hw", "--close")
+            self.assertNotEqual(code, 0, method)
+            self.assertEqual(self.removed, [], method)
+        self.assertIn(sid, self.world.v2.sessions)
+        self.assertNotIn("hw", sb.read_retired(self.world.state))
+        real = sb.V2Client.session_get
+        with mock.patch.object(sb.V2Client, "session_get", lambda client, session_id: dict(real(client, session_id), time={})):   # no readable last activity
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("cannot be read", err)
+        self.assertEqual(self.removed, [])
+
+    def test_s13_a_corrupt_hostile_or_too_deeply_nested_registry_is_read_bounded_and_ends_nothing(self):
+        sid = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        reg = Path(self.world.state) / "registry.json"
+        good = reg.read_text()
+        for bad in ("[" * 100000, '{"version": 1, "agents": {}, "retired": %s}' % ("[" * 70 + "]" * 70), "{not json", '{"version": 1, "agents": {}, "retired": []}'):
+            reg.write_text(bad)
+            code, out, err = self.run_cli("retire", "hw", "--close")
+            self.assertNotIn("Traceback", err + out, bad[:20])
+            self.assertNotEqual(code, 0, bad[:20])
+            self.assertEqual(self.removed, [], bad[:20])
+            self.assertIn(sid, self.world.v2.sessions)
+        reg.write_text(good)
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        self.assertEqual(self.removed, [sid])
+
+    # -- the mutants: each mutates the RULE (the source of the shared function) and the check that guards it must fail on an assertion
+
+    def rule_mutant(self, old, new):
+        import types
+        func, text = self.source_of("close_authority_problem")
+        src = __import__("ast").get_source_segment(text, func)
+        self.assertIn(old, src)
+        scope = dict(vars(sb))
+        exec(src.replace(old, new, 1), scope)
+        return mock.patch.object(sb, "close_authority_problem", types.FunctionType(scope["close_authority_problem"].__code__, vars(sb), "close_authority_problem"))
+
+    def test_s9_a_mutant_rule_that_allows_everyone_fails_the_non_boss_check(self):
+        with self.rule_mutant("    kind = gates_caller_kind(runner, now)\n", "    return None\n    kind = gates_caller_kind(runner, now)\n"):
+            with self.assertRaises(AssertionError):
+                self.test_s3_a_non_boss_is_refused_naming_the_rule()
+
+    def test_s9_a_mutant_rule_that_skips_the_boss_check_fails_the_non_boss_check(self):
+        with self.rule_mutant("if boss is None or boss != who:", "if False:"):
+            with self.assertRaises(AssertionError):
+                self.test_s3_a_non_boss_is_refused_naming_the_rule()
+
+    def test_s9_a_mutant_rule_that_skips_the_own_session_check_fails_that_check(self):
+        with self.rule_mutant("if who == name:", "if False:"):
+            with self.assertRaises(AssertionError):
+                self.test_s13_an_agent_cannot_end_its_own_session()
+
+    def test_s9_a_mutant_that_ignores_the_turn_in_progress_fails_the_check(self):
         with mock.patch.object(sb.V2Client, "session_active", lambda client: {}):
-            self.mutant_fails([self.test_s4_a_turn_in_progress_or_recent_activity_is_refused_without_force])
+            with self.assertRaises(AssertionError):
+                self.test_s4_a_turn_in_progress_or_recent_activity_is_refused_without_force()
 
 
 class TestRetireLostHeadless(StandInPids, Base):
@@ -85998,7 +86117,7 @@ class TestRecordJsonReaders(unittest.TestCase):
     BIN = REPO / "bin"
     # readers of record text and the shared helpers: each must call parse_bounded (the helpers ARE the parse)
     READERS = {"agent_presence.py:read_record": "agent_presence", "switchboard/reminders.py:read_reminders": "reminders",
-               "switchboard/reminders.py:read_record_file": "reminders"}
+               "switchboard/reminders.py:read_record_file": "reminders", "registry.py:_parse": "registry", "registry.py:_old_retired": "registry"}
     HELPERS = {"record_json.py:parse_bounded", "cloud_worker.py:parse_bounded"}
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
@@ -86135,8 +86254,6 @@ reassign.py:read_overrides
 reassign.py:read_overrides_strict
 reds.py:get
 reds.py:parse_artifact
-registry.py:_old_retired
-registry.py:_parse
 registry.py:_small
 registry.py:fold_old
 repo_exclusion.py:_commands
@@ -86324,7 +86441,8 @@ work_sync.py:_read_json
 
     def test_s9_mutants_the_scan_removed_from_each_reader_are_caught(self):
         """Run by hand too: replace parse_bounded by json.loads at the reader and the deep-file tests fail."""
-        for rel, old in (("agent_presence.py", "_record_json.parse_bounded("), ("switchboard/reminders.py", 'load_module("record_json").parse_bounded(')):
+        for rel, old in (("agent_presence.py", "_record_json.parse_bounded("), ("switchboard/reminders.py", 'load_module("record_json").parse_bounded('),
+                         ("registry.py", "_record_json.parse_bounded(")):
             text = self.mutate(rel, old, "json.loads(")
             self.assertNotIn("parse_bounded", text.replace("def parse_bounded", "")) if False else None
             self.assertIn("json.loads(", text)
