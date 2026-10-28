@@ -1303,8 +1303,9 @@ def unknown_report_to(state, name, agents, alias):
     import difflib
     known = sorted(set(found["agents"]) | set(found["retired"]) | set(agents))
     near = difflib.get_close_matches(name, known, n=5, cutoff=0.0) or known[:5]
+    first = ("" if known else " The registry holds no name yet: a first launch of a new installation may pass --boss-unregistered REASON (the reason is audited).")
     return ("--reports-to %s is not a registered identity (no agent, retired agent, cloud worker or role alias has it); nothing was created. Use one of: %s, "
-            "or register the lane first, or pass --boss-unregistered REASON." % (_one(name, 60), ", ".join(near[:5]) or "(no registered name yet)")), None
+            "or register the lane first, or pass --boss-unregistered REASON.%s" % (_one(name, 60), ", ".join(near[:5]) or "(no registered name yet)", first)), None
 
 
 def check_report_to(engine, state, args, local_agents):

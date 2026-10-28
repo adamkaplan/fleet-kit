@@ -573,5 +573,63 @@ class DocsBossText(unittest.TestCase):
         self.assertEqual(doc.count(phrase), 1)
 
 
+class EmptyRegistry(LaunchHarness):
+    """S15: a registry with no name at all refuses an unregistered `--reports-to` too, and the message says how a first launch passes."""
+
+    def local_route(self, boss, reason=None, check=None):
+        sb, state = make_state()
+        b = sb.load_module("cloud_worker")
+        b.bind(sb.__dict__)
+        seen, made = [], []
+        engine = types.SimpleNamespace(actor="t", audit=types.SimpleNamespace(append=lambda actor, kind, name, data: seen.append((kind, data))),
+                                       herdr=types.SimpleNamespace(workspace_create=lambda *a, **k: made.append("workspace")))
+        args = types.SimpleNamespace(name="tester7", reports_to=boss, boss_unregistered=reason)
+        saved = b.unknown_report_to
+        if check:
+            b.unknown_report_to = check(saved)
+        try:
+            with redirect_stderr(io.StringIO()):
+                b.check_report_to(engine, state, args, {})
+            return 0, "", seen, made
+        except sb.LaunchError as problem:
+            return 1, str(problem), seen, made
+        finally:
+            b.unknown_report_to = saved
+
+    def test_s15_both_routes_refuse_against_an_empty_registry_and_name_the_flag(self):
+        code, message, audit, made = self.local_route("lane-nobody")
+        self.assertEqual((code, audit, made), (1, [], []))
+        self.assertIn("--boss-unregistered", message)
+        self.assertIn("first launch of a new installation", message)
+        result, _, audit = self.run_launch("lane-nobody")
+        self.assertTrue(result.startswith("refused:"), result)
+        self.assertIn("--boss-unregistered", result)
+        self.assertIn("first launch of a new installation", result)
+        self.assertEqual(audit, [])
+
+    def test_s15_with_the_flag_and_a_reason_both_routes_go_on_with_one_audit_line(self):
+        code, _, audit, made = self.local_route("lane-nobody", "first launch of this installation")
+        self.assertEqual(code, 0)
+        self.assertEqual([k for k, _ in audit], ["launch.boss_unregistered"])
+        result, _, audit = self.run_launch("lane-nobody", override="first launch of this installation")
+        self.assertEqual(result, "reached")
+        self.assertEqual(len([a for a in audit if a[0] == "launch.boss_unregistered"]), 1)
+
+    def test_s15_a_registry_with_names_does_not_add_the_first_launch_sentence(self):
+        result, _, _ = self.run_launch("lane-nobody", agents=("lane-a",))
+        self.assertNotIn("first launch of a new installation", result)
+
+    def test_s15_mutant_skipping_the_check_against_an_empty_registry_is_caught(self):
+        def skip_empty(real):
+            def mutant(state, name, agents, alias):
+                found = load_sb().load_module("registry").read(state)
+                if not found.get("agents") and not found.get("retired"):
+                    return None, None   # the mutation: an empty registry refuses nothing
+                return real(state, name, agents, alias)
+            return mutant
+        code, _, _, _ = self.local_route("lane-nobody", check=skip_empty)
+        self.assertEqual(code, 0, "mutation applied: the empty registry no longer refuses, so the refusal test above fails under it")
+
+
 if __name__ == "__main__":
     unittest.main()
