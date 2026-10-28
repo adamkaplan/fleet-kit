@@ -497,6 +497,8 @@ KEY_FORMS = {
     "plain": ("PRIVATE KEY", "PRIVATE KEY"),
     "encrypted": ("ENCRYPTED PRIVATE KEY", "ENCRYPTED PRIVATE KEY"),
     "pgp": ("PGP PRIVATE KEY BLOCK", "PGP PRIVATE KEY BLOCK"),
+    "openssh": ("OPENSSH PRIVATE KEY", "OPENSSH PRIVATE KEY"),
+    "ec": ("EC PRIVATE KEY", "EC PRIVATE KEY"),
 }
 
 
@@ -552,6 +554,94 @@ class WholeKeyBlock(unittest.TestCase):
             slow = True   # the 10 s guard: the mutant did not finish
         self.assertTrue(slow, "the mutant is too slow for the 2.0 s bound, as the real pattern is not")
         self.assertLess(time.monotonic() - start, 15)
+
+
+class KeyBlockOddShapes(unittest.TestCase):
+    """S13 (widened) and U6: a dash, another end marker, or no end marker."""
+
+    BODY = ["MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "KcwggSjAgEAAoIBAQC7VJTUt9Us8cKj", "zzzzAAAA1111bbbb2222cccc"]
+
+    def pgp(self, armor="Version: GnuPG v2.0-x\nComment: a-b\n\n", body=None, end="-----END PGP PRIVATE KEY BLOCK-----"):
+        return "-----BEGIN PGP PRIVATE KEY BLOCK-----\n" + armor + "\n".join(body or self.BODY) + "\n" + end
+
+    def assert_no_body(self, got):
+        for line in self.BODY:
+            self.assertNotIn(line, got)
+
+    def test_s13_six_forms_multi_line_leave_no_body_line(self):
+        sb = load_sb()
+        kinds = ["RSA PRIVATE KEY", "PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "OPENSSH PRIVATE KEY", "EC PRIVATE KEY", "PGP PRIVATE KEY BLOCK"]
+        for kind in kinds:
+            with self.subTest(kind=kind):
+                text = "-----BEGIN %s-----\n%s\n-----END %s-----" % (kind, "\n".join(self.BODY), kind)
+                self.assert_no_body(sb.redact_command_text("x\n" + text + "\ny"))
+
+    def test_s13_a_dash_in_the_armor_header_leaves_no_body_line(self):
+        self.assert_no_body(load_sb().redact_command_text(self.pgp()))
+
+    def test_s13_a_dash_in_the_body_leaves_no_body_line(self):
+        body = ["MIIEvQIBADANBgkq-hkiG9w0BAQEFAASC", "Kcwg-SjAgEAAoIBAQC7VJTUt9Us8cKj", "zzzzAAAA1111bbbb2222cccc"]
+        got = load_sb().redact_command_text(self.pgp(armor="", body=body))
+        for line in body:
+            self.assertNotIn(line, got)
+
+    def test_s13_an_end_marker_of_another_kind_leaves_no_body_line(self):
+        got = load_sb().redact_command_text(self.pgp(end="-----END CERTIFICATE-----") + "\nafter")
+        self.assert_no_body(got)
+        self.assertIn("after", got)
+
+    def test_s13_a_begin_with_no_end_covers_the_text_up_to_the_next_begin(self):
+        text = "head\n-----BEGIN PRIVATE KEY-----\n" + "\n".join(self.BODY) + "\n-----BEGIN PRIVATE KEY-----\nzed"
+        got = load_sb().redact_command_text(text)
+        self.assert_no_body(got)
+        self.assertIn("head", got)
+
+    def test_s13_a_line_between_two_odd_blocks_is_kept(self):
+        got = load_sb().redact_command_text(self.pgp() + "\nunrelated line\n" + self.pgp(end="-----END CERTIFICATE-----") + "\nlast")
+        self.assert_no_body(got)
+        self.assertIn("unrelated line", got)
+        self.assertIn("last", got)
+
+    def test_s13_timing_on_the_real_path(self):
+        sb = load_sb()
+        texts = {
+            "one begin, no end": "-----BEGIN PRIVATE KEY-----" + "A" * 1000000,
+            "20000 begins": "-----BEGIN PRIVATE KEY-----" * 20000,
+            "dashes": "-----" * 200000,
+            "begin words": "-----BEGIN " * 90910,
+        }
+        for name, text in texts.items():
+            with self.subTest(case=name):
+                start = time.monotonic()
+                sb.redact_command_text(text)
+                self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_s13_mutant_a_non_dash_body_fails_the_dash_cases(self):
+        real = [p for p, _ in load_sb()._SECRET_PATTERNS if "PRIVATE KEY" in p.pattern and "(?:BEGIN|END)[A-Z ]*PRIVATE" not in p.pattern][0]
+        mutant = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----[^-]*-----END[A-Z ]*PRIVATE KEY(?: BLOCK)?-----")
+        self.assertIn("[^-]*", mutant.pattern, "mutation applied")
+        text = self.pgp()
+        self.assertIn(self.BODY[0], mutant.sub("[redacted]", text))
+        self.assertNotIn(self.BODY[0], real.sub("[redacted]", text))
+
+    def test_s13_mutant_a_lazy_dot_all_pattern_is_slow_on_many_begins(self):
+        code = ("import re,time\n"
+                "p=re.compile(r'-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----.*?-----END[A-Z ]*-----', re.S)\n"
+                "t='-----BEGIN PRIVATE KEY-----'*20000\n"
+                "s=time.monotonic(); p.sub('[redacted]', t); print(time.monotonic()-s)\n")
+        self.assertIn(".*?", code, "mutation applied")
+        try:
+            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+            slow = float(done.stdout.strip()) >= 2.0
+        except subprocess.TimeoutExpired:
+            slow = True
+        self.assertTrue(slow)
+
+    def test_u6_the_pattern_has_no_dash_class_and_has_the_marker_guard(self):
+        src = read("bin/fleet-switchboard")
+        line = [l for l in src.splitlines() if "PRIVATE KEY(?: BLOCK)?-----" in l and "(?:BEGIN|END)[A-Z ]*PRIVATE" not in l][0]
+        self.assertNotIn("[^-]*", line)
+        self.assertIn("(?!-----(?:BEGIN|END))", line)
 
 
 class HeaderFileAndOutput(unittest.TestCase):
