@@ -16800,18 +16800,15 @@ def cmd_gates_ask_close(args, runner, now):
     if ctx.plan is None or ctx.plan["result"] != "pass":
         raise LedgerCommandError("cannot close %s: %s" % (ctx.pr, ctx.plan_problem or "its plan fails `plan check`"))
     head = ctx.facts.get("head")
-    try:   # #1347: the last other pull request closed unmerged with a scenario claimed by no merged one: the ask does not close (a read that fails is said, never raised)
-        lost, gone = ask_unclaimed(ctx, runner, now)
-    except Exception as err:
-        lost, gone = [], []
-        print("note: closed pull requests of %s not judged: %s" % (ctx.pr, _one_line(str(err), 120)), file=sys.stderr)
-        if PEERS_TOO_MANY in str(err):
+    found = unclaimed_verdict(args, ctx, runner, now)   # #1347: the ONE rule of the merge gate; a read that fails is said, never raised
+    if found and found[2]:
+        print("refused: %s stays open: %s unclaimed by any merged pull request; closed without a merge: %s" % (ctx.pr, ", ".join(found[2]), ", ".join("#%s" % n for n in found[3])), file=sys.stderr)
+        return EXIT_ERROR
+    if found:
+        print("note: closed pull requests of %s not judged: %s" % (ctx.pr, found[1]), file=sys.stderr)
+        if found[0] == "too many pull requests":
             print("refused: %s stays open: %s (the chief of staff can log a waiver: `waive <pr> --gates CU`)" % (ctx.pr, PEERS_TOO_MANY), file=sys.stderr)
             return EXIT_ERROR
-    if lost:
-        print("refused: %s stays open: %s unclaimed by any merged pull request; closed without a merge: %s" % (
-            ctx.pr, ", ".join(lost), ", ".join("#%s" % n for n in gone)), file=sys.stderr)
-        return EXIT_ERROR
     authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
     rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"]]
     open_rows = [r for r in rows if r["status"] != "ok"]
@@ -18550,32 +18547,39 @@ def claim_union_refusal(args, runner, now):
         if not found:
             return refuse("unknown sibling", "this merged pull request has no claim recorded at or before its merge: its claim is unknown; the gate fails closed for a pull request with a claim line") if claiming else None
         body = plan_ledger.claim_body(text)
+    found = unclaimed_verdict(args, ctx, runner, now, body)
+    if found is None:
+        return None
+    return plan_ledger.union_refusal(ctx.pr, found[2], found[3]) if found[2] else "merge of %s refused: %s" % (ctx.pr, found[1]) + CU_HINT % ctx.pr
+
+
+def unclaimed_verdict(args, ctx, runner, now, body=None):
+    """#1347: THE ONE rule of 'unclaimed because of closed pull requests / too many / waived', called by the merge gate (`body` = this pull request's body) and by `gates ask-close`
+    (`body` None: the ask has no subject pull request). (what, detail, uncovered, closed numbers) when refused (`uncovered` is [] for a read that failed: `detail` says why, naming the bound
+    `too many pull requests to judge`), None when nothing is unclaimed, when this pull request has no claim line and a read failed, or when a head-bound `CU` waiver is logged."""
+    scenarios, closed = ctx.plan["scenarios_parsed"], []
     try:
-        peers = plan_peers(ctx, runner, now)
+        peers = plan_peers(ctx, runner, now, closed if body is None else None)   # the merge gate's union read stays the plain one
     except Exception as err:
-        if plan_ledger.pr_claim(body, scenarios)[0] is None:
+        if body is not None and plan_ledger.pr_claim(body, scenarios)[0] is None:
             return None   # a pull request with no claim line claims every per-PR scenario: the union is covered whatever the peers say (docs/switchboard.md)
         what = "unknown sibling" if isinstance(err, ClaimUnknown) else "too many pull requests" if PEERS_TOO_MANY in str(err) else "list error"
-        return refuse(what, "the claim union could not be read (%s); the gate fails closed for a pull request with a claim line" % _one_line(str(err), 100))
-    applies, uncovered, last = plan_ledger.claim_union(scenarios, body, peers)
-    if not (applies and last and uncovered):
-        return None
-    if _cu_waived(args, runner, now, "uncovered scenarios: " + ", ".join(uncovered), ctx):
-        return None
-    closed_prs = []
-    try:   # #1347: name the closed-unmerged pull requests in the refusal (one more bounded read, only on the refusal path)
-        plan_peers(ctx, runner, now, closed_prs)
-    except Exception:
-        closed_prs = []
-    return plan_ledger.union_refusal(ctx.pr, uncovered, [n for n, _ in closed_prs])
-
-
-def ask_unclaimed(ctx, runner, now):
-    """#1347: (uncovered scenario ids, closed pull request numbers) of an ASK whose other pull requests are all closed or merged and whose merged claims leave a scenario unclaimed
-    (`plan_ledger.closed_unclaimed`). Reads through `plan_peers` (the #976 bounded search: beyond its bound it raises `too many pull requests to judge`). ([], []) when there is nothing to say."""
-    closed = []
-    peers = plan_peers(ctx, runner, now, closed)
-    return plan_ledger.closed_unclaimed(ctx.plan["scenarios_parsed"], peers, closed)
+        found = (what, "the claim union could not be read (%s); the gate fails closed for a pull request with a claim line" % _one_line(str(err), 100), [], [])
+    else:
+        lost, gone = plan_ledger.closed_unclaimed(scenarios, peers, closed) if body is None else (None, None)
+        if body is not None:
+            applies, lost, last = plan_ledger.claim_union(scenarios, body, peers)
+            lost, gone = (lost, []) if applies and last else ([], [])
+            if lost:   # one more bounded read, only on the refusal path, to name the closed pull requests
+                try:
+                    plan_peers(ctx, runner, now, closed)
+                    gone = [n for n, _ in closed]
+                except Exception:
+                    pass
+        if not lost:
+            return None
+        found = ("uncovered scenarios: " + ", ".join(lost), None, lost, gone)
+    return None if _cu_waived(args, runner, now, found[0], ctx) else found
 
 
 def claim_union_note(report, ctx, runner, now):

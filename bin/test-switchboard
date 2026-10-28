@@ -79584,7 +79584,6 @@ class TestClosedUnmergedLastPr(unittest.TestCase):
         self.assertIn("--gates CU", text)
 
 
-
 class TestClaimUnionAtLastMerge(LedgerBase):
     """#976: the last merge of an ask is refused while the merged claims leave a per-PR scenario of the plan uncovered. Neutral plan: LEDGER_PLAN (per PR: S1, S2, S3, U1)."""
 
@@ -86811,6 +86810,215 @@ class TestAskIssueSubject(unittest.TestCase):
         report = json.loads(self.run_cmd("cmd_gates", subject=self.PR, json=True)[2])
         g1 = next(g for g in report["gates"] if g["gate"] == "G1")
         self.assertNotIn("S1", " ".join(g1["missing"]))   # test_x2 fails on it: it wants S1 missing
+
+
+class TestClosedUnmergedFamily(LedgerBase):
+    """#1347: the ask-close refusal, the bound and the waiver are members of ONE family with the merge refusal (`unclaimed_verdict`). Merge side through `claim_union_refusal`."""
+
+    body = TestClaimUnionAtLastMerge.body
+    record = TestClaimUnionAtLastMerge.record
+    merged_iso = TestClaimUnionAtLastMerge.merged_iso
+    refusal = TestClaimUnionAtLastMerge.refusal
+    waive = TestClaimUnionAtLastMerge.waive
+
+    def setUp(self):
+        LedgerBase.setUp(self)
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.peers = []
+
+    def flag_every_closed(self):
+        real = sb.unclaimed_verdict
+        def mutant(args, ctx, runner, now, body=None):
+            got = real(args, ctx, runner, now, body)
+            closed = []
+            if got is None:
+                sb.plan_peers(ctx, runner, now, closed)
+                if closed:
+                    return ("uncovered scenarios: S3", None, ["S3"], [n for n, _ in closed])
+            return got
+        return mock.patch.object(sb, "unclaimed_verdict", mutant)
+
+    def baseline(self):
+        self.body(None)
+        self.assertIsNone(self.refusal([("merged", None), ("closed", None)]))
+        self.assertIsNone(self.refusal([("merged", None)], base=300))
+        self.body("S1")
+        self.assertIsNone(self.refusal([("merged", "S2 U1 S3"), ("closed", "S3")], base=400))
+        self.assertIsNone(self.refusal([("merged", "S2 U1 S3")], base=500))
+
+    def test_s6_u4_the_merge_gate_gives_the_baseline_for_no_claim_lines_and_full_coverage(self):
+        self.baseline()
+
+    def test_s6_u4_a_mutant_that_flags_every_ask_with_a_closed_pull_request_fails(self):
+        with self.flag_every_closed():
+            with self.assertRaises(AssertionError):
+                self.baseline()
+
+    def test_the_merge_refusal_names_the_unclaimed_scenario_and_the_closed_pull_request(self):
+        self.body("S1")
+        why = self.refusal([("merged", "S2 U1"), ("closed", "S3")])
+        self.assertIn("S3", why or "")
+        self.assertIn("#101", why or "")
+
+    def test_the_merge_refusal_member_a_mutant_without_the_rule_fails(self):
+        with mock.patch.object(sb, "unclaimed_verdict", lambda *a, **k: None):
+            with self.assertRaises(AssertionError):
+                self.test_the_merge_refusal_names_the_unclaimed_scenario_and_the_closed_pull_request()
+
+    def test_the_bound_refuses_naming_the_waiver_and_a_head_bound_waiver_passes_only_for_that_head(self):
+        self.body("S1")
+        many = [dict(number=3000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * sb.PEER_PAGES)]
+        why = self.refusal([], pages=many)
+        self.assertIn("too many pull requests to judge", why or "")
+        self.assertIn("--gates CU", why or "")
+        sb.plan_ledger.append_checked(self.world.state, self.world.clock.now(), lambda have, seq: {"kind": "waiver", "pr": self.PR, "head": "e" * 40, "gates": ["CU"],
+                                                                                                    "expires": self.world.clock.now() + 86400, "by": "cos", "result": "pass", "reason": "other head"})
+        self.assertIn("too many pull requests to judge", self.refusal([], pages=many) or "")     # another head's waiver does not pass
+        self.assertEqual(self.waive()[0], 0)
+        self.assertIsNone(self.refusal([], pages=many))
+
+    def test_the_bound_and_waiver_members_have_mutants_that_fail(self):
+        with mock.patch.object(sb, "_cu_waived", lambda *a, **k: False):    # the waiver ignored
+            with self.assertRaises(AssertionError):
+                self.test_the_bound_refuses_naming_the_waiver_and_a_head_bound_waiver_passes_only_for_that_head()
+        real = sb.plan_peers
+        def unbounded(ctx, runner, now, closed=None):
+            try:
+                return real(ctx, runner, now, closed)
+            except ValueError:
+                return []
+        with mock.patch.object(sb, "plan_peers", unbounded):    # the bound swallowed
+            with self.assertRaises(AssertionError):
+                self.test_the_bound_refuses_naming_the_waiver_and_a_head_bound_waiver_passes_only_for_that_head()
+
+
+class TestClosedUnmergedAskClose(unittest.TestCase):
+    """#1347: `gates ask-close` through the real command with fakes: the refusal, the baseline, the bound and the waiver. Borrows the fakes of TestAskIssueSubject (its own tests are not repeated)."""
+
+    REPO, ASK, PR, HEAD, SCEN = (TestAskIssueSubject.REPO, TestAskIssueSubject.ASK, TestAskIssueSubject.PR, TestAskIssueSubject.HEAD, TestAskIssueSubject.SCEN)
+    api, plan, now, entries, run_cmd, prove, judge, record_all = (TestAskIssueSubject.api, TestAskIssueSubject.plan, TestAskIssueSubject.now, TestAskIssueSubject.entries,
+                                                                  TestAskIssueSubject.run_cmd, TestAskIssueSubject.prove, TestAskIssueSubject.judge, TestAskIssueSubject.record_all)
+
+    def setUp(self):
+        TestAskIssueSubject.setUp(self)
+        self.found = []
+        self.too_many = False
+        self.seen_pages = []
+
+    def merged(self, number, claim):
+        sb.plan_ledger.append_checked(self.state, self.now(), lambda have, seq: {"kind": "claim", "pr": "acme-org/widget-service#%d" % number, "head": "a" * 40, "claim_text": claim})
+        return dict(number=number, state="closed", merged_at="1970-01-12T14:06:40Z" if False else _dt.datetime.fromtimestamp(self.now() + 1000, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    body="PLAN: %s\nCLAIMS: %s" % (self.ASK, claim), pull_request={"merged_at": _dt.datetime.fromtimestamp(self.now() + 1000, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+
+    def closed(self, number, claim):
+        return dict(number=number, state="closed", merged_at=None, body="PLAN: %s\nCLAIMS: %s" % (self.ASK, claim), pull_request={"merged_at": None})
+
+    def ask_close(self):
+        test = self
+        class Reader:
+            def __init__(self, *a, **k):
+                pass
+            def _api(self, path, repo=None):
+                page = int(re.search(r"&page=(\d+)", path).group(1))
+                test.seen_pages.append(page)
+                items = [dict(number=3000 + n, state="open", body="no plan", pull_request={"merged_at": None}) for n in range(300)] if test.too_many else test.found
+                return {"total_count": len(items), "items": items[(page - 1) * 100:page * 100]}
+        real = sb._ledger_context
+        def ctx(*a, **k):
+            got = real(*a, **k)
+            got.config = dict(got.config, gh="gh", call_timeout_seconds=5)
+            return got
+        with mock.patch.object(sb, "IntentReader", Reader), mock.patch.object(sb, "GhAccounts", lambda *a, **k: None), mock.patch.object(sb, "_ledger_context", ctx):
+            return self.run_cmd("cmd_gates_ask_close")
+
+    def waiver(self, head):
+        sb.plan_ledger.append_checked(self.state, self.now(), lambda have, seq: {"kind": "waiver", "pr": self.ASK, "head": head, "gates": ["CU"], "expires": self.now() + 86400, "by": "cos", "result": "pass", "reason": "ship"})
+
+    def test_s5_the_refusal_names_the_unclaimed_scenarios_and_the_closed_pull_request(self):
+        self.record_all()
+        self.found = [self.merged(11, "S1"), self.closed(12, "S2 S3")]
+        code, why, out, err = self.ask_close()
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("S2, S3 unclaimed by any merged pull request", err)
+        self.assertIn("#12", err)
+        self.assertEqual(out, "")
+
+    def test_s5_a_mutant_without_the_refusal_is_caught(self):
+        with mock.patch.object(sb, "unclaimed_verdict", lambda *a, **k: None):
+            with self.assertRaises(AssertionError):
+                self.test_s5_the_refusal_names_the_unclaimed_scenarios_and_the_closed_pull_request()
+
+    def baseline(self):
+        for claims in (None, "S1 S2 S3"):
+            self.found = [self.merged(21, claims or ""), self.merged(22, "S2 S3")] if claims else []
+            plain = self.ask_close()
+            self.found = self.found + [self.closed(23, "S1")] if claims else [self.closed(23, "")]
+            self.assertEqual(self.ask_close(), plain)      # the closed pull request changes nothing
+            self.assertNotIn("unclaimed by any merged", plain[3])
+            self.assertEqual(plain[0], sb.EXIT_OK)
+
+    def test_s6_u4_ask_close_behaves_as_before_for_no_claim_lines_and_full_coverage(self):
+        self.record_all()
+        self.baseline()
+
+    def test_s6_u4_a_mutant_that_flags_every_ask_with_a_closed_pull_request_is_caught(self):
+        real = sb.unclaimed_verdict
+        def mutant(args, ctx, runner, now, body=None):
+            got = real(args, ctx, runner, now, body)
+            closed = []
+            if got is None:
+                sb.plan_peers(ctx, runner, now, closed)
+                if closed:
+                    return ("uncovered scenarios: S3", None, ["S3"], [n for n, _ in closed])
+            return got
+        with mock.patch.object(sb, "unclaimed_verdict", mutant):
+            with self.assertRaises(AssertionError):
+                self.test_s6_u4_ask_close_behaves_as_before_for_no_claim_lines_and_full_coverage()
+
+    def bound_and_waiver(self):
+        self.record_all()
+        self.too_many = True
+        code, why, out, err = self.ask_close()
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("too many pull requests to judge", err)
+        self.assertIn("--gates CU", err)
+        self.assertLessEqual(max(self.seen_pages), sb.PEER_PAGES)
+        self.waiver("e" * 40)       # another head
+        self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR)
+        self.waiver(sb.plan_ledger.ask_head(self.hash))
+        code, why, out, err = self.ask_close()
+        self.assertEqual(code, sb.EXIT_OK, err)
+
+    def test_the_bound_refuses_and_only_a_waiver_for_the_head_passes(self):
+        self.bound_and_waiver()
+
+    def test_the_bound_and_waiver_mutants_are_caught(self):
+        with mock.patch.object(sb, "_cu_waived", lambda *a, **k: False):
+            with self.assertRaises(AssertionError):
+                self.bound_and_waiver()
+
+    def test_a_plain_pull_request_and_a_non_ask_issue_never_raise(self):
+        self.pr_readable = True
+        for command in ("cmd_gates", "cmd_gates_ask_close"):
+            for subject in (self.PR, None):
+                self.run_cmd(command, subject=subject)
+        self.issue["body"] = "just text"
+        for command in ("cmd_gates", "cmd_gates_ask_close"):
+            self.assertTrue(self.run_cmd(command) is not None)
+        self.assertIn("not an ask issue", self.run_cmd("cmd_gates_ask_close", subject=self.PR)[1] or "")
+
+
+class TestClosedUnmergedDocs(unittest.TestCase):
+    """#1347 S9: the documentation says plainly that a closed-unmerged last pull request is a defect and what clears it."""
+
+    def test_the_union_check_section_names_the_defect_the_refusals_and_the_waiver(self):
+        text = (REPO / "docs/switchboard.md").read_text()
+        item = [l for l in text.split("\n") if l.startswith("- **A closed-unmerged last pull request is a defect")]
+        self.assertEqual(len(item), 1)
+        for needle in ("`gates ask-close` refuses the ask and names the unclaimed scenarios and the closed pull requests", "the next pull request's merge is refused too",
+                       "a pull request claims the scenario", "head-bound `CU` waiver"):
+            self.assertIn(needle, item[0])
 
 
 class TestNoPaneToJudge(StandInPids, Base):
