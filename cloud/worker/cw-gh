@@ -29,6 +29,7 @@ import urllib.request
 import zipfile
 
 API = "https://api.github.com"
+BRANCH_SOURCE = "/proc/1/environ"   # the ONE place the path is named (see own_branch)
 MAX_BYTES = 20 * 1024 * 1024
 MAX_LOG = 5 * 1024 * 1024  # of log text printed
 TIMEOUT = 60
@@ -340,6 +341,24 @@ def read_body_file(path):
         raise Fail("the body file is not text (not UTF-8)", 2)
 
 
+def own_branch():
+    """The pod's own branch: the value of CW_BRANCH in BRANCH_SOURCE (the initial environment of the pod's main process, which the launcher
+    set and the agent can read but not change), and NOTHING ELSE while that file can be read: a readable file without CW_BRANCH (or with an
+    empty one) gives "" and every own edit is refused.
+    Only where the file does not exist or cannot be read (a developer's machine, a CI runner whose PID 1 belongs to root) the OLD rule
+    applies: the caller's environment CW_BRANCH, else the current git HEAD. That fallback is NOT a bound (the same user can change both for one
+    call); it is never taken by design inside a pod. Limit: an agent that can create its own PID namespace could make /proc/1/environ its own."""
+    try:
+        with open(BRANCH_SOURCE, "rb") as f:
+            raw = f.read(1024 * 1024)
+    except OSError:
+        return os.environ.get("CW_BRANCH") or git("symbolic-ref", "--quiet", "--short", "HEAD")
+    for entry in raw.split(b"\0"):
+        if entry.startswith(b"CW_BRANCH="):
+            return entry[len(b"CW_BRANCH="):].decode("utf-8", "replace")
+    return ""
+
+
 def pr_edit(args):
     """ask 1200: exactly `pr edit N --body-file F`, for the pod's own pull request only (guard-table.tsv: the pr-edit rows)."""
     for a in args:
@@ -347,6 +366,8 @@ def pr_edit(args):
             raise refused("pr-edit-inline-body")
         if "://" in a or a in ("-R", "--repo") or a.startswith(("--repo=", "-R")):
             raise refused("pr-edit-url-other-repo")
+    if args and not re.fullmatch("[0-9]+", args[0]):   # ASCII digits only: isdigit() accepts a superscript and int() would then raise
+        raise refused("pr-edit-other-option")
     if len(args) != 3 or args[1] != "--body-file" or not args[0].isdigit():
         raise refused("pr-edit-other-option")
     n = int(args[0])
@@ -364,7 +385,7 @@ def pr_edit(args):
             raise ValueError
     except (Fail, KeyError, TypeError, ValueError):
         raise refused("pr-edit-read-failed")
-    mine = os.environ.get("CW_BRANCH") or git("symbolic-ref", "--quiet", "--short", "HEAD")
+    mine = own_branch()
     if base_repo.lower() != repo.lower() or not (mine and head == mine):   # the record alone (forgeable by the same user) is not enough: BOTH (a present record is checked above)
         raise refused("pr-edit-other-number")
     if head_repo.lower() != repo.lower():   # a fork's pull request with the same branch name is not the pod's own
