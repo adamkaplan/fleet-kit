@@ -202,7 +202,8 @@ class TestDocument(unittest.TestCase):
         self.assertEqual(self.doc_fields(text), {card: list(fields) for card, fields in sb.COCKPIT_FIELDS.items()})
         for question in self.QUESTIONS:
             self.assertRegex(text, r"%s\b.*" % question)
-        self.assertEqual(len(re.findall(r"raised, not built", text)), 4)
+        self.assertEqual(len(re.findall(r"raised, not built", text)), 3)
+        self.assertRegex(text, r"Q2:.*Answered by the Chief of Staff")
 
     def test_s5_a_field_added_to_the_code_only_or_to_the_document_only_fails_the_comparison(self):
         text = DOC.read_text()

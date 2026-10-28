@@ -29,7 +29,7 @@ The person who owns the fleet, and the assistant that person runs for themselves
 
 ## Questions
 
-- Q1: Should a person be able to answer a decision from the Cockpit? This is raised, not built.
-- Q2: Should the feed carry check results for a held pull request? This is raised, not built.
-- Q3: Should the feed be pushed to a device instead of read? This is raised, not built.
-- Q4: Should a card carry a longer description than its capped title? This is raised, not built.
+- Q1: May fleet data leave the fleet at all, and by file (a read-only mount, recommended) or by post (a new narrow credential kind in the Venue)? This is raised, not built.
+- Q2: May anyone beyond the person and that person's own assistant read the fleet cards? Answered by the Chief of Staff: no. Nothing widens it.
+- Q3: May the person's assistant read item texts (titles), or only counts and ids? This is raised, not built.
+- Q4: Fleet history stays in the Venue's append-only log forever: acceptable, or a bounded replaced cache? This is raised, not built.

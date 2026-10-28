@@ -181,7 +181,7 @@ def cockpit_next(state_dir, now):
 def publish_cockpit(engine):
     """The end of a pass: write cockpit.json when the content changed and at least every COCKPIT_HEARTBEAT seconds (through `state_write`: a private temp file
     renamed into place, mode 0600). Returns True when written. Writes this one file and nothing else."""
-    state = engine.state_dir
+    state = getattr(engine, "state_dir", None)
     if state is None:
         return False
     now = engine.now()

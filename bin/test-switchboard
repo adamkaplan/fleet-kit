@@ -15407,6 +15407,7 @@ class TestOneCharter(CharterRig, Base):
         ("bin/switchboard/handoff.py", "seam_applies"): "set: is this issue number known as a charter",
         ("bin/fleet-switchboard", "owned_numbers"): "registry: the numbers an agent owns (an orchestrator: its row's charter only; others: their own assignment)",
         ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/switchboard/triage.py", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
+        ("bin/switchboard/cockpit.py", "cockpit_cards"): "registry: reads every row's charter to find the orchestrator a blocked lane waits on (read-only feed)",
         ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
         ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/switchboard/decisions_b.py", "read_order_notices"): "own: the order notices' own records",
@@ -59804,7 +59805,8 @@ class TestWriteOnlyOnChange(Base):
         self.assertLessEqual(seen["sweep.json"], 1 + 1200 // sb.HEARTBEAT_SWEEP, dict(seen))          # once, plus a heartbeat per HEARTBEAT_SWEEP
         self.assertGreaterEqual(seen["v2-calls.json"], 1)
         self.assertLessEqual(seen["decisions.json"], 2, "decisions.json keeps its touch: its mtime is the signal, and a touch is not a rewrite")
-        self.assertLess(sum(seen.values()), 3 * 40 // 2, dict(seen))   # three files alone used to be written 40 times each
+        self.assertLessEqual(seen["cockpit.json"], 1 + 1200 // sb.COCKPIT_HEARTBEAT, dict(seen))   # the feed: once, plus a heartbeat per COCKPIT_HEARTBEAT, never between
+        self.assertLess(sum(seen.values()) - seen["cockpit.json"], 3 * 40 // 2, dict(seen))   # three files alone used to be written 40 times each
 
     def test_the_status_files_of_the_pass_keep_a_heartbeat(self):
         world = World(self, agents=("a0",), config={})
@@ -87089,6 +87091,7 @@ switchboard/agents_verify.py:agent_definition
 switchboard/agents_verify.py:agents_found
 switchboard/alert_labels.py:__init__
 switchboard/answer_delivery.py:cmd_decision_batch
+switchboard/cockpit.py:cockpit_current
 switchboard/decisions_a.py:read_batch_notes
 switchboard/decisions_a.py:read_escalated
 switchboard/decisions_b.py:read_order_notices
