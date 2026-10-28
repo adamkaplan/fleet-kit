@@ -8237,6 +8237,57 @@ def boss_name(discovery, observation):
     return boss if boss != observation.name else None  # a chief of staff launched with reports_to chief-of-staff is not its own boss
 
 
+BOSS_NEAR_MAX = 5   # #1046: at most this many registered names are listed in the refusal of an unregistered --reports-to
+
+
+def known_boss_names(engine, state):
+    """(names, whole): every registered identity a `--reports-to` may name: a running agent, a registered or retired one, and a cloud worker's
+    record. `whole` is false when the registry could not be read whole (the check then cannot tell, and the caller fails open)."""
+    got = registry_read(state)
+    names = set(got["agents"]) | set(got["retired"])
+    whole = got["whole"]
+    try:
+        names |= set(engine.discover(engine.now()).agents)
+    except Exception:
+        whole = False   # discovery that cannot answer is a read that cannot be trusted
+    cloud = Path(state) / "cloud"
+    if cloud.is_dir():
+        names |= {path.stem for path in cloud.glob("*.json")}
+    return names, whole
+
+
+def boss_name_problem(reports_to, names, whole):
+    """None when `reports_to` is acceptable, else the one-line refusal. Nothing is named, minted or created before it. The role name
+    `chief-of-staff` is always acceptable (it resolves as before); a read that is not whole, or that knows no name at all, accepts (it cannot tell); a name the lookup knows is accepted."""
+    if not reports_to or not whole or not names or reports_to == COS_ALIAS or reports_to in names:   # no name known at all (a fresh state): nothing to compare with, so no refusal
+        return None
+    near = difflib.get_close_matches(str(reports_to), sorted(names), n=BOSS_NEAR_MAX, cutoff=0.0)
+    return ("refused: --reports-to %s is not a registered identity (%s); nothing was created. Use one of: %s, or register the lane first, "
+            "or pass --boss-unregistered REASON." % (_one_line(str(reports_to), 60), "no running, registered, retired or cloud worker has that name",
+                                                     ", ".join(near) if near else "(none registered)"))
+
+
+def check_boss_name(engine, state, args):
+    """The check of `launch` (both routes), before anything is created. An override with a reason writes one `launch.boss_unregistered` line;
+    a registry that cannot be read whole warns once and goes on."""
+    boss = getattr(args, "reports_to", None)
+    if not boss:
+        return
+    names, whole = known_boss_names(engine, state)
+    problem = boss_name_problem(boss, names, whole)
+    if not whole and boss != COS_ALIAS:
+        sys.stderr.write("%s: launch: the agent registry could not be read whole: --reports-to %s is not checked\n" % (PROG, _one_line(str(boss), 60)))
+    reason = getattr(args, "boss_unregistered", None)
+    if problem and reason is not None:
+        if not reason.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", reason):
+            raise LaunchError("--boss-unregistered needs a reason: non-empty text on one line, no control characters")
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "launch.boss_unregistered", args.name, {"reports_to": _one_line(str(boss), 60), "reason": _one_line(reason, 200)})
+        return
+    if problem:
+        raise LaunchError(problem)
+
+
 # ---- PR notices: a heads-up that an orchestrator opened (or means to merge) a PR
 
 PR_NOTICES = "pr-notices.json"
@@ -13970,6 +14021,7 @@ def cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "memory_ok", None) is not None and (not args.memory_ok.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", args.memory_ok)):
         sys.stderr.write("%s: launch: --memory-ok needs a reason: non-empty text on one line, no control characters\n" % PROG)
         return EXIT_USAGE
+    check_boss_name(engine, state, args)   # #1046: an unregistered --reports-to is refused before anything is created (a new launch; every route above returned already)
     refusal = launch_memory_check(args, engine, state, runner, now)   # a NEW launch only: every resume, --cloud and the other routes returned above
     if refusal:
         sys.stderr.write("%s: %s\n" % (PROG, refusal))
@@ -22629,6 +22681,7 @@ def build_parser():
                         "reported since the launch (60m, or an ISO time with a zone)")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
     launch.add_argument("--memory-ok", dest="memory_ok", metavar="REASON", help="Skip the memory test of a new launch (audited with the reason)")
+    launch.add_argument("--boss-unregistered", dest="boss_unregistered", metavar="REASON", help="Launch although --reports-to names no registered identity (audited with the reason as launch.boss_unregistered)")
     launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod, default /work; the pod always runs its own 'worker' agent: --agent is only recorded)")
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
@@ -23985,6 +24038,44 @@ def add_skills_parsers(sub):
     skills_sub = skills.add_subparsers(dest="skills_action", required=True)
     skills_sub.add_parser("check", help="Say whether the installed skills equal the kit's; exit 1 naming each that differs or is missing")
     skills_sub.add_parser("sync", help="Copy exactly the kit's skills into the installed folders, keeping a backup of each file replaced")
+
+
+BRIEF_HEADER_FILE = "operator-brief-header.rules"   # #1046: the one source of the standard header: `ID: rule` per line, in skills/fleet-coordination
+
+
+def brief_header_lines(path=None):
+    """The standard brief header, derived from its one source file (never retyped here): a title line, then one `- [ID] rule` line per rule."""
+    path = Path(path) if path else Path(KIT_ROOT) / "skills" / "fleet-coordination" / BRIEF_HEADER_FILE
+    lines = ["Standard header for a brief to a cloud operator (settings are named by key, never by value):"]
+    for number, raw in enumerate(path.read_text().splitlines(), 1):
+        if not raw.strip() or raw.startswith("#"):
+            continue
+        ident, sep, rule = raw.partition(": ")
+        if not sep or not re.fullmatch(r"[A-Z][A-Z0-9-]*", ident) or not rule.strip():
+            raise ValueError("%s line %d is not `ID: rule`" % (path.name, number))
+        lines.append("- [%s] %s" % (ident, rule.strip()))
+    return lines
+
+
+def cmd_brief(args, runner, now):
+    """`brief header`: print the standard header once. Files only: no daemon, no cluster, no setting value."""
+    try:
+        lines = brief_header_lines()
+    except (OSError, ValueError) as err:
+        sys.stderr.write("%s: brief header: %s\n" % (PROG, _one_line(str(err), 160)))
+        return EXIT_ERROR
+    print("\n".join(lines))
+    return EXIT_OK
+
+
+cmd_brief.direct = True   # files only: no daemon start
+
+
+def add_brief_parsers(sub):
+    brief = sub.add_parser("brief", help="Print the standard header of a brief (`brief header`): one source, no pinned checkout hash, no setting value")
+    brief_sub = brief.add_subparsers(dest="brief_action", required=True)
+    header = brief_sub.add_parser("header", help="The standard header for a brief to a cloud operator, printed from skills/fleet-coordination/%s" % BRIEF_HEADER_FILE)
+    header.add_argument("--role", dest="brief_for", choices=("operator",), default="operator", help="Who the brief is for (only operator)")
 
 
 def _read_json_object(path, what):

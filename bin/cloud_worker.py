@@ -56,6 +56,12 @@ SETUP_PREAMBLE = """Setup (do this first, before the task below):
 
 Task:
 """
+# Temporary rules of `launch --cloud` (ask #1046): both live HERE, each names the ask whose merge removes it.
+TEMP_HARD_LIMIT_MINUTES = 55   # the longest --hard until the git token is renewed while a worker runs: removed by the merge of ask #1034
+TEMP_ISSUE_LINK_WARNING = True   # the one warning when the brief links an issue of the repository (a worker cannot read it yet): removed by the merge of ask #1019
+STACK_TOOLING_RE = re.compile(r"\b(docker|buildx)\b|\blane[- ]stack\b", re.I)   # what a brief names that needs the nested Docker of --stack
+HARD_RE = re.compile(r"(\d+)([smh])")
+DEFAULT_POD_SHAPE, DEFAULT_STACK_POD_SHAPE = "XS", "S"   # the launcher's own defaults, only to print the shape that will be made
 RECORD_MAX = 8192
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
@@ -1279,6 +1285,34 @@ def cmd_launch(args, runner, now):
         return _launch(args, runner, now, lambda state: stack.enter_context(reservation(state, args.name)))
 
 
+def hard_limit_problem(hard):
+    """None, or the named message of a --hard above the temporary limit (TEMP_HARD_LIMIT_MINUTES). A value this cannot read is the launcher's to judge."""
+    found = HARD_RE.fullmatch(str(hard or ""))
+    if not found:
+        return None
+    seconds = int(found.group(1)) * {"s": 1, "m": 60, "h": 3600}[found.group(2)]
+    if seconds <= TEMP_HARD_LIMIT_MINUTES * 60:
+        return None
+    return ("--hard %s is above %d minutes: the git token is not renewed while a worker runs and lasts about an hour, so a longer worker could not push "
+            "at its end (rule until ask #1034 merges: --hard at most %dm); nothing was created" % (_one(str(hard), 20), TEMP_HARD_LIMIT_MINUTES, TEMP_HARD_LIMIT_MINUTES))
+
+
+def brief_warnings(brief, repo, stack):
+    """The warning lines (at most one each) a brief earns before anything is created: it names docker, buildx or the lane stack tooling while --stack is not
+    given, or it links an issue of the repository."""
+    lines = []
+    if brief and not stack and STACK_TOOLING_RE.search(brief):
+        lines.append("warning: the brief names docker, buildx or the lane stack tooling but --stack is not given: the worker would have no nested Docker; continuing")
+    if brief and TEMP_ISSUE_LINK_WARNING and re.search(r"github\.com/%s/(issues|pull)/\d+|(?<![\w/.-])%s#\d+" % (re.escape(repo), re.escape(repo)), brief, re.I):
+        lines.append("warning: the brief links an issue of %s: the worker cannot read it yet (paste what it needs into the brief); continuing" % repo)
+    return lines
+
+
+def pod_shape_name(shape, stack):
+    """The shape the pod will have: the one asked for, else the launcher's default (XS, or S with --stack)."""
+    return shape or (DEFAULT_STACK_POD_SHAPE if stack else DEFAULT_POD_SHAPE)
+
+
 def _launch(args, runner, now, reserve):
     """`launch NAME --cloud --repo OWNER/REPO --branch B --agent A`: the allow-list first, then (with a cluster token minted for this command) the
     model entry and a one-hour git token go to the launcher as per-run secrets, the pod is created, and the session and the brief are sent through
@@ -1308,6 +1342,9 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
+    problem = hard_limit_problem(getattr(args, "hard", None))
+    if problem:
+        raise LaunchError(problem)
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
@@ -1325,7 +1362,10 @@ def _launch(args, runner, now, reserve):
                           "the pod instead of the local agent); retire it or pick another name; nothing was created" % name)
     if load_record(state, name) is not None:
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
+    H["check_boss_name"](engine, state, args)   # #1046: an unregistered --reports-to is refused here, before the brief, the vault, a token or a pod
     brief = H["read_brief"](args.brief_file, sys.stdin)
+    for line in brief_warnings(brief, repo, getattr(args, "stack", False)):
+        print("%s: %s" % (H["PROG"], line), file=sys.stderr)
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
     options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
     for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
@@ -1435,7 +1475,8 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
-    print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
+    print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True,
+                      "shape": pod_shape_name(args.shape, getattr(args, "stack", False))}, sort_keys=True))
     return H["EXIT_OK"]
 
 

@@ -1,0 +1,8 @@
+# The one source of the standard header of a brief to a cloud operator (ask #1046).
+# One rule per line: `ID: rule`. `fleet-switchboard brief header` prints these lines; the tests read this same file.
+ROUTE: The cluster admin route is the settings keys CW_CLUSTER_ADMIN_CMD and CW_CLUSTER_ADMIN_SECRET: read them from your settings file by key name; this brief never carries a value.
+CHECKOUT: No checkout hash is pinned in this brief: fetch the branch you are named and work from its current tip.
+SECRETS: Never print a token, a key or a kubeconfig; keep each in a private directory with owner-only mode (0700, files 0600) and shred it after use.
+DIAGNOSTICS: Send the token mint's diagnostics (its standard error) to the null device, /dev/null.
+DELETE: Delete by exact name only: never by label, pattern or wildcard.
+SURPRISE: At the first surprise, stop and report what you saw; do not work around it.

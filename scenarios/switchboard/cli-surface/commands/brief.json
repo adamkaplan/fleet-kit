@@ -1,0 +1,4 @@
+{
+ "command": "brief",
+ "help": "usage: fleet-switchboard brief [-h] {header} ... positional arguments: {header} header The standard header for a brief to a cloud operator, printed from skills/fleet-coordination/operator-brief-header.rules options: -h, --help show this help message and exit"
+}
