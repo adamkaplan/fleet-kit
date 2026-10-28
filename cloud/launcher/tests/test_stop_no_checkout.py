@@ -51,8 +51,6 @@ class StopNoCheckout(base.Base):
         absent = os.path.join(self.tmp.name, "absent", "repo")
         bare_dir = os.path.join(self.tmp.name, "plain")
         os.makedirs(bare_dir)
-        with open(os.path.join(bare_dir, "notes.txt"), "w") as f:
-            f.write("not a checkout\n")
         bad = []
         for worker, path in (("coder4", absent), ("coder5", bare_dir)):
             code, err, record = self.stop_pod(worker, {"CW_WORKDIR": path})
@@ -70,7 +68,7 @@ class StopNoCheckout(base.Base):
         self.assertEqual(self.problems_no_checkout(), [])
 
     def test_the_audit_and_record_for_no_checkout_are_exact(self):
-        code, err, record = self.stop_pod("coder4", {"CW_WORKDIR": os.path.join(self.tmp.name, "nowhere")})
+        code, err, record = self.stop_pod("coder4", {"CW_WORKDIR": os.path.join(self.tmp.name, "nowhere", "repo")})
         self.assertEqual(code, 0, err)
         self.assertEqual(record["end_hook"]["note"], SENTENCE)
         self.assertIs(record["end_hook"]["pushed"], False)
@@ -80,7 +78,7 @@ class StopNoCheckout(base.Base):
 
     def test_the_hook_tells_the_three_cases_apart(self):
         import end_hook
-        missing = end_hook.run(os.path.join(self.tmp.name, "none"), "coder7")
+        missing = end_hook.run(os.path.join(self.tmp.name, "none", "repo"), "coder7")
         self.assertIs(missing["no_repository"], True)
         self.assertEqual(missing["note"], SENTENCE)
         work = self.checkout_without_remote()
@@ -197,7 +195,7 @@ class StopNoCheckout(base.Base):
 
     def repo_dir(self, git_marker=True):
         d = os.path.join(self.space, "repo")
-        os.makedirs(os.path.join(d, ".git" if git_marker else "plain"))
+        os.makedirs(os.path.join(d, ".git") if git_marker else d)
         return d
 
     def answer(self, worker, path):
@@ -252,22 +250,86 @@ class StopNoCheckout(base.Base):
         d = self.repo_dir(git_marker=False)
         self.assert_reports_none("coder5", d)
 
-    # ---- S7 ----
-    def test_a_checkout_one_level_down_keeps_the_pod(self):
-        os.makedirs(os.path.join(self.space, "other", ".git"))
-        self.assert_pod_kept("coder4", os.path.join(self.space, "repo"))
+    # ---- S7: an absent repository directory, a workspace with ANY entry ----
+    def test_a_workspace_with_any_entry_keeps_the_pod(self):
+        import subprocess
+        makers = {
+            "depth1": lambda s: os.makedirs(os.path.join(s, "other", ".git")),
+            "depth4": lambda s: os.makedirs(os.path.join(s, "a", "b", "c", "d", ".git")),
+            "file": lambda s: open(os.path.join(s, "notes.txt"), "w").close(),
+            "dir": lambda s: os.makedirs(os.path.join(s, "plain")),
+            "bare": lambda s: subprocess.run(["git", "init", "-q", "--bare", os.path.join(s, "b.git")], check=True),
+            "many": lambda s: [open(os.path.join(s, "f%d" % i), "w").close() for i in range(3000)],
+        }
+        for i, (name, make) in enumerate(makers.items()):
+            space = os.path.join(self.tmp.name, "ws-" + name)
+            os.makedirs(space)
+            make(space)
+            with self.subTest(name):
+                self.assert_pod_kept("keep%d" % i, os.path.join(space, "repo"))
 
-    def test_a_checkout_at_depth_3_keeps_the_pod(self):
-        os.makedirs(os.path.join(self.space, "a", "b", "c", ".git"))
-        self.assert_pod_kept("coder4", os.path.join(self.space, "repo"))
-
-    def test_a_checkout_at_depth_4_is_beyond_the_scan_and_reports_no_repository(self):
-        os.makedirs(os.path.join(self.space, "a", "b", "c", "d", ".git"))
+    def test_an_empty_workspace_and_an_absent_one_report_no_repository(self):
         self.assert_reports_none("coder4", os.path.join(self.space, "repo"))
+        self.assert_reports_none("coder5", os.path.join(self.tmp.name, "gone", "repo"))
 
-    def test_a_workspace_with_no_marker_anywhere_reports_no_repository(self):
-        os.makedirs(os.path.join(self.space, "a", "b", "c"))
-        self.assert_reports_none("coder4", os.path.join(self.space, "repo"))
+    # ---- S8: a readable repository directory without a marker but with an entry ----
+    def test_a_readable_directory_with_an_entry_and_no_git_keeps_the_pod(self):
+        import subprocess
+        makers = {
+            "file": lambda d: open(os.path.join(d, "notes.txt"), "w").close(),
+            "bare": lambda d: subprocess.run(["git", "init", "-q", "--bare", d], check=True),
+            "tree": lambda d: (os.makedirs(os.path.join(d, "src", "pkg")), open(os.path.join(d, "src", "pkg", "m.py"), "w").close()),
+            "hidden": lambda d: open(os.path.join(d, ".hidden"), "w").close(),
+        }
+        for i, (name, make) in enumerate(makers.items()):
+            d = os.path.join(self.tmp.name, "rd-" + name, "repo")
+            os.makedirs(d)
+            make(d)
+            with self.subTest(name):
+                self.assert_pod_kept("rd%d" % i, d)
+
+    def test_a_directory_with_a_git_marker_is_a_checkout(self):
+        import end_hook
+        d = self.repo_dir()
+        self.assertIs(end_hook.no_checkout(d), False)
+
+    # ---- S9: the pre-stop entry point ----
+    def test_prestop_says_cannot_read_for_a_directory_that_cannot_be_searched(self):
+        self.need_user()
+        out = self.prestop_output()
+        self.assertIn("cannot read", out)
+        self.assertNotIn("no git repository here", out)
+
+    def prestop_output(self, patch=None):
+        import contextlib
+        import io
+        import end_hook
+        d = self.repo_dir()
+        self.set_mode(d, 0o600)
+        env = {"CW_WORKDIR": d, "CW_WORKER": "coder4"}
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                end_hook.prestop_main()
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return buf.getvalue()
+
+    # ---- U3: the decision has no exists/isdir/listdir and no bound ----
+    def test_the_decision_functions_hold_no_exists_check_and_no_bound(self):
+        import inspect
+        import end_hook
+        src = inspect.getsource(end_hook.no_checkout) + inspect.getsource(end_hook.probe_path) + inspect.getsource(end_hook.has_marker) \
+            + inspect.getsource(end_hook.first_entry)
+        for word in ("os.path.exists", "os.path.isdir", "os.path.isfile", "listdir", "DEPTH", "MAX_ENTRIES"):
+            self.assertNotIn(word, src)
+        self.assertFalse(hasattr(end_hook, "scan_for_checkout"))
 
     # ---- mutants (in memory, applied counter) ----
     def test_mutant_deciding_with_exists_reports_the_unreadable_states(self):
@@ -289,24 +351,78 @@ class StopNoCheckout(base.Base):
         with self.assertRaises(OSError):
             end_hook.run(d, "coder4")
 
-    def test_mutant_without_the_workspace_scan_reports_a_checkout_elsewhere(self):
+    def hook_with(self, fn):
         import end_hook
-        os.makedirs(os.path.join(self.space, "other", ".git"))
+        orig = end_hook.no_checkout
+        end_hook.no_checkout = fn
+        self.addCleanup(setattr, end_hook, "no_checkout", orig)
+        return end_hook, orig
+
+    def mutant_row(self, fn, setup, name):
+        """The mutant answers no_repository where the real hook raises; mutation asserted applied."""
         applied = []
-        orig = end_hook.scan_for_checkout
-        end_hook.scan_for_checkout = lambda w: applied.append(1)
-        self.addCleanup(setattr, end_hook, "scan_for_checkout", orig)
-        self.assertIs(end_hook.run(os.path.join(self.space, "repo"), "coder4")["no_repository"], True)
+
+        def wrapped(w):
+            applied.append(1)
+            return fn(w)
+        end_hook, orig = self.hook_with(wrapped)
+        self.assertIs(end_hook.run(setup, name)["no_repository"], True)
         self.assertTrue(applied)
-        end_hook.scan_for_checkout = orig
-        with self.assertRaises(RuntimeError):
-            end_hook.run(os.path.join(self.space, "repo"), "coder4")
+        end_hook.no_checkout = orig
+        with self.assertRaises((RuntimeError, OSError)):
+            end_hook.run(setup, name)
+
+    def test_mutant_readable_directory_without_marker_is_no_repository(self):
+        d = os.path.join(self.tmp.name, "m8", "repo")
+        os.makedirs(d)
+        open(os.path.join(d, "f"), "w").close()
+        self.mutant_row(lambda w: not os.path.isdir(os.path.join(w, ".git")), d, "coder4")
+
+    def test_mutant_depth_3_scan_misses_depth_4(self):
+        os.makedirs(os.path.join(self.space, "a", "b", "c", "d", ".git"))
+
+        def scan(w):
+            for root, dirs, _ in os.walk(w):
+                if root[len(w):].count(os.sep) <= 3 and ".git" in dirs:
+                    raise RuntimeError("found")
+            return True
+        self.mutant_row(scan, os.path.join(self.space, "repo"), "coder4")
+
+    def test_mutant_entry_bound_of_2000_on_the_deletion_path(self):
+        for i in range(3000):
+            open(os.path.join(self.space, "f%d" % i), "w").close()
+
+        def bounded(w):
+            n = len(os.listdir(os.path.dirname(w)))
+            if n > 2000:
+                return True   # the mutant: too many entries to look at, so answer as if none
+            raise RuntimeError("entries")
+        self.mutant_row(bounded, os.path.join(self.space, "repo"), "coder4")
+
+    def test_mutant_prestop_with_exists_prints_no_git_repository(self):
+        self.need_user()
+        import end_hook
+        applied = []
+        real = os.lstat
+
+        def fake(path, *a, **k):
+            if str(path).endswith(".git"):
+                applied.append(1)
+                raise FileNotFoundError(path)   # what os.path.exists makes of a permission error
+            return real(path, *a, **k)
+        os.lstat = fake
+        try:
+            out = self.prestop_output()
+        finally:
+            os.lstat = real
+        self.assertTrue(applied)
+        self.assertIn("no git repository here", out)
 
     def test_the_documentation_states_the_condition_and_the_limits(self):
         with open(DOC, encoding="utf-8") as f:
             text = " ".join(f.read().split())
-        for phrase in ("nothing can be lost, on this condition", "absent or readable and empty", "to a depth of 3",
-                       "keeps the pod", "depth 4", "only delete its own pod", "pushes from the workspace only"):
+        for phrase in ("nothing can be lost, on this condition", "absent or empty AND the workspace", "ANY entry in the workspace",
+                       "keeps the pod", "the reaper", "recover route", "only delete its own pod", "pushes from the workspace only"):
             self.assertIn(phrase, text)
 
 

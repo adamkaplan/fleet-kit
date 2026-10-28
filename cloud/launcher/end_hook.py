@@ -152,14 +152,10 @@ def config_refusal(workdir, repo, ctx):
 NO_REPOSITORY_NOTE = "no repository in the pod; nothing to push"
 
 
-SCAN_DEPTH = 3
-SCAN_MAX_ENTRIES = 2000
-
-
 def probe_path(path):
     """'absent' only when lstat of the path, or of a parent on the way, says FileNotFoundError or NotADirectoryError; 'dir' for a real
     directory. Any other OSError (permission, loop, name too long) propagates; a link at the path, a dangling link on the way, or a
-    non-directory at the path raises RuntimeError. Never os.path.exists/isdir: they turn an error into 'not found'."""
+    non-directory at the path raises RuntimeError. Never the os.path helpers: they turn an error into "not found"."""
     path = os.path.abspath(path)
     parts = [p for p in path.split(os.sep) if p]
     cur = os.sep
@@ -190,42 +186,29 @@ def has_marker(directory):
         return False
 
 
-def scan_for_checkout(workspace):
-    """First directory at depth <= SCAN_DEPTH below workspace (workspace itself included) that holds a .git entry, else None.
-    Bounded (SCAN_MAX_ENTRIES entries; more raises), links never followed, any scan error propagates."""
-    level, seen = [workspace], 0
-    for depth in range(SCAN_DEPTH + 1):
-        nxt = []
-        for d in level:
-            if has_marker(d):
-                return d
-            if depth == SCAN_DEPTH:
-                continue
-            with os.scandir(d) as it:
-                for e in it:
-                    seen += 1
-                    if seen > SCAN_MAX_ENTRIES:
-                        raise RuntimeError("the workspace %s holds too many entries to scan" % workspace)
-                    if e.is_dir(follow_symlinks=False):
-                        nxt.append(e.path)
-        level = nxt
-    return None
+def first_entry(directory):
+    """True when the directory holds any entry at all (a listing error propagates)."""
+    with os.scandir(directory) as it:
+        for _ in it:
+            return True
+    return False
 
 
 def no_checkout(workdir):
-    """True only when the repository is absent, or readable and without .git, and (when absent) the workspace holds no checkout.
-    Raises (the hook exits 1, the pod is kept) for anything it cannot tell."""
+    """True only when the repository directory is absent or empty AND the workspace is absent or empty. Any entry in the
+    workspace, or a directory the hook cannot read, raises (the hook exits 1, the pod is kept)."""
     state = probe_path(workdir)
     if state == "dir":
-        with os.scandir(workdir) as it:   # must be listable
-            list(it)
-        return not has_marker(workdir)
+        if has_marker(workdir):
+            return False
+        if first_entry(workdir):
+            raise RuntimeError("%s holds files but no .git: not deleting the pod" % workdir)
+        return True
     workspace = os.path.dirname(os.path.abspath(workdir))
     if probe_path(workspace) == "absent":
         return True
-    found = scan_for_checkout(workspace)
-    if found:
-        raise RuntimeError("no repository at %s but a checkout is at %s" % (workdir, found))
+    if first_entry(workspace):
+        raise RuntimeError("no repository at %s but the workspace %s is not empty: not deleting the pod" % (workdir, workspace))
     return True
 
 
@@ -322,9 +305,13 @@ def prestop_main():
     workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
     if not valid_worker(worker):
         return report(workdir, "the worker name is not valid", names=False)
-    if not os.path.exists(os.path.join(workdir, ".git")):
+    try:
+        gst = os.lstat(os.path.join(workdir, ".git"))
+    except (FileNotFoundError, NotADirectoryError):
         return report(workdir, "there is no git repository here", names=False)
-    if not os.path.isdir(os.path.join(workdir, ".git")):
+    except OSError as e:
+        return report(workdir, "cannot read %s/.git: %s" % (workdir, type(e).__name__), names=False)
+    if not stat.S_ISDIR(gst.st_mode):
         return report(workdir, ".git is a file: a linked worktree or a separate git directory is not supported", names=False)
     repo = os.environ.get("CW_REPO", "")
     if not REPO_RE.match(repo) or ".." in repo:
