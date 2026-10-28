@@ -99,23 +99,41 @@ MINTED = []  # the one token minted and not yet printed: a refusal after the min
 
 def revoke(token):
     """Best effort: revoke an installation token (DELETE /installation/token, authorised by that token). True only on HTTP 204."""
+    REVOKE_STATUS[:] = ["unreachable"]
     try:
         req = urllib.request.Request(api_base() + "/installation/token", method="DELETE",
                                      headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                                               "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cw-app-token"})
         with open_url(req, 15) as r:
+            REVOKE_STATUS[:] = [str(r.status)]
             return r.status == 204
+    except urllib.error.HTTPError as e:
+        REVOKE_STATUS[:] = [str(e.code)]
+        return False
     except BaseException:  # any failure (including a redirect or an exit) is "revocation failed", never a crash and never the token
         return False
 
 
+REVOKE_STATUS = ["unreachable"]  # what the last revoke met: an HTTP status, or the word unreachable
+
+
+def say_revoke_failed():
+    """The one line for a revoke that did not succeed: the status or the word unreachable, never the token."""
+    print("app-token: the token could not be revoked (status %s)" % REVOKE_STATUS[0], file=sys.stderr)
+
+
 def die(msg, code=1):
+    failed = False
     if MINTED:
         token = MINTED.pop()
-        msg += (" The token was revoked." if revoke(token)
+        ok = revoke(token)
+        failed = not ok
+        msg += (" The token was revoked." if ok
                 else " Revocation failed: the token expires within an hour and was never printed.")
         del token
     print("app-token: " + msg, file=sys.stderr)
+    if failed:
+        say_revoke_failed()
     sys.exit(code)
 
 
@@ -251,8 +269,9 @@ def find_installation(target, jwt):
     return inst, owner_id
 
 
-def mint(target):
-    """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
+def mint(target, keep=False):
+    """Return a token for target (OWNER/REPO), or exit through die(). Never prints. With keep the token stays in MINTED (so a failure
+    after the return still revokes it) and the one who asked clears it."""
     repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
     if not app_id.isdigit():
@@ -289,7 +308,8 @@ def mint(target):
     if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
         die("refusing: the token lives longer than 61 minutes")
     check_permissions(ans.get("permissions"))
-    MINTED.clear()
+    if not keep:
+        MINTED.clear()
     return token
 
 
@@ -381,6 +401,18 @@ def link_in_parents(path):
     return False
 
 
+def check_length(path):
+    """Refuse (exit 2), before anything is minted, a path over the file system's name or path limit (the smaller of PC_PATH_MAX and 4096)."""
+    try:
+        name_max = os.pathconf("/", "PC_NAME_MAX")
+        path_max = min(os.pathconf("/", "PC_PATH_MAX"), 4096)
+    except (OSError, ValueError):
+        name_max, path_max = 255, 4096
+    raw = os.fsencode(path)
+    if len(raw) >= path_max or any(len(p) > name_max for p in raw.split(b"/")):
+        die("the route --out is longer than the file system allows", 2)
+
+
 def check_out(path):
     """Refuse (exit 2) before minting unless path is new, in a private directory this user owns (no group or world access, no link but the system's own).
     Returns the path to create, with every judged link resolved."""
@@ -392,6 +424,7 @@ def check_out(path):
     if path.endswith("/"):
         die("the route --out must name a file", 2)
     path = os.path.join(os.getcwd(), path)
+    check_length(path)
     d = os.path.dirname(os.path.abspath(path))
     if link_in_parents(os.path.join(d, "x")):
         die("the directory of --out is a link or not a directory", 2)
@@ -452,29 +485,41 @@ def main(argv):
         check_fd(value)
     elif kind == "out":
         value = check_out(value)
-    token = mint(target)
-    if kind is None:
-        revoke(token)  # nobody received it
-        print("app-token: minted a token of %d bytes and did not deliver it: name a route with --fd N or --out PATH" % len(token), file=sys.stderr)
-        return
-    MINTED.append(token)  # until delivered, a refusal revokes it
     import signal
 
     def stop(signum, frame):
         raise SystemExit(128 + signum)
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, stop)
-    try:
+    try:   # ONE handler over the whole span: from the mint to the end of the delivery
+        token = mint(target, keep=True)
+        note_minted(token)
+        if kind is None:
+            MINTED.clear()
+            revoke(token)  # nobody received it
+            revoked = REVOKE_STATUS[0] == "204"
+            print("app-token: minted a token of %d bytes and did not deliver it: name a route with --fd N or --out PATH" % len(token), file=sys.stderr)
+            if not revoked:
+                say_revoke_failed()
+                sys.exit(1)
+            return
         deliver(kind, value, token)
-    except OSError:
-        die("the token could not be delivered to the route")
-    except KeyboardInterrupt:   # an interrupt or a signal during delivery: revoke, leave nothing, exit non-zero
+    except KeyboardInterrupt:   # an interrupt or a signal at any point: revoke, leave nothing, exit non-zero
         die("the delivery was interrupted", 130)
     except SystemExit as e:
+        if not MINTED:   # a refusal already revoked, or nothing was minted yet, or the run ended well
+            raise
         die("the delivery was interrupted", e.code if isinstance(e.code, int) and e.code else 1)
-    except Exception:
+    except Exception:   # OSError, a full disk, a broken pipe, an error in the code between the mint and the route
+        if not MINTED:   # before any token exists the failure is not this handler's
+            raise
         die("the token could not be delivered to the route")
     MINTED.clear()
+
+
+def note_minted(token):
+    """The step right after the mint: nothing to do, the token is already kept in MINTED until its delivery ends."""
+    return token
 
 
 if __name__ == "__main__":

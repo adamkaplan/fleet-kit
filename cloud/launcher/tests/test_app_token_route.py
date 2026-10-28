@@ -529,6 +529,149 @@ class RouteLinks(unittest.TestCase):
         self.assertEqual(ta.Stub.deletes, [])
 
 
+class RouteSpan(unittest.TestCase):
+    """Ask #1043, S18 to S20: the revoke covers the whole span from the mint to the end of the delivery, a long path is refused before
+    minting, and a failed revoke is said on one line of standard error (the status or the word unreachable, never the token)."""
+    setUpClass = classmethod(ta.Mint.setUpClass.__func__)
+    tearDownClass = classmethod(ta.Mint.tearDownClass.__func__)
+    setUp = ta.Mint.setUp
+    env, run_it, private_dir, mutant, run_fd = Route.env, Route.run_it, Route.private_dir, Route.mutant, Route.run_fd
+    interrupted = RouteLinks.interrupted
+
+    SPAN_CASES = (("interrupt", KeyboardInterrupt), ("SIGTERM", lambda *a: os.kill(os.getpid(), signal.SIGTERM)),
+                  ("SIGHUP", lambda *a: os.kill(os.getpid(), signal.SIGHUP)), ("broken pipe", BrokenPipeError),
+                  ("disk full", OSError(28, "No space left on device")), ("any exception", RuntimeError))
+
+    def load(self, path):
+        sys.path.insert(0, os.path.dirname(HERE))
+        spec = importlib.util.spec_from_file_location("app_token_span_%d" % len(sys.modules), path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def span_rows(self, mod):
+        """For each of the six failures raised in the step right after the mint: (name, exit code, DELETE requests, files left, DELETE headers)."""
+        rows = []
+        for name, effect in self.SPAN_CASES:
+            ta.Stub.deletes = []
+            code, deletes, left = self.interrupted(mod, effect, "note_minted")
+            rows.append((name, code, deletes, left, list(ta.Stub.deletes)))
+        return rows
+
+    def check_span(self, path=MINT):
+        for name, code, deletes, left, seen in self.span_rows(self.load(path)):
+            self.assertIsInstance(code, int, name)
+            self.assertNotEqual(code, 0, name)
+            self.assertEqual((deletes, left), (1, []), name)
+            self.assertEqual(seen, [("/installation/token", "Bearer " + TOKEN)], name)
+
+    def test_s18_a_failure_between_the_mint_and_the_delivery_revokes_once_and_leaves_no_file(self):
+        self.check_span()
+
+    def test_s18_only_the_file_this_run_created_is_removed(self):
+        mod = self.load(MINT)
+        real = self.private_dir()
+        other = os.path.join(real, "other")
+        with open(other, "w") as f:
+            f.write("keep")
+        ta.Stub.deletes = []
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(mod, "write_all", side_effect=OSError(28, "full")):
+            with self.assertRaises(SystemExit):
+                mod.main([REAL, "--out", os.path.join(real, "tok")])
+        self.assertEqual((os.listdir(real), len(ta.Stub.deletes)), (["other"], 1))
+
+    def test_s18_a_mutant_whose_handler_starts_at_the_delivery_fails(self):
+        path = self.mutant("    try:   # ONE handler over the whole span: from the mint to the end of the delivery\n        token = mint(target, keep=True)\n        note_minted(token)\n",
+                           "    token = mint(target, keep=True)\n    note_minted(token)\n    try:\n")
+        with open(path) as f, open(MINT) as g:
+            self.assertNotEqual(f.read(), g.read())   # the mutation was applied
+        with self.assertRaises(AssertionError):
+            self.check_span(path)
+
+    def long_name(self):
+        return os.path.join(self.private_dir(), "n" * 300)
+
+    def check_long(self, path=MINT):
+        ta.Stub.seen, ta.Stub.gets = [], []
+        p = self.run_it(["--out", self.long_name()], path)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual((ta.Stub.seen, ta.Stub.gets), ([], []))
+        self.assertNotIn(TOKEN, p.stdout + p.stderr)
+
+    def test_s19_a_path_over_the_name_or_path_limit_is_refused_before_minting(self):
+        self.check_long()
+        ta.Stub.seen, ta.Stub.gets = [], []
+        p = self.run_it(["--out", os.path.join(self.private_dir(), *["d" * 200] * 25, "tok")])
+        self.assertEqual((p.returncode, ta.Stub.seen, ta.Stub.gets), (2, [], []), p.stderr)
+
+    def test_s19_a_mutant_that_checks_after_minting_fails(self):
+        path = self.mutant("    check_length(path)\n", "", ("        note_minted(token)\n", "        note_minted(token)\n        check_length(value if kind == 'out' else '')\n"))
+        with self.assertRaises(AssertionError):
+            self.check_long(path)
+
+    LINE = "app-token: the token could not be revoked (status %s)"
+
+    def check_revoke_said(self, path=MINT, status=500):
+        ta.Stub.delete_status = status
+        self.addCleanup(setattr, ta.Stub, "delete_status", 204)
+        ta.Stub.deletes = []
+        p = self.run_it([], path)   # no route
+        lines = p.stderr.splitlines()
+        self.assertNotEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(lines.count(self.LINE % status), 1, p.stderr)
+        self.assertNotIn(TOKEN, p.stdout + p.stderr)
+        r, w = os.pipe()
+        os.close(r)   # a failed delivery
+        try:
+            q = self.run_it(["--fd", str(w)], path, (w,))
+        finally:
+            os.close(w)
+        self.assertNotEqual(q.returncode, 0, q.stderr)
+        self.assertEqual(q.stderr.splitlines().count(self.LINE % status), 1, q.stderr)
+        self.assertNotIn(TOKEN, q.stdout + q.stderr)
+
+    def test_s20_a_failed_revoke_is_said_on_one_line_and_exits_non_zero(self):
+        self.check_revoke_said()
+        self.check_revoke_said(status=404)
+
+    def test_s20_a_good_revoke_says_no_such_line(self):
+        p = self.run_it([])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("could not be revoked", p.stderr)
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            q = self.run_it(["--fd", str(w)], MINT, (w,))
+        finally:
+            os.close(w)
+        self.assertNotEqual(q.returncode, 0)
+        self.assertNotIn("could not be revoked", q.stderr)
+
+    def test_s20_an_unreachable_revoke_says_the_word_unreachable(self):
+        mod = self.load(MINT)
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(mod, "open_url", side_effect=OSError("down")):
+            self.assertFalse(mod.revoke("secret-value"))
+        self.assertEqual(mod.REVOKE_STATUS, ["unreachable"])
+        with contextlib.redirect_stderr(__import__("io").StringIO()) as err:
+            mod.say_revoke_failed()
+        self.assertEqual(err.getvalue(), self.LINE % "unreachable" + "\n")
+
+    def test_s20_mutants_that_ignore_the_revoke_result_fail(self):
+        for old, new in (('            revoked = REVOKE_STATUS[0] == "204"\n', "            revoked = True\n"),
+                         ("        failed = not ok\n", "        failed = False\n")):
+            with self.assertRaises(AssertionError):
+                self.check_revoke_said(self.mutant(old, new))
+
+    def test_s_pc5_the_readme_states_the_limits_and_the_new_lines(self):
+        with open(os.path.join(ROOT, "cloud/launcher/README.md")) as f:
+            readme = f.read()
+        for phrase in ("revoke covers the whole span from the mint to the end of the delivery",
+                       "path over the file system's name or path limit is refused before anything is minted",
+                       "app-token: the token could not be revoked (status N)",
+                       "same-user limits"):
+            self.assertIn(phrase, readme)
+
+
 def link_in_parents_real(path):
     sys.path.insert(0, os.path.dirname(HERE))
     import app_token

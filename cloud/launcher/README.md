@@ -475,6 +475,11 @@ accepting the old set). The exact refusal GitHub gives for a permission granted 
 The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
 may name a loopback `http` address, for tests).
 
+The revoke covers the whole span from the mint to the end of the delivery: any exception or signal (an interrupt, SIGTERM, SIGHUP, a broken pipe, a full disk, an error in the code between the mint and the route) revokes the token once with its own value, removes the file this run created (only that one) and exits non-zero.
+A path over the file system's name or path limit is refused before anything is minted (exit 2, no request to GitHub); the limit is the smaller of the file system's `PC_NAME_MAX` and `PC_PATH_MAX` names and a fixed cap of 4096 bytes in total.
+A revoke that fails (GitHub refuses the DELETE or the connection fails) prints one line on stderr, `app-token: the token could not be revoked (status N)`, where N is the HTTP status or the word `unreachable` (never the token), and the exit status is non-zero, for the no-route run and the failed-delivery run; a good revoke prints no such line.
+Two same-user limits remain, stated rather than fixed (a complete fix walks every path component with a directory descriptor and touches the link allowance above, so it is not cheap): F1, an ancestor of the path swapped for a link by the same user after the check redirects the delivery, and F2, the cleanup removes whatever is at the file's name. The attacker would already hold the caller's own user id, can read the delivered file and trace the mint: no new access.
+
 ### Running the mint by hand
 
 Run it only with the file route, in a private directory you own, and never with a redirect or a command substitution (a slip there is
