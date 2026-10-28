@@ -179,6 +179,70 @@ class TestCapsAndScrub(Fixture):
         keys = {key for items in doc["cards"].values() for item in items for key in item}
         self.assertTrue(keys <= {key for fields in sb.COCKPIT_FIELDS.values() for key in fields}, keys)
 
+    # One sample per alternative of each scrub regex (R-TEST-5 of the test review of #1436). The completeness test splits the compiled pattern, so a new
+    # alternative with no sample fails it; each sample would survive if its own alternative were removed or weakened.
+    TOKEN_SAMPLES = ["ghp_" + "A" * 20, "github_pat_" + "A" * 25, "sk-" + "a" * 20, "xoxb-1234567890ab", "AKIA" + "A" * 14, "eyJ" + "a" * 12 + "." + "b" * 12, "abcdef0123456789" * 2, "Qz" * 20]
+    PATH_SAMPLES = ["/home/u/x", "C:\\Users\\u\\k.pem", "a/b/c.txt"]
+    INLINE_SAMPLES = ["diff --git a/x b/x", "@@ -1,2 +3,4 @@"]
+    LINE_SAMPLES = ["diff --git a b", "index 1a2b3c..4d5e6f", "@@ -1 +1 @@", "+++ b/file", "--- a/file", "+added"]
+
+    @staticmethod
+    def alternatives(regex):
+        """The alternatives of a compiled pattern, read from its source: split at top level, else inside the one group that wraps it (escapes and classes skipped)."""
+        def split(at):
+            depth, cls, esc, out, cur = 0, False, False, [], ""
+            for ch in regex.pattern:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif cls:
+                    cls = ch != "]"
+                elif ch == "[":
+                    cls = True
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                elif ch == "|" and depth == at:
+                    out.append(cur)
+                    cur = ""
+                    continue
+                cur += ch
+            return out + [cur]
+        top = split(0)
+        return top if len(top) > 1 else split(1)
+
+    def test_every_alternative_of_each_scrub_regex_has_a_sample(self):
+        self.assertEqual(len(self.alternatives(sb._COCKPIT_TOKEN)), len(self.TOKEN_SAMPLES))
+        self.assertEqual(len(self.alternatives(sb._COCKPIT_PATH)), len(self.PATH_SAMPLES))
+        self.assertEqual(len(self.alternatives(sb._COCKPIT_DIFF_INLINE)), len(self.INLINE_SAMPLES))
+        self.assertEqual(len(self.alternatives(sb._COCKPIT_DIFF_LINE)), len(self.LINE_SAMPLES))
+
+    def test_each_token_path_and_inline_diff_alternative_is_replaced_in_a_title_and_a_note(self):
+        for samples, mark in ((self.TOKEN_SAMPLES, "[removed]"), (self.PATH_SAMPLES, "[path]"), (self.INLINE_SAMPLES, "[removed]")):
+            for sample in samples:
+                self.assertEqual(sb.cockpit_text("see %s now" % sample, 300), "see %s now" % mark, sample)
+                fleet_state(self.state, decisions=[entry("issue", ask=21, title="see %s now" % sample), entry("notice", number=7, title="see %s now" % sample), entry("captain", number=9, title="t", note="see %s now" % sample)])
+                doc = build(self.state)
+                self.assertEqual(doc["cards"]["decisions"][0]["title"], "see %s now" % mark, sample)
+                self.assertEqual(doc["cards"]["heads_up"][0]["note"], "see %s now" % mark, sample)
+                self.assertEqual(doc["cards"]["held_prs"][0]["reason"], "see %s now" % mark, sample)
+
+    def test_each_diff_line_alternative_drops_the_line_in_a_title_and_a_note(self):
+        for sample in self.LINE_SAMPLES:
+            value = "keep\n" + sample
+            self.assertEqual(sb.cockpit_text(value, 300), "keep", sample)
+            fleet_state(self.state, decisions=[entry("issue", ask=22, title=value), entry("notice", number=8, title=value), entry("captain", number=10, title="t", note=value)])
+            doc = build(self.state)
+            self.assertEqual(doc["cards"]["decisions"][0]["title"], "keep", sample)
+            self.assertEqual(doc["cards"]["heads_up"][0]["note"], "keep", sample)
+            self.assertEqual(doc["cards"]["held_prs"][0]["reason"], "keep", sample)
+
+    def test_every_control_character_class_is_replaced_by_a_space(self):
+        for ch in ("\x00", "\x1b", "\x7f", "\x85", "\u2028", "\u2029"):
+            self.assertEqual(sb.cockpit_text("a%sb" % ch, 50), "a b", repr(ch))
+
     def test_a_title_that_starts_with_a_sign_is_kept(self):
         fleet_state(self.state, decisions=[entry("issue", ask=5, title="+1 reviewer needed on the export")])
         self.assertEqual(build(self.state)["cards"]["decisions"][0]["title"], "+1 reviewer needed on the export")
