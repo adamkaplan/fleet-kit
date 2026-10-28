@@ -87,7 +87,7 @@ class TestFeedShape(Fixture):
         self.assertEqual(sorted(doc), ["cards", "generation", "produced_at", "schema_version"])
         self.assertEqual(doc["schema_version"], 1)
         self.assertIsInstance(doc["generation"], int)
-        self.assertEqual(tuple(doc["cards"]), tuple(sorted(CARDS)) if list(doc["cards"]) == sorted(doc["cards"]) else tuple(doc["cards"]))
+        self.assertEqual(list(doc["cards"]), sorted(CARDS), "the cards are written in a fixed order (sorted keys)")
         self.assertEqual(sorted(doc["cards"]), sorted(CARDS))
         for card, items in doc["cards"].items():
             self.assertTrue(items, "the fixture has an item of the %s card" % card)
@@ -210,10 +210,8 @@ class TestDocument(unittest.TestCase):
         wider = {card: list(fields) for card, fields in sb.COCKPIT_FIELDS.items()}
         wider["decisions"].append("path")
         self.assertNotEqual(self.doc_fields(text), wider, "a field added to the code only is a difference")
-        extra = text.replace("| decisions |", "| decisions |", 1)
         row = next(l for l in text.splitlines() if l.strip().startswith("| decisions"))
         self.assertNotEqual(self.doc_fields(text.replace(row, row.rstrip().rstrip("|") + ", path |")), {card: list(f) for card, f in sb.COCKPIT_FIELDS.items()}, "a field added to the document only is a difference")
-        self.assertEqual(extra, text)
 
 
 class TestWriting(Fixture):
@@ -275,6 +273,10 @@ class TestReadOnly(Fixture):
         forbidden = {"cmd_decision_write", "cmd_decisions", "deliver_answer", "answer_decision", "resolve_decision", "defer_decision", "mark_escalated", "mark_resolved",
                      "write_escalated", "subprocess", "urlopen", "request", "HTTPConnection", "socket", "runner", "gh_json", "_gh_json", "send_message", "cmd_send", "cmd_report"}
         self.assertEqual(sorted(names & forbidden), [], "no decision write verb, no process, no network name in the feed part")
+        # the list above is a floor: every function of the daemon that answers, resolves or defers a decision is named by its verb prefix, derived from the code
+        entry_tree = ast.parse((REPO / "bin" / "fleet-switchboard").read_text())
+        verbs = {n.name for n in ast.walk(entry_tree) if isinstance(n, ast.FunctionDef) and re.match(r"cmd_(decision_)?(answer|resolve|defer)", n.name)}
+        self.assertEqual(sorted(names & verbs), [], "no answer, resolve or defer verb of the daemon is named in the feed part: %s" % sorted(verbs))
         source = PART.read_text()
         for word in ("answer(", "resolve(", "defer("):
             self.assertNotIn(word, source)
@@ -304,3 +306,80 @@ class TestReadOnly(Fixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBranches(Fixture):
+    """Each branch of the feed builder that the feed's own scenarios did not reach, with the input that takes it."""
+
+    def feed_file(self):
+        return self.state / "cockpit.json"
+
+    def write_feed(self, body):
+        self.feed_file().write_text(body if isinstance(body, str) else json.dumps(body))
+
+    def test_a_damaged_feed_file_is_rebuilt_from_generation_one(self):
+        for body in ("{not json", "[]", json.dumps({"schema_version": 1, "generation": "x", "cards": {}}), json.dumps({"schema_version": 1, "generation": 4, "cards": []})):
+            self.write_feed(body)
+            self.assertEqual(sb.cockpit_current(self.feed_file()), (0, None), body)
+            self.assertEqual(build(self.state)["generation"], 1, body)
+
+    def test_a_feed_of_another_schema_version_is_not_continued(self):
+        cards = build(self.state)["cards"]
+        self.write_feed({"schema_version": 2, "generation": 9, "cards": cards})
+        self.assertEqual(sb.cockpit_current(self.feed_file()), (0, None))
+        self.assertEqual(build(self.state)["generation"], 1, "not 10: another version's generation is not carried")
+
+    def test_a_missing_feed_file_starts_at_one_and_a_current_one_is_continued(self):
+        self.assertEqual(sb.cockpit_current(self.feed_file()), (0, None))
+        doc = build(self.state)
+        self.write_feed(doc)
+        self.assertEqual(sb.cockpit_current(self.feed_file()), (doc["generation"], doc["cards"]))
+        self.assertEqual(build(self.state)["generation"], doc["generation"], "unchanged cards keep the generation")
+
+    def blocked_fleet(self, agents):
+        fleet_state(self.state, decisions=[], agents=agents, reports={})
+        return build(self.state)["cards"]
+
+    def test_a_blocked_agent_that_raised_no_decision_waits_on_its_boss_lane(self):
+        cards = self.blocked_fleet({"boss": {"role": "orchestrator", "charter": 5, "state": "working", "since": int(T0) - 10},
+                                    "w": {"role": "coder", "charter": 5, "state": "blocked", "since": int(T0) - 20}})
+        (blocked,) = cards["blocked"]
+        self.assertEqual(blocked["blocked_on"], "lane:boss")
+        self.assertEqual(blocked["reason"], "blocked", "no report: the plain word")
+
+    def test_a_blocked_agent_with_no_boss_waits_on_its_own_lane(self):
+        cards = self.blocked_fleet({"w": {"role": "coder", "charter": 9, "state": "blocked", "since": int(T0) - 20}})
+        (blocked,) = cards["blocked"]
+        self.assertEqual(blocked["blocked_on"], "lane:w")
+
+    def test_a_blocked_agent_that_raised_a_decision_waits_on_the_newest_one(self):
+        decisions = [entry("issue", ask=1, agent="w", since="2027-01-14T09:00:00Z"), entry("issue", ask=2, agent="w", since="2027-01-14T10:00:00Z")]
+        fleet_state(self.state, decisions=decisions, agents={"w": {"role": "coder", "charter": 9, "state": "blocked", "since": int(T0) - 20}}, reports={})
+        cards = build(self.state)["cards"]
+        newest = next(d for d in cards["decisions"] if d["since"] == "2027-01-14T10:00:00Z")
+        self.assertEqual(cards["blocked"][0]["blocked_on"], newest["id"])
+
+    def test_every_lane_state_of_the_registry_is_mapped_or_left_out_on_purpose(self):
+        agents = {"o-%s" % state: {"role": "orchestrator", "charter": n, "state": state, "since": int(T0) - 10} for n, state in enumerate(list(sb.COCKPIT_LANE_STATES) + ["starting", "unknown"])}
+        lanes = {lane["id"]: lane["state"] for lane in self.blocked_fleet(agents)["lanes"]}
+        for state, shown in sb.COCKPIT_LANE_STATES.items():
+            self.assertEqual(lanes.get("lane:o-%s" % state), shown, state)
+        self.assertEqual(lanes["lane:o-detached"], "down")
+        self.assertEqual(lanes["lane:o-dead"], "down")
+        self.assertNotIn("lane:o-starting", lanes, "a state with no mapping is left out, not guessed")
+        self.assertEqual(len(lanes), len(sb.COCKPIT_LANE_STATES))
+
+    def test_a_publish_that_raises_is_reported_and_the_rest_of_the_pass_runs(self):
+        names = ["prune_delivered_reminders", "friction_tick", "load_tick", "prune_report_riders", "cloud_watch_tick", "publish_decisions", "schedule_judge_warm", "write_catching_up", "health_write"]
+        calls = []
+        patches = [mock.patch.object(sb, n, side_effect=lambda *a, _n=n, **k: calls.append(_n)) for n in names]
+        patches.append(mock.patch.object(sb, "publish_cockpit", side_effect=RuntimeError("boom")))
+        engine = mock.Mock(now=lambda: T0)
+        report = {"errors": []}
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            sb.finish_pass(engine, None, report)
+        self.assertEqual([c for c in calls if c in ("write_catching_up", "health_write", "schedule_judge_warm")], ["write_catching_up", "health_write", "schedule_judge_warm"], "the steps after the feed still run")
+        engine._failed.assert_called_once()
+        self.assertEqual(engine._failed.call_args[0][:2], ("cockpit", "cockpit"))
