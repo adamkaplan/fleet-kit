@@ -529,3 +529,5 @@ after its record; one that holds unpushed work (`kept`) stays.
 
 How a lane reads it. `status` prints `pod failed: <reason>` (the reason cut to 160 characters, for example `OOMKilled (exit 137)`) for such a pod,
 instead of `does not answer`; the full reason, exit code and events are in the record's `run.json` under the run record directory.
+
+Two limits of what `status` and the reaper do. The switchboard prints the launcher's reason on one line: every control character removed, scrubbed once more by its own scrub, and a `pod_failed` value that is not text is treated like an answer it cannot read (the line for an unavailable launcher status), never an error. The reaper reads, records and deletes only a pod that carries a worker annotation: a pod with the launcher's label and none is left alone; a record that cannot be written leaves the pod in place, is reported once as `record not written`, and is written on the first pass that can.

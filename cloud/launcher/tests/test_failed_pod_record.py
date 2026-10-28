@@ -155,6 +155,107 @@ class S5Mutant(Fixture):
         self.assertTrue(applied, "the mutation was not applied")
 
 
+import re  # noqa: E402
+import test_cloud_status_summary as ss  # noqa: E402
+
+
+class S8StatusLine(ss.Base):
+    """S8: the switchboard's status line for a launcher answer whose pod_failed field is hostile or not text (ask #1442, proof of the first head)."""
+    INPUTS = (("escape", "OOM\x1b[31mred", True), ("bell", "OOM\x07ring", True), ("newline", "OOM\nkilled\tagain", True),
+              ("number", 137, False), ("object", {}, False), ("list", ["OOMKilled"], False))
+
+    def line_for(self, value):
+        self.record("coder7", hard=ss.ALIVE)
+        original = ss.CLOUD.run_launcher
+
+        def fake(runner, command, worker, *rest, **kw):
+            if command == "status":
+                return 0, {"phase": "Failed", "pod_failed": value, "cost_estimate_usd": 0}, ""
+            return original(runner, command, worker, *rest, **kw)
+        with mock.patch.object(ss.CLOUD, "run_launcher", fake), mock.patch.object(ss.CLOUD, "_answers", lambda *a, **k: False):
+            lines, rows = self.status()
+        return [line for line in lines if "coder7" in line], rows
+
+    def test_six_inputs_print_one_clean_line_and_never_raise(self):
+        for label, value, is_text in self.INPUTS:
+            with self.subTest(label):
+                mine, rows = self.line_for(value)
+                self.assertEqual(len(mine), 1, mine)
+                self.assertNotRegex(mine[0], r"[\x00-\x1f\x7f-\x9f]")
+                self.assertEqual(len(rows), 1)
+                if is_text:
+                    self.assertIn("pod failed: OOM", mine[0])
+                    self.assertNotIn("does not answer", mine[0])
+                else:   # the line printed for a launcher answer it cannot read
+                    self.assertIn("launcher status unavailable", mine[0])
+                    self.assertNotIn("pod failed:", mine[0])
+
+    def test_the_text_is_scrubbed_again_and_cut(self):
+        mine, _ = self.line_for("note " * 100 + " " + PLANT)
+        self.assertNotIn(PLANT, mine[0])
+        self.assertIn("pod failed: note", mine[0])
+        self.assertLessEqual(len(mine[0].split("pod failed: ")[1].split("; stops")[0]), 160)
+
+
+class S9Launcher(Fixture):
+    """S9: a foreign pod is untouched, an unwritable record is reported once and written when it can be, the stored event text is cut."""
+
+    def setUp(self):
+        super().setUp()
+        self.told = getattr(cw, "FAILED_UNWRITTEN_TOLD", set())
+        self.told.clear()
+        self.addCleanup(self.told.clear)
+
+    def test_a_labelled_pod_without_the_worker_annotation_is_never_touched(self):
+        self.fail("ownd", CASES["oomer"][0])
+        st = self.st()
+        name = cw.pod_name("ownd")
+        foreign = json.loads(json.dumps(st["pods"][name]))
+        foreign["metadata"]["name"] = "foreign-pod"
+        foreign["metadata"]["annotations"].pop("cw/worker")
+        st["pods"]["foreign-pod"] = foreign
+        self.write_state(st)
+        for minutes in (0, 11, 11):
+            self.clock.advance(minutes=minutes)
+            self.reap()
+        self.assertIn("foreign-pod", self.st()["pods"])
+        self.assertEqual([r["worker"] for r in self.records()], ["ownd"])
+        with open(self.env["FAKE_KUBE_CALLS"]) as f:
+            self.assertNotIn("foreign-pod", f.read())   # never read (no get, no events), never deleted
+
+    def test_an_unwritable_record_keeps_the_pod_is_told_once_and_is_written_when_it_can_be(self):
+        self.fail("stuck", CASES["oomer"][0])
+        real, calls = cw.run_record.write_private, []
+
+        def refuse(*a, **k):
+            calls.append(1)
+            if len(calls) <= 3:
+                raise OSError("disk full")
+            return real(*a, **k)
+        passes = []
+        with mock.patch.object(cw.run_record, "write_private", refuse):
+            for _ in range(4):
+                self.clock.advance(minutes=11)
+                passes.append(self.reap())
+        self.assertEqual([len(t) for t in passes], [1, 0, 0, 1])
+        self.assertTrue(passes[0][0][1].startswith("record not written"), passes[0])
+        self.assertTrue(passes[3][0][1].startswith("pod failed:"), passes[3])
+        self.assertEqual(len(self.records()), 1)
+        self.assertIsNotNone(self.pod("stuck"))   # in place for the 3 passes (11 minutes apart) and the 4th
+
+    def test_a_long_event_text_of_words_is_cut_to_300_characters(self):
+        self.fail("wordy", {"phase": "Failed"})
+        st = self.st()
+        for ev in st["events"]:
+            ev["message"] = " ".join("word%d" % i for i in range(100))[:500]
+        self.write_state(st)
+        self.reap()
+        events = self.records()[0]["events"]
+        self.assertTrue(events)
+        self.assertTrue(any(len(e) > 100 for e in events), events)   # words survive the scrub, so the cap is what cuts them
+        self.assertTrue(all(len(e) <= 300 for e in events))
+
+
 DOC_FILES = ("cloud/launcher/README.md", "docs/cloud-worker-interface.md")
 
 
@@ -175,6 +276,12 @@ class S1S6Docs(unittest.TestCase):
         for path in DOC_FILES:
             t = doc(path)
             for phrase in ("the reason, the exit code and the events", "exit reason `pod failed`", "`status` prints `pod failed: <reason>`", "ten minutes"):
+                self.assertIn(phrase, t, path)
+
+    def test_the_two_limits_of_the_second_head_are_stated(self):   # S8 and S9
+        for path in DOC_FILES:
+            t = doc(path)
+            for phrase in ("every control character removed", "never an error", "carries a worker annotation", "`record not written`"):
                 self.assertIn(phrase, t, path)
 
 

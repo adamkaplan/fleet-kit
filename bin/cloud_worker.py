@@ -1745,7 +1745,12 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
             else:
                 row["launcher_status"] = _reason(code, note)
                 extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
-            failed = _one(body.get("pod_failed"), 160) if code == 0 and body is not None and body.get("pod_failed") else None
+            failed = None
+            if code == 0 and isinstance(body, dict) and body.get("pod_failed") is not None:
+                failed = _failed_text(body["pod_failed"])
+                if failed is None:   # not text: the launcher's answer cannot be read, so the line is the one for an unreadable answer
+                    row["launcher_status"] = "the launcher's pod_failed answer is not text"
+                    extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
             if failed:   # the launcher read why the pod ended: no tunnel to a dead pod, no "does not answer"
                 row["answers"], row["pod_failed"] = False, failed
                 rows.append(row)
@@ -1759,6 +1764,18 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
         if cluster is not None:
             cluster.close()
     return lines, rows
+
+
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _failed_text(value):
+    """The launcher's reason for a Failed pod, made safe to print: None when it is not text; otherwise one line, every control character removed
+    (a newline or tab becomes a space), scrubbed once more by the ONE scrub the launcher module holds, cut to 160 characters. May be empty."""
+    if not isinstance(value, str):
+        return None
+    flat = _CONTROL_RE.sub(lambda m: " " if m.group() in "\t\n\r\x0b\x0c" else "", value)
+    return _one(_scrub_lib()(flat, (), 600), 160)
 
 
 def _answers(state, cluster, record, timeout):

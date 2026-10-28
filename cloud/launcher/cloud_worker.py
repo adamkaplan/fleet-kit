@@ -1510,6 +1510,7 @@ def _pod_repo(pod):
 FAILED_EVENTS_MAX = 10
 FAILED_EVENT_CHARS = 300
 FAILED_POD_KEEP_SECONDS = 600   # a Failed pod without unpushed work is deleted this long after its record
+FAILED_UNWRITTEN_TOLD = set()   # the Failed pods whose unwritable record was already reported (one report, not one per pass)
 
 
 def ann(pod, key, default=None):
@@ -2388,12 +2389,19 @@ class Launcher:
         info = {"worker": worker, "repository": _pod_repo(pod), "run_id": run_id, "pod_run_id": self._failed_key(pod), "start": ann(pod, "started") or "",
                 "end": iso(now), "recorded_at": iso(now), "exit_reason": "pod failed", "pod_failed_reason": text, "exit_code": code,
                 "pod_message": message, "events": events, "head_sha": None, "transcript": "unavailable", "reason": "the pod ended Failed; no session could be read"}
+        directory = None
         try:
             directory = os.path.join(run_record.private_root(self.recorder.root()), run_id)
             os.makedirs(directory, mode=0o700, exist_ok=True)
             run_record.write_private(directory, "run.json", json.dumps(info, sort_keys=True) + "\n")
         except OSError as e:
+            if directory:
+                try:
+                    os.rmdir(directory)   # an empty directory of a record that was not written is not left behind
+                except OSError:
+                    pass
             info["pod_message"] = self.kube.scrub("the record could not be written: %s" % e, 200)
+            info["unwritten"] = True
             return info, False   # not written: the next pass tries again
         return info, True
 
@@ -2455,7 +2463,16 @@ class Launcher:
             elif (pod.get("status") or {}).get("phase") == "Failed":
                 # A pod that ended Failed answers nothing: read why ONCE, keep the record, report it once; delete it ten minutes after
                 # its record unless it holds unpushed work (kept). A second pass reads no activity of it.
+                if not worker:   # it carries the launcher's label but no worker annotation: not this launcher's pod, never read, recorded or deleted
+                    continue
                 note, fresh = self._failed_note(pod)
+                told = (worker, self._failed_key(pod))
+                if note.get("unwritten"):   # the pod stays; said once, written on the first pass that can
+                    if told not in FAILED_UNWRITTEN_TOLD:
+                        FAILED_UNWRITTEN_TOLD.add(told)
+                        out.append((worker, "record not written: " + note["pod_message"], 1))
+                    continue
+                FAILED_UNWRITTEN_TOLD.discard(told)
                 if fresh:
                     out.append((worker, "pod failed: " + note["pod_failed_reason"][:160], 0))
                 elif ann(pod, "kept") != "true" and note.get("recorded_at") and \
