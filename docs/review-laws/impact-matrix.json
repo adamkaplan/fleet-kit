@@ -584,7 +584,8 @@
           "is_withdrawal",
           "orders_note",
           "steers_into_turn",
-          "superseded_by"
+          "superseded_by",
+          "text_parts"
         ],
         "bin/switchboard/engine.py": [
           "KeyTimes",

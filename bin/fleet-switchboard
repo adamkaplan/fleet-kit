@@ -13708,7 +13708,59 @@ def _send_by_registry(args, runner, now):
     return EXIT_OK
 
 
+SEND_PART_BUDGET = MESSAGE_CAP - 800   # characters of one part's text: the room left for the part line, the delivery header and the ask's lines
+
+
+def part_label(n, total):
+    return "part %d of %d\n" % (n, total)
+
+
+def send_plan(args):
+    """(the parts to send, None) or (None, the refusal): the text of `send` from the words or from `--file`, split by `text_parts` (the splitter
+    of `remind --text-file` too) when it is longer than one message holds. A text within one message is ONE part with no header."""
+    words = " ".join(args.text or []).strip()
+    path = getattr(args, "file", None)
+    if path and words:
+        return None, "give the message as words or as --file, not both: nothing sent"
+    if path:
+        text, problem = read_text_file(path, "--file", "nothing sent", own_dirs_only=True)
+        if problem:
+            return None, problem
+        if len(text) <= SEND_PART_BUDGET:
+            return [text], None
+        chunks, refused = text_parts(text, SEND_PART_BUDGET - 40)   # room for the "part n of m" line
+        if refused:
+            return None, "--file is too long to carry in %d parts: nothing sent" % FINDING_MAX_PARTS
+        return [part_label(n + 1, len(chunks)) + chunk for n, chunk in enumerate(chunks)], None
+    if not words:
+        return None, "nothing to send"
+    if len(words) > MESSAGE_CAP:
+        return None, ("the text is %d characters and a message holds %d: write it to a file and use --file F, which carries it in numbered "
+                      "parts: nothing sent" % (len(words), MESSAGE_CAP))
+    return [words], None
+
+
 def _cmd_send(args, runner, now):
+    parts, problem = send_plan(args)
+    if problem:
+        sys.stderr.write("%s: %s\n" % (PROG, problem))
+        return EXIT_USAGE
+    if len(parts) == 1:
+        args.text = [parts[0]]
+        return _send_one(args, runner, now)
+    for n, part in enumerate(parts):
+        one = copy.copy(args)
+        one.text = [part]
+        code = _send_one(one, runner, now)
+        if code != EXIT_OK:
+            sys.stderr.write("%s: part %d of %d was not sent (exit %s): %s sent, no later part is sent\n" % (
+                PROG, n + 1, len(parts), code, "none of the parts was" if n == 0 else "parts 1 to %d were" % n))
+            return code
+    sys.stderr.write("%s: %d parts queued, in order\n" % (PROG, len(parts)))
+    return EXIT_OK
+
+
+def _send_one(args, runner, now):
     routed = _send_by_registry(args, runner, now)
     if routed is not None:
         return routed
@@ -21466,7 +21518,8 @@ def build_parser():
                                                            "instead of exiting (the service uses this)")
     send = sub.add_parser("send", help="Deliver a message to another fleet agent now, by the delivery rule")
     send.add_argument("name", help="The recipient's fleet name")
-    send.add_argument("text", nargs="+", help="The message")
+    send.add_argument("text", nargs="*", help="The message (at most %d characters; a longer one goes with --file)" % MESSAGE_CAP)
+    send.add_argument("--file", help="Read the message from this file (a regular file of at most 100000 characters); a long one is sent as numbered parts \"part 2 of 3\"")
     send.add_argument("--issue", type=issue_arg, help="The issue the message is about")
     send.add_argument("--interrupt", action="store_true",
                       help="Stop and hold orders only: abort the recipient's running turn (its in-flight tool call "
@@ -22191,6 +22244,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
         if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
+        elif extra and args.action == "send" and not any(word.startswith("-") for word in extra):
+            args.text = list(args.text or []) + extra   # #1399: the same for `send a --issue 3 the text` now that the words may be replaced by --file
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))
         conflict = reaper_only_conflict(args)   # in the parser, before anything is written or loaded

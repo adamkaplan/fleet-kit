@@ -707,28 +707,37 @@ def cmd_remind(args, runner, now):
     return EXIT_OK
 
 
-def read_text_file(path):
-    """(text, None) of a UTF-8 text file for `remind --text-file`, or (None, why it is refused): unreadable, not a regular file, too large, not UTF-8 text, or empty."""
+def read_text_file(path, flag="--text-file", outcome="nothing armed", own_dirs_only=False):
+    """(text, None) of a UTF-8 text file for `remind --text-file` and `send --file` (`flag` and `outcome` word the refusals), or (None, why it is refused):
+    unreadable, not a regular file, too large, not UTF-8 text, or empty. `own_dirs_only` (send): a symlink is refused unless it resolves inside the
+    user's home, the temp directory or the working directory."""
+    import tempfile   # local: a module-level name here would be one more entry import (docs/architecture.md counts them)
+    name = _one_line(path, 80)
+    if own_dirs_only and os.path.islink(path):
+        real = os.path.realpath(path)
+        roots = [os.path.realpath(r) for r in (os.path.expanduser("~"), tempfile.gettempdir(), os.getcwd()) if r]
+        if not any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+            return None, "%s %s is a symlink that leaves your own directories: %s" % (flag, name, outcome)
     try:
         with open(path, "rb") as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                return None, "--text-file %s is not a regular file: nothing armed" % _one_line(path, 80)
+                return None, "%s %s is not a regular file: %s" % (flag, name, outcome)
             raw = handle.read(TEXT_FILE_MAX * 4 + 1)   # a character is at most 4 bytes: bounded whatever the file is
     except OSError as err:
-        return None, "--text-file %s cannot be read (%s): nothing armed" % (_one_line(path, 80), err.strerror or "error")
+        return None, "%s %s cannot be read (%s): %s" % (flag, name, err.strerror or "error", outcome)
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError:
         if len(raw) > TEXT_FILE_MAX * 4:
             text = None
         else:
-            return None, "--text-file %s is not UTF-8 text: nothing armed" % _one_line(path, 80)
+            return None, "%s %s is not UTF-8 text: %s" % (flag, name, outcome)
     if text is None or len(text) > TEXT_FILE_MAX:
-        return None, "--text-file %s is over %d characters: nothing armed" % (_one_line(path, 80), TEXT_FILE_MAX)
+        return None, "%s %s is over %d characters: %s" % (flag, name, TEXT_FILE_MAX, outcome)
     if "\x00" in text:
-        return None, "--text-file %s is not text (it holds a NUL): nothing armed" % _one_line(path, 80)
+        return None, "%s %s is not text (it holds a NUL): %s" % (flag, name, outcome)
     if not text:
-        return None, "--text-file %s is empty: nothing armed" % _one_line(path, 80)
+        return None, "%s %s is empty: %s" % (flag, name, outcome)
     return text, None
 
 

@@ -3254,9 +3254,9 @@ class TestSteerToWorking(Base):
                                now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
             return code, out.getvalue(), err.getvalue()
         before = len(self.world.v2.__dict__.get("sent", [])) if hasattr(self.world.v2, "sent") else 0
-        code, out, err = send("x" * 6000)
+        code, out, err = send("x" * 3990)
         self.assertEqual(code, sb.EXIT_USAGE)
-        self.assertIn("message is 6000 characters", err)
+        self.assertIn("message is 3990 characters", err)
         self.assertIn("nothing was sent", err)
         self.assertEqual(out, "")
         allowed = int(re.search(r"allowed text for this message is (\d+) characters", err).group(1))
@@ -3286,6 +3286,133 @@ class TestSteerToWorking(Base):
         allowed = int(re.search(r"allowed text for this message is (\d+) characters", str(cm.exception)).group(1))
         self.assertTrue(3000 < allowed < 4000, allowed)   # about 3,754, never the 8,444 of the short older fact
         self.assertTrue(deliver("y" * allowed).get("sent"), "the resend of the allowed length is not cut")
+
+    # ---- #1399: `send --file` carries a long message in numbered parts
+    def long_file(self, text, name="long.txt"):
+        folder = tempfile.mkdtemp(prefix="send-file-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    @staticmethod
+    def whole_lines(count=187):
+        return "\n".join("line %04d %s" % (n, "w" * 37) for n in range(count))   # about 9,000 characters of whole lines
+
+    def delivered(self):
+        return [a["text"] for a in self.world.admissions("platform")]
+
+    def send_file(self, text, *extra):
+        return self.cli_send("--file", self.long_file(text), *extra)
+
+    def test_1399_s2_a_9000_character_file_is_queued_as_three_parts_in_order_under_the_cap(self):
+        self.work()
+        text = self.whole_lines()
+        self.assertTrue(8900 < len(text) < 9100)
+        code, out, err = self.send_file(text)
+        self.assertEqual(code, 0, err)
+        texts = self.delivered()
+        self.assertEqual(len(texts), 3)
+        for n, got in enumerate(texts, 1):
+            self.assertIn("part %d of 3" % n, got)
+            self.assertNotIn("[cut at", got)
+            self.assertLess(len(got), sb.MESSAGE_CAP)
+        self.assertEqual(sorted(texts, key=lambda t: re.search(r"part (\d) of 3", t).group(1)), texts)
+        for number in range(187):   # every line arrived, once
+            self.assertEqual(sum("line %04d " % number in got for got in texts), 1)
+        found = [int(n) for got in texts for n in re.findall(r"line (\d{4}) ", got.split("\n- send from", 1)[1])]
+        self.assertEqual(found, sorted(found))   # the text itself runs in order across the parts
+        self.assertIn("3 parts queued", err)   # S7: the sender is told
+
+    def test_1399_s3_send_and_remind_split_with_the_one_function(self):
+        self.assertIs(sb.send_plan.__globals__["text_parts"], sb.finding_parts.__globals__["text_parts"])
+        text = self.whole_lines() + "\n" + "L" * 5000   # a long line too
+        chunks, _ = sb.text_parts(text, sb.SEND_PART_BUDGET - 40)
+        parts, problem = sb.send_plan(argparse.Namespace(text=[], file=self.long_file(text)))
+        self.assertIsNone(problem)
+        self.assertEqual([p.split("\n", 1)[1] for p in parts], chunks)
+        fact = sb.Fact("k", "platform", "reminder", text, 0)
+        self.assertEqual(sb.finding_parts(fact, sb.SEND_PART_BUDGET - 40), (chunks, ""))
+        calls = []
+        real = sb.text_parts
+        with mock.patch.dict(sb.send_plan.__globals__, {"text_parts": lambda *a: calls.append(a) or real(*a)}):
+            sb.send_plan(argparse.Namespace(text=[], file=self.long_file(text)))
+        self.assertEqual(len(calls), 1)
+
+    def test_1399_s4_a_file_under_the_cap_is_one_message_with_no_part_header(self):
+        self.work()
+        code, out, err = self.send_file("a short message\nfrom a file")
+        self.assertEqual(code, 0, err)
+        (got,) = self.delivered()
+        self.assertNotIn("part 1 of", got)
+        self.assertIn("a short message", got)
+        self.assertNotIn("parts queued", err)
+
+    def test_1399_s5_command_line_text_over_the_cap_is_refused_with_the_file_hint_and_nothing_is_queued(self):
+        self.work()
+        code, out, err = self.cli_send("x" * 5000)
+        self.assertEqual(code, 2)
+        for needle in ("5000 characters", "4000", "--file"):
+            self.assertIn(needle, err)
+        self.assertEqual(self.delivered(), [])
+
+    def test_1399_s6_a_file_that_cannot_be_used_is_refused_and_nothing_is_queued(self):
+        self.work()
+        folder = tempfile.mkdtemp(prefix="send-file-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        link = os.path.join(folder, "link.txt")
+        os.symlink("/etc/hosts", link)
+        cases = {"missing": os.path.join(folder, "none.txt"), "oversized": self.long_file("x" * (sb.TEXT_FILE_MAX + 1)),
+                 "a directory": folder, "symlink": link}
+        for why, path in cases.items():
+            with self.subTest(why=why):
+                code, out, err = self.cli_send("--file", path)
+                self.assertEqual(code, 2, err)
+                self.assertIn("nothing sent", err)
+        self.assertIn("symlink", err)
+        self.assertEqual(self.delivered(), [])
+        inside = os.path.join(folder, "inside.txt")   # a symlink that stays in the user's directories is fine
+        os.symlink(self.long_file("through a link"), inside)
+        code, _, err = self.cli_send("--file", inside)
+        self.assertEqual(code, 0, err)
+        code, _, err = self.cli_send("--file", self.long_file("a"), "and words")
+        self.assertEqual(code, 2)
+        code, _, err = self.cli_send()
+        self.assertEqual(code, 2)
+
+    def test_1399_s7_a_failed_part_is_named_and_no_later_part_is_sent(self):
+        self.work()
+        real = sb._send_one
+        calls = []
+
+        def fail_second(args, runner, now):
+            calls.append(args.text[0])
+            return sb.EXIT_HELD if len(calls) == 2 else real(args, runner, now)
+        with mock.patch.dict(sb.send_plan.__globals__, {"_send_one": fail_second}):
+            code, out, err = self.send_file(self.whole_lines())
+        self.assertEqual(code, sb.EXIT_HELD)
+        self.assertIn("part 2 of 3", err)
+        self.assertEqual(len(calls), 2)   # part 3 was never attempted
+        self.assertEqual(len(self.delivered()), 1)
+        self.assertNotIn("parts queued", err)
+
+    def test_1399_s8_the_mutants_are_caught(self):
+        def cut(text, budget):
+            return [text[:budget]], ""
+
+        real = sb.text_parts
+        reversed_order = lambda text, budget: (real(text, budget)[0][::-1], "")
+        mutants = {"cut at the cap": ("text_parts", cut), "parts out of order": ("text_parts", reversed_order),
+                   "no header": ("part_label", lambda n, total: "")}
+        tests = (self.test_1399_s2_a_9000_character_file_is_queued_as_three_parts_in_order_under_the_cap,)
+        for label, (name, mutant) in mutants.items():
+            with self.subTest(mutant=label):
+                with mock.patch.dict(sb.send_plan.__globals__, {name: mutant}):
+                    with self.assertRaises(AssertionError):
+                        for test in tests:
+                            test()
+                self.setUp()
 
 
 PLAN_CLAUSES = ["first clause is stated here", "second clause is stated here"]

@@ -208,11 +208,16 @@ PART_TRUNCATED = "(truncated)"
 
 
 def finding_parts(fact, budget):
-    """The summary of one finding as chunks of WHOLE lines, each at most `budget` characters (a longer line is split over chunks with a
-    continuation mark: nothing is cut). Pure and deterministic: the same fact gives the same chunks, so the
+    """The summary of one finding as chunks of WHOLE lines: `text_parts` of its summary. Returns (chunks, refused_text)."""
+    return text_parts(fact.summary, budget)
+
+
+def text_parts(text, budget):
+    """THE splitter of a long text (a finding, a `send --file`, a `remind --text-file`): chunks of WHOLE lines, each at most `budget` characters (a
+    longer line is split over chunks with a continuation mark: nothing is cut). Pure and deterministic: the same text gives the same chunks, so the
     continuation is derived from how many parts were delivered. Returns (chunks, refused_text)."""
     lines = []
-    for line in fact.summary.strip().split("\n"):
+    for line in text.strip().split("\n"):
         line = "".join(c if c.isprintable() else " " for c in line).rstrip()
         if len(line) > budget:   # #1302: a long line is split, never cut: a mark ends each piece and begins the next
             width = budget - 2 * len(LINE_CONTINUES) - 2
