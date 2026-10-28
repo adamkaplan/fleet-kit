@@ -711,6 +711,7 @@ def read_text_file(path, flag="--text-file", outcome="nothing armed", own_dirs_o
     """(text, None) of a UTF-8 text file for `remind --text-file` and `send --file` (`flag` and `outcome` word the refusals), or (None, why it is refused):
     unreadable, not a regular file, too large, not UTF-8 text, or empty. `own_dirs_only` (send): a symlink is refused unless it resolves inside the
     user's home, the temp directory or the working directory."""
+    import tempfile   # local: a module-level name here would be one more entry import (docs/architecture.md counts them)
     name = _one_line(path, 80)
     if own_dirs_only and os.path.islink(path):
         real = os.path.realpath(path)

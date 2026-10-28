@@ -22244,6 +22244,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
         if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
+        elif extra and args.action == "send" and not any(word.startswith("-") for word in extra):
+            args.text = list(args.text or []) + extra   # #1399: the same for `send a --issue 3 the text` now that the words may be replaced by --file
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))
         conflict = reaper_only_conflict(args)   # in the parser, before anything is written or loaded
