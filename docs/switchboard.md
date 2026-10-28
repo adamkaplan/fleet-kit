@@ -4501,6 +4501,15 @@ and the text of `send`, `report`, `remind`, `notice` and `intent` messages is ne
 - `gates <issue>` reads the records like a pull request's: scenarios proven and judged.
 - Closing rule of a report-only ask: every scenario of its plan is proven and judged at the current plan hash. `gates ask-close <owner/repo#N>` names the scenarios recorded (exit 0), or refuses and names each scenario not judged (exit 1). It closes nothing itself.
 
+**Epic records (#1383).** A scenario the plan claims at the epic (`claim: epic`, or a tester `measure` with no claim) is recorded on the ask issue or work item that owns the plan, never on a pull request: a pull request's `prove` and `verdict` refuse it, naming the epic command, and its gates do not require it. The form of an epic record:
+
+- Owning issue: `prove <id> --pr <owner/repo#N of the ask issue>`, `verdict <id> --pr ... --as <evaluator>`, or `item-prove` / `item-verdict --item <owner/repo#N>` for a work item; the ledger line carries `via: epic`, the evidence and the files it names (`--file`).
+- Plan hash: the record is void when the plan changes.
+- Default-branch head: the record is bound to a commit of the default branch, read from GitHub (its current head), or the one named by `--head` when it is on the default branch.
+- Containment rule: that commit must contain the merge commit of every merged pull request that links the plan (the bounded plan-link search of #976), and no pull request of the plan may still be open. A head that lacks one is refused, and `gates` ignores such a record.
+- Stale rule: a record at an older head is still recorded while no file the proof names changed since; it is stale when one did, when the proof names no file and anything changed, when the compare is 300 files or more, or when the compare or the head cannot be read.
+- Closing rule: `gates ask-close` refuses while an epic-claimed scenario is unrecorded or stale, naming it; `gates <issue>` and `gates item` list each as unrecorded, recorded at a head, or stale. The evaluator rules are a pull request's: a proof by its author, a verdict by an evaluator who is not a writer. Every deciding read fails closed: a refusal writes no row and no audit line. An ask with no epic-claimed scenario behaves as before.
+
 ## Plan evidence ledger and gates view (#107)
 
 Plan-driven development asks that a worker's proof of each plan scenario, and an evaluator's verdict on it, be held by the

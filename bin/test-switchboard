@@ -85960,6 +85960,406 @@ class TestAskIssueSubject(unittest.TestCase):
         self.assertNotIn("S1", " ".join(g1["missing"]))   # test_x2 fails on it: it wants S1 missing
 
 
+class TestEpicRecord(unittest.TestCase):
+    """#1383: an epic-claimed scenario is recorded on its owning ask issue or work item at the default branch's head, and read there. Fakes only; the search, the compares and the head are one fake GitHub."""
+
+    REPO, ASK, ITEM, PR = "acme-org/widget-service", "acme-org/widget-service#1130", "acme-org/widget-service#1140", "acme-org/widget-service#9"
+    CH = [c * 40 for c in "123456"]   # the default branch, oldest first
+    OFF = "9" * 40                    # a commit that is not on it
+    PIN, HEAD = "7" * 40, "d" * 40
+    SCEN = [{"id": "S1", "evaluator": "reviewer", "proof": "test", "claim": "pr"}, {"id": "E1", "evaluator": "tester", "proof": "test", "claim": "epic"},
+            {"id": "E2", "evaluator": "tester", "proof": "test", "claim": "epic"}, {"id": "E3", "evaluator": "tester", "proof": "test", "claim": "epic"}]
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.state = Path(self.dir)
+        self.hash = "sha256:" + "1" * 64
+        self.caller = "coder1"
+        self.tip = self.CH[4]
+        self.merged = [(10, self.CH[1])]     # (number, merge commit) of the merged pull requests of the plan
+        self.open = []
+        self.touched = {}                    # commit -> files it changed
+        self.broken = set()                    # read kinds that fail: head, search, compare
+        self.big_search = False
+        self.reads = []
+        self.audit = []
+        self.issue = {"user": {"login": "human"}, "body": "## Intent\nreport it\nDone when: reported\n", "state": "open",
+                      "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/1000", "labels": []}
+        self.pages = {"repos/%s/issues/1130/comments?per_page=100&page=1" % self.REPO: [{"id": 5, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}]}
+        self.scen = list(self.SCEN)
+        test = self
+
+        class Reader:
+            def __init__(self, *a, **k):
+                pass
+
+            def _api(self, path, repo=None):
+                return test.search(path)
+        self.engine = types.SimpleNamespace(intents=types.SimpleNamespace(_api=self.api), audit=types.SimpleNamespace(append=lambda *a: self.audit.append(a)), actor="t", herdr=None, v2=None,
+                                            discover=lambda now: types.SimpleNamespace(agents={}), now=lambda: 1.0)
+        self.config = {"intent_repo": self.REPO, "gh": "gh", "call_timeout_seconds": 5, "plan_evaluators": {"reviewer": ["rev1"], "tester": ["tst1", "coder1"]}}
+        for patch in (mock.patch.object(sb, "IntentReader", Reader), mock.patch.object(sb, "GhAccounts", lambda *a, **k: None),
+                      mock.patch.object(sb, "impact_carry_get", lambda *a: self.get), mock.patch.object(sb, "build_engine", lambda *a, **k: (self.engine, self.state, self.config)),
+                      mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan()), mock.patch.object(sb, "identify_caller", lambda *a: self.caller),
+                      mock.patch.object(sb, "launched_testers_for", lambda c: ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None),
+                      mock.patch.object(sb, "gates_suites_finding", lambda *a: None), mock.patch.object(sb, "item_context", self.item_ctx),
+                      mock.patch.object(sb, "pr_picture", lambda *a: ({"head": self.HEAD, "ci": "green"}, "PLAN: %s" % self.ASK, [], None) if a[2] == 9 else (None, "", [], "no pull request found"))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    # ---- the fake GitHub
+    def api(self, path, repo=None):
+        if path == "repos/%s/issues/1130" % self.REPO:
+            return self.issue
+        if path == "repos/%s/issues/9" % self.REPO:
+            return {"pull_request": {"url": "x"}, "user": {"login": "a"}}
+        if path in self.pages:
+            return self.pages[path]
+        raise sb.IntentError("not_found", path)
+
+    def plan(self):
+        return {"result": "pass", "defects": [], "scenarios_parsed": self.scen, "plan_hash": self.hash, "text": "", "source": "comment 5"}
+
+    def item_ctx(self, args, runner, now, writable):
+        entries, problem = sb.plan_ledger.read_ledger(self.state)
+        return types.SimpleNamespace(engine=self.engine, state=self.state, config=self.config, repo=self.REPO, number=1140, pr=self.ITEM, item=self.ITEM, entries=entries, problem=problem,
+                                     facts={}, unreadable=None, source=self.ASK, plan=self.plan(), plan_problem=None, plan_own=True,
+                                     issue={"author": "human", "body": "PLAN: %s" % self.ASK, "state": "open", "parent": None, "labels": []})
+
+    def search(self, path):
+        self.reads.append(path)
+        if "search" in self.broken:
+            raise sb.IntentError("boom", path)
+        page = int(re.search(r"&page=(\d+)", path).group(1))
+        items = [{"number": n, "state": "closed", "body": "PLAN: %s" % self.ASK, "pull_request": {"merged_at": "2026-01-01T00:00:00Z"}} for n, _ in self.merged]
+        items += [{"number": n, "state": "open", "body": "PLAN: %s" % self.ASK, "pull_request": {"merged_at": None}} for n in self.open]
+        if self.big_search:
+            items = [{"number": 500 + i, "state": "open", "body": "PLAN: other#1"} for i in range(400)]
+        return {"items": items[(page - 1) * 100:page * 100]}
+
+    def chain_files(self, old, new):
+        if old not in self.CH or new not in self.CH:
+            return None
+        lo, hi = self.CH.index(old), self.CH.index(new)
+        if lo > hi:
+            return "behind", []
+        return ("identical" if lo == hi else "ahead"), [f for c in self.CH[lo + 1:hi + 1] for f in self.touched.get(c, [])]
+
+    def get(self, path):
+        self.reads.append(path)
+        if path == "repos/%s" % self.REPO:
+            if "head" in self.broken:
+                raise ValueError("boom")
+            return {"default_branch": "main"}
+        if path == "repos/%s/commits/main" % self.REPO:
+            return {"sha": self.tip}
+        if path.startswith("repos/%s/commits/" % self.REPO):
+            sha = path.rsplit("/", 1)[1]
+            return {"sha": sha * (40 // len(sha))} if sha[0] in "0123456789" else {"sha": sha}
+        if path.startswith("repos/%s/pulls/" % self.REPO):
+            return {"merge_commit_sha": dict(self.merged)[int(path.rsplit("/", 1)[1])]}
+        if "/compare/" in path:
+            if "compare" in self.broken:
+                raise ValueError("boom")
+            old, new = path.rsplit("/compare/", 1)[1].split("...")
+            old = self.tip if old == "main" else old
+            got = self.chain_files(old, new)
+            if got is None:
+                return {"status": "diverged", "files": []}
+            return {"status": got[0], "files": [{"filename": f} for f in got[1]]}
+        raise ValueError(path)
+
+    # ---- the commands
+    def cmd(self, command, **kw):
+        args = types.SimpleNamespace(pr=self.ASK, item=self.ITEM, plan=None, ask=None, head=None, scenario=["E1"], all_scenarios=False, evaluator="tester", result="pass", evidence="ran it",
+                                     command=None, json=False, rest=[], all_gates=False, file=None)
+        for k, v in kw.items():
+            setattr(args, k, v)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = getattr(sb, command)(args, None, lambda: 1_000_000)
+            except sb.LedgerCommandError as exc:
+                return -1, out.getvalue(), str(exc)
+        return code, out.getvalue(), err.getvalue()
+
+    def prove(self, sid="E1", item=False, **kw):
+        self.caller = "coder1"
+        return self.cmd("cmd_item_prove" if item else "cmd_prove", scenario=[sid] if isinstance(sid, str) else sid, **kw)
+
+    def judge(self, sid="E1", item=False, who="tst1", **kw):
+        self.caller = who
+        return self.cmd("cmd_item_verdict" if item else "cmd_verdict", scenario=sid, **kw)
+
+    def rows(self):
+        return sb.plan_ledger.read_ledger(self.state)[0]
+
+    def record(self, sid="E1", item=False, **kw):
+        self.assertEqual(self.prove(sid, item, **kw)[0], sb.EXIT_OK)
+        self.assertEqual(self.judge(sid, item, **kw)[0], sb.EXIT_OK)
+
+    def gates(self, item=False):
+        code, out, err = self.cmd("cmd_gates", pr="item", rest=[self.ITEM]) if item else self.cmd("cmd_gates")
+        return out
+
+    def close(self):
+        return self.cmd("cmd_gates_ask_close")
+
+    def refused(self, result, needle):
+        self.assertNotEqual(result[0], sb.EXIT_OK)
+        self.assertIn(needle, result[1] + result[2])
+
+    # ---- the checks (a mutant is run against the same check and must fail it)
+    def check_containment(self):
+        r = self.prove("E1", head="1" * 40)   # CH[0]: before the merge of #10
+        self.refused(r, "does not contain the merge of #10")
+        self.assertEqual(self.rows(), [])
+
+    def record_pr(self):
+        """The ask's per-pull-request scenario S1, proven and judged."""
+        self.caller = "coder1"
+        self.assertEqual(self.cmd("cmd_prove", scenario=["S1"])[0], sb.EXIT_OK)
+        self.caller = "rev1"
+        self.assertEqual(self.cmd("cmd_verdict", scenario="S1", evaluator="reviewer")[0], sb.EXIT_OK)
+
+    def record_old(self, ids=("E1", "E2", "E3")):
+        for sid in ids:
+            self.record(sid, head="3" * 40, file=["src/a.py"])
+
+    def check_unrecorded_blocks_close(self):
+        self.record_pr()
+        self.record_old(("E2", "E3"))
+        code, out, err = self.close()
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("not judged: E1 (epic-claimed, unrecorded)", err)
+
+    def check_stale_blocks_close(self):
+        self.record_pr()
+        self.record_old()
+        self.tip = self.CH[5]
+        self.touched[self.CH[5]] = ["src/a.py"]
+        code, out, err = self.close()
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("(epic-claimed, stale)", err)
+
+    def check_writer_verdict_refused(self):
+        self.assertEqual(self.prove("E1")[0], sb.EXIT_OK)
+        self.refused(self.judge("E1", who="coder1"), "wrote this PR")
+        self.assertEqual([r["kind"] for r in self.rows()], ["proof"])
+
+    def check_epic_not_satisfied_unrecorded(self):
+        out = self.gates()
+        self.assertIn("epic E1 (tester): unrecorded", out)
+
+    # ---- S2..S5
+    def test_s2_an_ask_issue_records_its_epic_proof_at_the_default_head_read_from_github(self):
+        self.assertEqual(self.prove("E1")[0], sb.EXIT_OK)
+        rows = self.rows()
+        self.assertEqual([(r["kind"], r["pr"], r["plan_hash"], r["head"], r["via"]) for r in rows], [("proof", self.ASK, self.hash, self.tip, "epic")])
+        self.assertEqual(len(rows[0]["head"]), 40)
+
+    def test_s3_a_head_without_a_merge_and_a_plan_with_an_open_pull_request_are_refused_naming_it_and_write_nothing(self):
+        self.check_containment()
+        self.open = [11]
+        self.refused(self.prove("E1"), "#11")
+        self.assertEqual(self.rows(), [])
+
+    def test_s4_a_named_commit_must_be_on_the_default_branch(self):
+        self.refused(self.prove("E1", head=self.OFF), "is not on the default branch")
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.prove("E1", head="3" * 40)[0], sb.EXIT_OK)
+        self.assertEqual([r["head"] for r in self.rows()], ["3" * 40])
+
+    def test_s5_a_verdict_by_a_writer_is_refused_and_the_evaluators_is_recorded_for_both_subjects(self):
+        for item in (False, True):
+            self.assertEqual(self.prove("E1", item)[0], sb.EXIT_OK)
+            self.refused(self.judge("E1", item, who="coder1"), "wrote")
+            self.assertEqual(self.judge("E1", item, who="tst1")[0], sb.EXIT_OK)
+        self.assertEqual(sorted((r["pr"], r["kind"]) for r in self.rows()), sorted([(p, k) for p in (self.ASK, self.ITEM) for k in ("proof", "verdict")]))
+
+    # ---- S6..S8
+    def test_s6_gates_lists_unrecorded_recorded_and_older_head_for_the_ask_and_the_item(self):
+        for item in (False, True):
+            self.rows_before = len(self.rows())
+            self.record("E1", item)
+            self.record("E2", item, head="3" * 40)
+            out = self.gates(item)
+            lines = [l for l in out.splitlines() if l.startswith("  epic ")]
+            self.assertEqual(len(lines), 3, out)
+            self.assertIn("epic E1 (tester): recorded at %s (the default branch's head)" % self.tip[:8], lines[0])
+            self.assertIn("epic E2 (tester): recorded at 33333333 (still valid at %s" % self.tip[:8], lines[1])
+            self.assertIn("epic E3 (tester): unrecorded", lines[2])
+
+    def test_s7_a_touched_named_file_and_a_compare_of_300_files_read_stale_an_untouched_one_recorded(self):
+        for sid in ("E1", "E2", "E3"):
+            self.record(sid, head="3" * 40, file=["src/a.py"])
+        self.tip = self.CH[5]
+        self.touched[self.CH[5]] = ["docs/x.md"]
+        lines = [l for l in self.gates().splitlines() if l.startswith("  epic ")]
+        self.assertEqual(sum("recorded at 33333333 (still valid" in l for l in lines), 3)
+        self.touched[self.CH[5]] = ["docs/x.md", "src/a.py"]
+        self.assertEqual(sum("STALE" in l for l in (l for l in self.gates().splitlines() if l.startswith("  epic "))), 3)
+        self.touched[self.CH[5]] = ["f%d.txt" % i for i in range(300)]
+        out = self.gates()
+        self.assertEqual(sum("STALE" in l and "cannot be judged" in l for l in out.splitlines()), 3)
+
+    def test_s8_ask_close_refuses_an_unrecorded_scenario_naming_it(self):
+        self.check_unrecorded_blocks_close()
+
+    def test_s8_ask_close_refuses_a_stale_scenario_naming_it(self):
+        self.check_stale_blocks_close()
+
+    def test_s8_ask_close_names_the_ask_closable_when_every_epic_scenario_is_recorded_and_current(self):
+        self.record_pr()
+        self.record_old()
+        self.touched[self.CH[4]] = ["docs/y.md"]
+        code, out, err = self.close()
+        self.assertEqual(code, sb.EXIT_OK, err)
+        self.assertIn("may close: 4 of 4", out)
+
+    def test_s6_gates_of_an_ask_with_no_recorded_epic_scenario_lists_it_unrecorded(self):
+        self.check_epic_not_satisfied_unrecorded()
+
+    # ---- S9: a pull request
+    def test_s9_a_pull_request_does_not_require_the_epic_scenario_and_its_command_names_the_epic_command(self):
+        report = sb.plan_ledger.evaluate_gates(self.plan(), [], None, {"head": self.HEAD, "body": "PLAN: %s" % self.ASK, "ci": "green"}, self.PR)
+        self.assertEqual([s["id"] for s in report["scenarios"]], ["S1"])
+        g1 = next(g for g in report["gates"] if g["gate"] == "G1")
+        self.assertEqual(g1["missing"], ["S1: proof (`prove S1`); reviewer verdict (`verdict S1 --as reviewer`)"])
+        self.assertEqual(sum("E1" in m for m in g1["missing"]), 0)
+        r = self.prove("E1", pr=self.PR)
+        self.refused(r, "record it on the ask issue or work item that owns the plan")
+        self.assertIn("`prove E1 --pr", r[2])
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(sb.epic_gates_note({}, types.SimpleNamespace(plan=self.plan()), None, None), [])
+
+    # ---- S10: every deciding read fails closed
+    def test_s10_an_unreadable_head_search_or_compare_and_a_search_beyond_its_bound_refuse_naming_the_read_and_write_nothing(self):
+        for what, needle in (("head", "default branch's head"), ("search", "pull requests of the plan could not be read"), ("compare", "could not be read"), ("big", "too many pull requests")):
+            self.broken, self.big_search = ({what} if what in ("head", "search", "compare") else set()), what == "big"
+            for item in (False, True):
+                self.refused(self.prove("E1", item), needle)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.audit, [])
+
+    def test_s10_and_u4_an_ask_without_an_epic_scenario_reads_nothing_more_and_behaves_as_before(self):
+        self.scen = [self.SCEN[0]]
+        self.record_pr()
+        before = len(self.reads)
+        code, out, err = self.close()
+        self.assertEqual((code, out.strip()), (sb.EXIT_OK, "%s may close: 1 of 1 scenarios proven and judged at plan %s: S1" % (self.ASK, self.hash[:19])))
+        gates = self.gates()
+        self.assertEqual([l for l in gates.splitlines() if l.startswith("  epic ")], [])
+        self.assertEqual([r for r in self.reads[before:] if "compare" in r or "pulls" in r or "search" in r], [])
+        self.assertEqual(self.reads[before:], [])
+
+    # ---- U1..U3
+    def test_u2_a_record_at_a_head_that_lacks_a_merge_is_ignored_by_the_gate_and_one_that_holds_every_merge_counts(self):
+        self.record("E1", head="3" * 40)
+        sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ASK, "scenario": "E2", "plan_hash": self.hash, "head": self.CH[0], "result": "pass", "by": "coder1", "via": "epic", "evidence": "x"}, 1)
+        sb.plan_ledger.append_entry(self.state, {"kind": "verdict", "pr": self.ASK, "scenario": "E2", "plan_hash": self.hash, "head": self.CH[0], "result": "pass", "by": "tst1", "evaluator": "tester",
+                                                 "via": "epic", "evidence": "x"}, 1)
+        lines = [l for l in self.gates().splitlines() if l.startswith("  epic ")]
+        self.assertIn("recorded at 33333333", lines[0])
+        self.assertIn("epic E2 (tester): unrecorded", lines[1])
+        self.assertIn("is void", lines[1])
+
+    def test_u3_no_refusal_writes_a_row_or_an_audit_line(self):
+        self.open = [11]
+        self.refused(self.prove("E1"), "#11")
+        self.open = []
+        self.refused(self.prove("E1", head="1" * 40), "does not contain")
+        self.refused(self.prove("E1", head=self.OFF), "not on the default branch")
+        self.broken = {"head"}
+        self.refused(self.prove("E1"), "default branch's head")
+        self.broken = {"search"}
+        self.refused(self.prove("E1"), "could not be read")
+        self.broken = set()
+        self.assertEqual(self.prove("E1")[0], sb.EXIT_OK)
+        before = len(self.audit)
+        self.refused(self.judge("E1", who="coder1"), "wrote")
+        self.assertEqual((len(self.rows()), len(self.audit)), (1, before))
+        self.assertEqual(before, 1)   # the one record that was written is the one audit line
+
+    # ---- S11: the mutants
+    def mutant(self, target, name, replacement, check):
+        original = getattr(target, name)
+        with mock.patch.object(target, name, replacement):
+            self.assertIsNot(getattr(target, name), original, "the mutant is applied")
+            with self.assertRaises(AssertionError):
+                check()
+
+    def test_s11_m1_a_build_that_skips_the_containment_check_is_caught(self):
+        self.mutant(sb, "epic_contains", lambda *a: (lambda head: (True, None)), self.check_containment)
+
+    def test_s11_m2_a_close_that_ignores_an_unrecorded_claim_is_caught(self):
+        self.mutant(sb, "epic_view", lambda ctx, runner, now: ([], self.tip, None), self.check_unrecorded_blocks_close)
+
+    def test_s11_m3_a_close_that_lets_a_stale_claim_through_is_caught(self):
+        real = sb.plan_ledger.epic_state
+        self.mutant(sb.plan_ledger, "epic_state", lambda *a: dict(real(*a), state="recorded", status="ok") if real(*a)["state"] == "stale" else real(*a), self.check_stale_blocks_close)
+
+    def test_s11_m4_a_build_that_lets_a_writer_judge_is_caught(self):
+        self.mutant(sb.plan_ledger, "may_record_verdict", lambda *a: (True, None), self.check_writer_verdict_refused)
+
+    def test_s11_m5_a_build_that_reads_an_epic_claim_as_satisfied_is_caught(self):
+        self.mutant(sb.plan_ledger, "epic_state", lambda scenario, *a: {"id": scenario["id"], "evaluator": "tester", "state": "recorded", "status": "ok", "head": self.tip, "current": True,
+                                                                        "missing": [], "void": [], "why": None, "claim": "epic"}, self.check_unrecorded_blocks_close)
+        with mock.patch.object(sb.plan_ledger, "epic_state", lambda scenario, *a: {"id": scenario["id"], "evaluator": "tester", "state": "recorded", "status": "ok", "head": self.tip, "current": True,
+                                                                                   "missing": [], "void": [], "why": None, "claim": "epic"}):
+            with self.assertRaises(AssertionError):
+                self.check_epic_not_satisfied_unrecorded()
+
+    # ---- S12: the table over claim kinds and subject kinds, derived from the code
+    @staticmethod
+    def literals(path, function, kind):
+        tree = ast.parse(Path(path).read_text())
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == function)
+        found = set()
+        for node in ast.walk(fn):
+            if kind == "return" and isinstance(node, ast.Return) and isinstance(node.value, ast.Constant):
+                found.add(node.value.value)
+            if kind == "compare" and isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in ("pr", "epic"):
+                found.add(node.value)
+        return found
+
+    def test_s12_every_claim_kind_and_subject_kind_gives_the_outcome_of_one_table(self):
+        claims = self.literals(BIN.parent / "bin" / "plan_ledger.py", "claim_of", "compare")
+        subjects = (self.literals(BIN.parent / "bin" / "fleet-switchboard", "epic_subject", "return") - {None}) | {"pull request"}
+        table = {("pr", "pull request"): "recorded at the pull request's head", ("pr", "ask issue"): "recorded at the plan hash", ("pr", "work item"): "recorded at the reference commit",
+                 ("epic", "pull request"): "refused naming the epic command", ("epic", "ask issue"): "recorded at the default head", ("epic", "work item"): "recorded at the default head"}
+        self.assertEqual(set(table), {(c, s) for c in claims for s in subjects}, "the table covers every combination the code knows")
+        sb.plan_ledger.append_entry(self.state, {"kind": "item_tester", "pr": self.ITEM, "item": self.ITEM, "tester": "tst1", "session": "ses_example", "orchestrator": "orch", "head": self.PIN}, 1)
+        sid = {"pr": "S1", "epic": "E1"}
+        got = {}
+        for claim, subject in sorted(table):
+            before = len(self.rows())
+            kw = {"pull request": {"pr": self.PR}, "ask issue": {}, "work item": {}}[subject]
+            code, out, err = self.prove(sid[claim], item=subject == "work item", **kw)
+            new = self.rows()[before:]
+            if not new:
+                got[(claim, subject)] = "refused naming the epic command" if "record it on the ask issue or work item" in err else "refused"
+                continue
+            head = new[0]["head"]
+            got[(claim, subject)] = {self.HEAD: "recorded at the pull request's head", sb.plan_ledger.ask_head(self.hash): "recorded at the plan hash", self.PIN: "recorded at the reference commit",
+                                     self.tip: "recorded at the default head"}.get(head, "recorded at " + head)
+        self.assertEqual(got, table)
+        self.assertEqual(len(got), 6)
+
+    # ---- S13: the documentation
+    def test_s13_the_documentation_states_the_form_of_an_epic_record_and_the_closing_rule(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        section = text.split("**Epic records (#1383).**", 1)[1].split("\n## ", 1)[0]
+        for part in ("Owning issue:", "Plan hash:", "Default-branch head:", "Containment rule:", "Stale rule:", "Closing rule:"):
+            self.assertIn("- " + part, section)
+        self.assertEqual(text.count("**Epic records (#1383).**"), 1)
+
+    def test_u1_the_per_pull_request_ask_commands_still_record_at_the_plan_hash(self):
+        self.record_pr()
+        self.assertEqual({r["head"] for r in self.rows()}, {sb.plan_ledger.ask_head(self.hash)})
+
+
 class TestNoPaneToJudge(StandInPids, Base):
     """#1181: a row with no pane to judge (kind cloud or orchestrator, or an endpoint and no pane) is alive or unknown, never dead."""
     PASSES = 20
