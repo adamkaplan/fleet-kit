@@ -86480,6 +86480,34 @@ class TestEpicBatch(TestEpicRecord):
             return lambda head: (True, None) if sb.epic_batches(get, repo, default)[0] else (False, "no batch")
         self.mutant(sb, "epic_contains", loose, self.check_uncarried)
 
+    INT_TIP = "c" * 40
+
+    def check_after_the_cut(self):
+        self.member()
+        self.ahead = {(self.MEM, self.INT_TIP)}   # the member is in integration's tip, not in the batch's head as merged
+        self.refused(self.prove("E1"), "does not contain the merge of #11")
+        self.assertEqual(self.rows(), [])
+
+    def check_closed_unmerged(self):
+        self.member()
+        self.batches = [dict(self.batches[0], merged_at=None)]
+        self.refused(self.prove("E1"), "does not contain the merge of #11")
+        self.assertEqual(self.rows(), [])
+
+    def test_s14_a_member_merged_into_integration_after_the_batch_was_cut_is_refused(self):
+        self.check_after_the_cut()
+
+    def test_s14_m3_a_build_that_uses_integrations_current_tip_accepts_the_late_member_and_is_caught(self):
+        real = sb.epic_batches
+        self.mutant(sb, "epic_batches", lambda *a: ([(n, m, self.INT_TIP) for n, m, h in real(*a)[0]], True), self.check_after_the_cut)
+
+    def test_s14_a_batch_closed_without_a_merge_is_ignored(self):
+        self.check_closed_unmerged()
+
+    def test_s14_m4_a_build_that_counts_a_closed_unmerged_batch_is_caught(self):
+        self.mutant(sb, "epic_batches", lambda get, repo, default: ([(b["number"], b["merge_commit_sha"], b["head"]["sha"]) for b in self.batches], True), self.check_closed_unmerged)
+        self.ahead = {(self.MEM, self.BH)}
+
     # ---- S16
     def test_s16_a_plan_no_merged_pull_request_links_is_refused_and_writes_nothing(self):
         self.check_empty()
