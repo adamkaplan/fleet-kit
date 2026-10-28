@@ -66384,7 +66384,7 @@ class TestReviewPostAndDismiss(LedgerBase):
     def check_gates_line(self):
         self.reset()
         self.blocking(77, by="rdr1", head=self.OLD)
-        code, out, err = self.run_as("coder", "gates", self.PR)
+        code, out, err = self.run_as("rdr1", "gates", self.PR)
         lines = [l for l in out.splitlines() if l.startswith("blocking review:")]
         self.assertEqual(len(lines), 1, out)
         self.assertIn("rdr1 CHANGES_REQUESTED at %s" % self.OLD[:12], lines[0])
@@ -66961,7 +66961,7 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.reset()
         self.reviews = [{"id": 1000 + i, "user": {"login": "u%d" % i}, "state": "COMMENTED", "commit_id": self.HEAD, "body": "c"} for i in range(100)]
         self.blocking(77, by="rdr1")
-        code, out, err = self.run_as("coder", "gates", self.PR)
+        code, out, err = self.run_as("rdr1", "gates", self.PR)
         self.assertIn("--review 77", out)
         self.assertTrue(any(p.endswith("&page=2") for p in self.reads))
         self.assertNotIn("latest[author] = (state", (REPO / "shims" / "gh").read_text())   # the rule is not restated in the shim
