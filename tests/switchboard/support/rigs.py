@@ -50,17 +50,6 @@ from support.paths import BIN, REPO
 from support.carry_git import GitHubOverGit
 
 
-def set_retired(state, retired):
-    """A test sets the retired map: in the registry when it exists (the record), and in retired.json (its derived copy), as the registry itself would."""
-    state = Path(state)
-    (state / "retired.json").write_text(json.dumps(retired))
-    path = state / "registry.json"
-    if path.exists():
-        doc = json.loads(path.read_text())
-        doc["retired"] = retired
-        path.write_text(json.dumps(doc))
-
-
 def build_carry_repo(directory):
     """A real git repository (neutral names): `main` with a few files and a `feature` branch whose own change is a.txt edited and c.txt added. Returns the GitHubOverGit over it."""
     directory = Path(directory)

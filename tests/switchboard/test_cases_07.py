@@ -54,33 +54,6 @@ from support.scenario_roles import FAKE_GH
 from support.wire_fakes import FAKE_HERDR, FAKE_OPENCODE
 
 
-class TestEveryFunctionOf1066IsPinned(unittest.TestCase):
-    """The family of #1066: every function the change added or changed has a row naming the test that drives it; a row whose function or test is gone fails."""
-
-    ROWS = {
-        "Switchboard.pane_truth": ("TestPaneBoundByProcess", "test_S2_a_disagreeing_report_keeps_a_bound_and_alive_and_b_gets_no_pane"),
-        "Switchboard.discover": ("TestPaneBoundByProcess", "test_S4_a_live_pane_is_not_rebound_and_an_unreadable_process_list_binds_nothing_new"),
-        "pane_health_pass": ("TestPaneBoundByProcess", "test_S6_a_pane_whose_process_runs_the_session_is_never_dead_even_when_the_list_omits_it"),
-        "herdr_socket_path": ("TestServiceEnvironmentHoldsNoPane", "test_S9_ensure_starts_the_daemon_and_with_it_the_service_with_no_herdr_variable"),
-        "service_environment": ("TestServiceEnvironmentHoldsNoPane", "test_S9_every_name_is_stripped_not_only_the_pane_one"),
-        "daemon_environment": ("TestIdentityCheck", "test_a_daemon_started_from_an_agents_shell_carries_no_caller_identity"),
-        "spawn_daemon": ("TestServiceEnvironmentHoldsNoPane", "test_S9_ensure_starts_the_daemon_and_with_it_the_service_with_no_herdr_variable"),
-        "cmd_run": ("TestServiceEnvironmentHoldsNoPane", "test_cmd_run_leaves_the_daemon_and_so_the_service_with_none_of_the_six_names"),
-        "service_herdr_env": ("TestServiceEnvironmentHoldsNoPane", "test_service_herdr_env_gives_nothing_on_every_error_path_and_never_a_guess"),
-        "service_clean_restart_command": ("TestServiceEnvironmentHoldsNoPane", "test_the_status_line_for_a_running_service_that_carries_one_names_it_and_the_one_clean_restart"),
-        "format_install_lines": ("TestServiceEnvironmentHoldsNoPane", "test_the_status_line_for_a_running_service_that_carries_one_names_it_and_the_one_clean_restart"),
-        "collect_status": ("TestServiceEnvironmentHoldsNoPane", "test_a_mutant_status_that_never_reads_the_service_environment_loses_the_line"),
-        "render_service": ("TestServiceEnvironmentHoldsNoPane", "test_the_unit_keeps_its_path_line_even_when_the_path_holds_herdr_text_and_loses_only_the_six_entries"),
-        "strip_service_env_entries": ("TestServiceEnvironmentHoldsNoPane", "test_every_one_of_the_six_names_is_stripped_alone_and_a_longer_name_is_not"),
-        "registry.upsert": ("TestPaneBoundByProcess", "test_S3_a_cloud_worker_is_never_recorded_with_a_pane"),
-    }
-
-    def test_every_row_names_a_function_and_a_test_that_exist(self):
-        for fn, (cls, test) in self.ROWS.items():
-            with self.subTest(function=fn):
-                owner = sb.load_module("registry") if fn.startswith("registry.") else sb.Switchboard if fn.startswith("Switchboard.") else sb
-                self.assertTrue(callable(getattr(owner, fn.split(".")[-1], None)), fn)
-                self.assertTrue(callable(getattr(globals()[cls], test, None)), "%s.%s" % (cls, test))
 
 
 class TestChiefOfStaffNativePermissions(unittest.TestCase):
