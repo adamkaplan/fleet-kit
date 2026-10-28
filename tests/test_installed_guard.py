@@ -354,6 +354,27 @@ class TestTheEntryGuard(UnreadableTreeTests, TreeCase):
         self.assertTrue((self.tree / ".git" / "hooks" / "post-checkout").is_file())
         self.assertFalse((other / ".git" / "hooks" / "post-checkout").exists())
 
+
+    def test_a_fleet_command_run_from_a_git_hook_is_judged_by_its_own_tree(self):
+        """git exports GIT_DIR (and GIT_WORK_TREE, GIT_INDEX_FILE) to a hook: a command run from a hook of ANOTHER repository must still judge the installed tree."""
+        other = self.home / "feature-repo"
+        other.mkdir()
+        git(other, "init", "-q", "-b", "feat")
+        commit(other, "f.txt")
+        script = other / ".git" / "hooks" / "pre-commit"
+        script.write_text("#!/bin/sh\nexec \"%s\" -c 'import sys; sys.exit(0 if sys.argv[1] == \"feat\" else 1)' \"$(git rev-parse --abbrev-ref HEAD)\"\n" % sys.executable)
+        script.chmod(0o755)
+        probe = self.home / "probe.py"
+        probe.write_text("import json, os, sys\nsys.path.insert(0, %r)\nimport installed_guard as g\nprint(json.dumps(g.problem(sys.argv[1], sys.argv[2])))\n" % str(BIN))
+        env = dict(os.environ, **GIT_ENV)
+        planted = {k: v for k, v in env.items()}
+        planted.update({"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other), "GIT_INDEX_FILE": str(other / ".git" / "index")})
+        done = subprocess.run([sys.executable, str(probe), str(self.state), str(self.tree)], capture_output=True, text=True, env=planted)
+        self.assertEqual(json.loads(done.stdout), None, done.stderr)   # the installed tree is the clean default branch: good, whatever git was told
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
+        done = subprocess.run([sys.executable, str(probe), str(self.state), str(self.tree)], capture_output=True, text=True, env=planted)
+        self.assertIn("branch scratch", json.loads(done.stdout))
+
     def rev_parse_fails(self, code=128, out=""):
         real = subprocess.run
 
@@ -377,6 +398,15 @@ class TestTheEntryGuard(UnreadableTreeTests, TreeCase):
         run = self.rev_parse_fails()
         self.assertIsNotNone(namespace["problem"](self.state, self.tree, run))     # the mutant refuses on a read failure
         self.assertIsNone(guard.problem(self.state, self.tree, run))               # the real code does not
+
+
+    def test_a_local_default_branch_ahead_of_origin_is_told_the_way_out(self):
+        commit(self.tree, "local.txt")
+        line = guard.problem(self.state, self.tree)
+        self.assertIn("not an ancestor", line)
+        for phrase in ("push it", "reset", "git fetch origin", "may be stale"):
+            self.assertIn(phrase, line)
+        self.assertEqual(len(line.splitlines()), 1)
 
     def test_u1_a_clean_tree_costs_at_most_three_git_calls_and_no_network(self):
         calls = []
@@ -449,6 +479,9 @@ class TestTheDaemon(TreeCase):
         self.clock = [1_800_000_000.0]
         self.engine = FakeEngine(self.clock, self.fakes.herdr)
         os.environ[sb.INSTALLED_TREE_ALERT_ENV] = str(self.fakes.notifier)
+        pause = mock.patch.object(sb, "INSTALLED_TREE_RECHECK_SECONDS", 0)
+        pause.start()
+        self.addCleanup(pause.stop)
         modules = mock.patch.dict(sys.modules, {sb.__name__: sb})   # run_daemon hands its own module to the relay pass
         modules.start()
         self.addCleanup(modules.stop)
@@ -480,6 +513,35 @@ class TestTheDaemon(TreeCase):
         self.assertEqual(self.fakes.count(self.fakes.notifier_log), 2)
         self.assertEqual(self.fakes.count(self.fakes.herdr_log), 2)
         self.assertEqual(len(self.audit_lines("installed_tree.alert")), 2)
+
+
+    def test_one_bad_read_does_not_stop_the_daemon_two_in_a_row_do(self):
+        """A bad reading is confirmed by a second read in the same pass before the daemon stops and alerts."""
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
+        reads = []
+        real = sb.installed_tree_problem
+
+        def once_bad(state_dir, *a, **k):
+            line = real(state_dir, *a, **k)
+            reads.append(line)
+            if len(reads) == 2:               # the confirming read finds the tree good (a checkout was in flight)
+                return None
+            return line
+        with mock.patch.object(sb, "installed_tree_problem", once_bad):
+            self.run_passes(1)
+        self.assertEqual(len(reads), 2)
+        self.assertEqual((self.engine.passes, self.fakes.count(self.fakes.notifier_log)), (1, 0))
+        reads.clear()
+        self.run_passes(1)                    # two bad reads in a row: it stops and alerts
+        self.assertEqual((self.engine.passes, self.fakes.count(self.fakes.notifier_log)), (1, 1))
+
+    def test_the_problem_is_a_value_not_a_slice_of_the_refusal_text(self):
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
+        line = sb.installed_tree_problem(self.state)
+        self.assertIn("branch scratch", line)
+        self.assertFalse(line.startswith("fleet-switchboard"))
+        with mock.patch.object(sb, "installed_guard_module", side_effect=ImportError("stub")):
+            self.assertIn("could not run", sb.installed_tree_problem(self.state))
 
     def test_s6b_the_alert_needs_no_guarded_code_and_the_person_is_told_when_herdr_is_down(self):
         self.fakes = FakePrograms(self.home, herdr_ok=False)
@@ -611,6 +673,17 @@ class TestTheHooks(TreeCase):
                 proc.kill()
         self.assertIn("head_moved", (self.state / "audit.jsonl").read_text())
 
+
+    def test_a_path_with_a_quote_a_space_and_a_dollar_does_not_break_the_hook(self):
+        state = self.home / 'st "q" $HOME x'
+        state.mkdir()
+        steps = guard.install(self.tree, state, BIN, sys.executable)
+        self.assertTrue(all(status == "done" for _, status, _ in steps), steps)
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
+        lines = [l for l in (state / "audit.jsonl").read_text().splitlines() if "head_moved" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["detail"]["hook"], "post-checkout")
+
     def test_a_hook_that_is_not_ours_is_left_alone(self):
         hooks = self.tree / ".git" / "hooks"
         (hooks / "post-merge").write_text("#!/bin/sh\necho mine\n")
@@ -652,7 +725,7 @@ class TestTheDocument(unittest.TestCase):
     def test_the_document_states_the_limits(self):
         body = " ".join(self.section().split())
         for phrase in ("reverses", "records a verdict, a gate, a clear, a merge or a proof", "could not be read", "lives in the tree it guards", "deleting `installed-tree`", "records the tree it is run from", "core.hooksPath",
-                       "origin", "fileMode", "executable names"):
+                       "origin", "fileMode", "executable names", "XDG_STATE_HOME", "twice in a row"):
             self.assertIn(phrase, body)
 
     def test_the_cause_note_answers_the_three_questions(self):

@@ -14,6 +14,7 @@ The install also writes the hooks that record a move of HEAD, and copies the two
 """
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -98,7 +99,9 @@ def check(root, default_branch, run=subprocess.run):
     elif _ancestor(root, result, run):
         result["ok"] = True
     else:
-        result["why"] = "%s is not an ancestor of origin/%s" % ("a detached head" if branch is None else "the commit", default_branch)
+        result["why"] = ("%s is not an ancestor of origin/%s: if this is your own work ahead of origin, push it or reset the branch to origin/%s; "
+                         "origin/%s may be stale, so run `git fetch origin` first") % ("a detached head" if branch is None else "the commit", default_branch,
+                                                                                         default_branch, default_branch)
     return result
 
 
@@ -203,9 +206,10 @@ def hooks_dir(root, run=subprocess.run):
     return (base if base.is_absolute() else Path(root) / base) / "hooks"
 
 
-def hook_text(state_dir, python):
+def hook_text(state_dir, python, hook):
+    """The hook script for `hook`: every path and name is quoted for the shell, so a path with a quote, a space or a dollar sign cannot break it or run anything."""
     script = Path(state_dir) / SCRIPTS_DIR / SCRIPTS[0]
-    return '#!/bin/sh\n%s\n"%s" "%s" "%s" "$(basename "$0")" "$@" || true\nexit 0\n' % (HOOK_MARK, python, script, state_dir)   # never fails the git command that ran it
+    return "#!/bin/sh\n%s\n%s || true\nexit 0\n" % (HOOK_MARK, " ".join(shlex.quote(str(part)) for part in (python, script, state_dir, hook)) + ' "$@"')   # never fails the git command that ran it
 
 
 def install(root, state_dir, kit_bin, python, dry_run=False, run=subprocess.run):
@@ -239,7 +243,7 @@ def install(root, state_dir, kit_bin, python, dry_run=False, run=subprocess.run)
             out.append(("tree hook %s" % hook[5:], "skipped", "%s: no git directory" % hook))
             continue
         path = directory / hook
-        text = hook_text(state_dir, python)
+        text = hook_text(state_dir, python, hook)
         if path.exists() and HOOK_MARK not in path.read_text():
             out.append(("tree hook %s" % hook[5:], "skipped", "%s exists and is not ours: left alone, so a move of HEAD by that hook is not recorded" % path))
             continue

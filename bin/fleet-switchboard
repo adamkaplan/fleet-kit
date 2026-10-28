@@ -3755,6 +3755,7 @@ def wait_for_poke(sock, timeout):
 
 # #1380: the installed tree is the default branch, clean (bin/installed_guard.py). A command refuses on a bad tree (main); the daemon stops its
 # work, alerts by a standalone script, and resumes by itself when the tree is good. Nothing here changes the tree.
+INSTALLED_TREE_RECHECK_SECONDS = 1.0   # a bad reading is read once more this long after, in the same pass, before the daemon stops: a checkout in flight is not a bad tree
 INSTALLED_TREE_ALERT_ENV = "FLEET_SWITCHBOARD_ALERT_NOTIFIER"   # a program that shows the desktop notification (tests); default: the platform's own
 
 
@@ -3796,9 +3797,16 @@ def installed_tree_refusal(action, state_dir=None, root=None, runner=subprocess.
 
 
 def installed_tree_problem(state_dir, root=None, runner=subprocess.run):
-    """What is wrong with the installed tree, one line, or None (good, or not recorded). The daemon calls this on every pass."""
-    refused = installed_tree_refusal("run", state_dir, root, runner, records=True)   # at a pass an unreadable tree is skipped and alerted as a bad one is
-    return refused[len(PROG) + 2:] if refused and refused.startswith(PROG + ": ") else refused
+    """What is wrong with the installed tree, one line, or None (good, or not recorded). The daemon calls this on every pass. A tree git could not read
+    is a problem here too (the pass is skipped and alerted, as for a bad one)."""
+    state = Path(state_dir)
+    if not (state / "installed-tree").is_file():
+        return None
+    try:
+        kind, line, _ = installed_guard_module().judge(state, KIT_ROOT if root is None else root, runner)
+    except Exception as err:   # the guard itself is broken: the tree cannot be trusted
+        return "the installed-tree guard could not run (%s)" % _one_line(str(err), 160)
+    return line if kind in ("bad", "unreadable") else None
 
 
 def installed_tree_script(state_dir):
@@ -3865,6 +3873,9 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                     on_reload(watch)  # does not return when the daemon re-executes itself
                 try:
                     bad = installed_tree_problem(state_dir)   # #1380: at the start and on every pass
+                    if bad is not None:   # two reads in a row before it stops and alerts
+                        time.sleep(INSTALLED_TREE_RECHECK_SECONDS)
+                        bad = installed_tree_problem(state_dir)
                     if bad is None:
                         installed_tree_clear(state_dir)
                         engine.run_pass()
