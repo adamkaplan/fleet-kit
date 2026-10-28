@@ -69975,6 +69975,15 @@ class TestLoadAlert(Base):
         self.assertEqual(self._lane_run(1, 3)["busy"], 4)   # mixed adds the two
         self.assertEqual(self._lane_run(1, 3, stopped=(0, 1, 2))["busy"], 1)
 
+    def test_1487_a_lane_with_no_worker_of_either_kind_still_alerts(self):
+        """S7: busy 0 (no local, no cloud worker) with stalled asks keeps today's alert; a cloud-only lane's total is busy + idle."""
+        cfg = self.health.validate({"enabled": True}, "x")
+        fig = self.health.figures("orch", {"asks": [], "busy": 0, "idle": 0, "messages": 0, "decisions": 0, "cloud": 0}, [], self.T0, cfg)
+        self.assertEqual((fig["busy"], fig["idle"], fig["cloud"]), (0, 0, 0))
+        stalled = {"open_asks": 3, "active_asks": 3, "stalled": 3, "busy": 0, "idle": 0, "cloud": 0, "moved_backlog": 0, "moved_1h": 0}
+        self.assertEqual(self.health.crossing(stalled, cfg)[1], ["stalled"])
+        self.assertEqual(self.health.crossing(dict(stalled, busy=3, cloud=3), cfg)[1], ["stalled"])
+
     def test_1487_a_cloud_only_lane_is_not_coders_full_but_an_empty_lane_keeps_the_alert(self):
         cfg = self.health.validate({"enabled": True}, "x")
         base = {"open_asks": 5, "active_asks": 5, "stalled": 0, "moved_backlog": 1, "moved_1h": 0, "charter_moves_1h": 0, "idle": 0}

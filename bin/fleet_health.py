@@ -891,7 +891,7 @@ def status_lines(state_dir, now):
         f = latest[name]
         out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, waiting live %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle%s" % (
             name, num(f["open_asks"]), num(f["stalled"]), num(f.get("waiting_owner")), num(f.get("parked")), num(f.get("waiting_cos")), num(f.get("waiting_live")),
-            num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"], (" +%d\u2601 cloud" % f["cloud"]) if f.get("cloud") else ""))
+            num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"], (" (%d\u2601 cloud of the busy)" % f["cloud"]) if f.get("cloud") else ""))
         if f.get("waiting_owner_pr") or f.get("waiting_time"):
             out[-1] += "; " + waiting_phrase(f)
     if state.get("cloud_unplaced"):
