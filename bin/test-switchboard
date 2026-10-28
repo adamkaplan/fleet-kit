@@ -15407,6 +15407,7 @@ class TestOneCharter(CharterRig, Base):
         ("bin/switchboard/handoff.py", "seam_applies"): "set: is this issue number known as a charter",
         ("bin/fleet-switchboard", "owned_numbers"): "registry: the numbers an agent owns (an orchestrator: its row's charter only; others: their own assignment)",
         ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/switchboard/triage.py", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
+        ("bin/switchboard/cockpit.py", "cockpit_cards"): "registry: reads every row's charter to find the orchestrator a blocked lane waits on (read-only feed)",
         ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
         ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/switchboard/decisions_b.py", "read_order_notices"): "own: the order notices' own records",
@@ -70821,6 +70822,9 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+# The Cockpit feed test (#1423): the read-only feed of what the fleet needs from a person.
+_cockpit = importlib.import_module("test_cockpit")
+TestFeedShape, TestIdsAndEtags, TestCapsAndScrub, TestDocument, TestWriting, TestReadOnly, TestBranches = _cockpit.TestFeedShape, _cockpit.TestIdsAndEtags, _cockpit.TestCapsAndScrub, _cockpit.TestDocument, _cockpit.TestWriting, _cockpit.TestReadOnly, _cockpit.TestBranches
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -87086,6 +87090,7 @@ switchboard/agents_verify.py:agent_definition
 switchboard/agents_verify.py:agents_found
 switchboard/alert_labels.py:__init__
 switchboard/answer_delivery.py:cmd_decision_batch
+switchboard/cockpit.py:cockpit_current
 switchboard/decisions_a.py:read_batch_notes
 switchboard/decisions_a.py:read_escalated
 switchboard/decisions_b.py:read_order_notices
