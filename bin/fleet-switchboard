@@ -16431,6 +16431,15 @@ def epic_prove(ctx, args, runner, now, caller, scenarios):
 
 
 def epic_verdict(ctx, args, runner, now, scenario):
+    """Record the evaluator's verdict on an epic-claimed scenario (see `_epic_verdict`); every refusal names the epic claim first."""
+    try:
+        return _epic_verdict(ctx, args, runner, now, scenario)
+    except LedgerCommandError as err:
+        text = str(err)
+        raise LedgerCommandError(text if "epic" in text.split(":")[0] else "epic-claimed scenario %s: %s" % (scenario["id"], text)) from None
+
+
+def _epic_verdict(ctx, args, runner, now, scenario):
     """Record the evaluator's verdict on an epic-claimed scenario of the owning issue: the per-pull-request rules (a verdict by an evaluator the scenario names, registered for it, who is not a writer), at `epic_target`'s head."""
     if epic_subject(ctx) is None:
         raise LedgerCommandError("refused: an epic-claimed scenario is recorded on its ask issue or work item, never on a pull request; nothing was recorded")
