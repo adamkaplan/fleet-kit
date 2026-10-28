@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -151,11 +152,88 @@ def config_refusal(workdir, repo, ctx):
 NO_REPOSITORY_NOTE = "no repository in the pod; nothing to push"
 
 
+SCAN_DEPTH = 3
+SCAN_MAX_ENTRIES = 2000
+
+
+def probe_path(path):
+    """'absent' only when lstat of the path, or of a parent on the way, says FileNotFoundError or NotADirectoryError; 'dir' for a real
+    directory. Any other OSError (permission, loop, name too long) propagates; a link at the path, a dangling link on the way, or a
+    non-directory at the path raises RuntimeError. Never os.path.exists/isdir: they turn an error into 'not found'."""
+    path = os.path.abspath(path)
+    parts = [p for p in path.split(os.sep) if p]
+    cur = os.sep
+    for i, part in enumerate(parts):
+        cur = os.path.join(cur, part)
+        try:
+            st = os.lstat(cur)
+        except (FileNotFoundError, NotADirectoryError):
+            return "absent"
+        if stat.S_ISLNK(st.st_mode):
+            if i == len(parts) - 1:
+                raise RuntimeError("%s is a link, not a directory" % path)
+            try:
+                os.stat(cur)
+            except (FileNotFoundError, NotADirectoryError):
+                raise RuntimeError("%s is a dangling link" % cur)
+        elif i == len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError("%s is not a directory" % path)
+    return "dir"
+
+
+def has_marker(directory):
+    """True when directory holds a .git entry (file or directory); False only when lstat says it is absent; other errors propagate."""
+    try:
+        os.lstat(os.path.join(directory, ".git"))
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
+def scan_for_checkout(workspace):
+    """First directory at depth <= SCAN_DEPTH below workspace (workspace itself included) that holds a .git entry, else None.
+    Bounded (SCAN_MAX_ENTRIES entries; more raises), links never followed, any scan error propagates."""
+    level, seen = [workspace], 0
+    for depth in range(SCAN_DEPTH + 1):
+        nxt = []
+        for d in level:
+            if has_marker(d):
+                return d
+            if depth == SCAN_DEPTH:
+                continue
+            with os.scandir(d) as it:
+                for e in it:
+                    seen += 1
+                    if seen > SCAN_MAX_ENTRIES:
+                        raise RuntimeError("the workspace %s holds too many entries to scan" % workspace)
+                    if e.is_dir(follow_symlinks=False):
+                        nxt.append(e.path)
+        level = nxt
+    return None
+
+
+def no_checkout(workdir):
+    """True only when the repository is absent, or readable and without .git, and (when absent) the workspace holds no checkout.
+    Raises (the hook exits 1, the pod is kept) for anything it cannot tell."""
+    state = probe_path(workdir)
+    if state == "dir":
+        with os.scandir(workdir) as it:   # must be listable
+            list(it)
+        return not has_marker(workdir)
+    workspace = os.path.dirname(os.path.abspath(workdir))
+    if probe_path(workspace) == "absent":
+        return True
+    found = scan_for_checkout(workspace)
+    if found:
+        raise RuntimeError("no repository at %s but a checkout is at %s" % (workdir, found))
+    return True
+
+
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
-    # Three answers: no checkout at all (the directory is absent or holds no .git: nothing was cloned, nothing can be lost; this
-    # answer carries no_repository), a checkout whose push fails (RuntimeError from git: the caller prints `error`, exit 1), and
-    # nothing unpushed or pushed (as before).
-    if not os.path.exists(os.path.join(workdir, ".git")):
+    # Three answers: no checkout at all (see no_checkout: nothing was cloned, nothing can be lost; this answer carries
+    # no_repository), a checkout whose push fails (RuntimeError from git: the caller prints `error`, exit 1), and
+    # nothing unpushed or pushed (as before). A state the hook cannot read is an error, never "no repository".
+    if no_checkout(workdir):
         return {"pushed": False, "wip_branch": None, "skipped": [], "no_repository": True, "note": NO_REPOSITORY_NOTE}
     url = HOST_URL + "%s.git" % repo if prestop else None
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout

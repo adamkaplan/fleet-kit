@@ -172,5 +172,143 @@ class StopNoCheckout(base.Base):
         self.assertFalse(self.says_both(text.replace("it keeps the pod", "")))
 
 
+    # The hook reports no repository when it has looked: an unreadable state or a checkout elsewhere keeps the pod (ask #1483).
+    def setUp(self):
+        super().setUp()
+        self.modes = []
+        self.addCleanup(self.restore_modes)
+        self.space = os.path.join(self.tmp.name, "space")
+        os.makedirs(self.space)
+
+    def restore_modes(self):
+        for p, m in reversed(self.modes):
+            try:
+                os.chmod(p, m)
+            except OSError:
+                pass
+
+    def set_mode(self, path, mode):
+        self.modes.append((path, os.stat(path).st_mode & 0o7777))
+        os.chmod(path, mode)
+
+    def need_user(self):
+        if os.geteuid() == 0:
+            self.skipTest("running as root: root ignores file modes, so the permission states cannot be made")
+
+    def repo_dir(self, git_marker=True):
+        d = os.path.join(self.space, "repo")
+        os.makedirs(os.path.join(d, ".git" if git_marker else "plain"))
+        return d
+
+    def answer(self, worker, path):
+        code, err, record = self.stop_pod(worker, {"CW_WORKDIR": path})
+        return code, err, record
+
+    def assert_pod_kept(self, worker, path):
+        code, err, record = self.answer(worker, path)
+        self.assertEqual(code, cw.EXIT_HOOK, err)
+        self.assertIsNotNone(self.pod(worker))
+        self.assertNotIn(SENTENCE, json.dumps(record["end_hook"]) if record else "")
+
+    def assert_reports_none(self, worker, path):
+        code, err, record = self.answer(worker, path)
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self.pod(worker))
+        self.assertEqual(record["end_hook"]["note"], SENTENCE)
+
+    # ---- S6 ----
+    def test_a_repository_directory_of_mode_000_keeps_the_pod(self):
+        self.need_user()
+        d = self.repo_dir()
+        self.set_mode(d, 0)
+        self.assert_pod_kept("coder4", d)
+
+    def test_a_repository_directory_of_mode_600_keeps_the_pod(self):
+        self.need_user()
+        d = self.repo_dir()
+        self.set_mode(d, 0o600)
+        self.assert_pod_kept("coder4", d)
+
+    def test_a_repository_under_a_parent_that_cannot_be_entered_keeps_the_pod(self):
+        self.need_user()
+        d = self.repo_dir()
+        self.set_mode(self.space, 0)
+        self.assert_pod_kept("coder4", d)
+
+    def test_a_dangling_link_at_the_path_keeps_the_pod(self):
+        d = os.path.join(self.space, "repo")
+        os.symlink(os.path.join(self.space, "nowhere"), d)
+        self.assert_pod_kept("coder4", d)
+
+    def test_a_git_file_pointing_nowhere_is_a_checkout_and_a_failing_push_keeps_the_pod(self):
+        d = os.path.join(self.space, "repo")
+        os.makedirs(d)
+        with open(os.path.join(d, ".git"), "w") as f:
+            f.write("gitdir: /nonexistent/place\n")
+        self.assert_pod_kept("coder4", d)
+
+    def test_an_absent_directory_and_a_readable_empty_one_report_no_repository(self):
+        self.assert_reports_none("coder4", os.path.join(self.space, "repo"))
+        d = self.repo_dir(git_marker=False)
+        self.assert_reports_none("coder5", d)
+
+    # ---- S7 ----
+    def test_a_checkout_one_level_down_keeps_the_pod(self):
+        os.makedirs(os.path.join(self.space, "other", ".git"))
+        self.assert_pod_kept("coder4", os.path.join(self.space, "repo"))
+
+    def test_a_checkout_at_depth_3_keeps_the_pod(self):
+        os.makedirs(os.path.join(self.space, "a", "b", "c", ".git"))
+        self.assert_pod_kept("coder4", os.path.join(self.space, "repo"))
+
+    def test_a_checkout_at_depth_4_is_beyond_the_scan_and_reports_no_repository(self):
+        os.makedirs(os.path.join(self.space, "a", "b", "c", "d", ".git"))
+        self.assert_reports_none("coder4", os.path.join(self.space, "repo"))
+
+    def test_a_workspace_with_no_marker_anywhere_reports_no_repository(self):
+        os.makedirs(os.path.join(self.space, "a", "b", "c"))
+        self.assert_reports_none("coder4", os.path.join(self.space, "repo"))
+
+    # ---- mutants (in memory, applied counter) ----
+    def test_mutant_deciding_with_exists_reports_the_unreadable_states(self):
+        import end_hook
+        self.need_user()
+        applied = []
+
+        def old(workdir):
+            applied.append(1)
+            return not os.path.exists(os.path.join(workdir, ".git"))
+        d = self.repo_dir()
+        self.set_mode(d, 0)
+        orig = end_hook.no_checkout
+        end_hook.no_checkout = old
+        self.addCleanup(setattr, end_hook, "no_checkout", orig)
+        self.assertIs(end_hook.run(d, "coder4")["no_repository"], True)   # the mutant loses the work: the real checks above fail for it
+        self.assertTrue(applied)
+        end_hook.no_checkout = orig
+        with self.assertRaises(OSError):
+            end_hook.run(d, "coder4")
+
+    def test_mutant_without_the_workspace_scan_reports_a_checkout_elsewhere(self):
+        import end_hook
+        os.makedirs(os.path.join(self.space, "other", ".git"))
+        applied = []
+        orig = end_hook.scan_for_checkout
+        end_hook.scan_for_checkout = lambda w: applied.append(1)
+        self.addCleanup(setattr, end_hook, "scan_for_checkout", orig)
+        self.assertIs(end_hook.run(os.path.join(self.space, "repo"), "coder4")["no_repository"], True)
+        self.assertTrue(applied)
+        end_hook.scan_for_checkout = orig
+        with self.assertRaises(RuntimeError):
+            end_hook.run(os.path.join(self.space, "repo"), "coder4")
+
+    def test_the_documentation_states_the_condition_and_the_limits(self):
+        with open(DOC, encoding="utf-8") as f:
+            text = " ".join(f.read().split())
+        for phrase in ("nothing can be lost, on this condition", "absent or readable and empty", "to a depth of 3",
+                       "keeps the pod", "depth 4", "only delete its own pod", "pushes from the workspace only"):
+            self.assertIn(phrase, text)
+
+
 if __name__ == "__main__":
     unittest.main()
