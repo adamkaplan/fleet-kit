@@ -66,8 +66,8 @@ class Rig:
         self.engine = Engine(self.dir, fail)
         self.launcher = os.path.join(self.dir, "launcher.jsonl")
         open(self.launcher, "a").close()
-        self.sb = types.SimpleNamespace(parse_iso=parse, _one_line=lambda t, n=200: str(t)[:n], retired=lambda e, n: False)
-        self.discovery = types.SimpleNamespace(agents={})
+        self.sb = types.SimpleNamespace(parse_iso=parse, parse_bounded=json.loads, _one_line=lambda t, n=200: str(t)[:n], retired=lambda e, n: False)
+        self.alive = {}
 
     def created(self, name, deadline=NOW - 60, lane="lane-a", branch="ask-7"):
         line(self.engine.audit.path, ts=stamp(NOW - 7200), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(deadline)})
@@ -79,7 +79,7 @@ class Rig:
     def passes(self, n=1, at=NOW):
         out = []
         for _ in range(n):
-            out += self.mod.run_pass(self.sb, self.engine, at, self.discovery, self.launcher)
+            out += self.mod.run_pass(self.sb, self.engine, at, self.alive, self.launcher)
         return out
 
 
@@ -105,9 +105,9 @@ def scenarios(mod):
     r = Rig(mod)   # S3: the other kinds
     r.engine.audit.append("x", "cloud.create_failed", "w2", {"reason": "quota"})
     line(r.launcher, ts=stamp(NOW - 5), worker="", runtime_id="reaper", action="refresh-cluster-token", ok=False, reason="login failed")
-    r.discovery.agents["loc"] = types.SimpleNamespace(fleet={"reports_to": "boss"}, status="working")
+    r.alive["loc"] = {"lane": "boss", "ask": "ask-9"}
     first = r.passes()
-    r.discovery.agents.clear()
+    r.alive.clear()
     got = first + r.passes(at=NOW + 10)
     check("S3 kinds", sorted(x["kind"] for x in got) == ["local_worker", "reaper_missed", "refused_launch"])
     check("S3 named", all(("kind=" + x["kind"]) in x["text"] for x in got))

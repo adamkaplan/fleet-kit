@@ -9,7 +9,7 @@ line announces. The kinds (`KINDS`):
 - `pod_no_stop`: a cloud pod with a `cloud.created` line, its hard deadline passed, and NO stop line in the switchboard audit and none in the launcher
   audit (`cw-cloud/audit.jsonl`, action `stop`, ok), and no final report line (launcher action `report`). A stop of any reason, `done` included, is
   never alerted here (a clean end, or the launcher's own sender).
-- `local_worker`: a local worker seen alive in an earlier pass that is gone from discovery and is not retired in the registry.
+- `local_worker`: a local worker seen alive (`alive`: name -> lane and ask, built by the daemon through `boss_name`) in an earlier pass that is gone and is not retired in the registry.
 - `refused_launch`: a `cloud.create_failed` line of the switchboard audit.
 - `reaper_missed`: a failed line of the reaper's own login refresh in the launcher audit (runtime id `reaper`, `ok` false): the reaper could not pass.
 
@@ -34,7 +34,7 @@ SEEN_MAX = 500
 EVIDENCE_MAX = 200
 REAPER_ID = "reaper"
 
-NEEDS = ("parse_iso", "_one_line")
+NEEDS = ("parse_iso", "_one_line", "parse_bounded")
 
 
 def launcher_audit_path(env=None):
@@ -46,13 +46,13 @@ def _clean(text, limit=EVIDENCE_MAX):
     return re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", str(text)).strip()[:limit]
 
 
-def _load(path):
+def _load(sb, path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+            data = sb.parse_bounded(handle.read(READ_BYTES))
         if isinstance(data, dict):
             return data
-    except (OSError, ValueError):
+    except Exception:
         pass
     return {}
 
@@ -64,7 +64,7 @@ def _save(path, state):
     os.replace(tmp, path)
 
 
-def _read_new(path, state, key):
+def _read_new(sb, path, state, key):
     """The new complete lines of an audit file since the stored position (bounded). Never raises; unreadable gives no lines."""
     offsets = state.setdefault("offsets", {})
     try:
@@ -86,8 +86,8 @@ def _read_new(path, state, key):
     lines = []
     for chunk in raw[:end + 1].split(b"\n"):
         try:
-            item = json.loads(chunk.decode("utf-8", "replace"))
-        except ValueError:
+            item = sb.parse_bounded(chunk.decode("utf-8", "replace"))
+        except Exception:
             continue
         if isinstance(item, dict):
             lines.append((item, _clean(chunk.decode("utf-8", "replace"))))
@@ -134,7 +134,7 @@ def _ask_of(name, record):
     return re.sub(r"[-_.]?\d+$", "", name) or name
 
 
-def _losses(state, sb, engine, discovery, now, records):
+def _losses(state, sb, engine, alive, now, records):
     out = []
     for name, c in sorted(state.get("created", {}).items()):
         deadline = c.get("deadline")
@@ -152,16 +152,12 @@ def _losses(state, sb, engine, discovery, now, records):
     for key, r in sorted(state.get("reaper", {}).items()):
         out.append({"key": "reaper_missed:" + key, "kind": "reaper_missed", "name": REAPER_ID, "ask": "-", "at": r["at"], "lane": None, "line": r["line"]})
     seen = state.setdefault("seen", {})
-    present = set(discovery.agents) if discovery is not None else None
-    if present is not None:
-        for name, obs in discovery.agents.items():
-            fleet = obs.fleet if isinstance(obs.fleet, dict) else {}
-            boss = fleet.get("reports_to")
-            if isinstance(boss, str) and boss and boss != name and obs.status != "unknown":
-                state.get("gone", {}).pop(name, None)
-                seen[name] = {"at": now, "lane": boss, "ask": _clean(fleet.get("issue") or fleet.get("repo") or name, 80)}
+    if alive is not None:
+        for name, info in alive.items():
+            state.get("gone", {}).pop(name, None)
+            seen[name] = {"at": now, "lane": info.get("lane"), "ask": _clean(info.get("ask") or name, 80)}
         for name, s in sorted(seen.items()):
-            if name in present or name in state.get("gone", {}):
+            if name in alive or name in state.get("gone", {}):
                 continue
             if engine_retired(engine, sb, name):
                 state.setdefault("gone", {})[name] = now
@@ -193,23 +189,23 @@ def text_of(loss, earlier):
         loss["name"], loss["ask"], loss["kind"], _iso(loss["at"]), _clean(loss["line"]), repeat)
 
 
-def run_pass(sb, engine, now, discovery=None, launcher_audit=None):
+def run_pass(sb, engine, now, alive=None, launcher_audit=None):
     """One pass. Never raises into the caller. Returns the alerts raised this pass (a list of dicts)."""
-    if engine.audit is None:
-        return []
+    if getattr(engine.audit, "path", None) is None:
+        return []   # no audit file to read (a stub, or none): nothing to do, nothing created
     state_dir = os.path.dirname(str(engine.audit.path))
     path = os.path.join(state_dir, STATE_FILE)
-    state = _load(path)
+    state = _load(sb, path)
     before = json.dumps(state, sort_keys=True)
-    _fold(state, sb, _read_new(str(engine.audit.path), state, "switchboard"), "switchboard")
-    _fold(state, sb, _read_new(launcher_audit or launcher_audit_path(), state, "launcher"), "launcher")
+    _fold(state, sb, _read_new(sb, str(engine.audit.path), state, "switchboard"), "switchboard")
+    _fold(state, sb, _read_new(sb, launcher_audit or launcher_audit_path(), state, "launcher"), "launcher")
     records = {}
     for r in (getattr(engine, "cloud_watch", None) or {}).get("records", []):
         if isinstance(r, dict) and isinstance(r.get("worker"), str):
             records[r["worker"]] = r
     alerted = state.setdefault("alerted", {})
     raised = []
-    for loss in _losses(state, sb, engine, discovery, now, records):
+    for loss in _losses(state, sb, engine, alive, now, records):
         if loss["key"] in alerted:
             continue
         earlier = sum(1 for a in alerted.values() if a.get("ask") == loss["ask"] and loss["ask"] != "-")
