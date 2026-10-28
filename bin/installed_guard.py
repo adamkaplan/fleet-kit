@@ -38,8 +38,17 @@ def read_marker(state_dir):
     return (lines[0], lines[1]) if len(lines) == 2 and lines[0] and lines[1] else None
 
 
+# What of the caller's environment would point git at ANOTHER repository (a hook or a script run from inside one sets these): never passed on.
+GIT_REDIRECTS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
+
+
+def git_environment():
+    return {name: value for name, value in os.environ.items() if name not in GIT_REDIRECTS}
+
+
 def _git(root, *argv, run=subprocess.run):
-    return run(["git", "--no-optional-locks", "-C", str(root)] + list(argv), capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+    return run(["git", "--no-optional-locks", "-C", str(root)] + list(argv), capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+               env=git_environment())
 
 
 def check(root, default_branch, run=subprocess.run):
@@ -78,8 +87,9 @@ def check(root, default_branch, run=subprocess.run):
         result["why"] = "uncommitted change to a tracked file"
     elif branch is not None and branch != default_branch:
         result["why"] = "on branch %s, not the default branch %s" % (branch, default_branch)
-    elif result["commit"] is None:
-        result["why"] = "no commit"
+    elif result["commit"] is None:   # git could not name HEAD (a failed read that raised nothing): no evidence of a bad tree
+        result["ok"], result["note"] = True, "unreadable: git rev-parse failed"
+        return result
     elif result["remote"] is None:
         if branch is None:
             result["why"] = "detached head, and origin/%s is unknown so its ancestry cannot be verified" % default_branch
@@ -143,10 +153,15 @@ def entry_problem_line(action, state_dir, root, run=subprocess.run):
 # ------------------------------------------------------------------ install
 
 def default_branch_of(root, run=subprocess.run):
-    """The remote's default branch as the clone knows it (origin/HEAD), else `main`."""
+    """The remote's default branch as the clone knows it: `origin/HEAD`; when that is unset, the one of `main` and `master` that exists on origin; else None
+    (never a guess: a wrong name would refuse every command of a correct tree)."""
     done = _git(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", run=run)
     name = done.stdout.strip()
-    return name.split("/", 1)[1] if done.returncode == 0 and name.startswith("origin/") and len(name) > 7 else "main"
+    if done.returncode == 0 and name.startswith("origin/") and len(name) > 7:
+        return name.split("/", 1)[1]
+    done = _git(root, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/main", "refs/remotes/origin/master", run=run)
+    found = [line.rsplit("/", 1)[1] for line in done.stdout.split() if done.returncode == 0 and line.startswith("refs/remotes/origin/")]
+    return found[0] if len(found) == 1 else None
 
 
 def hooks_dir(root, run=subprocess.run):
@@ -168,6 +183,10 @@ def install(root, state_dir, kit_bin, python, dry_run=False, run=subprocess.run)
     out = []
     root, state_dir = Path(os.path.realpath(str(root))), Path(state_dir)
     branch = default_branch_of(root, run)
+    if branch is None:
+        out.append(("installed tree", "skipped", "the default branch of %s is not known (origin/HEAD is unset, and origin has both or neither of main and master): "
+                                                  "run `git remote set-head origin -a` there, then install again; nothing was recorded, so the guard stays off" % root))
+        return out
     marker = "%s\n%s\n" % (root, branch)
     target = state_dir / MARKER
     changed = not target.is_file() or target.read_text() != marker

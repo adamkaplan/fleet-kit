@@ -3769,8 +3769,10 @@ def installed_guard_module(directory=None):
     return module
 
 
-def installed_tree_refusal(action, state_dir=None, root=None, runner=subprocess.run):
+def installed_tree_refusal(action, state_dir=None, root=None, runner=subprocess.run, daemon=False):
     """The one line a command is refused with when the installed tree is not the default branch, clean; else None. Only a tree `install` recorded is judged."""
+    if daemon:   # `run` without --once: the daemon checks the tree itself at its start and on every pass, and alerts. Refused here, the service manager would restart it for ever, silently.
+        return None
     state = Path(state_dir) if state_dir is not None else state_dir_path()
     if not (state / "installed-tree").is_file():
         return None   # a worktree, a CI checkout or a tree install never recorded: nothing to judge
@@ -23378,7 +23380,7 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
         sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
         return EXIT_ERROR
-    refused = installed_tree_refusal(getattr(args, "action", None))   # #1380: before anything else runs, and for every command but the ones that move the tree
+    refused = installed_tree_refusal(getattr(args, "action", None), daemon=getattr(args, "action", None) == "run" and not getattr(args, "once", False))   # #1380: before anything else runs, and for every command but the ones that move the tree
     if refused:
         sys.stderr.write(refused + "\n")
         return EXIT_ERROR

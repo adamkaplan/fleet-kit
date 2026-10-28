@@ -16,6 +16,7 @@ The first alert of a bad tree goes at once; a repeat is sent only after --every 
   - a line appended to DIR/installed-tree-alerts.txt: the last resort.
 """
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -38,10 +39,13 @@ def run(argv):
 
 
 def audit(state, text):
-    fd = os.open(os.path.join(state, "audit.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "a") as handle:
-        handle.write(json.dumps({"ts": now(), "actor": "fleet-switchboard", "event": "installed_tree.alert", "subject": None,
-                                 "detail": {"text": text}}, sort_keys=True) + "\n")
+    path = os.path.join(state, "audit.jsonl")
+    with open(path + ".append.lock", "w") as guard:   # the audit's own lock: shared for an append (a rotation holds it exclusively)
+        fcntl.flock(guard, fcntl.LOCK_SH)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as handle:
+            handle.write(json.dumps({"ts": now(), "actor": "fleet-switchboard", "event": "installed_tree.alert", "subject": None,
+                                     "detail": {"text": text}}, sort_keys=True) + "\n")
 
 
 def herdr_toast(herdr, cos, text):

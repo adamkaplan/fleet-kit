@@ -7,8 +7,9 @@ directory, outside the tree, and it imports nothing of the kit: standard library
     guard_record_head_move.py <state dir> <hook name> [hook arguments...]
 
 It appends one line to <state dir>/audit.jsonl: event `installed_tree.head_moved`, the old and the new commit, the hook, the current
-directory and the ancestors of this process (pid, parent pid, command line), nearest first.
+directory and the ancestors of this process (pid, parent pid and the executable's name, never its arguments), nearest first.
 """
+import fcntl
 import json
 import os
 import subprocess
@@ -29,7 +30,7 @@ def git(*argv):
 def process_row(pid):
     """(parent pid, command line) of `pid`, or None."""
     try:
-        done = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+        done = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     line = done.stdout.strip()
@@ -37,7 +38,7 @@ def process_row(pid):
         return None
     parent, _, command = line.partition(" ")
     try:
-        return int(parent), command.strip()[:400]
+        return int(parent), os.path.basename(command.strip())[:80]   # the executable's name only: a command line carries arguments (paths, tokens)
     except ValueError:
         return None
 
@@ -68,9 +69,13 @@ def main(argv):
         return 0
     try:
         line = json.dumps(entry(argv[1], argv[2:]), sort_keys=True) + "\n"
-        fd = os.open(os.path.join(argv[0], "audit.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a") as handle:
-            handle.write(line)
+        path = os.path.join(argv[0], "audit.jsonl")
+        guard = os.fdopen(os.open(path + ".append.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600), "w")   # the audit's own lock: shared for an append (a rotation holds it exclusively)
+        with guard:
+            fcntl.flock(guard, fcntl.LOCK_SH)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as handle:
+                handle.write(line)
     except Exception as err:   # a record that cannot be written never stops the git command
         sys.stderr.write("fleet-kit: could not record the move of the installed tree: %s\n" % err)
     return 0

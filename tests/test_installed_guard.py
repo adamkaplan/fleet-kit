@@ -125,7 +125,7 @@ class TestTheEntryGuard(TreeCase):
         for name in ("status", "send", "run", "daemon", "key"):
             with self.subTest(name=name):
                 self.assertIsNotNone(sb.installed_tree_refusal(name))
-        self.assertEqual(set(guard.EXEMPT_COMMANDS), {"install", "upgrade", "doctor"})
+        self.assertEqual(set(guard.EXEMPT_COMMANDS), {"install", "upgrade", "doctor"})   # `run` (the daemon) is exempt in the entry only, and only without --once
 
     def test_s5_install_itself_runs_on_a_bad_tree(self):
         git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
@@ -180,6 +180,91 @@ class TestTheEntryGuard(TreeCase):
         git(self.tree, "switch", "-q", "main")
         commit(self.tree, "local.txt")                       # a local commit the remote does not hold
         self.assertEqual(self.command("version")[0], 1)
+
+
+    # ---- the review round (rev-1): the daemon, the default branch, the caller's git environment, a failed rev-parse
+
+    def test_a_restarted_daemon_on_a_bad_tree_is_not_refused_at_the_entry_and_alerts(self):
+        """`run` (the daemon, which checks the tree itself at its start and on every pass) is not refused at the entry: a refusal there makes the service
+        manager restart it for ever with no alert. `run --once` decides and delivers by itself, so it stays guarded."""
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
+        fakes = FakePrograms(self.home)
+        os.environ[sb.INSTALLED_TREE_ALERT_ENV] = str(fakes.notifier)
+        engine = FakeEngine([1_800_000_000.0], fakes.herdr)
+
+        def daemon(args, parser_commands, **kw):
+            with mock.patch.object(sb, "next_poll", lambda e, p: p), mock.patch.dict(sys.modules, {sb.__name__: sb}), \
+                    mock.patch.object(sb.load_module("cloud_relay_daemon"), "pass_if_configured", lambda *a, **k: None):
+                sb.run_daemon(engine, self.state, 60, wait=lambda sock, timeout: None, passes=1)
+            return 0
+        with mock.patch.object(sb, "dispatch", daemon):
+            code, err = self.command("run")
+        self.assertEqual((code, err), (0, ""))                      # not refused: the service manager has nothing to restart
+        self.assertEqual(fakes.count(fakes.notifier_log), 1)        # and the alert went out
+        self.assertEqual(engine.passes, 0)                          # with nothing decided
+        self.assertEqual(self.command("run", "--once")[0], 1)       # the one-shot pass has no check of its own: the entry guards it
+
+    def test_the_default_branch_is_not_assumed_to_be_main(self):
+        git(self.origin, "branch", "-q", "-m", "main", "master")
+        git(self.tree, "fetch", "-q", "origin", "--prune")
+        git(self.tree, "switch", "-q", "-c", "master", "origin/master")
+        git(self.tree, "branch", "-q", "-D", "main")
+        git(self.tree, "remote", "set-head", "origin", "-d")       # origin/HEAD unknown
+        (self.state / "installed-tree").unlink()
+        steps = {step: (status, detail) for step, status, detail in guard.install(self.tree, self.state, BIN, sys.executable)}
+        self.assertEqual(guard.read_marker(self.state), (os.path.realpath(str(self.tree)), "master"), steps)
+        self.assertEqual(self.command("version"), (0, ""))
+
+    def test_an_unknown_default_branch_is_not_recorded_and_the_install_says_so(self):
+        git(self.origin, "branch", "-q", "master", "main")          # both main and master exist: which is the default is not known
+        git(self.tree, "fetch", "-q", "origin")
+        git(self.tree, "remote", "set-head", "origin", "-d")
+        (self.state / "installed-tree").unlink()
+        steps = {step: (status, detail) for step, status, detail in guard.install(self.tree, self.state, BIN, sys.executable)}
+        self.assertIsNone(guard.read_marker(self.state))
+        self.assertEqual(steps["installed tree"][0], "skipped")
+        self.assertIn("git remote set-head origin", steps["installed tree"][1])
+
+    def test_the_callers_git_environment_does_not_move_the_guard_to_another_repository(self):
+        other = self.home / "other"
+        other.mkdir()
+        git(other, "init", "-q", "-b", "feature")
+        commit(other, "x.txt")
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
+        for name, value in (("GIT_DIR", str(other / ".git")), ("GIT_WORK_TREE", str(other)), ("GIT_INDEX_FILE", str(other / ".git" / "index"))):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {name: value}):
+                line = guard.problem(self.state, self.tree)
+                self.assertIsNotNone(line)
+                self.assertIn("branch scratch", line)
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other)}):
+            (self.state / "installed-tree").unlink()
+            guard.install(self.tree, self.state, BIN, sys.executable)
+        self.assertTrue((self.tree / ".git" / "hooks" / "post-checkout").is_file())
+        self.assertFalse((other / ".git" / "hooks" / "post-checkout").exists())
+
+    def rev_parse_fails(self, code=128, out=""):
+        real = subprocess.run
+
+        def run(argv, **kw):
+            if "rev-parse" in argv:
+                return subprocess.CompletedProcess(argv, code, out, "fatal: bad")
+            return real(argv, **kw)
+        return run
+
+    def test_a_rev_parse_that_fails_without_raising_is_no_evidence_so_the_command_runs(self):
+        run = self.rev_parse_fails()
+        self.assertIsNone(guard.problem(self.state, self.tree, run))
+        self.assertIn("unreadable", guard.note(self.state, self.tree, run))
+
+    def test_a_mutant_that_reads_a_failed_rev_parse_as_no_commit_is_caught(self):
+        source = (BIN / "installed_guard.py").read_text()
+        fixed = 'result["ok"], result["note"] = True, "unreadable: git rev-parse failed"\n        return result'
+        self.assertIn(fixed, source)
+        namespace = {"__name__": "mutant_guard"}
+        exec(compile(source.replace(fixed, 'result["why"] = "no commit"'), "mutant_guard.py", "exec"), namespace)
+        run = self.rev_parse_fails()
+        self.assertIsNotNone(namespace["problem"](self.state, self.tree, run))     # the mutant refuses on a read failure
+        self.assertIsNone(guard.problem(self.state, self.tree, run))               # the real code does not
 
     def test_u1_a_clean_tree_costs_at_most_three_git_calls_and_no_network(self):
         calls = []
@@ -376,11 +461,43 @@ class TestTheHooks(TreeCase):
         self.assertIn("could not record", done.stderr)
 
     def test_a_failed_git_directory_read_skips_the_hooks_and_still_records_the_tree(self):
+        real = subprocess.run
+
         def runner(argv, **kw):
-            return subprocess.CompletedProcess(argv, 128, "", "fatal")
+            return subprocess.CompletedProcess(argv, 128, "", "fatal") if "--git-common-dir" in argv else real(argv, **kw)
         (self.state / "installed-tree").unlink()
         steps = {step: status for step, status, _ in guard.install(self.tree, self.state, BIN, sys.executable, run=runner)}
         self.assertEqual((steps["tree hook checkout"], steps["tree hook merge"], steps["installed tree"]), ("skipped", "skipped", "done"))
+
+
+    def test_the_record_keeps_executable_names_only_and_never_an_argument(self):
+        self.install()
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
+        line = [json.loads(l) for l in (self.state / "audit.jsonl").read_text().splitlines() if "head_moved" in l][0]
+        for ancestor in line["detail"]["ancestors"]:
+            self.assertNotIn(" ", ancestor["command"], ancestor)
+            self.assertNotIn("/", ancestor["command"], ancestor)
+        self.assertEqual(sorted(line["detail"]["ancestors"][0]), ["command", "pid", "ppid"])
+        self.assertLessEqual(len(line["detail"]["ancestors"]), 16)
+
+    def test_the_recorder_takes_the_audits_append_lock(self):
+        import fcntl
+        import time
+        lock = self.state / "audit.jsonl.append.lock"
+        fd = os.open(str(lock), os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)           # a rotation holds it exclusively for its swap
+        proc = subprocess.Popen([sys.executable, str(BIN / "guard_record_head_move.py"), str(self.state), "post-merge"], cwd=str(self.tree),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(1.0)
+            self.assertIsNone(proc.poll(), "the recorder wrote while the audit was locked")
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            self.assertEqual(proc.wait(timeout=20), 0)
+        finally:
+            os.close(fd)
+            if proc.poll() is None:
+                proc.kill()
+        self.assertIn("head_moved", (self.state / "audit.jsonl").read_text())
 
     def test_a_hook_that_is_not_ours_is_left_alone(self):
         hooks = self.tree / ".git" / "hooks"
@@ -418,6 +535,13 @@ class TestTheDocument(unittest.TestCase):
         for statement in ("allowed when it is on the default branch, at a commit that is an ancestor of (or equal to) the remote default branch",
                           "`install`, `upgrade` and `doctor`", "How the operator moves the tree"):
             self.assertIn(statement, body)
+
+
+    def test_the_document_states_the_limits(self):
+        body = " ".join(self.section().split())
+        for phrase in ("lives in the tree it guards", "deleting `installed-tree`", "records the tree it is run from", "core.hooksPath",
+                       "origin", "fileMode", "executable names"):
+            self.assertIn(phrase, body)
 
     def test_the_cause_note_answers_the_three_questions(self):
         body = " ".join(self.section().split())
