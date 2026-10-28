@@ -16715,7 +16715,7 @@ def cmd_gates(args, runner, now):
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
     standing_lines = []   # #1404: every call lists each standing change request by the shim's rule, whatever the decision field says (the decision only widens the rule, as at the shim)
-    if isinstance(ctx.facts, dict) and not ctx.unreadable:
+    if isinstance(ctx.facts, dict) and not ctx.unreadable and not getattr(ctx, "ask_issue", False):   # an issue subject has no pull request: no reviews to list
         standing_lines = blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head"),
                                                "CHANGES_REQUESTED" if ctx.facts.get("review") == "changes requested" else "")
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
@@ -16742,7 +16742,7 @@ def cmd_gates(args, runner, now):
             lines.append("plan not read: %s" % ctx.plan_problem)
         if standing_lines:
             lines.extend(standing_lines)
-            verdict = blocked_verdict_line(ctx.pr, standing_lines)
+            verdict = standing_verdict_line(ctx.pr, standing_lines)
             if verdict:
                 lines.append(verdict)
         note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
@@ -20254,7 +20254,7 @@ def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decisi
         row["name"], row["commit"], row["id"], review_age_text(row["age"]), pr, row["id"]) for row in rows]
 
 
-def blocked_verdict_line(pr, lines):
+def standing_verdict_line(pr, lines):
     """The verdict-list line (#1404) naming the pull request as blocked by its standing requests, or None; read off the `blocking review:` lines (`review NN`), so it can never disagree with them."""
     ids = [m.group(1) for m in (re.search(r"\(review (\S+),", l) for l in lines if l.startswith("blocking review:")) if m]
     return "  BLOCKED: %s has %d standing change request(s) (review %s): a merge is refused until each is dismissed or approved over" % (pr, len(ids), ", ".join(ids)) if ids else None
