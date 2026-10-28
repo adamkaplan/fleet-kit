@@ -1,0 +1,33 @@
+# The ONE list of the test files CI runs. `bin/test-switchboard` (TestCiTestFileList) derives every `bin/test-*` file from the directory and fails
+# a file that is in neither section, a `run` row with no step in .github/workflows/test.yml, and an `exempt` row without a written reason.
+# Format, one row per line:
+#   run <path>
+#   exempt <path> | <why it has no step of its own: at least 20 characters>
+run bin/test-app-mint
+run bin/test-cloud-channel
+run bin/test-cloud-channel-server
+run bin/test-cloud-cli
+run bin/test-cloud-client
+run bin/test-cloud-hub
+run bin/test-cloud-hub-relay
+run bin/test-cloud-launcher
+run bin/test-cloud-neutral-names
+run bin/test-cloud-relay
+run bin/test-cloud-relay-daemon
+run bin/test-cloud-way-back
+run bin/test-cloud-worker
+run bin/test-decisions-pull
+run bin/test-fleet-doctor
+run bin/test-fleet-doctor-config
+run bin/test-fleet-doctor-heartbeat
+run bin/test-gh-hold
+run bin/test-health-records
+run bin/test-heartbeat
+run bin/test-path-suites
+run bin/test-switchboard
+run bin/test-workflow-split
+run cloud/tests/test-cloud
+exempt bin/test-cloud-cost-report | listed in bin/test-cloud-launcher.chain, so the bin/test-cloud-launcher step runs it
+exempt bin/test-cloud-launcher.chain | the chain list read by bin/test-cloud-launcher, not a test file
+exempt bin/test-cloud-launcher.parallel | a helper of bin/test-cloud-launcher, not a test file
+exempt bin/test-impact-brief | its TestCase classes are loaded and run by bin/test-switchboard (_load_brief_tests), so the bin/test-switchboard step runs it

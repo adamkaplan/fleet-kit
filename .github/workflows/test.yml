@@ -171,6 +171,14 @@ jobs:
           bin/test-workflow-split 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
 
+      # About 110 s: runs on both legs, inside the existing job.
+      - name: bin/test-path-suites
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          bin/test-path-suites 2>&1 | tee "$RUNNER_TEMP/out-paths.txt"
+          grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out-paths.txt"
+
       - name: bin/test-gh-hold
         if: ${{ !cancelled() }}
         run: |
