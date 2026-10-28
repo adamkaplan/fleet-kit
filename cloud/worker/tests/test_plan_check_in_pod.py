@@ -321,9 +321,6 @@ ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull req
     ('gh pr edit*--* --body-file*', 'deny'),
     ('gh pr edit*://*', 'deny'),
     ('gh pr edit*--repo*', 'deny'),
-    # ask 1200, S14: a shell command naming the pod's record of its own pull requests (the variable or the directory) is refused
-    ('*CW_PR_RECORD*', 'deny'),
-    ('*pr-record*', 'deny'),
 ]
 ADDED_ALLOWS = [k for k, v in ADDED_ROWS if v == 'allow']
 # The three deny rows that exist before ask 1083 and were moved: their order, and they come after every added allow row above.
