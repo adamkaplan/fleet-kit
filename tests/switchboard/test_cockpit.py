@@ -485,7 +485,7 @@ class TestSources(Fixture):
 
     def test_s9_the_verb_exits_3_and_names_the_unreadable_source_for_each_of_the_three(self):
         for source in sb.COCKPIT_SOURCES:
-            for how in [h for h in self.HOWS if (source, h) not in (("registry", "symlink"), ("reports", "missing"))]:   # the registry's own loader is not this feed's to change
+            for how in [h for h in self.HOWS if (source, h) not in (("reports", "missing"),)]:   # a symlinked registry.json is unreadable here (lstat), whatever the registry's own loader does
                 with self.subTest(source=source, how=how):
                     self.fresh()
                     break_source(self.state, source, how)
@@ -515,7 +515,7 @@ class TestSources(Fixture):
     def test_s9_the_daemon_keeps_the_last_good_file_byte_for_byte_when_any_source_cannot_be_read(self):
         feed = self.state / "cockpit.json"
         for source in sb.COCKPIT_SOURCES:
-            for how in [h for h in self.HOWS if (source, h) not in (("registry", "symlink"), ("reports", "missing"))]:   # the registry's own loader is not this feed's to change
+            for how in [h for h in self.HOWS if (source, h) not in (("reports", "missing"),)]:   # a symlinked registry.json is unreadable here (lstat), whatever the registry's own loader does
                 with self.subTest(source=source, how=how):
                     sb._STATE_LAST.clear()
                     self.fresh()
@@ -573,6 +573,8 @@ class TestScrubPatterns(Fixture):
         "Bearer abc.def-ghi",
         "X-Api-Key: abcd1234",
         "db_password=hunter2",
+        "db_password: hunter2",
+        "token abcd1234ef",
         "ops@example.com",
         "10.0.0.5:8080",
         "sk_live_" + "a1B2" * 6,
@@ -621,6 +623,111 @@ class TestScrubPatterns(Fixture):
         self.assertEqual([c for c in text if unicodedata.category(c) == "Cf"], [])
 
 
+class TestHardening(Fixture):
+    """NFKC before the patterns; the colon twin of the login rule; the registry symlink; one note per unreadable stretch; one audit per scrub failure stretch."""
+    NFKC = ["\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44=hunter2",                     # fullwidth name, ASCII equals: login rule
+            "\uff48\uff54\uff54\uff50\uff53://bob:pw@host/x",                                    # fullwidth scheme: URL with userinfo
+            "ops\uff20example.com",                                                                   # fullwidth at-sign: email
+            "ghp\uff3f" + "A" * 20,                                                                   # fullwidth underscore: a token
+            ]
+
+    def test_nfkc_runs_before_the_patterns_and_each_sample_is_removed_only_because_of_it(self):
+        for sample in self.NFKC:
+            with self.subTest(sample=sample):
+                self.assertEqual(sb.cockpit_text("see %s now" % sample, 300), "see [removed] now")
+                raw = sb._COCKPIT_SECRET.sub("[removed]", sample)
+                raw = sb._COCKPIT_TOKEN.sub("[removed]", raw)
+                self.assertNotEqual(raw, "[removed]", "the sample must pass the patterns without NFKC, or the test would not notice it removed")
+                fleet_state(self.state, decisions=[entry("issue", ask=51, title=sample, agent=sample, repo=sample), entry("notice", number=7, title=sample), entry("captain", number=9, title="t", note=sample)])
+                doc = build(self.state)
+                self.assertEqual(doc["cards"]["decisions"][0]["agent"], "[removed]")
+                self.assertEqual(doc["cards"]["heads_up"][0]["note"], "[removed]")
+                self.assertEqual(doc["cards"]["held_prs"][0]["reason"], "[removed]")
+
+    def test_nfkc_does_not_invent_a_secret(self):
+        self.assertEqual(sb.cockpit_text("\uff21\uff22 plan", 50), "AB plan")
+
+    COLON = [("password: x", "[removed]"), ("user: a pass: b", "[removed] [removed]"), ("api_key: abc", "[removed]"), ("token abcd1234ef", "[removed]"), ("login: bob", "[removed]")]
+
+    def test_the_colon_form_of_the_login_rule_and_the_token_phrase_are_removed(self):
+        for text, want in self.COLON:
+            with self.subTest(text=text):
+                self.assertEqual(sb.cockpit_text(text, 100), want)
+                eq = text.replace(": ", "=") if ": " in text and "user" not in text else None
+                if eq:
+                    self.assertEqual(sb.cockpit_text(eq, 100), "[removed]")
+
+    def test_what_still_passes_is_pinned(self):
+        for text in ("my password is X", "reach me at ::1 or fe80::1ff", "http://[::1]:8080", "Zm9vYmFy", "4111 1111 1111 1111", "call +1 555 010 9999"):
+            with self.subTest(text=text):
+                self.assertEqual(sb.cockpit_text(text, 100), text)
+
+    def test_a_symlinked_registry_is_unreadable_and_a_regular_one_is_ok(self):
+        self.assertEqual(sb.cockpit_read(self.state)[3]["registry"], "ok")
+        break_source(self.state, "registry", "symlink")
+        decisions, agents, reports, sources = sb.cockpit_read(self.state)
+        self.assertEqual((sources["registry"], agents), ("unreadable", {}))
+        self.assertEqual(sources["decisions"], "ok")
+
+    def notes(self, engine):
+        return [c for c in engine.audit.append.call_args_list if c[0][1] == "cockpit.unreadable"]
+
+    def engine(self, tick):
+        return self._engine
+
+    def publish(self, tick):
+        with mock.patch("time.monotonic", lambda: float(tick)):
+            self._engine.now = lambda: T0 + tick
+            return sb.publish_cockpit(self._engine)
+
+    def test_five_unreadable_passes_give_one_note_and_a_second_stretch_a_second_note(self):
+        sb._STATE_LAST.clear()
+        self._engine = mock.Mock(state_dir=self.state)
+        self.assertTrue(self.publish(0))
+        self.assertEqual(self.notes(self._engine), [])
+        good = (self.state / "last-reports.json").read_bytes()
+        (self.state / "last-reports.json").write_text("{bad")
+        (self.state / "decisions.json").write_text("{bad")
+        for tick in range(1, 6):
+            self.assertFalse(self.publish(tick * 100))
+        found = self.notes(self._engine)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][0][3]["sources"], ["decisions", "reports"])
+        fleet_state(self.state)
+        self.assertTrue(self.publish(700))
+        self.assertEqual(len(self.notes(self._engine)), 1)
+        (self.state / "registry.json").write_text("{bad")
+        self.assertFalse(self.publish(800))
+        self.assertFalse(self.publish(900))
+        found = self.notes(self._engine)
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[1][0][3]["sources"], ["registry"])
+
+    def test_a_partial_recovery_is_not_a_new_episode(self):
+        sb._STATE_LAST.clear()
+        self._engine = mock.Mock(state_dir=self.state)
+        (self.state / "registry.json").write_text("{bad")
+        self.publish(0)
+        (self.state / "decisions.json").write_text("{bad")
+        self.publish(100)
+        self.assertEqual(len(self.notes(self._engine)), 1)
+
+    def test_a_scrub_failure_is_raised_once_per_stretch_and_again_after_a_good_pass(self):
+        sb._STATE_LAST.clear()
+        self._engine = mock.Mock(state_dir=self.state)
+        bad = mock.patch.object(sb, "cockpit_text", side_effect=RuntimeError("x"))
+        self.assertTrue(self.publish(0))
+        with bad:
+            with self.assertRaises(sb.CockpitWithheld):
+                self.publish(100)
+            for tick in (200, 300, 400):
+                self.assertFalse(self.publish(tick), "the same failure is not audited again")
+        self.assertTrue(self.publish(500))
+        with bad:
+            with self.assertRaises(sb.CockpitWithheld):
+                self.publish(600)
+
+
 class TestFileRead(Fixture):
     def test_a_symlinked_feed_file_is_not_followed(self):
         real = self.state / "real.json"
@@ -658,7 +765,12 @@ class TestDocumentTable(unittest.TestCase):
         text = DOC.read_text()
         for phrase in ("best effort", "Q3", "status 3", "status 4", "180 seconds", "produced_at"):
             self.assertIn(phrase, text)
-        self.assertRegex(text, r"(?i)title text is outside the scrub")
+        self.assertRegex(text, r"(?i)free text \(titles, reasons, notes, agent/repo names\)")
+        first = text.split("\n\n")[1]
+        self.assertIn("WHICH fields", first)
+        self.assertIn("best effort", first)
+        for still in ("my password is X", "bare IPv6", "http://[::1]:8080", "short base64", "card or phone number", "NFKC", "`reason`"):
+            self.assertIn(still, text)
 
 
 if __name__ == "__main__":

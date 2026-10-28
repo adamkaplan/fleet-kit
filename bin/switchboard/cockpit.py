@@ -36,6 +36,8 @@ _COCKPIT_SECRET_CI = [   # matched ignoring case
     r"\bbearer\s+[\w.~+/=-]+",                                                                                    # a bearer value
     r"\b(?:x-[\w-]*(?:key|token|secret|auth)[\w-]*|(?:set-)?cookie)\s*:\s*\S+",               # a header that carries a credential
     r"\b\w*(?:password|passwd|secret|token|key|login)\w*\s*=\s*\S+",                                              # name=value for a credential name
+    r"\b\w*(?:pass(?:word|wd)?|secret|token|key|login|user(?:name)?)\w*\s*:\s*\S+",                                 # the colon twin: `password: x`, `user: a pass: b`
+    r"\b(?:token|secret|passw(?:or)?d)\s+(?=\S*\d)[\w.~+/=-]{6,}",                                              # `token abcd1234`: the word, a space, a value with a digit
     r"[\w.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",                                                                  # an email address
     r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b",                                                                       # IP:port
     r"\b(?:AIza[\w-]{35}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|SG\.[\w-]{16,}\.[\w-]{16,}|npm_[A-Za-z0-9]{30,}|glpat-[\w-]{20,}|hf_[A-Za-z0-9]{30,}|ya29\.[\w-]{20,}|(?:ASIA|AIDA)[0-9A-Z]{16})",   # other vendors' key shapes
@@ -55,6 +57,7 @@ def cockpit_text(value, limit):
     address, token-like string and file path replaced by a mark (best effort: a denylist). Applied to every string of the feed, whatever the source said."""
     if not isinstance(value, str):
         return ""
+    value = unicodedata.normalize("NFKC", value)   # fullwidth and compatibility lookalikes become plain ASCII BEFORE any pattern runs
     lines = value.splitlines()
     kept = [line for line in lines if not _COCKPIT_DIFF_LINE.match(line)] if len(lines) > 1 else lines   # a one-line title that starts with a sign is a title, not a diff
     text = _COCKPIT_CONTROL.sub(" ", "".join(c for c in " ".join(kept) if unicodedata.category(c) != "Cf"))   # Unicode category Cf (bidi overrides and isolates, zero-width, joiners, tags, the byte-order mark) is removed, not spaced: a word split by one is joined, so the patterns below match it
@@ -172,6 +175,11 @@ def cockpit_read(state_dir):
         loaded = load_module("registry")._load(state)
     except Exception:
         loaded = None
+    try:
+        mode = os.lstat(str(state / "registry.json")).st_mode   # `_load` opens with a plain open: a symlink or special file is unreadable here, as for the other two records
+        loaded = loaded if stat.S_ISREG(mode) else None
+    except OSError:
+        loaded = None
     whole = isinstance(loaded, dict) and bool(loaded.get("whole")) and isinstance(loaded.get("agents"), dict)
     never = not os.path.lexists(str(state / LAST_REPORT_FILE))   # written by the first report: a fleet nobody has reported in has none, and that is a reading, not a failure
     raw = {} if never else read_record_file(state / LAST_REPORT_FILE)
@@ -212,6 +220,9 @@ def cockpit_next(state_dir, now):
     return cockpit_document(cards, generation, now, sources), cards, generation
 
 
+_COCKPIT_EPISODE = {"unreadable": False, "withheld": False}   # one note per stretch: set at its first pass, cleared by a pass that has no such trouble
+
+
 def publish_cockpit(engine):
     """The end of a pass: write cockpit.json when the content changed and at least every COCKPIT_HEARTBEAT seconds (through `state_write`: a private temp file
     renamed into place, mode 0600, never through a symlink). Returns True when written. When a source cannot be read the last good file is KEPT (nothing is
@@ -220,9 +231,23 @@ def publish_cockpit(engine):
     if state is None:
         return False
     now = engine.now()
-    document, cards, generation = cockpit_next(state, now)
-    if "unreadable" in document["sources"].values():
+    try:
+        document, cards, generation = cockpit_next(state, now)
+    except CockpitWithheld:
+        again = _COCKPIT_EPISODE["withheld"]   # the failure is raised (audited by the pass) once per stretch; the next passes of it stay quiet
+        _COCKPIT_EPISODE["withheld"] = True
+        if again:
+            return False
+        raise
+    _COCKPIT_EPISODE["withheld"] = False
+    bad = [name for name in COCKPIT_SOURCES if document["sources"].get(name) == "unreadable"]
+    if bad:
+        audit = getattr(engine, "audit", None)
+        if not _COCKPIT_EPISODE["unreadable"] and audit is not None:   # the first pass of a stretch says so, naming the sources; the stretch ends when all are ok
+            audit.append(engine.actor, "cockpit.unreadable", None, {"sources": bad})
+        _COCKPIT_EPISODE["unreadable"] = True
         return False
+    _COCKPIT_EPISODE["unreadable"] = False
     return state_write(Path(state) / COCKPIT_FILE, json.dumps(document, indent=1, sort_keys=True) + "\n", stable=cockpit_stable(cards, generation), heartbeat=COCKPIT_HEARTBEAT, nofollow=True)
 
 
