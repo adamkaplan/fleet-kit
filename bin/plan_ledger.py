@@ -556,10 +556,30 @@ def claim_body(text, link="PLAN: x#1"):
     return link + ("\nCLAIMS: %s" % text if text is not None else "")
 
 
-def union_refusal(ref, uncovered):
-    return ("merge of %s refused: it is the last pull request of its ask and the claims of its merged pull requests do not cover %s; a pull request must claim %s "
+def union_refusal(ref, uncovered, closed=()):
+    tail = "; the closed-unmerged pull request%s %s left %s unclaimed (#1347)" % ("s" if len(closed) > 1 else "", ", ".join("#%s" % n for n in closed), "it" if len(uncovered) == 1 else "them") if closed else ""
+    return ("merge of %s refused: it is the last pull request of its ask and the claims of its merged pull requests do not cover %s%s; a pull request must claim %s "
             "(`CLAIMS:` under `PLAN:`), or the chief of staff logs a waiver (`waive %s --gates CU`)" % (
-                ref, ", ".join(uncovered), "it" if len(uncovered) == 1 else "them", ref))
+                ref, ", ".join(uncovered), tail, "it" if len(uncovered) == 1 else "them", ref))
+
+
+def closed_unclaimed(scenarios, peers, closed):
+    """(uncovered, closed_numbers) of one ask with NO subject pull request (#1347): `peers` is [(state, body)] of its `open` and `merged` pull requests, `closed` [(number, body)] of
+    those closed without a merge. Flagged only when the ask has a closed-unmerged pull request, none is open, some claim line narrows a pull request, and a per-pull-request
+    scenario is claimed by no merged one. A closed pull request's claim covers nothing. Otherwise ([], [])."""
+    if not closed or any(state == "open" for state, _ in peers):
+        return [], []
+    bodies = [b for _, b in peers] + [b for _, b in closed]
+    if not any(pr_claim(b, scenarios)[0] is not None for b in bodies):
+        return [], []
+    per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
+    covered = set()
+    for state, body in peers:
+        claimed, _, error = pr_scenarios(scenarios, body)
+        if state == "merged" and not error:
+            covered.update(c.get("id") for c in claimed)
+    uncovered = [i for i in per if i not in covered]
+    return (uncovered, [n for n, _ in closed]) if uncovered else ([], [])
 
 
 def canon_status(body):

@@ -79106,6 +79106,64 @@ class TestClaimUnionAtLastMerge(LedgerBase):
         docs = [REPO / "skills" / "fleet-planning" / "SKILL.md", REPO / "docs" / "plan-template.md"]
         self.assertEqual(sum(sentence in " ".join(d.read_text().split()) for d in docs), 2)
 
+class TestClosedUnmergedLastPr(unittest.TestCase):
+    """#1347: an ask whose last other pull request is closed unmerged with a per-PR scenario claimed by no merged one is flagged (`plan_ledger.closed_unclaimed`). Table-derived."""
+
+    SCEN = [{"id": "S1", "proof": "test", "evaluator": "ci", "claim": "pr"}, {"id": "S2", "proof": "test", "evaluator": "ci", "claim": "pr"}, {"id": "S3", "proof": "test", "evaluator": "ci", "claim": "pr"}]
+    BODY = {"line": "PLAN: acme/app#7\nCLAIMS: S1 S2", "rest": "PLAN: acme/app#7\nCLAIMS: S3", "none": "PLAN: acme/app#7"}
+
+    def judge(self, peers, closed, fn=None):
+        return (fn or sb.plan_ledger.closed_unclaimed)(self.SCEN, [(s, self.BODY[b]) for s, b in peers], [(9, self.BODY[b]) for b in closed])
+
+    def table(self):
+        """Every state of the ask's other pull requests: one merged claim in (line, rest, none, absent) x one closed claim (line, none, absent) x an open one (yes, no)."""
+        for merged in ("line", "rest", "none", None):
+            for closed in ("line", "none", None):
+                for opened in (False, True):
+                    expect = bool(closed and not opened and merged != "none" and (merged == "line" or closed == "line") and merged != "rest")
+                    if merged == "rest":
+                        expect = bool(closed and not opened)   # S1 S2 left: unclaimed
+                    if merged is None:
+                        expect = bool(closed == "line" and not opened)
+                    yield merged, closed, opened, expect
+
+    def check(self, fn=None):
+        rows = list(self.table())
+        wrong = []
+        for merged, closed, opened, expect in rows:
+            peers = ([("merged", merged)] if merged else []) + ([("open", "line")] if opened else [])
+            got = bool(self.judge(peers, [closed] if closed else [], fn)[0])
+            if got != expect:
+                wrong.append((merged, closed, opened))
+        return len(rows), wrong
+
+    def test_s7_every_combination_gives_the_table_outcome(self):
+        count, wrong = self.check()
+        self.assertEqual((count, wrong), (24, []))
+
+    def test_s2_the_closed_last_pr_with_an_unclaimed_scenario_is_flagged_naming_it_and_the_closed_number(self):
+        self.assertEqual(self.judge([("merged", "rest")], ["line"]), (["S1", "S2"], [9]))
+
+    def test_s3_u4_the_same_with_full_coverage_or_no_claim_lines_is_not_flagged(self):
+        self.assertEqual(self.judge([("merged", "line"), ("merged", "rest")], ["line"]), ([], []))
+        self.assertEqual(self.judge([("merged", "none")], ["none"]), ([], []))
+
+    def test_s8_the_mutant_that_ignores_closed_prs_fails(self):
+        ignore = lambda scen, peers, closed: sb.plan_ledger.closed_unclaimed(scen, peers, [])
+        self.assertNotEqual(self.check(ignore)[1], [])
+
+    def test_s8_the_mutant_that_counts_a_closed_claim_as_covered_fails(self):
+        def counts(scen, peers, closed):
+            return sb.plan_ledger.closed_unclaimed(scen, peers + [("merged", b) for _, b in closed], closed)
+        self.assertNotEqual(self.check(counts)[1], [])
+
+    def test_s4_the_refusal_names_the_closed_pull_request_and_the_waiver(self):
+        text = sb.plan_ledger.union_refusal("acme/app#5", ["S3"], [9])
+        self.assertIn("#9", text)
+        self.assertIn("S3", text)
+        self.assertIn("--gates CU", text)
+
+
 class TestPlanRulesWordedAlike(unittest.TestCase):
     """#943: the template and the planning skill carry both rules in the same words; the finding states its two recorded cases with neutral numbers."""
 
