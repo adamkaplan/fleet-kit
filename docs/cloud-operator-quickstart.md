@@ -393,6 +393,20 @@ The copy is not run or tested by the launcher; whether the installed `az` accept
 
 Revoke or rotate at the provider. The next stack launch then fails at the provider, not in the launcher.
 
+## Briefing a cloud operator
+
+Do not assemble an operator's brief by hand from older ones: a pinned checkout hash goes stale within a day, and a rule said to be "in an earlier brief" is not in the brief the operator reads. Start every operator brief from the standard header, which the switchboard prints from one source file (`skills/fleet-coordination/operator-brief-header.txt`):
+
+```
+fleet-switchboard brief header --role operator
+```
+
+It names the cluster admin route by its settings key (`CW_CLUSTER_ADMIN_CMD`, `CW_CLUSTER_ADMIN_SECRET`), never a value; pins no checkout hash; and carries the secret rules, the rule to send the token mint's diagnostics to the null device, the rule to delete by exact name and the rule to stop and report at the first surprise. Paste its output at the top of the brief, then add the task.
+
+`launch` also refuses a `--reports-to` name that is not a registered identity (a running, recorded or retired agent, a cloud worker, or the role alias `chief-of-staff`), before anything is created: it lists the nearest registered names. `--boss-unregistered REASON` goes on anyway and writes one `launch.boss_unregistered` audit line. If the registry cannot be read, the launch warns and goes on.
+
+Two temporary rules of `launch --cloud` (named constants in `bin/cloud_worker.py`): an explicit `--hard` above 55 minutes is refused until the git token is renewed while a worker runs (ask #1034), and a brief that links an issue of the repository prints one warning until a worker can read issues (ask #1019). A brief that names docker or buildx without `--stack` also prints one warning (the worker would have no nested Docker). The one-line output of a cloud launch now has a `shape` field.
+
 ## Checking a cloud pull request before the push
 
 Over one day a cloud pull request took nine pushes and others two to four, because each cloud coder learned the repository's checks from a red run: a new test file not chained in `bin/test-cloud-launcher`, an existing test of another file broken by the change, or an existing pinned test edited to make a new behaviour pass; and a cloud pod cannot run the whole suite. Run `bin/cloud-pr-preflight` at the repository root before any push (offline; it copies the default branch to a clean temporary directory and removes it on exit). It prints three sections: the completeness scan of the test list, a per-file table of every test under `cloud/launcher/tests` and `cloud/worker/tests` run one at a time on the branch and on the default branch (`CLOUD_PREFLIGHT_TIMEOUT`, default 120 seconds each), and every existing test file the branch changes, which you must justify in the pull request (it only lists them: an edited existing test does not change the exit status). A file failing on the branch only is named and fails the command; one failing the same on both is listed as environment-only; a timeout is "not run" and fails unless the file is on the short allow-list in the script. Paste the table into the pull request before pushing. Exit 0 means the scan found nothing unchained, no test fails on the branch only and none timed out unallowed, and (with `--expect`) no added file is stray; the edited-test list in section 3 never fails the run by itself, you justify it in the pull request. `--expect` takes path PREFIXES (`cloud/` allows anything under it); a rename shows as one added and one deleted file (a known limit); "environment-only" (the identical failure on both sides) can also hide a test that fails for a real reason on both sides, and the output line says so. The terminate, hangup and interrupt signals also remove the temporary copy and stop any running test; `CLOUD_PREFLIGHT_TIMEOUT` must be a whole number of seconds or the command refuses (exit 2).

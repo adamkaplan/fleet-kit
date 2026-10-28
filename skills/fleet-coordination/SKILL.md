@@ -53,6 +53,8 @@ The mistakes that cost the most review rounds and the most lost work. Meet them 
 - (i) Compare failure messages, not only test names, between the branch and a clean tree, and keep new strings and comments clear of the added-lines scans (`TestGitShim` in `bin/test-switchboard` and `TestEverySite` in `cloud/launcher/tests/test_stub_cleanup.py`): no literal ampersand, `nohup` or spawn text, no git-config variable names, no renamed import to pass a scan.
 - (j) Push the first version by minute 20, run slow suites afterwards in the background with a timeout, and say which git version the tests ran on: tests that depend on git behaviour are verified on a recent git.
 
+A person who briefs a cloud operator starts from the standard header: `fleet-switchboard brief header --role operator` (see "Briefing a cloud operator" in `docs/cloud-operator-quickstart.md`).
+
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
 
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
