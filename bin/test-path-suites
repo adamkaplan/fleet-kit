@@ -760,6 +760,70 @@ class TestRealExitCodesAreResults(unittest.TestCase):
         self.assertNotIn("NOSLOT", done.stdout)
 
 
+def table_stub():
+    """A bin/test-switchboard of one class per row of the table: every class passes, except TestArchitectureDocument, which fails when bin/ holds a file the stub's own table does not name (the class that reads the bin/ file set)."""
+    parts = ["#!/usr/bin/env python3\nimport os, sys, unittest\n\nKNOWN = {'calc-cli', 'test-by-import', 'test-by-command', 'test-switchboard', 'check-public-names'}\n"]
+    for g in ps.NEW_BIN_GUARDS:
+        if not g[2] or g[1] != "bin/test-switchboard":
+            continue
+        cls = g[2] + ("OnLinux" if g[2] == "TestTheReaperOnlyInstall" else "")
+        body = "assertEqual(sorted(set(os.listdir('bin')) - KNOWN), [])" if g[2] == "TestArchitectureDocument" else "assertTrue(True)"
+        parts.append("\nclass %s(unittest.TestCase):\n    def %s(self):\n        self.%s\n" % (cls, g[3] or "test_it", body))
+    parts.append("\nif __name__ == '__main__':\n    unittest.main()\n")
+    return "".join(parts)
+
+
+def table_fixture(add=True):
+    """`feature` ADDS bin/newtool (in no derived table) to a base whose bin/test-switchboard holds one stub class per row of the table; add=False edits lib/calc.py only."""
+    root = fixture()
+    write(root, "bin/test-switchboard", table_stub(), 0o755)
+    write(root, "bin/check-public-names", "#!/bin/sh\nexit 0\n", 0o755)
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "stub table")
+    git(root, "checkout", "-q", "-b", "feature")
+    write(root, "bin/newtool" if add else "lib/calc.py", "#!/usr/bin/env python3\nprint('new')\n" if add else "VERSION = 1\ndef add(a, b):\n    return a + b + 0\n", 0o755 if add else None)
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "change")
+    return root
+
+
+def table_lines(text):
+    """The PASS or FAIL lines the table printed: its rows' names, in the order printed."""
+    names = [g[0] for g in ps.NEW_BIN_GUARDS]
+    return [l for l in text.splitlines() if l.split(" ")[0] in ("PASS", "FAIL") and any(l.split(" ", 1)[1].startswith(n + " (") for n in names)]
+
+
+class TestOneTableOfTheBinSetClasses(unittest.TestCase):
+    """#1457 (S2, S3, S5, U1): preflight-pr runs the one table NEW_BIN_GUARDS when the change adds a file under bin/, with and without --merged."""
+
+    def test_s2_without_merged_one_pass_or_fail_line_per_row_of_the_table(self):
+        root = table_fixture()
+        done = run_switchboard(root, "preflight-pr")
+        lines = table_lines(done.stdout)
+        self.assertEqual(len(lines), len(ps.NEW_BIN_GUARDS), done.stdout + done.stderr)
+        self.assertEqual(done.returncode, 1)
+
+    def test_s3_with_merged_the_same_one_line_per_row(self):
+        root = table_fixture()
+        done = run_switchboard(root, "preflight-pr", "--merged")
+        self.assertEqual(len(table_lines(done.stdout)), len(ps.NEW_BIN_GUARDS), done.stdout + done.stderr)
+        names = lambda text: [(l.split(" ")[0], l.split(" ")[1]) for l in table_lines(text)]
+        self.assertEqual(names(done.stdout), names(run_switchboard(root, "preflight-pr").stdout))
+
+    def test_s5_the_class_the_new_file_breaks_prints_fail_and_the_others_pass(self):
+        root = table_fixture()
+        lines = table_lines(run_switchboard(root, "preflight-pr").stdout)
+        self.assertEqual([l.split(" ")[1] for l in lines if l.startswith("FAIL")], ["TestArchitectureDocument"], lines)
+        self.assertEqual(sum(1 for l in lines if l.startswith("PASS")), len(ps.NEW_BIN_GUARDS) - 1)
+
+    def test_u1_a_change_that_adds_no_bin_file_prints_no_table_line_and_the_lines_are_the_same_as_without_the_table(self):
+        root = table_fixture(add=False)
+        done = run_switchboard(root, "preflight-pr")
+        self.assertEqual(table_lines(done.stdout), [])
+        self.assertNotIn("new file under bin/", done.stdout)
+        self.assertNotIn("CANNOT RUN", done.stdout)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=1).result
     ok = result.wasSuccessful()

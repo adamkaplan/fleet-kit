@@ -69,6 +69,8 @@ bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only
 
 **Local runs are focused by default.** Run the focused classes of what you changed through `heavy --short`; CI runs the whole suite. Run the whole suite only for a change to the CI workflow itself or to a test CI cannot run; say which in the pull request. The heavy wrapper refuses a second full-suite job in a worktree while one is queued or running.
 
+**A change that adds a file under `bin/` runs one command before the first push:** `fleet-switchboard preflight-pr` (with or without `--merged`) runs the one table of the classes that read the set of `bin/` files (`NEW_BIN_GUARDS` in `bin/path_suites.py`), one PASS or FAIL line each.
+
 A change that deletes something or raises an alert is checked against three lines before its first push:
 
 - Drive the real code path in the tests, never a copied helper.
