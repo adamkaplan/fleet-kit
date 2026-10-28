@@ -13960,7 +13960,7 @@ def launch_memory_check(args, engine, state, runner, now):
     return None
 
 
-def cmd_launch(args, runner, now, socket_call=None):
+def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "read_repo", None) is not None and (getattr(args, "cloud", False) or args.resume):
         raise LaunchError("--read-repo needs a terminal launch of a new worker (not --headless, --cloud or --resume)")
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
@@ -14118,6 +14118,62 @@ def cmd_launch(args, runner, now, socket_call=None):
     if note and (brief or args.checkpoint or args.overdue):
         sys.stderr.write("%s: %s\n" % (PROG, note))
     return EXIT_OK
+
+
+LAUNCH_REFUSED_REASON_MAX = 300   # #1464: the reason in the caller's message, in characters
+
+
+class _StderrTee:
+    """Passes everything to the real stream and keeps the lines written (the reason of a refusal that is a printed line and an exit code)."""
+
+    def __init__(self, stream):
+        self.stream, self.lines = stream, []
+
+    def write(self, text):
+        self.lines.extend(part for part in str(text).splitlines() if part.strip())
+        return self.stream.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def launch_refusal_reason(text):
+    """#1464: one line, scrubbed of credential-shaped parts, at most LAUNCH_REFUSED_REASON_MAX characters."""
+    text = re.sub(r"\s+", " ", redact_command_text(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(text)))).strip()
+    return text if len(text) <= LAUNCH_REFUSED_REASON_MAX else text[:LAUNCH_REFUSED_REASON_MAX - 3] + "..."
+
+
+def tell_launch_refused(runner, now, name, reason):
+    """#1464: ONE `[switchboard]` message to the caller: `launch of NAME refused: <reason>`. A caller who cannot be identified (a plain shell, no
+    pane) is told nothing and the one line on stderr says so; nothing here raises: the refusal's own exit is what the launch returns."""
+    text = "launch of %s refused: %s" % (_one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(name)), 80), launch_refusal_reason(reason))
+    try:
+        engine, _, _ = build_engine(runner, now, "cli")
+        caller = identify_caller(engine.herdr, engine.v2, os.environ)
+        discovery = engine.discover(engine.now())
+        fact = Fact("launch.refused:%s:%s" % (caller, uuid.uuid4().hex[:16]), caller, "launch.refused", text, engine.now(), batch=False, sender="switchboard")
+        engine.send_fact(fact, discovery, engine.now())
+    except Exception:
+        sys.stderr.write("%s: the refusal was not sent to anyone: the caller could not be identified (a plain shell has no one to tell)\n" % PROG)
+
+
+def cmd_launch(args, runner, now, socket_call=None):
+    """`_cmd_launch`, and a refusal of it (a LaunchError, or any exit but OK) tells the caller once (#1464); what it prints and returns is unchanged."""
+    tee, real = _StderrTee(sys.stderr), sys.stderr
+    sys.stderr = tee
+    try:
+        code = _cmd_launch(args, runner, now, socket_call)
+    except LaunchError as err:
+        sys.stderr = real
+        tell_launch_refused(runner, now, getattr(args, "name", "?"), str(err))
+        raise
+    finally:
+        sys.stderr = real
+    if code != EXIT_OK:
+        line = tee.lines[-1] if tee.lines else "exit code %s" % code
+        line = re.sub(r"^%s: " % re.escape(PROG), "", line)
+        tell_launch_refused(runner, now, getattr(args, "name", "?"), line)
+    return code
 
 
 cmd_launch.ensure_on_use = True   # the daemon is alive when it runs

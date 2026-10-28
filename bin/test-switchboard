@@ -45544,6 +45544,246 @@ class TestLaunchMemoryGate(TwoRepoCase):
         self.assertRegex(text, r"lanes' safety check, not the owner's rule.*--memory-ok")
 
 
+class TestLaunchRefusedMessage(TestLaunchMemoryGate):
+    """#1464: a refused launch tells the caller ONE `[switchboard]` message `launch of NAME refused: <reason>`; a launch that succeeds tells nothing.
+    The refusal exits of `_cmd_launch` are DERIVED from its source (ast): every raise and every non-OK refusal return, and a table row runs each."""
+
+    NAME = "web-new"
+    TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4"
+
+    def setUp(self):
+        super().setUp()
+        self.as_agent("web-orch")
+
+    def base(self, *drop):
+        argv = ["launch", self.NAME, "--agent", "coder", "--dir", str(self.work), "--workspace", "w1", "--role", "coder", "--repo", ACME_WEB, "--memory-ok", "t"]
+        return argv
+
+    def sent(self):
+        return [t for t in self.texts("web-orch") if re.search(r"launch of \S+ refused:", t)]
+
+    def derived_exits(self):
+        """(id, lineno) of every refusal exit of `_cmd_launch`: a raise (not a bare re-raise) and a return of EXIT_USAGE or EXIT_MEMORY, from the source."""
+        source = Path(SWITCHBOARD).read_text()
+        tree = ast.parse(source)
+        (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_cmd_launch"]
+        found = []
+
+        def walk(body, ctx):
+            for st in body:
+                if (isinstance(st, ast.Raise) and st.exc is not None) or (isinstance(st, ast.Return) and isinstance(st.value, ast.Name) and st.value.id in ("EXIT_USAGE", "EXIT_MEMORY")):
+                    found.append((ctx + "|" + ast.get_source_segment(source, st)[:40].replace("\n", " "), st.lineno))
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, field, None)
+                    if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                        walk(sub, ctx + (" > " + ast.get_source_segment(source, st.test)[:30].replace("\n", " ") if isinstance(st, ast.If) and field == "body" else ""))
+                for handler in getattr(st, "handlers", []):
+                    walk(handler.body, ctx + " > except")
+        walk(fn.body, "")
+        return found
+
+    def rows(self):
+        """One row per derived exit: the argv and the patches that reach it."""
+        B = self.base()
+        no_memory_ok = B[:-2]
+        resume = B + ["--resume", "ses_x"]
+        brief = self.home / "brief.txt"
+        P = lambda name, **kw: mock.patch.object(sb, name, **kw)
+        stored = mock.patch.object(sb.V2Client, "session_get", lambda self, sid: {"metadata": {"fleet": {"name": "web-orch", "repo": ACME_WEB}}})
+        no_ws = [a for a in B if a not in ("--workspace", "w1")]
+        newws = no_ws + ["--new-workspace", "lab"]
+        return {
+            ' > getattr(args, "read_repo", Non|raise LaunchError("--read-repo needs a t': (B + ["--resume", "ses_x", "--read-repo", "acme/api"], []),
+            ' > getattr(args, "stack", False) |return EXIT_USAGE': (B + ["--stack"], []),
+            ' > getattr(args, "terminal", Fals|raise LaunchError("--terminal and --head': (B + ["--terminal", "--headless"], []),
+            ' > args.resume > given > stored and given != stored|raise LaunchError("--repo %s differs fro': (
+                resume[:-2] + ["--resume", "ses_x"] , [mock.patch.object(sb.V2Client, "session_get", lambda self, sid: {"metadata": {"fleet": {"name": "web-orch", "repo": ACME_API}}})]),
+            ' > args.resume > who|raise LaunchError("refused: %s" % who)': (resume, [stored, P("reattach_caller_problem", return_value="not yours")]),
+            ' > args.resume > args.brief_file is not None > except|return EXIT_USAGE': (resume + ["--brief-file", str(self.home / "nobrief.txt")], [stored, P("reattach_caller_problem", return_value=None)]),
+            ' > args.resume > except|raise LaunchError("another reattach of %': (resume, [stored, P("reattach_caller_problem", return_value=None), P("agent_lock", side_effect=sb.ImpactStateBusy("busy"))]),
+            ' > not args.agent or not args.dir|raise LaunchError("--agent and --dir are': (["launch", self.NAME], []),
+            ' > getattr(args, "memory_ok", Non|return EXIT_USAGE': (no_memory_ok + ["--memory-ok", "  "], []),
+            ' > refusal|return EXIT_MEMORY': (no_memory_ok, [mock.patch.object(sb, "launch_memory_check", lambda *a, **k: "memory: free 31%")]),
+            ' > getattr(args, "headless", Fals|raise LaunchError("--headless opens no t': (B + ["--headless"], []),
+            ' > (args.name or "").startswith(L|raise LaunchError("names starting %r are': (["launch", sb.LANE_NAME_PREFIX + "x"] + B[2:], []),
+            ' > problem|raise LaunchError(problem)': (B, [P("launch_agent_problem", return_value="the agent is not known")]),
+            ' > args.new_workspace > args.workspace|raise LaunchError("--new-workspace makes': (B + ["--new-workspace", "lab"], []),
+            ' > args.new_workspace > problems|raise LaunchError("; ".join(problems))': (newws, [P("launch_problems", return_value=["p1", "p2"])]),
+            ' > args.new_workspace > problem|raise LaunchError(problem)': (newws, [P("launch_account_problem", return_value="no account")]),
+            ' > use_headless > except > except|raise LaunchError("headless refused (%s)': (no_ws, [P("launch_headless", side_effect=sb.HeadlessRefused("no")), P("caller_workspace", side_effect=RuntimeError("none"))]),
+            ' > except > created|raise LaunchError("%s (workspace %s was ': (newws, [P("launch_agent", side_effect=sb.LaunchError("the tab did not open"))]),
+        }
+
+    def run_row(self, argv, patches):
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            return self.main(*argv)
+
+    def check_refused(self, argv, patches, label=""):
+        before = len(self.sent())
+        code, out, err = self.run_row(argv, patches)
+        got = self.sent()[before:]
+        self.assertNotEqual(code, 0, "%s: %s" % (label, err))
+        self.assertEqual(len(got), 1, "%s: %d messages, stderr: %s" % (label, len(got), err))
+        (text,) = got
+        self.assertIn("launch of %s refused: " % argv[1], text)
+        return text, err
+
+    # -- DW-3 / S6: derived
+
+    def test_s6_every_refusal_exit_derived_from_the_source_has_a_row_and_sends_exactly_one_message(self):
+        derived = self.derived_exits()
+        rows = self.rows()
+        self.assertEqual(sorted(i for i, _ in derived), sorted(rows), "a derived exit has no row, or a row no exit")
+        self.assertGreaterEqual(len(derived), 18)
+        for ident, line in derived:
+            argv, patches = rows[ident]
+            with self.subTest(exit=ident, line=line):
+                self.check_refused(argv, patches, ident)
+
+    # -- S2
+
+    def test_s2_the_memory_test_refusal_sends_one_message_with_the_reason_on_one_line(self):
+        (self.fake / "free").write_text("31")
+        code, _, err = self.main(*self.base()[:-2])
+        self.assertEqual(code, sb.EXIT_MEMORY)
+        (text,) = self.sent()
+        self.assertIn("launch of web-new refused: ", text)
+        self.assertIn("free 31%", text)
+        self.assertIn("launch of web-new refused: memory:", text)
+        print(repr(text))
+
+    # -- S3
+
+    def test_s3_the_preflight_the_brief_header_a_missing_brief_and_the_clouds_refusal_each_send_one_message(self):
+        timeout = sb.LaunchError("the cloud refused the worker: Unable to connect to the server: i/o timeout")
+        cases = {
+            "preflight": (["launch", self.NAME, "--cloud", "--repo", ACME_WEB],
+                          [mock.patch.object(sb, "run_cloud", side_effect=sb.LaunchError("refused: the repository preflight for acme/web did not pass: x; nothing was created"))]),
+            "cloud": (["launch", self.NAME, "--cloud", "--repo", ACME_WEB], [mock.patch.object(sb, "run_cloud", side_effect=timeout)]),
+            "brief header": (self.base() + ["--resume", "ses_x", "--brief-file", str(self.home / "nobrief.txt")], [mock.patch.object(sb.V2Client, "session_get", lambda self, sid: {"metadata": {"fleet": {"name": "web-orch", "repo": ACME_WEB}}}), mock.patch.object(sb, "reattach_caller_problem", return_value=None)]),
+            "missing brief": (self.base() + ["--brief-file", str(self.home / "nobrief.txt")], []),
+        }
+        self.assertEqual(len(cases), 4)
+        for label, (argv, patches) in cases.items():
+            with self.subTest(label):
+                text, _ = self.check_refused(argv, patches, label)
+        self.assertEqual(len(self.sent()), 4)
+
+    def test_s3b_a_cloud_route_that_returns_a_refusal_code_after_printing_its_line_sends_the_line(self):
+        def refuse(function, *args):
+            sys.stderr.write("%s: the cloud refused the worker: Unable to connect to the server: i/o timeout\n" % sb.PROG)
+            return sb.EXIT_USAGE
+        text, err = self.check_refused(["launch", self.NAME, "--cloud", "--repo", ACME_WEB], [mock.patch.object(sb, "run_cloud", refuse)])
+        self.assertIn("i/o timeout", text)
+        self.assertIn("the cloud refused the worker", err)   # PC-1: what is printed stays
+
+    # -- S4
+
+    def test_s4_a_launch_that_meets_two_refusals_sends_one_message(self):
+        argv = self.base() + ["--new-workspace", "lab"]
+        argv = [a for a in argv if a not in ("--workspace", "w1")]
+        first = sb.LaunchError("the tab did not open")
+        # the launch's own refusal is re-raised with the workspace note: two refusals on one path
+        text, _ = self.check_refused(argv, [mock.patch.object(sb, "launch_agent", side_effect=first)])
+        self.assertIn("the tab did not open", text)
+        self.assertEqual(len(self.sent()), 1)
+
+    # -- S5 / U2
+
+    def test_s5_a_launch_that_succeeds_sends_no_refusal_message(self):
+        code, out, err = self.main(*self.base())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.sent(), [])
+        self.assertNotIn("refusal was not sent", err)
+
+    # -- U3
+
+    def test_u3_a_long_reason_with_a_token_is_bounded_and_scrubbed(self):
+        reason = ("x" * 1000) + " " + self.TOKEN + " " + ("y" * 1000)
+        text, err = self.check_refused(self.base(), [mock.patch.object(sb, "launch_agent_problem", return_value=reason)])
+        self.assertNotIn(self.TOKEN, text)
+        self.assertNotIn(self.TOKEN, err.replace(reason, ""))
+        body = text.split("launch of %s refused: " % self.NAME, 1)[1].strip().splitlines()[0]
+        self.assertLessEqual(len(body), sb.LAUNCH_REFUSED_REASON_MAX)
+        self.assertLessEqual(len(sb.launch_refusal_reason(reason)), 300)
+        self.assertEqual(sb.launch_refusal_reason("a\nb\tc"), "a b c")
+
+    def test_a_caller_that_cannot_be_identified_is_told_nothing_and_the_launch_says_so(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, _, err = self.main(*self.base() + ["--headless"])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(err.count("the refusal was not sent to anyone"), 1)
+
+    # -- S7: mutants
+
+    def mutant(self, name, target, replacement, expect):
+        original = getattr(sb, target)
+        with mock.patch.object(sb, target, replacement):
+            self.assertIsNot(getattr(sb, target), original, "mutant %s is applied" % name)
+            with self.assertRaises(AssertionError, msg="mutant %s was not caught" % name):
+                expect()
+
+    def refused_once(self):
+        self.check_refused(self.base() + ["--headless"], [])
+
+    def succeeded_silently(self):
+        before = len(self.sent())
+        code, _, err = self.main(*self.base() + ["--name-unused"] if False else self.base())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.sent()), before)
+
+    def refused_scrubbed(self):
+        text, _ = self.check_refused(self.base(), [mock.patch.object(sb, "launch_agent_problem", return_value="x" * 2000 + " " + self.TOKEN)])
+        self.assertNotIn(self.TOKEN, text)
+        body = text.split("launch of %s refused: " % self.NAME, 1)[1].strip().splitlines()[0]
+        self.assertLessEqual(len(body), 300)
+
+    def test_s7_a_refusal_that_sends_nothing_is_caught(self):
+        self.mutant("silent", "tell_launch_refused", lambda *a, **k: None, self.refused_once)
+
+    def test_s7_a_refusal_that_sends_twice_is_caught(self):
+        real = sb.tell_launch_refused
+
+        def twice(*a, **k):
+            real(*a, **k)
+            real(*a, **k)
+        self.mutant("twice", "tell_launch_refused", twice, self.refused_once)
+
+    def test_s7_a_success_that_sends_one_is_caught(self):
+        real_inner, real_tell = sb._cmd_launch, sb.tell_launch_refused
+
+        def chatty(args, runner, now, socket_call=None):
+            code = real_inner(args, runner, now, socket_call)
+            real_tell(runner, now, args.name, "it went fine")
+            return code
+        self.mutant("chatty", "_cmd_launch", chatty, self.succeeded_silently)
+
+    def test_s7_a_reason_with_an_unscrubbed_token_is_caught(self):
+        self.mutant("unscrubbed", "launch_refusal_reason", lambda text: str(text), self.refused_scrubbed)
+
+    def test_s7_the_unmutated_build_passes_each_check(self):
+        self.refused_once()
+        self.succeeded_silently()
+        self.refused_scrubbed()
+
+    # -- S8
+
+    def test_s8_the_documentation_states_the_message_and_its_absence_on_success(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        sections = [s for s in re.split(r"\n(?=#{2,4} )", text) if s.startswith(("### `launch` tells the caller", "## `launch` tells the caller"))]
+        self.assertEqual(len(sections), 1)
+        self.assertIn("launch of NAME refused:", sections[0])
+        self.assertIn("none is sent", sections[0])
+
+
+for _name in dir(TestLaunchMemoryGate):   # the memory gate's own tests run in its class, not again here
+    if _name.startswith("test_") and _name not in vars(TestLaunchRefusedMessage):
+        setattr(TestLaunchRefusedMessage, _name, None)
+
+
 class TestLaunchNewWorkspace(TwoRepoCase):
     def launch(self, label="Acme Web", charter=None, extra=()):
         work = self.home / "checkout"
