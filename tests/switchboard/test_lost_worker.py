@@ -127,6 +127,16 @@ def scenarios(mod):
     line(r.launcher, ts=stamp(NOW - 40), worker="w2", runtime_id="pod/w2", action="report", ok=True, reason="")
     check("S5 clean", r.passes() == [] and r.engine.sent == [])
 
+    r = Rig(mod)   # S5b: work already done (final text says so), pod ends at the hard limit with pushed false: a clean end, not a loss
+    r.created("w3")
+    line(r.launcher, ts=stamp(NOW - 40), worker="w3", runtime_id="pod/w3", action="report", ok=True, reason="work done: PRs already open, nothing new to push")
+    line(r.launcher, ts=stamp(NOW - 30), worker="w3", runtime_id="pod/w3", action="stop", ok=True, reason="hard limit", pushed=False)
+    check("S5b done then hard limit", r.passes() == [] and r.engine.sent == [])
+    r = Rig(mod)   # pushed false alone proves nothing: a pod with that and neither a stop nor a report is still lost
+    r.created("w4")
+    line(r.launcher, ts=stamp(NOW - 30), worker="w4", runtime_id="pod/w4", action="send", ok=True, reason="pushed=false")
+    check("S5c pushed false alone is not a clean end", len(r.passes()) == 1)
+
     r = Rig(mod)   # S6: the third launch of an ask
     for n in ("a1", "a2", "a3"):
         r.created(n)
