@@ -22488,15 +22488,15 @@ def _checked_policy_thresholds(thresholds, source):
 
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
-    (re.compile(r"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]*)"
-                r"(\s*[=:]\s*|\s+)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1\2[redacted]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth))([A-Za-z0-9_.-]+)"
+                r"(\s*[=:]\s*|\s+)(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[\"'][^\n]*|\S+)"), r"\1\2[redacted]"),
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
-    (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
+    (re.compile(r"(://[^/\s:@]+:)\S{1,256}@"), r"\1[redacted]@"),   # the password may hold a slash or a raw @ (the last @ within 256 characters of one word)
     # a whole key block (begin marker, body, the block's own first end marker): the body is [^-]* so every scan stops at the next dash (linear)
-    (re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----[^-]*-----END[A-Z ]*PRIVATE KEY(?: BLOCK)?-----"), "[redacted]"),
+    (re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:(?!-----(?:BEGIN|END))[\s\S])*(?:-----END[A-Z ]*-----)?"), "[redacted]"),
     (re.compile(r"-----(?:BEGIN|END)[A-Z ]*PRIVATE KEY(?: BLOCK)?-----"), "[redacted]"),   # a lone marker
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
+    (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),   # a JWT (#773)
 )
 
 
