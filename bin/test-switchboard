@@ -85274,7 +85274,7 @@ class TestProofNamesFilesByDefault(LedgerBase):
         self.assertEqual(code, 0, err)
         row = [e for e in self.ledger() if e["kind"] == "proof"][-1]
         self.assertEqual(row["files"], ["bin/test-switchboard", "docs/switchboard.md", "tools/derive-closure"])
-        self.assertIn("S2 names 3 file(s): bin/test-switchboard, docs/switchboard.md, tools/derive-closure", out)
+        self.assertIn("S2 names 3 file(s): bin/test-switchboard, docs/switchboard.md, tools/derive-closure", err)
         self.assertNotIn("no-such-file", json.dumps(row["files"]))
 
     def test_S3_and_U3_prove_with_no_existing_file_still_records_and_says_it_will_not_carry(self):
@@ -85283,14 +85283,14 @@ class TestProofNamesFilesByDefault(LedgerBase):
         rows = [e for e in self.ledger() if e["kind"] == "proof"]
         self.assertEqual(len(rows), 1)
         self.assertNotIn("files", rows[0])
-        self.assertEqual(len([l for l in out.splitlines() if "will not carry" in l]), 1)
+        self.assertEqual(err.count("names"), 0)   # its output stays as it was (pinned by TestPlanLedger); `gates` says it names no file
         self.assertTrue(out.splitlines()[-1].startswith("recorded #"))   # the last line stays the final line of #1049
 
     def test_U3_an_explicit_file_is_recorded_as_before_and_nothing_new_is_refused(self):
         code, out, err = self.prove("coder", "S2", "--file", "src/widget.py")
         self.assertEqual(code, 0, err)
         self.assertEqual([e for e in self.ledger() if e["kind"] == "proof"][0]["files"], ["src/widget.py"])
-        self.assertNotIn("names no file", out)
+        self.assertNotIn("names no file", out + err)
         self.assertEqual(self.prove("coder", "NOPE")[0], sb.EXIT_PARTIAL)
 
     def test_a_path_outside_the_tree_or_a_directory_is_never_named(self):

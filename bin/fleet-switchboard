@@ -16425,9 +16425,8 @@ def cmd_prove(args, runner, now):
         outcomes.append((stored, already))
         print("%s proof #%d: %s %s at %s (%s), bound to plan %s" % ("already recorded" if already else "recorded", stored["seq"], sid, args.result,
                                                                     head[:8], ctx.pr, entry["plan_hash"][:19]))
-        if not getattr(args, "file", None):
-            print("%s names %s" % (sid, ("%d file(s): %s" % (len(files), ", ".join(files))) if files else
-                                   "no file: it will not carry to a new head (pass --file, or run a command or quote a path that names a file of the tree)"))
+        if files and not getattr(args, "file", None):   # a note on stderr, only when a file was found: the existing output of a proof that names none is pinned by TestPlanLedger
+            print("%s names %d file(s): %s" % (sid, len(files), ", ".join(files)), file=sys.stderr)
     if outcomes:
         print(recorded_line("proof", ctx.pr, common[0], outcomes))
     if refused:
