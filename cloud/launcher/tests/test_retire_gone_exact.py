@@ -301,7 +301,8 @@ class UnreadIdentity(tcw.Base):
     """S9: a create whose read of the new pod fails says so once on stderr and in the audit."""
     MARK = "pod identity"
 
-    def create_with_failed_read(self, patches=()):
+    def create_with_failed_read(self, patches=(), answer=None, worker="coder7"):
+        """answer: None raises at the read; else a function (real pod) -> what the read returns."""
         real_wait, real_get, state = cw.Launcher._wait_ready, cw.Kube.get_pod, {"ready": False}
 
         def wait(launcher, name, seconds):
@@ -311,14 +312,16 @@ class UnreadIdentity(tcw.Base):
 
         def get(kube, name):
             if state["ready"]:
-                raise cw.CloudError("the cluster did not answer")
+                if answer is None:
+                    raise cw.CloudError("the cluster did not answer")
+                return answer(real_get(kube, name))
             return real_get(kube, name)
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(cw.Launcher, "_wait_ready", wait))
             stack.enter_context(mock.patch.object(cw.Kube, "get_pod", get))
             for p in patches:
                 stack.enter_context(p)
-            return self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main")
+            return self.run_cli("create", worker, "--repo", "acme-org/widget-service", "--branch", "main")
 
     def lines(self, err):
         return [x for x in err.splitlines() if self.MARK in x]
@@ -332,6 +335,46 @@ class UnreadIdentity(tcw.Base):
         self.assertIn("coder7", self.lines(err)[0])
         self.assertEqual(len(audited), 1)
         self.assertEqual(json.loads(out)["pod_uid"], "")
+
+    def test_s9_every_way_the_uid_is_missing_gives_the_same_one_line_and_one_audit_line(self):
+        cases = {"the read raises": None, "the read returns nothing": lambda pod: None,
+                 "the pod has no uid": lambda pod: {"metadata": {}},
+                 "the uid is empty": lambda pod: {"metadata": {"uid": ""}},
+                 "the uid is not text": lambda pod: {"metadata": {"uid": 7}}}
+        template = "cloud-worker: WARNING: the pod identity of %s could not be read; the worker record holds none and a retire acts by name"
+        for n, (label, answer) in enumerate(cases.items()):
+            with self.subTest(label):
+                worker = "coder%d" % n
+                code, out, err = self.create_with_failed_read(answer=answer, worker=worker)
+                self.assertEqual(code, 0, err)
+                print("%s: %d of 1 stderr line" % (label, len(self.lines(err))))
+                want = template % worker
+                self.assertEqual(self.lines(err), [want])
+                audited = [x for x in self.audit_lines() if self.MARK in x["reason"]]
+                self.assertEqual(len(audited), n + 1)   # one line per create, none more
+                self.assertIn(want.split("WARNING: ")[1], audited[-1]["reason"])
+                self.assertEqual(json.loads(out)["pod_uid"], "")
+
+    def test_s9_a_mutant_that_notes_only_the_raising_case_fails_the_other_cases(self):
+        real, applied = cw.Launcher._read_pod_uid, []
+
+        def only_raising(launcher, worker, name, info):
+            applied.append(worker)
+            try:
+                uid = ((launcher.kube.get_pod(name) or {}).get("metadata") or {}).get("uid")
+            except cw.CloudError:
+                launcher._note_unread_identity(worker, info)
+                return ""
+            return uid or ""   # nothing is noted for a read that answers without a usable uid
+        mutant = mock.patch.object(cw.Launcher, "_read_pod_uid", only_raising)
+        code, out, err = self.create_with_failed_read([mutant])
+        self.assertTrue(applied, "the mutation was not applied")
+        self.assertEqual(len(self.lines(err)), 1, "the mutant still notes the raising case")
+        applied.clear()
+        code, out, err = self.create_with_failed_read([mutant], answer=lambda pod: None, worker="coder8")
+        self.assertTrue(applied, "the mutation was not applied")
+        print("mutant: %d stderr lines for a read that returns nothing (the check wants 1)" % len(self.lines(err)))
+        self.assertEqual(self.lines(err), [], "the mutant is silent on a read that returns nothing")
 
     def test_s9_a_mutant_that_records_the_empty_identity_silently_fails_the_test(self):
         applied = []

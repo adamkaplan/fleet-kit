@@ -1821,11 +1821,7 @@ class Launcher:
             except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
                 self._abort(worker, name, made, e)
             domain = self.env.get("CW_CLOUD_DOMAIN", "example.internal")
-            try:   # the pod's own uid, read once now: a later retire acts only on a pod with this uid
-                pod_uid = ((self.kube.get_pod(name) or {}).get("metadata") or {}).get("uid") or ""
-            except CloudError:
-                pod_uid = ""
-                self._note_unread_identity(worker, info)
+            pod_uid = self._read_pod_uid(worker, name, info)
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain), "pod_uid": pod_uid,
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
@@ -1838,6 +1834,18 @@ class Launcher:
             return self._audited(worker, "create", go, reason)
         finally:
             self._restore_signals(old)
+
+    def _read_pod_uid(self, worker, name, info):
+        """The pod's own uid, read once at create: a later retire acts only on a pod with this uid.
+        One check covers every way it is missing (the read raises, or gives nothing, no uid, an empty or non-text uid)."""
+        try:
+            uid = ((self.kube.get_pod(name) or {}).get("metadata") or {}).get("uid")
+        except CloudError:
+            uid = None
+        if not (isinstance(uid, str) and uid):
+            self._note_unread_identity(worker, info)
+            return ""
+        return uid
 
     def _note_unread_identity(self, worker, info):
         """The create could not read the new pod's uid: say so once on stderr and in the create's audit line."""
