@@ -205,6 +205,8 @@ FINDING_TABLE = {
     "_impact_matrix_episode": ("impact matrix unreadable", "episode (own state)", "per episode", "test_s6_an_unreadable_matrix_changes_nothing_and_says_so_once_for_the_episode"),
     "_impact_post_list": ("owner-hold rule list", "rule version (own state)", "per rule", "test_s8_an_unreadable_decision_or_rule_or_file_list_is_refused_and_nothing_is_lifted"),
     "cmd_remind": ("a reminder the agent set (`remind`)", "its own id (a request, not a finding)", "none: sent as asked", "test_a_reminder_is_a_fact_only_once_it_is_due"),
+    "cloud_push_told": ("cloud branch head", "worker and head (cloud-heads.json)", "once per new head", "test_a_pushed_head_tells_the_lane_once_and_the_same_head_again_tells_nobody"),
+    "cloud_branch_tick": ("cloud branch head", "worker and head (cloud-heads.json)", "once per new head", "test_a_pushed_head_tells_the_lane_once_and_the_same_head_again_tells_nobody"),
     "set_checkpoint_reminders": ("checkpoint reminder", "launch (own id)", "once per launch", "test_a_launch_checkpoint_reminder_is_not_a_wait_and_a_workers_own_reminder_is"),
     "notify_drop": ("reminder drop notice", "dropped reminder (removed first)", "once", "test_a_drop_sends_the_setter_one_notice_naming_text_and_reason_audited_once"),
     "SweepFacts": ("sweep (a fact, merged per wake)", "set and slot (own key)", "re-alarm hours", "test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines"),

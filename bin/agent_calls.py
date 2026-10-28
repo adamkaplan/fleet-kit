@@ -382,6 +382,9 @@ NOTICE_DIR = "gh-low-told"
 NOT_AGENTS = frozenset((DAEMON_LANE, UNKNOWN_LANE, "other"))
 
 
+USAGE_FUTURE = 60   # seconds a reading may be ahead of the caller's clock before it counts as stale
+
+
 def low_budget(state_dir, account, now):
     """(remaining, limit) when the daemon's fresh reading puts `account` below LOW_FRACTION of its hourly budget, else None."""
     body = _read_json(os.path.join(state_dir, USAGE_FILE)) if state_dir else None
@@ -390,7 +393,7 @@ def low_budget(state_dir, account, now):
         remaining, limit, at = row["remaining"], row["limit"], body["at"]
     except (KeyError, TypeError):
         return None
-    if not all(_number(n) for n in (remaining, limit, at)) or limit <= 0 or now - at > USAGE_FRESH:
+    if not all(_number(n) for n in (remaining, limit, at)) or limit <= 0 or now - at > USAGE_FRESH or at - now > USAGE_FUTURE:   # a reading dated in the future is no evidence: stale, so above the line
         return None
     return (int(remaining), int(limit)) if remaining < LOW_FRACTION * limit else None
 

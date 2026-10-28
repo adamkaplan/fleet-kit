@@ -2517,6 +2517,8 @@ class Switchboard:
         self._wt_state().index = value
 
 
+    branch_interval = 60   # #1407: the least seconds between two reads of one cloud branch (the fallback for a repository with no live forwarder)
+
     def __init__(self, config, v2, herdr, audit, sources=(), now=time.time, actor="daemon", intents=None,
                  state_dir=None):
         self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
@@ -5822,6 +5824,7 @@ BOSS_READ_SITES = {
     "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
+    "bin/fleet-switchboard:_cloud_branch_workers": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, to name the lane that is told",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
 }
 
@@ -9349,6 +9352,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("cloud-watch", "cloud-watch", err, report)
     try:
+        cloud_branch_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("cloud-branch", "cloud-branch", err, report)
+    try:
         publish_decisions(engine)
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
@@ -9361,6 +9368,204 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("health-records", "health-records", err, report)
     schedule_judge_warm(engine, discovery)
+
+
+BRANCH_READS_PER_PASS = 20     # #1407: the most branch-head reads one pass makes (the rest wait for the next pass, round robin)
+BRANCH_PASS_SECONDS = 5.0      # the most monotonic time one pass spends on them
+BRANCH_READ_TIMEOUT = 5        # the timeout of one read
+BRANCH_HEADS_FILE = "cloud-heads.json"
+BRANCH_ABSENT_EVERY = 30       # a branch never seen is counted in ONE audit line every this many reads of it
+PUSH_CACHE_DELIVERIES = 100    # #1407: the push route reads the record list at most once per this many deliveries
+PUSH_CACHE_SECONDS = 10        # ... and a worker launched since is known within this many seconds
+BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
+BRANCH_REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+
+def _branch_target_ok(repo, branch):
+    """True for an OWNER/NAME and a branch that are safe in a read path: no part is `.` or `..` (or starts with a dot-dot run), no empty or dot segment in the
+    branch, no `%` or character outside the name set, no leading `-`."""
+    if not (isinstance(repo, str) and isinstance(branch, str) and BRANCH_REPO_RE.fullmatch(repo) and BRANCH_NAME_RE.fullmatch(branch)):
+        return False
+    if any(part in (".", "..") or part.startswith("..") for part in repo.split("/")):
+        return False
+    return not branch.startswith("-") and ".." not in branch and all(seg not in ("", ".") for seg in branch.split("/"))
+BRANCH_SHA_RE = re.compile(r"[0-9a-f]{40}")
+BRANCH_OBJECT_SHA_RE = re.compile(r"\"object\"\s*:\s*\{[^{}]*?\"sha\"\s*:\s*\"([0-9a-f]{40})\"")
+
+
+def _branch_heads_read(state_dir):
+    return agent_calls._read_json(str(Path(state_dir) / BRANCH_HEADS_FILE)) or {}   # the shared reader of daemon-written state: a missing, unreadable or non-object file is {}
+
+
+def _branch_heads_write(state_dir, heads):
+    path = Path(state_dir) / BRANCH_HEADS_FILE
+    temp = path.with_name(BRANCH_HEADS_FILE + ".tmp")
+    temp.write_text(json.dumps(heads, sort_keys=True))
+    os.replace(str(temp), str(path))
+
+
+def _branch_head(engine, repo, branch):
+    """(head, None) for a branch that exists, ("absent", None) for one that does not (yet), (None, why) for a read that failed. One bounded GET of the
+    ref through the repository's own account (counted, conditional, paused while the account is limited); nothing is written."""
+    try:
+        done = engine.accounts.read(engine.accounts.runner, "repos/%s/git/ref/heads/%s" % (repo, branch), repo, BRANCH_READ_TIMEOUT)
+    except (GhRateLimited, AccountError, OSError, subprocess.SubprocessError) as err:
+        return None, _one_line(type(err).__name__, 40)
+    if done.returncode != 0:
+        if re.search(r"\(HTTP 404\)", done.stderr or "") or re.match(r"HTTP/[\d.]+ 404\b", done.stdout or ""):   # the real not-found shape, not any text holding 404
+            return "absent", None
+        return None, "gh exit %s" % done.returncode
+    found = BRANCH_OBJECT_SHA_RE.search((done.stdout or "")[:20000])   # the answer is read for the one hex id of `object`, nothing else of it is parsed or kept
+    return (found.group(1), None) if found else (None, "unreadable answer")
+
+
+BRANCH_HEADS_LOCK = threading.Lock()   # the tick (engine thread) and the push route (listener thread) both write cloud-heads.json
+
+
+def _branch_heads_merge(state_dir, updates, keep=None):
+    """Write `updates` into cloud-heads.json over what is there NOW (the push route may have written since this pass read it); with `keep`, drop the
+    workers that are no longer recorded."""
+    with BRANCH_HEADS_LOCK:
+        heads = _branch_heads_read(state_dir)
+        before = dict(heads)
+        heads.update(updates)
+        if keep is not None:
+            heads = {k: v for k, v in heads.items() if k in keep}
+        if heads != before:
+            _branch_heads_write(state_dir, heads)
+
+
+def _cloud_branch_workers(state_dir, discovery, records, now):
+    """[(worker, repo, branch, lane, launch_head)] for the LIVE cloud workers whose launching lane is registered here (another lane's record, and a
+    worker that is retired, ended or gone, is never in it), sorted; None when the registry cannot be read whole (nothing is acted on). Shared by the
+    per-pass read and the push route."""
+    listed = registry_read(state_dir)
+    if not listed["whole"]:
+        return None
+    retired, last_reports = listed["retired"], _read_small(state_dir, LAST_REPORT_FILE)
+    eligible = []
+    for record in records:
+        worker, repo, branch = record.get("worker"), record.get("repo"), record.get("branch")
+        if not (isinstance(worker, str) and _branch_target_ok(repo, branch)):
+            continue
+        boss = _cloud_boss(record.get("reports_to"))
+        lane = resolve_boss(discovery, boss) if boss else None
+        if lane not in discovery.agents or not cloud_record_live(record=record, worker=worker, retired=retired, last_reports=last_reports, now=now):
+            continue   # another lane's record (no lane registered here to tell) or a worker that is retired, ended or gone: never read
+        eligible.append((worker, repo, branch, lane, record.get("launch_head")))
+    eligible.sort()
+    return eligible
+
+
+def cloud_push_told(state_dir, worker, branch, lane, launch_head, head, now):
+    """The push route's side of the same rule as the read: the message text, or None when the head is the one already told, or the first head seen
+    and the launch head (or none recorded). Records the head in cloud-heads.json."""
+    with BRANCH_HEADS_LOCK:
+        heads = _branch_heads_read(state_dir)
+        entry = heads.get(worker) if isinstance(heads.get(worker), dict) else {}
+        if entry.get("head") == head:
+            return None
+        first_equal = entry.get("head") is None and (launch_head is None or launch_head == head)
+        heads[worker] = {"head": head}
+        _branch_heads_write(state_dir, heads)
+    if first_equal:
+        return None
+    text = "pod %s pushed %s head %s" % (_one_line(worker, 60), _one_line(branch, 100), head[:8])
+    add_reminder(state_dir, lane, now, now, text)
+    return text
+
+
+def cloud_branch_tick(engine, discovery):
+    """#1407: a cloud pod has no switchboard command and its push raises no event, so ONE bounded read per pass of the head of the branch of each live
+    cloud worker whose lane is registered here (round robin, at most BRANCH_READS_PER_PASS reads and BRANCH_PASS_SECONDS), and ONE message to the
+    launching lane per new head: `pod NAME pushed BRANCH head XXXXXXXX`. Never a token or commit content. Read-only on the remote; below the daemon's
+    low-budget line an account's branches are not read. Returns the messages made."""
+    result = getattr(engine, "cloud_watch", None)
+    if result and getattr(engine, "hub", None) is not None:
+        engine.hub.cloud_records = result["records"]
+    if discovery is None or discovery.problems or not result or engine.state_dir is None or getattr(engine, "accounts", None) is None:
+        return []
+    now = engine.now()
+    eligible = _cloud_branch_workers(engine.state_dir, discovery, result["records"], now)
+    if eligible is None:
+        return []
+    hub = getattr(engine, "hub", None)
+    interval, clock = getattr(engine, "branch_interval", 0), getattr(engine, "branch_clock", None) or time.monotonic
+    read_at = getattr(engine, "_branch_read_at", None)
+    if read_at is None:
+        read_at = engine._branch_read_at = {}
+    started = clock()
+    # the fallback: only a repository with NO live forwarder is read (a live one tells us of a push as it happens), each branch at most once per interval
+    eligible = [e for e in eligible if not (hub is not None and hub.forwarder_live(e[1]))
+                and not (interval and e[0] in read_at and started - read_at[e[0]] < interval)]
+    eligible.sort()
+    heads = _branch_heads_read(engine.state_dir)
+    cursor = getattr(engine, "_branch_cursor", None)
+    if cursor is not None:
+        eligible = [e for e in eligible if e[0] > cursor] + [e for e in eligible if e[0] <= cursor]
+    absent = getattr(engine, "_branch_absent", None)
+    if absent is None:
+        absent = engine._branch_absent = {}
+    absent_due = []
+    deadline, reads, cut, skipped, failed, told, changed, updates = clock() + BRANCH_PASS_SECONDS, 0, None, set(), 0, [], False, {}
+    for worker, repo, branch, lane, launch_head in eligible:
+        if reads >= BRANCH_READS_PER_PASS:
+            cut = "reads"
+            break
+        if clock() > deadline:
+            cut = "time"
+            break
+        account = engine.accounts.describe(repo)
+        if account in skipped or agent_calls.low_budget(str(engine.state_dir), account, now) is not None:
+            skipped.add(account)
+            continue
+        reads += 1
+        read_at[worker] = clock()
+        engine._branch_cursor = worker
+        head, why = _branch_head(engine, repo, branch)
+        entry = heads.get(worker) if isinstance(heads.get(worker), dict) else {}
+        if head is None:
+            failed += 1
+            continue
+        if head == "absent":
+            if entry.get("head") is None:
+                absent[worker] = absent.get(worker, 0) + 1
+                if absent[worker] % BRANCH_ABSENT_EVERY == 0:
+                    absent_due.append(worker)
+            if entry.get("head") is None and not entry.get("absent"):
+                heads[worker], changed = {"absent": True}, True
+                updates[worker] = heads[worker]
+            continue
+        if entry.get("head") == head:
+            continue
+        first_equal = entry.get("head") is None and not entry.get("absent") and (launch_head is None or launch_head == head)   # the head the launch left (none recorded: the first one seen is it)
+        heads[worker], changed = {"head": head}, True
+        updates[worker] = heads[worker]
+        if first_equal:
+            continue
+        text = "pod %s pushed %s head %s" % (_one_line(worker, 60), _one_line(branch, 100), head[:8])
+        _branch_heads_merge(engine.state_dir, {worker: heads[worker]})   # the head is recorded BEFORE it is told: a crash between the two never tells twice
+        add_reminder(engine.state_dir, lane, now, now, text)
+        told.append(text)
+    names = {r.get("worker") for r in result["records"]}
+    if not result.get("capped"):
+        for gone in [k for k in list(absent) if k not in names]:
+            del absent[gone]
+        for gone in [k for k in read_at if k not in names]:   # the per-branch times are kept for the recorded workers only
+            del read_at[gone]
+    if changed or not result.get("capped"):
+        _branch_heads_merge(engine.state_dir, updates, None if result.get("capped") else names)
+    if engine.audit is not None:
+        if cut:
+            engine.audit.append(engine.actor, "cloud-branch.capped", "cloud-branch", {"bound": cut, "reads": reads, "waiting": len(eligible) - reads - len(skipped)})
+        if skipped:
+            engine.audit.append(engine.actor, "cloud-branch.skipped_budget", "cloud-branch", {"accounts": sorted(skipped)})
+        if absent_due:   # a branch that was NEVER seen is not silent forever: one line per BRANCH_ABSENT_EVERY reads of it, all such branches in one line
+            engine.audit.append(engine.actor, "cloud-branch.absent", "cloud-branch", {"branches": len(absent_due), "reads_each": BRANCH_ABSENT_EVERY})
+        if failed:
+            engine.audit.append(engine.actor, "cloud-branch.unreadable", "cloud-branch", {"branches": failed})
+    return told
+
 
 
 # ---- #117: the "waiting on the person" sweep. Deterministic (no model), over what the hub can read in a few bounded,
@@ -11863,6 +12068,8 @@ class GitHubHub:
         self._routed_batch, self._conflicts = [], set()
         self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}
         self._cursors, self.last_incomplete, self.last_failed_primary = {}, False, False   # #494: per repo, the steps of an unfinished catch-up window
+        self._push_cache, self._push_dropped, self._push_flushed = None, 0, self.now()   # #1407: the recorded workers (read rarely), the pushes dropped since the last audit line
+        self.cloud_records = None   # #1407: the cloud worker records of the last pass, set by cloud_branch_tick
         self.engine = None
         self.intent_verdicts = {}  # intent.edit key -> (wakes the Chief of Staff, why): decided once per edit
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
@@ -11886,6 +12093,60 @@ class GitHubHub:
         if reader is not None:
             reader.live = self.forwarder_generation   # a repo with a live forwarder: its webhook invalidates, so an Intent may be trusted longer
         return engine
+
+    def forwarder_live(self, repo):
+        """#1407: True when `repo` has a forwarder running now (its push events reach this daemon), so its branches are not read. Polling, down, starting and
+        an unwatched repository are not live."""
+        watch = self.watches.get(repo)
+        return watch is not None and watch.mode == "forwarder"
+
+    def route_push(self, repo, payload):
+        """#1407: a push delivery of `refs/heads/BRANCH` of `repo` to the branch of a LIVE recorded cloud worker of a lane registered here tells that lane
+        once per new head, with no GitHub read. Returns True when the push names such a worker (told or not). A tag, a deletion, any other branch and a
+        record of another lane or a retired worker do nothing. The recorded workers are read at most once per PUSH_CACHE_DELIVERIES deliveries and
+        PUSH_CACHE_SECONDS, never per delivery."""
+        ref, head, now = payload.get("ref"), payload.get("after"), self.now()
+        if payload.get("deleted") is True or not (isinstance(ref, str) and ref.startswith("refs/heads/") and isinstance(head, str)
+                                                  and BRANCH_SHA_RE.fullmatch(head) and set(head) != {"0"}):
+            return False
+        branch = ref[len("refs/heads/"):]
+        if not _branch_target_ok(repo, branch):
+            return False
+        with self.lock:
+            cached = self._push_cache
+            if cached is None or cached[1] >= PUSH_CACHE_DELIVERIES or now - cached[0] >= PUSH_CACHE_SECONDS or now < cached[0]:
+                cached = self._push_cache = [now, 0, None]
+            cached[1] += 1
+            fresh = cached[2] is None
+        if fresh:
+            table = self._push_workers_load(now)
+            with self.lock:
+                cached[2] = table
+        table = cached[2] or {}
+        matches = table.get((repo, branch)) or []
+        for worker, lane, launch_head in matches:
+            cloud_push_told(self.state_dir, worker, branch, lane, launch_head, head, now)
+        return bool(matches)
+
+    def _push_workers_load(self, now):
+        """{(repo, branch): [(worker, lane, launch_head)]} of the live recorded cloud workers: ONE read of the record list."""
+        discovery = self.discover()
+        if discovery is None or discovery.problems:
+            return {}
+        records = self.cloud_records or []   # the list the last pass of `cloud_watch_tick` read (set by `cloud_branch_tick`): the push route reads no file and loads no module
+        table = {}
+        for worker, repo, branch, lane, launch_head in _cloud_branch_workers(self.state_dir, discovery, records, now) or []:
+            table.setdefault((repo, branch), []).append((worker, lane, launch_head))
+        return table
+
+    def _push_dropped_note(self, now):
+        """One audit line, at most once a minute, with how many pushes matched no recorded worker (never one line per delivery)."""
+        with self.lock:
+            self._push_dropped += 1
+            if now - self._push_flushed < 60:
+                return
+            count, self._push_dropped, self._push_flushed = self._push_dropped, 0, now
+        self._audit("github.push_dropped", None, {"pushes": count, "why": "no recorded cloud worker has the branch"})
 
     def forwarder_generation(self, repo):
         """The number of times `repo`'s forwarder has started while it is running now, or None when it is not live (polling, down, starting): an entry
@@ -12026,6 +12287,21 @@ class GitHubHub:
         if sent not in (None, repo):
             self._audit("github.rejected", repo, {"reason": "payload names another repo", "event": event})
             return 202, "ignored"
+        if event == "push":   # #1407: a push is routed to a cloud worker's lane, or dropped at once: no queue item, no read, no per-delivery audit line
+            with self.lock:
+                watch = self.watches.get(repo)
+                if watch is not None:
+                    watch.last_event = self.now()
+            try:
+                routed = self.route_push(repo, payload)
+            except Exception as err:
+                self._audit("github.rejected", repo, {"reason": "push not routed: %s" % _one_line(str(err))})
+                return 202, "accepted"
+            if routed:
+                self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"), "keys": [], "count": 0})
+            else:
+                self._push_dropped_note(self.now())
+            return 202, "accepted"
         try:
             items = webhook_items(event, dict(payload, repository={"full_name": repo}), self.now())
         except Exception as err:
