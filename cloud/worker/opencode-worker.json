@@ -143,7 +143,9 @@
       "gh pr edit*--repo*": "deny",
       "gh api*PATCH*": "deny",
       "gh api*PUT*": "deny",
-      "gh api*DELETE*": "deny"
+      "gh api*DELETE*": "deny",
+      "*CW_PR_RECORD*": "deny",
+      "*pr-record*": "deny"
     }
   },
   "agent": {
@@ -292,7 +294,9 @@
           "gh pr edit*--repo*": "deny",
           "gh api*PATCH*": "deny",
           "gh api*PUT*": "deny",
-          "gh api*DELETE*": "deny"
+          "gh api*DELETE*": "deny",
+          "*CW_PR_RECORD*": "deny",
+          "*pr-record*": "deny"
         }
       }
     }

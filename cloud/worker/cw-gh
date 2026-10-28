@@ -245,8 +245,9 @@ def record_pr(n):
     """The pod's own record of pull requests it created (the file named by CW_PR_RECORD, one number a line); best effort."""
     path = os.environ.get("CW_PR_RECORD")
     if path and isinstance(n, int):
-        try:
-            with open(path, "a") as f:
+        try:   # owner-only (0600) and never through a symlink at the path (O_NOFOLLOW): a planted link fails closed, nothing is written
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "a") as f:
                 f.write("%d\n" % n)
         except OSError:
             pass
