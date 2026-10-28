@@ -77883,6 +77883,16 @@ class HoldChecks:
         self.t.assertEqual(hold_decide(f, HOLD_API, ["src/a.py"], config=empty), ("none", []))
         self.t.assertEqual(hold_decide(f, HOLD_API, ["src/a.py"], config=hold_config({"hold": {}}))[0], "none")
 
+    def c_report_carries_the_hold(self, f):
+        """S20: the real pr_floor_report (fake gh read) carries the entry's hold: the wiring, not only owner_decide."""
+        engine = mock.Mock()
+        engine.config, engine.state_dir, engine.audit = hold_config(), None, None
+        raw = {"files": [{"path": "auth/login.py"}], "changedFiles": 1, "headRefOid": "a" * 40, "baseRefOid": "b" * 40}
+        with mock.patch.object(sb, "read_pr_json", return_value=raw), mock.patch.object(sb, "agent_block_states", return_value={}):
+            report = sb.pr_floor_report(engine, HOLD_API, 5)
+        self.t.assertEqual(report["owner_decision"], "hold", report["owner_reasons"])
+        self.t.assertTrue(any("identity" in r and "auth/**" in r for r in report["owner_reasons"]), report["owner_reasons"])
+
     def names(self):
         return [n for n in dir(self) if n.startswith("c_")]
 
@@ -77938,6 +77948,49 @@ def _hold_mutants(f):
         def skip(paths, hold, exclude, cls=cls):
             return real_hits(paths, {c: g for c, g in hold.items() if c != cls}, exclude)
         out["M7 class %s is not read" % cls] = ({"entry_hits": skip}, {"c_class_holds"})
+
+    # M8..M14: the checks that had no mutant (the validation, S15, S16, S18, S19, S20)
+    def entry_of(a, kw):
+        return kw["entry"] if "entry" in kw else (a[7] if len(a) > 7 else None)
+
+    def is_ok(entry):
+        return isinstance(entry, tuple) and entry[0] == "ok"
+
+    def floor_globs_hold(paths, hold, exclude):
+        return real_hits(paths, hold, exclude) + [("identity", "src/**", p) for p in paths if f.matches(p, ["src/**"])]
+
+    def new_path_only(paths, hold, exclude):
+        return real_hits(list(paths)[-1:], hold, exclude)
+
+    def rating_silenced(matrix, *a, **kw):
+        decision, reasons = real_decide(matrix, *a, **kw)
+        if not is_ok(entry_of(a, kw)):
+            return decision, reasons
+        kept = [r for r in reasons if not r.startswith("rating:")]
+        return ("hold", kept) if kept else ("none", [])
+
+    def escape_unjudged(matrix, *a, **kw):
+        decision, reasons = real_decide(matrix, *a, **kw)
+        if not is_ok(entry_of(a, kw)):
+            return decision, reasons
+        kept = [r for r in reasons if "outside the repository" not in r]
+        return ("hold", kept) if kept else ("none", [])
+
+    def refuse_all(raw):
+        if raw and raw.get("repos"):
+            raise ValueError("'impact_floor.repos' hold is refused")
+
+    def entry_for_every_repo(config, repo, matrix=None):
+        return real_hold(config, repo, matrix) or ("ok", {}, [], True)
+
+    out["M15 a repository with no hold entry gets an empty one"] = ({"entry_hold": entry_for_every_repo}, {"c_no_entry_as_before"})
+    out["M8 a valid hold entry is refused"] = ({"validate_config": refuse_all}, {"c_validate_accepts"})
+    out["M9 an invalid hold entry is accepted"] = ({"validate_config": lambda raw: None}, {"c_validate_refuses"})
+    out["M10 the floor globs hold an entry repository"] = ({"entry_hits": floor_globs_hold}, {"c_unlisted_and_floor_only"})
+    out["M11 only a rename's new path is read"] = ({"entry_hits": new_path_only}, {"c_rename_source"})
+    out["M12 an entry silences the rating"] = ({"owner_decide": rating_silenced}, {"c_rating_still_holds"})
+    out["M13 an escaping path is not held under an entry"] = ({"owner_decide": escape_unjudged}, {"c_escape_holds"})
+    out["M14 the report is not wired to the entry"] = ({"entry_hold": lambda config, repo, matrix=None: None}, {"c_report_carries_the_hold"})
     return out
 
 
@@ -77971,6 +78024,20 @@ class TestImpactHoldByEntry(unittest.TestCase):
                     except AssertionError:
                         failed.add(check)
             self.assertTrue(failed & expected, "mutant %r survived: failed %s, expected one of %s" % (name, sorted(failed), sorted(expected)))
+
+    def test_every_check_has_a_mutant_that_makes_that_check_fail(self):
+        """Completeness, derived from the code: each c_* check is named by a mutant, and under that mutant that very check fails (a check added without a mutant fails here)."""
+        mutants = _hold_mutants(self.f)
+        named = {c for _, expected in mutants.values() for c in expected}
+        self.assertEqual(sorted(set(self.checks.names()) - named), [], "checks with no mutant")
+        self.assertEqual(sorted(named - set(self.checks.names())), [], "mutants naming no check")
+        for name, (patches, expected) in mutants.items():
+            for check in sorted(expected):
+                with contextlib.ExitStack() as stack:
+                    for attr, replacement in patches.items():
+                        stack.enter_context(mock.patch.object(self.f, attr, replacement))
+                    with self.assertRaises(AssertionError, msg="mutant %r does not fail its check %s" % (name, check)):
+                        getattr(self.checks, check)(self.f)
 
     def test_the_kit_name_and_machinery_are_read_from_the_matrix_not_copied(self):
         text = Path(self.f.__file__).read_text()
