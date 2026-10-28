@@ -285,5 +285,296 @@ class S1S6Docs(unittest.TestCase):
                 self.assertIn(phrase, t, path)
 
 
+import hashlib  # noqa: E402
+import inspect  # noqa: E402
+import textwrap  # noqa: E402
+
+
+def mutated(cls, name, old, new):
+    """A copy of cls.name whose source has `old` replaced by `new` (in the module's own globals); the mutation is asserted applied."""
+    src = textwrap.dedent(inspect.getsource(getattr(cls, name)))
+    assert old in src, "the mutation did not apply: %r" % old
+    ns = {}
+    exec(src.replace(old, new, 1), vars(cw), ns)
+    return ns[name]
+
+
+class Tree(Fixture):
+    """A record root of its own, a snapshot of everything around it, and a clean told-once set."""
+
+    def setUp(self):
+        super().setUp()
+        self.runs = os.path.join(self.tmp.name, "box", "runs")
+        self.env["CW_RUN_RECORD_DIR"] = self.runs
+        os.makedirs(self.runs, mode=0o700)
+        cw.FAILED_UNWRITTEN_TOLD.clear()
+        self.addCleanup(cw.FAILED_UNWRITTEN_TOLD.clear)
+
+    def snapshot(self):
+        out = set()
+        for root, dirs, names in os.walk(self.tmp.name):
+            dirs[:] = [d for d in dirs if d != "locks"]
+            for n in dirs + names:
+                if not n.startswith(("kube.json", "calls.jsonl", "audit.jsonl")):
+                    out.add(os.path.join(root, n))
+        return out
+
+    def calls(self):
+        with open(self.env["FAKE_KUBE_CALLS"]) as f:
+            return f.read()
+
+    def deletes(self):
+        return [line for line in self.calls().splitlines() if "delete" in line]
+
+    def set_annotation(self, worker, key, value):
+        st = self.st()
+        st["pods"][cw.pod_name(worker)]["metadata"]["annotations"][key] = value
+        self.write_state(st)
+
+    def planted(self, worker, annotation, status=None):
+        self.fail(worker, status or CASES["oomer"][0])
+        self.set_annotation(worker, "cw/worker", annotation)
+
+
+BAD_NAMES = (("empty", ""), ("space", " "), ("dots", "../.."), ("dotx", "../x"), ("slash", "/"), ("long", "a" * 33), ("upper", "Abc"),
+             ("control", "ab\x07c"), ("newline", "abc\n"), ("inner", "x/../y"), ("tab", "\tabc"))
+
+
+class HNameBeforePath(Tree):
+    def run_one(self, annotation):
+        self.count = getattr(self, "count", 0) + 1
+        self.last = "evil%d" % self.count
+        self.planted(self.last, annotation)
+        name = cw.pod_name(self.last)
+        before = self.snapshot()
+        made = len(self.calls().splitlines())   # the creation of the fixture is not a read by the code under test
+        reports = []
+        for minutes in (0, 11, 11):
+            self.clock.advance(minutes=minutes)
+            reports += self.reap()
+        code, out, err = self.run_cli("status")
+        self.assertEqual(code, 0, err)
+        pod_reads = sum(1 for line in self.calls().splitlines()[made:] if name in line)
+        return reports, before, self.snapshot(), pod_reads, self.deletes()
+
+    def test_a_worker_annotation_that_is_not_a_name_is_skipped_like_no_annotation(self):
+        for label, annotation in BAD_NAMES:
+            with self.subTest(label):
+                reports, before, after, pod_reads, deletes = self.run_one(annotation)
+                self.assertEqual(after, before)             # 0 files or directories written under or OUTSIDE the root
+                self.assertEqual(os.listdir(self.runs), [])
+                self.assertEqual(pod_reads, 0)              # 0 cluster reads of that pod
+                self.assertEqual(deletes, [])               # 0 deletes
+                self.assertEqual([r for r in reports if "pod failed" in r[1] or "record" in r[1]], [])
+                self.assertIsNotNone(self.pod(self.last))
+
+    def test_a_good_name_is_still_recorded(self):
+        self.planted("fine", "fine")
+        self.reap()
+        self.assertEqual([r["worker"] for r in self.records()], ["fine"])
+
+    def test_the_status_path_writes_nothing_for_a_foreign_failed_pod(self):   # L1
+        for label, annotation in (("none", None), ("dotx", "../x")):
+            with self.subTest(label):
+                foreign = "foreign" + label
+                self.planted(foreign, "x")
+                if annotation is None:
+                    st = self.st()
+                    st["pods"][cw.pod_name(foreign)]["metadata"]["annotations"].pop("cw/worker")
+                    self.write_state(st)
+                else:
+                    self.set_annotation(foreign, "cw/worker", annotation)
+                before = self.snapshot()
+                made = len(self.calls().splitlines())
+                code, out, err = self.run_cli("status")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual([l for l in self.calls().splitlines()[made:] if cw.pod_name(foreign) in l], [])
+
+    def test_a_mutant_that_removes_the_check_fails_the_dotdot_test(self):
+        applied = []
+        reap = mutated(cw.Launcher, "reap", "if not self._failed_name_fits(pod):", "if False:")
+        note = mutated(cw.Launcher, "_failed_note", "if not self._failed_name_fits(pod):", "if False:")
+        record = mutated(cw.Launcher, "record", 'and not self._failed_name_fits(pod):', "and False:")
+        applied.append(1)
+        with mock.patch.object(cw.Launcher, "reap", reap), mock.patch.object(cw.Launcher, "_failed_note", note), \
+                mock.patch.object(cw.Launcher, "record", record):
+            reports, before, after, pod_reads, deletes = self.run_one("../x")
+        self.assertTrue(applied)
+        self.assertTrue(pod_reads > 0 or deletes or after != before, "the mutant was not caught")
+
+    def test_the_directory_is_checked_to_be_inside_the_root_as_a_second_line(self):
+        self.planted("evil", "../..")
+        before = self.snapshot()
+        with mock.patch.object(cw.Launcher, "_failed_name_fits", lambda self_, pod: True):
+            out = self.reap()
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(out and out[0][1].startswith("record not written"), out)
+        self.assertIsNotNone(self.pod("evil"))
+
+
+class M1Safety(Tree):
+    def test_a_failed_pod_is_deleted_with_its_uid_and_a_recreated_pod_is_left_whole(self):   # (i)
+        self.fail("plain", CASES["oomer"][0])
+        uid = self.pod("plain")["metadata"]["uid"]
+        self.reap()
+        self.clock.advance(minutes=11)
+        seen = []
+        real = cw.Kube.delete_pod
+
+        def spy(kube, name, u=None):
+            seen.append(u)
+            return real(kube, name, u)
+        with mock.patch.object(cw.Kube, "delete_pod", spy):
+            self.assertEqual(self.reap(), [])
+        self.assertEqual(seen, [uid])
+        self.assertIsNone(self.pod("plain"))
+
+    def recreated(self, mutant=False):
+        self.fail("swap", CASES["oomer"][0])
+        self.reap()
+        self.clock.advance(minutes=11)
+        listed = cw.Kube(self.env).list_pods()               # the pods as the pass read them
+        st = self.st()
+        st["pods"][cw.pod_name("swap")]["metadata"]["uid"] = "uid-recreated"   # same name and run id, a new uid, after the list
+        self.write_state(st)
+        patches = [mock.patch.object(cw.Kube, "list_pods", lambda kube: listed)]
+        if mutant:
+            real = cw.Launcher._remove
+            patches.append(mock.patch.object(cw.Launcher, "_remove", lambda self_, name, nonce, uid=None: real(self_, name, nonce, None)))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return self.reap()
+
+    def test_a_pod_recreated_under_the_same_name_is_left_whole(self):
+        out = self.recreated()
+        self.assertIsNotNone(self.pod("swap"))
+        self.assertTrue(out and out[0][1].startswith("failed pod not deleted"), out)
+
+    def test_mutant_without_the_uid_deletes_the_recreated_pod(self):
+        self.recreated(mutant=True)
+        self.assertIsNone(self.pod("swap"), "the mutant did not delete: the test cannot tell")
+
+    def test_a_failed_pod_past_its_hard_deadline_takes_the_old_stop_path(self):   # (ii)
+        self.fail("late", CASES["oomer"][0])
+        noted = []
+        real = cw.Launcher._failed_note
+        stopped = []
+        with mock.patch.object(cw.Launcher, "_failed_note", lambda self_, pod: noted.append(1) or real(self_, pod)), \
+                mock.patch.object(cw.Launcher, "stop", lambda self_, a, reason=None: stopped.append(reason) or {}):
+            self.clock.advance(hours=3)   # past every hard deadline
+            out = self.reap()
+        self.assertEqual(stopped, ["hard limit"])
+        self.assertEqual(noted, [])
+        self.assertEqual(out, [("late", "hard limit", 0)])
+
+    def test_mutant_that_checks_failed_first_takes_the_new_branch(self):
+        self.fail("late", CASES["oomer"][0])
+        mutant = mutated(cw.Launcher, "reap", "if hard is not None and now >= hard:", "if False:")
+        stopped = []
+        with mock.patch.object(cw.Launcher, "reap", mutant), \
+                mock.patch.object(cw.Launcher, "stop", lambda self_, a, reason=None: stopped.append(reason) or {}):
+            self.clock.advance(hours=3)
+            self.reap()
+        self.assertEqual(stopped, [], "the mutant still took the stop path")
+
+    def lists_that_fail(self):
+        return (lambda kube: (_ for _ in ()).throw(cw.CloudError("the server is down")),
+                lambda kube: json.loads("{"),
+                lambda kube: [{"metadata": None}])
+
+    def touched_after_failed_lists(self):
+        """How many of the 3 failed lists left the pod untouched (a delete or a new file counts as touched)."""
+        self.fail("quiet", CASES["oomer"][0])
+        self.clock.advance(minutes=30)
+        before, untouched = self.snapshot(), 0
+        for fake in self.lists_that_fail():
+            with mock.patch.object(cw.Kube, "list_pods", fake):
+                try:
+                    self.reap()
+                except Exception:   # a pass that cannot read the list may stop with an error; it must touch nothing
+                    pass
+            if self.snapshot() == before and not self.deletes() and self.pod("quiet") is not None:
+                untouched += 1
+        return untouched
+
+    def test_a_failed_or_partial_pod_list_touches_nothing(self):   # (iii)
+        self.assertEqual(self.touched_after_failed_lists(), 3)
+
+    def test_mutant_that_goes_on_with_another_list_when_the_list_fails_is_caught(self):
+        def lister(self_):
+            try:
+                return self_.kube.list_pods()
+            except Exception:
+                return self_.kube.list_pods_all()   # the mutation: a failed list is replaced by another read and the pass acts
+        mutant = mutated(cw.Launcher, "reap", "for pod in self.kube.list_pods():", "for pod in self._lister():")
+        with mock.patch.object(cw.Launcher, "_lister", lister, create=True), mock.patch.object(cw.Launcher, "reap", mutant):
+            self.assertLess(self.touched_after_failed_lists(), 3)
+
+
+class L2L3BDC(Tree):
+    def test_a_record_with_a_time_that_cannot_be_read_does_not_stop_the_pass(self):   # L2: the pod is left, said once
+        self.fail("broke", CASES["oomer"][0])
+        self.fail("fine", CASES["oomer"][0])
+        self.reap()
+        path = [os.path.join(self.runs, n, "run.json") for n in os.listdir(self.runs) if n.startswith("broke-")][0]
+        with open(path) as f:
+            info = json.load(f)
+        info["recorded_at"] = "not a time"
+        with open(path, "w") as f:
+            json.dump(info, f)
+        self.clock.advance(minutes=11)
+        first = self.reap()
+        second = self.reap()
+        self.assertEqual(len([r for r in first if r[0] == "broke"]), 1)
+        self.assertEqual([r for r in second if r[0] == "broke"], [])   # said once
+        self.assertIsNotNone(self.pod("broke"))                       # left, not deleted and not rewritten
+        self.assertEqual(len(self.records()), 2)
+        self.assertIsNone(self.pod("fine"))                           # the healthy pod is still handled
+
+    def test_a_record_of_another_worker_with_the_same_pod_run_id_is_not_accepted(self):   # L3
+        self.fail("mine", CASES["oomer"][0])
+        key = cw.ann(self.pod("mine"), "run-id") or self.pod("mine")["metadata"]["uid"]
+        tail = hashlib.sha1(key.encode()).hexdigest()[:6]
+        other = os.path.join(self.runs, "mine-20260101T000000Z-" + tail)
+        os.makedirs(other, mode=0o700)
+        with open(os.path.join(other, "run.json"), "w") as f:
+            json.dump({"worker": "someone", "pod_run_id": key, "exit_reason": "pod failed", "recorded_at": cw.iso(self.clock())}, f)
+        self.reap()
+        self.assertEqual(sorted(r["worker"] for r in self.records()), ["mine", "someone"])
+
+    def test_an_unreadable_deadline_of_a_failed_pod_is_said_once_and_the_pod_is_recorded(self):   # B
+        self.fail("odd", CASES["oomer"][0])
+        self.set_annotation("odd", "cw/hard-deadline", "not a time")
+        first, second = self.reap(), self.reap()
+        self.assertEqual(sum(1 for r in first + second if r[1] == "unreadable deadline"), 1)
+        self.assertEqual([r["worker"] for r in self.records()], ["odd"])
+
+    def test_a_failed_pod_with_a_deletion_time_is_recorded_and_deleted_as_before(self):   # C
+        self.fail("going", CASES["oomer"][0])
+        st = self.st()
+        st["pods"][cw.pod_name("going")]["metadata"]["deletionTimestamp"] = cw.iso(self.clock())
+        self.write_state(st)
+        self.reap()
+        self.assertEqual(len(self.records()), 1)
+        self.assertIsNotNone(self.pod("going"))
+        self.clock.advance(minutes=11)
+        self.reap()
+        self.assertIsNone(self.pod("going"))   # the code does not look at the deletion time: the delete is sent after ten minutes
+
+
+class M2L4DDocs(unittest.TestCase):
+    def test_the_last_limits_are_stated(self):
+        for path in DOC_FILES:
+            t = doc(path)
+            for phrase in ("A record written when the pod could not be read has, as its reason, the text of the read error", "and is not refreshed",
+                           "checked against the worker-name rule", "clears the entry of an unwritable record when that record is written",
+                           "leaves a few bytes in the set until the process ends", "not stripped of control characters (the JSON escapes them)",
+                           "only the status line prints, and it is stripped"):
+                self.assertIn(phrase, t, path)
+
+
+
 if __name__ == "__main__":
     unittest.main()

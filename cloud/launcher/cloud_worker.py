@@ -2307,6 +2307,9 @@ class Launcher:
 
     def record(self, pod):
         name = pod["metadata"]["name"]
+        if (pod.get("status") or {}).get("phase") == "Failed" and not self._failed_name_fits(pod):   # not this launcher's pod: nothing is read of it
+            return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": "Failed", "idle_since": None,
+                    "deadlines": {"idle": None, "hard": ann(pod, "hard-deadline")}, "cost_estimate_usd": self.cost(pod)}
         if (pod.get("status") or {}).get("phase") == "Failed":   # a dead pod answers nothing: its reason is read, once, from the cluster
             note, _ = self._failed_note(pod)
             return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": "Failed", "idle_since": None,
@@ -2355,6 +2358,11 @@ class Launcher:
             text = status.get("reason") or whole.get("_unread") or last.get("reason") or "no reason was given"
         return self.kube.scrub(text, 300), code, events, self.kube.scrub(status.get("message") or "", 300)
 
+    def _failed_name_fits(self, pod):
+        """True when the pod's worker annotation is a worker name (NAME_RE, the whole text): only then it may become a part of a path."""
+        worker = ann(pod, "worker")
+        return isinstance(worker, str) and bool(NAME_RE.fullmatch(worker))
+
     def _failed_key(self, pod):
         return ann(pod, "run-id") or (pod.get("metadata") or {}).get("uid") or pod["metadata"]["name"]
 
@@ -2367,18 +2375,29 @@ class Launcher:
         except OSError:
             return None
         for n in names:
-            if n.startswith(worker + "-") and n.endswith("-" + tail):
+            if n.startswith(worker + "-") and n.endswith("-" + tail):   # the name is a guide; the record's own fields decide
                 try:
                     with open(os.path.join(root, n, "run.json")) as f:
                         info = json.load(f)
                 except (OSError, ValueError):
                     continue
-                if info.get("pod_run_id") == self._failed_key(pod) and info.get("exit_reason") == "pod failed":
+                if isinstance(info, dict) and info.get("pod_run_id") == self._failed_key(pod) and info.get("exit_reason") == "pod failed" \
+                        and info.get("worker") == worker:
                     return info
         return None
 
+    def _failed_aged(self, worker, pod, note, now):
+        """True when the record is old enough for the pod to go, False when not, None when its time cannot be read. Such a record counts as
+        no usable record: the pod is left (neither rewritten nor deleted), the caller says so once, and the other pods of the pass go on."""
+        try:
+            return (now - parse_iso(note["recorded_at"])).total_seconds() >= FAILED_POD_KEEP_SECONDS
+        except (ValueError, TypeError):
+            return None
+
     def _failed_note(self, pod):
         """(record, new): the run record of a Failed pod; read ONCE (the pod's status and events) and written once; a second call finds it."""
+        if not self._failed_name_fits(pod):   # no path part is built from a text that is not a worker name: nothing is read or written
+            return {"unwritten": True, "skipped": True, "pod_failed_reason": "", "pod_message": "the pod carries no usable worker name"}, False
         found = self._failed_find(pod)
         if found:
             return found, False
@@ -2391,7 +2410,11 @@ class Launcher:
                 "pod_message": message, "events": events, "head_sha": None, "transcript": "unavailable", "reason": "the pod ended Failed; no session could be read"}
         directory = None
         try:
-            directory = os.path.join(run_record.private_root(self.recorder.root()), run_id)
+            base = run_record.private_root(self.recorder.root())
+            directory = os.path.join(base, run_id)
+            if not os.path.realpath(directory).startswith(os.path.realpath(base) + os.sep):   # a second line of defence
+                directory = None
+                raise OSError("the record directory is outside the record root")
             os.makedirs(directory, mode=0o700, exist_ok=True)
             run_record.write_private(directory, "run.json", json.dumps(info, sort_keys=True) + "\n")
         except OSError as e:
@@ -2453,17 +2476,24 @@ class Launcher:
         for pod in self.kube.list_pods():
             worker = ann(pod, "worker")
             reason = None
+            failed = (pod.get("status") or {}).get("phase") == "Failed"
             try:
                 hard = self.hard_deadline(pod)
             except (ValueError, TypeError):
-                out.append((worker, "unreadable deadline", 1))  # one bad pod never stops the pass
-                continue
-            if now >= hard:
+                if not failed:
+                    out.append((worker, "unreadable deadline", 1))  # one bad pod never stops the pass
+                    continue
+                hard = None   # a Failed pod is still handled below; its deadline is said once, not on every pass
+                said = (worker, self._failed_key(pod), "deadline")
+                if self._failed_name_fits(pod) and said not in FAILED_UNWRITTEN_TOLD:
+                    FAILED_UNWRITTEN_TOLD.add(said)
+                    out.append((worker, "unreadable deadline", 1))
+            if hard is not None and now >= hard:
                 reason = "hard limit"
-            elif (pod.get("status") or {}).get("phase") == "Failed":
+            elif failed:
                 # A pod that ended Failed answers nothing: read why ONCE, keep the record, report it once; delete it ten minutes after
                 # its record unless it holds unpushed work (kept). A second pass reads no activity of it.
-                if not worker:   # it carries the launcher's label but no worker annotation: not this launcher's pod, never read, recorded or deleted
+                if not self._failed_name_fits(pod):   # no worker annotation, or one that is not a worker name: not this launcher's pod, never read, recorded or deleted
                     continue
                 note, fresh = self._failed_note(pod)
                 told = (worker, self._failed_key(pod))
@@ -2475,8 +2505,12 @@ class Launcher:
                 FAILED_UNWRITTEN_TOLD.discard(told)
                 if fresh:
                     out.append((worker, "pod failed: " + note["pod_failed_reason"][:160], 0))
-                elif ann(pod, "kept") != "true" and note.get("recorded_at") and \
-                        (now - parse_iso(note["recorded_at"])).total_seconds() >= FAILED_POD_KEEP_SECONDS:
+                elif ann(pod, "kept") != "true" and note.get("recorded_at") and self._failed_aged(worker, pod, note, now) is None:
+                    said = (worker, self._failed_key(pod), "time")
+                    if said not in FAILED_UNWRITTEN_TOLD:
+                        FAILED_UNWRITTEN_TOLD.add(said)
+                        out.append((worker, "record time unreadable; the pod is left", 1))
+                elif ann(pod, "kept") != "true" and note.get("recorded_at") and self._failed_aged(worker, pod, note, now):
                     try:
                         self._remove(pod["metadata"]["name"], ann(pod, "run-id") or None, (pod.get("metadata") or {}).get("uid"))
                     except CloudError as e:
