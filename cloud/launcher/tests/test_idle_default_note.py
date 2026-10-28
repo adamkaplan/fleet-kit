@@ -97,6 +97,12 @@ def sb_module(case):
 
 
 class CreateDefault(lbase.Base):
+    def create(self, worker="coder7", *extra):
+        """A create that adds no idle flag of its own (the test base's helper pins 10m), so the default is what is under test."""
+        code, out, err = self.run_cli("create", worker, "--repo", "acme-org/widget-service", "--branch", "main", *extra)
+        self.assertEqual(code, 0, err)
+        return json.loads(out)
+
     def test_a_create_without_idle_gives_1800_seconds_and_a_deadline_30_minutes_out(self):
         out = self.create("coder7")
         self.assertEqual(self.pod()["metadata"]["annotations"]["cw/idle-seconds"], "1800")
