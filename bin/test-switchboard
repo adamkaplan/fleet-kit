@@ -85419,6 +85419,35 @@ class TestProofNamesFilesByDefault(LedgerBase):
         with mock.patch.object(sb.plan_ledger, "head_view", blind), self.assertRaises(AssertionError):
             self.check_views(self.views())
 
+    def test_S4_a_failed_proof_is_never_read_as_proven_or_carried(self):
+        failed = [{"seq": 1, "kind": "proof", "pr": self.PR, "scenario": "A", "plan_hash": "h", "head": self.NEW, "result": "fail", "files": ["a.py"]},
+                  {"seq": 2, "kind": "proof", "pr": self.PR, "scenario": "B", "plan_hash": "h", "head": "1" * 40, "result": "fail", "files": ["b.py"]},
+                  {"seq": 3, "kind": "carried", "pr": self.PR, "proof": 2, "scenario": "B", "plan_hash": "h", "old_head": "1" * 40, "new_head": self.NEW}]
+        for sid in "AB":
+            line = sb.plan_ledger.head_view(sid, "tester", failed, self.PR, "h", self.NEW, lambda old: ["z.py"])
+            self.assertIn("says fail", line)
+            self.assertNotIn("proven", line)
+            self.assertNotIn("carried (", line)
+        self.assertIn("A: proven at this head", self.views()["A"])
+
+    def test_S4_the_result_blind_head_view_mutant_is_caught(self):
+        real = sb.plan_ledger.head_view
+
+        def blind(scenario_id, evaluator, entries, pr, plan_hash, head, files_between):
+            return real(scenario_id, evaluator, [dict(e, result="pass") if e.get("kind") == "proof" else e for e in entries], pr, plan_hash, head, files_between)
+        failed = [{"seq": 1, "kind": "proof", "pr": self.PR, "scenario": "A", "plan_hash": "h", "head": self.NEW, "result": "fail", "files": ["a.py"]}]
+        with mock.patch.object(sb.plan_ledger, "head_view", blind), self.assertRaises(AssertionError):
+            self.assertIn("says fail", sb.plan_ledger.head_view("A", "tester", failed, self.PR, "h", self.NEW, lambda old: []))
+
+    def test_S8_the_documentation_says_a_named_file_is_not_the_full_dependency_set(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("## A proof names its files by default")
+        section = text[start:text.index("\n## ", start + 5)]
+        self.assertIn("a named file is not the proof's full dependency set: a proof carries when the files it names are unchanged, not when everything it depends on is", section)
+        self.assertIn("working tree the command runs in", section)
+        self.assertIn("a symlink is named under its own name", section)
+        self.assertIn("a quoted docs file in the evidence makes the proof depend on it", section)
+
     def test_S8_the_documentation_names_the_three_statements(self):
         text = (REPO / "docs" / "switchboard.md").read_text()
         start = text.index("## A proof names its files by default")

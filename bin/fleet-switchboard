@@ -16353,7 +16353,7 @@ def _record(ctx, args, now, entry):
 
 
 def tree_file_exists(runner=None):
-    """(#1405) `exists(path)` for `plan_ledger.proof_files`: True for a regular file of the working tree this command runs in, found under the git top level (else the current directory),
+    """(#1405) `exists(path)` for `plan_ledger.proof_files`: True for a regular file of the working tree the command runs in (not the pull request head's tree), found under the git top level (else the current directory),
     never outside it. Any trouble reading is "no such file"."""
     try:
         top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)

@@ -626,6 +626,9 @@ def head_view(scenario_id, evaluator, entries, pr, plan_hash, head, files_betwee
     if not rows:
         return None
     row = rows[-1]
+    if row.get("result") != "pass":   # a failed proof is never proven and never carried
+        return "%s: proof at this head says %s" % (scenario_id, row.get("result") or "fail") if row.get("head") == head else \
+            "%s: void: the proof recorded at %s says %s, so it is never carried" % (scenario_id, str(row.get("head"))[:8], row.get("result") or "fail")
     if row.get("head") == head:
         return "%s: proven at this head" % scenario_id
     named = sorted({f for f in (row.get("files") or ()) if isinstance(f, str) and f})
