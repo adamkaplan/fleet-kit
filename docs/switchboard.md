@@ -6197,7 +6197,7 @@ The daemon checks at its start and on every pass, and acts on a bad tree only wh
 
 When a git read fails without a plain answer (a lock, a corrupt `HEAD`, a timeout, git missing), the tree is neither good nor bad: it is unreadable. This reverses the earlier rule that a failed read is no evidence, for the commands that matter:
 
-- A command that records a verdict, a gate, a clear, a merge or a proof refuses with one line saying the tree could not be read. These are the commands whose handler is flagged `ledger` or `records` in the command registry (`prove`, `verdict`, `waive`, `gates`, `gates-check`, `merge-gate`, `item-prove`, `item-verdict`, `impact`, `cloud-clear`, `review`, `plan` and `run --once`); a test holds every command whose name says it records one of those things to the flags, so a new one cannot be forgotten.
+- A command that records a verdict, a gate, a clear, a merge or a proof refuses with one line saying the tree could not be read. These are the commands whose handler is flagged `ledger`, marked `@recording` (the one list `recording_commands()` reads) or flagged `guard_records` in the command registry (`prove`, `verdict`, `waive`, `gates`, `gates-check`, `merge-gate`, `item-prove`, `item-verdict`, `impact`, `cloud-clear`, `review`, `plan` and `run --once`); a test holds every command whose name says it records one of those things to the flags, so a new one cannot be forgotten.
 - Any other command runs, with one note on stderr that it ran without the check.
 - The daemon skips that pass and alerts, as for a bad tree, and resumes by itself when the tree can be read.
 

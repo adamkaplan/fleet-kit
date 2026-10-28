@@ -3772,9 +3772,10 @@ def installed_guard_module(directory=None):
 
 def command_records(action, known):
     """True when the command `action` records a verdict, a gate, a clear, a merge or a proof: DERIVED from the registry, by the flags of its handler
-    (`ledger`: the evidence ledger's commands; `records`: the others, set beside the handler). `run` is one: its `--once` pass decides and delivers."""
+    (`ledger`: the evidence ledger's commands; `records`: the ONE list of `@recording` functions (`recording_commands()`), never a second one; `guard_records`: the others, set beside the handler). `run` is one: its `--once` pass decides and delivers."""
     handler = resolve_command(action, known)
-    return handler is not None and (getattr(handler, "ledger", False) is True or getattr(handler, "records", False) is True)
+    return handler is not None and (getattr(handler, "ledger", False) is True or isinstance(getattr(handler, "records", None), str)
+                                    or getattr(handler, "guard_records", False) is True)
 
 
 def installed_tree_check(action, state_dir=None, root=None, runner=subprocess.run, daemon=False, records=False):
@@ -7322,7 +7323,7 @@ def cmd_cloud_clear(args, runner, now):
     return run_cloud("cmd_cloud_clear", args, runner, now)
 
 
-cmd_cloud_clear.records = True   # a clear (#1380)
+cmd_cloud_clear.guard_records = True   # a clear (#1380)
 
 
 def watch_problem(engine, state, name, discovery):
@@ -13865,7 +13866,7 @@ def cmd_run(args, runner, now, wait):
 
 
 STANDBY_SECONDS = 10  # how often `run --standby` looks again for a free lock
-cmd_run.records = True   # `run --once` decides and delivers (#1380); the daemon itself is not refused at the entry and checks the tree on every pass
+cmd_run.guard_records = True   # `run --once` decides and delivers (#1380); the daemon itself is not refused at the entry and checks the tree on every pass
 
 
 def cmd_ensure(args, spawn=subprocess.Popen):
@@ -17577,7 +17578,7 @@ def cmd_impact(args, runner, now):
 
 
 cmd_impact.direct = True   # no error mapping, no daemon start
-cmd_impact.records = True   # `impact clear` records a clear (#1380: it refuses on a tree git could not read)
+cmd_impact.guard_records = True   # `impact clear` records a clear (#1380: it refuses on a tree git could not read)
 
 
 IMPACT_MATRIX_PATHS_MAX = 50   # paths printed per floor rule by `impact matrix --for-rater`
@@ -20523,7 +20524,6 @@ def cmd_review(args, runner, now):
 
 
 cmd_review.direct = True   # no error mapping, no daemon start
-cmd_review.records = True   # `review record` records a review verdict (#1380)
 
 
 def cmd_review_checkout(args, runner, now):
@@ -23356,7 +23356,7 @@ def cmd_plan(args, runner, now, socket_call=None):
 
 
 cmd_plan.direct = True   # no error mapping, no daemon start
-cmd_plan.records = True   # the plan ledger's approvals and gates (#1380)
+cmd_plan.guard_records = True   # the plan ledger's approvals and gates (#1380)
 
 
 def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen, socket_call=None):

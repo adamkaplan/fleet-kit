@@ -97,6 +97,14 @@ class UnreadableTreeTests:
         flagged = {name for name in self.known() if getattr(sb.resolve_command(name, self.known()), "ledger", False)}
         self.assertTrue(flagged and flagged <= recording)   # every command of the evidence ledger records
 
+    def test_the_guards_set_contains_every_marked_recording_function_and_the_marks_are_untouched(self):
+        """The repo's one list (`recording_commands()`, the `@recording` functions) is inside the guard's set; the guard adds flags, it never overwrites a mark."""
+        marked = sb.recording_commands()
+        self.assertEqual(sorted(marked), ["prove", "review", "verdict"])
+        self.assertTrue(set(marked) <= set(self.recording()))
+        for name, kind in marked.items():
+            self.assertIsInstance(sb.resolve_command(name, self.known()).records, str, name)
+
     def test_every_command_whose_name_says_it_records_is_a_recording_command(self):
         """The completeness check: a command named for a verdict, a gate, a proof, a clear or a merge that no flag marks fails here."""
         self.assertEqual(guard.unflagged_recording_names(self.known(), set(self.recording())), [])
