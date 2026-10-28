@@ -100,7 +100,7 @@ TestPlanReceipts, TestDecisionHeadlines, TestExternalAdapterErrors, TestJobTool 
 TestPlanKind, TestAuditRotation, TestAgentsVerify, TestReviewLawsStarterSet = (_support_test_cases_02.TestPlanKind, _support_test_cases_02.TestAuditRotation, _support_test_cases_02.TestAgentsVerify, _support_test_cases_02.TestReviewLawsStarterSet)   # support import
 TestPluginPush, TestReconcileOnRead = (_support_test_cases_02.TestPluginPush, _support_test_cases_02.TestReconcileOnRead)   # support import
 _support_test_cases_03 = importlib.import_module("test_cases_03")   # support import
-TestV2Client, TestStatus, TestPoke, GitHubOverGit = (_support_test_cases_03.TestV2Client, _support_test_cases_03.TestStatus, _support_test_cases_03.TestPoke, _support_test_cases_03.GitHubOverGit)   # support import
+TestV2Client, TestStatus, TestPoke = (_support_test_cases_03.TestV2Client, _support_test_cases_03.TestStatus, _support_test_cases_03.TestPoke)   # support import
 TestReportFoldVariants, TestDecisionWriteWaitsForTheList, TestTrialDecisionsPlugin, TestCommissioningDocs = (_support_test_cases_03.TestReportFoldVariants, _support_test_cases_03.TestDecisionWriteWaitsForTheList, _support_test_cases_03.TestTrialDecisionsPlugin, _support_test_cases_03.TestCommissioningDocs)   # support import
 TestKeyFile, TestTodolistPlugin, ReaperOnlyFakes, TestTheReaperOnlyDryRunLive = (_support_test_cases_03.TestKeyFile, _support_test_cases_03.TestTodolistPlugin, _support_test_cases_03.ReaperOnlyFakes, _support_test_cases_03.TestTheReaperOnlyDryRunLive)   # support import
 TestInstallPutsTheCliOnPath, TestExternalAdapterKeys, TestExternalAdapterOperations, TestExternalAdapterPort = (_support_test_cases_03.TestInstallPutsTheCliOnPath, _support_test_cases_03.TestExternalAdapterKeys, _support_test_cases_03.TestExternalAdapterOperations, _support_test_cases_03.TestExternalAdapterPort)   # support import
@@ -49117,7 +49117,7 @@ class TestMadeUpPids(unittest.TestCase):
         return sorted(set(hits))
 
     def test_no_integer_literal_stands_in_for_a_process_anywhere_in_the_test_file(self):
-        self.assertEqual(sum((self.pid_literals(p.read_text()) for p in [Path(__file__), *sorted((REPO / "tests" / "switchboard").glob("test_*.py"))]), []), [])   # this file and the test files the classes moved to
+        self.assertEqual(sum((self.pid_literals(p.read_text()) for p in [Path(__file__), *sorted((REPO / "tests" / "switchboard").glob("test_*.py")), *sorted((REPO / "tests" / "switchboard" / "support").glob("*.py"))]), []), [])   # this file, the test files the classes moved to and the support modules the fakes moved to
 
     def test_the_scan_catches_each_position_a_hard_coded_number_can_take(self):
         mutants = ('rows = [(4001, 1, self.p, 7, "x")]', 'rows = [(self.px[1], 4001, self.p, 7)]', 'call(pid=4001)', 'call(shell_pid=4001)', 'x = {"pid": 4001}',
