@@ -106,7 +106,8 @@ A JSON object keyed by agent name:
     "url": "http://<agent-host>:<port>",
     "session": "<session id>",
     "password_file": "/path/to/password-file",
-    "issue": "<optional>"
+    "issue": 7,
+    "repo": "acme-org/widget-service"
   }
 }
 ```
@@ -118,7 +119,12 @@ A JSON object keyed by agent name:
 - `session`: letters, digits, `_`, `-`, 1 to 100 characters.
 - `password_file`: file holding the agent's OpenCode password (at most 4096 characters, no control characters, trailing newline
   removed); sent as Basic auth with user `opencode`.
-- `issue`: optional; named in the message header and sent in the prompt metadata.
+- `issue`: optional; a whole number above 0 (a number, never text); named in the message header and sent in the prompt metadata. The
+  launcher writes it at registration from the create's `--issue`, and leaves the key out when the create names no issue.
+- `repo`: the repository (`OWNER/NAME`) of the create, written by the launcher at registration.
+
+The launcher, not the person or the agent, writes `repo` and `issue` in the entry of every registered worker, in the one place
+that registers it.
 
 A recipient not in the file is refused 404. A bad record is a 503. The hub posts to `<url>/api/session/<session>/prompt` with
 delivery `queue` and a 10 second timeout; a non-2xx answer from the agent is a 503.
