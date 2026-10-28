@@ -6172,3 +6172,7 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## An Intent edit is told once (#1437)
+
+An Intent edit is delivered once per recipient, however many wakes follow. The edit is named by the issue (with its repo), the edit time (`updated_at`) and a body hash (a hash of the changed Intent and Done-when text), so a second real edit of the same issue is a new edit and is delivered once too. The record of who was told is kept in `intent-told.json` in the state directory (bounded in size and age), so it survives a restart; a missing or corrupt file reads as empty and is audited, never an error.

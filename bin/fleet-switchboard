@@ -2832,11 +2832,16 @@ class Switchboard:
         fresh.conflict = list(previous.conflict)
         return fresh, None
 
-    def _acknowledge(self, keys):
+    def _acknowledge(self, keys, recipient=None):
         """Tell the fact sources that hold items in memory (GitHub, PR 5) which keys are delivered."""
         for source in self.sources:
+            told = getattr(source, "told", None)
             acknowledge = getattr(source, "acknowledge", None)
-            if acknowledge is not None:
+            if told is not None and recipient is not None:
+                told(keys, recipient)   # before acknowledge: the record is written while the held payload still names the edit
+                if acknowledge is not None:
+                    acknowledge(keys, recipient)
+            elif acknowledge is not None:
                 acknowledge(keys)
 
     def charter_repo(self, observation):
@@ -2969,7 +2974,7 @@ class Switchboard:
                 return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
                               "cannot read what %s already has: %s" % (recipient, err))
             pending = [fact for fact in facts if fact.key not in delivered]
-            self._acknowledge(delivered)
+            self._acknowledge(delivered, recipient)
             if pending and not complete:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
                               "the last %d messages of %s reach back less than to %s, so what it "
@@ -3091,7 +3096,7 @@ class Switchboard:
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
-        self._acknowledge(keys)
+        self._acknowledge(keys, plan.recipient)
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "commit_told"):
             self.intents.commit_told()
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
@@ -11454,6 +11459,7 @@ REVIEW_STRICT_RE = re.compile(r"^Review of ([0-9a-f]{40}): (APPROVE|CHANGES REQU
 REVIEW_VERDICTS = ("CHANGES REQUESTED", "APPROVE")
 REVIEW_NAME_CAP = 40
 REVIEW_UNOWNED_FILE, REVIEW_UNOWNED_CAP = "review-unowned.json", 2000
+INTENT_TOLD_FILE, INTENT_TOLD_CAP, INTENT_TOLD_AGE = "intent-told.json", 2000, 14 * 86400   # #1437: which recipient was told which Intent edit
 
 
 def _review_verdict(first_line):
@@ -12068,14 +12074,72 @@ class GitHubHub:
             while len(self.queue) > GITHUB_QUEUE_LIMIT:
                 self.queue.pop(next(iter(self.queue)))
 
-    def acknowledge(self, keys):
+    def acknowledge(self, keys, recipient=None):
         """The engine found these keys delivered: forget them. Not stored, so a later
         catch-up that reads them again queues them once more, and the transcript
         stops the repeat."""
         with self.lock:
             for key in keys:
                 self.queue.pop(key, None)
-                self.intent_edits.pop(key, None)
+                # an Intent edit named with its recipient (#1437) is kept until every Chief of Staff has it: `told` records who does
+                if recipient is None:
+                    self.intent_edits.pop(key, None)
+        if recipient is not None:
+            chiefs = self._chiefs_of_staff()
+            with self.lock:
+                for key in [k for k in keys if k in self.intent_edits]:
+                    if all(self._told_has(name, self.intent_edits[key]) for name in chiefs):
+                        del self.intent_edits[key]
+
+    def _told_load(self):
+        """The durable record {"<recipient>|<edit id>": time}, read once and kept; corrupt or missing reads as empty."""
+        if getattr(self, "_told", None) is None:
+            path = Path(self.state_dir) / INTENT_TOLD_FILE if getattr(self, "state_dir", None) else None
+            data = {}
+            if path is not None:
+                try:
+                    data = load_module("record_json").parse_bounded(path.read_text())
+                except OSError:
+                    data = {}
+                except ValueError:
+                    data = {}
+                    self._audit("github.rejected", "-", {"reason": "%s is unreadable: read as empty" % INTENT_TOLD_FILE})
+            self._told = {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, (int, float))} \
+                if isinstance(data, dict) else {}
+        return self._told
+
+    def told(self, keys, recipient):
+        """The engine confirmed `keys` delivered to `recipient`: record each held Intent edit among them, per recipient, durably."""
+        with self.lock:
+            edits = [self.intent_edits[k] for k in keys if k in self.intent_edits]
+            if not edits:
+                return
+            record = self._told_load()
+            now = self.now()
+            for payload in edits:
+                record["%s|%s" % (recipient, intent_edit_id(payload))] = now
+            for stale in [k for k, t in record.items() if t < now - INTENT_TOLD_AGE]:
+                del record[stale]
+            while len(record) > INTENT_TOLD_CAP:
+                del record[min(record, key=record.get)]
+            if getattr(self, "state_dir", None) is None:
+                return
+            path = Path(self.state_dir) / INTENT_TOLD_FILE
+            tmp = path.with_name(INTENT_TOLD_FILE + ".tmp")
+            try:
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as handle:
+                    handle.write(json.dumps(record))
+                os.replace(str(tmp), str(path))
+            except OSError:
+                pass
+
+    def _told_has(self, recipient, payload):
+        return "%s|%s" % (recipient, intent_edit_id(payload)) in self._told_load()
+
+    def _was_told(self, recipient, payload):
+        with self.lock:
+            return self._told_has(recipient, payload)
 
     # -- an edit to an ask's Intent (PR 6's item and toast, which nothing called until now)
 
@@ -12158,6 +12222,8 @@ class GitHubHub:
                     fact = intent_change_fact(payload, name)
                     if fact is None or fact.created < self.now() - self.lookback:
                         continue
+                    if self._was_told(name, payload):
+                        continue
                     wakes, note = self.intent_edit_wakes(fact)
                     if not wakes:
                         continue
@@ -12200,6 +12266,7 @@ class GitHubHub:
                 self.start()  # inside the daemon's lock: the first pass starts it
             return self.facts()
         github_facts.acknowledge = self.acknowledge
+        github_facts.told = self.told
         github_facts.toasts = self.toasts
         return github_facts
 
@@ -15530,6 +15597,14 @@ def intent_change_fact(payload, recipient="chief-of-staff"):
     key = "intent.edit:%s:%s" % ("%s#%d" % (repo, number) if repo else number, updated)
     return Fact(key, recipient, "intent.edit", summary, created, issue=number,
                 sender=login if isinstance(login, str) and login else "github", repo=repo)
+
+
+def intent_edit_id(payload):
+    """What names one Intent edit (#1437): repo#issue, the edit time (`updated_at`) and a hash of the changed Intent text."""
+    number, updated, _ = _payload_issue(payload)
+    repo = (payload.get("repository") or {}).get("full_name")
+    text = json.dumps([[label, new] for label, _old, new in intent_diff(payload)])
+    return "%s#%d:%s:%s" % (repo, number, updated, hashlib.sha256(text.encode()).hexdigest()[:16])
 
 
 def intent_change_toast(payload):
