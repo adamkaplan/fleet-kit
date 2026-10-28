@@ -45710,12 +45710,14 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         self.assertLessEqual(len(sb.launch_refusal_reason(reason)), 300)
         self.assertEqual(sb.launch_refusal_reason("a\nb\tc"), "a b c")
 
-    def test_a_caller_that_cannot_be_identified_is_told_nothing_and_the_launch_says_so(self):
+    def test_a_caller_that_cannot_be_identified_is_told_nothing_and_nothing_more_is_printed(self):
         os.environ.pop("HERDR_PANE_ID", None)
         code, _, err = self.main(*self.base() + ["--headless"])
         self.assertNotEqual(code, 0)
         self.assertEqual(self.sent(), [])
-        self.assertEqual(err.count("the refusal was not sent to anyone"), 1)
+        self.assertNotIn("not sent", err)
+        self.assertEqual(len([l for l in err.strip().splitlines() if l.strip()]), 1)
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "launch.refusal_unsent"][0]["subject"], self.NAME)
 
     # -- S7: mutants
 

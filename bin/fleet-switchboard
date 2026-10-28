@@ -14145,16 +14145,21 @@ def launch_refusal_reason(text):
 
 def tell_launch_refused(runner, now, name, reason):
     """#1464: ONE `[switchboard]` message to the caller: `launch of NAME refused: <reason>`. A caller who cannot be identified (a plain shell, no
-    pane) is told nothing and the one line on stderr says so; nothing here raises: the refusal's own exit is what the launch returns."""
+    pane) is told nothing and nothing more is printed; nothing here raises: the refusal's own exit is what the launch returns."""
     text = "launch of %s refused: %s" % (_one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(name)), 80), launch_refusal_reason(reason))
+    engine = None
     try:
         engine, _, _ = build_engine(runner, now, "cli")
         caller = identify_caller(engine.herdr, engine.v2, os.environ)
         discovery = engine.discover(engine.now())
         fact = Fact("launch.refused:%s:%s" % (caller, uuid.uuid4().hex[:16]), caller, "launch.refused", text, engine.now(), batch=False, sender="switchboard")
         engine.send_fact(fact, discovery, engine.now())
-    except Exception:
-        sys.stderr.write("%s: the refusal was not sent to anyone: the caller could not be identified (a plain shell has no one to tell)\n" % PROG)
+    except Exception as err:   # nothing more is printed (what a refused launch prints stays as it is): the audit line, when there is a log, is the record
+        try:
+            if engine is not None and engine.audit is not None:
+                engine.audit.append(engine.actor, "launch.refusal_unsent", str(name)[:80], {"why": _one_line(str(err), 160)})
+        except Exception:
+            pass
 
 
 def cmd_launch(args, runner, now, socket_call=None):
