@@ -2447,6 +2447,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | `facts` | NOT CHECKED when the PR view is unreadable (the whole `facts` is None) | no view, no gate board |
 | `unreadable` | NOT CHECKED (the PR view's own error) | same |
 | `head` | NOT CHECKED when absent | no head: no per-head moment |
+| `review` | a PR view with no decision reads as none: GitHub's `reviewDecision` (`changes requested` or not) only widens which standing change requests `gates` lists (the review list itself is read by `standing_requests`, never by a gate); an unreadable review list is said on a `blocking review:` line | no gate reads it: information only (#1404) |
 | `notice_senders` | absent: fewer known writers; the writers of the proofs still exclude their own verdicts, so the pull request stays as ready as the board says (the row tests only that the baseline stays ready; an exclusion of a proof by a notice sender is not tested here) | it only narrows who is excluded; a failing notice read raises, which is NOT CHECKED |
 | `author` | absent: the proof writers and notice senders still exclude their own verdicts; the board is read as it is (the row tests only that the baseline stays ready; an exclusion of a proof by the author is not tested here) | the author is one more excluded name; it opens no gate on its own |
 | `ci` | NOT READY when None, none or unknown (G4 missing) | the PR view was whole: no green run is not green |
