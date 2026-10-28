@@ -21860,7 +21860,14 @@ def cmd_preflight_pr(args, runner, now):
             args.merged = False
             code = cmd_preflight_pr_in(args, runner, now, merged.path)
             return EXIT_ERROR if run_new_bin_guards(ps, runner, merged.path, added, now) and code == EXIT_OK else code
-    return cmd_preflight_pr_in(args, runner, now, root)
+    code = cmd_preflight_pr_in(args, runner, now, root)
+    try:   # #1457: without --merged the one table of NEW_BIN_GUARDS runs too, when the change adds a file under bin/; a change that adds none prints nothing more
+        ps = load_module("path_suites")
+        base = ps.default_base(root, runner)
+        added = ps.added_paths(root, base, runner) if base else []
+    except Exception:   # no base to compare with: the change is not known to add a bin file, so nothing more runs and nothing more is printed
+        added = []
+    return EXIT_ERROR if run_new_bin_guards(ps, runner, root, added, now) and code == EXIT_OK else code
 
 
 def run_new_bin_guards(ps, runner, root, added, now):
