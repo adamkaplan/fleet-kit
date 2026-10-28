@@ -358,7 +358,7 @@ class TestDocs(unittest.TestCase):
             text = " ".join(f.read().split())
         for phrase in ("within one pass of the launcher's stop",
                        "once per run id and cause", "the worker, the reason, the time, whether the work was pushed", "the run record's name",
-                       "the field `cause`", "`idle`, `hard`, `pod_gone`", "`pod_failed`", "decides from `cause` alone", "alerts on its FIRST line", "a vanished pod is noticed one reaper pass late", "before the audit's last 24 hours is not noticed", "ONE message to the Chief of Staff always", "send nothing, because they carry no `cause`",
+                       "the field `cause`", "`idle`, `hard`, `pod_gone`", "`pod_failed`", "decides from `cause` alone", "alerts on its FIRST line", "a vanished pod is noticed one reaper pass late", "before the audit's last 24 hours is not noticed", "confirmed by reading it by its own name", "older than 10 minutes, so a pod gone within 10 minutes is noticed on a later pass", "a failed stop does not close the run", "ONE message to the Chief of Staff always", "send nothing, because they carry no `cause`",
                        "lost, never repeated, when a send fails after the state is saved", "drains one megabyte per pass", "a corrupt cursor skips the lines written meanwhile"):
             self.assertIn(phrase, text)
 

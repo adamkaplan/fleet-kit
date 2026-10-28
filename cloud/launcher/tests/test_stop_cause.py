@@ -27,17 +27,20 @@ class Cause(tcw.Base):
     def hook(self):
         pass
 
-    def mutant(self, old, new):
-        """The launcher module with `old` replaced by `new` (asserted applied, once)."""
+    def mutant(self, old, new, *more):
+        """The launcher module with `old` replaced by `new` (and each further pair), each asserted applied, once."""
         import types
         with open(cw.__file__) as f:
             text = f.read()
-        self.assertEqual(text.count(old), 1, "the mutation did not apply")
+        pairs = [(old, new)] + [more[i:i + 2] for i in range(0, len(more), 2)]
+        for o, n in pairs:
+            self.assertEqual(text.count(o), 1, "the mutation did not apply")
+            text = text.replace(o, n)
         mod = types.ModuleType("cw_mutant")
         mod.__file__ = cw.__file__
         sys.modules["cw_mutant"] = mod
         self.addCleanup(sys.modules.pop, "cw_mutant", None)
-        exec(compile(text.replace(old, new), "cw_mutant", "exec"), mod.__dict__)
+        exec(compile(text, "cw_mutant", "exec"), mod.__dict__)
         mod.Launcher.run_hook = lambda launcher, name: {"pushed": False, "wip_branch": None}
         return mod
 
@@ -104,15 +107,75 @@ class Cause(tcw.Base):
             self.reap()
         self.assertEqual([(l["cause"], l["ok"]) for l in self.stops()], [("hard", False)])
 
-    def test_s11_a_vanished_pod_is_written_once_over_three_passes(self):
+    def other_pod_alive(self):
+        """A second worker whose pod stays in the snapshot (an empty snapshot is no evidence)."""
+        self.create("coder8", "--hard", "5h")
+
+    def vanish(self, minutes=30):
         self.create()
+        self.other_pod_alive()
         self.lose_pod()
+        self.clock.advance(minutes=minutes)
+
+    def coder7_stops(self):
+        return [l for l in self.stops() if l["worker"] == "coder7" and l.get("cause") == "pod_gone"]
+
+    def test_s11_a_vanished_pod_is_written_once_over_three_passes(self):
+        self.vanish()
         for _ in range(3):
             self.reap()
-        stops = self.stops()
+        stops = self.coder7_stops()
         self.assertEqual(len(stops), 1)
         self.assertEqual((stops[0]["cause"], stops[0]["ok"], stops[0]["worker"], stops[0]["runtime_id"], stops[0]["reason"]),
                          ("pod_gone", True, "coder7", "pod/" + cw.pod_name("coder7"), "pod gone; no stop was recorded"))
+
+    def test_s15_a_create_two_minutes_old_writes_nothing(self):
+        self.vanish(minutes=2)
+        self.reap()
+        self.assertEqual(self.coder7_stops(), [])
+
+    def test_s15_a_pod_the_by_name_read_returns_writes_nothing(self):
+        self.vanish()
+        with mock.patch.object(cw.Kube, "get_pod", lambda kube, name: {"metadata": {"name": name}}):
+            self.reap()
+        self.assertEqual(self.coder7_stops(), [])
+
+    def test_s15_a_by_name_read_that_fails_writes_nothing(self):
+        self.vanish()
+
+        def bad(kube, name):
+            raise cw.CloudError("kubectl get: the server is unavailable")
+        with mock.patch.object(cw.Kube, "get_pod", bad):
+            self.reap()
+        self.assertEqual(self.coder7_stops(), [])
+
+    def test_s15_an_empty_snapshot_with_the_pod_existing_writes_nothing(self):
+        self.create()
+        self.clock.advance(minutes=30)
+        with mock.patch.object(cw.Kube, "list_pods", lambda kube: []), \
+                mock.patch.object(cw.Kube, "get_pod", lambda kube, name: {"metadata": {"name": name}}):
+            self.reap()
+        self.assertEqual(self.stops(), [])
+
+    def test_s16_a_failed_stop_line_leaves_the_run_open(self):
+        self.vanish()
+        self.audit_append({"action": "stop", "worker": "coder7", "ok": False, "runtime_id": self.rid_of("coder7")})
+        self.reap()
+        self.assertEqual(len(self.coder7_stops()), 1)
+
+    def test_s16_a_run_closed_by_a_stop_that_happened_writes_nothing(self):
+        self.vanish()
+        self.audit_append({"action": "stop", "worker": "coder7", "ok": True, "runtime_id": self.rid_of("coder7")})
+        self.reap()
+        self.assertEqual(len(self.coder7_stops()), 0)
+
+    def rid_of(self, worker):
+        return [l for l in self.audit_lines() if l["action"] == "create" and l["worker"] == worker][0]["runtime_id"]
+
+    def audit_append(self, rec):
+        rec = dict(rec, ts=cw.iso(self.clock()))
+        with open(self.env["CW_CLOUD_AUDIT"], "a") as f:
+            f.write(json.dumps(rec) + "\n")
 
     def test_s11_a_present_pod_writes_nothing(self):
         self.create()
@@ -155,12 +218,66 @@ class Cause(tcw.Base):
         self.assertNotIn("cause", self.stops()[0])   # the real code writes pod_gone
 
     def test_m8_a_vanished_pass_that_writes_on_every_pass_is_caught(self):
-        mod = self.mutant('elif rec.get("action") in ("stop", "delete") and rid in open_runs:', 'elif False:')
-        self.create()
-        self.lose_pod()
+        mod = self.mutant('elif rec.get("action") in ("stop", "delete") and rec.get("ok") is True and rid in open_runs:', 'elif False:')
+        self.vanish()
         for _ in range(3):
             mod.Launcher(mod.Kube(self.env), self.env, self.clock).reap()
-        self.assertEqual(len(self.stops()), 3)   # the real code writes 1
+        self.assertEqual(len(self.coder7_stops()), 3)   # the real code writes 1
+
+    def stamping_mutant(self):
+        return self.mutant("if not pods:\n            return", "if False:\n            return",
+                           "if (now - created).total_seconds() <= VANISHED_MIN_AGE_SECONDS:", "if False:",
+                           "gone = self.kube.get_pod(pod_name(worker)) is None", "gone = True")
+
+    def test_m9_a_mutant_that_stamps_from_the_snapshot_alone_fails_four_s15_tests(self):
+        mod = self.stamping_mutant()
+        failed = 0
+        young = self.vanish_with(mod, minutes=2)
+        failed += bool(young)
+        returned = self.vanish_with(mod, read=lambda kube, name: {"metadata": {"name": name}})
+        failed += bool(returned)
+
+        def bad(kube, name):
+            raise cw.CloudError("kubectl get: the server is unavailable")
+        failed += bool(self.vanish_with(mod, read=bad))
+        self.create("coder9")
+        self.clock.advance(minutes=30)
+        with mock.patch.object(cw.Kube, "list_pods", lambda kube: []), \
+                mock.patch.object(mod.Kube, "list_pods", lambda kube: []):
+            mod.Launcher(mod.Kube(self.env), self.env, self.clock).reap()
+        failed += any(l["worker"] == "coder9" for l in self.stops())
+        self.assertEqual(failed, 4)   # the real code writes nothing in all four
+
+    def vanish_with(self, mod, minutes=30, read=None):
+        """Lines the mutant writes for a fresh worker whose pod is gone (the real tests expect none when read is given or minutes is small)."""
+        self.n_vanished = getattr(self, "n_vanished", 0) + 1
+        name = "wolf%s" % "abcdefgh"[self.n_vanished]
+        self.create(name)
+        st = self.st()
+        st["pods"].pop(cw.pod_name(name))
+        self.write_state(st)
+        self.clock.advance(minutes=minutes)
+        if read:
+            with mock.patch.object(mod.Kube, "get_pod", read):
+                mod.Launcher(mod.Kube(self.env), self.env, self.clock).reap()
+        else:
+            mod.Launcher(mod.Kube(self.env), self.env, self.clock).reap()
+        return [l for l in self.stops() if l["worker"] == name]
+
+    def test_m10_a_mutant_where_any_stop_closes_the_run_is_caught(self):
+        mod = self.mutant('and rec.get("ok") is True and rid in open_runs:', 'and rid in open_runs:')
+        self.vanish()
+        self.audit_append({"action": "stop", "worker": "coder7", "ok": False, "runtime_id": self.rid_of("coder7")})
+        mod.Launcher(mod.Kube(self.env), self.env, self.clock).reap()
+        self.assertEqual(len([l for l in self.coder7_stops()]), 0)   # the real code writes 1
+
+    def test_u4_the_vanished_code_reads_the_pod_by_name_before_the_write_and_checks_ok(self):
+        with open(cw.__file__) as f:
+            text = f.read()
+        body = text[text.index("def _note_vanished_pods"):text.index("def renew_git_tokens")]
+        self.assertIn("VANISHED_MIN_AGE_SECONDS = 600", text)
+        self.assertLess(body.index("self.kube.get_pod(pod_name(worker))"), body.index('self.audit(worker, rid, "stop"'))
+        self.assertIn('rec.get("ok") is True', body)
 
 
 if __name__ == "__main__":

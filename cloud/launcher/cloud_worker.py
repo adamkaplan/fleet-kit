@@ -1060,6 +1060,8 @@ def refresh_reason(err):
 
 VANISHED_READ_BYTES = 2 * 1024 * 1024   # the most audit bytes the vanished-pod check reads
 VANISHED_WINDOW_SECONDS = 24 * 3600      # and the oldest line it looks at
+VANISHED_MIN_AGE_SECONDS = 600           # a create line must be older than this before its pod is read by name
+VANISHED_MAX_READS = 20                  # the most by-name pod reads of one pass
 
 
 def audit_path(env):
@@ -2426,11 +2428,25 @@ class Launcher:
                 continue
             rid = rec.get("runtime_id")
             if rec.get("action") == "create" and rec.get("ok") is True and isinstance(rid, str) and rid:
-                open_runs[rid] = rec.get("worker")
-            elif rec.get("action") in ("stop", "delete") and rid in open_runs:
-                del open_runs[rid]
-        for rid, worker in open_runs.items():
-            if rid not in present and isinstance(worker, str) and NAME_RE.match(worker):
+                open_runs[rid] = (rec.get("worker"), when)
+            elif rec.get("action") in ("stop", "delete") and rec.get("ok") is True and rid in open_runs:
+                del open_runs[rid]   # only a stop that happened closes the run; a failed stop (the pod was kept) leaves it open
+        if not pods:
+            return   # an empty snapshot is no evidence of anything
+        reads = 0
+        for rid, (worker, created) in open_runs.items():
+            if rid in present or not isinstance(worker, str) or not NAME_RE.match(worker):
+                continue
+            if (now - created).total_seconds() <= VANISHED_MIN_AGE_SECONDS:
+                continue   # too young: a later pass notices it
+            if reads >= VANISHED_MAX_READS:
+                break
+            reads += 1
+            try:
+                gone = self.kube.get_pod(pod_name(worker)) is None   # None only on the exact not-found of this one pod
+            except (CloudError, ValueError, TypeError, OSError):
+                continue   # any other answer: nothing is written for it
+            if gone:
                 self.audit(worker, rid, "stop", 0.0, True, "pod gone; no stop was recorded", "pod_gone")
 
     # -- the git token's renewal (one more step of the reaper's pass) --
