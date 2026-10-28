@@ -233,6 +233,85 @@ class Diag(unittest.TestCase):
             self.s4(m, signal.SIGTERM)
 
 
+# Ask #1414, KILL after a short grace: a lane entry whose child ignores TERM. The child writes "<shell pid> <sleep pid>" to its file.
+STUBBORN = "test_lane_stubborn.py"
+FAKES[STUBBORN] = (
+    "import os, subprocess, sys\nd = os.environ['DIAG_DIR']\n"
+    "p = subprocess.Popen(['sh', '-c', \"trap '' TERM; sleep 120 & echo \\\"$$ $!\\\" > \\\"$1.tmp\\\"; mv \\\"$1.tmp\\\" \\\"$1\\\"; wait\", 'sh', os.path.join(d, 'stub.pid')])\n"
+    "p.wait()\n")
+
+
+class Kill(unittest.TestCase):
+    """The cases of the KILL after the grace, run under the default shell and under dash (classes below)."""
+    GRACE = "2"
+    shell = None
+    tree, start, wait_file, content, kill_later = Diag.tree, Diag.start, Diag.wait_file, Diag.content, Diag.kill_later
+
+    def alive(self, pid):
+        """Running, not a zombie (a pod without an init leaves the dead as zombies)."""
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except OSError:
+            return False
+
+    def stubborn_tree(self, script, serial):
+        d = self.tree(script, serial, [STUBBORN])
+        def cleanup():
+            for w in self.content(os.path.join(self.diag, "stub.pid")).split():
+                try:
+                    os.kill(int(w), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+        self.addCleanup(cleanup)
+        self.kill_later("lane.pid")
+        return d
+
+    def stub_pids(self):
+        return [int(w) for w in self.wait_file("stub.pid").split()]
+
+    def gone(self, pids, what):
+        end = time.time() + int(self.GRACE) + 6   # the grace plus a margin
+        while any(self.alive(x) for x in pids) and time.time() < end:
+            time.sleep(0.1)
+        self.assertEqual([x for x in pids if self.alive(x)], [], "a TERM-ignoring descendant was left running after %s" % what)
+
+    def k_signal(self, script, sig):
+        d = self.stubborn_tree(script, [SERIAL_SLOW])
+        self.kill_later("serial.pid")
+        p = self.start(d, {"CHAIN_KILL_GRACE": self.GRACE})
+        pids = self.stub_pids()
+        self.wait_file("serial.pid")
+        p.send_signal(sig)
+        p.wait(timeout=60)
+        self.assertEqual(p.returncode, 130 if sig == signal.SIGINT else 143)
+        self.gone(pids, "signal %s" % sig)
+
+    def k_serial_failure(self, script):
+        d = self.stubborn_tree(script, [SERIAL_BAD])
+        p = self.start(d, {"CHAIN_KILL_GRACE": self.GRACE, "CHAIN_LANE_WAIT": "2"})
+        pids = self.stub_pids()
+        p.wait(timeout=60)
+        self.assertEqual(p.returncode, 1)
+        self.gone(pids, "a serial failure")
+
+    def test_k_a_term_ignoring_descendant_is_gone_after_an_interrupt(self):
+        self.k_signal(real_script(), signal.SIGINT)
+
+    def test_k_a_term_ignoring_descendant_is_gone_after_a_terminate(self):
+        self.k_signal(real_script(), signal.SIGTERM)
+
+    def test_k_a_term_ignoring_descendant_is_gone_after_a_serial_failure(self):
+        self.k_serial_failure(real_script())
+
+    def test_k_mutant_without_the_kill_fails_each_case(self):
+        text = real_script()
+        m = mutate(text, '    [ -z "$surv" ] || kill -KILL $surv 2>/dev/null\n', "")
+        for case in (lambda: self.k_signal(m, signal.SIGINT), lambda: self.k_signal(m, signal.SIGTERM), lambda: self.k_serial_failure(m)):
+            with self.assertRaises(AssertionError):
+                case()
+
+
 class Docs(unittest.TestCase):
     def section(self):
         doc = base.slurp(os.path.join(base.ROOT, "cloud", "launcher", "README.md"))
@@ -262,6 +341,14 @@ class DashDiag(Diag):
 if DASH is None:
     print("SKIPPED: no dash on this machine (/bin/dash, /usr/bin/dash): the dash cases do not run", flush=True)
     del DashDiag
+
+
+class DashKill(Kill):
+    shell = DASH
+
+
+if DASH is None:
+    del DashKill
 
 
 if __name__ == "__main__":

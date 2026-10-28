@@ -60,6 +60,8 @@ ARGS_ENTRIES=" test_cloud_worker.py test_cloud_stack.py test_cloud_stack_wait.py
 # slowest entry measured is about 300; the environment variable CHAIN_LANE_WAIT overrides it, for tests), then stops every lane and its loop, replays
 # their output, and only then prints RESULT: FAIL (status 1). After the exit no lane process is left and nothing writes into the removed directory.
 LANE_WAIT=${CHAIN_LANE_WAIT:-300}
+# After the TERM, a descendant that ignores it gets KILL once KILL_GRACE seconds have passed (default 5; CHAIN_KILL_GRACE overrides it, for tests).
+KILL_GRACE=${CHAIN_KILL_GRACE:-5}
 PAR=bin/test-cloud-launcher.parallel
 [ -f "$PAR" ] || PAR=/dev/null   # no parallel list: every entry runs serially
 OUT=$(mktemp -d) || exit 1
@@ -81,6 +83,31 @@ stop_groups() { # stop every lane (loop and entry in flight) and the running ser
     eval "p=\$lp$l"
     [ -z "$p" ] || wait "$p" 2>/dev/null
   done
+  # A descendant that ignores TERM gets KILL after a short grace (KILL_GRACE seconds): the survivors of the SAME roots (the pids listed above, and what
+  # still hangs below the same roots now) are ended; a pid is never an empty word, 0, 1 or this script's own pid.
+  if [ -n "$all" ]; then
+    g=0
+    while [ "$g" -lt "$KILL_GRACE" ]; do
+      left=0
+      for x in $all; do kill -0 "$x" 2>/dev/null && left=1; done
+      [ "$left" = 0 ] && break
+      sleep 1
+      g=$((g + 1))
+    done
+    more=
+    for l in 0 1 2; do
+      eval "p=\$lp$l"
+      [ -z "$p" ] || [ -e "$OUT/lane$l.done" ] || more="$more $(descendants "$p")"
+    done
+    [ -z "$cur" ] || more="$more $(descendants "$cur")"
+    surv=
+    for x in $all $more; do
+      case "$x" in ''|0|1|$$) continue ;; esac
+      kill -0 "$x" 2>/dev/null && surv="$surv $x"
+    done
+    # shellcheck disable=SC2086
+    [ -z "$surv" ] || kill -KILL $surv 2>/dev/null
+  fi
   return 0
 }
 trap 'rc=$?; trap - EXIT; rm -rf "$OUT"; exit $rc' EXIT
