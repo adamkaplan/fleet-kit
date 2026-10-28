@@ -1,6 +1,10 @@
 {
   "permission": {
     "question": "deny",
+    "edit": {
+      "*": "allow",
+      "*pr-record*": "deny"
+    },
     "bash": {
       "*": "allow",
       "gh pr merge*": "deny",
@@ -152,6 +156,10 @@
     "worker": {
       "permission": {
         "question": "deny",
+        "edit": {
+          "*": "allow",
+          "*pr-record*": "deny"
+        },
         "bash": {
           "*": "allow",
           "gh pr merge*": "deny",

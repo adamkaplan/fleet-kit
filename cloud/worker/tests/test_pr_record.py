@@ -146,6 +146,60 @@ class T(unittest.TestCase):
                 self.assertEqual(self.guard(link, "pr edit %d --body-file %s" % (CREATED, self.body)).returncode, 3)
                 self.assertNotIn(P.TOKEN, r.stdout + r.stderr)
 
+    # S15: a forged number in the record does not make another branch's pull request editable; own branch AND recorded does
+    def client_with_record(self, n, numbers):
+        rec = os.path.join(self.d, "forged-record")
+        open(rec, "w").write(numbers)
+        P.H.seen = []
+        env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "CW_GH_API_BASE": self.base, "GH_TOKEN": P.TOKEN, "CW_BRANCH": P.BRANCH, "CW_PR_RECORD": rec}
+        r = subprocess.run([sys.executable, CW_GH, "pr", "edit", str(n), "--body-file", self.body], env=env, capture_output=True, text=True,
+                           cwd=self.work, timeout=60, stdin=subprocess.DEVNULL)
+        self.assertNotIn(P.TOKEN, r.stdout + r.stderr)
+        return r
+
+    def test_s15_a_forged_number_of_another_branch_is_refused_and_an_own_number_is_edited(self):
+        forged = self.client_with_record(8, "8\n")
+        self.assertEqual(forged.returncode, 3, forged.stderr)
+        self.assertIn("refused: pr-edit-other-number", forged.stderr)
+        self.assertEqual(len(P.patches()), 0)
+        own = self.client_with_record(CREATED, "%d\n" % CREATED)
+        self.assertEqual(own.returncode, 0, own.stderr)
+        self.assertEqual(len(P.patches()), 1)
+
+    # S16 (a): the file-editing tool is denied for a path holding pr-record, in both agent blocks
+    def test_s16_the_edit_tool_is_denied_for_the_record_in_both_blocks(self):
+        import json
+        with open(os.path.join(WORKER, "opencode-worker.json")) as f:
+            conf = json.load(f)
+        blocks = (conf["permission"], conf["agent"]["worker"]["permission"])
+        self.assertEqual(sum(1 for b in blocks if isinstance(b.get("edit"), dict) and b["edit"].get("*pr-record*") == "deny"), 2)
+        for b in blocks:
+            self.assertEqual(b["edit"].get("*"), "allow")
+            self.assertEqual(list(b["edit"]).index("*"), 0)   # the last matching rule wins: the allow-all comes first
+            self.assertIn("bash", b)
+            self.assertEqual(b["question"], "deny")
+
+    # S16 (b): a pr-record that is already a symlink refuses the start, and the target's mode is not changed
+    def test_s16_a_symlink_at_the_record_directory_refuses_the_start(self):
+        target = os.path.join(self.d, "elsewhere")
+        os.mkdir(target)
+        os.chmod(target, 0o755)
+        os.symlink(target, os.path.join(self.tmpfs, "pr-record"))
+        r = self.start("sh", "-c", "echo started")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("started", r.stdout)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)
+
+    # the interface document says what the client enforces, what an agent can still do, and the false positives
+    def test_the_interface_document_states_the_limits_of_the_record(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(WORKER)), "docs", "cloud-worker-interface.md")) as f:
+            doc = f.read()
+        for phrase in ("a convenience, not a boundary", "in the record AND its head branch is the pod's own branch",
+                       "What an agent here can still do", "replace the directory", "edit the body of a pull request of its OWN branch",
+                       "false positives", "already a symlink"):
+            self.assertEqual(doc.count(phrase), 1, phrase)
+
     # the guard row: a command naming the record is refused
     FORMS = ("echo 99 >> $CW_PR_RECORD", "echo 99 > /run/cw-tmp/pr-record/numbers", 'cat "$CW_PR_RECORD"')
 

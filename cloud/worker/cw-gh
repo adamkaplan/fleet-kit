@@ -365,7 +365,7 @@ def pr_edit(args):
     except (Fail, KeyError, TypeError, ValueError):
         raise refused("pr-edit-read-failed")
     mine = os.environ.get("CW_BRANCH") or git("symbolic-ref", "--quiet", "--short", "HEAD")
-    if base_repo.lower() != repo.lower() or not ((mine and head == mine) or recorded(n)):
+    if base_repo.lower() != repo.lower() or not (mine and head == mine):   # the record alone (forgeable by the same user) is not enough: BOTH (a present record is checked above)
         raise refused("pr-edit-other-number")
     if head_repo.lower() != repo.lower():   # a fork's pull request with the same branch name is not the pod's own
         raise refused("pr-edit-other-number")
