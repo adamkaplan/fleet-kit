@@ -411,7 +411,7 @@ def crossing(fig, cfg):
     reasons, severity = [], 0
     if fig["stalled"] >= cfg["stalled_asks"]:
         reasons.append("stalled"); severity += fig["stalled"]
-    full = fig["busy"] is not None and fig["idle"] is not None and fig["busy"] > 0 and fig["idle"] == 0
+    full = fig["busy"] is not None and fig["idle"] is not None and fig["busy"] - fig["cloud"] > 0 and fig["idle"] == 0   # #1487: busy counts running cloud workers; a lane with only those is not "full" by that alone
     if full and fig.get("moved_backlog") is not None and fig.get("moved_1h") is not None:
         # all coders busy: only when something is stuck (an ask stalled) or open asks clearly outnumber what moves and nothing moved in the last hour
         active = fig["active_asks"] if fig.get("active_asks") is not None else fig["open_asks"]   # asks waiting on someone or parked are not queued work
