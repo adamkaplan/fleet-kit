@@ -7,10 +7,13 @@ import contextlib
 import io
 import json
 import os
+import inspect
 import re
+import signal
 import stat
 import sys
 import tempfile
+import textwrap
 import types
 import unittest
 from unittest import mock
@@ -435,6 +438,109 @@ class UnreadIdentity(tcw.Base):
         self.assertEqual([x for x in self.audit_lines() if self.MARK in x["reason"]], [])
 
 
+def fire_term(pod):
+    signal.raise_signal(signal.SIGTERM)   # the launcher's own handler turns it into the termination exception
+    return pod
+
+
+class SignalDuringTheRead(tcw.Base):
+    """S10: a signal during the read of the new pod's uid ends the create with the usual cleanup (real Launcher.create, fake cluster)."""
+    SIGNALS = {"interrupt": raising(KeyboardInterrupt()), "termination exception": raising(cw.Interrupted("signal 15")), "SIGTERM raised": fire_term}
+
+    def fd(self, value):
+        r, w = os.pipe()
+        os.write(w, value.encode())
+        os.close(w)
+        self.addCleanup(os.close, r)
+        return r
+
+    def create_with(self, answer, patches=()):
+        real_wait, real_get, state = cw.Launcher._wait_ready, cw.Kube.get_pod, {"ready": False, "reads": 0}
+
+        def wait(launcher, name, seconds):
+            result = real_wait(launcher, name, seconds)
+            state["ready"] = True   # every read from here on is the create's read of the uid
+            return result
+
+        def get(kube, name):
+            if state["ready"]:
+                state["reads"] += 1
+                return answer(real_get(kube, name))
+            return real_get(kube, name)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(cw.Launcher, "_wait_ready", wait))
+            stack.enter_context(mock.patch.object(cw.Kube, "get_pod", get))
+            for p in patches:
+                stack.enter_context(p)
+            result = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-secret-fd", "model-key=%d" % self.fd("v1"))
+        self.assertEqual(state["reads"], 1, "the read of the uid was not reached")
+        return result
+
+    def deletes(self):
+        with open(self.env["FAKE_KUBE_CALLS"]) as handle:
+            return [x for x in handle.read().splitlines() if '"delete"' in x]
+
+    def left(self):
+        st = self.st()
+        return len(st.get("pods", {})), len(st.get("secrets", {}))
+
+    def cleanups(self):
+        if not os.path.exists(self.env["CW_CLOUD_AUDIT"]):
+            return []
+        return [x for x in self.audit_lines() if x["action"] in ("create.interrupted", "create.failed")]
+
+    def test_s10_a_signal_during_the_read_removes_the_pod_and_the_secrets_once(self):
+        for label, answer in self.SIGNALS.items():
+            with self.subTest(label):
+                self.setUp()
+                code, out, err = self.create_with(answer)
+                print("%s: %d pods, %d Secrets left, %d cleanups, status %d, %d deletes" % ((label,) + self.left() + (len(self.cleanups()), code, len(self.deletes()))))
+                self.assertEqual(code, cw.EXIT_INTERRUPTED, err)
+                self.assertEqual(self.left(), (0, 0))
+                self.assertEqual(len(self.deletes()), 3, "the pod, the password Secret and the per-run Secret, once each")
+                lines = self.cleanups()
+                self.assertEqual(len(lines), 1)
+                self.assertEqual(lines[0]["action"], "create.interrupted")
+                self.assertFalse(lines[0]["ok"])
+                pod = cw.pod_name("coder7")
+                for gone in ("pod/" + pod, "secret/%s-pw" % pod, "secret/%s-run" % pod):
+                    self.assertIn(gone, lines[0]["reason"])
+        
+    def test_s10_an_ordinary_failure_of_the_read_keeps_the_pod_with_one_note_and_no_cleanup(self):
+        code, out, err = self.create_with(raising(RuntimeError("boom")))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.left()[0], 1)
+        self.assertEqual(len(self.st()["secrets"]), 2)
+        self.assertEqual(len([x for x in err.splitlines() if "pod identity" in x]), 1, err)
+        self.assertEqual(self.cleanups(), [])
+        self.assertEqual(self.deletes(), [])
+
+    def test_s10_a_mutant_that_reads_after_the_cleanup_block_leaves_the_pod_and_a_secret(self):
+        source = textwrap.dedent(inspect.getsource(cw.Launcher.create))
+        self.assertEqual(source.count("self._read_pod_uid(worker, name, info)"), 1)
+        lines = source.splitlines(keepends=True)
+        out = []
+        for line in lines:
+            if line.strip().startswith("pod_uid = self._read_pod_uid"):
+                continue
+            if line.strip().startswith("domain = self.env.get"):
+                out.append(" " * (len(line) - len(line.lstrip())) + "pod_uid = self._read_pod_uid(worker, name, info)\n")
+            out.append(line)
+        mutated = "".join(out)
+        self.assertNotEqual(mutated, source, "the mutation was not applied")
+        scope = {}
+        exec(mutated, vars(cw), scope)
+        for label, answer in self.SIGNALS.items():
+            with self.subTest(label):
+                self.setUp()
+                with mock.patch.object(cw.Launcher, "create", scope["create"]):
+                    code, out_, err = self.create_with(answer)
+                print("mutant, %s: %d pods, %d Secrets left, %d cleanups" % ((label,) + self.left() + (len(self.cleanups()),)))
+                self.assertEqual(self.left()[0], 1, "the mutant left no pod: the test would not catch it")
+                self.assertGreaterEqual(self.left()[1], 1)
+                self.assertEqual(self.cleanups(), [])
+
+
 class Documents(unittest.TestCase):
     CAUSES = ("stop audit did not name the Secrets it removed", "not-found match was a substring match", "Secret read still used the loose match",
               "name with a trailing newline passed the name pattern", "record was not bound to a pod identity", "hub entry of a gone orchestrator was left behind")
@@ -470,6 +576,15 @@ class Documents(unittest.TestCase):
     def test_s9_both_documents_say_a_create_that_cannot_read_the_uid_says_so(self):
         for rel, title in (("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)"), ("docs/cloud-worker-interface.md", "## Retire of a gone worker (ask #1327)")):
             self.assertIn(self.UNREAD, self.section(rel, title).lower(), rel)
+
+    SIGNALLED = "a signal (an interrupt or a termination request) during that read of the new pod's uid ends the create with its usual cleanup: the pod and its secrets are removed once"
+    KEPT = "an ordinary failure of the read gives the note and no cleanup, and the pod is kept"
+
+    def test_s10_both_documents_say_a_signal_during_the_read_ends_the_create_with_its_cleanup(self):
+        for rel, title in (("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)"), ("docs/cloud-worker-interface.md", "## Retire of a gone worker (ask #1327)")):
+            part = self.section(rel, title).lower()
+            self.assertIn(self.SIGNALLED, part, rel)
+            self.assertIn(self.KEPT, part, rel)
 
 
 if __name__ == "__main__":

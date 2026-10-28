@@ -1809,6 +1809,7 @@ class Launcher:
                 if a.password_fd is not None:
                     with os.fdopen(os.dup(a.password_fd), "w") as f:
                         f.write(password)
+                pod_uid = self._read_pod_uid(worker, name, info)   # inside the cleanup: a signal during this read ends the create like any other failure
             except (CloudError, OSError) as e:
                 left = self._cleanup(name, made)  # nothing is left running (and costing) or holding a password
                 err = e if isinstance(e, CloudError) else CloudError("could not hand over the password: %s" % e)
@@ -1822,7 +1823,6 @@ class Launcher:
             except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
                 self._abort(worker, name, made, e)
             domain = self.env.get("CW_CLOUD_DOMAIN", "example.internal")
-            pod_uid = self._read_pod_uid(worker, name, info)
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain), "pod_uid": pod_uid,
                     **({"identity_note": info["identity_note"]} if "identity_note" in info else {}),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
