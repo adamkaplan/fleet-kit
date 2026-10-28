@@ -532,7 +532,10 @@ class TestDocuments(unittest.TestCase):
             for phrase in ("closed vocabulary", "ERROR_VOCABULARY", "bin/pod_state_line.py", "a secret that is itself a word of the vocabulary", "transient", "removed when the command ends", "mode `0700`",
                            "(the ten most plausible are password, secret, token, key, login, user, account, access, service, session)", "A number of up to three digits prints.",
                            "kept out only when they are 4 or more characters", "environment values under 8 characters are not covered",
-                           "Upper-case forms of vocabulary words print as typed."):
+                           "Upper-case forms of vocabulary words print as typed.",
+                           "A run of numbers joined by separators (a dash, a dot, a colon, a slash, a space or a comma between digit groups) counts as one number and prints only when the whole run holds at most three digits.",
+                           "A run of three or more separator characters in a row prints as the placeholder.",
+                           "a clock such as 10:30:00 and a counter such as [1/3] lose their numbers"):
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
 
@@ -1025,7 +1028,7 @@ class TestPlaceholderAndNormalising(unittest.TestCase):
         self.assertIn("failed", out)
 
     def test_an_error_class_name_and_a_short_number_print_and_a_long_number_does_not(self):
-        out = CLOUD.redact_error("ConnectionResetError 404 123456")
+        out = CLOUD.redact_error("ConnectionResetError 404 failed 123456")
         self.assertIn("ConnectionResetError", out)
         self.assertIn("404", out)
         self.assertNotIn("123456", out)
@@ -1045,6 +1048,32 @@ class TestPlaceholderAndNormalising(unittest.TestCase):
         self.assertEqual(out, "connection refused: [redacted]")
         self.assertNotIn("10.0.0.1", CLOUD.redact_error("dial 10.0.0.1 failed"))
         self.assertNotIn("10.0.0.1", CLOUD.redact_error("dial 10.0.0.1:80 failed"))
+
+    def test_s14_split_numbers_and_separator_runs_are_the_placeholder_and_short_forms_print(self):
+        split = ("123-456-789", "1-2-3-4-5-6", "192.168.1", "4111 1111 1111 1111", "12:34:56", "((()))", "::::", "----")
+        shown = []
+        for text in split:
+            with self.subTest(text=text):
+                plain = CLOUD.redact_error("error: " + text + " failed")
+                known = CLOUD.redact_error("error: " + text + " failed", known=[text])
+                again = CLOUD.redact_error("failed " + text, known=[text])
+                self.assertEqual(plain, "error: [redacted] failed")
+                self.assertEqual(known, "error: [redacted] failed")
+                self.assertEqual(again, "failed [redacted]")
+                shown.append(text)
+        self.assertEqual(len(shown), 8)
+        for text in ("code 404", "code 500", "exit code 255", "exit code 13", "back-off error", "Error: failed"):
+            with self.subTest(text=text):
+                self.assertEqual(CLOUD.redact_error(text), text)
+
+    def test_s14_a_run_of_three_or_more_separators_and_a_known_digit_group_secret_are_removed_everywhere(self):
+        self.assertEqual(CLOUD.redact_error("failed..."), "failed[redacted]")
+        self.assertEqual(CLOUD.redact_error("failed.. error"), "failed.. error")
+        self.assertEqual(CLOUD.redact_error("code 1 2 3"), "code 1 2 3")
+        self.assertEqual(CLOUD.redact_error("code 1 2 34"), "code [redacted]")
+        for secret in ("(-)(", "1-2-3", "7.7.7"):
+            out = CLOUD.redact_error("error 1 and x%s failed %s" % (secret, secret), known=[secret])
+            self.assertNotIn(secret, out)
 
     def test_every_other_token_is_the_placeholder_in_any_language(self):
         self.assertEqual(CLOUD.redact_error("error: " + CYR_PASSWORD + " " + CJK_PASSWORD), "error: [redacted]")

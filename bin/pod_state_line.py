@@ -34,6 +34,9 @@ _CAMEL_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")   # a CamelCase word: 
 _DOTTED_RUN = re.compile(r"\d+(?:\.\d+){3,}")   # an address: numbers joined by 3 or more dots is ONE token, redacted whole
 _TOKEN = re.compile(r"[^\W_]+|.", re.S)   # a run of letters and digits (any script), or one other character
 PLACEHOLDER = "[redacted]"
+_NUMBER_RUN = re.compile(r"(?<![^\W\d_])\d+(?:[-.:/ ,]\d+)+(?![^\W\d_])")   # digit groups joined by one separator (dash, dot, colon, slash, space, comma): ONE number
+_SEPARATOR_RUN = re.compile(r"[:,.()\"'/=\-_\[\]]{3,}")   # three or more separator characters in a row ('((()))', '::::', '...')
+_PLAIN_FORM = re.compile(r"[\d:,.()\"'/=\-_\[\] ]+")   # a known secret of separators and digits only
 
 
 def _normalise(text, spaced):
@@ -81,6 +84,17 @@ def _mark_variant(line, spaced, known, mask):
     for run in _DOTTED_RUN.finditer(N):
         low, high = idx[run.start()], idx[run.end() - 1] + 1
         mask[low:high] = b"\x01" * (high - low)
+    for run in _NUMBER_RUN.finditer(N):   # numbers joined by separators are ONE number: it prints only when the whole run holds at most 3 digits
+        if sum(c.isdigit() for c in run.group()) > 3:
+            mask[idx[run.start()]:idx[run.end() - 1] + 1] = b"\x01" * (idx[run.end() - 1] + 1 - idx[run.start()])
+    for run in _SEPARATOR_RUN.finditer(N):   # three or more separator characters in a row
+        mask[idx[run.start()]:idx[run.end() - 1] + 1] = b"\x01" * (idx[run.end() - 1] + 1 - idx[run.start()])
+    for form in known:   # this run's own secret made of separators and digits only is removed wherever it appears
+        if _PLAIN_FORM.fullmatch(form):
+            at = N.find(form)
+            while at >= 0:
+                mask[idx[at]:idx[at + len(form) - 1] + 1] = b"\x01" * (idx[at + len(form) - 1] + 1 - idx[at])
+                at = N.find(form, at + 1)
     for found in _TOKEN.finditer(N):
         start, end = found.span()
         word = found.group()
