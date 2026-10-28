@@ -1742,6 +1742,65 @@ class HeavyOrphanFacts:
             engine._note("heavy.orphan_check_error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
 
 
+def add_scratch_parsers(sub):
+    sub.add_parser("scratch", help="Print the path of your own scratch directory (private, kept by every fleet command; not a place for a secret)")
+
+
+def cmd_scratch(args, runner, now):
+    """`scratch`: print the path of the calling agent's own scratch directory, made (0700) when absent. The name is the caller's own: no argument names another."""
+    scratch = load_module("scratch_dir")
+    try:
+        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        name = identify_caller(engine.herdr, engine.v2, os.environ)
+    except (V2Error, HerdrError, ConfigError, CallerError) as err:
+        sys.stderr.write("%s: scratch: %s\n" % (PROG, _one_line(str(err))))
+        return EXIT_ERROR
+    try:
+        path = scratch.own_dir(engine.state_dir, name)
+    except scratch.Refused as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_USAGE
+    print(path)
+    line = scratch.warning(path)
+    if line:
+        sys.stderr.write(line + "\n")   # on stderr: `$(fleet-switchboard scratch)` stays the path alone
+    return EXIT_OK
+
+
+cmd_scratch.direct = True   # it answers on its own terms: no daemon start, its own exit codes
+
+
+class ScratchBoundFacts:
+    """The daemon's look at the scratch directories (ask #1456): one `scratch.over_bound` audit line a day for each that stays over the bound. It only says; it
+    removes and refuses nothing. At most one look every ten minutes. Returns no facts."""
+
+    __name__ = "scratch_bound_facts"
+    INTERVAL = 600
+
+    def __init__(self):
+        self.engine, self.last = None, None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        if engine is None or engine.state_dir is None or getattr(engine, "temp_janitor_runner", None) is None:   # only the real daemon: a test engine and a command line have none
+            return []
+        now = engine.now()
+        if self.last is not None and now - self.last < self.INTERVAL:
+            return []
+        self.last = now
+        try:
+            scratch = load_module("scratch_dir")
+            for agent, size in scratch.due_today(engine.state_dir, now):
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "scratch.over_bound", agent, {"bytes": size, "bound": scratch.BOUND_BYTES})
+        except Exception as err:   # a look never stops the daemon
+            engine._note("scratch.bound_check_error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+        return []
+
+
 class Fact:
     """Something one fleet agent should be told.
 
@@ -1851,7 +1910,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), RedCiFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts(), ScratchBoundFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -6720,6 +6779,8 @@ def reclaim_worktree(engine, runner, path, entry, apply=True):
     if not isinstance(entry, dict) or not isinstance(path, str) or not os.path.isabs(path) or path.startswith("-"):
         return "refused", "%s: refused: not a usable registry entry" % _one_line(str(path), 60)
     agent = entry.get("agent")
+    if load_disk_janitor().scratch_covers(path, engine.state_dir):   # ask #1456: a scratch directory is kept by every removing command
+        return "refused", "%s: refused: it holds or is inside a scratch directory, which is never removed" % path
     facts = worktree_facts(runner, path)
     if not facts["exists"]:
         dropped = apply and _unregister_worktree(engine.state_dir, path)

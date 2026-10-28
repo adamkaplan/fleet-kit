@@ -366,6 +366,15 @@ def write_cursor(state_dir, name):
     return True
 
 
+def scratch_covers(path, state_dir):
+    """True when `path` is, holds or sits inside <state>/scratch, the agents' kept scratch directories (ask #1456): no removal ever touches such a path."""
+    if state_dir is None:
+        return False
+    root = os.path.join(os.path.realpath(str(state_dir)), "scratch")
+    real = os.path.realpath(str(path))
+    return real == root or real.startswith(root + os.sep) or root.startswith(real + os.sep)
+
+
 def scan(temp_dir, state_dir, now, cfg, uid=None, clock=time.monotonic, busy=None, budget=None):
     """[judge rows] for the top-level entries from the cursor on, in name order; every entry is kept when the fleet's records could not be read in full. Reads only.
     The scan starts at the first name AFTER the cursor (the last name an earlier budget stop judged; the first name when there is none or it is past the end).
@@ -387,7 +396,10 @@ def scan(temp_dir, state_dir, now, cfg, uid=None, clock=time.monotonic, busy=Non
             rows.append({"name": n, "path": os.path.join(str(temp_dir), n), "action": "keep", "why": "not judged: the scan's time budget was spent", "size": 0,
                          "age_days": 0, "ident": None, "judged": False})
             continue
-        rows.append(judge(os.path.join(str(temp_dir), n), text, now, cfg, uid, clock, busy))
+        row = judge(os.path.join(str(temp_dir), n), text, now, cfg, uid, clock, busy)
+        if row["action"] == "remove" and scratch_covers(row["path"], state_dir):
+            row["action"], row["why"] = "keep", "holds or is a scratch directory of an agent: never removed"
+        rows.append(row)
     if not complete:
         for row in rows:
             row["incomplete"] = True
@@ -438,7 +450,7 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
             continue
         again_text, again_complete = named_text(state_dir)
         again = judge(row["path"], again_text, now, cfg, uid, clock, recheck_busy or busy)
-        if not again_complete or again["action"] != "remove" or again["ident"] != row["ident"] or not safe_dir(temp_dir)[0]:
+        if not again_complete or again["action"] != "remove" or again["ident"] != row["ident"] or not safe_dir(temp_dir)[0] or scratch_covers(row["path"], state_dir):
             lines.append("kept %s: it changed since the scan" % row["name"])
             kept += 1
             continue

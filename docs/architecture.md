@@ -69,6 +69,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `decisions_pull.py` | 4 | rewrite the local decisions file from a remote source | |
 | `disk_janitor.py` | 4 | the temp-directory janitor | |
 | `fleet_health.py` | 4 | the load of each orchestrator and the threshold alert | |
+| `scratch_dir.py` | 4 | the caller's own scratch directory under the state directory: made private, refused when unsafe, warned at 100 MB | |
 | `queue_ejections.py` | 4 | a pull request ejected from the merge queue wakes its orchestrator | |
 | `spotlight_guard.py` | 4 | is each guarded folder still kept out of the Spotlight index | |
 | `switchboard/reminders.py` | 4 | the reminders file, `remind`, checkpoint reminders, budget notice and the GitHub event constants | |
