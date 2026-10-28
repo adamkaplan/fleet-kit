@@ -351,7 +351,7 @@ def pr_edit(args):
         raise refused("pr-edit-other-option")
     n = int(args[0])
     rec = os.environ.get("CW_PR_RECORD")
-    if rec and os.path.exists(rec) and os.path.getsize(rec) > 0 and not recorded(n):
+    if rec and not recorded(n):   # a pod that names a record edits only a number in it (a missing or empty record holds none)
         raise refused("pr-edit-other-number")
     repo = repo_of({})
     try:

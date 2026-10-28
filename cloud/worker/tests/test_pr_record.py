@@ -166,6 +166,23 @@ class T(unittest.TestCase):
         self.assertEqual(own.returncode, 0, own.stderr)
         self.assertEqual(len(P.patches()), 1)
 
+    def test_s15_a_mutant_restoring_the_record_alone_edits_the_forged_number(self):
+        src = open(CW_GH).read()
+        old = "or not (mine and head == mine):"
+        self.assertEqual(src.count(old), 1)
+        mut = os.path.join(self.d, "cw-gh-mutant")
+        open(mut, "w").write(src.replace(old, "or not ((mine and head == mine) or recorded(n)):"))
+        self.assertNotEqual(open(mut).read(), src)   # the mutation was applied
+        rec = os.path.join(self.d, "forged-record")
+        open(rec, "w").write("8\n")
+        env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "CW_GH_API_BASE": self.base, "GH_TOKEN": P.TOKEN, "CW_BRANCH": P.BRANCH, "CW_PR_RECORD": rec}
+        P.H.seen = []
+        r = subprocess.run([sys.executable, mut, "pr", "edit", "8", "--body-file", self.body], env=env, capture_output=True, text=True,
+                           cwd=self.work, timeout=60, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(P.patches()), 1)
+        self.assertEqual(self.client_with_record(8, "8\n").returncode, 3)   # the true build refuses it
+
     # S16 (a): the file-editing tool is denied for a path holding pr-record, in both agent blocks
     def test_s16_the_edit_tool_is_denied_for_the_record_in_both_blocks(self):
         import json
