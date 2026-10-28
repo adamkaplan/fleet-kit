@@ -84715,6 +84715,39 @@ class TestImpactHoldByEntry(unittest.TestCase):
         self.assertEqual(report({"path": "cloud/launcher/token_mint.py"})["owner_decision"], "none")
         self.assertEqual(report({"path": "cloud/launcher/token_mint.py"}, HOLD_WEB)["owner_decision"], "hold")
 
+    def test_u2_a_repository_hold_entry_never_lifts_the_delegated_clears_closure_and_new_file_refusals(self):
+        """#1241 U2: the clear takes no entry; the entry reaches it only through the report. The same files, the same closure mapping, once with a hold entry that lists nothing for them and once with no entry: the clear refuses the same two things."""
+        dc = sb.load_module("delegated_clear")
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        closure_path, new_path = "bin/agent_presence.py", "bin/zz_acme_new_module.py"
+        self.assertIn(closure_path, rule["closure_files"])
+        self.assertTrue(sb.impact_floor.matches(new_path, rule["new_file_globs"]))
+        files = [{"filename": closure_path, "status": "modified"}, {"filename": new_path, "status": "added"}]
+        mapping = {closure_path: ["it changes a line of the closure (acme definition)"], new_path: []}
+        engine = mock.Mock()
+        engine.config, engine.state_dir, engine.audit = hold_config(dict(HOLD_ENTRY, hold={"identity": ["auth/**"]}, hold_exclude=[])), None, None   # the entry names nothing under bin/: the most permissive one
+        raw = {"files": [{"path": f["filename"]} for f in files], "changedFiles": len(files), "headRefOid": "a" * 40, "baseRefOid": "b" * 40}
+
+        def refused(module, repo):
+            with mock.patch.object(sb, "read_pr_json", return_value=raw), mock.patch.object(sb, "agent_block_states", return_value={}):
+                report = sb.pr_floor_report(engine, repo, 5)
+            report = dict(report, review_action="none")   # an independent review is recorded: only the closure and the new file are left to refuse
+            return module.refusals(rule, report, files, matches=sb.impact_floor.matches, closure=mapping)
+        with_entry, without = refused(dc, HOLD_API), refused(dc, "acme-org/widget-none")
+        self.assertEqual(with_entry, without, "the entry changes what the clear refuses")
+        self.assertEqual(len(with_entry), 2, with_entry)
+        self.assertTrue(any("acme definition" in r for r in with_entry), with_entry)
+        self.assertTrue(any("adds, deletes or renames a file" in r for r in with_entry), with_entry)
+        old = "if matches(path, rule[\"closure_files\"]) or matches(path, [\"bin/switchboard/*.py\"]):"
+        source = (BIN / "delegated_clear.py").read_text()
+        self.assertEqual(source.count(old), 1)
+        import types
+        mutant = types.ModuleType("delegated_clear_mutant")   # a build that lets an entry skip the closure rule: here, skipped for the repository that has one
+        mutant.__file__ = str(BIN / "delegated_clear.py")
+        exec(compile(source.replace(old, "if False:"), str(BIN / "delegated_clear.py"), "exec"), mutant.__dict__)
+        self.assertNotEqual(refused(mutant, HOLD_API), refused(dc, "acme-org/widget-none"), "a build that skips the closure rule for an entry passes this test")
+        self.assertEqual(len(refused(mutant, HOLD_API)), 1)
+
 
 class TestOperatorHoldDocs(unittest.TestCase):
     """#1241 clause 7: the operator section of docs/switchboard.md."""
