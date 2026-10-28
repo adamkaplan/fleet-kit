@@ -1576,12 +1576,43 @@ def pod_deadline_floor(max_hard):
     return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
 
 
-def check_shape(a):
-    """Set a.shape when it names none (XS, or S for a stack launch) and refuse an unknown name, or a row that cannot run a stack, with --stack."""
-    if getattr(a, "shape", None) is None:
-        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
-    if a.shape not in SHAPES:
+def repo_min_shapes(raw):
+    """THE parse of CW_REPO_MIN_SHAPE: {repository key: shape} from comma-separated OWNER/NAME=SHAPE pairs, or None when any entry is malformed (no
+    '=', an unknown shape, a repository that is not OWNER/NAME, a repeated repository, a control character). The repository part is parsed by `_repo_key`,
+    the one parse the allow-list uses. The settings file's validator and check_shape both call it."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        return None
+    floors = {}
+    for entry in raw.split(","):
+        repo, sep, shape = entry.partition("=")
+        key = _repo_key(repo.strip())
+        shape = shape.strip()
+        if not sep or key is None or shape not in SHAPES or key in floors:
+            return None
+        floors[key] = shape
+    return floors
+
+
+def check_shape(a, env=None):
+    """Set a.shape when it names none (XS, or S for a stack launch or an orchestrator) and refuse an unknown name, or a row that cannot run a stack, with --stack.
+    With `env` holding CW_REPO_MIN_SHAPE and a repository listed in it, the listed shape is a floor: an unnamed shape becomes the larger of the floor and
+    the shape the flags give, and a named shape below the floor is refused. An unlisted repository or an unset setting changes nothing."""
+    floor = None
+    raw = ((env or {}).get("CW_REPO_MIN_SHAPE") or "").strip()
+    if raw:
+        floors = repo_min_shapes(raw)
+        if floors is None:
+            raise CloudError("refused: CW_REPO_MIN_SHAPE is not a list of OWNER/NAME=SHAPE entries; nothing was created", EXIT_USAGE)
+        floor = floors.get(_repo_key(getattr(a, "repo", None) or "") or "")
+    named = getattr(a, "shape", None)
+    if named is not None and named not in SHAPES:
         raise CloudError("shape must be one of %s" % ", ".join(SHAPES), EXIT_USAGE)
+    if named is not None and floor is not None and list(SHAPES).index(named) < list(SHAPES).index(floor):
+        raise CloudError("refused: %s needs at least shape %s (CW_REPO_MIN_SHAPE), not %s; name a larger shape or change the setting; nothing was created" % (scrub(a.repo, (), 120), floor, named), EXIT_USAGE)
+    if named is None:
+        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
+        if floor is not None and list(SHAPES).index(floor) > list(SHAPES).index(a.shape):
+            a.shape = floor
     if getattr(a, "stack", False) and not SHAPES[a.shape]["stack"]:
         raise CloudError("--stack needs a shape that can run a nested Docker stack (%s), not %s" % (", ".join(k for k, v in SHAPES.items() if v["stack"]), a.shape), EXIT_USAGE)
 
@@ -1749,7 +1780,7 @@ class Launcher:
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.match(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
-            check_shape(a)   # resolves an unnamed shape; before any cluster, vault or token call
+            check_shape(a, self.env)   # resolves an unnamed shape; before any cluster, vault or token call
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
@@ -2555,6 +2586,7 @@ SETTINGS = (
     ("CW_STACK_REGISTRY", False, "registry-host"),  # the stack registry's host name (pull-only for a stack pod); all three CW_STACK_ keys are set together or not at all
     ("CW_STACK_PULL_CLIENT_ID", False, "guid"),    # the client id of the pull identity (not a secret)
     ("CW_STACK_PULL_TENANT_ID", False, "guid"),    # the tenant id (not a secret)
+    ("CW_REPO_MIN_SHAPE", False, "name"),          # comma-separated OWNER/NAME=SHAPE: the smallest pod shape a launch for that repository may use (a floor)
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
@@ -2700,6 +2732,7 @@ VALIDATORS = {
     "CW_STACK_REGISTRY": ("a lower-case registry host name ending in .azurecr.io: no scheme, path, port, user or IP address", _registry_host_ok),
     "CW_STACK_PULL_CLIENT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_STACK_PULL_TENANT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
+    "CW_REPO_MIN_SHAPE": ("a comma-separated list of OWNER/NAME=SHAPE entries (SHAPE one of %s), no repository twice" % ", ".join(SHAPES), lambda v: repo_min_shapes(v) is not None),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
