@@ -427,4 +427,8 @@ Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-
 - `CLOUD_PREPUSH_PREFLIGHT=full` asks `bin/cloud-prepush` for the full mode; `quick` (the default) is printed as `preflight mode: quick`; any other value is refused with exit 2. Continuous integration stays the full check.
 <!-- preflight-modes:end -->
 
-Known limit of the text redaction: a password in a URL that holds a raw space (`://user:pass word@host`) is not covered, because a space ends a word and the pattern cannot tell the rest of the text from the password; percent-encode the space.
+Known limit of the text redaction: a password in a URL that holds a raw space (`://user:pass word@host`) is not covered, because a space ends a word and the pattern cannot tell the rest of the text from the password; percent-encode the space. In short: a URL password that holds a space is not redacted.
+
+A begin marker with no end marker redacts the text to its end: a key block that a foreign end marker interrupts is redacted through that marker, up to its own end marker, the next begin marker or the end of the text.
+
+The local launch makes one more discovery of the local agents before the report-to check; it is a read with no behaviour change.
