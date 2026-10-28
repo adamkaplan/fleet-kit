@@ -18413,8 +18413,7 @@ def claim_union_refusal(args, runner, now):
             return refuse("unknown sibling", "this merged pull request has no claim recorded at or before its merge: its claim is unknown; the gate fails closed for a pull request with a claim line") if claiming else None
         body = plan_ledger.claim_body(text)
     try:
-        closed_prs = []
-        peers = plan_peers(ctx, runner, now, closed_prs)
+        peers = plan_peers(ctx, runner, now)
     except Exception as err:
         if plan_ledger.pr_claim(body, scenarios)[0] is None:
             return None   # a pull request with no claim line claims every per-PR scenario: the union is covered whatever the peers say (docs/switchboard.md)
@@ -18425,6 +18424,11 @@ def claim_union_refusal(args, runner, now):
         return None
     if _cu_waived(args, runner, now, "uncovered scenarios: " + ", ".join(uncovered), ctx):
         return None
+    closed_prs = []
+    try:   # #1347: name the closed-unmerged pull requests in the refusal (one more bounded read, only on the refusal path)
+        plan_peers(ctx, runner, now, closed_prs)
+    except Exception:
+        closed_prs = []
     return plan_ledger.union_refusal(ctx.pr, uncovered, [n for n, _ in closed_prs])
 
 
