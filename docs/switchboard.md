@@ -2787,6 +2787,8 @@ that key in one locked step and writes ONE audit line, `reminder.cancelled` (key
 reminder is never matched, and a copy already delivered is not recalled. At the delivery step each reminder fact is checked once more
 against `reminders.json`: a copy that fired and became a fact, and was then cancelled or superseded by a newer due copy of the same
 owner and key while it was on its way, is not delivered, and `reminder.drop_in_flight` names the dropped id and the replacing id (or `cancelled`).
+When some facts of a plan are dropped this way the plan is decided again from the facts left (a wake planned for a dropped fact does not
+carry the rest); a changed action is audited as `recheck`. A reminders file that cannot be read at this step defers the delivery to the next pass: nothing is sent or lost.
 
 **Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
 ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are

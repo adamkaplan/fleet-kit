@@ -3020,7 +3020,11 @@ class Switchboard:
             # #1401: a reminder superseded by a re-arm or cancelled after it became a fact is not delivered; the drop names both reminders
             kept_facts = []
             for fact in plan.pending:
-                replaced = source.recheck_delivery(fact)
+                try:
+                    replaced = source.recheck_delivery(fact)
+                except ReminderError as err:   # as the other reads of the file: the pass step fails, the reminder stays queued, the next pass decides again
+                    self._note("source.error", "reminders", {"error": _one_line(str(err))})
+                    return {"sent": False, "action": "deferred", "reason": "the reminders file cannot be read: %s" % _one_line(str(err), 200)}
                 if replaced is None:
                     kept_facts.append(fact)
                 elif self.audit is not None:
@@ -3030,6 +3034,17 @@ class Switchboard:
                 plan.pending = kept_facts
                 if not kept_facts:
                     return {"sent": False, "action": "dropped", "reason": "every reminder on its way was superseded or cancelled"}
+                # the plan is decided again from what remains: a wake planned for a dropped fact does not carry the lower-class rest
+                redone = decide(plan.recipient, kept_facts, observation, self.now(), self.batch_seconds, self.engaged_seconds)
+                if plan.folded and redone.action == "wake":
+                    redone.action = "note"
+                if redone.action != plan.action and not (interrupt and redone.action in ("note", "wake")):
+                    if self.audit is not None:
+                        self.audit.append(self.actor, "recheck", plan.recipient, {"was": plan.action, "now": redone.action, "reason": redone.reason,
+                                                                                  "keys": [fact.key for fact in kept_facts]})
+                    if redone.action not in ("note", "wake"):
+                        return {"sent": False, "action": redone.action, "reason": redone.reason}
+                    plan.action = redone.action
         repos = self.repos_in_play()
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
             self.intents.discard_told()

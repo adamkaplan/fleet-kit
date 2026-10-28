@@ -10587,6 +10587,58 @@ class TestReminders(PR4Base):
         self.assertEqual(self.audit_events("reminder.drop_in_flight")[0]["detail"]["dropped"], mine["id"])
         self.assertEqual(len(self.audit_events("reminder.drop_in_flight")), 1)
 
+    def planned(self, facts):
+        engine = self.world.engine
+        discovery = engine.discover(self.world.clock.now())
+        return engine.plan("platform", facts, discovery, self.world.clock.now()), discovery
+
+    def test_a_plan_is_decided_again_from_the_facts_left_after_the_recheck_drops_some(self):
+        old = self.keyed(delay=10)
+        self.world.tick(10)
+        (fact,) = [f for f in self.reminder_facts() if f.key == "reminder:" + old["id"]]
+        lower = sb.Fact("worker:x:idle", "platform", "worker", "x finished", self.world.clock.now(), batch=True)
+        plan, discovery = self.planned([fact, lower])
+        self.assertEqual(plan.action, "wake", "the unbatched reminder alone plans the wake")
+        alone = sb.decide("platform", [lower], plan.observation, self.world.clock.now(), self.world.engine.batch_seconds,
+                          self.world.engine.engaged_seconds)
+        self.assertEqual(alone.action, "wait")
+        self.cancel_key()
+        outcome = self.world.engine.deliver(plan)
+        self.assertEqual((outcome["sent"], outcome["action"]), (False, alone.action))
+        self.assertEqual(self.world.admissions("platform"), [])
+        (line,) = self.audit_events("recheck")
+        self.assertEqual((line["detail"]["was"], line["detail"]["now"]), ("wake", "wait"))
+
+    def test_an_unreadable_reminders_file_at_the_recheck_delivers_nothing_loses_nothing_then_delivers_once(self):
+        old = self.keyed(delay=10)
+        self.world.tick(10)
+        path = Path(self.world.state) / "reminders.json"
+        good = path.read_text()
+        def corrupt():
+            path.write_text("not json")
+        report = self.deliver_with(corrupt)
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.assertEqual(report["sent"], [])
+        path.write_text(good)
+        self.world.engine.run_pass()
+        self.world.engine.run_pass()
+        sent = [m for m in self.world.admissions("platform") if "reminder:" + old["id"] in m["keys"]]
+        self.assertEqual(len(sent), 1)
+
+    def test_a_sender_less_reminder_passes_the_recheck_and_is_delivered(self):
+        item = self.remind(delay=10)
+        self.world.tick(10)
+        self.world.engine.run_pass()
+        self.assertEqual([m["keys"] for m in self.world.admissions("platform")], [["reminder:" + item["id"]]])
+        self.assertEqual(self.audit_events("reminder.drop_in_flight"), [])
+
+    def test_an_until_closed_reminder_passes_the_recheck_and_is_delivered(self):
+        item = self.remind(delay=10, condition={"until_closed": "o/r#5"})
+        self.world.tick(10)
+        self.world.engine.run_pass()
+        self.assertEqual([m["keys"] for m in self.world.admissions("platform")], [["reminder:" + item["id"]]])
+        self.assertEqual(self.audit_events("reminder.drop_in_flight"), [])
+
     def test_every_path_that_removes_or_skips_a_reminder_is_in_the_docs_table(self):
         here = os.path.dirname(os.path.abspath(__file__))
         src = open(os.path.join(here, "switchboard", "reminders.py")).read()
