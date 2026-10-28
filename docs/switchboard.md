@@ -573,6 +573,12 @@ cloud: nodes 3 (pool pool-a 2 x size-1, oldest 5d3h; pool pool-b 1 x size-2, old
 The nodes are by pool (the node's pool label) and size (its instance-type
 label), with the age of the oldest node of the pool; a label that is not there
 reads `unknown`. The pods are every pod of the workers' namespace, by phase.
+
+Each live cloud worker then has one line: its runtime id, its phase, about what it has cost so far, its idle deadline, whether it answers
+through a tunnel opened for that probe only, and when it stops. The launcher's `status` is read ONCE for all workers (not once per worker), and the
+probes run four at a time, each given up after 5 seconds, so the whole run stays within a bound however many workers there are. A worker that is
+missing from that read, or whose probe fails, says so on its own line and never empties the others. `status --lane NAME` shows only the cloud
+workers whose recorded boss is NAME; without the flag every cloud worker is shown.
 The read is bounded: the whole summary, the login included, is given 30 s; the
 launcher run is killed as a group at that bound. The line is never omitted and
 the command never hangs: when the cluster could not be read, the summary is

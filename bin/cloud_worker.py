@@ -12,6 +12,7 @@ from a private file the switchboard itself wrote, and is never logged, printed, 
 before a byte is sent.
 """
 import base64
+import concurrent.futures as futures
 import contextlib
 import datetime
 import fcntl
@@ -585,8 +586,8 @@ def launcher_argv():
 STACK_MODEL_KEY_LIMIT = 16384   # bytes: a model API key is far smaller
 
 
-def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None, cluster=None, secrets=()):
-    """Run `cloud-worker <command> <worker> <options> --json`. Returns (exit code, parsed JSON or None, one-line stderr). A launcher that is missing
+def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None, cluster=None, secrets=(), listing=False):
+    """(`listing=True`, the status read only, also returns a JSON list as it is.) Run `cloud-worker <command> <worker> <options> --json`. Returns (exit code, parsed JSON or None, one-line stderr). A launcher that is missing
     or too slow is a CloudError with a plain reason. `cluster` (a Cluster) gives the launcher its login: a token FILE in the cluster's private
     directory, never a value in an argument or the environment. `secrets` [(name, value)] go to the launcher as per-run secrets through
     inherited pipes (`--run-secret-fd NAME=N`): a value is never in an argument, the environment or a file. `runner` is kept for the callers'
@@ -648,7 +649,8 @@ def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, pa
     except ValueError:
         body = None
     clean = cluster.clean if cluster is not None else (lambda text, limit=300: _scrub_lib()(text, (), limit))
-    return child.returncode, body if isinstance(body, dict) else None, _one(clean(err or "", 2000))
+    keep = isinstance(body, (dict, list)) if listing else isinstance(body, dict)   # only the status read may answer with a list
+    return child.returncode, body if keep else None, _one(clean(err or "", 2000))
 
 
 LAUNCHER_OUTPUT_LIMIT = 4000000   # bytes of the launcher's stdout (a snapshot of a large cluster is far below it)
@@ -1675,13 +1677,15 @@ def _summary_line(snapshot, now):
     return "cloud: %s; pods %d (%s)" % (nodes_text, len(pods), pod_text)
 
 
-def status_lines(runner, state, timeout=STATUS_SECONDS):
+def status_lines(runner, state, timeout=STATUS_SECONDS, lane=None):
     """(lines, rows) for `status`: ONE cloud summary line from ONE cluster read, then per cloud worker its record and, from the launcher's
     read-only `status`, phase and cost, and whether the worker answers through a tunnel that exists only for that probe. A record whose hard
     deadline has passed and whose pod is gone is ENDED (the deadline is the time it ended); a record whose pod still stands says so. A trouble is
     said on the line, never raised."""
     records = list_records(state)
-    lines, rows = [], []
+    if lane is not None:   # --lane NAME: only the workers whose recorded boss is NAME
+        records = [r for r in records if r.get("reports_to") == lane]
+    lines, rows, live = [], [], []
     cluster, snapshot, reason = None, None, None
     started = time.monotonic()
     deadline = started + SNAPSHOT_SECONDS   # ONE deadline for the whole read: the login's commands and the launcher run share it
@@ -1735,24 +1739,95 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
                 rows.append(row)
                 lines.append("      cloud %s: %s, not queried (no cluster reached); stops at %s" % (record["worker"], record["runtime_id"], record.get("hard_deadline") or "?"))
                 continue
-            try:
-                code, body, note = run_launcher(runner, "status", record["worker"], (), timeout, cluster=cluster)
-            except CloudError as err:
-                code, body, note = -1, None, str(err)
-            if code == 0 and body is not None:
-                row.update({key: body.get(key) for key in ("phase", "idle_since", "cost_estimate_usd")})
-                extra = "phase %s, about $%s so far" % (_safe(body.get("phase"), "?"), body.get("cost_estimate_usd", "?"))
-            else:
-                row["launcher_status"] = _reason(code, note)
-                extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
-            row["answers"] = _answers(state, cluster, record, timeout)
+            lines.append(None)   # filled once the one launcher read and the probes are done, so the order stays the records' order
             rows.append(row)
-            lines.append("      cloud %s: %s, %s; %s; stops at %s" % (record["worker"], record["runtime_id"], extra,
-                                                                     "answers" if row["answers"] else "does not answer", record.get("hard_deadline") or "?"))
+            live.append((len(lines) - 1, row, record))
+        if live:
+            code, found, note = _read_all(runner, cluster, timeout)
+            answers = _probe_all(state, cluster, [record for _, _, record in live], timeout)
+            for (at, row, record), answered in zip(live, answers):
+                body = found.get(record["worker"]) if found is not None else None
+                if body is not None and body.get("error"):   # the launcher read this one pod and said why it could not
+                    row["launcher_status"] = _one(str(body["error"]), 100)
+                    extra = "launcher status unavailable (%s)" % row["launcher_status"]
+                elif body is not None:
+                    row.update({key: body.get(key) for key in ("phase", "idle_since", "cost_estimate_usd")})
+                    idle = (body.get("deadlines") or {}).get("idle") if isinstance(body.get("deadlines"), dict) else body.get("idle_deadline")
+                    row["idle_deadline"] = idle if idle is not None else row.get("idle_deadline")
+                    extra = "phase %s, about $%s so far" % (_safe(body.get("phase"), "?"), _cost(body.get("cost_estimate_usd")))
+                    if idle is not None:
+                        extra += ", idle deadline %s" % _stamp(idle)
+                else:
+                    row["launcher_status"] = _reason(code, note) if found is None else "not in the launcher's status"
+                    extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
+                row["answers"] = answered
+                lines[at] = "      cloud %s: %s, %s; %s; stops at %s" % (record["worker"], record["runtime_id"], extra,
+                                                                       "answers" if answered else "does not answer", record.get("hard_deadline") or "?")
     finally:
         if cluster is not None:
             cluster.close()
     return lines, rows
+
+
+def _stamp(value):
+    """A deadline the launcher printed, shown only when it is a plain timestamp."""
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9TZ:.+-]{1,40}", value) else "?"
+
+
+def _cost(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else "?"
+
+
+PROBE_WORKERS = 4      # live workers probed at a time
+PROBE_SECONDS = 5      # each probe's own bound
+
+
+def _read_all(runner, cluster, timeout):
+    """ONE launcher `status` (no worker name) for all pods: (code, {worker: record} or None, one-line reason). A list of records is the launcher's real
+    answer; one object is the older shape (taken as the record of every worker)."""
+    try:
+        code, body, note = run_launcher(runner, "status", "", (), timeout, cluster=cluster, listing=True)
+    except CloudError as err:
+        return -1, None, str(err)
+    if code != 0 or body is None:
+        return code, None, note
+    found = {item["worker"]: item for item in body if isinstance(item, dict) and isinstance(item.get("worker"), str)} if isinstance(body, list) else {}
+    if isinstance(body, dict):   # the older shape: taken as it stands, whatever name it carries
+        return code, _Everyone(body), note
+    return code, found, note
+
+
+class _Everyone(dict):
+    """The old object-only answer has no worker name: it stands for any worker asked."""
+
+    def __init__(self, body):
+        super().__init__()
+        self.body = body
+
+    def get(self, key, default=None):
+        return self.body
+
+
+def _probe_one(state, cluster, record, timeout):
+    """_answers for one worker, in its own thread, given up after PROBE_SECONDS: a raise or a timeout is False for that worker only."""
+    box = []
+
+    def run():
+        try:
+            box.append(bool(_answers(state, cluster, record, min(timeout, PROBE_SECONDS))))
+        except BaseException:
+            box.append(False)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(PROBE_SECONDS)
+    return box[0] if box else False
+
+
+def _probe_all(state, cluster, records, timeout):
+    """The probes of the live workers, PROBE_WORKERS at a time; the answers come back in the order of `records`."""
+    with futures.ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
+        return list(pool.map(lambda record: _probe_one(state, cluster, record, timeout), records))
 
 
 def _answers(state, cluster, record, timeout):
@@ -1765,13 +1840,13 @@ def _answers(state, cluster, record, timeout):
         return False
 
 
-def status_extra(runner):
+def status_extra(runner, lane=None):
     """The hook of `status`: (lines, rows). Never raises."""
     try:
         state = H["state_dir_path"]()
         if not (state / CLOUD_DIR).is_dir():
             return [], []
-        return status_lines(runner, state)
+        return status_lines(runner, state, lane=lane)
     except Exception as err:
         return ["      cloud workers: unreadable (%s)" % _one(str(err), 100)], []
 
