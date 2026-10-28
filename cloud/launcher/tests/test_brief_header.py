@@ -1,6 +1,7 @@
 """Ask #1046: a standard operator brief header, and a launch that refuses a report-to name nobody can answer to. Offline: fake cluster pieces,
 fake registry in a temporary state directory. Scenarios: S2 S3 (the header), S4 S5 (the check), S6 (mutants), S7 (documentation), S9 S11 (cloud
 shape and temporary rules), U2 (no secret), U3 (the one constant in one place)."""
+import hashlib
 import inspect
 import io
 import os
@@ -8,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -21,6 +23,7 @@ sys.path.insert(0, LAUNCHER)
 SOURCE = os.path.join(ROOT, "skills", "fleet-coordination", "operator-brief-header.txt")
 PLANTED = "planted-" + "Hq7Lz2" * 5   # a fake setting value
 SB = os.path.join(ROOT, "bin", "fleet-switchboard")
+HEADER_OUTPUT_SHA256 = "79ee69b86fb787c543317ea9973a9c4ad2915ae2dcb494bb2dc8b6bbf7bc3002"   # the output at the commit before the change
 
 
 def read(path):
@@ -382,11 +385,11 @@ class OverrideReasonScrub(LaunchHarness):
         sb = load_sb()
         calls = []
         real = sb.scrubbed_flag_text
-        sb.scrubbed_flag_text = lambda text: calls.append(text) or real(text)
+        sb.scrubbed_flag_text = lambda text, limit=160: calls.append(text) or real(text, limit)
         self.memory_audit("release fix", sb)
         with mock.patch.object(sys.modules[__name__], "load_sb", lambda: sb):
             result, _, audit = self.run_launch("lane-nobody", override="release fix")
-        self.assertEqual(calls, ["release fix", "release fix"], "one call from each flag")
+        self.assertEqual(calls, ["release fix", "lane-nobody", "release fix"], "one call from each free-text field: the memory reason, the boss text, the boss reason")
         self.assertEqual([a for a in audit if a[0] == "launch.boss_unregistered"][0][2]["reason"], "release fix")
 
     def test_mutant_cut_without_scrub_fails_every_shape_case(self):
@@ -408,6 +411,166 @@ class OverrideReasonScrub(LaunchHarness):
         leaked = [n for n, t in _shapes().items() if SECRET_PART[n] and SECRET_PART[n] in self.memory_audit("fix " + t, sb)]
         self.assertEqual(sorted(leaked), ["bearer", "key", "token", "url"])
         self.assertNotIn(SECRET_PART["token"], self.boss_audit("fix " + _shapes()["token"]), "the new flag still scrubs")
+
+
+BOSS_SHAPES = {
+    "token": ("ghp_" + "aB3dE5gH7j" * 3 + "KLmnop", "ghp_" + "aB3dE5gH7j" * 3),
+    "bearer": ("Authorization: Bearer abcDEF1234567890xyz", "abcDEF1234567890xyz"),
+    "key": ("-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkq\n-----END PRIVATE KEY-----", "MIIBVgIBADANBgkq"),
+    "url": ("https://user:pass@host/path", "user:pass@"),
+    "control": ("boss\x07one\ntwo", None),
+}
+
+
+class EveryFreeTextField(OverrideReasonScrub):
+    """S12: the three free-text fields (memory reason, boss reason, boss text) go through the one helper."""
+
+    def launch_with_sb(self, sb, boss, reason):
+        from unittest import mock
+        with mock.patch.object(sys.modules[__name__], "load_sb", lambda: sb):
+            return self.run_launch(boss, override=reason)
+
+    def boss_line(self, sb, boss, reason="plain reason"):
+        _, _, audit = self.launch_with_sb(sb, boss, reason)
+        lines = [a for a in audit if a[0] == "launch.boss_unregistered"]
+        return lines[0][2] if lines else None
+
+    def test_s12_three_fields_five_shapes_leave_no_secret_part(self):
+        sb = load_sb()
+        for name, (text, part) in BOSS_SHAPES.items():
+            with self.subTest(field="boss text", shape=name):
+                if name == "control":
+                    detail = {"reports_to": sb.scrubbed_flag_text(text, 60), "reason": ""}
+                else:
+                    detail = self.boss_line(sb, text)
+                    self.assertIsNotNone(detail)
+                self.assertNotIn("\n", detail["reports_to"])
+                self.assertNotRegex(detail["reports_to"], r"[\x00-\x1f]")
+                if part:
+                    self.assertEqual(repr(detail).count(part), 0)
+            with self.subTest(field="boss reason", shape=name):
+                if part:
+                    detail = self.boss_line(sb, "lane-nobody", text)
+                    self.assertEqual(repr(detail).count(part), 0)
+            with self.subTest(field="memory reason", shape=name):
+                got = self.memory_audit(text, sb)
+                self.assertNotIn("\n", got)
+                if part:
+                    self.assertEqual(got.count(part), 0)
+
+    def test_s12_a_plain_text_is_kept_as_typed_per_field(self):
+        sb = load_sb()
+        detail = self.boss_line(sb, "lane-nobody", "the lane starts later")
+        self.assertEqual(detail, {"reports_to": "lane-nobody", "reason": "the lane starts later"})
+        self.assertEqual(self.memory_audit("release fix", sb), "release fix")
+
+    def test_s12_the_three_sites_call_the_one_helper(self):
+        src = read("bin/cloud_worker.py")
+        self.assertIn('"reports_to": H["scrubbed_flag_text"](args.reports_to, 60)', src)
+        self.assertIn('"reason": H["scrubbed_flag_text"](reason)', src)
+        self.assertIn("scrubbed_flag_text(reason)", inspect.getsource(load_sb().launch_memory_check))
+
+    def test_s12_mutant_the_boss_text_cut_without_scrub_leaks(self):
+        sb = load_sb()
+        real = sb.scrubbed_flag_text
+        sb.scrubbed_flag_text = lambda text, limit=160: sb._one_line(text, limit) if limit == 60 else real(text, limit)
+        text, part = BOSS_SHAPES["token"]
+        detail = self.boss_line(sb, text)
+        self.assertIn(part, detail["reports_to"], "mutation applied: the boss text leaks")
+        self.assertEqual(self.boss_line(load_sb(), text)["reports_to"].count(part), 0, "the real helper does not")
+
+    def test_s12_mutant_scrubbing_just_the_new_flag_reason_leaves_memory_ok_leaking(self):
+        sb = load_sb()
+        src = inspect.getsource(sb.launch_memory_check).replace("scrubbed_flag_text(reason)", "_one_line(reason, 200)")
+        self.assertIn("_one_line(reason, 200)", src, "mutation applied")
+        exec(compile(src.replace("def launch_memory_check", "def mutant_memory_check", 1), "<mutant>", "exec"), sb.__dict__)
+        sb.launch_memory_check = sb.__dict__["mutant_memory_check"]
+        text, part = BOSS_SHAPES["token"]
+        self.assertIn(part, self.memory_audit(text, sb))
+        self.assertEqual(self.boss_line(sb, "lane-nobody", text)["reason"].count(part), 0)
+
+
+KEY_BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\nzzzzAAAA1111bbbb2222cccc\n"
+KEY_FORMS = {
+    "rsa": ("RSA PRIVATE KEY", "RSA PRIVATE KEY"),
+    "plain": ("PRIVATE KEY", "PRIVATE KEY"),
+    "encrypted": ("ENCRYPTED PRIVATE KEY", "ENCRYPTED PRIVATE KEY"),
+    "pgp": ("PGP PRIVATE KEY BLOCK", "PGP PRIVATE KEY BLOCK"),
+}
+
+
+class WholeKeyBlock(unittest.TestCase):
+    """S13: the key pattern covers the whole block, and stays linear."""
+
+    @staticmethod
+    def block(kind):
+        return "-----BEGIN %s-----\n%s-----END %s-----" % (kind, KEY_BODY, kind)
+
+    def test_s13_four_block_forms_leave_no_body_line(self):
+        sb = load_sb()
+        for name, (kind, _) in KEY_FORMS.items():
+            with self.subTest(form=name):
+                got = sb.redact_command_text("before\n" + self.block(kind) + "\nafter")
+                for line in KEY_BODY.splitlines():
+                    self.assertNotIn(line, got)
+                self.assertIn("before", got)
+                self.assertIn("after", got)
+
+    def test_s13_a_line_between_two_blocks_is_kept(self):
+        sb = load_sb()
+        got = sb.redact_command_text(self.block("RSA PRIVATE KEY") + "\nkeep this line\n" + self.block("PRIVATE KEY"))
+        self.assertIn("keep this line", got)
+        for line in KEY_BODY.splitlines():
+            self.assertNotIn(line, got)
+
+    def test_s13_timing_one_begin_marker_no_end_marker(self):
+        sb = load_sb()
+        text = "-----BEGIN PRIVATE KEY-----" + "A" * 1000000
+        start = time.monotonic()
+        sb.redact_command_text(text)
+        self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_s13_timing_many_begin_markers_no_end_marker(self):
+        sb = load_sb()
+        text = "-----BEGIN PRIVATE KEY-----" * 20000
+        start = time.monotonic()
+        sb.redact_command_text(text)
+        self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_s13_mutant_a_lazy_dot_all_pattern_fails_the_many_begin_timing(self):
+        code = ("import re,sys,time\n"
+                "p=re.compile(r'-----BEGIN[A-Z ]*PRIVATE KEY-----.*?-----END[A-Z ]*PRIVATE KEY-----', re.S)\n"
+                "t='-----BEGIN PRIVATE KEY-----'*20000\n"
+                "s=time.monotonic(); p.sub('[redacted]', t); print(time.monotonic()-s)\n")
+        self.assertIn(".*?", code, "mutation applied")
+        start = time.monotonic()
+        try:
+            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+            slow = float(done.stdout.strip()) >= 2.0
+        except subprocess.TimeoutExpired:
+            slow = True   # the 10 s guard: the mutant did not finish
+        self.assertTrue(slow, "the mutant is too slow for the 2.0 s bound, as the real pattern is not")
+        self.assertLess(time.monotonic() - start, 15)
+
+
+class HeaderFileAndOutput(unittest.TestCase):
+    def test_s14_the_file_comment_names_the_title_line_and_the_id_text_form(self):
+        comment = "\n".join(l for l in open(SOURCE).read().splitlines() if l.startswith("#"))
+        self.assertIn("title line", comment)
+        self.assertIn("`[id] text`", comment)
+        self.assertNotIn("and nothing else", comment)
+
+    def test_s14_the_printed_output_is_the_recorded_one(self):
+        code, out, err = run_header()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(hashlib.sha256(out.encode()).hexdigest(), HEADER_OUTPUT_SHA256)
+
+
+class DocsBossText(unittest.TestCase):
+    def test_the_quickstart_names_the_scrubbed_boss_text(self):
+        doc = read("docs/cloud-operator-quickstart.md")
+        phrase = "The boss text of --boss-unregistered is scrubbed too, and cut to 60 characters."
+        self.assertEqual(doc.count(phrase), 1)
 
 
 if __name__ == "__main__":
