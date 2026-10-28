@@ -84,7 +84,7 @@ class TestFeedShape(Fixture):
     def test_s1_the_five_cards_carry_exactly_the_agreed_fields(self):
         code, doc = verb(self.root)
         self.assertEqual(code, 0)
-        self.assertEqual(sorted(doc), ["cards", "generation", "produced_at", "schema_version"])
+        self.assertEqual(sorted(doc), ["cards", "generation", "produced_at", "schema_version", "sources"])
         self.assertEqual(doc["schema_version"], 1)
         self.assertIsInstance(doc["generation"], int)
         self.assertEqual(list(doc["cards"]), sorted(CARDS), "the cards are written in a fixed order (sorted keys)")
@@ -109,12 +109,13 @@ class TestFeedShape(Fixture):
         self.assertEqual(sorted(doc["cards"]), sorted(CARDS))
         self.assertEqual(subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "cockpit"], capture_output=True, text=True, env=env, timeout=60).returncode, 2, "no --json: usage")
 
-    def test_a_missing_or_damaged_state_reads_as_empty_cards_not_an_error(self):
+    def test_a_missing_or_damaged_state_reads_as_empty_cards_and_unreadable_sources(self):
         empty = self.root / "empty" / "fleet-switchboard"
         empty.mkdir(parents=True)
         (empty / "decisions.json").write_text("{not json")
         doc = build(empty)
         self.assertEqual(doc["cards"], {card: [] for card in CARDS})
+        self.assertEqual(doc["sources"], {"decisions": "unreadable", "registry": "unreadable", "reports": "unreadable"}, "and it says so: it is not an all-clear")
 
 
 class TestIdsAndEtags(Fixture):
@@ -368,10 +369,6 @@ class TestReadOnly(Fixture):
         self.assertEqual(len(baseline["decisions"]), len(DECISIONS), "no decision was dropped composing the feed")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestBranches(Fixture):
     """Each branch of the feed builder that the feed's own scenarios did not reach, with the input that takes it."""
 
@@ -447,3 +444,215 @@ class TestBranches(Fixture):
         self.assertEqual([c for c in calls if c in ("write_catching_up", "health_write", "schedule_judge_warm")], ["write_catching_up", "health_write", "schedule_judge_warm"], "the steps after the feed still run")
         engine._failed.assert_called_once()
         self.assertEqual(engine._failed.call_args[0][:2], ("cockpit", "cockpit"))
+
+
+def break_source(state, source, how):
+    """Make one source unreadable: its file gone, damaged, a symlink to a good file, or over the size cap."""
+    name = {"decisions": "decisions.json", "registry": "registry.json", "reports": "last-reports.json"}[source]
+    path = Path(state) / name
+    if how == "missing":
+        path.unlink()
+    elif how == "damaged":
+        path.write_text("{not json")
+    elif how == "symlink":
+        target = Path(state) / (name + ".real")
+        path.rename(target)
+        path.symlink_to(target)
+    else:
+        path.write_text(json.dumps({"pad": "x" * 1_100_000}))
+
+
+class TestSources(Fixture):
+    """S9: an unreadable source is not an all-clear. The document says which of the three places could not be read; the verb exits 3; the daemon keeps the last good file."""
+    HOWS = ("missing", "damaged", "symlink", "oversize")
+
+    def fresh(self):
+        for path in list(self.state.iterdir()):
+            path.unlink()
+        fleet_state(self.state)
+
+    def test_s9_a_readable_fleet_says_ok_for_each_source_and_exits_0(self):
+        code, doc = verb(self.root)
+        self.assertEqual((code, doc["sources"]), (0, {"decisions": "ok", "registry": "ok", "reports": "ok"}))
+        self.assertEqual(sorted(sb.COCKPIT_SOURCES), sorted(doc["sources"]))
+
+    def test_s9_the_verb_exits_3_and_names_the_unreadable_source_for_each_of_the_three(self):
+        for source in sb.COCKPIT_SOURCES:
+            for how in [h for h in self.HOWS if (source, h) != ("registry", "symlink")]:   # the registry's own loader is not this feed's to change
+                with self.subTest(source=source, how=how):
+                    self.fresh()
+                    break_source(self.state, source, how)
+                    code, doc = verb(self.root)
+                    self.assertEqual(code, 3)
+                    self.assertEqual(doc["sources"], {s: "unreadable" if s == source else "ok" for s in sb.COCKPIT_SOURCES})
+                    self.assertEqual(sorted(doc["cards"]), sorted(CARDS), "the document is still printed")
+
+    def test_s9_an_empty_state_directory_is_three_unreadable_sources_not_five_quiet_cards(self):
+        empty = self.root / "bare" / "fleet-switchboard"
+        empty.mkdir(parents=True)
+        code, doc = verb(self.root / "bare")
+        self.assertEqual(code, 3)
+        self.assertEqual(set(doc["sources"].values()), {"unreadable"})
+
+    def test_s9_the_real_command_line_exits_3_on_an_empty_state_directory(self):
+        bare = self.root / "bare2"
+        (bare / "fleet-switchboard").mkdir(parents=True)
+        done = subprocess.run([sys.executable, str(REPO / "bin" / "fleet-switchboard"), "cockpit", "--json"], capture_output=True, text=True, env=dict(os.environ, XDG_STATE_HOME=str(bare)), timeout=60)
+        self.assertEqual(done.returncode, 3, done.stderr)
+        self.assertEqual(json.loads(done.stdout)["sources"]["decisions"], "unreadable")
+
+    def publish(self, tick):
+        with mock.patch("time.monotonic", lambda: float(tick)):
+            return sb.publish_cockpit(mock.Mock(state_dir=self.state, now=lambda: T0 + tick))
+
+    def test_s9_the_daemon_keeps_the_last_good_file_byte_for_byte_when_any_source_cannot_be_read(self):
+        feed = self.state / "cockpit.json"
+        for source in sb.COCKPIT_SOURCES:
+            for how in [h for h in self.HOWS if (source, h) != ("registry", "symlink")]:   # the registry's own loader is not this feed's to change
+                with self.subTest(source=source, how=how):
+                    sb._STATE_LAST.clear()
+                    self.fresh()
+                    self.assertTrue(self.publish(0))
+                    good = feed.read_bytes()
+                    break_source(self.state, source, how)
+                    self.assertFalse(self.publish(500), "past the heartbeat, still nothing is written")
+                    self.assertEqual(feed.read_bytes(), good)
+
+    def test_s9_a_pass_on_an_empty_state_directory_creates_no_file(self):
+        sb._STATE_LAST.clear()
+        for path in self.state.iterdir():
+            path.unlink()
+        self.assertFalse(self.publish(0))
+        self.assertFalse((self.state / "cockpit.json").exists())
+
+    def test_the_sources_are_in_the_documents_key_list(self):
+        self.assertEqual(sb.COCKPIT_DOCUMENT_KEYS, ("schema_version", "generation", "produced_at", "sources", "cards"))
+
+
+class TestScrubFailsClosed(Fixture):
+    def broken(self):
+        return mock.patch.object(sb, "cockpit_text", side_effect=RuntimeError("secret ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 inside"))
+
+    def test_s9_the_verb_prints_one_line_and_exits_4_with_no_document_and_no_traceback(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root)}), self.broken(), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sb.cmd_cockpit(argparse.Namespace(json=True), lambda: T0)
+        self.assertEqual(code, 4)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("ghp_", err.getvalue(), "the error text is not echoed: it could hold what the scrub meant to remove")
+
+    def test_s9_the_daemon_keeps_the_last_good_file_when_the_scrub_fails(self):
+        sb._STATE_LAST.clear()
+        feed = self.state / "cockpit.json"
+        engine = mock.Mock(state_dir=self.state, now=lambda: T0)
+        with mock.patch("time.monotonic", lambda: 0.0):
+            self.assertTrue(sb.publish_cockpit(engine))
+        good = feed.read_bytes()
+        with mock.patch("time.monotonic", lambda: 500.0), self.broken():
+            with self.assertRaises(sb.CockpitWithheld):
+                sb.publish_cockpit(engine)
+        self.assertEqual(feed.read_bytes(), good)
+
+
+class TestScrubPatterns(Fixture):
+    """The widened scrub (best effort). One sample per alternative of `_COCKPIT_SECRET`; removing an alternative lets its sample through."""
+    SECRET_SAMPLES = [
+        "https://bob:pw@git.example.com/acme-org/widget-service.git",
+        "postgres://db.internal:5432/widgets",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "Authorization: Basic dXNlcjpwYXNz",
+        "Bearer abc.def-ghi",
+        "X-Api-Key: abcd1234",
+        "db_password=hunter2",
+        "ops@example.com",
+        "10.0.0.5:8080",
+        "sk_live_" + "a1B2" * 6,
+        "QUJDREVGR0hJSktMTU5PUA==",
+        "Qa1" * 10,
+    ]
+    EXTRA = ["mongodb+srv://cluster0.example.net/app", "mysql://root@localhost/app", "redis://cache:6379/0", "http://user@host/x", "login=bob", "api_key=zzz", "Cookie: sid",
+             "AIza" + "A" * 35, "SG." + "a" * 20 + "." + "b" * 20, "npm_" + "a" * 32, "glpat-" + "a" * 20, "hf_" + "a" * 32, "ya29." + "a" * 25, "ASIA" + "A" * 16, "rk_test_" + "a" * 20,
+             "Proxy-Authorization: Basic abc", "-----BEGIN CERTIFICATE-----", "-----BEGIN OPENSSH PRIVATE KEY-----"]
+
+    def test_every_alternative_has_a_sample(self):
+        self.assertEqual(len(TestCapsAndScrub.alternatives(sb._COCKPIT_SECRET)), len(self.SECRET_SAMPLES))
+
+    def test_each_sample_is_replaced_whole_in_a_title_a_note_and_a_reason(self):
+        for sample in self.SECRET_SAMPLES + self.EXTRA:
+            with self.subTest(sample=sample):
+                self.assertEqual(sb.cockpit_text("see %s now" % sample, 300), "see [removed] now")
+                fleet_state(self.state, decisions=[entry("issue", ask=31, title="see %s now" % sample), entry("notice", number=7, title="see %s now" % sample), entry("captain", number=9, title="t", note="see %s now" % sample)])
+                doc = build(self.state)
+                self.assertEqual(doc["cards"]["decisions"][0]["title"], "see [removed] now")
+                self.assertEqual(doc["cards"]["heads_up"][0]["note"], "see [removed] now")
+                self.assertEqual(doc["cards"]["held_prs"][0]["reason"], "see [removed] now")
+
+    def test_each_alternative_removed_lets_its_own_sample_through(self):
+        parts = TestCapsAndScrub.alternatives(sb._COCKPIT_SECRET)
+        for index, sample in enumerate(self.SECRET_SAMPLES):
+            with self.subTest(sample=sample):
+                self.assertEqual(sb._COCKPIT_SECRET.sub("[removed]", sample), "[removed]")
+                mutant = re.compile("|".join(parts[:index] + parts[index + 1:]))
+                self.assertNotEqual(mutant.sub("[removed]", sample), "[removed]", "the sample is caught by another alternative too: the test would not notice this one removed")
+
+    def test_ordinary_titles_are_kept(self):
+        for title in ("Choose the retention for widget exports", "Which region first?", "Rotate the API keys next quarter", "Reviewer needed on #41", "ExportRetentionPolicyConfiguration"):
+            self.assertEqual(sb.cockpit_text(title, 300), title)
+
+    def test_every_format_character_is_removed_from_every_string(self):
+        import unicodedata
+        formats = [chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Cf"]
+        self.assertTrue(len(formats) > 100)
+        self.assertEqual([hex(ord(c)) for c in formats if sb.cockpit_text("a%sb" % c, 20) != "ab"], [])
+        for ch in ("\u202e", "\u200b", "\u2066", "\u2069"):
+            self.assertEqual(sb.cockpit_text("pay%sload" % ch, 20), "payload", repr(ch))
+        self.assertEqual(sb.cockpit_text("gh\u200bp_" + "A" * 20, 50), "[removed]", "a token split by a zero-width character is joined and removed")
+        fleet_state(self.state, decisions=[entry("issue", ask=40, title="a\u202eb", agent="c\u200bd")])
+        text = json.dumps(build(self.state), ensure_ascii=False)
+        self.assertEqual([c for c in text if unicodedata.category(c) == "Cf"], [])
+
+
+class TestFileRead(Fixture):
+    def test_a_symlinked_feed_file_is_not_followed(self):
+        real = self.state / "real.json"
+        real.write_text(json.dumps(build(self.state)))
+        (self.state / "cockpit.json").symlink_to(real)
+        self.assertEqual(sb.cockpit_current(self.state / "cockpit.json"), (0, None))
+
+    def test_an_oversize_feed_file_is_not_read(self):
+        doc = build(self.state)
+        doc["pad"] = "x" * 1_100_000
+        (self.state / "cockpit.json").write_text(json.dumps(doc))
+        self.assertEqual(sb.cockpit_current(self.state / "cockpit.json"), (0, None))
+
+    def test_the_writer_does_not_write_through_a_symlinked_temp_name(self):
+        sb._STATE_LAST.clear()
+        victim = self.root / "victim"
+        victim.write_text("keep")
+        (self.state / ("cockpit.json.%d.tmp" % os.getpid())).symlink_to(victim)
+        with mock.patch("time.monotonic", lambda: 0.0):
+            with self.assertRaises(OSError):
+                sb.publish_cockpit(mock.Mock(state_dir=self.state, now=lambda: T0))
+        self.assertEqual(victim.read_text(), "keep")
+
+
+class TestDocumentTable(unittest.TestCase):
+    def test_s9_the_document_keys_and_sources_are_on_the_docs_table_in_both_directions(self):
+        rows = {}
+        for line in DOC.read_text().splitlines():
+            cells = [c.strip().strip("`") for c in line.strip().strip("|").split("|")]
+            if len(cells) == 2 and cells[0] in ("document", "sources"):
+                rows[cells[0]] = tuple(k.strip().strip("`") for k in cells[1].split(","))
+        self.assertEqual(rows, {"document": sb.COCKPIT_DOCUMENT_KEYS, "sources": sb.COCKPIT_SOURCES})
+
+    def test_the_docs_say_what_the_scrub_does_not_promise_and_where_freshness_lives(self):
+        text = DOC.read_text()
+        for phrase in ("best effort", "Q3", "status 3", "status 4", "180 seconds", "produced_at"):
+            self.assertIn(phrase, text)
+        self.assertRegex(text, r"(?i)title text is outside the scrub")
+
+
+if __name__ == "__main__":
+    unittest.main()

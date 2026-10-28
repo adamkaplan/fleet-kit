@@ -20,9 +20,30 @@ COCKPIT_FIELDS = {
 }
 COCKPIT_CAPS = {"title": 120, "reason": 200, "note": 300, "blocked_reason": 120, "repo": 100, "agent": 80, "sender": 80, "kind": 20, "hold": 40}
 COCKPIT_HOLDS_MAX = 5
+COCKPIT_SOURCES = ("decisions", "registry", "reports")   # the three places the feed reads: each is "ok" or "unreadable" in the document's `sources`
+COCKPIT_DOCUMENT_KEYS = ("schema_version", "generation", "produced_at", "sources", "cards")
+COCKPIT_EXIT_UNREADABLE = 3   # the verb printed the document, but a source could not be read: it is NOT an all-clear
+COCKPIT_EXIT_WITHHELD = 4     # the scrub failed: no document was printed (fail closed)
 COCKPIT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 COCKPIT_LANE_STATES = {"working": "ok", "blocked": "blocked", "idle": "idle", "detached": "down", "dead": "down"}
 _COCKPIT_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+# BEST EFFORT, a denylist: what looks like a login, key or address is replaced. One alternative per shape; each has a sample in the tests.
+_COCKPIT_SECRET_CI = [   # matched ignoring case
+    r"\b[a-z][a-z0-9+.-]*://[^\s/?#@]+@\S*",                                                                      # a URL that carries userinfo: the whole URL
+    r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|oracle)://\S+",                    # a database URL
+    r"-----BEGIN [A-Z0-9 ]+-----",                                                                                 # a PEM header
+    r"\b(?:proxy-)?authorization\s*[:=]\s*(?:\w+\s+)?\S+",                                                          # an Authorization header, its scheme and its value
+    r"\bbearer\s+[\w.~+/=-]+",                                                                                    # a bearer value
+    r"\b(?:x-[\w-]*(?:key|token|secret|auth)[\w-]*|(?:set-)?cookie)\s*:\s*\S+",               # a header that carries a credential
+    r"\b\w*(?:password|passwd|secret|token|key|login)\w*\s*=\s*\S+",                                              # name=value for a credential name
+    r"[\w.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",                                                                  # an email address
+    r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b",                                                                       # IP:port
+    r"\b(?:AIza[\w-]{35}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|SG\.[\w-]{16,}\.[\w-]{16,}|npm_[A-Za-z0-9]{30,}|glpat-[\w-]{20,}|hf_[A-Za-z0-9]{30,}|ya29\.[\w-]{20,}|(?:ASIA|AIDA)[0-9A-Z]{16})",   # other vendors' key shapes
+]
+_COCKPIT_SECRET = re.compile("|".join(["(?i:%s)" % alternative for alternative in _COCKPIT_SECRET_CI] + [
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{16,}={1,2}",                                                                 # padded base64
+    r"(?<![A-Za-z0-9+/])(?=[A-Za-z+/]*\d)(?=[^A-Z]*[A-Z])(?=[^a-z]*[a-z])[A-Za-z0-9+/]{24,}",                      # long mixed-case base64 with a digit (case matters)
+]))
 _COCKPIT_DIFF_LINE = re.compile(r"^(diff --git |index [0-9a-f]+\.\.|@@ |\+\+\+ |--- |[+-][^+\-\s])")
 _COCKPIT_DIFF_INLINE = re.compile(r"diff --git\s+\S+\s+\S+|@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 _COCKPIT_TOKEN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|[A-Fa-f0-9]{32,}|[A-Za-z0-9+/_-]{40,}={0,2})\b")
@@ -30,14 +51,15 @@ _COCKPIT_PATH = re.compile(r"(?:(?<![\w.-])(?:~|\.{1,2})?/(?:[\w.@+-]+/)*[\w.@+-
 
 
 def cockpit_text(value, limit):
-    """`value` as one plain line of at most `limit` characters, for a reader outside the fleet: control characters gone, diff lines dropped, a token-like string
-    and a file path replaced by a mark. Applied to every string of the feed, whatever the source said."""
+    """`value` as one plain line of at most `limit` characters, for a reader outside the fleet: control and format characters gone, diff lines dropped, a login, key,
+    address, token-like string and file path replaced by a mark (best effort: a denylist). Applied to every string of the feed, whatever the source said."""
     if not isinstance(value, str):
         return ""
     lines = value.splitlines()
     kept = [line for line in lines if not _COCKPIT_DIFF_LINE.match(line)] if len(lines) > 1 else lines   # a one-line title that starts with a sign is a title, not a diff
-    text = _COCKPIT_CONTROL.sub(" ", " ".join(kept))
+    text = _COCKPIT_CONTROL.sub(" ", "".join(c for c in " ".join(kept) if unicodedata.category(c) != "Cf"))   # Unicode category Cf (bidi overrides and isolates, zero-width, joiners, tags, the byte-order mark) is removed, not spaced: a word split by one is joined, so the patterns below match it
     text = _COCKPIT_DIFF_INLINE.sub("[removed]", text)
+    text = _COCKPIT_SECRET.sub("[removed]", text)
     text = _COCKPIT_TOKEN.sub("[removed]", text)
     text = _COCKPIT_PATH.sub("[path]", text)
     text = " ".join(text.split())
@@ -135,22 +157,30 @@ def cockpit_cards(decisions, agents, last_reports):
     return {name: _cockpit_newest_first(items) for name, items in cards.items()}
 
 
+class CockpitWithheld(Exception):
+    """The scrub failed: the feed is withheld (fail closed). The message names the kind of error, never its text (that could hold what the scrub meant to remove)."""
+
+
 def cockpit_read(state_dir):
-    """(decisions, agents, last_reports) as the state files hold them; a file that is missing or damaged reads as empty. Reads only: the registry's own
-    `_load` never migrates, and nothing here writes."""
+    """(decisions, agents, last_reports, sources): the state files as they are, and for each of COCKPIT_SOURCES `ok` or `unreadable`. A file that is missing,
+    damaged, unsafe (a symlink, a special file) or too big reads as empty AND as `unreadable`: an empty reading is never told apart from a quiet fleet by its
+    cards alone. Reads only: the registry's own `_load` never migrates, and nothing here writes."""
     state = Path(state_dir)
-    body = read_decisions_file(state / DECISIONS_FILE)
-    decisions = body["decisions"] if body else []
+    body = read_record_file(state / DECISIONS_FILE)   # the safe reader: no symlink, no special file, a size cap
+    body = body if isinstance(body, dict) and isinstance(body.get("decisions"), list) and isinstance(body.get("errors"), list) else None
     try:
         loaded = load_module("registry")._load(state)
     except Exception:
         loaded = None
-    agents = loaded["agents"] if isinstance(loaded, dict) and loaded.get("whole") else {}
-    return decisions, agents, _read_small(state, LAST_REPORT_FILE)
+    whole = isinstance(loaded, dict) and bool(loaded.get("whole")) and isinstance(loaded.get("agents"), dict)
+    raw = read_record_file(state / LAST_REPORT_FILE)
+    sources = {"decisions": "ok" if body else "unreadable", "registry": "ok" if whole else "unreadable", "reports": "ok" if isinstance(raw, dict) else "unreadable"}
+    reports = {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+    return (body["decisions"] if body else []), (loaded["agents"] if whole else {}), reports, sources
 
 
-def cockpit_document(cards, generation, now):
-    return {"schema_version": COCKPIT_SCHEMA_VERSION, "generation": generation, "produced_at": iso(now), "cards": cards}
+def cockpit_document(cards, generation, now, sources):
+    return {"schema_version": COCKPIT_SCHEMA_VERSION, "generation": generation, "produced_at": iso(now), "sources": dict(sources), "cards": cards}
 
 
 def cockpit_stable(cards, generation):
@@ -159,34 +189,40 @@ def cockpit_stable(cards, generation):
 
 
 def cockpit_current(path):
-    """(generation, cards) of the file as it is, or (0, None) when it is missing or not a feed of this version."""
-    try:
-        body = json.loads(Path(path).read_text())
-    except (OSError, ValueError):
-        return 0, None
+    """(generation, cards) of the file as it is, or (0, None) when it is missing, unsafe (a symlink, a special file, over the record cap) or not a feed of this
+    version. Read through the one safe reader of state records."""
+    body = read_record_file(path)
     if not isinstance(body, dict) or body.get("schema_version") != COCKPIT_SCHEMA_VERSION or not isinstance(body.get("generation"), int) or not isinstance(body.get("cards"), dict):
         return 0, None
     return body["generation"], body["cards"]
 
 
 def cockpit_next(state_dir, now):
-    """(document, cards, generation): the feed for now. The generation is the file's own while the cards are unchanged, and one more when they changed."""
-    cards = cockpit_cards(*cockpit_read(state_dir))
+    """(document, cards, generation): the feed for now. The generation is the file's own while the cards are unchanged, and one more when they changed.
+    Raises CockpitWithheld when the scrub fails: no document, no partial one."""
+    decisions, agents, reports, sources = cockpit_read(state_dir)
+    try:
+        cards = cockpit_cards(decisions, agents, reports)
+    except Exception as exc:
+        raise CockpitWithheld("the scrub failed (%s)" % type(exc).__name__) from None
     generation, current = cockpit_current(Path(state_dir) / COCKPIT_FILE)
     if current != cards:
         generation += 1
-    return cockpit_document(cards, generation, now), cards, generation
+    return cockpit_document(cards, generation, now, sources), cards, generation
 
 
 def publish_cockpit(engine):
     """The end of a pass: write cockpit.json when the content changed and at least every COCKPIT_HEARTBEAT seconds (through `state_write`: a private temp file
-    renamed into place, mode 0600). Returns True when written. Writes this one file and nothing else."""
+    renamed into place, mode 0600, never through a symlink). Returns True when written. When a source cannot be read the last good file is KEPT (nothing is
+    written: an empty reading must not replace it), and when the scrub fails CockpitWithheld is raised before any write. Writes this one file and nothing else."""
     state = getattr(engine, "state_dir", None)
     if state is None:
         return False
     now = engine.now()
     document, cards, generation = cockpit_next(state, now)
-    return state_write(Path(state) / COCKPIT_FILE, json.dumps(document, indent=1, sort_keys=True) + "\n", stable=cockpit_stable(cards, generation), heartbeat=COCKPIT_HEARTBEAT)
+    if "unreadable" in document["sources"].values():
+        return False
+    return state_write(Path(state) / COCKPIT_FILE, json.dumps(document, indent=1, sort_keys=True) + "\n", stable=cockpit_stable(cards, generation), heartbeat=COCKPIT_HEARTBEAT, nofollow=True)
 
 
 def add_cockpit_parsers(sub):
@@ -197,13 +233,18 @@ def add_cockpit_parsers(sub):
 
 
 def cmd_cockpit(args, now):
-    """`cockpit --json`: the feed for now, from the state files; it writes nothing."""
+    """`cockpit --json`: the feed for now, from the state files; it writes nothing. Exit 0; 3 when a source could not be read (the document is still printed, its
+    `sources` says which); 4 when the scrub failed (one line on stderr, no document). The verb's own produced_at is the time it ran: only the FILE's tells its age."""
     if not getattr(args, "json", False):
         sys.stderr.write("%s: cockpit prints JSON: use --json\n" % PROG)
         return EXIT_USAGE
-    document, _, _ = cockpit_next(state_dir_path(), now())
+    try:
+        document, _, _ = cockpit_next(state_dir_path(), now())
+    except CockpitWithheld as exc:
+        sys.stderr.write("%s: cockpit: the feed is withheld: %s\n" % (PROG, exc))
+        return COCKPIT_EXIT_WITHHELD
     print(json.dumps(document, indent=1, sort_keys=True))
-    return EXIT_OK
+    return COCKPIT_EXIT_UNREADABLE if "unreadable" in document["sources"].values() else EXIT_OK
 
 
 cmd_cockpit.direct = True   # no error mapping, no daemon start: it reads files and prints
