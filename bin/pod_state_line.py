@@ -56,7 +56,7 @@ def _normalise(text, spaced):
     return "".join(chars), idx
 
 
-def _token_allowed(token, before, after, known):
+def _token_prints(token, before, after, known):
     """True when a run of letters and digits may print: a word of ERROR_VOCABULARY (compared in lower case), a number of at most three digits that stands
     between separators, or an error-class name (CamelCase letters only, at most 40, ending in Error, Exception, Warning or Timeout, and EVERY CamelCase word of it a word of ERROR_VOCABULARY)."""
     low = token.lower()
@@ -89,7 +89,7 @@ def _mark_variant(line, spaced, known, mask):
         else:
             before = N[start - 1] if start else " "
             after = N[end] if end < size else " "
-            allowed = _token_allowed(word, before, after, known)
+            allowed = _token_prints(word, before, after, known)
         if not allowed:
             low, high = idx[start], idx[end - 1] + 1
             mask[low:high] = b"\x01" * (high - low)

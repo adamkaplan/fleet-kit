@@ -91,6 +91,12 @@ class Base(S.Base):
             self.addCleanup(patch.stop)
         self.files_before = {}
 
+    def run_command(self, *argv):
+        # tempfile caches the temporary directory of the whole process at its first use: without this, the command's directory is that of whichever test came first
+        # (the global one, shared with every concurrent command of the same user), not the TMPDIR this test gave it. Only the command sees the patch.
+        with mock.patch.object(tempfile, "tempdir", os.environ["TMPDIR"]):
+            return super().run_command(*argv)
+
     @contextlib.contextmanager
     def fake_tunnel(self, cluster, record):
         yield record
@@ -125,6 +131,46 @@ class Base(S.Base):
         self.assertTrue(all(verbs), "no real verb read from %r" % (calls,))   # a check that cannot see a verb is not a check
         writes = [c for c, verb in zip(calls, verbs) if verb not in READ_VERBS]
         self.assertEqual(writes, [], writes)
+
+    def own_tmp(self):
+        """The temporary directory the command was GIVEN (its TMPDIR, a directory under the test's home): the one place its login directory can be."""
+        directory = Path(os.environ["TMPDIR"])
+        self.assertEqual(directory, self.home / "tmp")
+        return directory
+
+    def leftovers(self):
+        """What the command's own temporary directory holds, as names: the per-user root of the login directories (cwtok-UID, which stays, private) counts by its children."""
+        tmp, found = self.own_tmp(), []
+        for name in sorted(os.listdir(str(tmp))):
+            if name.startswith("cwtok-"):
+                found += ["%s/%s" % (name, child) for child in sorted(os.listdir(str(tmp / name)))]
+            else:
+                found.append(name)
+        return found
+
+    def listing_kubectl(self):
+        """A kubectl that, before it answers like the fake one, writes what the login directory holds at that moment (DURING the command) to a file."""
+        listing = self.home / "during.txt"
+        script = self.home / "listing-kubectl"
+        script.write_text('#!/bin/sh\nif [ "$1" = "--kubeconfig" ]; then d=$(dirname "$2"); echo "DIR $d" >> "%s"; for f in $(ls -A "$d"); do echo "FILE $f" >> "%s"; done; fi\nexec "%s" "$@"\n'
+                          % (listing, listing, os.path.join(HERE, "fake_kubectl")))
+        script.chmod(0o700)
+        patch = mock.patch.dict(os.environ, {"CW_KUBECTL": str(script)})
+        patch.start()
+        self.addCleanup(patch.stop)
+        return listing
+
+    def assert_login_seen_then_gone(self, listing):
+        """DURING: the command's kubectl saw a login directory UNDER ITS OWN temporary directory holding the token and the config. AFTER: its temporary directory is empty."""
+        tmp = self.own_tmp()
+        lines = listing.read_text().splitlines() if listing.exists() else []
+        dirs = {line[4:] for line in lines if line.startswith("DIR ")}
+        self.assertTrue(dirs, "the command's kubectl never saw a login directory")
+        for directory in dirs:
+            self.assertEqual(Path(directory).parent, tmp, "the login directory is not under the command's own temporary directory")
+        names = {line[5:] for line in lines if line.startswith("FILE ")}
+        self.assertLessEqual({"config"}, names, lines)
+        self.assertEqual(self.leftovers(), [], "the command's own temporary directory holds something afterwards")
 
 
 class TestErrorLine(Base):
@@ -399,17 +445,28 @@ class TestRefusal(Base):
                     self.assert_read_only()
 
     def test_s5_the_transient_login_is_gone_afterwards_and_the_state_directory_stays_private(self):
-        """The command logs in with a token file and a kubeconfig in a private directory under the temporary directory (removed on every way out), and
-        sets the cloud directory of the state to mode 0700 (the same shared code as the other cloud commands)."""
+        """The command logs in with a token file and a kubeconfig in a private directory under ITS OWN temporary directory (the TMPDIR it was given; removed on every
+        way out: checked on success and on the two error paths of TestTransientLogin), and sets the cloud directory of the state to mode 0700 (the shared code of the other cloud commands)."""
         self.worker()
-        root = Path(tempfile.gettempdir()) / ("cwtok-%d" % os.getuid())
-        before = sorted(root.glob("cmd-*")) if root.exists() else []
+        listing = self.listing_kubectl()
+        self.assertEqual(self.leftovers(), [])
         os.chmod(str(self.state_dir / "cloud"), 0o755)
         code, out, err = self.status_line()
         self.assertEqual(code, 0, err)
-        after = sorted(root.glob("cmd-*")) if root.exists() else []
-        self.assertEqual(after, before, "a transient login directory is left behind")
+        self.assert_login_seen_then_gone(listing)
         self.assertEqual(os.stat(str(self.state_dir / "cloud")).st_mode & 0o777, 0o700)
+
+    def test_s5_a_command_that_leaves_its_login_directory_behind_fails_the_check(self):
+        """The mutant: the removal of the login directory does nothing; the check must fail, mutation asserted applied."""
+        self.worker()
+        listing = self.listing_kubectl()
+        applied = []
+        with mock.patch.object(CLOUD.shutil, "rmtree", lambda *a, **k: applied.append(a)):
+            self.status_line()
+        self.assertTrue(applied, "the mutation was not applied")
+        with self.assertRaises(AssertionError):
+            self.assert_login_seen_then_gone(listing)
+        self.assertTrue(self.leftovers(), "the mutant left nothing behind to see")
 
     def test_s5_the_plain_status_command_is_unchanged(self):
         self.worker()
@@ -685,7 +742,10 @@ def make_secret(rng, vocabulary):
             return secret
 
 
-def hostile_texts(count=1000, seed=1397):
+SEED = 1397
+
+
+def hostile_texts(count=1000, seed=SEED):
     """(text, planted secret) pairs from a seeded generator: any keyword, any shape of splitting, wrapping, URL, path, quote and encoding."""
     import random
     rng = random.Random(seed)
@@ -746,13 +806,14 @@ class TestProperty(Base):
                 self.worker()
                 self.v2.messages = [message(1798365852000, "", error=text)]
                 code, out, err = self.status_line()
-                self.assertEqual(code, 0, err)
-                self.assertEqual(len(out.splitlines()), 1, out)
+                where = "text %d of seed %d: %r, planted %r, exit %r, out %r, err %r" % (n, SEED, text, secret, code, out, err)   # the next failure explains itself
+                self.assertEqual(code, 0, where)
+                self.assertEqual(len(out.splitlines()), 1, where)
                 part = out.split("; last error ", 1)[1]
             bad = printed_tokens_ok(part, vocabulary)
             pieces = leaked(secret, part)
             if bad or pieces or len(part) > 160:
-                failures.append((text[:60], bad[:2], pieces[:2]))
+                failures.append((text[:60], bad[:2], pieces[:2], "text %d of seed %d: %r, planted %r, printed %r" % (n, SEED, text, secret, part)))
         return failures
 
     def test_s9_the_generator_is_seeded_and_makes_a_thousand_varied_texts(self):
@@ -764,7 +825,7 @@ class TestProperty(Base):
     def test_s9_1000_of_1000_texts_print_only_allowed_tokens_and_no_planted_piece(self):
         self.assertTrue(BASE_VOCAB, "the vocabulary is not there")
         failures = self.run_texts()
-        self.assertEqual(failures, [], "%d of 1000 texts print something that is not allowed" % len(failures))
+        self.assertEqual(failures, [], "%d of 1000 texts print something that is not allowed; the first: %s" % (len(failures), failures[0][3] if failures else ""))
 
     def test_s9_a_printed_token_outside_the_vocabulary_is_seen_by_the_check(self):
         self.assertEqual(printed_tokens_ok("Error: " + "hunter2", frozenset(("error",))), ["hunter2"])
@@ -988,11 +1049,20 @@ class TestPlaceholderAndNormalising(unittest.TestCase):
     def test_every_other_token_is_the_placeholder_in_any_language(self):
         self.assertEqual(CLOUD.redact_error("error: " + CYR_PASSWORD + " " + CJK_PASSWORD), "error: [redacted]")
 
-    def test_a_two_million_character_line_prints_within_ten_seconds_and_a_longer_one_prints_a_phrase(self):
+    def test_a_two_million_character_line_prints_in_linear_time_and_a_longer_one_prints_a_phrase(self):
+        """The property is that the redaction is linear and ends. The REAL guard is the ratio: 2M characters take less than 16 times what 250K take (8 times the text is 8 times the work when linear; a quadratic one is 64 times), measured
+        in PROCESS time (the CPU seconds of this process, not the seconds spent waiting under load). The 60 second wall clock bound is only a backstop
+        against a redaction that does not end; a tighter wall clock bound failed under load (12 s against 1.4 s unloaded)."""
+        def cpu(text):
+            began = time.process_time()
+            out = CLOUD.redact_error(text)
+            return time.process_time() - began, out
+        small, _ = cpu("ab1 " * 62500)
         began = time.monotonic()
-        out = CLOUD.redact_error("ab1 " * 500000)
-        self.assertLess(time.monotonic() - began, 10)
+        large, out = cpu("ab1 " * 500000)
+        self.assertLess(time.monotonic() - began, 60)
         self.assertLessEqual(len(out), 160)
+        self.assertLess(large, 16 * max(small, 0.02), "2M characters took %.2f s of CPU, 250K took %.2f s: not linear" % (large, small))
         self.assertEqual(CLOUD.redact_error("a" * 2000001), "[error text too long to show]")
 
 
@@ -1023,9 +1093,11 @@ class TestTransientLogin(Base):
     def test_s5_success_the_login_files_are_private_and_gone(self):
         self.worker()
         seen = self.watch()
+        listing = self.listing_kubectl()
         code, out, err = self.status_line()
         self.assertEqual(code, 0, err)
         self.check(seen, ("token", "config"))
+        self.assert_login_seen_then_gone(listing)
 
     def test_s5_error_path_one_a_launcher_that_cannot_be_reached(self):
         self.worker()
@@ -1035,18 +1107,27 @@ class TestTransientLogin(Base):
         self.write_cluster(state)
         os.environ["FAKE_KUBE_ECHO"] = "the cluster is down"
         self.addCleanup(os.environ.pop, "FAKE_KUBE_ECHO", None)
+        listing = self.listing_kubectl()
         code, out, err = self.status_line()
         self.assertEqual(code, 1, (out, err))
         self.assertIn("state not read", out)
         self.check(seen, ("token", "config"))
+        self.assert_login_seen_then_gone(listing)
 
     def test_s5_error_path_two_a_login_that_fails_after_the_token_file_is_written(self):
         self.worker()
         seen = self.watch()
-        with mock.patch.object(CLOUD.json, "dump", side_effect=OSError(28, "No space left on device")):
+        during = []
+
+        def fail(*a, **k):
+            during.append(self.leftovers())   # the login directory exists, in the command's own temporary directory, at this moment
+            raise OSError(28, "No space left on device")
+        with mock.patch.object(CLOUD.json, "dump", side_effect=fail):
             code, out, err = self.status_line()
         self.assertNotEqual(code, 0)
         self.check(seen, ("token",))
+        self.assertEqual([len(x) for x in during], [1], during)
+        self.assertEqual(self.leftovers(), [])
 
     def test_s5_a_build_that_leaves_the_token_file_behind_is_seen(self):
         self.worker()
