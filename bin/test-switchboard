@@ -66670,6 +66670,63 @@ class TestReviewPostAndDismiss(LedgerBase):
                     count += 1
         self.assertEqual(count, 2 * len(seqs) * (1 + len(seqs)))
 
+    def two_requests(self):
+        self.reset()
+        self.blocking(77, by="rdr1")
+        self.blocking(78, by="rdr2")
+        self.reviews[0]["user"] = {"login": "login-one"}   # the rule is per login
+        self.reviews[1]["user"] = {"login": "login-two"}
+
+    def check_dismiss_command_only_for_own(self):
+        self.two_requests()
+        code, out, err = self.run_as("rdr1", "gates", self.PR)
+        lines = {l.split()[2]: l for l in out.splitlines() if l.startswith("blocking review:")}
+        self.assertEqual(sorted(lines), ["rdr1", "rdr2"], out)
+        self.assertIn("review dismiss %s --review 77 --reason TEXT" % self.PR, lines["rdr1"])
+        self.assertNotIn("review dismiss", lines["rdr2"])
+        self.assertIn("ask rdr2 or a person to dismiss it", lines["rdr2"])
+
+    def test_the_dismiss_command_is_named_only_for_the_callers_own_request(self):
+        self.check_dismiss_command_only_for_own()
+
+    def test_the_mutant_that_names_the_command_for_every_author_fails(self):
+        real = sb.blocking_review_lines
+        self.mutant_fails(self.check_dismiss_command_only_for_own, blocking_review_lines=lambda *a, **k: real(*a[:7]))
+
+    def test_a_caller_that_is_not_a_fleet_agent_is_told_to_ask_for_every_request(self):
+        self.two_requests()
+        code, out, err = self.run_as(None, "gates", self.PR)
+        lines = [l for l in out.splitlines() if l.startswith("blocking review:")]
+        self.assertEqual(len(lines), 2, out)
+        for line in lines:
+            self.assertNotIn("review dismiss", line)
+            self.assertRegex(line, r"ask rdr[12] or a person to dismiss it")
+
+    def test_the_blocked_line_says_other_ways_of_requesting_are_not_covered(self):
+        self.standing()
+        out, lines = self.gate_lines()
+        verdict = [l for l in out.splitlines() if l.startswith("  BLOCKED:")][0]
+        self.assertIn("no BLOCKED line is not proof that a merge passes", verdict)
+
+    def check_offer_skips_a_superseded_request(self):
+        self.standing()
+        self.reviews[0]["commit_id"] = self.OLD
+        self.reviews.pop()
+        out = self.post()[1]
+        self.assertIn("your earlier change request 77 (at %s): dismiss it if it is fixed: fleet-switchboard review dismiss" % self.OLD[:12], out)
+        self.assertIn("(this approve did not dismiss it and nothing here does)", out)
+        self.assertNotIn("still stands", out)
+        self.reviews.append({"id": 90, "user": {"login": "shared"}, "state": "APPROVED", "commit_id": self.HEAD, "body": "ok\n\n" + sb.fleet_mark("rdr1")})
+        self.assertNotIn("review dismiss", self.post()[1])   # superseded by the same login's approval: the rule no longer lists it
+
+    def test_the_offer_never_offers_a_request_a_later_approval_superseded(self):
+        self.check_offer_skips_a_superseded_request()
+
+    def test_the_mutant_that_offers_every_own_request_fails(self):
+        def every(engine, runner, now, repo, number, ref, name, head):
+            return ["note: your earlier change request 77 (at %s): dismiss it if it is fixed: fleet-switchboard review dismiss %s --review 77 --reason TEXT" % (self.OLD[:12], ref)]
+        self.mutant_fails(self.check_offer_skips_a_superseded_request, review_dismiss_offer=every)
+
     def test_the_mutant_that_lists_no_standing_request_fails(self):
         self.mutant_fails(self.check_standing_listed, standing_requests=lambda *a, **k: ([], ""))
         self.mutant_fails(self.check_verdict_names_it, standing_requests=lambda *a, **k: ([], ""))
@@ -66694,7 +66751,7 @@ class TestReviewPostAndDismiss(LedgerBase):
         sections = [s for s in re.split(r"\n(?=#{2,3} )", text) if s.startswith("### Standing change requests are listed by `gates`")]
         self.assertEqual(len(sections), 1)
         for statement in ("`gates` lists, in every call, each standing CHANGES_REQUESTED", "this approve did not dismiss it", "Dismissal stays the reader's own act or a person's"):
-            self.assertIn(statement.replace("this approve did not dismiss it", "that this approve did not dismiss it") if False else statement, " ".join(sections[0].split()).replace("says that this approve", "says that this approve"))
+            self.assertIn(statement, " ".join(sections[0].split()))
 
     def test_the_mutant_that_skips_the_head_check_fails(self):
         self.mutant_fails(self.check_post_head_refusals, review_head_problem=lambda given, current: None)
