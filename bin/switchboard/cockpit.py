@@ -173,7 +173,8 @@ def cockpit_read(state_dir):
     except Exception:
         loaded = None
     whole = isinstance(loaded, dict) and bool(loaded.get("whole")) and isinstance(loaded.get("agents"), dict)
-    raw = read_record_file(state / LAST_REPORT_FILE)
+    never = not os.path.lexists(str(state / LAST_REPORT_FILE))   # written by the first report: a fleet nobody has reported in has none, and that is a reading, not a failure
+    raw = {} if never else read_record_file(state / LAST_REPORT_FILE)
     sources = {"decisions": "ok" if body else "unreadable", "registry": "ok" if whole else "unreadable", "reports": "ok" if isinstance(raw, dict) else "unreadable"}
     reports = {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
     return (body["decisions"] if body else []), (loaded["agents"] if whole else {}), reports, sources

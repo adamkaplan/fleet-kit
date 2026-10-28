@@ -13,7 +13,7 @@
 
 ## Sources: an unreadable source is not an all-clear
 
-The document carries `sources`: for each of the three places the feed reads (`decisions` = `decisions.json`, `registry` = `registry.json`, `reports` = `last-reports.json`) either `ok` or `unreadable` (missing, damaged, a symlink or special file, or over the size cap). An unreadable source reads as empty cards, so `sources` is how a reader tells that from a quiet fleet.
+The document carries `sources`: for each of the three places the feed reads (`decisions` = `decisions.json`, `registry` = `registry.json`, `reports` = `last-reports.json`) either `ok` or `unreadable` (missing (except `last-reports.json`, which the first report creates), damaged, a symlink or special file, or over the size cap). An unreadable source reads as empty cards, so `sources` is how a reader tells that from a quiet fleet.
 
 - The verb prints the document and exits status 3 when any source is unreadable (0 otherwise).
 - The daemon writes nothing when any source is unreadable: the last good `cockpit.json` stays as it was, and ages (see Freshness).

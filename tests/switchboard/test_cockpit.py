@@ -115,7 +115,7 @@ class TestFeedShape(Fixture):
         (empty / "decisions.json").write_text("{not json")
         doc = build(empty)
         self.assertEqual(doc["cards"], {card: [] for card in CARDS})
-        self.assertEqual(doc["sources"], {"decisions": "unreadable", "registry": "unreadable", "reports": "unreadable"}, "and it says so: it is not an all-clear")
+        self.assertEqual(doc["sources"], {"decisions": "unreadable", "registry": "unreadable", "reports": "ok"}, "and it says so: it is not an all-clear")
 
 
 class TestIdsAndEtags(Fixture):
@@ -476,9 +476,16 @@ class TestSources(Fixture):
         self.assertEqual((code, doc["sources"]), (0, {"decisions": "ok", "registry": "ok", "reports": "ok"}))
         self.assertEqual(sorted(sb.COCKPIT_SOURCES), sorted(doc["sources"]))
 
+    def test_s9_a_last_reports_file_that_was_never_written_is_a_fleet_nobody_has_reported_in_not_an_unreadable_source(self):
+        (self.state / "last-reports.json").unlink()
+        code, doc = verb(self.root)
+        self.assertEqual((code, doc["sources"]["reports"]), (0, "ok"))
+        sb._STATE_LAST.clear()
+        self.assertTrue(self.publish(0), "the daemon writes the feed on a fleet with no report yet")
+
     def test_s9_the_verb_exits_3_and_names_the_unreadable_source_for_each_of_the_three(self):
         for source in sb.COCKPIT_SOURCES:
-            for how in [h for h in self.HOWS if (source, h) != ("registry", "symlink")]:   # the registry's own loader is not this feed's to change
+            for how in [h for h in self.HOWS if (source, h) not in (("registry", "symlink"), ("reports", "missing"))]:   # the registry's own loader is not this feed's to change
                 with self.subTest(source=source, how=how):
                     self.fresh()
                     break_source(self.state, source, how)
@@ -487,12 +494,12 @@ class TestSources(Fixture):
                     self.assertEqual(doc["sources"], {s: "unreadable" if s == source else "ok" for s in sb.COCKPIT_SOURCES})
                     self.assertEqual(sorted(doc["cards"]), sorted(CARDS), "the document is still printed")
 
-    def test_s9_an_empty_state_directory_is_three_unreadable_sources_not_five_quiet_cards(self):
+    def test_s9_an_empty_state_directory_is_unreadable_decisions_and_registry_not_five_quiet_cards(self):
         empty = self.root / "bare" / "fleet-switchboard"
         empty.mkdir(parents=True)
         code, doc = verb(self.root / "bare")
         self.assertEqual(code, 3)
-        self.assertEqual(set(doc["sources"].values()), {"unreadable"})
+        self.assertEqual(doc["sources"], {"decisions": "unreadable", "registry": "unreadable", "reports": "ok"})
 
     def test_s9_the_real_command_line_exits_3_on_an_empty_state_directory(self):
         bare = self.root / "bare2"
@@ -508,7 +515,7 @@ class TestSources(Fixture):
     def test_s9_the_daemon_keeps_the_last_good_file_byte_for_byte_when_any_source_cannot_be_read(self):
         feed = self.state / "cockpit.json"
         for source in sb.COCKPIT_SOURCES:
-            for how in [h for h in self.HOWS if (source, h) != ("registry", "symlink")]:   # the registry's own loader is not this feed's to change
+            for how in [h for h in self.HOWS if (source, h) not in (("registry", "symlink"), ("reports", "missing"))]:   # the registry's own loader is not this feed's to change
                 with self.subTest(source=source, how=how):
                     sb._STATE_LAST.clear()
                     self.fresh()
