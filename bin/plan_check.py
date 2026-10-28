@@ -997,6 +997,7 @@ EXPLAIN = {
     "discriminates-overlap": ("`discriminates` reuses most words of `pass`: it should name a wrong build", "name what the wrong build does"),
     "many-scenarios": ("a plan with many scenarios is hard to review", "split it into slices"),
     "no-constraint-list": ("PC-n scenarios cannot be checked without a constraints list", "add `PC-<n>: ...` lines to the plan"),
+    "no-failure-mode": ("the plan reads or produces something but no scenario covers an input that is missing, corrupt or unreadable", "add a scenario: the output says so and the last good output is kept"),
     "one-clause-many-parts": ("a one-sentence Done-when with many parts counts as one clause", "declare the clauses in a `clauses:` block"),
 }
 

@@ -17,19 +17,21 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 ## One plan comment
 
-A plan is one canonical comment, edited in place; each revision adds a short receipt comment (what changed, why, the new plan hash), never a second plan comment. Receipt format: `docs/plan-template.md`.
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
+
+Receipt format: `docs/plan-template.md`.
 
 ## The method, in order
 
 1. **Done-when**: copy the ask's clauses, numbered `(1) ... (2) ...`. They are the authority; never reword them.
-   A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
-   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (other pull requests' claims are listed, not yet enforced: #976).
+   A work item with no Done-when of its own takes the Done-when of its parent ask (its sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge): every per-pull-request scenario must be claimed by some pull request, else the last merge is refused (a `CU` waiver passes).
 2. **Clauses to scenarios**: every clause needs at least one behaviour scenario (`S`); behaviour that must NOT change is a
    `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
    screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
-   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
+   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`.
 
    **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
    An uncovered Done-when clause gets a new `S` scenario; never edit, reword or delete the clause.
@@ -38,7 +40,7 @@ A plan is one canonical comment, edited in place; each revision adds a short rec
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
    tier**, and **the integration-branch decision** (stay on main, or `integration/<epic-slug>`).
    **Size** is a T-shirt in AGENT time, never human-days: S under 1 hour, M a few hours, L about a day, XL several days, each with what makes it that
-   size. Never pick the smaller option for less work when a larger one simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may say `size: S`).
+   size. Never pick the smaller option for less work when a larger one simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may carry `size: S`).
 
 ## Check it
 
@@ -48,14 +50,11 @@ issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; forma
 
 ## The form
 
-Put it in the repo the work concerns. **a short issue body** (outcome, Done-when, link to the
-detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
-`scenarios:` yaml block. The latest such comment counts. One plan per ask; sections for work items.
+Put it in the repo the work concerns: **a short issue body** (outcome, Done-when, link to the detail) plus **one detail comment** headed `Plan (scenarios)` with the plan text and the `scenarios:` yaml block. The latest counts. One plan per ask.
 
 ## Challenge it
 
-A `plan review` command launches independent read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
-chosen per item. Up to three rounds; a standing objection then goes to the Chief of Staff, then the owner.
+A `plan review` command (not built yet: ask the Chief of Staff for a hand-run review) launches independent read-only reviewers and records their verdicts. The tier comes from the ask or epic the plan serves. Up to three rounds; a standing objection goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
@@ -63,8 +62,8 @@ chosen per item. Up to three rounds; a standing objection then goes to the Chief
 - **Scenario adversary**: a bad build that passes every scenario (an empty or stubbed implementation); an undecidable pass rule; an evaluator who cannot record the proof.
 - **Risk and security**: no rollback or a half-applied state; a contract change; a held-PR area; who can forge a verdict.
 - **Scope and what-not-how**: a step that dictates the design; no out-of-scope; creep; overlap with another plan.
-- **Cost and sequencing**: a smaller plan that meets the same Done-when; order and parallelism; an unwarranted integration branch.
-- **The owner's view**: would the owner be surprised; does it solve the asked problem.
+- **Cost and sequencing**: a smaller plan with the same Done-when; order; an unwarranted integration branch.
+- **The owner's view**: would the owner be surprised; is the asked problem solved.
 
 ## Good and bad
 
@@ -88,7 +87,7 @@ scenarios:
     evaluator: ci
 ```
 
-Default for each input read: the input is missing, corrupt or unreadable: the output says so and the last good output is kept (`plan check` warns `no-failure-mode`).
+For each input read: it is missing, corrupt or unreadable: the output says so and the last good output is kept (`plan check` warns `no-failure-mode`).
 
 Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `commission()` method" (how).
 
