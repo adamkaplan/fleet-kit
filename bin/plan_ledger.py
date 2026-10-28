@@ -515,6 +515,16 @@ def pr_scenarios(scenarios, body):
     return [s for s in mine if s.get("id") in ids], [s for s in mine if s.get("id") not in ids], None
 
 
+def covered_ids(scenarios, bodies):
+    """The ids the claims of these pull request bodies cover; a refused claim line covers nothing. The ONE reader of claimed scenarios for the union and #1347."""
+    covered = set()
+    for body in bodies:
+        claimed, _, error = pr_scenarios(scenarios, body)
+        if not error:
+            covered.update(c.get("id") for c in claimed)
+    return covered
+
+
 def claim_union(scenarios, this_body, others):
     """(applies, uncovered, last): the claim union of one ask (#976). `others` is [(state, body)] for the OTHER pull requests of the same plan, state `open` or `merged`
     (one closed without a merge proves nothing and is not passed in). `last` is true when none of them is open: this merge is the ask's last. `applies` is true only when
@@ -524,11 +534,7 @@ def claim_union(scenarios, this_body, others):
     bodies = [this_body] + [body for _, body in others]
     narrowed = any(pr_claim(body, scenarios)[0] is not None for body in bodies)
     last = not any(state == "open" for state, _ in others)
-    covered = set()
-    for body in [this_body] + [body for state, body in others if state == "merged"]:
-        claimed, _, error = pr_scenarios(scenarios, body)
-        if not error:
-            covered.update(c.get("id") for c in claimed)
+    covered = covered_ids(scenarios, [this_body] + [body for state, body in others if state == "merged"])
     return narrowed, [i for i in per if i not in covered], last
 
 
@@ -573,11 +579,7 @@ def closed_unclaimed(scenarios, peers, closed):
     if not any(pr_claim(b, scenarios)[0] is not None for b in bodies):
         return [], []
     per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
-    covered = set()
-    for state, body in peers:
-        claimed, _, error = pr_scenarios(scenarios, body)
-        if state == "merged" and not error:
-            covered.update(c.get("id") for c in claimed)
+    covered = covered_ids(scenarios, [body for state, body in peers if state == "merged"])
     uncovered = [i for i in per if i not in covered]
     return (uncovered, [n for n, _ in closed]) if uncovered else ([], [])
 
