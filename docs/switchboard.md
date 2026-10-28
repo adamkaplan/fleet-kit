@@ -2769,7 +2769,13 @@ and names `--keep-if-closed`.
 `remind --key <text>` names the purpose: arming again with the same key replaces your pending reminder of that key (one pending per
 owner and key; another owner's or another key's reminder is never touched), and `remind --list` shows the key. A fired, undelivered
 reminder is dropped when a newer one of the same owner and key is due and will be delivered (one `reminder.drop_superseded` audit line names both ids). A
-delivery 5 minutes or more after its due time says "late by N min". Arming a text over 4000 characters (the delivery cap) prints a
+delivery 5 minutes or more after its due time says "late by N min".
+
+A reminder copy delivered more than 30 minutes after it fired begins with the line "delayed: sent HH:MMZ" (the sent time in UTC; the mark replaces
+the "late by" note); a copy delivered within 30 minutes is unchanged (#1468). Queued copies with the same sender, recipient and text (keyed or not)
+are delivered as ONE line with the count and the newest sent time ("(30 copies, newest sent HH:MMZ)"); every copy is acknowledged, so none is delivered
+again. Another sender, recipient or text is never merged. Cause: each fired copy was its own `reminder:<id>` fact and `merge_wake_facts` merges only
+`WAKE_KINDS` (sweep, triage), so an unkeyed reminder and a keyed one that was not superseded (no #1285 drop) came one per turn. Arming a text over 4000 characters (the delivery cap) prints a
 warning with the number of characters over. A newer reminder still in the future does NOT drop an older fired one: the older is delivered (with its late note) and the newer fires as usual, so a lane never gets nothing. A keyed reminder needs a known sender (an unidentified caller is refused). The key is cut at 80 characters, so two longer keys with the same first 80 characters are one key. The match is the owner and the key, not the recipient `to`. A cut body ends with an ellipsis before the note. The late note is added before the 4000 cap and kept: the body is cut, not the note. Without `--key` nothing changes. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
 reason (the issue closed, the pull request merged), audited as `reminder.drop_notice`; the notice is sent only by the sweep
 that removes the reminder, so it is never repeated. An issue already closed at creation is refused (exit 2, "already

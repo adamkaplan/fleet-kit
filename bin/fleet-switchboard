@@ -3018,7 +3018,7 @@ class Switchboard:
         repos = self.repos_in_play()
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
             self.intents.discard_told()
-        pending = merge_wake_facts(plan.recipient, plan.pending)   # #1275: the sweep, triage and load-alert items of one wake are ONE message
+        pending = merge_wake_facts(plan.recipient, merge_reminder_copies(plan.pending))   # #1275: the sweep, triage and load-alert items of one wake are ONE message
         text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
                                 repos=repos, delivered=self.now())
         sent = next((fact for fact in carried if fact.kind == "send"), None)
