@@ -1803,21 +1803,26 @@ STATE_WAIT_SECONDS = 60   # `launch --cloud` waits at most this long for the fir
 READ_FAIL = "state not read"
 _clock = time.monotonic   # the wait's clock and pause: a test swaps them for a fake clock, so no test waits for real
 _sleep = time.sleep
-_MOVED = frozenset(("ERROR_VOCABULARY", "ERROR_LINE_MAX", "PLACEHOLDER", "redact_error", "state_line"))   # the names of the part bin/switchboard/pod_state_line.py that this module re-exports
+_MOVED = frozenset(("ERROR_VOCABULARY", "ERROR_LINE_MAX", "PLACEHOLDER", "redact_error", "state_line"))   # the names of the module bin/pod_state_line.py that this module re-exports
+
+
+def _state_module():
+    """bin/pod_state_line.py, loaded only when a command that needs it runs (never at import: it is not in the switchboard's closure)."""
+    return H["load_module"]("pod_state_line")
 
 
 def __getattr__(name):
-    if name in _MOVED and name in H:
-        return H[name]
+    if name in _MOVED and H.get("load_module"):
+        return getattr(_state_module(), name)
     raise AttributeError(name)
 
 
 def _known_secrets(state, record, cluster):
-    return H["known_secrets"](_ME, state, record, cluster)
+    return _state_module().known_secrets(_ME, state, record, cluster)
 
 
 def read_state(runner, state, cluster, record, timeout, snapshot=None, v2_for=None, messages=20):
-    return H["pod_read_state"](_ME, runner, state, cluster, record, timeout, snapshot, v2_for, messages)
+    return _state_module().pod_read_state(_ME, runner, state, cluster, record, timeout, snapshot, v2_for, messages)
 
 
 @refusals
@@ -1835,7 +1840,7 @@ def cmd_state(args, runner, now):
     with Cluster() as cluster:
         try:
             row = read_state(runner, state, cluster, record, STATUS_SECONDS)
-            line = H["state_line"](args.name, state, row)
+            line = _state_module().state_line(args.name, state, row)
         except CloudError as err:
             row, line = {"state": READ_FAIL}, "cloud %s: %s (%s)" % (args.name, READ_FAIL, _one(cluster.clean(str(err), 100), 100))
     print(line)
@@ -1844,7 +1849,7 @@ def cmd_state(args, runner, now):
 
 
 def launch_state_line(runner, state, cluster, record, name, v2, accepted_ms=None, seconds=STATE_WAIT_SECONDS):
-    return H["pod_launch_state_line"](_ME, runner, state, cluster, record, name, v2, accepted_ms, seconds)
+    return _state_module().pod_launch_state_line(_ME, runner, state, cluster, record, name, v2, accepted_ms, seconds)
 
 
 # ---------------------------------------------------------------- retire

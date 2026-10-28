@@ -1,5 +1,5 @@
 # The state line of a cloud worker (ask #1397): the closed vocabulary of the error line, its redaction, and the reading and the formatting of the state.
-# A part of the switchboard's namespace (bin/fleet-switchboard.parts); bin/cloud_worker.py wires it (its command entry points). A function that needs
+# A top-level module of bin/ (not a part: it is not in bin/fleet-switchboard.parts); bin/cloud_worker.py loads it only when a state command runs. A function that needs
 # something of the cloud module takes that module as `W` (its first argument), so a name a test swaps in the module is seen here too.
 import datetime as _datetime
 import os

@@ -15,7 +15,6 @@ switchboard/alert_labels.py
 switchboard/handoff.py
 switchboard/agents_verify.py
 switchboard/answer_delivery.py
-switchboard/pod_state_line.py
 switchboard/audit.py
 switchboard/decision.py
 switchboard/engine.py

@@ -62,6 +62,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `health_records.py` | 2 | health recorders: what the daemon has already read, turned into records | |
 | `pr_events.py` | 2 | `pr-state` read from the forwarder's webhook events | |
 | `pr_reading.py` | 2 | the one reading of a pull request that `merge-gate` and the clear packet share | |
+| `pod_state_line.py` | 2 | the state line of a cloud worker: the closed vocabulary of the error line, its redaction and the state reading | |
 | `registry.py` | 2 | the one agent registry (interface frozen in `docs/agent-registry.md`) | |
 | `decision_core.py` | 3 | the pure core of the Decision subsystem | |
 | `cpu_guard.py` | 4 | the CPU guard: numbers, a clock and a state directory in; a verdict out | |
@@ -71,7 +72,6 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `fleet_health.py` | 4 | the load of each orchestrator and the threshold alert | |
 | `queue_ejections.py` | 4 | a pull request ejected from the merge queue wakes its orchestrator | |
 | `spotlight_guard.py` | 4 | is each guarded folder still kept out of the Spotlight index | |
-| `switchboard/pod_state_line.py` | 2 | the state line of a cloud worker: the closed vocabulary of the error line, its redaction and the state reading | |
 | `switchboard/reminders.py` | 4 | the reminders file, `remind`, checkpoint reminders, budget notice and the GitHub event constants | |
 | `triage_digest.py` | 4 | the stale digest's memory and rules | |
 | `triage_ownerless.py` | 4 | ownerless, quiet issues of a team repository | |
