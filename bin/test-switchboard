@@ -73321,6 +73321,82 @@ class TestOwnerHoldRule(unittest.TestCase):
         self.assertTrue(self.floor.class_is_top_tier({}, "availability"), "no block: everything is top tier (fail closed)")
 
 
+class TestOwnerHoldFloorConfig(Base):
+    """Ask #1241 (plan S1 as amended by PC-11, and S28): the module's functions stay where the callers read them, and an impact_floor entry that cannot be read is refused whole, never dropped."""
+    NAMES = {"owner_hold_rule": "impact_floor.py", "top_tier_hits": "impact_floor.py", "owner_decide": "impact_floor.py",
+             "floor_for": "impact_floor.py", "floor_paths": "impact_floor.py", "pr_floor_report": "fleet-switchboard"}   # each in the file that defines it
+
+    def defined(self, source):
+        import ast
+        return {n.name for n in ast.parse(source).body if isinstance(n, ast.FunctionDef)}
+
+    def missing(self, sources):
+        """The names not defined as a module-level function in the file that owns each."""
+        return sorted(n for n, f in self.NAMES.items() if n not in self.defined(sources[f]))
+
+    def test_s1_the_six_named_functions_are_module_level_functions_of_their_own_file_and_a_missing_one_is_named(self):
+        sources = {f: (BIN / f).read_text() for f in set(self.NAMES.values())}
+        self.assertEqual(self.missing(sources), [], "0 missing")
+        renamed = dict(sources, **{"impact_floor.py": sources["impact_floor.py"].replace("def owner_decide(", "def owner_decide_renamed(", 1)})
+        self.assertEqual(self.missing(renamed), ["owner_decide"], "a rename in a copy is found")
+        moved = dict(sources, **{"fleet-switchboard": sources["fleet-switchboard"].replace("def pr_floor_report(", "def pr_floor_report_x(", 1)})
+        self.assertEqual(self.missing(moved), ["pr_floor_report"])
+        with mock.patch.dict(self.NAMES, {"no_such_function_bogus": "impact_floor.py"}):
+            self.assertEqual(self.missing(sources), ["no_such_function_bogus"])
+
+    def good(self):
+        return {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 5,
+                "impact_floor": {"repos": {"acme/widget-api": {"globs": ["shims/**"]}}}}
+
+    def bad_configs(self):
+        broken = self.good()
+        broken["impact_floor"]["repos"]["acme/widget-api"]["hold"] = "{not json"   # a hold entry that cannot be parsed
+        number = dict(self.good(), impact_floor=7)
+        return {"hold entry unparseable": broken, "impact_floor a number": number}
+
+    def refuses(self, text):
+        """The assertions of S28 for one config text (so a mutant build can be run against the very same ones)."""
+        self.config_file.write_text(text)
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.load_runnable_config()
+        self.assertIn("impact_floor", str(caught.exception))
+        with captured() as (out, err):
+            code = sb.main(["status"])   # the command that reads the config and says why it is unusable
+        out, err = out.getvalue(), err.getvalue()
+        self.assertEqual(code, sb.EXIT_ERROR, err)
+        self.assertIn("impact_floor", out + err)
+
+    def test_s28_an_impact_floor_that_cannot_be_read_is_refused_naming_it_and_the_running_config_is_kept(self):
+        for label, bad in self.bad_configs().items():
+            with self.subTest(label):
+                self.write_config(self.good())
+                kept = sb.load_runnable_config()
+                clock = SimClock()
+                watch = sb.ConfigWatch(self.config_file, kept, clock.now)
+                snapshot = json.loads(json.dumps(kept, sort_keys=True, default=str))
+                self.refuses(json.dumps(bad))
+                self.assertIsNone(watch.check())
+                clock.t += sb.CONFIG_STABLE_SECONDS + 0.5
+                self.assertIsNone(watch.check(), "an invalid file never reloads")
+                self.assertIn("impact_floor", watch.invalid["reason"])
+                self.assertEqual(json.loads(json.dumps(watch.config, sort_keys=True, default=str)), snapshot, "the last good config is what runs")
+                self.assertIs(watch.config, kept)
+
+    def test_s28_a_build_that_drops_the_invalid_entry_and_loads_on_fails_the_same_assertions(self):
+        floor = sb.load_module("impact_floor")
+        real = floor.validate
+        def dropping(raw, source="config"):   # the mutant: the check of the key is gone, so the bad entry loads
+            return None
+        for label, bad in self.bad_configs().items():
+            with self.subTest(label):
+                self.write_config(self.good())
+                self.refuses(json.dumps(bad))   # the real build passes it
+                with mock.patch.object(floor, "validate", dropping):
+                    with self.assertRaises(AssertionError):
+                        self.refuses(json.dumps(bad))
+                self.assertIs(floor.validate, real)
+
+
 class TestDecisionIdForms(WriteWorld):
     """Ask #463: a decision is found by the natural forms of its id, and a miss names the right one."""
 
