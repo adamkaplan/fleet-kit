@@ -1,4 +1,4 @@
 {
  "command": "status",
- "help": "usage: fleet-switchboard status [-h] [--json] options: -h, --help show this help message and exit --json Emit machine-readable JSON instead"
+ "help": "usage: fleet-switchboard status [-h] [--json] [name] positional arguments: name A cloud worker of yours: print ONE line of its state (starting, running, waiting on a prompt, exited), the time of its last tool call or message and its last error (read only) options: -h, --help show this help message and exit --json Emit machine-readable JSON instead"
 }
