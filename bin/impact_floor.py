@@ -216,7 +216,7 @@ OPERATOR_HOLD_CLASS = "execution"   # the one class an entry may list that the m
 
 def hold_classes():
     """The classes a repos entry may list: the matrix's top tier classes (read from the file, none written here) and the operator's own. An unreadable matrix
-    leaves only the operator's class, so an entry naming a top tier class is read as invalid and the decision falls back to the kit-wide default."""
+    leaves only the operator's class, so an entry naming a top tier class is read as invalid and the decision falls back to holding the whole change."""
     try:
         rule = owner_hold_rule(_matrix_cached())
     except MatrixError:
@@ -233,7 +233,7 @@ def __getattr__(name):   # HOLD_CLASSES stays readable as a module attribute, bu
 
 def hold_problem(entry):
     """None when the `hold` / `hold_exclude` keys of a repos entry are well formed, else the rest of the message (starting at the key, naming it). One reader for the
-    configuration check and for the decision (which falls back to the kit-wide default on a problem)."""
+    configuration check and for the decision (which holds the whole change on a problem)."""
     hold, HOLD_CLASSES = entry.get("hold", {}), hold_classes()
     if not isinstance(hold, dict):
         return "hold' must be an object with the classes %s" % ", ".join(HOLD_CLASSES)
@@ -299,8 +299,8 @@ def _refuse_machinery_excludes(name, excludes):
 
 
 def entry_hold(config, repo, matrix=None):
-    """The per-repository owner hold of `repo`: None when its `impact_floor.repos` entry has no `hold` / `hold_exclude` key (the kit-wide default, as before);
-    ("invalid", why) when it cannot be read (the caller applies the kit-wide default and says so, never no hold); else ("ok", {class: globs}, exclude, replaces)
+    """The per-repository owner hold of `repo`: None when its `impact_floor.repos` entry has no `hold` / `hold_exclude` key (the kit-wide rule, as before);
+    ("invalid", why) when it cannot be read (the caller holds the whole change and says so, never no hold); else ("ok", {class: globs}, exclude, replaces)
     where `replaces` is False for the kit repository (named in the matrix floor): there the entry only ADDS holds and the matrix top tier paths still apply."""
     wanted = (repo or "").lower()
     section = (config or {}).get("impact_floor") if isinstance(config, dict) else None
@@ -313,7 +313,7 @@ def entry_hold(config, repo, matrix=None):
                 return None
             try:
                 problem = hold_problem(entry)
-            except Exception as err:   # anything odd about the entry: fail towards the kit-wide default
+            except Exception as err:   # anything odd about the entry: fail towards holding the whole change
                 problem = "%s' unreadable: %s" % ("hold", type(err).__name__)
             if problem:
                 return "invalid", problem
@@ -633,7 +633,7 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None
     holds; more such paths than the block allows hold without being read. `record` ((action, class) of the independent impact reviewer's record for
     this head, or None): a hold action of a top tier, missing or unknown class holds, of a class the matrix file names as not top tier asks for a second review.
     `entry` (from `entry_hold`, default None: nothing changes): a repository's own hold. ("ok", ...) replaces the top tier PATH hold of that repository (not for the
-    kit repository, where it only adds); ("invalid", why) applies the kit-wide default and says so. The machinery holds below run whatever the entry says."""
+    kit repository, where it only adds); ("invalid", why) holds the whole change and says so. The machinery holds below run whatever the entry says."""
     reasons = []
     if owner_hold_rule(matrix) is None:   # FAIL CLOSED: no usable rule means every change holds for the owner
         reasons.append("owner_hold rule missing or malformed in the impact matrix file: every change holds")
