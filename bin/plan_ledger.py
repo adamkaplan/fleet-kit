@@ -603,6 +603,48 @@ def carry_decision(row, evaluator, files_changed, merge_of_default, ci_green):
     return "carry", "carried"
 
 
+PATH_TOKEN_RE = re.compile(r"[^\s`'\"<>()\[\]{},;:=|]+")   # a word of a command or of evidence, cut at quotes, brackets and separators
+
+
+def proof_files(command, evidence, exists):
+    """(#1405) The files a proof names when `--file` was not given: sorted, the words of `command` (its arguments) and of `evidence` (the paths quoted in it) that look like a
+    path (a `/` or a `.` inside) and for which `exists(path)` says it is a file of the tree. Nothing else is named, so a word that is no dependency cannot carry a proof."""
+    found = set()
+    for text in (command, evidence):
+        for word in PATH_TOKEN_RE.findall(str(text or "")):
+            word = word.rstrip(".").removeprefix("./")
+            if word and not word.startswith(("/", "-", "..")) and ("/" in word or "." in word[1:]) and exists(word):
+                found.add(word)
+    return sorted(found)
+
+
+def head_view(scenario_id, evaluator, entries, pr, plan_hash, head, files_between):
+    """(#1405) The one `gates` line of a scenario's proof at `head`, or None when it has no proof of this plan: `proven at this head`, `carried ...`, or `void: ...` naming the
+    first named file that changed, that the proof names no file, or `unknown` when the difference cannot be read. `files_between(old_head)` returns the changed files or None
+    (never read as no change). It reuses `carry_decision`'s own reading of the named files."""
+    rows = [e for e in entries if e.get("pr") == pr and e.get("kind") == "proof" and e.get("scenario") == scenario_id and e.get("plan_hash") == plan_hash]
+    if not rows:
+        return None
+    row = rows[-1]
+    if row.get("head") == head:
+        return "%s: proven at this head" % scenario_id
+    named = sorted({f for f in (row.get("files") or ()) if isinstance(f, str) and f})
+    if row["seq"] in carried_seqs(entries, pr, head, plan_hash):
+        return "%s: carried (%s unchanged since %s)" % (scenario_id, ", ".join(named), str(row.get("head"))[:8])
+    if evaluator not in CARRY_EVALUATORS:
+        return "%s: void: head moved (a %s proof is re-recorded at each green head, never carried)" % (scenario_id, evaluator)
+    if not named:
+        return "%s: void: the proof names no file, so it is never carried" % scenario_id
+    changed = files_between(row.get("head"))
+    if changed is None:
+        return "%s: unknown: the difference since %s cannot be read, so nothing is carried" % (scenario_id, str(row.get("head"))[:8])
+    first = next((f for f in named if f in set(changed)), None)
+    if first:
+        return "%s: void: %s changed since %s" % (scenario_id, first, str(row.get("head"))[:8])
+    return "%s: void: the named files are unchanged since %s but it is not carried (it needs a merge of the default branch or tests and documentation only, and green CI)" % (
+        scenario_id, str(row.get("head"))[:8])
+
+
 def carry_line(row, scenario, old_head, new_head, merge_of_default, pr):
     """The ONE ledger line of a carry: the proof, the old head, the new head and the three facts. The proof's own row is never rewritten."""
     return {"kind": "carried", "pr": pr, "proof": row["seq"], "scenario": scenario, "plan_hash": row.get("plan_hash"), "old_head": old_head, "new_head": new_head,
@@ -921,6 +963,7 @@ def render_gates(report, pr):
             lines.append("  %s: %s" % (s["id"], note))
         for view in s.get("carried") or ():   # #1129: a carried proof is shown with the head it was recorded at
             lines.append("  %s: carried: row #%d recorded at %s, held here by carried line #%d" % (s["id"], view["proof"], str(view["original_head"])[:8], view["carried_line"]))
+    lines.extend("  proof: %s" % l for l in report.get("head_lines") or ())   # #1405: per scenario, proven / carried / void by a named file
     rating = report.get("impact_rating")
     if isinstance(rating, dict):
         lines.append("  " + impact_rating_line(rating, report.get("head")))
