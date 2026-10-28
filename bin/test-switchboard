@@ -46748,13 +46748,14 @@ REAPER_ONLY_STEPS = {
     "step_service": "not called: the switchboard's own service is not installed here",
     "step_janitor_job": "not called: the weekly disk job belongs to the full install",
     "step_ensure": "not called: the daemon is not started here",
+    "step_installed_tree": "not called: the installed tree's record, guard scripts and hooks belong to the full install",
     "step_reaper": "called: the reaper's own step, the one thing this path does",
 }
 # Every module-level function of bin/fleet-switchboard that the installer's steps call, and what it does. A function
 # the installer starts to call must be classified here: the completeness test fails when one has no row.
 INSTALLER_READERS = ("_one_line", "_read_json_object", "_xdg", "check_writable_target", "collect_status", "config_path",
                      "cos_orders_path", "fault", "format_status", "herdr_integration_status", "home_link_is_ours",
-                     "home_link_path", "load_config", "plugin_report", "private_env", "reaper_default_login_file", "reaper_file_path", "reaper_login_file", "reaper_settings_problem",
+                     "home_link_path", "installed_guard_module", "load_config", "plugin_report", "private_env", "reaper_default_login_file", "reaper_file_path", "reaper_login_file", "reaper_settings_problem",
                      "reaper_service_settings", "reaper_settings", "render_reaper", "render_service", "service_file_path",
                      "service_kind", "service_path_dirs", "service_values", "set_file_mode", "state_dir_path",
                      "v2_version_of", "validate_config", "weekly_job_scan")
