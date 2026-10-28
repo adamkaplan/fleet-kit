@@ -97,8 +97,32 @@ def http_error_text(code, retry_after=None):
 MINTED = []  # the one token minted and not yet printed: a refusal after the mint revokes it (never in a message)
 
 
+class Interrupted(SystemExit):
+    """The exit a SIGTERM or SIGHUP makes (128 + the signal number): an interrupt, unlike the exit a refusal makes."""
+
+
+INTERRUPTS = (KeyboardInterrupt, Interrupted)
+
+
 def revoke(token):
-    """Best effort: revoke an installation token (DELETE /installation/token, authorised by that token). True only on HTTP 204."""
+    """Revoke an installation token. An interrupt during the request: one more request, then the interrupt is raised again (the
+    run ends interrupted, never swallowed); a revoke that still did not complete says its one line first. True only on HTTP 204."""
+    interrupt, ok = None, False
+    for _ in range(2):
+        try:
+            ok = revoke_request(token)
+            break
+        except INTERRUPTS as e:
+            interrupt = interrupt or e
+    if interrupt is None:
+        return ok
+    if not ok:
+        say_revoke_failed()
+    raise interrupt
+
+
+def revoke_request(token):
+    """Best effort: one DELETE /installation/token, authorised by that token. True only on HTTP 204. An interrupt passes through."""
     REVOKE_STATUS[:] = ["unreachable"]
     try:
         req = urllib.request.Request(api_base() + "/installation/token", method="DELETE",
@@ -110,6 +134,8 @@ def revoke(token):
     except urllib.error.HTTPError as e:
         REVOKE_STATUS[:] = [str(e.code)]
         return False
+    except INTERRUPTS:
+        raise
     except BaseException:  # any failure (including a redirect or an exit) is "revocation failed", never a crash and never the token
         return False
 
@@ -124,16 +150,24 @@ def say_revoke_failed():
 
 def die(msg, code=1):
     failed = False
+    interrupt = None
     if MINTED:
         token = MINTED.pop()
-        ok = revoke(token)
+        try:
+            ok = revoke(token)
+        except INTERRUPTS as e:   # interrupted during the revoke: it was made once more, and said its line if it failed
+            interrupt, ok = e, REVOKE_STATUS[0] == "204"
         failed = not ok
+        if interrupt is not None:
+            failed = False
         msg += (" The token was revoked." if ok
                 else " Revocation failed: the token expires within an hour and was never printed.")
         del token
     print("app-token: " + msg, file=sys.stderr)
     if failed:
         say_revoke_failed()
+    if interrupt is not None:   # the interrupt ends the run with its own status
+        code = 130 if isinstance(interrupt, KeyboardInterrupt) else interrupt.code
     sys.exit(code)
 
 
@@ -287,10 +321,12 @@ def mint(target, keep=False):
     ans = github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt,
                       {"repositories": [repo], "permissions": dict(EXPECTED_PERMISSIONS)})
     token = ans.get("token") if isinstance(ans, dict) else None
+    if isinstance(token, str) and token:
+        # kept the moment it is known: the caller never holds a token that is not in the list
+        MINTED.append(token)
     repos = ans.get("repositories") if isinstance(ans, dict) else None
     if not isinstance(token, str) or not token:
         die("the answer has no token")
-    MINTED.append(token)
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
         die("refusing: the token does not cover exactly the one target repository")
     full = repos[0].get("full_name")
@@ -488,15 +524,17 @@ def main(argv):
     import signal
 
     def stop(signum, frame):
-        raise SystemExit(128 + signum)
+        raise Interrupted(128 + signum)
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, stop)
     try:   # ONE handler over the whole span: from the mint to the end of the delivery
         token = mint(target, keep=True)
         note_minted(token)
         if kind is None:
-            MINTED.clear()
-            revoke(token)  # nobody received it
+            try:
+                revoke(token)  # nobody received it: revoke first, forget the token after the call has ended
+            finally:
+                MINTED.clear()
             revoked = REVOKE_STATUS[0] == "204"
             print("app-token: minted a token of %d bytes and did not deliver it: name a route with --fd N or --out PATH" % len(token), file=sys.stderr)
             if not revoked:

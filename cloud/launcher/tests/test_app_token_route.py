@@ -672,6 +672,136 @@ class RouteSpan(unittest.TestCase):
             self.assertIn(phrase, readme)
 
 
+class RouteWindows(unittest.TestCase):
+    """Ask #1043, S21 and PC-6: every window in which an interrupt can arrive ends with the token revoked and the interrupted status
+    (130 for Ctrl-C, 143 for SIGTERM, 129 for SIGHUP); the no-route run revokes before it forgets the token."""
+    setUpClass = classmethod(ta.Mint.setUpClass.__func__)
+    tearDownClass = classmethod(ta.Mint.tearDownClass.__func__)
+    setUp = ta.Mint.setUp
+    env, private_dir, mutant = Route.env, Route.private_dir, Route.mutant
+    load = RouteSpan.load
+
+    SIGNALS = (("KeyboardInterrupt", 130), ("SIGTERM", 143), ("SIGHUP", 129))
+    POINTS = ("after the mint, before it is kept", "kept, before the revoke call", "during the revoke request")
+    LINE = RouteSpan.LINE
+
+    @staticmethod
+    def raise_signal(name):
+        def effect(*a, **k):
+            if name == "KeyboardInterrupt":
+                raise KeyboardInterrupt
+            os.kill(os.getpid(), getattr(signal, name))
+        return effect
+
+    def run_window(self, mod, name, point):
+        """(exit status, completed DELETEs seen by the stub, stderr text) of one run with the signal raised at the point."""
+        ta.Stub.deletes = []
+        saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+        self.addCleanup(lambda: [signal.signal(s, h) for s, h in saved.items()])
+        effect = self.raise_signal(name)
+        args, patches = [REAL], []
+        if point == self.POINTS[0]:
+            patches.append(mock.patch.object(mod, "note_minted", side_effect=effect))
+        elif point == self.POINTS[1]:
+            args += ["--out", os.path.join(self.private_dir(), "tok")]
+            patches.append(mock.patch.object(mod, "write_all", side_effect=effect))
+        else:
+            real_open, fired = mod.open_url, []
+
+            def fake_open(req, timeout=30):
+                if req.get_method() == "DELETE" and not fired:   # the first revoke request is the one interrupted
+                    fired.append(1)
+                    effect()
+                return real_open(req, timeout)
+            patches.append(mock.patch.object(mod, "open_url", side_effect=fake_open))
+        err = __import__("io").StringIO()
+        with mock.patch.dict(os.environ, self.env()), contextlib.redirect_stderr(err), contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            try:
+                mod.main(args)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+            except BaseException as e:   # an interrupt that the handler let out
+                code = repr(e)
+        return code, list(ta.Stub.deletes), err.getvalue()
+
+    def check_table(self, path=MINT):
+        mod = self.load(path)
+        for name, status in self.SIGNALS:
+            for point in self.POINTS:
+                code, deletes, text = self.run_window(mod, name, point)
+                label = "%s / %s" % (name, point)
+                self.assertEqual(code, status, label + text)
+                self.assertEqual(deletes, [("/installation/token", "Bearer " + TOKEN)], label)
+                self.assertNotIn(TOKEN, text, label)
+                self.assertNotIn("could not be revoked", text, label)
+
+    def test_s21_nine_cases_each_end_with_one_completed_revoke_and_the_interrupted_status(self):
+        self.check_table()
+
+    def test_s21_a_revoke_that_cannot_complete_says_one_line_without_the_token(self):
+        self.addCleanup(setattr, ta.Stub, "delete_status", 204)
+        ta.Stub.delete_status = 500
+        mod = self.load(MINT)
+        for name, status in self.SIGNALS:
+            code, deletes, text = self.run_window(mod, name, self.POINTS[2])
+            self.assertEqual(code, status, name)
+            self.assertEqual(text.splitlines().count(self.LINE % 500), 1, text)
+            self.assertNotIn(TOKEN, text)
+
+    def test_s21_the_no_route_run_still_holds_the_token_when_the_revoke_starts(self):
+        mod = self.load(MINT)
+        seen = []
+        real = mod.revoke_request
+
+        def watch(token):
+            seen.append(list(mod.MINTED))
+            return real(token)
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(mod, "revoke_request", side_effect=watch):
+            mod.main([REAL])
+        self.assertEqual(seen, [[TOKEN]])
+        self.assertEqual(mod.MINTED, [])
+
+    def test_s21_a_mutant_that_forgets_before_it_revokes_fails(self):
+        path = self.mutant("            try:\n                revoke(token)  # nobody received it: revoke first, forget the token after the call has ended\n"
+                           "            finally:\n                MINTED.clear()\n", "            MINTED.clear()\n            revoke(token)\n")
+        mod = self.load(path)
+        seen, real = [], mod.revoke_request
+
+        def watch(token):
+            seen.append(list(mod.MINTED))
+            return real(token)
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(mod, "revoke_request", side_effect=watch):
+            mod.main([REAL])
+        self.assertEqual(seen, [[]])   # the window is open: the token was forgotten while the revoke had not begun
+        self.assertNotEqual(seen, [[TOKEN]])   # what the real run shows (see the test above)
+
+    def test_s21_a_mutant_that_keeps_the_token_late_fails_the_before_kept_cases(self):
+        path = self.mutant("        MINTED.append(token)\n", "        pass\n",
+                           ("        note_minted(token)\n", "        note_minted(token)\n        MINTED.append(token)\n"))
+        mod = self.load(path)
+        code, deletes, text = self.run_window(mod, "SIGTERM", self.POINTS[0])
+        self.assertEqual(deletes, [])   # the token was live and never revoked
+        with self.assertRaises(AssertionError):
+            self.check_table(path)
+
+    def test_s21_a_mutant_that_swallows_the_interrupt_fails_the_status_check(self):
+        path = self.mutant("    raise interrupt\n", "    return ok\n")
+        with self.assertRaises(AssertionError):
+            self.check_table(path)
+
+    def test_s_pc6_the_readme_states_the_revoke_order_and_the_limits(self):
+        with open(os.path.join(ROOT, "cloud/launcher/README.md")) as f:
+            readme = f.read()
+        for phrase in ("The no-route run revokes the token before it forgets it",
+                       "interrupt of any kind ends with the token revoked and the interrupted status",
+                       "a root-owned link accepted in a directory another non-root user owns is inside the same-user limit",
+                       "leaves an empty 0600 file with no token"):
+            self.assertIn(phrase, readme)
+
+
 def link_in_parents_real(path):
     sys.path.insert(0, os.path.dirname(HERE))
     import app_token
