@@ -323,6 +323,36 @@ def check_fd(fd):
         die("the route --fd %d is not writable" % fd, 2)
     if tty:
         die("the route --fd %d is a terminal" % fd, 2)
+    if same_stream_as_output(fd):
+        die("the route --fd %d is the same open file or pipe as standard output or standard error" % fd, 2)
+
+
+def same_stream_as_output(fd):
+    """True when fd is another descriptor of the same open file or pipe (same device and inode) as descriptor 1 or 2."""
+    try:
+        mine = os.fstat(fd)
+    except OSError:
+        return False
+    for std in (1, 2):
+        try:
+            st = os.fstat(std)
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == (mine.st_dev, mine.st_ino):
+            return True
+    return False
+
+
+def link_in_parents(path):
+    """True when any component of the directory chain above path (not only the last) is a symbolic link."""
+    cur = os.path.abspath(path)
+    while True:
+        up = os.path.dirname(cur)
+        if up == cur:
+            return False
+        cur = up
+        if os.path.islink(cur):
+            return True
 
 
 def check_out(path):
@@ -331,6 +361,8 @@ def check_out(path):
     if not path or "\0" in path:
         die("the route --out needs a path", 2)
     d = os.path.dirname(os.path.abspath(path))
+    if link_in_parents(os.path.join(d, "x")):
+        die("the directory of --out is a link or not a directory", 2)
     try:
         st = os.lstat(d)
     except OSError:

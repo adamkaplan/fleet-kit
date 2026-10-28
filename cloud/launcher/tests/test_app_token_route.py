@@ -178,6 +178,64 @@ class Route(unittest.TestCase):
         self.assertEqual((p.returncode, got, p.stdout), (1, b"", ""))
         self.assertEqual(len(ta.Stub.deletes), 1)
 
+    # -- S16: a descriptor that is another name of standard output or standard error is refused before minting --
+    def run_dup(self, which, path=MINT):
+        """(process, stub requests seen): --fd N where N is a second descriptor of the very pipe (which = 'out') or file (which = 'err') the run's std stream is."""
+        ta.Stub.seen, ta.Stub.gets = [], []
+        if which == "out":
+            r, w = os.pipe()
+            try:
+                p = subprocess.run([sys.executable, path, REAL, "--fd", str(w)], env=self.env(), stdout=w, stderr=subprocess.PIPE, text=True, timeout=60, pass_fds=(w,))
+            finally:
+                os.close(w)
+            with os.fdopen(r, "rb") as f:
+                seen = f.read()
+        else:
+            with tempfile.TemporaryFile() as f:
+                p = subprocess.run([sys.executable, path, REAL, "--fd", str(f.fileno())], env=self.env(), stdout=subprocess.PIPE, stderr=f, text=True, timeout=60, pass_fds=(f.fileno(),))
+                f.seek(0)
+                seen = f.read()
+        return p, seen, list(ta.Stub.seen) + list(ta.Stub.gets)
+
+    def check_dups(self, path=MINT):
+        for which in ("out", "err"):
+            p, seen, requests = self.run_dup(which, path)
+            self.assertEqual(p.returncode, 2, (which, p.stderr))
+            self.assertEqual(requests, [], which)
+            self.assertNotIn(TOKEN.encode(), seen, which)
+
+    def test_s16_a_second_descriptor_of_standard_output_or_error_is_refused_before_minting(self):
+        self.check_dups()
+        p, got = self.run_fd()   # a separate pipe is still accepted
+        self.assertEqual((p.returncode, got), (0, TOKEN.encode()), p.stderr)
+
+    def test_s16_a_mutant_that_checks_only_0_1_2_fails(self):
+        path = self.mutant("    if same_stream_as_output(fd):", "    if False:")
+        with self.assertRaises(AssertionError):
+            self.check_dups(path)
+
+    def test_s7_a_link_in_any_ancestor_of_the_path_route_is_refused_before_minting(self):
+        real = self.private_dir()
+        os.mkdir(os.path.join(real, "inner"))
+        os.chmod(os.path.join(real, "inner"), 0o700)
+        link = os.path.join(self.tmp.name, "alink")
+        os.symlink(real, link)
+        ta.Stub.seen, ta.Stub.gets = [], []
+        p = self.run_it(["--out", os.path.join(link, "inner", "tok")])
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertNotIn(TOKEN, p.stdout + p.stderr)
+        self.assertEqual((ta.Stub.seen, ta.Stub.gets, os.listdir(os.path.join(real, "inner"))), ([], [], []))
+
+    def test_s7_a_mutant_that_checks_only_the_immediate_parent_fails(self):
+        path = self.mutant('    if link_in_parents(os.path.join(d, "x")):', "    if False:")
+        real = self.private_dir()
+        os.mkdir(os.path.join(real, "inner"))
+        os.chmod(os.path.join(real, "inner"), 0o700)
+        link = os.path.join(self.tmp.name, "blink")
+        os.symlink(real, link)
+        p = self.run_it(["--out", os.path.join(link, "inner", "tok")], path)
+        self.assertEqual(p.returncode, 0)   # the mutant lets it through: the test above would fail on it
+
     # -- DW-5: each mutant is caught --
     def caught(self, check, old, new, *more):
         path = self.mutant(old, new, *more)
@@ -291,6 +349,10 @@ class Route(unittest.TestCase):
         self.assertEqual((sorted(found - set(self.CALLERS)), sorted(set(self.CALLERS) - found)), ([], []))
         self.assertFalse([f for f, route in self.CALLERS.items() if "stdout" in route.replace("an override prints on stdout", "")])
 
+    def read_doc(self, name):
+        with open(os.path.join(ROOT, name)) as f:
+            return f.read()
+
     def test_s14_the_documents_say_how_to_run_the_mint_by_hand_safely(self):
         docs = ["cloud/launcher/README.md", "docs/cloud-operator-quickstart.md", "docs/agent-credentials.md", "cloud/README.md"]
         for name in docs:
@@ -305,6 +367,14 @@ class Route(unittest.TestCase):
         self.assertIn("--out", readme)
         self.assertIn("rm ", readme[readme.index("Running the mint by hand"):])
         self.assertNotIn("prints the one-hour git token for the repository (default", readme)
+        self.assertNotIn("Neither writes a file", readme)
+        mint = readme[readme.index("**The cause (ask #1043):**"):]
+        self.assertTrue(mint.startswith("**The cause (ask #1043):** the mint printed the one-hour repository token on standard output, where terminals, transcripts and logs capture it; two recorded cases"))
+        self.assertIn("`3>&1`", readme)
+        self.assertIn("symbolic link in any part of the directory path", readme)
+        real = "app-token: minted a token of %d bytes and did not deliver it: name a route with --fd N or --out PATH" % len(TOKEN)   # the text the mint prints (test_s2 runs it)
+        self.assertIn(real, readme)
+        self.assertIn("same pipe or file as standard output or standard error", self.read_doc("docs/cloud-operator-quickstart.md"))
 
 
 if __name__ == "__main__":

@@ -443,18 +443,17 @@ token file by hand. The reaper does that now, by itself, and runs unattended for
 ## Server-side guards: `app_token.py` and `preflight.py`
 
 A guard is enforced where the action takes effect (the repository's rules, the token's scope), not in a wrapper.
-These two programs are the server side of that. Neither writes a file; neither prints a secret.
+These two programs are the server side of that. The mint writes a file only when a person names `--out` (one new file, mode 0600); the preflight writes none; neither prints a secret.
 
-**`app_token.py OWNER/REPO`** mints a one-hour GitHub App installation token for that one repository and writes it only to a route the
-caller names, never to stdout or stderr. **The cause** this answers (ask #1043): the mint used to print the token on plain stdout, the one
-channel that terminals, tool transcripts and logs capture by default, so a misordered redirect and a debugging run each showed a live
-token. The fix removes stdout as a delivery channel. The routes (exactly one per run):
+**The cause (ask #1043):** the mint printed the one-hour repository token on standard output, where terminals, transcripts and logs capture it; two recorded cases (a misordered redirect, and a debugging run of a clone) each showed a live token.
+**`app_token.py OWNER/REPO`** now mints a one-hour GitHub App installation token for that one repository and writes it only to a route the
+caller names, never to stdout or stderr. The fix removes stdout as a delivery channel. The routes (exactly one per run):
 
 - `--fd N`: a descriptor (3 or more, open, writable, not a terminal) the caller passes down, normally a pipe the launcher reads. No file exists. This is the route for programs.
 - `--out PATH`: a new file, mode 0600, created only after every check passed, in a directory you own with no group or world access; it is refused when PATH exists and never overwritten. This is the route for a person.
 - no route: the token is minted, then revoked (nobody received it), and stderr says one line with the token's byte count; stdout stays empty, exit 0.
 
-A bad route (0, 1 or 2, a closed or read-only descriptor, a terminal, both routes, a bad directory) exits 2 before anything is minted. A delivery
+A bad route (0, 1 or 2, a closed or read-only descriptor, a terminal, a second descriptor of the very file or pipe that standard output or standard error is (`3>&1`, `3>&2`), both routes, a bad directory, a symbolic link in any part of the directory path) exits 2 before anything is minted. A delivery
 that fails revokes the token and exits non-zero. Success is silent. It refuses (exit 1, one line on stderr naming the key, never a value) to deliver a token unless:
 
 - the installation is found, not stored: the mint asks GitHub (`GET /repos/OWNER/REPO/installation`, signed with the App's
@@ -489,7 +488,12 @@ rm -r "$HOME/.cw-token-dir"
 ```
 
 The run prints nothing on success. With no route it only reports a byte count and revokes the token, so it is a safe way to check that the
-mint works. The file is created with mode 0600 and the mint refuses an existing path. Do not print the file in a shared session or a log.
+mint works. The one line on stderr (here for a token of 49 bytes; the count is the token's own) reads:
+
+```
+app-token: minted a token of 49 bytes and did not deliver it: name a route with --fd N or --out PATH
+```
+ The file is created with mode 0600 and the mint refuses an existing path. Do not print the file in a shared session or a log.
 
 **`preflight.py OWNER/REPO [--branch NAME] [--accept-classic]`** reads, with GET only, whether the default branch
 refuses direct pushes (a `pull_request` rule that requires at least one approving review, or a `merge_queue` rule, in an active ruleset that covers the branch; `evaluate` and `disabled` rulesets and rulesets not covering the branch are refused by name; ref patterns follow GitHub: `*` stops at `/`, `**` crosses it, and a pattern the program does not understand, such as a character class, covers nothing), force-pushes (`non_fast_forward`) and deletion
