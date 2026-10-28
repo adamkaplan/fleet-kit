@@ -20224,7 +20224,10 @@ def rest_review_as_view(review):
 def standing_requests(engine, runner, now, repo, number, head="", decision=""):
     """(rows, problem): the standing CHANGES_REQUESTED reviews of ONE pull request, by the SAME rule as the merge shim (`shims/review_rule.py`, never a copy), each
     row {login, name, id, commit, age}; `problem` is a one-line cause when the list could not be read whole or the rule file is unreadable (never an empty `rows`)."""
-    ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number))
+    try:
+        ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number))
+    except Exception as err:   # a read that cannot even be made is unreadable, never "none", and never raises out of `gates`
+        ok, reviews, why = False, None, type(err).__name__
     if not ok:
         return [], "the reviews could not be read whole (%s): not listed" % why
     try:
