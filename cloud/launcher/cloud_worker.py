@@ -1746,6 +1746,7 @@ class Launcher:
 
         def go(info):
             info["rid"] = "pod/" + name
+            issue_no = parse_issue_number(getattr(a, "issue", None))   # before anything is made
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.match(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
@@ -1788,7 +1789,7 @@ class Launcher:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
                 if hub:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
-                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password)
+                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, a.repo, issue_no)
                 self._make(made, "pod", self.kube.apply, spec)
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
@@ -1849,11 +1850,15 @@ class Launcher:
     def _registry_secret(self):
         return self.env.get("CW_HUB_REGISTRY_SECRET") or DEFAULT_REGISTRY_SECRET
 
-    def _register(self, agent, channel_secret, spec, domain, password):
-        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file}}. Only the hash is stored."""
+    def _register(self, agent, channel_secret, spec, domain, password, repo=None, issue=None):
+        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file, repo[, issue]}}. Only the hash is stored."""
         digest = hashlib.sha256(channel_secret.encode()).hexdigest()
         name = spec["metadata"]["name"]
         entry = {"url": hub_agent_url(name, self.env.get("CW_CLOUD_NAMESPACE", "cw")), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
+        if repo is not None:
+            entry["repo"] = repo
+        if issue is not None:
+            entry["issue"] = issue
 
         def change(sec, agents):
             sec[agent], agents[agent] = digest, entry
@@ -2904,6 +2909,17 @@ def stack_registry_check(a, env, out):
     return 0
 
 
+def parse_issue_number(value):
+    """None when no issue is named; else an int above 0; anything else is a usage error."""
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,9}", value):
+        return int(value)
+    raise CloudError("--issue must be a whole number above 0, got %r; nothing was created" % str(value)[:40], EXIT_USAGE)
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="cloud-worker")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2920,6 +2936,7 @@ def build_parser():
     k.add_argument("--identity", default=PULLER_IDENTITY)
     c = cmd("create")
     c.add_argument("--repo", required=True)
+    c.add_argument("--issue", default=None, help="the issue number (a whole number above 0) written into the hub entry of a registered worker")
     c.add_argument("--branch", required=True)
     c.add_argument("--idle", default="10m")
     c.add_argument("--hard", default="2h")
