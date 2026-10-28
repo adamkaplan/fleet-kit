@@ -6193,6 +6193,14 @@ It judges only the tree `install` recorded (`installed-tree` in the state direct
 
 The daemon checks at its start and on every pass. On a bad tree it stays alive but decides and delivers nothing (no verdict, merge or message), re-checks on each pass and resumes by itself when the tree is good. The first alert goes at once, a repeat after a day, through a standalone script the install copied into the state directory (`guard/guard_alert.py`, standard library only, nothing from the tree): an audit line, a herdr toast addressed to the Chief of Staff, a desktop notification for the person on every alert, and a line in `installed-tree-alerts.txt`.
 
+### A tree git cannot read
+
+When a git read fails without a plain answer (a lock, a corrupt `HEAD`, a timeout, git missing), the tree is neither good nor bad: it is unreadable. This reverses the earlier rule that a failed read is no evidence, for the commands that matter:
+
+- A command that records a verdict, a gate, a clear, a merge or a proof refuses with one line saying the tree could not be read. These are the commands whose handler is flagged `ledger` or `records` in the command registry (`prove`, `verdict`, `waive`, `gates`, `gates-check`, `merge-gate`, `item-prove`, `item-verdict`, `impact`, `cloud-clear`, `review`, `plan` and `run --once`); a test holds every command whose name says it records one of those things to the flags, so a new one cannot be forgotten.
+- Any other command runs, with one note on stderr that it ran without the check.
+- The daemon skips that pass and alerts, as for a bad tree, and resumes by itself when the tree can be read.
+
 ### How the operator moves the tree
 
 Save your work, put the tree back on the default branch and fast-forward it to `origin/<default>` yourself in a terminal of your own (no agent does this), and run `fleet-switchboard install` again: it records the tree and its default branch, copies the two guard scripts and writes the `post-checkout` and `post-merge` hooks in the tree's `.git/hooks` (a hook that is not ours is left alone). Each hook appends one `installed_tree.head_moved` line to the audit (under the audit's own append lock) with the old and new commit and the chain of ancestor processes (pid, parent pid and executable names only, never their arguments: a command line can carry a path or a secret), so the next move names who made it.

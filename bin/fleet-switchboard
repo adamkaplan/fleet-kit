@@ -3769,22 +3769,35 @@ def installed_guard_module(directory=None):
     return module
 
 
-def installed_tree_refusal(action, state_dir=None, root=None, runner=subprocess.run, daemon=False):
-    """The one line a command is refused with when the installed tree is not the default branch, clean; else None. Only a tree `install` recorded is judged."""
+def command_records(action, known):
+    """True when the command `action` records a verdict, a gate, a clear, a merge or a proof: DERIVED from the registry, by the flags of its handler
+    (`ledger`: the evidence ledger's commands; `records`: the others, set beside the handler). `run` is one: its `--once` pass decides and delivers."""
+    handler = resolve_command(action, known)
+    return handler is not None and (getattr(handler, "ledger", False) is True or getattr(handler, "records", False) is True)
+
+
+def installed_tree_check(action, state_dir=None, root=None, runner=subprocess.run, daemon=False, records=False):
+    """(refusal, note) of the installed-tree guard for a command: a one-line refusal, or None to run it, and a one-line note for stderr, or None. Only a tree
+    `install` recorded is judged."""
     if daemon:   # `run` without --once: the daemon checks the tree itself at its start and on every pass, and alerts. Refused here, the service manager would restart it for ever, silently.
-        return None
+        return None, None
     state = Path(state_dir) if state_dir is not None else state_dir_path()
     if not (state / "installed-tree").is_file():
-        return None   # a worktree, a CI checkout or a tree install never recorded: nothing to judge
+        return None, None   # a worktree, a CI checkout or a tree install never recorded: nothing to judge
     try:
-        return installed_guard_module().entry_problem_line(action, state, KIT_ROOT if root is None else root, runner)
+        return installed_guard_module().entry_problem_line(action, state, KIT_ROOT if root is None else root, runner, records)
     except Exception as err:   # the guard itself is broken: the tree cannot be trusted, and the commands that move it still run
-        return None if action in ("install", "upgrade", "doctor") else "%s: refused: the installed-tree guard could not run (%s)" % (PROG, _one_line(str(err), 160))
+        return (None if action in ("install", "upgrade", "doctor") else "%s: refused: the installed-tree guard could not run (%s)" % (PROG, _one_line(str(err), 160))), None
+
+
+def installed_tree_refusal(action, state_dir=None, root=None, runner=subprocess.run, daemon=False, records=False):
+    """The refusal line of `installed_tree_check`, or None."""
+    return installed_tree_check(action, state_dir, root, runner, daemon, records)[0]
 
 
 def installed_tree_problem(state_dir, root=None, runner=subprocess.run):
     """What is wrong with the installed tree, one line, or None (good, or not recorded). The daemon calls this on every pass."""
-    refused = installed_tree_refusal("run", state_dir, root, runner)
+    refused = installed_tree_refusal("run", state_dir, root, runner, records=True)   # at a pass an unreadable tree is skipped and alerted as a bad one is
     return refused[len(PROG) + 2:] if refused and refused.startswith(PROG + ": ") else refused
 
 
@@ -7296,6 +7309,9 @@ def cmd_cloud_clear(args, runner, now):
     password file), and every one it removes is named. A record with a pod, or one not past its deadline, is never touched, and it refuses when
     the cluster could not be read: it never removes a record it cannot prove is gone. The caller rule is `retire`'s."""
     return run_cloud("cmd_cloud_clear", args, runner, now)
+
+
+cmd_cloud_clear.records = True   # a clear (#1380)
 
 
 def watch_problem(engine, state, name, discovery):
@@ -13838,6 +13854,7 @@ def cmd_run(args, runner, now, wait):
 
 
 STANDBY_SECONDS = 10  # how often `run --standby` looks again for a free lock
+cmd_run.records = True   # `run --once` decides and delivers (#1380); the daemon itself is not refused at the entry and checks the tree on every pass
 
 
 def cmd_ensure(args, spawn=subprocess.Popen):
@@ -17549,6 +17566,7 @@ def cmd_impact(args, runner, now):
 
 
 cmd_impact.direct = True   # no error mapping, no daemon start
+cmd_impact.records = True   # `impact clear` records a clear (#1380: it refuses on a tree git could not read)
 
 
 IMPACT_MATRIX_PATHS_MAX = 50   # paths printed per floor rule by `impact matrix --for-rater`
@@ -20494,6 +20512,7 @@ def cmd_review(args, runner, now):
 
 
 cmd_review.direct = True   # no error mapping, no daemon start
+cmd_review.records = True   # `review record` records a review verdict (#1380)
 
 
 def cmd_review_checkout(args, runner, now):
@@ -23326,6 +23345,7 @@ def cmd_plan(args, runner, now, socket_call=None):
 
 
 cmd_plan.direct = True   # no error mapping, no daemon start
+cmd_plan.records = True   # the plan ledger's approvals and gates (#1380)
 
 
 def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen, socket_call=None):
@@ -23380,10 +23400,13 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
         sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
         return EXIT_ERROR
-    refused = installed_tree_refusal(getattr(args, "action", None), daemon=getattr(args, "action", None) == "run" and not getattr(args, "once", False))   # #1380: before anything else runs, and for every command but the ones that move the tree
+    action = getattr(args, "action", None)
+    refused, noted = installed_tree_check(action, daemon=action == "run" and not getattr(args, "once", False), records=command_records(action, parser.commands))   # #1380: before anything else runs, and for every command but the ones that move the tree
     if refused:
         sys.stderr.write(refused + "\n")
         return EXIT_ERROR
+    if noted:
+        sys.stderr.write(noted + "\n")
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
 
 

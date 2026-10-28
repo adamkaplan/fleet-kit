@@ -53,17 +53,17 @@ def _git(root, *argv, run=subprocess.run):
 
 def check(root, default_branch, run=subprocess.run):
     """The state of the tree at `root`: {"ok", "note", "branch" (None when detached), "commit", "dirty" [paths], "remote" (commit or None), "why"}."""
-    result = {"ok": False, "note": None, "branch": None, "commit": None, "dirty": [], "remote": None, "why": None}
+    result = {"ok": False, "note": None, "unreadable": False, "branch": None, "commit": None, "dirty": [], "remote": None, "why": None}
     try:
         status = _git(root, "status", "--porcelain=v1", "--branch", "--untracked-files=no", run=run)
     except (OSError, subprocess.SubprocessError) as err:   # git missing, or it timed out: no evidence of a bad tree
         status = None
-        result["note"] = "unreadable: %s" % type(err).__name__
+        result["note"], result["unreadable"] = "unreadable: %s" % type(err).__name__, True
     lines = status.stdout.splitlines() if status is not None and status.returncode == 0 else []
     if not lines or not lines[0].startswith("## "):
         # A read that failed (a lock, a timeout, a repository mid-operation) is NOT evidence of a bad tree: the command runs, the daemon goes on, and
         # the next check reads again. Only a read that succeeded and found something wrong refuses.
-        result["ok"], result["note"] = True, result["note"] or "unreadable: git status failed"
+        result["ok"], result["unreadable"], result["note"] = True, True, result["note"] or "unreadable: git status failed"
         return result
     head = lines[0][3:]
     if head.startswith("HEAD (no branch)"):
@@ -78,7 +78,7 @@ def check(root, default_branch, run=subprocess.run):
     try:
         revs = _git(root, "rev-parse", "HEAD", remote_ref, run=run)
     except (OSError, subprocess.SubprocessError) as err:
-        result["ok"], result["note"] = True, "unreadable: %s" % type(err).__name__
+        result["ok"], result["unreadable"], result["note"] = True, True, "unreadable: %s" % type(err).__name__
         return result
     out = revs.stdout.split()
     result["commit"] = out[0] if out and SHA.match(out[0]) else None
@@ -88,7 +88,7 @@ def check(root, default_branch, run=subprocess.run):
     elif branch is not None and branch != default_branch:
         result["why"] = "on branch %s, not the default branch %s" % (branch, default_branch)
     elif result["commit"] is None:   # git could not name HEAD (a failed read that raised nothing): no evidence of a bad tree
-        result["ok"], result["note"] = True, "unreadable: git rev-parse failed"
+        result["ok"], result["unreadable"], result["note"] = True, True, "unreadable: git rev-parse failed"
         return result
     elif result["remote"] is None:
         if branch is None:
@@ -107,10 +107,10 @@ def _ancestor(root, result, run):
     try:
         done = _git(root, "merge-base", "--is-ancestor", result["commit"], result["remote"], run=run)
     except (OSError, subprocess.SubprocessError) as err:
-        result["note"] = "unreadable: %s" % type(err).__name__
+        result["note"], result["unreadable"] = "unreadable: %s" % type(err).__name__, True
         return True
     if done.returncode not in (0, 1):   # 1 is the answer "no"; anything else is git failing
-        result["note"] = "unreadable: git merge-base failed"
+        result["note"], result["unreadable"] = "unreadable: git merge-base failed", True
         return True
     return done.returncode == 0
 
@@ -142,12 +142,43 @@ def note(state_dir, root, run=subprocess.run):
     return check(marker[0], marker[1], run)["note"]
 
 
-def entry_problem_line(action, state_dir, root, run=subprocess.run):
-    """What a command prints, or None to run it. Exempt commands are never refused."""
+# A command whose name says it records a verdict, a gate, a clear, a merge or a proof. The registry flags the real ones (`ledger`, `records` on the handler);
+# a command with such a word in its name and no flag is named by `unflagged_recording_names`, which a test holds empty.
+RECORDING_WORDS = ("verdict", "prove", "gate", "gates", "merge", "clear", "waive", "proof")
+
+
+def unflagged_recording_names(known, recording):
+    """The commands of `known` whose name carries a RECORDING_WORDS word and that are not in `recording`: sorted."""
+    return sorted(name for name in known if set(name.split("-")) & set(RECORDING_WORDS) and name not in recording)
+
+
+def judge(state_dir, root, run=subprocess.run):
+    """(kind, line, note): kind is "off" (the guard does not apply), "ok", "bad" (line names what is wrong) or "unreadable" (git could not be read:
+    line says so, note is the git reason)."""
+    marker = read_marker(state_dir)
+    if marker is None or os.path.realpath(marker[0]) != os.path.realpath(str(root)):
+        return "off", None, None
+    state = check(marker[0], marker[1], run)
+    if state["unreadable"]:
+        return "unreadable", "the installed tree %s could not be read (%s)" % (marker[0], state["note"]), state["note"]
+    if not state["ok"]:
+        return "bad", describe(marker[0], marker[1], state), None
+    return "ok", None, state["note"]
+
+
+def entry_problem_line(action, state_dir, root, run=subprocess.run, records=False):
+    """(refusal, note) for a command. Exempt commands are never refused. A tree that is bad refuses every command. A tree that could not be read
+    refuses a command that RECORDS a verdict, a gate, a clear, a merge or a proof (`records`); any other command runs, with the note."""
     if action in EXEMPT_COMMANDS:
-        return None
-    line = problem(state_dir, root, run)
-    return None if line is None else "fleet-switchboard: refused: " + line
+        return None, None
+    kind, line, note = judge(state_dir, root, run)
+    if kind == "bad":
+        return "fleet-switchboard: refused: " + line, None
+    if kind == "unreadable":
+        if records:   # the unreadable tree: a record made on a tree nobody could read is the one thing this guard exists to stop
+            return "fleet-switchboard: refused: %s; a command that records a verdict, a gate, a clear, a merge or a proof does not run until it can be read: try again, or check the tree with git" % line, None
+        return None, "fleet-switchboard: note: %s; this command ran without the check" % line
+    return None, ("fleet-switchboard: note: the installed tree: %s" % note) if note else None
 
 
 # ------------------------------------------------------------------ install

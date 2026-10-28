@@ -71,7 +71,117 @@ class TreeCase(Base):
         return code, err.getvalue()
 
 
-class TestTheEntryGuard(TreeCase):
+class UnreadableTreeTests:
+    """Plan rev 7, rule 4: a git read that fails without raising leaves the tree UNREADABLE. A command that records a verdict, a gate, a clear, a merge or a
+    proof refuses; a plain read command runs with a note; the daemon skips that pass with the alert. The recording commands are DERIVED from the registry
+    (the flags on the command handlers), never listed by hand here."""
+
+    def break_tree(self):
+        (self.tree / ".git" / "HEAD").write_text("garbage\n")
+
+    def mend_tree(self):
+        (self.tree / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+
+    def known(self):
+        return sb.build_parser().commands
+
+    def recording(self):
+        return sorted(name for name in self.known() if sb.command_records(name, self.known()))
+
+    def test_the_recording_commands_are_derived_from_the_registry_and_include_the_ones_that_matter(self):
+        recording = set(self.recording())
+        for name in ("prove", "verdict", "item-prove", "item-verdict", "waive", "gates", "gates-check", "merge-gate", "impact", "cloud-clear", "review", "run"):
+            self.assertIn(name, recording)
+        for name in ("status", "version", "intent", "pending", "send", "pr-state", "whoami"):
+            self.assertNotIn(name, recording)
+        flagged = {name for name in self.known() if getattr(sb.resolve_command(name, self.known()), "ledger", False)}
+        self.assertTrue(flagged and flagged <= recording)   # every command of the evidence ledger records
+
+    def test_every_command_whose_name_says_it_records_is_a_recording_command(self):
+        """The completeness check: a command named for a verdict, a gate, a proof, a clear or a merge that no flag marks fails here."""
+        self.assertEqual(guard.unflagged_recording_names(self.known(), set(self.recording())), [])
+
+    def test_a_new_verdict_or_merge_command_is_covered_or_the_check_names_it(self):
+        flagged = lambda args: 0
+        flagged.ledger = True
+        forgotten = lambda args: 0
+        with mock.patch.dict(sb.__dict__, {"cmd_zap_verdict": flagged, "cmd_zap_merge": forgotten}):
+            known = set(self.known()) | {"zap-verdict", "zap-merge"}
+            self.assertTrue(sb.command_records("zap-verdict", known))                     # a flagged one is covered at once
+            self.assertFalse(sb.command_records("zap-merge", known))
+            recording = {name for name in known if sb.command_records(name, known)}
+            self.assertEqual(guard.unflagged_recording_names(known, recording), ["zap-merge"])   # an unflagged one is named
+
+    def test_every_recording_command_refuses_on_an_unreadable_tree_and_every_other_runs_with_a_note(self):
+        self.break_tree()
+        known = self.known()
+        for name in sorted(known):
+            if name in ("install", "run"):
+                continue
+            with self.subTest(name=name):
+                line = sb.installed_tree_refusal(name, records=sb.command_records(name, known))
+                if name in self.recording():
+                    self.assertIsNotNone(line)
+                    self.assertEqual(len(line.splitlines()), 1)
+                    self.assertIn("could not be read", line)
+                else:
+                    self.assertIsNone(line)
+
+    def test_end_to_end_a_merge_gate_is_refused_and_status_runs_with_a_note(self):
+        self.break_tree()
+        code, err = self.command("merge-gate", "acme/widget#1")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assertIn("could not be read", err)
+        with mock.patch.object(sb, "dispatch", lambda *a, **k: 0):
+            code, err = self.command("status")
+        self.assertEqual(code, 0)
+        self.assertIn("could not be read", err)
+        self.assertEqual(len(err.splitlines()), 1)
+        self.mend_tree()
+        self.assertEqual(self.command("version"), (0, ""))
+
+    def test_each_recording_command_is_load_bearing_one_mutant_per_member(self):
+        self.break_tree()
+        known = self.known()
+        for name in self.recording():
+            if name in ("run",):
+                continue
+            with self.subTest(name=name):
+                self.assertIsNotNone(sb.installed_tree_refusal(name, records=sb.command_records(name, known)))
+                self.assertIsNone(sb.installed_tree_refusal(name, records=False))   # the mutant: this member read as a plain command runs
+
+    def test_a_mutant_that_treats_unreadable_as_fine_is_caught(self):
+        source = (BIN / "installed_guard.py").read_text()
+        marker = "if records:   # the unreadable tree"
+        self.assertIn(marker, source)
+        namespace = {"__name__": "mutant_guard"}
+        exec(compile(source.replace(marker, "if False:   # mutant"), "mutant_guard.py", "exec"), namespace)
+        self.break_tree()
+        mutant = namespace["entry_problem_line"]("merge-gate", self.state, self.tree, subprocess.run, True)
+        self.assertEqual(mutant[0], None)                                             # the mutant lets the merge gate run
+        self.assertIsNotNone(guard.entry_problem_line("merge-gate", self.state, self.tree, subprocess.run, True)[0])
+
+    def test_the_daemon_skips_a_pass_on_an_unreadable_tree_alerts_and_resumes(self):
+        fakes = FakePrograms(self.home)
+        os.environ[sb.INSTALLED_TREE_ALERT_ENV] = str(fakes.notifier)
+        engine = FakeEngine([1_800_000_000.0], fakes.herdr)
+
+        def run(count):
+            with mock.patch.object(sb, "next_poll", lambda e, p: p), mock.patch.dict(sys.modules, {sb.__name__: sb}), \
+                    mock.patch.object(sb.load_module("cloud_relay_daemon"), "pass_if_configured", lambda *a, **k: None):
+                sb.run_daemon(engine, self.state, 60, wait=lambda sock, timeout: None, passes=count)
+        self.break_tree()
+        run(2)
+        self.assertEqual(engine.passes, 0)
+        self.assertEqual(fakes.count(fakes.notifier_log), 1)
+        self.assertIn("could not be read", (self.home / "notify.log").read_text())
+        self.mend_tree()
+        run(2)
+        self.assertEqual(engine.passes, 2)
+
+
+class TestTheEntryGuard(UnreadableTreeTests, TreeCase):
     def outcomes(self):
         """S2, S3, S4: the exit status of a command for each state of the tree."""
         found = {}
@@ -107,7 +217,7 @@ class TestTheEntryGuard(TreeCase):
         self.assertEqual(found["clean"], (0, ""))
 
     def test_s9_a_mutant_that_removes_the_check_fails_each_of_them(self):
-        always_ok = lambda root, branch, run=subprocess.run: {"ok": True, "note": None, "branch": "main", "commit": None, "dirty": [], "remote": None, "why": None}
+        always_ok = lambda root, branch, run=subprocess.run: {"ok": True, "note": None, "unreadable": False, "branch": "main", "commit": None, "dirty": [], "remote": None, "why": None}
         mutant = sb.installed_guard_module()
         mutant.check = always_ok   # the entry loads its own fresh copy of the module: the mutant is what it loads
         with mock.patch.object(sb, "installed_guard_module", return_value=mutant):
@@ -145,7 +255,9 @@ class TestTheEntryGuard(TreeCase):
 
     def test_a_fresh_clone_without_the_remote_ref_is_allowed_with_a_note_and_a_detached_one_is_not(self):
         git(self.tree, "update-ref", "-d", "refs/remotes/origin/main")
-        self.assertEqual(self.command("version"), (0, ""))
+        code, err = self.command("version")
+        self.assertEqual(code, 0)
+        self.assertIn("ancestry unverified", err)
         self.assertIn("ancestry unverified", guard.note(self.state, self.tree))
         git(self.tree, "switch", "-q", "--detach", "HEAD")
         self.assertEqual(self.command("version")[0], 1)
@@ -258,7 +370,7 @@ class TestTheEntryGuard(TreeCase):
 
     def test_a_mutant_that_reads_a_failed_rev_parse_as_no_commit_is_caught(self):
         source = (BIN / "installed_guard.py").read_text()
-        fixed = 'result["ok"], result["note"] = True, "unreadable: git rev-parse failed"\n        return result'
+        fixed = 'result["ok"], result["unreadable"], result["note"] = True, True, "unreadable: git rev-parse failed"\n        return result'
         self.assertIn(fixed, source)
         namespace = {"__name__": "mutant_guard"}
         exec(compile(source.replace(fixed, 'result["why"] = "no commit"'), "mutant_guard.py", "exec"), namespace)
@@ -539,7 +651,7 @@ class TestTheDocument(unittest.TestCase):
 
     def test_the_document_states_the_limits(self):
         body = " ".join(self.section().split())
-        for phrase in ("lives in the tree it guards", "deleting `installed-tree`", "records the tree it is run from", "core.hooksPath",
+        for phrase in ("reverses", "records a verdict, a gate, a clear, a merge or a proof", "could not be read", "lives in the tree it guards", "deleting `installed-tree`", "records the tree it is run from", "core.hooksPath",
                        "origin", "fileMode", "executable names"):
             self.assertIn(phrase, body)
 
