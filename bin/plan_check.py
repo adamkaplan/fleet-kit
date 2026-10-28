@@ -861,6 +861,24 @@ def plan_hash(text):
     return "sha256:" + hashlib.sha256(" ".join((text or "").split()).encode("utf-8")).hexdigest()
 
 
+# The words that say a plan reads or produces something (ask #1455): the one table of the `no-failure-mode` warning.
+FAILURE_TRIGGER_WORDS = ("read", "reads", "reader", "feed", "producer", "guard", "scan", "derive", "derived")
+FAILURE_SCENARIO_RE = re.compile(r"\b(?:missing|corrupt|corrupted|unreadable|absent)\b", re.IGNORECASE)
+
+
+def failure_mode_warning(scenarios, text):
+    """A warning (never a defect, never in the hash) when the plan's text speaks of reading or producing something and no scenario
+    speaks of a missing, corrupt, unreadable or absent input. Only for a plan that has scenarios."""
+    if not scenarios:
+        return None
+    if not re.search(r"\b(?:%s)\b" % "|".join(FAILURE_TRIGGER_WORDS), text or "", re.IGNORECASE):
+        return None
+    if any(FAILURE_SCENARIO_RE.search(" ".join(str(v) for v in s.values())) for s in scenarios):
+        return None
+    return {"id": "-", "code": "no-failure-mode", "message": "no-failure-mode: the plan reads or produces something but no scenario "
+            "covers an input that is missing, corrupt or unreadable: add one (the output says so and the last good output is kept)"}
+
+
 # ----------------------------------------------------------------------------------- the whole check
 
 def _clause_key(clause):
@@ -893,6 +911,9 @@ def check(text, done_when, plan_done_when=None):
                           "joined in order they must reproduce the Done-when text (case, spacing, punctuation and `(n)` "
                           "numbers are ignored). First difference: %s. The ask has: %r" % ((first_difference(declared, clauses, done_when) or "the clauses differ"), _normal(done_when)[:160])})
     defects, warnings = validate(scenarios, clauses, text)
+    warning = failure_mode_warning(scenarios, text)
+    if warning:
+        warnings.append(warning)
     defects = [d for d in defects if not (extra and d["code"] == "no-done-when")] + extra
     if declared is None and len(clauses) == 1 and len(re.findall(r"[;,]", clauses[0])) >= 3 and not re.search(r"\([0-9]+\)", done_when or ""):
         warnings.append({"id": "-", "code": "one-clause-many-parts", "message": "the Done-when counts as 1 clause but has %d "

@@ -62,6 +62,8 @@ scenarios:
     claim: pr         # optional: pr (default) = proven per PR; epic = proven at the epic's integrated head
 ```
 
+**Default scenario for every input a plan reads:** the input is missing, corrupt or unreadable: the output says so and the last good output is kept. `plan check` WARNS (`no-failure-mode`; never fails, the hash is unchanged) when the plan's text reads or produces something (read, reads, reader, feed, producer, guard, scan, derive, derived) and no scenario speaks of a missing, corrupt, unreadable or absent input.
+
 Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 
 **A scenario the tester can only prove after the merge is not claimed by a slice pull request (#579).** With NO `claim` written, a scenario whose evaluator is the tester and whose proof is a `measure` is read by G1 as `claim: epic`: a slice pull request is not asked to prove it, and G1 lists it as `epic-claimed, proven after the merge at the integration head`. Write `claim: pr` to have a pull request claim it anyway; `claim: epic` stays epic. `prove`, `verdict` and `verdict --all` read it the same way (one function, `claim_of`) and refuse it with the message of an explicit `claim: epic`. Every other scenario with no claim is `pr`, as before. The plan's own text decides: the plan hash is unchanged (the canonical text has always read an unwritten claim as `pr`; only G1's reading changes), and `plan check` still requires the scenario's id, text, pass and discriminates.
