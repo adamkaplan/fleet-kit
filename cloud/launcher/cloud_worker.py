@@ -1249,6 +1249,12 @@ def scan_credentials(spec):
 REGISTRY_KEYS = ("secrets.json", "agents.json")
 
 
+def _not_found_exactly(stderr, what):
+    """True only when the whole message (one trailing newline trimmed) is the client's not-found text for the ONE object asked for (kind and exact name)."""
+    text = stderr[:-1] if stderr.endswith("\n") else stderr
+    return bool(what) and text == "Error from server (NotFound): %s not found" % what
+
+
 class Kube:
     """The only door to the cloud: one kubectl call per method. Never puts a secret on a command line."""
 
@@ -1330,7 +1336,7 @@ class Kube:
         if p.returncode != 0:
             if keep_stdout and p.stdout.strip():
                 return p.stdout  # the caller reads the failure from the tool's own JSON
-            if ok_missing and "NotFound" in p.stderr and (missing_what is None or (missing_what in p.stderr and " not found" in p.stderr)):
+            if ok_missing and _not_found_exactly(p.stderr, missing_what):
                 return None
             last = (self.scrub(p.stderr, limit=SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
             raise CloudError("kubectl %s: %s" % (args[0], self.scrub(last)))
@@ -1352,7 +1358,7 @@ class Kube:
             raise self._exists(e, "%s %s" % (obj["kind"], obj["metadata"]["name"])) from None
 
     def get_secret(self, full_name):
-        out = self.run(["get", "secret", full_name, "-o", "json"], ok_missing=True)
+        out = self.run(["get", "secret", full_name, "-o", "json"], ok_missing=True, missing_what='secrets "%s"' % full_name)
         return json.loads(out) if out else None
 
     def get_pod(self, name):
@@ -1432,7 +1438,7 @@ class Kube:
                 ", ".join("%s/%s" % x for x in left), "; ".join(self.delete_command(k, o) for k, o in left)))
 
     def get_run_secret(self, name):
-        out = self.run(["get", "secret", name + "-run", "-o", "json"], ok_missing=True)
+        out = self.run(["get", "secret", name + "-run", "-o", "json"], ok_missing=True, missing_what='secrets "%s-run"' % name)
         return json.loads(out) if out else None
 
     def create_run_secret(self, name, pod, values, run_id=None):
@@ -1610,7 +1616,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
     if agent == "orchestrator" or hub_on(env):   # with the hub setting unset a worker pod gets none of these: its spec is exactly what it was
         boss = getattr(a, "boss", None)
-        if (agent == "orchestrator" and not boss) or (boss and not NAME_RE.match(boss)):
+        if (agent == "orchestrator" and not boss) or (boss and not NAME_RE.fullmatch(boss)):
             raise CloudError("--agent orchestrator needs --boss NAME", EXIT_USAGE)
         if CHANNEL_SECRET_KEY not in run_names:
             raise CloudError("a hub pod needs its channel secret", EXIT_USAGE)
@@ -1700,8 +1706,11 @@ class Launcher:
     def _audited(self, worker, action, fn, reason="", runtime_id=""):
         info = {"rid": runtime_id, "cost": 0.0}
 
-        def why():   # a stop that wrote a run record names its directory once, here
-            return "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
+        def why():   # a stop that wrote a run record names its directory once, here; a gone-pod stop names the Secrets it removed (names only)
+            text = "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
+            if "removed" in info:
+                text = "%s%ssecrets removed: %s" % (text, "; " if text else "", ", ".join(info["removed"]) or "none")
+            return text
         try:
             result = fn(info)
         except CloudError as e:
@@ -1716,7 +1725,7 @@ class Launcher:
         return result
 
     def _need(self, worker):
-        if not NAME_RE.match(worker or ""):
+        if not NAME_RE.fullmatch(worker or ""):
             raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
         pod = self.kube.get_pod(pod_name(worker))
         return pod
@@ -1747,7 +1756,7 @@ class Launcher:
         def go(info):
             info["rid"] = "pod/" + name
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
-            if not NAME_RE.match(worker):
+            if not NAME_RE.fullmatch(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
             check_shape(a)   # resolves an unnamed shape; before any cluster, vault or token call
             now = self.clock()
@@ -1810,7 +1819,11 @@ class Launcher:
             except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
                 self._abort(worker, name, made, e)
             domain = self.env.get("CW_CLOUD_DOMAIN", "example.internal")
-            return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
+            try:   # the pod's own uid, read once now: a later retire acts only on a pod with this uid
+                pod_uid = ((self.kube.get_pod(name) or {}).get("metadata") or {}).get("uid") or ""
+            except CloudError:
+                pod_uid = ""
+            return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain), "pod_uid": pod_uid,
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
                     "password_fd": a.password_fd}
@@ -1862,7 +1875,7 @@ class Launcher:
 
     def hub_session(self, a):
         """Write the session id into the agent's hub entry (a no-op when it has none). Called by the switchboard once the session exists."""
-        if not NAME_RE.match(a.worker or "") or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", a.session or ""):
+        if not NAME_RE.fullmatch(a.worker or "") or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", a.session or ""):
             raise CloudError("bad worker name or session id", EXIT_USAGE)
         found = []
 
@@ -2082,6 +2095,9 @@ class Launcher:
             pod = self._need(worker)
             uid = ((pod or {}).get("metadata") or {}).get("uid")
             self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "FLEET_CLOUD_TOKEN_FILE") else None   # a hub pod, orchestrator or worker
+            want_uid = getattr(a, "pod_uid", None)
+            if want_uid and pod and uid != want_uid:   # a new pod holds the name: not the one the record names; it and its Secrets are left whole
+                raise CloudError("pod/%s is not the pod this worker's record names (its uid differs); nothing was stopped or deleted" % name, EXIT_REFUSED)
             if nonce and pod:
                 info["rid"] = "pod/" + name
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
@@ -2092,10 +2108,15 @@ class Launcher:
                 # The pod read said NotFound (an operator deleted it); any other read error raised in _need above and never reaches here.
                 removed = []
                 if not nonce:   # by name, pod NotFound: only this worker's own two Secrets (exact names) may be left over; nothing else is touched
+                    if self.kube.get_pod(name):   # read again: a pod that reads as gone is retired by name only when no live pod holds the name
+                        raise CloudError("pod/%s exists now (another pod holds the name); its Secrets are left whole" % name, EXIT_REFUSED)
                     for full, fn in ((name + "-pw", self.kube.delete_secret), (name + "-run", self.kube.delete_run_secret)):
                         if self.kube.get_secret(full):
                             fn(name)
                             removed.append(full)
+                    info["removed"] = removed
+                if getattr(a, "hub_entry", False) and not self._unregister(worker):   # the same call the live path uses; a failure is reported
+                    raise CloudError("the hub registry entry of %s could not be removed (the Secrets are); retire again to finish" % worker)
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None, "pod_gone": True, "secrets_removed": removed}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
@@ -2310,7 +2331,7 @@ class Launcher:
                 "cost_estimate_usd": self.cost(pod)}
 
     def status(self, a):
-        if a.worker and not NAME_RE.match(a.worker):
+        if a.worker and not NAME_RE.fullmatch(a.worker):
             raise CloudError("bad worker name %r" % a.worker, EXIT_USAGE)
         pods = [self.kube.get_pod(pod_name(a.worker))] if a.worker else self.kube.list_pods()
         if a.worker and not pods[0]:
@@ -2342,7 +2363,7 @@ class Launcher:
         """The pod's copy, unless the switchboard record (read only, --record-dir) names a later or earlier one."""
         hard = parse_iso(ann(pod, "hard-deadline"))
         rd = self.env.get("CW_CLOUD_RECORD_DIR")
-        if rd and NAME_RE.match(ann(pod, "worker", "")):
+        if rd and NAME_RE.fullmatch(ann(pod, "worker", "")):
             try:
                 with open(os.path.join(rd, ann(pod, "worker") + ".json")) as f:
                     hard = parse_iso(json.load(f)["hard_deadline"])
@@ -2435,7 +2456,7 @@ class Launcher:
         """The repository the switchboard's worker record names (read only, CW_CLOUD_RECORD_DIR): the one source the renewal trusts for what
         the worker was launched for. A missing or unreadable record stops the renewal."""
         rd = self.env.get("CW_CLOUD_RECORD_DIR")
-        if not rd or not NAME_RE.match(worker or ""):
+        if not rd or not NAME_RE.fullmatch(worker or ""):
             raise _NotRenewed("no worker record to read (CW_CLOUD_RECORD_DIR is not set)" if not rd else "bad worker name")
         try:
             with open(os.path.join(rd, worker + ".json")) as f:
@@ -2946,6 +2967,8 @@ def build_parser():
                    help="the nonce create recorded: stop acts only when the pod carries it (another run's worker of the same name is left whole, exit 6); without it stop acts by name")
     s.add_argument("--record-dir", help="where the run record goes (default: $CW_RUN_RECORD_DIR, else runs/ beside the audit file)")
     s.add_argument("--no-record", action="store_true", help="write no run record (a record is the default: every stop makes one)")
+    s.add_argument("--pod-uid", type=_pod_uid, help="the uid create recorded: stop acts only on the pod with this uid (a new pod under the name is left whole, exit 6)")
+    s.add_argument("--hub-entry", action="store_true", help="also remove the worker's hub entry when its pod is already gone (a hub orchestrator)")
     e = cmd("extend")
     e.add_argument("--hard")
     e.add_argument("--idle")
@@ -2967,6 +2990,12 @@ def build_parser():
 def _run_id(v):
     if not re.fullmatch(r"[0-9a-f]{8,64}", v):
         raise argparse.ArgumentTypeError("--run-id is 8 to 64 lowercase hex characters")
+    return v
+
+
+def _pod_uid(v):
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", v):
+        raise argparse.ArgumentTypeError("--pod-uid is 1 to 64 letters, digits, dots, dashes or underscores")
     return v
 
 

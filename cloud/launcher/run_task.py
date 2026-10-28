@@ -440,7 +440,7 @@ def main(argv=None, env=None):
         a = p.parse_args(argv)
     except SystemExit as e:
         return 2 if e.code else 0
-    if not cw.NAME_RE.match(a.worker) or not REPO_RE.fullmatch(a.repo) or not re.match(r"^[A-Za-z0-9._/-]{1,200}$", a.branch):
+    if not cw.NAME_RE.fullmatch(a.worker) or not REPO_RE.fullmatch(a.repo) or not re.match(r"^[A-Za-z0-9._/-]{1,200}$", a.branch):
         print("run-task: bad worker name, repository (OWNER/NAME) or branch", file=sys.stderr)
         return 2
     try:

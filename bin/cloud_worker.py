@@ -97,7 +97,7 @@ def cloud_dir(state):
 
 
 def valid_name(name):
-    return isinstance(name, str) and bool(H["NAME_RE"].match(name))
+    return isinstance(name, str) and bool(H["NAME_RE"].fullmatch(name))
 
 
 def record_path(state, name):
@@ -1462,6 +1462,8 @@ def _record_from_create(name, body):
     problem = endpoint_problem(record["url"])
     if problem:
         raise CloudError("the launcher named an endpoint that is refused: %s" % problem)
+    if isinstance(body.get("pod_uid"), str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", body["pod_uid"]):
+        record["pod_uid"] = body["pod_uid"]   # the pod's identity at create time: a retire acts only on the pod that has it
     return record
 
 
@@ -1797,9 +1799,15 @@ def cmd_retire(args, runner, now, record):
     if args.undo:
         raise LaunchError("a cloud worker's pod is gone once retired: there is nothing to undo")
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200] or "finished"
+    extra = ["--reason", reason]
+    uid = record.get("pod_uid")
+    if isinstance(uid, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", uid):
+        extra += ["--pod-uid", uid]
+    if record.get("agent") == "orchestrator":   # a hub orchestrator: its hub entry goes with it, also when its pod is already gone
+        extra += ["--hub-entry"]
     try:
         with Cluster() as cluster:
-            code, body, note = run_launcher(runner, "stop", args.name, ["--reason", reason], STOP_SECONDS, cluster=cluster)
+            code, body, note = run_launcher(runner, "stop", args.name, extra, STOP_SECONDS, cluster=cluster)
     except Refusal:
         raise
     except CloudError as err:
