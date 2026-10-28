@@ -45845,6 +45845,52 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         self.assertIsNot(sb.LAUNCH_AFTER_CREATED, only_first)
         self.assertIs(sb.LAUNCH_AFTER_CREATED, original)
 
+    # A raise that says "created" about something else than the worker (checked before any pod exists); first 30 characters -> reason.
+    CREATED_EXEMPT = {
+        'the launch reservation of %s i': 'refused before any pod exists: it says nothing was created',
+        '%s is not on the cloud allow-l': 'refused before any pod exists: it says nothing was created',
+        'CW_ALLOWED_REPOS has an entry ': 'refused before any pod exists: it says nothing was created',
+        'CW_TOOLING_REPO is not OWNER/N': 'refused before any pod exists: it says nothing was created',
+        'the stack model secret %s %s; ': 'refused before any pod exists: it says nothing was created',
+        'the git token command gave no ': 'refused before any pod exists: it says nothing was created',
+        '--agent orchestrator needs --r': 'refused before any pod exists: it says nothing was created',
+        '--shape %r is not a pod shape ': 'refused before any pod exists: it says nothing was created',
+        'a local fleet agent named %s e': 'refused before any pod exists: it says nothing was created',
+        '--dir %r is not a path in the ': 'refused before any pod exists: it says nothing was created',
+        'the launch reservation of %s c': 'refused before any pod exists: it says nothing was created',
+        '%s is being launched by anothe': 'refused before any pod exists: it says nothing was created',
+        'the vault check lock %s was no': 'refused before any pod exists: it says nothing was created',
+        'the vault access check stopped': 'refused before any pod exists: it says nothing was created',
+        'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
+    }
+
+    def other_created_words(self, source):
+        """first 30 characters of every raise in `source` whose text says 'created' and is not a marker site and not in CREATED_EXEMPT."""
+        stray = []
+        for node in ast.walk(ast.parse(source)):
+            if not (isinstance(node, ast.Raise) and node.exc is not None):
+                continue
+            consts = [c.value for c in ast.walk(node.exc) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+            text = "".join(consts) + " " + ast.get_source_segment(source, node)
+            if not re.search("created", text, re.I):
+                continue
+            if sb.LAUNCH_AFTER_CREATED.search(text.replace("%s ", "")) or sb.LAUNCH_AFTER_CREATED.search(ast.get_source_segment(source, node)):
+                continue
+            if (consts[0] if consts else "")[:30] in self.CREATED_EXEMPT:
+                continue
+            stray.append((consts[0] if consts else "")[:30])
+        return stray
+
+    def test_s9_no_raise_of_the_launcher_mentions_a_created_worker_in_other_words(self):
+        self.assertEqual(self.other_created_words((BIN / "cloud_worker.py").read_text()), [])
+
+    def test_s9_a_mutant_raise_that_says_created_in_other_words_is_caught(self):
+        source = (BIN / "cloud_worker.py").read_text()
+        mutant = source + '\n\ndef _fake():\n    raise LaunchError("the pod was created but the pin failed")\n'
+        self.assertNotEqual(mutant, source)   # applied
+        self.assertEqual(self.other_created_words(source), [])
+        self.assertEqual(self.other_created_words(mutant), ["the pod was created but the pin"[:30]])   # caught
+
     # -- S10: sys.stderr is the real stream after every ending
 
     def stderr_after(self, patch, launch=None):
