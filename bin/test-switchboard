@@ -26176,7 +26176,7 @@ class TestSweep(Base):
         untested = self.docs_fact_rows() - {c[0] for c in self.BOARD_ROWS}
         self.assertEqual(sorted(untested), sorted(self.NOT_PROBED))
 
-    NOT_PROBED = ["facts", "now", "pr"]   # always set, or the whole view (the `unreadable` row is probed)
+    NOT_PROBED = ["facts", "now", "pr", "review"]   # always set, or the whole view (the `unreadable` row is probed); `review` only widens the listing of standing change requests (#1404)
 
     def test_986_a_mutant_per_row_class_fails_the_real_board_probe(self):
         for rows, where, old, new in self.BOARD_MUTANTS:
