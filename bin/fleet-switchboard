@@ -16714,6 +16714,10 @@ def cmd_gates(args, runner, now):
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
+    standing_lines = []   # #1404: every call lists each standing change request by the shim's rule, whatever the decision field says (the decision only widens the rule, as at the shim)
+    if isinstance(ctx.facts, dict) and not ctx.unreadable:
+        standing_lines = blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head"),
+                                               "CHANGES_REQUESTED" if ctx.facts.get("review") == "changes requested" else "")
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
     if args.json:
@@ -16723,6 +16727,8 @@ def cmd_gates(args, runner, now):
             report["rating_block"] = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head"))
         if shares:
             report["shares"] = shares
+        if standing_lines:
+            report["blocking_reviews"] = standing_lines
         print(json.dumps(report, sort_keys=True))
     else:
         lines = plan_ledger.render_gates(report, ctx.pr)
@@ -16734,8 +16740,11 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
-        if isinstance(ctx.facts, dict) and ctx.facts.get("review") == "changes requested" and not ctx.unreadable:
-            lines.extend(blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head")))   # #1123: GitHub's decision blocks the merge; say who and how to clear it
+        if standing_lines:
+            lines.extend(standing_lines)
+            verdict = blocked_verdict_line(ctx.pr, standing_lines)
+            if verdict:
+                lines.append(verdict)
         note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
         if note:
             lines.append("rating: %s" % note)
@@ -20099,6 +20108,9 @@ def cmd_review_post(args, runner, now):
         if notice:
             print("note: " + notice)
         print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name) + (" (posted as a comment)" if notice else ""))
+        if args.verdict == "approve":
+            for line in review_dismiss_offer(engine, runner, now, repo, number, ref, name, head):
+                print(line)
         return EXIT_OK
     except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
         review_refusal_audit(seen.get("engine"), "review.post.refused", seen.get("ref"), seen.get("name"), seen.get("head"), str(err), verdict=args.verdict) if seen.get("name") and seen.get("ref") else None
@@ -20206,23 +20218,57 @@ def rest_review_as_view(review):
     """A Reviews-API review in the shape `gh pr view --json reviews` gives the shim's rule (author.login, commit.oid)."""
     user = review.get("user") if isinstance(review.get("user"), dict) else {}
     return {"author": {"login": user.get("login")} if user.get("login") else None, "state": review.get("state"),
-            "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id")}
+            "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id"), "submitted_at": review.get("submitted_at")}
 
 
-def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED"):
-    """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks."""
+def standing_requests(engine, runner, now, repo, number, head="", decision=""):
+    """(rows, problem): the standing CHANGES_REQUESTED reviews of ONE pull request, by the SAME rule as the merge shim (`shims/review_rule.py`, never a copy), each
+    row {login, name, id, commit, age}; `problem` is a one-line cause when the list could not be read whole or the rule file is unreadable (never an empty `rows`)."""
     ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number))
     if not ok:
-        return ["blocking review: the reviews could not be read whole (%s): not listed" % why]
+        return [], "the reviews could not be read whole (%s): not listed" % why
     try:
         rule = load_review_rule()
     except Exception:
-        return ["blocking review: the rule file shims/review_rule.py is unreadable: blocking reviews not listed"]
+        return [], "the rule file shims/review_rule.py is unreadable: blocking reviews not listed"
     rows = []
     for login, review in rule.blocking_reviews([rest_review_as_view(r) for r in reviews if isinstance(r, dict)], head or "", decision):
-        rows.append("blocking review: %s CHANGES_REQUESTED at %s (dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
-            signed_by_fleet(review.get("body")) or login, str(review["commit"]["oid"] or "unknown")[:12], pr, review.get("id")))
-    return rows
+        stamp = parse_iso(review.get("submitted_at")) if isinstance(review.get("submitted_at"), str) else None
+        rows.append({"login": login, "name": signed_by_fleet(review.get("body")) or login, "id": review.get("id"),
+                     "commit": str(review["commit"]["oid"] or "unknown")[:12], "age": None if stamp is None else max(0, int(now() - stamp))})
+    return rows, ""
+
+
+def review_age_text(seconds):
+    """`3d`, `5h`, `12m` or `unknown age` for the age of a review."""
+    return "unknown age" if seconds is None else "%dd" % (seconds // 86400) if seconds >= 172800 else _age_text(seconds)
+
+
+def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED"):
+    """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks.
+    Each names the review id, the commit, the author's fleet name and its age (#1404)."""
+    rows, problem = standing_requests(engine, runner, now, repo, number, head, decision)
+    if problem:
+        return ["blocking review: " + problem]
+    return ["blocking review: %s CHANGES_REQUESTED at %s (review %s, %s old; dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
+        row["name"], row["commit"], row["id"], review_age_text(row["age"]), pr, row["id"]) for row in rows]
+
+
+def blocked_verdict_line(pr, lines):
+    """The verdict-list line (#1404) naming the pull request as blocked by its standing requests, or None; read off the `blocking review:` lines (`review NN`), so it can never disagree with them."""
+    ids = [m.group(1) for m in (re.search(r"\(review (\S+),", l) for l in lines if l.startswith("blocking review:")) if m]
+    return "  BLOCKED: %s has %d standing change request(s) (review %s): a merge is refused until each is dismissed or approved over" % (pr, len(ids), ", ".join(ids)) if ids else None
+
+
+def review_dismiss_offer(engine, runner, now, repo, number, ref, name, head):
+    """Lines of the offer after an APPROVE (#1404): the exact `review dismiss` command for the reader's OWN older standing change requests of this pull request. It only READS and prints: nothing is dismissed here."""
+    ok, listed, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number), fresh=True)
+    if not ok:
+        return ["note: older change requests of yours could not be listed (%s): check `fleet-switchboard gates %s`" % (_one_line(why, 120), ref)]
+    older = [r for r in listed if isinstance(r, dict) and str(r.get("state") or "").upper() in REVIEW_DISMISS_STATES
+             and review_is_own(r, name) and str(r.get("commit_id") or "").lower() != head.lower()]
+    return ["note: your older change request %s (at %s) still stands: this approve did not dismiss it and nothing here does; to clear it run: fleet-switchboard review dismiss %s --review %s --reason TEXT"
+            % (r.get("id"), str(r.get("commit_id") or "unknown")[:12], ref, r.get("id")) for r in older]
 
 
 @recording("review_record", applies=is_review_record)
