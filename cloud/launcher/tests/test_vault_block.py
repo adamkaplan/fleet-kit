@@ -542,6 +542,96 @@ class FailClosed(Fake):
         self.assertEqual(self.calls(), 1)
 
 
+class ProbeLock(Fake):
+    """Plan S12: the probe lock never hangs or spins, whatever it is; a block never outlasts the setting measured from now."""
+
+    CHILD = ("import sys, os, time, types\nsys.path.insert(0, %r)\nm = types.ModuleType('mod'); m.__file__ = %r; sys.modules['mod'] = m\n"
+             "exec(compile(open(%r).read(), %r, 'exec'), m.__dict__)\nt = time.time()\n"
+             "try:\n    m.cluster_token(dict(os.environ), '20m')\n    kind = 'ok'\nexcept m.ClusterLogin as e:\n    kind = e.kind\n"
+             "print('%%s %%.2f' %% (kind, time.time() - t))\n")
+
+    def run_child(self, module_text=REAL):
+        """Run one command in a child with a 10 second limit; return (seconds, stderr) or (None, ...) when it had to be killed."""
+        code = self.CHILD % (LAUNCHER, REAL, module_text, REAL)
+        proc = subprocess.Popen([sys.executable, "-c", code], env=dict(self.env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            return None, err
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        return float(out.split()[1]), err
+
+    def make_lock(self, kind):
+        os.makedirs(os.path.dirname(self.lock_path()), mode=0o700, exist_ok=True)
+        lock = self.lock_path()
+        if kind == "fifo":
+            os.mkfifo(lock)
+        elif kind == "symlink":
+            os.symlink(os.path.join(self.dir, "nowhere"), lock)
+        elif kind == "directory":
+            os.mkdir(lock)
+            old = time.time() - 3600
+            os.utime(lock, (old, old))
+        else:   # a regular file of a process that is gone
+            with open(lock, "w") as f:
+                f.write("999999999")
+
+    def check_case(self, kind, module_text=REAL):
+        self.make_lock(kind)
+        seconds, err = self.run_child(module_text)
+        self.assertIsNotNone(seconds, "%s: the command hung (killed after 10 s)" % kind)
+        self.assertLess(seconds, 5, kind)
+        self.assertLessEqual(self.calls(), 1, kind)
+        return err
+
+    def test_each_lock_case_returns_at_once_with_at_most_one_call(self):
+        for kind in ("fifo", "symlink", "directory", "dead"):
+            with self.subTest(kind):
+                self.setUp()
+                err = self.check_case(kind)
+                lines = [l for l in err.splitlines() if l.strip()]
+                if kind == "dead":
+                    self.assertEqual(lines, [], "a dead holder's lock is ignored silently")
+                else:
+                    self.assertEqual(len(lines), 1, err)
+                    self.assertIn(self.lock_path(), lines[0])
+                    self.assertIn("delete it by hand", lines[0])
+
+    def test_a_mutant_that_opens_the_lock_blocking_hangs_on_the_fifo(self):
+        source = read("cloud/launcher/cloud_worker.py")
+        old = "os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)"
+        self.assertEqual(source.count(old), 1)
+        mutated = source.replace(old, "os.open(lock, os.O_RDONLY)")
+        self.assertNotEqual(mutated, source, "the mutation is applied")
+        path = os.path.join(self.dir, "cloud_worker_mutant_lock.py")
+        with open(path, "w") as f:
+            f.write(mutated)
+        self.make_lock("fifo")
+        seconds, _ = self.run_child(path)
+        self.assertIsNone(seconds, "the blocking open hangs")
+
+    def test_a_clock_set_back_a_year_never_lengthens_the_block(self):
+        self.refused()
+        self.assertEqual(self.calls(), 1)
+        year = 365 * 86400
+        fake = lambda: time.time() - year   # noqa: E731
+        minutes = cw.vault_block_minutes(self.env)
+        block = cw.read_vault_block(self.env, fake())
+        self.assertLessEqual(block[1], fake() + 60 * minutes + 5)
+        with self.assertRaises(cw.ClusterLogin) as caught:
+            cw.VaultFlight.enter(dict(self.env), clock=fake)
+        self.assertEqual(caught.exception.kind, "vault-blocked")
+        later = lambda: time.time() - year + 60 * minutes + 30   # noqa: E731
+        flight = cw.VaultFlight.enter(dict(self.env), clock=later)   # the one probe
+        flight.release()
+        self.assertEqual(self.calls(), 1)
+
+
 class Isolation(Fake):
     """The block follows the state directory the tests redirect (XDG_STATE_HOME) and nowhere else."""
 

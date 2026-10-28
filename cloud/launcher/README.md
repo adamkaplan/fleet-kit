@@ -352,6 +352,8 @@ After the time: exactly one command probes the vault (it takes the lock file; a 
 
 How to clear it by hand: delete the file `vault-block.json` in the switchboard state directory (for example when the firewall was opened and waiting is not wanted).
 
+Never longer than the setting from now, and the probe lock: a block never outlasts the setting measured from now (its end is the earliest of the file's modification time, its change time and now, plus the setting's length), so a system clock that was set back, which leaves the file's times in the future, cannot make a block last until the clock catches up: such a file's time is reset to now and the block ends one setting's length later. The probe lock is opened without following a symbolic link and without blocking, and counts only when it is a plain file of this user. A lock that is anything else (a named pipe, a symbolic link, a directory, a file of another user) is replaced at once, with ONE line on stderr that names it (when it cannot be removed, the command goes on without a lock and makes at most one vault call); to clear it by hand, delete `vault-block.lock`. A plain lock left by a process that is gone is ignored silently, and a lock dated far from now is ignored too. No wait loop runs without a sleep and a bound.
+
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
 a cluster Secret scoped to the pod and mounted at `/run/cw/server-password` (0600); Basic auth, as the local v2

@@ -851,17 +851,26 @@ def _damaged_block(path, base, minutes):
     return (base, base + 60 * minutes, path)
 
 
-def read_vault_block(env):
+def read_vault_block(env, now=None):
     """None when there is no block file; otherwise (refused_at, retry_at, damaged_path) in epoch seconds (damaged_path is None for a good file).
     A file that is corrupt, empty, huge, a symlink, not ours, with a negative or non-number time blocks too, until the file's time (the earlier of its
-    modification and change time, so a future date cannot lengthen it) plus the setting's length. A retry time is capped to the setting's maximum."""
+    modification and change time and now, so a future date or a clock set back cannot lengthen it) plus the setting's length. A retry time is capped to it."""
     path = os.path.join(vault_block_dir(env), VAULT_BLOCK_NAME)
     try:
         found = os.lstat(path)
     except OSError:
         return None
     minutes = vault_block_minutes(env)
-    base = min(found.st_mtime, found.st_ctime)
+    now = time.time() if now is None else now
+    mtime = found.st_mtime
+    if mtime > now and stat.S_ISREG(found.st_mode) and found.st_uid == os.getuid():
+        try:
+            os.utime(path, (now, now), follow_symlinks=False)   # a time ahead of the clock (it was set back): the block starts now, never later
+            mtime = now
+        except OSError:
+            pass
+    # a time ahead of now is not believed: the block ends at most one setting's length from now (and from the first time it was seen so)
+    base = min([t for t in (mtime, found.st_ctime) if t <= now] + [now])
     if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_size > VAULT_BLOCK_MAX_BYTES:
         return _damaged_block(path, base, minutes)
     try:
@@ -926,16 +935,41 @@ def _unlink(path):
         pass
 
 
-def _lock_holder_gone(lock):
-    """True when the lock names a process that no longer exists (a killed command). An empty or unreadable lock is not judged gone: its age decides."""
+def _inspect_lock(lock):
+    """(mtime, holder_gone) of the probe lock, or None when it is unusable (a FIFO, a symlink, a directory, a file of another user, unreadable).
+    It is opened WITHOUT following a symlink and WITHOUT blocking, then judged by fstat: only a regular file of this user is a lock."""
     try:
-        with open(lock) as f:
-            pid = int(f.read(20).strip())
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except (OSError, ValueError):
-        return False
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid():
+            return None
+        try:
+            pid = int(os.read(fd, 20).decode("ascii", "replace").strip())
+            os.kill(pid, 0)
+            gone = False
+        except ProcessLookupError:
+            gone = True
+        except (OSError, ValueError, OverflowError):
+            gone = False   # an empty or unreadable lock is not judged gone: its age decides
+        return (found.st_mtime, gone)
+    finally:
+        os.close(fd)
+
+
+def _clear_unusable_lock(lock):
+    """Replace an unusable lock (one line names it); True when it is gone, False when it cannot be removed (the call then goes on without a lock)."""
+    print("cloud-worker: the vault probe lock %s is not a plain file of this user; ignoring it (delete it by hand to clear it)" % lock, file=sys.stderr)
+    for remove in (os.unlink, os.rmdir):
+        try:
+            remove(lock)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            pass
     return False
 
 
@@ -953,18 +987,22 @@ class VaultFlight:
         directory = vault_block_dir(env)
         lock = os.path.join(directory, VAULT_BLOCK_LOCK_NAME)
         while True:
-            block = read_vault_block(env)
+            block = read_vault_block(env, clock())
             if block is not None and clock() < block[1]:
                 raise _vault_blocked(block)
             try:
                 os.makedirs(directory, mode=0o700, exist_ok=True)
                 fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             except FileExistsError:
-                try:
-                    age = clock() - os.lstat(lock).st_mtime
-                except OSError:
-                    continue   # it went away between the two calls: take it
-                if age > vault_lock_stale_seconds() or _lock_holder_gone(lock):
+                seen = _inspect_lock(lock)
+                if seen is None:
+                    if not os.path.lexists(lock):
+                        continue   # it went away between the two calls: take it
+                    if _clear_unusable_lock(lock):
+                        continue
+                    return flight   # cannot be removed: no lock is kept, and the call goes on (one call at most)
+                age = clock() - seen[0]
+                if abs(age) > vault_lock_stale_seconds() or seen[1]:   # too old, or dated far from now (a clock set back), or its command was killed
                     _unlink(lock)   # a stale lock (too old, or its command was killed) is ignored
                     continue
                 if block is not None:
@@ -976,7 +1014,7 @@ class VaultFlight:
             os.write(fd, str(os.getpid()).encode())   # who holds it: a lock of a command that is gone is ignored at once
             os.close(fd)
             flight.lock = lock
-            block = read_vault_block(env)   # the holder before us may have just written it
+            block = read_vault_block(env, clock())   # the holder before us may have just written it
             if block is not None and clock() < block[1]:
                 flight.release()
                 raise _vault_blocked(block)
