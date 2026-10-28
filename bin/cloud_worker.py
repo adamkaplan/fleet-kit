@@ -1584,9 +1584,24 @@ SNAPSHOT_SECONDS = 30   # the bound of the WHOLE cloud summary read, ONE monoton
 #                         run) gets what is left of it, so the login and the launcher together never pass it (a step that starts after it refuses)
 
 
-def _safe(value, default="Unknown"):
-    """A cluster-supplied word that is printed (a pool, a size, a phase): the launcher's `safe_value` rule, applied again here (defence in depth)."""
-    return _lib().safe_value(value) if value else default
+_KINDS = {"stamp": re.compile(r"[0-9TZ:.+-]{1,40}"), "path": re.compile(r"[A-Za-z0-9._/-]{1,127}", re.ASCII)}
+
+
+def _safe(value, default="Unknown", kind=None):
+    """THE ONE scrub of every free-text field a status row takes from the launcher's record or answer (a pool, a size, a phase, a worker name, a
+    runtime id, a deadline, an error): the launcher's `safe_value` rule, applied again here (defence in depth). `kind` only widens the letters a
+    whole value may hold ("stamp": a timestamp, "path": a runtime id); a value that is not a string, or holds anything else, is `?`, and an
+    empty one is `default`. Nothing raises."""
+    if not value:
+        return default
+    if kind in _KINDS:
+        return value if isinstance(value, str) and _KINDS[kind].fullmatch(value) else "?"
+    return _lib().safe_value(value)
+
+
+def _row_value(value, kind=None):
+    """The value of a JSON row field: absent stays absent (None), anything else goes through `_safe`."""
+    return None if value is None else _safe(value, "?", kind)
 
 
 def _cluster_snapshot(runner, cluster, timeout):
@@ -1705,39 +1720,40 @@ def status_lines(runner, state, timeout=STATUS_SECONDS, lane=None):
         else:
             lines.append("      " + _summary_line(snapshot, time.time()))
         for record in records:
-            row = {"worker": record["worker"]}
+            row = {"worker": _safe(record["worker"], "?")}
             if "problem" in record:
                 row["problem"] = record["problem"]
-                lines.append("      cloud %s: %s" % (record["worker"], record["problem"]))
+                lines.append("      cloud %s: %s" % (row["worker"], record["problem"]))
                 rows.append(row)
                 continue
-            row.update({key: record.get(key) for key in ("runtime_id", "idle_deadline", "hard_deadline", "session")})
+            row.update({"runtime_id": _row_value(record.get("runtime_id"), "path"), "idle_deadline": _row_value(record.get("idle_deadline"), "stamp"),
+                        "hard_deadline": _row_value(record.get("hard_deadline"), "stamp"), "session": _row_value(record.get("session"), "path")})
             if _ended(record):
                 pod = _pod_of(record, snapshot) if snapshot is not None else None
                 if snapshot is not None and not _pod_known(record):   # its pod cannot be told: never "ended"
                     row["launcher_status"] = "pod unknown"
                     lines.append("      cloud %s: %s, past its hard deadline %s (pod unknown: the runtime id is not pod/<name>)"
-                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
+                                 % (row["worker"], _safe(record.get("runtime_id"), "?", "path"), _safe(record.get("hard_deadline"), "?", "stamp")))
                 elif snapshot is None:   # the cluster was not read: such a record is NEVER called ended
                     row["launcher_status"] = "no cluster reached"
                     lines.append("      cloud %s: %s, past its hard deadline %s (not queried; no cluster reached)"
-                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
+                                 % (row["worker"], _safe(record.get("runtime_id"), "?", "path"), _safe(record.get("hard_deadline"), "?", "stamp")))
                 elif pod is None:
                     row["launcher_status"] = "ended"
-                    row["ended_at"] = record.get("hard_deadline")
+                    row["ended_at"] = row["hard_deadline"]
                     lines.append("      cloud %s: %s, ended at %s (no pod), past its hard deadline"
-                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
+                                 % (row["worker"], _safe(record.get("runtime_id"), "?", "path"), _safe(record.get("hard_deadline"), "?", "stamp")))
                 else:
                     row["launcher_status"] = "past its hard deadline"
-                    row["phase"] = pod.get("phase")
+                    row["phase"] = _row_value(pod.get("phase"))
                     lines.append("      cloud %s: %s, pod still present past its hard deadline %s (phase %s)"
-                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline"), _safe(pod.get("phase"), "?")))
+                                 % (row["worker"], _safe(record.get("runtime_id"), "?", "path"), _safe(record.get("hard_deadline"), "?", "stamp"), _safe(pod.get("phase"), "?")))
                 rows.append(row)
                 continue
             if cluster is None:
                 row["launcher_status"] = "no cluster reached"
                 rows.append(row)
-                lines.append("      cloud %s: %s, not queried (no cluster reached); stops at %s" % (record["worker"], record["runtime_id"], record.get("hard_deadline") or "?"))
+                lines.append("      cloud %s: %s, not queried (no cluster reached); stops at %s" % (row["worker"], _safe(record.get("runtime_id"), "?", "path"), _safe(record.get("hard_deadline"), "?", "stamp") or "?"))
                 continue
             lines.append(None)   # filled once the one launcher read and the probes are done, so the order stays the records' order
             rows.append(row)
@@ -1746,32 +1762,29 @@ def status_lines(runner, state, timeout=STATUS_SECONDS, lane=None):
             code, found, note = _read_all(runner, cluster, timeout)
             answers = _probe_all(state, cluster, [record for _, _, record in live], timeout)
             for (at, row, record), answered in zip(live, answers):
-                body = found.get(record["worker"]) if found is not None else None
+                body = found.get(record["worker"]) if found is not None and isinstance(record["worker"], str) else None
                 if body is not None and body.get("error"):   # the launcher read this one pod and said why it could not
-                    row["launcher_status"] = _one(str(body["error"]), 100)
+                    row["launcher_status"] = _safe(body["error"], "?")
                     extra = "launcher status unavailable (%s)" % row["launcher_status"]
                 elif body is not None:
-                    row.update({key: body.get(key) for key in ("phase", "idle_since", "cost_estimate_usd")})
+                    cost = body.get("cost_estimate_usd")
+                    row.update({"phase": _row_value(body.get("phase")), "idle_since": _row_value(body.get("idle_since"), "stamp"),
+                                "cost_estimate_usd": cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else _row_value(cost)})
                     idle = (body.get("deadlines") or {}).get("idle") if isinstance(body.get("deadlines"), dict) else body.get("idle_deadline")
-                    row["idle_deadline"] = idle if idle is not None else row.get("idle_deadline")
+                    row["idle_deadline"] = _row_value(idle, "stamp") if idle is not None else row.get("idle_deadline")
                     extra = "phase %s, about $%s so far" % (_safe(body.get("phase"), "?"), _cost(body.get("cost_estimate_usd")))
                     if idle is not None:
-                        extra += ", idle deadline %s" % _stamp(idle)
+                        extra += ", idle deadline %s" % _safe(idle, "?", "stamp")
                 else:
                     row["launcher_status"] = _reason(code, note) if found is None else "not in the launcher's status"
                     extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
                 row["answers"] = answered
-                lines[at] = "      cloud %s: %s, %s; %s; stops at %s" % (record["worker"], record["runtime_id"], extra,
-                                                                       "answers" if answered else "does not answer", record.get("hard_deadline") or "?")
+                lines[at] = "      cloud %s: %s, %s; %s; stops at %s" % (row["worker"], _safe(record.get("runtime_id"), "?", "path"), extra,
+                                                                       "answers" if answered else "does not answer", _safe(record.get("hard_deadline"), "?", "stamp"))
     finally:
         if cluster is not None:
             cluster.close()
     return lines, rows
-
-
-def _stamp(value):
-    """A deadline the launcher printed, shown only when it is a plain timestamp."""
-    return value if isinstance(value, str) and re.fullmatch(r"[0-9TZ:.+-]{1,40}", value) else "?"
 
 
 def _cost(value):

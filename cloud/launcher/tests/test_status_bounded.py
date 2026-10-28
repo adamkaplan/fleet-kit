@@ -4,6 +4,8 @@ probes run four at a time, `--lane` narrows the rows, and a worker whose read fa
 
 Offline: the fake kubectl of the status summary tests is the cluster; the launcher's status answer and the reachability probe are fakes.
 """
+import contextlib
+import json
 import os
 import sys
 import threading
@@ -200,6 +202,94 @@ class Bounded(Base):
         self.assertTrue(applied, "the mutation was not applied")
         with self.assertRaises(AssertionError):
             self.assertLess(took, 30, took)
+
+
+DIRTY_TAIL = "\n" + "ghp_" + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ" + " AKIA" + "ABCDEFGHIJKLMNOP"
+NOT_TEXT = (5, None, ["a"], {"a": 1}, True)
+
+# every free-text field a cloud status row takes from the launcher's record or answer: (field, where it comes from)
+ROW_FIELDS = (("worker", "record"), ("runtime_id", "record"), ("hard_deadline", "record"), ("idle_deadline", "record"), ("session", "record"),
+              ("phase", "answer"), ("idle_since", "answer"), ("cost_estimate_usd", "answer"), ("deadlines.idle", "answer"), ("error", "answer"),
+              ("pod_phase", "pod"))
+
+
+def dirty(field):
+    return "\x1b[31m" + field + DIRTY_TAIL
+
+
+class Scrubbed(Bounded):
+    """Every free-text field of a status row goes through the one helper, in the text row and in the JSON row, and a value that is not text raises nothing."""
+
+    mine = contextlib.ExitStack()
+
+    def row_with(self, field, source, value):
+        """(text of the lines, JSON of the rows) of a status whose `field` holds `value`."""
+        module = self.cloud()
+        self.mine.close()   # the patches of an earlier field of the same test go
+        self.mine = contextlib.ExitStack()
+        self.addCleanup(self.mine.close)
+        if source == "record":
+            path = self.record("w0", hard=ALIVE)
+            body = json.loads(path.read_text())
+            body[field] = value   # the record is the launcher's untrusted file: it reaches the row as it stands (the loader's own checks aside)
+            self.names = ["w0"]
+            self.fakes(real_shape if field != "idle_deadline" else (lambda n: {k: v for k, v in real_shape(n).items() if k != "deadlines"}))
+            self.mine.enter_context(mock.patch.object(module, "list_records", lambda state: [body]))
+        elif source == "answer":
+            self.names = self.live(1)
+
+            def answer(name):
+                body = real_shape(name)
+                if field == "deadlines.idle":
+                    body["deadlines"] = {"hard": ALIVE, "idle": value}
+                else:
+                    body[field] = value
+                return body
+            self.fakes(answer)
+        else:   # the pod of a record past its hard deadline that still stands
+            self.record("w0")
+            self.names = ["w0"]
+            self.fakes(real_shape)
+            self.mine.enter_context(mock.patch.object(module, "_pod_of", lambda record, snapshot: {"name": "cw-w0", "phase": value}))
+        lines, rows = self.status()
+        return "\n".join(l for l in lines if l), json.dumps(rows), lines, rows
+
+    def check_scrubbed(self, field, source):
+        text, as_json, _, _ = self.row_with(field, source, dirty(field))
+        for where, shown in (("text row", text), ("json row", as_json)):
+            for bad in ("\x1b", "\\u001b", "ghp_", "AKIA"):
+                self.assertNotIn(bad, shown, "%s: %s of the %s" % (field, repr(bad), where))
+
+    def test_s8_every_field_of_a_row_is_scrubbed_in_the_text_row_and_the_json_row(self):
+        for field, source in ROW_FIELDS:
+            with self.subTest(field=field):
+                self.check_scrubbed(field, source)
+
+    def test_s8_a_value_that_is_not_text_raises_nothing_in_any_field(self):
+        for field, source in ROW_FIELDS:
+            for value in NOT_TEXT:
+                with self.subTest(field=field, value=repr(value)):
+                    text, as_json, lines, rows = self.row_with(field, source, value)
+                    self.assertNotIn("unreadable", text)
+                    self.assertIn("      cloud ", text.split("\n", 1)[-1])   # the row of the one worker is printed
+                    self.assertEqual(len(rows), 1, lines)
+
+    def test_s8_a_mutant_that_skips_the_scrub_for_one_field_fails_that_fields_test(self):
+        module = self.cloud()
+        real = module._safe
+        for field, source in ROW_FIELDS:
+            with self.subTest(field=field):
+                applied = []
+
+                def skipping(value, default="Unknown", kind=None, field=field):
+                    if isinstance(value, str) and ("\x1b[31m" + field + "\n") in value:
+                        applied.append(True)
+                        return value   # the scrub is skipped for this field only
+                    return real(value, default, kind)
+                with mock.patch.object(module, "_safe", skipping):
+                    with self.assertRaises(AssertionError):
+                        self.check_scrubbed(field, source)
+                self.assertTrue(applied, "the mutation was not applied")
 
 
 class TestDocs(unittest.TestCase):
