@@ -46,11 +46,17 @@ def _git(root, *argv, run=subprocess.run):
 
 def check(root, default_branch, run=subprocess.run):
     """The state of the tree at `root`: {"ok", "note", "branch" (None when detached), "commit", "dirty" [paths], "remote" (commit or None), "why"}."""
-    status = _git(root, "status", "--porcelain=v1", "--branch", "--untracked-files=no", run=run)
-    lines = status.stdout.splitlines() if status.returncode == 0 else []
     result = {"ok": False, "note": None, "branch": None, "commit": None, "dirty": [], "remote": None, "why": None}
+    try:
+        status = _git(root, "status", "--porcelain=v1", "--branch", "--untracked-files=no", run=run)
+    except (OSError, subprocess.SubprocessError) as err:   # git missing, or it timed out: no evidence of a bad tree
+        status = None
+        result["note"] = "unreadable: %s" % type(err).__name__
+    lines = status.stdout.splitlines() if status is not None and status.returncode == 0 else []
     if not lines or not lines[0].startswith("## "):
-        result["why"] = "git could not read the tree"
+        # A read that failed (a lock, a timeout, a repository mid-operation) is NOT evidence of a bad tree: the command runs, the daemon goes on, and
+        # the next check reads again. Only a read that succeeded and found something wrong refuses.
+        result["ok"], result["note"] = True, result["note"] or "unreadable: git status failed"
         return result
     head = lines[0][3:]
     if head.startswith("HEAD (no branch)"):
@@ -62,7 +68,11 @@ def check(root, default_branch, run=subprocess.run):
     result["branch"] = branch
     result["dirty"] = [line[3:].split(" -> ")[-1] for line in lines[1:] if len(line) > 3]
     remote_ref = "refs/remotes/origin/%s" % default_branch
-    revs = _git(root, "rev-parse", "HEAD", remote_ref, run=run)
+    try:
+        revs = _git(root, "rev-parse", "HEAD", remote_ref, run=run)
+    except (OSError, subprocess.SubprocessError) as err:
+        result["ok"], result["note"] = True, "unreadable: %s" % type(err).__name__
+        return result
     out = revs.stdout.split()
     result["commit"] = out[0] if out and SHA.match(out[0]) else None
     result["remote"] = out[1] if revs.returncode == 0 and len(out) > 1 and SHA.match(out[1]) else None
@@ -77,11 +87,24 @@ def check(root, default_branch, run=subprocess.run):
             result["why"] = "detached head, and origin/%s is unknown so its ancestry cannot be verified" % default_branch
         else:
             result["ok"], result["note"] = True, "ancestry unverified: origin/%s is not fetched yet" % default_branch
-    elif _git(root, "merge-base", "--is-ancestor", result["commit"], result["remote"], run=run).returncode == 0:
+    elif _ancestor(root, result, run):
         result["ok"] = True
     else:
         result["why"] = "%s is not an ancestor of origin/%s" % ("a detached head" if branch is None else "the commit", default_branch)
     return result
+
+
+def _ancestor(root, result, run):
+    """True when HEAD is an ancestor of the remote default branch; also True (with a note) when git could not answer: a failed read is no evidence."""
+    try:
+        done = _git(root, "merge-base", "--is-ancestor", result["commit"], result["remote"], run=run)
+    except (OSError, subprocess.SubprocessError) as err:
+        result["note"] = "unreadable: %s" % type(err).__name__
+        return True
+    if done.returncode not in (0, 1):   # 1 is the answer "no"; anything else is git failing
+        result["note"] = "unreadable: git merge-base failed"
+        return True
+    return done.returncode == 0
 
 
 def describe(root, default_branch, state):
@@ -138,7 +161,7 @@ def hooks_dir(root, run=subprocess.run):
 
 def hook_text(state_dir, python):
     script = Path(state_dir) / SCRIPTS_DIR / SCRIPTS[0]
-    return '#!/bin/sh\n%s\nexec "%s" "%s" "%s" "$(basename "$0")" "$@"\n' % (HOOK_MARK, python, script, state_dir)
+    return '#!/bin/sh\n%s\n"%s" "%s" "%s" "$(basename "$0")" "$@" || true\nexit 0\n' % (HOOK_MARK, python, script, state_dir)   # never fails the git command that ran it
 
 
 def install(root, state_dir, kit_bin, python, dry_run=False, run=subprocess.run):

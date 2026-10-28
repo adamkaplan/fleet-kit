@@ -153,6 +153,32 @@ class TestTheEntryGuard(TreeCase):
             self.assertIn("could not run", sb.installed_tree_refusal("status"))
             self.assertIsNone(sb.installed_tree_refusal("install"))
 
+    def test_a_failed_read_of_the_tree_is_no_evidence_so_the_command_runs(self):
+        """A git failure, a timeout or a missing git: the guard allows and says so; only a read that succeeded and found something wrong refuses."""
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
+        self.assertEqual(self.command("version")[0], 1)
+        for failure in (subprocess.TimeoutExpired("git", 20), FileNotFoundError("git"),
+                        subprocess.CompletedProcess(["git"], 128, "", "fatal: another git process seems to be running")):
+            def broken(argv, **kw):
+                if isinstance(failure, BaseException):
+                    raise failure
+                return failure
+            with self.subTest(failure=repr(failure)):
+                self.assertIsNone(guard.problem(self.state, self.tree, broken))
+                self.assertIn("unreadable", guard.note(self.state, self.tree, broken))
+
+    def test_a_moved_tree_is_allowed_after_a_fetch_a_fast_forward_and_at_the_default_tip(self):
+        commit(self.origin, "four.txt")
+        git(self.tree, "fetch", "-q", "origin")
+        self.assertEqual(self.command("version"), (0, ""))   # behind the remote: an ancestor
+        git(self.tree, "pull", "-q", "--ff-only")
+        self.assertEqual(self.command("version"), (0, ""))
+        git(self.tree, "switch", "-q", "--detach", "origin/main")
+        self.assertEqual(self.command("version")[0], 0)      # a detached head at the default tip
+        git(self.tree, "switch", "-q", "main")
+        commit(self.tree, "local.txt")                       # a local commit the remote does not hold
+        self.assertEqual(self.command("version")[0], 1)
+
     def test_u1_a_clean_tree_costs_at_most_three_git_calls_and_no_network(self):
         calls = []
         real = subprocess.run
@@ -339,6 +365,26 @@ class TestTheHooks(TreeCase):
         self.assertTrue(all(status == "done" for _, status, _ in first))
         self.assertTrue(all(status == "already done" for _, status, _ in self.install()))
         self.assertEqual(len({step for step, _, _ in first}), len(first))   # one step name each: the install test groups by it
+
+    def test_a_hook_that_cannot_record_never_fails_the_git_command(self):
+        self.install()
+        shutil_state = self.state / "guard"
+        (shutil_state / "guard_record_head_move.py").write_text("import sys\nsys.exit(7)\n")
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")   # git asserts exit status 0
+        self.assertIn("exit 0", (self.tree / ".git" / "hooks" / "post-checkout").read_text())
+
+    def test_the_recorder_that_cannot_write_says_so_and_exits_zero(self):
+        done = subprocess.run([sys.executable, str(BIN / "guard_record_head_move.py"), str(self.home / "no-such-dir"), "post-checkout", "a", "b", "1"],
+                              capture_output=True, text=True, cwd=str(self.tree))
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("could not record", done.stderr)
+
+    def test_a_failed_git_directory_read_skips_the_hooks_and_still_records_the_tree(self):
+        def runner(argv, **kw):
+            return subprocess.CompletedProcess(argv, 128, "", "fatal")
+        (self.state / "installed-tree.json").unlink()
+        steps = {step: status for step, status, _ in guard.install(self.tree, self.state, BIN, sys.executable, run=runner)}
+        self.assertEqual((steps["tree hook checkout"], steps["tree hook merge"], steps["installed tree"]), ("skipped", "skipped", "done"))
 
     def test_a_hook_that_is_not_ours_is_left_alone(self):
         hooks = self.tree / ".git" / "hooks"
