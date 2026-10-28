@@ -14137,6 +14137,9 @@ class _StderrTee:
         return getattr(self.stream, name)
 
 
+LAUNCH_AFTER_CREATED = re.compile(r"the worker (?:\S+ )?was created|the pane is open without the brief")   # #1464: the text the code writes when a failure comes AFTER the worker (pod or pane) exists
+
+
 def launch_refusal_reason(text):
     """#1464: one line, scrubbed of credential-shaped parts, at most LAUNCH_REFUSED_REASON_MAX characters."""
     text = re.sub(r"\s+", " ", redact_command_text(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(text)))).strip()
@@ -14146,13 +14149,14 @@ def launch_refusal_reason(text):
 def tell_launch_refused(runner, now, name, reason):
     """#1464: ONE `[switchboard]` message to the caller: `launch of NAME refused: <reason>`. A caller who cannot be identified (a plain shell, no
     pane) is told nothing and nothing more is printed; nothing here raises: the refusal's own exit is what the launch returns."""
-    text = "launch of %s refused: %s" % (_one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(name)), 80), launch_refusal_reason(reason))
+    verb = "FAILED after the worker was created" if LAUNCH_AFTER_CREATED.search(str(reason)) else "refused"   # the worker exists: not a refusal
+    text = "launch of %s %s: %s" % (_one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(name)), 80), verb, launch_refusal_reason(reason))
     engine = None
     try:
         engine, _, _ = build_engine(runner, now, "cli")
         caller = identify_caller(engine.herdr, engine.v2, os.environ)
         discovery = engine.discover(engine.now())
-        fact = Fact("launch.refused:%s:%s" % (caller, uuid.uuid4().hex[:16]), caller, "launch.refused", text, engine.now(), batch=False, sender="switchboard")
+        fact = Fact("launch.refused:%s:%s" % (caller, uuid.uuid4().hex[:16]), caller, "launch.failed" if verb[0] == "F" else "launch.refused", text, engine.now(), batch=False, sender="switchboard")
         engine.send_fact(fact, discovery, engine.now())
     except Exception as err:   # nothing more is printed (what a refused launch prints stays as it is): the audit line, when there is a log, is the record
         try:

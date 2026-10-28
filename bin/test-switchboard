@@ -45780,6 +45780,118 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         self.assertIn("launch of NAME refused:", sections[0])
         self.assertIn("none is sent", sections[0])
 
+    # -- S9: a failure after the worker was created is FAILED, never refused
+
+    def created_exits(self):
+        """(id, format text) of every raise in cloud_worker.py whose message carries the marker the code writes (`the worker was created`), from the source."""
+        source = (BIN / "cloud_worker.py").read_text()
+        found = {}
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Raise) and node.exc is not None:
+                for part in ast.walk(node.exc):
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str) and sb.LAUNCH_AFTER_CREATED.search(part.value.replace("%s ", "")):
+                        found[part.value[:30]] = part.value
+        for node in ast.walk(ast.parse(source)):   # a literal split over several parts of one raise: the whole raise text
+            if isinstance(node, ast.Raise) and node.exc is not None and sb.LAUNCH_AFTER_CREATED.search(ast.get_source_segment(source, node)) and not any(
+                    sb.LAUNCH_AFTER_CREATED.search(c.value.replace("%s ", "")) for c in ast.walk(node.exc) if isinstance(c, ast.Constant) and isinstance(c.value, str)):
+                found["raise@%d" % node.lineno] = ast.get_source_segment(source, node)
+        return found
+
+    def render(self, template):
+        return re.sub(r"%s", "the-reason", template)
+
+    def check_failed(self, argv, patches, label=""):
+        before = len(self.texts("web-orch"))
+        code, out, err = self.run_row(argv, patches)
+        got = [t for t in self.texts("web-orch")[before:] if "launch of " in t]
+        self.assertNotEqual(code, 0, label)
+        self.assertEqual(len(got), 1, "%s: %s" % (label, got))
+        self.assertIn("launch of %s FAILED after the worker was created: " % argv[1], got[0], label)
+        self.assertNotIn("refused", got[0], label)
+        self.assertLessEqual(len(got[0].split("created: ", 1)[1].strip().splitlines()[0]), 300)
+        return got[0]
+
+    def created_rows(self):
+        return {"the worker was created but its re": "the worker was created but its record could not be stored (%s); stop was requested",
+                "%s: %s (the worker %s was created; %": "%s: %s (the worker %s was created; %s)",
+                "%s (the worker was created; %s)": "%s (the worker was created; %s)"}
+
+    def test_s9_every_raise_carrying_the_created_marker_has_a_row_and_sends_one_failed_message(self):
+        derived = self.created_exits()
+        rows = self.created_rows()
+        self.assertEqual(len(derived), len(rows), "a raise with the marker has no row (or a row has none): %s" % sorted(derived))
+        self.assertEqual(sorted(derived.values()), sorted(rows.values()))
+        for template in derived.values():
+            with self.subTest(template=template):
+                text = self.render(template).replace("the-reason", "x" * 400 if "(%s)" in template else "the-reason")
+                self.check_failed(["launch", self.NAME, "--cloud", "--repo", ACME_WEB], [mock.patch.object(sb, "run_cloud", side_effect=sb.LaunchError(text))], template)
+
+    def test_s9_a_resume_brief_that_is_not_delivered_after_the_pane_opened_is_FAILED_not_refused(self):
+        stored = mock.patch.object(sb.V2Client, "session_get", lambda self, sid: {"metadata": {"fleet": {"name": "web-orch", "repo": ACME_WEB}}})
+        brief = self.home / "brief.txt"
+        brief.write_text("do the work\n")
+        with mock.patch.object(sb, "reattach_caller_problem", return_value=None), mock.patch.object(sb, "resume_agent", return_value={"name": self.NAME, "session": "ses_x"}), \
+                mock.patch.object(sb, "send_brief", side_effect=RuntimeError("no route")):
+            self.check_failed(self.base() + ["--resume", "ses_x", "--brief-file", str(brief)], [stored], "resume")
+
+    def test_s9_a_mutant_that_handles_only_the_first_site_is_caught(self):
+        def first_only(reason):
+            return None
+        original = sb.LAUNCH_AFTER_CREATED
+        only_first = re.compile(r"the worker was created but")
+        with mock.patch.object(sb, "LAUNCH_AFTER_CREATED", only_first):
+            with self.assertRaises(AssertionError):
+                self.test_s9_every_raise_carrying_the_created_marker_has_a_row_and_sends_one_failed_message()
+        self.assertIsNot(sb.LAUNCH_AFTER_CREATED, only_first)
+        self.assertIs(sb.LAUNCH_AFTER_CREATED, original)
+
+    # -- S10: sys.stderr is the real stream after every ending
+
+    def stderr_after(self, patch, launch=None):
+        """True when sys.stderr, read right after `cmd_launch` ends (inside the test's own capture), is the stream it had when it began."""
+        seen, inner = [], launch or sb.cmd_launch
+
+        def watch(args, runner, now, socket_call=None):
+            before = sys.stderr
+            try:
+                return inner(args, runner, now, socket_call)
+            finally:
+                seen.append(sys.stderr is before)
+                sys.stderr = before
+        watch.ensure_on_use = True
+        with patch, mock.patch.object(sb, "cmd_launch", watch):
+            try:
+                self.main(*self.base())
+            except BaseException:
+                pass
+        return seen == [True]
+
+    def stderr_checks(self, launch=None):
+        self.assertTrue(self.stderr_after(contextlib.nullcontext(), launch), "after a success")
+        self.assertTrue(self.stderr_after(mock.patch.object(sb, "launch_agent_problem", return_value="no"), launch), "after a LaunchError")
+        self.assertTrue(self.stderr_after(mock.patch.object(sb, "_cmd_launch", return_value=sb.EXIT_USAGE), launch), "after a non-OK return")
+        self.assertTrue(self.stderr_after(mock.patch.object(sb, "_cmd_launch", side_effect=KeyboardInterrupt), launch), "after a KeyboardInterrupt")
+
+    def test_s10_sys_stderr_is_the_real_stream_after_a_success_a_non_ok_return_and_a_keyboard_interrupt(self):
+        self.stderr_checks()
+
+    def test_s10_a_cmd_launch_without_the_finally_is_caught(self):
+        def no_finally(args, runner, now, socket_call=None):
+            sys.stderr = sb._StderrTee(sys.stderr)
+            return sb._cmd_launch(args, runner, now, socket_call)
+        with self.assertRaises(AssertionError):
+            self.stderr_checks(no_finally)
+
+    # -- S11
+
+    def test_s11_the_documentation_states_the_five_things(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        (section,) = [s for s in re.split(r"\n(?=#{2,4} )", text) if s.startswith(("### `launch` tells the caller", "## `launch` tells the caller"))]
+        flat = " ".join(section.split())
+        for needle in ("untrusted text sent as data", "the last line the launch printed", "a trailing warning", "`exit code N`", "opaque by design",
+                       "FAILED after the worker was created", "not as refused", "no timeout of their own"):
+            self.assertIn(needle, flat)
+
 
 for _name in dir(TestLaunchMemoryGate):   # the memory gate's own tests run in its class, not again here
     if _name.startswith("test_") and _name not in vars(TestLaunchRefusedMessage):
