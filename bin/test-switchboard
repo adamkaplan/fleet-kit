@@ -2639,7 +2639,7 @@ class TestApprovalAnywhere(Base):
         self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7), ("acme/fleet#8", self.h8)])
 
     def check_issue_named_only_in_the_text(self):
-        self.send("For #8 (not this one): Approved at %s" % self.h8, on=7)
+        self.send("For #8 (the other one): Approved at %s" % self.h8, on=7)
         self.assertEqual(self.issues_approved(), [("acme/fleet#8", self.h8)])
 
     def check_no_match_is_audited(self):
@@ -2948,7 +2948,7 @@ class TestApprovalCheck(Base):
         self.assertEqual(event["detail"]["plan_hash"], self.current())
 
     def test_a_sentence_approval_of_no_current_plan_records_nothing_and_says_so_once(self):
-        code, err = self.send("not Approved at sha256:%s" % ("a" * 64))
+        code, err = self.send("I Approved at sha256:%s" % ("a" * 64))
         self.assertEqual(code, 0, err)
         self.assertEqual(self.approved(), [])
         self.assertEqual(err.count("approval for no current plan"), 1, err)
