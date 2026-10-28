@@ -51,10 +51,14 @@ class World(unittest.TestCase):
             json.dump({"end_hook": {"pushed": pushed, "wip_branch": name + "/wip" if pushed else None}}, f)
         return runs
 
-    def stop(self, name, reason, run="a1b2c3", ts="2026-01-01T10:00:00Z", ok=True, record=True):
+    def stop(self, name, reason, run="a1b2c3", ts="2026-01-01T10:00:00Z", ok=True, record=True, cause="auto"):
         runs = os.path.join(self.dir, "runs", "%s-20260101T000000Z-0f1e2d" % name)
         text = "%s; run-id=%s" % (reason, run) + ("; run record %s" % runs if record else "")
-        self.line({"ts": ts, "action": "stop", "worker": name, "ok": ok, "reason": text, "runtime_id": "pod/" + name})
+        entry = {"ts": ts, "action": "stop", "worker": name, "ok": ok, "reason": text, "runtime_id": "pod/" + name}
+        cause = {"idle": "idle", "hard limit": "hard"}.get(reason) if cause == "auto" else cause
+        if cause:
+            entry["cause"] = cause
+        self.line(entry)
 
     def line(self, entry):
         with open(self.audit, "a") as f:
@@ -134,7 +138,6 @@ class TestQuiet(World):
         self.worker("worker7")
         for i, reason in enumerate(("done", "finished", "ended", "pushed the branch", "launch interrupted", "comment read", "stopped by hand", "")):
             self.stop("worker7", reason, run="r%d" % i)
-        self.stop("worker7", "idle", ok=False, run="failed-stop")
         self.run_pass()
         self.assertEqual(self.sent, [])
 
@@ -176,8 +179,8 @@ class TestUntrusted(World):
 
     def test_s7_a_persons_lines_send_nothing_and_the_reapers_lines_send(self):
         self.worker("worker7")
-        for i, reason in enumerate(("idle workers cleanup", "hard limit exceeded by me", "Idle", "hardening done")):
-            self.stop("worker7", reason, run="p%d" % i)
+        for i, reason in enumerate(("idle workers cleanup", "hard limit exceeded by me", "Idle", "hardening done", "idle", "hard limit")):
+            self.stop("worker7", reason, run="p%d" % i, cause=None)
         self.assertEqual(self.reasons_sent(), 0)
         self.stop("worker7", "idle", run="ra")
         self.stop("worker7", "hard limit", run="rb")
@@ -207,7 +210,7 @@ class TestUntrusted(World):
             raise RuntimeError("down " + text)
         out = real.scan_audit(self.audit, self.cursor, self.cloud, {}, refuse, PARSE, lambda w, d: lines.append((w, d)))
         self.assertEqual(len(out), 2)
-        self.assertEqual(lines, [("worker7", {"reason": "idle"})])
+        self.assertEqual(lines, [("worker7", {"reason": "idle limit"})])
 
     def test_s9_a_hostile_run_record_cannot_reach_the_message(self):
         runs = self.worker("worker7")
@@ -224,7 +227,7 @@ class TestUntrusted(World):
     def test_s9_a_bad_record_name_is_unknown(self):
         self.worker("worker7")
         bad = os.path.join(self.dir, "runs", "worker7-not-a-record")
-        self.line({"ts": "2026-01-01T10:00:00Z", "action": "stop", "worker": "worker7", "ok": True, "reason": "idle; run-id=q; run record " + bad})
+        self.line({"ts": "2026-01-01T10:00:00Z", "action": "stop", "worker": "worker7", "ok": True, "cause": "idle", "reason": "idle; run-id=q; run record " + bad})
         self.run_pass()
         self.assertEqual(len(self.sent), 2)
         for to, text in self.sent:
@@ -253,9 +256,10 @@ class TestUntrusted(World):
         self.assertEqual(self.sent, [])
 
     def test_m1_a_prefix_match_mutant_is_caught(self):
-        broken = mutant("return head if head in LABELS else None", "return next((l for l in LABELS if head.startswith(l)), None)")
+        broken = mutant("label = CAUSES.get(cause) if isinstance(cause, str) else None",
+                        'label = CAUSES.get(cause) if isinstance(cause, str) else ("idle limit" if str(line.get("reason")).split(";")[0] == "idle" else None)')
         self.worker("worker7")
-        self.stop("worker7", "idle workers cleanup")
+        self.stop("worker7", "idle", cause=None)
         self.assertEqual(self.reasons_sent(broken), 2)   # the real code sends 0
 
     def test_m2_an_unchecked_boss_mutant_is_caught(self):
@@ -280,13 +284,81 @@ class TestUntrusted(World):
         self.assertEqual(len(self.sent), 10)   # the real code sends 0
 
 
+class TestCauseRules(World):
+    def test_s12_four_causes_send_two_messages_each_with_the_cause_in_words(self):
+        self.worker("worker7")
+        for i, cause in enumerate(("idle", "hard", "pod_gone", "pod_failed")):
+            self.stop("worker7", "x", run="c%d" % i, cause=cause)
+        self.run_pass()
+        self.assertEqual(len(self.sent), 8)
+        for words in ("idle limit", "hard limit", "pod gone", "pod failed"):
+            self.assertEqual(len([1 for to, t in self.sent if "reason %s;" % words in t]), 2)
+
+    def test_s12_a_cause_that_is_not_one_of_the_four_sends_nothing(self):
+        self.worker("worker7")
+        self.stop("worker7", "idle", cause="other")
+        self.stop("worker7", "idle", cause=["idle"], run="l")
+        self.run_pass()
+        self.assertEqual(self.sent, [])
+
+    def test_s13_a_failed_stop_alerts_on_its_first_line_and_its_retries_send_nothing(self):
+        self.worker("worker7")
+        self.stop("worker7", "idle", ok=False)
+        for _ in range(6):
+            self.stop("worker7", "idle", ok=False)
+        self.run_pass()
+        self.assertEqual(len(self.sent), 2)
+        for to, text in self.sent:
+            self.assertIn("pod was kept", text)
+            self.assertIn("may be unpushed", text)
+
+    def test_s13_the_first_line_and_a_later_success_of_the_same_run_and_cause_make_one_alert_in_all(self):
+        self.worker("worker7")
+        self.stop("worker7", "idle", ok=False)
+        self.stop("worker7", "idle", ok=True)
+        self.run_pass()
+        self.assertEqual(len(self.sent), 2)
+
+    def test_s14_no_run_id_two_lines_ten_minutes_apart_make_one_pair(self):
+        self.worker("worker7")
+        for ts in ("2026-01-01T10:00:00Z", "2026-01-01T10:10:00Z"):
+            self.line({"ts": ts, "action": "stop", "worker": "worker7", "ok": True, "cause": "pod_gone", "reason": "pod gone; no stop was recorded"})
+        self.run_pass()
+        self.assertEqual(len(self.sent), 2)
+        for to, text in self.sent:
+            self.assertIn("work pushed: unknown", text)
+            self.assertIn("run record: unknown", text)
+
+    def test_s14_another_hour_alerts_again(self):
+        self.worker("worker7")
+        for ts in ("2026-01-01T10:59:00Z", "2026-01-01T11:00:00Z"):
+            self.line({"ts": ts, "action": "stop", "worker": "worker7", "ok": True, "cause": "pod_gone", "reason": "pod gone"})
+        self.run_pass()
+        self.assertEqual(len(self.sent), 4)
+
+    def test_m5_a_mutant_that_skips_failed_lines_is_caught(self):
+        broken = mutant('not isinstance(line.get("ok"), bool)', 'line.get("ok") is not True')
+        self.worker("worker7")
+        self.stop("worker7", "idle", ok=False)
+        self.run_pass(broken)
+        self.assertEqual(self.sent, [])   # the real code sends 2
+
+    def test_m6_a_mutant_that_keys_on_the_exact_time_is_caught(self):
+        broken = mutant('hour.group(0)), cause)', 'line.get("ts")), cause)')
+        self.worker("worker7")
+        for ts in ("2026-01-01T10:00:00Z", "2026-01-01T10:10:00Z"):
+            self.line({"ts": ts, "action": "stop", "worker": "worker7", "ok": True, "cause": "pod_gone", "reason": "x"})
+        self.run_pass(broken)
+        self.assertEqual(len(self.sent), 4)   # the real code sends 2
+
+
 class TestDocs(unittest.TestCase):
     def test_s6_the_interface_doc_says_what_is_sent_to_whom_and_when(self):
         with open(DOC, encoding="utf-8") as f:
             text = " ".join(f.read().split())
         for phrase in ("within one pass of the launcher's stop",
-                       "once per run id and reason", "the worker, the reason, the time, whether the work was pushed", "the run record's name",
-                       "EQUALS `idle` or `hard limit` exactly", "ONE message to the Chief of Staff always", "A person's own words", "cannot be told from the reaper",
+                       "once per run id and cause", "the worker, the reason, the time, whether the work was pushed", "the run record's name",
+                       "the field `cause`", "`idle`, `hard`, `pod_gone`", "`pod_failed`", "decides from `cause` alone", "alerts on its FIRST line", "a vanished pod is noticed one reaper pass late", "before the audit's last 24 hours is not noticed", "ONE message to the Chief of Staff always", "send nothing, because they carry no `cause`",
                        "lost, never repeated, when a send fails after the state is saved", "drains one megabyte per pass", "a corrupt cursor skips the lines written meanwhile"):
             self.assertIn(phrase, text)
 

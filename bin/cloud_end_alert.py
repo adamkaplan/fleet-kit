@@ -1,12 +1,12 @@
 """A cloud worker that the launcher ended alerts its boss and the Chief of Staff at once (ask #1480).
 
-The launcher writes one JSON line per action to its audit file. This pass reads the NEW stop lines (from a stored cursor), and for a stop the launcher
-made for an idle worker or a worker past its hard limit (the reason's first part equals `idle` or `hard limit`, exactly), it sends ONE message to the
+The launcher writes one JSON line per action to its audit file. This pass reads the NEW stop lines (from a stored cursor), and for a stop line that carries the field `cause` (idle,
+hard, pod_gone or pod_failed; decided from that field alone), it sends ONE message to the
 Chief of Staff always and ONE to the boss recorded in the worker's cloud record when that name is a valid agent name, unless the worker already
 reported done. The message holds exactly five facts: the worker, the reason, the time, pushed (yes, no or unknown) and the run record's name (or
 unknown); never a branch, an address, a log line or a transcript.
 
-The state is one small private file (0600): {"offset": bytes already read, "sent": [[run id, reason], ...] (the last 500)}. A missing or corrupt
+The state is one small private file (0600): {"offset": bytes already read, "sent": [[run id, cause], ...] (the last 500)}. A missing or corrupt
 file starts at the END of the audit file, so old history is never replayed. The state is saved BEFORE the messages go: a crash loses a message,
 it never sends one twice. Pure of the daemon: the send function, the paths, the last reports and the shared bounded parse (record_json.parse_bounded) are handed in.
 """
@@ -19,10 +19,9 @@ CHIEF = "chief-of-staff"
 SENT_KEEP = 500          # the (run id, reason) keys kept
 READ_BYTES = 1 << 20     # the most audit bytes one pass reads
 FILE_BYTES = 65536       # the most a record file may be
-# The launcher's stop reasons (cloud/launcher/cloud_worker.py, reap and stop): `idle` and `hard limit`, followed by "; run-id=NONCE" and "; run record DIR".
-# "pod gone" and the failed-pod wording are kept for a stop that names them; anything else (done, finished, ended, pushed ..., a person's words) sends nothing.
-# The audit file and the run records are UNTRUSTED text: the reason's first part (up to the first semicolon) must EQUAL one of these, exactly.
-LABELS = ("idle", "hard limit")
+# The launcher writes the field `cause` on every stop it makes of its own accord; the decision reads that field and nothing else (the reason text is
+# never read for it: a person's words, even `idle`, send nothing). The audit file and the run records are UNTRUSTED text.
+CAUSES = {"idle": "idle limit", "hard": "hard limit", "pod_gone": "pod gone", "pod_failed": "pod failed"}
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")   # the switchboard's own agent-name pattern (NAME_RE in bin/fleet-switchboard)
 WORKER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECORD_STAMP = r"\d{8}T\d{6}Z-[0-9a-f]{6}"   # the launcher's run record name: <worker>-<UTC stamp>-<6 hex> (cloud/launcher/run_record.py)
@@ -82,12 +81,6 @@ def save_state(path, offset, keys):
         raise
 
 
-def label_of(reason):
-    """The plain label of a stop reason the launcher gave, or None for any other reason."""
-    head = reason.split(";")[0] if isinstance(reason, str) else ""
-    return head if head in LABELS else None
-
-
 def raw_dir(reason):
     """The run record path the reason names ("" when none)."""
     rec = re.search(r"run record (\S+)", reason)
@@ -115,9 +108,12 @@ def pushed_text(record_dir, parse):
     return "yes" if hook["pushed"] else "no"
 
 
-def message_text(worker, label, when, pushed, record_name):
-    return ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; work pushed: %s; run record: %s."
+def message_text(worker, label, when, pushed, record_name, kept=False):
+    text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; work pushed: %s; run record: %s."
             % (worker, label, when, pushed, record_name or "unknown"))
+    if kept:
+        text += " The end hook could not push: the pod was kept and the work may be unpushed."
+    return text
 
 
 def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None):
@@ -149,14 +145,18 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
             line = parse(raw.decode("utf-8")) if raw.strip() else None
         except (ValueError, UnicodeDecodeError):
             continue
-        if not isinstance(line, dict) or line.get("action") != "stop" or line.get("ok") is not True:
+        if not isinstance(line, dict) or line.get("action") != "stop" or not isinstance(line.get("ok"), bool):
             continue
-        label = label_of(line.get("reason"))
-        worker = line.get("worker")
+        cause, worker = line.get("cause"), line.get("worker")
+        label = CAUSES.get(cause) if isinstance(cause, str) else None
+        reason = line.get("reason") if isinstance(line.get("reason"), str) else ""
         if label is None or not isinstance(worker, str) or not WORKER_NAME.fullmatch(worker):
             continue
-        run_id, record_name = parse_reason(line["reason"])
-        key = (run_id or "%s@%s" % (worker, line.get("ts")), label)
+        run_id, record_name = parse_reason(reason)
+        hour = re.match(r"\d{4}-\d\d-\d\dT\d\d", str(line.get("ts")))
+        if not run_id and not hour:
+            continue
+        key = (run_id or "%s@%s" % (worker, hour.group(0)), cause)   # no run id: worker, cause and the hour
         if key in keys:
             continue
         if (last_reports.get(worker) or {}).get("state") == "done":
@@ -164,8 +164,8 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
         record = read_small(os.path.join(str(cloud_dir), worker + ".json"), parse)
         boss = record.get("reports_to") if record and record.get("worker") == worker else None
         name = record_name_of(worker, record_name)
-        pushed = pushed_text(raw_dir(line["reason"]), parse) if name else "unknown"
-        text = message_text(worker, label, plain(line.get("ts"), 30), pushed, name)
+        pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
+        text = message_text(worker, label, plain(line.get("ts"), 30), pushed, name, line["ok"] is False)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         out.extend((to, text, worker, label) for to in reversed(to_list))
