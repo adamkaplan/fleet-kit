@@ -428,3 +428,7 @@ Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-
 <!-- preflight-modes:end -->
 
 Known limit of the text redaction: a password in a URL that holds a raw space (`://user:pass word@host`) is not covered, because a space ends a word and the pattern cannot tell the rest of the text from the password; percent-encode the space.
+
+Two more stated limits of the text redaction: a begin marker with no end marker redacts the text to its end, and a URL password that holds a space is not redacted.
+
+The local route: the local launch makes one more discovery of the local agents before the report-to check; it is a read with no behaviour change.

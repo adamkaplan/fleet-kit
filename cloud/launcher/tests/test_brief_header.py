@@ -588,7 +588,7 @@ class KeyBlockOddShapes(unittest.TestCase):
     def test_s13_an_end_marker_of_another_kind_leaves_no_body_line(self):
         got = load_sb().redact_command_text(self.pgp(end="-----END CERTIFICATE-----") + "\nafter")
         self.assert_no_body(got)
-        self.assertIn("after", got)
+        self.assertNotIn("after", got)   # S18: a foreign end marker does not end the block, so the text to its end is redacted
 
     def test_s13_a_begin_with_no_end_covers_the_text_up_to_the_next_begin(self):
         text = "head\n-----BEGIN PRIVATE KEY-----\n" + "\n".join(self.BODY) + "\n-----BEGIN PRIVATE KEY-----\nzed"
@@ -600,7 +600,7 @@ class KeyBlockOddShapes(unittest.TestCase):
         got = load_sb().redact_command_text(self.pgp() + "\nunrelated line\n" + self.pgp(end="-----END CERTIFICATE-----") + "\nlast")
         self.assert_no_body(got)
         self.assertIn("unrelated line", got)
-        self.assertIn("last", got)
+        self.assertNotIn("last", got)   # S18: the second block has no own end marker, so it runs to the end of the text
 
     def test_s13_timing_on_the_real_path(self):
         sb = load_sb()
@@ -641,7 +641,7 @@ class KeyBlockOddShapes(unittest.TestCase):
         src = read("bin/fleet-switchboard")
         line = [l for l in src.splitlines() if "PRIVATE KEY(?: BLOCK)?-----" in l and "(?:BEGIN|END)[A-Z ]*PRIVATE" not in l][0]
         self.assertNotIn("[^-]*", line)
-        self.assertIn("(?!-----(?:BEGIN|END))", line)
+        self.assertIn("(?!-----BEGIN[A-Z ]{0,40}PRIVATE KEY)(?!-----END[A-Z ]{0,40}PRIVATE KEY)", line)   # S18
 
 
 class SecretFamilyOddShapes(unittest.TestCase):
@@ -700,6 +700,126 @@ class SecretFamilyOddShapes(unittest.TestCase):
                 self.assertLess(time.monotonic() - start, 2.0)
 
 
+class KeyBlockForeignMarkers(unittest.TestCase):
+    """S18: the key body ends at an own end marker, the next key begin marker, or the end of the text; a foreign marker inside it does not end it."""
+
+    BODY = ["MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "KcwggSjAgEAAoIBAQC7VJTUt9Us8cKj", "zzzzAAAA1111bbbb2222cccc"]
+    BEGIN = "-----BEGIN PRIVATE KEY-----\n"
+    OWN_END = "\n-----END PRIVATE KEY-----"
+    FOREIGN = "-----END CERTIFICATE-----"
+    OLD_BODY = r"-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?:(?!-----(?:BEGIN|END))[\s\S])*(?:-----END[A-Z ]*-----)?"
+
+    def shapes(self):
+        b = self.BODY
+        f = self.FOREIGN
+        return {
+            "foreign end once": self.BEGIN + b[0] + "\n" + f + "\n" + b[1] + "\n" + b[2],
+            "foreign end twice": self.BEGIN + b[0] + "\n" + f + "\n" + b[1] + "\n" + f + "\n" + b[2],
+            "foreign end then own end": self.BEGIN + b[0] + "\n" + f + "\n" + b[1] + "\n" + b[2] + self.OWN_END,
+            "foreign end then no own end": self.BEGIN + b[0] + "\n" + f + "\n" + b[1] + "\n" + b[2] + "\n",
+        }
+
+    def test_s18_four_interrupted_shapes_leave_no_body_line(self):
+        sb = load_sb()
+        for name, text in self.shapes().items():
+            with self.subTest(shape=name):
+                got = sb.redact_command_text(text)
+                for line in self.BODY:
+                    self.assertNotIn(line, got)
+
+    def test_s18_a_complete_key_then_plain_text_then_a_certificate_block_keeps_the_plain_text_and_the_certificate_block(self):
+        cert = "-----BEGIN CERTIFICATE-----\nCERTBODYLINE\n-----END CERTIFICATE-----"
+        text = self.BEGIN + self.BODY[0] + self.OWN_END + "\nplain text line\n" + cert
+        got = load_sb().redact_command_text(text)
+        self.assertNotIn(self.BODY[0], got)
+        self.assertIn("plain text line", got)
+        self.assertIn(cert, got)
+
+    def test_s18_a_key_with_no_own_end_then_a_certificate_block_is_all_redacted(self):
+        cert = "-----BEGIN CERTIFICATE-----\nCERTBODYLINE\n-----END CERTIFICATE-----"
+        got = load_sb().redact_command_text(self.BEGIN + self.BODY[0] + "\n" + cert)
+        self.assertNotIn(self.BODY[0], got)
+        self.assertNotIn("CERTBODYLINE", got)
+
+    def test_s18_two_complete_blocks_keep_the_line_between(self):
+        got = load_sb().redact_command_text(self.BEGIN + self.BODY[0] + self.OWN_END + "\nunrelated\n" + self.BEGIN + self.BODY[1] + self.OWN_END)
+        self.assertIn("unrelated", got)
+        self.assertNotIn(self.BODY[0], got)
+        self.assertNotIn(self.BODY[1], got)
+
+    def test_s18_timing_on_the_real_path(self):
+        sb = load_sb()
+        pieces = {
+            "one begin, no end": "-----BEGIN PRIVATE KEY-----" + "A" * 1000000,
+            "20000 begins": "-----BEGIN PRIVATE KEY-----" * 20000,
+            "dashes": "-----" * 200000,
+            "begin words": "-----BEGIN " * 90910,
+            "foreign ends": "-----END CERTIFICATE-----" * 40000,
+            "end plus capitals": ("-----END " + "A" * 100) * 9174,
+            "begin then foreign ends": "-----BEGIN PRIVATE KEY-----" + "-----END CERTIFICATE-----" * 40000,
+            "begin then end plus capitals": "-----BEGIN PRIVATE KEY-----" + ("-----END " + "A" * 100) * 9174,
+        }
+        for name, text in pieces.items():
+            with self.subTest(case=name):
+                start = time.monotonic()
+                sb.redact_command_text(text)
+                self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_s18_mutant_the_old_body_fails_the_interrupted_shapes(self):
+        mutant = re.compile(self.OLD_BODY)
+        self.assertIn("(?!-----(?:BEGIN|END))", mutant.pattern, "mutation applied")
+        failed = 0
+        for text in self.shapes().values():
+            got = mutant.sub("[redacted]", text)
+            if any(line in got for line in self.BODY):
+                failed += 1
+        self.assertEqual(failed, 4)
+
+
+class NamedValueQuoteBeforeSeparator(unittest.TestCase):
+    """S19: a closing quote between the name and its separator (a JSON-style pair)."""
+
+    def red(self, text):
+        return load_sb().redact_command_text(text)
+
+    def test_s19_json_style_pairs_leave_no_value_character(self):
+        cases = {
+            '"password": "a secret value"': ["secret", "value"],
+            "'token': 'a b'": ["a b"],
+            '"api_key" : "x\\"y z"': ["x\\", "y z"],
+        }
+        for text, parts in cases.items():
+            with self.subTest(text=text):
+                got = self.red(text)
+                for part in parts:
+                    self.assertNotIn(part, got)
+                self.assertIn("[redacted]", got)
+
+    def test_s19_the_quote_text_is_kept(self):
+        self.assertEqual(self.red('"password": "abc"'), '"password": [redacted]')
+
+    def test_s19_timing_on_the_real_path(self):
+        sb = load_sb()
+
+        def rep(unit):
+            return (unit * (1000000 // len(unit) + 1))[:1000000]
+        for name, text in {"quoted token": rep('"token": '), "look-behind one": rep("xtokenx "), "look-behind two": rep("a-a-a ")}.items():
+            with self.subTest(case=name):
+                start = time.monotonic()
+                sb.redact_command_text(text)
+                self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_s19_mutant_a_separator_with_only_equals_or_colon_leaves_the_json_value(self):
+        real = [p for p, _ in load_sb()._SECRET_PATTERNS if "passw" in p.pattern][0]
+        quote_group = "([\\\"']?)("
+        self.assertIn(quote_group, real.pattern)
+        mutant = re.compile(real.pattern.replace(quote_group, "()(", 1))
+        self.assertNotEqual(mutant.pattern, real.pattern, "mutation applied")
+        text = '"password": "a secret value"'
+        self.assertIn("secret", mutant.sub(r"\1\2\3[redacted]", text))
+        self.assertNotIn("secret", real.sub(r"\1\2\3[redacted]", text))
+
+
 class HeaderFileAndOutput(unittest.TestCase):
     def test_s14_the_file_comment_names_the_title_line_and_the_id_text_form(self):
         comment = "\n".join(l for l in open(SOURCE).read().splitlines() if l.startswith("#"))
@@ -711,6 +831,15 @@ class HeaderFileAndOutput(unittest.TestCase):
         code, out, err = run_header()
         self.assertEqual(code, 0, err)
         self.assertEqual(hashlib.sha256(out.encode()).hexdigest(), HEADER_OUTPUT_SHA256)
+
+
+class DocsRedactionLimits(unittest.TestCase):
+    def test_the_quickstart_states_the_redaction_limits_and_the_local_read(self):
+        doc = read("docs/cloud-operator-quickstart.md")
+        for phrase in ("a begin marker with no end marker redacts the text to its end",
+                       "a URL password that holds a space is not redacted",
+                       "the local launch makes one more discovery of the local agents before the report-to check; it is a read with no behaviour change"):
+            self.assertEqual(doc.count(phrase), 1, phrase)
 
 
 class DocsBossText(unittest.TestCase):
