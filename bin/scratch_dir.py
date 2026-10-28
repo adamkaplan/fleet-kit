@@ -144,3 +144,25 @@ def due_today(state_dir, now):
         except OSError:
             return []   # not recorded: say nothing now rather than say it every pass
     return fresh
+
+
+LOOK_SECONDS = 600   # the daemon looks at most this often
+
+
+def daily_look(engine):
+    """The daemon's look (called from a pass, only in the real daemon): one `scratch.over_bound` audit line a day for each scratch directory that stays over the
+    bound. It only says: nothing is removed or refused. Never raises."""
+    try:
+        now = engine.now()
+        last = getattr(engine, "scratch_last", None)
+        if last is not None and now - last < LOOK_SECONDS:
+            return
+        engine.scratch_last = now
+        for agent, size in due_today(engine.state_dir, now):
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "scratch.over_bound", agent, {"bytes": size, "bound": BOUND_BYTES})
+    except Exception as err:   # a look never stops the daemon
+        try:
+            engine._note("scratch.bound_check_error", None, {"error": ("%s: %s" % (type(err).__name__, err))[:160]})
+        except Exception:
+            pass

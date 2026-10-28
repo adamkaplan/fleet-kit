@@ -206,6 +206,34 @@ def cmd_whoami(args, runner, now):
     return EXIT_OK
 
 
+def add_scratch_parsers(sub):
+    sub.add_parser("scratch", help="Print the path of your own scratch directory (private, kept by every fleet command; not a place for a secret)")
+
+
+def cmd_scratch(args, runner, now):
+    """`scratch`: print the path of the calling agent's own scratch directory, made (0700) when absent. The name is the caller's own: no argument names another."""
+    scratch = load_module("scratch_dir")
+    try:
+        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        name = identify_caller(engine.herdr, engine.v2, os.environ)
+    except (V2Error, HerdrError, ConfigError, CallerError) as err:
+        sys.stderr.write("%s: scratch: %s\n" % (PROG, _one_line(str(err))))
+        return EXIT_ERROR
+    try:
+        path = scratch.own_dir(engine.state_dir, name)
+    except scratch.Refused as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_USAGE
+    print(path)
+    line = scratch.warning(path)
+    if line:
+        sys.stderr.write(line + "\n")   # on stderr: `$(fleet-switchboard scratch)` stays the path alone
+    return EXIT_OK
+
+
+cmd_scratch.direct = True   # it answers on its own terms: no daemon start, its own exit codes
+
+
 def add_foreground_parsers(sub):
     whoami = sub.add_parser("whoami", help="Print your fleet name (for scripts: the gh shim signs with it)")
     whoami.add_argument("--json", action="store_true", help="Print {\"name\", \"repo\"} on one line: the gh shim's single "

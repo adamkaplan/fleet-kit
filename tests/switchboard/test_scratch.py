@@ -41,7 +41,7 @@ class ScratchCase(Base):
     def setUp(self):
         super().setUp()
         self.state_dir.mkdir(parents=True, mode=0o700)
-        self.engine = types.SimpleNamespace(state_dir=str(self.state_dir), herdr=None, v2=None, audit=None, actor="switchboard", config={})
+        self.engine = types.SimpleNamespace(state_dir=str(self.state_dir), herdr=None, v2=None, audit=None, actor="switchboard", config={"temp_janitor": {"enabled": False}})   # the daemon source returns right after its scratch look
         self.who = "acme-lane"
 
     def call(self, *argv, who=None):
@@ -183,7 +183,7 @@ class TestNoRemovingCommandSweeps(ScratchCase):
         self.engine.temp_janitor_runner = object()
         self.engine.now = time.time
         self.engine._note = lambda *a, **k: None
-        source = sb.ScratchBoundFacts()
+        source = sb.TempJanitorFacts()
         source.bind(self.engine)
         source()
 
@@ -216,11 +216,11 @@ class TestNoRemovingCommandSweeps(ScratchCase):
         for target, run in (("rotate", self.run_rotation), ("__call__", self.run_daemon_pass)):
             with self.subTest(mutant=target):
                 self.keep = self.plant()
-                original = sb.AuditLog.rotate if target == "rotate" else sb.ScratchBoundFacts.__call__
+                original = sb.AuditLog.rotate if target == "rotate" else sb.TempJanitorFacts.__call__
                 def sweeping(*a, **k):
                     shutil.rmtree(str(self.state_dir / "scratch"))
                     return original(*a, **k)
-                owner = sb.AuditLog if target == "rotate" else sb.ScratchBoundFacts
+                owner = sb.AuditLog if target == "rotate" else sb.TempJanitorFacts
                 with mock.patch.object(owner, target, sweeping):
                     run()
                 self.assertFalse((self.keep / "merge.sh").exists())
@@ -257,16 +257,16 @@ class TestOverBoundAudit(ScratchCase):
             handle.truncate(101 * MB)
         self.clock = 1_800_000_000.0
         lines = self.audit_engine()
-        source = sb.ScratchBoundFacts()
+        source = sb.TempJanitorFacts()
         source.bind(self.engine)
         source()
-        source.last = None   # the second pass is a later look, the same day
+        self.engine.scratch_last = None   # the second pass is a later look, the same day
         self.clock += 3600
         source()
         self.assertEqual(lines, [("scratch.over_bound", "acme-lane")])
         self.assertEqual(sorted(os.listdir(str(keep))), ["big.bin", "merge.sh"])
         self.clock += 86400   # still over the next day: one more line
-        source.last = None
+        self.engine.scratch_last = None
         source()
         self.assertEqual(len(lines), 2)
 
@@ -276,11 +276,11 @@ class TestOverBoundAudit(ScratchCase):
             handle.truncate(101 * MB)
         self.clock = 1_800_000_000.0
         lines = self.audit_engine()
-        source = sb.ScratchBoundFacts()
+        source = sb.TempJanitorFacts()
         source.bind(self.engine)
         with mock.patch.object(scratch_dir, "due_today", lambda state, now: scratch_dir.over_bound(state)):
             source()
-            source.last = None
+            self.engine.scratch_last = None
             source()
         self.assertEqual(len(lines), 2)   # the test above asserts 1: this build fails it
 
@@ -288,7 +288,7 @@ class TestOverBoundAudit(ScratchCase):
         self.plant()
         self.clock = 1_800_000_000.0
         lines = self.audit_engine()
-        source = sb.ScratchBoundFacts()
+        source = sb.TempJanitorFacts()
         source.bind(self.engine)
         source()
         self.assertEqual(lines, [])
