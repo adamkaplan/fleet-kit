@@ -86593,6 +86593,7 @@ class TestAskIssueSubject(unittest.TestCase):
         self.assertIn("3 of 3 claimed scenarios proven and judged", g1["detail"])
 
     def test_s5_the_closing_command_names_what_was_recorded_or_refuses_naming_the_unjudged_scenario(self):
+        self.enterContext(mock.patch.object(sb, "unclaimed_verdict", lambda *a, **k: None))
         self.record_all(("S1", "S2"))
         self.assertEqual(self.prove("S3")[0], sb.EXIT_OK)
         code, why, out, err = self.run_cmd("cmd_gates_ask_close")
