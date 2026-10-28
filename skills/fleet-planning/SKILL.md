@@ -87,7 +87,7 @@ scenarios:
     evaluator: ci
 ```
 
-A missing or corrupt input: say so, keep the last good output (`plan check` warns `no-failure-mode`).
+Input missing, corrupt or unreadable: say so, keep the last good output (`plan check` warns `no-failure-mode`).
 
 Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `commission()` method" (how).
 
