@@ -2302,7 +2302,7 @@ class Launcher:
     def record(self, pod):
         name = pod["metadata"]["name"]
         act = self.activity(name)
-        idle_for = int(ann(pod, "idle-seconds", "600"))
+        idle_for = int(ann(pod, "idle-seconds", "600"))   # 600: a pod made before the create's default became 30m carries no annotation and keeps its 10m
         since = act[1] if act and not act[0] else None
         return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": pod.get("status", {}).get("phase"),
                 "idle_since": iso(since) if since else None,
@@ -2372,7 +2372,7 @@ class Launcher:
                     # its hard limit; it is reported so it is not silent.
                     out.append((worker, "activity unreadable", 1))
                     continue
-                if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
+                if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):   # 600: a pod without the annotation was made before the default became 30m
                     reason = "idle"
             if reason:
                 self.last_hook = None
@@ -2921,7 +2921,7 @@ def build_parser():
     c = cmd("create")
     c.add_argument("--repo", required=True)
     c.add_argument("--branch", required=True)
-    c.add_argument("--idle", default="10m")
+    c.add_argument("--idle", default="30m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack or --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE))
