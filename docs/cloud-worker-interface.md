@@ -111,6 +111,8 @@ Runs inside the pod on `stop`, a hard deadline, an idle stop and a node drain no
 
 A clean tree whose HEAD is already pushed pushes nothing and reports `pushed: false`.
 
+A pod with no checkout: when `/work/repo` is absent, or exists but holds no `.git`, nothing was cloned and nothing can be lost. The hook answers `no_repository: true`, the stop goes on and deletes the pod, the run record's `end_hook.note` is `no repository in the pod; nothing to push`, and the stop's audit reason carries the same words. A failed push in a real checkout (a refused push, an expired token, a conflict) is never treated this way: it keeps the pod, as in item 3.
+
 ## 6. Idle and hard limit
 
 - **Idle** = no tool call and no model activity (a running session or step) for `CW_IDLE_SECONDS`. Inbound

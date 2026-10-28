@@ -185,6 +185,7 @@ POD_TERMINATION_GRACE_SECONDS = 60
 PRESTOP_BUDGET_SECONDS = 45
 PRESTOP_LIFECYCLE = {"preStop": {"exec": {"command": ["/usr/local/bin/cw-prestop", str(PRESTOP_BUDGET_SECONDS)]}}}
 # The one read-only recovery route for work a hook could not push (a constant string).
+NO_REPOSITORY_NOTE = "no repository in the pod; nothing to push"   # the end hook's answer when /work/repo holds no checkout (end_hook.py says the same)
 RECOVERY_ROUTE = ("recover read-only: the work is still in /work/repo of the kept pod; see the pod's own output line "
                   "(cw-prestop: not pushed) and the run record")
 
@@ -1701,7 +1702,8 @@ class Launcher:
         info = {"rid": runtime_id, "cost": 0.0}
 
         def why():   # a stop that wrote a run record names its directory once, here
-            return "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
+            text = "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
+            return "%s; %s" % (text, info["hook_note"]) if text and info.get("hook_note") else (text or info.get("hook_note", ""))
         try:
             result = fn(info)
         except CloudError as e:
@@ -2118,6 +2120,10 @@ class Launcher:
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
             view = self._hook_view(res)   # every field text from the pod: a string, scrubbed, short
+            no_repo = res.get("no_repository") is True and not view["error"]   # no checkout in the pod: the launcher's own words, not the pod's
+            if no_repo:
+                view["note"] = NO_REPOSITORY_NOTE
+                info["hook_note"] = NO_REPOSITORY_NOTE
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
             self._hook_record(info, dict(view, ran=True))
             if view["error"]:
@@ -2134,10 +2140,12 @@ class Launcher:
             try:
                 raw = res.get("skipped")
                 skipped = [self.kube.scrub(x, 200) for x in raw][:50] if isinstance(raw, list) else []
-                note = self.kube.scrub(res.get("note") or "")
+                note = NO_REPOSITORY_NOTE if no_repo else self.kube.scrub(res.get("note") or "")
             except Exception:  # output handling never undoes the stop
                 pass
-            if note:
+            if no_repo:
+                print("cloud-worker: end hook: %s" % note, file=sys.stderr)
+            elif note:
                 print("cloud-worker: end hook: %s; nothing to push" % note, file=sys.stderr)
             if skipped:  # these files were not pushed and went with the pod: say so, loudly
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)

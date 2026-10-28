@@ -148,7 +148,15 @@ def config_refusal(workdir, repo, ctx):
             raise ConfigRefused(shown)
 
 
+NO_REPOSITORY_NOTE = "no repository in the pod; nothing to push"
+
+
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
+    # Three answers: no checkout at all (the directory is absent or holds no .git: nothing was cloned, nothing can be lost; this
+    # answer carries no_repository), a checkout whose push fails (RuntimeError from git: the caller prints `error`, exit 1), and
+    # nothing unpushed or pushed (as before).
+    if not os.path.exists(os.path.join(workdir, ".git")):
+        return {"pushed": False, "wip_branch": None, "skipped": [], "no_repository": True, "note": NO_REPOSITORY_NOTE}
     url = HOST_URL + "%s.git" % repo if prestop else None
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout
     paths = [e[3:] for e in status.split("\0") if len(e) > 3]
