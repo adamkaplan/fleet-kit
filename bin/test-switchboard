@@ -59805,7 +59805,9 @@ class TestWriteOnlyOnChange(Base):
         self.assertLessEqual(seen["sweep.json"], 1 + 1200 // sb.HEARTBEAT_SWEEP, dict(seen))          # once, plus a heartbeat per HEARTBEAT_SWEEP
         self.assertGreaterEqual(seen["v2-calls.json"], 1)
         self.assertLessEqual(seen["decisions.json"], 2, "decisions.json keeps its touch: its mtime is the signal, and a touch is not a rewrite")
-        self.assertLess(sum(seen.values()), 3 * 40 // 2, dict(seen))   # three files alone used to be written 40 times each
+        self.assertGreaterEqual(seen["cockpit.json"], 1, dict(seen))
+        self.assertLessEqual(seen["cockpit.json"], 1 + 1200 // sb.COCKPIT_HEARTBEAT, dict(seen))   # the feed: once, plus a heartbeat per COCKPIT_HEARTBEAT, never between
+        self.assertLess(sum(seen.values()) - seen["cockpit.json"], 3 * 40 // 2, dict(seen))   # three files alone used to be written 40 times each
 
     def test_the_status_files_of_the_pass_keep_a_heartbeat(self):
         world = World(self, agents=("a0",), config={})
@@ -70852,7 +70854,7 @@ class TestTheArchitectureTestIsRun(unittest.TestCase):
                 else:
                     yield item
         ids = [t.id() for t in flat(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]))]
-        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine"):
+        for name in ("TestDerivedClosure", "TestRefusalInAPart", "TestMovingADefinition", "TestTheDerivationIsHeld", "TestShadowRule", "TestShadowGlue", "TestShadowStatuses", "TestReasonsAreOneCleanLine", "TestFeedShape", "TestIdsAndEtags", "TestCapsAndScrub", "TestDocument", "TestWriting", "TestReadOnly", "TestBranches"):
             with self.subTest(case=name):
                 self.assertGreaterEqual(len([i for i in ids if ".%s." % name in i]), 2, "the hook that loads tests/switchboard/test_closure.py is gone")
 
