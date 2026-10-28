@@ -312,7 +312,7 @@ class TestConfig(Base):
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "undelivered_wake_minutes": 15, "undelivered_wake_tell_minutes": None, "undelivered_wake_per_pass": 2, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
-            "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
+            "github_repos": [], "gh": sb.own_gh_path("gh"), "gh_by_name": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],   # #1216: the RESOLVED gh (a machine with a gh on PATH names it by path); `gh_by_name` is the gh as configured (PATH finds the shim), used by the one merge call of `merge-gate --pass --merge`
             "owner_logins": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
@@ -7710,7 +7710,7 @@ class TestGithubConfig(Base):
     def test_defaults_watch_nothing_and_name_the_documented_events(self):
         config = self.cfg()
         self.assertEqual((config["github_repos"], config["gh"], config["github_lookback_hours"],
-                          config["github_port"]), ([], "gh", 24, None))
+                          config["github_port"]), ([], sb.own_gh_path("gh"), 24, None))   # the RESOLVED gh: environment-independent
         self.assertEqual(config["github_events"], ["issues", "issue_comment", "sub_issues", "pull_request",
                                                    "pull_request_review", "check_suite", "workflow_run"])
 
@@ -12160,7 +12160,6 @@ class TestAgentShellCalls(Base):
         self.shim("api", "repos/acme/app/issues/5")
         self.assertFalse((self.state / "agent-calls.jsonl").exists())
         sb.agent_calls.fold(str(self.state), time.time())
-        self.shim("api", "repos/acme/app/issues/5", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
         self.shim("auth", "status")
         self.assertFalse((self.state / "agent-calls.jsonl").exists())
 
@@ -12289,8 +12288,12 @@ class TestAgentShellCalls(Base):
         sb.record_github_calls(engine)
         sb.record_github_calls(engine)                                                       # inside the minute: no second read
         self.assertEqual(len([a for a in asked if a[0][1:] == ["api", "rate_limit"]]), 1)
-        self.assertEqual([a[1] for a in asked if a[0][1:] == ["api", "rate_limit"]], ["1"])  # the switchboard's own marker: the shim never counts it
+        self.assertEqual([a[1] for a in asked if a[0][1:] == ["api", "rate_limit"]], [None])  # no marker any more: the daemon reaches the real gh by path (own_gh_path), so the shim never sees, hence never counts, it
+        self.assertEqual([a[0][0] for a in asked if a[0][1:] == ["api", "rate_limit"]], [FAKE_GH])
         self.assertEqual(len(accounts.calls), 0, "the rate-limit read is not a counted call")
+        accounts.read(runner, "repos/acme/app/issues/1", "acme/app", 5)
+        self.assertEqual(len(accounts.calls), 1, "the daemon's OWN counter records a read it makes (the shim's per-account file never sees it)")
+        self.assertEqual(asked[-1][0][0], FAKE_GH)
         body = json.loads((self.state / "github-usage.json").read_text())["accounts"]["acme-a"]
         self.assertEqual((body["used"], body["remaining"], body["reset"]), (4000, 1000, reset))
         text = "\n".join(sb.agent_calls.usage_lines(str(self.state), clock[0]))
@@ -12299,6 +12302,17 @@ class TestAgentShellCalls(Base):
         clock[0] += 61
         sb.record_github_calls(engine)
         self.assertEqual(len([a for a in asked if a[0][1:] == ["api", "rate_limit"]]), 2)
+
+    def test_usage_the_daemons_read_runs_the_real_gh_binary_and_its_own_counter_counts_it_not_the_shims_file(self):
+        real = self.home / "realgh"
+        real.write_text("#!/bin/sh\necho \"real $*\" >> %s\necho '{}'\n" % (self.home / "real.log"))
+        real.chmod(0o755)
+        accounts = sb.GhAccounts({"gh": str(real), "call_timeout_seconds": 5, "gh_users": {}}, subprocess.run, time.time, environ={})
+        done = accounts.read(subprocess.run, "repos/acme/app/issues/1", "acme/app", 5)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.home / "real.log").read_text().splitlines(), ["real api repos/acme/app/issues/1"], "the REAL gh binary ran, by path")
+        self.assertEqual(len(accounts.calls), 1, "the daemon's own counter counted it")
+        self.assertFalse((self.state / "agent-calls.jsonl").exists(), "the shim's per-account call file does not record the daemon's own reads")
 
     def test_usage_a_garbled_read_is_left_out_and_never_raises(self):
         accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {"acme/*": "acme-a"}}, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "not json", ""),
@@ -12440,6 +12454,40 @@ class TestShimReadCache(Base):
         self.assertEqual(len(self.network()), 2)
         self.assertIn("If-None-Match: \"v1\"", self.network()[1])
         self.assertEqual(len((self.state / "agent-calls.jsonl").read_text().splitlines()), 1, "the 304 is not counted as a call")
+
+    def marker_mutant(self, func):
+        """#1216: a copy of the shim directory in which `func` honours the retired marker again (returns at once)."""
+        source = SHIM.read_text()
+        start = source.index("def %s(" % func)
+        head = source[start:]
+        at = head.index(":\n", head.index(")")) + 2
+        if head[at:].lstrip().startswith('"""'):
+            at = head.index('"""', head.index('"""', at) + 3) + 4
+        guard = '    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":\n        return None\n'
+        target = self.home / ("mutant-" + func)
+        shutil.copytree(str(SHIM.parent), str(target))
+        (target / "gh").write_text(source[:start] + head[:at] + guard + head[at:])
+        return target / "gh"
+
+    def test_mutants_honouring_the_marker_in_count_call_and_the_cache_fail_these_cases(self):   # #1216
+        marker = {"FLEET_SWITCHBOARD_OWN_GH": "1"}
+        for func in ("count_call", "cached_read"):
+            with self.subTest(func=func):
+                (self.state / "agent-calls.jsonl").unlink() if (self.state / "agent-calls.jsonl").exists() else None
+                shutil.rmtree(str(self.state / "gh-read-cache"), True)
+                self.log.write_text("")
+                self.run_shim("api", self.PATH, env=marker); self.run_shim("api", self.PATH, env=marker)
+                spooled = (self.state / "agent-calls.jsonl").read_text().splitlines() if (self.state / "agent-calls.jsonl").exists() else []
+                real = (len(spooled), len(self.network()))
+                self.assertEqual(real, (1, 1), "the real shim, marker set: one call counted, the repeat served from the cache")
+                (self.state / "agent-calls.jsonl").unlink()
+                shutil.rmtree(str(self.state / "gh-read-cache"), True)
+                self.log.write_text("")
+                mutant = self.marker_mutant(func)
+                with mock.patch.dict(globals(), {"SHIM": mutant}), rebound("SHIM", mutant):
+                    self.run_shim("api", self.PATH, env=marker); self.run_shim("api", self.PATH, env=marker)
+                spooled = (self.state / "agent-calls.jsonl").read_text().splitlines() if (self.state / "agent-calls.jsonl").exists() else []
+                self.assertNotEqual((len(spooled), len(self.network())), real, "the mutant differs: the case above fails it")
 
     def test_s8_a_write_by_the_same_agent_drops_its_entries_and_another_agents_write_does_not(self):
         self.run_shim("api", self.PATH)
@@ -20188,7 +20236,7 @@ class TestGhShimGateProbe(Base):
                 self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), "the real gh's exit code and output pass through")
                 self.assertEqual(seen["argv"], list(args))
                 (call,) = self.gate_calls()
-                self.assertEqual(call, "gates-check acme/app#12 --for %s --json own=1" % kind)
+                self.assertEqual(call, "gates-check acme/app#12 --for %s --json own=" % kind)
 
     def review(self, state, who="rev", at="2026-01-01T00:00:00Z"):
         return {"state": state, "author": {"login": who}, "submittedAt": at}
@@ -20377,12 +20425,18 @@ class TestGhShimGateProbe(Base):
         self.assertNotIn("\x1b", logged)
         self.assertIn("with escapes", logged)
 
-    def test_only_merge_is_checked_and_the_daemons_own_calls_are_not(self):
+    def test_only_merge_is_checked_and_the_marker_buys_nothing(self):
         block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
         done, seen = self.merge(reviews=block, args=("pr", "ready", "12", "-R", "acme/app"))
         self.assertEqual(done.returncode, 7)
-        done, seen = self.merge(reviews=block, env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
-        self.assertEqual(done.returncode, 7)
+
+    def test_a_blocking_review_refuses_a_merge_with_the_marker_set_and_unset(self):   # #1216 S2: the review probe does not honour the marker
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        for env in ({"FLEET_SWITCHBOARD_OWN_GH": "1"}, {}):
+            with self.subTest(env=env):
+                done, seen = self.merge(reviews=block, env=env)
+                self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+                self.assertIn("blocking review", done.stderr)
 
     HEAD = "a" * 40
     REFUSAL = ("fleet-switchboard: merge of acme/app#12 refused: missing G1: no passing CI record at this head. Way out: ask the chief of "
@@ -20460,10 +20514,10 @@ class TestGhShimGateProbe(Base):
         self.assertEqual(self.gate_calls(), [], "the directory's repo is not listed: not asked, not rewritten")
         self.assertEqual(seen["argv"], ["pr", "merge", "5"])
         done, seen = self.run_shim("pr", "merge", "5", env=dict(self.ENFORCE, FAKE_REPO="acme/app"))
-        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=1")
+        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=")
         self.assertEqual(seen["argv"][-2:], ["--match-head-commit", "a" * 40])
         done, seen = self.run_shim("pr", "merge", "5", env=dict(self.ENFORCE, GH_REPO="acme/app"))
-        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=1", "GH_REPO is honoured")
+        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=", "GH_REPO is honoured")
         self.calls_log.unlink()
         done, seen = self.run_shim("pr", "merge", "5", env=self.ENFORCE)   # the real gh cannot say which repo: never guess the fleet repo
         self.assertEqual((done.returncode, self.gate_calls()), (7, []))
@@ -20477,7 +20531,7 @@ class TestGhShimGateProbe(Base):
                      ("pr", "merge", "https://github.com/acme/app/pull/5/files")):
             with self.subTest(args=args):
                 done, seen = self.run_shim(*args, env=self.ENFORCE)
-                self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=1")
+                self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=")
                 self.assertEqual(seen["argv"], list(args) + ["--match-head-commit", head])
         for args in (("pr", "merge", "5", "-R", "acme/app", "--auto=true"), ("pr", "merge", "5", "-R", "acme/app", "-sd", "--auto")):
             with self.subTest(args=args):
@@ -20556,10 +20610,75 @@ class TestGhShimGateProbe(Base):
         self.run_shim("pr", "merge", "https://github.com/someone/app/pull/9")
         self.assertEqual(self.gate_calls(), [], "a fork's PR is another repo: not listed, not probed")
 
-    def test_the_switchboards_own_gh_calls_are_not_probed(self):
-        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
-        self.assertEqual(seen["argv"], ["pr", "merge", "12", "-R", "acme/app"])
-        self.assertEqual(self.gate_calls(), [])
+    def mutant_shim(self, func):
+        """A copy of the whole shim directory in which `func` honours the marker again (returns at once for it); SHIM points at it while the case runs."""
+        source = SHIM.read_text()
+        head = source[source.index("def %s(" % func):]
+        at = head.index(":\n", head.index(")")) + 2
+        guard = '    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":\n        return None\n'
+        if source[source.index("def %s(" % func) + at - 2 - 1:][:0] == "":
+            pass
+        # a docstring comes first: put the guard after it
+        body = head[at:]
+        stripped = body.lstrip()
+        if stripped.startswith('"""'):
+            end = body.index('"""', body.index('"""') + 3) + 3
+            at += end + 1
+        mutant = source.replace(head, head[:at] + guard + head[at:], 1)
+        ast.parse(mutant)
+        target = self.home / "mutant-shims"
+        shutil.copytree(SHIM.parent, target)
+        (target / "gh").write_text(mutant)
+        return target / "gh"
+
+    def test_mutants_that_honour_the_marker_again_fail_the_cases(self):   # #1216 S6: review probe and gate probe
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        self.write_gates({"acme/app": {"mode": "enforce"}})
+        gate = {"FLEET_SWITCHBOARD_OWN_GH": "1", "FAKE_GATE_EXIT": "10", "FAKE_GATE_JSON": json.dumps({"verdict": "refuse", "mode": "enforce", "message": self.REFUSAL})}
+        for func, run in (("review_probe", lambda: self.merge(reviews=block, env={"FLEET_SWITCHBOARD_OWN_GH": "1"})),
+                          ("gate_probe", lambda: self.run_shim("pr", "merge", "12", "-R", "acme/app", env=gate))):
+            with self.subTest(func=func):
+                real = self.run_shim_result_code(run)
+                self.assertEqual(real, 10, "the real shim refuses")
+                mutant = self.mutant_shim(func)
+                try:
+                    with mock.patch.dict(globals(), {"SHIM": mutant}), rebound("SHIM", mutant):
+                        self.assertNotEqual(self.run_shim_result_code(run), 10, "the mutant lets the merge run")
+                finally:
+                    shutil.rmtree(self.home / "mutant-shims", ignore_errors=True)
+
+    def run_shim_result_code(self, run):
+        done, seen = run()
+        return done.returncode
+
+    def test_table_bad_inputs_behave_the_same_with_the_marker_set_and_unset(self):   # #1216: the marker changes nothing for any bad input
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        self.write_gates({"acme/app": {"mode": "enforce"}})
+        table = (("no switchboard", dict(binary=False), {}),
+                 ("reviews not json", {}, {"FAKE_REVIEWS": "not json"}),
+                 ("reviews call error", {}, {"FAKE_REVIEWS_EXIT": "3"}),
+                 ("blockers call error", {}, {"FAKE_BLOCKERS_EXIT": "5"}),
+                 ("gate call error", {}, {"FAKE_GATE_EXIT": "9"}),
+                 ("gate wrong type", {}, {"FAKE_GATE_JSON": "[1]"}),
+                 ("gate not json", {}, {"FAKE_GATE_JSON": "nope", "FAKE_GATE_EXIT": "10"}),
+                 ("gate refuses", {}, {"FAKE_GATE_EXIT": "10", "FAKE_GATE_JSON": json.dumps({"verdict": "refuse", "mode": "enforce", "message": "no"})}))
+        for name, kw, env in table:
+            with self.subTest(case=name):
+                got = []
+                for extra in ({}, {"FLEET_SWITCHBOARD_OWN_GH": "1"}):
+                    done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env=dict(env, **extra), **kw)
+                    got.append((done.returncode, seen is None))
+                self.assertEqual(got[0], got[1], "the marker changes nothing")
+        for extra in ({}, {"FLEET_SWITCHBOARD_OWN_GH": "1"}):   # a blocking review is refused either way
+            done, seen = self.merge(reviews=block, env=extra)
+            self.assertEqual((done.returncode, seen), (10, None))
+
+    def test_the_marker_does_not_skip_the_gate_probe(self):   # #1216 S3: the gate probe does not honour the marker
+        self.write_gates({"acme/app": {"mode": "enforce"}})
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FLEET_SWITCHBOARD_OWN_GH": "1", "FAKE_GATE_EXIT": "10",
+            "FAKE_GATE_JSON": json.dumps({"verdict": "refuse", "mode": "enforce", "message": self.REFUSAL})})
+        self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+        self.assertEqual(len(self.gate_calls()), 1)
 
     def test_the_spool_is_private_clipped_and_bounded(self):
         self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "3"})
@@ -28156,6 +28275,37 @@ class TestIdentityCheck(ReportBase):
                 self.assertIsNone(seen)
                 self.assertIn("read only", done.stderr)
 
+    def test_s8_the_marker_set_by_a_caller_does_not_lift_the_read_repository_guard(self):   # #1216: read_scope does not honour the marker
+        marker = {"FLEET_SWITCHBOARD_OWN_GH": "1"}
+        for args in (("issue", "comment", "5", "-R", "acme-org/widget-api", "--body", "x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
+            with self.subTest(args=args):
+                done, seen = self.read_repo_run(args, extra_env=marker)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIn("refus", done.stderr)
+                self.assertIsNone(seen)
+
+    def with_mutant_shim(self, func, run):
+        """`run()` with the module's SHIM pointing at a copy of the shim directory whose `func` honours the marker again."""
+        target = Path(self.home) / ("mutant-" + func)
+        shutil.copytree(SHIM.parent, target)
+        (target / "gh").write_text(marker_mutant_source(func))
+        with mock.patch.dict(globals(), {"SHIM": target / "gh"}), rebound("SHIM", target / "gh"):
+            return run()
+
+    def test_s9_each_probe_mutant_that_honours_the_marker_again_fails_its_case_through_the_real_shim(self):   # #1216: read_scope, read_account_env, account_env
+        marker = {"FLEET_SWITCHBOARD_OWN_GH": "1"}
+        write = ("issue", "comment", "5", "-R", "acme-org/widget-api", "--body", "x")
+        read = ("issue", "view", "5", "-R", "acme-org/widget-api")
+        own_read = ("issue", "list", "-R", "acme/api")
+        users, tokens = {"acme/*": "acct-personal"}, {"acct-personal": "tok-personal"}
+        cases = {"read_scope": (lambda: self.read_repo_run(write, extra_env=marker), lambda d, seen: d.returncode == 1 and seen is None),
+                 "read_account_env": (lambda: self.read_repo_run(read, extra_env=marker), lambda d, seen: seen is not None and seen["token"] == "tok-bot"),
+                 "account_env": (lambda: self.run_gh_shim("acme/api", users, tokens, args=own_read, extra_env=marker), lambda d, seen: seen is not None and seen["token"] == "tok-personal")}
+        for func, (run, holds) in cases.items():
+            with self.subTest(func=func):
+                self.assertTrue(holds(*run()), "the real shim holds with the marker set")
+                self.assertFalse(holds(*self.with_mutant_shim(func, run)), "the mutant (marker honoured again) fails the case")
+
     def test_s3_a_repository_that_is_neither_the_workers_own_nor_the_declared_one_is_refused_for_reads_and_writes(self):
         for args in (("issue", "view", "5", "-R", "acme-org/other"), ("pr", "view", "https://github.com/acme-org/other/pull/1"), ("api", "repos/acme-org/other/issues"),
                      ("repo", "view", "acme-org/other"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x"),
@@ -28656,21 +28806,19 @@ class TestIdentityCheck(ReportBase):
         }
         for label, env in env_of.items():
             with self.subTest(label):
-                self.assertEqual((env["GH_TOKEN"], env[sb.OWN_GH_ENV]), ("tok-ops", "1"))
-                # the daemon's own env, with a foreign identity somewhere the shim could find it: the account stays
-                self.assertEqual(self.shim_token(dict(env, **self.FOREIGN)), "tok-ops")
-        # without the marker the same call WOULD be re-identified (the regression): the shim swaps in the caller's account
-        unmarked = {k: v for k, v in env_of["a sweep or triage read (gh_api via child_env)"].items() if k != sb.OWN_GH_ENV}
-        self.assertEqual(self.shim_token(unmarked), "tok-personal")
+                self.assertEqual(env["GH_TOKEN"], "tok-ops")
+                self.assertNotIn(sb.OWN_GH_ENV, env)   # #1216 S9: no marker; the call reaches the real gh by path, not the shim
+        # the marker buys nothing at the shim: a caller that sets it is re-identified like any other
+        marked = dict(env_of["a sweep or triage read (gh_api via child_env)"], **{sb.OWN_GH_ENV: "1"})
+        self.assertEqual(self.shim_token(marked), "tok-personal")
 
     def test_a_default_account_call_of_the_daemon_is_not_re_identified_either(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop(sb.OWN_GH_ENV, None)
+            os.environ[sb.OWN_GH_ENV] = "1"
             sb.main(["version"])
-            self.assertEqual(os.environ.get(sb.OWN_GH_ENV), "1")             # every switchboard process is marked
-            inherited = {sb.OWN_GH_ENV: os.environ[sb.OWN_GH_ENV], "GH_TOKEN": "default-token"}
+            self.assertNotIn(sb.OWN_GH_ENV, os.environ)             # #1216: no switchboard process is marked; an inherited marker is dropped
         self.assertIsNone(self.accounts().env_for("elsewhere/repo"))          # no mapping: env None, the child inherits
-        self.assertEqual(self.shim_token(dict(inherited, **self.FOREIGN)), "default-token")
 
     def test_a_real_agents_own_gh_call_is_still_re_identified(self):
         # no marker in an agent's shell (a launch does not copy this process's environment): the #139 behaviour stays
@@ -33223,6 +33371,7 @@ class TestRecordingCommands(LedgerBase):
         "gates": "reads; its `ci-record` form is the daemon's recorder", "gates_ci_record": "the built-in `ci` recorder",
         "item_prove": "a work item, not a pull request", "item_verdict": "a work item, not a pull request", "item_ci_record": "a work item, not a pull request",
         "waive": "a waiver, not a proof or a verdict", "launch": "registers a tester; not a record of a judgement",
+        "merge_gate": "records the claim line as a side effect of gating; its own output is the gate result",
     }
 
     def setUp(self):
@@ -54038,7 +54187,7 @@ class TestPrNotices(DecisionsBase):
         self.notices()
         self.assertEqual(len(self.gh.calls), 2)
         argv = self.gh.calls[0][0]
-        self.assertEqual(argv, ["gh", "pr", "view", "7", "--repo", "acme/api", "--json", sb.PR_VIEW_FIELDS])
+        self.assertEqual(argv, [sb.own_gh_path("gh"), "pr", "view", "7", "--repo", "acme/api", "--json", sb.PR_VIEW_FIELDS])
         for _ in range(5):  # passes every few seconds
             self.world.tick(5)
             self.notices()
@@ -79117,7 +79266,9 @@ class TestPullFileListRead(LedgerBase):
 PARENT_RULE = ("A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, "
                "and a Done-when the work item carries itself must still match exactly.")
 CLAIM_RULE = ("A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, "
-              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).")
+              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). "
+              "So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).")
+CLAIM_SENTENCE = "So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes)."
 WORK_ITEM_PLAN = LEDGER_PLAN.split("```yaml", 1)[0].split("## Intent", 1)[0] + "```yaml" + LEDGER_PLAN.split("```yaml", 1)[1]
 
 
@@ -79365,10 +79516,10 @@ class TestPrClaimLine(LedgerBase):
             {"number": 9, "state": "open", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S3"},                    # this PR itself
         ]
         route = self.route
-        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps(others), "") if "/pulls?state=all" in " ".join(argv) else route(argv, **kw))
+        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps({"total_count": len(others), "items": [dict(o, pull_request={"merged_at": o["merged_at"]}) for o in others]}), "") if "search/issues" in " ".join(argv) else route(argv, **kw))
         code, report, err = self.gates()
         self.assertEqual(sorted(report["unclaimed"]), ["S3", "U1"])
-        self.assertIn("claimed by no other open or merged pull request of this plan yet: S3, U1", self.row(report, "G1")["detail"])
+        self.assertIn("claimed by no other pull request (open or merged, same plan) yet: S3, U1", self.row(report, "G1")["detail"])
         others[0]["body"] = "PLAN: acme/app#7\nCLAIMS: S3 U1"            # another PR now claims the rest: nothing is unclaimed
         self.assertEqual(self.gates()[1]["unclaimed"], [])
 
@@ -79377,8 +79528,383 @@ class TestPrClaimLine(LedgerBase):
         the item commands have no pull request body and read `slice:` instead."""
         text = (BIN / "fleet-switchboard").read_text()
         self.assertEqual(text.count("plan_ledger.pr_scenarios("), 5)   # prove/verdict S, verdict --all, the ci recorder, and the two reads of the union note
-        self.assertEqual((BIN / "plan_ledger.py").read_text().count("pr_scenarios("), 2)   # its definition and the G1 call
+        self.assertEqual((BIN / "plan_ledger.py").read_text().count("pr_scenarios("), 3)   # its definition, the G1 call and the claim union
 
+
+
+class TestClaimUnionAtLastMerge(LedgerBase):
+    """#976: the last merge of an ask is refused while the merged claims leave a per-PR scenario of the plan uncovered. Neutral plan: LEDGER_PLAN (per PR: S1, S2, S3, U1)."""
+
+    THREE = [{"id": "S1", "proof": "test", "evaluator": "ci"}, {"id": "S2", "proof": "test", "evaluator": "ci"}, {"id": "S3", "proof": "test", "evaluator": "ci"}]
+
+    def setUp(self):
+        super().setUp()
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.peers = []
+
+    def waive(self, who="cos", gates="CU"):
+        return self.run_as(who, "waive", self.PR, "--gates", gates, "--reason", "the owner decided to ship without the third pull request")
+
+    def body(self, claims):
+        self.pr["body"] = "PLAN: acme/app#7\n%scanon: updated the docs" % ("CLAIMS: %s\n" % claims if claims is not None else "")
+
+    def record(self, number, claim):
+        """The claim line the merge gate wrote for sibling #number when it was merged (the union reads this, never the merged body)."""
+        sb.plan_ledger.append_checked(self.world.state, self.world.clock.now(), lambda have, seq: {"kind": "claim", "pr": "acme/app#%d" % number, "head": "a" * 40, "claim_text": claim})
+
+    def merged_iso(self, after=1000):
+        return _dt.datetime.fromtimestamp(int(self.world.clock.now()) + after, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def refusal(self, peers=None, record=True, pages=None, edit=None, failing=False, base=100, merged_after=1000, seen=None):
+        listed = [dict(number=base + n, state=state, merged_at=self.merged_iso(merged_after) if state == "merged" else None, body="PLAN: acme/app#7\n" + (("CLAIMS: %s" % c) if c else ""))
+                  for n, (state, c) in enumerate(self.peers if peers is None else peers)]
+        for one in listed:
+            if record and one["state"] == "merged":
+                self.record(one["number"], (one["body"].split("CLAIMS: ")[1] if "CLAIMS: " in one["body"] else None))
+            one["state"] = "closed" if one["state"] == "merged" else one["state"]
+            if edit and one["number"] in edit:
+                one["body"] = "PLAN: acme/app#7\nCLAIMS: %s" % edit[one["number"]]   # the merged body edited AFTER the merge
+        listed = listed + (pages or [])
+        route = self.route
+        def pulls(argv):
+            if seen is not None:
+                seen.append(" ".join(argv))
+            if failing:
+                return subprocess.CompletedProcess(argv, 1, "", "boom")
+            page = int(re.search(r"&page=(\d+)", " ".join(argv)).group(1))
+            items = [dict(one, pull_request={"merged_at": one.get("merged_at")}) for one in listed[(page - 1) * 100:page * 100]]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"total_count": len(listed), "items": items}), "")
+        route2 = lambda argv, **kw: (pulls(argv) if "search/issues" in " ".join(argv) else route(argv, **kw))
+        args = types.SimpleNamespace(pr=self.PR)
+        saved, self.route = self.route, route2
+        try:
+            return sb.claim_union_refusal(args, route2, self.world.clock.now)
+        finally:
+            self.route = saved
+
+    def test_the_plan_link_search_sends_the_quoted_link_with_the_hash_percent_encoded(self):
+        self.body("S1")
+        seen = []
+        self.refusal([("open", "S2 U1 S3")], seen=seen)
+        url = [u for u in seen if "search/issues" in u][0]
+        query = re.search(r"search/issues\?q=([^&\s]*)", url).group(1)
+        self.assertEqual(query, 'repo%3Aacme%2Fapp+is%3Apr+%22acme%2Fapp%237%22+in%3Abody')   # `"acme/app#7"` quoted; the `#` is %23, never a raw fragment
+        self.assertNotIn("#", query)
+        self.assertEqual(urllib.parse.unquote_plus(query), 'repo:acme/app is:pr "acme/app#7" in:body')
+
+    def test_s2_two_prs_claiming_s1_and_s2_of_three_leave_s3_and_the_union_is_pure(self):
+        applies, uncovered, last = sb.plan_ledger.claim_union(self.THREE, "PLAN: x#1\nCLAIMS: S2", [("merged", "PLAN: x#1\nCLAIMS: S1")])
+        self.assertEqual((applies, uncovered, last), (True, ["S3"], True))
+
+    def test_s3_the_last_merge_is_refused_naming_the_uncovered_scenario_and_a_third_claiming_it_allows(self):
+        self.body("S1")
+        why = self.refusal([("merged", "S2 U1")])
+        self.assertIsNotNone(why)
+        self.assertIn("S3", why)
+        self.assertNotIn("S2", why.split("do not cover")[1].split(";")[0])
+        self.assertIsNone(self.refusal([("merged", "S2 U1"), ("merged", "S3")]))       # a third claims S3: allowed
+
+    def test_a_merge_that_is_not_the_asks_last_is_not_refused(self):
+        self.body("S1")
+        self.assertIsNone(self.refusal([("merged", "S2 U1"), ("open", "S3")]))
+
+    def test_s4_a_logged_cu_waiver_passes_the_last_merge(self):
+        self.body("S1")
+        self.assertIsNotNone(self.refusal([("merged", "S2 U1")]))
+        self.assertEqual(self.waive("cos", "CU")[0], 0)
+        self.assertIsNone(self.refusal([("merged", "S2 U1")]))
+
+    def test_s4_a_plan_with_no_claim_lines_is_unchanged(self):
+        self.body(None)
+        self.assertIsNone(self.refusal([("merged", None), ("open", None)]))
+        self.assertIsNone(self.refusal([]))
+        self.assertEqual(sb.plan_ledger.claim_union(self.THREE, "PLAN: x#1", []), (False, [], True))
+
+    def test_u1_a_plan_without_claim_lines_and_a_non_last_merge_give_no_refusal(self):
+        self.body(None)
+        self.assertIsNone(self.refusal([("open", None)]))
+        self.body("S1")
+        self.assertIsNone(self.refusal([("open", "S2 S3 U1")]))
+
+    def test_m1_a_merged_siblings_body_edited_after_the_merge_does_not_cover_the_scenario(self):
+        self.body("S1")
+        why = self.refusal([("merged", "S2 U1")], edit={100: "S2 U1 S3"})
+        self.assertIsNotNone(why)
+        self.assertIn("S3", why)
+        self.assertIsNone(self.refusal([("merged", "S2 U1 S3")], base=200))     # a claim that was recorded (first line of its own) does cover it
+
+    def test_m1_a_merged_sibling_with_no_recorded_claim_is_refused_as_unknown(self):
+        self.body("S1")
+        why = self.refusal([("merged", "S2 U1 S3")], record=False)
+        self.assertIn("could not be read", why)
+        self.assertIn("no recorded claim", why)
+
+    def test_m1_a_mutant_that_reads_the_current_body_of_a_merged_sibling_fails_the_edit_test(self):
+        def clause():
+            self.test_m1_a_merged_siblings_body_edited_after_the_merge_does_not_cover_the_scenario()
+        clause()
+        real = sb.plan_ledger.recorded_claim
+        def mutant(entries, pr):
+            return True, "S2 U1 S3"      # the edited current body
+        with mock.patch.object(sb.plan_ledger, "recorded_claim", mutant):
+            with self.assertRaises(AssertionError):
+                clause()
+
+    def test_m1_the_claim_is_recorded_once_by_the_merge_gate(self):
+        self.body("S1")
+        self.refusal([])
+        self.refusal([])
+        self.assertEqual([e["claim_text"] for e in self.ledger() if e["kind"] == "claim" and e["pr"] == self.PR], ["S1"])
+
+    def test_m2_gates_says_when_a_sibling_was_closed_without_a_merge(self):
+        self.body("S1 S2")
+        others = [{"number": 12, "state": "closed", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S3"}]
+        route = self.route
+        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps({"total_count": len(others), "items": [dict(o, pull_request={"merged_at": o["merged_at"]}) for o in others]}), "") if "search/issues" in " ".join(argv) else route(argv, **kw))
+        report = self.gates()[1]
+        self.assertIn("the ask's scenarios left unclaimed: S3: its claimant #12 was closed without a merge", self.row(report, "G1")["detail"])
+        others[0]["state"] = "open"
+        self.assertNotIn("closed without a merge", self.row(self.gates()[1], "G1")["detail"])
+
+    def test_m2_the_last_merge_is_refused_when_the_only_claimant_of_s3_was_closed_without_a_merge(self):
+        self.body("S1 S2")
+        why = self.refusal([("closed", "S3")])
+        self.assertIsNotNone(why)
+        self.assertIn("S3", why.split("do not cover")[1].split(";")[0])      # the closed sibling covers nothing
+
+    def test_m2_a_mutant_that_counts_a_closed_unmerged_sibling_as_merged_when_closed_is_none_fails_the_refusal_path(self):
+        real = sb.plan_peers
+        applied = []
+        def mutant(ctx, runner, now, closed=None):
+            if closed is not None:
+                return real(ctx, runner, now, closed)
+            seen = []
+            peers = real(ctx, runner, now, seen)
+            applied.append(len(seen))
+            return peers + [("merged", body) for _, body in seen]      # the closed-unmerged claimant covers its scenarios
+        with mock.patch.object(sb, "plan_peers", mutant):
+            with self.assertRaises(AssertionError):
+                self.test_m2_the_last_merge_is_refused_when_the_only_claimant_of_s3_was_closed_without_a_merge()
+        self.assertEqual(applied, [1])      # the mutation was applied
+
+    def test_m2_a_mutant_that_never_says_it_fails(self):
+        real = sb.claim_union_note
+        self.test_m2_gates_says_when_a_sibling_was_closed_without_a_merge()
+        def mutant(report, ctx, runner, now):
+            real(report, ctx, runner, now)
+            for row in report["gates"]:
+                row["detail"] = (row.get("detail") or "").replace("closed without a merge", "")
+        with mock.patch.object(sb, "claim_union_note", mutant):
+            with self.assertRaises(AssertionError):
+                self.test_m2_gates_says_when_a_sibling_was_closed_without_a_merge()
+
+    def test_m3_plan_peers_reads_every_page_up_to_the_bound_and_refuses_beyond_it(self):
+        self.body("S1 S2 S3 U1")
+        filler = [dict(number=1000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * 2)]
+        self.assertIsNone(self.refusal([("open", "S1")], pages=filler))      # 201 pull requests: all pages read
+        # the peer on page 2 is read: it is open, so this is not the ask's last merge
+        first = [dict(number=1000 + n, state="open", merged_at=None, body="no plan") for n in range(100)]
+        self.body("S1")
+        self.assertIsNone(self.refusal([], pages=first[:99] + [dict(number=2000, state="open", merged_at=None, body="PLAN: acme/app#7\nCLAIMS: S2")]))
+        many = [dict(number=3000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * sb.PEER_PAGES)]
+        why = self.refusal([], pages=many)
+        self.assertIn("too many pull requests to judge", why)
+
+    def test_m3_a_mutant_that_reads_the_first_page_only_fails(self):
+        def clause():
+            self.body("S1")
+            self.assertIsNone(self.refusal([], pages=[dict(number=2000 + n, state="open", merged_at=None, body="no plan") for n in range(99)]
+                                           + [dict(number=2999, state="open", merged_at=None, body="PLAN: acme/app#7\nCLAIMS: S2")]))
+            self.assertIn("too many pull requests to judge", self.refusal([], pages=[dict(number=4000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * sb.PEER_PAGES)]))
+        clause()
+        real = sb.PEER_PAGES
+        with mock.patch.object(sb, "PEER_PAGES", 1):
+            with self.assertRaises(AssertionError):
+                clause()
+
+    def unjudged(self, how, claims):
+        """claim_union_refusal when the context cannot be read (how=raise) or its plan is not `pass` (how=fail)."""
+        self.body(claims)
+        real = sb._ledger_context
+        def ctx(*a, **k):
+            if how == "raise":
+                raise RuntimeError("boom")
+            got = real(*a, **k)
+            got.plan = dict(got.plan, result="fail")
+            return got
+        with mock.patch.object(sb, "_ledger_context", ctx):
+            return sb.claim_union_refusal(types.SimpleNamespace(pr=self.PR), self.route, self.world.clock.now)
+
+    def test_m2_an_unreadable_or_not_pass_plan_refuses_a_claiming_pull_request_and_passes_one_without(self):
+        for how, why in (("raise", "the plan could not be read"), ("fail", "the plan check is not pass")):
+            got = self.unjudged(how, "S1")
+            self.assertIn("claim union could not be judged: " + why, got or "", how)
+            self.assertIsNone(self.unjudged(how, None), how)
+
+    def test_m2_a_mutant_that_passes_a_claiming_pull_request_on_those_paths_fails(self):
+        with mock.patch.object(sb, "_unjudged", lambda *a, **k: None):
+            with self.assertRaises(AssertionError):
+                self.test_m2_an_unreadable_or_not_pass_plan_refuses_a_claiming_pull_request_and_passes_one_without()
+
+    def test_m4_a_list_error_refuses_a_pull_request_with_a_claim_line_and_passes_one_without(self):
+        self.body("S1")
+        why = self.refusal([], failing=True)
+        self.assertIn("claim union could not be read", why)
+        self.body(None)
+        self.assertIsNone(self.refusal([], failing=True))   # no claim line: it claims every per-PR scenario, so the union is covered (docs/switchboard.md)
+
+    def waived_paths(self):
+        """(name, callable returning the refusal) for each path that refuses a claiming last PR before the union is judged."""
+        many = [dict(number=4000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * sb.PEER_PAGES)]
+        return [("unknown sibling", lambda: self.refusal([("merged", "S2 U1 S3")], record=False), "no recorded claim"),
+                ("list error", lambda: self.refusal([], failing=True), "could not be read"),
+                ("too many pull requests", lambda: self.refusal([], pages=many), "too many pull requests to judge"),
+                ("record failure", lambda: self.record_failing(), "could not be recorded")]
+
+    def record_failing(self):
+        with mock.patch.object(sb, "record_claim", mock.Mock(side_effect=OSError("disk full"))):
+            return self.refusal([])
+
+    def waiver_clause(self):
+        for name, call, text in self.waived_paths():
+            self.body("S1")
+            why = call()
+            self.assertIn(text, why or "", name)
+            self.assertIn("waive %s --gates CU" % self.PR, why, name)       # the refusal names the waiver
+        self.assertEqual(self.waive("cos", "CU")[0], 0)
+        for name, call, text in self.waived_paths():
+            self.body("S1")
+            self.assertIsNone(call(), name)                                  # a head-bound waiver lets it through
+        audit = (self.world.state / "audit.jsonl").read_text() if (self.world.state / "audit.jsonl").exists() else ""
+        for what in ("unknown sibling", "list error", "too many pull requests", "the claim could not be recorded"):
+            self.assertIn(what, audit)
+
+    def test_h1_every_refusal_of_a_claiming_pull_request_names_the_waiver_and_a_head_bound_waiver_passes_it(self):
+        self.waiver_clause()
+
+    def test_h1_a_waiver_for_another_head_passes_none_of_them(self):
+        self.waive("cos", "CU")
+        self.pr["headRefOid"] = "f" * 40
+        for name, call, text in self.waived_paths():
+            self.body("S1")
+            self.assertIn(text, call() or "", name)
+
+    def test_h1_a_mutant_that_consults_the_waiver_after_the_refusal_fails(self):
+        self.waiver_clause()
+        with mock.patch.object(sb, "_cu_waived", lambda *a, **k: False):
+            with self.assertRaises(AssertionError):
+                self.waiver_clause()
+
+    def test_h2_rerunning_the_gate_on_a_merged_pull_request_after_a_body_edit_moves_nothing(self):
+        self.body("S1")
+        self.refusal([])                                   # recorded while open
+        self.body("S1 S2 S3 U1")
+        self.pr["state"] = "MERGED"
+        self.refusal([])
+        self.assertEqual([e["claim_text"] for e in self.ledger() if e["kind"] == "claim" and e["pr"] == self.PR], ["S1"])
+
+    def test_h2_a_closed_or_merged_pull_request_with_no_claim_line_is_not_recorded(self):
+        for state in ("CLOSED", "MERGED"):
+            self.body("S1")
+            self.pr["state"] = state
+            why = self.refusal([])
+            self.assertIn("not open", why or "", state)
+            self.assertEqual([e for e in self.ledger() if e["kind"] == "claim" and e["pr"] == self.PR], [], state)
+
+    def record_at(self, number, claim, offset):
+        """A claim line for sibling #number stamped `offset` seconds from now (the sibling's merge is 1000 seconds from now)."""
+        sb.plan_ledger.append_checked(self.world.state, self.world.clock.now() + offset, lambda have, seq: {"kind": "claim", "pr": "acme/app#%d" % number, "head": "a" * 40, "claim_text": claim})
+
+    def test_h2_a_merged_sibling_reads_the_claim_in_force_at_its_merge_not_a_later_line(self):
+        entries = [{"kind": "claim", "pr": "a#1", "claim_text": "S1", "ts": 10}, {"kind": "claim", "pr": "a#1", "claim_text": "S1 S2", "ts": 20}]
+        self.assertEqual(sb.plan_ledger.recorded_claim(entries, "a#1", at=15), (True, "S1"))
+        self.assertEqual(sb.plan_ledger.recorded_claim(entries, "a#1", at=20), (True, "S1 S2"))
+        self.assertEqual(sb.plan_ledger.recorded_claim(entries, "a#1", at=5), (False, None))
+        self.assertEqual(sb.plan_ledger.recorded_claim(entries[:1] + [{"kind": "claim", "pr": "a#1", "claim_text": "S1"}], "a#1", at=15), (False, None))   # no usable timestamp
+        self.body("S1")
+        self.record_at(100, "S2 U1 S3", 500)               # in force at the merge
+        self.record_at(100, "S2 U1", 2000)                 # a later NARROWER line, after the merge: the union does not narrow
+        self.assertIsNone(self.refusal([("merged", "S2 U1")], record=False))
+
+    def test_h2_a_broad_line_recorded_while_open_then_narrowed_before_the_merge_refuses(self):
+        self.body("S2 U1")
+        self.record_at(100, None, 100)                     # recorded by an early gate run: no claim line, it claims every scenario
+        self.record_at(100, "S1", 200)                     # narrowed, then merged: its own proof gate counted only S1
+        why = self.refusal([("merged", "S1")], record=False)
+        self.assertIn("S3", why or "")
+
+    def test_h2_a_later_broader_line_after_the_merge_does_not_move_the_union(self):
+        self.body("S2 U1")
+        self.record_at(100, "S1", 500)
+        self.record_at(100, "S1 S2 S3 U1", 2000)           # a broader edit recorded after the merge
+        self.assertIn("S3", self.refusal([("merged", "S1")], record=False) or "")
+
+    def test_h2_a_merged_sibling_with_no_usable_timestamp_or_merge_time_is_refused_as_unknown(self):
+        self.body("S1")
+        self.record_at(100, "S2 U1 S3", 500)
+        self.assertIsNone(self.refusal([("merged", "S2 U1")], record=False))
+        self.assertIn("no recorded claim", self.refusal([("merged", "S2 U1")], record=False, merged_after=-100) or "")   # every line is after the merge
+
+    def test_h2_a_mutant_where_the_first_or_the_newest_line_wins_fails(self):
+        real = sb.plan_ledger.recorded_claim
+        def clause():
+            self.test_h2_a_merged_sibling_reads_the_claim_in_force_at_its_merge_not_a_later_line()
+            self.test_h2_a_broad_line_recorded_while_open_then_narrowed_before_the_merge_refuses()
+            self.test_h2_a_later_broader_line_after_the_merge_does_not_move_the_union()
+        clause()
+        first = lambda e, p, first=False, at=None: real(e, p, first=True)
+        newest = lambda e, p, first=False, at=None: real(e, p)
+        for name, mutant in (("first line wins", first), ("newest line wins regardless of merged_at", newest)):
+            with mock.patch.object(sb.plan_ledger, "recorded_claim", mutant):
+                with self.assertRaises(AssertionError, msg=name):
+                    clause()
+
+    def test_h2_a_mutant_that_records_a_merged_pull_request_fails(self):
+        self.test_h2_a_closed_or_merged_pull_request_with_no_claim_line_is_not_recorded()
+        real = sb.record_claim
+        def mutant(ctx, now):
+            ctx.facts = dict(ctx.facts, state="open")
+            return real(ctx, now)
+        with mock.patch.object(sb, "record_claim", mutant):
+            with self.assertRaises(AssertionError):
+                self.test_h2_a_closed_or_merged_pull_request_with_no_claim_line_is_not_recorded()
+
+    def test_mb_an_unjudged_claiming_pull_request_is_refused_naming_the_waiver_and_a_waiver_passes_it(self):
+        for how in ("raise", "fail"):
+            self.assertIn("waive %s --gates CU" % self.PR, self.unjudged(how, "S1") or "", how)
+        self.assertEqual(self.waive("cos", "CU")[0], 0)
+        for how in ("raise", "fail"):
+            self.assertIsNone(self.unjudged(how, "S1"), how)
+            self.assertIsNone(self.unjudged(how, None), how)
+
+    def test_l2_a_huge_claims_line_is_stored_clipped_and_a_mutant_that_stores_it_whole_fails(self):
+        def clause():
+            line = sb.load_plan_ledger().claim_line(self.PR, "a" * 40, "PLAN: acme/app#7\nCLAIMS: " + "S1 " * 100000)
+            self.assertLessEqual(len(line["claim_text"]), 1000)
+            self.assertEqual(sb.plan_ledger.claim_line(self.PR, "a" * 40, "PLAN: acme/app#7\nCLAIMS: S1 S2")["claim_text"], "S1 S2")
+        clause()
+        with mock.patch.object(sb.load_plan_ledger(), "CLAIM_TEXT_LIMIT", 10 ** 9):
+            with self.assertRaises(AssertionError):
+                clause()
+
+    def test_s5_a_mutant_that_ignores_the_union_fails_the_clause_tests(self):
+        ledger = sb.load_plan_ledger()
+        real = ledger.claim_union
+        def clause():
+            self.test_s3_the_last_merge_is_refused_naming_the_uncovered_scenario_and_a_third_claiming_it_allows()
+            self.test_s2_two_prs_claiming_s1_and_s2_of_three_leave_s3_and_the_union_is_pure()
+        clause()
+        mutant = lambda scenarios, this_body, others: (True, [], True)
+        with mock.patch.object(ledger, "claim_union", mutant):
+            with self.assertRaises(AssertionError):
+                clause()
+        self.assertIs(ledger.claim_union, real)
+
+    def test_s6_the_planning_skill_and_the_plan_template_say_every_scenario_must_be_claimed(self):
+        sentence = "every per-pull-request scenario must be claimed by some pull request"
+        docs = [REPO / "skills" / "fleet-planning" / "SKILL.md", REPO / "docs" / "plan-template.md"]
+        self.assertEqual(sum(sentence in " ".join(d.read_text().split()) for d in docs), 2)
 
 class TestPlanRulesWordedAlike(unittest.TestCase):
     """#943: the template and the planning skill carry both rules in the same words; the finding states its two recorded cases with neutral numbers."""
@@ -79391,6 +79917,20 @@ class TestPlanRulesWordedAlike(unittest.TestCase):
             text = self.squash(path)
             for rule in (PARENT_RULE, CLAIM_RULE):
                 self.assertEqual(text.count(rule), 1, (path.name, rule[:40]))
+
+    def sentence_clause(self, sentence):
+        """The whole sentence, word for word, is in the template, the skill and the code's rule."""
+        self.assertTrue(CLAIM_RULE.endswith(sentence))
+        for path in (REPO / "docs" / "plan-template.md", REPO / "skills" / "fleet-planning" / "SKILL.md"):
+            self.assertEqual(self.squash(path).count(sentence), 1, path.name)
+
+    def test_the_every_scenario_sentence_is_identical_in_the_template_the_skill_and_the_rule(self):
+        self.sentence_clause(CLAIM_SENTENCE)
+
+    def test_a_mutant_that_changes_one_word_of_the_sentence_fails(self):
+        self.sentence_clause(CLAIM_SENTENCE)
+        with self.assertRaises(AssertionError):
+            self.sentence_clause(CLAIM_SENTENCE.replace("must be claimed", "has to be claimed"))
 
     def test_the_rules_in_the_code_match_the_words(self):
         self.assertIn("CLAIMS:", PARENT_RULE + CLAIM_RULE)
@@ -79409,6 +79949,7 @@ class TestPlanRulesWordedAlike(unittest.TestCase):
         block = source[source.index("class TestParentAskDoneWhen"):source.index("class TestPlanRulesWordedAlike")]
         for repo in set(re.findall(r"\b[a-z][\w.-]*/[a-z][\w.-]*#\d+", block)):
             self.assertTrue(repo.startswith("acme/"), repo)
+
 
 NO_CAP_WORDS = re.compile(r"(cap|quota|ceiling|allowance)", re.I)
 AGENT_WORDS = re.compile(r"(agent|lane|caller|worker|spender)", re.I)
@@ -79585,7 +80126,7 @@ class TestShimTopSpender(Base):
     # Every environment name the shim reads, with a hostile value for it. DERIVED from the shim's own code (see `shim_environment_names`): a name the shim starts to read
     # and this table does not list fails the test below, so a new switch cannot appear unseen. SWITCH_OFF lists the names that can still make the caller wait less.
     HOSTILE = {"FLEET_REAL_GH": "/nonexistent/gh", "FLEET_SHIM_CACHE": "off", "FLEET_SHIM_GATE_SECONDS": "0.001", "FLEET_SHIM_LOOKUP_SECONDS": "0.001",
-               "FLEET_SHIM_MERGE_GATE_SECONDS": "0.001", "FLEET_SWITCHBOARD_BIN": "OTHER", "FLEET_SWITCHBOARD_OWN_GH": "1", "FLEET_SWITCHBOARD_STATE": "EMPTY", "GH_HOST": "ghe.example", "GH_REPO": "other/repo",
+               "FLEET_SHIM_MERGE_GATE_SECONDS": "0.001", "FLEET_SWITCHBOARD_BIN": "OTHER", "FLEET_SWITCHBOARD_STATE": "EMPTY", "GH_HOST": "ghe.example", "GH_REPO": "other/repo",
                "PATH": "SAME", "XDG_CONFIG_HOME": "EMPTY", "XDG_STATE_HOME": "EMPTY", "HOME": "EMPTY"}
     SWITCH_OFF = frozenset()   # none: the block reads no variable; who the caller is comes from the switchboard's answer for its session (see the shim's comment)
 
@@ -80641,11 +81182,13 @@ class TestGhShimMergeGate(Base):
             self.assertEqual(done.returncode, 0, args)
             self.assertNotIn("review rule unreadable", done.stderr)
 
-    def test_the_own_gh_marker_skips_the_review_check_entirely_a_known_limit(self):
-        """KNOWN limit (pre-existing, not changed here): FLEET_SWITCHBOARD_OWN_GH=1 skips review_probe, so even a bad rule does not refuse."""
+    def test_the_own_gh_marker_does_not_skip_the_review_check(self):
+        """#1216: FLEET_SWITCHBOARD_OWN_GH=1 means nothing to the shim: review_probe still runs, so a bad rule still refuses."""
         self.bad_rule_shim(None)
         done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FLEET_SWITCHBOARD_OWN_GH="1"))
-        self.assertNotIn("review rule unreadable", done.stderr)
+        self.assertEqual(done.returncode, 10)
+        self.assertIsNone(seen)
+        self.assertIn("review rule unreadable", done.stderr)
 
     def test_every_sibling_module_the_shim_loads_ships_beside_it(self):
         shipped = {p.name for p in SHIM.parent.iterdir() if p.suffix == ".py" or p.name in ("gh", "git")}
@@ -80695,9 +81238,9 @@ class TestGhShimMergeGate(Base):
                 environ = {"PATH": "%s:%s:%s" % (self.home / "shimbin", self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
                            "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_REAL_GH": str(fake), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS,
                            "FLEET_SHIM_GATE_SECONDS": SHIM_LOOKUP_SECONDS}
-                if inner.own_marker or own:
-                    environ["FLEET_SWITCHBOARD_OWN_GH"] = "1"
-                done = subprocess.run([str(shim_gh)] + argv, capture_output=True, text=True, env=environ, timeout=60)
+                # #1216: no marker. An own call (own=True) runs the real gh by its path, so the shim never sees it; the merge call (own=False) goes through the shim
+                binary = str(fake) if own else str(shim_gh)
+                done = subprocess.run([binary] + argv, capture_output=True, text=True, env=environ, timeout=60)
                 inner.merges.append(list(argv))
                 return done.returncode, done.stdout, done.stderr
 
@@ -80727,13 +81270,13 @@ class TestGhShimMergeGate(Base):
         self.assertEqual((done.returncode, seen), (10, None))
         self.assertEqual(len(done.stderr.strip().splitlines()), 1)
         self.assertIn("no gate pass recorded", done.stderr)
-        self.assertEqual(self.merge_calls(), ["merge-gate acme/app#12 --check --json own=1"])
+        self.assertEqual(self.merge_calls(), ["merge-gate acme/app#12 --check --json own="])
 
     def test_an_allowed_merge_is_bound_to_the_checked_head_and_releases_the_lock_when_it_returns(self):
         done, seen = self.run_shim(*self.MERGE, env=self.allowed())
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(seen["argv"], list(self.MERGE) + ["--match-head-commit", self.HEAD])
-        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=1")
+        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=")
 
     def test_an_allowed_merge_without_the_lock_releases_nothing(self):
         done, seen = self.run_shim(*self.MERGE, env=self.allowed(locked=False))
@@ -80744,7 +81287,7 @@ class TestGhShimMergeGate(Base):
         (self.bin / "gh").write_text((self.bin / "gh").read_text().replace("sys.exit(0)\n", "sys.exit(0)\n", 1).rsplit("sys.exit(0)", 1)[0] + "sys.exit(9)\n")
         done, seen = self.run_shim(*self.MERGE, env=self.allowed())
         self.assertEqual(done.returncode, 9)
-        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=1")
+        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=")
 
     def test_the_gate_fails_closed_without_a_switchboard_on_an_error_and_on_a_late_answer(self):
         done, seen = self.run_shim(*self.MERGE, binary=False)
@@ -80969,22 +81512,22 @@ class TestGhShimMergeGate(Base):
         self.assertGreater(len(names), 5)
         shim = self.shim_module()
         with mock.patch.dict(os.environ, {n: "x" for n in names}):
-            seen = shim.sb_env(own=True)
+            seen = shim.sb_env()
         kept = sorted(n for n in names if n in seen)
-        self.assertEqual(kept, sorted(set(shim.ENV_ALLOW + ("FLEET_SWITCHBOARD_OWN_GH",)) & set(names)), "only the identity names and the own-call marker survive")
+        self.assertEqual(kept, sorted(set(shim.ENV_ALLOW) & set(names)), "only the identity names survive (never the own-call marker, #1216)")
 
     FAMILIES = {"PYTHONPATH": "/tmp/evil-py", "PYTHONHOME": "/tmp/evil-home", "PYTHONUSERBASE": "/tmp/evil-user", "PYTHONSTARTUP": "/tmp/evil-start", "LD_PRELOAD": "/tmp/evil.so",
                 "LD_LIBRARY_PATH": "/tmp/evil-lib", "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib", "DYLD_LIBRARY_PATH": "/tmp/evil-dy", "XDG_STATE_HOME": "/tmp/evil-state",
                 "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "FLEET_SWITCHBOARD_BIN": "/tmp/evil-bin", "MADE_UP_VARIABLE": "1", "PATH": "/tmp/evil-path", "GH_TOKEN": "x"}
     DENY_LIST = '    env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "FLEET_SWITCHBOARD_"))}'
     ALLOW_LIST = '    env = {"PATH": ENV_PATH}\n    for name in ENV_ALLOW:\n        if name in os.environ:\n            env[name] = os.environ[name]'
-    TAIL = '    if own:\n        env["FLEET_SWITCHBOARD_OWN_GH"] = "1"\n    return env'
+    TAIL = '    return env'
 
     def family_problems(self):
         """Which hostile families reach a switchboard through `sb_env`: the names, or the PATH when it is the caller's."""
         shim = self.shim_module()
         with mock.patch.dict(os.environ, self.FAMILIES):
-            env = shim.sb_env(own=True)
+            env = shim.sb_env()
         reached = sorted(n for n in self.FAMILIES if n != "PATH" and n in env)
         return reached + (["PATH"] if env.get("PATH") == self.FAMILIES["PATH"] else [])
 
@@ -81192,7 +81735,7 @@ class TestGhShimMergeGate(Base):
     def test_an_allowed_api_merge_releases_the_lock_when_it_returns(self):
         done, seen = self.run_shim("api", "-X", "PUT", "repos/acme/app/pulls/12/merge", env=self.allowed())
         self.assertEqual((done.returncode, seen["argv"]), (0, ["api", "-X", "PUT", "repos/acme/app/pulls/12/merge"]))
-        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=1")
+        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=")
 
     def test_a_worker_cannot_switch_the_gate_off_or_point_it_elsewhere_through_its_environment(self):
         other = self.home / "elsewhere"
@@ -81205,6 +81748,19 @@ class TestGhShimMergeGate(Base):
             with self.subTest(env=sorted(extra)):
                 done, seen = self.run_shim(*self.MERGE, env=dict(refuse, **extra))
                 self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+
+    def test_the_merge_gate_probe_mutant_that_honours_the_marker_again_lets_a_refused_merge_run(self):   # #1216: the held-pass / lock probe
+        refuse = {"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps({"allowed": False, "reason": "no gate pass recorded"}), "FLEET_SWITCHBOARD_OWN_GH": "1"}
+        done, seen = self.run_shim(*self.MERGE, env=refuse)
+        self.assertEqual((done.returncode, seen), (10, None), "the real shim refuses with the marker set")
+        source = marker_mutant_source("merge_gate_probe")
+        (self.home / "gh-mutant").write_text(source)
+        self.shim_path = self.home / "gh-mutant"
+        try:
+            done, seen = self.run_shim(*self.MERGE, env=refuse)
+            self.assertEqual(done.returncode, 0, "the mutant lets the refused merge run: the case above fails it")
+        finally:
+            self.shim_path = None
 
     def test_the_gate_reads_the_account_home_from_the_password_database_not_from_the_environment(self):
         loader = importlib.machinery.SourceFileLoader("gh_shim_home", str(SHIM))
@@ -84379,6 +84935,256 @@ class TestAssembler(unittest.TestCase):
         self.assertIn("usage: fleet-switchboard status", done.stdout)
 
 
+def marker_mutant_source(func, ret="None"):
+    """The REAL shim's text with the retired marker honoured again at the top of `func` (after its docstring): `return` / `return None` when the variable is "1"."""
+    source = SHIM.read_text()
+    start = source.index("def %s(" % func)
+    head = source[start:]
+    at = head.index(":\n", head.index(")")) + 2
+    stripped = head[at:].lstrip()
+    if stripped.startswith('"""'):
+        at += head[at:].index('"""') + 3 + head[at:][head[at:].index('"""') + 3:].index('"""') + 3 + 1
+    guard = '    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":\n        return%s\n' % ("" if ret == "" else " " + ret)
+    mutant = source[:start] + head[:at] + guard + head[at:]
+    ast.parse(mutant)
+    return mutant
+
+
+class TestOwnMarkerNotHonoured(unittest.TestCase):
+    """#1216: shims/gh reads FLEET_SWITCHBOARD_OWN_GH nowhere (derived scan), and each probe has a mutant that honours it again which the case above it fails."""
+    NAME = "FLEET_SWITCHBOARD_OWN_GH"
+
+    def test_the_shim_reads_the_marker_nowhere(self):
+        tree = ast.parse(SHIM.read_text())
+        reads = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == self.NAME]
+        self.assertEqual(reads, [], "a string constant naming the marker in shims/gh (a read or a set), by line")
+
+    def test_every_own_call_site_of_the_switchboard_carries_no_marker(self):
+        text = switchboard_source()
+        self.assertNotIn('{OWN_GH_ENV: "1"}', text)
+        self.assertNotIn('setdefault(OWN_GH_ENV', text)
+
+    # The rule: every Python source the daemon can load: the main script, every bin/switchboard/*.py and EVERY bin/*.py (each is a module of load_module(name));
+    # the scripts for humans carry no .py name, so they are not in it.
+    BARE_GH_SOURCES = (["bin/fleet-switchboard"] + sorted("bin/switchboard/" + n.name for n in (REPO / "bin" / "switchboard").glob("*.py"))
+                       + sorted("bin/" + n.name for n in (REPO / "bin").glob("*.py")))
+    SUBPROCESS_CALLS = {"run", "Popen", "call", "check_call", "check_output", "runner", "_runner", "run_cmd"}
+    # THE ALLOW-LIST (#1330): the two agent-facing reads that name the bare "gh" ON PURPOSE. Keyed (path, enclosing function) -> (the argv the bare call carries after "gh", the reason).
+    # LIMIT: an allow-list NARROWS what this guard checks on a credential path: inside these two functions a bare "gh" is no longer flagged, so the guard says nothing about any other
+    # call they add; test_every_allowed_bare_gh_entry_exists pins each entry to a real function whose bare call is the one named, and a third site anywhere else still fails the scan.
+    ALLOWED_BARE_GH = {
+        ("bin/fleet-switchboard", "issue_is_ask"): (("api",), "agent-facing: the shim must see this call"),
+        ("bin/fleet-switchboard", "preflight_body_warnings"): (("pr", "view"), "agent-facing: the shim must see this call"),
+    }
+
+    @staticmethod
+    def enclosing_function(tree, line):
+        """The name of the innermost function whose span holds `line`, or None."""
+        spans = [(n.end_lineno - n.lineno, n.name) for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.lineno <= line <= n.end_lineno]
+        return min(spans)[1] if spans else None
+
+    @classmethod
+    def bare_gh_sites(cls, sources):
+        """(path, line) of every place a command is built whose first argv element is the literal "gh". CLOSED rule, by AST over `sources` ({path: text}):
+        (1) a LIST literal (a tuple of tool names, as in `for tool in ("gh", "git")`, is not an argv) whose first element is the string constant "gh" (covers `runner(["gh", ...])`, `["gh"] + argv` and a name bound to such a list);
+        (2) a call to run/Popen/call/check_call/check_output or a runner whose first positional argument is a string constant that starts with "gh " or is "gh".
+        The ONE merge call of `merge-gate --pass --merge` is not an exception: it names `config.get("gh_by_name", ...)`, never the literal, so it is not seen and needs none.
+        KNOWN LIMITS, what it cannot catch: a variable holding "gh" (`g = "gh"; [g, ...]`); a tuple (deliberate: `for tool in ("gh", "git")`); an f-string
+        (JoinedStr) command; `config.get(..., "gh")` (a default); a string built at run time (`"g" + "h"`, an argv read from a file or the environment);
+        `config["gh_by_name"]` itself; a shell string that is not a plain constant; and any source outside BARE_GH_SOURCES; the daemon's own calls are held by
+        config["gh"] (own_gh_path) and by the behaviour tests around it, which this scan does not replace."""
+        found = []
+        for path, text in sources.items():
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.List) and node.elts and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == "gh":
+                    if (path, cls.enclosing_function(tree, node.lineno)) in cls.ALLOWED_BARE_GH:
+                        continue
+                    found.append((path, node.lineno))
+                elif isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    fn = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+                    first = node.args[0].value
+                    if fn in cls.SUBPROCESS_CALLS and (first == "gh" or first.startswith("gh ")):
+                        found.append((path, node.lineno))
+        return found
+
+    def test_no_bare_gh_argv_remains_in_the_switchboard_sources(self):
+        """#1216: a bare "gh" reaches the shim as an AGENT call (counted, read-scoped, refusable). Derived over the sources, not a hand list; see bare_gh_sites for the rule and its limits."""
+        sources = {p: (REPO / p).read_text() for p in self.BARE_GH_SOURCES}
+        self.assertGreater(len(sources), 5, "the scan must see bin/switchboard/*.py too")
+        self.assertEqual(self.bare_gh_sites(sources), [], "a command whose first argv element is the literal 'gh' (path, line): use config['gh'] (the real gh by path)")
+
+    def test_every_allowed_bare_gh_entry_exists(self):
+        """Each allow-list entry names a function found in the scanned sources whose bare gh list is the one the entry names, with a reason; a rename or a deleted function fails here."""
+        self.assertEqual(sorted(self.ALLOWED_BARE_GH), [("bin/fleet-switchboard", "issue_is_ask"), ("bin/fleet-switchboard", "preflight_body_warnings")])
+        for (path, name), (argv, reason) in sorted(self.ALLOWED_BARE_GH.items()):
+            self.assertIn(path, self.BARE_GH_SOURCES)
+            self.assertTrue(reason)
+            tree = ast.parse((REPO / path).read_text())
+            funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
+            self.assertEqual(len(funcs), 1, "the allowed function %s is not in %s" % (name, path))
+            lists = [n for n in ast.walk(funcs[0]) if isinstance(n, ast.List) and n.elts and isinstance(n.elts[0], ast.Constant) and n.elts[0].value == "gh"]
+            self.assertEqual(len(lists), 1, "%s must hold exactly one bare gh call" % name)
+            self.assertEqual(tuple(e.value for e in lists[0].elts[1:1 + len(argv)] if isinstance(e, ast.Constant)), argv)
+
+    def test_a_third_bare_gh_site_still_fails_the_scan(self):
+        """The hand mutant: a bare gh planted in a temp copy of a scanned source, outside the allow-list, is flagged (and one in an allowed function's neighbour too)."""
+        sources = {p: (REPO / p).read_text() for p in self.BARE_GH_SOURCES}
+        self.assertEqual(self.bare_gh_sites(sources), [])
+        planted = dict(sources, **{"bin/switchboard/audit.py": sources["bin/switchboard/audit.py"] + '\n\ndef third_site(runner):\n    return runner(["gh", "api", "user"])\n'})
+        self.assertEqual(len(self.bare_gh_sites(planted)), 1)
+        neighbour = sources["bin/fleet-switchboard"] + '\n\ndef issue_is_ask_again(runner):\n    return runner(["gh", "api", "user"])\n'
+        self.assertEqual(len(self.bare_gh_sites(dict(sources, **{"bin/fleet-switchboard": neighbour}))), 1)
+
+    def test_a_mutant_that_re_adds_a_bare_gh_site_fails_the_scan(self):
+        sources = {p: (REPO / p).read_text() for p in self.BARE_GH_SOURCES}
+        for path, old, new in (("bin/fleet-switchboard", 'runner([ctx.config["gh"], "pr", "diff", str(ctx.number)', 'runner(["gh", "pr", "diff", str(ctx.number)'),
+                               ("bin/fleet-switchboard", 'runner([real_gh, "pr", "view"', 'runner(["gh", "pr", "view"')):
+            self.assertIn(old, sources[path])
+            mutant = dict(sources, **{path: sources[path].replace(old, new, 1)})
+            self.assertEqual(len(self.bare_gh_sites(mutant)), 1, old)
+        self.assertIn("bin/ci_runs.py", sources)
+        old = 'subprocess.run([GH, "api", "repos/%s/actions/runs/%d"'
+        self.assertIn(old, sources["bin/ci_runs.py"])
+        mutant = dict(sources, **{"bin/ci_runs.py": sources["bin/ci_runs.py"].replace(old, old.replace("[GH,", '["gh",'), 1)})
+        self.assertEqual(len(self.bare_gh_sites(mutant)), 1, "a bare gh re-added in bin/ci_runs.py")
+        extra = dict(sources, **{"bin/switchboard/audit.py": sources["bin/switchboard/audit.py"] + '\nsubprocess.run("gh pr list")\n'})
+        self.assertEqual(len(self.bare_gh_sites(extra)), 1, "a string command in a module under bin/switchboard is seen too")
+
+    def test_the_own_call_path_resolves_the_real_gh_beside_the_shim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = Path(tmp, "shim"), Path(tmp, "real")
+            shimdir.mkdir(); realdir.mkdir()
+            shimdir.joinpath("gh").write_text(SHIM.read_text()); shimdir.joinpath("gh").chmod(0o755)
+            realdir.joinpath("gh").write_text("#!/bin/sh\nexit 0\n"); realdir.joinpath("gh").chmod(0o755)
+            path = os.pathsep.join([str(shimdir), str(realdir)])
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": path}), str(realdir / "gh"))
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": str(realdir)}), str(realdir / "gh"), "the real gh first on PATH is named by its path")
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": path, "FLEET_REAL_GH": str(realdir / "gh")}), str(realdir / "gh"))
+            self.assertEqual(sb.own_gh_path("/x/gh", {"PATH": path}), "/x/gh")
+
+    def test_the_config_load_hands_the_resolved_gh_to_the_run_identity_reader(self):
+        """#1216: bin/ci_runs.py reads a run through config['gh'] (set at the config load), so a daemon the hook started never reaches the shim by name."""
+        ci = sb.load_module("ci_runs")
+        self.addCleanup(setattr, ci, "GH", ci.GH)
+        ci.GH = None
+        cfg = sb.validate_config({})
+        self.assertEqual(ci.GH, cfg["gh"])
+        self.assertNotEqual(ci.GH, "gh")
+
+    REAL_FAKE = "#!/bin/sh\necho \"real $* token=$GH_TOKEN\" >> \"$FAKE_LOG\"\necho '{\"ok\": 1}'\n"
+
+    def layout(self, tmp, real=True):
+        shimdir, realdir = Path(tmp, "shim"), Path(tmp, "real")
+        shimdir.mkdir(); realdir.mkdir()
+        for entry in SHIM.parent.iterdir():
+            if entry.is_file():
+                shutil.copy(str(entry), str(shimdir / entry.name))
+        if real:
+            realdir.joinpath("gh").write_text(self.REAL_FAKE); realdir.joinpath("gh").chmod(0o755)
+        return shimdir, realdir
+
+    def test_the_daemon_refuses_at_start_when_its_gh_is_the_shim(self):
+        """No real gh behind the shim: PATH holding only the shim, or a configured absolute gh that IS the shim, is refused with the named reason (never run as an agent)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp, real=False)
+            with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                sb.own_gh_path("gh", {"PATH": str(shimdir)})
+            with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                sb.own_gh_path("gh", {"PATH": str(shimdir), "FLEET_REAL_GH": str(shimdir / "gh")})
+            with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                sb.own_gh_path(str(shimdir / "gh"), {"PATH": str(shimdir)})
+            done = subprocess.run([sys.executable, str(SWITCHBOARD), "run", "--once"], capture_output=True, text=True, timeout=60,
+                                  env={"PATH": str(shimdir), "HOME": tmp, "XDG_CONFIG_HOME": tmp, "XDG_STATE_HOME": tmp, "FLEET_SWITCHBOARD_STATE": tmp})
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn("no real gh behind the shim", done.stderr)
+
+    def test_an_absolute_real_gh_is_used_as_it_is_and_a_real_gh_behind_the_shim_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp)
+            self.assertEqual(sb.own_gh_path(str(realdir / "gh"), {"PATH": str(shimdir)}), str(realdir / "gh"))
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": os.pathsep.join([str(shimdir), str(realdir)])}), str(realdir / "gh"))
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": os.pathsep.join([str(shimdir), str(realdir)]), "FLEET_REAL_GH": str(shimdir / "gh")}), str(realdir / "gh"),
+                             "FLEET_REAL_GH naming the shim is ignored")
+            config = {"github_repos": [], "github_events": ["issue_comment"], "gh": str(realdir / "gh"), "github_lookback_hours": 1, "github_port": None, "github_ignore_authors": []}
+            with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                sb._validate_github(dict(config, gh=str(shimdir / "gh")), "cfg")
+
+    def test_the_resolved_path_prevents_re_identification_the_daemons_call_reaches_the_real_gh_by_path_never_the_shim(self):
+        """The deleted regression, restored: with the marker gone, a daemon call through the SHIM would be re-identified (token swapped). The resolved path never reaches it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp)
+            log = Path(tmp, "calls.log")
+            path = os.pathsep.join([str(shimdir), str(realdir)])
+            resolved = sb.own_gh_path("gh", {"PATH": path})
+            self.assertEqual(resolved, str(realdir / "gh"))
+            environ = {"PATH": path, "HOME": tmp, "FAKE_LOG": str(log), "GH_TOKEN": "tok-daemon", "FLEET_SWITCHBOARD_STATE": tmp}
+            done = subprocess.run([resolved, "api", "rate_limit"], capture_output=True, text=True, env=environ, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(log.read_text().splitlines(), ["real api rate_limit token=tok-daemon"], "the fake real gh ran, with the daemon's own token, unswapped")
+            self.assertFalse(Path(tmp, "agent-calls.jsonl").exists(), "the shim never saw it: nothing counted")
+
+    def test_the_validated_config_keeps_the_resolved_real_gh_and_a_daemon_call_never_runs_the_shim(self):
+        """#1216 wiring: _validate_github must STORE the resolved path (a bare own_gh_path(...) that discards it leaves 'gh' and the daemon back behind the shim)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp)
+            log = Path(tmp, "calls.log")
+            path = os.pathsep.join([str(shimdir), str(realdir)])
+            base = {"github_repos": [], "github_events": ["issue_comment"], "gh": "gh", "github_lookback_hours": 1, "github_port": None, "github_ignore_authors": []}
+            with mock.patch.dict(os.environ, {"PATH": path, "FAKE_LOG": str(log), "GH_TOKEN": "tok-daemon", "HOME": tmp, "FLEET_SWITCHBOARD_STATE": tmp}):
+                os.environ.pop("FLEET_REAL_GH", None)
+                config = sb.validate_config({"gh": "gh"})
+                self.assertEqual(config["gh"], str(realdir / "gh"), "the config holds the RESOLVED real gh, not the bare name")
+                done = subprocess.run([config["gh"], "api", "rate_limit"], capture_output=True, text=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(log.read_text().splitlines(), ["real api rate_limit token=tok-daemon"])
+                self.assertFalse(Path(tmp, "agent-calls.jsonl").exists())
+                full = sb.validate_config({"gh": "gh"})
+                self.assertEqual(full["gh"], str(realdir / "gh"))
+            source = switchboard_source()
+            line = 'config["gh"] = own_gh_path(config["gh"])'
+            self.assertIn(line, source)
+            mutant = source.replace(line, 'own_gh_path(config["gh"])', 1)   # validate, then DISCARD
+            scope = {"__name__": "mutant_discard", "__file__": str(SWITCHBOARD)}
+            exec(compile(mutant, "mutant", "exec"), scope)
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                kept = scope["validate_config"]({"gh": "gh"})
+            self.assertEqual(kept["gh"], "gh", "the discarding mutant leaves the bare name: the assertion above fails it")
+
+    def test_a_relative_configured_gh_that_is_the_shim_is_refused_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp, real=False)
+            cwd = os.getcwd()
+            os.chdir(str(shimdir))
+            try:
+                with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                    sb.own_gh_path("./gh", {"PATH": str(shimdir)})
+            finally:
+                os.chdir(cwd)
+
+    def test_the_shim_is_recognised_by_its_real_file_and_editing_the_docstring_fails_here(self):
+        self.assertTrue(sb.is_shim_file(str(SHIM)), "own_gh_path must know the REAL shims/gh by its signature: update SHIM_HEAD together with the docstring")
+        self.assertIn(sb.SHIM_HEAD, SHIM.read_bytes()[:400])
+        with tempfile.TemporaryDirectory() as tmp:
+            other = Path(tmp, "gh")
+            other.write_text("#!/bin/sh\nexit 0\n"); other.chmod(0o755)
+            self.assertFalse(sb.is_shim_file(str(other)))
+            self.assertFalse(sb.is_shim_file(str(Path(tmp, "missing"))))
+
+    def test_each_mutant_that_honours_the_marker_again_is_seen(self):
+        """Each mutant puts a marker read back into one shim function; the derived scan fails for every one of them (and passes for the real code above)."""
+        source = SHIM.read_text()
+        for func in ("review_probe", "gate_probe", "merge_gate_probe", "read_scope", "audit_write", "read_account_env", "account_env", "count_call"):
+            with self.subTest(func=func):
+                self.assertIn("def %s(" % func, source)
+                head = source[source.index("def %s(" % func):]
+                body_at = head.index(":\n", head.index(")")) + 2
+                mutant = source.replace(head, head[:body_at] + '    if os.environ.get("%s") == "1":\n        return None\n' % self.NAME + head[body_at:], 1)
+                tree = ast.parse(mutant)
+                self.assertTrue([n for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == self.NAME], func)
+
+
 class TestReadCheckRuns1237(unittest.TestCase):
     """#1237 review: every refusal branch of ci_runs.read_check_runs, missing_workflows and plan_ledger's ci_workflows rule, with a mutant each."""
 
@@ -84942,12 +85748,20 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
 
     def test_the_run_read_returns_workflow_id_and_event_or_none(self):
         ci = load_ci_runs()
+        ci.GH = "/real/bin/gh"
+        self.addCleanup(setattr, ci, "GH", None)
         import subprocess as sp
         from unittest import mock
         def fake(out, code=0):
             return mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], code, out, ""))
-        with fake('{"w": 7, "e": "push"}'):
+        with fake('{"w": 7, "e": "push"}') as run:
             self.assertEqual(ci._read_run("o/r", 5), (7, "push"))
+            self.assertEqual(run.call_args.args[0][0], "/real/bin/gh", "#1216: the real gh by path, never the bare name that the shim answers")
+        ci.GH = None
+        with fake('{"w": 7, "e": "push"}') as run:
+            self.assertIsNone(ci._read_run("o/r", 5), "no resolved gh: no read (fails closed), never a bare gh")
+            run.assert_not_called()
+        ci.GH = "/real/bin/gh"
         with fake('{"w": 7, "e": "push"}', 1):
             self.assertIsNone(ci._read_run("o/r", 5))
         with fake('{"w": "7", "e": "push"}'):
@@ -85047,6 +85861,8 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         import subprocess as sp
         from unittest import mock
         ci = load_ci_runs()
+        ci.GH = "/real/bin/gh"
+        self.addCleanup(setattr, ci, "GH", None)
         for exc in (sp.TimeoutExpired("gh", 20), OSError("no gh"), ValueError("x")):
             with mock.patch.object(sp, "run", side_effect=exc):
                 self.assertIsNone(ci._read_run("o/r", 5))
@@ -87494,3 +88310,4 @@ if __name__ == "__main__":
         except OSError as _err:
             sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
     sys.exit(main(sys.argv[1:]))
+
