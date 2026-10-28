@@ -1808,11 +1808,14 @@ _MOVED = frozenset(("ERROR_VOCABULARY", "ERROR_LINE_MAX", "PLACEHOLDER", "redact
 
 def _state_module():
     """bin/pod_state_line.py, loaded only when a command that needs it runs (never at import: it is not in the switchboard's closure)."""
-    return H["load_module"]("pod_state_line")
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.append(here)
+    return __import__("pod_state_line")
 
 
 def __getattr__(name):
-    if name in _MOVED and H.get("load_module"):
+    if name in _MOVED:
         return getattr(_state_module(), name)
     raise AttributeError(name)
 

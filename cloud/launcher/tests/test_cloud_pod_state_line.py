@@ -472,7 +472,7 @@ class TestDocuments(unittest.TestCase):
     def test_the_inherent_limit_and_the_local_files_are_in_both_documents(self):
         for rel in DOCS:
             text = read(rel)
-            for phrase in ("closed vocabulary", "ERROR_VOCABULARY", "bin/cloud_worker.py", "a secret that is itself one of the vocabulary", "transient", "removed when the command ends", "mode `0700`"):
+            for phrase in ("closed vocabulary", "ERROR_VOCABULARY", "bin/pod_state_line.py", "a secret that is itself one of the vocabulary", "transient", "removed when the command ends", "mode `0700`"):
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
 
@@ -633,7 +633,7 @@ class TestContexts(unittest.TestCase):
 
 
 # ---- the allow-list round (ask #1397, plan revision 3): the error line prints token by token through ONE closed vocabulary (ERROR_VOCABULARY in
-# bin/cloud_worker.py). Every secret below is synthetic and built from plain parts.
+# bin/pod_state_line.py). Every secret below is synthetic and built from plain parts.
 BASE_VOCAB = frozenset(CLOUD.ERROR_VOCABULARY) if hasattr(CLOUD, "ERROR_VOCABULARY") else frozenset()   # taken at import: a mutant that edits the live list is still judged by this copy
 SEPARATORS = frozenset(" :,.()\"'/=-_[]")
 CLASS_NAME = re.compile(r"[A-Z][A-Za-z]{0,39}")
@@ -797,12 +797,12 @@ class TestVocabularyScan(Base):
         for rel, text in self.sources():
             copies += [rel] * len(signature.findall(text))
             tables += [rel] * len(old.findall(text))
-        self.assertEqual(copies, ["bin/switchboard/pod_state_line.py"], copies)
+        self.assertEqual(copies, ["bin/pod_state_line.py"], copies)
         self.assertEqual(tables, [], tables)
 
     def test_s12_a_mutant_that_adds_a_planted_word_is_caught_by_the_property_test(self):
         mutant = CLOUD.ERROR_VOCABULARY | {SENTINEL}
-        with mock.patch.dict(sb.__dict__, {"ERROR_VOCABULARY": mutant}), mock.patch.dict(CLOUD.H, {"ERROR_VOCABULARY": mutant}):   # the list lives in the part bin/switchboard/pod_state_line.py: the namespace holds it
+        with mock.patch.object(CLOUD._state_module(), "ERROR_VOCABULARY", mutant):   # the list lives in the module bin/pod_state_line.py
             self.assertIn(SENTINEL, CLOUD.ERROR_VOCABULARY)   # the mutation is applied
             failures = TestProperty.run_texts(self, count=100)   # the planted word comes at the 8th text and every 50th after
         self.assertGreaterEqual(len(failures), 1)
