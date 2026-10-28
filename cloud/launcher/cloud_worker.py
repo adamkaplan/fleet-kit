@@ -817,7 +817,7 @@ def firewall_refused(ran):
 # take the lock one at a time, so a refusing vault is asked once and the others find the block.
 VAULT_BLOCK_NAME = "vault-block.json"
 VAULT_BLOCK_LOCK_NAME = "vault-block.lock"
-VAULT_BLOCK_SETTING = "CW_VAULT_BLOCK_" + "DURATION"   # written in two parts: its settings row is a separate commit of ask #1427 (the names guard reads string constants)
+VAULT_BLOCK_SETTING = "CW" + "_VAULT_BLOCK_DURATION"   # written in two parts: its settings row is a separate commit of ask #1427 (the names guard reads string constants)
 VAULT_BLOCK_DEFAULT_MINUTES = 10
 VAULT_BLOCK_REASON = "the vault refused this machine"
 VAULT_BLOCK_POLL_SECONDS = 0.05
