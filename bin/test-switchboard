@@ -82813,6 +82813,31 @@ class TestCiTestFileList(unittest.TestCase):
         problems = _ci_list_problems(text, self.real_files(), self.WORKFLOW.read_text())
         self.assertEqual(problems, ["no workflow step runs: bin/test-ghost", "exempt without a reason: bin/test-x"])
 
+    def _exempt_claim_problems(self, source, namespace):
+        row = [l for l in self.LIST.read_text().splitlines() if l.startswith("exempt bin/test-impact-brief")]
+        if not row:
+            return []
+        names = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_brief_modules" for t in node.targets):
+                names = {c.value for c in ast.walk(node.value) if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+        problems = []
+        if "test-impact-brief" not in names:
+            problems.append("exempt row claims bin/test-switchboard loads it, but _brief_modules does not: " + row[0])
+        for cls in ("BriefTests", "MutantTests"):
+            if "Brief_impact_brief_" + cls not in namespace:
+                problems.append("exempt row claims " + cls + " is imported, but it is not: " + row[0])
+        return problems
+
+    def test_the_exempt_test_impact_brief_is_really_loaded_here(self):
+        self.assertEqual(self._exempt_claim_problems(Path(__file__).read_text(), globals()), [])
+
+    def test_a_switchboard_that_stops_loading_test_impact_brief_fails_naming_the_row(self):
+        source = Path(__file__).read_text().replace(', "test-impact-brief")}', ')}', 1)
+        problems = self._exempt_claim_problems(source, {k: v for k, v in globals().items() if not k.startswith("Brief_impact_brief_")})
+        self.assertEqual(len(problems), 3)
+        self.assertTrue(all("exempt bin/test-impact-brief" in p for p in problems))
+
     def test_the_documentation_names_the_list_file(self):
         self.assertEqual(sum(1 for l in (REPO / "docs" / "switchboard.md").read_text().splitlines() if ".github/ci-test-files.txt" in l), 1)
 
