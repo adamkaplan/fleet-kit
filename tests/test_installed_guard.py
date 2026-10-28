@@ -22,7 +22,7 @@ from support.loader import sb
 from support.paths import REPO
 
 BIN = REPO / "bin"
-guard = sb.load_module("installed_guard")
+guard = sb.installed_guard_module()
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com", "GIT_TERMINAL_PROMPT": "0"}
 
@@ -59,7 +59,7 @@ class TreeCase(Base):
         git(self.home, "clone", "-q", str(self.origin), str(self.tree))
         git(self.tree, "fetch", "-q", "origin")
         self.state = sb.ensure_state_dir()
-        (self.state / "installed-tree.json").write_text(json.dumps({"root": str(self.tree), "default_branch": "main"}))
+        (self.state / "installed-tree").write_text("%s\nmain\n" % self.tree)
         self.patch = mock.patch.object(sb, "KIT_ROOT", self.tree)
         self.patch.start()
         self.addCleanup(self.patch.stop)
@@ -108,7 +108,9 @@ class TestTheEntryGuard(TreeCase):
 
     def test_s9_a_mutant_that_removes_the_check_fails_each_of_them(self):
         always_ok = lambda root, branch, run=subprocess.run: {"ok": True, "note": None, "branch": "main", "commit": None, "dirty": [], "remote": None, "why": None}
-        with mock.patch.object(guard, "check", always_ok):
+        mutant = sb.installed_guard_module()
+        mutant.check = always_ok   # the entry loads its own fresh copy of the module: the mutant is what it loads
+        with mock.patch.object(sb, "installed_guard_module", return_value=mutant):
             found = self.outcomes()
         self.assertEqual({name: code for name, (code, _) in found.items()}, {"other branch": 0, "detached integration": 0, "detached ancestor": 0, "dirty": 0, "clean": 0})
         for name in ("other branch", "detached integration", "dirty"):
@@ -132,12 +134,12 @@ class TestTheEntryGuard(TreeCase):
             self.assertEqual(self.command("status")[0], 1)
 
     def test_a_tree_the_install_never_recorded_is_not_judged(self):
-        (self.state / "installed-tree.json").unlink()
+        (self.state / "installed-tree").unlink()
         git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
         self.assertEqual(self.command("version")[0], 0)
 
     def test_a_recorded_tree_that_is_not_this_one_is_not_judged(self):
-        (self.state / "installed-tree.json").write_text(json.dumps({"root": str(self.home / "elsewhere"), "default_branch": "main"}))
+        (self.state / "installed-tree").write_text("%s\nmain\n" % (self.home / "elsewhere"))
         git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
         self.assertEqual(self.command("version")[0], 0)
 
@@ -149,7 +151,7 @@ class TestTheEntryGuard(TreeCase):
         self.assertEqual(self.command("version")[0], 1)
 
     def test_the_guard_that_cannot_run_refuses_all_but_the_exempt(self):
-        with mock.patch.object(sb, "load_module", side_effect=ImportError("stub")):
+        with mock.patch.object(sb, "installed_guard_module", side_effect=ImportError("stub")):
             self.assertIn("could not run", sb.installed_tree_refusal("status"))
             self.assertIsNone(sb.installed_tree_refusal("install"))
 
@@ -250,9 +252,6 @@ class TestTheDaemon(TreeCase):
         self.clock = [1_800_000_000.0]
         self.engine = FakeEngine(self.clock, self.fakes.herdr)
         os.environ[sb.INSTALLED_TREE_ALERT_ENV] = str(self.fakes.notifier)
-        patch = mock.patch.object(sb, "load_module", wraps=sb.load_module)
-        self.load = patch.start()
-        self.addCleanup(patch.stop)
         modules = mock.patch.dict(sys.modules, {sb.__name__: sb})   # run_daemon hands its own module to the relay pass
         modules.start()
         self.addCleanup(modules.stop)
@@ -289,13 +288,9 @@ class TestTheDaemon(TreeCase):
         self.fakes = FakePrograms(self.home, herdr_ok=False)
         self.engine.herdr = mock.Mock(binary=str(self.fakes.herdr))
         os.environ[sb.INSTALLED_TREE_ALERT_ENV] = str(self.fakes.notifier)
-        real = self.load.side_effect
-
-        def stub(name):
-            if name == "installed_guard":
-                raise ImportError("a stub that raises on import")
-            return sb.load_module.__wrapped__(name)
-        self.load.side_effect = stub
+        stub = mock.patch.object(sb, "installed_guard_module", side_effect=ImportError("a stub that raises on import"))
+        stub.start()
+        self.addCleanup(stub.stop)
         self.run_passes(1)
         self.assertEqual(self.fakes.count(self.fakes.herdr_log), 1)       # tried, and failed: it is down
         self.assertEqual(self.fakes.count(self.fakes.notifier_log), 1)    # the desktop notification fires on every alert
@@ -355,6 +350,7 @@ class TestTheHooks(TreeCase):
         self.assertEqual(moves[2]["detail"]["new"], self.integration)
 
     def test_s8_the_install_writes_both_hooks_executable_and_is_idempotent(self):
+        (self.state / "installed-tree").unlink()   # setUp recorded the tree already
         first = self.install()
         hooks = Path(git(self.tree, "rev-parse", "--git-common-dir"))
         hooks = (hooks if hooks.is_absolute() else self.tree / hooks) / "hooks"
@@ -382,7 +378,7 @@ class TestTheHooks(TreeCase):
     def test_a_failed_git_directory_read_skips_the_hooks_and_still_records_the_tree(self):
         def runner(argv, **kw):
             return subprocess.CompletedProcess(argv, 128, "", "fatal")
-        (self.state / "installed-tree.json").unlink()
+        (self.state / "installed-tree").unlink()
         steps = {step: status for step, status, _ in guard.install(self.tree, self.state, BIN, sys.executable, run=runner)}
         self.assertEqual((steps["tree hook checkout"], steps["tree hook merge"], steps["installed tree"]), ("skipped", "skipped", "done"))
 
@@ -394,7 +390,7 @@ class TestTheHooks(TreeCase):
         self.assertEqual((hooks / "post-merge").read_text(), "#!/bin/sh\necho mine\n")
 
     def test_the_install_records_the_tree_and_the_default_branch(self):
-        (self.state / "installed-tree.json").unlink()
+        (self.state / "installed-tree").unlink()
         self.install()
         self.assertEqual(guard.read_marker(self.state), (os.path.realpath(str(self.tree)), "main"))
 

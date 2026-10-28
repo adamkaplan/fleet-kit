@@ -5,21 +5,20 @@ commit that is an ancestor of (or equal to) the remote default branch, with no u
 merge gate may be computed by that code.
 
 This module only READS the tree: `git status`, `git rev-parse` and `git merge-base`, at most three calls, no fetch, no network, no write (U2). It
-applies only to the tree `install` recorded in <state dir>/installed-tree.json: a worktree, a CI checkout or a test tree has no record and is never
+applies only to the tree `install` recorded in <state dir>/installed-tree: a worktree, a CI checkout or a test tree has no record and is never
 judged. A tree whose remote-tracking ref of the default branch is missing (a fresh clone with no fetch yet) is allowed when it is clean on the default
 branch, with a one-line note.
 
 The install also writes the hooks that record a move of HEAD, and copies the two standalone scripts (guard_record_head_move.py, guard_alert.py) into
 <state dir>/guard/, outside the tree. Standard library only.
 """
-import json
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
-MARKER = "installed-tree.json"        # in the state directory: {"root": <real path of the installed tree>, "default_branch": "main"}
+MARKER = "installed-tree"             # in the state directory: two plain lines, the real path of the installed tree and its default branch (no JSON: nothing to parse)
 SCRIPTS_DIR = "guard"                 # in the state directory: the two standalone scripts
 SCRIPTS = ("guard_record_head_move.py", "guard_alert.py")
 HOOKS = ("post-checkout", "post-merge")
@@ -33,11 +32,10 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 def read_marker(state_dir):
     """(root, default branch) the install recorded, or None (no record, or an unreadable one: the guard does not apply)."""
     try:
-        data = json.loads((Path(state_dir) / MARKER).read_text())
-        root, branch = data["root"], data["default_branch"]
-    except (OSError, ValueError, KeyError, TypeError):
+        lines = (Path(state_dir) / MARKER).read_text().splitlines()
+    except (OSError, ValueError):
         return None
-    return (root, branch) if isinstance(root, str) and isinstance(branch, str) and root and branch else None
+    return (lines[0], lines[1]) if len(lines) == 2 and lines[0] and lines[1] else None
 
 
 def _git(root, *argv, run=subprocess.run):
@@ -134,7 +132,7 @@ def note(state_dir, root, run=subprocess.run):
     return check(marker[0], marker[1], run)["note"]
 
 
-def entry_refusal(action, state_dir, root, run=subprocess.run):
+def entry_problem_line(action, state_dir, root, run=subprocess.run):
     """What a command prints, or None to run it. Exempt commands are never refused."""
     if action in EXEMPT_COMMANDS:
         return None
@@ -170,7 +168,7 @@ def install(root, state_dir, kit_bin, python, dry_run=False, run=subprocess.run)
     out = []
     root, state_dir = Path(os.path.realpath(str(root))), Path(state_dir)
     branch = default_branch_of(root, run)
-    marker = json.dumps({"root": str(root), "default_branch": branch}, sort_keys=True) + "\n"
+    marker = "%s\n%s\n" % (root, branch)
     target = state_dir / MARKER
     changed = not target.is_file() or target.read_text() != marker
     if changed and not dry_run:

@@ -70,7 +70,7 @@ def main(argv):
     parser.add_argument("--every", type=float, default=86400, help="seconds between alerts for a tree that stays bad (default: one day)")
     parser.add_argument("--clear", action="store_true", help="the tree is good again: forget the last alert, so the next bad tree alerts at once")
     args = parser.parse_args(argv)
-    marker = os.path.join(args.state, "installed-tree-alert.json")
+    marker = os.path.join(args.state, "installed-tree-alert")   # the clock of the last alert, one number in plain text
     if args.clear:
         try:
             os.unlink(marker)
@@ -80,15 +80,15 @@ def main(argv):
         return 0
     clock = args.now if args.now is not None else datetime.now(timezone.utc).timestamp()
     try:
-        last = float(json.load(open(marker))["at"])
-    except (OSError, ValueError, KeyError, TypeError):
+        last = float(open(marker).read().strip())
+    except (OSError, ValueError):
         last = None
     if last is not None and 0 <= clock - last < args.every:
         print(json.dumps({"sent": False, "why": "alerted less than a day ago"}))
         return 0
     try:
         with open(marker, "w") as handle:
-            json.dump({"at": clock}, handle)
+            handle.write(repr(clock))
     except OSError:
         pass
     done = {}
