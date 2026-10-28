@@ -5845,6 +5845,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 # Every function that reads a worker's boss from the raw `reports_to` text, and why it may. Anything else must go through `boss_name` (the lookup that
 # resolves the role alias and the boss record). A test scans this file for `reports_to` readers and fails when one is not in this table.
 BOSS_READ_SITES = {
+    "bin/fleet-switchboard:headless_target": "a retired worker is not discovered: its STORED metadata (boss record applied), resolved through `resolve_boss`, as `reattach_caller_problem` does",
     "bin/switchboard/handoff.py:_boss_of": "the literal text; `boss_name` is built on it",
     "bin/fleet-switchboard:notice_boss": "resolves the text through `resolve_boss`, over a discovery that already applies the boss record",
     "bin/fleet-switchboard:reattach_caller_problem": "a dead agent is not discovered: its STORED metadata, overlaid with the boss record",
@@ -6166,6 +6167,23 @@ def adopt_before_close(engine, runner, now, name):
                 engine.__dict__.setdefault("retire_close_route", {})[name] = "boss gone, adopted by %s (%s): its boss rule applies" % (heir, why)
 
 
+def close_authority_problem(runner, now, name, boss, verb, what):
+    """THE rule of who may close what (None when the caller may, else why not): the operator at their own terminal, or the agent's recorded `boss` (the Chief of
+    Staff for an agent that reports to it directly); never the agent itself. The pane close (`retire_close_problem`: "close", "pane") and the headless
+    session end (`headless_close_problem`: "end", "session") both call it, so the two cannot drift."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "person":
+        return None
+    if kind[0] == "agent":
+        who = kind[1]
+        if who == name:
+            return "an agent cannot %s its own %s" % (verb, what)
+        if boss is None or boss != who:
+            return "%s may not %s %s's %s: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may" % (who, verb, name, what)
+        return None
+    return "%s: only the operator or the agent's own boss may %s a %s" % (kind[1], verb, what)
+
+
 def retire_close_problem(engine, runner, now, discovery, name, seen, force):
     """(pane, None) when `retire --close` may close `name`'s pane now, else (None, why not). Judged BEFORE the retirement, so a refusal changes nothing.
     Who: the operator at their own terminal (any agent), the agent's recorded boss, or the Chief of Staff for an agent that reports to it DIRECTLY;
@@ -6175,17 +6193,9 @@ def retire_close_problem(engine, runner, now, discovery, name, seen, force):
     reg = load_module("registry").read(engine.state_dir)
     if not reg["whole"]:   # fails CLOSED: a pane is never closed on a half read of the registry
         return None, "the agent registry cannot be read (%s): nothing was closed" % _one_line(reg["problem"] or "unknown", 100)
-    kind = gates_caller_kind(runner, now)
-    if kind[0] == "person":
-        who = "the operator"
-    elif kind[0] == "agent":
-        who = kind[1]
-        if who == name:
-            return None, "an agent cannot close its own pane"
-        if seen is None or boss_name(discovery, seen) != who:
-            return None, "%s may not close %s's pane: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may" % (who, name)
-    else:
-        return None, "%s: only the operator or the agent's own boss may close a pane" % kind[1]
+    why = close_authority_problem(runner, now, name, None if seen is None else boss_name(discovery, seen), "close", "pane")
+    if why:
+        return None, why
     if seen is None or not seen.pane or not seen.session_id:
         return None, "%s has no pane and session the switchboard can see: nothing to close" % name
     pane = seen.pane
@@ -6289,6 +6299,95 @@ def restore_headless_record(engine, state, name, entry):
     return "%s: its headless record was restored: it is watched again" % name, True
 
 
+def headless_target(engine, discovery, name):
+    """(session, boss, live) of a HEADLESS worker `retire --close` may judge: a live record (discovery shows it headless) or the retirement's headless entry
+    (`retired.json`: session, url, created; the worker is no longer discovered). None when `name` is neither. The boss of a retired worker is read from
+    the stored session metadata (with the boss record applied), as `reattach` reads a dead worker's."""
+    seen = discovery.agents.get(name)
+    if seen is not None:
+        return (seen.session_id, boss_name(discovery, seen), True) if seen.headless and seen.session_id else None
+    entry = (load_module("registry").read(engine.state_dir)["retired"] or {}).get(name)   # the registry's own read (a read that is not whole lists nobody: nothing is judged)
+    kept = entry.get("headless") if isinstance(entry, dict) else None
+    if not isinstance(kept, dict) or not isinstance(kept.get("session"), str):
+        return None
+    sid = entry.get("session") or kept["session"]
+    boss = kept.get("boss") if isinstance(kept.get("boss"), str) and NAME_RE.match(kept["boss"]) else None   # kept at the retirement: the session may be gone
+    try:
+        stored = _fleet_meta(engine.v2.session_get(sid)) or {}
+        stored = load_module("reassign").overlay(engine.state_dir, stored, sid) if stored else stored
+        boss = (resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None) or boss
+    except Exception:
+        pass
+    return sid, boss, False
+
+
+def _session_is_gone(engine, sid):
+    """True when the service says the session no longer exists (404); False when it is there; raises for any other answer (the caller fails closed)."""
+    try:
+        engine.v2.session_get(sid)
+        return False
+    except V2Error as err:
+        if err.reason == "http" and err.status == 404:
+            return True
+        raise
+
+
+def headless_close_problem(engine, runner, now, discovery, name, target, force):
+    """(session, None) when `retire --close` may end the headless session of `name` now, ("ended", None) when it is already gone, else (None, why not).
+    Who: `close_authority_problem`, the pane close's own rule.
+    What: no turn in progress and no activity within `retire_idle_minutes` (unless --force), and never while a registered
+    worktree of the worker holds uncommitted or unpushed work (also with --force). Every unreadable fact is a refusal."""
+    sid, boss, _ = target
+    why = close_authority_problem(runner, now, name, boss, "end", "session")
+    if why:
+        return None, why
+    try:
+        info = engine.v2.session_get(sid)
+    except V2Error as err:
+        if err.reason == "http" and err.status == 404:
+            return "ended", None   # already gone: nothing to judge, nothing to change
+        return None, "session %s cannot be read now (%s): nothing was ended" % (sid, _one_line(str(err), 80))
+    except Exception as err:
+        return None, "session %s cannot be read now (%s): nothing was ended" % (sid, _one_line(str(err), 80))
+    if not force:
+        try:
+            active = engine.v2.session_active()
+        except Exception as err:
+            return None, "the service cannot say whether %s has a turn in progress (%s): nothing was ended" % (name, _one_line(str(err), 80))
+        if not isinstance(active, dict):
+            return None, "the service cannot say whether %s has a turn in progress: nothing was ended" % name
+        if sid in active:
+            return None, "%s has a turn in progress: pass --force to end it anyway" % name
+        window = engine.config.get("retire_idle_minutes")
+        times = info.get("time") if isinstance(info, dict) and isinstance(info.get("time"), dict) else {}
+        last = max([t for t in (_seconds(times.get("updated")), _seconds(times.get("idle")), _seconds(times.get("created"))) if t is not None] or [None], key=lambda t: -1 if t is None else t)
+        if not retire_idle_window_ok(window) or last is None or not math.isfinite(last):
+            return None, "the last activity of %s cannot be read: nothing was ended" % name
+        if now() - last < window * 60:
+            return None, "%s had activity %s ago (within retire_idle_minutes, %s): pass --force to end it anyway" % (name, _idle_span_text(now() - last), window)
+    for path, entry in sorted(read_worktrees(engine.state_dir).items()):
+        if isinstance(entry, dict) and entry.get("agent") == name:
+            facts = worktree_facts(runner, path)
+            if facts["exists"] and (facts["why"] or facts["dirty"] or facts["pushed"] is False):
+                return None, "%s holds uncommitted or unpushed work in %s: --force does not override it, nothing was ended" % (name, path)
+    return sid, None
+
+
+def end_headless_session(engine, runner, now, name, sid, caller, reason="retire --close"):
+    """End the session through the service's own session removal, audit one `headless.closed` line. (line, ok)."""
+    try:
+        with engine._external("headless.session.remove", name, {"session": sid}):
+            engine.v2.session_remove(sid)
+    except V2Error as err:
+        if not (err.reason == "http" and err.status == 404):
+            return "%s: its session %s was NOT ended (%s)" % (name, sid, _one_line(str(err), 100)), False
+    except Exception as err:
+        return "%s: its session %s was NOT ended (%s)" % (name, sid, _one_line(str(err), 100)), False
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "headless.closed", name, {"by": caller, "session": sid, "reason": reason})
+    return "ended the session %s of %s in the service: its memory is released" % (sid, name), True
+
+
 def cmd_retire(args, runner, now):
     """`retire <name> [--reason TEXT]` / `retire --undo <name>`: a finished worker is RETIRED: the daemon stops reporting it DEAD or DETACHED, `reattach
     --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
@@ -6302,8 +6401,24 @@ def cmd_retire(args, runner, now):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the agent: `%s retire <name>`" % PROG)
     discovery = engine.discover(engine.now())
+    close_headless = None
+    if getattr(args, "close", False) and not args.undo:
+        close_headless = headless_target(engine, discovery, name)
+        if close_headless is not None and not close_headless[2]:   # already retired: judged from the retirement record, ended after the fact
+            sid, why = headless_close_problem(engine, runner, now, discovery, name, close_headless, getattr(args, "force", False))
+            caller = identify_who(engine, runner, now)
+            if why:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "headless.close_refused", name, {"session": close_headless[0], "by": caller, "why": _one_line(why, 160)})
+                raise LaunchError("refused: %s" % why)
+            if sid == "ended":
+                print("%s: already ended: its session %s is no longer in the service, nothing was changed" % (name, close_headless[0]))
+                return EXIT_OK
+            line, ok = end_headless_session(engine, runner, now, name, sid, caller)
+            print(line)
+            return EXIT_OK if ok else 1
     hint = ((registry_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
-    who = reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)
+    who = None if close_headless is not None else reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)   # a headless close is judged by its own, narrower rule
     if who:
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.retire_refused", name, {"why": _one_line(who, 160)})
@@ -6311,9 +6426,19 @@ def cmd_retire(args, runner, now):
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
     known = known_agent(state, name)   # a pruned retired agent is still known
-    close_pane, close_by, close_note, headless_kept = None, None, None, None
+    close_pane, close_by, close_note, headless_kept, headless_sid = None, None, None, None, None
+    ended_ok = True   # False when the session could not be ended: the worker is retired, but the command must not read as a success
     if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
-        close_note = "headless: it has no terminal, so there is nothing to close"
+        if close_headless is None:   # a live headless agent whose session the switchboard does not know: nothing to judge, nothing to end
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "headless.close_refused", name, {"session": None, "by": identify_who(engine, runner, now), "why": "no session known"})
+            raise LaunchError("refused: no session known for %s (nothing was retired or ended)" % name)
+        headless_sid, why = headless_close_problem(engine, runner, now, discovery, name, close_headless, getattr(args, "force", False))
+        close_by = identify_who(engine, runner, now)
+        if why:
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "headless.close_refused", name, {"session": close_headless[0], "by": close_by, "why": _one_line(why, 160)})
+            raise LaunchError("refused: %s (nothing was retired or ended)" % why)
     elif getattr(args, "close", False) and not args.undo:
         if seen is not None:
             adopt_before_close(engine, runner, now, name)   # #838: a retired worker with no live boss is adopted by its heir first, so the ordinary boss rule judges the close
@@ -6360,6 +6485,10 @@ def cmd_retire(args, runner, now):
                 print(restored)
             return EXIT_OK
         headless_kept = headless_record_to_free(state, name)
+        if headless_kept is not None:   # the boss is kept with the retirement: once the session is gone it cannot be read from it, and the boss rule must still judge the close
+            live = headless_target(engine, discovery, name)
+            if live is not None and live[2] and live[1]:
+                headless_kept = dict(headless_kept, boss=live[1])
         headless_lost = seen is None and not known and headless_kept is not None   # a headless record with no session: the worker is lost, not unknown
         if seen is None and not known and not headless_lost:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
@@ -6385,7 +6514,13 @@ def cmd_retire(args, runner, now):
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
     if headless_kept is not None:
         print(free_headless_record(engine, state, name))
-    if close_note is not None:
+    if headless_sid is not None:
+        if headless_sid == "ended":
+            line, ok = "its session is already ended", True
+        else:
+            line, ended_ok = end_headless_session(engine, runner, now, name, headless_sid, close_by)
+        print("%s is retired: %s (`%s retire --undo %s` puts the record back)" % (name, line, PROG, name))
+    elif close_note is not None:
         print("%s is retired: not watched, not reattached by --all-detached; %s. Its session keeps running in the service until it finishes or is interrupted (`%s retire --undo %s` reverses the retirement)" % (name, close_note, PROG, name))
     elif close_pane is not None:
         line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
@@ -6408,7 +6543,7 @@ def cmd_retire(args, runner, now):
             print("tmpdir: " + line)
     except Exception as err:   # the retirement is already written: said, never a traceback
         sys.stderr.write("%s: private temp directory not handled (%s): the agent is retired; remove it by hand\n" % (PROG, _one_line(str(err), 100)))
-    return EXIT_OK
+    return EXIT_OK if ended_ok else 1   # the worker is retired either way; a session that was NOT ended is a failure a script can see
 
 
 # ---------------------------------------------------------------- worktree lifecycle (#321 slices S2, S3, S10)
@@ -12774,7 +12909,10 @@ class GitHubHub:
         for run in found_runs or []:
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
-        red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now)   # #1141: the same runs, no new read
+        def present_pull(number):   # #1378: the pull request's present head and state, read only for an unowned red run not yet told
+            got = [v for v in self.gh_api(base + "pulls/%d" % number, paginate=False) if isinstance(v, dict)]
+            return got[0] if got else None
+        red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now, present_pull)   # #1141: the same runs
         self.last_failed_primary = bool(failed)
         self.last_incomplete = bool(stopped or failed)   # #494: a step is still to do: the caller keeps the cursor and the marker where they are
         items = [item for item in items if item is not None]
@@ -20454,10 +20592,22 @@ def _review_caller(runner, now):
     return kind[1]
 
 
-def _review_api(engine, runner, now, repo, path, method=None, payload=None):
-    """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`)."""
+def _review_api(engine, runner, now, repo, path, method=None, payload=None, fresh=False):
+    """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`). `fresh` runs the GET straight through the runner: never the conditional-read cache."""
     config = engine.config
     reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    if method is None and fresh:
+        try:
+            env = reader.env_for(repo)
+            done = runner([config["gh"], "api", path], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=reader.timeout, **({"env": env} if env is not None else {}))
+        except (OSError, subprocess.SubprocessError, IntentError) as err:
+            return False, None, _one_line(str(err), 200)
+        if done.returncode != 0:
+            return False, None, reader.accounts.scrub(_one_line(done.stderr or done.stdout or "", 200)) or "exit %d" % done.returncode
+        try:
+            return True, json.loads(done.stdout or "null"), ""
+        except ValueError:
+            return False, None, "GitHub answered a success that is not JSON (not trusted)"
     if method is None:
         try:
             return True, reader._api(path, repo), ""
@@ -20480,11 +20630,11 @@ def _review_api(engine, runner, now, repo, path, method=None, payload=None):
 REVIEW_PAGE_LIMIT = 50   # pages of 100: a list longer than this is not read whole, and the caller refuses
 
 
-def _review_pages(engine, runner, now, repo, path):
+def _review_pages(engine, runner, now, repo, path, fresh=False):
     """(ok, all items, one-line detail) of a Reviews-API list read page by page to the LAST page (a short page ends it); a failed page, a page that is not a list, or more than REVIEW_PAGE_LIMIT pages fails the whole read."""
     items = []
     for page in range(1, REVIEW_PAGE_LIMIT + 1):
-        ok, got, why = _review_api(engine, runner, now, repo, "%s?per_page=100&page=%d" % (path, page))
+        ok, got, why = _review_api(engine, runner, now, repo, "%s?per_page=100&page=%d" % (path, page), fresh=fresh)
         if not ok or not isinstance(got, list):
             return False, None, why or "page %d is not a list" % page
         items.extend(got)
@@ -20506,6 +20656,29 @@ def review_forged_marker(text):
     """True when `text` holds fleet-switchboard `from=` marker text in ANY form: normalised (HTML entities decoded, NFKC, case folded, every character that is not a letter or digit dropped) so spacing, case, entities, zero-width characters and an HTML comment around it change nothing."""
     plain = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", html.unescape(html.unescape(text))).casefold())
     return "fleetswitchboardfrom" in plain
+
+
+def review_is_own_account(author, mine):
+    """True when the pull request's author is the poster's own GitHub account (both read; an unreadable one is never equal)."""
+    return isinstance(author, str) and isinstance(mine, str) and bool(author) and author.casefold() == mine.casefold()
+
+
+def review_earlier(listed, head, name):
+    """The first review `name` already posted at `head` (its marker, its commit), else None."""
+    return next((r for r in (listed or []) if isinstance(r, dict) and r.get("commit_id") == head and review_is_own(r, name)), None)
+
+
+def review_again(args):
+    """True when the caller asked for a second review at one head (`--again`)."""
+    return bool(getattr(args, "again", False))
+
+
+def review_refusal_text(why, head, word):
+    """GitHub's own reason (one capped line) and, for the own-account refusal, the next step."""
+    text = "GitHub refused the review: %s" % _one_line(why, 200)
+    if REVIEW_OWN_REFUSAL.search(why):
+        text += "; this pull request is authored by your own account: post with `--verdict comment`; keep the first line `Review of %s: %s`" % (head, word)
+    return text + " (nothing was posted)"
 
 
 def cmd_review_post(args, runner, now):
@@ -20536,20 +20709,28 @@ def cmd_review_post(args, runner, now):
         if problem:
             raise ReviewError(problem)
         word, event = REVIEW_POST_VERDICTS[args.verdict]
-        body = "Review of %s: %s\n\n%s\n\n%s" % (head, word, text, fleet_mark(name))
         path = review_post_path(repo, number)
-        ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        if not review_again(args):   # one review per reader per head (fresh read, never cached); an unreadable list does not block
+            ok, listed, _why = _review_pages(engine, runner, now, repo, path, fresh=True)
+            earlier = review_earlier(listed, head, name) if ok else None
+            if earlier is not None:
+                raise ReviewError("refused: %s already posted review %s at this head (%s): a second review at one head needs --again (nothing was posted)" % (name, earlier.get("id"), head[:12]))
+        body = "Review of %s: %s\n\n%s\n\n%s" % (head, word, text, fleet_mark(name))
         notice = ""
-        if not ok and event != "COMMENT" and REVIEW_OWN_REFUSAL.search(why):   # the same account's own pull request: a comment-type review, never an issue comment
-            event, notice = "COMMENT", "GitHub refused %s on this account's own pull request: posted as a comment-type review instead" % word
-            ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        if event != "COMMENT":   # the pull request's author is the poster's own account: GitHub refuses approve and request-changes there, so a comment review carries the verdict word
+            ok, me, _why = _review_api(engine, runner, now, repo, "user", fresh=True)
+            author = (raw.get("author") or {}).get("login") if isinstance(raw.get("author"), dict) else None
+            mine = me.get("login") if ok and isinstance(me, dict) else None
+            if review_is_own_account(author, mine):
+                event, notice = "COMMENT", "this pull request is authored by your own account: posted as a comment review (GitHub refuses %s here); the first line keeps `Review of %s: %s`" % (word, head, word)
+        ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
         if not ok:
-            raise ReviewError("GitHub refused the review: %s (nothing was posted)" % why)
+            raise ReviewError(review_refusal_text(why, head, word))
         if engine.audit is not None:
             engine.audit.append(engine.actor, "review.post", ref, {"who": name, "verdict": args.verdict, "event": event, "head": head[:12], "body": plan_ledger.clip(body, 400)})
         if notice:
             print("note: " + notice)
-        print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name))
+        print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name) + (" (posted as a comment)" if notice else ""))
         return EXIT_OK
     except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
         review_refusal_audit(seen.get("engine"), "review.post.refused", seen.get("ref"), seen.get("name"), seen.get("head"), str(err), verdict=args.verdict) if seen.get("name") and seen.get("ref") else None
@@ -21101,6 +21282,7 @@ def add_review_parsers(sub):
     post.add_argument("--head", required=True, help="The FULL head sha judged (it must be the PR's current head)")
     post.add_argument("--verdict", required=True, help="approve | request-changes | comment")
     post.add_argument("--body-file", dest="body_file", required=True, help="File holding the review's text")
+    post.add_argument("--again", action="store_true", help="Post although you already reviewed this head (the refusal names the earlier review)")
     dismiss = rsub.add_parser("dismiss", allow_abbrev=False, help="Dismiss your OWN CHANGES_REQUESTED review after the fix (re-reads the cited line at the current head)")
     dismiss.add_argument("pr", help="owner/repo#N or the PR's URL")
     dismiss.add_argument("--review", required=True, type=int, help="The review's id")

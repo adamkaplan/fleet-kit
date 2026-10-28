@@ -1,0 +1,130 @@
+{
+  "cases": [
+    "idle_after_normal_turn",
+    "idle_after_provider_error",
+    "working"
+  ],
+  "forms": [
+    "queue_resume",
+    "queue",
+    "steer_resume",
+    "steer",
+    "prompt"
+  ],
+  "how": "tests/switchboard/support/delivery_measure.py: a throwaway profile and service, the scripted model, one fresh session per cell, each removed through session.remove",
+  "measured": "2026-10-27",
+  "rows": [
+    {
+      "case": "idle_after_normal_turn",
+      "form": "queue_resume",
+      "ms": 73,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "idle_after_normal_turn",
+      "form": "queue",
+      "ms": null,
+      "outcome": "nothing reached the model in 8s",
+      "turn_started": false
+    },
+    {
+      "case": "idle_after_normal_turn",
+      "form": "steer_resume",
+      "ms": 70,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "idle_after_normal_turn",
+      "form": "steer",
+      "ms": null,
+      "outcome": "nothing reached the model in 8s",
+      "turn_started": false
+    },
+    {
+      "case": "idle_after_normal_turn",
+      "form": "prompt",
+      "ms": 64,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "idle_after_provider_error",
+      "form": "queue_resume",
+      "ms": 69,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "idle_after_provider_error",
+      "form": "queue",
+      "ms": null,
+      "outcome": "nothing reached the model in 8s",
+      "turn_started": false
+    },
+    {
+      "case": "idle_after_provider_error",
+      "form": "steer_resume",
+      "ms": 78,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "idle_after_provider_error",
+      "form": "steer",
+      "ms": null,
+      "outcome": "nothing reached the model in 8s",
+      "turn_started": false
+    },
+    {
+      "case": "idle_after_provider_error",
+      "form": "prompt",
+      "ms": 64,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "working",
+      "form": "queue_resume",
+      "ms": 15297,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "working",
+      "form": "queue",
+      "ms": 15330,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "working",
+      "form": "steer_resume",
+      "ms": 15160,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "working",
+      "form": "steer",
+      "ms": 15194,
+      "outcome": "reached the model",
+      "turn_started": true
+    },
+    {
+      "case": "working",
+      "form": "prompt",
+      "ms": 15162,
+      "outcome": "reached the model",
+      "turn_started": true
+    }
+  ],
+  "sessions": {
+    "created": 15,
+    "left": 0,
+    "removed": 15
+  },
+  "turn_started_means": "a model request carrying the delivered message arrived within the wait (8 s idle; the running turn's own length plus 8 s when working); ms is from the delivery call's return to that request",
+  "v2_version": "2.1.4"
+}

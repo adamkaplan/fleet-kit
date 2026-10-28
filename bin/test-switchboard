@@ -7134,6 +7134,246 @@ for _path in sc.scenario_files(sc.DEFAULT_DIR):
 GITHUB_STEPS = ("comment", "kill-forwarder", "occupy-hook", "awaiting")
 
 
+DELIVERY_FIXTURE = REPO / "tests" / "switchboard" / "fixtures" / "delivery_measure.json"
+IDLE_CASES = ("idle_after_normal_turn", "idle_after_provider_error")
+
+
+def delivery_fixture():
+    return json.loads(DELIVERY_FIXTURE.read_text())
+
+
+def measured_table(fixture, override=None):
+    """{(case, form): turn started?} of the fixture's rows, with `override` ({(case, form): bool}) changed on a copy: the mutants of the fake."""
+    table = {(row["case"], row["form"]): bool(row["turn_started"]) for row in fixture["rows"]}
+    table.update(override or {})
+    return table
+
+
+def derived_forms():
+    """Every way one message is delivered, from the client's own table: each delivery with resume true and false, and a plain prompt."""
+    return [d + "_resume" if resume else d for d in sb.V2Client.DELIVERIES for resume in (True, False)] + ["prompt"]
+
+
+class TestMeasuredDelivery(Base):
+    """#1345: the answers measured on a real OpenCode v2 (tests/switchboard/fixtures/delivery_measure.json, the table of docs/switchboard.md) are the source. A fake v2 built from them reproduces each row, the
+    daemon's wake to an idle agent is checked against them, and every set (forms, cases, rows) is derived from the table, never listed by hand."""
+
+    def setUp(self):
+        super().setUp()
+        self.fixture = delivery_fixture()
+        self.world = World(self, agents=("platform",))
+        self.client = sb.V2Client(FAKE_OPENCODE, {}, self.world.v2, 5)
+
+    # -- the fake replays each row
+    def replay(self, table, case, form):
+        """Put a fresh session of the fake (built from `table`) in `case`, deliver one message in `form` through the daemon's client, and say whether it reached the model: (reached, turn started at once)."""
+        v2 = self.world.v2
+        v2.measured = table
+        sid = v2.create_session({"fleet": {"name": "m-%s-%s" % (case, form), "role": "coder"}})
+        if case == "working":
+            v2.start_turn(sid, "task", fleet=True, lasts=60, steps=3)
+            self.world.tick(5)
+        else:
+            v2.start_turn(sid, "setup", fleet=False)
+            self.world.tick(1)
+            if case == "idle_after_provider_error":
+                v2.sessions[sid]["outcome"] = "failed"
+        key = "measure:%s:%s" % (case, form)
+        meta = {"fleet": {"keys": [key], "from": "switchboard"}}
+        delivery, resume = sb_form_args(form)
+        before = len(v2.model_calls)
+        if form == "prompt":
+            self.client.prompt(sid, "text", meta)
+        else:
+            self.client.synthetic(sid, "text", meta, resume, delivery, sb.derive_message_id(sid, [key]))
+        at_once = any(c["session"] == sid and key in [k for i in c["inputs"] for k in i["keys"]] for c in v2.model_calls[before:])
+        self.world.tick(120)   # a working session reaches the model at its next step or after its last reply
+        reached = any(c["session"] == sid and key in [k for i in c["inputs"] for k in i["keys"]] for c in v2.model_calls[before:])
+        return reached, at_once
+
+    def mismatches(self, table):
+        """The rows the fake built from `table` does not reproduce (an idle row: a turn started at once; a working row: the message reached the model)."""
+        wrong = []
+        for row in self.fixture["rows"]:
+            reached, at_once = self.replay(table, row["case"], row["form"])
+            seen = reached if row["case"] == "working" else at_once
+            if seen != row["turn_started"]:
+                wrong.append((row["case"], row["form"]))
+        return wrong
+
+    def test_the_fake_reproduces_every_measured_row(self):
+        self.assertEqual(self.mismatches(measured_table(self.fixture)), [])
+
+    def test_the_fake_has_an_idle_session_that_ignores_a_queued_item_and_one_that_starts_a_turn_from_it(self):
+        table = measured_table(self.fixture)
+        for case in IDLE_CASES:
+            self.assertEqual(self.replay(table, case, "queue"), (False, False), case)        # ignores a queued item (no resume): it waits in the inbox
+            self.assertEqual(self.replay(table, case, "queue_resume"), (True, True), case)   # starts a turn from it
+
+    def test_mutant_the_fake_ignoring_a_form_is_caught_for_every_row(self):
+        """Each row of the table, flipped alone: a fake that ignores a form that starts a turn (or starts one for a form that does not) fails the replay at exactly that row."""
+        table = measured_table(self.fixture)
+        for key, answer in sorted(table.items()):
+            with self.subTest(key=key):
+                self.assertEqual(self.mismatches(measured_table(self.fixture, {key: not answer})), [key])
+
+    def test_mutant_a_fake_that_starts_a_turn_from_every_item_is_caught(self):
+        every = {key: True for key in measured_table(self.fixture)}
+        self.assertNotEqual(self.mismatches(every), [])
+        none = {key: False for key in measured_table(self.fixture)}
+        self.assertNotEqual(self.mismatches(none), [])
+
+    # -- the daemon's wake to an idle session
+    def idle_wake(self, case, rewrite=None):
+        """A wake to the one agent, idle in `case`, through the real pass. Returns (the form the daemon admitted it in, whether a turn started from it, how often the safety net ran)."""
+        v2 = self.world.v2
+        v2.measured = measured_table(self.fixture)
+        sid = self.world.sessions["platform"]
+        v2.start_turn(sid, "task", fleet=True)   # a turn of the fleet's own (nobody typed): the session is idle after it and not engaged, so the plan is a wake
+        self.world.tick(1)
+        if case == "idle_after_provider_error":
+            v2.sessions[sid]["outcome"] = "failed"
+        self.world.fact("platform", "lab.fact:1")
+        self.world.tick(90)   # not engaged any more: the plan is a wake
+        net = []
+        real_net = sb.undelivered_wake_tick
+        spy = lambda engine, discovery: (net.append(1), real_net(engine, discovery))[1]
+        before = len(v2.model_calls)
+        patches = [mock.patch.object(sb, "undelivered_wake_tick", spy)]
+        if rewrite is not None:
+            real = sb.V2Client.synthetic
+            patches.append(mock.patch.object(sb.V2Client, "synthetic", lambda client, session, text, meta, resume, delivery, mid, description=None: real(
+                client, session, text, meta, *rewrite(resume, delivery), mid, description)))
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            self.world.engine.run_pass()
+        (admitted,) = self.world.admissions("platform")
+        used = FakeV2.form_of(admitted["delivery"], admitted["resume"])
+        started = any(c["phase"] == "turn_start" and admitted["id"] in [i["id"] for i in c["inputs"]] for c in v2.model_calls[before:])
+        return used, started, len(net)
+
+    def check_wake(self, case, rewrite=None):
+        """The rule: the wake to an idle session goes in a form the table says starts a turn in that case, and a turn did start, with the net called once."""
+        used, started, net = self.idle_wake(case, rewrite)
+        table = measured_table(self.fixture)
+        self.assertTrue(table[(case, used)], "%s: the wake went as %s, which the table says starts no turn" % (case, used))
+        self.assertTrue(started, "%s: no turn started from the wake (%s)" % (case, used))
+        self.assertEqual(net, 1)
+        return used
+
+    def test_the_daemon_wakes_an_idle_session_in_a_form_that_starts_a_turn_in_each_idle_case(self):
+        used = {}
+        for case in IDLE_CASES:
+            self.setUp()   # a fresh world for each case
+            used[case] = self.check_wake(case)
+        self.assertEqual(len(used), 2)   # both idle cases have a named delivery
+        self.assertEqual(set(used.values()), {"queue_resume"})   # what the daemon sends today: queue with resume, and the table says it starts a turn in both
+
+    def test_mutant_the_wrong_delivery_for_an_idle_agent_is_caught_for_every_form_that_starts_no_turn(self):
+        """Derived from the table: every form that starts no turn on an idle session, sent for the wake instead, fails the rule."""
+        table = measured_table(self.fixture)
+        wrong = sorted({form for (case, form), started in table.items() if case in IDLE_CASES and not started})
+        self.assertEqual(wrong, ["queue", "steer"])
+        for form in wrong:
+            for case in IDLE_CASES:
+                with self.subTest(form=form, case=case):
+                    self.setUp()
+                    delivery, resume = sb_form_args(form)
+                    with self.assertRaises(AssertionError):
+                        self.check_wake(case, lambda r, d, delivery=delivery, resume=resume: (resume, delivery))
+
+    # -- completeness
+    def test_the_table_is_complete_over_the_delivery_forms_and_cases(self):
+        forms = derived_forms()
+        self.assertEqual(sorted(self.fixture["forms"]), sorted(forms))
+        self.assertEqual(sorted(sb_form_arg_names()), sorted(forms))
+        cases = sorted({row["case"] for row in self.fixture["rows"]})
+        self.assertEqual(sorted(self.fixture["cases"]), cases)
+        self.assertEqual(sorted((r["case"], r["form"]) for r in self.fixture["rows"]), sorted((c, f) for c in cases for f in forms))   # exactly one row per case and form
+        self.assertEqual(len(self.fixture["rows"]), len(cases) * len(forms))
+        for row in self.fixture["rows"]:
+            self.assertIsInstance(row["turn_started"], bool)
+            self.assertEqual(isinstance(row["ms"], int) and row["ms"] >= 0, row["turn_started"], row)   # a time in ms exactly when a turn started
+        self.assertTrue(self.fixture["v2_version"])
+        self.assertEqual(self.fixture["sessions"]["left"], 0)
+        self.assertEqual(self.fixture["sessions"]["created"], self.fixture["sessions"]["removed"])
+
+    def test_the_replay_covers_every_derived_form(self):
+        """Not a hand list: the forms the replay drove are collected from the replay itself."""
+        driven = set()
+        real = self.replay
+        def spy(table, case, form):
+            driven.add((case, form))
+            return real(table, case, form)
+        self.replay = spy
+        self.assertEqual(self.mismatches(measured_table(self.fixture)), [])
+        self.assertEqual(driven, {(c, f) for c in self.fixture["cases"] for f in derived_forms()})
+
+    def test_the_fixture_holds_no_secret_and_no_session_id(self):
+        text = DELIVERY_FIXTURE.read_text()
+        self.assertEqual(re.findall(r"ses_[A-Za-z0-9]{10,}", text), [])
+        self.assertEqual(re.findall(r"(?i)token|secret|password|bearer|api[_-]?key", text), [])
+
+    # -- the measurement helper (the live run is opt-in: it needs the Mac's opencode and takes a few minutes)
+    def test_the_helper_removes_its_session_through_the_service_even_when_a_cell_fails(self):
+        helper = importlib.import_module("support.delivery_measure")
+        removed, created = [], []
+        class Client:
+            def session_create(client, agent, title, directory, metadata):
+                created.append(title)
+                return {"id": "ses_throwaway"}
+            def prompt(client, *a, **k):
+                raise RuntimeError("the service went away")
+            def session_remove(client, sid):
+                removed.append(sid)
+        run = helper.Measurement.__new__(helper.Measurement)
+        run.client, run.sb, run.created, run.removed, run.nonce, run.agent, run.workdir, run.wait = Client(), sb, [], [], "abcd1234", None, REPO, 1
+        with self.assertRaises(RuntimeError):
+            run.cell(1, "idle_after_normal_turn", "queue")
+        self.assertEqual(removed, ["ses_throwaway"])
+        self.assertTrue(all(title.startswith(helper.TITLE_PREFIX) for title in created))   # named so it is never mistaken for a fleet agent
+
+    @unittest.skipUnless(os.access(os.environ.get("FLEET_KIT_LIVE_DELIVERY_MEASURE", ""), os.X_OK), "live: set FLEET_KIT_LIVE_DELIVERY_MEASURE to the path of an opencode v2 binary (it runs in a throwaway profile)")
+    def test_live_the_measurement_runs_in_a_throwaway_profile_and_leaves_nothing(self):
+        helper = importlib.import_module("support.delivery_measure")
+        with mock.patch.dict(os.environ, {sb.ALLOW_REAL_V2_ENV: "1"}):   # this one test means to run the real binary, inside the helper's own throwaway profile; restored after
+            result = helper.measure(os.environ["FLEET_KIT_LIVE_DELIVERY_MEASURE"])
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(len(result["rows"]), len(helper.CASES) * len(helper.FORMS))
+        self.assertEqual(result["sessions_left"], 0)
+        self.assertEqual(result["sessions_created"], result["sessions_removed"])
+
+    # -- the docs
+    DOC_ROW = re.compile(r"^\| `(?P<case>[a-z_]+)` \| `(?P<form>[a-z_]+)` \| (?P<started>yes|no) \| (?P<ms>[0-9]+|-) \|$")
+
+    def test_the_table_in_the_docs_equals_the_fixture(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("### Which delivery starts a turn (#1345)"):]
+        section = section[:section.index("\n### ", 10)]
+        rows = [m.groupdict() for m in map(self.DOC_ROW.match, section.splitlines()) if m]
+        docs = [(r["case"], r["form"], r["started"] == "yes", None if r["ms"] == "-" else int(r["ms"])) for r in rows]
+        fixture = [(r["case"], r["form"], r["turn_started"], r["ms"]) for r in self.fixture["rows"]]
+        self.assertEqual(docs, fixture)
+        self.assertIn(self.fixture["v2_version"], section)   # the measured version is named
+
+    def test_the_docs_say_the_completeness_test_is_derived_from_the_table_and_name_the_mutants(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("### Which delivery starts a turn (#1345)"):]
+        section = section[:section.index("\n### ", 10)]
+        for word in ("completeness", "mutant", "derives the forms", "ended-turn state"):
+            self.assertIn(word, section)
+
+
+def sb_form_args(form):
+    """(delivery, resume) of a form name, from the measurement helper's own table."""
+    return importlib.import_module("support.delivery_measure").FORM_ARGS[form]
+
+
+def sb_form_arg_names():
+    return list(importlib.import_module("support.delivery_measure").FORM_ARGS)
+
+
 class FakeProc:
     """A forwarder child: alive until it exits or is told to stop."""
 
@@ -14843,12 +15083,12 @@ class CharterRig:
         self.cmd_reads = []
         def cmd_parent(reader, number, repo=None, **kw):
             self.cmd_reads.append(("parent", number, repo))
-            if not repo:   # #1275: the fake honours the repo argument (a call without it fails)
+            if repo != self.expected_repo():   # #1275, #1345: the fake takes and CHECKS the repo it is asked about (a call without it, or for another repo, fails)
                 raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return self.cmd_parents[number]
         def cmd_issue(reader, number, repo=None):
             self.cmd_reads.append(("issue", number, repo))
-            if not repo:
+            if repo != self.expected_repo():
                 raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
         real_invalidate = sb.IntentReader.invalidate
@@ -14860,6 +15100,10 @@ class CharterRig:
             patcher.start()
             self.addCleanup(patcher.stop)
 
+
+    def expected_repo(self):
+        """The repo the guard must read for the orchestrator being set (orch-b in these tests): its registry row's repo, else the rig's."""
+        return ((self.registry.read(self.world.state)["agents"].get("orch-b") or {}).get("repo")) or self.REPO
 
     def orchestrator(self, name, charter=None, issue=None, registry=True):
         """A running orchestrator whose live SESSION metadata says `charter` and `issue`; its registry row (the first-seen fill the pass makes) holds the metadata charter unless `registry` is a value or False."""
@@ -15266,6 +15510,68 @@ class TestCharterSetGuard(CharterRig, Base):
         code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.cmd_reads, [("parent", 3, self.REPO), ("invalidate", 3, self.REPO), ("issue", 3, self.REPO)])
+
+    GUARD_MUTANTS = {   # #1345: the guard's two reads and its cache step, each changed once in the REAL source of cmd_charter: name -> (old text, new text)
+        "the parent read ignores the repo": ("engine.intents.parent(value, repo0, strict=True)", "engine.intents.parent(value, None, strict=True)"),
+        "the parent read asks another repo": ("engine.intents.parent(value, repo0, strict=True)", "engine.intents.parent(value, 'other-org/elsewhere', strict=True)"),
+        "the label read ignores the repo": ("record = engine.intents.issue(value, repo0)", "record = engine.intents.issue(value, None)"),
+        "the label read asks another repo": ("record = engine.intents.issue(value, repo0)", "record = engine.intents.issue(value, 'other-org/elsewhere')"),
+        "the label read is served from the cache": ("engine.intents.invalidate(value, repo0)", "pass"),
+        "the invalidation forgets another repo": ("engine.intents.invalidate(value, repo0)", "engine.intents.invalidate(value, 'other-org/elsewhere')"),
+    }
+
+    ROW_REPO = "acme-org/billing-service"
+
+    def mutated_charter(self, old, new):
+        source = textwrap.dedent(inspect.getsource(sb.cmd_charter))
+        self.assertEqual(source.count(old), 1, old)   # the mutant is one change of one place, and the place is still there
+        scope = dict(vars(sb))
+        exec(compile(source.replace(old, new), "<mutant of cmd_charter>", "exec"), scope)
+        scope["cmd_charter"].ensure_on_use = True
+        return scope["cmd_charter"]
+
+    def cached_label_set(self, mutant=None):
+        """One `charter set orch-b 3` through the REAL reader and its REAL cache, the label gone upstream but still CACHED (as an earlier read of the same engine leaves it): the real `parent` read seeds the
+        issue cache with the label the way an earlier read would. Returns (exit code, stderr). The unmutated guard forgets the cached label first, reads afresh and refuses."""
+        self.orchestrator("orch-b", registry=None)
+        self.registry.upsert(self.world.state, "orch-b", dict(self.row("orch-b"), charter=None, repo=self.ROW_REPO))   # the row's repo is NOT the reader's default: a read that drops the repo lands elsewhere
+        stale = {"number": 3, "labels": [{"name": sb.orchestrator_label()}]}
+        upstream = {"number": 3, "labels": [{"name": "bug"}]}
+        def api(reader, path, repo=None):
+            if repo != self.ROW_REPO:   # the fake takes and checks the repo it is asked about
+                raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
+            if path.endswith("/parent"):
+                raise self.NOPARENT
+            return upstream
+        def parent(reader, number, repo=None, **kw):
+            found = REAL_INTENT_PARENT(reader, number, repo, **kw)
+            seeded = sb.IssueIntent.from_api(stale)
+            seeded.repo = repo
+            reader._cache[("issue", repo, number)] = (reader.now(), seeded, None)   # the earlier read: cached, and a ttl long enough that it would be served
+            return found
+        patches = [mock.patch.object(sb.IntentReader, "issue", REAL_INTENT_ISSUE), mock.patch.object(sb.IntentReader, "parent", parent), mock.patch.object(sb.IntentReader, "_api", api)]
+        if mutant is not None:
+            patches.append(mock.patch.object(sb, "cmd_charter", mutant))
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        return code, err
+
+    def test_the_label_is_never_served_stale_from_the_cache(self):
+        code, err = self.cached_label_set()
+        self.assertEqual(code, 2, err)   # the label was removed after the cached read: the guard sees it gone
+        self.assertIn("is not a charter", err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+
+    def test_every_guard_mutant_is_refused_by_the_strict_fakes_or_the_cache_test(self):
+        """The 3 mutants the batch readers found alive (a read of the wrong repo, a read without the repo, a cached label) and their siblings: each is one change of the real source of cmd_charter and each must change the outcome."""
+        survivors = []
+        for name, (old, new) in sorted(self.GUARD_MUTANTS.items()):
+            code, err = self.cached_label_set(self.mutated_charter(old, new))
+            if (code, "is not a charter" in err) == (2, True):   # the unmutated guard's answer: a refusal for the missing label
+                survivors.append(name)
+        self.assertEqual(survivors, [])
 
     def test_changing_a_set_charter_needs_replace(self):
         self.orchestrator("orch-b", registry=3)
@@ -17674,10 +17980,11 @@ class TestHeadlessPresence(Base):
         self.assertTrue(any("finished the health check" in t for t in boss_texts), boss_texts)
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        self.world.clock.t += 3600   # idle long enough for the close of a headless worker
         code, out, err = self.run_cli("retire", "hw", "--close")
         self.assertEqual(code, 0, err)
         self.assertIn("hw is retired", out)
-        self.assertIn("nothing to close", out)
+        self.assertIn("ended the session", out)
         self.assertEqual(self.world.herdr.closed, [], "no pane was closed")
         self.assertIn("hw", sb.read_retired(self.world.state))
 
@@ -20651,7 +20958,7 @@ class TestHandoff(HandoffCase):
         # (#1123) plus ONE site in `_review_api`, the shared helper of `review post` and `review dismiss`: their writes (a review, a dismissal) are deliberate and the only ones added;
         # the reader code (IntentReader, checked above, and checkout/measure) stays read-only
         self.assertEqual(source.count('"--method"'), 4)
-        self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 3)   # post (twice: the verdict and the fallback) and the dismissal: each goes through the helper
+        self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 2)   # the post (the verdict and its own-account fallback share one call site, the event is a variable) and the dismissal: each goes through the helper
 
 
 class TestForegroundScenarios(Base):
@@ -29908,7 +30215,12 @@ class TestRedCi(Base):
 
     def feed(self, *runs):
         self.world.tick(1)
-        sb.red_ci_runs(self.engine, self.REPO, list(runs), self.world.clock.now())
+        sb.red_ci_runs(self.engine, self.REPO, list(runs), self.world.clock.now(), lambda n: self.prs.get(n))
+
+    prs = {}   # the present record of each pull request; a missing number is an unreadable one
+
+    def present(self, number, head, state="open", merged=False):
+        self.prs = {**self.prs, number: {"state": state, "merged": merged, "head": {"sha": head}}}
 
     def lines(self, name):
         self.engine.sources = [self.source]
@@ -29936,6 +30248,7 @@ class TestRedCi(Base):
         for conclusion, status in (("cancelled", "completed"), ("skipped", "completed"), ("neutral", "completed"), (None, "in_progress")):
             self.feed(self.run_rec(conclusion, "h9", status=status))
         self.feed(self.run_rec("failure", "h9", name="lint"))       # not required
+        self.present(55, "h9")
         self.feed(self.run_rec("failure", "h9", pr=55))             # no worker owns #55: only the Chief of Staff, once
         self.assertEqual(self.lines("orch"), [])
         self.assertEqual(len(self.lines("cos")), 1)
@@ -29949,6 +30262,71 @@ class TestRedCi(Base):
         self.assertEqual(len(self.lines("orch")), 2)
         self.feed(self.run_rec("failure", "h1", rid=150))
         self.assertEqual(len(self.lines("orch")), 3)
+
+    def unowned(self):
+        return [l for l in self.lines("cos") if "no worker owns" in l]
+
+    def test_unowned_once_per_head_and_check_across_restart_and_rerun(self):   # #1378 S2, S3
+        self.present(1304, "aaa111")
+        self.feed(self.run_rec("failure", "aaa111", pr=1304, rid=500))
+        self.engine.red_ci = None
+        self.feed(self.run_rec("failure", "aaa111", pr=1304, rid=500))
+        self.engine.red_ci = None
+        self.feed(self.run_rec("failure", "aaa111", pr=1304, rid=501, attempt=2))
+        self.assertEqual(len(self.unowned()), 1)
+
+    def test_unowned_new_head_alerts_once_more(self):   # S7
+        self.present(1304, "aaa111")
+        self.feed(self.run_rec("failure", "aaa111", pr=1304))
+        self.present(1304, "bbb222")
+        self.feed(self.run_rec("failure", "bbb222", pr=1304))
+        self.feed(self.run_rec("failure", "bbb222", pr=1304, rid=900))
+        self.assertEqual(len(self.unowned()), 2)
+
+    def test_unowned_stale_head_is_silent(self):   # S4: the recorded shape of #1304; the read holds no newer run
+        self.present(1304, "bbb222")
+        self.feed(self.run_rec("failure", "aaa111", pr=1304))
+        self.assertEqual(self.unowned(), [])
+
+    def test_unowned_closed_or_merged_is_silent(self):   # S5
+        self.present(7, "h1", state="closed")
+        self.present(8, "h1", state="closed", merged=True)
+        self.feed(self.run_rec("failure", "h1", pr=7), self.run_rec("failure", "h1", pr=8))
+        self.assertEqual(self.unowned(), [])
+
+    @contextlib.contextmanager
+    def mutant(self, owner, name, old, new):
+        """Run with `owner.name` rebuilt from its source with `old` replaced by `new`; the old text must be present (else the mutation did not apply)."""
+        source = textwrap.dedent(inspect.getsource(getattr(owner, name)))
+        self.assertIn(old, source, "the mutation did not apply to %s" % name)
+        original = getattr(owner, name)
+        exec(compile(source.replace(old, new, 1), "<mutant %s>" % name, "exec"), vars(owner))
+        try:
+            yield
+        finally:
+            setattr(owner, name, original)
+
+    def test_unowned_mutant_key_without_the_head_misses_a_new_head(self):   # #1378: applied by hand too; S7 fails under it
+        with self.mutant(sb.load_module("red_ci"), "unowned_key", 'clean(head, 64).replace(":", "_")', '""'):
+            self.present(1304, "aaa111")
+            self.feed(self.run_rec("failure", "aaa111", pr=1304))
+            self.present(1304, "bbb222")
+            self.feed(self.run_rec("failure", "bbb222", pr=1304))
+            self.assertEqual(len(self.unowned()), 1)   # the real key gives 2 (test_unowned_new_head_alerts_once_more)
+
+    def test_unowned_mutant_without_the_state_check_alerts_a_closed_pr(self):   # #1378: applied by hand too; S5 fails under it
+        old = 'pr.get("state") == "open" and not pr.get("merged") and '
+        with self.mutant(sb, "red_ci_runs", old, ""):
+            self.present(55, "h1", state="closed")
+            self.present(56, "h2", state="closed", merged=True)   # #7 is owned by a worker: 55 and 56 are unowned
+            self.feed(self.run_rec("failure", "h1", pr=55))
+            self.feed(self.run_rec("failure", "h2", pr=56))
+            self.assertEqual(len(self.unowned()), 2)   # the real code gives none (test_unowned_closed_or_merged_is_silent)
+
+    def test_unowned_unreadable_present_state_is_silent(self):   # S6
+        self.prs = {}
+        self.feed(self.run_rec("failure", "h1", pr=7))
+        self.assertEqual(self.unowned(), [])
 
     def test_timed_out_and_startup_failure_are_red_others_silent(self):
         for i, (c, n) in enumerate((("timed_out", 1), ("startup_failure", 1), ("action_required", 0), ("stale", 0))):
@@ -30104,10 +30482,11 @@ class TestRedCi(Base):
             self.assertRegex(doc, r"`%s`[^\n]*\b%s\b" % (word, {"red": "red", "green": "green", "none": "(silent|none)"}[action]), word)
         self.assertEqual({w for w, a in module.COLOUR.items() if a == "red"}, {"failure", "timed_out", "startup_failure"})
 
-    def test_unowned_note_is_new_for_a_rerun(self):
+    def test_unowned_note_is_not_new_for_a_rerun(self):   # #1378: the key is (PR, head, check), never the run id or the attempt
+        self.present(55, "h9")
         self.feed(self.run_rec("failure", "h9", pr=55, rid=201))
         self.feed(self.run_rec("failure", "h9", pr=55, rid=201, attempt=2))
-        self.assertEqual(len(self.lines("cos")), 2)
+        self.assertEqual(len(self.lines("cos")), 1)
 
     def test_config_warns_on_matrix_job_names_and_validates_default_branches(self):
         err = io.StringIO()
@@ -50361,6 +50740,356 @@ class TestHeadlessAnswerPath(WriteWorld):
         self.assertEqual(getattr(self.world.v2, "permission_replies", []), [], "no reply reached the service")
 
 
+class TestRetireCloseHeadless(StandInPids, Base):
+    """#1062: `retire --close` ends a HEADLESS worker's session through the service's session removal, by the boss rule of a pane close; also after the
+    plain retire (judged from the retirement record). Fakes only: the service is the fake v2."""
+
+    GIT_ENV = TestLaunch.GIT_ENV
+    git, make_repo, add_worktree = TestLaunch.git, TestLaunch.make_repo, TestLaunch.add_worktree
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss", "other"))
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.engine.state_dir = self.world.state
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        for patch in (mock.patch.object(sb.V2Client, "service_identity", lambda client: 100),
+                      mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None),
+                      mock.patch.dict(os.environ, {}, clear=False)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.removed = []
+        real = sb.V2Client.session_remove
+
+        def counting(client, session_id):
+            self.removed.append(session_id)
+            return real(client, session_id)
+        patch = mock.patch.object(sb.V2Client, "session_remove", counting)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def as_(self, who):
+        if who is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+
+    def hw(self, name="hw", boss="boss"):
+        sid = self.world.v2.create_session({"fleet": {"name": name, "role": "coder", "reports_to": boss, "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, name, sid, None, now=self.world.clock.now())
+        self.world.clock.t += 3600   # long idle by default
+        return sid
+
+    def lines(self, name, event="headless.closed"):
+        return [e for e in self.world.audit() if e["event"] == event and e["subject"] == name]
+
+    def test_s2_a_boss_ends_an_idle_headless_worker_and_one_line_says_so(self):
+        sid = self.hw()
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.removed, [sid])
+        self.assertEqual(len([l for l in out.splitlines() if "ended" in l]), 1, out)
+        self.assertNotIn("nothing to close", out)
+
+    def test_s3_a_non_boss_is_refused_naming_the_rule(self):
+        sid = self.hw()
+        self.as_("other")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("only the operator, or the agent's own boss", err)
+        self.assertEqual(self.removed, [])
+        self.assertIn(sid, self.world.v2.sessions)
+        self.assertNotIn("hw", sb.read_retired(self.world.state), "a refusal changes nothing")
+
+    def test_s4_a_turn_in_progress_or_recent_activity_is_refused_without_force(self):
+        sid = self.hw()
+        self.world.v2.sessions[sid]["turn"] = {"id": "t1"}
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("turn in progress", err)
+        self.assertEqual(self.removed, [])
+        code, out, err = self.run_cli("retire", "hw", "--close", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.removed, [sid])
+
+    def test_s4_activity_within_the_idle_window_is_refused_without_force(self):
+        sid = self.hw()
+        self.world.v2.sessions[sid]["idle"] = self.world.clock.now() - 30
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("retire_idle_minutes", err)
+        self.assertEqual(self.removed, [])
+
+    def test_s5_an_already_retired_worker_is_ended_by_its_recorded_boss_and_a_second_call_changes_nothing(self):
+        sid = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"))
+        self.assertEqual(self.removed, [], "plain retire ends nothing")   # U2
+        self.as_("other")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, "a non-boss is refused after the retirement too")
+        self.assertEqual(self.removed, [])
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.removed, [sid])
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertIn("already ended", out)
+        self.assertEqual(self.removed, [sid])
+        self.assertEqual(len(self.lines("hw")), 1)   # S7
+
+    def test_s6_unpushed_or_uncommitted_work_refuses_even_with_force(self):
+        sid = self.hw()
+        self.make_repo()
+        wt = self.add_worktree("w-hl", unpushed=True)
+        self.assertTrue(sb.register_worktree(self.world.state, str(wt), "hw", None, wt.name, 1))
+        self.as_("boss")
+        for extra in ((), ("--force",)):
+            code, out, err = self.run_cli("retire", "hw", "--close", *extra)
+            self.assertEqual(code, 1)
+            self.assertIn("uncommitted or unpushed work", err)
+        self.assertEqual(self.removed, [])
+
+    def test_s7_the_audit_holds_who_asked_the_session_and_the_reason(self):
+        sid = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        (line,) = self.lines("hw")
+        self.assertEqual((line["detail"]["by"], line["detail"]["session"]), ("boss", sid))
+        self.assertTrue(line["detail"]["reason"])
+
+    def test_the_chief_of_staff_ends_a_direct_report_and_the_operator_any(self):
+        sid = self.hw(boss="chief-of-staff")
+        self.as_("cos")
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        self.assertEqual(self.removed, [sid])
+        other = self.hw("hw2")
+        self.as_(None)
+        self.assertEqual(self.run_cli("retire", "hw2", "--close")[0], 0)
+        self.assertEqual(self.removed, [sid, other])
+
+    def test_u2_a_plain_retire_of_a_headless_worker_ends_nothing(self):
+        self.hw()
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.removed, [])
+
+    # -- #1062 amended plan: S8, S11-S13 (the rule is one function: S12)
+
+    def test_s8_a_live_headless_agent_with_no_known_session_is_refused_without_a_traceback(self):
+        """discovery can show a live headless agent whose session id is unknown: `headless_target` then has nothing to judge (the fake service always
+        names the session, so the shape is made by the one lookup that answers it)."""
+        sid = self.hw()
+        self.as_("boss")
+        with mock.patch.object(sb, "headless_target", lambda engine, discovery, name: None):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out)
+        self.assertIn("no session known for hw", err)
+        self.assertNotIn("Traceback", err + out)
+        self.assertEqual(self.removed, [])
+        self.assertIn(sid, self.world.v2.sessions)
+        self.assertNotIn("hw", sb.read_retired(self.world.state), "nothing was retired")
+        self.assertIsNotNone(self.ap.load_record(self.world.state, "hw"))
+
+    def test_s11_a_failed_delete_after_the_retirement_exits_non_zero_says_not_ended_and_audits_no_closed_line(self):
+        sid = self.hw()
+        self.as_("boss")
+        boom = mock.Mock(side_effect=sb.V2Error("http", status=500, detail="boom"))
+        with mock.patch.object(sb.V2Client, "session_remove", boom):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("NOT ended", out)
+        self.assertIn("hw", sb.read_retired(self.world.state), "the worker is retired either way")
+        self.assertEqual(self.lines("hw"), [], "no headless.closed line for a delete that failed")
+        self.assertIn(sid, self.world.v2.sessions)
+        # the already-retired path says the same thing the same way
+        with mock.patch.object(sb.V2Client, "session_remove", boom):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("NOT ended", out)
+        self.assertEqual(self.lines("hw"), [])
+
+    def source_of(self, name):
+        import ast
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        return {n.name: n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.FunctionDef)}[name], text
+
+    def test_s12_who_may_close_is_defined_once_and_called_by_the_pane_close_and_the_headless_end(self):
+        import ast
+        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        tree = ast.parse(text)
+        funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        holders = sorted(n for n, f in funcs.items() if "only the operator or the agent's own boss may" in (ast.get_source_segment(text, f) or "").replace("\n", " "))
+        self.assertEqual(holders, ["close_authority_problem"], "the wording of the rule lives in one function")
+        for caller in ("retire_close_problem", "headless_close_problem"):
+            calls = {c.func.id for c in ast.walk(funcs[caller]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            self.assertIn("close_authority_problem", calls, caller)
+            self.assertNotIn("gates_caller_kind", calls, "%s decides who may by itself" % caller)
+
+    def test_s12_a_change_to_the_shared_rule_reaches_both_closes(self):
+        discovery = self.engine.discover(self.world.clock.now())
+        seen = discovery.agents["other"]
+        self.hw()
+        target = sb.headless_target(self.engine, self.engine.discover(self.world.clock.now()), "hw")
+        with mock.patch.object(sb, "close_authority_problem", lambda *a, **k: "THE ONE RULE"):
+            self.assertEqual(sb.retire_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "other", seen, False), (None, "THE ONE RULE"))
+            self.assertEqual(sb.headless_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "hw", target, False), (None, "THE ONE RULE"))
+
+    def gone(self):
+        return mock.patch.object(sb.V2Client, "session_get", mock.Mock(side_effect=sb.V2Error("http", status=404, detail="gone")))
+
+    def test_s13_a_gone_session_of_a_live_worker_is_still_judged_by_the_boss_rule(self):
+        sid = self.hw()
+        self.as_("other")
+        with self.gone():
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("only the operator or the agent's own boss may end a session", err)
+        self.assertNotIn("already ended", out + err)
+        self.assertNotIn("hw", sb.read_retired(self.world.state), "nothing was retired")
+        self.assertEqual(self.removed, [])
+
+    def test_s13_a_non_boss_asking_about_a_retired_worker_with_a_gone_session_gets_the_refusal_not_already_ended(self):
+        sid = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        del self.world.v2.sessions[sid]   # the session is gone from the service
+        self.as_("other")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("other may not end hw's session", err)
+        self.assertNotIn("already ended", out + err)
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertIn("already ended", out, "the boss still learns it")
+        self.assertEqual(self.removed, [])
+
+    def test_s13_a_mutant_that_checks_authority_after_the_gone_shortcut_fails_the_two_refusals(self):
+        import inspect, textwrap
+        src = textwrap.dedent(inspect.getsource(sb.headless_close_problem))
+        check = '    why = close_authority_problem(runner, now, name, boss, "end", "session")\n    if why:\n        return None, why\n'
+        self.assertIn(check, src)
+        mutant = src.replace(check, "", 1).replace("    try:\n        info = engine.v2.session_get(sid)", "    try:\n        info = engine.v2.session_get(sid)", 1)
+        tail = "    except Exception as err:\n        return None, \"session %s cannot be read now (%s): nothing was ended\" % (sid, _one_line(str(err), 80))\n"
+        self.assertIn(tail, mutant)
+        mutant = mutant.replace(tail, tail + check, 1)
+        self.assertNotEqual(mutant, src, "the mutant is applied")
+        scope = dict(sb.__dict__)
+        exec(mutant, scope)
+        self.hw()
+        self.as_("other")
+        with mock.patch.object(sb, "headless_close_problem", scope["headless_close_problem"]), self.gone():
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        refused = code == 1 and "may not end hw's session" in err and "already ended" not in out + err
+        self.assertFalse(refused, "the mutant must fail the refusal of the two tests above: %r" % (out + err))
+
+    def test_s13_an_agent_cannot_end_its_own_session(self):
+        sid = self.hw()
+        self.as_("boss")
+        with mock.patch.object(sb, "gates_caller_kind", lambda runner, now: ("agent", "hw", "coder")):
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("an agent cannot end its own session", err)
+        self.assertEqual(self.removed, [])
+        self.assertIn(sid, self.world.v2.sessions)
+
+    def test_s13_a_retired_name_reused_by_a_live_agent_judges_the_live_record_and_ends_nothing_through_the_old_retirement(self):
+        old = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        new = self.hw()   # the name is launched again: a live record and a retirement of the same name
+        self.assertNotEqual(old, new)
+        self.assertIn("hw", sb.read_retired(self.world.state))
+        self.as_("other")
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1, "the live worker's boss rule applies, not the old retirement's")
+        self.assertEqual(self.removed, [])
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        self.assertEqual(self.removed, [new], "only the live session is ended")
+        self.assertIn(old, self.world.v2.sessions, "the old retirement ends nothing")
+
+    def test_s13_an_unreadable_session_or_activity_read_refuses_and_ends_nothing(self):
+        sid = self.hw()
+        self.as_("boss")
+        down = sb.V2Error("exit", detail="down")
+        for method in ("session_active", "session_get"):
+            with mock.patch.object(sb.V2Client, method, mock.Mock(side_effect=down)):
+                code, out, err = self.run_cli("retire", "hw", "--close")
+            self.assertNotEqual(code, 0, method)
+            self.assertEqual(self.removed, [], method)
+        self.assertIn(sid, self.world.v2.sessions)
+        self.assertNotIn("hw", sb.read_retired(self.world.state))
+        real = sb.V2Client.session_get
+        with mock.patch.object(sb.V2Client, "session_get", lambda client, session_id: dict(real(client, session_id), time={})):   # no readable last activity
+            code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 1)
+        self.assertIn("cannot be read", err)
+        self.assertEqual(self.removed, [])
+
+    def test_s13_a_corrupt_hostile_or_too_deeply_nested_registry_is_read_bounded_and_ends_nothing(self):
+        sid = self.hw()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        reg = Path(self.world.state) / "registry.json"
+        good = reg.read_text()
+        for bad in ("[" * 100000, '{"version": 1, "agents": {}, "retired": %s}' % ("[" * 70 + "]" * 70), "{not json", '{"version": 1, "agents": {}, "retired": []}'):
+            reg.write_text(bad)
+            code, out, err = self.run_cli("retire", "hw", "--close")
+            self.assertNotIn("Traceback", err + out, bad[:20])
+            self.assertNotEqual(code, 0, bad[:20])
+            self.assertEqual(self.removed, [], bad[:20])
+            self.assertIn(sid, self.world.v2.sessions)
+        reg.write_text(good)
+        self.assertEqual(self.run_cli("retire", "hw", "--close")[0], 0)
+        self.assertEqual(self.removed, [sid])
+
+    # -- the mutants: each mutates the RULE (the source of the shared function) and the check that guards it must fail on an assertion
+
+    def rule_mutant(self, old, new):
+        import types
+        func, text = self.source_of("close_authority_problem")
+        src = __import__("ast").get_source_segment(text, func)
+        self.assertIn(old, src)
+        scope = dict(vars(sb))
+        exec(src.replace(old, new, 1), scope)
+        return mock.patch.object(sb, "close_authority_problem", types.FunctionType(scope["close_authority_problem"].__code__, vars(sb), "close_authority_problem"))
+
+    def test_s9_a_mutant_rule_that_allows_everyone_fails_the_non_boss_check(self):
+        with self.rule_mutant("    kind = gates_caller_kind(runner, now)\n", "    return None\n    kind = gates_caller_kind(runner, now)\n"):
+            with self.assertRaises(AssertionError):
+                self.test_s3_a_non_boss_is_refused_naming_the_rule()
+
+    def test_s9_a_mutant_rule_that_skips_the_boss_check_fails_the_non_boss_check(self):
+        with self.rule_mutant("if boss is None or boss != who:", "if False:"):
+            with self.assertRaises(AssertionError):
+                self.test_s3_a_non_boss_is_refused_naming_the_rule()
+
+    def test_s9_a_mutant_rule_that_skips_the_own_session_check_fails_that_check(self):
+        with self.rule_mutant("if who == name:", "if False:"):
+            with self.assertRaises(AssertionError):
+                self.test_s13_an_agent_cannot_end_its_own_session()
+
+    def test_s9_a_mutant_that_ignores_the_turn_in_progress_fails_the_check(self):
+        with mock.patch.object(sb.V2Client, "session_active", lambda client: {}):
+            with self.assertRaises(AssertionError):
+                self.test_s4_a_turn_in_progress_or_recent_activity_is_refused_without_force()
+
+
 class TestRetireLostHeadless(StandInPids, Base):
     """#678: `retire` of a headless worker whose session is gone (a record on file, nothing discovered): authority, the record, the remembered boss."""
 
@@ -65673,7 +66402,8 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.posted, self.issue_comments, self.dismissed = [], [], []
         self.reviews, self.inline, self.files, self.refuse_own = [], {}, {}, False
         self.reads, self.fail_read, self.raw_ok = [], None, None
-        self.pr = dict(self.pr, headRefOid=self.HEAD, reviewDecision="")
+        self.poster, self.fail_user = "poster", False   # the account the fake token belongs to
+        self.pr = dict(self.pr, headRefOid=self.HEAD, reviewDecision="", author={"login": "someone-else"})
         self.audit_path = self.world.audit_path
         self.audit_path.write_text("")
 
@@ -65688,6 +66418,8 @@ class TestReviewPostAndDismiss(LedgerBase):
                 self.issue_comments.append(sent)
                 return done(0, {})
             if path.endswith("/pulls/9/reviews"):
+                if not path.startswith("repos/acme/app/"):
+                    return done(1, {}, "gh: Not Found (HTTP 404)")   # the fake checks the repo it is asked about
                 if self.refuse_own and sent["event"] != "COMMENT":
                     return done(1, {}, "gh: Unprocessable Entity: Can not approve your own pull request (HTTP 422)")
                 self.posted.append(sent)
@@ -65705,7 +66437,11 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.reads.append(path)
         paged = re.search(r"\?per_page=100&page=(\d+)$", path)
         page = (int(paged.group(1)) - 1) * 100 if paged else 0
+        if path == "user":
+            return done(1, {}, "gh: boom (HTTP 500)") if self.fail_user else done(0, {"login": self.poster})
         if re.search(r"/pulls/9/reviews\?per_page=100&page=\d+$", path):
+            if not path.startswith("repos/acme/app/"):
+                return done(1, {}, "gh: Not Found (HTTP 404)")   # the fake checks the repo it is asked about
             return done(*self.fail_read) if self.fail_read and self.fail_read[2] == "reviews" else done(0, self.reviews[page:page + 100])
         found = re.search(r"/pulls/9/reviews/(\d+)(/comments)?", path)
         if found:
@@ -65823,18 +66559,77 @@ class TestReviewPostAndDismiss(LedgerBase):
         code, out, err = self.dismiss(77, "the key is %s" % self.SECRETS[0])
         self.assertNotIn(self.SECRETS[0], out + err)
 
-    def test_on_the_same_accounts_own_pull_request_it_falls_back_to_a_comment_type_review_and_says_so(self):
-        for verdict in ("approve", "request-changes"):
-            with self.subTest(verdict=verdict):
-                self.reset()
-                self.refuse_own = True
+    # -- the own-account case, the second review at one head, and the refusal text (#1344)
+
+    def own(self):
+        self.pr["author"] = {"login": self.poster}
+
+    def check_own_account(self):
+        self.reset()
+        for verdict, (word, event) in sb.REVIEW_POST_VERDICTS.items():
+            for mine in (True, False):
+                self.posted.clear()
+                self.reviews.clear()
+                self.pr["author"] = {"login": self.poster if mine else "someone-else"}
                 code, out, err = self.post(verdict=verdict)
                 self.assertEqual(code, 0, err)
                 self.assertEqual(len(self.posted), 1)
-                self.assertEqual(self.posted[0]["event"], "COMMENT")   # U5: the Reviews API's comment event
-                self.assertEqual(self.issue_comments, [])
-                self.assertIn("comment-type review", out)
-                self.assertTrue(self.posted[0]["body"].endswith(sb.fleet_mark("rdr1")))
+                sent = self.posted[0]
+                self.assertEqual(sent["event"], "COMMENT" if mine else event, (verdict, mine))
+                self.assertEqual(sent["body"].splitlines()[0], "Review of %s: %s" % (self.HEAD, word))
+                self.assertEqual("posted as a comment" in out, mine and event != "COMMENT", out)
+
+    def check_refusal_reason(self):
+        self.reset()
+        self.refuse_own, self.fail_user = True, True   # the author cannot be read: GitHub's refusal is all there is
+        code, out, err = self.post()
+        self.assertEqual((code, self.posted), (2, []))
+        self.assertIn("can not approve your own pull request", err.lower())
+        self.assertIn("post with `--verdict comment`", err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+
+    def check_one_review_per_head(self):
+        self.reset()
+        self.reviews.append({"id": 321, "user": {"login": "shared"}, "state": "COMMENTED", "commit_id": self.HEAD,
+                             "body": "Review of %s: COMMENT\n\nx\n\n%s" % (self.HEAD, sb.fleet_mark("rdr1"))})
+        code, out, err = self.post()
+        self.assertEqual((code, self.posted), (2, []))
+        self.assertIn("321", err)
+        code, out, err = self.run_as("rdr1", "review", "post", self.PR, "--head", self.HEAD, "--verdict", "approve", "--body-file", self.body_file(), "--again")
+        self.assertEqual((code, len(self.posted)), (0, 1), err)
+
+    def test_the_own_account_case_is_posted_as_a_comment_review_for_every_verdict_form(self):
+        self.check_own_account()
+
+    def test_the_refusal_prints_githubs_reason_as_one_line_and_the_next_step(self):
+        self.check_refusal_reason()
+
+    def test_a_second_review_at_one_head_needs_again_and_the_refusal_names_the_earlier_one(self):
+        self.check_one_review_per_head()
+
+    def test_a_review_at_another_head_or_by_another_reader_is_not_a_second_review(self):
+        self.reset()
+        self.reviews.append({"id": 5, "user": {"login": "shared"}, "state": "COMMENTED", "commit_id": self.OLD, "body": "x\n\n" + sb.fleet_mark("rdr1")})
+        self.reviews.append({"id": 6, "user": {"login": "shared"}, "state": "COMMENTED", "commit_id": self.HEAD, "body": "x\n\n" + sb.fleet_mark("rdr2")})
+        self.assertEqual(self.post()[0], 0)
+
+    def test_the_new_reads_are_never_cached_and_name_the_repo(self):
+        self.reset()
+        self.post()
+        self.assertIn("user", self.reads)
+        self.assertTrue(any(r.startswith("repos/acme/app/pulls/9/reviews?") for r in self.reads), self.reads)
+
+    def test_the_mutant_that_drops_the_reason_fails(self):
+        self.mutant_fails(self.check_refusal_reason, review_refusal_text=lambda why, head, word: "GitHub refused (nothing was posted)")
+
+    def test_the_mutant_that_posts_the_own_account_case_as_approve_fails(self):
+        self.mutant_fails(self.check_own_account, review_is_own_account=lambda author, mine: False)
+
+    def test_the_mutant_that_accepts_a_second_review_at_one_head_fails(self):
+        self.mutant_fails(self.check_one_review_per_head, review_earlier=lambda listed, head, name: None)
+
+    def test_the_mutant_that_ignores_again_fails(self):
+        self.mutant_fails(self.check_one_review_per_head, review_again=lambda args: False)
 
     def test_the_caller_must_be_a_registered_reader_or_reviewer_and_is_named_by_its_registered_name(self):
         self.reset()
@@ -87546,7 +88341,7 @@ class TestRecordJsonReaders(unittest.TestCase):
     BIN = REPO / "bin"
     # readers of record text and the shared helpers: each must call parse_bounded (the helpers ARE the parse)
     READERS = {"agent_presence.py:read_record": "agent_presence", "switchboard/reminders.py:read_reminders": "reminders",
-               "switchboard/reminders.py:read_record_file": "reminders"}
+               "switchboard/reminders.py:read_record_file": "reminders", "registry.py:_parse": "registry", "registry.py:_old_retired": "registry"}
     HELPERS = {"record_json.py:parse_bounded", "cloud_worker.py:parse_bounded"}
     # every other json.loads / json.load site in bin/: daemon-written state, command output, a socket body or a line of a log, with a reason
     EXEMPT_REASON = "not a record file another process writes: daemon-written state, command output, a request body or a log line"
@@ -87683,8 +88478,6 @@ reassign.py:read_overrides
 reassign.py:read_overrides_strict
 reds.py:get
 reds.py:parse_artifact
-registry.py:_old_retired
-registry.py:_parse
 registry.py:_small
 registry.py:fold_old
 repo_exclusion.py:_commands
@@ -87872,7 +88665,8 @@ work_sync.py:_read_json
 
     def test_s9_mutants_the_scan_removed_from_each_reader_are_caught(self):
         """Run by hand too: replace parse_bounded by json.loads at the reader and the deep-file tests fail."""
-        for rel, old in (("agent_presence.py", "_record_json.parse_bounded("), ("switchboard/reminders.py", 'load_module("record_json").parse_bounded(')):
+        for rel, old in (("agent_presence.py", "_record_json.parse_bounded("), ("switchboard/reminders.py", 'load_module("record_json").parse_bounded('),
+                         ("registry.py", "_record_json.parse_bounded(")):
             text = self.mutate(rel, old, "json.loads(")
             self.assertNotIn("parse_bounded", text.replace("def parse_bounded", "")) if False else None
             self.assertIn("json.loads(", text)
