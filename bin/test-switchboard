@@ -38008,6 +38008,13 @@ class TestWholeRead(LedgerBase):
         self.assertIsNone(sb.whole_read_problem([("a", 5, 5), ("a", 3, 5)], ["a"]))   # the fuller of two rows for one path counts
         self.assertIn("line 4", sb.whole_read_problem([("a", 3, 5), ("a", 3, 5)], ["a"]))
 
+    def test_1458_the_short_files_read_refusal_names_the_repo_path_form(self):
+        why = sb.whole_read_problem([("app.py", 5, 5)], ["bin/widget-api/app.py", "docs/notes.md"])
+        for part in ("not read: bin/widget-api/app.py", "repo path", "files.txt", "e.g. bin/widget-api/app.py"):
+            self.assertIn(part, why)
+        self.assertEqual(why.count("\n"), 0)
+        self.assertIsNone(sb.whole_read_problem([("a", 5, 5)], ["a"]))
+
     def test_1047_an_uncited_mark_is_replaced_by_a_later_record_and_shown_in_the_state_line(self):
         uncited = "- no rule here | block | src/a.py:4 | vague | fix it\n"
         self.assertEqual(self.record(self.WHOLE, verdict="request-changes", findings=uncited, reviewer="code")[0], 0)
