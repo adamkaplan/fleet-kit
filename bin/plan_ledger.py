@@ -563,7 +563,7 @@ def claim_body(text, link="PLAN: x#1"):
 
 
 def union_refusal(ref, uncovered, closed=()):
-    tail = "; the closed-unmerged pull request%s %s left %s unclaimed (#1347)" % ("s" if len(closed) > 1 else "", ", ".join("#%s" % n for n in closed), "it" if len(uncovered) == 1 else "them") if closed else ""
+    tail = "; the closed-unmerged pull request%s %s left %s unclaimed (#1347)" % ("s" if len(closed) > 1 else "", ", ".join("#%s" % n for n in closed), "it" if len(uncovered) == 1 else "them") if closed else "; the closed pull requests could not be read" if closed is None else ""
     return ("merge of %s refused: it is the last pull request of its ask and the claims of its merged pull requests do not cover %s%s; a pull request must claim %s "
             "(`CLAIMS:` under `PLAN:`), or the chief of staff logs a waiver (`waive %s --gates CU`)" % (
                 ref, ", ".join(uncovered), tail, "it" if len(uncovered) == 1 else "them", ref))

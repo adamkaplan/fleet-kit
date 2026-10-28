@@ -79568,6 +79568,18 @@ class TestClosedUnmergedLastPr(unittest.TestCase):
         self.assertEqual(self.judge([("merged", "line"), ("merged", "rest")], ["line"]), ([], []))
         self.assertEqual(self.judge([("merged", "none")], ["none"]), ([], []))
 
+    def narrowing_by_closed_claim(self, fn=None):
+        self.assertEqual(self.judge([], ["line"], fn), (["S1", "S2", "S3"], [9]))   # only the closed pull request's claim line narrows the plan
+
+    def test_s13_a_closed_prs_claim_line_counts_as_narrowing(self):
+        self.narrowing_by_closed_claim()
+
+    def test_s13_a_mutant_that_ignores_the_closed_claim_line_for_narrowing_fails(self):
+        real = sb.plan_ledger.closed_unclaimed
+        ignores = lambda scen, peers, closed: real(scen, peers, [(n, "PLAN: acme/app#7") for n, _ in closed])
+        with self.assertRaises(AssertionError):
+            self.narrowing_by_closed_claim(ignores)
+
     def test_s8_the_mutant_that_ignores_closed_prs_fails(self):
         ignore = lambda scen, peers, closed: sb.plan_ledger.closed_unclaimed(scen, peers, [])
         self.assertNotEqual(self.check(ignore)[1], [])
@@ -86866,6 +86878,27 @@ class TestClosedUnmergedFamily(LedgerBase):
             with self.assertRaises(AssertionError):
                 self.test_the_merge_refusal_names_the_unclaimed_scenario_and_the_closed_pull_request()
 
+    def second_read_fails(self):
+        self.body("S1")
+        real = sb.plan_peers
+        def flaky(ctx, runner, now, closed=None):
+            if closed is not None:
+                raise RuntimeError("the second read failed")
+            return real(ctx, runner, now, closed)
+        with mock.patch.object(sb, "plan_peers", flaky):
+            why = self.refusal([("merged", "S2 U1"), ("closed", "S3")])
+        self.assertIn("S3", why or "")
+        self.assertIn("the closed pull requests could not be read", why or "")
+
+    def test_s11_a_failed_second_read_still_refuses_and_says_the_closed_pull_requests_could_not_be_read(self):
+        self.second_read_fails()
+
+    def test_s11_a_mutant_that_swallows_the_second_read_silently_is_caught(self):
+        real = sb.plan_ledger.union_refusal
+        with mock.patch.object(sb.plan_ledger, "union_refusal", lambda ref, unc, closed=(): real(ref, unc, closed or ())):
+            with self.assertRaises(AssertionError):
+                self.second_read_fails()
+
     def test_the_bound_refuses_naming_the_waiver_and_a_head_bound_waiver_passes_only_for_that_head(self):
         self.body("S1")
         many = [dict(number=3000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * sb.PEER_PAGES)]
@@ -86904,6 +86937,7 @@ class TestClosedUnmergedAskClose(unittest.TestCase):
         TestAskIssueSubject.setUp(self)
         self.found = []
         self.too_many = False
+        self.broken = None
         self.seen_pages = []
 
     def merged(self, number, claim):
@@ -86922,6 +86956,10 @@ class TestClosedUnmergedAskClose(unittest.TestCase):
             def _api(self, path, repo=None):
                 page = int(re.search(r"&page=(\d+)", path).group(1))
                 test.seen_pages.append(page)
+                if test.broken == "list error":
+                    raise RuntimeError("the search failed")
+                if test.broken == "bad shape":
+                    return {"items": "not a list"}
                 items = [dict(number=3000 + n, state="open", body="no plan", pull_request={"merged_at": None}) for n in range(300)] if test.too_many else test.found
                 return {"total_count": len(items), "items": items[(page - 1) * 100:page * 100]}
         real = sb._ledger_context
@@ -86998,6 +87036,43 @@ class TestClosedUnmergedAskClose(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 self.bound_and_waiver()
 
+    def failed_read(self, kind):
+        self.record_all()
+        if kind == "too many pull requests":
+            self.too_many = True
+        elif kind == "unknown sibling":   # merged, and no claim line was ever recorded for it
+            self.found = [dict(number=31, state="closed", merged_at="2026-01-01T00:00:00Z", body="PLAN: %s\nCLAIMS: S1" % self.ASK, pull_request={"merged_at": "2026-01-01T00:00:00Z"})]
+        else:
+            self.broken = kind
+
+    KINDS = ("too many pull requests", "list error", "unknown sibling", "bad shape")
+
+    def every_failed_read_refuses_and_the_waiver_passes(self):
+        for kind in self.KINDS:
+            self.setUp()
+            self.failed_read(kind)
+            code, why, out, err = self.ask_close()
+            self.assertEqual(code, sb.EXIT_ERROR, (kind, err))
+            self.assertIn("list error" if kind == "bad shape" else kind, err)   # a bad shape is a list error of the one rule
+            self.assertIn("--gates CU", err)
+            self.assertEqual(out, "")
+            self.waiver("e" * 40)      # another head: still refused
+            self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR, kind)
+            self.waiver(sb.plan_ledger.ask_head(self.hash))
+            self.assertEqual(self.ask_close()[0], sb.EXIT_OK, (kind, self.ask_close()[3]))
+
+    def test_s10_a_failed_read_of_each_kind_refuses_the_close_and_only_the_head_bound_waiver_passes(self):
+        self.every_failed_read_refuses_and_the_waiver_passes()
+
+    def test_s10_a_mutant_that_fails_open_on_a_failed_read_is_caught(self):
+        real = sb.unclaimed_verdict
+        def open_again(args, ctx, runner, now, body=None):
+            got = real(args, ctx, runner, now, body)
+            return got if got is None or got[2] or got[0] == "too many pull requests" else None   # the old behaviour: only the bound refused
+        with mock.patch.object(sb, "unclaimed_verdict", open_again):
+            with self.assertRaises(AssertionError):
+                self.every_failed_read_refuses_and_the_waiver_passes()
+
     def test_a_plain_pull_request_and_a_non_ask_issue_never_raise(self):
         self.pr_readable = True
         for command in ("cmd_gates", "cmd_gates_ask_close"):
@@ -87019,6 +87094,17 @@ class TestClosedUnmergedDocs(unittest.TestCase):
         for needle in ("`gates ask-close` refuses the ask and names the unclaimed scenarios and the closed pull requests", "the next pull request's merge is refused too",
                        "a pull request claims the scenario", "head-bound `CU` waiver"):
             self.assertIn(needle, item[0])
+
+
+class TestUnionCheckLimitsDocs(unittest.TestCase):
+    """#1347 S12: the union-check section states its three limits plainly."""
+
+    def test_the_section_states_the_three_limits(self):
+        text = (REPO / "docs/switchboard.md").read_text()
+        for needle in ("An ask whose only pull request closed unmerged with no claim line and no narrowing claim anywhere passes.",
+                       "A last merge made before the union gate existed is not caught at `gates ask-close`.",
+                       "A failed read refuses the close, and only the head-bound `CU` waiver clears it."):
+            self.assertEqual(text.count(needle), 1, needle)
 
 
 class TestNoPaneToJudge(StandInPids, Base):

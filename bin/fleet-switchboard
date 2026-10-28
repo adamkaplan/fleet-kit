@@ -16806,9 +16806,8 @@ def cmd_gates_ask_close(args, runner, now):
         return EXIT_ERROR
     if found:
         print("note: closed pull requests of %s not judged: %s" % (ctx.pr, found[1]), file=sys.stderr)
-        if found[0] == "too many pull requests":
-            print("refused: %s stays open: %s (the chief of staff can log a waiver: `waive <pr> --gates CU`)" % (ctx.pr, PEERS_TOO_MANY), file=sys.stderr)
-            return EXIT_ERROR
+        print("refused: %s stays open: %s failed (%s); the chief of staff can log a waiver: `waive <pr> --gates CU`" % (ctx.pr, found[0], PEERS_TOO_MANY if found[0] == "too many pull requests" else found[1]), file=sys.stderr)
+        return EXIT_ERROR
     authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
     rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"]]
     open_rows = [r for r in rows if r["status"] != "ok"]
@@ -18575,7 +18574,7 @@ def unclaimed_verdict(args, ctx, runner, now, body=None):
                     plan_peers(ctx, runner, now, closed)
                     gone = [n for n, _ in closed]
                 except Exception:
-                    pass
+                    gone = None   # said by union_refusal: the closed pull requests could not be read
         if not lost:
             return None
         found = ("uncovered scenarios: " + ", ".join(lost), None, lost, gone)
