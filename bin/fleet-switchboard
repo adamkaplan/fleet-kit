@@ -13991,6 +13991,8 @@ def cmd_launch(args, runner, now, socket_call=None):
     problem = launch_agent_problem(engine.config, runner, args.agent)
     if problem:
         raise LaunchError(problem)
+    if args.reports_to:   # #1046: a boss nobody can answer to is refused before anything is created (a registered name, a retired one, the role alias or a cloud record passes)
+        load_module("cloud_worker").bind(globals()).check_report_to(engine, state, args, engine.discover(engine.now()).agents)
     brief = read_brief(args.brief_file, sys.stdin)
     launch_gate_probe(engine, state, engine.config, args, brief, runner, now)   # #107 slice 3c: shadow only, never refuses
     launched = now()
@@ -22613,6 +22615,7 @@ def build_parser():
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
+    launch.add_argument("--boss-unregistered", dest="boss_unregistered", metavar="REASON", help="Launch although --reports-to names no registered identity (audited with the reason)")
     launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")
     launch.add_argument("--repo", help="metadata.fleet.repo, OWNER/REPO: the project the agent works in. Its gh "
                                        "account (config gh_users) is the agent's GH_TOKEN")
@@ -23978,6 +23981,40 @@ def cmd_skills(args, runner, now):
 
 
 cmd_skills.direct = True   # files only: no daemon start
+
+
+BRIEF_HEADER_FILE = Path("skills") / "fleet-coordination" / "operator-brief-header.txt"   # the one source of the standard brief header (ask #1046)
+
+
+def brief_header_text(path=None):
+    """The standard brief header printed from its one source file: a title, then each rule as `[id] text`. Nothing is retyped here."""
+    source = Path(path) if path else KIT_ROOT / BRIEF_HEADER_FILE
+    lines = ["Standard brief header (fleet-switchboard brief header):"]
+    for line in source.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            ident, _, text = line.partition(" | ")
+            lines.append("- [%s] %s" % (ident.strip(), text.strip()))
+    return "\n".join(lines)
+
+
+def cmd_brief(args, runner, now):
+    """`brief header --role operator`: print the standard header a person starts a brief from (files only; it reads no setting value)."""
+    try:
+        print(brief_header_text())
+    except OSError as err:
+        sys.stderr.write("%s: brief: the header source %s cannot be read (%s)\n" % (PROG, BRIEF_HEADER_FILE, _one_line(str(err), 100)))
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+cmd_brief.direct = True   # files only: no daemon start
+
+
+def add_brief_parsers(sub):
+    brief = sub.add_parser("brief", help="Print the standard header of a brief for a cloud operator (`brief header --role operator`)")
+    brief_sub = brief.add_subparsers(dest="brief_action", required=True)
+    header = brief_sub.add_parser("header", help="Print the standard header: the admin route by setting key name, the secret rules, delete by exact name, stop at the first surprise")
+    header.add_argument("--role", required=True, choices=("operator",), help="whose brief: operator")
 
 
 def add_skills_parsers(sub):

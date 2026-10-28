@@ -1,0 +1,11 @@
+# The standard header of a brief for a cloud operator or tester (ask #1046).
+# One rule per line: `id | text`. `fleet-switchboard brief header --role operator` prints this file and nothing else;
+# tests read the same file. A line starting with # is a comment. Names of settings only, never a value.
+route | Cluster admin route: read the setting key CW_CLUSTER_ADMIN_CMD (a command that prints the kubeconfig) or the key CW_CLUSTER_ADMIN_SECRET (the vault secret name) from the cloud settings file; use the key name, never print or paste its value.
+no-pin | Check out the branch tip the assignment names, whatever it is today: this brief pins no checkout hash, because a pinned hash goes stale within a day.
+secret-print | Never print, log, commit or paste a token, a key or a kubeconfig, in any form.
+secret-dir | Keep any file that holds a secret in a private directory (mode 700) and make the file owner-only (mode 600).
+secret-shred | Shred every secret file when you are done, and remove the private directory.
+mint-null | Send the diagnostics of the token mint (standard error) to /dev/null, so no secret reaches the log.
+delete-exact | Delete a pod or a record only by its exact name: never by a pattern, a label or a prefix.
+stop-surprise | At the first surprise, stop and report: say what you saw, and change nothing more.

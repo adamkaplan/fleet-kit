@@ -1,0 +1,4 @@
+{
+ "command": "brief",
+ "help": "usage: fleet-switchboard brief [-h] {header} ... positional arguments: {header} header Print the standard header: the admin route by setting key name, the secret rules, delete by exact name, stop at the first surprise options: -h, --help show this help message and exit"
+}

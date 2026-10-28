@@ -56,6 +56,11 @@ SETUP_PREAMBLE = """Setup (do this first, before the task below):
 
 Task:
 """
+# The two TEMPORARY launch rules (ask #1046): the only place they are written; each names the ask whose merge removes it.
+TEMP_HARD_LIMIT_MINUTES = 55   # the git token is not renewed while a worker runs: removed when ask #1034 (token renewal) merges
+TEMP_ISSUE_LINK_WARNING = True   # a worker cannot read issues yet: removed when ask #1019 (issue reading by workers) merges
+POD_SHAPE_DEFAULT = "XS"
+POD_SHAPE_DEFAULT_WIDE = "S"   # with --stack, and for an orchestrator
 RECORD_MAX = 8192
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
@@ -1279,6 +1284,74 @@ def cmd_launch(args, runner, now):
         return _launch(args, runner, now, lambda state: stack.enter_context(reservation(state, args.name)))
 
 
+def unknown_report_to(state, name, agents, alias):
+    """(problem, warning) for a `--reports-to` name: `problem` is the text that stops a launch when no registry entry (running, recorded or retired), no
+    cloud record and not the role alias `alias` carries the name; `warning` is said when the registry could not be read (then nothing is refused:
+    a read that cannot be trusted never stops a launch)."""
+    if not name or name in agents or name == alias:
+        return None, None
+    registry = H["load_module"]("registry")
+    found = registry.read(state)
+    if not found.get("whole"):
+        return None, "the agent registry could not be read (%s); the name %s was not checked" % (_one(str(found.get("problem") or "unknown"), 100), _one(name, 60))
+    if name in found["agents"] or name in found["retired"]:
+        return None, None
+    try:
+        if load_record(state, name) is not None:
+            return None, None
+    except (CloudError, KeyError, OSError):
+        pass
+    import difflib
+    known = sorted(set(found["agents"]) | set(found["retired"]) | set(agents))
+    near = difflib.get_close_matches(name, known, n=5, cutoff=0.0) or known[:5]
+    return ("--reports-to %s is not a registered identity (no agent, retired agent, cloud worker or role alias has it); nothing was created. Use one of: %s, "
+            "or register the lane first, or pass --boss-unregistered REASON." % (_one(name, 60), ", ".join(near[:5]) or "(no registered name yet)")), None
+
+
+def check_report_to(engine, state, args, local_agents):
+    """The report-to check of a launch, local or cloud: stops it (a LaunchError) before anything is created when `--reports-to` names no registered identity,
+    unless `--boss-unregistered REASON` is given (then one audit line). A registry that cannot be read warns and goes on."""
+    problem, warning = unknown_report_to(state, args.reports_to, local_agents, H["COS_ALIAS"])
+    if warning:
+        print("%s: launch: warning: %s" % (H["PROG"], warning), file=sys.stderr)
+    if not problem:
+        return
+    reason = getattr(args, "boss_unregistered", None)
+    if reason is None:
+        raise H["LaunchError"](problem)
+    if not reason.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", reason):
+        raise H["LaunchError"]("--boss-unregistered needs a reason: non-empty text on one line, no control characters; nothing was created")
+    _audit(engine, "launch.boss_unregistered", args.name, {"reports_to": _one(args.reports_to, 60), "reason": _one(reason, 160)})
+
+
+def hard_limit_problem(text):
+    """The refusal text when an explicit `--hard` is above TEMP_HARD_LIMIT_MINUTES (a duration the launcher would read as Ns, Nm or Nh), else None."""
+    m = re.fullmatch(r"(\d+)([smh])", text or "")
+    if not m:
+        return None   # not a duration: the launcher says so
+    if int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)] <= TEMP_HARD_LIMIT_MINUTES * 60:
+        return None
+    return ("--hard %s is above %dm: the git token is not renewed while a worker runs, so a worker living longer could not push at its end. "
+            "Rule: --hard %dm or less until ask #1034 (token renewal) merges; nothing was created." % (_one(text, 20), TEMP_HARD_LIMIT_MINUTES, TEMP_HARD_LIMIT_MINUTES))
+
+
+def pod_shape(args):
+    """The pod shape the launch gets: the one named, else the launcher's default (S with --stack or for an orchestrator, XS otherwise)."""
+    if args.shape:
+        return str(args.shape)
+    return POD_SHAPE_DEFAULT_WIDE if getattr(args, "stack", False) or args.agent == "orchestrator" else POD_SHAPE_DEFAULT
+
+
+def brief_warnings(args, repo, brief):
+    """The one-line warnings a brief earns (each at most once): it names docker or buildx while --stack is not given, or it links an issue of the repository."""
+    notes = []
+    if not getattr(args, "stack", False) and re.search(r"\b(docker|buildx|lane stack|lane-stack|stack-up)\b", brief or "", re.I):
+        notes.append("warning: the brief names docker, buildx or the lane stack tooling but --stack is not given: the worker would have no nested Docker (pod shape %s)" % pod_shape(args))
+    if TEMP_ISSUE_LINK_WARNING and re.search(r"(github\.com/%s/issues/\d+|(?<![\w/.-])%s#\d+)" % (re.escape(repo), re.escape(repo)), brief or "", re.I):
+        notes.append("warning: the brief links an issue of %s: the worker cannot read issues yet (ask #1019); put what it needs in the brief" % repo)
+    return notes
+
+
 def _launch(args, runner, now, reserve):
     """`launch NAME --cloud --repo OWNER/REPO --branch B --agent A`: the allow-list first, then (with a cluster token minted for this command) the
     model entry and a one-hour git token go to the launcher as per-run secrets, the pod is created, and the session and the brief are sent through
@@ -1308,6 +1381,9 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
+    problem = hard_limit_problem(args.hard)   # the temporary token rule: before the settings, any token or call
+    if problem:
+        raise LaunchError(problem)
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
@@ -1325,7 +1401,11 @@ def _launch(args, runner, now, reserve):
                           "the pod instead of the local agent); retire it or pick another name; nothing was created" % name)
     if load_record(state, name) is not None:
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
+    if args.reports_to:
+        check_report_to(engine, state, args, local_agents=engine.discover(engine.now()).agents)
     brief = H["read_brief"](args.brief_file, sys.stdin)
+    for note in brief_warnings(args, repo, brief):   # before anything is created: one line each, then the launch goes on
+        print("%s: %s" % (H["PROG"], note), file=sys.stderr)
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
     options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
     for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
@@ -1435,7 +1515,7 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
-    print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
+    print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True, "shape": pod_shape(args)}, sort_keys=True))
     return H["EXIT_OK"]
 
 
