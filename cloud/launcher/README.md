@@ -453,7 +453,7 @@ caller names, never to stdout or stderr. The fix removes stdout as a delivery ch
 - `--out PATH`: a new file, mode 0600, created only after every check passed, in a directory you own with no group or world access; it is refused when PATH exists and never overwritten. This is the route for a person.
 - no route: the token is minted, then revoked (nobody received it), and stderr says one line with the token's byte count; stdout stays empty, exit 0.
 
-A bad route (0, 1 or 2, a closed or read-only descriptor, a terminal, a second descriptor of the very file or pipe that standard output or standard error is (`3>&1`, `3>&2`), both routes, a bad directory, a symbolic link in any part of the directory path) exits 2 before anything is minted. A delivery
+A bad route (0, 1 or 2, a closed or read-only descriptor, a terminal, a second descriptor of the very file or pipe that standard output or standard error is (`3>&1`, `3>&2`), both routes, a bad directory, a symbolic link in any part of the directory path) exits 2 before anything is minted. The path route accepts the system's own root-owned links in a directory others cannot write, or a sticky one (such as `/var` and `/tmp` on a Mac); a `..` component and every other link are refused. A delivery
 that fails revokes the token and exits non-zero. Success is silent. It refuses (exit 1, one line on stderr naming the key, never a value) to deliver a token unless:
 
 - the installation is found, not stored: the mint asks GitHub (`GET /repos/OWNER/REPO/installation`, signed with the App's

@@ -7,6 +7,7 @@ import importlib.util
 import os
 import pty
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -372,9 +373,166 @@ class Route(unittest.TestCase):
         self.assertTrue(mint.startswith("**The cause (ask #1043):** the mint printed the one-hour repository token on standard output, where terminals, transcripts and logs capture it; two recorded cases"))
         self.assertIn("`3>&1`", readme)
         self.assertIn("symbolic link in any part of the directory path", readme)
+        self.assertIn("the system's own root-owned links in a directory others cannot write, or a sticky one", readme)
+        self.assertIn("a `..` component and every other link are refused", readme)
         real = "app-token: minted a token of %d bytes and did not deliver it: name a route with --fd N or --out PATH" % len(TOKEN)   # the text the mint prints (test_s2 runs it)
         self.assertIn(real, readme)
         self.assertIn("same pipe or file as standard output or standard error", self.read_doc("docs/cloud-operator-quickstart.md"))
+
+
+class RouteLinks(unittest.TestCase):
+    """Ask #1043, the findings of the independent proof: '..' is refused, only the system's own links pass, an interrupt revokes."""
+    setUpClass = classmethod(ta.Mint.setUpClass.__func__)
+    tearDownClass = classmethod(ta.Mint.tearDownClass.__func__)
+    setUp = ta.Mint.setUp
+    env, run_it, private_dir, mutant = Route.env, Route.run_it, Route.private_dir, Route.mutant
+
+    def test_s17_a_dot_dot_component_is_refused_before_minting(self):
+        real = self.private_dir()
+        link = os.path.join(self.tmp.name, "dlink")
+        os.symlink(real, link)
+        for name, out in (("link/../x", os.path.join(link, "..", "x")), ("sub/../x", os.path.join(real, "sub", "..", "x")),
+                          ("a/b/../../c", os.path.join(real, "a", "b", "..", "..", "c"))):
+            ta.Stub.seen, ta.Stub.gets = [], []
+            p = self.run_it(["--out", out])
+            self.assertEqual(p.returncode, 2, name + p.stderr)
+            self.assertEqual((ta.Stub.seen, ta.Stub.gets), ([], []), name)
+        self.assertEqual(os.listdir(real), [])
+
+    def test_s17_a_mutant_that_checks_dot_dot_lexically_fails(self):
+        path = self.mutant('    if ".." in path.split("/"):', "    if False:")
+        real = self.private_dir()
+        os.mkdir(os.path.join(real, "sub"), 0o700)
+        p = self.run_it(["--out", os.path.join(real, "sub", "..", "x")], path)
+        self.assertEqual(p.returncode, 0)   # the mutant lets it through: the test above would fail on it
+
+    def fake_fs(self, link_uid, parent_mode):
+        """Patch lstat and readlink: /sys (a directory of parent_mode, uid 0) holds link -> real (a 0700 directory of this user)."""
+        me = os.getuid()
+        table = {"/": (stat.S_IFDIR | 0o755, 0), "/sys": (stat.S_IFDIR | parent_mode, 0), "/sys/link": (stat.S_IFLNK | 0o777, link_uid),
+                 "/sys/real": (stat.S_IFDIR | 0o700, me)}
+
+        def lstat(p):
+            if p not in table:
+                raise FileNotFoundError(p)
+            mode, uid = table[p]
+            return os.stat_result((mode, 1, 1, 1, uid, 0, 0, 0, 0, 0))
+        return (mock.patch.object(os, "lstat", lstat), mock.patch.object(os, "readlink", lambda p: "real"),
+                mock.patch.object(os, "getcwd", lambda: "/"), mock.patch.object(os.path, "realpath", lambda p: p.replace("/link", "/real")))
+
+    def judge(self, link_uid, parent_mode):
+        sys.path.insert(0, os.path.dirname(HERE))
+        import app_token
+        a, b, c, d = self.fake_fs(link_uid, parent_mode)
+        with a, b, c, d:
+            return app_token.link_in_parents("/sys/link/tok")
+
+    def test_s17_only_a_root_made_link_in_a_directory_others_cannot_write_is_accepted(self):
+        me = os.getuid()
+        self.assertTrue(self.judge(me, 0o755), "made by the caller")
+        self.assertTrue(self.judge(me + 1, 0o755), "made by another user")
+        self.assertFalse(self.judge(0, 0o755), "root, 0755")
+        self.assertFalse(self.judge(0, 0o1777), "root, sticky 1777")
+        self.assertTrue(self.judge(0, 0o777), "root, 0777 not sticky")
+
+    def test_s17_the_default_temporary_directory_is_accepted_for_real(self):
+        self.assertFalse(link_in_parents_real(os.path.join(tempfile.gettempdir(), "x", "tok")))
+
+    def test_s17_mutants_that_refuse_every_link_or_accept_every_link_fail(self):
+        me = os.getuid()
+        for old, new, case in (("    if link_st.st_uid != 0:\n        return False\n", "    return False\n", (0, 0o755, False)),   # refuses every link
+                               ("    if link_st.st_uid != 0:\n        return False\n", "    return True\n", (me, 0o755, True))):   # accepts every link
+            path = self.mutant(old, new)
+            spec = importlib.util.spec_from_file_location("app_token_mutant", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            a, b, c, d = self.fake_fs(case[0], case[1])
+            with a, b, c, d:
+                self.assertNotEqual(mod.link_in_parents("/sys/link/tok"), case[2], case)
+
+    def test_s17_the_other_shapes_of_a_bad_path_are_refused_before_minting(self):
+        real = self.private_dir()
+        open(os.path.join(real, "afile"), "w").close()
+        cases = {"absent middle component": os.path.join(real, "absent", "x", "tok"), "a file in the middle": os.path.join(real, "afile", "tok"),
+                 "a trailing slash": real + "/tok/", "a newline": os.path.join(real, "to\nk"), "a NUL": os.path.join(real, "to\0k"),
+                 "a very long path": os.path.join(real, "d" * 5000, "tok"), "empty": ""}
+        for name, out in cases.items():
+            ta.Stub.seen, ta.Stub.gets = [], []
+            try:
+                p = self.run_it(["--out", out])
+            except ValueError:   # a NUL cannot even be an argument: refused by the system before the program runs
+                self.assertIn("NUL", name)
+                continue
+            self.assertEqual(p.returncode, 2, name + p.stderr)
+            self.assertEqual((ta.Stub.seen, ta.Stub.gets), ([], []), name)
+        self.assertEqual(os.listdir(real), ["afile"])
+        # a double slash and a dot component are the same place, accepted and created
+        p = self.run_it(["--out", real + "//./tok"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(sorted(os.listdir(real)), ["afile", "tok"])
+
+    def interrupted(self, mod, effect, patch_name="write_all"):
+        real = self.private_dir()
+        ta.Stub.deletes = []
+        saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+        self.addCleanup(lambda: [signal.signal(s, h) for s, h in saved.items()])
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(mod, patch_name, side_effect=effect):
+            try:
+                mod.main([REAL, "--out", os.path.join(real, "tok")])
+                code = 0
+            except SystemExit as e:
+                code = e.code
+            except BaseException as e:   # an exception that the handler let out
+                code = repr(e)
+        return code, len(ta.Stub.deletes), os.listdir(real)
+
+    def test_s17_any_failure_or_signal_during_delivery_revokes_removes_and_exits_non_zero(self):
+        sys.path.insert(0, os.path.dirname(HERE))
+        import app_token
+        for name, effect in (("interrupt", KeyboardInterrupt), ("SIGTERM", lambda *a: os.kill(os.getpid(), signal.SIGTERM)),
+                             ("SIGHUP", lambda *a: os.kill(os.getpid(), signal.SIGHUP)), ("broken pipe", BrokenPipeError),
+                             ("disk full", OSError(28, "No space left on device")), ("any exception", RuntimeError)):
+            code, deletes, left = self.interrupted(app_token, effect)
+            self.assertIsInstance(code, int, name)
+            self.assertNotEqual(code, 0, name)
+            self.assertEqual((deletes, left), (1, []), name)
+        with mock.patch.object(os, "fsync", side_effect=OSError(5, "io")):   # a failed flush
+            code, deletes, left = self.interrupted(app_token, None)
+        self.assertEqual((deletes, left), (1, []))
+
+    def test_s17_an_interrupt_during_delivery_revokes_removes_the_file_and_exits_non_zero(self):
+        sys.path.insert(0, os.path.dirname(HERE))
+        import app_token
+        real = self.private_dir()
+        out = os.path.join(real, "tok")
+        ta.Stub.deletes = []
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(app_token, "write_all", side_effect=KeyboardInterrupt):
+            with self.assertRaises(SystemExit) as e:
+                app_token.main([REAL, "--out", out])
+        self.assertNotEqual(e.exception.code, 0)
+        self.assertEqual(len(ta.Stub.deletes), 1)
+        self.assertIn(TOKEN, ta.Stub.deletes[0][1])
+        self.assertEqual(os.listdir(real), [])
+
+    def test_s17_a_mutant_without_the_handler_fails(self):
+        path = self.mutant("    except KeyboardInterrupt:", "    except ZeroDivisionError:")
+        spec = importlib.util.spec_from_file_location("app_token_mutant2", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        real = self.private_dir()
+        ta.Stub.deletes = []
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(mod, "write_all", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                mod.main([REAL, "--out", os.path.join(real, "tok")])
+        self.assertEqual(ta.Stub.deletes, [])
+
+
+def link_in_parents_real(path):
+    sys.path.insert(0, os.path.dirname(HERE))
+    import app_token
+    return app_token.link_in_parents(path)
 
 
 if __name__ == "__main__":

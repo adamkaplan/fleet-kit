@@ -343,26 +343,60 @@ def same_stream_as_output(fd):
     return False
 
 
+def link_is_system_made(link_st, parent_st):
+    """True for a link made by the system itself: owned by uid 0, in a directory others cannot write (or one that is sticky)."""
+    import stat
+    if link_st.st_uid != 0:
+        return False
+    return not parent_st.st_mode & 0o022 or bool(parent_st.st_mode & stat.S_ISVTX)
+
+
 def link_in_parents(path):
-    """True when any component of the directory chain above path (not only the last) is a symbolic link."""
-    cur = os.path.abspath(path)
-    while True:
-        up = os.path.dirname(cur)
-        if up == cur:
-            return False
-        cur = up
-        if os.path.islink(cur):
-            return True
+    """True when a component of the directory chain above path is a link that is not made by the system itself, or is not a directory.
+    Each component is judged with lstat from the root down (a link is followed only when it is judged); a missing one is not judged here."""
+    import stat
+    todo = [p for p in path.split("/") if p not in ("", ".")][:-1]
+    cur, budget = "/", 40
+    try:
+        st_cur = os.lstat("/")
+        while todo:
+            part = todo.pop(0)
+            nxt = os.path.join(cur, part)
+            st = os.lstat(nxt)
+            if stat.S_ISLNK(st.st_mode):
+                budget -= 1
+                target = os.readlink(nxt)
+                tparts = [p for p in target.split("/") if p not in ("", ".")]
+                if budget < 0 or ".." in tparts or not link_is_system_made(st, st_cur):
+                    return True
+                if target.startswith("/"):
+                    cur, st_cur = "/", os.lstat("/")
+                todo = tparts + todo
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                return True
+            cur, st_cur = nxt, st
+    except OSError:
+        return False
+    return False
 
 
 def check_out(path):
-    """Refuse (exit 2) before minting unless path is new, in a private directory this user owns (no group or world access, not a link)."""
+    """Refuse (exit 2) before minting unless path is new, in a private directory this user owns (no group or world access, no link but the system's own).
+    Returns the path to create, with every judged link resolved."""
     import stat
-    if not path or "\0" in path:
+    if not path or "\0" in path or "\n" in path:
         die("the route --out needs a path", 2)
+    if ".." in path.split("/"):
+        die("the route --out must not hold a '..' component", 2)
+    if path.endswith("/"):
+        die("the route --out must name a file", 2)
+    path = os.path.join(os.getcwd(), path)
     d = os.path.dirname(os.path.abspath(path))
     if link_in_parents(os.path.join(d, "x")):
         die("the directory of --out is a link or not a directory", 2)
+    d = os.path.realpath(d)   # every link in it was judged above
+    path = os.path.join(d, os.path.basename(path))
     try:
         st = os.lstat(d)
     except OSError:
@@ -373,6 +407,7 @@ def check_out(path):
         die("the directory of --out must be owned by you with no group or world access (mode 0700)", 2)
     if os.path.lexists(path):
         die("refusing: --out path exists; the mint never overwrites", 1)
+    return path
 
 
 def write_all(fd, data):
@@ -386,16 +421,25 @@ def deliver(kind, value, token):
     if kind == "fd":
         write_all(value, data)
         return
-    fd = os.open(value, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    d, name = os.path.split(value)
+    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)   # the checked directory itself: nothing can redirect the create
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+    except BaseException:
+        os.close(dfd)
+        raise
     try:
         write_all(fd, data)
-    except OSError:
+        os.fsync(fd)
+    except BaseException:   # any error or interrupt: the file this run created is removed
         os.close(fd)
         try:
-            os.unlink(value)
+            os.unlink(name, dir_fd=dfd)
         except OSError:
             pass
+        os.close(dfd)
         raise
+    os.close(dfd)
     os.close(fd)
 
 
@@ -407,16 +451,28 @@ def main(argv):
     if kind == "fd":
         check_fd(value)
     elif kind == "out":
-        check_out(value)
+        value = check_out(value)
     token = mint(target)
     if kind is None:
         revoke(token)  # nobody received it
         print("app-token: minted a token of %d bytes and did not deliver it: name a route with --fd N or --out PATH" % len(token), file=sys.stderr)
         return
     MINTED.append(token)  # until delivered, a refusal revokes it
+    import signal
+
+    def stop(signum, frame):
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
     try:
         deliver(kind, value, token)
     except OSError:
+        die("the token could not be delivered to the route")
+    except KeyboardInterrupt:   # an interrupt or a signal during delivery: revoke, leave nothing, exit non-zero
+        die("the delivery was interrupted", 130)
+    except SystemExit as e:
+        die("the delivery was interrupted", e.code if isinstance(e.code, int) and e.code else 1)
+    except Exception:
         die("the token could not be delivered to the route")
     MINTED.clear()
 
