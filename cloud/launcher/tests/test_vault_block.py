@@ -15,12 +15,12 @@ import cloud_worker as cw  # noqa: E402
 SUB = "00000000-0000-0000-0000-000000000001"
 REFUSAL = "ERROR: (Forbidden) Client address is not authorized and caller is not a trusted service. Code: Forbidden Inner error: ForbiddenByFirewall"
 BEHAVIOURS = {
-    "refuse": 'echo "%s" >&2; exit 1' % REFUSAL,
-    "slow-refuse": 'sleep 1; echo "%s" >&2; exit 1' % REFUSAL,
+    "refuse": 'echo "%s" > /dev/stderr; exit 1' % REFUSAL,
+    "slow-refuse": 'sleep 1; echo "%s" > /dev/stderr; exit 1' % REFUSAL,
     "slow-ok": 'sleep 1; echo "config-body"',
     "ok": 'echo "config-body"',
-    "missing": 'echo "ERROR: (SecretNotFound) A secret with (name/id) was not found in this key vault." >&2; exit 1',
-    "login": 'echo "ERROR: Please run az login to setup account." >&2; exit 1',
+    "missing": 'echo "ERROR: (SecretNotFound) A secret with (name/id) was not found in this key vault." > /dev/stderr; exit 1',
+    "login": 'echo "ERROR: Please run az login to setup account." > /dev/stderr; exit 1',
     "malformed": "exit 0",
     "hang": "exec sleep 30",
 }
