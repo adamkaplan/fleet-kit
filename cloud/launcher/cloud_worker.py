@@ -824,9 +824,10 @@ VAULT_BLOCK_POLL_SECONDS = 0.05
 
 
 def vault_block_dir(env):
-    """The switchboard's state directory: $XDG_STATE_HOME (default ~/.local/state) / the switchboard's directory name."""
+    """The block's folder: the switchboard's state directory ($XDG_STATE_HOME, default ~/.local/state, / the switchboard's directory name), in its
+    `cloud` folder, where the launcher keeps its other records and where its tests already clear their files between two launches."""
     base = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local", "state")
-    return os.path.join(base, CONFIG_DIR_NAME)
+    return os.path.join(base, CONFIG_DIR_NAME, "cloud")
 
 
 def vault_block_minutes(env):
@@ -842,26 +843,44 @@ def vault_lock_stale_seconds():
     return 2 * TOKEN_CMD_SECONDS + VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE
 
 
-def _own_regular(path):
+VAULT_BLOCK_MAX_BYTES = 65536   # a block file is tiny: a larger one is not ours
+
+
+def _damaged_block(path, base, minutes):
+    """A block file that cannot be trusted FAILS CLOSED: it blocks until the file's own time plus the setting's length (never longer), then one probe runs."""
+    return (base, base + 60 * minutes, path)
+
+
+def read_vault_block(env):
+    """None when there is no block file; otherwise (refused_at, retry_at, damaged_path) in epoch seconds (damaged_path is None for a good file).
+    A file that is corrupt, empty, huge, a symlink, not ours, with a negative or non-number time blocks too, until the file's time (the earlier of its
+    modification and change time, so a future date cannot lengthen it) plus the setting's length. A retry time is capped to the setting's maximum."""
+    path = os.path.join(vault_block_dir(env), VAULT_BLOCK_NAME)
     try:
         found = os.lstat(path)
     except OSError:
         return None
-    return found if stat.S_ISREG(found.st_mode) and found.st_uid == os.getuid() else None
-
-
-def read_vault_block(env):
-    """(refused_at, retry_at) in epoch seconds, or None when there is no readable block (a damaged or foreign file is no block)."""
-    path = os.path.join(vault_block_dir(env), VAULT_BLOCK_NAME)
-    if _own_regular(path) is None:
-        return None
+    minutes = vault_block_minutes(env)
+    base = min(found.st_mtime, found.st_ctime)
+    if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_size > VAULT_BLOCK_MAX_BYTES:
+        return _damaged_block(path, base, minutes)
     try:
-        with open(path) as f:
-            data = json.loads(f.read(4096))
-        at, retry = float(data["at"]), float(data["retry_at"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-    return (at, retry) if math.isfinite(at) and math.isfinite(retry) else None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(VAULT_BLOCK_MAX_BYTES + 1)
+        if len(raw) > VAULT_BLOCK_MAX_BYTES:
+            return _damaged_block(path, base, minutes)
+        data = json.loads(raw.decode("utf-8"))
+        at, retry = data["at"], data["retry_at"]
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (at, retry)):
+            raise ValueError("not a number")
+        at, retry = float(at), float(retry)
+        if not (math.isfinite(at) and math.isfinite(retry)) or at < 0 or retry < 0:
+            raise ValueError("not a time")
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return _damaged_block(path, base, minutes)
+    retry = min(retry, base + 60 * minutes)
+    return (min(at, retry), retry, None)
 
 
 def _stamp(epoch):
@@ -870,6 +889,9 @@ def _stamp(epoch):
 
 def vault_block_line(block):
     """The ONE line a blocked command prints: the reason and the retry time (never a value, an address or a name)."""
+    if len(block) > 2 and block[2]:
+        return "the vault block file %s cannot be trusted (damaged, too large, too far ahead or not a plain file of this user); no vault call is made until %s (delete that file to clear it by hand)" % (
+            block[2], _stamp(block[1]))
     return "%s at %s; no vault call is made until %s (delete the vault-block file in the switchboard state directory to clear it by hand)" % (
         VAULT_BLOCK_REASON, _stamp(block[0]), _stamp(block[1]))
 

@@ -87,10 +87,10 @@ class Fake(unittest.TestCase):
             return len(f.read().split())
 
     def block_path(self):
-        return os.path.join(self.state, cw.CONFIG_DIR_NAME, cw.VAULT_BLOCK_NAME)
+        return os.path.join(self.state, cw.CONFIG_DIR_NAME, "cloud", cw.VAULT_BLOCK_NAME)
 
     def lock_path(self):
-        return os.path.join(self.state, cw.CONFIG_DIR_NAME, cw.VAULT_BLOCK_LOCK_NAME)
+        return os.path.join(self.state, cw.CONFIG_DIR_NAME, "cloud", cw.VAULT_BLOCK_LOCK_NAME)
 
     def expire(self):
         """The retry time has passed: the file's times move into the past."""
@@ -446,6 +446,123 @@ class Docs(unittest.TestCase):
         self.assertEqual(cw.VAULT_BLOCK_NAME, "vault-block.json")
         self.assertEqual(cw.VAULT_BLOCK_SETTING, "CW_VAULT_BLOCK_DURATION")
         self.assertEqual(cw.VAULT_BLOCK_DEFAULT_MINUTES, 10)
+
+
+class FailClosed(Fake):
+    """Plan S11 and cos's rule: a block file that cannot be trusted BLOCKS (one clear line naming the file, no vault call, no uncaught error)
+    until the file's own time plus the setting's length; then the single probe runs."""
+
+    def put(self, body, mode="w"):
+        os.makedirs(os.path.dirname(self.block_path()), mode=0o700, exist_ok=True)
+        with open(self.block_path(), mode) as f:
+            f.write(body)
+
+    def assertBlocksClosed(self, label):
+        err = self.refused()
+        self.assertIsNotNone(err, label)
+        self.assertEqual(err.kind, "vault-blocked", label)
+        self.assertEqual(len(err.line.splitlines()), 1, label)
+        self.assertIn(self.block_path(), err.line, label)
+        self.assertIn("delete that file to clear it by hand", err.line, label)
+        self.assertEqual(self.calls(), 0, label)
+        return err
+
+    def damaged_files(self):
+        good = json.dumps({"at": time.time(), "reason": "x", "retry_at": time.time() + 600})
+        def symlink():
+            os.makedirs(os.path.dirname(self.block_path()), exist_ok=True)
+            target = os.path.join(self.dir, "elsewhere.json")
+            with open(target, "w") as f:
+                f.write(good)
+            os.symlink(target, self.block_path())
+        return {
+            "corrupt text": lambda: self.put("{not json"),
+            "empty": lambda: self.put(""),
+            "huge": lambda: self.put(good + " " * 70000),
+            "negative retry": lambda: self.put('{"at": 1, "retry_at": -5}'),
+            "NaN retry": lambda: self.put('{"at": 1, "retry_at": NaN}'),
+            "text retry": lambda: self.put('{"at": 1, "retry_at": "soon"}'),
+            "boolean retry": lambda: self.put('{"at": 1, "retry_at": true}'),
+            "symlink": symlink,
+        }
+
+    def test_each_untrustworthy_file_blocks_with_one_line_and_no_call(self):
+        for label, make in self.damaged_files().items():
+            with self.subTest(label):
+                if os.path.lexists(self.block_path()):
+                    os.unlink(self.block_path())
+                make()
+                self.assertBlocksClosed(label)
+
+    def test_a_far_future_or_huge_retry_time_is_capped_and_never_crashes(self):
+        for label, retry in (("30 years", time.time() + 30 * 365 * 86400), ("1e12", 1e12), ("1e300", 1e300)):
+            with self.subTest(label):
+                self.put(json.dumps({"at": 1e12, "reason": "x", "retry_at": retry}))
+                err = self.refused()
+                self.assertEqual(err.kind, "vault-blocked")
+                self.assertEqual(self.calls(), 0)
+                block = cw.read_vault_block(self.env)
+                self.assertLessEqual(block[1], time.time() + 60 * 60 + 5)
+
+    def test_a_future_dated_file_is_blocked_only_until_its_real_time_plus_the_setting(self):
+        self.put("{not json")
+        future = time.time() + 10 * 365 * 86400
+        os.utime(self.block_path(), (future, future))   # the change time stays the real one
+        self.assertBlocksClosed("future-dated")
+        self.assertLessEqual(cw.read_vault_block(self.env)[1], time.time() + 60 * cw.vault_block_minutes(self.env) + 5)
+
+    def test_the_end_of_the_block_of_a_corrupt_file_runs_the_single_probe(self):
+        self.put("{not json")
+        self.assertBlocksClosed("corrupt")
+        old = time.time() - 3600
+        os.utime(self.block_path(), (old, old))
+        self.mode("ok")
+        self.assertIsNone(self.refused())   # the probe ran and succeeded
+        self.assertEqual(self.calls(), 1)
+        self.assertFalse(os.path.exists(self.block_path()), "success removes the file")
+
+    def test_the_end_of_the_block_of_a_corrupt_file_renews_it_on_a_refusal(self):
+        self.put("x" * 70000)
+        old = time.time() - 3600
+        os.utime(self.block_path(), (old, old))
+        self.assertEqual(self.refused().kind, "admin-unreadable")
+        self.assertEqual(self.calls(), 1)
+        self.assertIsNotNone(cw.read_vault_block(self.env)[1])
+        self.assertIsNone(cw.read_vault_block(self.env)[2], "rewritten as a good block")
+        self.assertEqual(self.refused().kind, "vault-blocked")
+        self.assertEqual(self.calls(), 1)
+
+    def test_a_symlink_block_is_not_followed_and_is_replaced_by_the_renewal(self):
+        self.damaged_files()["symlink"]()
+        self.assertBlocksClosed("symlink")
+        old = time.time() - 3600
+        os.utime(self.block_path(), (old, old), follow_symlinks=False)
+        self.refused()
+        self.assertFalse(os.path.islink(self.block_path()))
+        self.assertEqual(self.calls(), 1)
+
+
+class Isolation(Fake):
+    """The block follows the state directory the tests redirect (XDG_STATE_HOME) and nowhere else."""
+
+    def test_a_firewall_refusal_writes_the_block_there_and_nothing_under_another_home(self):
+        other_home = tempfile.mkdtemp(prefix="vault-block-home-")
+        self.addCleanup(shutil.rmtree, other_home, True)
+        self.env["HOME"] = other_home
+        self.assertEqual(self.refused().kind, "admin-unreadable")
+        self.assertTrue(os.path.exists(self.block_path()))
+        self.assertTrue(self.block_path().startswith(self.state + os.sep))
+        self.assertEqual(os.listdir(other_home), [], "nothing under the default state directory's home")
+
+    def test_a_block_left_in_one_state_directory_does_not_touch_another(self):
+        self.refused()
+        self.assertTrue(os.path.exists(self.block_path()))
+        second = tempfile.mkdtemp(prefix="vault-block-other-")
+        self.addCleanup(shutil.rmtree, second, True)
+        self.env["XDG_STATE_HOME"] = os.path.join(second, "state")
+        self.mode("ok")
+        self.assertIsNone(self.refused())
+        self.assertEqual(self.calls(), 2)
 
 
 class Setting(unittest.TestCase):
