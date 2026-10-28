@@ -215,7 +215,7 @@ class TestNewBinFileGuards(unittest.TestCase):
         root = new_bin_fixture()
         done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertEqual(guard_count(done.stdout), 4, done.stdout)
+        self.assertEqual(guard_count(done.stdout), len(ps.NEW_BIN_GUARDS), done.stdout)
         self.assertEqual(len(ps.NEW_BIN_GUARDS), len(ps.guard_rows(["bin/newtool"])))   # pin change of #1457: the rows the plan returns, not a literal
         for name in ("TestAuthorityModulesGuard", "TestAgentRegistryInventory", "TestImpactHold", "bin/check-public-names"):
             self.assertIn(name, done.stdout)
@@ -225,7 +225,7 @@ class TestNewBinFileGuards(unittest.TestCase):
     def test_s10_the_mutant_that_names_only_the_files_own_suite_shows_zero_of_the_four(self):
         root = new_bin_fixture()
         self.assertEqual(guard_count(plan_of_own_suite_only(root, "main")), 0)
-        self.assertEqual(guard_count(ps.render(*ps.plan(root, ["bin/newtool"], added=ps.added_paths(root, "main")))), 4)
+        self.assertEqual(guard_count(ps.render(*ps.plan(root, ["bin/newtool"], added=ps.added_paths(root, "main")))), len(ps.NEW_BIN_GUARDS))
 
     def test_s10_a_change_that_adds_no_bin_file_names_none_of_the_guards(self):
         root = new_bin_fixture(add=False)
@@ -236,14 +236,14 @@ class TestNewBinFileGuards(unittest.TestCase):
         root = new_bin_fixture()
         done = run_switchboard(root, "preflight-pr", "--merged")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertEqual(done.stdout.count("CANNOT RUN"), 4, done.stdout)
-        self.assertEqual(guard_count(done.stdout), 4)
+        self.assertEqual(done.stdout.count("CANNOT RUN"), len(ps.NEW_BIN_GUARDS), done.stdout)
+        self.assertEqual(guard_count(done.stdout), len(ps.NEW_BIN_GUARDS))
 
     def test_s10_heavy_changed_run_says_plainly_the_guards_it_could_not_run(self):
         root = new_bin_fixture()
         done = run_switchboard(root, "heavy", "--changed", "--base", "main")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertEqual(done.stdout.count("CANNOT RUN"), 4, done.stdout)
+        self.assertEqual(done.stdout.count("CANNOT RUN"), len(ps.NEW_BIN_GUARDS), done.stdout)
 
 
 class TestListAndRefusal(unittest.TestCase):
@@ -712,9 +712,9 @@ class TestPreflightGuardsNotRunMarker(unittest.TestCase):
 
     def test_a_guard_that_exits_75_without_the_marker_is_a_failure_and_with_it_not_run(self):
         failed, words = self.verdicts(marker=False)
-        self.assertEqual((failed, set(words)), (4, {"FAIL"}))
+        self.assertEqual((failed, set(words)), (len(ps.NEW_BIN_GUARDS), {"FAIL"}))
         failed, words = self.verdicts(marker=True)
-        self.assertEqual((failed, set(words)), (4, {"NOSLOT"}))
+        self.assertEqual((failed, set(words)), (len(ps.NEW_BIN_GUARDS), {"NOSLOT"}))
 
     def test_added_files_that_cannot_be_listed_are_said_not_silently_dropped(self):
         def broken(*a, **k):
