@@ -31,6 +31,7 @@ _SEPARATORS = frozenset(" :,.()\"'/=-_[]")   # the punctuation of an error sente
 _ERROR_CLASS = re.compile(r"[A-Z][A-Za-z]{0,39}")
 _ERROR_CLASS_END = ("Error", "Exception", "Warning", "Timeout")
 _CAMEL_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")   # a CamelCase word: split at lower-to-upper; a run of capitals is one word (HTTPError: HTTP, Error)
+_DOTTED_RUN = re.compile(r"\d+(?:\.\d+){3,}")   # an address: numbers joined by 3 or more dots is ONE token, redacted whole
 _TOKEN = re.compile(r"[^\W_]+|.", re.S)   # a run of letters and digits (any script), or one other character
 PLACEHOLDER = "[redacted]"
 
@@ -56,12 +57,12 @@ def _normalise(text, spaced):
 
 
 def _token_allowed(token, before, after, known):
-    """True when a run of letters and digits may print: a word of ERROR_VOCABULARY (compared in lower case), a number of at most five digits that stands
+    """True when a run of letters and digits may print: a word of ERROR_VOCABULARY (compared in lower case), a number of at most three digits that stands
     between separators, or an error-class name (CamelCase letters only, at most 40, ending in Error, Exception, Warning or Timeout, and EVERY CamelCase word of it a word of ERROR_VOCABULARY)."""
     low = token.lower()
     if token.isascii():
         if token.isdigit():
-            ok = len(token) <= 5 and before in _SEPARATORS and after in _SEPARATORS
+            ok = len(token) <= 3 and before in _SEPARATORS and after in _SEPARATORS
         else:
             ok = low in ERROR_VOCABULARY or (token.isalpha() and _ERROR_CLASS.fullmatch(token) is not None and token.endswith(_ERROR_CLASS_END)
                                              and all(w.lower() in ERROR_VOCABULARY for w in _CAMEL_WORD.findall(token)))
@@ -77,6 +78,9 @@ def _mark_variant(line, spaced, known, mask):
     neither a letter, a digit, white space nor a separator)."""
     N, idx = _normalise(line, spaced)
     size = len(N)
+    for run in _DOTTED_RUN.finditer(N):
+        low, high = idx[run.start()], idx[run.end() - 1] + 1
+        mask[low:high] = b"\x01" * (high - low)
     for found in _TOKEN.finditer(N):
         start, end = found.span()
         word = found.group()
@@ -95,10 +99,10 @@ def redact_error(text, known=()):
     """The error line that `status` prints, through an ALLOW-LIST: leaks are excluded by construction. The LAST original line (any kind of line break
     ends a line; one that holds only invisible characters is empty) is read as tokens, in two readings (zero-width, format, control and combining
     characters turned into spaces, and removed; text normalised NFKC, white space one space); a token prints only when it is allowed in BOTH readings:
-    a word of ERROR_VOCABULARY (lower-case comparison), a number of at most five digits between separators, or an error-class name; a separator
+    a word of ERROR_VOCABULARY (lower-case comparison), a number of at most three digits between separators, or an error-class name; a separator
     (space : , . ( ) quotes / = - _ and brackets) prints. EVERY other token is `[redacted]`, whatever precedes it, in any language or spelling; a run of
     placeholders and the separators between them is one placeholder. The result is cut at ERROR_LINE_MAX. The one inherent limit: a secret that is
-    itself a word of the vocabulary (or a number of up to five digits) prints; `known` (this run's own secrets) are kept out even then."""
+    itself a word of the vocabulary (or a number of up to three digits) prints; `known` (this run's own secrets) are kept out even then."""
     text = str(text or "")
     if not text.strip():
         return ""

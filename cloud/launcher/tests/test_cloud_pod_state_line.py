@@ -472,7 +472,10 @@ class TestDocuments(unittest.TestCase):
     def test_the_inherent_limit_and_the_local_files_are_in_both_documents(self):
         for rel in DOCS:
             text = read(rel)
-            for phrase in ("closed vocabulary", "ERROR_VOCABULARY", "bin/pod_state_line.py", "a secret that is itself one of the vocabulary", "transient", "removed when the command ends", "mode `0700`"):
+            for phrase in ("closed vocabulary", "ERROR_VOCABULARY", "bin/pod_state_line.py", "a secret that is itself a word of the vocabulary", "transient", "removed when the command ends", "mode `0700`",
+                           "(the ten most plausible are password, secret, token, key, login, user, account, access, service, session)", "A number of up to three digits prints.",
+                           "kept out only when they are 4 or more characters", "environment values under 8 characters are not covered",
+                           "Upper-case forms of vocabulary words print as typed."):
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
 
@@ -654,14 +657,14 @@ def camel_words(name):
 
 
 def printed_tokens_ok(error_part, vocabulary=BASE_VOCAB):
-    """The tokens of a printed error part that are NOT allowed: not the placeholder, not a vocabulary word, a number of at most 5 digits, a separator
+    """The tokens of a printed error part that are NOT allowed: not the placeholder, not a vocabulary word, a number of at most 3 digits, a separator
     or an error-class name."""
     bad = []
     rest = error_part.replace(PLACEHOLDER, " ")
     for tok in re.findall(r"[^\W_]+|.", rest):
         if tok in SEPARATORS or tok.isspace():
             continue
-        if tok.lower() in vocabulary or (tok.isascii() and tok.isdigit() and len(tok) <= 5):
+        if tok.lower() in vocabulary or (tok.isascii() and tok.isdigit() and len(tok) <= 3):
             continue
         if tok.isascii() and tok.isalpha() and CLASS_NAME.fullmatch(tok) and tok.endswith(CLASS_END) and all(w.lower() in vocabulary for w in camel_words(tok)):
             continue
@@ -880,7 +883,30 @@ class TestRealErrors(Base):
     crash, quota, ErrImagePull, code = NotFound); the three that name something (a module, a pod, a directory) lose that NAME to the placeholder and
     keep the cause word and the error class. Nothing more is claimed than the vocabulary holds."""
 
+    def clean_env(self, extra=None):
+        """A minimal environment for the test: no variable named KEY, TOKEN or AUTH can hold a word of the vocabulary (a developer's SSH_AUTH_SOCK does)."""
+        env = {"PATH": os.environ.get("PATH", "")}
+        env.update(extra or {})
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_s11_a_vocabulary_word_that_is_an_environment_value_is_kept_out(self):
+        # A vocabulary word of 4 or more characters that is also (part of) an environment value of 8 or more characters under a KEY/TOKEN/AUTH name
+        # is kept out: it prints as the placeholder, as a known secret. The planted value stands for a developer's SSH_AUTH_SOCK.
+        self.clean_env({"SSH_AUTH_SOCK": "/run/user/1000/agent.sock"})
+        for text in ("RuntimeError: agent crashed", "pods is forbidden: User cannot list"):
+            self.setUp()
+            self.worker()
+            self.v2.messages = [message(1798365852000, "", error=text)]
+            code, out, err = self.status_line()
+            part = out.split("; last error ", 1)[1]
+            self.assertNotIn("agent", part.lower().replace("[redacted]", ""))
+            self.assertNotIn("user", part.lower().replace("[redacted]", ""))
+            self.assertIn(PLACEHOLDER, part)
+
     def test_s11_each_keeps_its_cause_and_at_most_three_lose_a_name(self):
+        self.clean_env()
         lost = []
         for text, causes, loses in POD_ERRORS:
             with self.subTest(text):
@@ -942,6 +968,22 @@ class TestPlaceholderAndNormalising(unittest.TestCase):
         self.assertIn("ConnectionResetError", out)
         self.assertIn("404", out)
         self.assertNotIn("123456", out)
+
+    def test_s13_numbers_of_at_most_three_digits_print_and_longer_ones_and_addresses_do_not(self):
+        for text in ("code 404", "code 500", "exit code 255", "exit code 137", "exit code 13"):
+            with self.subTest(text):
+                self.assertEqual(CLOUD.redact_error(text), text)
+        for text, gone in (("exit code 1234", "1234"), ("exit code 40960", "40960"), ("port 4096", "4096")):
+            with self.subTest(text):
+                out = CLOUD.redact_error(text)
+                self.assertNotIn(gone, out)
+                self.assertIn(PLACEHOLDER, out)
+        # An address is 4 numbers of at most 3 digits joined by dots. Each part alone would print, so the rule is explicit: a dotted run of numbers with
+        # 3 or more dots is ONE token and is redacted whole; a port of 4 or more digits after a colon is redacted as any long number.
+        out = CLOUD.redact_error("connection refused: 10.0.0.1:4096")
+        self.assertEqual(out, "connection refused: [redacted]")
+        self.assertNotIn("10.0.0.1", CLOUD.redact_error("dial 10.0.0.1 failed"))
+        self.assertNotIn("10.0.0.1", CLOUD.redact_error("dial 10.0.0.1:80 failed"))
 
     def test_every_other_token_is_the_placeholder_in_any_language(self):
         self.assertEqual(CLOUD.redact_error("error: " + CYR_PASSWORD + " " + CJK_PASSWORD), "error: [redacted]")
