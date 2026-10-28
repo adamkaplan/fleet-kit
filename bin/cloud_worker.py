@@ -1320,7 +1320,7 @@ def check_report_to(engine, state, args, local_agents):
         raise H["LaunchError"](problem)
     if not reason.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", reason):
         raise H["LaunchError"]("--boss-unregistered needs a reason: non-empty text on one line, no control characters; nothing was created")
-    _audit(engine, "launch.boss_unregistered", args.name, {"reports_to": _one(args.reports_to, 60), "reason": H["scrubbed_flag_text"](reason)})
+    _audit(engine, "launch.boss_unregistered", args.name, {"reports_to": H["scrubbed_flag_text"](args.reports_to, 60), "reason": H["scrubbed_flag_text"](reason)})
 
 
 def pod_shape(args):
