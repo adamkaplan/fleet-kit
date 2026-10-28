@@ -25,10 +25,12 @@ are was were be been the a an and or but if then else this that it its has have 
 only more than too many much one two first last again already now never always bad gateway unreachable unsupported unexpected internal required
 authentication login open read write create delete update list get find warning exception notfound alreadyexists errimagepull imagepullbackoff
 crashloopbackoff oomkilled evicted enoent eacces eexist econnrefused etimedout
+runtime attribute os io assertion system called process subprocess url ssl json decode unicode index
 """.split())
 _SEPARATORS = frozenset(" :,.()\"'/=-_[]")   # the punctuation of an error sentence
 _ERROR_CLASS = re.compile(r"[A-Z][A-Za-z]{0,39}")
 _ERROR_CLASS_END = ("Error", "Exception", "Warning", "Timeout")
+_CAMEL_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")   # a CamelCase word: split at lower-to-upper; a run of capitals is one word (HTTPError: HTTP, Error)
 _TOKEN = re.compile(r"[^\W_]+|.", re.S)   # a run of letters and digits (any script), or one other character
 PLACEHOLDER = "[redacted]"
 
@@ -55,13 +57,14 @@ def _normalise(text, spaced):
 
 def _token_allowed(token, before, after, known):
     """True when a run of letters and digits may print: a word of ERROR_VOCABULARY (compared in lower case), a number of at most five digits that stands
-    between separators, or an error-class name (CamelCase letters only, at most 40, ending in Error, Exception, Warning or Timeout)."""
+    between separators, or an error-class name (CamelCase letters only, at most 40, ending in Error, Exception, Warning or Timeout, and EVERY CamelCase word of it a word of ERROR_VOCABULARY)."""
     low = token.lower()
     if token.isascii():
         if token.isdigit():
             ok = len(token) <= 5 and before in _SEPARATORS and after in _SEPARATORS
         else:
-            ok = low in ERROR_VOCABULARY or (token.isalpha() and _ERROR_CLASS.fullmatch(token) is not None and token.endswith(_ERROR_CLASS_END))
+            ok = low in ERROR_VOCABULARY or (token.isalpha() and _ERROR_CLASS.fullmatch(token) is not None and token.endswith(_ERROR_CLASS_END)
+                                             and all(w.lower() in ERROR_VOCABULARY for w in _CAMEL_WORD.findall(token)))
     else:
         ok = False
     if ok and known and len(low) >= 4 and any(low in secret for secret in known):

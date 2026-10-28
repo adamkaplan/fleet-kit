@@ -648,6 +648,11 @@ KEYWORDS = ("password", "Passwort", "mot de passe", "contrasena", "senha", "clav
 ZW = ("\u200b", "\u200d", "\u2060", "\ufeff", "\u202e", "\u00ad")
 
 
+def camel_words(name):
+    """The CamelCase words of a name, split at lower-to-upper boundaries; a run of capitals is one word (HTTPError: HTTP, Error)."""
+    return re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+", name)
+
+
 def printed_tokens_ok(error_part, vocabulary=BASE_VOCAB):
     """The tokens of a printed error part that are NOT allowed: not the placeholder, not a vocabulary word, a number of at most 5 digits, a separator
     or an error-class name."""
@@ -658,7 +663,7 @@ def printed_tokens_ok(error_part, vocabulary=BASE_VOCAB):
             continue
         if tok.lower() in vocabulary or (tok.isascii() and tok.isdigit() and len(tok) <= 5):
             continue
-        if tok.isascii() and tok.isalpha() and CLASS_NAME.fullmatch(tok) and tok.endswith(CLASS_END):
+        if tok.isascii() and tok.isalpha() and CLASS_NAME.fullmatch(tok) and tok.endswith(CLASS_END) and all(w.lower() in vocabulary for w in camel_words(tok)):
             continue
         bad.append(tok)
     return bad
@@ -685,7 +690,7 @@ def hostile_texts(count=1000, seed=1397):
     for n in range(count):
         secret = SENTINEL if n % 50 == 7 else make_secret(rng, BASE_VOCAB)
         kw = rng.choice(KEYWORDS)
-        shape = rng.randrange(14)
+        shape = rng.randrange(15)
         half = max(1, len(secret) // 2)
         if shape == 0:
             text = "%s: %s" % (kw, secret)
@@ -714,6 +719,9 @@ def hostile_texts(count=1000, seed=1397):
             text = "Error: %s=%s" % (kw.replace(" ", "+"), "".join("%%%02x" % ord(c) for c in secret))
         elif shape == 12:   # decimal and hex HTML encodings
             text = "Error: %s %s &#x%s;" % (kw, "".join("&#%d;" % ord(c) for c in secret), secret.encode().hex())
+        elif shape == 13:   # hidden inside a CamelCase string that ends in Error or Exception
+            secret = ("".join(c for c in secret if c.isalpha()) or "Zqxv").capitalize()
+            text = "%s%s: failed" % (secret, rng.choice(("Error", "Exception")))
         else:   # after plain filler words
             text = "Error: %s is the one for the %s that was %s" % (kw, rng.choice(("service", "server", "account")), secret)
         if rng.random() < 0.2:
@@ -757,7 +765,7 @@ class TestProperty(Base):
 
     def test_s9_a_printed_token_outside_the_vocabulary_is_seen_by_the_check(self):
         self.assertEqual(printed_tokens_ok("Error: " + "hunter2", frozenset(("error",))), ["hunter2"])
-        self.assertEqual(printed_tokens_ok("RuntimeError: [redacted] 404 and", frozenset(("and",))), [])
+        self.assertEqual(printed_tokens_ok("RuntimeError: [redacted] 404 and", frozenset(("and", "runtime", "error"))), [])
 
 
 class TestVocabularyScan(Base):
@@ -839,6 +847,20 @@ class TestSurvivors(Base):
         self.assertEqual(failures, [])
 
 
+class TestCamelSurvivors(Base):
+    """S10 (class names): a secret written as a CamelCase string ending in Error or Exception does not print."""
+
+    def test_s10_a_secret_inside_a_camel_case_error_name_does_not_print(self):
+        for name, planted in (("MySecretPasswordHunterTwoError", "Hunter"), ("QzjxkvwpmbhgtfdlnsyrError", "Qzjxkvwpmb"), ("OtpCodeFourEightTwoException", "Four")):
+            with self.subTest(name):
+                self.setUp()
+                self.worker()
+                self.v2.messages = [message(1798365852000, "", error=name + ": failed")]
+                code, out, err = self.status_line()
+                self.assertNotIn(planted, out)
+                self.assertIn(PLACEHOLDER, out)
+
+
 # S11: (text, the cause words that must stay, whether a NAME is lost to the placeholder)
 POD_ERRORS = (
     ("failed to pull image: pull access denied", ("failed to pull image: pull access denied",), False),
@@ -875,6 +897,37 @@ class TestRealErrors(Base):
         self.assertLessEqual(len(lost), 3)
 
 
+class TestClassNames(Base):
+    """The fix of the fourth proof: a CamelCase name prints only if EVERY CamelCase word of it is a word of the vocabulary."""
+    PRINT = ("ModuleNotFoundError", "TimeoutError", "RuntimeError", "ConnectionResetError", "PermissionError", "FileExistsError", "HTTPError",
+             "CalledProcessError")
+    HIDDEN = ("MySecretPasswordHunterTwoError", "QzxwvbnmklpjhgtfdlnsyrabcdefghijkError", "QzxwvbnmklpjhgtfdlnsyrabcdefghiError",
+              "HunterTwoException", "PasswordHunterError", "ZZZError", "SecretKeyXqzvException")
+
+    def test_the_readable_error_classes_print(self):
+        for name in self.PRINT:
+            with self.subTest(name):
+                self.assertEqual(CLOUD.redact_error(name + ": failed"), name + ": failed")
+
+    def test_a_name_with_a_word_outside_the_vocabulary_is_the_placeholder(self):
+        for name in self.HIDDEN:
+            with self.subTest(name):
+                out = CLOUD.redact_error(name + ": failed")
+                self.assertEqual(out, "[redacted]: failed")
+
+    def test_the_arbitrary_35_letters_ending_in_error_do_not_print(self):
+        name = "Qzxwvbnmklpjhgtfdlnsyrabcdefghijk"[:30] + "Error"
+        self.assertEqual(len(name), 35)
+        self.assertNotIn("Qzxw", CLOUD.redact_error("failed " + name))
+
+    def test_the_words_are_split_at_lower_to_upper_and_an_acronym_is_one_word(self):
+        self.assertEqual(camel_words("HTTPError"), ["HTTP", "Error"])
+        self.assertEqual(camel_words("CalledProcessError"), ["Called", "Process", "Error"])
+
+    def test_the_vocabulary_stays_short(self):
+        self.assertLessEqual(len(CLOUD.ERROR_VOCABULARY), 260)
+
+
 class TestPlaceholderAndNormalising(unittest.TestCase):
     def test_a_run_of_placeholders_and_separators_is_one_placeholder(self):
         self.assertEqual(CLOUD.redact_error("failed: /aa1/bb2/cc3 a1b2"), "failed: /[redacted]")
@@ -885,8 +938,8 @@ class TestPlaceholderAndNormalising(unittest.TestCase):
         self.assertIn("failed", out)
 
     def test_an_error_class_name_and_a_short_number_print_and_a_long_number_does_not(self):
-        out = CLOUD.redact_error("WidgetStartupError 404 123456")
-        self.assertIn("WidgetStartupError", out)
+        out = CLOUD.redact_error("ConnectionResetError 404 123456")
+        self.assertIn("ConnectionResetError", out)
         self.assertIn("404", out)
         self.assertNotIn("123456", out)
 
