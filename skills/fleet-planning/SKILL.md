@@ -31,7 +31,7 @@ Receipt format: `docs/plan-template.md`.
    screenshot | review`; `review` quotes text), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
-   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`.
+   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
    **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
    An uncovered Done-when clause gets a new `S` scenario; never edit, reword or delete the clause.
@@ -54,7 +54,7 @@ Put it in the repo the work concerns: **a short issue body** (outcome, Done-when
 
 ## Challenge it
 
-A `plan review` command (not built yet: ask the Chief of Staff for a hand-run review) launches independent read-only reviewers and records their verdicts. The tier comes from the ask or epic the plan serves. Up to three rounds; a standing objection goes to the Chief of Staff, then the owner.
+A `plan review` command (not built yet: ask the Chief of Staff for a hand-run review) launches independent read-only reviewers and records their verdicts. The tier is computed from the ask or epic the plan serves, not chosen per item. Up to three rounds; a standing objection goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
@@ -87,7 +87,7 @@ scenarios:
     evaluator: ci
 ```
 
-For each input read: it is missing, corrupt or unreadable: the output says so and the last good output is kept (`plan check` warns `no-failure-mode`).
+A missing or corrupt input: say so, keep the last good output (`plan check` warns `no-failure-mode`).
 
 Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `commission()` method" (how).
 
