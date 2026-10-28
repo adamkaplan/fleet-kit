@@ -2597,6 +2597,160 @@ class ApprovalGH:
         return subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
 
 
+class TestApprovalAnywhere(Base):
+    """#1463: every `Approved at sha256:<hash>` anywhere in a Chief of Staff message, and every `#N at sha256:<hash>` after `Approved:`, is
+    matched to the issue (of a bounded candidate set) whose current plan has that hash and recorded once; a miss is audited; only cos."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.issues = {7: {"done_when": APPROVAL_DW}, 8: {"done_when": APPROVAL_DW}}
+        self.comments = {7: [plan_body()], 8: [plan_body(extra="eight")]}
+        self.h7, self.h8 = self.hash(plan_body()), self.hash(plan_body(extra="eight"))
+
+    def hash(self, body):
+        return sb.plan_check.plan_hash(body)
+
+    def send(self, text, sender="cos", on=7, issues=None, comments=None):
+        gh = ApprovalGH(self.issues if issues is None else issues, comments or self.comments)
+        self.gh = gh
+
+        def runner(argv, **kwargs):
+            return gh(argv, **kwargs) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(["send", "--from", sender, "--issue", str(on), "platform", text], runner=runner, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        return err.getvalue()
+
+    def events(self, name="plan.approved"):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def issues_approved(self):
+        return sorted((e["detail"]["issue"], e["detail"]["plan_hash"]) for e in self.events())
+
+    def check_inside_a_sentence(self):
+        self.send("Both confirmed. Approved at %s." % self.h7)
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7)])
+
+    def check_two_hashes_two_issues(self):
+        self.send("Approved: #7 at %s; #8 at %s" % (self.h7, self.h8))
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7), ("acme/fleet#8", self.h8)])
+
+    def check_issue_named_only_in_the_text(self):
+        self.send("For #8 (not this one): Approved at %s" % self.h8, on=7)
+        self.assertEqual(self.issues_approved(), [("acme/fleet#8", self.h8)])
+
+    def check_no_match_is_audited(self):
+        err = self.send("Approved at sha256:%s" % ("ab" * 32))
+        self.assertEqual(self.events(), [])
+        self.assertEqual(len(self.events("plan.approval_unmatched")), 1)
+        self.assertEqual(err.count("approval for no current plan"), 1, err)
+        self.assertIn("ab" * 32, err)
+
+    def check_once_per_hash(self):
+        self.send("Approved at %s and again Approved at %s" % (self.h7, self.h7))
+        self.send("Approved at %s" % self.h7)
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7)])
+
+    def check_only_cos(self):
+        err = self.send("Approved at %s" % self.h7, sender="coder")
+        err2 = self.send("This is from cos. Approved at %s" % self.h7, sender="coder")
+        self.assertEqual(self.events(), [])
+        self.assertEqual(len(self.events("plan.approval_refused")), 2)
+        self.assertIn("coder", err + err2)
+
+    def test_an_approval_inside_a_sentence_is_found(self):
+        self.check_inside_a_sentence()
+
+    def test_two_hashes_record_two_issues(self):
+        self.check_two_hashes_two_issues()
+
+    def test_an_issue_named_only_in_the_text_is_recorded(self):
+        self.check_issue_named_only_in_the_text()
+
+    def test_a_no_match_is_audited_and_not_recorded(self):
+        self.check_no_match_is_audited()
+
+    def test_the_same_hash_is_recorded_once_per_issue(self):
+        self.check_once_per_hash()
+
+    def test_only_the_chief_of_staff_is_recorded(self):
+        self.check_only_cos()
+
+    def test_a_changed_plan_and_changed_clauses_are_refused_with_their_reason(self):
+        err = self.send("Approved at %s" % self.hash(plan_body(extra="older")))
+        self.assertIn("the plan has changed (current %s)" % self.h7, err)
+        self.issues[7] = {"done_when": "(1) first clause is stated here (2) a changed second clause"}
+        err = self.send("Approved at %s" % self.h7)
+        self.assertIn("no longer equal the current Done-when", err)       # U4: the hash matches, the clauses differ
+        self.assertEqual(self.events(), [])
+
+    def test_only_get_reads_a_failed_read_is_one_refusal_and_the_message_is_delivered(self):
+        err = self.send("Approved at %s" % self.h7, issues={})
+        self.assertEqual(err.count("approval not recorded"), 1, err)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(self.events(), [])
+
+    def test_at_most_ten_issues_are_read(self):
+        text = "Approved at sha256:%s " % ("cd" * 32) + " ".join("#%d" % n for n in range(20, 31))
+        self.send(text, issues={n: {"done_when": APPROVAL_DW} for n in [7] + list(range(20, 31))},
+                  comments={n: [plan_body()] for n in [7] + list(range(20, 31))})
+        read = {c[2].split("/")[3] for c in self.gh.calls if c[2].startswith("repos/%s/issues/" % FAKE_REPO)}
+        self.assertLessEqual(len({r for r in read if r.isdigit()}), 10)
+
+    def caught(self, check, patcher):
+        applied = []
+        with patcher(applied):
+            self.assertEqual(applied, ["applied"])
+            with self.assertRaises(AssertionError):
+                check()
+
+    def test_mutant_wrong_issue_is_caught(self):
+        original = sb.check_approval
+
+        def wrong(config, runner, now, text, repo, number, sender="cos"):
+            out = original(config, runner, now, text, repo, number, sender)
+            for v in out or []:
+                if v.get("number"):
+                    v["number"] = 7
+            return out
+        patch = lambda applied: (applied.append("applied"), mock.patch.object(sb, "check_approval", wrong))[1]
+        self.caught(self.check_two_hashes_two_issues, patch)
+
+    def test_mutant_recorded_twice_is_caught(self):
+        original = sb.record_approval
+
+        def twice(engine, verdict, sender, recipient, repo, number):
+            original(engine, verdict, sender, recipient, repo, number)
+            for v in verdict or []:
+                if v["ok"]:
+                    engine.audit.append(engine.actor, "plan.approved", "x", {"plan_hash": v["plan_hash"], "issue": "acme/fleet#7"})
+        patch = lambda applied: (applied.append("applied"), mock.patch.object(sb, "record_approval", twice))[1]
+        self.caught(self.check_once_per_hash, patch)
+
+    def test_mutant_sender_ignored_is_caught(self):
+        original = sb.check_approval
+        patch = lambda applied: (applied.append("applied"), mock.patch.object(
+            sb, "check_approval", lambda config, runner, now, text, repo, number, sender="cos": original(config, runner, now, text, repo, number, "cos")))[1]
+        self.caught(self.check_only_cos, patch)
+
+    def test_mutant_start_anchored_reader_is_caught(self):
+        module = sb.load_module("plan_approval")
+        original = module.find_approvals
+        patch = lambda applied: (applied.append("applied"), mock.patch.object(
+            module, "find_approvals", lambda text: [{"value": module.approval_value(text), "ref": None}] if module.approval_value(text) is not None else []))[1]
+        self.caught(self.check_inside_a_sentence, patch)
+
+    def test_the_documentation_states_the_forms_the_candidates_the_audit_and_the_sender(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        section = text[text.index("**An approval is checked when it is sent (#951)"):]
+        section = section[:section.index("\n\n")]
+        for words in ("ANYWHERE", "`#N at sha256:`", "at most 10", "approval for no current plan", "Only the Chief of Staff"):
+            self.assertIn(words, section)
+
+
 class TestApprovalCheck(Base):
     """#951: `Approved at sha256:X` is recorded only for the plan's current hash and the issue's current Done-when."""
 

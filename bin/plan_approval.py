@@ -16,6 +16,55 @@ def approval_value(text):
     return None if found is None else found.group(1).rstrip(".,;:")
 
 
+ANYWHERE_RE = re.compile(r"Approved at sha256:([0-9a-fA-F]{64})(?![0-9a-fA-F])", re.IGNORECASE)
+LIST_RE = re.compile(r"(?<![\w/])(?:([\w.-]+/[\w.-]+))?#(\d+) at sha256:([0-9a-fA-F]{64})(?![0-9a-fA-F])")
+MENTION_RE = re.compile(r"(?<![\w/&])(?:([\w.-]+/[\w.-]+))?#(\d+)\b")
+APPROVED_COLON_RE = re.compile(r"Approved:", re.IGNORECASE)
+MAX_CANDIDATES = 10
+
+
+def find_approvals(text):
+    """(#1463) Every approval in a message, each hash once, in order: the value of a message that STARTS with `Approved at sha256:` (as
+    before, even when it is not a full hash), every `Approved at sha256:<64 hex>` anywhere, and every `#N at sha256:<64 hex>` (or
+    `owner/repo#N ...`) after `Approved:`. Returns [{"value": hash, "ref": (repo or None, N) or None}]."""
+    text = text or ""
+    found, seen = [], set()
+
+    def add(value, ref):
+        key = value.lower()
+        if key not in seen:
+            seen.add(key)
+            found.append({"value": key if HEX64_RE.match(value) else value, "ref": ref})
+    start = approval_value(text)
+    if start is not None:
+        add(start, None)
+    spans = [(m.start(), m.group(1), None) for m in ANYWHERE_RE.finditer(text)]
+    colon = APPROVED_COLON_RE.search(text)
+    if colon:
+        for m in LIST_RE.finditer(text, colon.end()):
+            spans.append((m.start(), m.group(3), (m.group(1), int(m.group(2)))))
+    for _, value, ref in sorted(spans, key=lambda s: s[0]):
+        add(value, ref)
+    return found
+
+
+def candidates(text, repo, number, limit=MAX_CANDIDATES):
+    """The bounded set of issues to read: the one the message was sent on, then each `#N at sha256` of an `Approved:` list, then each
+    issue the text names as `#N` or `owner/repo#N`; (repo, number) pairs, at most `limit`, never more however many the text names."""
+    out = []
+
+    def add(r, n):
+        if r is not None and n is not None and (r, n) not in out and len(out) < limit:
+            out.append((r, n))
+    add(repo, number)
+    for item in find_approvals(text):
+        if item["ref"]:
+            add(item["ref"][0] or repo, item["ref"][1])
+    for m in MENTION_RE.finditer(text or ""):
+        add(m.group(1) or repo, int(m.group(2)))
+    return out
+
+
 def done_when_hash(done_when):
     return hashlib.sha256(" ".join((done_when or "").split()).encode("utf-8")).hexdigest()
 

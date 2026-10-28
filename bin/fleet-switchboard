@@ -14364,7 +14364,7 @@ def _cmd_send(args, runner, now):
     if lane_problem:
         sys.stderr.write("%s: not sent, %s\n" % (PROG, lane_problem))
         return EXIT_USAGE
-    verdict = check_approval(config, runner, now, text, repo, number)   # #951: only a message that starts `Approved at sha256:`; GETs only; never raises
+    verdict = check_approval(config, runner, now, text, repo, number, sender)   # #951, #1463: every approval hash in the message; only the Chief of Staff's; GETs only; never raises
     try:
         outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt)
     except InterruptRefused as err:
@@ -14382,49 +14382,114 @@ def _cmd_send(args, runner, now):
     return EXIT_OK
 
 
-def check_approval(config, runner, now, text, repo, number):
-    """#951: None for a message that carries no approval (nothing is read). Otherwise the verdict of `plan_approval.evaluate`, from GET reads of the
-    issue, its comments and (when it has no Done-when of its own) its ask. FAIL MODE: any failure to read is a refusal line, never an error:
-    the message is delivered either way."""
+def _read_for_approval(reader, repo, number):
+    """The GET reads of one issue for an approval (#951): (comments, done_when). Raises on any failure to read."""
+    issue = reader.issue(number, repo)
+    done_when = issue.done_when
+    if not done_when:
+        ask, _ = reader.ask_of(number, repo)
+        done_when = reader.issue(ask, repo).done_when if ask != number else None
+    comments = []
+    for page in range(1, PLAN_COMMENT_PAGES + 1):
+        got = reader._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
+        if not isinstance(got, list):
+            raise IntentError("gh", "the comments did not come back as a list")
+        comments.extend(got)
+        if len(got) < 100:
+            break
+    return comments, done_when
+
+
+def check_approval(config, runner, now, text, repo, number, sender="cos"):
+    """#951, #1463: None for a message that carries no approval (nothing is read). Otherwise a list with one verdict per hash found
+    (`plan_approval.find_approvals`): `plan_approval.evaluate` per candidate issue (the one sent on and the ones the text names, at most
+    10), from GET reads. Only the Chief of Staff's approval is read at all: another sender gets one audit line naming it. FAIL MODE: any
+    failure to read is a refusal line, never an error: the message is delivered either way."""
     module = load_module("plan_approval")
-    value = module.approval_value(text)
-    if value is None:
-        return None
-    if number is None:
-        return {"ok": False, "line": "approval not recorded: the message names no issue (use --issue); the message was delivered"}
     try:
+        found = module.find_approvals(text)
+    except Exception:
+        return None
+    if not found:
+        return None
+    if sender != COS_NAME:
+        return [{"ok": False, "audit": "plan.approval_refused", "sender": sender, "hashes": [f["value"] for f in found],
+                 "line": "approval not recorded: only the Chief of Staff's approval is recorded, and this message is from %s; the message was delivered" % sender}]
+    if number is None:
+        return [{"ok": False, "line": "approval not recorded: the message names no issue (use --issue); the message was delivered"}]
+    try:
+        plan_check = load_plan_check()
         reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
-        issue = reader.issue(number, repo)
-        done_when = issue.done_when
-        if not done_when:
-            ask, _ = reader.ask_of(number, repo)
-            done_when = reader.issue(ask, repo).done_when if ask != number else None
-        comments = []
-        for page in range(1, PLAN_COMMENT_PAGES + 1):
-            got = reader._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
-            if not isinstance(got, list):
-                raise IntentError("gh", "the comments did not come back as a list")
-            comments.extend(got)
-            if len(got) < 100:
-                break
-        return module.evaluate(value, comments, done_when, load_plan_check())
+        reads, failed = {}, {}
+        for cand in module.candidates(text, repo, number):
+            try:
+                reads[cand] = _read_for_approval(reader, cand[0], cand[1])
+            except Exception as err:
+                failed[cand] = err
+        verdicts = []
+        for item in found:
+            value, matched, first = item["value"], None, None
+            for cand in reads:
+                comments, done_when = reads[cand]
+                verdict = module.evaluate(value, comments, done_when, plan_check)
+                if verdict["ok"] and matched is None:
+                    matched = dict(verdict, repo=cand[0], number=cand[1])
+                elif not verdict["ok"] and verdict.get("plan_hash") and "sha256:" + value.lower() == verdict["plan_hash"] and first is None:
+                    first = verdict                       # the plan is this hash, but the clauses differ (or no Done-when): refused with its reason
+            if matched is not None:
+                verdicts.append(matched)
+            elif first is not None:
+                verdicts.append(first)
+            elif not reads:
+                err = failed.get((repo, number)) or next(iter(failed.values()), "")
+                verdicts.append({"ok": False, "line": "approval not recorded: the issue could not be read (%s); the message was delivered"
+                                 % _one_line(str(err), 120)})
+            else:
+                own = module.evaluate(value, *reads[(repo, number)], plan_check) if (repo, number) in reads else None
+                if not module.HEX64_RE.match(value) and own is not None:
+                    verdicts.append(own)                  # not a full hash: refused as before
+                    continue
+                why = own["line"].split(": ", 1)[1].rsplit("; the message", 1)[0] if own is not None else "the issue could not be read"
+                verdicts.append({"ok": False, "audit": "plan.approval_unmatched", "hashes": [value],
+                                 "line": "approval not recorded: approval for no current plan sha256:%s (%s); the message was delivered" % (value, why)})
+        return verdicts
     except Exception as err:
-        return {"ok": False, "line": "approval not recorded: the issue could not be read (%s); the message was delivered" % _one_line(str(err), 120)}
+        return [{"ok": False, "line": "approval not recorded: the issue could not be read (%s); the message was delivered" % _one_line(str(err), 120)}]
 
 
 def record_approval(engine, verdict, sender, recipient, repo, number):
-    """Audit a passing approval with both hashes, or print the one refusal line. A no-approval message (None) is untouched."""
+    """Audit each passing approval once per hash and issue with both hashes, or print the one refusal line (audited when it names a sender
+    or a hash no plan has). A no-approval message (None) is untouched."""
     if verdict is None:
         return
-    if not verdict["ok"]:
-        sys.stderr.write("%s: %s\n" % (PROG, verdict["line"]))
-        return
-    if engine.audit is not None:
-        try:
-            engine.audit.append(engine.actor, "plan.approved", "%s#%d" % (repo, number),
-                                {"from": sender, "to": recipient, "plan_hash": verdict["plan_hash"], "done_when_hash": verdict["done_when_hash"]})
-        except OSError:
-            pass
+    done = set()
+    if engine.audit is not None:                  # once per hash and issue across sends too: the audit already holds it
+        for entry in _audit_tail(engine.state_dir):
+            detail = entry.get("detail") if entry.get("event") == "plan.approved" else None
+            if isinstance(detail, dict) and detail.get("issue"):
+                done.add((detail.get("plan_hash"), detail["issue"]))
+    for one in ([verdict] if isinstance(verdict, dict) else verdict):
+        if not one["ok"]:
+            sys.stderr.write("%s: %s\n" % (PROG, one["line"]))
+            if one.get("audit") and engine.audit is not None:
+                try:
+                    engine.audit.append(engine.actor, one["audit"], "%s#%s" % (repo, number),
+                                        {"from": sender, "to": recipient, "hashes": one.get("hashes", []), "reason": one["line"][:200]})
+                except OSError:
+                    pass
+            continue
+        target_repo, target = one.get("repo", repo), one.get("number", number)
+        key = (one["plan_hash"], "%s#%d" % (target_repo, target))
+        if key in done:
+            continue
+        done.add(key)
+        if engine.audit is not None:
+            try:
+                engine.audit.append(engine.actor, "plan.approved", "%s#%d" % (target_repo, target),
+                                    {"from": sender, "to": recipient, "plan_hash": one["plan_hash"], "done_when_hash": one["done_when_hash"],
+                                     "issue": "%s#%d" % (target_repo, target)})
+            except OSError:
+                pass
 
 
 def cmd_report(args, runner, now):
