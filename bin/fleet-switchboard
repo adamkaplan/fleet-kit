@@ -3815,8 +3815,43 @@ def run_lock_held(state_dir):
 # whichever shell started it, and neither do the processes it starts.
 CALLER_ENV_NAMES = ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "OPENCODE_SESSION_ID",
                     "FLEET_SWITCHBOARD_ROLE", "FLEET_SWITCHBOARD_REPO")
-OWN_GH_ENV = "FLEET_SWITCHBOARD_OWN_GH"   # set in every switchboard process: its gh calls name their own account (GhAccounts);
-                                          # the gh shim leaves such a call's token alone and never re-identifies it
+OWN_GH_ENV = "FLEET_SWITCHBOARD_OWN_GH"   # #1216: NEVER set for a gh call any more (only cleared: pane children, own children); the shim does not read it.
+                                          # The switchboard's own gh calls reach the REAL gh by its resolved path (own_gh_path), so the shim never sees them.
+SHIM_HEAD = b'"""gh, signing what an agent says'
+
+
+def is_shim_file(candidate):
+    """True when `candidate` is the fleet gh shim (its docstring opens with SHIM_HEAD in the first 400 bytes)."""
+    try:
+        with open(candidate, "rb") as handle:
+            return SHIM_HEAD in handle.read(400)
+    except OSError:
+        return False
+
+
+def own_gh_path(name, environ=None):
+    """The gh the switchboard's OWN calls run: the real binary by path, never the shim. An absolute `name` is used as it is, unless it IS the shim (refused:
+    ConfigError 'no real gh behind the shim'). `gh`: FLEET_REAL_GH when it names an executable and is not the shim; else the first `gh` on PATH that is not the shim;
+    when PATH holds only the shim, ConfigError (every own call would be re-identified, counted and audited as an agent's). No gh on PATH at all: `name` as it is."""
+    environ = os.environ if environ is None else environ
+    if name != "gh":
+        if os.sep in name and os.path.isfile(name) and is_shim_file(os.path.abspath(name)):   # absolute or relative (./gh)
+            raise ConfigError("no real gh behind the shim: the configured gh %s is the fleet shim" % name)
+        return name
+    override = environ.get("FLEET_REAL_GH")
+    if override and os.path.isabs(override) and os.access(override, os.X_OK) and not is_shim_file(override):
+        return override
+    seen_shim = False
+    for entry in (environ.get("PATH") or "").split(os.pathsep):
+        candidate = os.path.join(entry, "gh") if entry else ""
+        if not (candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+            continue
+        if not is_shim_file(candidate):
+            return candidate
+        seen_shim = True
+    if seen_shim:
+        raise ConfigError("no real gh behind the shim: PATH holds only the fleet shim (set 'gh' to an absolute path, or FLEET_REAL_GH)")
+    return name
 
 
 # #1066: the OpenCode service is started lazily by whatever process first needs it, and it inherits that process's environment. A service that carries a
@@ -11205,6 +11240,12 @@ def _validate_github(config, source):
     if not isinstance(config["gh"], str) or not config["gh"].strip():
         raise ConfigError("%s: 'gh' must be a non-empty string (a path or a command name), got %r"
                           % (source, config["gh"]))
+    try:
+        config["gh_by_name"] = config["gh"]   # #1216: as configured (`gh`: PATH finds the shim); the one merge call of `merge-gate --pass --merge` goes through it, so the shim gates it
+        config["gh"] = own_gh_path(config["gh"])   # #1216: the daemon's own calls name the real gh by path
+        load_module("ci_runs").GH = config["gh"]   # #1216: so does the run-identity read of bin/ci_runs.py
+    except ConfigError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
     if not _is_number(config["github_lookback_hours"]) or config["github_lookback_hours"] <= 0:
         raise ConfigError("%s: 'github_lookback_hours' must be a positive number, got %r"
                           % (source, config["github_lookback_hours"]))
@@ -14853,7 +14894,7 @@ class GhAccounts:
         account = self.account_for(repo) if repo else None
         if account is None:
             return None
-        return dict(self.environ, GH_TOKEN=self.token_for(account), **{OWN_GH_ENV: "1"})
+        return dict(self.environ, GH_TOKEN=self.token_for(account))   # no marker: own calls reach the real gh, not the shim
 
     def token_env(self, repo):
         """{"GH_TOKEN": token} for an agent working in `repo`, {} when the repo uses the default account."""
@@ -14933,13 +14974,14 @@ class GhAccounts:
     def read_usage(self):
         """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
         token when one is set). That endpoint does not count against the budget, and it is NOT counted here either (it does not go through `read`, and the
-        child carries the switchboard's own marker). Bounded: at most 8 accounts, one call each, each with the call timeout. Never raises; an account that
+        child runs the real gh by path, so the shim never sees it). Bounded: at most 8 accounts, one call each, each with the call timeout. Never raises; an account that
         cannot be read is left out."""
         found = {}
         names = sorted({a for a in (self.config.get("gh_users") or {}).values() if isinstance(a, str) and a})[:agent_calls.USAGE_ACCOUNTS]
         for account in names + ([None] if self.default_available() else []):
             try:
-                env = dict(self.environ, **{OWN_GH_ENV: "1"})
+                env = dict(self.environ)
+                env.pop(OWN_GH_ENV, None)
                 if account is not None:
                     env["GH_TOKEN"] = self.token_for(account)
                 done = self.runner([self.config["gh"], "api", "rate_limit"], capture_output=True, text=True,
@@ -16666,7 +16708,7 @@ def gates_suites_finding(runner, ctx):
     try:
         ps = load_module("path_suites")
         top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-        done = runner(["gh", "pr", "diff", str(ctx.number), "--repo", ctx.repo, "--name-only"], capture_output=True, text=True)
+        done = runner([ctx.config["gh"], "pr", "diff", str(ctx.number), "--repo", ctx.repo, "--name-only"], capture_output=True, text=True)
         if top.returncode != 0 or done.returncode != 0:
             return None
         root, changed = top.stdout.strip(), [p for p in done.stdout.split("\n") if p.strip()]
@@ -18668,21 +18710,21 @@ def add_merge_gate_parsers(sub):
 
 
 def merge_gate_gh(config, runner, repo):
-    """`gh(argv, own=True) -> (code, stdout, stderr)` for `repo`'s account, never raising; a call names itself the switchboard's own, so the shim does not probe it,
-    EXCEPT with `own=False` (the one merge call of `--pass --merge`): that call carries no marker, so the shim's own checks (the review check among them) run."""
+    """`gh(argv, own=True) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call runs the real gh by its resolved path (own_gh_path, config['gh']), so it never reaches the shim,
+    EXCEPT with `own=False` (the one merge call of `--pass --merge`): that call goes through the gh as configured (`gh_by_name`: the shim where PATH finds it), so the shim's own checks (the review check among them) run."""
     accounts = GhAccounts(config, runner, time.time)
     try:
         refuse_excluded(config, repo)
         env = accounts.env_for(repo)
     except AccountError as err:
         raise LedgerCommandError(str(err)) from None
-    env = dict(env if env is not None else os.environ, **{OWN_GH_ENV: "1"})
-    plain_env = {k: v for k, v in env.items() if k != OWN_GH_ENV}
+    env = dict(env if env is not None else os.environ)
+    env.pop(OWN_GH_ENV, None)   # no marker: the real gh is reached by its path (own_gh_path), not through the shim
 
     def gh(argv, own=True):
         try:
-            done = runner([config["gh"]] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
-                          env=env if own else plain_env)
+            done = runner([config["gh"] if own else config.get("gh_by_name", config["gh"])] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
+                          env=env)
         except (OSError, subprocess.SubprocessError) as err:
             return 1, "", accounts.scrub(_one_line(str(err), 120))
         return done.returncode, done.stdout or "", accounts.scrub(done.stderr or "")
@@ -21403,11 +21445,12 @@ def _changed_plan(args, runner):
         number = str(args.pr).strip().split("#")[-1]
         if not re.fullmatch(r"[0-9]{1,9}", number):
             raise ps.PathSuitesError("--pr %r: the number after '#' must be digits" % str(args.pr)[:60])
-        theirs = runner(["gh", "pr", "view", number, "--json", "headRefOid", "-q", ".headRefOid"], cwd=root, capture_output=True, text=True)
+        real_gh = load_config()["gh"]   # #1216: the real gh by path (own_gh_path), never the bare name the shim answers
+        theirs = runner([real_gh, "pr", "view", number, "--json", "headRefOid", "-q", ".headRefOid"], cwd=root, capture_output=True, text=True)
         mine = runner(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True)
         if theirs.returncode != 0 or (theirs.stdout or "").strip() != (mine.stdout or "").strip() or not (mine.stdout or "").strip():
             raise ps.PathSuitesError("--pr %s: the checked-out HEAD is not the pull request's head (or its head could not be read): check out the pull request's branch" % number)
-        done = runner(["gh", "pr", "diff", number, "--name-only"], cwd=root, capture_output=True, text=True)
+        done = runner([real_gh, "pr", "diff", number, "--name-only"], cwd=root, capture_output=True, text=True)
         if done.returncode == 0 and done.stdout.strip():
             paths = sorted(p for p in done.stdout.split("\n") if p.strip())
     if paths is None:
@@ -23288,7 +23331,7 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
 
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
          socket_call=None):
-    os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
+    os.environ.pop(OWN_GH_ENV, None)   # #1216: an inherited marker means nothing; own gh calls reach the real gh by path (own_gh_path)
     raw = tuple(argv if argv is not None else sys.argv[1:])   # #835: the command line as typed, captured BEFORE any registrar runs: `review record` reads its rating inputs from this, never from the shared parser
     held = {name: (globals()[name], globals()[name].__code__) for name in RATING_PATH_FUNCTIONS if name in globals()}
     parser = build_parser()
