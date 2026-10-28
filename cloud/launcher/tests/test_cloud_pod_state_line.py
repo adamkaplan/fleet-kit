@@ -533,9 +533,9 @@ class TestDocuments(unittest.TestCase):
                            "(the ten most plausible are password, secret, token, key, login, user, account, access, service, session)", "A number of up to three digits prints.",
                            "kept out only when they are 4 or more characters", "environment values under 8 characters are not covered",
                            "Upper-case forms of vocabulary words print as typed.",
-                           "A run of numbers joined by separators (a dash, a dot, a colon, a slash, a space or a comma between digit groups) counts as one number and prints only when the whole run holds at most three digits.",
-                           "A run of three or more separator characters in a row prints as the placeholder.",
-                           "a clock such as 10:30:00 and a counter such as [1/3] lose their numbers"):
+                           "A maximal run of characters that holds no letter (digits, spaces and punctuation of any kind) counts as one token and prints only when it holds at most three digits in all and at most two characters that are neither digits nor spaces; otherwise the whole run is the placeholder.",
+                           "a clock, a counter such as [1/3], a date and a port such as port 4096 lose their numbers",
+                           "a dotted address of three or more dots"):
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
 
@@ -1045,7 +1045,7 @@ class TestPlaceholderAndNormalising(unittest.TestCase):
         # An address is 4 numbers of at most 3 digits joined by dots. Each part alone would print, so the rule is explicit: a dotted run of numbers with
         # 3 or more dots is ONE token and is redacted whole; a port of 4 or more digits after a colon is redacted as any long number.
         out = CLOUD.redact_error("connection refused: 10.0.0.1:4096")
-        self.assertEqual(out, "connection refused: [redacted]")
+        self.assertEqual(out, "connection refused[redacted]")   # the colon is part of the run ": 10.0.0.1:4096"
         self.assertNotIn("10.0.0.1", CLOUD.redact_error("dial 10.0.0.1 failed"))
         self.assertNotIn("10.0.0.1", CLOUD.redact_error("dial 10.0.0.1:80 failed"))
 
@@ -1054,11 +1054,11 @@ class TestPlaceholderAndNormalising(unittest.TestCase):
         shown = []
         for text in split:
             with self.subTest(text=text):
-                plain = CLOUD.redact_error("error: " + text + " failed")
-                known = CLOUD.redact_error("error: " + text + " failed", known=[text])
+                plain = CLOUD.redact_error("error " + text + " failed")
+                known = CLOUD.redact_error("error " + text + " failed", known=[text])
                 again = CLOUD.redact_error("failed " + text, known=[text])
-                self.assertEqual(plain, "error: [redacted] failed")
-                self.assertEqual(known, "error: [redacted] failed")
+                self.assertEqual(plain, "error [redacted] failed")
+                self.assertEqual(known, "error [redacted] failed")
                 self.assertEqual(again, "failed [redacted]")
                 shown.append(text)
         self.assertEqual(len(shown), 8)
@@ -1075,24 +1075,85 @@ class TestPlaceholderAndNormalising(unittest.TestCase):
             out = CLOUD.redact_error("error 1 and x%s failed %s" % (secret, secret), known=[secret])
             self.assertNotIn(secret, out)
 
+    def test_s14_the_one_rule_by_shape_a_run_with_no_letter(self):
+        split = ("123-456-789", "1-2-3-4-5-6", "192.168.1", "4111 1111 1111 1111", "12:34:56", "1_2_3_4", "12_34_56_78", "1=2=3=4", "1(2)3(4)", "1'2'3'4",
+                 "1[2]3[4]", "1, 2, 3, 4", "1 - 2 - 3 - 4", "1: 2: 3: 4", "1  2  3  4", "((()))", "::::", "----", "- - -")
+        self.assertEqual(len(split), 19)
+        for text in split:
+            with self.subTest(text=text):
+                self.assertEqual(CLOUD.redact_error("error " + text + " failed"), "error [redacted] failed")
+                self.assertEqual(CLOUD.redact_error("error " + text + " failed", known=[text]), "error [redacted] failed")
+                self.assertEqual(CLOUD.redact_error("failed " + text, known=[text]), "failed [redacted]")
+        for text in ("code 404", "code 500", "exit code 255", "exit code 13", "exit code 137", "error 1.2.3 failed", "back-off error", "error: failed", "failed (code 5)"):
+            with self.subTest(text=text):
+                self.assertEqual(CLOUD.redact_error(text), text)
+        self.assertEqual(CLOUD.redact_error("error ..a.. failed"), "error ..a.. failed")
+
+    def test_s14_no_string_of_digits_and_punctuation_with_four_digits_prints_four_digits(self):
+        import random
+        for seed in range(1000):
+            rng = random.Random(seed)
+            text = "".join(rng.choice("0123456789 :,.()\"'/=-_[]") for _ in range(rng.randint(4, 40)))
+            if sum(c.isdigit() for c in text) < 4:
+                text += "1234"[:4 - sum(c.isdigit() for c in text)]
+            out = CLOUD.redact_error("error " + text)
+            self.assertNotRegex(out, r"\d.*\d.*\d.*\d", "seed %d text %r printed %r" % (seed, text, out))
+
+    def test_s11_the_nine_real_errors_lose_no_number_and_six_keep_the_whole_line(self):
+        whole = [t for t, c, loses in POD_ERRORS if not loses]
+        self.assertEqual(len(POD_ERRORS), 9)
+        self.assertEqual(len(whole), 6)
+        for text in whole:
+            self.assertEqual(CLOUD.redact_error(text), text)
+        self.assertFalse([t for t, c, loses in POD_ERRORS if re.search(r"\d", t) and "coder7" not in t])   # none holds a timestamp or a counter
+
     def test_every_other_token_is_the_placeholder_in_any_language(self):
         self.assertEqual(CLOUD.redact_error("error: " + CYR_PASSWORD + " " + CJK_PASSWORD), "error: [redacted]")
 
+    CHILD = (
+        "import sys, time\n"
+        "sys.path.insert(0, %r)\n"
+        "import pod_state_line as P\n"
+        "if sys.argv[2] == 'quadratic':\n"
+        "    real = P._normalise\n"
+        "    def slow(text, spaced):\n"
+        "        out = real(text, spaced)\n"
+        "        for i in range(len(text)):\n"
+        "            text.find('\\x00')   # the mutant: a scan of the whole text for each character\n"
+        "        return out\n"
+        "    P._normalise = slow\n"
+        "text = 'ab1 ' * (int(sys.argv[1]) // 4)\n"
+        "began = time.process_time()\n"
+        "out = P.redact_error(text)\n"
+        "print(time.process_time() - began, len(out))\n"
+    ) % os.path.join(ROOT, "bin")
+
+    def run_redaction(self, size, limit, mutant="none"):
+        """(CPU seconds of the redaction, length of its output), run in a SUBPROCESS with a hard wall limit: past it the test FAILS (it does not hang)."""
+        began = time.monotonic()
+        try:
+            done = subprocess.run([sys.executable, "-c", self.CHILD, str(size), mutant], capture_output=True, text=True, timeout=limit)
+        except subprocess.TimeoutExpired:
+            self.fail("the redaction of %d characters did not end within %d s (process time elapsed %.1f s)" % (size, limit, time.monotonic() - began))
+        self.assertEqual(done.returncode, 0, done.stderr[-300:])
+        cpu, length = done.stdout.split()
+        return float(cpu), int(length)
+
     def test_a_two_million_character_line_prints_in_linear_time_and_a_longer_one_prints_a_phrase(self):
         """The property is that the redaction is linear and ends. The REAL guard is the ratio: 2M characters take less than 16 times what 250K take (8 times the text is 8 times the work when linear; a quadratic one is 64 times), measured
-        in PROCESS time (the CPU seconds of this process, not the seconds spent waiting under load). The 60 second wall clock bound is only a backstop
-        against a redaction that does not end; a tighter wall clock bound failed under load (12 s against 1.4 s unloaded)."""
-        def cpu(text):
-            began = time.process_time()
-            out = CLOUD.redact_error(text)
-            return time.process_time() - began, out
-        small, _ = cpu("ab1 " * 62500)
-        began = time.monotonic()
-        large, out = cpu("ab1 " * 500000)
-        self.assertLess(time.monotonic() - began, 60)
-        self.assertLessEqual(len(out), 160)
+        in PROCESS time. The run is in a subprocess with a hard limit of 60 s: a redaction that does not end FAILS with the elapsed time, it does not hang."""
+        small, _ = self.run_redaction(250000, 60)
+        large, length = self.run_redaction(2000000, 60)
+        self.assertLessEqual(length, 160)
         self.assertLess(large, 16 * max(small, 0.02), "2M characters took %.2f s of CPU, 250K took %.2f s: not linear" % (large, small))
         self.assertEqual(CLOUD.redact_error("a" * 2000001), "[error text too long to show]")
+
+    def test_a_quadratic_redaction_fails_within_the_limit_and_does_not_hang(self):
+        began = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            self.run_redaction(2000000, 5, mutant="quadratic")
+        self.assertIn("did not end within 5 s", str(caught.exception))
+        self.assertLess(time.monotonic() - began, 30)
 
 
 class TestTransientLogin(Base):
