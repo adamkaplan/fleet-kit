@@ -2841,13 +2841,25 @@ class TestApprovalCheck(Base):
         self.assertIn("full 64-character hash", err)
 
     def test_a_message_without_an_approval_reads_nothing(self):
-        for text in ("hello", "I Approved at %s" % self.current(), "not Approved at sha256:%s" % ("a" * 64)):
+        for text in ("hello",):
             code, err = self.send(text)
             self.assertEqual(code, 0, err)
             self.assertEqual(err.count("\n"), 1, err)
             self.assertNotIn("approval", err)
             self.assertEqual([c for c in self.gh.calls if "comments" in c[2]], [], text)   # the message path's own intent reads stay; the check adds none
         self.assertEqual(self.approved(), [])
+
+    def test_an_approval_inside_a_sentence_is_recorded(self):
+        code, err = self.send("I Approved at %s" % self.current())
+        self.assertEqual(code, 0, err)
+        (event,) = self.approved()
+        self.assertEqual(event["detail"]["plan_hash"], self.current())
+
+    def test_a_sentence_approval_of_no_current_plan_records_nothing_and_says_so_once(self):
+        code, err = self.send("not Approved at sha256:%s" % ("a" * 64))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.approved(), [])
+        self.assertEqual(err.count("approval for no current plan"), 1, err)
 
     def test_the_documentation_shows_the_check_and_every_answer(self):
         text = (BIN.parent / "docs" / "switchboard.md").read_text()
