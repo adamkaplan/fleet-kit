@@ -128,6 +128,15 @@ A clean tree whose HEAD is already pushed pushes nothing and reports `pushed: fa
 - Both stops are checked at least every minute and take effect within 3 minutes of the limit (plan scenarios S2, S3).
 - **OPEN**: how a worker asks for its own extension (a command inside the pod, or only an operator).
 
+**The alert when the launcher ends a worker (ask #1480).** The switchboard's daemon reads the launcher's audit file from a stored cursor
+(`cloud-end-alert.json` in the daemon's state directory, mode 0600; a missing or corrupt cursor starts at the end of the file, so old history is
+never replayed). When a stop line says the launcher ended a worker for being idle, past its hard limit, a pod that was gone or a failed pod, and
+the worker has a cloud worker record with a recorded boss (`reports_to`) and has not reported `done`, the daemon sends ONE message to that
+recorded boss and ONE to the Chief of Staff, within one pass of the launcher's stop. Each names only the worker, the reason, the time, whether the
+work was pushed (from the run record's `end_hook`) and the run record's name: never an address, a log line or a transcript. It is sent once per run
+id and reason (the last 500 are kept), so a retried stop sends nothing more. A stop by name (`done`, `finished`, `pushed ...`, a person's own
+words) sends nothing. The reason texts the launcher writes are `idle` and `hard limit`, each followed by `; run-id=NONCE` and `; run record DIR`.
+
 ## 7. How the switchboard reaches the cloud (wiring)
 
 `launch --cloud`, `send`, `read`, `status` and `retire` reach the cluster with a token of at most one hour minted from the

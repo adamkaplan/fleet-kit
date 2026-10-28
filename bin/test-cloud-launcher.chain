@@ -4,6 +4,7 @@ cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_chain_time.py
 cloud/launcher/tests/test_cloud_allowlist.py
 cloud/launcher/tests/test_cloud_docs_wording.py
+cloud/launcher/tests/test_cloud_end_alert.py
 cloud/launcher/tests/test_cloud_hub_manifest.py
 cloud/launcher/tests/test_cloud_hub_network.py
 cloud/launcher/tests/test_cloud_k1.py

@@ -39,6 +39,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `brief_advisory.py` | 0 | the pure rules that read an impact brief for the advisory case, the Decisions row and the held-body rationale line (#1215) | |
 | `charter_check.py` | 0 | the one check of the endpoints of a command that moves or copies between charters | |
 | `ci_runs.py` | 0 | the newest run of each check decides the CI verdict | |
+| `cloud_end_alert.py` | 0 | the pass that reads the launcher's audit file and tells a cloud worker's boss and the Chief of Staff, once per run and reason, that the launcher ended it (ask #1480; the send function and the bounded parse are handed in) | |
 | `cloud_quick.py` | 0 | the shared selection helper of the cloud pre-push quick mode: picks the tests that read the changed files, holds the scan list and the heavy-test list, resolves a scan selector (standard library only) | |
 | `closed_labels.py` | 0 | a closed issue never keeps asking for an answer | |
 | `dead_hint.py` | 0 | what is known about a dead agent and what to do about it (pure text) | |

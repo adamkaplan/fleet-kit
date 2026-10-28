@@ -5857,6 +5857,7 @@ BOSS_READ_SITES = {
     "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
+    "bin/cloud_end_alert.py:scan_audit": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record; the message goes to the lane name `send` resolves (the same lookup), with the Chief of Staff as the second recipient",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
 }
 
@@ -9360,6 +9361,24 @@ def cloud_watch_tick(engine, discovery):
     return result
 
 
+CLOUD_END_ALERT_FILE = "cloud-end-alert.json"   # #1480: the private cursor and the sent keys of the pass that reads the launcher's audit file
+
+
+def cloud_audit_path():
+    """Where the cloud launcher's audit file is (the launcher's own rule: $CW_CLOUD_AUDIT, else cw-cloud/audit.jsonl in its state directory)."""
+    return os.environ.get("CW_CLOUD_AUDIT") or os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")
+
+
+def cloud_end_tick(engine, discovery):
+    """#1480: a cloud worker the launcher ended (idle, hard limit, pod gone, failed pod) tells its boss and the Chief of Staff in the same pass, once per run
+    and reason. Reads the launcher's audit file from a stored cursor; sends through the daemon's own `send`. Returns what was handed to it."""
+    if engine.state_dir is None:
+        return []
+    return load_module("cloud_end_alert").scan_audit(cloud_audit_path(), Path(engine.state_dir) / CLOUD_END_ALERT_FILE, Path(engine.state_dir) / "cloud",
+                                                     _read_small(engine.state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
+                                                     load_module("record_json").parse_bounded)
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -9383,6 +9402,10 @@ def finish_pass(engine, discovery, report):
         cloud_watch_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-watch", "cloud-watch", err, report)
+    try:
+        cloud_end_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("cloud-end-alert", "cloud-end-alert", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:
