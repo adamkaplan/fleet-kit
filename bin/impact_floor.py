@@ -211,13 +211,30 @@ def validate_config(raw):
             raise ValueError("'impact_floor.repos.%s.globs' must name at least one glob" % name)
 
 
-HOLD_CLASSES = ("identity", "credentials", "authority", "execution")   # the four classes an entry may list (the operator's own names, not kit-wide data)
+OPERATOR_HOLD_CLASS = "execution"   # the one class an entry may list that the matrix's top tier does not name (the operator's own, not kit-wide data)
+
+
+def hold_classes():
+    """The classes a repos entry may list: the matrix's top tier classes (read from the file, none written here) and the operator's own. An unreadable matrix
+    leaves only the operator's class, so an entry naming a top tier class is read as invalid and the decision falls back to the kit-wide default."""
+    try:
+        rule = owner_hold_rule(_matrix_cached())
+    except MatrixError:
+        rule = None
+    top = sorted(rule[0]) if rule else []
+    return tuple(top) + (OPERATOR_HOLD_CLASS,)
+
+
+def __getattr__(name):   # HOLD_CLASSES stays readable as a module attribute, but is derived at use
+    if name == "HOLD_CLASSES":
+        return hold_classes()
+    raise AttributeError(name)
 
 
 def hold_problem(entry):
     """None when the `hold` / `hold_exclude` keys of a repos entry are well formed, else the rest of the message (starting at the key, naming it). One reader for the
     configuration check and for the decision (which falls back to the kit-wide default on a problem)."""
-    hold = entry.get("hold", {})
+    hold, HOLD_CLASSES = entry.get("hold", {}), hold_classes()
     if not isinstance(hold, dict):
         return "hold' must be an object with the classes %s" % ", ".join(HOLD_CLASSES)
     unknown = sorted(set(hold) - set(HOLD_CLASSES))
@@ -304,7 +321,7 @@ def entry_hold(config, repo, matrix=None):
                 kit = {n.lower() for n in default_floors(matrix)}
             except MatrixError:
                 kit = {wanted}
-            hold = entry.get("hold", {})
+            hold, HOLD_CLASSES = entry.get("hold", {}), hold_classes()
             return "ok", {cls: list(hold.get(cls) or []) for cls in HOLD_CLASSES}, list(entry.get("hold_exclude") or []), wanted not in kit
     return None
 
@@ -312,7 +329,7 @@ def entry_hold(config, repo, matrix=None):
 def entry_hits(paths, hold, exclude):
     """[(class, glob, path)] of the changed paths that match a listed glob of the entry and no exclude (an empty class lists nothing)."""
     out = []
-    for cls in HOLD_CLASSES:
+    for cls in hold_classes():
         for glob in hold.get(cls) or []:
             for p in sorted({p for p in paths if isinstance(p, str)}):
                 if matches(p, [glob]) and not matches_named(p, exclude):
