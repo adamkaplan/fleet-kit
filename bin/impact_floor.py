@@ -585,7 +585,23 @@ def class_is_top_tier(matrix, cls):
     return cls.strip().lower() not in rule[1]
 
 
-def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None, entry=None):
+def registrar_reasons(registrar):
+    """[reasons] the registrar lint (#964) holds a pull request for the owner. `registrar` is None when the daemon file did not change (nothing was read), else {"findings": [(registrar, verb, name)], "closure": [the closure
+    names] or absent, "why": None or the reason the diff could not be read}. An unreadable diff holds (fail closed); a finding holds and names the registrar and, when the closure derivation names it, the closure name,
+    otherwise says that the shape is not allowed. The reason says the same words as the rater's line."""
+    if registrar is None:
+        return []
+    if not isinstance(registrar, dict) or registrar.get("why") or not isinstance(registrar.get("findings"), list):
+        return ["registrar diff could not be read (%s): held" % str((registrar or {}).get("why") if isinstance(registrar, dict) else "unreadable")[:120]]
+    closure = set(registrar.get("closure") or ())
+    return ["registrar %s %s closure name %s: %s" % (name, verb, hit, REGISTRAR_RULE_TEXT) if hit in closure
+            else "registrar %s %s %s: this shape is not allowed in a registrar (%s)" % (name, verb, hit, REGISTRAR_RULE_TEXT) for name, verb, hit in registrar["findings"]]
+
+
+REGISTRAR_RULE_TEXT = "a registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives, except the named registration helpers and the pure builtins of one table (every import, call or rebinding of a name of the clear's closure among them) is held for the owner"
+
+
+def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None, registrar=None, entry=None):
     """The decision under the owner-hold rule. `paths`: every changed path (a deletion and a rename's old path too); `impacts`: [(severity, probability, class)]
     from the independent rating (class may be None); `floor_hit`: the paths that hit the old floor (floor_paths). Returns (decision, reasons):
 
@@ -641,6 +657,8 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None
             hits = {cls: got for cls, got in hits.items() if got}
     for cls, got in sorted(hits.items()):
         reasons.append("top tier path (%s): %s" % (cls, ", ".join(got[:5]) + (" ..." if len(got) > 5 else "")))
+    for reason in registrar_reasons(registrar):
+        reasons.append(reason)
     if record is not None and record[0] == "hold" and class_is_top_tier(matrix, record[1]):
         reasons.append("independent impact review says hold, class %s" % (record[1] or "missing"))
     rated = []

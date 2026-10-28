@@ -186,11 +186,18 @@ class StopNonce(base.Base):
 
     # U1 (the no-pod case)
     def test_u1_a_stop_without_a_nonce_and_without_a_pod_deletes_nothing_and_exits_0(self):
+        # pin change of #1125: a by-name stop of a gone pod removes that worker's own -pw and -run Secrets, and nothing else
         self.plant(A, ("secret", "run"))
-        before = self.st()
+        st = self.st()
+        st["secrets"]["other-worker-pw"] = 1
+        st["pods"]["other-worker"] = {"metadata": {"name": "other-worker"}, "status": {"phase": "Running"}}
+        self.write_state(st)
         code, out, err = self.stop()
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.st(), before)
+        after = self.st()
+        self.assertEqual(sorted(after["secrets"]), ["other-worker-pw"])
+        self.assertEqual(sorted(after["pods"]), ["other-worker"])
+        self.assertEqual(sorted(json.loads(out)["secrets_removed"]), [self.name + "-pw", self.name + "-run"])
 
     # U1
     def test_u1_a_stop_without_a_nonce_acts_by_name_as_before(self):

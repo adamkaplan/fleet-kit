@@ -33,8 +33,9 @@ OLD = re.compile(P, re.I)
 # The channel's interface names, set by the switchboard, and byte-identical copies of its own files: the ONLY places the old prefix may stay.
 # The names are stripped before the scan; the copies (exact paths) are skipped whole. The word planted in any other file still fails.
 CHANNEL_NAMES = tuple(P.upper() + x for x in ("_AGENT_NAME", "_BOSS", "_CLOUD_CHANNEL_URL", "_CLOUD_TOKEN_FILE"))
+CHANNEL_NAMES += tuple(P.upper() + x for x in ("_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS", "_CLOUD_AGENT_NAMESPACE"))   # the hub manifest's own names
 CHANNEL_COPIES = ("cloud/worker/bin/cloud_cli.py", "cloud/worker/bin/cloud_client.py", "cloud/worker/bin/cloud_hub.py",
-                  "cloud/worker/bin/cloud_channel.py", "cloud/worker/bin/cloud_channel_server.py", "cloud/worker/agents/orchestrator.md")
+                  "cloud/worker/bin/cloud_channel.py", "cloud/worker/bin/cloud_channel_server.py", "cloud/worker/bin/cloud_relay.py", "cloud/worker/agents/orchestrator.md")
 
 
 def old_name_in(rel, text):
@@ -49,7 +50,7 @@ ALLOWED_COPY = {"cloud/worker/plan_check.py"}
 
 
 def files():
-    for top in ("cloud", "bin/test-cloud-launcher", "docs/cloud-worker-interface.md"):
+    for top in ("cloud", "bin/test-cloud-launcher", "bin/test-cloud-launcher.chain", "docs/cloud-worker-interface.md"):
         full = os.path.join(ROOT, top)
         if os.path.isfile(full):
             yield top, full
@@ -90,6 +91,21 @@ class S5Names(base.Base):
         self.assertTrue(old_name_in("cloud/launcher/cloud_worker.py", "x " + P.upper() + "_OTHER_NAME"))
         self.assertTrue(old_name_in("cloud/README.md", "the " + P + " word"))
         self.assertTrue(old_name_in("cloud/worker/bin/cloud_new.py", P))   # a copy not on the list is scanned
+
+    def test_hub_manifest_scan_stays_live(self):
+        import tempfile, shutil
+        src = os.path.join(ROOT, "cloud", "k8s", "cloud-hub.yaml")
+        with tempfile.TemporaryDirectory() as d:
+            cp = os.path.join(d, "cloud-hub.yaml")
+            shutil.copy(src, cp)
+            text = open(cp).read()
+            rel = "cloud/k8s/cloud-hub.yaml"
+            self.assertFalse(old_name_in(rel, text))
+            self.assertFalse(old_name_in(rel, " ".join(P.upper() + x for x in (
+                "_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS", "_CLOUD_AGENT_NAMESPACE"))))
+            self.assertTrue(old_name_in(rel, text + "\n" + P.upper() + "_CLOUD_HUB_OTHER: x\n"))
+            self.assertTrue(old_name_in(rel, text + "\n# the " + P + " word\n"))
+            self.assertTrue(old_name_in(rel, text + "\n# the " + P + " word\n" + P.upper() + "_CLOUD_AGENT_NAMESPACE: x\n"))
 
     def test_table_maps_only_to_cw_names(self):
         for old, new in NAMES.items():

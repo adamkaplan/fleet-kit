@@ -165,6 +165,11 @@
         "bin/cloud_worker.py",
         "bin/cloud_channel.py",
         "bin/cloud_channel_server.py",
+        "bin/cloud_relay_daemon.py",
+        "bin/cloud_hub.py",
+        "bin/cloud_relay.py",
+        "cloud/worker/bin/cloud_relay.py",
+        "bin/cloud_cli.py",
         "bin/external_adapter.py",
         "bin/delegated_clear.py",
         "bin/impact_hold.py",
@@ -211,6 +216,11 @@
           "bin/cloud_worker.py",
           "bin/cloud_channel.py",
           "bin/cloud_channel_server.py",
+          "bin/cloud_relay_daemon.py",
+          "bin/cloud_hub.py",
+          "bin/cloud_relay.py",
+          "cloud/worker/bin/cloud_relay.py",
+          "bin/cloud_cli.py",
           "bin/external_adapter.py",
           "bin/delegated_clear.py",
           "bin/impact_hold.py",
@@ -281,7 +291,10 @@
         "only"
       ],
       "exempt": {
+        "bin/brief_advisory.py": "is_advisory and owner_hold_wanted only read a brief that bin/impact_brief.py built and answer whether the daemon writes an owner-hold label for a pull request the floor already holds; they clear, release and merge nothing. Trace: the only callers are impact_plan in bin/impact_hold.py and the Decisions row in bin/decision_core.py; the clear itself (bin/delegated_clear.py) does not read them, and a pull request whose brief names a material risk is held as before.",
+        "bin/path_suites.py": "gate_finding words an INFORMATION line (a pull request changes a path and names none of the suites that exercise it). Trace: its only caller is the gates finding in bin/fleet-switchboard, which prints the line for people to read and never changes a gate verdict; no role, tier, identity, verdict, clear or merge is produced or read (ask #1045).",
         "bin/agent_calls.py": "release_notice gives back a once-an-hour message claim for an account's budget notice. Trace: its only caller is the budget notice command in bin/fleet-switchboard, which calls it after claim_notice when the reminder could not be added; it truncates a rate-limit file in the state directory and returns nothing, so no role, tier, identity, verdict or clear is produced or read.",
+        "bin/plan_approval.py": "`evaluate` returns the verdict and the one stderr line of a refused approval. Trace: its only caller is `check_approval` in bin/fleet-switchboard (the send command), which prints the line and records an approval only after a GET-only read of the plan comment; the module is pure, reads and writes nothing, and returns no role, tier, identity or clear, and nothing in bin/ reads its result as one. Exemption reason: refusal-only; no clear or hold depends on plan.approved; list it as an authority module if a clear ever depends on plan.approved.",
         "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry. Trace: used only inside bin/spotlight_guard.py (the Spotlight index check of ask #438); the module returns no role, tier, identity, verdict or clear, and nothing in bin/ reads its result as one.",
         "bin/triage_digest.py": "gate is a rate limit on the stale digest (warm-up and interval). Trace: its only caller is the triage digest in bin/fleet-switchboard, where `allowed` decides whether a digest message is SENT now; no role, tier, verdict or clear is produced or read.",
         "bin/triage_plan_open.py": "merged_links reads which links a merged unit names. Trace: its callers are the triage's plan-open check in bin/fleet-switchboard, which only lists findings for people to read; nothing it returns reaches answer_authority, a caller check, a verdict or a clear."
@@ -305,12 +318,28 @@
       "bin/delegated_clear.py",
       "bin/impact_floor.py",
       "bin/impact_hold.py",
+      "bin/impact_brief.py",
+      "bin/brief_advisory.py",
       "bin/plan_check.py",
       "bin/plan_ledger.py",
       "bin/repo_exclusion.py",
-      "docs/review-laws/impact-matrix.json"
+      "docs/review-laws/impact-matrix.json",
+      "tools/derive-closure",
+      "tests/switchboard/test_closure.py",
+      "bin/fleet-switchboard.parts"
     ],
     "never_carried_meaning": "The owner's clear is NEVER carried over a merge of main that resolved a conflict by hand (bin/clear_carry.py, bin/impact_hold.py: the carry reads this list through impact_floor.carry_never_paths and holds no path of its own) when that merge touches one of these paths or the pull request's own change does: the clear's own code and this matrix. Credential and identity paths are not here: they are carried like any other path (the owner's answer, ask #815). Every exact path of `delegated_clear.clear_code_paths` is here, because the ledger and the plan check decide who may confirm a carry; its directory globs (the plugin, the shims, the templates, the proof tools, the workflows) are not, and the shims are identity paths the owner chose to carry. A test checks both lists against each other and that every bin module named for the clear, the hold or the floor is here. The guard for what is not listed (the daemon file, the globs) is the independent reviewer's confirmation and the continuous tests, not a proof.",
+    "substance_decider": {
+      "meaning": "Who may decide a clear on the SUBSTANCE of the impact brief (bin/delegated_clear.py `decide_on_substance` reads this block). A class listed in `owner_only` is always the owner's: the merge shim and the clear-and-hold machinery's own decision of who may clear. A class listed in `chief_of_staff` (every other class the brief knows, a test derives both lists from bin/impact_brief.py KNOWN_CLASSES) may be decided by the Chief of Staff only when the brief names no material risk (a credentials, identity, issuance, spend or authority path the diff ADDS to is one), no loosening and no `not shown` piece. A class named in neither is unknown and is the owner's. Nothing is relaxed by default.",
+      "owner_only": ["clear_machinery", "merge_shim"],
+      "owner_only_paths": {
+        "clear_machinery": ["docs/review-laws/impact-matrix.json", "bin/delegated_clear.py", "bin/chat_clear.py", "bin/clear_carry.py", "bin/impact_hold.py", "bin/impact_floor.py", "bin/impact_brief.py", "bin/brief_advisory.py", "bin/plan_check.py", "bin/plan_ledger.py", "bin/repo_exclusion.py", "bin/fleet-switchboard", "plugins/fleet-hooks/**", "templates/**", "tools/cos-permissions-proof/**", "tools/derive-closure", "tests/switchboard/test_closure.py", "bin/fleet-switchboard.parts", ".github/workflows/**"],
+        "merge_shim": ["bin/merge_gate.py", "shims/**"]
+      },
+      "owner_only_paths_meaning": "The REAL path list that makes the owner-only classes reachable (bin/impact_brief.py `classify` reads it): every path of `delegated_clear.clear_code_paths` is in exactly one of the two lists (a test checks it), plus bin/brief_advisory.py and bin/fleet-switchboard (the whole file: the brief sees files, not hunks, so a change to the daemon file is read as a change to the clear's code and fails closed to the owner).",
+      "chief_of_staff": ["authority", "code", "credentials", "docs", "identity", "issuance", "owner_voice", "release", "review_definitions", "spend", "tests"],
+      "material_risks": ["credentials_widened", "issuance_widened", "spend", "irreversible", "speaks_for_owner", "authority_widened"]
+    },
     "delegated_clear": {
       "meaning": "What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path, class or function name of its own). For an order WITHOUT a `max_level`, two refusals apply. The first refuses a pull request whose top tier path hits include a class of `never_path_classes`. The second refuses a pull request whose independent review's class is one of `top_tier_review_classes` (or none is recorded). For an order WITH a `max_level`, the score rule in `score` replaces those two refusals. The refusals below apply either way, with or without a `max_level`. A pull request that changes ANY file matching `clear_code_paths` (the clear and hold machinery by name, and the directories the daemon and the CLI load at start) is refused: never delegated also means ALWAYS HELD for the owner, because the floor holds a pull request that changes one of them (the code the clear merely loads, `closure_files`, is outside that hold until the closure ask #940 lands). A pull request that ADDS, DELETES or RENAMES a file matching `new_file_globs` (a new file under bin/ is loaded at config load) is refused. A pull request that changes a file of `closure_files` (the daemon file and the bin modules the clear loads or runs (the daemon's imports at load, the config readers every module declares, and a recorded run of the clear: a test derives the list); for a module other than the daemon file ANY import-time statement, and the functions of `module_roots`) on a line that belongs to the CLEAR CLOSURE is refused: the definitions reachable by name from `closure_roots`, the module-level bindings they read, any other top-level statement, or a definition that refers to a `clear_entry_points` name. Other changes under bin/ (an authority module edit that does not change who may do what) are allowed.",
       "score": {
@@ -344,6 +373,8 @@
         "bin/clear_carry.py",
         "bin/impact_hold.py",
         "bin/impact_floor.py",
+        "bin/impact_brief.py",
+        "bin/brief_advisory.py",
         "bin/plan_check.py",
         "bin/plan_ledger.py",
         "bin/repo_exclusion.py",
@@ -351,6 +382,9 @@
         "shims/**",
         "templates/**",
         "tools/cos-permissions-proof/**",
+        "tools/derive-closure",
+        "tests/switchboard/test_closure.py",
+        "bin/fleet-switchboard.parts",
         ".github/workflows/**"
       ],
       "new_file_globs": [
@@ -373,23 +407,55 @@
         "bin/plan_review.py",
         "bin/pr_events.py",
         "bin/queue_ejections.py",
+        "bin/record_json.py",
         "bin/reassign.py",
+        "bin/red_ci.py",
         "bin/reds.py",
         "bin/registry.py",
         "bin/report_fold.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
-        "bin/work_sync.py"
+        "bin/work_sync.py",
+        "bin/switchboard/v2_transport.py",
+        "bin/switchboard/facts.py",
+        "bin/switchboard/import_v1.py",
+        "bin/switchboard/decisions_a.py",
+        "bin/switchboard/reminders.py",
+        "bin/switchboard/plan_review.py",
+        "bin/switchboard/triage.py",
+        "bin/switchboard/alert_labels.py",
+        "bin/switchboard/handoff.py",
+        "bin/switchboard/audit.py",
+        "bin/switchboard/decision.py",
+        "bin/switchboard/engine.py",
+        "bin/switchboard/jev.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
         "bin/agent_presence.py": [
           "*"
         ],
+        "bin/record_json.py": [
+          "*"
+        ],
         "bin/awaiting_live.py": [
           "validate"
         ],
         "bin/ci_runs.py": [
+          "*",
+          "_details_repo",
+          "_identity",
+          "_rank",
+          "_run_id",
+          "_started",
+          "_time",
+          "_unfinished",
+          "_winners",
+          "latest_runs",
+          "newest",
+          "own_repo"
+        ],
+        "bin/red_ci.py": [
           "*"
         ],
         "bin/cpu_guard.py": [
@@ -431,7 +497,154 @@
         "bin/spotlight_guard.py": [
           "settings",
           "validate"
+        ],
+        "bin/switchboard/v2_transport.py": [
+          "V2Breaker",
+          "V2Client",
+          "V2Error",
+          "V2Http",
+          "V2Unreachable",
+          "_V2Unauthorized",
+          "_one_line",
+          "_without",
+          "refuse_real_opencode_under_test",
+          "state_write",
+          "v2_service_file",
+          "valid_description"
+        ],
+        "bin/switchboard/facts.py": [
+          "CpuFacts",
+          "DiskFacts",
+          "FactError",
+          "SpotlightFacts",
+          "disk_free",
+          "disk_guard_settings",
+          "validate_disk_guard"
+        ],
+        "bin/switchboard/import_v1.py": [
+        ],
+        "bin/switchboard/decisions_a.py": [
+          "parse_bare_pr_ref"
+        ],
+        "bin/switchboard/reminders.py": [
+          "ReminderError",
+          "ReminderFacts",
+          "_clean_line",
+          "add_reminder",
+          "drop_superseded_item",
+          "found_reason",
+          "merge_wake",
+          "merge_wake_facts",
+          "read_record_file",
+          "read_reminders",
+          "reminders_lock",
+          "remove_reminders",
+          "wake_class_of",
+          "write_reminders"
+        ],
+        "bin/switchboard/plan_review.py": [
+          "ReviewError",
+          "_read_capped"
+        ],
+        "bin/switchboard/triage.py": [
+          "_alert_bad_label",
+          "_alert_bad_repo",
+          "_alert_duplicate_label",
+          "_alert_labels_not_a_list",
+          "_alert_not_a_map",
+          "_alert_repo_not_read",
+          "_check_sla",
+          "parked_until",
+          "read_mark",
+          "triage_awaiting_labels",
+          "triage_says_reviewed",
+          "validate_triage_config",
+          "whole",
+          "whole_skipped"
+        ],
+        "bin/switchboard/alert_labels.py": [
+          "AlertWakeFacts",
+          "RedCiFacts",
+          "TriageFacts"
+        ],
+        "bin/switchboard/handoff.py": [
+          "WorkerFacts",
+          "_Unread",
+          "_boss_of",
+          "_guard_awaiting_issue",
+          "_guard_awaiting_pr",
+          "_guard_ci",
+          "_guard_decision",
+          "_guard_last_report",
+          "_guard_reminder",
+          "_guard_review_requested",
+          "_guard_review_window",
+          "_issue_of",
+          "_label_names",
+          "_owned_issue",
+          "_owned_pulls",
+          "_owned_work_items",
+          "_readable_head",
+          "_readable_time",
+          "_stalled_age",
+          "legitimately_waiting",
+          "owned_readable",
+          "reply_text",
+          "worker_horizon",
+          "worker_owned"
+        ],
+        "bin/switchboard/audit.py": [
+          "AuditLog",
+          "_sensitive",
+          "redact",
+          "utc_now"
+        ],
+        "bin/switchboard/decision.py": [
+          "InterruptRefused",
+          "MessageTooLong",
+          "Plan",
+          "_line_of",
+          "clock_utc",
+          "collapse_riders",
+          "compose",
+          "compose_order",
+          "decide",
+          "describe_items",
+          "hold_reason",
+          "is_withdrawal",
+          "orders_note",
+          "steers_into_turn",
+          "superseded_by"
+        ],
+        "bin/switchboard/engine.py": [
+          "KeyTimes",
+          "LockError",
+          "SentLedger"
+        ],
+        "bin/switchboard/jev.py": [
+          "JevClient",
+          "JevError",
+          "KeyFileError",
+          "ReplayJev",
+          "_canonical",
+          "_checked_jev_settings",
+          "_clip",
+          "_is_probability",
+          "_scrub_provider_text",
+          "_usage_of",
+          "build_jev",
+          "check_answers",
+          "jev_key_file",
+          "locate_jev_key",
+          "validate_jev_config"
         ]
+      },
+      "registrar_allow": {
+        "meaning": "The ONE allow table of the registrar lint (bin/delegated_clear.py `registrar_findings`, #964). A registrar may set up its own parsers and nothing else: any import, any write outside its own names, any call of a function it neither defines nor receives is held for the owner, EXCEPT the pure builtins and the registration helpers named here. The builtins are listed by name and are only ones that cannot reach or rebind another object (never getattr, setattr, delattr, eval, exec, compile, globals, locals, vars, __import__ or open: a test pins them absent). `parser_methods` are the argparse methods a registrar may call on the parser it is handed or on one it built; every other member of the handed parser (`choices`, `_name_parser_map`, `_actions`, `_defaults`, `_registries`, `parser_class`...) is shared with the other commands and is held, and a store is allowed only as a plain store of a literal on a parser the registrar built. A registration helper is a daemon-file function that argparse calls as a `type=`; a test verifies each is pure and that every daemon-file callable a real registrar hands to its parser is listed. The lint does not read a helper as part of a registrar, so a changed line of a helper holds for the owner. argparse RUNS what it is handed as `type=`, `action=`, a default it converts and `choices=` at parse time, so a value for any argument or keyword of a parser method except `free_keywords` (text, or a function stored by set_defaults `func=`) must be a literal, a builtin or helper of this table or a function the registrar defines; `action=` takes a string literal only. `aliases=` on add_parser and set_defaults on the handed parser are held (they name another command or set defaults every command shares); a command name equal to an existing one is an accepted residual risk the lint cannot see (the names are the other registrars'). `super` is not in the table: a registrar that calls it is held (the helpers may call it, by their own purity test). Growing this table is itself an edit of this file, which is the owner's clear.",
+        "pure_builtins": ["abs", "all", "any", "bool", "dict", "enumerate", "float", "frozenset", "int", "isinstance", "issubclass", "len", "list", "max", "min", "range", "repr", "reversed", "set", "sorted", "str", "sum", "tuple", "zip"],
+        "helpers": ["RepoIssue", "issue_arg", "parse_issue_ref"],
+        "parser_methods": ["add_argument", "add_argument_group", "add_mutually_exclusive_group", "add_parser", "add_subparsers", "set_defaults"],
+        "free_keywords": ["help", "dest", "metavar", "required", "nargs", "const", "func"]
       },
       "dynamic_actions": [
         "review"
@@ -545,6 +758,7 @@
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
+        "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
         "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
@@ -552,6 +766,8 @@
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
+        "bin/path_suites.py": "loaded only by the gates finding (an information line), `heavy --changed`/`--list` and `preflight-pr --merged`: the suite map and its runs, not the clear",
+        "bin/plan_approval.py": "loaded only by `check_approval`, the send command's approval check (#951), which the clear never calls",
         "bin/pr_reading.py": "loaded only by `cmd_merge_gate`: the merge gate command, not the clear",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
