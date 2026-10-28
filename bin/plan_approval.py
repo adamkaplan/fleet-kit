@@ -3,6 +3,7 @@
 `Approved at sha256:X` is recorded only when X is the current hash of the issue's one plan comment AND the plan's declared
 clauses are the issue's current Done-when. `evaluate` returns the verdict; the caller reads GitHub (GET only) and audits.
 """
+import bisect
 import hashlib
 import re
 
@@ -23,7 +24,7 @@ APPROVED_COLON_RE = re.compile(r"Approved:", re.IGNORECASE)
 MAX_CANDIDATES = 10
 
 
-def find_approvals(text):
+def find_approvals(text, sights=None):
     """(#1463) Every approval in a message, each hash once, in order: the value of a message that STARTS with `Approved at sha256:` (as
     before, even when it is not a full hash), every `Approved at sha256:<64 hex>` anywhere, and every `#N at sha256:<64 hex>` (or
     `owner/repo#N ...`) after `Approved:`. Returns [{"value": hash, "ref": (repo or None, N) or None}]."""
@@ -38,12 +39,12 @@ def find_approvals(text):
     start = approval_value(text)
     if start is not None:
         add(start, None)
-    for _, value, ref in _sightings(text)[0]:
+    for _, value, ref in (sights or _sightings(text))[0]:
         add(value, ref)
     return found
 
 
-def _sightings(text):
+def _sightings(text, ranges=None):
     """(clean, refused): every form found, as (position, value, ref), split by `refusal_of`; the start-anchored form is a form too."""
     text = text or ""
     spans = []
@@ -56,14 +57,15 @@ def _sightings(text):
         for m in LIST_RE.finditer(text, colon.end()):
             spans.append((m.start(), m.group(3), (m.group(1), int(m.group(2)))))
     clean, refused = [], []
+    ranges = ranges or Ranges(text)
     for span in sorted(spans, key=lambda s: s[0]):
-        (refused if refusal_of(text, span[0]) else clean).append(span)
+        (refused if refusal_of(text, span[0], ranges) else clean).append(span)
     return clean, refused
 
 
-def refused_forms(text):
+def refused_forms(text, sights=None):
     """The values of the forms refused as negated or quoted (#1463); [] when none."""
-    return [value for _, value, _ in _sightings(text)[1]]
+    return [value for _, value, _ in (sights or _sightings(text))[1]]
 
 
 # ---- the ONE check that refuses a found form: REFUSALS is the family (name, test(text, position)); `refusal_of` runs a form through it.
@@ -74,49 +76,94 @@ FENCE_RE = re.compile(r"^[ \t]*(```|~~~)")
 WINDOW_WORDS = 5
 
 
+class Ranges:
+    """(#1463) What the refusal members need to know about ONE message, computed once: line breaks, fenced lines, code spans and the
+    positions of each quotation mark. Every member then tests a position by bisect, so a message with many forms is read once."""
+    built = 0                                   # how many were built (a test counts it)
+
+    def __init__(self, text):
+        Ranges.built += 1
+        self.text = text
+        self.breaks = [i for i, c in enumerate(text) if c == "\n"]
+        self.fenced = []                        # (start, end) of the lines inside a fenced block
+        fence, offset = None, 0
+        for line in text.splitlines(True):
+            mark = FENCE_RE.match(line)
+            inside = fence is not None
+            if mark:
+                fence = None if fence == mark.group(1) else (fence or mark.group(1))
+            if inside and not mark:
+                self.fenced.append((offset, offset + len(line)))
+            offset += len(line)
+        self.fenced_starts = [r[0] for r in self.fenced]
+        self.spans = [(m.start(), m.end()) for m in re.finditer(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", text, re.DOTALL)]
+        self.span_starts = [r[0] for r in self.spans]
+        self.marks = {}
+        for q in ('"', "\u201c", "\u201d"):
+            self.marks[q] = [i for i, c in enumerate(text) if c == q]
+
+    def line_start(self, pos):
+        i = bisect.bisect_left(self.breaks, pos)
+        return self.breaks[i - 1] + 1 if i else 0
+
+    def line_end(self, pos):
+        i = bisect.bisect_left(self.breaks, pos)
+        return self.breaks[i] if i < len(self.breaks) else len(self.text)
+
+
+def _inside(starts, ranges, pos):
+    i = bisect.bisect_right(starts, pos) - 1
+    return i >= 0 and ranges[i][0] <= pos < ranges[i][1]
+
+
 def _negation(word):
     body = r"n['\u2019]t" if word == "n't" else r"\s+".join(re.escape(w) for w in word.split())
     pattern = re.compile((r"(?<![\w'\u2019])" if word != "n't" else r"(?<=\w)") + body + r"(?![\w'\u2019])", re.IGNORECASE)
 
-    def test(text, pos):
-        before = text[text.rfind("\n", 0, pos) + 1:pos]
-        return pattern.search(" ".join(before.split()[-WINDOW_WORDS:])) is not None
+    def test(text, pos, ranges=None):
+        ranges = ranges or Ranges(text)
+        ls, size = ranges.line_start(pos), 256
+        while True:                              # a growing window: only the last words of the line are read
+            start = max(ls, pos - size)
+            chunk = text[start:pos]
+            if start == ls or len(chunk.split()) > WINDOW_WORDS:
+                break
+            size *= 4
+        return pattern.search(" ".join(chunk.split()[-WINDOW_WORDS:])) is not None
     return test
 
 
-def _line_of(text, pos):
-    return text[text.rfind("\n", 0, pos) + 1:(text.find("\n", pos) if text.find("\n", pos) >= 0 else len(text))]
+def _blockquote(text, pos, ranges=None):
+    ranges = ranges or Ranges(text)
+    i, end = ranges.line_start(pos), ranges.line_end(pos)
+    while i < end and text[i].isspace():
+        i += 1
+    return i < end and text[i] == ">"
 
 
-def _blockquote(text, pos):
-    return _line_of(text, pos).lstrip().startswith(">")
+def _code_span(text, pos, ranges=None):
+    ranges = ranges or Ranges(text)
+    return _inside(ranges.span_starts, ranges.spans, pos)
 
 
-def _code_span(text, pos):
-    return any(m.start() <= pos < m.end() for m in re.finditer(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", text, re.DOTALL))
-
-
-def _fenced(text, pos):
-    fence, offset = None, 0
-    for line in text.splitlines(True):
-        mark = FENCE_RE.match(line)
-        inside = fence is not None
-        if mark:
-            fence = None if fence == mark.group(1) else (fence or mark.group(1))
-        if offset <= pos < offset + len(line):
-            return inside and not mark
-        offset += len(line)
-    return False
+def _fenced(text, pos, ranges=None):
+    ranges = ranges or Ranges(text)
+    return _inside(ranges.fenced_starts, ranges.fenced, pos)
 
 
 def _between(opening, closing):
-    def test(text, pos):
-        line = _line_of(text, pos)
-        col = pos - (text.rfind("\n", 0, pos) + 1)
-        before, after = line[:col], line[col:]
+    def test(text, pos, ranges=None):
+        ranges = ranges or Ranges(text)
+        ls, le = ranges.line_start(pos), ranges.line_end(pos)
+        po, pc = ranges.marks[opening], ranges.marks[closing]
+        after = bisect.bisect_left(pc, pos)
+        has_after = after < len(pc) and pc[after] < le
         if opening == closing:
-            return before.count(opening) % 2 == 1 and closing in after
-        return before.rfind(opening) > before.rfind(closing) and opening in before and closing in after
+            return (bisect.bisect_left(po, pos) - bisect.bisect_left(po, ls)) % 2 == 1 and has_after
+        def last(marks):
+            i = bisect.bisect_left(marks, pos)
+            return marks[i - 1] if i and marks[i - 1] >= ls else -1
+        return last(po) > last(pc) and has_after
     return test
 
 
@@ -125,15 +172,17 @@ REFUSALS = [("negation: " + w, _negation(w)) for w in NEGATION_WORDS] + [
     ("quote: straight double quotes", _between('"', '"')), ("quote: curly double quotes", _between("\u201c", "\u201d"))]
 
 
-def refusal_of(text, pos):
-    """The name of the first member of REFUSALS that refuses the form at `pos` of `text`, else None."""
+def refusal_of(text, pos, ranges=None):
+    """The name of the first member of REFUSALS that refuses the form at `pos` of `text`, else None. `ranges` (from `Ranges(text)`)
+    is built once per message by the caller; without it one is built here."""
+    ranges = ranges or Ranges(text)
     for name, test in REFUSALS:
-        if test(text, pos):
+        if test(text, pos, ranges):
             return name
     return None
 
 
-def candidates(text, repo, number, limit=MAX_CANDIDATES):
+def candidates(text, repo, number, limit=MAX_CANDIDATES, sights=None):
     """The bounded set of issues to read: the one the message was sent on, then each `#N at sha256` of an `Approved:` list, then each
     issue the text names as `#N` or `owner/repo#N`; (repo, number) pairs, at most `limit`, never more however many the text names."""
     out = []
@@ -142,7 +191,7 @@ def candidates(text, repo, number, limit=MAX_CANDIDATES):
         if r is not None and n is not None and (r, n) not in out and len(out) < limit:
             out.append((r, n))
     add(repo, number)
-    for item in find_approvals(text):
+    for item in find_approvals(text, sights):
         if item["ref"]:
             add(item["ref"][0] or repo, item["ref"][1])
     for m in MENTION_RE.finditer(text or ""):

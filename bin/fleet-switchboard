@@ -14407,11 +14407,12 @@ def check_approval(config, runner, now, text, repo, number, sender="cos"):
     failure to read is a refusal line, never an error: the message is delivered either way."""
     module = load_module("plan_approval")
     try:
-        found = module.find_approvals(text)
+        sights = module._sightings(text)               # once per message: the three readers share it
+        found = module.find_approvals(text, sights)
     except Exception:
         return None
     try:
-        refused = module.refused_forms(text)
+        refused = module.refused_forms(text, sights)
     except Exception:
         refused = []
     if not found and not refused:
@@ -14428,7 +14429,7 @@ def check_approval(config, runner, now, text, repo, number, sender="cos"):
         plan_check = load_plan_check()
         reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
         reads, failed = {}, {}
-        for cand in module.candidates(text, repo, number):
+        for cand in module.candidates(text, repo, number, sights=sights):
             try:
                 reads[cand] = _read_for_approval(reader, cand[0], cand[1])
             except Exception as err:

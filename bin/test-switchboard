@@ -2843,6 +2843,125 @@ class TestApprovalRefusals(Base):
             self.assertIn(words, section)
 
 
+class TestApprovalFinderCost(Base):
+    """#1463: the refusal finder reads a message ONCE (ranges built once, `_sightings` once per `check_approval`), counted, not timed; and it
+    agrees with the old per-form algorithm (kept here as the reference) on a table of hostile messages."""
+    H = "a" * 64
+    G = "b" * 64
+
+    def module(self):
+        return sb.load_module("plan_approval")
+
+    # the OLD algorithm, per form, kept as the reference
+    def old_refusal(self, text, pos):
+        module = self.module()
+        def line_of(t, p):
+            return t[t.rfind("\n", 0, p) + 1:(t.find("\n", p) if t.find("\n", p) >= 0 else len(t))]
+        def code_span(t, p):
+            return any(m.start() <= p < m.end() for m in re.finditer(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", t, re.DOTALL))
+        def fenced(t, p):
+            fence, offset = None, 0
+            for line in t.splitlines(True):
+                mark = module.FENCE_RE.match(line)
+                inside = fence is not None
+                if mark:
+                    fence = None if fence == mark.group(1) else (fence or mark.group(1))
+                if offset <= p < offset + len(line):
+                    return inside and not mark
+                offset += len(line)
+            return False
+        def between(opening, closing):
+            def test(t, p):
+                line = line_of(t, p)
+                col = p - (t.rfind("\n", 0, p) + 1)
+                before, after = line[:col], line[col:]
+                if opening == closing:
+                    return before.count(opening) % 2 == 1 and closing in after
+                return before.rfind(opening) > before.rfind(closing) and opening in before and closing in after
+            return test
+        def negation(word):
+            body = r"n['\u2019]t" if word == "n't" else r"\s+".join(re.escape(w) for w in word.split())
+            pattern = re.compile((r"(?<![\w'\u2019])" if word != "n't" else r"(?<=\w)") + body + r"(?![\w'\u2019])", re.IGNORECASE)
+            return lambda t, p: pattern.search(" ".join(t[t.rfind("\n", 0, p) + 1:p].split()[-5:])) is not None
+        tests = [negation(w) for w in module.NEGATION_WORDS] + [lambda t, p: line_of(t, p).lstrip().startswith(">"), code_span, fenced,
+                                                                 between('"', '"'), between("\u201c", "\u201d")]
+        return any(t(text, pos) for t in tests)
+
+    def old_sightings(self, text):
+        module = self.module()
+        spans = []
+        lead = module.APPROVAL_RE.match(text)
+        if lead is not None:
+            spans.append((lead.start(1) - len("Approved at sha256:"), module.approval_value(text), None))
+        spans += [(m.start(), m.group(1), None) for m in module.ANYWHERE_RE.finditer(text)]
+        colon = module.APPROVED_COLON_RE.search(text)
+        if colon:
+            for m in module.LIST_RE.finditer(text, colon.end()):
+                spans.append((m.start(), m.group(3), (m.group(1), int(m.group(2)))))
+        clean, refused = [], []
+        for span in sorted(spans, key=lambda x: x[0]):
+            (refused if self.old_refusal(text, span[0]) else clean).append(span)
+        return clean, refused
+
+    def hostile(self):
+        A, B = "Approved at sha256:" + self.H, "Approved at sha256:" + self.G
+        words = ["not", "no", "never", "don't", "do not", "did not", "cannot", "without", "not yet", "nothing"]
+        out = ["%s %s" % (w, A) for w in words]
+        out += ["`%s`" % A, "``%s``" % A, "`stray\n%s\n` and %s" % (A, B), "```\n%s\n```\n%s" % (A, B), "~~~\n%s\n```\n%s\n~~~" % (A, B),
+                "> %s\n%s" % (A, B), "\"%s\" %s" % (A, B), "\u201c%s\u201d %s" % (A, B), "\"%s %s" % (A, B), "x\" %s \"y" % A,
+                "\u200bnot %s" % A, "n\u043ft %s" % A, "%s, not yet" % A, "%s %s" % (A, B), "Approved: #7 at sha256:%s; #8 at sha256:%s" % (self.H, self.G),
+                "`Approved: #7 at sha256:%s`; #8 at sha256:%s" % (self.H, self.G), "no\n%s" % A, "a b c d e no f %s" % A, "no a b c d e %s" % A,
+                "```\n```\n%s" % A, "  > %s" % A, "`a` %s `b`" % A, "``a` %s `b``" % A, "%s\n" % A * 3, "\u201cx\u201d \u201d%s" % A,
+                "Approved at sha256:" + "c" * 10, "", "hello", "%s\n`\n%s\n`" % (A, B), "No issues found. %s" % A]
+        return out
+
+    def test_the_new_finder_equals_the_old_per_form_algorithm_on_40_hostile_messages(self):
+        module = self.module()
+        messages = self.hostile()
+        self.assertGreaterEqual(len(messages), 40)
+        for text in messages:
+            self.assertEqual(module._sightings(text), self.old_sightings(text), repr(text))
+            old_clean, old_refused = self.old_sightings(text)
+            self.assertEqual(module.refused_forms(text), [v for _, v, _ in old_refused], repr(text))
+            self.assertEqual([f["value"] for f in module.find_approvals(text)],
+                             list(dict.fromkeys((v.lower() if module.HEX64_RE.match(v) else v) for _, v, _ in old_clean)), repr(text))
+
+    def big_messages(self):
+        form = "Approved at sha256:%064x"
+        plain = " ".join(form % i for i in range(3000))
+        fenced = "```\n" + "\n".join(form % i for i in range(3000)) + "\n```"
+        spans = " ".join("`" + form % i + "`" for i in range(3000))
+        return {"plain": plain, "fenced": fenced, "spans": spans}
+
+    def count_one_check(self, text):
+        module = self.module()
+        calls = []
+        real = module._sightings
+        before = module.Ranges.built
+        with mock.patch.object(module, "_sightings", lambda *a, **k: calls.append(1) or real(*a, **k)):
+            sb.check_approval({}, None, None, text, "acme/fleet", None)
+        return len(calls), module.Ranges.built - before
+
+    def test_3000_forms_are_read_once_per_message_counted_and_a_per_form_rescan_is_caught(self):
+        module = self.module()
+        for kind, text in self.big_messages().items():
+            self.assertEqual(self.count_one_check(text), (1, 1), kind)
+            self.assertGreaterEqual(sum(map(len, module._sightings(text))), 3000, kind)
+
+            real = module.refusal_of
+            small = "\n".join(text.split("\n")[:30]) if kind == "fenced" else " ".join(text.split(" ")[:90])
+            with mock.patch.object(module, "refusal_of", lambda t, pos, ranges=None: real(t, pos, module.Ranges(t))):   # MUTANT: a rescan per form
+                self.assertGreater(self.count_one_check(small)[1], 3, kind)
+            self.assertEqual(self.count_one_check(small)[1], 1, kind)
+
+    def test_the_documentation_states_the_four_limits_of_the_refusals(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        section = text[text.index("**An approval is checked when it is sent (#951)"):]
+        section = section[:section.index("\n\n")]
+        for words in ("zero-width character or a homoglyph", "odd number of quotes", "negation AFTER the form", "stray backtick pairs with a later one across lines"):
+            self.assertIn(words, section)
+
+
 class TestApprovalCheck(Base):
     """#951: `Approved at sha256:X` is recorded only for the plan's current hash and the issue's current Done-when."""
 
