@@ -14410,13 +14410,20 @@ def check_approval(config, runner, now, text, repo, number, sender="cos"):
         found = module.find_approvals(text)
     except Exception:
         return None
-    if not found:
+    try:
+        refused = module.refused_forms(text)
+    except Exception:
+        refused = []
+    if not found and not refused:
         return None
     if sender != COS_NAME:
-        return [{"ok": False, "audit": "plan.approval_refused", "sender": sender, "hashes": [f["value"] for f in found],
+        return [{"ok": False, "audit": "plan.approval_refused", "sender": sender, "hashes": [f["value"] for f in found] + refused,
                  "line": "approval not recorded: only the Chief of Staff's approval is recorded, and this message is from %s; the message was delivered" % sender}]
+    lead = [{"ok": False, "audit": "plan.approval_negated_or_quoted", "hashes": refused, "line": "approval not recorded: negated or quoted"}] if refused else []
+    if not found:
+        return lead                                   # a refused form reads no issue
     if number is None:
-        return [{"ok": False, "line": "approval not recorded: the message names no issue (use --issue); the message was delivered"}]
+        return lead + [{"ok": False, "line": "approval not recorded: the message names no issue (use --issue); the message was delivered"}]
     try:
         plan_check = load_plan_check()
         reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
@@ -14452,9 +14459,9 @@ def check_approval(config, runner, now, text, repo, number, sender="cos"):
                 why = own["line"].split(": ", 1)[1].rsplit("; the message", 1)[0] if own is not None else "the issue could not be read"
                 verdicts.append({"ok": False, "audit": "plan.approval_unmatched", "hashes": [value],
                                  "line": "approval not recorded: approval for no current plan sha256:%s (%s); the message was delivered" % (value, why)})
-        return verdicts
+        return lead + verdicts
     except Exception as err:
-        return [{"ok": False, "line": "approval not recorded: the issue could not be read (%s); the message was delivered" % _one_line(str(err), 120)}]
+        return lead + [{"ok": False, "line": "approval not recorded: the issue could not be read (%s); the message was delivered" % _one_line(str(err), 120)}]
 
 
 def record_approval(engine, verdict, sender, recipient, repo, number):

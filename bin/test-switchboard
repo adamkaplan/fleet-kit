@@ -2751,6 +2751,98 @@ class TestApprovalAnywhere(Base):
             self.assertIn(words, section)
 
 
+class TestApprovalRefusals(Base):
+    """#1463: an approval form that is negated or quoted is REFUSED: one check (`plan_approval.REFUSALS`, a family of members, tested by
+    `refusal_of`); a refused form prints `approval not recorded: negated or quoted` once, is audited, records nothing and reads no issue.
+    The negation window is the 5 words before the form on the same line and does NOT stop at a sentence boundary."""
+    def setUp(self):
+        Base.setUp(self)
+        self.world = World(self, agents=("platform", "coder"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.issues = {7: {"done_when": APPROVAL_DW}, 8: {"done_when": APPROVAL_DW}}
+        self.comments = {7: [plan_body()], 8: [plan_body(extra="eight")]}
+        self.h7, self.h8 = self.hash(plan_body()), self.hash(plan_body(extra="eight"))
+
+    hash = TestApprovalAnywhere.hash
+    send = TestApprovalAnywhere.send
+    events = TestApprovalAnywhere.events
+    issues_approved = TestApprovalAnywhere.issues_approved
+    LINE = "approval not recorded: negated or quoted"
+    SAMPLES = {
+        "negation: not": "not {A}", "negation: no": "no {A}", "negation: never": "never {A}", "negation: n't": "we haven't, isn't {A}",
+        "negation: do not": "do not {A}", "negation: did not": "did not {A}", "negation: have not": "have not {A}",
+        "negation: has not": "has not {A}", "negation: cannot": "cannot {A}", "negation: without": "without {A}", "negation: not yet": "not yet {A}",
+        "quote: > line": "  > {A}", "quote: code span": "see `{A}` ok", "quote: fenced block": "```\n{A}\n```",
+        "quote: straight double quotes": 'she wrote "{A}" once', "quote: curly double quotes": "she wrote \u201c{A}\u201d once"}
+
+    def text(self, member):
+        return self.SAMPLES[member].replace("{A}", "Approved at %s" % self.h7)
+
+    def check_member(self, member):
+        text = self.text(member)
+        module = sb.load_module("plan_approval")
+        test = dict(module.REFUSALS)[member]
+        self.assertTrue(test(text, text.index("Approved")), member)
+        before = len(self.events("plan.approval_negated_or_quoted"))
+        err = self.send(text)
+        self.assertEqual(self.events(), [], member)
+        self.assertEqual(err.count(self.LINE), 1, err)
+        self.assertEqual(len(self.events("plan.approval_negated_or_quoted")), before + 1)
+        self.assertEqual([c for c in self.gh.calls if "comments" in c[2]], [], member)      # a refused form reads no issue
+
+    def test_the_members_are_derived_from_the_code_and_each_has_a_sample(self):
+        module = sb.load_module("plan_approval")
+        names = [name for name, _ in module.REFUSALS]
+        self.assertEqual(len(names), 16)
+        self.assertEqual(sorted(names), sorted(self.SAMPLES), "a member without a test (or a test without a member)")
+        self.assertEqual(len(module.NEGATION_WORDS), 11)
+
+    def test_every_member_is_refused_once_and_records_nothing(self):
+        for member in [name for name, _ in sb.load_module("plan_approval").REFUSALS]:
+            with self.subTest(member=member):
+                self.check_member(member)
+
+    def test_every_member_mutant_is_caught(self):
+        module = sb.load_module("plan_approval")
+        for member, _ in list(module.REFUSALS):
+            with self.subTest(member=member):
+                mutant = [(n, (lambda text, pos: False) if n == member else t) for n, t in module.REFUSALS]
+                with mock.patch.object(module, "REFUSALS", mutant):
+                    with self.assertRaises(AssertionError, msg=member):
+                        self.check_member(member)
+
+    def test_the_window_does_not_stop_at_a_sentence_and_is_five_words(self):
+        err = self.send("No issues found. Approved at %s" % self.h7)       # the documented false refusal
+        self.assertEqual(self.events(), [])
+        self.assertEqual(err.count(self.LINE), 1, err)
+        self.send("not a b c d e Approved at %s" % self.h7)                  # 5 words between the negation and the form: out of the window? it is the 6th word back
+        self.assertEqual(len(self.events()), 1)
+        err = self.send("not\nApproved at %s" % self.h7)                    # another line: not the same line
+        self.assertNotIn(self.LINE, err)
+
+    def test_a_clean_form_in_the_same_message_still_records_whichever_comes_first(self):
+        err = self.send("> Approved at %s\nApproved at %s #8" % (self.h8, self.h7))
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7)])
+        self.assertEqual(err.count(self.LINE), 1, err)
+        err = self.send("Approved at %s\n> Approved at %s" % (self.h8, self.h7), on=8)     # the clean one first
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7), ("acme/fleet#8", self.h8)])
+        self.assertEqual(err.count(self.LINE), 1, err)
+
+    def test_combinations_are_refused(self):
+        for text in ('> not Approved at %s' % self.h7, '"never ' + "Approved at %s\"" % self.h7, "`no` %s" % ("Approved at %s" % self.h7),
+                     'he said "ok" and did not Approved at %s' % self.h7, '"x" without Approved at %s' % self.h7):
+            err = self.send(text)
+            self.assertEqual(err.count(self.LINE), 1, (text, err))
+        self.assertEqual(self.events(), [])
+
+    def test_the_documentation_states_the_refusals(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        section = text[text.index("**An approval is checked when it is sent (#951)"):]
+        section = section[:section.index("\n\n")]
+        for words in ("approval not recorded: negated or quoted", "5 words", "No issues found. Approved at sha256:", "false refusal", "fenced code block"):
+            self.assertIn(words, section)
+
+
 class TestApprovalCheck(Base):
     """#951: `Approved at sha256:X` is recorded only for the plan's current hash and the issue's current Done-when."""
 

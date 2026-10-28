@@ -38,14 +38,99 @@ def find_approvals(text):
     start = approval_value(text)
     if start is not None:
         add(start, None)
-    spans = [(m.start(), m.group(1), None) for m in ANYWHERE_RE.finditer(text)]
+    for _, value, ref in _sightings(text)[0]:
+        add(value, ref)
+    return found
+
+
+def _sightings(text):
+    """(clean, refused): every form found, as (position, value, ref), split by `refusal_of`; the start-anchored form is a form too."""
+    text = text or ""
+    spans = []
+    lead = APPROVAL_RE.match(text)
+    if lead is not None and approval_value(text) is not None:
+        spans.append((lead.start(1) - len("Approved at sha256:"), approval_value(text), None))
+    spans += [(m.start(), m.group(1), None) for m in ANYWHERE_RE.finditer(text)]
     colon = APPROVED_COLON_RE.search(text)
     if colon:
         for m in LIST_RE.finditer(text, colon.end()):
             spans.append((m.start(), m.group(3), (m.group(1), int(m.group(2)))))
-    for _, value, ref in sorted(spans, key=lambda s: s[0]):
-        add(value, ref)
-    return found
+    clean, refused = [], []
+    for span in sorted(spans, key=lambda s: s[0]):
+        (refused if refusal_of(text, span[0]) else clean).append(span)
+    return clean, refused
+
+
+def refused_forms(text):
+    """The values of the forms refused as negated or quoted (#1463); [] when none."""
+    return [value for _, value, _ in _sightings(text)[1]]
+
+
+# ---- the ONE check that refuses a found form: REFUSALS is the family (name, test(text, position)); `refusal_of` runs a form through it.
+# The negation window is the 5 words before the form on the SAME LINE and does NOT stop at a sentence boundary: 'No issues found.
+# Approved at sha256:<current>' is refused too (a documented false refusal: a resend is cheaper than an accidental approval).
+NEGATION_WORDS = ("not", "no", "never", "n't", "do not", "did not", "have not", "has not", "cannot", "without", "not yet")
+FENCE_RE = re.compile(r"^[ \t]*(```|~~~)")
+WINDOW_WORDS = 5
+
+
+def _negation(word):
+    body = r"n['\u2019]t" if word == "n't" else r"\s+".join(re.escape(w) for w in word.split())
+    pattern = re.compile((r"(?<![\w'\u2019])" if word != "n't" else r"(?<=\w)") + body + r"(?![\w'\u2019])", re.IGNORECASE)
+
+    def test(text, pos):
+        before = text[text.rfind("\n", 0, pos) + 1:pos]
+        return pattern.search(" ".join(before.split()[-WINDOW_WORDS:])) is not None
+    return test
+
+
+def _line_of(text, pos):
+    return text[text.rfind("\n", 0, pos) + 1:(text.find("\n", pos) if text.find("\n", pos) >= 0 else len(text))]
+
+
+def _blockquote(text, pos):
+    return _line_of(text, pos).lstrip().startswith(">")
+
+
+def _code_span(text, pos):
+    return any(m.start() <= pos < m.end() for m in re.finditer(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", text, re.DOTALL))
+
+
+def _fenced(text, pos):
+    fence, offset = None, 0
+    for line in text.splitlines(True):
+        mark = FENCE_RE.match(line)
+        inside = fence is not None
+        if mark:
+            fence = None if fence == mark.group(1) else (fence or mark.group(1))
+        if offset <= pos < offset + len(line):
+            return inside and not mark
+        offset += len(line)
+    return False
+
+
+def _between(opening, closing):
+    def test(text, pos):
+        line = _line_of(text, pos)
+        col = pos - (text.rfind("\n", 0, pos) + 1)
+        before, after = line[:col], line[col:]
+        if opening == closing:
+            return before.count(opening) % 2 == 1 and closing in after
+        return before.rfind(opening) > before.rfind(closing) and opening in before and closing in after
+    return test
+
+
+REFUSALS = [("negation: " + w, _negation(w)) for w in NEGATION_WORDS] + [
+    ("quote: > line", _blockquote), ("quote: code span", _code_span), ("quote: fenced block", _fenced),
+    ("quote: straight double quotes", _between('"', '"')), ("quote: curly double quotes", _between("\u201c", "\u201d"))]
+
+
+def refusal_of(text, pos):
+    """The name of the first member of REFUSALS that refuses the form at `pos` of `text`, else None."""
+    for name, test in REFUSALS:
+        if test(text, pos):
+            return name
+    return None
 
 
 def candidates(text, repo, number, limit=MAX_CANDIDATES):
