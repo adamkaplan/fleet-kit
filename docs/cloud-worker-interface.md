@@ -157,3 +157,20 @@ Setting `CW_STACK_MODEL_SECRET` names a vault secret; it applies to `launch --cl
 ## Why the question tool is refused in a pod
 
 A question prompt on a headless pod is never answered: the pod's permission set named no rule for the question tool and the orchestrator agent definition sets it to `allow`, so a call opened a prompt nobody saw and the session waited until it was stopped. The permission is now `deny` at the top level and in the `worker` agent block of `cloud/worker/opencode-worker.json`. The orchestrator's pod copy of its definition is written with `deny` at pod start by the entrypoint (it refuses to start unless the `allow` line occurs once and only once); the image file `cloud/worker/agents/orchestrator.md` is unchanged, a byte-identical copy of the local role, which a person answers. The reason is that a config block cannot beat the definition's own rule: in a real run of the pinned release the definition's rule came last and the last match wins. The question tool is refused in a pod; a question goes out through the report path (`cw-cloud`, kind `question`, one of `KINDS` in `cloud/worker/bin/cloud_cli.py`).
+
+## A pod that ends Failed (ask #1442)
+
+Cause. A cloud pod that ended in the Failed phase (for example a container killed for memory, exit 137, or a pod evicted by its node) showed only
+"does not answer" in `status`, because every read of a worker goes through the agent inside the pod. The reaper asked the dead pod for its activity,
+found it unreadable, reported `activity unreadable` every minute and kept the pod for two hours, until its hard limit. No run record was written,
+because the stop path that writes it is never reached for a pod nobody can enter, so nobody could see why the pod had failed. The missing read was
+the pod's own status and events (`get_pod` and `pod_events`), which the launcher already could make and did not make for a Failed pod.
+
+What the record holds. The first reaper pass or `status` that sees the pod Failed reads, once, the pod's reason, each container's terminated reason
+and exit code, and the last 10 events (each cut to 300 characters), every text through the launcher's own scrub, and writes a run record
+(`run.json`, exit reason `pod failed`) with the reason, the exit code and the events. A later pass finds that record by the run id of the pod and
+does nothing for it: no activity read, no second record, no second report. A Failed pod without the `kept` annotation is deleted ten minutes
+after its record; one that holds unpushed work (`kept`) stays.
+
+How a lane reads it. `status` prints `pod failed: <reason>` (the reason cut to 160 characters, for example `OOMKilled (exit 137)`) for such a pod,
+instead of `does not answer`; the full reason, exit code and events are in the record's `run.json` under the run record directory.

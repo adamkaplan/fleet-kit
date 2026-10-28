@@ -512,3 +512,20 @@ value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault se
 `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
 
 **Repository allow-list.** `create` (and the driver, `run-task`, through the same function `check_repo_allowed`) launches only for a repository the owner listed. `CW_ALLOWED_REPOS` is a comma-separated list of `OWNER/NAME`, compared exactly and case-insensitively; no wildcard. Unset, empty, or any entry that is not `OWNER/NAME` shaped (a dot segment, a space, a `*`, an extra slash) refuses everything (fail closed). `CW_TOOLING_REPO` (`OWNER/NAME`) names the tooling's own repository, which is refused even when it is listed; unset adds no extra check, malformed refuses. A refused repository exits `2` with `refused: <repo> is not on the cloud allow-list` before any `kubectl` call, so nothing is created. Both settings are read from the environment of whoever runs the launcher or the driver, like the other `CW_` settings: the operator exports them in the shell (or the service unit) that starts it. An agent running as the same user could set them for a command it runs, so the list is a mistake-guard for the operator, not a boundary; the stops are the token's one-repository scope and the repository's own rules. The check compares spellings: a renamed or transferred repository is not matched by its old name, and an entry or tooling value ending in `.git` is malformed and refuses. The guard table is `docs/cloud-guard-parity.md`.
+
+## A pod that ends Failed (ask #1442)
+
+Cause. A cloud pod that ended in the Failed phase (for example a container killed for memory, exit 137, or a pod evicted by its node) showed only
+"does not answer" in `status`, because every read of a worker goes through the agent inside the pod. The reaper asked the dead pod for its activity,
+found it unreadable, reported `activity unreadable` every minute and kept the pod for two hours, until its hard limit. No run record was written,
+because the stop path that writes it is never reached for a pod nobody can enter, so nobody could see why the pod had failed. The missing read was
+the pod's own status and events (`get_pod` and `pod_events`), which the launcher already could make and did not make for a Failed pod.
+
+What the record holds. The first reaper pass or `status` that sees the pod Failed reads, once, the pod's reason, each container's terminated reason
+and exit code, and the last 10 events (each cut to 300 characters), every text through the launcher's own scrub, and writes a run record
+(`run.json`, exit reason `pod failed`) with the reason, the exit code and the events. A later pass finds that record by the run id of the pod and
+does nothing for it: no activity read, no second record, no second report. A Failed pod without the `kept` annotation is deleted ten minutes
+after its record; one that holds unpushed work (`kept`) stays.
+
+How a lane reads it. `status` prints `pod failed: <reason>` (the reason cut to 160 characters, for example `OOMKilled (exit 137)`) for such a pod,
+instead of `does not answer`; the full reason, exit code and events are in the record's `run.json` under the run record directory.

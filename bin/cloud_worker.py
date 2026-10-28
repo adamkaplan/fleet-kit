@@ -1745,6 +1745,12 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
             else:
                 row["launcher_status"] = _reason(code, note)
                 extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
+            failed = _one(body.get("pod_failed"), 160) if code == 0 and body is not None and body.get("pod_failed") else None
+            if failed:   # the launcher read why the pod ended: no tunnel to a dead pod, no "does not answer"
+                row["answers"], row["pod_failed"] = False, failed
+                rows.append(row)
+                lines.append("      cloud %s: %s, pod failed: %s; stops at %s" % (record["worker"], record["runtime_id"], failed, record.get("hard_deadline") or "?"))
+                continue
             row["answers"] = _answers(state, cluster, record, timeout)
             rows.append(row)
             lines.append("      cloud %s: %s, %s; %s; stops at %s" % (record["worker"], record["runtime_id"], extra,
