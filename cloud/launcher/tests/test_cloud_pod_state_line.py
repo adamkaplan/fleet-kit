@@ -789,12 +789,12 @@ class TestVocabularyScan(Base):
         for rel, text in self.sources():
             copies += [rel] * len(signature.findall(text))
             tables += [rel] * len(old.findall(text))
-        self.assertEqual(copies, ["bin/cloud_worker.py"], copies)
+        self.assertEqual(copies, ["bin/switchboard/pod_state_line.py"], copies)
         self.assertEqual(tables, [], tables)
 
     def test_s12_a_mutant_that_adds_a_planted_word_is_caught_by_the_property_test(self):
         mutant = CLOUD.ERROR_VOCABULARY | {SENTINEL}
-        with mock.patch.object(CLOUD, "ERROR_VOCABULARY", mutant):
+        with mock.patch.dict(sb.__dict__, {"ERROR_VOCABULARY": mutant}), mock.patch.dict(CLOUD.H, {"ERROR_VOCABULARY": mutant}):   # the list lives in the part bin/switchboard/pod_state_line.py: the namespace holds it
             self.assertIn(SENTINEL, CLOUD.ERROR_VOCABULARY)   # the mutation is applied
             failures = TestProperty.run_texts(self, count=100)   # the planted word comes at the 8th text and every 50th after
         self.assertGreaterEqual(len(failures), 1)
