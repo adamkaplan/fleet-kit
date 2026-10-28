@@ -9360,6 +9360,18 @@ def cloud_watch_tick(engine, discovery):
     return result
 
 
+def lost_worker_tick(engine, discovery):
+    """#1481: the lost-worker detector (bin/lost_worker.py). Reads the audits and the cloud records the pass already holds; sends one alert per loss."""
+    module = load_module("lost_worker")
+    registry = load_module("registry")
+
+    def retired(eng, name):
+        return registry.get_retired(eng.state_dir, name) is not None
+
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, retired=retired)
+    return module.run_pass(ns, engine, engine.now(), discovery)
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -9383,6 +9395,10 @@ def finish_pass(engine, discovery, report):
         cloud_watch_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-watch", "cloud-watch", err, report)
+    try:
+        lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
+    except Exception as err:
+        engine._failed("lost-worker", "lost-worker", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:

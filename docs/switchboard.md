@@ -6220,3 +6220,20 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## A lost worker is announced to its lane and the Chief of Staff (#1481)
+
+The alert is one line that starts `[lost worker]`. One detector in the daemon's pass (`bin/lost_worker.py`, called from `finish_pass` after the cloud watch) reads the switchboard audit and the cloud launcher's audit (`~/.local/state/cw-cloud/audit.jsonl`, or `CW_CLOUD_AUDIT`) from a stored byte position, and sends once per loss to the launching lane (the cloud record's `reports_to`) and to the Chief of Staff (one message when they are the same agent). It changes no worker, pod, label or record; its own memory is `lost-workers.json` in the state directory, so a restart repeats nothing. A message that cannot be sent is audited once (`lost_worker.alert_not_sent`) and the pass goes on.
+
+The line names the worker, the ask, the kind, the last event time and the evidence line (an audit line, cut short), and says `repeat: N earlier lost worker(s) of this ask` when the same ask lost workers before, else `first loss of this ask`.
+
+The four kinds it sends for:
+
+| Kind | Record that shows it |
+|---|---|
+| `pod_no_stop` | a `cloud.created` line, its hard deadline passed, no stop line in either audit (stops of any reason, `done` included, never alert here) and no final report line |
+| `local_worker` | a local worker seen alive in an earlier pass, now gone from discovery and not retired in the registry |
+| `refused_launch` | a `cloud.create_failed` line |
+| `reaper_missed` | a failed line of the reaper's own login refresh in the launcher audit (runtime id `reaper`) |
+
+A worker the cloud launcher ends (idle, hard limit, pod gone, failed pod) is announced by the launcher's sender (#1480), not here. Tests: `tests/switchboard/test_lost_worker.py`.
