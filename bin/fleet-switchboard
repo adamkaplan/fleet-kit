@@ -2832,17 +2832,27 @@ class Switchboard:
         fresh.conflict = list(previous.conflict)
         return fresh, None
 
-    def _acknowledge(self, keys, recipient=None):
-        """Tell the fact sources that hold items in memory (GitHub, PR 5) which keys are delivered."""
+    def _acknowledge(self, keys):
+        """Tell the fact sources that hold items in memory (GitHub, PR 5) which keys are delivered.
+        After `_record_told` the keys are acknowledged for that recipient (#1437), once."""
+        recipient, self._told_for = getattr(self, "_told_for", None), None
+        for source in self.sources:
+            acknowledge = getattr(source, "acknowledge", None)
+            if acknowledge is None:
+                continue
+            if recipient is not None and getattr(source, "told", None) is not None:
+                acknowledge(keys, recipient)
+            else:
+                acknowledge(keys)
+
+    def _record_told(self, keys, recipient):
+        """#1437: the durable once-per-recipient record, written BEFORE _acknowledge (the held payload still names the edit);
+        the next _acknowledge is for this recipient."""
+        self._told_for = recipient
         for source in self.sources:
             told = getattr(source, "told", None)
-            acknowledge = getattr(source, "acknowledge", None)
-            if told is not None and recipient is not None:
-                told(keys, recipient)   # before acknowledge: the record is written while the held payload still names the edit
-                if acknowledge is not None:
-                    acknowledge(keys, recipient)
-            elif acknowledge is not None:
-                acknowledge(keys)
+            if told is not None:
+                told(keys, recipient)
 
     def charter_repo(self, observation):
         """PR 17: the repo an agent's charter is in: its own `repo`, else the intent repo."""
@@ -2974,7 +2984,8 @@ class Switchboard:
                 return decide(recipient, facts, None, now, self.batch_seconds, self.engaged_seconds,
                               "cannot read what %s already has: %s" % (recipient, err))
             pending = [fact for fact in facts if fact.key not in delivered]
-            self._acknowledge(delivered, recipient)
+            self._record_told(delivered, recipient)
+            self._acknowledge(delivered)
             if pending and not complete:
                 return decide(recipient, pending, None, now, self.batch_seconds, self.engaged_seconds,
                               "the last %d messages of %s reach back less than to %s, so what it "
@@ -3096,7 +3107,8 @@ class Switchboard:
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
-        self._acknowledge(keys, plan.recipient)
+        self._record_told(keys, plan.recipient)
+        self._acknowledge(keys)
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "commit_told"):
             self.intents.commit_told()
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
