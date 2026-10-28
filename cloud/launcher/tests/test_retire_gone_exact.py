@@ -297,6 +297,60 @@ class RetireSide(unittest.TestCase):
         self.assertNotIn("--hub-entry", self.calls_of({"agent": "coder"}))
 
 
+class UnreadIdentity(tcw.Base):
+    """S9: a create whose read of the new pod fails says so once on stderr and in the audit."""
+    MARK = "pod identity"
+
+    def create_with_failed_read(self, patches=()):
+        real_wait, real_get, state = cw.Launcher._wait_ready, cw.Kube.get_pod, {"ready": False}
+
+        def wait(launcher, name, seconds):
+            result = real_wait(launcher, name, seconds)
+            state["ready"] = True   # every read from here on is the create's read of the uid
+            return result
+
+        def get(kube, name):
+            if state["ready"]:
+                raise cw.CloudError("the cluster did not answer")
+            return real_get(kube, name)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(cw.Launcher, "_wait_ready", wait))
+            stack.enter_context(mock.patch.object(cw.Kube, "get_pod", get))
+            for p in patches:
+                stack.enter_context(p)
+            return self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main")
+
+    def lines(self, err):
+        return [x for x in err.splitlines() if self.MARK in x]
+
+    def test_s9_a_failed_read_gives_one_stderr_line_naming_the_worker_and_one_audit_line(self):
+        code, out, err = self.create_with_failed_read()
+        self.assertEqual(code, 0, err)
+        audited = [x for x in self.audit_lines() if self.MARK in x["reason"]]
+        print("%d of 1 stderr line, %d of 1 audit line" % (len(self.lines(err)), len(audited)))
+        self.assertEqual(len(self.lines(err)), 1, err)
+        self.assertIn("coder7", self.lines(err)[0])
+        self.assertEqual(len(audited), 1)
+        self.assertEqual(json.loads(out)["pod_uid"], "")
+
+    def test_s9_a_mutant_that_records_the_empty_identity_silently_fails_the_test(self):
+        applied = []
+        silent = mock.patch.object(cw.Launcher, "_note_unread_identity", lambda launcher, worker, info: applied.append(worker))
+        code, out, err = self.create_with_failed_read([silent])
+        self.assertTrue(applied, "the mutation was not applied")
+        print("mutant: %d stderr lines (the test wants 1)" % len(self.lines(err)))
+        self.assertEqual(len(self.lines(err)), 0)
+        self.assertEqual([x for x in self.audit_lines() if self.MARK in x["reason"]], [])
+
+    def test_s9_a_create_whose_read_works_prints_no_such_line(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cw.main(["create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main"], self.env, self.clock, lambda s: self.clock.advance(seconds=s))
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(self.lines(err.getvalue()), [])
+        self.assertEqual([x for x in self.audit_lines() if self.MARK in x["reason"]], [])
+
+
 class Documents(unittest.TestCase):
     CAUSES = ("stop audit did not name the Secrets it removed", "not-found match was a substring match", "Secret read still used the loose match",
               "name with a trailing newline passed the name pattern", "record was not bound to a pod identity", "hub entry of a gone orchestrator was left behind")
@@ -321,6 +375,12 @@ class Documents(unittest.TestCase):
             found = [s for s in self.SAYS if s.lower() in part.lower()]
             print("%d of 5 statements in %s" % (len(found), rel))
             self.assertEqual(found, list(self.SAYS), rel)
+
+    UNREAD = "a create whose read of the new pod fails cannot record the pod's uid: it says so in one stderr line and in its audit line"
+
+    def test_s9_both_documents_say_a_create_that_cannot_read_the_uid_says_so(self):
+        for rel, title in (("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)"), ("docs/cloud-worker-interface.md", "## Retire of a gone worker (ask #1327)")):
+            self.assertIn(self.UNREAD, self.section(rel, title).lower(), rel)
 
 
 if __name__ == "__main__":

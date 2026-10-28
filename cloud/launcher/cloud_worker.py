@@ -1710,6 +1710,8 @@ class Launcher:
             text = "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
             if "removed" in info:
                 text = "%s%ssecrets removed: %s" % (text, "; " if text else "", ", ".join(info["removed"]) or "none")
+            if info.get("identity_note"):
+                text = "%s%s%s" % (text, "; " if text else "", info["identity_note"])
             return text
         try:
             result = fn(info)
@@ -1823,6 +1825,7 @@ class Launcher:
                 pod_uid = ((self.kube.get_pod(name) or {}).get("metadata") or {}).get("uid") or ""
             except CloudError:
                 pod_uid = ""
+                self._note_unread_identity(worker, info)
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain), "pod_uid": pod_uid,
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
@@ -1835,6 +1838,12 @@ class Launcher:
             return self._audited(worker, "create", go, reason)
         finally:
             self._restore_signals(old)
+
+    def _note_unread_identity(self, worker, info):
+        """The create could not read the new pod's uid: say so once on stderr and in the create's audit line."""
+        note = "the pod identity of %s could not be read; the worker record holds none and a retire acts by name" % worker
+        print("cloud-worker: WARNING: %s" % note, file=sys.stderr)
+        info["identity_note"] = note
 
     @staticmethod
     def _catch_signals():
