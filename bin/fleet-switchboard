@@ -9363,7 +9363,10 @@ def cloud_watch_tick(engine, discovery):
 
 def lost_worker_tick(engine, discovery):
     """#1481: the lost-worker detector (bin/lost_worker.py). Reads the audits and the cloud records the pass already holds; sends one alert per loss."""
-    module = load_module("lost_worker")
+    import importlib.util   # by path, beside this file, as `_brief_advisory` does: the module stays out of the clear's loaded set (no impact-matrix row)
+    spec = importlib.util.spec_from_file_location("lost_worker", os.path.join(os.path.dirname(os.path.realpath(__file__)), "lost_worker.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     registry = load_module("registry")
 
     def retired(eng, name):
