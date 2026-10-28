@@ -21835,6 +21835,8 @@ def preflight_changed(runner, root):
 
 def cmd_preflight_pr(args, runner, now):
     """`preflight-pr`: run each class of PREFLIGHT_CLASSES under `heavy`, print one PASS or FAIL line per class, exit 1 when any fails. Only runs tests."""
+    if getattr(args, "body", None):   # off by default: only reads the description and the plan (bin/switchboard/body_check.py)
+        return cmd_body_check(args.body, runner, now)
     top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if top.returncode != 0:
         sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
@@ -21947,6 +21949,7 @@ def add_preflight_pr_parsers(sub):
                                "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict. "
                                "With --merged the same classes run on a local merge of the base into the head (a temporary worktree, removed afterwards).")
     pre.add_argument("--merged", action="store_true", help="Run on a local merge of the current base into the head, so a change green alone and red against the moved base is found before the push")
+    pre.add_argument("--body", metavar="PR", help="Only read the pull request (owner/repo#N) and its plan: refuse a description whose first section is not the cause the plan's cause-first scenario asks for (writes nothing)")
 
 
 def add_disk_parsers(sub):

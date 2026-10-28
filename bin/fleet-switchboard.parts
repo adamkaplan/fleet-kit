@@ -10,6 +10,7 @@ switchboard/decisions_b.py
 switchboard/reminders.py
 switchboard/plan_review.py
 switchboard/pr_explain.py
+switchboard/body_check.py
 switchboard/triage.py
 switchboard/alert_labels.py
 switchboard/handoff.py
