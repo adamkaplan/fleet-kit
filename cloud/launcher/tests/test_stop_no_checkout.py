@@ -418,6 +418,94 @@ class StopNoCheckout(base.Base):
         self.assertTrue(applied)
         self.assertIn("no git repository here", out)
 
+    # ---- ask #1483: one mutant per unreadable row, the real shape of an interrupted launch, a stray entry ----
+    def exists_style_decision(self, applied):
+        def old(workdir):
+            applied.append(1)
+            return not os.path.exists(os.path.join(workdir, ".git"))
+        import end_hook
+        orig = end_hook.no_checkout
+        end_hook.no_checkout = old
+        self.addCleanup(setattr, end_hook, "no_checkout", orig)
+        return end_hook, orig
+
+    def row_expectation(self, end_hook, d):
+        with self.assertRaises((RuntimeError, OSError)):
+            end_hook.run(d, "mut2")
+
+    def row_mutant(self, make_row):
+        """With the exists-style decision the row reports no_repository, so the row's own check fails; the real hook raises."""
+        self.need_user()
+        d = make_row()
+        applied = []
+        end_hook, orig = self.exists_style_decision(applied)
+        self.assertIs(end_hook.run(d, "mut1")["no_repository"], True)
+        self.assertTrue(applied)
+        with self.assertRaises(AssertionError):
+            self.row_expectation(end_hook, d)   # the row's own check: the hook must raise (keep the pod); the mutant reports none
+        self.assertGreaterEqual(len(applied), 2)
+        end_hook.no_checkout = orig
+        with self.assertRaises((RuntimeError, OSError)):
+            end_hook.run(d, "mut3")
+
+    def test_mutant_exists_style_decision_fails_the_mode_000_row(self):
+        def row():
+            d = self.repo_dir()
+            self.set_mode(d, 0)
+            return d
+        self.row_mutant(row)
+
+    def test_mutant_exists_style_decision_fails_the_mode_600_row(self):
+        def row():
+            d = self.repo_dir()
+            self.set_mode(d, 0o600)
+            return d
+        self.row_mutant(row)
+
+    def test_mutant_exists_style_decision_fails_the_unenterable_parent_row(self):
+        def row():
+            d = self.repo_dir()
+            self.set_mode(self.space, 0)
+            return d
+        self.row_mutant(row)
+
+    def test_the_real_lstat_turns_a_permission_error_into_not_found_in_the_mutant(self):
+        self.need_user()
+        d = self.repo_dir()
+        self.set_mode(d, 0)
+        with self.assertRaises(PermissionError):
+            os.lstat(os.path.join(d, ".git"))
+        self.assertFalse(os.path.exists(os.path.join(d, ".git")))
+
+    def test_an_interrupted_launch_with_an_empty_mounted_workspace_reports_no_repository(self):
+        import end_hook
+        ws = os.path.join(self.tmp.name, "mounted")
+        os.makedirs(ws)
+        self.assertEqual(os.listdir(ws), [])
+        self.assertTrue(os.access(ws, os.R_OK))
+        res = end_hook.run(os.path.join(ws, "repo"), "coder4")
+        self.assertIs(res["no_repository"], True)
+        self.assert_reports_none("coder5", os.path.join(ws, "repo"))
+
+    def test_a_workspace_with_one_stray_lost_and_found_directory_keeps_the_pod(self):
+        # A fail-safe: the scratch volume of the launcher is an emptyDir and carries no such entry today.
+        import end_hook
+        ws = os.path.join(self.tmp.name, "stray")
+        os.makedirs(os.path.join(ws, "lost+found"))
+        self.assertEqual(os.listdir(ws), ["lost+found"])
+        with self.assertRaises(RuntimeError) as cm:
+            end_hook.run(os.path.join(ws, "repo"), "coder4")
+        self.assertIn(ws, str(cm.exception))
+        self.assert_pod_kept("coder6", os.path.join(ws, "repo"))
+
+    def test_the_deletion_path_source_has_no_exists_style_helper(self):
+        import inspect
+        import end_hook
+        src = inspect.getsource(end_hook.no_checkout) + inspect.getsource(end_hook.probe_path) + inspect.getsource(end_hook.has_marker)
+        for word in ("os.path.exists", "os.path.isdir", "os.path.isfile", "listdir"):
+            self.assertNotIn(word, src)
+
+
     def test_the_documentation_states_the_condition_and_the_limits(self):
         with open(DOC, encoding="utf-8") as f:
             text = " ".join(f.read().split())
