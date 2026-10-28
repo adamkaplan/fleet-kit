@@ -182,7 +182,7 @@ class T(unittest.TestCase):
 
     def test_a_pull_request_the_pod_created_is_recorded_and_allowed(self):
         rec = os.path.join(self.tmp.name, "rec2")
-        PRS[11] = pr(head="another")
+        PRS[11] = pr(head=BRANCH)
         r = self.client("pr edit 11 --body-file " + self.hold, extra={"CW_PR_RECORD": rec})
         self.assertEqual(r.returncode, 3)
         open(rec, "w").write("11\n")
@@ -228,7 +228,7 @@ class T(unittest.TestCase):
         return p
 
     def test_mutants_of_the_client_each_fail_the_checks(self):
-        m = self.mutant('or recorded(n)):\n        raise refused("pr-edit-other-number")', 'or True):\n        raise refused("pr-edit-other-number")')
+        m = self.mutant('or not (mine and head == mine):', 'or False:')
         self.assertEqual(self.edit(8, script=m).returncode, 0)   # allows any number (the true build: 3)
         src = open(CW_GH).read()
         for name, old, new, probe in (
@@ -248,7 +248,7 @@ class T(unittest.TestCase):
                 self.assertIn("refused: " + row, t.stderr)
 
     def test_mutant_that_skips_the_own_check_edits_another_pull_request(self):
-        m = self.mutant('if base_repo.lower() != repo.lower() or not ((mine and head == mine) or recorded(n)):', "if False:")
+        m = self.mutant('if base_repo.lower() != repo.lower() or not (mine and head == mine):', "if False:")
         self.assertEqual(self.edit(8, script=m).returncode, 0)
         self.assertEqual(self.edit(8).returncode, 3)
 

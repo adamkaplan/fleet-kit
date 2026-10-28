@@ -45,6 +45,22 @@ def strip_question(cfg):
     return c
 
 
+RECORD_BASH_PATTERNS = ("*CW_PR_RECORD*", "*pr-record*")   # ask 1200: the closed list of what its change adds
+RECORD_EDIT_ENTRY = {"*": "allow", "*pr-record*": "deny"}   # the editing tool's entry for the record paths
+
+
+def strip_record_entries(cfg):
+    """A deep copy without ONLY the entries ask 1200 adds (the two bash patterns and the exact edit entry), in both blocks."""
+    c = copy.deepcopy(cfg)
+    blocks = [c["permission"]] + [a.get("permission", {}) for a in c.get("agent", {}).values()]
+    for b in blocks:
+        for pat in RECORD_BASH_PATTERNS:
+            b.get("bash", {}).pop(pat, None)
+        if b.get("edit") == RECORD_EDIT_ENTRY:
+            del b["edit"]
+    return c
+
+
 def base_file(rel, mode="text"):
     """The base commit's copy of a file through git (origin/integration, else origin/main); (ref, content) or (None, None)."""
     for ref in ("origin/integration", "origin/main"):
@@ -81,7 +97,23 @@ class T(unittest.TestCase):
         base = base_other_keys()
         if base is None:
             loud_skip(self, "the base permission file")
-        self.assertEqual(strip_question(load()), base)
+        self.assertEqual(strip_record_entries(strip_question(load())), base)
+
+    def test_record_entries_strip_only_the_closed_list(self):
+        cfg = load()
+        stripped = strip_record_entries(cfg)
+        self.assertNotEqual(stripped, cfg, "mutation not applied")
+        for b in (stripped["permission"], stripped["agent"]["worker"]["permission"]):
+            self.assertNotIn("edit", b)
+            self.assertFalse(set(RECORD_BASH_PATTERNS) & set(b["bash"]))
+        for mut in ("bash", "edit"):
+            m = copy.deepcopy(cfg)
+            if mut == "bash":
+                m["permission"]["bash"]["gh extra thing*"] = "allow"
+            else:
+                m["agent"]["worker"]["permission"]["edit"]["*other*"] = "deny"
+            self.assertNotEqual(m, cfg, "mutation not applied")
+            self.assertNotEqual(strip_record_entries(m), strip_record_entries(cfg))
 
     def test_s4_empty_agent_block_is_not_dropped(self):
         cfg = load()
