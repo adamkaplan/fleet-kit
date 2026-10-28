@@ -9376,7 +9376,8 @@ def cloud_end_tick(engine, discovery):
         return []
     return load_module("cloud_end_alert").scan_audit(cloud_audit_path(), Path(engine.state_dir) / CLOUD_END_ALERT_FILE, Path(engine.state_dir) / "cloud",
                                                      _read_small(engine.state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
-                                                     load_module("record_json").parse_bounded)
+                                                     load_module("record_json").parse_bounded,
+                                                     lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail))
 
 
 def finish_pass(engine, discovery, report):

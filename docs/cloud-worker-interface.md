@@ -129,13 +129,10 @@ A clean tree whose HEAD is already pushed pushes nothing and reports `pushed: fa
 - **OPEN**: how a worker asks for its own extension (a command inside the pod, or only an operator).
 
 **The alert when the launcher ends a worker (ask #1480).** The switchboard's daemon reads the launcher's audit file from a stored cursor
-(`cloud-end-alert.json` in the daemon's state directory, mode 0600; a missing or corrupt cursor starts at the end of the file, so old history is
-never replayed). When a stop line says the launcher ended a worker for being idle, past its hard limit, a pod that was gone or a failed pod, and
-the worker has a cloud worker record with a recorded boss (`reports_to`) and has not reported `done`, the daemon sends ONE message to that
-recorded boss and ONE to the Chief of Staff, within one pass of the launcher's stop. Each names only the worker, the reason, the time, whether the
-work was pushed (from the run record's `end_hook`) and the run record's name: never an address, a log line or a transcript. It is sent once per run
-id and reason (the last 500 are kept), so a retried stop sends nothing more. A stop by name (`done`, `finished`, `pushed ...`, a person's own
-words) sends nothing. The reason texts the launcher writes are `idle` and `hard limit`, each followed by `; run-id=NONCE` and `; run record DIR`.
+(`cloud-end-alert.json` in the daemon's state directory, mode 0600; a missing or corrupt cursor, or one past the end of the file, starts at the end of the file, so old history is
+never replayed). The audit file and the run records are untrusted text. When a stop line's reason, up to its first semicolon, EQUALS `idle` or `hard limit` exactly (not a prefix, not another letter case) and
+the worker has not reported `done`, the daemon sends ONE message to the Chief of Staff always, and ONE to the boss recorded in the worker's cloud record when that boss is a valid agent name (a boss that is the Chief of Staff gets one message; an invalid name is never a recipient and never in a message), within one pass of the launcher's stop. The message holds exactly five facts: the worker, the reason, the time, whether the work was pushed (`yes`, `no` or `unknown`; never the branch) and the run record's name (only when it matches the launcher's `<worker>-<UTC stamp>-<6 hex>`, else `unknown`): never an address, a log line or a transcript. It is sent once per run
+id and reason (the last 500 are kept), so a retried stop sends nothing more. A person's own words (`idle workers cleanup`, `Idle`, `done`, `pushed ...`) send nothing. A failed send writes one audit line naming the worker and the reason, never the text, and never stops the pass. The reaper writes `idle` and `hard limit`, each followed by `; run-id=NONCE` and `; run record DIR`. Known limits: a person wording a stop exactly `idle` or `hard limit` cannot be told from the reaper; a message is lost, never repeated, when a send fails after the state is saved; an unread backlog of more than one megabyte drains one megabyte per pass; a corrupt cursor skips the lines written meanwhile.
 
 ## 7. How the switchboard reaches the cloud (wiring)
 

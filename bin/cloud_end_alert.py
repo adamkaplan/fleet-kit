@@ -1,9 +1,10 @@
 """A cloud worker that the launcher ended alerts its boss and the Chief of Staff at once (ask #1480).
 
 The launcher writes one JSON line per action to its audit file. This pass reads the NEW stop lines (from a stored cursor), and for a stop the launcher
-made for an idle worker, a worker past its hard limit, a pod that was gone or a failed pod, it sends ONE message to the boss recorded in the worker's
-cloud record and ONE to the Chief of Staff, unless the worker already reported done. The message names the worker, the reason, the time, whether the
-work was pushed and the run record's name; never an address, a log line or a transcript.
+made for an idle worker or a worker past its hard limit (the reason's first part equals `idle` or `hard limit`, exactly), it sends ONE message to the
+Chief of Staff always and ONE to the boss recorded in the worker's cloud record when that name is a valid agent name, unless the worker already
+reported done. The message holds exactly five facts: the worker, the reason, the time, pushed (yes, no or unknown) and the run record's name (or
+unknown); never a branch, an address, a log line or a transcript.
 
 The state is one small private file (0600): {"offset": bytes already read, "sent": [[run id, reason], ...] (the last 500)}. A missing or corrupt
 file starts at the END of the audit file, so old history is never replayed. The state is saved BEFORE the messages go: a crash loses a message,
@@ -20,8 +21,11 @@ READ_BYTES = 1 << 20     # the most audit bytes one pass reads
 FILE_BYTES = 65536       # the most a record file may be
 # The launcher's stop reasons (cloud/launcher/cloud_worker.py, reap and stop): `idle` and `hard limit`, followed by "; run-id=NONCE" and "; run record DIR".
 # "pod gone" and the failed-pod wording are kept for a stop that names them; anything else (done, finished, ended, pushed ..., a person's words) sends nothing.
-LABELS = (("idle", "idle"), ("hard limit", "hard limit"), ("pod gone", "pod gone"), ("pod failed", "failed pod"), ("pod was failed", "failed pod"),
-          ("failed pod", "failed pod"))
+# The audit file and the run records are UNTRUSTED text: the reason's first part (up to the first semicolon) must EQUAL one of these, exactly.
+LABELS = ("idle", "hard limit")
+AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")   # the switchboard's own agent-name pattern (NAME_RE in bin/fleet-switchboard)
+WORKER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+RECORD_STAMP = r"\d{8}T\d{6}Z-[0-9a-f]{6}"   # the launcher's run record name: <worker>-<UTC stamp>-<6 hex> (cloud/launcher/run_record.py)
 SAFE = re.compile(r"[^A-Za-z0-9._/:+@=-]")
 
 
@@ -58,7 +62,9 @@ def load_state(path, size, parse):
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or not isinstance(sent, list):
         return size, [], True
     keys = [(str(k[0]), str(k[1])) for k in sent if isinstance(k, list) and len(k) == 2]
-    return (0 if offset > size else offset), keys, False   # a smaller file is a new file: read it from its start
+    if offset > size:
+        return size, keys, True   # a truncated or rotated file: start at its end, alert no old line
+    return offset, keys, False
 
 
 def save_state(path, offset, keys):
@@ -78,11 +84,14 @@ def save_state(path, offset, keys):
 
 def label_of(reason):
     """The plain label of a stop reason the launcher gave, or None for any other reason."""
-    head = reason.split(";")[0].strip().lower() if isinstance(reason, str) else ""
-    for start, label in LABELS:
-        if head == start or head.startswith(start + " "):
-            return label
-    return None
+    head = reason.split(";")[0] if isinstance(reason, str) else ""
+    return head if head in LABELS else None
+
+
+def raw_dir(reason):
+    """The run record path the reason names ("" when none)."""
+    rec = re.search(r"run record (\S+)", reason)
+    return rec.group(1) if rec else ""
 
 
 def parse_reason(reason):
@@ -92,24 +101,26 @@ def parse_reason(reason):
     return (run.group(1) if run else ""), (os.path.basename(rec.group(1).rstrip("/")) if rec else "")
 
 
+def record_name_of(worker, dirname):
+    """The run record's name when it matches the launcher's pattern for this worker, else None."""
+    return dirname if re.fullmatch(re.escape(worker) + "-" + RECORD_STAMP, dirname or "") else None
+
+
 def pushed_text(record_dir, parse):
-    """`yes (branch X)`, `no`, or `unknown`, from the run record's end_hook."""
+    """`yes`, `no` or `unknown` from the run record's end_hook; never the branch."""
     run = read_small(os.path.join(record_dir, "run.json"), parse) if record_dir else None
     hook = run.get("end_hook") if run else None
-    if not isinstance(hook, dict):
+    if not isinstance(hook, dict) or not isinstance(hook.get("pushed"), bool):
         return "unknown"
-    if hook.get("pushed") is True:
-        branch = plain(hook.get("wip_branch") or "", 100)
-        return "yes (branch %s)" % branch if branch else "yes"
-    return "no"
+    return "yes" if hook["pushed"] else "no"
 
 
 def message_text(worker, label, when, pushed, record_name):
     return ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; work pushed: %s; run record: %s."
-            % (worker, label, when, pushed, record_name or "none"))
+            % (worker, label, when, pushed, record_name or "unknown"))
 
 
-def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse):
+def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, audit=None):
     """One pass. `send(recipient, text)` is the daemon's own send path. Returns [(recipient, text)] handed to it."""
     try:
         size = os.stat(str(audit_file)).st_size
@@ -117,7 +128,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse):
         return []
     offset, keys, fresh = load_state(state_file, size, parse)
     if fresh:
-        save_state(state_file, size, [])
+        save_state(state_file, size, keys)
         return []
     if offset >= size:
         if offset != size:
@@ -142,7 +153,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse):
             continue
         label = label_of(line.get("reason"))
         worker = line.get("worker")
-        if label is None or not isinstance(worker, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", worker):
+        if label is None or not isinstance(worker, str) or not WORKER_NAME.fullmatch(worker):
             continue
         run_id, record_name = parse_reason(line["reason"])
         key = (run_id or "%s@%s" % (worker, line.get("ts")), label)
@@ -152,17 +163,25 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse):
             continue
         record = read_small(os.path.join(str(cloud_dir), worker + ".json"), parse)
         boss = record.get("reports_to") if record and record.get("worker") == worker else None
-        boss = "".join(c for c in boss if c.isprintable())[:64].strip() if isinstance(boss, str) else ""
-        if not boss:
-            continue
-        match = re.search(r"run record (\S+)", line["reason"])
-        text = message_text(worker, label, plain(line.get("ts"), 30), pushed_text(match.group(1) if match else "", parse), plain(record_name, 80))
+        name = record_name_of(worker, record_name)
+        pushed = pushed_text(raw_dir(line["reason"]), parse) if name else "unknown"
+        text = message_text(worker, label, plain(line.get("ts"), 30), pushed, name)
         keys.append(key)
-        out.extend((to, text) for to in ([boss] if boss == CHIEF else [boss, CHIEF]))
+        to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
+        out.extend((to, text, worker, label) for to in reversed(to_list))
     save_state(state_file, offset + cut, keys)
-    for to, text in out:
+    failed = set()
+    for to, text, worker, label in out:
         try:
-            send(to, text)
+            result = send(to, text)
+            ok = not (result is False or (isinstance(result, dict) and result.get("sent") is False))
         except Exception:
-            pass   # one recipient that cannot be reached never stops the other
-    return out
+            ok = False
+        if not ok and (worker, label) not in failed:
+            failed.add((worker, label))
+            try:
+                if audit is not None:
+                    audit(worker, {"reason": label})   # the worker and the reason only, never the message text
+            except Exception:
+                pass
+    return [(to, text) for to, text, _w, _l in out]

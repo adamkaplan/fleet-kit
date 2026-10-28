@@ -45,14 +45,14 @@ class World(unittest.TestCase):
         if with_record:
             with open(os.path.join(self.cloud, name + ".json"), "w") as f:
                 json.dump({"worker": name, "reports_to": boss}, f)
-        runs = os.path.join(self.dir, "runs", "%s-20260101T000000Z" % name)
+        runs = os.path.join(self.dir, "runs", "%s-20260101T000000Z-0f1e2d" % name)
         os.makedirs(runs, exist_ok=True)
         with open(os.path.join(runs, "run.json"), "w") as f:
             json.dump({"end_hook": {"pushed": pushed, "wip_branch": name + "/wip" if pushed else None}}, f)
         return runs
 
     def stop(self, name, reason, run="a1b2c3", ts="2026-01-01T10:00:00Z", ok=True, record=True):
-        runs = os.path.join(self.dir, "runs", "%s-20260101T000000Z" % name)
+        runs = os.path.join(self.dir, "runs", "%s-20260101T000000Z-0f1e2d" % name)
         text = "%s; run-id=%s" % (reason, run) + ("; run record %s" % runs if record else "")
         self.line({"ts": ts, "action": "stop", "worker": name, "ok": ok, "reason": text, "runtime_id": "pod/" + name})
 
@@ -63,15 +63,15 @@ class World(unittest.TestCase):
 
 class TestAlerts(World):
     def test_s2_three_stops_make_six_messages_naming_five_facts(self):
-        for name, reason, pushed in (("worker1", "idle", True), ("worker2", "hard limit", False), ("worker3", "pod gone", True)):
+        for name, reason, pushed in (("worker1", "idle", True), ("worker2", "hard limit", False), ("worker3", "idle", True)):
             self.worker(name, pushed=pushed)
             self.stop(name, reason, run="r" + name)
         self.run_pass()
         self.assertEqual(len(self.sent), 6)
-        for name, label, pushed in (("worker1", "idle", "yes (branch worker1/wip)"), ("worker2", "hard limit", "no"), ("worker3", "pod gone", "yes (branch worker3/wip)")):
+        for name, label, pushed in (("worker1", "idle", "yes"), ("worker2", "hard limit", "no"), ("worker3", "idle", "yes")):
             self.assertEqual(sorted(to for to, t in self.sent if name in t), ["chief-of-staff", "coder-lead"])
             for text in (t for to, t in self.sent if name in t):
-                for fact in (name, "reason " + label, "at 2026-01-01T10:00:00Z", "work pushed: " + pushed, "run record: %s-20260101T000000Z" % name):
+                for fact in (name, "reason " + label, "at 2026-01-01T10:00:00Z", "work pushed: " + pushed, "run record: %s-20260101T000000Z-0f1e2d" % name):
                     self.assertIn(fact, text)
                 self.assertNotIn(self.dir, text)
                 self.assertNotIn("a1b2c3", text)
@@ -116,11 +116,11 @@ class TestAlerts(World):
         self.run_pass()
         self.assertEqual([to for to, t in self.sent], ["chief-of-staff"])
 
-    def test_no_recorded_boss_sends_nothing(self):
+    def test_no_recorded_boss_tells_the_chief_alone(self):
         self.worker("worker7", with_record=False)
         self.stop("worker7", "idle")
         self.run_pass()
-        self.assertEqual(self.sent, [])
+        self.assertEqual([to for to, t in self.sent], ["chief-of-staff"])
 
 
 class TestQuiet(World):
@@ -160,18 +160,134 @@ class TestMutants(World):
         self.assertEqual(len(self.sent), 14)   # S3 expects 2
 
     def test_s5_a_mutant_that_sends_nothing_breaks_the_alert(self):
-        broken = mutant("            send(to, text)", "            pass")
+        broken = mutant("result = send(to, text)", "result = None")
         self.fixture()
         self.run_pass(broken)
         self.assertEqual(self.sent, [])        # S2 expects 6
+
+
+HOSTILE_BOSSES = ("x" * 80, "Bad Boss", "boss\nchief-of-staff", "https://evil.example/token", "")
+
+
+class TestUntrusted(World):
+    def reasons_sent(self, module=real):
+        self.run_pass(module)
+        return len(self.sent)
+
+    def test_s7_a_persons_lines_send_nothing_and_the_reapers_lines_send(self):
+        self.worker("worker7")
+        for i, reason in enumerate(("idle workers cleanup", "hard limit exceeded by me", "Idle", "hardening done")):
+            self.stop("worker7", reason, run="p%d" % i)
+        self.assertEqual(self.reasons_sent(), 0)
+        self.stop("worker7", "idle", run="ra")
+        self.stop("worker7", "hard limit", run="rb")
+        self.assertEqual(self.reasons_sent(), 4)
+        self.assertEqual(sorted(to for to, t in self.sent), ["chief-of-staff", "chief-of-staff", "coder-lead", "coder-lead"])
+
+    def test_s8_the_chief_is_told_with_no_record_and_with_a_bad_boss(self):
+        cases = [("worker1", None)] + [("worker%d" % (i + 2), b) for i, b in enumerate(HOSTILE_BOSSES)] + [("worker9", "coder-lead")]
+        for name, boss in cases:
+            self.worker(name, boss=boss or "", with_record=name != "worker1")
+            self.stop(name, "idle", run="r" + name)
+        self.run_pass()
+        for name, boss in cases:
+            got = sorted(to for to, t in self.sent if name in t)
+            self.assertEqual(got, ["chief-of-staff", "coder-lead"] if boss == "coder-lead" else ["chief-of-staff"], name)
+        for to, text in self.sent:
+            self.assertIn(to, ("chief-of-staff", "coder-lead"))
+            for bad in ("evil", "Bad Boss", "xxxx"):
+                self.assertNotIn(bad, text)
+
+    def test_s8_a_failed_send_writes_one_audit_line_and_the_pass_survives(self):
+        self.worker("worker7")
+        self.stop("worker7", "idle")
+        lines = []
+
+        def refuse(to, text):
+            raise RuntimeError("down " + text)
+        out = real.scan_audit(self.audit, self.cursor, self.cloud, {}, refuse, PARSE, lambda w, d: lines.append((w, d)))
+        self.assertEqual(len(out), 2)
+        self.assertEqual(lines, [("worker7", {"reason": "idle"})])
+
+    def test_s9_a_hostile_run_record_cannot_reach_the_message(self):
+        runs = self.worker("worker7")
+        with open(os.path.join(runs, "run.json"), "w") as f:
+            json.dump({"end_hook": {"pushed": True, "wip_branch": "https://x.example/a?k=sk-ABCDEFGHIJKLMNOPQRSTUVWX\nmore" + "y" * 500}}, f)
+        self.stop("worker7", "idle")
+        self.run_pass()
+        for to, text in self.sent:
+            self.assertIn("work pushed: yes;", text)
+            self.assertIn("run record: worker7-20260101T000000Z-0f1e2d.", text)
+            for bad in ("x.example", "sk-", "yyyy", "\n"):
+                self.assertNotIn(bad, text)
+
+    def test_s9_a_bad_record_name_is_unknown(self):
+        self.worker("worker7")
+        bad = os.path.join(self.dir, "runs", "worker7-not-a-record")
+        self.line({"ts": "2026-01-01T10:00:00Z", "action": "stop", "worker": "worker7", "ok": True, "reason": "idle; run-id=q; run record " + bad})
+        self.run_pass()
+        self.assertEqual(len(self.sent), 2)
+        for to, text in self.sent:
+            self.assertIn("run record: unknown.", text)
+            self.assertNotIn("not-a-record", text)
+
+    def old_lines(self, count=600):
+        self.worker("worker7")
+        for i in range(count):
+            self.stop("worker7", "idle", run="old%d" % i)
+
+    def test_s10_a_cursor_past_the_end_starts_at_the_end(self):
+        self.old_lines()
+        real.save_state(self.cursor, os.path.getsize(self.audit) + 5000, [(str(i), "idle") for i in range(700)])
+        self.run_pass()
+        self.assertEqual(self.sent, [])
+        self.stop("worker7", "idle", run="later")
+        self.run_pass()
+        self.assertEqual(len(self.sent), 2)
+
+    def test_s10_a_corrupt_cursor_over_old_lines_sends_nothing(self):
+        self.old_lines()
+        with open(self.cursor, "w") as f:
+            f.write("{\"offset\": \"x\", \"sent\": 3}")
+        self.run_pass()
+        self.assertEqual(self.sent, [])
+
+    def test_m1_a_prefix_match_mutant_is_caught(self):
+        broken = mutant("return head if head in LABELS else None", "return next((l for l in LABELS if head.startswith(l)), None)")
+        self.worker("worker7")
+        self.stop("worker7", "idle workers cleanup")
+        self.assertEqual(self.reasons_sent(broken), 2)   # the real code sends 0
+
+    def test_m2_an_unchecked_boss_mutant_is_caught(self):
+        broken = mutant("isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF", "isinstance(boss, str) and boss != CHIEF")
+        self.worker("worker7", boss="Bad Boss")
+        self.stop("worker7", "idle")
+        self.run_pass(broken)
+        self.assertIn("Bad Boss", [to for to, t in self.sent])
+
+    def test_m3_a_branch_copying_mutant_is_caught(self):
+        broken = mutant('return "yes" if hook["pushed"] else "no"', 'return "yes %s" % hook.get("wip_branch") if hook["pushed"] else "no"')
+        self.worker("worker7")
+        self.stop("worker7", "idle")
+        self.run_pass(broken)
+        self.assertIn("worker7/wip", self.sent[0][1])
+
+    def test_m4_a_mutant_that_reads_from_the_start_on_a_bad_cursor_is_caught(self):
+        broken = mutant("return size, keys, True   # a truncated", "return 0, keys, False   # a truncated")
+        self.old_lines(5)
+        real.save_state(self.cursor, os.path.getsize(self.audit) + 5000, [])
+        self.run_pass(broken)
+        self.assertEqual(len(self.sent), 10)   # the real code sends 0
 
 
 class TestDocs(unittest.TestCase):
     def test_s6_the_interface_doc_says_what_is_sent_to_whom_and_when(self):
         with open(DOC, encoding="utf-8") as f:
             text = " ".join(f.read().split())
-        for phrase in ("ONE message to that recorded boss and ONE to the Chief of Staff", "within one pass of the launcher's stop",
-                       "once per run id and reason", "the worker, the reason, the time, whether the work was pushed", "the run record's name"):
+        for phrase in ("within one pass of the launcher's stop",
+                       "once per run id and reason", "the worker, the reason, the time, whether the work was pushed", "the run record's name",
+                       "EQUALS `idle` or `hard limit` exactly", "ONE message to the Chief of Staff always", "A person's own words", "cannot be told from the reaper",
+                       "lost, never repeated, when a send fails after the state is saved", "drains one megabyte per pass", "a corrupt cursor skips the lines written meanwhile"):
             self.assertIn(phrase, text)
 
 
