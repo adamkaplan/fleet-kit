@@ -10625,6 +10625,20 @@ class TestReminders(PR4Base):
         sent = [m for m in self.world.admissions("platform") if "reminder:" + old["id"] in m["keys"]]
         self.assertEqual(len(sent), 1)
 
+    def test_a_reminders_file_error_at_the_recheck_defers_with_one_text_free_audit_line(self):
+        old = self.keyed(delay=10)
+        self.world.tick(10)
+        (fact,) = [f for f in self.reminder_facts() if f.key == "reminder:" + old["id"]]
+        plan, discovery = self.planned([fact])
+        path = Path(self.world.state) / "reminders.json"
+        path.write_text(json.dumps({"reminders": [{"bogus": "PLANTED-SECRET-TEXT"}]}))
+        outcome = self.world.engine.deliver(plan)
+        self.assertEqual(outcome["action"], "deferred")
+        self.assertNotIn("PLANTED-SECRET-TEXT", json.dumps(outcome))
+        (line,) = self.audit_events("source.error")
+        self.assertNotIn("PLANTED-SECRET-TEXT", json.dumps(line))
+        self.assertIn("ReminderError", line["detail"]["error"])
+
     def test_a_sender_less_reminder_passes_the_recheck_and_is_delivered(self):
         item = self.remind(delay=10)
         self.world.tick(10)

@@ -3023,8 +3023,9 @@ class Switchboard:
                 try:
                     replaced = source.recheck_delivery(fact)
                 except ReminderError as err:   # as the other reads of the file: the pass step fails, the reminder stays queued, the next pass decides again
-                    self._note("source.error", "reminders", {"error": _one_line(str(err))})
-                    return {"sent": False, "action": "deferred", "reason": "the reminders file cannot be read: %s" % _one_line(str(err), 200)}
+                    why = "the reminders file could not be read (%s)" % type(err).__name__   # no reminder text: str(err) can carry the bad item
+                    self._note("source.error", "reminders", {"error": why})
+                    return {"sent": False, "action": "deferred", "reason": why}
                 if replaced is None:
                     kept_facts.append(fact)
                 elif self.audit is not None:
