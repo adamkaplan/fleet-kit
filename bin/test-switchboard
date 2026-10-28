@@ -419,6 +419,57 @@ class TestConfig(Base):
                     sb.load_config()
                 self.assertIn(needle, str(caught.exception))
 
+    def test_relay_holders_is_a_known_key_with_a_validated_shape(self):
+        """#1479. S1/S2/S6: a valid object (and {}) loads silently. S3/S4/S5: each bad shape is a ConfigError naming relay_holders. U1/U2: other loading unchanged."""
+        for good in ({"acme/app#12": "pod-a"}, {}):
+            with self.subTest(good=good):
+                sb._WARNED_CONFIG.clear()
+                err = io.StringIO()
+                self.write_config({"relay_holders": good})
+                with contextlib.redirect_stderr(err):
+                    config = sb.load_config()
+                self.assertNotIn("relay_holders", err.getvalue())
+                self.assertEqual(config["relay_holders"], good)
+        bad = [([1], None), ("x", None), (None, None), ({"acme/app": "pod-a"}, "'acme/app'"),
+               ({"a/b#1": ""}, "'a/b#1'"), ({"a/b#1": "  "}, "'a/b#1'"), ({"a/b#1": 7}, "'a/b#1'"), ({"a/b#1": None}, "'a/b#1'")]
+        for value, entry in bad:
+            with self.subTest(value=value):
+                self.write_config({"relay_holders": value})
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.load_config()
+                self.assertIn("'relay_holders'", str(caught.exception))
+                if entry:
+                    self.assertIn(entry, str(caught.exception))
+        sb._WARNED_CONFIG.clear()
+        err = io.StringIO()
+        self.write_config({"no_such_key": 1})
+        with contextlib.redirect_stderr(err):
+            self.assertNotIn("relay_holders", sb.load_config())
+        self.assertEqual(err.getvalue().count("does not read: no_such_key"), 1)
+
+    def test_a_bad_relay_holders_fails_the_cli_like_every_other_config_error(self):
+        """The CLI maps a ConfigError to exit 1 (EXIT_ERROR) for every key, so this one does the same."""
+        self.write_config({"relay_holders": ["acme/app#1"]})
+        with captured() as (out, err):
+            code = sb.main(["status"])
+        self.assertEqual(code, 1)
+        self.assertIn("relay_holders", out.getvalue() + err.getvalue())
+
+    def test_relay_holders_validation_mutant_is_caught(self):
+        """The mutant drops the validation call; the bad-shape cases of the test above must then fail."""
+        real = sb.validate_relay_holders
+        shape = type(self)("test_relay_holders_is_a_known_key_with_a_validated_shape")
+        before = unittest.TestResult()
+        shape.run(before)
+        self.assertEqual(len(before.failures) + len(before.errors), 0, "the real build passes")
+        sb.validate_relay_holders = lambda config, source: None
+        try:
+            after = unittest.TestResult()
+            type(self)("test_relay_holders_is_a_known_key_with_a_validated_shape").run(after)
+        finally:
+            sb.validate_relay_holders = real
+        self.assertGreaterEqual(len(after.failures), 3, "the mutant fails the bad-shape cases")
+
     def test_malformed_files_are_refused(self):
         for text, needle in (("{not json", "not valid JSON"), ("[1, 2]", "JSON object"), ('"x"', "JSON object")):
             with self.subTest(text=text):

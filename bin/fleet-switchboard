@@ -472,7 +472,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -725,6 +725,7 @@ def validate_config(raw, source="config"):
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
     validate_red_ci_required(config, source)  # #1141
     validate_default_branches(config, source)
+    validate_relay_holders(config, source)  # #1479
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
     validate_hold_labels_config(config, source)  # #376
@@ -836,6 +837,20 @@ def validate_default_branches(config, source):
         return
     if not isinstance(raw, dict) or len(raw) > 20 or not all(isinstance(r, str) and r and isinstance(b, str) and b for r, b in raw.items()):
         raise ConfigError("%s: 'default_branches' must be an object of at most 20 repository -> non-empty branch name" % source)
+
+
+def validate_relay_holders(config, source):
+    """`relay_holders`: read by the relay daemon, not here. Absent is fine; present it is an object of "<repo>#<issue>" -> a non-empty pod name ({} is valid)."""
+    if "relay_holders" not in config:
+        return
+    raw = config["relay_holders"]
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'relay_holders' must be an object of repo#issue -> pod name, got %r" % (source, type(raw).__name__))
+    for key, pod in raw.items():
+        if "#" not in key:
+            raise ConfigError("%s: 'relay_holders' key %r must look like repo#issue" % (source, key))
+        if not isinstance(pod, str) or not pod.strip():
+            raise ConfigError("%s: 'relay_holders' entry %r must be a non-empty pod name" % (source, key))
 
 
 def validate_plan_evaluators(config, source):
