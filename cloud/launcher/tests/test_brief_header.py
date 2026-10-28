@@ -125,13 +125,14 @@ class LaunchHarness(unittest.TestCase):
         sb, state = make_state(agents, retired)
         b = sb.load_module("cloud_worker")
         audit = []
+        discovery = (extra or {}).pop("discovery", None)
 
         class Eng:
             actor = "test"
             audit = types.SimpleNamespace(append=lambda actor, event, name, detail: audit.append((event, name, detail)))
 
             def discover(self, now):
-                return types.SimpleNamespace(agents={})
+                return discovery(now) if discovery else types.SimpleNamespace(agents={})
 
             def now(self):
                 return 0
@@ -629,6 +630,45 @@ class EmptyRegistry(LaunchHarness):
             return mutant
         code, _, _, _ = self.local_route("lane-nobody", check=skip_empty)
         self.assertEqual(code, 0, "mutation applied: the empty registry no longer refuses, so the refusal test above fails under it")
+
+
+class OneDiscovery(LaunchHarness):
+    """S16: the report-to check reuses the launch's first discovery; the launch makes two in all (before and after the pod is made)."""
+
+    def counted(self, boss, wrap=None):
+        from unittest import mock
+        found = types.SimpleNamespace(agents={"lane-a": object()})
+        recorder = mock.Mock(return_value=found)
+        if wrap:
+            b = load_sb().load_module("cloud_worker")
+            real = b.check_report_to
+            b.check_report_to = wrap(real, recorder)
+        try:
+            result, _, _ = self.run_launch(boss, agents=("lane-a",), extra={"discovery": recorder})
+        finally:
+            if wrap:
+                b.check_report_to = real
+        return result, recorder
+
+    def test_s16_the_check_adds_no_discovery_and_accepts_the_first_answer(self):
+        result, recorder = self.counted("lane-a")
+        self.assertEqual(result, "reached")
+        self.assertEqual(recorder.call_count, 1, "before the pod is made the launch discovers once")
+
+    def test_s16_the_launch_has_exactly_two_discovery_calls(self):
+        tail = read("bin/cloud_worker.py")
+        tail = tail[tail.index("def _launch("):]
+        tail = tail[:tail.index("def _registry_note")]
+        self.assertEqual(tail.count(".discover("), 2)
+
+    def test_s16_mutant_an_extra_discovery_in_the_check_is_caught(self):
+        def extra_call(real, recorder):
+            def mutant(engine, state, args, local_agents):
+                engine.discover(engine.now())   # the mutation: the extra discovery
+                return real(engine, state, args, local_agents)
+            return mutant
+        result, recorder = self.counted("lane-a", wrap=extra_call)
+        self.assertEqual(recorder.call_count, 2, "mutation applied: the extra call is counted, so the one-call test above fails under it")
 
 
 if __name__ == "__main__":

@@ -1381,14 +1381,15 @@ def _launch(args, runner, now, reserve):
         raise Refusal(str(err)) from None
     engine, state, _ = H["build_engine"](runner, now, "cli")
     reserve(state)
-    local = engine.discover(engine.now()).agents.get(name)
+    found = engine.discover(engine.now())   # the launch's first discovery: the report-to check reuses its answer
+    local = found.agents.get(name)
     if local is not None:   # `route` prefers a cloud record: every later send/read/retire for the local agent would go INTO the pod
         raise LaunchError("a local fleet agent named %s exists: a cloud worker cannot take its name (send, read and retire by name would reach "
                           "the pod instead of the local agent); retire it or pick another name; nothing was created" % name)
     if load_record(state, name) is not None:
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
     if args.reports_to:
-        check_report_to(engine, state, args, local_agents=engine.discover(engine.now()).agents)
+        check_report_to(engine, state, args, local_agents=found.agents)
     brief = H["read_brief"](args.brief_file, sys.stdin)
     for note in brief_warnings(args, repo, brief):   # before anything is created: one line each, then the launch goes on
         print("%s: %s" % (H["PROG"], note), file=sys.stderr)
