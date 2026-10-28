@@ -22,6 +22,19 @@ def iso(seconds):
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def via_route(argv, env):
+    """Run the mint with the named route (a pipe, --fd): the result's stdout is what came through the route (the token), and the real stdout must be empty."""
+    r, w = os.pipe()
+    try:
+        p = subprocess.run(argv + ["--fd", str(w)], env=env, capture_output=True, text=True, timeout=60, pass_fds=(w,))
+    finally:
+        os.close(w)
+    with os.fdopen(r) as f:
+        token = f.read()
+    assert p.stdout == "", "the mint wrote to standard output"
+    return subprocess.CompletedProcess(p.args, p.returncode, token, p.stderr)
+
+
 class Stub(http.server.BaseHTTPRequestHandler):
     answer = {}
     redirect_code = 307
@@ -166,7 +179,7 @@ class Mint(unittest.TestCase):
                  CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
         e.update(env)
         argv = [sys.executable, "-c", runner, MINT, repo] if runner else [sys.executable, MINT, repo]
-        return subprocess.run(argv, env=e, capture_output=True, text=True, timeout=60)
+        return via_route(argv, e)
 
     def test_prints_only_the_token_and_signs_a_valid_short_jwt(self):
         p = self.run_mint()
@@ -455,7 +468,7 @@ class Mint(unittest.TestCase):
         self.assertFalse(os.path.exists(marker))
         env = {k: v for k, v in os.environ.items() if k != "CW_APP_INSTALLATION_CMD"}
         env.update(CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
-        p = subprocess.run([sys.executable, MINT, REAL], env=env, capture_output=True, text=True, timeout=60)
+        p = via_route([sys.executable, MINT, REAL], env)
         self.assertEqual((p.returncode, p.stdout), (0, TOKEN), p.stderr)
 
     def test_s5_the_stored_id_is_ignored_even_when_not_a_number(self):
@@ -552,7 +565,7 @@ class Mint(unittest.TestCase):
             f.write(src_text)
         e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap, RAISE_CLASS="RecursionError")
         argv = [sys.executable, "-c", runner, path, repo] if runner else [sys.executable, path, repo]
-        return subprocess.run(argv, env=e, capture_output=True, text=True, timeout=60)
+        return via_route(argv, e)
 
     def mint_refused_variant(self, text, answer):
         """True when the build refuses a mint answer (a second repository, or an owner id that differs) with no token on stdout."""

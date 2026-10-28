@@ -1255,10 +1255,16 @@ def stack_model_secret(env=None):
 
 
 def git_token(repo, cluster):
-    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does."""
+    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD (prints it on stdout), else the mint (cloud/launcher/app_token.py REPO --fd N through a pipe), as the driver does."""
     raw = os.environ.get("CW_GIT_TOKEN_CMD")
-    argv = shlex.split(raw) if raw else [sys.executable, str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "app_token.py"), repo]
     env = {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}
+    if not raw:   # the default mint hands the token over a pipe it names (--fd), never on stdout: the launcher's one helper does it
+        lib = _lib()
+        try:
+            return lib.run_git_token_cmd(lib.git_token_cmd(repo, env), repo, env)
+        except lib.CloudError as err:
+            raise Refusal("%s; nothing was created" % _one(cluster.clean(str(err), 200), 200)) from None
+    argv = shlex.split(raw)
     ran = _capture(argv, env=dict(env, GH_REPO=repo))
     token = (ran[1] if ran and ran[0] == 0 else "").strip()
     if not token or len(token) > 4096:

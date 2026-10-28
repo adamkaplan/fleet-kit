@@ -464,17 +464,46 @@ def git_token_cmd(repo, env):
     return shlex.split(raw) if raw else [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py"), repo]
 
 
-def run_git_token_cmd(cmd, repo, env, register=None):
-    """THE mint call (the launch and the renewal both come here): run cmd for repo in env, return the token it printed. Never prints, never puts
-    the token in an argument or a file. register(text) hears the child's stdout before it is judged, so a caller's scrubber knows it.
-    Raises CloudError(EXIT_USAGE) with no value in the text."""
+def read_pipe_end(fd, limit=8192):
+    """Everything in the read end of a pipe (at most limit bytes), then close it. The writer has exited, so this does not wait."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
+        data = b""
+        while len(data) < limit:
+            chunk = os.read(fd, limit - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data.decode("utf-8", "replace")
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+
+
+def mint_is_default(cmd, env):
+    """True for the repository's own mint (no CW_GIT_TOKEN_CMD): it delivers the token through a descriptor, never on stdout. An override command prints on stdout."""
+    return not env.get("CW_GIT_TOKEN_CMD") and len(cmd) >= 2 and cmd[1] == os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py")
+
+
+def run_git_token_cmd(cmd, repo, env, register=None):
+    """THE mint call (the launch and the renewal both come here): run cmd for repo in env, return the token it gave. The default mint hands it over a
+    pipe (--fd); an operator's CW_GIT_TOKEN_CMD prints it on stdout. Never prints, never puts the token in an argument or a file. register(text) hears
+    the token before it is judged, so a caller's scrubber knows it. Raises CloudError(EXIT_USAGE) with no value in the text."""
+    ends = os.pipe() if mint_is_default(cmd, env) else None
+    try:
+        p = subprocess.run(cmd + ["--fd", str(ends[1])] if ends else cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS,
+                           stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo), pass_fds=(ends[1],) if ends else ())
     except (OSError, subprocess.TimeoutExpired, ValueError):
         p = None
+    finally:
+        if ends:
+            os.close(ends[1])
+    given = read_pipe_end(ends[0]) if ends else (p.stdout if p else "")
     if p and register:
         register(p.stdout.strip())
-    token = (p.stdout if p and p.returncode == 0 else "").strip()
+        if ends:
+            register(given.strip())
+    token = (given if p and p.returncode == 0 else "").strip()
     if not token or len(token) > GIT_TOKEN_MAX_CHARS:
         why = ""
         if p and p.stderr.strip():

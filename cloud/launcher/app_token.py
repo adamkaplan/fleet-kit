@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""app-token: print a one-hour GitHub App installation token for ONE repository, to stdout, and nothing else.
+"""app-token: mint a one-hour GitHub App installation token for ONE repository and write it to the route the caller names, and nowhere else.
 
-usage: app_token.py OWNER/REPO
+usage: app_token.py OWNER/REPO --fd N       (programs: a pipe descriptor the caller opened and passed down; N is 3 or more, open, writable, not a terminal)
+       app_token.py OWNER/REPO --out PATH   (a person: a new file, mode 0600, in a private directory you own; refused when PATH exists)
+       app_token.py OWNER/REPO              (no route: the token is minted, never shown, revoked, and only its byte count is said on stderr)
+
+The token is never written to standard output or standard error. Why: standard output is the channel that terminals, tool transcripts
+and logs capture by default, so a slip in a redirect or a debugging run showed a one-hour token (twice). Errors go to stderr, never a value.
 
 The App id and private key are read from the vault by commands (stdout of each, in memory only):
   CW_APP_ID_CMD, CW_APP_KEY_CMD
@@ -12,10 +17,10 @@ The installation is NOT read from the vault: GET /repos/OWNER/REPO/installation 
 covers the repository, and its account must be the repository owner. CW_APP_INSTALLATION_CMD and a stored installation id are obsolete:
 accepted, never run, ignored.
 The key goes to `openssl dgst -sha256 -sign /dev/fd/N` through a pipe: never a file, an argument or the environment.
-The 9-minute app JWT and the token are never printed except the token, once, on stdout. Errors go to stderr, never a value.
+The 9-minute app JWT and the token are never printed. A token that could not be delivered to its route is revoked.
 Only https://api.github.com is used; CW_GITHUB_API_BASE may name a loopback http URL (tests).
 The request asks for, and the answer must carry EXACTLY, the permissions of EXPECTED_PERMISSIONS below (no extra key, no
-higher level, none missing), else no token is printed. A missing key is the App not yet granted (or the installation not yet
+higher level, none missing), else no token is delivered. A missing key is the App not yet granted (or the installation not yet
 accepting) a permission: the refusal names it and the owner step.
 CW_OPENSSL names the openssl binary (default openssl).
 """
@@ -288,11 +293,100 @@ def mint(target):
     return token
 
 
+USAGE = "usage: app_token.py OWNER/REPO [--fd N | --out PATH]"
+
+
+def parse_route(rest):
+    """(kind, value) with kind in None, 'fd', 'out'; any other shape is exit 2 and nothing is minted."""
+    if not rest:
+        return None, None
+    if len(rest) != 2 or rest[0] not in ("--fd", "--out"):
+        die(USAGE, 2)
+    if rest[0] == "--fd":
+        if not (rest[1].isascii() and rest[1].isdigit() and len(rest[1]) <= 6):
+            die(USAGE, 2)
+        return "fd", int(rest[1])
+    return "out", rest[1]
+
+
+def check_fd(fd):
+    """Refuse (exit 2) before minting unless fd is 3 or more, open, writable and not a terminal."""
+    import fcntl
+    if fd < 3:
+        die("the route --fd must be 3 or more (0, 1 and 2 are the terminal's)", 2)
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        tty = os.isatty(fd)
+    except OSError:
+        die("the route --fd %d is not an open descriptor" % fd, 2)
+    if flags & os.O_ACCMODE == os.O_RDONLY:
+        die("the route --fd %d is not writable" % fd, 2)
+    if tty:
+        die("the route --fd %d is a terminal" % fd, 2)
+
+
+def check_out(path):
+    """Refuse (exit 2) before minting unless path is new, in a private directory this user owns (no group or world access, not a link)."""
+    import stat
+    if not path or "\0" in path:
+        die("the route --out needs a path", 2)
+    d = os.path.dirname(os.path.abspath(path))
+    try:
+        st = os.lstat(d)
+    except OSError:
+        die("the directory of --out does not exist", 2)
+    if not stat.S_ISDIR(st.st_mode):
+        die("the directory of --out is a link or not a directory", 2)
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        die("the directory of --out must be owned by you with no group or world access (mode 0700)", 2)
+    if os.path.lexists(path):
+        die("refusing: --out path exists; the mint never overwrites", 1)
+
+
+def write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def deliver(kind, value, token):
+    """Write exactly the token to the route. Raises OSError when it cannot."""
+    data = token.encode()
+    if kind == "fd":
+        write_all(value, data)
+        return
+    fd = os.open(value, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        write_all(fd, data)
+    except OSError:
+        os.close(fd)
+        try:
+            os.unlink(value)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+
+
 def main(argv):
-    if len(argv) != 1 or not valid_target(argv[0]):
-        die("usage: app_token.py OWNER/REPO", 2)
-    sys.stdout.write(mint(argv[0]))
-    sys.stdout.flush()
+    if len(argv) < 1 or not valid_target(argv[0]):
+        die(USAGE, 2)
+    target = argv[0]
+    kind, value = parse_route(argv[1:])
+    if kind == "fd":
+        check_fd(value)
+    elif kind == "out":
+        check_out(value)
+    token = mint(target)
+    if kind is None:
+        revoke(token)  # nobody received it
+        print("app-token: minted a token of %d bytes and did not deliver it: name a route with --fd N or --out PATH" % len(token), file=sys.stderr)
+        return
+    MINTED.append(token)  # until delivered, a refusal revokes it
+    try:
+        deliver(kind, value, token)
+    except OSError:
+        die("the token could not be delivered to the route")
+    MINTED.clear()
 
 
 if __name__ == "__main__":
