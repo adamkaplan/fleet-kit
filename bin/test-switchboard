@@ -87084,6 +87084,97 @@ class TestClosedUnmergedAskClose(unittest.TestCase):
         self.assertIn("not an ask issue", self.run_cmd("cmd_gates_ask_close", subject=self.PR)[1] or "")
 
 
+class TestAskWaive(unittest.TestCase):
+    """#1347 S14, S15: `waive` for an ASK issue through the real `cmd_waive`; the waiver is bound to the plan hash and clears the refusal of `gates ask-close`."""
+
+    T = TestClosedUnmergedAskClose
+    REPO, ASK, PR = T.REPO, T.ASK, T.PR
+    api, plan, now, entries, run_cmd, prove, judge, record_all = (TestAskIssueSubject.api, TestAskIssueSubject.plan, TestAskIssueSubject.now, TestAskIssueSubject.entries,
+                                                                  TestAskIssueSubject.run_cmd, TestAskIssueSubject.prove, TestAskIssueSubject.judge, TestAskIssueSubject.record_all)
+    SCEN, HEAD = TestAskIssueSubject.SCEN, TestAskIssueSubject.HEAD
+    ask_close = T.ask_close
+    failed_read = T.failed_read
+    REASON = "the pull requests of the ask cannot be read: reviewed by hand"
+
+    def setUp(self):
+        TestAskIssueSubject.setUp(self)
+        self.found, self.too_many, self.broken, self.seen_pages = [], False, None, []
+        self.kind = ("agent", "cos", "chief-of-staff")
+
+    def waive(self, subject=None, gates="CU", reason=None):
+        test = self
+        class Reader:
+            def __init__(self, *a, **k):
+                pass
+            def _api(self, path, repo=None):
+                if test.broken:
+                    raise RuntimeError("the search failed")
+                return {"total_count": 0, "items": []}
+        real = sb._ledger_context
+        def ctx(*a, **k):
+            got = real(*a, **k)
+            got.config = dict(got.config, gh="gh", call_timeout_seconds=5)
+            return got
+        with mock.patch.object(sb, "gates_caller_kind", lambda *a: self.kind), mock.patch.object(sb, "IntentReader", Reader), mock.patch.object(sb, "GhAccounts", lambda *a, **k: None), \
+                mock.patch.object(sb, "_ledger_context", ctx):
+            return self.run_cmd("cmd_waive", subject=subject, gates=gates, reason=self.REASON if reason is None else reason)
+
+    def waivers(self):
+        return [e for e in self.entries() if e["kind"] == "waiver"]
+
+    def refused_ask(self):
+        self.record_all()
+        self.failed_read("list error")
+        self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR)
+
+    def happy(self):
+        self.refused_ask()
+        code, why, out, err = self.waive()
+        self.assertEqual(code, sb.EXIT_OK, (why, err))
+        (row,) = self.waivers()
+        self.assertEqual((row["pr"], row["head"], row["gates"], row["by"]), (self.ASK, sb.plan_ledger.ask_head(self.hash), ["CU"], "cos"))
+        self.assertEqual(self.ask_close()[0], sb.EXIT_OK)
+        self.hash = "sha256:" + "2" * 64      # the plan is revised: the waiver is void
+        self.record_all()                     # every scenario is proven and judged again at the new hash, so only the failed read can refuse
+        self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR)
+
+    def test_s14_the_chief_of_staff_waives_the_ask_and_a_revised_plan_voids_it(self):
+        self.happy()      # the issue author (a shared login) is not the chief of staff's fleet name: not a writer by accident
+
+    def test_s14_a_writer_of_the_ask_and_a_plain_agent_cannot_waive(self):
+        self.refused_ask()
+        self.kind = ("agent", "coder1", "chief-of-staff")      # coder1 recorded the proofs of the ask
+        self.assertIn("a writer cannot waive", self.waive()[1] or "")
+        self.kind = ("agent", "coder2", "coder")
+        self.assertIn("may not waive", self.waive()[1])
+        self.assertEqual(self.waivers(), [])
+        self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR)
+
+    def test_s15_gate_other_than_cu_short_reason_and_work_item_are_refused(self):
+        self.refused_ask()
+        self.assertIn("only CU", self.waive(gates="G1")[1])
+        self.assertIn("at least", self.waive(reason="short")[1])
+        with mock.patch.object(sb, "item_entry_refusal", lambda *a, **k: "%s is a work item" % self.ASK):
+            self.assertIn("work item", self.waive()[1])
+        self.assertEqual(self.waivers(), [])
+
+    def test_s15_an_ask_that_is_not_refused_records_nothing_new(self):
+        self.record_all()
+        code, why, out, err = self.waive()
+        self.assertEqual(code, sb.EXIT_OK)
+        self.assertIn("nothing recorded", out)
+        self.assertEqual(self.waivers(), [])
+
+    def test_the_mutants_are_caught(self):
+        for patch, case in ((mock.patch.object(sb, "ask_subject", lambda *a, **k: None), "happy"),                       # any issue number refused: no waiver recorded
+                            (mock.patch.object(sb.plan_ledger, "authors_of", lambda *a, **k: set()), "test_s14_a_writer_of_the_ask_and_a_plain_agent_cannot_waive"),   # no writer check
+                            (mock.patch.object(sb.plan_ledger, "ask_head", lambda h: "e" * 40), "happy")):               # head not the plan hash: a revised plan keeps the waiver
+            self.setUp()
+            with patch:
+                with self.assertRaises(AssertionError, msg=case):
+                    getattr(self, case)()
+
+
 class TestClosedUnmergedDocs(unittest.TestCase):
     """#1347 S9: the documentation says plainly that a closed-unmerged last pull request is a defect and what clears it."""
 

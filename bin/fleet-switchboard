@@ -77,7 +77,7 @@ import html
 import unicodedata
 import http.client
 import urllib.parse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from datetime import datetime, timezone
 import collections
 import ast
@@ -96,7 +96,7 @@ import json
 import math
 import os
 from pathlib import Path
-import inspect
+import inspect, io
 import re
 import secrets
 import select
@@ -16590,11 +16590,24 @@ def cmd_waive(args, runner, now):
         _gates_audit(engine, "gate.waiver.refused", pr, {"by": who, "why": "the ledger is not trustworthy"})
         raise LedgerCommandError("refused: the ledger is not trustworthy, nothing was recorded: %s" % problem)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
-    why = item_entry_refusal(engine, repo, number, entries, unreadable)   # #770: a work item's gates are not waived through the pull request command
+    why = item_entry_refusal(engine, repo, number, entries, unreadable, True)   # #770: a work item's gates are not waived through the pull request command
+    ask = ask_subject(engine, repo, number, entries, unreadable, None, runner, now, True) if unreadable and not why else None   # #1347: an ASK issue: the plan hash is its head
+    if unreadable and not why and ask is None:
+        why = item_entry_refusal(engine, repo, number, entries, unreadable)
     if why:
         _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "waive"})
         raise LedgerCommandError("refused: %s" % why)
-    ctx = types.SimpleNamespace(facts=dict(facts or {}, body=body, notice_senders=senders), unreadable=unreadable)
+    if ask is not None:
+        if gates != ["CU"]:
+            raise LedgerCommandError("refused: only CU can be waived for an ask issue (%s), nothing was recorded" % pr)
+        facts, senders = ask["facts"], ()
+        probe = types.SimpleNamespace(pr=args.pr, plan=None, ask=None)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            closable = cmd_gates_ask_close(probe, runner, now) == EXIT_OK   # the ONE closing rule: an ask it passes needs no waiver
+        if closable:
+            print("nothing recorded: `gates ask-close` does not refuse %s, so there is nothing to waive" % pr)
+            return EXIT_OK
+    ctx = types.SimpleNamespace(facts=dict(facts or {}, body=body, notice_senders=senders), unreadable=None if ask else unreadable)
     head = _head_of(ctx, args)
     writers = plan_ledger.authors_of(entries, pr, senders, (facts or {}).get("author"))
     if who in writers:
@@ -16806,7 +16819,7 @@ def cmd_gates_ask_close(args, runner, now):
         return EXIT_ERROR
     if found:
         print("note: closed pull requests of %s not judged: %s" % (ctx.pr, found[1]), file=sys.stderr)
-        print("refused: %s stays open: %s failed (%s); the chief of staff can log a waiver: `waive <pr> --gates CU`" % (ctx.pr, found[0], PEERS_TOO_MANY if found[0] == "too many pull requests" else found[1]), file=sys.stderr)
+        print("refused: %s stays open: %s failed (%s); the chief of staff can log a waiver: `waive %s --gates CU --reason \"...\"`" % (ctx.pr, found[0], PEERS_TOO_MANY if found[0] == "too many pull requests" else found[1], ctx.pr), file=sys.stderr)
         return EXIT_ERROR
     authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
     rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"]]
