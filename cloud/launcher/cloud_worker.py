@@ -1518,6 +1518,7 @@ def ann(pod, key, default=None):
 
 
 SAFE_VALUE = re.compile(r"[A-Za-z0-9._-]{1,63}", re.ASCII)
+POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid: the create records it, the retire hands it back (bin/cloud_worker.py holds the equal text)
 
 
 def safe_value(value):
@@ -1823,6 +1824,7 @@ class Launcher:
             domain = self.env.get("CW_CLOUD_DOMAIN", "example.internal")
             pod_uid = self._read_pod_uid(worker, name, info)
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain), "pod_uid": pod_uid,
+                    **({"identity_note": info["identity_note"]} if "identity_note" in info else {}),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
                     "password_fd": a.password_fd}
@@ -1837,12 +1839,13 @@ class Launcher:
 
     def _read_pod_uid(self, worker, name, info):
         """The pod's own uid, read once at create: a later retire acts only on a pod with this uid.
-        One check covers every way it is missing (the read raises, or gives nothing, no uid, an empty or non-text uid)."""
+        ONE check covers every way it is missing: the read raises any error, or answers anything but a pod with a uid in the form a retire accepts
+        (nothing, text, a list, metadata that is no dict, no uid, an empty, non-text, spaced, control-character or over-long uid)."""
         try:
-            uid = ((self.kube.get_pod(name) or {}).get("metadata") or {}).get("uid")
-        except CloudError:
+            uid = self.kube.get_pod(name)["metadata"]["uid"]
+        except Exception:   # the pod exists: no failure of this read may escape the create
             uid = None
-        if not (isinstance(uid, str) and uid):
+        if not (isinstance(uid, str) and POD_UID_RE.fullmatch(uid)):
             self._note_unread_identity(worker, info)
             return ""
         return uid
@@ -3011,7 +3014,7 @@ def _run_id(v):
 
 
 def _pod_uid(v):
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", v):
+    if not POD_UID_RE.fullmatch(v):
         raise argparse.ArgumentTypeError("--pod-uid is 1 to 64 letters, digits, dots, dashes or underscores")
     return v
 

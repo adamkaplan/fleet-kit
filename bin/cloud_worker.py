@@ -1399,6 +1399,7 @@ def _launch(args, runner, now, reserve):
             raise LaunchError("the worker was created but its record could not be stored (%s); stop was requested" % _one(cluster.clean(str(err), 100), 100)) from None
         _audit(engine, "cloud.created", name, {"runtime_id": record["runtime_id"], "host": urllib.parse.urlsplit(record["url"]).hostname,
                                                "idle_deadline": record.get("idle_deadline"), "hard_deadline": record.get("hard_deadline")})
+        _show_identity_note(body, cluster)
         try:   # a local agent may have taken the name while the pod was being made; discovery that cannot answer counts as a failure (cannot tell)
             taken = engine.discover(engine.now()).agents.get(name) is not None
             problem = "a local fleet agent named %s appeared while the pod was being made" % name if taken else None
@@ -1451,6 +1452,16 @@ def _registry_note(engine, what, state, name, *args):
         _audit(engine, "cloud.registry_error", name, {"why": _one(str(err), 120)})
 
 
+POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid (the launcher's cloud_worker.py holds the equal text: a test compares them)
+
+
+def _show_identity_note(body, cluster):
+    """The launcher's one-line note that a pod's uid could not be read (the record holds none): shown once on stderr, never on stdout."""
+    note = body.get("identity_note")
+    if isinstance(note, str) and note:
+        print("%s: WARNING: %s" % (H["PROG"], _one(cluster.clean(note, 300), 300)), file=sys.stderr)
+
+
 def _record_from_create(name, body):
     if body is None:
         raise CloudError("the launcher printed no record")
@@ -1462,7 +1473,7 @@ def _record_from_create(name, body):
     problem = endpoint_problem(record["url"])
     if problem:
         raise CloudError("the launcher named an endpoint that is refused: %s" % problem)
-    if isinstance(body.get("pod_uid"), str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", body["pod_uid"]):
+    if isinstance(body.get("pod_uid"), str) and POD_UID_RE.fullmatch(body["pod_uid"]):
         record["pod_uid"] = body["pod_uid"]   # the pod's identity at create time: a retire acts only on the pod that has it
     return record
 

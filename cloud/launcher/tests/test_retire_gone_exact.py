@@ -27,6 +27,12 @@ OTHER = {"other-agent": "f" * 64}
 SWITCHBOARD_NAME_RE = r"^[a-z][a-z0-9_-]{0,31}$"   # the switchboard's agent name rule (a test below reads it from the switchboard)
 
 
+def raising(error):
+    def answer(pod):
+        raise error
+    return answer
+
+
 def read(rel):
     with open(os.path.join(ROOT, rel), encoding="utf-8") as handle:
         return handle.read()
@@ -301,6 +307,19 @@ class UnreadIdentity(tcw.Base):
     """S9: a create whose read of the new pod fails says so once on stderr and in the audit."""
     MARK = "pod identity"
 
+    # every way the uid is missing or not the form a retire accepts: the nine kinds of the one check (each row a case)
+    MISSING = {"the read raises a cloud error": None, "the read raises another error": raising(RuntimeError("boom")),
+               "the read returns nothing": lambda pod: None,
+               "the read returns text": lambda pod: "pod",
+               "the read returns a list": lambda pod: [pod],
+               "the metadata is not a dict": lambda pod: {"metadata": "x"},
+               "the pod has no uid": lambda pod: {"metadata": {}},
+               "the uid is empty": lambda pod: {"metadata": {"uid": ""}},
+               "the uid is not text": lambda pod: {"metadata": {"uid": 7}},
+               "the uid has white space": lambda pod: {"metadata": {"uid": "uid 1"}},
+               "the uid has a control character": lambda pod: {"metadata": {"uid": "uid\x01"}},
+               "the uid is over 64 characters": lambda pod: {"metadata": {"uid": "a" * 65}}}
+
     def create_with_failed_read(self, patches=(), answer=None, worker="coder7"):
         """answer: None raises at the read; else a function (real pod) -> what the read returns."""
         real_wait, real_get, state = cw.Launcher._wait_ready, cw.Kube.get_pod, {"ready": False}
@@ -337,10 +356,7 @@ class UnreadIdentity(tcw.Base):
         self.assertEqual(json.loads(out)["pod_uid"], "")
 
     def test_s9_every_way_the_uid_is_missing_gives_the_same_one_line_and_one_audit_line(self):
-        cases = {"the read raises": None, "the read returns nothing": lambda pod: None,
-                 "the pod has no uid": lambda pod: {"metadata": {}},
-                 "the uid is empty": lambda pod: {"metadata": {"uid": ""}},
-                 "the uid is not text": lambda pod: {"metadata": {"uid": 7}}}
+        cases = self.MISSING
         template = "cloud-worker: WARNING: the pod identity of %s could not be read; the worker record holds none and a retire acts by name"
         for n, (label, answer) in enumerate(cases.items()):
             with self.subTest(label):
@@ -371,10 +387,35 @@ class UnreadIdentity(tcw.Base):
         self.assertTrue(applied, "the mutation was not applied")
         self.assertEqual(len(self.lines(err)), 1, "the mutant still notes the raising case")
         applied.clear()
-        code, out, err = self.create_with_failed_read([mutant], answer=lambda pod: None, worker="coder8")
+        silent_on = []
+        for n, (label, answer) in enumerate(self.MISSING.items()):
+            if answer is None:
+                continue   # the one case the mutant handles
+            try:
+                code, out, err = self.create_with_failed_read([mutant], answer=answer, worker="coder%d" % (n + 20))
+            except Exception:   # the mutant lets the read's error escape: no note either
+                err = ""
+            silent_on.append((label, len(self.lines(err))))
         self.assertTrue(applied, "the mutation was not applied")
-        print("mutant: %d stderr lines for a read that returns nothing (the check wants 1)" % len(self.lines(err)))
-        self.assertEqual(self.lines(err), [], "the mutant is silent on a read that returns nothing")
+        print("mutant: stderr lines for the other %d cases (the check wants 1 each): %s" % (len(silent_on), [c for _, c in silent_on]))
+        self.assertEqual([c for _, c in silent_on], [0] * (len(self.MISSING) - 1), "the mutant is silent on every other way the uid is missing")
+
+    def test_s9_a_uid_in_the_accepted_form_is_recorded_without_a_note(self):
+        for uid in ("a" * 64, "uid-1.2_3", "7"):
+            with self.subTest(uid):
+                code, out, err = self.create_with_failed_read(answer=lambda pod, uid=uid: {"metadata": {"uid": uid}}, worker="coder%d" % len(uid))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.lines(err), [])
+                self.assertEqual(json.loads(out)["pod_uid"], uid)
+                self.assertNotIn("identity_note", json.loads(out))
+
+    def test_s9_the_note_is_in_the_create_answer_for_the_switchboard_to_show(self):
+        code, out, err = self.create_with_failed_read()
+        self.assertEqual(json.loads(out)["identity_note"], "the pod identity of coder7 could not be read; the worker record holds none and a retire acts by name")
+
+    def test_s9_the_launcher_and_the_switchboard_accept_one_uid_form(self):
+        self.assertEqual(cw.POD_UID_RE.pattern, sbcw.POD_UID_RE.pattern)
+        self.assertEqual(cw.POD_UID_RE.flags, sbcw.POD_UID_RE.flags)
 
     def test_s9_a_mutant_that_records_the_empty_identity_silently_fails_the_test(self):
         applied = []
@@ -419,7 +460,12 @@ class Documents(unittest.TestCase):
             print("%d of 5 statements in %s" % (len(found), rel))
             self.assertEqual(found, list(self.SAYS), rel)
 
-    UNREAD = "a create whose read of the new pod fails cannot record the pod's uid: it says so in one stderr line and in its audit line"
+    UNREAD = "a create whose read of the new pod fails or gives no usable uid cannot record the pod's uid: it says so in one stderr line and in its audit line"
+    SHOWN = "a successful `launch --cloud` shows that line once on its own stderr"
+
+    def test_s9_both_documents_say_launch_shows_the_note(self):
+        for rel, title in (("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)"), ("docs/cloud-worker-interface.md", "## Retire of a gone worker (ask #1327)")):
+            self.assertIn(self.SHOWN, self.section(rel, title).lower(), rel)
 
     def test_s9_both_documents_say_a_create_that_cannot_read_the_uid_says_so(self):
         for rel, title in (("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)"), ("docs/cloud-worker-interface.md", "## Retire of a gone worker (ask #1327)")):
