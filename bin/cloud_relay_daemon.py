@@ -604,3 +604,41 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ):
     except Exception as err:
         engine._note("relay.pass_failed", None, {"error": " ".join(str(err).split())[:160]})
         return 0
+
+
+CADENCE = 5.0   # seconds between relay checks, on the relay's own loop (not tied to the engine pass)
+
+
+class RelayLoop:
+    """Pulls and answers relay requests on their own short cadence, in one daemon thread, so a long engine pass
+    cannot make the hub's wait run out. One thread means one in-flight pass; each pass keeps its own total
+    deadline and PASS_BUDGET (pass_once). The ledger flock is taken by the Executor as before."""
+
+    def __init__(self, engine, host, runner, now, environ=os.environ, cadence=CADENCE, sleep=None):
+        self.args = (engine, host, runner, now, environ)
+        self.cadence = cadence
+        self.stop_flag = threading.Event()
+        self.sleep = sleep or self.stop_flag.wait
+        self.thread = None
+
+    def run(self):
+        while not self.stop_flag.is_set():
+            pass_if_configured(*self.args)   # never raises
+            if self.stop_flag.is_set():
+                break
+            self.sleep(self.cadence)
+
+    def stop(self, join=2.0):
+        self.stop_flag.set()
+        if self.thread is not None:
+            self.thread.join(join)
+
+
+def start_loop(engine, host, runner, now, environ=os.environ, **kw):
+    """Start the relay loop; None (nothing runs) unless FLEET_RELAY_HUB_URL and FLEET_RELAY_HUB_TOKEN_FILE are set."""
+    if not environ.get("FLEET_RELAY_HUB_URL") or not environ.get("FLEET_RELAY_HUB_TOKEN_FILE"):
+        return None
+    loop = RelayLoop(engine, host, runner, now, environ, **kw)
+    loop.thread = threading.Thread(target=loop.run, name="relay-loop", daemon=True)
+    loop.thread.start()
+    return loop

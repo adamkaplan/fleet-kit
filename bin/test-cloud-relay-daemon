@@ -1446,6 +1446,49 @@ class OneWallClock(unittest.TestCase):
         self.assertIsNone(err)   # the mutant parses the cut body as complete
 
 
+class RelayLoopCadence(unittest.TestCase):
+    """#1477: the relay is pulled on its own loop, not after the engine pass.
+    Mutants: pull inline after the pass (S1/S2 fail: no call while the pass runs); a loop started with no hub (U3 fails);
+    a thread per tick (single-worker test fails); cadence over 30 s (cadence test fails)."""
+    ENV = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"}
+
+    def setUp(self):
+        self.orig = relay.pass_if_configured
+
+    def tearDown(self):
+        relay.pass_if_configured = self.orig
+
+    def test_nothing_starts_without_a_hub(self):
+        before = threading.active_count()
+        self.assertIsNone(relay.start_loop(None, None, None, None, environ={}))
+        self.assertEqual(threading.active_count(), before)
+
+    def test_cadence_is_well_under_the_hub_wait(self):
+        self.assertLessEqual(relay.CADENCE, 5.0)
+        self.assertLess(relay.CADENCE, 30.0)
+
+    def test_requests_are_pulled_repeatedly_while_a_long_pass_runs_and_by_one_worker(self):
+        calls, threads = [], set()
+        relay.pass_if_configured = lambda *a: (calls.append(time.monotonic()), threads.add(threading.get_ident()))
+        loop = relay.start_loop(None, None, None, None, environ=self.ENV, cadence=0.02)
+        long_pass_end = time.monotonic() + 0.3   # stands for the engine pass, which does not touch this loop
+        time.sleep(0.3)
+        loop.stop()
+        self.assertGreaterEqual(len([c for c in calls if c < long_pass_end]), 5)
+        self.assertEqual(len(threads), 1)
+        self.assertFalse(loop.thread.is_alive())
+
+    def test_a_stuck_pull_blocks_only_its_own_thread(self):
+        gate = threading.Event()
+        relay.pass_if_configured = lambda *a: gate.wait(5)
+        loop = relay.start_loop(None, None, None, None, environ=self.ENV, cadence=0.02)
+        started = time.monotonic()
+        loop.stop(join=0.1)   # the caller is not held by the stuck thread
+        self.assertLess(time.monotonic() - started, 1.0)
+        gate.set()
+        loop.thread.join(2)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False).result
     print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")

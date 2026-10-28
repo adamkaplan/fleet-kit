@@ -2905,6 +2905,37 @@ class TestDaemon(Base):
 # -------------------------------------------------- the poke socket, ensure, the plugin
 
 
+class TestDaemonRelayLoop(Base):
+    """#1477: the relay is not pulled inline after run_pass; it has its own loop, so a stuck relay does not stall passes."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+
+    def test_a_blocked_relay_does_not_stop_the_engine_passes(self):
+        import os as _os
+        relay = sb.load_module("cloud_relay_daemon")
+        gate, orig = threading.Event(), relay.pass_if_configured
+        relay.pass_if_configured = lambda *a, **k: gate.wait(30)
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"}
+        saved = {k: _os.environ.get(k) for k in env}
+        _os.environ.update(env)
+        try:
+            started = time.time()
+            self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3), 3)
+            self.assertLess(time.time() - started, 5)
+        finally:
+            gate.set()
+            relay.pass_if_configured = orig
+            for k, v in saved.items():
+                _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
+
+    def test_no_relay_thread_without_a_hub(self):
+        before = [t.name for t in threading.enumerate()]
+        sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=1)
+        self.assertEqual([t.name for t in threading.enumerate()], before)
+
+
 class TestDaemonWaits(Base):
     def setUp(self):
         super().setUp()
