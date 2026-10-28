@@ -401,7 +401,7 @@ DEFAULTS = {
     "gh": "gh",
     "github_lookback_hours": 24,
     "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
-                      "check_suite", "workflow_run"],
+                      "check_suite", "workflow_run", "push"],   # #1407: `push` tells a lane its cloud worker's branch moved (a config with its own list must add it)
     "github_port": None,
     "github_ignore_authors": [],  # logins whose events are never delivered: the agents' own account, when it is not yours
     "owner_logins": [],  # GitHub logins of the person: an Intent edit by one of them always reaches the Chief of Staff

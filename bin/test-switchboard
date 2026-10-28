@@ -315,7 +315,7 @@ class TestConfig(Base):
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "owner_logins": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
-                              "check_suite", "workflow_run"],
+                              "check_suite", "workflow_run", "push"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
             "awaiting_cos_label": None, "decisions_cos_grace_seconds": 300, "cos_orders_file": None,  # PR 18
             "pr_notice_hold_minutes": 0,  # PR notices
@@ -7712,13 +7712,13 @@ class TestGithubConfig(Base):
         self.assertEqual((config["github_repos"], config["gh"], config["github_lookback_hours"],
                           config["github_port"]), ([], "gh", 24, None))
         self.assertEqual(config["github_events"], ["issues", "issue_comment", "sub_issues", "pull_request",
-                                                   "pull_request_review", "check_suite", "workflow_run"])
+                                                   "pull_request_review", "check_suite", "workflow_run", "push"])
 
     def test_a_config_gets_its_own_lists(self):
         first = self.cfg()
         first["github_repos"].append("a/b")
         first["github_events"].append("push")
-        self.assertEqual((self.cfg()["github_repos"], len(self.cfg()["github_events"])), ([], 7))
+        self.assertEqual((self.cfg()["github_repos"], len(self.cfg()["github_events"])), ([], 8))
         self.assertEqual(sb.DEFAULTS["github_repos"], [])
 
     def test_good_values(self):
@@ -8124,7 +8124,7 @@ class TestGithubListener(Base):
         self.assertIn("--url=http://127.0.0.1:%d/github" % port, argv)
         self.assertIn("--repo=%s" % GH_REPO, argv)
         self.assertIn("--events=issues,issue_comment,sub_issues,pull_request,pull_request_review,"
-                      "check_suite,workflow_run", argv)
+                      "check_suite,workflow_run,push", argv)
 
     def test_the_source_never_binds_another_address(self):
         source = inspect.getsource(sb.GitHubHub.open_listener)
@@ -81644,6 +81644,7 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         "known_session": ("test_known_session_and_watch_follow_the_registrys_retired_record", "known_session"),
         "janitor_agent_roots": ("test_s1_an_entry_a_live_or_recently_retired_agent_owns_is_kept", "janitor_agent_roots"),
         "cmd_retire": ("test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken", "undo"),
+        "_cloud_branch_workers": ("test_a_retired_worker_is_dropped_from_the_workers_whose_branch_is_read_at_the_next_read", "retire"),
     }
 
     def registry_callers(self):

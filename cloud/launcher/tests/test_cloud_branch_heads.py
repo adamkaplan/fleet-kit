@@ -291,7 +291,7 @@ class PushBase(Base):
         self.make_hub(sb)
 
     def make_hub(self, module):
-        config = module.validate_config({"github_repos": [REPO], "github_events": ["issues", "pull_request", "push"]})
+        config = module.validate_config({"github_repos": [REPO]})
         self.hub = module.GitHubHub(config, self.state, self.audit, runner=self.remote, spawn=None, now=self.hub_clock)
         watch = self.hub.watches[REPO]
         watch.secret, watch.proc = "synthetic-secret", FakeForwarder()
@@ -408,7 +408,9 @@ class TestPushRoute(PushBase):
 
 
 class TestFallback(PushBase):
-    def test_s13_the_forwarder_arguments_hold_push(self):
+    def test_s13_the_default_list_and_the_forwarder_arguments_hold_push(self):
+        self.assertIn("push", sb.DEFAULTS["github_events"])
+        self.assertIn("push", sb.validate_config({})["github_events"])
         argv = self.hub.argv_for(self.hub.watches[REPO])
         events = [a for a in argv if a.startswith("--events=")][0][len("--events="):].split(",")
         self.assertIn("push", events)
