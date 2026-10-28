@@ -2747,7 +2747,7 @@ class TestApprovalAnywhere(Base):
         text = (BIN.parent / "docs" / "switchboard.md").read_text()
         section = text[text.index("**An approval is checked when it is sent (#951)"):]
         section = section[:section.index("\n\n")]
-        for words in ("ANYWHERE", "`#N at sha256:`", "at most 10", "approval for no current plan", "Only the Chief of Staff"):
+        for words in ("ANYWHERE", "`#N at sha256:<64 hex>`", "at most 10", "approval for no current plan", "Only the Chief of Staff"):
             self.assertIn(words, section)
 
 
