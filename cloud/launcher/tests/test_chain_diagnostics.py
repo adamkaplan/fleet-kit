@@ -26,6 +26,30 @@ FAKES = {
 }
 
 
+def is_alive(pid):
+    """Running and not a zombie (a pod without an init never reaps the dead). A pid that does not exist is dead."""
+    if os.path.exists("/proc/self/stat"):
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                # the state follows the LAST ")" : the command name may hold spaces and parentheses
+                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except (OSError, IndexError):
+            return False
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+    except OSError:
+        out = None
+    if out is not None:
+        return bool(out.strip()) and "Z" not in out
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def real_script():
     return base.slurp(base.SCRIPT)
 
@@ -98,13 +122,6 @@ class Diag(unittest.TestCase):
                     pass
         self.addCleanup(kill)
 
-    def alive(self, pid):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        return True
-
     # S2: the RUN line is printed before the entry ends; every live line names the entry; the replay is whole.
     def s2(self, script):
         d = self.tree(script, ["test_ok.py"], [LANE])
@@ -155,9 +172,9 @@ class Diag(unittest.TestCase):
         p.wait(timeout=60)   # not communicate(): a lane left running holds the output pipe open
         self.assertNotEqual(p.returncode, 0)
         end = time.time() + 10
-        while any(self.alive(x) for x in pids) and time.time() < end:
+        while any(is_alive(x) for x in pids) and time.time() < end:
             time.sleep(0.1)
-        self.assertEqual([x for x in pids if self.alive(x)], [], "a lane or serial process was left running after signal %s" % sig)
+        self.assertEqual([x for x in pids if is_alive(x)], [], "a lane or serial process was left running after signal %s" % sig)
 
     # S6: after a serial failure no lane starts a new entry; an entry in flight that outlives the bound is stopped; nothing is left running.
     def s6_no_new_entry(self, script):
@@ -184,9 +201,9 @@ class Diag(unittest.TestCase):
         self.assertEqual(out.rstrip().split("\n")[-1], "RESULT: FAIL")
         pid = int(self.wait_file("lane.pid"))
         end = time.time() + 5
-        while self.alive(pid) and time.time() < end:
+        while is_alive(pid) and time.time() < end:
             time.sleep(0.1)
-        self.assertFalse(self.alive(pid), "the entry in flight was left running")
+        self.assertFalse(is_alive(pid), "the entry in flight was left running")
 
     def test_s6_a_serial_failure_starts_no_new_lane_entry(self):
         self.s6_no_new_entry(real_script())
@@ -247,14 +264,6 @@ class Kill(unittest.TestCase):
     shell = None
     tree, start, wait_file, content, kill_later = Diag.tree, Diag.start, Diag.wait_file, Diag.content, Diag.kill_later
 
-    def alive(self, pid):
-        """Running, not a zombie (a pod without an init leaves the dead as zombies)."""
-        try:
-            with open("/proc/%d/stat" % pid) as f:
-                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
-        except OSError:
-            return False
-
     def stubborn_tree(self, script, serial):
         d = self.tree(script, serial, [STUBBORN])
         def cleanup():
@@ -272,9 +281,9 @@ class Kill(unittest.TestCase):
 
     def gone(self, pids, what):
         end = time.time() + int(self.GRACE) + 6   # the grace plus a margin
-        while any(self.alive(x) for x in pids) and time.time() < end:
+        while any(is_alive(x) for x in pids) and time.time() < end:
             time.sleep(0.1)
-        self.assertEqual([x for x in pids if self.alive(x)], [], "a TERM-ignoring descendant was left running after %s" % what)
+        self.assertEqual([x for x in pids if is_alive(x)], [], "a TERM-ignoring descendant was left running after %s" % what)
 
     def k_signal(self, script, sig):
         d = self.stubborn_tree(script, [SERIAL_SLOW])
@@ -310,6 +319,45 @@ class Kill(unittest.TestCase):
         for case in (lambda: self.k_signal(m, signal.SIGINT), lambda: self.k_signal(m, signal.SIGTERM), lambda: self.k_serial_failure(m)):
             with self.assertRaises(AssertionError):
                 case()
+
+
+class IsAlive(unittest.TestCase):
+    """The liveness helper itself, and a mutant of it."""
+    def test_a_zombie_is_dead(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            end = time.time() + 5
+            while is_alive(pid) and time.time() < end:
+                time.sleep(0.05)
+            self.assertFalse(is_alive(pid), "an unreaped exited child was counted alive")
+        finally:
+            os.waitpid(pid, 0)
+
+    def test_a_live_sleeper_is_alive(self):
+        p = subprocess.Popen(["sleep", "30"])
+        try:
+            time.sleep(0.2)
+            self.assertTrue(is_alive(p.pid))
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_a_pid_that_does_not_exist_is_dead(self):
+        p = subprocess.Popen(["true"])
+        p.wait()   # reaped: the pid is free
+        self.assertFalse(is_alive(p.pid))
+
+    def test_s4_mutant_a_helper_that_is_always_alive_fails_the_s4_tests(self):
+        from unittest import mock
+        me = sys.modules[__name__]
+        for cls in [c for c in (Diag, globals().get("DashDiag")) if c is not None]:
+            with mock.patch.object(me, "is_alive", lambda pid: True):
+                self.assertTrue(me.is_alive(0), "the mutation was not applied")
+                res = unittest.TestResult()
+                cls("test_s4_an_interrupt_and_a_terminate_leave_no_process").run(res)
+            self.assertFalse(res.wasSuccessful(), "the S4 test of %s passed with a helper that is always alive" % cls.__name__)
 
 
 class Docs(unittest.TestCase):
