@@ -911,7 +911,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 if left:
                     row["detail"] += "; left to the epic's other pull requests by the CLAIMS line: %s" % ", ".join(s["id"] for s in left)
                 if epic:
-                    row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s" % ", ".join(epic)
+                    row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s (not required of this pull request: each is recorded on the owning issue, unrecorded, recorded or stale there; read its `gates`)" % ", ".join(epic)
         elif gid == "G4":
             ci = (facts or {}).get("ci")
             if ci in ("green", "passing"):

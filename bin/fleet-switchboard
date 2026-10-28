@@ -16291,9 +16291,12 @@ def epic_default_head(get, repo):
 
 def epic_claimants(ctx, runner, now, get):
     """([(number, merge commit)] of the merged pull requests that link the plan, [numbers] of the open ones), by the bounded plan-link search of #976 (`plan_listing`). A pull request closed without a merge proves
-    nothing. A merged one with no readable 40-character merge commit raises: the head cannot be judged."""
-    merged, opened = [], []
+    nothing. A merged one with no readable 40-character merge commit raises: the head cannot be judged. Also the logins of the writers of those pull requests. Each merged entry is (number, merge commit, base branch or None)."""
+    merged, opened, writers = [], [], set()
     for other in plan_listing(ctx, runner, now, _epic_same_plan(ctx.config.get("intent_repo"))):
+        login = (other.get("user") or {}).get("login") if isinstance(other.get("user"), dict) else None
+        if isinstance(login, str) and login:
+            writers.add(login)
         if other.get("state") == "open":
             opened.append(other.get("number"))
         elif other.get("merged_at"):
@@ -16301,21 +16304,67 @@ def epic_claimants(ctx, runner, now, get):
             sha = pull.get("merge_commit_sha") if isinstance(pull, dict) else None
             if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
                 raise ValueError("the merge commit of pull request #%s could not be read" % other.get("number"))
-            merged.append((other.get("number"), sha))
-    return merged, opened
+            base = (pull.get("base") or {}).get("ref") if isinstance(pull.get("base"), dict) else None
+            merged.append((other.get("number"), sha, base))
+    return merged, opened, writers
 
 
-def epic_contains(get, repo, merged):
-    """contains(head) -> (True, None) or (False, why): `head` holds the merge commit of every merged pull request of the plan (GitHub's compare says the merge is behind the head, or the head itself). A compare that fails is (False, ...)."""
-    cache = {}
+EPIC_BATCH_PAGES = 3   # #1383: the batch pull requests are looked for in at most this many pages of 100 closed pull requests of the default branch; beyond it a claimant is refused naming the bound
+
+
+def epic_batches(get, repo, default):
+    """([(number, merge commit, head sha)] of the merged pull requests whose base is the default branch, newest first; whether the list is complete). A bounded read: EPIC_BATCH_PAGES pages of 100. Raises when a page cannot be read."""
+    out = []
+    for page in range(1, EPIC_BATCH_PAGES + 1):
+        rows = get("repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=100&page=%d" % (repo, urllib.parse.quote(default, safe=""), page))
+        if not isinstance(rows, list):
+            raise ValueError("the closed pull requests of %s did not come back as a list" % default)
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("merged_at"):
+                continue
+            merge, head = row.get("merge_commit_sha"), (row.get("head") or {}).get("sha") if isinstance(row.get("head"), dict) else None
+            if all(isinstance(x, str) and re.fullmatch(r"[0-9a-f]{40}", x) for x in (merge, head)):
+                out.append((row.get("number"), merge, head))
+        if len(rows) < 100:
+            return out, True
+    return out, False
+
+
+def epic_contains(get, repo, merged, default=None):
+    """contains(head) -> (True, None) or (False, why). `merged` is [(number, merge commit[, base])]. EMPTY is refused (nothing to contain). A claimant is contained when (a) its merge commit is behind `head` or is it (GitHub's compare), or (b) its
+    base is not the default branch and its merge commit is behind or is the head commit of a merged pull request of the default branch (the batch) whose own merge commit is behind or is `head`. The batch pull requests are the bounded
+    read of `epic_batches`; beyond the bound, or unreadable, the claimant is refused (fail closed). A compare that fails is (False, ...)."""
+    cache, batches = {}, []
+
+    def behind(old, new):
+        got = get("repos/%s/compare/%s...%s" % (repo, old, new))
+        return isinstance(got, dict) and got.get("status") in ("ahead", "identical")
+
+    def carried(sha, head):
+        """(True, None) or (False, how it was not)."""
+        if not batches:
+            batches.append(epic_batches(get, repo, default))
+        listed, complete = batches[0]
+        for _, merge, batch_head in listed:
+            if behind(merge, head) and behind(sha, batch_head):
+                return True, None
+        return False, "" if complete else " (the newest %d closed pull requests of %s were read: the bound)" % (EPIC_BATCH_PAGES * 100, default)
 
     def contains(head):
         if head not in cache:
             cache[head] = (True, None)
-            for number, sha in merged:
+            if not merged:
+                cache[head] = (False, "no merged pull request of the plan: nothing to contain")
+            for entry in merged:
+                number, sha = entry[0], entry[1]
+                base = entry[2] if len(entry) > 2 else None
                 try:
-                    got = get("repos/%s/compare/%s...%s" % (repo, sha, head))
-                    inside = isinstance(got, dict) and got.get("status") in ("ahead", "identical")
+                    inside = behind(sha, head)
+                    if not inside and default and base not in (None, default):
+                        inside, bound = carried(sha, head)
+                        if not inside:
+                            cache[head] = (False, "%s does not contain the merge of #%s (%s), merged into %s, and no merged pull request of %s carries it%s" % (head[:8], number, sha[:8], base, default, bound))
+                            break
                 except Exception:
                     cache[head] = (False, "the compare of the merge of #%s could not be read" % number)
                     break
@@ -16360,16 +16409,16 @@ def epic_target(ctx, runner, now, named):
         head = full
     record_step("the plan-link search of %s" % ctx.source)
     try:
-        merged, opened = epic_claimants(ctx, runner, now, get)
+        merged, opened, writers = epic_claimants(ctx, runner, now, get)
     except Exception as err:
         raise LedgerCommandError("refused: the pull requests of the plan could not be read (%s): nothing was recorded" % _one_line(str(err), 120)) from None
     if opened:
         raise LedgerCommandError("refused: pull request %s of the plan %s is still open: an epic scenario is recorded after every pull request of the plan has merged; nothing was recorded"
                                  % (", ".join("#%s" % n for n in opened[:5]), ctx.source))
-    ok, why = epic_contains(get, ctx.repo, merged)(head)
+    ok, why = epic_contains(get, ctx.repo, merged, default)(head)
     if not ok:
         raise LedgerCommandError("refused: %s: nothing was recorded" % why)
-    return head, default
+    return head, default, writers
 
 
 def epic_authors(ctx):
@@ -16387,22 +16436,25 @@ def epic_view(ctx, runner, now):
     if not scenarios:
         return [], None, None
     get = epic_get(ctx, runner)
-    default_head, why = None, None
+    default_head, why, default, writers = None, None, None, set()
     try:
-        default_head = epic_default_head(get, ctx.repo)[1]
+        default, default_head = epic_default_head(get, ctx.repo)
     except Exception as err:
         why = "the default branch's head could not be read (%s)" % _one_line(str(err), 100)
     try:
-        merged, _ = epic_claimants(ctx, runner, now, get)
-        contains = epic_contains(get, ctx.repo, merged)
+        merged, _, writers = epic_claimants(ctx, runner, now, get)
+        contains = epic_contains(get, ctx.repo, merged, default)
     except Exception as err:
         why = why or "the pull requests of the plan could not be read (%s)" % _one_line(str(err), 100)
         contains = lambda head: (False, "the pull requests of the plan could not be read")
     try:
-        authors = epic_authors(ctx)
+        authors = epic_authors(ctx) | writers
     except ItemAgentsUnreadable as err:
         authors = None
         why = why or str(err)
+    if authors is not None and not authors:   # fail closed: with no writer known no one can be excluded
+        authors = None
+        why = why or "no writer of %s is known to the switchboard: no one can be excluded" % ctx.pr
     rows = []
     for scenario in scenarios:
         if authors is None:   # the writers cannot be excluded: nothing is read as recorded
@@ -16416,7 +16468,7 @@ def epic_prove(ctx, args, runner, now, caller, scenarios):
     """Record the proof of each epic-claimed scenario in `scenarios` on the owning issue at `epic_target`'s head: [(stored, already)] and the refused count. Every read comes first: a refusal writes nothing."""
     if epic_subject(ctx) is None or not caller:
         raise LedgerCommandError("refused: an epic-claimed scenario is recorded on its ask issue or work item, never on a pull request; nothing was recorded")
-    head, _ = epic_target(ctx, runner, now, args.head)
+    head, _, _ = epic_target(ctx, runner, now, args.head)
     evidence = _evidence(args)
     outcomes = []
     for scenario in scenarios:
@@ -16430,13 +16482,20 @@ def epic_prove(ctx, args, runner, now, caller, scenarios):
     return outcomes, head
 
 
+class EpicRefusal(LedgerCommandError):
+    """A refusal of an epic verdict: the scenario and the reason, kept apart; the message names the epic claim first."""
+
+    def __init__(self, scenario_id, reason):
+        super().__init__("epic-claimed scenario %s: %s" % (scenario_id, reason))
+        self.scenario_id, self.reason = scenario_id, reason
+
+
 def epic_verdict(ctx, args, runner, now, scenario):
     """Record the evaluator's verdict on an epic-claimed scenario (see `_epic_verdict`); every refusal names the epic claim first."""
     try:
         return _epic_verdict(ctx, args, runner, now, scenario)
     except LedgerCommandError as err:
-        text = str(err)
-        raise LedgerCommandError(text if "epic" in text.split(":")[0] else "epic-claimed scenario %s: %s" % (scenario["id"], text)) from None
+        raise EpicRefusal(scenario["id"], str(err)) from None
 
 
 def _epic_verdict(ctx, args, runner, now, scenario):
@@ -16469,7 +16528,9 @@ def _epic_verdict(ctx, args, runner, now, scenario):
             ok = why is None
     if not ok:
         raise LedgerCommandError("refused: %s: nothing was recorded" % why)
-    head, _ = epic_target(ctx, runner, now, args.head)
+    head, _, writers = epic_target(ctx, runner, now, args.head)
+    if caller in writers:
+        raise LedgerCommandError("refused: %s wrote a pull request of the plan and may not judge it: nothing was recorded" % caller)
     evidence = _evidence(args)
     problem = plan_ledger.review_evidence_problem(evidence, scenario) if plan_ledger.proof_of(scenario) == "review" else None
     if problem:
@@ -16958,6 +17019,15 @@ def cmd_gates_ask_close(args, runner, now):
     epic_ids = {x["id"] for x in plan_ledger.epic_scenarios(ctx.plan)}   # #1383: an epic-claimed scenario is recorded at the default branch's head, and read there below
     rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"] if x["id"] not in epic_ids]
     epic_rows, default_head, epic_why = epic_view(ctx, runner, now)
+    if epic_ids:   # #1383: an open pull request of the plan holds the ask open (read now, not only at record time); an unreadable list refuses
+        try:
+            opened = epic_claimants(ctx, runner, now, epic_get(ctx, runner))[1]
+        except Exception as err:
+            print("refused: the pull requests of the plan could not be read (%s): %s stays open" % (_one_line(str(err), 120), ctx.pr), file=sys.stderr)
+            return EXIT_ERROR
+        if opened:
+            print("refused: pull request %s of the plan is still open: %s stays open until every pull request of the plan has merged" % (", ".join("#%s" % n for n in opened[:5]), ctx.pr), file=sys.stderr)
+            return EXIT_ERROR
     open_rows = [r for r in rows if r["status"] != "ok"]
     open_epic = [r for r in epic_rows if r["status"] != "ok"]
     total = len(rows) + len(epic_rows)
@@ -18802,12 +18872,13 @@ def compare_files(get, repo, old_head, new_head):
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
     if not isinstance(compared, dict):
         raise CarryRefused("the compare could not be read")
-    files = [f["filename"] for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+    rows = [f for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+    files = [f["filename"] for f in rows]
     if len(files) >= CARRY_COMPARE_FILE_CAP or compared.get("truncated") or (compared.get("total_files") or 0) >= CARRY_COMPARE_FILE_CAP:
         raise CarryRefused(CARRY_TOO_LARGE)
     if compared.get("status") not in ("ahead", "identical"):
         raise CarryRefused(CARRY_NOT_DESCENDANT % compared.get("status"))
-    return files
+    return files + [f["previous_filename"] for f in rows if isinstance(f.get("previous_filename"), str)]   # a renamed file changed under both names
 
 
 def carry_head_facts(get, repo, old_head, new_head):

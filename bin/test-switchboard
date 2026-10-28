@@ -86360,6 +86360,170 @@ class TestEpicRecord(unittest.TestCase):
         self.assertEqual({r["head"] for r in self.rows()}, {sb.plan_ledger.ask_head(self.hash)})
 
 
+class TestEpicBatch(TestEpicRecord):
+    """#1383 amended (S14-S16 and the Lows): a member merged into an integration branch is carried by a batch pull request of the default branch; an empty claimant set and an open pull request refuse; the writers of the claimants never judge; a renamed file reads as changed."""
+
+    MEM, BH = "a" * 40, "b" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.bases = {}
+        self.batches = [{"number": 20, "merged_at": "2026-01-02T00:00:00Z", "merge_commit_sha": self.CH[2], "head": {"sha": self.BH}}]
+        self.ahead = {(self.MEM, self.BH)}
+        self.users = {}
+        self.full = False
+        self.renamed = False
+
+    def get(self, path):
+        if "/pulls?state=closed&base=main" in path:
+            self.reads.append(path)
+            if "batches" in self.broken:
+                raise ValueError("boom")
+            if self.full:
+                return [{"number": 900 + i, "merged_at": None} for i in range(100)]
+            return self.batches if path.endswith("page=1") else []
+        if path.startswith("repos/%s/pulls/" % self.REPO):
+            number = int(path.rsplit("/", 1)[1])
+            return {"merge_commit_sha": dict(self.merged)[number], "base": {"ref": self.bases.get(number, "main")}}
+        if "/compare/" in path:
+            old, new = path.rsplit("/compare/", 1)[1].split("...")
+            if (old, new) in self.ahead:
+                return {"status": "ahead", "files": []}
+            got = super().get(path)
+            if self.renamed and got.get("files"):
+                got = dict(got, files=[{"filename": "src/b.py", "previous_filename": "src/a.py"}])
+            return got
+        return super().get(path)
+
+    def search(self, path):
+        got = super().search(path)
+        for item in got["items"]:
+            if item["number"] in self.users:
+                item["user"] = {"login": self.users[item["number"]]}
+        return got
+
+    def member(self):
+        """The plan's one merged pull request is a member merged into the integration branch."""
+        self.merged, self.bases = [(11, self.MEM)], {11: "integration"}
+
+    # ---- the checks
+    def check_carried(self):
+        self.member()
+        self.assertEqual(self.prove("E1")[0], sb.EXIT_OK)
+        self.assertEqual([r["head"] for r in self.rows()], [self.tip])
+
+    def check_uncarried(self):
+        self.member()
+        self.ahead = set()   # the batch does not hold the member
+        self.refused(self.prove("E1"), "does not contain the merge of #11")
+        self.assertEqual(self.rows(), [])
+
+    def check_empty(self):
+        self.merged = []
+        self.refused(self.prove("E1"), "nothing to contain")
+        self.assertEqual(self.rows(), [])
+
+    def check_open_blocks_close(self):
+        self.record_pr()
+        self.record_old()
+        self.tip = self.CH[3]
+        self.assertEqual(self.close()[0], sb.EXIT_OK)
+        self.open = [12]
+        code, out, err = self.close()
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("#12", err)
+
+    def check_claimant_writer(self):
+        self.users = {10: "tst1"}
+        self.assertEqual(self.prove("E1")[0], sb.EXIT_OK)
+        self.refused(self.judge("E1", who="tst1"), "wrote a pull request of the plan")
+        self.assertEqual([r["kind"] for r in self.rows()], ["proof"])
+
+    def check_rename_stale(self):
+        self.renamed = True
+        self.record_old(("E1",))
+        self.tip = self.CH[5]
+        self.touched[self.CH[5]] = ["src/b.py"]
+        self.assertIn("STALE", self.gates())
+
+    # ---- S14
+    def test_s14_a_member_merged_into_the_integration_branch_counts_when_a_batch_carried_it_to_the_default_branch(self):
+        self.check_carried()
+
+    def test_s14_a_member_no_batch_carried_is_refused_naming_it_and_so_is_a_head_from_before_the_batch(self):
+        self.member()
+        self.batches = []
+        self.refused(self.prove("E1"), "does not contain the merge of #11")
+        self.assertEqual(self.rows(), [])
+        self.check_uncarried()
+        self.batches = [{"number": 20, "merged_at": "2026-01-02T00:00:00Z", "merge_commit_sha": self.CH[2], "head": {"sha": self.BH}}]
+        self.ahead = {(self.MEM, self.BH)}
+        self.refused(self.prove("E1", head="2" * 40), "does not contain the merge of #11")
+        self.assertEqual(self.rows(), [])
+
+    def test_s14_a_batch_list_beyond_its_bound_or_unreadable_refuses_naming_the_bound_and_writes_nothing(self):
+        self.member()
+        self.batches = []
+        self.full = True
+        self.refused(self.prove("E1"), "the bound")
+        self.full = False
+        self.broken.add("batches")
+        self.refused(self.prove("E1"), "could not be read")
+        self.assertEqual(self.rows(), [])
+
+    def test_s14_m1_a_build_that_tests_the_members_own_merge_only_refuses_the_carried_member_and_is_caught(self):
+        real = sb.epic_contains
+        self.mutant(sb, "epic_contains", lambda get, repo, merged, default=None: real(get, repo, [m[:2] for m in merged], None), self.check_carried)
+
+    def test_s14_m2_a_build_that_accepts_any_merged_default_branch_pull_request_is_caught(self):
+        def loose(get, repo, merged, default=None):
+            return lambda head: (True, None) if sb.epic_batches(get, repo, default)[0] else (False, "no batch")
+        self.mutant(sb, "epic_contains", loose, self.check_uncarried)
+
+    # ---- S16
+    def test_s16_a_plan_no_merged_pull_request_links_is_refused_and_writes_nothing(self):
+        self.check_empty()
+
+    def test_s16_m1_a_build_where_the_empty_claimant_set_is_vacuously_contained_is_caught(self):
+        self.mutant(sb, "epic_contains", lambda get, repo, merged, default=None: (lambda head: (True, None)), self.check_empty)
+
+    # ---- S15
+    def test_s15_ask_close_refuses_while_a_pull_request_of_the_plan_is_open_naming_it(self):
+        self.check_open_blocks_close()
+
+    def test_s15_m1_an_ask_close_that_reads_open_pull_requests_only_at_record_time_is_caught(self):
+        real = sb.epic_claimants
+        self.mutant(sb, "epic_claimants", lambda *a: (lambda m, o, w: (m, [] if self.open else o, w))(*real(*a)), self.check_open_blocks_close)
+
+    # ---- the Lows
+    def test_l1_the_writers_of_the_claimant_pull_requests_may_not_judge_the_epic_scenario(self):
+        self.check_claimant_writer()
+
+    def test_l1_m1_a_build_that_ignores_the_claimants_writers_is_caught(self):
+        real = sb.epic_claimants
+        self.mutant(sb, "epic_claimants", lambda *a: (lambda m, o, w: (m, o, set()))(*real(*a)), self.check_claimant_writer)
+
+    def test_l2_with_no_writer_known_nothing_reads_as_recorded(self):
+        self.issue["user"]["login"] = None
+        self.assertIn("no writer", self.gates())
+
+    def test_l3_a_renamed_named_file_reads_as_changed_in_the_compare_and_so_stale(self):
+        self.check_rename_stale()
+        got = sb.compare_files(lambda p: {"status": "ahead", "files": [{"filename": "src/b.py", "previous_filename": "src/a.py"}]}, "o/r", "a", "b")
+        self.assertEqual(sorted(got), ["src/a.py", "src/b.py"])
+
+    def test_l3_m1_a_compare_that_drops_the_previous_name_reads_the_renamed_file_as_untouched_and_is_caught(self):
+        real = sb.compare_files
+        strip = lambda get: (lambda p: dict(get(p), files=[{"filename": f["filename"]} for f in get(p).get("files", [])]))
+        self.mutant(sb, "compare_files", lambda get, repo, a, b: real(strip(get), repo, a, b), self.check_rename_stale)
+
+    def test_l5_a_verdict_refusal_is_structured_and_names_the_epic_claim_first(self):
+        self.prove("E1")
+        err = self.judge("E1", who="coder1")[2]
+        self.assertIn("not recorded: epic-claimed scenario E1: refused:", err)
+        self.assertTrue(issubclass(sb.EpicRefusal, sb.LedgerCommandError))
+
+
 class TestNoPaneToJudge(StandInPids, Base):
     """#1181: a row with no pane to judge (kind cloud or orchestrator, or an endpoint and no pane) is alive or unknown, never dead."""
     PASSES = 20
