@@ -1804,24 +1804,36 @@ _sleep = time.sleep
 _SECRET_ENV_NAME = re.compile(r"(?:KEY|TOKEN|SECRET|PASS|CRED|AUTH)", re.I)
 ERROR_TEXT_MAX = 2000000   # past this the text is not read at all (it prints one fixed phrase): the redaction below is linear, this only bounds its memory
 _BREAK_CHARS = frozenset("\n\r\x0b\x0c\x85\u2028\u2029")   # every kind of line break: LF, CR, VT, FF, NEL, LS, PS
-_STRONG_WORDS = ("password", "passwd", "passphrase", "passcode", "pwd", "secret", "token", "apikey", "credential", "cookie", "bearer", "authorization", "privatekey")
-_WEAK_WORDS = frozenset(("pass", "key", "auth", "session", "private", "sid", "cred", "creds"))   # common words: they mark a value only with a `:` or `=`
-_SKIP_WORDS = frozenset("a an the is are was were be not no limit limits expired expiry invalid missing required refused rejected exceeded denied for has had have of to in "
-                        "from or and must can could cannot failed error errors unauthorized forbidden found empty unset set exists reached refresh needs need this that these those it its your with on at by when so as than".split())
-_ATOM = re.compile(r"[^/\\:=,;?&@#|\"'()\[\]{}<>!*\s]+")
-_LONE_SEP = re.compile(r"[:=]+[\"']?|[-=]+>")
-_END_SEP = re.compile(r"[:=][\"'\])}]*,?$")
+
+# THE closed vocabulary of the error line (ask #1397): the ONE list, in this ONE place. A token of the error line prints only if its lower-case form is
+# here (or it is a short number, a separator or an error-class name, see redact_error). Short, technical and public: no names, no everyday nouns. The one
+# inherent limit: a secret that is itself one of these words prints.
+ERROR_VOCABULARY = frozenset("""
+error errors failed failure fatal refused denied forbidden unauthorized timeout timed out expired invalid missing unknown unavailable not found
+cannot could unable no such file directory exists exist permission access connection reset closed broken pipe exit exited code status signal killed
+terminated limit exceeded quota memory disk space full retry retrying back off pull push image registry manifest layer pod pods container node cluster
+namespace service account token secret key password session message request requests response server client agent user git branch commit merge conflict
+rejected protected hook guard rule run runs running start started stopped crash crashed panic trace traceback line module import named desc rpc http
+https tcp tls dns host port address path name value type expected got while when during after before on in at of to from for with without by as is
+are was were be been the a an and or but if then else this that it its has have had did does do will would should may might can must all any some
+only more than too many much one two first last again already now never always bad gateway unreachable unsupported unexpected internal required
+authentication login open read write create delete update list get find warning exception notfound alreadyexists errimagepull imagepullbackoff
+crashloopbackoff oomkilled evicted enoent eacces eexist econnrefused etimedout
+""".split())
+_SEPARATORS = frozenset(" :,.()\"'/=-_[]")   # the punctuation of an error sentence
+_ERROR_CLASS = re.compile(r"[A-Z][A-Za-z]{0,39}")
+_ERROR_CLASS_END = ("Error", "Exception", "Warning", "Timeout")
+_TOKEN = re.compile(r"[^\W_]+|.", re.S)   # a run of letters and digits (any script), or one other character
+PLACEHOLDER = "[redacted]"
 
 
 def _normalise(text, spaced):
-    """(N, idx): the text as the rules read it, and for each character of N the index of the original character it came from. NFKC; a line break is
-    a plain space (a CR and an LF stay, which the Authorization shape reads); a zero-width, format (bidi included), control or combining character is
-    removed (`spaced` False: a keyword or a secret split by it is whole again) or turned into a space (`spaced` True: two words it separated stay two)."""
+    """(N, idx): the text as the rules read it, and for each character of N the index of the original character it came from. NFKC; a line break or any
+    white space is a plain space; a zero-width, format (bidi included), control or combining character is removed (`spaced` False: a word split by
+    it is whole again) or turned into a space (`spaced` True: two words it separated stay two)."""
     chars, idx = [], []
     for i, ch in enumerate(text):
         if " " <= ch <= "~":
-            piece = ch
-        elif ch in "\r\n":
             piece = ch
         elif ch in _BREAK_CHARS or ch.isspace():
             piece = " "
@@ -1830,169 +1842,93 @@ def _normalise(text, spaced):
         else:
             piece = unicodedata.normalize("NFKC", ch)
         for one in piece:
-            chars.append(" " if one.isspace() and one not in "\r\n" else one)
+            chars.append(" " if one.isspace() else one)
             idx.append(i)
     return "".join(chars), idx
 
 
-def _value_like(atom):
-    """True for a piece that may be a value: 12+ characters that are not plain words, letters and digits mixed at 8+, or hex at 16+. A plain word is
-    letters only (up to 24); a short number is up to 5 digits; words joined by - _ . stay plain up to 3 parts and 24 characters."""
-    core = atom.strip("-_.+~")
-    if len(core) < 8:
-        return False
-    if re.fullmatch(r"[0-9a-fA-F]{16,}", core):
-        return True
-    if re.fullmatch(r"[a-z0-9-]{1,20}(?:\.[a-z0-9-]{1,20}){1,4}", core) and len(core) <= 40 and not any(_value_like(label) for label in core.split(".")):
-        return False   # a host name
-    parts = [p for p in re.split(r"[-_.]", core) if p]
-    if len(core) <= 24 and len(parts) <= 3 and all((p.isalpha() and len(p) <= 24) or (p.isdigit() and len(p) <= 5) for p in parts):
-        return False
-    if len(core) >= 12:
-        return True
-    return any(c.isdigit() for c in core) and any(c.isalpha() for c in core)
+def _token_allowed(token, before, after, known):
+    """True when a run of letters and digits may print: a word of ERROR_VOCABULARY (compared in lower case), a number of at most five digits that stands
+    between separators, or an error-class name (CamelCase letters only, at most 40, ending in Error, Exception, Warning or Timeout)."""
+    low = token.lower()
+    if token.isascii():
+        if token.isdigit():
+            ok = len(token) <= 5 and before in _SEPARATORS and after in _SEPARATORS
+        else:
+            ok = low in ERROR_VOCABULARY or (token.isalpha() and _ERROR_CLASS.fullmatch(token) is not None and token.endswith(_ERROR_CLASS_END))
+    else:
+        ok = False
+    if ok and known and len(low) >= 4 and any(low in secret for secret in known):
+        return False   # this run's own secret holds it: it stays out even when it is a word of the list
+    return ok
 
 
-def _keyword(token):
-    """(strong, weak, has_sep, ends_sep, attached) for a token that names a secret, else None. A path (it holds a slash and no `=`) names nothing."""
-    if "/" in token and "=" not in token:
-        return None
-    name = re.split(r"[:=]", token, maxsplit=1)[0]
-    low = re.sub(r"[^a-z]", "", name.lower())
-    strong = any(word in low for word in _STRONG_WORDS)
-    weak = bool(_WEAK_WORDS.intersection(re.findall(r"[a-z]+", name.lower())))
-    if not (strong or weak):
-        return None
-    has_sep = len(name) < len(token)
-    return strong, weak, has_sep, bool(_END_SEP.search(token)), bool(re.search(r"[:=][^:=\s]*[A-Za-z0-9]", token))
-
-
-def _mark_variant(text, spaced, lib, grams, mask):
-    """Run every rule on one reading of the text and mark the ORIGINAL positions it redacts. Returns the last original position that holds a visible character."""
-    N, idx = _normalise(text, spaced)
-
-    def mark(a, b):
-        if b > a:
-            low, high = idx[a], idx[b - 1] + 1
+def _mark_variant(line, spaced, known, mask):
+    """Judge every token of one reading of the line and mark the ORIGINAL positions of each token that may not print (and of every character that is
+    neither a letter, a digit, white space nor a separator)."""
+    N, idx = _normalise(line, spaced)
+    size = len(N)
+    for found in _TOKEN.finditer(N):
+        start, end = found.span()
+        word = found.group()
+        if len(word) == 1 and not word.isalnum():
+            allowed = word in _SEPARATORS or word == " "
+        else:
+            before = N[start - 1] if start else " "
+            after = N[end] if end < size else " "
+            allowed = _token_allowed(word, before, after, known)
+        if not allowed:
+            low, high = idx[start], idx[end - 1] + 1
             mask[low:high] = b"\x01" * (high - low)
-
-    for pattern, _ in lib.CREDENTIAL_SHAPES:   # the launcher's own shapes (an Authorization header, a URL's user:password), then its token shapes
-        for found in pattern.finditer(N):
-            mark(found.start(), found.end())
-    for pattern in lib.TOKEN_SHAPES:
-        for found in pattern.finditer(N):
-            mark(found.start(), found.end())
-    if grams:   # any 8+ character piece of a known secret
-        size = lib.MIN_FRAGMENT
-        for i in range(len(N) - size + 1):
-            if N[i:i + size] in grams:
-                j = i + size
-                while j < len(N) and any(N[i:j + 1] in sec for sec in grams[N[i:i + size]]):
-                    j += 1
-                mark(i, j)
-    tokens = [(m.start(), m.end(), m.group()) for m in re.finditer(r"\S+", N)]
-    remaining, sep_mode, scanned, quote = 0, False, 0, None
-    for s, e, t in tokens:
-        if quote:   # a quoted value with spaces in it: every token up to the closing quote
-            mark(s, e)
-            if quote in t:
-                quote = None
-            continue
-        found = _keyword(t)
-        if found:   # (c) after a secret keyword: the value after it, and the next three tokens
-            strong, weak, has_sep, ends_sep, attached = found
-            if attached:
-                mark(s, e)
-            budget = 3 if (strong or has_sep) else 1   # a common word (key, session ...) with no `:` or `=` after it marks one value
-            remaining, sep_mode, scanned = (budget if (ends_sep or not attached) else 0), has_sep, 0
-            continue
-        if remaining:
-            if _LONE_SEP.fullmatch(t):
-                sep_mode = True
-                continue
-            word = re.sub(r"[^a-z]", "", t.lower())
-            if not sep_mode and word in _SKIP_WORDS and scanned < 6:
-                scanned += 1
-                continue
-            mark(s, e)
-            remaining -= 1
-            continue
-        for assigned in re.finditer(r"=([^=&\s]+)", t):   # NAME=value, a query's token=value: the value never stays
-            mark(s + assigned.start(1), s + assigned.end(1))
-            first = assigned.group(1)[0]
-            if first in "\"'" and first not in assigned.group(1)[1:]:
-                quote = first
-        if t.endswith("="):
-            remaining, sep_mode, scanned = 1, True, 0
-    for s, e, t in tokens:   # (d) deny by default: a token that is not a plain word, a short number or a path piece
-        core = t.strip(".,;:!?()[]{}<>\"'")
-        if re.fullmatch(r"[A-Za-z0-9+/=_-]{16,}", core) and not core.startswith(("/", ".", "~")) and (re.search(r"[0-9+=]", core) or len(core) > 24):
-            mark(s, e)
-            continue
-        for atom in _ATOM.finditer(t):
-            if _value_like(atom.group()):
-                mark(s + atom.start(), s + atom.end())
-    line_of, line = [], 0   # a secret wrapped over two lines: the end of one line and the start of the next, read as one piece
-    for ch in N:
-        line_of.append(line)
-        line += ch in "\r\n"
-    for (s1, e1, t1), (s2, e2, t2) in zip(tokens, tokens[1:]):
-        if line_of[s2] != line_of[s1] and re.fullmatch(r"[A-Za-z0-9+/_=-]+", t1) and re.fullmatch(r"[A-Za-z0-9+/_=-]+", t2) and _value_like(t1 + t2):
-            mark(s1, e1)
-            mark(s2, e2)
-    last = len(N)
-    while last and N[last - 1].isspace():
-        last -= 1
-    return idx[last - 1] if last else -1
 
 
 def redact_error(text, known=()):
-    """The error line that `status` prints, DENY BY DEFAULT. It is made over the WHOLE text, never a cut of it: (a) the text is read twice, with its
-    zero-width, format, control and combining characters removed and turned into spaces (a position redacted in either reading is redacted); (b)
-    every kind of line break is a plain space; (c) the launcher's own shapes (a token, a JWT, an Authorization header, a URL's user:password) and any
-    8+ character piece of this run's known secrets go; (d) the value after a secret keyword (password, token, secret, key, auth, bearer, credential,
-    cookie, session, private ...) and the next three tokens go, and so does every value after `=`; (e) every token that is not a plain word, a short
-    number or a path piece goes when it is 12+ characters, letters and digits mixed at 8+, or hex at 16+. ONLY THEN is the last non-empty line of the
-    ORIGINAL text taken, and it is cut at ERROR_LINE_MAX. It is for a person to see what went wrong, so it may lose words; it never shows a secret
-    or a piece of one. Known limit: a SHORT value that no keyword precedes (under 8 characters, or letters only under 25), a passphrase of several
-    words and a `-p` or `curl -u` form cannot be told from text and print."""
+    """The error line that `status` prints, through an ALLOW-LIST: leaks are excluded by construction. The LAST original line (any kind of line break
+    ends a line; one that holds only invisible characters is empty) is read as tokens, in two readings (zero-width, format, control and combining
+    characters turned into spaces, and removed; text normalised NFKC, white space one space); a token prints only when it is allowed in BOTH readings:
+    a word of ERROR_VOCABULARY (lower-case comparison), a number of at most five digits between separators, or an error-class name; a separator
+    (space : , . ( ) quotes / = - _ and brackets) prints. EVERY other token is `[redacted]`, whatever precedes it, in any language or spelling; a run of
+    placeholders and the separators between them is one placeholder. The result is cut at ERROR_LINE_MAX. The one inherent limit: a secret that is
+    itself a word of the vocabulary (or a number of up to five digits) prints; `known` (this run's own secrets) are kept out even then."""
     text = str(text or "")
     if not text.strip():
         return ""
     if len(text) > ERROR_TEXT_MAX:
         return "[error text too long to show]"
-    lib = _lib()
-    grams = {}
-    for secret in sorted({v for v in known if v and len(v.strip()) >= lib.MIN_FRAGMENT}, key=len, reverse=True):
-        for form in {secret, secret.strip()}:
-            for i in range(len(form) - lib.MIN_FRAGMENT + 1):
-                grams.setdefault(form[i:i + lib.MIN_FRAGMENT], []).append(form)
-    mask = bytearray(len(text))
-    last = max(_mark_variant(text, spaced, lib, grams, mask) for spaced in (False, True))
-    if last < 0:
+    line = None
+    for part in reversed(re.split("[\n\r\x0b\x0c\x85\u2028\u2029]", text)):   # the last line that holds a visible character
+        if _normalise(part, True)[0].strip():
+            line = part
+            break
+    if line is None:
         return ""
-    start = last
-    while start > 0 and text[start - 1] not in _BREAK_CHARS:
-        start -= 1
-    end = last + 1
-    while end < len(text) and text[end] not in _BREAK_CHARS:
-        end += 1
-    out, red, space = [], False, False
-    for i in range(start, end):
-        ch = text[i]
-        if ch.isspace():
-            space = bool(out)
-        elif unicodedata.category(ch)[0] in "CM":
+    forms = [k.lower() for k in known if k and len(k.strip()) >= 4]
+    mask = bytearray(len(line))
+    for spaced in (False, True):
+        _mark_variant(line, spaced, forms, mask)
+    out = []   # items: (kind, text) with kind "s" separator, "w" word, "r" placeholder
+    for i, ch in enumerate(line):
+        if len(out) > 2000:   # far more than ERROR_LINE_MAX shows
+            break
+        if mask[i]:
+            if out and out[-1][0] == "r":
+                continue
+            seps = 0
+            while seps < len(out) and out[-1 - seps][0] == "s":
+                seps += 1
+            if seps < len(out) and out[-1 - seps][0] == "r":   # placeholder, separators, placeholder: one placeholder
+                del out[len(out) - seps:]
+                continue
+            out.append(("r", PLACEHOLDER))
             continue
-        elif mask[i]:
-            if not red:
-                out.append(" [redacted]" if space else "[redacted]")
-                red = True
-            space = False
+        if ch in _SEPARATORS or ch.isspace() or unicodedata.category(ch)[0] in "CM":
+            piece = ch if ch in _SEPARATORS else " "
+            if piece == " " and out and out[-1] == ("s", " "):
+                continue
+            out.append(("s", piece))
         else:
-            out.append((" " + ch) if space else ch)
-            space, red = False, False
-    return "".join(out)[:ERROR_LINE_MAX]
+            out.append(("w", ch))
+    return "".join(piece for _, piece in out).strip()[:ERROR_LINE_MAX]
 
 
 def _known_secrets(state, record, cluster):

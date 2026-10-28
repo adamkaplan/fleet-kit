@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -43,7 +44,7 @@ def kube_verb(call):
             return word
     return None
 TOKEN = "ghp_" + "Ab3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0dF3gH6"
-PASSWORD = "Zq7-planted-passphrase"
+PASSWORD = "Zq7-planted-phrasing"
 ENV_VALUE = "INTERNAL_HOST=vault-7.corp.example"
 ENV_SECRET = "plantedenvvalue4242"
 
@@ -178,8 +179,8 @@ class TestErrorLine(Base):
         self.assertNotIn("synthetic-password", line)
 
     def test_s2_a_plain_error_is_kept(self):
-        line = self.line_with_error("ERROR: connection refused by the proxy")
-        self.assertIn("ERROR: connection refused by the proxy", line)
+        line = self.line_with_error("ERROR: connection refused by the server")
+        self.assertIn("ERROR: connection refused by the server", line)
 
     def test_s2_no_error_says_none_and_no_message_says_none_yet(self):
         self.worker()
@@ -471,12 +472,12 @@ class TestDocuments(unittest.TestCase):
     def test_the_inherent_limit_and_the_local_files_are_in_both_documents(self):
         for rel in DOCS:
             text = read(rel)
-            for phrase in ("Known limit: a short value", "a passphrase of several words", "`curl -u`", "transient", "removed when the command ends", "mode `0700`"):
+            for phrase in ("closed vocabulary", "ERROR_VOCABULARY", "bin/cloud_worker.py", "a secret that is itself one of the vocabulary", "transient", "removed when the command ends", "mode `0700`"):
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
 
 
-def leaked(secret, line, width=6):
+def leaked(secret, line, width=4):
     """The pieces of `secret` of `width` or more characters that the printed line still holds."""
     return [secret[i:i + width] for i in range(0, len(secret) - width + 1) if secret[i:i + width] in line]
 
@@ -507,7 +508,7 @@ HOSTILE = (
 
 
 class TestHostile(Base):
-    """S2 again, through the real `status NAME` path: 0 planted pieces of 6 or more characters, whatever separates the value from its marker."""
+    """S2 again, through the real `status NAME` path: 0 planted pieces of 4 or more characters, whatever separates the value from its marker."""
 
     def printed(self, text):
         self.worker()
@@ -595,33 +596,6 @@ class TestDenyByDefault(Base):
                 failures.append((label, shown[:2]))
         self.assertEqual(failures, [], "%d of %d cases leak" % (len(failures), len(table())))
 
-    def test_s2_a_plain_readable_error_still_prints_readable_in_every_case(self):
-        line = self.printed(READABLE)
-        self.assertIn(READABLE, line)
-        for plain in ("ERROR: connection refused by the proxy", "Error: ImagePullBackOff for image registry.example/widget:1.4", "Error: pull refused: 403 Forbidden for pod coder7",
-                      "Error: quota exceeded: 429 Too Many Requests, retry in 30 s", "Traceback: ValueError: bad input in /app/run.py line 42"):
-            with self.subTest(plain):
-                self.setUp()
-                self.assertIn(plain.split(": ", 1)[1][:20], self.printed(plain))
-
-    FIVE = ("Error: pull refused: unauthorized: authentication required for registry.example.internal/widget/api:1.4.2",
-            "Error: push to acme-org/widget-service refused by the guard: branch main is protected (rule R7)",
-            "Error: AgentCrash: unhandled TypeError at run (/app/dist/agent.js:412:19) in session",
-            "Error: quota exceeded: 429 Too Many Requests for model widget-large, retry after 30 s",
-            "Error: ImagePullBackOff: back-off pulling image registry.example.internal/worker:2026.10")
-
-    def test_s2_five_real_shaped_pod_failures_print_as_they_are(self):
-        """The usefulness bar, measured: a pull refused, a push refused by the guard, an agent crash line, a quota message and an image pull that
-        sticks all print unchanged (nothing in them is a secret, so nothing may be taken out)."""
-        for plain in self.FIVE:
-            with self.subTest(plain):
-                self.assertEqual(CLOUD.redact_error(plain), plain)
-                self.setUp()
-                self.assertIn(plain, self.printed(plain))
-
-    def test_s2_a_plain_last_line_after_a_plain_first_line_prints_as_it_is(self):
-        self.assertEqual(CLOUD.redact_error("Error: step failed\n" + READABLE), READABLE)
-
     def test_a_100000_character_line_is_handled_in_linear_time(self):
         for text in ("a" * 100000, "ab " * 40000, "password: " * 10000, "a1" * 50000 + " token", "=" * 100000, "x://" + "u:" * 50000, "A" * 99990 + "\r\n" * 5):
             began = time.monotonic()
@@ -656,6 +630,335 @@ class TestContexts(unittest.TestCase):
             for value in known:
                 out = CLOUD.redact_error("Error: " + context.format(value[:5] + "\u200b" + value[5:]), known)
                 self.assertEqual(leaked(value, out), [], out)
+
+
+# ---- the allow-list round (ask #1397, plan revision 3): the error line prints token by token through ONE closed vocabulary (ERROR_VOCABULARY in
+# bin/cloud_worker.py). Every secret below is synthetic and built from plain parts.
+BASE_VOCAB = frozenset(CLOUD.ERROR_VOCABULARY) if hasattr(CLOUD, "ERROR_VOCABULARY") else frozenset()   # taken at import: a mutant that edits the live list is still judged by this copy
+SEPARATORS = frozenset(" :,.()\"'/=-_[]")
+CLASS_NAME = re.compile(r"[A-Z][A-Za-z]{0,39}")
+CLASS_END = ("Error", "Exception", "Warning", "Timeout")
+PLACEHOLDER = "[redacted]"
+SENTINEL = "zq" + "uill" + "feather"   # a planted word: the mutant adds it to the list
+CYR_PASSWORD = "\u043f\u0430\u0440\u043e\u043b\u044c"
+CJK_PASSWORD = "\u5bc6\u7801"
+KEYWORDS = ("password", "Passwort", "mot de passe", "contrasena", "senha", "clave", "wachtwoord", CYR_PASSWORD, CJK_PASSWORD, "pw", "p4ssw0rd", "otp code",
+            "token", "secret", "api key", "the api key for the service is", "pass word", "pass phrase is", "Bearer", "Authorization", "kennwort", "losenord",
+            "p\u0430ssword", "pa55phrase", "credential", "sesame", "mdp", "passe", "geheim", "tajne", "\u30d1\u30b9\u30ef\u30fc\u30c9", "\ube44\ubc00\ubc88\ud638")
+ZW = ("\u200b", "\u200d", "\u2060", "\ufeff", "\u202e", "\u00ad")
+
+
+def printed_tokens_ok(error_part, vocabulary=BASE_VOCAB):
+    """The tokens of a printed error part that are NOT allowed: not the placeholder, not a vocabulary word, a number of at most 5 digits, a separator
+    or an error-class name."""
+    bad = []
+    rest = error_part.replace(PLACEHOLDER, " ")
+    for tok in re.findall(r"[^\W_]+|.", rest):
+        if tok in SEPARATORS or tok.isspace():
+            continue
+        if tok.lower() in vocabulary or (tok.isascii() and tok.isdigit() and len(tok) <= 5):
+            continue
+        if tok.isascii() and tok.isalpha() and CLASS_NAME.fullmatch(tok) and tok.endswith(CLASS_END):
+            continue
+        bad.append(tok)
+    return bad
+
+
+def make_secret(rng, vocabulary):
+    """A synthetic secret of 1 to 64 characters: letters and digits (a digit run of at most 3), holding no vocabulary word of 4 or more letters."""
+    while True:
+        out = []
+        for _ in range(rng.randint(1, 64)):
+            digits = len(out) >= 1 and out[-1].isdigit() and (len(out) < 2 or out[-2].isdigit())
+            out.append(rng.choice("0123456789") if (not digits and rng.random() < 0.25) else rng.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+        secret = "".join(out)
+        low = secret.lower()
+        if not any(len(w) >= 4 and w in low for w in vocabulary) and not any(w in low for w in ("redact", "error")):
+            return secret
+
+
+def hostile_texts(count=1000, seed=1397):
+    """(text, planted secret) pairs from a seeded generator: any keyword, any shape of splitting, wrapping, URL, path, quote and encoding."""
+    import random
+    rng = random.Random(seed)
+    texts = []
+    for n in range(count):
+        secret = SENTINEL if n % 50 == 7 else make_secret(rng, BASE_VOCAB)
+        kw = rng.choice(KEYWORDS)
+        shape = rng.randrange(14)
+        half = max(1, len(secret) // 2)
+        if shape == 0:
+            text = "%s: %s" % (kw, secret)
+        elif shape == 1:
+            text = "%s %s" % (kw, secret)
+        elif shape == 2:
+            text = "%s=%s" % (kw, secret)
+        elif shape == 3:   # split by hyphens
+            text = "%s %s" % (kw, "-".join(secret[i:i + rng.randint(1, 4)] for i in range(0, len(secret), 3)))
+        elif shape == 4:   # split by spaces
+            text = "%s: %s" % (kw, " ".join(secret[i:i + rng.randint(1, 5)] for i in range(0, len(secret), 4)))
+        elif shape == 5:   # zero-width characters inside the secret and the keyword
+            z = rng.choice(ZW)
+            text = "%s%s%s: %s" % (kw[:2], z, kw[2:], z.join(secret))
+        elif shape == 6:   # keyword on one line, secret on the next
+            text = "failed\n%s:\n%s" % (kw, secret)
+        elif shape == 7:   # wrapped over two lines
+            text = "Error: bad\n%s: %s\n%s" % (kw, secret[:half], secret[half:])
+        elif shape == 8:   # inside a URL
+            text = "Error: GET https://host.example/v1/%s/%s/x?%s=%s failed" % (kw.replace(" ", "-"), secret, kw.replace(" ", "_"), secret)
+        elif shape == 9:   # inside a path
+            text = "Error: open /home/user/.%s/%s/%s: no such file" % (kw.replace(" ", "-"), secret, secret[:half])
+        elif shape == 10:   # quotes
+            text = 'Error: {"%s": "%s"} \'%s\'' % (kw, secret, secret)
+        elif shape == 11:   # percent encoding
+            text = "Error: %s=%s" % (kw.replace(" ", "+"), "".join("%%%02x" % ord(c) for c in secret))
+        elif shape == 12:   # decimal and hex HTML encodings
+            text = "Error: %s %s &#x%s;" % (kw, "".join("&#%d;" % ord(c) for c in secret), secret.encode().hex())
+        else:   # after plain filler words
+            text = "Error: %s is the one for the %s that was %s" % (kw, rng.choice(("service", "server", "account")), secret)
+        if rng.random() < 0.2:
+            text = text + "\n" + text.split("\n")[-1]
+        texts.append((text, secret))
+    return texts
+
+
+class TestProperty(Base):
+    """S9: 1000 seeded hostile texts through `status NAME`: every printed token is allowed and 0 planted pieces of 4+ characters appear."""
+
+    def run_texts(self, count=1000, vocabulary=BASE_VOCAB):
+        """The failures: (text, what) for each text whose printed line holds a token that is not allowed or a planted piece."""
+        failures = []
+        for text, secret in hostile_texts(count):
+            if len(failures) + 1 > count:
+                break
+            self.worker()
+            self.v2.messages = [message(1798365852000, "", error=text)]
+            code, out, err = self.status_line()
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(out.splitlines()), 1, out)
+            part = out.split("; last error ", 1)[1]
+            bad = printed_tokens_ok(part, vocabulary)
+            pieces = leaked(secret, part)
+            if bad or pieces or len(part) > 160:
+                failures.append((text[:60], bad[:2], pieces[:2]))
+        return failures
+
+    def test_s9_the_generator_is_seeded_and_makes_a_thousand_varied_texts(self):
+        texts = hostile_texts()
+        self.assertEqual(len(texts), 1000)
+        self.assertEqual(texts, hostile_texts())
+        self.assertGreaterEqual(len({len(secret) for _, secret in texts}), 40)
+
+    def test_s9_1000_of_1000_texts_print_only_allowed_tokens_and_no_planted_piece(self):
+        self.assertTrue(BASE_VOCAB, "the vocabulary is not there")
+        failures = self.run_texts()
+        self.assertEqual(failures, [], "%d of 1000 texts print something that is not allowed" % len(failures))
+
+    def test_s9_a_printed_token_outside_the_vocabulary_is_seen_by_the_check(self):
+        self.assertEqual(printed_tokens_ok("Error: " + "hunter2", frozenset(("error",))), ["hunter2"])
+        self.assertEqual(printed_tokens_ok("RuntimeError: [redacted] 404 and", frozenset(("and",))), [])
+
+
+class TestVocabularyScan(Base):
+    """S12: ONE list in ONE place, no second copy, no keyword table; a mutant that adds a planted word is caught by the property test."""
+
+    def sources(self):
+        found = []
+        for base in ("bin", "cloud/launcher"):
+            for path in sorted((Path(ROOT) / base).rglob("*")):
+                if path.suffix in (".py", ".sh", "") and path.is_file() and "tests" not in path.parts and "__pycache__" not in path.parts:
+                    try:
+                        found.append((str(path.relative_to(ROOT)), path.read_text(encoding="utf-8")))
+                    except (UnicodeDecodeError, OSError):
+                        pass
+        return found
+
+    def test_s12_the_vocabulary_is_one_frozenset_of_about_two_hundred_words_in_the_worker_module(self):
+        vocabulary = CLOUD.ERROR_VOCABULARY
+        self.assertIs(type(vocabulary), frozenset)
+        self.assertTrue(150 <= len(vocabulary) <= 260, len(vocabulary))
+        self.assertTrue(all(w == w.lower() and w.isascii() and w.isalpha() for w in vocabulary))
+        for everyday in ("horse", "battery", "staple", "apple", "hunter", "correct"):
+            self.assertNotIn(everyday, vocabulary)
+
+    def test_s12_no_second_copy_of_the_list_and_no_old_keyword_table_remains(self):
+        signature = re.compile(r"refused\W+denied\W+forbidden\W+unauthorized\W+timeout")
+        old = re.compile("_STRONG" + "_WORDS|_WEAK" + "_WORDS|_SKIP" + "_WORDS|def _key" + "word\\(|def _value" + "_like\\(")
+        copies, tables = [], []
+        for rel, text in self.sources():
+            copies += [rel] * len(signature.findall(text))
+            tables += [rel] * len(old.findall(text))
+        self.assertEqual(copies, ["bin/cloud_worker.py"], copies)
+        self.assertEqual(tables, [], tables)
+
+    def test_s12_a_mutant_that_adds_a_planted_word_is_caught_by_the_property_test(self):
+        mutant = CLOUD.ERROR_VOCABULARY | {SENTINEL}
+        with mock.patch.object(CLOUD, "ERROR_VOCABULARY", mutant):
+            self.assertIn(SENTINEL, CLOUD.ERROR_VOCABULARY)   # the mutation is applied
+            failures = TestProperty.run_texts(self, count=100)   # the planted word comes at the 8th text and every 50th after
+        self.assertGreaterEqual(len(failures), 1)
+
+
+def survivors():
+    """The nine survivor shapes: (label, text, planted values)."""
+    value = SEVEN
+    cases = [("a: %s" % kw, "Error: login failed: %s: %s" % (kw, value), [value])
+             for kw in ("Passwort", "mot de passe", "contrasena", "senha", "clave", "wachtwoord", CYR_PASSWORD, CJK_PASSWORD)]
+    cases += [("b: lookalike", "Error: p\u0430ssword: %s" % value, [value])]
+    cases += [("c: %s" % kw, "Error: bad %s: %s" % (kw, value), [value]) for kw in ("p4ssw0rd", "pw")]
+    cases += [("c: otp code", "Error: bad otp code: 482913", ["482913"])]
+    cases += [("d: api key", "Error: the api key for the service is %s" % value, [value])]
+    cases += [("e: pass word", "Error: pass word: %s" % value, [value]), ("e: pass phrase", "Error: pass phrase is %s" % value, [value])]
+    cases += [("f: four words", "Error: correct horse battery staple", ["correct", "horse", "battery", "staple"])]
+    twelve = "qzxwvb" + "nmklpj"
+    cases += [("g: wrapped 12 letters", "Error: bad %s\n%s" % (twelve[:6], twelve[6:]), [twelve, twelve[:6], twelve[6:]])]
+    cases += [("h: url path", "Error: GET /v1/users/%s/.." % value, [value])]
+    twenty = "qzjxkvwpmb" + "hgtfdlnsyr"
+    cases += [("i: twenty letters", "Error: bad %s" % twenty, [twenty])]
+    return cases
+
+
+class TestSurvivors(Base):
+    """S10: the nine survivor shapes; none of the planted values prints."""
+
+    def test_s10_none_of_the_planted_values_prints_and_nine_of_nine_shapes_are_there(self):
+        shapes = {label[0] for label, _, _ in survivors()}
+        self.assertEqual(shapes, set("abcdefghi"))
+        failures = []
+        for label, text, values in survivors():
+            self.setUp()
+            self.worker()
+            self.v2.messages = [message(1798365852000, "", error=text)]
+            code, out, err = self.status_line()
+            self.assertEqual(code, 0, err)
+            part = out.split("; last error ", 1)[1]
+            shown = [v for v in values if v in part]
+            if shown or printed_tokens_ok(part):
+                failures.append((label, shown, printed_tokens_ok(part)))
+        self.assertEqual(failures, [])
+
+
+# S11: (text, the cause words that must stay, whether a NAME is lost to the placeholder)
+POD_ERRORS = (
+    ("failed to pull image: pull access denied", ("failed to pull image: pull access denied",), False),
+    ("push refused: protected branch", ("push refused: protected branch",), False),
+    ("RuntimeError: agent crashed", ("RuntimeError: agent crashed",), False),
+    ("exceeded quota: pods", ("exceeded quota: pods",), False),
+    ("ErrImagePull", ("ErrImagePull",), False),
+    ("ModuleNotFoundError: No module named 'widgetlib'", ("ModuleNotFoundError", "No module named"), True),
+    ("pods \"coder7\" is forbidden: User cannot list", ("is forbidden: User cannot list",), True),
+    ("could not open /x/y: File exists", ("could not open", "File exists"), True),
+    ("code = NotFound desc = failed to find", ("code = NotFound desc = failed to find",), False),
+)
+
+
+class TestRealErrors(Base):
+    """S11: nine real-shaped pod errors keep their cause word or error class. Six keep the whole line (pull refused, push refused by the guard, agent
+    crash, quota, ErrImagePull, code = NotFound); the three that name something (a module, a pod, a directory) lose that NAME to the placeholder and
+    keep the cause word and the error class. Nothing more is claimed than the vocabulary holds."""
+
+    def test_s11_each_keeps_its_cause_and_at_most_three_lose_a_name(self):
+        lost = []
+        for text, causes, loses in POD_ERRORS:
+            with self.subTest(text):
+                self.setUp()
+                self.worker()
+                self.v2.messages = [message(1798365852000, "", error=text)]
+                code, out, err = self.status_line()
+                part = out.split("; last error ", 1)[1]
+                for cause in causes:
+                    self.assertIn(cause, part)
+                self.assertEqual(PLACEHOLDER in part, loses, part)
+                lost += [text] * (PLACEHOLDER in part)
+        self.assertEqual(len(POD_ERRORS), 9)
+        self.assertLessEqual(len(lost), 3)
+
+
+class TestPlaceholderAndNormalising(unittest.TestCase):
+    def test_a_run_of_placeholders_and_separators_is_one_placeholder(self):
+        self.assertEqual(CLOUD.redact_error("failed: /aa1/bb2/cc3 a1b2"), "failed: /[redacted]")
+
+    def test_a_token_is_allowed_only_if_allowed_in_both_readings(self):
+        out = CLOUD.redact_error("Error: tok\u200ben pw\u200b9 and failed")
+        self.assertNotIn("pw", out)
+        self.assertIn("failed", out)
+
+    def test_an_error_class_name_and_a_short_number_print_and_a_long_number_does_not(self):
+        out = CLOUD.redact_error("WidgetStartupError 404 123456")
+        self.assertIn("WidgetStartupError", out)
+        self.assertIn("404", out)
+        self.assertNotIn("123456", out)
+
+    def test_every_other_token_is_the_placeholder_in_any_language(self):
+        self.assertEqual(CLOUD.redact_error("error: " + CYR_PASSWORD + " " + CJK_PASSWORD), "error: [redacted]")
+
+    def test_a_two_million_character_line_prints_within_ten_seconds_and_a_longer_one_prints_a_phrase(self):
+        began = time.monotonic()
+        out = CLOUD.redact_error("ab1 " * 500000)
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertLessEqual(len(out), 160)
+        self.assertEqual(CLOUD.redact_error("a" * 2000001), "[error text too long to show]")
+
+
+class TestTransientLogin(Base):
+    """S5 (extended): the token file and kubeconfig sit in a private 0700 directory and are GONE before the command exits, on success and on 2 error paths."""
+
+    def watch(self):
+        seen = []
+        real = CLOUD.Cluster.close
+
+        def close(cluster):
+            if cluster.dir:
+                seen.append((cluster.dir, os.stat(cluster.dir).st_mode & 0o777, sorted(os.listdir(cluster.dir))))
+            return real(cluster)
+        patch = mock.patch.object(CLOUD.Cluster, "close", close)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return seen
+
+    def check(self, seen, files):
+        self.assertEqual(len(seen), 1, seen)
+        directory, mode, names = seen[0]
+        self.assertEqual(mode, 0o700)
+        for name in files:
+            self.assertIn(name, names)
+        self.assertFalse(os.path.exists(directory), "the login directory is left behind")
+
+    def test_s5_success_the_login_files_are_private_and_gone(self):
+        self.worker()
+        seen = self.watch()
+        code, out, err = self.status_line()
+        self.assertEqual(code, 0, err)
+        self.check(seen, ("token", "config"))
+
+    def test_s5_error_path_one_a_launcher_that_cannot_be_reached(self):
+        self.worker()
+        seen = self.watch()
+        state = self.cluster()
+        state["fail_cmd"] = "get"
+        self.write_cluster(state)
+        os.environ["FAKE_KUBE_ECHO"] = "the cluster is down"
+        self.addCleanup(os.environ.pop, "FAKE_KUBE_ECHO", None)
+        code, out, err = self.status_line()
+        self.assertEqual(code, 1, (out, err))
+        self.assertIn("state not read", out)
+        self.check(seen, ("token", "config"))
+
+    def test_s5_error_path_two_a_login_that_fails_after_the_token_file_is_written(self):
+        self.worker()
+        seen = self.watch()
+        with mock.patch.object(CLOUD.json, "dump", side_effect=OSError(28, "No space left on device")):
+            code, out, err = self.status_line()
+        self.assertNotEqual(code, 0)
+        self.check(seen, ("token",))
+
+    def test_s5_a_build_that_leaves_the_token_file_behind_is_seen(self):
+        self.worker()
+        seen = self.watch()
+        with mock.patch.object(CLOUD.shutil, "rmtree", lambda *a, **k: None):
+            self.status_line()
+        self.assertTrue(seen and os.path.exists(seen[0][0]))
+        shutil.rmtree(seen[0][0], ignore_errors=True)
 
 
 class Clock:
