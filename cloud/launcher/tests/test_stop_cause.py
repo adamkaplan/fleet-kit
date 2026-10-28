@@ -72,13 +72,26 @@ class Cause(tcw.Base):
         self.assertEqual([l["cause"] for l in stops], ["hard"])
         self.assertTrue(stops[0]["reason"].startswith("hard limit"))
 
-    def test_s11_a_retire_of_a_gone_pod_carries_pod_gone(self):
+    def test_s11_a_stop_by_name_of_an_absent_pod_carries_no_cause(self):
         self.create()
         self.lose_pod()
         code, out, err = self.run_cli("stop", "coder7", "--reason", "retire")
         self.assertEqual(code, 0, err)
         self.assertIs(json.loads(out).get("pod_gone"), True)
-        self.assertEqual([l["cause"] for l in self.stops()], ["pod_gone"])
+        stops = self.stops()
+        self.assertEqual(len(stops), 1)
+        self.assertNotIn("cause", stops[0])
+
+    def test_s11_a_stop_by_name_of_a_failed_pod_carries_no_cause(self):
+        self.create()
+        st = self.st()
+        st["pods"][cw.pod_name("coder7")].setdefault("status", {})["phase"] = "Failed"
+        self.write_state(st)
+        code, out, err = self.run_cli("stop", "coder7", "--reason", "retire")
+        self.assertEqual(code, 0, err)
+        stops = self.stops()
+        self.assertEqual(len(stops), 1)
+        self.assertNotIn("cause", stops[0])
 
     def test_s11_a_failed_pod_carries_pod_failed(self):
         self.create("coder7", "--hard", "1h")
@@ -211,11 +224,12 @@ class Cause(tcw.Base):
 
     def test_m7_a_mutant_that_writes_the_cause_for_two_of_four_stops_is_caught(self):
         import argparse
-        mod = self.mutant('info["cause"] = "pod_gone"\n                if nonce:', 'if nonce:')
+        mod = self.mutant('if getattr(a, "cause", None):   # only the reaper\'s own stop names a cause; a by-name stop carries none\n                    info["cause"] = "pod_gone"',
+                          'if True:\n                    info["cause"] = "pod_gone"')
         self.create()
         self.lose_pod()
         mod.Launcher(mod.Kube(self.env), self.env, self.clock).stop(argparse.Namespace(worker="coder7", reason="retire", run_id=None))
-        self.assertNotIn("cause", self.stops()[0])   # the real code writes pod_gone
+        self.assertIn("cause", self.stops()[0])   # the mutant writes pod_gone for a by-name stop; the real code writes none
 
     def test_m8_a_vanished_pass_that_writes_on_every_pass_is_caught(self):
         mod = self.mutant('elif rec.get("action") in ("stop", "delete") and rec.get("ok") is True and rid in open_runs:', 'elif False:')

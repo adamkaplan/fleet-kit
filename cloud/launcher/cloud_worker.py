@@ -2098,7 +2098,8 @@ class Launcher:
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
                     raise CloudError("worker %s does not match run id %s; nothing was stopped or deleted" % (worker, nonce), EXIT_REFUSED)
             if not pod:
-                info["cause"] = "pod_gone"
+                if getattr(a, "cause", None):   # only the reaper's own stop names a cause; a by-name stop carries none
+                    info["cause"] = "pod_gone"
                 if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
                     self._remove(name, nonce)
                 # The pod read said NotFound (an operator deleted it); any other read error raised in _need above and never reaches here.
@@ -2117,7 +2118,7 @@ class Launcher:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
             phase = (pod.get("status") or {}).get("phase")
-            if phase == "Failed":
+            if phase == "Failed" and getattr(a, "cause", None):
                 info["cause"] = "pod_failed"
             if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
