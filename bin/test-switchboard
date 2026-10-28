@@ -30197,6 +30197,94 @@ class TestPlanWake(Base):
         self.assertEqual(len({f.key for f in facts}), 1)
 
 
+class TestCloudPodReport(ReportBase):
+    """#1478: a cloud pod (an endpoint record, no pane, no session) reports to the boss its record names, through the REAL engine and the relay executor."""
+    TOKEN = "tok-secret-1478-xyz"
+
+    def record(self, name="probe-pod", **extra):
+        base = self.world.engine.state_dir / "cloud"
+        base.mkdir(parents=True, exist_ok=True)
+        rec = {"worker": name, "url": "https://pod.example/x", "runtime_id": "r1", "reports_to": "platform", "repo": "acme/api", "auth_ref": "file:/x/" + self.TOKEN}
+        rec.update(extra)
+        rec = {k: v for k, v in rec.items() if v is not None}
+        (base / (name + ".json")).write_text(json.dumps(rec))
+
+    def executor(self):
+        sys.path.insert(0, str(Path(sb.__file__).resolve().parent))
+        import cloud_relay_daemon as relay
+        engine = self.world.engine
+        backend = relay.SwitchboardBackend(sb, (engine, None, {}), None, lambda: 1)
+        self.assertIs(type(backend).report, relay.SwitchboardBackend.report)
+        backend.pr_issues = lambda pr: {2}
+        audits = self.audits = []
+        backend.audit = lambda kind, pr, detail: (audits.append((kind, detail)), engine.audit.append("relay", kind, pr, detail))
+        return relay, relay.Executor(str(self.world.engine.state_dir), backend, lambda: 1000), backend
+
+    def call(self, ex, relay, pod="probe-pod", cid="c1", state="done", text="all done"):
+        req = {"pod": pod, "repo": "acme/api", "issue": 2, "call": {"call_id": cid, "command": "report", "pr": "acme/api#7", "args": {"state": state, "text": text}}}
+        return ex.handle(req)
+
+    def test_s1_s3_s7_a_paneless_pod_reports_to_its_boss_and_the_audit_names_it(self):
+        self.record()
+        relay, ex, _ = self.executor()
+        status, reason, _r = self.call(ex, relay)
+        self.assertEqual((status, reason), (200, "reported"))
+        (message,) = self.world.admissions("platform")
+        self.assertIn("done: all done", message["text"])
+        self.assertRegex(message["keys"][0], r"^report:probe-pod:[0-9a-f]{16}$")
+        self.assertEqual([d["by"] for k, d in self.audits if k == "report.delivered"], ["probe-pod"])   # report.claimed is only the replay-of-a-pending-claim line
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "relay.failed"], [])
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "relay.refused"], [])
+        self.assertNotIn(self.TOKEN, json.dumps(message) + json.dumps(self.world.audit()))
+
+    def test_s2_one_call_id_three_times_delivers_once(self):
+        self.record()
+        relay, ex, _ = self.executor()
+        outs = [self.call(ex, relay)[:2] for _ in range(3)]
+        self.assertEqual(outs, [(200, "reported"), (200, "replay: already reported"), (200, "replay: already reported")])
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+
+    def test_s4_a_progress_state_is_a_rider_and_does_not_wake(self):
+        self.record()
+        out = self.world.engine.report("probe-pod", "working", "halfway")
+        self.assertEqual(out["action"], "rider")
+        riders = [f for f in sb.report_rider_facts(self.world.engine) if f.recipient == "platform"]
+        self.assertEqual([f.sender for f in riders], ["probe-pod"])
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_s5_an_unknown_name_with_no_cloud_record_is_refused_not_found(self):
+        self.record("someone-else", worker="another-name")   # a file under the wrong worker name is no record
+        for name in ("ghost", "someone-else", "../x"):
+            with self.assertRaises(sb.ReportError) as got:
+                self.world.engine.report(name, "done", "x")
+            self.assertIn("not found", str(got.exception))
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.assertEqual(sb.report_rider_facts(self.world.engine), [])
+
+    def test_s6_a_record_with_no_boss_reports_to_nobody_and_the_audit_names_the_pod(self):
+        self.record(reports_to=None)
+        relay, ex, _ = self.executor()
+        status, reason, _r = self.call(ex, relay)
+        self.assertEqual((status, reason), (400, "the report was refused"))
+        (refused,) = [d for k, d in self.audits if k == "relay.refused"]
+        self.assertEqual(refused["by"], "probe-pod")
+        self.assertIn("reports to nobody", refused["why"])
+        self.assertEqual([k for k, d in self.audits if k == "relay.failed"], [])
+        with self.assertRaises(sb.ReportError) as got:
+            self.world.engine.report("probe-pod", "done", "x")
+        self.assertIn("reports to nobody", str(got.exception))
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_u1_a_local_agent_still_uses_its_pane_and_an_unknown_local_name_keeps_its_text(self):
+        self.record("coder")   # a stale cloud file of the same name never replaces a pane sender
+        self.report()
+        (message,) = self.world.admissions("platform")
+        self.assertRegex(message["keys"][0], r"^report:coder:[0-9a-f]{16}$")
+        with self.assertRaises(sb.ReportError) as got:
+            self.world.engine.report("nobody", "done", "x")
+        self.assertIn("not found", str(got.exception))
+
+
 class TestRiders(ReportBase):
     def test_a_fact_is_not_a_rider_unless_it_says_so_and_the_field_round_trips(self):
         self.assertIn("rider", sb.Fact.FIELDS)

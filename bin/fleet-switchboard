@@ -3408,6 +3408,8 @@ class Switchboard:
         discovery = self.discover(now)
         me = discovery.agents.get(sender)
         if me is None:
+            me = cloud_sender(self.state_dir, sender)   # #1478: a cloud pod has no pane; its own endpoint record (never the request) names it and its boss
+        if me is None:
             raise ReportError(discovery.missing(sender))
         boss = boss_name(discovery, me)  # the role name chief-of-staff resolves to the registered cos agent (#102)
         if boss is None:
@@ -22994,6 +22996,21 @@ def cloud_record_live(record, worker, retired, last_reports, now):
         if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
             return False
     return True
+
+
+def cloud_sender(state_dir, name):
+    """#1478: the pane-less sender of a cloud worker's report: an Observation built from its endpoint record (the same `reports_to` the lane count
+    reads), or None when `name` has no such record. Only a record of that exact worker counts; nothing in it but name, reports_to, repo is used."""
+    if state_dir is None or not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        return None
+    record, _kind = load_module("cloud_worker").read_record_file(Path(state_dir) / "cloud" / (name + ".json"), CLOUD_LOAD_MAX_BYTES)
+    if record is None or record.get("worker") != name:
+        return None
+    boss = _cloud_boss(record.get("reports_to"))
+    fleet = {"name": name, "role": "cloud-worker", "reports_to": boss or None, "issue": None}
+    if isinstance(record.get("repo"), str):
+        fleet["repo"] = record["repo"]
+    return Observation(name, None, None, "unknown", fleet)
 
 
 def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None, clock=None):
