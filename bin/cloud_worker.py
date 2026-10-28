@@ -56,8 +56,7 @@ SETUP_PREAMBLE = """Setup (do this first, before the task below):
 
 Task:
 """
-# The two TEMPORARY launch rules (ask #1046): the only place they are written; each names the ask whose merge removes it.
-TEMP_HARD_LIMIT_MINUTES = 55   # the git token is not renewed while a worker runs: removed when ask #1034 (token renewal) merges
+# The TEMPORARY launch rule (ask #1046): the only place it is written; it names the ask whose merge removes it.
 TEMP_ISSUE_LINK_WARNING = True   # a worker cannot read issues yet: removed when ask #1019 (issue reading by workers) merges
 POD_SHAPE_DEFAULT = "XS"
 POD_SHAPE_DEFAULT_WIDE = "S"   # with --stack, and for an orchestrator
@@ -1324,17 +1323,6 @@ def check_report_to(engine, state, args, local_agents):
     _audit(engine, "launch.boss_unregistered", args.name, {"reports_to": _one(args.reports_to, 60), "reason": _one(reason, 160)})
 
 
-def hard_limit_problem(text):
-    """The refusal text when an explicit `--hard` is above TEMP_HARD_LIMIT_MINUTES (a duration the launcher would read as Ns, Nm or Nh), else None."""
-    m = re.fullmatch(r"(\d+)([smh])", text or "")
-    if not m:
-        return None   # not a duration: the launcher says so
-    if int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)] <= TEMP_HARD_LIMIT_MINUTES * 60:
-        return None
-    return ("--hard %s is above %dm: the git token is not renewed while a worker runs, so a worker living longer could not push at its end. "
-            "Rule: --hard %dm or less until ask #1034 (token renewal) merges; nothing was created." % (_one(text, 20), TEMP_HARD_LIMIT_MINUTES, TEMP_HARD_LIMIT_MINUTES))
-
-
 def pod_shape(args):
     """The pod shape the launch gets: the one named, else the launcher's default (S with --stack or for an orchestrator, XS otherwise)."""
     if args.shape:
@@ -1381,9 +1369,6 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
-    problem = hard_limit_problem(args.hard)   # the temporary token rule: before the settings, any token or call
-    if problem:
-        raise LaunchError(problem)
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created

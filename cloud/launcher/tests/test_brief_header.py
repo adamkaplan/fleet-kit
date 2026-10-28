@@ -1,6 +1,6 @@
 """Ask #1046: a standard operator brief header, and a launch that refuses a report-to name nobody can answer to. Offline: fake cluster pieces,
 fake registry in a temporary state directory. Scenarios: S2 S3 (the header), S4 S5 (the check), S6 (mutants), S7 (documentation), S9 S11 (cloud
-shape and temporary rules), U2 (no secret), U3 (the two constants in one place)."""
+shape and temporary rules), U2 (no secret), U3 (the one constant in one place)."""
 import io
 import os
 import re
@@ -117,7 +117,7 @@ class Sentinel(Exception):
 class LaunchHarness(unittest.TestCase):
     """The real cloud `_launch`, stopped at the launcher lookup (a Sentinel there means: everything before it passed, nothing was created)."""
 
-    def run_launch(self, boss, agents=(), retired=(), brief="plain brief", hard=None, stack=False, shape=None, override=None, extra=None):
+    def run_launch(self, boss, agents=(), retired=(), brief="plain brief", hard=None, stack=False, shape=None, override=None, extra=None, settings=None):
         sb, state = make_state(agents, retired)
         b = sb.load_module("cloud_worker")
         audit = []
@@ -150,7 +150,7 @@ class LaunchHarness(unittest.TestCase):
         err = io.StringIO()
         result = "reached"
         try:
-            b.launcher_argv, b.use_settings, b.check_allowed = stop, (lambda: "test"), (lambda repo: None)
+            b.launcher_argv, b.use_settings, b.check_allowed = stop, (settings or (lambda: "test")), (lambda repo: None)
             b._lib, b.load_record, b.H, b.stack_model_secret = (lambda: lib), (lambda st, n: None), h, (lambda env=None: None)
             try:
                 with redirect_stderr(err), redirect_stdout(io.StringIO()):
@@ -223,26 +223,44 @@ class Check(LaunchHarness):
 
 
 class CloudLimits(LaunchHarness):
-    def test_s11_a_hard_limit_above_55_minutes_is_refused_with_the_reason_and_the_rule(self):
-        result, _, _ = self.run_launch(None, hard="56m")
-        self.assertTrue(result.startswith("refused:"), result)
-        self.assertIn("token", result)
-        self.assertIn("55m", result)
-        self.assertIn("#1034", result)
-        self.assertEqual(self.run_launch(None, hard="55m")[0], "reached")
-        self.assertEqual(self.run_launch(None, hard="3000s")[0], "reached")
-        self.assertTrue(self.run_launch(None, hard="2h")[0].startswith("refused:"))
+    def assert_long_limits_proceed(self, settings=None):
+        for hard in ("56m", "90m", "55m"):
+            result, err, _ = self.run_launch(None, hard=hard, settings=settings)
+            self.assertEqual(result, "reached", hard)
+            self.assertNotIn("refused", result + err, hard)
 
-    def test_s11_mutant_a_longer_limit_accepted_is_caught(self):
+    def test_s11_a_long_hard_limit_proceeds_the_token_is_renewed_while_a_worker_runs(self):
+        self.assert_long_limits_proceed()
+
+    def test_s11_the_issue_link_warning_still_prints_once_with_a_long_limit(self):
+        result, err, _ = self.run_launch(None, hard="90m", brief="see acme-org/widget-service#13")
+        self.assertEqual(result, "reached")
+        self.assertEqual(len([l for l in err.splitlines() if "cannot read" in l and "issue" in l]), 1, err)
+        self.assertIn("#1019", err)
+
+    def test_s11_mutant_a_restored_refusal_above_55_minutes_is_caught(self):
         sb, _ = make_state()
         b = sb.load_module("cloud_worker")
-        original = b.TEMP_HARD_LIMIT_MINUTES
-        b.TEMP_HARD_LIMIT_MINUTES = 600
+        applied = []
+        hard_now = []
+
+        def mutant_settings():   # the restored rule: a launch above 55 minutes is refused before the settings are used
+            if hard_now[-1] != "55m":
+                applied.append(hard_now[-1])
+                raise b.H["LaunchError"]("--hard %s is above 55m: refused" % hard_now[-1])
+            return "test"
+        original = LaunchHarness.run_launch
+
+        def tracking(self_, boss, **kw):
+            hard_now.append(kw.get("hard"))
+            return original(self_, boss, **kw)
+        LaunchHarness.run_launch = tracking
         try:
-            result = self.run_launch(None, hard="56m")[0]
+            with self.assertRaises(AssertionError):
+                self.assert_long_limits_proceed(settings=mutant_settings)
         finally:
-            b.TEMP_HARD_LIMIT_MINUTES = original
-        self.assertEqual(result, "reached", "the constant is the one place: the refusal test above fails under this mutant")
+            LaunchHarness.run_launch = original
+        self.assertEqual(applied, ["56m"], "the mutation was applied")
 
     def test_s11_a_brief_that_links_an_issue_of_the_repository_warns_once_and_continues(self):
         brief = "see https://github.com/acme-org/widget-service/issues/12 and acme-org/widget-service#13"
@@ -271,13 +289,15 @@ class CloudLimits(LaunchHarness):
         tail = src[src.index("def _launch("):]
         self.assertIn('"shape": pod_shape(args)', tail[:tail.index("def _registry_note")])
 
-    def test_u3_the_two_temporary_rules_are_constants_in_one_module_each_naming_its_ask(self):
+    def test_u3_the_one_temporary_rule_is_a_constant_in_one_module_followed_by_an_ask_number(self):
         src = read("bin/cloud_worker.py")
-        for name, ask in (("TEMP_HARD_LIMIT_MINUTES", "#1034"), ("TEMP_ISSUE_LINK_WARNING", "#1019")):
-            line = [l for l in src.splitlines() if l.startswith(name + " =")]
-            self.assertEqual(len(line), 1, name)
-            self.assertIn(ask, line[0])
-        self.assertNotIn("55", src[src.index("def _launch("):src.index("def _registry_note")])
+        names = re.findall(r"^(TEMP_[A-Z_]+) =", src, re.M)
+        self.assertEqual(names, ["TEMP_ISSUE_LINK_WARNING"])
+        line = [l for l in src.splitlines() if l.startswith("TEMP_ISSUE_LINK_WARNING =")]
+        self.assertEqual(len(line), 1)
+        self.assertIn("#1019", line[0])
+        self.assertNotIn("TEMP_HARD_LIMIT_MINUTES", src)
+        self.assertNotIn("hard_limit_problem", src)
 
 
 class Docs(unittest.TestCase):

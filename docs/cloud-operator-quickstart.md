@@ -405,7 +405,7 @@ It names the cluster admin route by its settings key (`CW_CLUSTER_ADMIN_CMD`, `C
 
 `launch` also refuses a `--reports-to` name that is not a registered identity (a running, recorded or retired agent, a cloud worker, or the role alias `chief-of-staff`), before anything is created: it lists the nearest registered names. `--boss-unregistered REASON` goes on anyway and writes one `launch.boss_unregistered` audit line. If the registry cannot be read, the launch warns and goes on.
 
-Two temporary rules of `launch --cloud` (named constants in `bin/cloud_worker.py`): an explicit `--hard` above 55 minutes is refused until the git token is renewed while a worker runs (ask #1034), and a brief that links an issue of the repository prints one warning until a worker can read issues (ask #1019). A brief that names docker or buildx without `--stack` also prints one warning (the worker would have no nested Docker). The one-line output of a cloud launch now has a `shape` field.
+One temporary rule of `launch --cloud` (a named constant in `bin/cloud_worker.py`): a brief that links an issue of the repository prints one warning until a worker can read issues (ask #1019). A brief that names docker or buildx without `--stack` also prints one warning (the worker would have no nested Docker). The one-line output of a cloud launch now has a `shape` field.
 
 ## Checking a cloud pull request before the push
 
