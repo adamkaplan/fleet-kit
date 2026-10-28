@@ -1,4 +1,5 @@
 """The plan check's `no-failure-mode` warning (ask #1455): a plan that reads or produces something and has no scenario about a missing, corrupt, unreadable or absent input."""
+import re
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,22 @@ class TestNoFailureMode(unittest.TestCase):
         text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
         self.assertIn("quoted heredoc", text)
         self.assertIn("backtick", text)
+
+    def test_every_trigger_word_warns_and_every_failure_word_clears_it(self):
+        """One case per member of the two tables, derived from the code (R-TEST-5)."""
+        quiet = plan().replace("reads three files and writes a feed", "prints a summary line").replace("long feed", "long list").replace("the feed", "the list")
+        failure_words = [w for w in re.findall(r"[a-z]+", plan_check.FAILURE_SCENARIO_RE.pattern) if w not in ("b", "bb")]
+        self.assertEqual(sorted(failure_words), sorted(["missing", "corrupt", "corrupted", "unreadable", "absent"]))
+        for word in plan_check.FAILURE_TRIGGER_WORDS:
+            with self.subTest(trigger=word):
+                warned = quiet.replace("prints a summary line", "the verb will %s it" % word)
+                self.assertEqual(run(warned).stdout.count("no-failure-mode"), 1, word)
+                for fw in failure_words:
+                    with self.subTest(trigger=word, failure=fw):
+                        self.assertIsNone(plan_check.failure_mode_warning([{"text": "an input that is %s" % fw}], "the verb will %s it" % word))
+
+    def test_a_plan_with_trigger_words_and_no_scenarios_has_no_warning(self):
+        self.assertIsNone(plan_check.failure_mode_warning([], "the verb reads three files"))
 
 
 if __name__ == "__main__":
