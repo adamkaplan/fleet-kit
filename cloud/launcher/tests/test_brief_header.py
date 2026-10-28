@@ -1,6 +1,7 @@
 """Ask #1046: a standard operator brief header, and a launch that refuses a report-to name nobody can answer to. Offline: fake cluster pieces,
 fake registry in a temporary state directory. Scenarios: S2 S3 (the header), S4 S5 (the check), S6 (mutants), S7 (documentation), S9 S11 (cloud
 shape and temporary rules), U2 (no secret), U3 (the one constant in one place)."""
+import inspect
 import io
 import os
 import re
@@ -309,6 +310,104 @@ class Docs(unittest.TestCase):
         section = section[:section.index("\n## ", 5)] if "\n## " in section[5:] else section
         self.assertEqual(section.count(self.COMMAND), 1)
         self.assertEqual(read("skills/fleet-coordination/SKILL.md").count(self.COMMAND), 1)
+
+    def test_the_override_sentences_are_in_the_quickstart(self):
+        doc = read("docs/cloud-operator-quickstart.md")
+        for phrase in ("The override --boss-unregistered REASON is not restricted to a person: an agent may pass it.",
+                       "It writes one launch.boss_unregistered audit line (the actor, the worker, the boss text and the reason).",
+                       "A worker launched so has a boss nobody answers to: only the operator or the Chief of Staff can end it.",
+                       "The reasons of both overrides, --boss-unregistered and --memory-ok, are scrubbed of secret shapes"):
+            self.assertEqual(doc.count(phrase), 1, phrase)
+
+
+def _shapes():
+    return {
+        "token": "ghp_" + "aB3dE5gH7j" * 3 + "KLmnop",
+        "bearer": "Authorization: Bearer abcDEF1234567890xyz",
+        "key": "-----BEGIN PRIVATE KEY-----",
+        "url": "https://user:pass@host/path",
+        "control": "line one\x07\nline two",
+    }
+
+
+SECRET_PART = {"token": "ghp_" + "aB3dE5gH7j" * 3, "bearer": "abcDEF1234567890xyz", "key": "BEGIN PRIVATE KEY", "url": "user:pass@", "control": None}
+
+
+class OverrideReasonScrub(LaunchHarness):
+    """S12: both override flags send their reason through the one helper `scrubbed_flag_text`."""
+
+    def boss_audit(self, text):
+        # the flag's own up-front check refuses a control character, so the control case goes in through the helper below
+        result, _, audit = self.run_launch("lane-nobody", override=text)
+        lines = [a for a in audit if a[0] == "launch.boss_unregistered"]
+        return lines[0][2]["reason"] if lines else None
+
+    def memory_audit(self, text, sb=None):
+        sb = sb or load_sb()
+        seen = []
+        eng = types.SimpleNamespace(actor="t", audit=types.SimpleNamespace(append=lambda actor, kind, name, data: seen.append((kind, data))))
+        sb.memory_read = lambda runner: None
+        sb.launch_memory_check(types.SimpleNamespace(memory_ok=text, name="w"), eng, tempfile.mkdtemp(), None, lambda: 0)
+        return [d for k, d in seen if k == "launch.memory_ok"][0]["reason"]
+
+    def test_s12_two_flags_five_shapes(self):
+        sb = load_sb()
+        for name, text in _shapes().items():
+            part = SECRET_PART[name]
+            with self.subTest(flag="memory-ok", shape=name):
+                got = self.memory_audit("fix " + text, sb)
+                self.assertNotIn("\n", got)
+                if part:
+                    self.assertNotIn(part, got)
+            with self.subTest(flag="boss-unregistered", shape=name):
+                if name == "control":
+                    got = load_sb().scrubbed_flag_text("fix " + text)
+                else:
+                    got = self.boss_audit("fix " + text)
+                    self.assertIsNotNone(got)
+                self.assertNotIn("\n", got)
+                if part:
+                    self.assertNotIn(part, got)
+        self.assertEqual(self.memory_audit("release fix", sb), "release fix")
+        self.assertEqual(self.boss_audit("release fix"), "release fix")
+
+    def test_the_helper_cuts_to_160_and_removes_controls(self):
+        sb = load_sb()
+        got = sb.scrubbed_flag_text("a\x00b\nc" + "x" * 300)
+        self.assertEqual(len(got), 160)
+        self.assertNotRegex(got, r"[\x00-\x1f]")
+
+    def test_both_flags_call_the_same_helper(self):
+        from unittest import mock
+        sb = load_sb()
+        calls = []
+        real = sb.scrubbed_flag_text
+        sb.scrubbed_flag_text = lambda text: calls.append(text) or real(text)
+        self.memory_audit("release fix", sb)
+        with mock.patch.object(sys.modules[__name__], "load_sb", lambda: sb):
+            result, _, audit = self.run_launch("lane-nobody", override="release fix")
+        self.assertEqual(calls, ["release fix", "release fix"], "one call from each flag")
+        self.assertEqual([a for a in audit if a[0] == "launch.boss_unregistered"][0][2]["reason"], "release fix")
+
+    def test_mutant_cut_without_scrub_fails_every_shape_case(self):
+        sb = load_sb()
+        sb.scrubbed_flag_text = lambda text: sb._one_line(text, 160)   # the old behaviour: cut, no scrub
+        leaked = [n for n, t in _shapes().items() if SECRET_PART[n] and SECRET_PART[n] in self.memory_audit("fix " + t, sb)]
+        self.assertEqual(sorted(leaked), ["bearer", "key", "token", "url"], "mutation applied: the unscrubbed cut keeps each secret shape")
+
+    def test_mutant_only_the_new_flag_scrubs_fails_the_memory_ok_cases(self):
+        from unittest import mock
+        sb = load_sb()
+        real = sb.scrubbed_flag_text
+        # the memory-ok site calls the helper through the module global: a build that cuts there without scrub is this global replaced for that site only
+        src = inspect.getsource(sb.launch_memory_check).replace("scrubbed_flag_text(reason)", "_one_line(reason, 200)")
+        self.assertIn("_one_line(reason, 200)", src, "mutation applied")
+        namespace = sb.__dict__
+        exec(compile(src.replace("def launch_memory_check", "def mutant_memory_check", 1), "<mutant>", "exec"), namespace)
+        sb.launch_memory_check = namespace["mutant_memory_check"]
+        leaked = [n for n, t in _shapes().items() if SECRET_PART[n] and SECRET_PART[n] in self.memory_audit("fix " + t, sb)]
+        self.assertEqual(sorted(leaked), ["bearer", "key", "token", "url"])
+        self.assertNotIn(SECRET_PART["token"], self.boss_audit("fix " + _shapes()["token"]), "the new flag still scrubs")
 
 
 if __name__ == "__main__":

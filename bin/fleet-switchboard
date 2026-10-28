@@ -13921,7 +13921,7 @@ def launch_memory_check(args, engine, state, runner, now):
         except OSError:
             pass   # the cache is only an optimisation: a failed write costs the next launch one wait, deliberately silent
     if reason is not None:
-        audit("launch.memory_ok", {"reason": _one_line(reason, 200), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
+        audit("launch.memory_ok", {"reason": scrubbed_flag_text(reason), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
         return None
     if first is None:
         sys.stderr.write("%s: memory test not available: launching\n" % PROG)
@@ -22493,6 +22493,7 @@ _SECRET_PATTERNS = (
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
     (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
+    (re.compile(r"-----(?:BEGIN|END)[A-Z ]*PRIVATE KEY-----"), "[redacted]"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
 )
 
@@ -22510,6 +22511,17 @@ def redact_command_text(text, extra=()):
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+OVERRIDE_TEXT_LIMIT = 160
+
+
+def scrubbed_flag_text(text):
+    """The text of an override flag (`--boss-unregistered`, `--memory-ok`) as the audit keeps it: secret shapes replaced (the scrub
+    above), control characters removed (one line), then cut to OVERRIDE_TEXT_LIMIT characters. A text without a secret shape stays as typed."""
+    text = redact_command_text(text)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", text)
+    return _one_line(text, OVERRIDE_TEXT_LIMIT)
 
 
 # ------------------------------------------------------- standing authority
