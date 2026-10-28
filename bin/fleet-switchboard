@@ -16301,7 +16301,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     record_step("a GitHub read of %s" % pr)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
     if writable:   # #770: an item's entries are written only by the item commands
-        why = item_entry_problem_line(engine, repo, number, entries, unreadable, True)
+        why = item_entry_refusal(engine, repo, number, entries, unreadable, True)
         if why:
             _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "pull request command"})
             raise LedgerCommandError("refused: %s" % why)
@@ -16619,7 +16619,7 @@ def cmd_waive(args, runner, now):
         _gates_audit(engine, "gate.waiver.refused", pr, {"by": who, "why": "the ledger is not trustworthy"})
         raise LedgerCommandError("refused: the ledger is not trustworthy, nothing was recorded: %s" % problem)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
-    why = item_entry_problem_line(engine, repo, number, entries, unreadable)   # #770: a work item's gates are not waived through the pull request command
+    why = item_entry_refusal(engine, repo, number, entries, unreadable)   # #770: a work item's gates are not waived through the pull request command
     if why:
         _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "waive"})
         raise LedgerCommandError("refused: %s" % why)
@@ -16849,7 +16849,7 @@ cmd_gates.ledger = True   # state and GETs only; its own errors are usage errors
 # ---------------------------------------------------------------- verdicts for a work item with no pull request (#770, plan fleet-kit#777)
 # The rules are bin/item_verdicts.py. This is the reading (GET only) and the writing (the ledger and the audit). The pull request RULES (`launched_testers_for`,
 # `plan_ledger.may_record_verdict`, `ci_record_core`) are untouched, and the ordinary pull request COMMANDS refuse an item (an issue number or a number with an item
-# registration: `item_entry_problem_line`), so an item's entries are written only here. An item key is `owner/repo#N` of an ISSUE.
+# registration: `item_entry_refusal`), so an item's entries are written only here. An item key is `owner/repo#N` of an ISSUE.
 
 def _item_of(args):
     try:
@@ -16942,7 +16942,7 @@ def item_agents(ctx):
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 
 
-def item_entry_problem_line(engine, repo, number, entries, unreadable, allow_ask=False):
+def item_entry_refusal(engine, repo, number, entries, unreadable, allow_ask=False):
     """Why the ORDINARY pull request commands (prove, verdict, gates ci-record, waive) must not write for `repo#number`, or None. They refuse a number that is an ISSUE (the pull request
     could not be read and GitHub says it is an issue) and a number that has an item registration: an item's entries are written only by item-prove, item-verdict and item-ci-record.
     A real pull request is never affected (it is read, and has no registration)."""
