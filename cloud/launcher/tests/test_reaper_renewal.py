@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -273,7 +274,7 @@ class S6SlowPass(unittest.TestCase):
             devnull = os.open(os.devnull, os.O_RDONLY)
             with mock.patch.object(real, "reaper_lock", return_value=devnull), mock.patch.object(real, "Launcher", return_value=launcher), \
                     contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-                real._reap_main(env, args, lambda s: None, clock=clock, refresher=Refresher(kube), kube=kube, ticker_wait=lambda: None)
+                real._reap_main(env, args, lambda s: None, clock=clock, refresher=Refresher(kube), kube=kube, ticker_wait=lambda: time.sleep(0.01))
             lines = audit_lines(env)
         self.assertEqual(len([x for x in lines if x["action"] == real.SLOW_PASS_ACTION]), 1)
 

@@ -3239,6 +3239,8 @@ class RenewalTicker:
 
     def close(self):
         self._stop.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(5)   # a tick in flight ends first
 
 
 def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None):
