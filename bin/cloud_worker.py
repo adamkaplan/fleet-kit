@@ -1351,7 +1351,7 @@ def _launch(args, runner, now, reserve):
     with Cluster(recovery) as cluster:
         model = model_entry()
         cluster.add(model)
-        token = git_token(repo, cluster, args.agent if args.agent in _lib().AGENTS else "worker")   # the first token is minted under the role of the launch
+        token = git_token(repo, cluster)   # the first token is minted under the role of the launch
         cluster.add(token)
         run_secrets = [("model-auth", model), ("git-token", token)]
         if stack_model:
