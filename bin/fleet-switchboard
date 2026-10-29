@@ -401,7 +401,7 @@ DEFAULTS = {
     "gh": "gh",
     "github_lookback_hours": 24,
     "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
-                      "check_suite", "workflow_run", "push"],   # #1407: `push` tells a lane its cloud worker's branch moved (a config with its own list must add it)
+                      "check_suite", "workflow_run", "push", "check_run"],   # #1568: `check_run` carries a staging stack's state; #1407: `push` tells a lane its cloud worker's branch moved (a config with its own list must add it)
     "github_port": None,
     "github_ignore_authors": [],  # logins whose events are never delivered: the agents' own account, when it is not yours
     "owner_logins": [],  # GitHub logins of the person: an Intent edit by one of them always reaches the Chief of Staff
@@ -413,6 +413,8 @@ DEFAULTS = {
     "cos_orders_file": None,        # PR 18: the Chief of Staff's own standing orders, an absolute path; None means standing-orders.md beside config.json
     # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
     "gh_users": {},
+    "github_stage_checks": [],  # #1568: names of check runs (for example `stage`) whose run, passing or not, is delivered to the pull request's owner when the sender is on `github_stage_bots` (at most 10); none by default
+    "github_stage_bots": [],  # #1568: logins (the payload's sender) whose listed check run is delivered; both lists must match; none by default
     "github_bot_logins": [],  # the cloud readers' bot account(s), each a fleet identity besides the `gh_users` accounts (at most 10); none by default
     "intent_live_silence_minutes": 10,  # #367: a live forwarder whose last event (or start) is older than this does not get the long intent trust (0 = always trusted, as before)
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
@@ -3059,6 +3061,8 @@ class Switchboard:
         if busy:
             detail["busy"] = True
         description = None if fault("no-description") else describe_items(plan.recipient, carried, repos)
+        if description and any(STAGE_LINE_PREFIX in str(f.summary) for f in carried):   # #1568: a sign-in link's signed value (query, fragment) is never written to the audit
+            description = stage_redact(description)
         detail["description"] = description
         if interrupt:
             # resume false: nothing else runs; the wake below is what the agent acts on (and it carries any
@@ -11358,7 +11362,7 @@ cmd_budget_notice.direct = True   # run by the gh shim: no daemon start, no erro
 # forwarder start and lives only in memory and in that forwarder's argv.
 
 GITHUB_EVENTS = ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
-                 "check_suite", "workflow_run"]
+                 "check_suite", "workflow_run", "check_run"]
 GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 GITHUB_EVENT_RE = re.compile(r"^[a-z_]+$")
 GITHUB_BACKOFF_BASE = 5        # seconds before the first restart; doubles each failure
@@ -11442,6 +11446,14 @@ def _validate_github(config, source):
     if not isinstance(bots, list) or len(bots) > 10 or not all(isinstance(a, str) and GITHUB_LOGIN_RE.match(a) for a in bots):
         raise ConfigError("%s: 'github_bot_logins' must be a list of at most 10 GitHub logins, got %r" % (source, bots))
     config["github_bot_logins"] = list(bots)
+    checks = config["github_stage_checks"]   # #1568: names of check runs, at most 10, each one line of at most 100 characters
+    if not isinstance(checks, list) or len(checks) > 10 or not all(isinstance(c, str) and c.strip() == c and 0 < len(c) <= 100 and c.isprintable() for c in checks):
+        raise ConfigError("%s: 'github_stage_checks' must be a list of at most 10 check names, got %r" % (source, checks))
+    config["github_stage_checks"] = list(checks)
+    stage_bots = config["github_stage_bots"]
+    if not isinstance(stage_bots, list) or len(stage_bots) > 10 or not all(isinstance(a, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.\[\]-]{0,59}", a) for a in stage_bots):
+        raise ConfigError("%s: 'github_stage_bots' must be a list of at most 10 GitHub logins, got %r" % (source, stage_bots))
+    config["github_stage_bots"] = list(stage_bots)
     poll = config["github_poll_seconds"]
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
         raise ConfigError("%s: 'github_poll_seconds' must be a number of at least %d (each read of a repo costs "
@@ -11846,7 +11858,8 @@ def _wh_sub_issues(repo, payload, now):
 
 WEBHOOK_HANDLERS = {"issues": _wh_issues, "issue_comment": _wh_issue_comment, "pull_request": _wh_pull_request,
                     "pull_request_review": _wh_review, "check_suite": _wh_check_suite,
-                    "workflow_run": _wh_workflow_run, "sub_issues": _wh_sub_issues}
+                    "workflow_run": _wh_workflow_run, "sub_issues": _wh_sub_issues,
+                    "check_run": lambda repo, payload, now: _wh_check_run(repo, payload, now)}   # #1568: the handler is a part that runs after this file (the assembler)
 
 
 def webhook_items(event, payload, now):
@@ -12338,6 +12351,17 @@ class GitHubHub:
                 self._audit("github.ignored", dropped[0].repo, {"keys": [item.key for item in dropped],
                                                                 "authors": sorted({item.sender for item in dropped})})
                 items = [item for item in items if item not in dropped]
+        stage_on = bool(self.config.get("github_stage_checks") and self.config.get("github_stage_bots"))
+        kept = []
+        for item in items:   # #1568: a check run is heard only when both stage lists are set (none by default: nothing new); a listed one is actionable whatever its conclusion
+            if getattr(item, "stage", None):
+                if not stage_on:
+                    continue
+                if stage_listed(self.config, item):
+                    item.actionable = True
+                    item.summary += ": " + stage_line(item.stage_summary)
+            kept.append(item)
+        items = kept
         with self.lock:
             for item in items:
                 self.queue.setdefault(item.key, item)  # the same object seen twice is one item
@@ -12545,6 +12569,10 @@ class GitHubHub:
             return  # the fleet cannot be read: keep it, ask again next pass
         try:
             owner, routed_by = self.route_of(item, discovery.agents, now)
+            if getattr(item, "head_branch", None) and stage_listed(self.config, item):   # #1568: a cloud worker's pull request goes to the lane that launched it (#1407's branch-head table)
+                lanes = [w[1] for w in (self._push_workers_load(now).get((item.repo, item.head_branch)) or [])]
+                if len(set(lanes)) == 1 and lanes[0] in discovery.agents:
+                    owner, routed_by = lanes[0], "cloud"
         except GitHubUnavailable:
             return
         if item.key.startswith("github.reviewcomment:"):

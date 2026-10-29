@@ -8,6 +8,7 @@ switchboard/import_v1.py
 switchboard/decisions_a.py
 switchboard/decisions_b.py
 switchboard/reminders.py
+switchboard/stage_events.py
 switchboard/plan_review.py
 switchboard/pr_explain.py
 switchboard/triage.py
