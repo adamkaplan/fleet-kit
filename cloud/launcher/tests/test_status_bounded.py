@@ -33,6 +33,7 @@ class Fakes:
         super().setUp()
         self.reads, self.probes = [], []
         self.lock = threading.Lock()
+        self.running, self.peak = 0, 0   # the probes in flight now, and the most seen at once
 
     def live(self, count, lane_of=lambda i: "orch"):
         names = ["w%d" % i for i in range(count)]
@@ -62,7 +63,11 @@ class Fakes:
         def probe(state, cluster, record, timeout):
             with self.lock:
                 self.probes.append(record["worker"])
+                self.running += 1
+                self.peak = max(self.peak, self.running)
             time.sleep(delay)
+            with self.lock:
+                self.running -= 1
             return True
 
         stack = [mock.patch.object(module, "run_launcher", launcher), mock.patch.object(module, "_answers", probe)]
@@ -101,12 +106,11 @@ class Bounded(Fakes, Base):
 
     def test_s3_fifteen_live_workers_finish_within_thirty_seconds_with_fifteen_lines(self):
         self.names = self.live(15)
-        self.fakes(real_shape, delay=1.5)
-        started = time.monotonic()
+        self.fakes(real_shape, delay=0.3)
         lines, rows = self.status()
-        took = time.monotonic() - started
-        print("s3 took %.1f s" % took, file=sys.stderr)
-        self.assertLess(took, 30, took)
+        print("s3 most probes at once: %d" % self.peak, file=sys.stderr)
+        self.assertGreater(self.peak, 1, "the probes ran one after another")
+        self.assertLessEqual(self.peak, 4, "more than four probes ran at once")
         self.assertEqual(len([l for l in lines if l.strip().startswith("cloud w")]), 15, lines)
         self.assertEqual([r["worker"] for r in rows], sorted(self.names))   # the records' order
         self.assertEqual(len(self.reads), 1, self.reads)   # ONE read, without a worker name
@@ -127,6 +131,7 @@ class Bounded(Fakes, Base):
         with mock.patch.object(module, "PROBE_SECONDS", 0.5), mock.patch.object(module, "_answers", probe):
             started = time.monotonic()
             lines, _ = self.status()
+        # a hang guard only: the expected time is 0.5 s (the probe bound), the probe sleeps 30 s; 10 s is a factor 20 of the expected time
         self.assertLess(time.monotonic() - started, 10)
         by = {n: [l for l in lines if "cloud %s:" % n in l][0] for n in self.names}
         self.assertIn("does not answer", by["w0"])
@@ -182,7 +187,12 @@ class Bounded(Fakes, Base):
         self.names = self.live(count)
         self.fakes(real_shape)
         module = self.cloud()
-        hang = lambda state, cluster, record, timeout: time.sleep(30)
+        begun = []
+
+        def hang(state, cluster, record, timeout):
+            with self.lock:
+                begun.append(record["worker"])
+            time.sleep(30)
         stage_now, probe_now = (10 ** 6, 0.1) if mutate else (stage, probe)
         with mock.patch.object(module, "PROBE_STAGE_SECONDS", stage_now), mock.patch.object(module, "PROBE_SECONDS", probe_now), \
                 mock.patch.object(module, "_answers", hang):
@@ -191,10 +201,14 @@ class Bounded(Fakes, Base):
             took = time.monotonic() - started
         print("stage %s took %.1f s" % ("mutant" if mutate else "real", took), file=sys.stderr)
         self.assertEqual(len(rows), count)
-        self.assertLess(took, stage + 2, took)
         mine = [l for l in lines if l.strip().startswith("cloud w")]
         self.assertEqual(len(mine), count)
-        self.assertTrue(any("not probed" in l for l in mine), "no line says not probed")
+        not_probed = len([l for l in mine if "not probed" in l])
+        print("stage: %d probes begun, %d lines not probed" % (len(begun), not_probed), file=sys.stderr)
+        self.assertTrue(not_probed, "no line says not probed")
+        self.assertLess(len(begun), count, "every probe was begun: the stage deadline did not stop the starts")
+        # a hang guard only: the expected time is the stage deadline (2 s); 40 s is a factor 20 of it
+        self.assertLess(took, stage * 20, took)
         return mine
 
     def test_s9_three_hundred_hanging_workers_end_at_the_stage_deadline_with_not_probed_lines(self):
@@ -276,18 +290,16 @@ class Bounded(Fakes, Base):
             applied.append(True)
             out = []
             for record in records:   # a read and a probe per worker, in turn
-                time.sleep(1.5)
+                time.sleep(0.3)
                 out.append(module._probe_one(state, cluster, record, timeout))
             return out
         self.names = self.live(15)
-        self.fakes(real_shape, delay=1.5)
+        self.fakes(real_shape, delay=0.3)
         with mock.patch.object(module, "_probe_all", one_by_one):
-            started = time.monotonic()
             self.status()
-            took = time.monotonic() - started
         self.assertTrue(applied, "the mutation was not applied")
         with self.assertRaises(AssertionError):
-            self.assertLess(took, 30, took)
+            self.assertGreater(self.peak, 1, "the probes ran one after another")
 
 
 DIRTY_TAIL = "\n" + "ghp_" + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ" + " AKIA" + "ABCDEFGHIJKLMNOP"

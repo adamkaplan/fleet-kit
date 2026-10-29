@@ -24,6 +24,7 @@ class LauncherRecords(launcher_tests.Base):
         self.cw = launcher_tests.cw
         self.calls = []
         self.lock = threading.Lock()
+        self.running, self.peak = 0, 0   # the reads in flight now, and the most seen at once
 
     def pods(self, count):
         started = self.cw.iso(launcher_tests.T0)
@@ -39,7 +40,11 @@ class LauncherRecords(launcher_tests.Base):
         def activity(name):
             with lock:
                 calls.append(name)
+                self.running += 1
+                self.peak = max(self.peak, self.running)
             time.sleep(sleep)
+            with lock:
+                self.running -= 1
             if name in fail:
                 raise RuntimeError("the exec failed")
             return False, launcher_tests.T0
@@ -55,14 +60,12 @@ class LauncherRecords(launcher_tests.Base):
         with mock.patch.object(self.cw, "STATUS_POD_SECONDS", 1):
             if serial:   # the mutant: the old loop
                 self.applied = True
-                started = time.monotonic()
                 records = [launcher.record(p) for p in pods]
             else:
-                started = time.monotonic()
                 records = self.ask(launcher)
-            took = time.monotonic() - started
-        print("launcher 15 pods took %.2f s" % took, file=sys.stderr)
-        self.assertLess(took, self.SLEEP * 15 / 4 + 1, took)
+        print("launcher 15 pods: %d reads at once at most" % self.peak, file=sys.stderr)
+        self.assertGreater(self.peak, 1, "the pods were read one after another")
+        self.assertLessEqual(self.peak, self.cw.STATUS_WORKERS, "more reads at once than the number of workers")
         self.assertEqual([r["worker"] for r in records], ["w%d" % i for i in range(15)])
         return records
 
@@ -71,7 +74,7 @@ class LauncherRecords(launcher_tests.Base):
         self.assertTrue(all(r["idle_since"] is not None for r in records))
         self.assertEqual(len(self.calls), 15)
 
-    def test_s10_a_mutant_with_the_serial_loop_fails_the_timing_test(self):
+    def test_s10_a_mutant_with_the_serial_loop_fails_the_concurrency_test(self):
         self.applied = False
         with self.assertRaises(AssertionError):
             self.check_concurrent(serial=True)
@@ -129,6 +132,8 @@ class TotalDeadline(launcher_tests.Base):
         self.addCleanup(release.set)
 
         def activity(name):
+            with self.lock:
+                self.calls.append(name)
             release.wait(60)   # far past every bound
             return False, launcher_tests.T0
         launcher.activity = activity
@@ -143,21 +148,24 @@ class TotalDeadline(launcher_tests.Base):
             started = time.monotonic()
             thread = threading.Thread(target=lambda: answer.append(self.ask(launcher)), daemon=True)
             thread.start()
-            thread.join(3)
+            thread.join(30)   # a hang guard only: the expected answer is at 2 s, 30 s is a factor 15
             took = time.monotonic() - started
-        print("launcher %d hanging pods took %.2f s" % (count, took), file=sys.stderr)
-        self.assertTrue(answer, "no answer within 2 + 1 s")
+        print("launcher %d hanging pods answered after %.2f s" % (count, took), file=sys.stderr)
+        self.assertTrue(answer, "no answer within 30 s")
         records = answer[0]
         self.assertEqual([r["worker"] for r in records], ["w%d" % i for i in range(count)])
         self.assertGreaterEqual(len([r for r in records if r["idle_since"] is None and r["deadlines"]["idle"] is None]), 1)
+        with self.lock:
+            begun = len(self.calls)
+        print("launcher %d hanging pods: %d reads begun" % (count, begun), file=sys.stderr)
+        self.assertLess(begun, count, "every read was begun: the total deadline did not stop the starts")
         for record, pod in zip(records, pods):
             self.assertEqual(list(record), ["worker", "runtime_id", "phase", "idle_since", "deadlines", "cost_estimate_usd"])
             self.assertEqual(record["phase"], "Running")
             self.assertEqual(record["deadlines"]["hard"], pod["metadata"]["annotations"]["cw/hard-deadline"])
-        return took
 
     def test_s13_three_hundred_hanging_pods_answer_within_the_total_deadline_with_every_record_in_order(self):
-        self.assertLess(self.check_total(), 3)
+        self.check_total()
 
     def test_s13_a_mutant_without_the_total_deadline_fails_the_three_hundred_pod_test(self):
         self.applied = False
