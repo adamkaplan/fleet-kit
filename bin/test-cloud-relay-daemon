@@ -1844,6 +1844,10 @@ class GhBudget(Fixture):
     """#1477 PC-6 (U7 to U10): the relay's GitHub budget, on the REAL SwitchboardBackend, Executor, RelayLoop, MeteredRunner and a REAL GhAccounts
     over a stub host whose _ledger_context makes the same kinds of gh calls the real one does: `repeat` pull request reads through engine.gh_runner
     (the same argv: memoized after the first) and one plan read through accounts.read (the gate's own path).
+    The per-command counts below (prove 3, verdict 3, gates 2, report 1) are measured against this STUB ledger context (one pull request read, at most
+    one plan read, one fresh head read). The REAL context adds more reads (carries, the ask subject): those are not in these counts and fail closed
+    through the room reserve of 3 (RELAY_GH_PER_REQUEST) and the hard-stop `take` (429 in the middle, nothing written). The per-pod share (120) is NOT a
+    reservation: five or more pods can still fill the global 600 an hour, and then every pod gets 429 "relay GitHub budget".
     Exact calls per request on a clean build (stub): prove 3 (link pr read, plan read, FRESH head read), verdict 3, gates 2, report 1."""
 
     def setUp(self):
@@ -1861,6 +1865,7 @@ class GhBudget(Fixture):
         self.accounts = accounts = load_gh_accounts()({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, now, environ={})
         engine = types.SimpleNamespace(accounts=accounts, gh_runner=None, state_dir=self.state, audit=None, report=lambda *a: None)
         self.n_ctx, self.late = 0, []
+        self.blocked_done = threading.Event()
 
         def runner(argv, *a, **k):
             gh.append(list(argv))
@@ -1869,12 +1874,15 @@ class GhBudget(Fixture):
         def ledger_context(args, rn, now_, writable, parts=None, floor=False, plan_read=True):
             self.n_ctx += 1
             head = HEAD2 if move_after is not None and self.n_ctx > move_after else HEAD
-            if block is not None and self.n_ctx == block[0]:
+            blocked = block is not None and self.n_ctx == block[0]
+            if blocked:
                 block[1].wait(5)
             for _ in range(repeat):
                 parts[0].gh_runner(["gh", "pr", "view", args.pr])   # the pull request read
             if plan_read:
                 parts[0].accounts.read(parts[0].gh_runner, "repos/o/r/plan", REPO, 5)   # one plan read, through the gate
+            if blocked:
+                self.blocked_done.set()   # the abandoned late read has made all its calls
             return types.SimpleNamespace(repo=REPO, facts={"head": head, "author": None, "body": "Closes #1"}, source=REPO + "#1",
                                          plan={"plan_hash": "sha256:" + "b" * 64, "scenarios_parsed": [{"id": "S1", "evaluator": "tester"}]},
                                          entries=[], problem=None, pr=PR)
@@ -2092,8 +2100,11 @@ class GhBudget(Fixture):
         self.assertNotEqual(v2.memo, {})
 
     def test_a_late_head_read_of_an_earlier_request_does_not_serve_the_next(self):
+        self.late_head_scenario(relay)
+
+    def late_head_scenario(self, mod=relay):
         gate = threading.Event()
-        ex, backend = self.world(block=(3, gate))   # the third context of request 1 is its final head read
+        ex, backend = self.world(mod, block=(3, gate))   # the third context of request 1 is its final head read
         saved, relay.HEAD_TIMEOUT = relay.HEAD_TIMEOUT, 0.1
         try:
             got = self.one(ex, "prove", **dict(PROVE))
@@ -2102,8 +2113,15 @@ class GhBudget(Fixture):
         self.assertEqual(got["status"], 504)
         self.n_ctx = 10   # later reads are never blocked
         gate.set()
-        time.sleep(0.2)
+        self.assertTrue(self.blocked_done.wait(5))   # the late read has finished (an event, not a sleep)
+        self.gh.clear()
         self.assertEqual(self.one(ex, "prove", **dict(PROVE, cid="c-next"))["status"], 200)
+        self.assertEqual(len(self.gh), 3)   # the next request makes its own 3 calls: nothing of the late one is memoized for it
+
+    def test_u8_mutant_with_a_memo_shared_across_requests_fails_the_late_head_test(self):
+        mod = load_backend_module("            view.runner = self.runner.for_request(view.pod)\n", "            view.runner = self.runner\n")
+        with self.assertRaises(AssertionError):
+            self.late_head_scenario(mod)
 
     def test_final_head_is_read_fresh_not_from_the_memo(self):
         ex, _ = self.world(move_after=2)   # the head moves after the link and plan reads

@@ -197,12 +197,15 @@ _TIMEOUT = object()
 
 
 def _bounded(fn, timeout):
-    """fn() with a deadline: _TIMEOUT when it does not answer in time, None when it raises (an unknown head, refused as stale)."""
+    """fn() with a deadline: _TIMEOUT when it does not answer in time, the Refuse itself when it raises one (429 budget/pause: the pod sees the named
+    cause), None for any other failure (an unknown head, refused as stale)."""
     box = []
 
     def run():
         try:
             box.append(fn())
+        except Refuse as r:
+            box.append(r)
         except Exception:
             box.append(None)
     t = threading.Thread(target=run, daemon=True)
@@ -263,16 +266,36 @@ class RelayBudget:
             return why
 
 
-_WRITE_FLAGS = {"-X", "--method", "-f", "-F", "--field", "--raw-field", "--input"}
+_READ_FLAGS = frozenset({"-i", "--paginate"})                       # known read flags without a value
+_READ_VALUE_FLAGS = frozenset({"-H", "--jq", "-q", "--cache"})      # known read flags that take one value
 
 
 def _is_read(argv):
-    """Only these argv shapes are memoized within a request: `gh pr view ...` and a `gh api <path>` with no method or body flag."""
+    """An ALLOW-list: only `gh pr view ...` and `gh api <path>` whose other args are all known read flags are memoized within a request.
+    Anything else (any spelling of a method, field or input flag, `-XPOST`, `--field=x`, an unknown flag, a second positional) counts as a write."""
     if not isinstance(argv, (list, tuple)) or len(argv) < 3:
         return False
     if argv[1] == "pr" and argv[2] == "view":
         return True
-    return argv[1] == "api" and not any(x in _WRITE_FLAGS or str(x).startswith("--method=") for x in argv[2:])
+    if argv[1] != "api":
+        return False
+    paths, i, rest = 0, 0, list(argv[2:])
+    while i < len(rest):
+        x = rest[i]
+        if not isinstance(x, str):
+            return False
+        if x in _READ_FLAGS:
+            i += 1
+        elif x in _READ_VALUE_FLAGS:
+            if i + 1 >= len(rest):
+                return False
+            i += 2
+        elif x.startswith("-"):
+            return False
+        else:
+            paths += 1
+            i += 1
+    return paths == 1
 
 
 class MeteredRunner:
@@ -460,6 +483,8 @@ class Executor:
             return entry
 
         first = _bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)   # the slow read is made BEFORE the flock, under a short timeout
+        if isinstance(first, Refuse):
+            raise first
         if first is _TIMEOUT:
             raise Refuse(504, "the PR head could not be read in time: nothing was written", "live_head timed out after %ds" % HEAD_TIMEOUT)
         stored = plan_ledger.append_checked(self.state, self.now(), build)
