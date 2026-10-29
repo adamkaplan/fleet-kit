@@ -281,6 +281,7 @@ HUB_SUBDOMAIN = "cw-agents"   # the headless Service (made by the hub manifests)
 
 
 PERSISTENT_ANNOTATION = "cw/persistent"   # on the pod template (so on the pod) and on the StatefulSet of a persistent orchestrator
+PERSISTENT_PATTERN = re.compile(r"[1-9][0-9]?")   # the ONE form of the value, used by the settings validator and by the launch: no leading zero, no space
 PERSISTENT_SETTING = "CW_MAX_PERSISTENT"   # the settings maximum of persistent orchestrators in the namespace
 PERSISTENT_DEFAULT_MAX = 2
 PERSISTENT_MAX_LIMIT = 20
@@ -1223,10 +1224,10 @@ def spend_cap(env):
 
 def max_persistent(env):
     """The settings maximum of persistent orchestrators in the namespace: the setting (an integer 1 to 20), else 2. A bad value refuses (exit 2)."""
-    raw = (env.get(PERSISTENT_SETTING) or "").strip()
+    raw = env.get(PERSISTENT_SETTING) or ""
     if not raw:
         return PERSISTENT_DEFAULT_MAX
-    if not re.fullmatch(r"[0-9]{1,2}", raw) or not 1 <= int(raw) <= PERSISTENT_MAX_LIMIT:
+    if not PERSISTENT_PATTERN.fullmatch(raw) or not 1 <= int(raw) <= PERSISTENT_MAX_LIMIT:
         raise CloudError("%s must be an integer from 1 to %d; nothing was created" % (PERSISTENT_SETTING, PERSISTENT_MAX_LIMIT), EXIT_USAGE)
     return int(raw)
 
@@ -2963,7 +2964,7 @@ VALIDATORS = {
     "CW_STACK_PULL_CLIENT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_STACK_PULL_TENANT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
-    "CW_MAX_PERSISTENT": ("an integer from 1 to 20", lambda v: bool(re.fullmatch(r"[1-9][0-9]?", v)) and 1 <= int(v) <= PERSISTENT_MAX_LIMIT),
+    "CW_MAX_PERSISTENT": ("an integer from 1 to 20", lambda v: bool(PERSISTENT_PATTERN.fullmatch(v)) and 1 <= int(v) <= PERSISTENT_MAX_LIMIT),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 

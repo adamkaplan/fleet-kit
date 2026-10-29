@@ -679,7 +679,7 @@ class MaximumValueForm(unittest.TestCase):
         self.check_form(cw)
 
     def test_form_mutant_the_looser_rule_is_caught(self):
-        old = 'bool(re.fullmatch(r"[1-9][0-9]?", v))'
+        old = 'bool(PERSISTENT_PATTERN.fullmatch(v))'
         mod = mutant(old, 'bool(re.fullmatch(r"[0-9]{1,2}", v))')
         with self.assertRaises(AssertionError):
             self.check_form(mod)
@@ -1106,6 +1106,60 @@ class S16Docs(unittest.TestCase):
                 t = self.text(rel)
                 self.assertNotIn("create, patch", t)
                 self.assertNotIn("six verbs", t)
+
+
+class OneFormOfTheValue(unittest.TestCase):
+    """M1: the settings check and the launch share ONE pattern, matched on the raw string (no strip)."""
+    BAD = ("0", "01", "00", "+5", "-5", "21", " 5 ", "5\n", "5 ", "\u0662", "1.0")
+    GOOD = ("1", "5", "20")
+
+    def both(self, mod, v):
+        check = mod.VALIDATORS["CW_MAX_PERSISTENT"][1](v)
+        try:
+            launch = mod.max_persistent({"CW_MAX_PERSISTENT": v}) == int(v)
+        except mod.CloudError:
+            launch = False
+        return check, launch
+
+    def agree(self, mod):
+        for v in self.GOOD:
+            self.assertEqual(self.both(mod, v), (True, True), repr(v))
+        for v in self.BAD:
+            self.assertEqual(self.both(mod, v), (False, False), repr(v))
+
+    def test_value_list_matches_on_both_paths(self):
+        self.agree(cw)
+
+    def test_value_mutant_that_restores_the_strip_fails(self):
+        mod = mutant('raw = env.get(PERSISTENT_SETTING) or ""', 'raw = (env.get(PERSISTENT_SETTING) or "").strip()')
+        with self.assertRaises(AssertionError):
+            self.agree(mod)
+
+    def test_value_mutant_with_a_second_pattern_fails(self):
+        mod = mutant("if not PERSISTENT_PATTERN.fullmatch(raw) or", 'if not re.fullmatch(r"[0-9]{1,2}", raw) or')
+        with self.assertRaises(AssertionError):
+            self.agree(mod)
+
+    def test_value_pattern_is_written_once(self):
+        with open(SOURCE) as f:
+            src = f.read()
+        self.assertEqual(src.count('[1-9][0-9]?'), 1)
+        self.assertEqual(src.count("PERSISTENT_PATTERN"), 3)
+
+
+class StopWithoutRuleSentence(unittest.TestCase):
+    SENTENCE = ("Until the Role rule for StatefulSets is applied, the stop and the delete of ANY worker whose pod is gone keep the Secrets and say so; "
+                "apply the Role rule BEFORE this change is installed.")
+
+    def test_sentence_is_found_in_both_documents(self):
+        for rel in ("cloud/launcher/README.md", "docs/cloud-worker-interface.md"):
+            with open(os.path.join(ROOT, rel)) as f:
+                self.assertIn(self.SENTENCE, " ".join(f.read().split()), rel)
+
+    def test_sentence_mutant_dropped_is_caught(self):
+        with open(os.path.join(ROOT, "docs/cloud-worker-interface.md")) as f:
+            t = " ".join(f.read().split()).replace(self.SENTENCE, "")
+        self.assertNotIn(self.SENTENCE, t)
 
 
 if __name__ == "__main__":
