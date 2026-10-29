@@ -13,6 +13,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CLOUD = os.path.join(HERE, "..", "..")
 SCRIPT = os.path.join(CLOUD, "worker", "activity.py")
 STUB = os.path.join(HERE, "stub_server.py")
+sys.path.insert(0, HERE)
+import stub_support  # noqa: E402
 
 
 class Activity(unittest.TestCase):
@@ -25,14 +27,8 @@ class Activity(unittest.TestCase):
         self.log = os.path.join(self.tmp.name, "stub.log")
 
     def serve(self, mode="ok"):
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()
-        p = subprocess.Popen([sys.executable, STUB, str(port)], env=dict(os.environ, STUB_MODE=mode, STUB_LOG=self.log), stderr=subprocess.PIPE, text=True)
-        self.addCleanup(p.wait)
-        self.addCleanup(p.stderr.close)
-        self.addCleanup(p.kill)
+        port = stub_support.free_port()
+        p = stub_support.start(self, [sys.executable, STUB, str(port)], port=port, env=dict(os.environ, STUB_MODE=mode, STUB_LOG=self.log), stderr=subprocess.PIPE, text=True)
         for _ in range(50):
             if p.poll() is not None:
                 self.fail("stub exited %s at start (python %s, port %s): %s" % (p.returncode, sys.version.split()[0], port, p.stderr.read().strip()))

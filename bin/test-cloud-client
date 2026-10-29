@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""test-cloud-client: offline tests for bin/cloud_client.py. Real code, fake transport and token file; one mutant per rule.
+
+    bin/test-cloud-client
+"""
+import contextlib
+import gc
+import io
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+SOURCE = (BIN / "cloud_client.py").read_text()
+
+
+def load(source=SOURCE):
+    module = types.ModuleType("cloud_client_under_test")
+    exec(compile(source, "cloud_client.py", "exec"), module.__dict__)
+    return module
+
+
+def mutant(old, new):
+    source = SOURCE
+    for o, n in (zip(old, new) if isinstance(old, tuple) else [(old, new)]):
+        assert source.count(o) == 1, o
+        source = source.replace(o, n)
+    return load(source)
+
+
+class Post:
+    def __init__(self, *answers):
+        self.answers, self.requests = list(answers), []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+NOSLEEP = lambda seconds: None
+
+
+class Case(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = Path(self.dir.name) / "token"
+        self.path.write_text("tok-one\n")
+        self.sleeps = []
+
+    def send(self, module, post, **kw):
+        kw.setdefault("sleep", self.sleeps.append)
+        return module.send("w1", "o1", "hi", post, token_path=str(self.path), **kw)
+
+    def check_token_at_call_time(self, module):
+        post = Post({"status": 200})
+        self.send(module, post)
+        self.path.write_text("tok-two")
+        self.send(module, post)
+        return [r["authorization"] for r in post.requests] == ["Bearer tok-one", "Bearer tok-two"]
+
+    def check_key_reused(self, module):
+        post = Post({"status": 503}, {"status": 503}, {"status": 200})
+        ok, _ = self.send(module, post)
+        keys = {r["body"]["key"] for r in post.requests}
+        return ok and len(post.requests) == 3 and len(keys) == 1
+
+    def check_given_key(self, module):
+        post = Post({"status": 503}, {"status": 200})
+        self.send(module, post, key="mine")
+        return [r["body"]["key"] for r in post.requests] == ["mine", "mine"]
+
+    def check_auth_line(self, module):
+        for status in (401, 403):
+            post = Post({"status": status, "error": "wrong audience"})
+            ok, line = self.send(module, post)
+            if ok or "\n" in line or str(status) not in line or "wrong audience" not in line or "tok-one" in line:
+                return False
+            if len(post.requests) != 1:
+                return False
+        return True
+
+    def check_newline_reason(self, module):
+        ok, line = self.send(module, Post({"status": 401, "error": "bad\nsecond line"}))
+        return not ok and "\n" not in line and "401" in line
+
+    def check_no_token_in_errors(self, module):
+        ok, line = self.send(module, Post(RuntimeError("tok-one")))
+        return not ok and "tok-one" not in line
+
+    def check_redact_reason(self, module):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            ok1, l1 = self.send(module, Post({"status": 401, "error": "bad tok-one here"}))
+            ok2, l2 = self.send(module, Post({"status": 503, "error": "tok-one"}))
+        seen = l1 + l2 + out.getvalue() + err.getvalue()
+        return not ok1 and not ok2 and "tok-one" not in seen and "401" in l1
+
+    def check_token_cap(self, module):
+        self.path.write_text("a" * 4097)
+        post = Post({"status": 200})
+        ok, line = self.send(module, post)
+        if ok or post.requests or "\n" in line or "4096" not in line or "aaaa" in line:
+            return False
+        self.path.write_text("a" * 4096)
+        return self.send(module, Post({"status": 200}))[0]
+
+    def check_token_chars(self, module):
+        for bad in ("zq en", "zq\x01x", "zq;rm", "z\nq"):
+            self.path.write_text(bad)
+            post = Post({"status": 200})
+            ok, line = self.send(module, post)
+            if ok or post.requests or "\n" in line or "zq" in line or "bad characters" not in line:
+                return False
+        self.path.write_text("aB3._~+/=-\n")
+        return self.send(module, Post({"status": 200}))[0]
+
+    def check_missing_token(self, module):
+        self.path.unlink()
+        post = Post({"status": 200})
+        ok, line = self.send(module, post)
+        return not ok and not post.requests and "no token file" in line
+
+    def check_empty_token(self, module):
+        self.path.write_text("\n")
+        post = Post({"status": 200})
+        ok, line = self.send(module, post)
+        return not ok and not post.requests and "empty token file" in line
+
+    def check_clamp(self, module):
+        post = Post({"status": 503})
+        ok, line = self.send(module, post, retries=1000)
+        return not ok and len(post.requests) == module.MAX_RETRIES and "after %d tries" % module.MAX_RETRIES in line
+
+    def check_exhausted(self, module):
+        post = Post({"status": 502, "error": "bad gateway"})
+        ok, line = self.send(module, post, retries=3)
+        return (not ok and len(post.requests) == 3 and "\n" not in line and "502" in line
+                and "bad gateway" in line and "after 3 tries" in line and len(self.sleeps) == 2)
+
+    def check_no_retry_other(self, module):
+        for status in (400, 409, 413, 404):
+            post = Post({"status": status, "error": "nope"})
+            ok, line = self.send(module, post)
+            if ok or len(post.requests) != 1 or str(status) not in line or "\n" in line or self.sleeps:
+                return False
+        return True
+
+    def check_retry_transport(self, module):
+        post = Post(OSError("down"), {"status": 0}, {"status": 200})
+        ok, _ = self.send(module, post)
+        return ok and len(post.requests) == 3
+
+    def check_backoff(self, module):
+        post = Post({"status": 503})
+        self.send(module, post, retries=3)
+        return len(self.sleeps) == 2 and all(x > 0 for x in self.sleeps)
+
+    def check_duplicate(self, module):
+        post = Post({"status": 200, "delivered": False, "duplicate": True})
+        ok, line = self.send(module, post)
+        return ok and line == "" and len(post.requests) == 1
+
+    def check_duplicate_matches_channel(self, module):
+        # The real channel's duplicate answer is what the client must treat as delivered.
+        sys.path.insert(0, str(BIN))
+        try:
+            import cloud_channel
+        finally:
+            sys.path.pop(0)
+        answer = cloud_channel._reply(200, delivered=False, duplicate=True)
+        status = answer.get("status") if isinstance(answer, dict) else None
+        ok, _ = self.send(module, Post(answer if isinstance(answer, dict) else {"status": status}))
+        return ok
+
+    def check_report(self, module):
+        post = Post({"status": 200})
+        ok, _ = module.report("w1", "o1", "done", post, token_path=str(self.path))
+        b = post.requests[0]["body"]
+        return ok and b["recipient"] == "o1" and b["text"] == "report: done" and b["sender"] == "w1"
+
+    def check_report_boss(self, module):
+        post = Post({"status": 200})
+        module.report("w1", "o7", "done", post, token_path=str(self.path))
+        return post.requests[0]["body"]["recipient"] == "o7"
+
+    def check_request_dropped(self, module):
+        post = Post({"status": 200})
+        self.send(module, post)
+        gc.collect()
+        return not [o for o in gc.get_objects() if isinstance(o, dict) and o.get("authorization") == "Bearer tok-one"
+                    and o is not post.requests[0]] and "not kept after" in module.__doc__
+
+    CHECKS = [
+        ("check_token_at_call_time", "token = _read_token(token_path)", "token = _CACHE.setdefault('t', _read_token(token_path))"),
+        ("check_key_reused", "    for n in range(tries):\n", "    for n in range(tries):\n        key = uuid.uuid4().hex\n"),
+        ("check_given_key", "key = key or uuid.uuid4().hex", "key = uuid.uuid4().hex"),
+        ("check_auth_line", "if status != 0 and not (", "if status == 999 and not ("),
+        ("check_newline_reason", 'return re.sub(r"[^\\w .:,/-]", "?", text)[:80]', "return text[:80]"),
+        ("check_no_token_in_errors", ('answer = {"status": 0, "error": type(err).__name__}', 'text = text.replace(token, "?")'),
+         ('answer = {"status": 0, "error": str(err)}', "pass")),
+        ("check_redact_reason", 'text = text.replace(token, "?")', "pass"),
+        ("check_token_cap", "if len(raw) > MAX_TOKEN_BYTES:", "if False:"),
+        ("check_token_chars", "if not _TOKEN_CHARS.fullmatch(token):", "if False:"),
+        ("check_missing_token", 'raise _TokenError("cloud channel: no token file")', 'raise _TokenError("cloud channel: x")'),
+        ("check_empty_token", "    if not token:\n", "    if False:\n"),
+        ("check_clamp", "tries = max(1, min(retries, MAX_RETRIES))", "tries = max(1, retries)"),
+        ("check_exhausted", "if n + 1 < tries:", "if False:"),
+        ("check_no_retry_other", "if status != 0 and not (isinstance(status, int) and 500 <= status <= 599):",
+         "if status in (401, 403):"),
+        ("check_retry_transport", "if status != 0 and not (", "if status == 0 or not ("),
+        ("check_backoff", "sleep(BACKOFF_SECONDS * (2 ** n))", "pass"),
+        ("check_duplicate", ("del token, answer", "if status == 200:"),
+         ("dup = answer.get('duplicate')\n        del token, answer", "if status == 200 and not dup:")),
+        ("check_duplicate_matches_channel", "if status == 200:", "if status == 201:"),
+        ("check_report", '"report: " + text', "text"),
+        ("check_report_boss", "return send(sender, boss,", 'return send(sender, "captain",'),
+        ("check_request_dropped", "not kept after the call returns", "never kept"),
+    ]
+
+
+def add(name, check, old, new):
+    def real(self):
+        self.assertTrue(getattr(self, check)(load()))
+
+    def dead(self):
+        module = mutant(old, new)
+        module.__dict__["_CACHE"] = {}
+        self.assertFalse(getattr(self, check)(module))
+    setattr(Case, "test_" + name, real)
+    setattr(Case, "test_mutant_" + name, dead)
+
+
+for c, o, nw in Case.CHECKS:
+    add(c[6:], c, o, nw)
+
+if __name__ == "__main__":
+    result = unittest.main(argv=[sys.argv[0]] + sys.argv[1:], exit=False).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)

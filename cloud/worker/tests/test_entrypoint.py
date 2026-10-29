@@ -99,8 +99,10 @@ class Entrypoint(unittest.TestCase):
         port = s.getsockname()[1]
         s.close()
         client = (
-            "import base64, http.client, os, subprocess, sys, time\n"
-            "p = subprocess.Popen([sys.executable, %r, '%d'])\n"
+            "import base64, http.client, os, sys, time\n"
+            "sys.path.insert(0, %r)\n"
+            "import stub_support\n"
+            "p = stub_support.spawn([sys.executable, %r, '%d'])\n"
             "try:\n"
             "    for _ in range(100):\n"
             "        try:\n"
@@ -111,7 +113,7 @@ class Entrypoint(unittest.TestCase):
             "            time.sleep(0.1)\n"
             "    sys.exit(4)\n"
             "finally:\n"
-            "    p.kill()\n" % (STUB, port, port))
+            "    stub_support.stop_group(p, %d)\n" % (os.path.dirname(STUB), STUB, port, port, port))
         r = self.start(sys.executable, "-c", client)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assert_not_printed(r.stdout + r.stderr, "entrypoint output")

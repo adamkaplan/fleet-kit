@@ -2,7 +2,7 @@
 
 Launcher, reaper, end hook and token mint for cloud workers, built to `docs/cloud-worker-interface.md`.
 
-- `cloud-worker create|stop|extend|delete|status|reap` (`cloud_worker.py`): reaches the cloud only through `kubectl`
+- `cloud-worker create|stop|extend|delete|status|snapshot|reap` (`cloud_worker.py`): reaches the cloud only through `kubectl`
   (`CW_KUBECTL`, `CW_CLOUD_NAMESPACE`); writes one audit line per action to `CW_CLOUD_AUDIT`
   (default `~/.local/state/cw-cloud/audit.jsonl`, mode 0600). `reap` is one pass (or `--loop SECONDS`, never slower
   than 60); run it from a cron-like scheduler. It stops a pod past its hard deadline, or idle (not busy, last
@@ -17,8 +17,56 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   token FILE by path. After the private settings file lands, the reaper reads it as the launcher does. Every ending writes one line
   `<UTC time> reaper exiting: WHY`: end of its pass, stopped by a signal, stopped by an interrupt, an error (a crash in a pass), or
   `cluster login failed: ...` (a login failure exits non-zero). A restarted reaper stops by name and finds no pod for one the last
-  pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (a 0600 file named for the user's namespace in `~/.local/state/cw-cloud/locks`, found through the password database, so a different audit file, state directory or login (a token file, a kube context, a kubeconfig) is still a rival; one user runs one reaper per namespace. The lock directory itself is checked for owner and mode, its parents are not walked, which is adequate for a lock) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes (a regular file of the user's own with other content is overwritten by install, by rename, as the installer's own path; a symlink, a non-regular file, a foreign or group-writable file is refused). Path settings must be absolute paths of plain characters. A `path_walk` earlier on `sys.path` (the launcher directory or `PYTHONPATH`) would win over the kit's: that is the same user's own environment, not a boundary. While the Mac sleeps the reaper pauses.
-- `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line.
+  pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (a 0600 file named for the user's namespace in `~/.local/state/cw-cloud/locks`, found through the password database, so a different audit file, state directory or login (a token file, a kube context, a kubeconfig) is still a rival; one user runs one reaper per namespace. The lock directory itself is checked for owner and mode, its parents are not walked, which is adequate for a lock) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes (a regular file of the user's own with other content is overwritten by install, by rename, as the installer's own path; a symlink, a non-regular file, a foreign or group-writable file is refused). Path settings must be absolute paths of plain characters. A `path_walk` earlier on `sys.path` (the launcher directory or `PYTHONPATH`) would win over the kit's: that is the same user's own environment, not a boundary. While the Mac sleeps the reaper pauses. The installer's `--cloud-reaper-only` option installs and loads that service and nothing else: it writes the reaper's service file (mode 0600) and the state directory, and leaves the config, the profile pieces, the command link, the plugin link, the switchboard's own service and the daemon alone. It first checks the settings file (`cloud.env`: a regular file of the user's own, mode 0600, with the cluster login names `CW_CLOUD_SERVER`, `CW_CLOUD_NAMESPACE` and `CW_CLOUD_TOKEN_FILE` (the last from the install's environment) and the vault names `CW_VAULT_NAME`, `CW_VAULT_SUBSCRIPTION`) and refuses with one named line, writing nothing; the full `--with-cloud-reaper` install does not check. The way back is `install --uninstall --cloud-reaper-only`, which removes only the reaper's service file; plain `--uninstall` (and `--uninstall --no-service`) removes more than the reaper: the herdr plugin link (unless `--no-herdr-link`), the plugin, agent and skill pieces, the wrapper and the command link. Prerequisites: the Mac must be awake (the reaper pauses when it sleeps) and the vault must be reachable from this machine (a source-address allowlist: from another network the refresh is refused and the reaper keeps its old token until it ends).
+
+  **The reaper's own cluster login and the minter.** The reaper keeps its own login fresh (the token file, renewed when under 20 minutes
+  are left). The UNATTENDED reaper pins its mint command (`strict`, below); the interactive launch path keeps its previous behaviour, since it
+  runs in the person's own shell, which can read the vault with the person's own login anyway. The launch path keeps its previous behaviour: `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLOUD_NAMESPACE` can still be set by whoever controls the launcher's environment (an interactive shell with the person's own login): unchanged. The new guards protect the UNATTENDED reaper service. With the minter credential (a ServiceAccount that can only create tokens for `cw-operator`) the administrator credential no longer travels this route: the residual risk is the minter's token for `cw-operator` only. This is a stated limit, not a fix. The unattended reaper uses a fixed route: it ignores `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLUSTER_TOKEN_CMD` (neither
+  the environment nor `cloud.env` is read for them). It reads the vault through `az`, and runs `kubectl`, each resolved to an absolute path
+  from a FIXED list (`/opt/homebrew/bin/az`, `/usr/local/bin/az`, `/usr/bin/az`; `/opt/homebrew/bin/kubectl`, `/usr/local/bin/kubectl`,
+  `/usr/bin/kubectl`), never from `PATH`, and only an existing regular executable file that is not group- or world-writable and is owned by
+  root or the running user. The command is `create token cw-operator --duration=Nm` with `-n` the namespace (`CW_CLOUD_NAMESPACE`, a DNS-1123
+  label); the account, the subcommand and the duration are fixed in code. The vault names (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`,
+  `CW_CLUSTER_ADMIN_SECRET`) stay settings. A person who needs a custom command uses the launch path. The children run with a minimal
+  environment (a fixed `PATH`, `HOME`, `LANG`, `AZURE_CONFIG_DIR` only when you set it, `KUBECONFIG=/dev/null`) and nothing else.
+  If one of those three names is set (in the process environment or in `cloud.env`), the refresh still uses the fixed route and the reaper
+  names the setting, never its value: on the first pass and then at most once an hour it prints `cluster login: CW_KUBECTL is ignored in the
+  unattended refresh (the reaper uses a fixed kubectl path); use the launch path for a custom command` on stderr and writes one audit line
+  (action `ignored-setting-notice`) per name. The settings the reaper's `cloud.env` needs are NAMES only: the cluster server
+  (`CW_CLOUD_SERVER`), the namespace (`CW_CLOUD_NAMESPACE`), the token file (`CW_CLOUD_TOKEN_FILE`), the vault names (`CW_VAULT_NAME`,
+  `CW_VAULT_SUBSCRIPTION`), `CW_CLUSTER_ADMIN_SECRET` (the NAME of the vault secret, not its content), and optionally
+  `CW_CLUSTER_TOKEN_DURATION`.
+  The fixed kubectl and az lists are /opt/homebrew/bin, /usr/local/bin and /usr/bin: the check requires a regular executable that is not group- or world-writable and owned by root or the reaper's own user, and it does not check the parent directories. Homebrew's directory is writable by the installing user, so a process running as the same user can plant a user-owned executable there: a residual of any same-user service, not a fix.
+  The reaper's az keeps HOME and AZURE_CONFIG_DIR from the reaper's environment: whoever sets that environment can change which login state az uses, but not which program runs.
+  **The minter credential is LONG-LIVED.** The vault holds a long-lived minter token for ONE account's tokens (`cw-operator` in the cloud
+  namespace): not cluster admin, but not short-lived. The Secret `cw-minter-token` is a `kubernetes.io/service-account-token` Secret, so the
+  control plane fills it with a NON-EXPIRING bearer token for `cw-minter`. Whoever reads that vault secret can mint `cw-operator` tokens (up to
+  the server's maximum lifetime) until the Secret is deleted. The Role bounds the ACCOUNT (only `create` on `serviceaccounts/token` for
+  `cw-operator`), not the LIFETIME: a holder using the API directly can ask for a token longer than 60 minutes; the 60-minute cap is in the
+  launcher code only, and this change does not enforce the server's maximum. Who holds the vault copy: the vault's readers, that is the operators
+  and the launcher's settings route. A short-lived alternative exists in principle (an Entra login through `CW_CLUSTER_TOKEN_CMD` on the launch
+  path); that is a later ask.
+  *Rotate the minter token:* delete the Secret `cw-minter-token` and re-apply the manifest (`kubectl apply -f cloud/k8s/cw-minter.yaml`) so the
+  control plane issues a new token; write the new kubeconfig into the vault under the same secret name by pipe (never printed); then check
+  (the `can-i` and `create token` checks below).
+  The credential behind the vault secret named by `CW_CLUSTER_ADMIN_SECRET` is a MINTER-ONLY kubeconfig: a ServiceAccount (`cw-minter`) whose
+  only right is `create` on `serviceaccounts/token` for `cw-operator`. It used to be a cluster administrator's kubeconfig, and the code is
+  safe under both. On this deployment the minter is live.
+  *The minter manifest* is `cloud/k8s/cw-minter.yaml` (four objects in namespace `cw`, label `app: cw-minter`, no secret in the file: the
+  ServiceAccount, a Role with the one rule, the RoleBinding and the token Secret that the cluster fills in). To apply it: run a server dry
+  run first (`kubectl apply --dry-run=server -f cloud/k8s/cw-minter.yaml`), get the Chief of Staff's word, then
+  `kubectl apply -f cloud/k8s/cw-minter.yaml`. Build the kubeconfig of `cw-minter` (the server, the cluster CA and the token of the Secret
+  `cw-minter-token`) and put it in the vault under the secret NAME that `CW_CLUSTER_ADMIN_SECRET` names, by pipe, never printed. Check it:
+  `kubectl auth can-i create serviceaccounts/token -n cw` with the minter's own kubeconfig answers yes (and `can-i` for pods answers no); a real `kubectl create token cw-operator` with the minter's kubeconfig works
+  and the same for `default` is refused. Rollback: revert `CW_CLUSTER_ADMIN_SECRET` in the settings FIRST (point it back at the earlier secret name), then delete the minter
+  objects (`kubectl -n cw delete -l app=cw-minter serviceaccount,role,rolebinding,secret`), then the vault secret.
+  *Token file limits.* The token file's expiry is read from the token's own `exp` claim, which is NOT verified (the file is the person's, mode
+  0600 and the user's own: a file that others can read, or that is not the user's, counts as expired and is replaced). A token with no
+  readable `exp` (not a JWT) is accepted at mint time with no lifetime check, and the file then counts as expired on every read, so it is
+  renewed at each retry gap (at most every 5 minutes). After a failed refresh the next try is no sooner than 300 s later; a clock that
+  jumps back counts as expired and retries. `main` calls the refresh once before the loop and the loop's first pass checks again: harmless
+  (the second is a no-op, the file is fresh).
+- `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line. `--prestop` (used by the container's `cw-prestop` hook) pushes with a plain push, never forced, and prints one plain line. The hook does not trust the repository's configuration: it refuses a repository whose local configuration has any key outside a CLOSED allow-list of named inert keys (no wildcard: `gc.*` and `pack.*` are refused because `gc.recentObjectsHook` runs a command; the keys are core.repositoryformatversion/filemode/bare/logallrefupdates/ignorecase/precomposeunicode/symlinks, user.name/email, remote.origin.url/pushurl/fetch, init.defaultbranch, receive.denycurrentbranch and the exact forms branch.NAME.remote (origin or .) and branch.NAME.merge (refs/heads/...); a clone made with `--filter` (partial clone) or git-lfs writes other keys and is therefore refused: no push for those repositories), runs every git call by an absolute path with automatic gc and maintenance pinned off, and prints one `cw-prestop:` line (it names the key and up to 50 unpushed file names, never a value; The line is the only trace of a refused run; it lives in the pod's log and ends with the pod unless the cluster ships logs elsewhere (nothing in the repository keeps it); the remote url is compared after userinfo is stripped, and the push goes to the URL built from CW_REPO whatever the remote says), ignores every global/system configuration, and pushes only to the explicit address of the worker's own repository with the pod's own credential helper; the honest limit: the pod token lives 60 minutes (until the reaper renews tokens) and the hook runs only while the token is valid. If the repository's configuration is odd or hostile the hook pushes nothing and the unpushed work is LOST when the pod ends (the work is NOT retained: the pod is deleted after the hook; the trade-off for not trusting that configuration); the one output line names the key only, never a value.
 - `token_mint.py`, installed as `cw-token-mint`: mints a token at start and on demand, refuses more than 3600 s,
   writes it to a tmpfs file only.
 - Tests: `bin/test-cloud-launcher` (fake `kubectl`, fake clock, real `git`, loopback HTTP; no cloud).
@@ -44,6 +92,8 @@ descriptor `N`, pipes it to `kubectl` on stdin into one Secret `<pod>-run`, and 
 The Secret goes with the pod at `stop`, `delete` and a failed or interrupted `create`; a pod kept because the end hook failed keeps it.
 
 Accepted scope of the role: `cw-operator` can get and list every secret in the workers namespace (a Role cannot limit `list` by label), so the namespace must hold only worker pods and their per-pod secrets; that is enforced in the deployment repository, not here.
+
+**The one-verb node rule (`list` on `nodes`).** The `cw-operator` role of `cloud/k8s/operator-rbac.yaml` is namespaced: pods, their logs, exec, port-forward and secrets in the workers' namespace, and nothing cluster-wide. Reading the cluster's NODES needs one more rule, and it cannot live in that Role: a namespaced Role cannot grant a cluster-scoped resource. It is a `ClusterRole` with exactly ONE rule, `list` on `nodes` (the core API group), bound to the `cw-operator` service account by a `ClusterRoleBinding`: `list` on `nodes`, and nothing else (no `get`, no `watch`, no write, no wildcard). `kubectl get nodes -o json` is a list, so that verb is enough. It is the OWNER's step, applied apart from the code (its own manifest, its own pull request), and the code works with or without it: `cloud-worker snapshot` reads the pods either way, and when the node list is refused it says so (`nodes_read` false) instead of failing, and the switchboard's `status` then counts the nodes by the **pod placement** (the distinct node names of the pods) and says that in the line: it cannot see the idle nodes. Nothing else is asked of the cluster: the status read makes no write call at all.
 
 Everything that renders `kubectl` output (errors, the end hook's text, audit reasons) passes through one `scrub()`: this run's secret values and any 8+ character piece of one, token-shaped strings, long base64/hex runs, an `Authorization` header of any scheme (any case and spacing) and the `user:password@` of a URL of any scheme are removed, then the text is cut (the launcher, the run record and the driver all use this one function). Limits: the Authorization shape removes the rest of its header line and its folded continuation lines; the URL shape removes the userinfo of a `scheme://` URL only inside its own part (the user and the password hold no `/ ? # @ :`, so host, path, query and fragment survive: scoped packages, `@user` paths, `?email=a@b`, a port), and an unencoded password with those characters only when a `:` follows the user and what follows is not a bare port (every quantifier bounded, so hostile text cannot slow the scan); a secret split by a newline is caught only for pieces of 8 or more characters (the existing rule); two known slip-throughs: a password that starts with digits and then holds `/`, `?` or `#` (it reads as a port), and a user part over 200 characters; a credential that is not in either shape and is not a registered value is not recognised. A failed `create`, `stop` or `delete` that leaves a per-run Secret says so once (audit and stderr) with its name and the exact `kubectl ... delete secret NAME` command, never a value.
 
@@ -101,6 +151,9 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
 | `CW_OPENCODE_BIN` | the `opencode` program (default `opencode` on `PATH`); the launcher runs `opencode auth export` (fixed arguments, scrubbed environment, output through a pipe, in memory) and keeps only the one `github-copilot` entry, as a one-entry array. Refused by name: command missing or failing, no entry, two entries, an inactive entry, an entry that is not `oauth`; nothing is created |
 | `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
+| `CW_HUB_CHANNEL_URL` | the address of the hub's channel an orchestrator or hub pod is told (`FLEET_CLOUD_CHANNEL_URL`); an `http` or `https` URL with a host, an optional port and an optional one-segment path; not a secret; default `http://cloud-hub.cw.svc:8443/message`. **Set (this or `CW_HUB_REGISTRY_SECRET`) = the hub setting is on: every launch registers** with the hub (a worker launch included), and a launch needs the headless Service `cw-agents` |
+| `CW_HUB_REGISTRY_SECRET` | the NAME of the hub's registry Secret in the cloud namespace (never its content); a Kubernetes name; default `cloud-hub-registry`. **Set (this or `CW_HUB_CHANNEL_URL`) = the hub setting is on: every launch registers.** Unset, a worker launch is exactly what it was |
+| `--agent` (not a setting) | `worker` (default) or `orchestrator`: the agent the pod runs, passed to the pod as `CW_AGENT`; any other value is refused before anything is made; `--agent orchestrator` needs `--boss NAME` |
 
 - **A cluster token per use.** Every command that needs the cluster mints its own token at that moment: the administrator
   kubeconfig is read from the vault by command and given to `kubectl create token cw-operator` on a pipe (never a file or
@@ -133,6 +186,166 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
 
+## How a member adds a test to the chain
+
+Cause of the old merge rounds: the whole chain of `bin/test-cloud-launcher` was ONE shell line of more than forty commands joined by `&&`, and every member that added a test appended to that same line, so every pair of concurrent members conflicted on it.
+
+The chain is now `bin/test-cloud-launcher.chain`, one path per line, sorted alphabetically, followed by one fixed last line (`cloud/worker/tests/test_cloud_prepush_preflight.py`) that no member edits. To add a test, add one line to bin/test-cloud-launcher.chain at its alphabetical place, above the fixed last line. A new entry that sorts AFTER the fixed last line still goes ABOVE it; the script fails if the last line is anything else. The order is deliberately sorted alphabetically for conflict-freedom, NOT the order of the old one-line chain; it changes which test fails first (the first red stops the run). The list holds the `bin/test-cloud-*` scripts too (the hub, relay and cost scripts), run without arguments.
+
+The script runs each entry once, stops at the first red with `RESULT: FAIL`, and prints `ran N entries` and `RESULT: PASS` otherwise. Arguments given to the script are passed only to the ten entries that took them in the old one-line chain; every other entry runs without arguments. Its checks: every `test_*.py` is listed or named in `EXCEPTIONS` with a reason; every `bin/test-cloud-cost-*` script is listed; every `bin/test-cloud-*` script is listed or named in `BIN_EXCEPTIONS` (`own-ci-step` means a workflow step runs that script. Hub-relay, relay and relay-daemon are workflow steps since ask #1377, so they carry `own-ci-step` too. A test derives the reasons from the workflow files and fails when a reason is untrue); a list entry that is a symlink is refused; every listed entry exists, is not a duplicate and stays inside the repository; the list is not empty (an empty list is a failure, not a pass).
+
+Residual risk: two members adding names that sort next to each other (the same place in the list) still conflict in git (adjacent inserts), and the first member to add in an empty gap next to the fixed last line conflicts with it. Only entries far apart merge cleanly. A test documents this limit.
+
+## Chain times (ask #1390)
+
+Cause: the whole chain of `bin/test-cloud-launcher` ran one entry after another. On the macOS `test-cloud` leg that took 24 to 30 minutes (24 on the default branch at batch 6, 25.7 on one pull request and 30.2 on another, whose step limit of 30 minutes then cut the leg with no test failing); on Ubuntu it took 15.6 minutes. The cost was the entries themselves, mostly real subprocess starts of the fake cluster client, not fixed sleeps, and the macOS runner is about twice as slow.
+
+The fix is parallel lanes, not removing or moving a test: the entries named in `bin/test-cloud-launcher.parallel` (a subset of the chain, slowest first, each using its own temporary directory and no fixed port) run in three lanes beside the serial loop, each with its own output file replayed whole afterwards. Every chain entry still runs on BOTH systems: there is no macOS-only exception and no Ubuntu-only list, because the 22 entries that start no subprocess total about 150 seconds and moving them would lower macOS coverage for almost no time. A parallel entry that is not in the chain is refused, and `cloud/launcher/tests/test_chain_time.py` checks both lists. Each entry prints `RUN <entry>` and `TIME <entry> <seconds>`.
+
+Chain time after the change: macOS 11.6 minutes, Ubuntu 5.1 minutes (one run of the pull request's head; the step timeout is 20 minutes). The per-entry seconds below are from that run, so they include the slowdown of running beside other entries.
+
+Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_app_token.py` (122 s), `test_driver.py` (120 s).
+
+Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
+
+Not yet measured: none
+
+A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
+### macOS (per entry)
+
+| Entry | Seconds | Lane |
+|---|---|---|
+| `bin/test-cloud-cost-report` | 1 | serial |
+| `bin/test-cloud-retired` | 66 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
+| `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_docs_wording.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_network.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_pod_replaced.py` | 3 | serial |
+| `cloud/launcher/tests/test_cloud_pr_preflight.py` | 25 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_quick.py` | 14 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_wired.py` | 42 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 7 | serial |
+| `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 15 | serial |
+| `cloud/launcher/tests/test_cloud_shapes.py` | 27 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 22 | serial |
+| `cloud/launcher/tests/test_cluster_token_refresh.py` | 37 | serial |
+| `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cw_names.py` | 5 | serial |
+| `cloud/launcher/tests/test_docs_preflight_modes.py` | 0 | serial |
+| `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
+| `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
+| `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
+| `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
+| `cloud/launcher/tests/test_stack_registry_check.py` | 2 | serial |
+| `cloud/launcher/tests/test_stack_registry_pod.py` | 1 | serial |
+| `cloud/launcher/tests/test_token_read_at_call.py` | 1 | serial |
+| `cloud/launcher/tests/test_vault_check_pins.py` | 1 | serial |
+| `cloud/worker/tests/test_cloud_prepush.py` | 30 | serial |
+| `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
+| `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
+| `cloud/worker/tests/test_identity_image.py` | 4 | serial |
+| `cloud/worker/tests/test_question_denied.py` | 0 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 6 | serial |
+| `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
+| `cloud/worker/tests/test_stack_up.py` | 1 | serial |
+| `cloud/worker/tests/test_cloud_prepush_preflight.py` | 21 | serial |
+| `cloud/launcher/tests/test_cloud_prestop.py` | 314 | parallel |
+| `cloud/launcher/tests/test_git_token_renewal.py` | 310 | parallel |
+| `cloud/launcher/tests/test_run_record.py` | 239 | parallel |
+| `cloud/launcher/tests/test_driver.py` | 120 | parallel |
+| `cloud/launcher/tests/test_cloud_stack_wait.py` | 117 | parallel |
+| `cloud/launcher/tests/test_app_token.py` | 122 | parallel |
+| `cloud/launcher/tests/test_orchestrator_hub_session.py` | 74 | parallel |
+| `cloud/launcher/tests/test_cloud_worker.py` | 75 | parallel |
+| `cloud/launcher/tests/test_cloud_k1.py` | 65 | parallel |
+| `cloud/launcher/tests/test_preflight.py` | 65 | parallel |
+| `cloud/launcher/tests/test_cloud_stack.py` | 54 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_bounds.py` | 46 | parallel |
+| `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
+| `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
+| `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
+| `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
+| `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
+| `cloud/worker/tests/test_cw_gh_comments.py` | 37 | parallel |
+| `cloud/worker/tests/test_cloud_prepush_hardening.py` | 34 | parallel |
+| `cloud/worker/tests/test_stack_pull.py` | 35 | parallel |
+
+### Ubuntu (per entry)
+
+| Entry | Seconds | Lane |
+|---|---|---|
+| `bin/test-cloud-cost-report` | 0 | serial |
+| `bin/test-cloud-retired` | 33 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
+| `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_docs_wording.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_network.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_pod_replaced.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_pr_preflight.py` | 10 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_quick.py` | 6 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_wired.py` | 5 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 10 | serial |
+| `cloud/launcher/tests/test_cloud_shapes.py` | 11 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 16 | serial |
+| `cloud/launcher/tests/test_cluster_token_refresh.py` | 7 | serial |
+| `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cw_names.py` | 2 | serial |
+| `cloud/launcher/tests/test_docs_preflight_modes.py` | 0 | serial |
+| `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
+| `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
+| `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
+| `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
+| `cloud/launcher/tests/test_stack_registry_check.py` | 1 | serial |
+| `cloud/launcher/tests/test_stack_registry_pod.py` | 1 | serial |
+| `cloud/launcher/tests/test_token_read_at_call.py` | 0 | serial |
+| `cloud/launcher/tests/test_vault_check_pins.py` | 0 | serial |
+| `cloud/worker/tests/test_cloud_prepush.py` | 15 | serial |
+| `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
+| `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
+| `cloud/worker/tests/test_identity_image.py` | 1 | serial |
+| `cloud/worker/tests/test_question_denied.py` | 0 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 1 | serial |
+| `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
+| `cloud/worker/tests/test_stack_up.py` | 0 | serial |
+| `cloud/worker/tests/test_cloud_prepush_preflight.py` | 15 | serial |
+| `cloud/launcher/tests/test_cloud_prestop.py` | 29 | parallel |
+| `cloud/launcher/tests/test_git_token_renewal.py` | 106 | parallel |
+| `cloud/launcher/tests/test_run_record.py` | 153 | parallel |
+| `cloud/launcher/tests/test_driver.py` | 93 | parallel |
+| `cloud/launcher/tests/test_cloud_stack_wait.py` | 58 | parallel |
+| `cloud/launcher/tests/test_app_token.py` | 31 | parallel |
+| `cloud/launcher/tests/test_orchestrator_hub_session.py` | 4 | parallel |
+| `cloud/launcher/tests/test_cloud_worker.py` | 23 | parallel |
+| `cloud/launcher/tests/test_cloud_k1.py` | 32 | parallel |
+| `cloud/launcher/tests/test_preflight.py` | 28 | parallel |
+| `cloud/launcher/tests/test_cloud_stack.py` | 29 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_bounds.py` | 45 | parallel |
+| `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
+| `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
+| `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
+| `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
+| `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
+| `cloud/worker/tests/test_cw_gh_comments.py` | 1 | parallel |
+| `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
+| `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
+
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
 a cluster Secret scoped to the pod and mounted at `/run/cw/server-password` (0600); Basic auth, as the local v2
@@ -144,7 +357,7 @@ The password reaches slice C once, on a file descriptor it passes with `--passwo
 
 **Other choices where the contract was silent.** Deadlines live on the pod as annotations (`cw/hard-deadline`,
 `cw/idle-seconds`); the reaper honours the record's `hard_deadline` read-only when `CW_CLOUD_RECORD_DIR` is set.
-**The cluster-side floor.** Every pod from `render_pod` (the one builder; shapes S and M, with or without a pull secret or run secrets) sets
+**The cluster-side floor.** Every pod from `render_pod` (the one builder; shapes XS, S and M, with or without a pull secret or run secrets) sets
 `spec.activeDeadlineSeconds` = the `--max-hard` cap + `POD_DEADLINE_GRACE_SECONDS` (300 s). The cap, not the initial hard limit, because
 Kubernetes cannot raise the field on a running pod, so `extend` within the cap must stay legal; the grace lets the reaper (record, end hook)
 act first. The cap's default is 8h, so the floor is always finite. A pod past it is `Failed` with reason `DeadlineExceeded`; `stop` and the
@@ -155,7 +368,7 @@ the create's own clock, so the floor can trail the stored cap by scheduling time
 exceeding the hard limit and alerting is not decided: it exits 1 from `reap` so a scheduler can alert). The spend cap
 is read from `CW_CLOUD_SPEND_CAP_USD`; unset or empty means the prototype's USD 25, and zero, negative, non-numeric,
 `nan`, `inf` or a cost that cannot be read refuses `create` (exit 5). The check adds this launch's estimate (hard limit times the shape's rate) to what the running pods already cost. A worker name with `_` maps to `-` plus a 4-hex
-hash for the pod name. Shape rates are placeholders (`S` 0.10, `M` 0.20 USD/hour); `create` refuses a spec with a stored credential.
+hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `S`); `create` refuses a spec with a stored credential.
 
 **Not in this slice.** Automatic detection of a node drain notice: the end hook runs on `stop`, the idle stop and the hard limit; a drain is handled today by the operator running `stop --reason "node drain"`. The `cw-worker` service account's cloud identity and what it may do belong to the image/cluster setup (slice A and the platform), not here. `bin/test-cloud-launcher` is not yet wired into CI (the suite lists are CI's own).
 
@@ -198,6 +411,42 @@ the next run's names.
 | `stop`: `annotate kept` and `annotate hook-ran` | the pod (its `uid`) at the start | one merge patch by name after the hook | Yes: the patch body carries the `uid` (the API server refuses a mismatch). A changed pod is not marked, with one audit line: for `hook-ran` that leaves `delete` refusing (the safe side), for `kept` the failed hook's error is reported with it |
 | `delete` (no run id given) | the pod (its `uid`) | deletes the pod (bound to that `uid`) and both Secrets | The pod delete is bound; the two Secrets are deleted by name, by the operator's explicit command, with no run id to compare (`--force` is its own statement). Note: `delete` without `--force` trusts the `hook-ran` marker, which a stop now writes only onto the pod it read |
 | `extend` | the pod (its `uid`) | annotates the deadline, bound to that `uid` | Yes: a changed pod is not extended (run it again) |
+
+## The reaper's own cluster login (unattended)
+
+**The cause.** The reaper logs in to the cluster with the namespaced operator's token file (`CW_CLOUD_TOKEN_FILE`,
+with `CW_CLOUD_SERVER` and `CW_CLOUD_NAMESPACE`). A token of that account lives at most sixty minutes
+(`MAX_TOKEN_SECONDS`). Nothing in this repository used to create or refresh that file: the only minting,
+`cluster_token` in the launch wiring, runs in memory for a launch and never reached the reaper's driver. So an
+installed reaper stopped working within the hour: every pass failed the cluster call, the reaper exited with an
+`error:` line and the service restarted it every 30 seconds.
+
+**The fix.** The reaper keeps its own login fresh, without a person. At the start of every pass, when the token
+file is missing or has less than `CLUSTER_TOKEN_REFRESH_MARGIN_SECONDS` (1200, so 20 minutes) of life left, the
+reaper makes a fresh short-lived token for the namespaced operator account itself, by the same route the launch
+uses in memory: the cluster administrator kubeconfig is read from the vault (`CW_VAULT_SUBSCRIPTION` and
+`CW_VAULT_NAME` for the vault, `CW_CLUSTER_ADMIN_SECRET` for the name of the secret inside it) into memory and
+handed to the one `kubectl create token cw-operator` command over a pipe (`/dev/fd/N`: never a file, never an
+argument, never printed), and the administrator value is dropped when that command ends. The token is written to
+the token file with mode `0600`, by an atomic replace (a temp file in the same directory, then `os.replace`), so
+there is never a moment with another mode and the old file stays whole if anything fails. The token that lands in
+the file holds the operator account's own rights in the namespace and nothing more.
+
+**What it reads.** The token file (`CW_CLOUD_TOKEN_FILE`), the cluster (`CW_CLOUD_SERVER`), the namespace
+(`CW_CLOUD_NAMESPACE`), the vault (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`) and the name of the secret inside it
+(`CW_CLUSTER_ADMIN_SECRET`). No new setting name is added: the margin and the requested life (60 minutes, the
+cap) are constants of the launcher. The reaper's service file and its environment still carry names and paths
+only; no token and no administrator value ever reaches them.
+
+**When it fails.** The old file stays as it is, one audit line names the reason (`refresh-cluster-token`, one line
+per change of reason), the pass report names the failure (`cluster token not refreshed: WHY`), and the next
+attempt follows the retry gap (`CLUSTER_TOKEN_RETRY_SECONDS`, 300): the vault is read at most once every five
+minutes, so a failing vault never spins. A vault that refuses this machine is named as such, and the reaper never
+runs the vault access check (that check belongs to the launch path alone). Another login is never touched:
+`CW_KUBE_CONTEXT` and `CW_KUBECONFIG` are left alone, and no other credential is ever tried.
+
+**The manual install comment on the installer ask is superseded**: it recorded that a person had to refresh the
+token file by hand. The reaper does that now, by itself, and runs unattended for days.
 
 ## Server-side guards: `app_token.py` and `preflight.py`
 

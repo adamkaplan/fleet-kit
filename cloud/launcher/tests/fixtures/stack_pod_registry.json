@@ -1,0 +1,195 @@
+{
+  "stack_registry": {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "metadata": {
+      "annotations": {
+        "cw/hard-deadline": "2026-10-14T14:00:00Z",
+        "cw/idle-seconds": "600",
+        "cw/max-hard": "2026-10-14T20:00:00Z",
+        "cw/pull-client-id": "11111111-2222-3333-4444-555555555555",
+        "cw/pull-tenant-id": "66666666-7777-8888-9999-000000000000",
+        "cw/registry-host": "acme-registry.azurecr.io",
+        "cw/shape": "S",
+        "cw/stack": "true",
+        "cw/started": "2026-10-14T12:00:00Z",
+        "cw/worker": "coder7"
+      },
+      "labels": {
+        "app": "cw-worker",
+        "cw/worker": "coder7"
+      },
+      "name": "coder7-ffda"
+    },
+    "spec": {
+      "activeDeadlineSeconds": 29100,
+      "automountServiceAccountToken": false,
+      "containers": [
+        {
+          "env": [
+            {
+              "name": "CW_WORKER",
+              "value": "coder7"
+            },
+            {
+              "name": "CW_REPO",
+              "value": "acme-org/widget-service"
+            },
+            {
+              "name": "CW_BRANCH",
+              "value": "main"
+            },
+            {
+              "name": "CW_IDLE_SECONDS",
+              "value": "600"
+            },
+            {
+              "name": "CW_HARD_DEADLINE",
+              "value": "2026-10-14T14:00:00Z"
+            },
+            {
+              "name": "CW_AUDIT_RUNTIME_ID",
+              "value": "pod/coder7-ffda"
+            },
+            {
+              "name": "CW_TOKEN_ENDPOINT",
+              "value": "https://tokens.example.internal/mint"
+            }
+          ],
+          "image": "registry.example.internal/worker:1",
+          "lifecycle": {
+            "preStop": {
+              "exec": {
+                "command": [
+                  "/usr/local/bin/cw-prestop",
+                  "45"
+                ]
+              }
+            }
+          },
+          "name": "worker",
+          "readinessProbe": {
+            "tcpSocket": {
+              "port": 4096
+            }
+          },
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "memory": "4Gi"
+            }
+          },
+          "securityContext": {
+            "allowPrivilegeEscalation": true,
+            "capabilities": {
+              "drop": [
+                "ALL"
+              ]
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/run/cw",
+              "name": "pw",
+              "readOnly": true
+            },
+            {
+              "mountPath": "/run/cw-tmp",
+              "name": "tokens"
+            },
+            {
+              "mountPath": "/work",
+              "name": "scratch"
+            },
+            {
+              "mountPath": "/opt/cw-registry/token",
+              "name": "registry-token",
+              "readOnly": true
+            }
+          ]
+        }
+      ],
+      "hostUsers": false,
+      "nodeSelector": {
+        "sysbox-install": "yes"
+      },
+      "restartPolicy": "Never",
+      "runtimeClassName": "sysbox-runc",
+      "securityContext": {
+        "fsGroup": 1000,
+        "runAsGroup": 1000,
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "serviceAccountName": "cw-stack-puller",
+      "terminationGracePeriodSeconds": 60,
+      "volumes": [
+        {
+          "name": "pw",
+          "secret": {
+            "defaultMode": 384,
+            "items": [
+              {
+                "key": "password",
+                "path": "server-password"
+              }
+            ],
+            "secretName": "coder7-ffda-pw"
+          }
+        },
+        {
+          "emptyDir": {
+            "medium": "Memory"
+          },
+          "name": "tokens"
+        },
+        {
+          "emptyDir": {},
+          "name": "scratch"
+        },
+        {
+          "name": "registry-token",
+          "projected": {
+            "defaultMode": 256,
+            "sources": [
+              {
+                "serviceAccountToken": {
+                  "audience": "api://AzureADTokenExchange",
+                  "expirationSeconds": 600,
+                  "path": "token"
+                }
+              },
+              {
+                "downwardAPI": {
+                  "items": [
+                    {
+                      "fieldRef": {
+                        "fieldPath": "metadata.annotations['cw/registry-host']"
+                      },
+                      "path": "registry-host"
+                    },
+                    {
+                      "fieldRef": {
+                        "fieldPath": "metadata.annotations['cw/pull-client-id']"
+                      },
+                      "path": "client-id"
+                    },
+                    {
+                      "fieldRef": {
+                        "fieldPath": "metadata.annotations['cw/pull-tenant-id']"
+                      },
+                      "path": "tenant-id"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

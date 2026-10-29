@@ -788,6 +788,12 @@ def labels_entry(repo, number, tag, record, escalated, default_repo=None):
              "note": "no notice recorded: no sender and no lane; held on its labels alone", "merge_after": None, "head": head}
     if record.get("holds"):
         entry["holds"] = list(record["holds"])
+    brief = record.get("brief")   # slice D (#1215): the brief's one `why` sentence is the row's rationale; advisory when no material risk
+    why = brief.get("why") if isinstance(brief, dict) else None
+    if isinstance(why, str) and why.strip():
+        entry["rationale"] = why.strip()
+        entry["advisory"] = brief.get("decider") == "chief_of_staff" and brief.get("material") == []
+        entry["note"] = ("advisory for the Chief of Staff: " if entry["advisory"] else "for the owner: ") + why.strip()
     return entry
 
 
