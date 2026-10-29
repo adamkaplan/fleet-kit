@@ -564,7 +564,7 @@ class SwitchboardBackend:
 
 
 def pass_if_configured(engine, host, runner, now, environ=os.environ):
-    """Called by the daemon after each pass. Does nothing unless FLEET_RELAY_HUB_URL and FLEET_RELAY_HUB_TOKEN_FILE are set; never raises."""
+    """One relay pull and answer, run by the relay loop (RelayLoop.run) on its own engine. Does nothing unless FLEET_RELAY_HUB_URL and FLEET_RELAY_HUB_TOKEN_FILE are set; never raises."""
     url, tokfile = environ.get("FLEET_RELAY_HUB_URL"), environ.get("FLEET_RELAY_HUB_TOKEN_FILE")
     if not url or not tokfile:
         return 0
@@ -612,32 +612,60 @@ CADENCE = 5.0   # seconds between relay checks, on the relay's own loop (not tie
 class RelayLoop:
     """Pulls and answers relay requests on their own short cadence, in one daemon thread, so a long engine pass
     cannot make the hub's wait run out. One thread means one in-flight pass; each pass keeps its own total
-    deadline and PASS_BUDGET (pass_once). The ledger flock is taken by the Executor as before."""
+    deadline and PASS_BUDGET (pass_once). The ledger flock is taken by the Executor as before.
 
-    def __init__(self, engine, host, runner, now, environ=os.environ, cadence=None, sleep=None):
-        self.args = (engine, host, runner, now, environ)
+    CONCURRENCY RULE: the Engine is not thread-safe (discovery, the V2Reads caches, per-pass counters, _last). This thread
+    never touches the pass thread's engine: `engine_factory` builds the loop's OWN Engine (same config and state dir, own
+    caches), in the thread that starts the loop. What the two engines share is only files, each under its own lock (the
+    ledger flock, the audit and report-rider file locks). Without a factory (tests only) the given engine is used."""
+
+    def __init__(self, engine, host, runner, now, environ=os.environ, cadence=None, sleep=None, engine_factory=None):
+        self.engine = engine_factory() if engine_factory is not None else engine
+        self.args = (self.engine, host, runner, now, environ)
         self.cadence = CADENCE if cadence is None else cadence
         self.stop_flag = threading.Event()
         self.sleep = sleep or self.stop_flag.wait
         self.thread = None
+        self.failures = 0
+
+    def _record_failure(self, err):
+        """Counts the failure, and audits it if it can; never raises (the audit append itself may be what failed)."""
+        self.failures += 1
+        try:
+            self.engine._note("relay.loop_failed", None, {"error": type(err).__name__})
+        except BaseException:
+            pass
 
     def run(self):
         while not self.stop_flag.is_set():
-            pass_if_configured(*self.args)   # never raises
+            try:
+                pass_if_configured(*self.args)   # never raises, but its own handler calls _note, which can
+            except Exception as err:
+                self._record_failure(err)
             if self.stop_flag.is_set():
                 break
             self.sleep(self.cadence)
 
     def stop(self, join=2.0):
+        """Stops the loop and waits `join` s. A pull can last about 90 s: if the thread is still alive an audit line says so, and
+        the late thread can still write (a ledger append is flock-atomic; a pass cut by its deadline posts nothing)."""
         self.stop_flag.set()
         if self.thread is not None:
             self.thread.join(join)
+            if self.thread.is_alive():
+                try:
+                    self.engine._note("relay.stop_timeout", None, {"error": "the relay thread was still running %g s after stop" % join})
+                except BaseException:
+                    pass
 
 
 def start_loop(engine, host, runner, now, environ=os.environ, **kw):
-    """Start the relay loop; None (nothing runs) unless FLEET_RELAY_HUB_URL and FLEET_RELAY_HUB_TOKEN_FILE are set."""
+    """Start the relay loop; None (nothing runs) unless FLEET_RELAY_HUB_URL and FLEET_RELAY_HUB_TOKEN_FILE are set.
+    Raises ValueError when there is a hub but no host module (a None host would fail silently in every pass)."""
     if not environ.get("FLEET_RELAY_HUB_URL") or not environ.get("FLEET_RELAY_HUB_TOKEN_FILE"):
         return None
+    if host is None:
+        raise ValueError("the relay loop needs the switchboard module as its host")
     loop = RelayLoop(engine, host, runner, now, environ, **kw)
     loop.thread = threading.Thread(target=loop.run, name="relay-loop", daemon=True)
     loop.thread.start()

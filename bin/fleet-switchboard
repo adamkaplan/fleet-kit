@@ -2491,6 +2491,7 @@ class Switchboard:
     `audit` None makes it read-only: `pending` and `status` use it that way,
     and any write then raises instead of happening unaudited.
     """
+    _note_lock = threading.Lock()   # _note's check-then-set on _last; the relay thread has its own engine, this guards any second caller
 
     # The sweep cache of the worktree in-use checks (`worktree_sweep`) is PER THREAD: the daemon's janitor thread and its main thread (auto-retire reclaim)
     # each hold their own, so one can never read, seed or clear the other's session index (#762).
@@ -2568,10 +2569,11 @@ class Switchboard:
         return self.audit.external(self.actor, event, subject, detail)
 
     def _note(self, event, subject, detail):
-        """Audit a non-write event once per change, not once per pass."""
-        if self.audit is None or self._last.get((event, subject)) == detail:
-            return
-        self._last[(event, subject)] = detail
+        """Audit a non-write event once per change, not once per pass. The check-then-set is under a lock."""
+        with self._note_lock:
+            if self.audit is None or self._last.get((event, subject)) == detail:
+                return
+            self._last[(event, subject)] = detail
         self.audit.append(self.actor, event, subject, detail)
 
     # -- observe
@@ -3756,7 +3758,7 @@ def wait_for_poke(sock, timeout):
 DAEMON_RECORD = "daemon.json"  # what the running daemon says about itself: its pid, and where its key came from
 
 
-def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, watch=None, on_reload=None):
+def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, watch=None, on_reload=None, relay_engine=None):
     """`run`: a pass on every poke, and at least every `poll` seconds, under the
     single-instance lock.
 
@@ -3766,6 +3768,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
     `wait(sock, timeout)` and `passes` are for tests and `--once`. `record` is written to daemon.json
     once the lock is held, with this pid: `status` reads it to say what the DAEMON has, not what the shell
     that runs `status` has.
+    `relay_engine` builds the relay thread's OWN engine (the Engine is not thread-safe: the relay thread must not share the
+    pass thread's); None means it shares `engine` (tests only; `run` always passes one).
     """
     wait = wait or wait_for_poke
     with single_instance(state_dir):
@@ -3780,7 +3784,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
         relay_loop = None
         try:
             try:   # the relay is pulled on its own cadence, not after each pass (#1477)
-                relay_loop = load_module("cloud_relay_daemon").start_loop(engine, sys.modules.get(__name__), subprocess.run, engine.now, os.environ)
+                relay_loop = load_module("cloud_relay_daemon").start_loop(
+                    engine, sys.modules[__name__], subprocess.run, engine.now, os.environ, engine_factory=relay_engine)
             except Exception as err:
                 engine._failed(None, "pass", err, {"errors": []})
             done = 0
@@ -13798,7 +13803,8 @@ def cmd_run(args, runner, now, wait):
     try:
         run_daemon(engine, state, args.poll or config["poll_seconds"], wait,
                    record=dict(daemon_record(config), config_loaded_at=iso(now())), watch=watch,
-                   on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv))
+                   on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv),
+                   relay_engine=lambda: build_engine(runner, now, "daemon")[0])   # the relay thread's own engine
     except KeyboardInterrupt:
         return EXIT_OK
     finally:
