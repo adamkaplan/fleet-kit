@@ -155,11 +155,22 @@ def pins_listing(files, hits, read_lines):
     return sorted((p, ln[0], c, t, ln[1]) for (p, tl, c, t), ln in found.items())
 
 
+def pins_base_problem(base):
+    """Why `base` is refused, or None: a value that starts with `-` would be read by git as an option (`--output=FILE` writes a file)."""
+    if not isinstance(base, str) or not base or base.startswith("-"):
+        return "pins: the base is a ref, not an option"
+    return None
+
+
 def cmd_pins(args, runner, now):
     """`pins [--base REF]`: the existing tests that name a function, class or constant the diff changes or removes, or a quoted message of a removed or changed line."""
     import sys
     from pathlib import Path
     base = args.base
+    problem = pins_base_problem(base)
+    if problem:
+        sys.stderr.write("%s\n" % problem)
+        return 1
     try:
         files = pins_read_diff(base, runner)
         names, messages = pins_terms(files)

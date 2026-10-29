@@ -131,6 +131,20 @@ class TestPins(PinsRepo):
         self.assertIn("could not read the diff", err)
         self.assertEqual(lines, [])
 
+    def refuse_option_bases(self):
+        out = Path(self.dir) / "scratch-out.txt"
+        for base in ("--output=%s" % out, "-U5", "--no-index"):
+            self.calls.clear()
+            code, lines, err = self.pins(base=base)
+            self.assertNotEqual(code, 0, base)
+            self.assertIn("pins: the base is a ref, not an option", err)
+            self.assertEqual(lines, [])
+            self.assertEqual(self.calls, [], "no git call before the refusal")
+            self.assertFalse(out.exists(), "no file written")
+
+    def test_a_base_that_looks_like_an_option_is_refused(self):
+        self.refuse_option_bases()
+
     def test_the_listing_is_bounded_and_says_it_cut(self):   # S6
         body = "".join("    def test_many_%03d(self):\n        compute_widget_total(1)\n\n" % i for i in range(300))
         self.write("tests/test_many.py", "import unittest\n\n\nclass TestMany(unittest.TestCase):\n" + body)
@@ -191,6 +205,13 @@ class TestPinsMutants(PinsRepo):
 
     def test_a_finder_that_lists_none_fails(self):
         self.run_mutant("pins_search", lambda names, messages, runner: [])
+
+    def test_a_finder_without_the_option_refusal_is_caught(self):
+        original = sb.pins_base_problem
+        with mock.patch.object(sb, "pins_base_problem", lambda base: None):
+            self.assertIsNot(sb.pins_base_problem, original, "the mutant is applied")
+            with self.assertRaises(AssertionError):
+                TestPins.refuse_option_bases(self)
 
     def test_a_finder_that_lists_the_added_tests_fails(self):
         real = sb.pins_listing
