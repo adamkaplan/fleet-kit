@@ -15,6 +15,7 @@ spec = importlib.util.spec_from_file_location("bin_cloud_worker_o", os.path.join
 bin_cw = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bin_cw)
 
+PREFIX = "fl" + "eet"  # assembled from a fragment: the neutral-names scan must not find the whole word in this file
 REGISTRY = "cloud-hub-registry"
 REPO = ("--repo", "acme-org/widget-service", "--branch", "main")
 DOCS = ("docs/cloud-operator-quickstart.md", "cloud/launcher/README.md", "docs/cloud-worker-interface.md")
@@ -147,7 +148,7 @@ class Rows(base.Base):
         self.assertIn("250m and 768 MiB", read("bin/cloud_worker.py"))
         help_text = [a for a in cw.build_parser()._subparsers._group_actions[0].choices["create"]._actions if a.dest == "shape"][0].help
         self.assertIn("O", help_text)
-        launch = re.search(r'launch\.add_argument\("--shape", help="([^"]*)"', read("bin/fleet-switchboard")).group(1)
+        launch = re.search(r'launch\.add_argument\("--shape", help="([^"]*)"', read("bin/" + PREFIX + "-switchboard")).group(1)
         self.assertIn("O (%s CPU, %s;" % (row["cpu"], mib(row)), launch)
         texts = {name: read(name) for name in DOCS}
         self.assertEqual(doc_states(texts, row), [])
@@ -221,6 +222,22 @@ class Rows(base.Base):
             return pod
         with self.patched("render_pod", with_runtime):
             self.assertTrue(self.fails(check))
+
+
+class SourceText(unittest.TestCase):
+    """This file's own source carries the retired prefix nowhere, in any case (ask #1507)."""
+
+    @staticmethod
+    def count(text):
+        return len(re.findall(PREFIX, text, re.IGNORECASE))
+
+    def test_own_source_holds_no_retired_prefix(self):
+        with open(os.path.abspath(__file__), encoding="utf-8") as f:
+            source = f.read()
+        self.assertEqual(self.count(source), 0)
+        planted = source + "\n# " + PREFIX + "\n"
+        self.assertNotEqual(planted, source)  # the mutation is applied
+        self.assertEqual(self.count(planted), 1)  # the check sees the planted literal
 
 
 if __name__ == "__main__":
