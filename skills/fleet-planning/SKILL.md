@@ -90,15 +90,15 @@ scenarios:
     evaluator: ci
 ```
 
-Input missing, corrupt or unreadable: say so, keep the last good output (`plan check` warns `no-failure-mode`).
+Input missing, corrupt or unreadable: say so, keep last good output.
 
 Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `commission()` method" (how).
 
 ## Wordings `plan check` accepts
 
 - every declared `DW`/`PC` is covered by a scenario;
-- `discriminates` names a concrete wrong build (a stub that returns an empty list);
-- `pass` has an observable number or status (`exit status is 0`);
+- `discriminates` names a concrete wrong build;
+- `pass` has an observable number or status;
 - the declared clauses joined equal the ask's Done-when;
 - check a slice with `--ask <its own work item>`.
 
