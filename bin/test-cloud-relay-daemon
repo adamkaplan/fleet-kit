@@ -1489,6 +1489,172 @@ class RelayLoopCadence(unittest.TestCase):
         loop.thread.join(2)
 
 
+class TwoLoopsTrace(Fixture):
+    """#1477 U1/U4: two relay loops (two Executors on one state dir) answer at once.
+    Mutants: the replay check in build removed (U1: 2 records); no flock (U4: 2 holders); the head read inside build (U4: a network call under the lock)."""
+
+    def trace(self, mod, workers=2, each=4):
+        import threading as th
+        orig_lock, orig_write, orig_append = plan_ledger._lock_exclusive, plan_ledger._write_head, plan_ledger.append_checked
+        tl, lk = th.local(), th.Lock()
+        out = types.SimpleNamespace(holders=0, most=0, net=0)
+
+        def release():
+            if getattr(tl, "locked", False):
+                tl.locked = False
+                with lk:
+                    out.holders -= 1
+
+        def lock_ex(fd, *a):
+            if not getattr(mod, "NO_FLOCK", False):
+                orig_lock(fd, *a)
+            tl.locked = True
+            with lk:
+                out.holders += 1
+                out.most = max(out.most, out.holders)
+
+        def write_head(*a, **k):
+            release()   # still inside the lock: the close that frees it comes after
+            return orig_write(*a, **k)
+
+        def append(state, now, build):
+            def wrapped(entries, seq):
+                time.sleep(0.02)   # widen the window in which a second writer would overlap
+                try:
+                    return build(entries, seq)
+                except BaseException:
+                    release()
+                    raise
+            return orig_append(state, now, wrapped)
+        backend = self.backend
+        real_head = backend.live_head
+
+        def live_head(pr):
+            if getattr(tl, "locked", False):
+                out.net += 1
+            return real_head(pr)
+        backend.live_head = live_head
+        plan_ledger._lock_exclusive, plan_ledger._write_head, plan_ledger.append_checked = lock_ex, write_head, append
+        try:
+            def work(n):
+                ex = mod.Executor(self.state, backend, lambda: 1000)
+                for i in range(each):
+                    hub = FakeHub()
+                    rid = hub.submit(CODER, "prove", cid="w%d-%d" % (n, i), **PROVE)
+                    mod.pass_once(ex, hub.fetch, hub.post)
+            ts = [th.Thread(target=work, args=(n,)) for n in range(workers)]
+            [t.start() for t in ts]
+            [t.join(30) for t in ts]
+        finally:
+            plan_ledger._lock_exclusive, plan_ledger._write_head, plan_ledger.append_checked = orig_lock, orig_write, orig_append
+        return out
+
+    def test_two_loops_never_hold_the_flock_together_and_read_no_network_under_it(self):
+        got = self.trace(relay)
+        self.assertEqual((got.most, got.net), (1, 0))
+
+    def test_mutant_without_the_flock_is_caught(self):
+        mod = load_backend_module()
+        mod.NO_FLOCK = True
+        self.assertGreater(self.trace(mod).most, 1)
+
+    def test_mutant_head_read_under_the_lock_is_caught(self):
+        mod = load_backend_module("if not _same_head(first, head):", "if not _same_head(b.live_head(pr), head):")
+        self.assertGreater(self.trace(mod, workers=1, each=1).net, 0)
+
+    def two_sends(self, mod):
+        import threading as th
+        barrier = th.Barrier(2)
+        real_head = self.backend.live_head
+
+        def live_head(pr):
+            with __import__("contextlib").suppress(th.BrokenBarrierError):
+                barrier.wait(5)   # both loops have missed the index before either appends
+            return real_head(pr)
+        self.backend.live_head = live_head
+        answers = []
+
+        def send():
+            hub = FakeHub()
+            hub.submit(CODER, "prove", cid="same", **PROVE)
+            mod.pass_once(mod.Executor(self.state, self.backend, lambda: 1000), hub.fetch, hub.post)
+            answers.append(list(hub.results.values())[0])
+        ts = [th.Thread(target=send) for _ in range(2)]
+        [t.start() for t in ts]
+        [t.join(20) for t in ts]
+        return answers
+
+    def test_same_call_id_sent_twice_writes_one_record_and_one_claim(self):
+        answers = self.two_sends(relay)
+        self.assertEqual([a["status"] for a in answers], [200, 200])
+        self.assertEqual(answers[0]["record"]["seq"], answers[1]["record"]["seq"])
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(len(json.loads((Path(self.state) / relay.INDEX_FILE).read_text())), 1)
+
+    def test_mutant_replay_check_in_build_removed_is_caught(self):
+        mod = load_backend_module("            if again:\n                raise Replay(again)\n", "            pass\n")
+        self.two_sends(mod)
+        self.assertEqual(len(self.entries()), 2)
+
+
+class TrickleHub(unittest.TestCase):
+    """#1477 U5: a hub that sends one byte per second. The relay's pass is cut at the total deadline and audits one "relay pass cut"."""
+
+    def serve(self):
+        import socketserver
+        stop = threading.Event()
+
+        class H(socketserver.BaseRequestHandler):
+            def handle(self):
+                with __import__("contextlib").suppress(OSError):
+                    self.request.recv(4096)
+                    for b in b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n" + b"x" * 40:
+                        if stop.wait(1.0):
+                            return
+                        self.request.sendall(bytes([b]))
+        srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (stop.set(), srv.shutdown(), srv.server_close()))
+        return "http://127.0.0.1:%d" % srv.server_address[1]
+
+    def one_pass(self, mod, deadline, limit):
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, deadline
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        fetch, post = mod.http_transport(self.serve(), "tok")
+        notes = []
+        ex = types.SimpleNamespace(backend=types.SimpleNamespace(audit=lambda *a: notes.append(a)))
+        worker = threading.Thread(target=lambda: mod.pass_once(ex, fetch, post), daemon=True)
+        t0 = time.monotonic()
+        worker.start()
+        worker.join(limit)
+        return (not worker.is_alive()), time.monotonic() - t0, notes
+
+    def test_pass_returns_within_5s_with_one_cut_line(self):
+        done, took, notes = self.one_pass(relay, 1.0, 5.0)
+        self.assertTrue(done)
+        self.assertLess(took, 5.0)
+        self.assertEqual([(k, d["error"]) for k, _, d in notes], [("relay.pass_cut", "relay pass cut")])
+
+    def test_mutant_without_the_total_deadline_is_caught(self):
+        # the deadline not applied (a 60 s deadline stands for none): the pass is still running after 3 s
+        done, _, _ = self.one_pass(relay, 60.0, 3.0)
+        self.assertFalse(done)
+
+
+class HubFilesUnchanged(unittest.TestCase):
+    """#1477 U6: the hub keeps its 30 s wait and its worker copy is byte-identical to bin/cloud_relay.py."""
+
+    def test_wait_is_30_and_the_copies_match(self):
+        import cloud_relay
+        self.assertEqual(cloud_relay.WAIT, 30)
+        copy = BIN.parent / "cloud" / "worker" / "bin" / "cloud_relay.py"
+        self.assertEqual(copy.read_bytes(), (BIN / "cloud_relay.py").read_bytes())
+        for other in (BIN.parent / "cloud" / "worker" / "bin").glob("*.py"):
+            if (BIN / other.name).exists():
+                self.assertEqual(other.read_bytes(), (BIN / other.name).read_bytes(), other.name)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False).result
     print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
