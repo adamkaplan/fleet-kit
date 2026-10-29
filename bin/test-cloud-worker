@@ -724,7 +724,7 @@ class TestWiring(Base):
         self.assertNothingKept()
 
     def test_u3_the_token_directory_is_gone_after_every_ending(self):
-        self.assertEqual(self.launch()[0], 0)
+        r = self.launch(); print(r[2][-600:]); self.assertEqual(r[0], 0)
         with mock.patch.object(sb, "gates_caller_kind", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 self.main("send", "coder7", "hi")
