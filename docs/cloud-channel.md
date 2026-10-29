@@ -27,6 +27,13 @@ One document to set up, run and take down the cloud hub and the pod-side command
   - Relay timing: the hub waits 30 s (`cloud_relay.WAIT`) for the daemon's answer. The daemon pulls the relay on its own loop (a
     thread, `cloud_relay_daemon.CADENCE` = 5 s), not after each engine pass, so a long engine pass does not delay an answer. If a pull is
     still late the pod's call gets 504; that is safe: the entry stays queued and the same call_id is replay-safe.
+  - Relay engine lifetime and sharing: `relay_engine` is REQUIRED when a hub is configured (no factory: the relay fails to start with
+    a ValueError, audited by `run_daemon` as a failed pass step; the daemon's passes go on). The relay engine is built ONCE at daemon start and
+    reads config (`relay_holders`, `plan_evaluators`) only then. `reload_in_place` re-execs the whole process, so it is never staler than the
+    pass engine's config. A failed factory means no relay for that process lifetime (audited through `engine._failed`, not retried).
+    It shares only files (ledger flock, audit, report riders) and does NOT write `v2-link.json` (built with `owns_link=False`: one writer,
+    so `status` cannot flap). Known limit: it DUPLICATES `GhAccounts` (its own GitHub rate-limit gate: its own pause, counter and remembered
+    answers, apart from the pass engine's) and a V2Client. Neither holds a resource that needs closing.
   - Relay concurrency rule: the Engine is not thread-safe, so the relay thread never touches the pass thread's engine. It runs on its
     OWN engine (built at start from the same config and state dir, with its own caches); a relayed `report` is still delivered at once
     ("delivered", not queued). The two engines share only files, each under its own lock (ledger flock, audit and report-rider file locks).
