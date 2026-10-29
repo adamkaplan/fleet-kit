@@ -178,6 +178,8 @@ class TestPins(PinsRepo):
         self.assertIn("It only reads", body)
         self.assertIn("What it lists", body)
         self.assertIn("Run the listed classes before you push", body)
+        self.assertIn("run what you edited too", body)
+        self.assertIn("cut: search timed out: N of M terms not searched", body)
 
 
 class TestPinsMutants(PinsRepo):
@@ -335,6 +337,105 @@ class TestPinsReview(PinsRepo):
         _, sub_lines, _ = self.pins()
         self.assertEqual(len(self.listed(root_lines)), 1, root_lines)
         self.assertEqual(sub_lines, root_lines)
+
+
+class TestPinsStrictRead(PinsRepo):
+    """Strict read 2: a big diff, the user's diff settings, a stray line break, a quoted path."""
+    def fake(self, diff_out="", grep=None):
+        def run(argv, **kwargs):
+            self.calls.append((list(argv), kwargs))
+            if argv[1] == "diff":
+                return subprocess.CompletedProcess(argv, 0, diff_out, "")
+            return grep(argv, **kwargs)
+        return run
+
+    def run_cmd(self, runner):
+        with captured() as (out, err):
+            code = sb.cmd_pins(argparse.Namespace(base="HEAD"), runner, lambda: 0.0)
+        return code, out.getvalue().splitlines(), err.getvalue()
+
+    def timing_out_after_first(self):
+        n = []
+
+        def grep(argv, **kw):
+            n.append(1)
+            if len(n) > 1:
+                raise subprocess.TimeoutExpired(argv, 30)
+            return subprocess.CompletedProcess(argv, 0, "tests/t.py:3:    widget_fn_001()\n", "")
+        return grep
+
+    def test_a_timed_out_search_cuts_and_exits_zero(self):   # M1
+        self.write("tests/t.py", "def test_a(self):\n    pass\n    widget_fn_001()\n")
+        diff = "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1,120 +0,0 @@\n" + "".join("-def widget_fn_%03d(): pass\n" % i for i in range(120))
+        code, lines, err = self.run_cmd(self.fake(diff, self.timing_out_after_first()))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(lines[0], "cut: search timed out: 70 of 120 terms not searched")
+        self.assertTrue([l for l in lines if "widget_fn_001" in l], lines)
+
+    def test_a_finder_that_raises_on_a_timeout_is_caught(self):   # M1 mutant: the old behaviour
+        def old(names, messages, runner):
+            try:
+                runner(["git", "grep"], input="")
+                return []
+            except subprocess.TimeoutExpired as err:
+                raise sb.PinsError("could not search the tests: %s" % err)
+        with mock.patch.object(sb, "pins_search", old):
+            with self.assertRaises(AssertionError):
+                self.test_a_timed_out_search_cuts_and_exits_zero()
+
+    def test_601_terms_run_in_13_chunks(self):   # M1
+        grep = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "")
+        names = ["widget_fn_%04d" % i for i in range(601)]
+        sb.pins_search(names, [], self.fake("", grep))
+        greps = [c for c in self.calls if c[0][1] == "grep"]
+        self.assertEqual(len(greps), 13)
+        self.assertTrue(all(len(c[1]["input"].split()) <= 50 and c[1]["timeout"] <= 30 for c in greps))
+
+    def test_the_diff_call_pins_prefixes_and_textconv(self):   # L1 argv
+        self.write("acme.py", BASE_SRC.replace("count * 2", "count * 3"))
+        self.pins()
+        diff = [c for c in self.calls if c[1] == "diff"][0]
+        self.assertEqual(diff[:2], ["git", "diff"])
+        for opt in ("--src-prefix=a/", "--dst-prefix=b/", "--no-textconv"):
+            self.assertIn(opt, diff)
+
+    def test_the_diff_call_turns_quote_path_off(self):   # L3 argv
+        seen = {}
+
+        def run(argv, **kw):
+            seen.update(kw)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        sb.pins_read_diff("HEAD", run)
+        env = seen["env"]
+        pairs = [(env["GIT_CONFIG_KEY_%d" % i], env["GIT_CONFIG_VALUE_%d" % i]) for i in range(int(env["GIT_CONFIG_COUNT"]))]
+        self.assertIn(("core.quotePath", "false"), pairs)
+
+    def test_other_prefixes_are_not_a_clean_answer(self):   # L1 headers
+        for pre in ("c/", "w/"):
+            diff = "diff --git %sm.py %sm.py\n--- %sm.py\n+++ %sm.py\n@@ -1 +0,0 @@\n-def widget_fn_001(): pass\n" % ((pre,) * 4)
+            code, lines, err = self.run_cmd(self.fake(diff, lambda a, **k: subprocess.CompletedProcess(a, 1, "", "")))
+            self.assertEqual(code, 1)
+            self.assertIn("not understood", err)
+            self.assertNotIn("no existing test names a changed definition or message", lines)
+
+    def test_a_quoted_path_is_refused_loudly(self):   # L3 headers
+        diff = 'diff --git a/m.py b/m.py\n--- a/m.py\n+++ "b/caf\\303\\251.py"\n@@ -1 +0,0 @@\n-def widget_fn_001(): pass\n'
+        code, lines, err = self.run_cmd(self.fake(diff, lambda a, **k: subprocess.CompletedProcess(a, 1, "", "")))
+        self.assertEqual(code, 1)
+        self.assertIn("quoted path", err)
+
+    def test_a_non_ascii_file_name_is_read(self):   # L3 real git
+        self.write("caf\u00e9.py", "def widget_fn_001(): pass\n")
+        self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "more")
+        self.write("caf\u00e9.py", "")
+        self.assertIn("caf\u00e9.py", sb.pins_read_diff("HEAD", self.runner))
+
+    def test_a_form_feed_and_a_line_separator_in_a_hunk_line_are_content(self):   # L2
+        diff = "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1,2 +0,0 @@\n-def widget_fn_001(): x = \"a\x0c\u2028 lost message here\"\n-def widget_fn_002(): pass\n"
+        files = sb.pins_read_diff("HEAD", self.fake(diff))
+        self.assertTrue({"widget_fn_001", "widget_fn_002"} <= files["m.py"]["names"], files)
+        self.assertIn("a\x0c\u2028 lost message here", files["m.py"]["messages"])
 
 
 if __name__ == "__main__":

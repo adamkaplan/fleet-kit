@@ -8,6 +8,9 @@
 PINS_MAX_LINES = 200
 PINS_MIN_MESSAGE = 12   # a quoted string shorter than this is noise
 PINS_MIN_NAME = 4
+PINS_CHUNK = 50   # terms per `git grep`
+PINS_SEARCH_SECONDS = 100   # the whole search; one call gets at most PINS_CALL_SECONDS of what is left
+PINS_CALL_SECONDS = 30
 PINS_MAX_TERMS = 300   # of each kind: a bound on what one search is given
 PINS_SEARCH_PATHS = ("tests", "bin/test-*", "cloud/launcher/tests", "cloud/worker/tests", "cloud/tests")
 PINS_COMMON_WORDS = frozenset((
@@ -25,6 +28,12 @@ PINS_CLASS_RE = re.compile(r"^(\s*)class\s+(\w+)")
 
 class PinsError(Exception):
     """The diff could not be read."""
+
+
+class PinsHits(list):
+    """The hits of a search; `unsearched` and `total` say how many terms a timeout left unsearched (0 when it finished)."""
+    unsearched = 0
+    total = 0
 
 
 def _pins_one_line(text, limit=300):
@@ -48,16 +57,21 @@ def pins_messages_of(line):
 
 def pins_read_diff(base, runner):
     """{path: {"added": set of new-side line numbers, "names": set, "messages": set}} for `git diff -U0 base`; PinsError when git cannot read it."""
+    import os
     import subprocess
+    env = dict(os.environ)   # core.quotePath=false through the environment (a path with a non-ASCII character is not quoted), the way that leaves the argv as `git diff`
+    count = int(env["GIT_CONFIG_COUNT"]) if env.get("GIT_CONFIG_COUNT", "").isdigit() else 0
+    env.update({"GIT_CONFIG_COUNT": str(count + 1), "GIT_CONFIG_KEY_%d" % count: "core.quotePath", "GIT_CONFIG_VALUE_%d" % count: "false"})
     try:
-        done = runner(["git", "diff", "-U0", "--no-color", "--no-ext-diff", base, "--"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+        done = runner(["git", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", base, "--"],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60, env=env)
     except (OSError, subprocess.SubprocessError) as err:
         raise PinsError("could not read the diff: %s" % _pins_one_line(str(err), 200))
     if done.returncode != 0:
         raise PinsError("could not read the diff against %s: %s" % (base, _pins_one_line(done.stderr or "git diff failed", 200)))
     files, path, new_line, old_path = {}, None, 0, None
     left_old = left_new = 0   # the lines a hunk still owes: inside one, a line is content whatever it starts with (a removed `-- x` reads `--- x`)
-    for raw in (done.stdout or "").splitlines():
+    for raw in (done.stdout or "").split("\n"):   # on \n only: splitlines also breaks on form feed, U+2028 and others, and a piece of a hunk line would be read as context
         if left_old > 0 or left_new > 0:
             if path is not None:
                 entry = files[path]
@@ -83,8 +97,12 @@ def pins_read_diff(base, runner):
                 files.setdefault(path, {"added": set(), "names": set(), "messages": set()})
             continue
         if raw.startswith("diff --git"):
+            if not raw.startswith("diff --git a/"):
+                raise PinsError("the diff headers were not understood: %s" % _pins_one_line(raw, 120))   # a prefix other than a/ b/ would read as no file: a false all-clear
             path, old_path = None, None
             continue
+        if raw.startswith(('--- "', '+++ "')):
+            raise PinsError("the diff headers were not understood (a quoted path): %s" % _pins_one_line(raw, 120))
         hunk = PINS_HUNK_RE.match(raw)
         if hunk and path is not None:
             new_line = int(hunk.group(3))
@@ -112,28 +130,43 @@ def pins_term_cut(files):
 
 
 def pins_search(names, messages, runner):
-    """[(path, line number, line text, term)] for every line of the existing tests that holds a term (git grep over tracked files only)."""
+    """[(path, line number, line text, term)] for every line of the existing tests that holds a term (git grep over tracked files only), the terms searched
+    PINS_CHUNK at a time. A call that times out ends the search with what was found; the result then says how many terms are left (PinsHits)."""
     import re
     import subprocess
+    import time
     terms = list(names) + list(messages)
+    hits = PinsHits()
+    hits.total = len(terms)
     if not terms:
-        return []
-    try:   # the terms go in on standard input (`-f -`), never as arguments
-        done = runner(["git", "grep", "-n", "-I", "-F", "--no-color", "-f", "-", "--"] + list(PINS_SEARCH_PATHS), input="\n".join(terms) + "\n",
-                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
-    except (OSError, subprocess.SubprocessError) as err:
-        raise PinsError("could not search the tests: %s" % _pins_one_line(str(err), 200))
-    if done.returncode not in (0, 1):
-        raise PinsError("could not search the tests: %s" % _pins_one_line(done.stderr or "git grep failed", 200))
+        return hits
     name_res = {n: re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(n)) for n in names}
-    hits = []
-    for raw in (done.stdout or "").splitlines():
-        parts = raw.split(":", 2)
-        if len(parts) != 3 or not parts[1].isdigit():
-            continue
-        path, number, text = parts[0], int(parts[1]), parts[2]
-        for term in [n for n in names if name_res[n].search(text)] + [m for m in messages if m in text]:
-            hits.append((path, number, text, term))
+    seen, started = set(), time.monotonic()
+    for first in range(0, len(terms), PINS_CHUNK):
+        chunk = terms[first:first + PINS_CHUNK]
+        left = PINS_SEARCH_SECONDS - (time.monotonic() - started)
+        done = None
+        if left > 0:
+            try:   # the terms go in on standard input (`-f -`), never as arguments
+                done = runner(["git", "grep", "-n", "-I", "-F", "--no-color", "-f", "-", "--"] + list(PINS_SEARCH_PATHS), input="\n".join(chunk) + "\n",
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=min(PINS_CALL_SECONDS, left))
+            except subprocess.TimeoutExpired:
+                done = None
+            except (OSError, subprocess.SubprocessError) as err:
+                raise PinsError("could not search the tests: %s" % _pins_one_line(str(err), 200))
+        if done is None:
+            hits.unsearched = len(terms) - first
+            break
+        if done.returncode not in (0, 1):
+            raise PinsError("could not search the tests: %s" % _pins_one_line(done.stderr or "git grep failed", 200))
+        for raw in (done.stdout or "").split("\n"):
+            parts = raw.split(":", 2)
+            if len(parts) != 3 or not parts[1].isdigit() or (parts[0], parts[1], parts[2], first) in seen:
+                continue
+            seen.add((parts[0], parts[1], parts[2], first))
+            path, number, text = parts[0], int(parts[1]), parts[2]
+            for term in [n for n in chunk if n in name_res and name_res[n].search(text)] + [m for m in chunk if m not in name_res and m in text]:
+                hits.append((path, number, text, term))
     return hits
 
 
@@ -239,6 +272,8 @@ def cmd_pins(args, runner, now):
     cut_names, cut_messages = pins_term_cut(files)
     if cut_names or cut_messages:
         print("cut: %d names / %d messages not searched" % (cut_names, cut_messages))
+    if getattr(hits, "unsearched", 0):
+        print("cut: search timed out: %d of %d terms not searched" % (hits.unsearched, hits.total))
     cache = {}
 
     def read_lines(path):
