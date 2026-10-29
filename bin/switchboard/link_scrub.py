@@ -1,5 +1,9 @@
 # ---- #1576: a URL in a GitHub comment summary that carries a signed name in its query or fragment loses both (docs/switchboard.md, "Signed links in comment summaries").
 
+import re
+import urllib.parse
+
+
 SIGNED_NAMES = ("token", "access_token", "id_token", "refresh_token", "sig", "signature", "key", "api_key", "apikey", "secret",
                 "client_secret", "password", "passwd", "code", "expires", "expiry", "x-amz-signature", "x-amz-credential",
                 "x-amz-security-token", "auth", "jwt")
