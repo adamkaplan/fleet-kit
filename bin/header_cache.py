@@ -11,9 +11,15 @@ This module only holds files; which commands may use it (the CACHE-ALLOWED set) 
 that run before it are the reader's (bin/fleet-switchboard, IntentReader). Loaded by path, lazily.
 """
 import hashlib
+import importlib.util as _ilu
 import json
 import os
 import time
+from pathlib import Path
+
+_spec = _ilu.spec_from_file_location("record_json", str(Path(__file__).resolve().parent / "record_json.py"))
+_record_json = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_record_json)   # the shared bounded-depth parse (#1314): a cache file is a record another process writes
 
 OPEN_AGE = 600            # seconds: an open issue
 CLOSED_AGE = 24 * 3600    # seconds: a closed issue
@@ -44,6 +50,18 @@ def _name(account, repo, number):
     return "%s.%s.json" % (_h("%s#%s" % (str(repo).lower(), number)), _h(str(account)))
 
 
+def encode_issue(found):
+    """The stored fields of an issue object (`getattr` of each of ISSUE_FIELDS)."""
+    return {k: getattr(found, k, None) for k in ISSUE_FIELDS}
+
+
+def decode_issue(stored):
+    """(the IssueIntent constructor arguments, workspace, pull_request) of a stored issue; KeyError/TypeError when it is not whole."""
+    values = [stored[k] for k in ISSUE_FIELDS]
+    number, state, intent, done_when, updated_at, flag = values[:6]
+    return (number, state, "", intent, done_when, updated_at, bool(flag)), stored.get("workspace"), bool(stored.get("pull_request"))
+
+
 def age_for(state):
     return CLOSED_AGE if state == "closed" else OPEN_AGE
 
@@ -53,7 +71,7 @@ def _read(path):
         if os.path.getsize(path) > MAX_BYTES:
             return None
         with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+            data = _record_json.parse_bounded(handle.read())
         return data if isinstance(data, dict) and data.get("v") == VERSION else None
     except (OSError, ValueError, UnicodeError):
         return None
@@ -138,7 +156,7 @@ def _evict(path_dir):
 
 
 def drop(state, repo, number):
-    """Delete the entries of this issue of every account (the daemon's event, `--fresh`, a write to the issue). Never raises; the count dropped."""
+    """Delete the entries of this issue of every account (the daemon's event, FLEET_HEADER_FRESH=1, a write to the issue). Never raises; the count dropped."""
     dropped = 0
     try:
         prefix = _h("%s#%s" % (str(repo).lower(), number)) + "."

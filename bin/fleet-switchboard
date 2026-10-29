@@ -15225,7 +15225,7 @@ def work_lines(issue, tag=None):
 
 
 HEADER_CACHE_ACTION = [None]   # the command being run (set by `dispatch`): the file cache of the header serves only a CACHE-ALLOWED one
-HEADER_CACHE_FRESH = [False]   # `--fresh` was given: the entry is dropped and the read is made
+HEADER_CACHE_FRESH = [False]   # FLEET_HEADER_FRESH=1 in the environment: the entry is dropped and the read is made (it can only make a read fresher: no environment value enables the cache, lengthens an age or changes the setting)
 
 
 def always_fresh_commands():
@@ -15242,6 +15242,16 @@ def always_fresh_commands():
 def cache_allowed_commands():
     """The CACHE-ALLOWED set: the commands whose handler says `header_cache = True` (display and routing only)."""
     return {name[4:].replace("_", "-") for name, fn in list(globals().items()) if name.startswith("cmd_") and callable(fn) and getattr(fn, "header_cache", False) is True}
+
+
+def handler_header_action(name, handler):
+    """What `dispatch` stores (#1520): `name` when this command's handler says `header_cache = True` and is not ALWAYS-FRESH (flagged `ledger`, `records` or `guard_records`, or named in HEADER_FRESH_EXTRA), else None. It reads
+    the handler's own flags (no derivation by name here: `cache_allowed_commands` and `always_fresh_commands` are the derived sets the completeness test compares this with)."""
+    if getattr(handler, "header_cache", False) is not True or name in HEADER_FRESH_EXTRA:
+        return None
+    if getattr(handler, "ledger", False) is True or isinstance(getattr(handler, "records", None), str) or getattr(handler, "guard_records", False) is True:
+        return None
+    return name
 
 
 def header_cache_action(name):
@@ -15454,11 +15464,12 @@ class IntentReader:
             return found
 
         def encode(found):
-            return {k: getattr(found, k, None) for k in load_module("header_cache").ISSUE_FIELDS}
+            return load_module("header_cache").encode_issue(found)
 
         def decode(stored):
-            found = IssueIntent(stored["number"], stored["state"], "", stored["intent"], stored["done_when"], stored["updated_at"], bool(stored["charter"]))
-            found.workspace, found.pull_request, found.repo = stored.get("workspace"), bool(stored.get("pull_request")), repo
+            args, workspace, pull_request = load_module("header_cache").decode_issue(stored)
+            found = IssueIntent(*args)
+            found.workspace, found.pull_request, found.repo = workspace, pull_request, repo
             found.labels, found.parked_until = [], None
             return found
 
@@ -22870,7 +22881,6 @@ def build_parser():
     sub = parser.add_subparsers(dest="action", required=True)
     status = sub.add_parser("status", help="Config, clients, and every fleet agent with what is pending for it")
     status.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
-    status.add_argument("--fresh", action="store_true", help="Read the ask header from GitHub now (drop the cached one)")
     run = sub.add_parser("run", help="The daemon: observe, derive, decide, deliver, every poll seconds")
     run.add_argument("--once", action="store_true", help="One pass, then exit")
     run.add_argument("--poll", type=float, help="Seconds between passes (default: config poll_seconds)")
@@ -22881,7 +22891,6 @@ def build_parser():
     send.add_argument("name", help="The recipient's fleet name")
     send.add_argument("text", nargs="+", help="The message")
     send.add_argument("--issue", type=issue_arg, help="The issue the message is about")
-    send.add_argument("--fresh", action="store_true", help="Read the ask header from GitHub now (drop the cached one)")
     send.add_argument("--interrupt", action="store_true",
                       help="Stop and hold orders only: abort the recipient's running turn (its in-flight tool call "
                            "is cut), then deliver the message as a wake. Only a boss to its own worker.")
@@ -22953,7 +22962,6 @@ def build_parser():
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
-    pending.add_argument("--fresh", action="store_true", help="Read the ask header from GitHub now (drop the cached one)")
     remind = sub.add_parser("remind", help="A message to an agent that is due later")
     remind.add_argument("name", nargs="?", help="The recipient's fleet name")
     remind.add_argument("when", nargs="?", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
@@ -23574,7 +23582,7 @@ cmd_plan.direct = True   # no error mapping, no daemon start
 def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen, socket_call=None):
     """Run the parsed command: the exit code. `known` is the set of registered subcommands (parser.commands)."""
     available = {"args": args, "runner": runner, "now": now, "spawn": spawn, "socket_call": socket_call, "wait": wait}
-    HEADER_CACHE_ACTION[0], HEADER_CACHE_FRESH[0] = header_cache_action(args.action), bool(getattr(args, "fresh", False))   # #1520
+    HEADER_CACHE_ACTION[0], HEADER_CACHE_FRESH[0] = handler_header_action(args.action, resolve_command(args.action, known)), os.environ.get("FLEET_HEADER_FRESH") == "1"   # #1520
     try:
         return _dispatch(args, known, available)
     finally:
@@ -26840,7 +26848,7 @@ def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=Fa
     if env is not None:
         extra["env"] = env
     written = re.match(r"repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)", str(path))
-    if written:
+    if written and HEADER_CACHE_ACTION[0] is not None:   # only a CACHE-ALLOWED command's own write: an always-fresh command (the clear included) reads fresh and never touches the cache
         load_module("header_cache").drop(state_dir_path(), written.group(1), int(written.group(2)))   # #1520: a write to the issue (comment, edit, label) drops its header entry
     try:
         done = runner(argv, capture_output=True, text=True, timeout=engine.config["call_timeout_seconds"], **extra)
@@ -26848,7 +26856,7 @@ def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=Fa
         raise IntentError("unavailable", "gh did not answer within %ss" % engine.config["call_timeout_seconds"]) from None
     except OSError as err:
         raise IntentError("unavailable", "cannot run %s: %s" % (engine.config["gh"], err.strerror or err)) from None
-    if written:
+    if written and HEADER_CACHE_ACTION[0] is not None:
         load_module("header_cache").drop(state_dir_path(), written.group(1), int(written.group(2)))   # again once it is done: a read in between cannot keep the old header
     if done.returncode != 0:
         detail = _one_line(done.stderr, GH_ERROR_MAX) or _one_line(done.stdout, GH_ERROR_MAX) or "exit %d" % done.returncode   # #967: the failure's own words, whole (the clear's refusal shows them)

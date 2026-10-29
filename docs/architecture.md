@@ -273,3 +273,6 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `registry.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `registry.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `registry.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `header_cache.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `header_cache.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `header_cache.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |

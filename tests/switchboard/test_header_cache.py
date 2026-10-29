@@ -226,6 +226,27 @@ class TestSets(HeaderCacheBase):
                 found.append(action)
         return found
 
+    def test_the_handler_flags_dispatch_reads_agree_with_the_derived_sets(self):   # S4
+        registered = sb.build_parser().commands
+        for action in sorted(registered):
+            handler = sb.resolve_command(action, registered)
+            self.assertEqual(sb.handler_header_action(action, handler), sb.header_cache_action(action), action)
+
+    def test_the_environment_only_makes_a_read_fresher(self):   # rev 3: FLEET_HEADER_FRESH=1 drops; no environment value enables the cache or sets an age
+        registered = sb.build_parser().commands
+        seen = []
+        def spy(*a, **k):
+            seen.append((sb.HEADER_CACHE_ACTION[0], sb.HEADER_CACHE_FRESH[0]))
+            return 0
+        args = mock.Mock(action="send")
+        for env, want in (({}, False), ({"FLEET_HEADER_FRESH": "1"}, True), ({"FLEET_HEADER_FRESH": "0"}, False), ({"FLEET_HEADER_CACHE": "on", "FLEET_HEADER_AGE": "99999"}, False)):
+            with mock.patch.dict(os.environ, env), mock.patch.object(sb, "_dispatch", spy):
+                os.environ.pop("FLEET_HEADER_FRESH", None) if "FLEET_HEADER_FRESH" not in env else None
+                sb.dispatch(args, registered)
+            self.assertEqual(seen[-1], ("send", want), env)
+        self.assertEqual((sb.HEADER_CACHE_ACTION[0], sb.HEADER_CACHE_FRESH[0]), (None, False))
+        self.assertNotIn("--fresh", (Path(__file__).resolve().parents[2] / "bin" / "header_cache.py").read_text())
+
     def test_the_sets_do_not_overlap(self):
         self.assertEqual(sb.always_fresh_commands() & sb.cache_allowed_commands(), set())
         self.assertTrue({"send", "report", "comment", "pending", "remind", "status"} <= sb.cache_allowed_commands())
@@ -433,7 +454,7 @@ class TestDocs(unittest.TestCase):
         text = (Path(__file__).resolve().parents[2] / "docs" / "switchboard.md").read_text()
         start = text.index("Header cache (#1520)")
         section = text[start:start + 6000]
-        for fact in ("header-cache", "ALWAYS-FRESH", "CACHE-ALLOWED", "10 minutes", "24 hours", "--fresh", "header_cache", "restart"):
+        for fact in ("header-cache", "ALWAYS-FRESH", "CACHE-ALLOWED", "10 minutes", "24 hours", "FLEET_HEADER_FRESH=1", "header_cache", "restart"):
             self.assertIn(fact, section)
 
 
