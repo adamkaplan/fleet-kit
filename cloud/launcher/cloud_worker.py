@@ -1252,6 +1252,8 @@ REGISTRY_KEYS = ("secrets.json", "agents.json")
 
 STATUS_WORKERS = 4       # pods whose record `status` (no worker name) reads at a time
 STATUS_POD_SECONDS = 5   # each pod's own bound for its record
+# One total deadline for the whole no-name read; it stays BELOW the switchboard's call cap of 60 s so the launcher always answers first.
+STATUS_TOTAL_SECONDS = 40
 
 
 class Kube:
@@ -2339,10 +2341,14 @@ class Launcher:
                     box.append(self.record(pod))
                 except BaseException:
                     box.append(None)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return self._record_with(pod, None)
             worker = threading.Thread(target=run, daemon=True)
             worker.start()
-            worker.join(STATUS_POD_SECONDS)
+            worker.join(min(STATUS_POD_SECONDS, left))
             return box[0] if box and box[0] is not None else self._record_with(pod, None)
+        deadline = time.monotonic() + STATUS_TOTAL_SECONDS
         pool = futures.ThreadPoolExecutor(max_workers=STATUS_WORKERS)
         try:
             return list(pool.map(one, pods))

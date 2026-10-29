@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -465,6 +466,95 @@ class Lows(Fakes, Base):
         self.assertTrue(applied, "the mutation was not applied")
 
 
+class ErrorNotes(Fakes, Base):
+    """S14: the strict text kind belongs to the status rows only. The error notes of create, stop, hub and the cluster read keep a non-ASCII
+    character (an accented letter, a CJK character) and lose a control character, as before this change."""
+    NOTE = "caf\u00e9 \u4e16\u754c failed"
+
+    def shown(self, call):
+        """The text a person sees from `call` (a function that raises or prints with the launcher's stderr set to NOTE + a control character)."""
+        module = self.cloud()
+        with mock.patch.object(module, "run_launcher", lambda *a, **k: (3, {"worker": "w0"} if a[1:2] == ("create",) else None, self.NOTE)):
+            return call(module)
+
+    def check_intact(self, text):
+        self.assertIn("caf\u00e9 \u4e16\u754c failed", text)
+        self.assertNotRegex(text, r"[\x00-\x1f\x7f]")   # the launcher run already made the note one line without control characters
+
+    def test_s14_the_cluster_read_note_keeps_non_ascii(self):
+        def call(module):
+            with self.assertRaises(module.CloudError) as caught:
+                module._cluster_snapshot(None, None, 5)
+            return str(caught.exception)
+        self.check_intact(self.shown(call))
+
+    def test_s14_the_stop_note_keeps_non_ascii(self):
+        def call(module):
+            over = {"LaunchError": RuntimeError, "build_engine": lambda r, n, c: (None, None, None), "gates_caller_kind": lambda r, n: ("person", "x"),
+                    "EXIT_OK": 0, "EXIT_ERROR": 1, "PROG": "sb"}
+            with mock.patch.dict(module.H, over), mock.patch.object(module, "_may_retire", lambda k, r: True), mock.patch.object(module, "Cluster", mock.MagicMock), \
+                    mock.patch.object(module, "_audit", lambda *a: None):
+                with self.assertRaises(RuntimeError) as caught:
+                    module.cmd_retire(types.SimpleNamespace(name="w0", reason="done", undo=False), None, None, {"runtime_id": "pod/w0"})
+            return str(caught.exception)
+        self.check_intact(self.shown(call))
+
+    def test_s14_the_create_and_hub_notes_keep_non_ascii(self):
+        """The create and the hub-session call sites of `_launch` take the note from `_reason` unwrapped (the create one is run, the hub one is read)."""
+        module = self.cloud()
+        for label in ("create", "hub-session"):
+            with self.subTest(site=label):
+                self.check_intact(module._reason(3, self.NOTE))
+        source = Path(os.path.join(KIT, "bin", "cloud_worker.py")).read_text()
+        for site in ('"the cloud worker was not created: %s" % _reason(code, note)', '"the hub entry could not be given the session: %s" % _reason(hcode, hnote)'):
+            self.assertEqual(source.count(site), 1, site)
+
+    def test_s14_a_mutant_that_applies_the_text_kind_to_the_note_shows_a_question_mark_at_every_site(self):
+        module = self.cloud()
+        applied = []
+        real = module._reason
+
+        def strict(code, note):
+            applied.append(True)
+            return real(code, module._safe(note, "?", "text") if note else note)
+        with mock.patch.object(module, "_reason", strict):
+            with self.assertRaises(AssertionError):
+                self.test_s14_the_cluster_read_note_keeps_non_ascii()
+            with self.assertRaises(AssertionError):
+                self.test_s14_the_stop_note_keeps_non_ascii()
+            with self.assertRaises(AssertionError):
+                self.check_intact(module._reason(3, self.NOTE))
+        self.assertGreaterEqual(len(applied), 3, "the mutation was not applied")
+
+    def test_s14_a_status_row_with_the_same_text_still_passes_the_strict_kind(self):
+        module = self.cloud()
+        self.assertEqual(module._safe(self.NOTE, "?", "text"), "?")
+        self.assertEqual(module._safe("plain note", "?", "text"), "plain note")
+
+    def test_s14_a_failing_create_note_holds_the_text_intact(self):
+        self.check_intact(self.cloud()._reason(3, self.NOTE))
+
+    def test_s14_the_shared_redaction_table_is_reached_through_the_bound_namespace(self):
+        module = self.cloud()
+        for text in ("Authorization: Bearer " + "abcDEF123456" * 3, "password=hunter2xyz"):
+            with self.subTest(text=text):
+                self.assertEqual(module._safe(text, "?", "text"), "?")
+        self.names = self.live(1)
+        self.fakes(real_shape)
+        real = module.run_launcher
+        stub = lambda runner, command, worker, *a, **k: (3, None, "password=hunter2xyz") if command == "status" else real(runner, command, worker, *a, **k)
+        with mock.patch.object(module, "run_launcher", stub):
+            lines, rows = self.status()
+        self.assertNotIn("hunter2xyz", "\n".join(l for l in lines if l) + json.dumps(rows))
+
+    def test_s14_a_mutant_without_the_shared_table_lets_the_bearer_value_through(self):
+        module = self.cloud()
+        applied = []
+        with mock.patch.dict(module.H, {"redact_command_text": lambda text, extra=(): applied.append(True) or text}):
+            self.assertEqual(module._safe("password=hunter2xyz", "?", "text"), "password=hunter2xyz")
+        self.assertTrue(applied, "the mutation was not applied")
+
+
 class TestDocs(unittest.TestCase):
     def test_the_status_document_says_what_each_line_shows_and_the_lane_flag(self):
         flat = " ".join(Path(os.path.join(KIT, "docs", "switchboard.md")).read_text().split())
@@ -481,7 +571,8 @@ class TestDocs(unittest.TestCase):
                        "status --lane leaves out a record that has a problem (it has no recorded boss)",
                        "for a duplicate worker name in the launcher's list the last record wins",
                        "a runtime id or path is checked by its character set and length, not by its shape",
-                       "the tunnel process of an abandoned probe lives until the status process exits"):
+                       "the tunnel process of an abandoned probe lives until its own 120-second timeout",
+                       "the launcher's status for all workers has one total deadline of 40 seconds, and a pod not read by then is shown with its idle time unknown and the rest of its record"):
             self.assertEqual(flat.count(wanted), 1, wanted)
 
 

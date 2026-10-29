@@ -721,7 +721,7 @@ def _restore_signals(old):
 
 
 def _reason(code, note):
-    note = _safe(note, "?", "text") if note else note   # the launcher's standard error is untrusted text: the ONE helper
+    # the note is one line already (run_launcher): kept as it was for every caller that is not a status row (non-ASCII kept); the strict "text" kind is applied by the status rows only
     return "%s%s" % (EXIT_REASONS.get(code, "exit %d" % code), (": " + note) if note else "")
 
 
@@ -1602,9 +1602,15 @@ def _safe(value, default="Unknown", kind=None):
     if not value:
         return default
     if kind in _KINDS:
-        ok = isinstance(value, str) and _KINDS[kind].fullmatch(value) and not (kind == "text" and _SECRET_SHAPED.search(value))
+        ok = isinstance(value, str) and _KINDS[kind].fullmatch(value) and not (kind == "text" and _secret_shaped(value))
         return value if ok else "?"
     return _lib().safe_value(value)
+
+
+def _secret_shaped(value):
+    """The shared redaction table of the switchboard (reached through its bound namespace, no import) changes the text, or the local list matches."""
+    redact = H.get("redact_command_text")
+    return bool(_SECRET_SHAPED.search(value)) or (redact is not None and redact(value) != value)
 
 
 def _row_value(value, kind=None):
