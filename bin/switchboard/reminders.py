@@ -266,6 +266,46 @@ def merge_wake_facts(recipient, facts, budget=None):
     return [f for f in facts if not wake_class_of(f)] + rest + [merged]
 
 
+DELAYED_MARK_SECONDS = 1800   # #1468: a reminder copy delivered later than this after it fired is marked "delayed: sent HH:MMZ"
+
+
+def delayed_text(text, sent_at):
+    """The reminder text with the first line "delayed: sent HH:MMZ" (UTC)."""
+    return "delayed: sent %sZ\n%s" % (time.strftime("%H:%M", time.gmtime(sent_at)), text)
+
+
+def merge_reminder_copies(facts):
+    """#1468: queued reminder copies with the same sender, recipient and text (keyed or not) become ONE fact with the count and the newest
+    sent time. The merged fact carries every copy's key in `members`, so all are acknowledged. Any other fact passes through untouched."""
+    groups = {}
+    for fact in facts:
+        if fact.kind == "reminder" and not getattr(fact, "wake_class", None) and hasattr(fact, "reminder_text"):
+            groups.setdefault((fact.sender, fact.recipient, fact.reminder_text), []).append(fact)
+    merged_for = {}
+    for (sender, recipient, text), group in groups.items():
+        if len(group) < 2:
+            continue
+        newest = max(group, key=lambda f: (f.created, f.key))
+        body = "%s (%d copies, newest sent %sZ)" % (text, len(group), time.strftime("%H:%M", time.gmtime(newest.created)))
+        if getattr(newest, "delayed", False):
+            body = delayed_text(body, newest.created)
+        keys = sorted(f.key for f in group)
+        merged = Fact("reminder-merge:" + hashlib.sha256("|".join(keys).encode()).hexdigest()[:12], recipient, "reminder", body,
+                      newest.created, issue=newest.issue, batch=False, sender=sender, repo=newest.repo)
+        merged.members = keys
+        for f in group:
+            merged_for[id(f)] = merged
+    out, seen = [], set()
+    for fact in facts:
+        merged = merged_for.get(id(fact))
+        if merged is None:
+            out.append(fact)
+        elif id(merged) not in seen:
+            seen.add(id(merged))
+            out.append(merged)
+    return out
+
+
 def remove_reminders(state_dir, ids):
     """Drop these ids from reminders.json. Returns the ids that were there."""
     with reminders_lock(state_dir):
@@ -443,12 +483,17 @@ class ReminderFacts:
                     continue
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
             late = (self.engine.now() if self.engine else time.time()) - item["at"]
-            if late >= LATE_NOTE_SECONDS:
+            raw_text = text
+            if late > DELAYED_MARK_SECONDS:
+                text = delayed_text(text, item["at"])
+            elif late >= LATE_NOTE_SECONDS:
                 note = " (late by %d min)" % int(late // 60)
                 cut = len(text) + len(note) > TEXT_CAP
                 text = text[:max(0, TEXT_CAP - len(note) - (1 if cut else 0))] + ("\u2026" if cut else "") + note   # the note is applied before the cap and kept: the body is cut, not the note
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
+            facts[-1].reminder_text = raw_text
+            facts[-1].delayed = late > DELAYED_MARK_SECONDS
             if isinstance(item.get("wake_class"), str):
                 facts[-1].wake_class = item["wake_class"]
         return facts

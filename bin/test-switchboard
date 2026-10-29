@@ -10205,6 +10205,59 @@ class TestReminders(PR4Base):
                          ("platform", "reminder", 2, "coder", False, EPOCH + 600))
         self.assertEqual(found.summary, "look at the build")
 
+    # ---- #1468: a late reminder copy is marked, copies of one reminder are one line
+
+    def copies(self, count, sender="coder", to="platform", text="look at the build", step=60):
+        now = self.world.clock.now()
+        for n in range(count):
+            sb.add_reminder(self.world.state, to, now + 1 + n * step, now, text, sender=sender, key=("k%d-%s-%s-%s" % (n, sender, to, text) if n % 2 else None))
+
+    def test_s2_a_copy_fired_45_minutes_before_delivery_starts_with_the_delayed_mark(self):
+        self.remind(delay=10)
+        self.world.tick(10 + 45 * 60)
+        (found,) = self.reminder_facts()
+        sent = time.strftime("%H:%MZ", time.gmtime(EPOCH + 10))
+        self.assertEqual(found.summary.splitlines()[0], "delayed: sent " + sent)
+        self.assertEqual(found.summary.splitlines()[1:], ["look at the build"])
+
+    def test_s3_a_copy_fired_10_minutes_before_delivery_is_unchanged(self):
+        self.remind(delay=10)
+        self.world.tick(10 + 600)
+        (found,) = self.reminder_facts()
+        self.assertEqual(found.summary, "look at the build (late by 10 min)")
+        self.assertNotIn("delayed:", found.summary)
+
+    def deliveries(self):
+        self.world.engine.run_pass()
+        return self.world.admissions("platform")
+
+    def test_s4_s5_thirty_fired_copies_are_one_delivery_all_acknowledged_none_again(self):
+        self.copies(30)
+        self.world.tick(30 * 60 + 40 * 60)
+        sent = self.deliveries()
+        self.assertEqual(len(sent), 1, sent)
+        self.assertIn("30 copies", sent[0]["text"])
+        newest = time.strftime("%H:%MZ", time.gmtime(EPOCH + 1 + 29 * 60))
+        self.assertIn("newest sent " + newest, sent[0]["text"])
+        self.assertIn("delayed: sent " + newest, sent[0]["text"])
+        self.assertEqual(len(sent[0]["keys"]), 30)
+        self.world.tick(10)
+        self.assertEqual(len(self.deliveries()), 1, "none delivered again")
+
+    def test_s6_another_sender_recipient_or_text_is_never_merged(self):
+        self.copies(2)
+        self.copies(2, sender="other")
+        self.copies(2, text="another text")
+        self.world.tick(3 * 60)
+        facts = sb.merge_reminder_copies(self.reminder_facts())
+        self.assertEqual(len(facts), 3, [f.summary for f in facts])
+        self.assertEqual(sorted(len(getattr(f, "members", [])) for f in facts), [2, 2, 2])
+        self.copies(2, to="coder")
+        self.world.tick(3 * 60)
+        other = [f for f in self.reminder_facts() if f.recipient == "coder"]
+        self.assertEqual(len(sb.merge_reminder_copies(self.reminder_facts())), 4)
+        self.assertEqual(len(other), 2)
+
     def test_a_due_reminder_is_delivered_then_pruned_once_it_is_in_the_transcript(self):
         item = self.remind(delay=10)
         self.world.tick(10)
