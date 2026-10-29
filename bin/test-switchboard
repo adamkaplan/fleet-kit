@@ -81901,6 +81901,12 @@ Brief_test_brief_fix_TestClassifyRoots, Brief_test_brief_fix_TestDeletionsAndCla
     _brief_modules["test_brief_fix"].TestMutants, _brief_modules["test_brief_fix"].TestTablesDerivedFromTheCode)
 Brief_test_brief_order_TestRefusalOrder = _brief_modules["test_brief_order"].TestRefusalOrder
 Brief_impact_brief_BriefTests, Brief_impact_brief_MutantTests = _brief_modules["test-impact-brief"].BriefTests, _brief_modules["test-impact-brief"].MutantTests
+# #1552: tests/test_plan_check_words.py is run by THIS runner too (loaded by path like the brief tests above; bound by name so CI collects it)
+_plan_check_words_spec = importlib.util.spec_from_file_location("plan_check_words_tests", REPO / "tests" / "test_plan_check_words.py")
+_plan_check_words_module = importlib.util.module_from_spec(_plan_check_words_spec)
+sys.path.insert(0, str(REPO))
+_plan_check_words_spec.loader.exec_module(_plan_check_words_module)
+PlanCheckWords_Words, PlanCheckWords_Corpus = _plan_check_words_module.Words, _plan_check_words_module.Corpus
 for _name, _module in _brief_modules.items():   # a TestCase added to one of these files and not bound above would silently drop out of CI
     _held = {v for k, v in globals().items() if k.startswith("Brief_")}
     _defined = {v for v in vars(_module).values() if isinstance(v, type) and issubclass(v, unittest.TestCase) and v.__module__ == _module.__name__}

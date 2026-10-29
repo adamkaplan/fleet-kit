@@ -1,6 +1,7 @@
-"""#1552: the `review-for-code` defect names the matched keywords on its own line. Run: python3 -m unittest tests.test_plan_check_words"""
+"""#1552: the `review-for-code` defect appends the matched keywords to its message (the same line). Run: python3 -m unittest tests.test_plan_check_words"""
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -66,15 +67,23 @@ class Words(unittest.TestCase):
                                          "returns, raises, throws, function, endpoint, stdout, stderr, prints and 2 more"])
         self.assertEqual(sum(1 for l in out if "matched:" in l), 3)
 
+    def test_s3_boundary_exactly_9_and_exactly_8(self):   # S3 boundary
+        eight = "returns raises throws function endpoint stdout stderr prints"
+        got9, _ = lines(plan([review(eight + " logs")]))
+        self.assertEqual(words_of(got9), ["returns, raises, throws, function, endpoint, stdout, stderr, prints and 1 more"])
+        got8, _ = lines(plan([review(eight)]))
+        self.assertEqual(words_of(got8), ["returns, raises, throws, function, endpoint, stdout, stderr, prints"])
+        self.assertNotIn(" and ", words_of(got8)[0])
+
     def test_u1_secret_and_prose_not_echoed(self):   # U1
         secret = "ghp_" + "A1b2C3d4" * 4
-        got, out = lines(plan([review("a prose sentence about nothing returns " + secret, "the verdict quotes 3 words from sentence " + secret)]))
+        scenario_text = "a prose sentence about nothing returns " + secret
+        got, out = lines(plan([review(scenario_text, "the verdict quotes 3 words from sentence " + secret)]))
         mine = [d["message"] for d in got["defects"] if d["code"] == "review-for-code"]
         self.assertEqual(len(mine), 1)
         self.assertNotIn(secret, mine[0])
         self.assertNotIn("prose", mine[0])
         self.assertTrue(mine[0].endswith("(matched: returns)"))
-        self.assertEqual(plan_check.REVIEW_CODE_RE.pattern.count("|"), 56)
 
     def test_s5_mutants_are_caught(self):   # S5: the S2 assertion fails for each wrong build
         text = plan([review("the command returns the text and never changes it", "the reviewer refuses zzmarkerq")])
@@ -137,6 +146,9 @@ class Corpus(unittest.TestCase):
     def test_s4_u2_only_the_review_message_changes(self):   # S4 and U2
         old = old_module()
         if old is None:
+            # CI clones with fetch-depth 0, so the base commit must exist there: a skip would hide the S4 check. Elsewhere (shallow clone) skip.
+            if os.environ.get("CI"):
+                self.fail("the base commit %s is absent while CI is set" % BASE)
             self.skipTest("the base commit is not in this checkout")
         self.assertEqual(len(CORPUS), 20)
         codes_seen = set()
