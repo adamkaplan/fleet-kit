@@ -88298,6 +88298,14 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
     """#1457: the classes that read the set of files under bin/ are derived from the test files themselves (a class that lists bin/ with glob, rglob, iterdir or the reader scan);
     each is a row of path_suites.NEW_BIN_GUARDS (what `preflight-pr` runs when a change adds a file under bin/) or is named here exempt, with the reason."""
     READS = re.compile(r"(?:\bBIN\b(?:\.parent)?|\(\s*\w+\s*/\s*[\"']bin[\"']\s*\)|\bbin_dir\b)\s*\.\s*(?:glob|rglob|iterdir)\(|os\.listdir\([^)]*bin|[\"']bin[\"']\s*\)\s*\.\s*(?:glob|rglob|iterdir)|\bscan\(self\.BIN\)")
+    READS_MORE = re.compile(r"os\.walk\([^)]*\bbin\b|ls-files[\"'],\s*[\"']bin[\"']|\bglob\.glob\([^)]*\bbin\b")   # the os.walk, glob.glob and git ls-files idioms
+    HAND_LISTED = {   # rows of the table the derivation cannot see (the class reaches the bin/ listing through a helper or an import), each named with the reason
+        "bin/check-public-names": "a script, not a test class: it scans the added lines under bin/ and has no class for the derivation to find",
+        "TestArchitectureDocument": "reads the bin/ modules through the architecture tools, not a spelling the derivation matches (it failed on the new module of 1429)",
+        "TestRecordingCommands": "reaches the bin/ listing through a helper the derivation does not read; the reader of PR 1489 removed its row and the test still passed",
+        "TestTheReaperOnlyInstall": "reads the bin/ files through a helper (the Linux-only install checks), not a spelling the derivation matches",
+        "TestDerivedClosure": "lives in tests/switchboard/test_closure.py and reaches the bin/ listing through an import, not a spelling the derivation matches",
+    }
     EXEMPT = {   # each ran green against a tree with one planted new file under bin/ (an unlisted module); the reason says what it does with the listing
         "TestSlice3Modules": "walks bin/*.py to check the rules of each module's own source, and passed with a planted unlisted module",
         "TestModuleLoader": "loads each module of bin/ to prove it imports, and passed with a planted unlisted module",
@@ -88318,7 +88326,7 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
     def reading_classes(cls, name, text):
         """{class name} of the top-level classes of `text` whose source lists the bin/ directory's files."""
         tree = ast.parse(text)
-        return {n.name for n in tree.body if isinstance(n, ast.ClassDef) and n.name != cls.__name__ and cls.READS.search(ast.get_source_segment(text, n) or "")}
+        return {n.name for n in tree.body if isinstance(n, ast.ClassDef) and n.name != cls.__name__ and (cls.READS.search(ast.get_source_segment(text, n) or "") or cls.READS_MORE.search(ast.get_source_segment(text, n) or ""))}
 
     @classmethod
     def derived(cls):
@@ -88330,6 +88338,14 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
 
     def table(self):
         return {g[2] for g in sb.load_module("path_suites").NEW_BIN_GUARDS if g[2]}
+
+    def rows(self):
+        return {g[2] or g[1] for g in sb.load_module("path_suites").NEW_BIN_GUARDS}
+
+    def uncovered(self, found, rows, hand=None):
+        """Rows that are neither derived nor hand-listed, then hand-listed names that are no row (a stale entry)."""
+        hand = self.HAND_LISTED if hand is None else hand
+        return sorted(r for r in rows if r not in found and r not in hand) + sorted(h for h in hand if h not in rows)
 
     def unlisted(self, found, table):
         return sorted(name for name in found if name not in table and name not in self.EXEMPT)
@@ -88353,6 +88369,28 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
         planted = "import unittest\nBIN = None\n\nclass TestPlantedReader(unittest.TestCase):\n    def test_it(self):\n        self.assertEqual(sorted(p.name for p in BIN.glob('*.py')), [])\n"
         found = {n: "planted" for n in self.reading_classes("planted", planted)}
         self.assertEqual(self.unlisted(found, self.table()), ["TestPlantedReader"])
+
+    def test_every_row_of_the_table_is_derived_or_hand_listed_and_every_hand_listed_name_is_a_row(self):
+        self.assertEqual(self.uncovered(self.derived(), self.rows()), [])
+        for name, why in self.HAND_LISTED.items():
+            self.assertGreaterEqual(len(why.strip()), 20, name)
+
+    def test_removing_any_one_row_fails_the_check_naming_it_derived_or_hand_listed(self):
+        found = self.derived()
+        rows = self.rows()
+        self.assertTrue(set(found) & rows and set(self.HAND_LISTED) & rows, "both kinds of row are exercised")
+        for gone in sorted(rows):
+            hand_only = gone in self.HAND_LISTED
+            # a hand-listed row removed leaves a stale entry; a derived row removed is caught by the derived-vs-table check
+            if hand_only:
+                self.assertEqual(self.uncovered(found, rows - {gone}), [gone])
+            else:
+                self.assertEqual(self.unlisted(found, {r for r in rows if r != gone}), [gone] if gone not in self.EXEMPT else [])
+
+    def test_a_stale_hand_listed_name_and_an_unlisted_row_both_fail_the_check(self):
+        """Mutants: a hand-list entry for a class that is no row, and a row that is neither derived nor hand-listed."""
+        self.assertEqual(self.uncovered(self.derived(), self.rows(), dict(self.HAND_LISTED, TestNoSuchClass="a stale entry that names no row")), ["TestNoSuchClass"])
+        self.assertEqual(self.uncovered(self.derived(), self.rows() | {"TestNewRow"}), ["TestNewRow"])
 
     def test_the_table_with_one_class_removed_fails_the_completeness_check(self):
         found = self.derived()
