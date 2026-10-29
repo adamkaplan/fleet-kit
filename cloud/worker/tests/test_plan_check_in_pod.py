@@ -140,6 +140,9 @@ class PlanCheckInPod(unittest.TestCase):
         listed = {k for k, _ in ADDED_ROWS}
         self.assertEqual([(k, v) for k, v in bash.items() if k in listed], ADDED_ROWS)
         base = {k: v for k, v in bash.items() if k not in listed}
+        # pin change of #1549: the two substring rows 'git*push*main*' and 'git*push*master*' became whole-ref rules (keys that start with '*git*push*')
+        base = {k: v for k, v in base.items() if not k.startswith("*git*push*")}
+        base.update({"git*push*main*": "deny", "git*push*master*": "deny"})
         rest = dict(conf, permission={"bash": base}, agent={"worker": dict(conf["agent"]["worker"], permission={"bash": base})})
         self.assertEqual(hashlib.sha256(json.dumps(rest, sort_keys=True).encode()).hexdigest(), PINNED_JSON_WITHOUT_ADDED_ROWS)
         self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "guard.sh")))
