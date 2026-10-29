@@ -14926,14 +14926,16 @@ class GhAccounts:
 
     # -- reads: counted, conditional (ETag) and paused while the account is rate limited
 
-    def read(self, runner, path, repo, timeout, paginate=False, extra_flags=(), **run_kwargs):
+    def read(self, runner, path, repo, timeout, paginate=False, extra_flags=(), validator=None, **run_kwargs):
         """One `gh api <path>` GET with the repo's account. Returns a CompletedProcess like the runner's, its stdout the BODY only:
 
           - a read GitHub answered `304 Not Modified` to (we send the ETag we hold) is answered from memory and costs nothing against the limit;
           - every read is counted by account and endpoint (`status` shows them);
           - a 403/429 that says the limit is spent pauses every read of that account until the limit resets (GhRateLimited is raised
             at once, no process is started). No read is exempt: writes do not go through here.
-        A runner whose answer has no HTTP header block (a fake, `--paginate`) is passed through as it is."""
+        A runner whose answer has no HTTP header block (a fake, `--paginate`) is passed through as it is.
+        `validator` (#1520): a caller's stored ETag (True: none stored, but ask with `-i` so the ETag comes back). The read is then conditional even in a one-shot command; a 304 answers
+        with an empty body and `.not_modified = True`, and a 2xx carries `.etag`."""
         refuse_excluded(self.config, repo)   # #446: the lowest layer every gh read goes through: nothing is spawned for an excluded repository
         account = self.describe(repo)
         now = self.now()
@@ -14947,7 +14949,9 @@ class GhAccounts:
             if until is not None:
                 raise GhRateLimited(account, until)
             cached = None if paginate else self.etags.get((account, path))
-        use_head = self.conditional and not paginate and not extra_flags   # a raw read of a file is not conditional
+        use_head = (self.conditional or validator is not None) and not paginate and not extra_flags   # a raw read of a file is not conditional
+        if isinstance(validator, str) and cached is None:
+            cached = (validator, None)   # the caller's stored validator
         flags = list(extra_flags) if extra_flags else ["--paginate"] if paginate else (["-i"] + (["-H", "If-None-Match: " + cached[0]] if cached else []) if use_head else [])
         argv = [self.config["gh"], "api"] + flags + [path]   # the path stays last
         env = self.env_for(repo) if repo else None
@@ -14966,6 +14970,10 @@ class GhAccounts:
                 self._pause(account, now + GH_LIMIT_DEFAULT_PAUSE, 0)
             return done
         if status == 304 and cached is not None:
+            if cached[1] is None:   # the caller's validator: it holds the body
+                out = subprocess.CompletedProcess(argv, 0, "", "")
+                out.not_modified = True
+                return out
             with self.lock:
                 self.etags.move_to_end((account, path))
             return subprocess.CompletedProcess(argv, 0, cached[1], "")
@@ -14977,7 +14985,9 @@ class GhAccounts:
                     self.etags.move_to_end((account, path))
                     while len(self.etags) > GH_ETAG_MAX or sum(len(v[1]) for v in self.etags.values()) > GH_ETAG_BYTES_MAX:
                         self.etags.popitem(last=False)
-            return subprocess.CompletedProcess(argv, done.returncode, body, done.stderr)
+            out = subprocess.CompletedProcess(argv, done.returncode, body, done.stderr)
+            out.etag = etag
+            return out
         if status in (403, 429):
             reset = self._limit_reset(status, headers, body, now)
             if reset is not None:
@@ -15293,7 +15303,8 @@ class IntentReader:
         except AccountError as err:
             raise IntentError("gh", str(err)) from None
 
-    def _api(self, path, repo=None):
+    def _api(self, path, repo=None, meta=None):
+        """`meta` (#1520): a dict that may hold the stored validator under "etag"; the read is then conditional (a 304 costs nothing: meta["not_modified"] is set and None returned) and the answer's ETag is put back in it."""
         config = self.config if self.config is not None else getattr(self.accounts, "config", None)   # every construction passes `accounts=GhAccounts(config, ...)`
         if config is not None and load_module("repo_exclusion").is_excluded(config, repo or self.repo):
             raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))   # #446: no read
@@ -15302,7 +15313,7 @@ class IntentReader:
         extra = {"env": env} if env is not None else {}
         try:
             if self.accounts is not None and repo:   # counted, conditional (a 304 costs nothing) and paused while the account is rate limited
-                result = self.accounts.read(self.runner, path, repo, self.timeout, stdin=subprocess.DEVNULL)
+                result = self.accounts.read(self.runner, path, repo, self.timeout, stdin=subprocess.DEVNULL, validator=None if meta is None else (meta.get("etag") or True))
             else:
                 result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
                                      stdin=subprocess.DEVNULL, **extra)
@@ -15314,6 +15325,11 @@ class IntentReader:
             raise IntentError("unavailable", "gh did not answer within %ss" % self.timeout) from None
         except OSError as err:
             raise IntentError("unavailable", "cannot run %s: %s" % (self.gh, err.strerror or err)) from None
+        if meta is not None:
+            meta["not_modified"] = bool(getattr(result, "not_modified", False))
+            meta["etag"] = getattr(result, "etag", None)
+            if meta["not_modified"]:
+                return None
         if result.returncode != 0:
             detail = _one_line(result.stderr) or _one_line(result.stdout) or "exit %d" % result.returncode
             if self.accounts is not None:
@@ -15432,8 +15448,18 @@ class IntentReader:
                         return decode(found)
                     except (KeyError, TypeError, ValueError):
                         pass
-            value = fetch()
-            hc.store(state, account, repo, number, kind, encode(value), self.now())
+            old = None if HEADER_CACHE_FRESH[0] else hc.stale(state, account, repo, number, kind, self.now())
+            meta = {"etag": old.get("etag")} if old is not None else None   # the refresh after the age is a CONDITIONAL read: an unchanged issue answers 304 and costs nothing. A cold read stays plain (no `-i`); a stored entry with no validator asks for one
+            value = fetch(meta)
+            if meta is not None and meta.get("not_modified") and old is not None:
+                try:
+                    value = decode(old)
+                    hc.store(state, account, repo, number, kind, encode(value), self.now(), meta.get("etag") or old.get("etag"))
+                    return value
+                except (KeyError, TypeError, ValueError):
+                    meta = None
+                    value = fetch(None)   # the stored body would not decode: a plain read
+            hc.store(state, account, repo, number, kind, encode(value), self.now(), meta.get("etag") if meta else None)
             return value
 
         return run
@@ -15461,8 +15487,11 @@ class IntentReader:
     def issue(self, number, repo=None):
         repo = repo or self.repo
 
-        def fetch():
-            found = IssueIntent.from_api(self._api("repos/%s/issues/%d" % (repo, number), repo))
+        def fetch(meta=None):
+            body = self._api("repos/%s/issues/%d" % (repo, number), repo, meta)
+            if meta is not None and meta.get("not_modified"):
+                return None
+            found = IssueIntent.from_api(body)
             found.repo = repo
             return found
 
@@ -15489,9 +15518,11 @@ class IntentReader:
         """The parent issue's number, or None when the issue has no parent. `strict` (#1249, charter set): a 404 whose body is not the exact "no parent" shape raises."""
         repo = repo or self.repo
 
-        def fetch():
+        def fetch(meta=None):
             try:
-                found = self._api("repos/%s/issues/%d/parent" % (repo, number), repo)
+                found = self._api("repos/%s/issues/%d/parent" % (repo, number), repo, meta)
+                if meta is not None and meta.get("not_modified"):
+                    return None
             except IntentError as err:
                 if err.reason == "not_found":
                     if strict and not self.NO_PARENT_SHAPE.fullmatch(str(err).strip()):

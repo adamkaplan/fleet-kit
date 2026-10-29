@@ -20,6 +20,8 @@ class FakeGh:
 
     def __init__(self):
         self.requests = []
+        self.not_modified = 0   # requests answered 304: free against the budget
+        self.conditional = []   # the requests that sent a validator
         self.issues = {}     # number -> dict(state, body)
         self.parents = {}    # number -> parent number
 
@@ -28,6 +30,23 @@ class FakeGh:
                                "body": "## Intent\n\n%s\n\nDone when: %s\n" % (intent, done), "extra": "PLANTED-FIELD"}
 
     def __call__(self, argv, **kw):
+        done = self.answer(argv)
+        if "-i" not in argv or done.returncode != 0:
+            return done
+        import hashlib
+        etag = '"%s"' % hashlib.sha1(done.stdout.encode()).hexdigest()[:16]
+        sent = [argv[i + 1].split(": ", 1)[1] for i, a in enumerate(argv[:-1]) if a == "-H" and argv[i + 1].startswith("If-None-Match: ")]
+        if sent:
+            self.conditional.append(argv[-1])
+        if sent and sent[0] == etag:
+            self.not_modified += 1
+            return subprocess.CompletedProcess(argv, 0, "HTTP/2.0 304 Not Modified\r\netag: %s\r\n\r\n" % etag, "")
+        return subprocess.CompletedProcess(argv, 0, "HTTP/2.0 200 OK\r\netag: %s\r\n\r\n%s" % (etag, done.stdout), "")
+
+    def budget_counted(self):
+        return len(self.requests) - self.not_modified
+
+    def answer(self, argv):
         path = argv[-1]
         self.requests.append(path)
         parts = path.split("/")   # repos / owner / name / issues / N [/ parent]
@@ -108,6 +127,21 @@ class TestAges(HeaderCacheBase):
         again = len(self.gh.requests)
         self.header()
         self.assertEqual(self.count(again), 0, "the read at 11 minutes stored a new entry")
+
+    def test_the_refresh_after_the_age_is_conditional_and_an_unchanged_issue_costs_nothing(self):   # S7 (rev 3)
+        self.action("send")
+        first = self.header()
+        self.clock.t += 11 * 60
+        self.assertEqual(self.header(), first)   # the first refresh has no validator stored: it asks for one (a plain counted read)
+        counted, free = self.gh.budget_counted(), self.gh.not_modified
+        self.clock.t += 11 * 60
+        self.assertEqual(self.header(), first)
+        self.assertLessEqual(self.gh.budget_counted() - counted, 1)   # every refresh with a validator was a 304; only the 404 of "no parent" has none and is read plainly
+        self.assertGreater(self.gh.not_modified, free)
+        self.assertGreater(len(self.gh.conditional), 0)
+        self.gh.issue(5, intent="Changed intent")   # a changed issue answers 200 and the header is the new one
+        self.clock.t += 11 * 60
+        self.assertIn("Changed intent", " ".join(self.header()[1]))
 
     def test_closed_issue_is_served_a_day_and_read_again_after(self):   # S2
         self.gh.issue(5, state="closed")
@@ -314,7 +348,7 @@ class TestSafety(HeaderCacheBase):
         for planted in ("PLANTED-FIELD", "TOKEN-NEVER-STORED", "updated_at\": \"2026-10-29T01:00:00Z\", \"title"):
             self.assertNotIn(planted, text)
         allowed = {"v", "state", "account", "repo", "number", "issue", "parent"}
-        named = set(sb.load_module("header_cache").ISSUE_FIELDS) | {"at"}
+        named = set(sb.load_module("header_cache").ISSUE_FIELDS) | {"at", "etag"}
         for f in files:
             data = json.loads(f.read_text())
             self.assertLessEqual(set(data), allowed)
@@ -407,7 +441,8 @@ class TestReplay(HeaderCacheBase):
     HOUR = (("send", 548), ("remind", 113), ("plan", 22), ("comment", 16), ("verdict", 14), ("notice", 12), ("send", 13))   # v2.synthetic, reminder.add, plan.approved, github.comment, plan.proof, notice.pr, cloud.send
     ISSUES = 60
 
-    def replay(self, cache_on, clustered):
+    def replay(self, cache_on, shape):
+        """(budget-counted reads, plain request count) of the synthetic hour. shape: "burst" (an ask is worked in a burst), "uniform" (each issue hit evenly over the hour: command i at i/N of the hour, issue i mod 60) or "random" (random issue and time)."""
         import random
         rng = random.Random(1520)
         for n in range(1, self.ISSUES + 1):
@@ -416,38 +451,50 @@ class TestReplay(HeaderCacheBase):
         for n in range(90, 97):
             self.gh.issue(900 + n - 90)
         commands = [name for name, count in self.HOUR for _ in range(count)]
-        stamps = sorted(rng.uniform(0, 3600) for _ in commands)
         rng.shuffle(commands)
+        stamps = sorted(rng.uniform(0, 3600) for _ in commands)
+        if shape == "uniform":
+            stamps = [3600.0 * i / len(commands) for i in range(len(commands))]
         config = dict(self.config, header_cache="on" if cache_on else "off")
-        start, begun = self.clock.t, len(self.gh.requests)
-        for name, at in zip(commands, stamps):
+        start, begun, free = self.clock.t, len(self.gh.requests), self.gh.not_modified
+        for i, (name, at) in enumerate(zip(commands, stamps)):
             self.clock.t = start + at
-            number = 1000 + 1 + (int(at / 3600 * self.ISSUES) if clustered else rng.randrange(self.ISSUES))   # an ask is worked in bursts, or the pessimistic case: spread over the hour
+            number = 1000 + 1 + {"burst": int(at / 3600 * self.ISSUES), "uniform": i % self.ISSUES}.get(shape, rng.randrange(self.ISSUES))
             self.action(name if name in sb.always_fresh_commands() or name in sb.cache_allowed_commands() else "send")
             try:
                 self.header(number, config=config)
             except sb.IntentError:
                 pass
-        return len(self.gh.requests) - begun
+        plain = len(self.gh.requests) - begun
+        return plain - (self.gh.not_modified - free), plain
 
-    def test_the_cache_makes_at_most_a_fifth_of_the_reads(self):   # S7
-        without = self.replay(False, True)
+    def figures(self, shape):
+        without = self.replay(False, shape)
         self.tmp.cleanup()
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["XDG_STATE_HOME"] = self.tmp.name
-        self.gh.requests.clear()
-        with_cache = self.replay(True, True)
-        print("\nS7 replay (bursts): without the cache %d reads, with it %d (%.1f%%)" % (without, with_cache, 100.0 * with_cache / without))
-        self.assertLessEqual(with_cache * 5, without)
+        with_cache = self.replay(True, shape)
+        print("\nS7 replay (%s): budget-counted without the cache %d, with it %d (%.2f%%); plain requests without %d, with %d (of which %d answered 304)"
+              % (shape, without[0], with_cache[0], 100.0 * with_cache[0] / without[0], without[1], with_cache[1], with_cache[1] - with_cache[0]))
+        return without, with_cache
 
-    def test_the_spread_over_the_hour_figure_is_measured_too(self):   # S7: the pessimistic shape, quoted not asserted at 20 percent
-        without = self.replay(False, False)
-        self.tmp.cleanup()
-        self.tmp = tempfile.TemporaryDirectory()
-        os.environ["XDG_STATE_HOME"] = self.tmp.name
-        with_cache = self.replay(True, False)
-        print("\nS7 replay (spread): without the cache %d reads, with it %d (%.1f%%)" % (without, with_cache, 100.0 * with_cache / without))
-        self.assertLess(with_cache, without)
+    def test_burst_shape_counted_reads_are_at_most_a_fifth(self):   # S7
+        without, with_cache = self.figures("burst")
+        self.assertLessEqual(with_cache[0] * 5, without[0])
+
+    def test_uniform_shape_counted_reads_are_at_most_a_fifth(self):   # S7: the bar is 20 percent, never moved
+        without, with_cache = self.figures("uniform")
+        self.assertLessEqual(with_cache[0] * 5, without[0])
+
+    def test_random_spread_figure_is_measured_too(self):   # S7: quoted, not asserted at 20 percent
+        without, with_cache = self.figures("random")
+        self.assertLess(with_cache[0], without[0])
+
+    def test_a_plain_refresh_after_the_age_would_fail_the_uniform_bar(self):   # S7 mutant: no validator sent
+        hc = sb.load_module("header_cache")
+        with mock.patch.object(hc, "stale", lambda *a, **k: None):
+            without, with_cache = self.figures("uniform")
+        self.assertGreater(with_cache[0] * 5, without[0])
 
 
 class TestIsolation(HeaderCacheBase):   # S11

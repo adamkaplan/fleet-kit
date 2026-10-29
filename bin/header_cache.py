@@ -113,7 +113,19 @@ def load(state, account, repo, number, part, now, max_age=None):
         return None
 
 
-def store(state, account, repo, number, part, value, now):
+STALE_LIMIT = 30 * 24 * 3600   # a stored validator older than this is not offered (hygiene: a 304 makes any age safe)
+
+
+def stale(state, account, repo, number, part, now):
+    """The stored `part` of one key whatever its age (its validator, if it has one, is asked conditionally; with none the refresh asks for the validator), or None: same key checks as `load`."""
+    try:
+        found = load(state, account, repo, number, part, now, max_age=STALE_LIMIT)
+        return found
+    except Exception:
+        return None
+
+
+def store(state, account, repo, number, part, value, now, etag=None):
     """Keep `part` ("issue": the ISSUE_FIELDS of `value`; "parent": {"parent": number or None}) of one key. Best effort; True when written."""
     try:
         if not usable(state):
@@ -127,9 +139,10 @@ def store(state, account, repo, number, part, value, now):
             data = {}
         data.update({"v": VERSION, "state": _state_key(state), "account": str(account), "repo": str(repo), "number": number})
         if part == "issue":
-            data["issue"] = dict({k: value.get(k) for k in ISSUE_FIELDS}, at=now)
+            data["issue"] = dict({k: value.get(k) for k in ISSUE_FIELDS}, at=now, etag=etag if isinstance(etag, str) and len(etag) < 200 else None)
         elif part == "parent":
-            data["parent"] = {"parent": value.get("parent") if isinstance(value.get("parent"), int) else None, "at": now}
+            data["parent"] = {"parent": value.get("parent") if isinstance(value.get("parent"), int) else None, "at": now,
+                              "etag": etag if isinstance(etag, str) and len(etag) < 200 else None}
         else:
             return False
         text = json.dumps(data, sort_keys=True)
