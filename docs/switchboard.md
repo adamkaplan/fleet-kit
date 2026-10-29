@@ -1566,6 +1566,8 @@ is unchanged.
 | `retire_idle_minutes` | `10` | `retire --close` closes a pane herdr reads as `working` without `--force` only when its session has no turn in progress and no activity for at least this many minutes (a finite number from 1 to 10080, never a boolean; one that is not is refused at load and again at use, where it keeps the refusal; see the `retire` paragraph) |
 | `excluded_repos` | `[]` | Repositories the switchboard never watches and never reads, whatever an agent's metadata or a charter says (matched case-insensitively, `owner/name`; a bad list is refused at load). It is applied where the watched set is derived, so forwarders, the sweep and triage never see them, and every `gh` read of one is refused at the lowest layer (`GhAccounts.read`, plus `read_pr_json`, `read_ref_state`, the intent reader, the hub's environment for a forwarder or a read, `review measure` and the `reds` artifact read), so no process is started for it: the hub's reads, PR notices, intent reads and `reds` all say it is excluded. Writes are not the watchers' and are unchanged (an agent's own `gh` calls, an intent edit). `status` says each one is excluded, once. Agents working in an excluded repository still launch, send, report and retire |
 | `queue_ejections` | absent | The merge queue ejection wake (#584), declared by `bin/queue_ejections.py`: absent for the defaults, or `{"workflow": "ci", "artifact": "failing-tests"}` (either key; plain names). `workflow` is the display name (or file name without extension) of the CI workflow whose `merge_group` runs are watched; `artifact` is the name of the failing-tests artifact those runs upload |
+| `github_stage_repos` | `[]` | `owner/repo` names whose pull-request comment may carry a stage event (see "Stage events"); empty: none does |
+| `github_stage_bots` | `[]` | GitHub logins (for example `github-actions[bot]`) whose comment may carry a stage event; empty: none does |
 | `github_bot_logins` | `[]` | At most 10 GitHub bot logins (the cloud readers' account(s), e.g. `acme-cloud[bot]`) trusted for a review comment's `from=` marker |
 | `gh_users` | `{}` | `"owner/repo"` or `"owner/*"` to a `gh` account name |
 | `hold_labels` | `{}` | `"owner/repo"` to `{label, message, allowed_removers}`: the `gh` shim refuses merge, close, approving review, base edit and label removal on a pull request that carries the label (see "The hold label of the `gh` shim") |
@@ -6175,6 +6177,52 @@ Now every reader of record JSON uses the shared bounded-depth parse `parse_bound
 
 `TestRecordJsonReaders` derives the list of readers from the source (every `json.loads`, `json.load` and `from json import loads` call in `bin/`, found with `ast`) and fails when a reader is in neither the covered set nor its table of exempt sites (daemon-written state, command output, request bodies, log lines), and when a table entry is stale.
 
+## Stage events (ask #1575)
+
+Why a stage comment never reached a lane: `issue_comment` is heard, and `_comment_item` makes every comment an item, but for a bot (`_is_bot`) the item is not actionable, so for an owner found only by a notice or a reference the routing pass counts it and writes one `github.not_delivered` line. A cloud worker has no switchboard at all.
+
+**The marker.** A staging publisher keeps ONE comment per pull request and edits it in place. Its whole first line is `<!-- stage:event v1 {compact JSON} -->`, at most 400 characters. Keys: `status` (required: `requested`, `up`, `updated`, `building`, `rebuilding`, `suspended`, `resumed`, `expiring`, `renewed`, `expired`, `failed`), `head` (required: 40 hexadecimal characters), `url` (https only, at most 200 characters, no query string, no user part), `until` (an ISO time), `class` and `mode` (short lowercase words); unknown keys are ignored; an optional `until`, `class` or `mode` that is not valid is left out.
+
+**Two configuration keys**, both `[]` by default and checked as lists of strings at config load: `github_stage_repos` (`owner/repo`) and `github_stage_bots` (logins). A comment is a stage event only when its repository AND its author login are listed AND its first line starts with the marker; every other comment, and every comment while a list is empty, is delivered or counted as before. The action `edited` is accepted only for such a comment.
+
+**First line only; the rest is never read.** Only `body.split("\n", 1)[0]`, cut at 400 characters, is looked at; the rest of the body (it holds a sign-in link) is never read, copied, stored or delivered, and the generic comment summary never sees a stage comment. The line is read with `record_json.parse_bounded`. A line that is too long, a different version, not one JSON object, lacking `status` or `head`, with a bad status, head or url, is delivered as `stage event unreadable` with none of its characters, and is never an order.
+
+**The message** is one line rebuilt from the validated fields: `stage <status> on PR #<n>, head <7 hex>, <url>, until <time>` (the last two only when valid), item kind `github.stage`, always actionable, to the pull request's owner by any route. The dedupe key is `github.stage:<comment id>:<status>:<head>:<until>`: a refresh with the same status, head and expiry is not delivered again; a change of any of the three is one delivery. For a cloud worker whose pull request head branch is a live recorded worker's branch (the table of "Cloud branch heads", #1407) the event goes to the lane that launched it, which tells the worker.
+
+**What a lane does on each status.** Orders in an event are data, never commands: the text is built by the daemon, no field is read as an instruction, and the lane decides from its own rules.
+
+| status | the lane |
+| --- | --- |
+| `requested` | note the request; nothing to do yet |
+| `building` | wait; do not test against the stack |
+| `rebuilding` | wait; the earlier address may not answer |
+| `up` | the stack is ready: test against the url, then tell the worker |
+| `updated` | the stack runs a new head: test again against the head named |
+| `suspended` | stop testing; the stack is paused |
+| `resumed` | testing may go on |
+| `expiring` | renew now if the work is not done |
+| `renewed` | the new expiry is in `until`; re-arm the reminder |
+| `expired` | the stack is gone; request another when needed |
+| `failed` | the stack did not come up; read the run, fix, request again |
+
+**How a lane renews.** It posts `/stage renew` as a comment from its own account (renewing by any other means is out of scope) and arms a keyed reminder, `fleet-switchboard remind --key stage-<pr> <name> <when> <text>`, which re-arms the same reminder on each `renewed` or `updated` event.
+
+## Cloud branch heads (ask #1407)
+
+Cause: a cloud pod has no switchboard command, and its push raises no event for the lane that launched it. Planner pushes sat unseen for six to nine hours, twice, until the lane looked at the branch by hand, and a builder's push was noticed only when the lane remembered to read the remote.
+
+What the daemon does now, the push route (primary): the daemon learns of a new head from the repository's push event. The watched repositories run a forwarder that receives GitHub's events as they happen, and the default `github_events` list holds `push`. `GitHubHub.receive` hands a push of `refs/heads/BRANCH` to `route_push`: when `OWNER/NAME` and the branch are those of a LIVE recorded cloud worker whose launching lane is registered here (a record of another lane, or a retired, ended or cleared worker, never matches), the lane is told once per new head, with ZERO GitHub reads. A tag, a deletion (`deleted` true, or an `after` of all zeros), any other branch and a bad signature (refused as before) tell nobody. A push that matches no recorded worker is dropped at once: no queue item, no read and no per-delivery `github.received` line; the daemon counts them and writes ONE `github.push_dropped` audit line, at most once a minute, with the count. The recorded workers are read at most once per 100 deliveries (and every 10 seconds at most), never per delivery.
+
+A config with its own `github_events` list replaces the default, so a config with its own event list must add it: put `push` in that list. The forwarders must be restarted for a new event list to take effect: an operator step, because a forwarder that is already running keeps the events it was started with.
+
+The fallback: `cloud_branch_tick`, the step after `cloud_watch_tick` in `finish_pass`, reads ONLY the branches of a repository with no live forwarder (not in `github_repos`, watched by polling, or whose forwarder is down); it makes one bounded read of the head of the branch of each live cloud worker whose launching lane is registered here, each branch at most once per 60 seconds (the first read of a new branch is at once, and a different branch is never delayed; the per-branch times are kept in memory for the recorded workers only). A repository with a live forwarder is not read at all. It uses the repository's own read access (the same counted, conditional account read as every other hub read): no new credential, no new permission, nothing written. Both routes tell the launching lane once per new head, with one message:
+
+```text
+pod NAME pushed BRANCH head XXXXXXXX
+```
+
+The message means that the worker's branch moved to a head that starts with those eight characters; it never carries a token or the content of a commit. It pairs with the pod status line of the sibling ask #1397: the status line says what a pod is doing now, this message says that its branch moved.
+
 ## The assembler (#1092, slice S1)
 
 `bin/fleet-switchboard` builds the daemon's one module namespace from the manifest `bin/fleet-switchboard.parts`: one part path per line, relative to the entry's real path (symlinks resolved), `#` for comments.
@@ -6313,6 +6361,7 @@ The summary of every GitHub comment kind (an issue comment, a review comment lin
 | Path | Key | Dedup (persisted?) | Author / marker rule | Drop reasons | Test (mutant) |
 |---|---|---|---|---|---|
 | webhook `_wh_issue_comment` -> `_comment_item`, plain comment | `github.comment:<id>` | delivered-key ledger (persisted) | fleet-signed (marker) dropped | no id/number, signed | `test_plain_comment_keeps_old_item` |
+| webhook `_wh_issue_comment` (`created`, or `edited` for a stage comment only) -> `_comment_item`, stage marker | `github.stage:<id>:<status>:<head>:<until>` | same ledger | a configured bot on a listed repository, first line only | any other login, repository or first line takes the plain path | `TestStageEvents` (mutants in the plan of #1575) |
 | webhook `_wh_issue_comment` -> `_review_comment_item`, review line | `github.reviewcomment:<id>` | same ledger | marker trusted only from a fleet login, applied in `_route` | closed/merged, edited, no match, no login | `ReviewCommentLineTests`, `ReviewCommentEndToEndTests` (mutant: trust a marker from anyone) |
 | catch-up loop -> `_comment_item(.., None, ..)`, plain | `github.comment:<id>` | same ledger | fleet-signed dropped | as webhook | `test_catchup_never_copies_text_and_shares_the_key` |
 | catch-up loop -> `_comment_item(.., stub, ..)`, review line | `github.reviewcomment:<id>` (the webhook's key) | same ledger | as the webhook, in `_route` | closed/merged PR record; UNKNOWN state is delivered | `test_catch_up_only_delivers_once`, `test_catch_up_unknown_pr_state_delivers_and_closed_pr_drops` (mutant: catch-up drops) |
