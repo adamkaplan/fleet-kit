@@ -3,6 +3,7 @@
 A fake gh counts the requests it is asked. The reader is the real IntentReader over the real GhAccounts; the command running is set the way `dispatch` sets it."""
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -312,7 +313,7 @@ class TestSafety(HeaderCacheBase):
         text = " ".join(f.read_text() for f in files)
         for planted in ("PLANTED-FIELD", "TOKEN-NEVER-STORED", "updated_at\": \"2026-10-29T01:00:00Z\", \"title"):
             self.assertNotIn(planted, text)
-        allowed = {"v", "account", "repo", "number", "issue", "parent"}
+        allowed = {"v", "state", "account", "repo", "number", "issue", "parent"}
         named = set(sb.load_module("header_cache").ISSUE_FIELDS) | {"at"}
         for f in files:
             data = json.loads(f.read_text())
@@ -447,6 +448,66 @@ class TestReplay(HeaderCacheBase):
         with_cache = self.replay(True, False)
         print("\nS7 replay (spread): without the cache %d reads, with it %d (%.1f%%)" % (without, with_cache, 100.0 * with_cache / without))
         self.assertLess(with_cache, without)
+
+
+class TestIsolation(HeaderCacheBase):   # S11
+    def other_state(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        return other.name
+
+    def stray_is_served(self):
+        """Store an entry under this test's state directory, copy its file into another state directory under the name that directory would use; True when a read under the other one is served from it."""
+        self.action("send")
+        self.header()
+        strays = self.files()
+        hc = sb.load_module("header_cache")
+        other = self.other_state()
+        before = Path(sb.state_dir_path())
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": other}):
+            target = Path(sb.state_dir_path()) / hc.DIR_NAME
+            target.mkdir(parents=True)
+            account = sb.GhAccounts(self.config, self.gh, self.clock).describe(self.REPO)
+            for stray in strays:   # each file under the name the other directory would give that issue
+                number = json.loads(stray.read_text())["number"]
+                (target / hc._name(sb.state_dir_path(), account, self.REPO, number)).write_bytes(stray.read_bytes())
+            self.assertNotEqual(before, Path(sb.state_dir_path()))
+            mark = len(self.gh.requests)
+            self.header()
+            return self.count(mark) == 0
+
+    def test_a_stray_entry_in_another_state_directory_is_never_served(self):
+        self.assertFalse(self.stray_is_served())
+
+    def test_a_cache_keyed_by_the_issue_number_alone_fails_it(self):   # the mutant
+        hc = sb.load_module("header_cache")
+        with mock.patch.object(hc, "_state_key", lambda state: "same"):
+            self.assertTrue(self.stray_is_served())   # served across directories: the test above would fail
+
+    def test_every_test_gets_its_own_state_directory_and_one_shared_directory_is_caught(self):
+        first = Path(sb.state_dir_path())
+        self.tmp.cleanup()
+        self.setUp()
+        self.assertNotEqual(first, Path(sb.state_dir_path()))
+        # the mutant: two tests share one directory, and the second is served the first's entry
+        self.action("send")
+        self.header()
+        mark = len(self.gh.requests)
+        self.header()
+        self.assertEqual(self.count(mark), 0)   # the same directory serves it: only a distinct directory per test prevents this
+
+    def test_under_the_test_runner_a_state_directory_the_test_did_not_set_is_not_used(self):
+        hc = sb.load_module("header_cache")
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        with mock.patch.dict(os.environ, {"FLEET_SWITCHBOARD_UNDER_TEST": "1"}):
+            os.environ.pop("XDG_STATE_HOME", None)
+            self.assertFalse(hc.store(home, "a", self.REPO, 5, "parent", {"parent": 1}, 1.0))
+            self.assertIsNone(hc.load(home, "a", self.REPO, 5, "parent", 1.0))
+            self.assertFalse(Path(home, hc.DIR_NAME).exists())
+            os.environ["XDG_STATE_HOME"] = self.tmp.name
+            self.assertFalse(hc.usable(home))
+            self.assertTrue(hc.usable(os.path.join(self.tmp.name, "x")))
 
 
 class TestDocs(unittest.TestCase):

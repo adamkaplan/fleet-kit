@@ -46,8 +46,24 @@ def _dir(state):
     return os.path.join(str(state), DIR_NAME)
 
 
-def _name(account, repo, number):
-    return "%s.%s.json" % (_h("%s#%s" % (str(repo).lower(), number)), _h(str(account)))
+def _state_key(state):
+    """The state directory as a key part: the real path, hashed. An entry is named by it and carries it, so a file copied or left in another directory is never served."""
+    return _h(os.path.realpath(str(state)))
+
+
+def usable(state):
+    """False when this state directory may not hold a cache. Under the test runner (FLEET_SWITCHBOARD_UNDER_TEST=1) the state directory must be the one the test set itself (XDG_STATE_HOME set, the state under it):
+    a default that falls to the real user's `~/.local/state` is never read or written."""
+    if os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST") == "1":
+        base = os.environ.get("XDG_STATE_HOME")
+        if not base:
+            return False
+        return os.path.realpath(str(state)).startswith(os.path.realpath(base) + os.sep)
+    return True
+
+
+def _name(state, account, repo, number):
+    return "%s.%s.%s.json" % (_h("%s#%s" % (str(repo).lower(), number)), _h(str(account)), _state_key(state))
 
 
 def encode_issue(found):
@@ -80,8 +96,10 @@ def _read(path):
 def load(state, account, repo, number, part, now, max_age=None):
     """The stored `part` ("issue" or "parent") of one key, a dict, or None when there is none, it is too old, or it is not for this key."""
     try:
-        data = _read(os.path.join(_dir(state), _name(account, repo, number)))
-        if data is None or data.get("account") != str(account) or str(data.get("repo", "")).lower() != str(repo).lower() or data.get("number") != number:
+        if not usable(state):
+            return None
+        data = _read(os.path.join(_dir(state), _name(state, account, repo, number)))
+        if data is None or data.get("state") != _state_key(state) or data.get("account") != str(account) or str(data.get("repo", "")).lower() != str(repo).lower() or data.get("number") != number:
             return None
         found = data.get(part)
         if not isinstance(found, dict) or not isinstance(found.get("at"), (int, float)):
@@ -98,14 +116,16 @@ def load(state, account, repo, number, part, now, max_age=None):
 def store(state, account, repo, number, part, value, now):
     """Keep `part` ("issue": the ISSUE_FIELDS of `value`; "parent": {"parent": number or None}) of one key. Best effort; True when written."""
     try:
+        if not usable(state):
+            return False
         path_dir = _dir(state)
         os.makedirs(path_dir, mode=0o700, exist_ok=True)
         os.chmod(path_dir, 0o700)
-        path = os.path.join(path_dir, _name(account, repo, number))
+        path = os.path.join(path_dir, _name(state, account, repo, number))
         data = _read(path)
-        if data is None or data.get("account") != str(account) or data.get("number") != number:
+        if data is None or data.get("state") != _state_key(state) or data.get("account") != str(account) or data.get("number") != number:
             data = {}
-        data.update({"v": VERSION, "account": str(account), "repo": str(repo), "number": number})
+        data.update({"v": VERSION, "state": _state_key(state), "account": str(account), "repo": str(repo), "number": number})
         if part == "issue":
             data["issue"] = dict({k: value.get(k) for k in ISSUE_FIELDS}, at=now)
         elif part == "parent":
@@ -159,6 +179,8 @@ def drop(state, repo, number):
     """Delete the entries of this issue of every account (the daemon's event, FLEET_HEADER_FRESH=1, a write to the issue). Never raises; the count dropped."""
     dropped = 0
     try:
+        if not usable(state):
+            return 0
         prefix = _h("%s#%s" % (str(repo).lower(), number)) + "."
         for name in os.listdir(_dir(state)):
             if name.startswith(prefix):

@@ -14443,6 +14443,7 @@ def check_approval(config, runner, now, text, repo, number):
         return {"ok": False, "line": "approval not recorded: the message names no issue (use --issue); the message was delivered"}
     try:
         reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+        reader.file_cache = False   # #1520: an approval decides from the issue as it is now, even inside `send` (a display command)
         issue = reader.issue(number, repo)
         done_when = issue.done_when
         if not done_when:
@@ -15397,10 +15398,12 @@ class IntentReader:
 
     # -- the file cache of the header (#1520): bin/header_cache.py, loaded lazily by path
 
+    file_cache = True   # False on a reader whose answer decides something (an approval): it reads fresh whatever command runs
+
     def _file_layer(self, repo):
         """(state dir, account) when this read may use the shared file cache, else None. Only a CACHE-ALLOWED command, with the setting not off, and only AFTER the
         exclusion and the account have been checked (a repo or account this process may not read never reaches the cache: IntentError as for a fresh read)."""
-        if HEADER_CACHE_ACTION[0] is None:   # `dispatch` sets it only for a CACHE-ALLOWED command (header_cache_action): any other process, command or daemon reads fresh
+        if not self.file_cache or HEADER_CACHE_ACTION[0] is None:   # a reader that decides (the approval check inside `send`) sets `file_cache = False`; `dispatch` sets it only for a CACHE-ALLOWED command (header_cache_action): any other process, command or daemon reads fresh
             return None
         config = self.config if self.config is not None else getattr(self.accounts, "config", None)
         if not isinstance(config, dict) or not load_module("header_cache").enabled(config):
