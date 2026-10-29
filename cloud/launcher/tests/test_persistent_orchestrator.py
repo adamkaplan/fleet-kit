@@ -782,16 +782,16 @@ class S10Manifest(unittest.TestCase):
         role = [d for d in k1.rbac_docs() if d["kind"] == "Role"][0]
         rules = [(tuple(r["groups"]), tuple(r["resources"]), tuple(r["verbs"])) for r in role["rules"]]
         added = [r for r in rules if r not in self.OLD_RULES]
-        self.assertEqual(added, [(("apps",), ("statefulsets",), ("get", "list", "create", "delete"))])
+        self.assertEqual(added, [(("apps",), ("statefulsets",), ("get", "list", "watch", "create", "delete"))])
         self.assertEqual([r for r in self.OLD_RULES if r not in rules], [])
         self.assertEqual(len(rules), len(self.OLD_RULES) + 1)
-        self.assertEqual(len(added[0][2]), 4)
+        self.assertEqual(len(added[0][2]), 5)
         self.assertNotIn("*", role["text"].replace('apiGroups: [""]', ""))
 
 
 class S10Verbs(unittest.TestCase):
-    """The StatefulSet rule has exactly four verbs: the launcher creates the workload with create -f and never patches one."""
-    EXACT = ["get", "list", "create", "delete"]
+    """The StatefulSet rule has exactly five verbs: the launcher creates the workload with create -f and never patches one."""
+    EXACT = ["get", "list", "watch", "create", "delete"]
 
     def verbs_in(self, text):
         role = [d for d in k1.rbac_docs(text) if d["kind"] == "Role"][0]
@@ -804,12 +804,12 @@ class S10Verbs(unittest.TestCase):
         with open(os.path.join(ROOT, "cloud/k8s/operator-rbac.yaml")) as f:
             return f.read()
 
-    def test_s10_the_statefulset_rule_holds_exactly_four_verbs(self):
+    def test_s10_the_statefulset_rule_holds_exactly_five_verbs(self):
         self.check(self.read())
 
     def test_s10_mutant_a_patch_verb_added_fails_the_check(self):
         text = self.read()
-        changed = text.replace('verbs: ["get", "list", "create", "delete"]', 'verbs: ["get", "list", "create", "patch", "delete"]')
+        changed = text.replace('verbs: ["get", "list", "watch", "create", "delete"]', 'verbs: ["get", "list", "watch", "create", "patch", "delete"]')
         self.assertNotEqual(changed, text)
         with self.assertRaises(AssertionError):
             self.check(changed)
@@ -819,6 +819,27 @@ class S10Verbs(unittest.TestCase):
             lines = [l for l in f if '"patch"' in l or "'patch'" in l]
         self.assertTrue(lines)
         self.assertFalse([l for l in lines if "statefulset" in l.lower()])
+
+    def wait_and_watch(self, manifest_text, source_text):
+        """The delete's line holds --wait=true AND the rule holds watch: one without the other fails."""
+        has_wait = '"--wait=true"' in source_text.split("def delete_workload_and_wait", 1)[1].split("\n    def ", 1)[0]
+        has_watch = any("watch" in v for v in self.verbs_in(manifest_text))
+        self.assertEqual(has_wait, has_watch)
+        self.assertTrue(has_wait and has_watch)
+
+    def test_s10_the_wait_in_the_delete_matches_watch_in_the_rule(self):
+        with open(SOURCE) as f:
+            src = f.read()
+        self.wait_and_watch(self.read(), src)
+
+    def test_s10_mutant_a_manifest_without_watch_is_blocked(self):
+        text = self.read()
+        changed = text.replace('verbs: ["get", "list", "watch", "create", "delete"]', 'verbs: ["get", "list", "create", "delete"]')
+        self.assertNotEqual(changed, text)
+        with open(SOURCE) as f:
+            src = f.read()
+        with self.assertRaises(AssertionError):
+            self.wait_and_watch(changed, src)
 
 
 class OneRead(PBase):
