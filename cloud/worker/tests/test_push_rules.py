@@ -96,7 +96,7 @@ class Slices(unittest.TestCase):
             miss = [x for x in fs if not hit(b, x)]
             self.assertEqual(miss, [])
 
-    def test_s4_two_blocks_hold_the_same_push_rules_and_the_family_is_listed(self):
+    def test_s4_two_blocks_carry_the_same_push_rules_and_the_family_is_listed(self):
         top, inner = blocks(self.conf)
         a = [(p, v) for p, v in top.items() if "git*push" in p]
         b = [(p, v) for p, v in inner.items() if "git*push" in p]
