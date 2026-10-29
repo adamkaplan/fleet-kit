@@ -1710,9 +1710,21 @@ class TrickleHub(unittest.TestCase):
         self.addCleanup(lambda: (stop.set(), srv.shutdown(), srv.server_close()))
         return "http://127.0.0.1:%d" % srv.server_address[1]
 
-    def one_pass(self, mod, deadline, limit):
+    def one_pass(self, mod, deadline, limit, join_after=None):
+        """join_after: the seconds the call's worker join waits. The transport's own deadlines (socket, watchdog, total) stay at `deadline`, so
+        the cut by the join is certain to come first: the outcome never depends on which of two equal timers fires first."""
         old, mod.READ_DEADLINE = mod.READ_DEADLINE, deadline
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        if join_after is not None:
+            real = threading
+
+            class Short(real.Thread):
+                def join(self, timeout=None):
+                    return super().join(join_after if timeout is not None else None)
+            shim = types.SimpleNamespace(**{k: getattr(real, k) for k in dir(real) if not k.startswith("__")})
+            shim.Thread = Short
+            self.addCleanup(setattr, mod, "threading", mod.threading)
+            mod.threading = shim
         fetch, post = mod.http_transport(self.serve(), "tok")
         notes = []
         ex = types.SimpleNamespace(backend=types.SimpleNamespace(audit=lambda *a: notes.append(a)))
@@ -1723,14 +1735,14 @@ class TrickleHub(unittest.TestCase):
         return (not worker.is_alive()), time.monotonic() - t0, notes
 
     def test_pass_returns_within_5s_with_one_cut_line(self):
-        done, _, notes = self.one_pass(relay, 1.0, 20.0)   # the stub needs about 40 s to finish; 20 s is a loose bound for a loaded machine
+        done, _, notes = self.one_pass(relay, 2.5, 20.0, join_after=0.5)   # join cuts at 0.5 s, the transport deadline is 2.5 s; the stub needs about 40 s to finish; 20 s is a loose bound for a loaded machine
         self.assertTrue(done)
         self.assertEqual([(k, d["error"]) for k, _, d in notes], [("relay.pass_cut", "relay pass cut")])
 
     def test_mutant_without_the_total_deadline_is_caught(self):
         # the deadline removed from the REAL code (a string mutant, like the neighbouring tests): the pass is still running after 3 s
         mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
-        done, _, _ = self.one_pass(mod, 1.0, 3.0)
+        done, _, _ = self.one_pass(mod, 2.5, 3.0)   # bytes come every 1 s: no per-read timeout of 2.5 s fires, only a total deadline could end the pass
         self.assertFalse(done)
 
 
