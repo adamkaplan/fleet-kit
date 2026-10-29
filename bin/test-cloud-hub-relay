@@ -391,10 +391,15 @@ class TestBoundsAndCaps(unittest.TestCase):
                 s = socket.create_connection(("127.0.0.1", hub.port))
                 s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-a-1\r\nContent-Length: 100\r\n\r\n")
                 t0 = time.time()
+                import select
+                sent, readable_at = 0, None
                 for _ in range(8):   # a byte every 0.4 s would pass a per-read timeout
                     try: s.sendall(b" ")
                     except OSError: break
                     time.sleep(0.4)
+                    sent += 1
+                    if readable_at is None and select.select([s], [], [], 0)[0]: readable_at = sent
+                self.assertTrue(readable_at is not None and readable_at < 8, readable_at)   # the 408 was readable mid-trickle, before the 8th byte
                 data = s.recv(4096)
                 self.assertIn(b" 408 ", data.split(b"\r\n")[0])
                 self.assertLess(time.time() - t0, 20.0)   # a hang guard only (20x the 1.0 s body deadline); the observation is the 408 itself
@@ -404,29 +409,20 @@ class TestBoundsAndCaps(unittest.TestCase):
             cloud_relay.BODY_DEADLINE = old
 
     def test_slow_body_trickle_mutant_never_cuts(self):
-        import socket
         old_src = "time.monotonic() + cloud_relay.BODY_DEADLINE"
         src = Path(cloud_hub.__file__).read_text()
         self.assertIn(old_src, src)
         self.assertNotEqual(src.replace(old_src, "time.monotonic() + 1000"), src)
         mod = mutant(cloud_hub, old_src, "time.monotonic() + 1000")
-        old = cloud_relay.BODY_DEADLINE
-        cloud_relay.BODY_DEADLINE = 1.0
+        orig = cloud_hub.make_hub
+        cloud_hub.make_hub = mod.make_hub
+        case = TestBoundsAndCaps("test_slow_body_trickle_cut_at_deadline")
         try:
-            with Hub(hub_mod=mod) as hub:
-                s = socket.create_connection(("127.0.0.1", hub.port))
-                s.settimeout(3.0)
-                s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-a-1\r\nContent-Length: 100\r\n\r\n")
-                for _ in range(8):
-                    try: s.sendall(b" ")
-                    except OSError: break
-                    time.sleep(0.4)
-                try: data = s.recv(4096)
-                except (socket.timeout, OSError): data = b""
-                self.assertNotIn(b" 408 ", data.split(b"\r\n")[0])   # the mutant never cuts
-                s.close()
+            with self.assertRaises(AssertionError):
+                case.test_slow_body_trickle_cut_at_deadline()
         finally:
-            cloud_relay.BODY_DEADLINE = old
+            cloud_hub.make_hub = orig
+            case.doCleanups()
 
     def test_held_wait_caps_keep_daemon_routes_alive(self):
         # per pod 4, global 6; both pods saturate, a refused call queues nothing, the daemon still gets through
