@@ -627,6 +627,8 @@ line and the registry note that `retire` writes, and makes no `stop` call
 (there is no pod). `retire` of such a record ends it cleanly, as it always
 did.
 
+**`read` of a retired cloud worker (#1546).** After a pod is retired, `read NAME` no longer fails with the tunnel error: when no live record serves the name and a run record of that name exists under the run-record directory, it prints a first line saying the text is from the record of a retired run and when it ended, then the last text of the worker in the newest run record, and exits 0. The text is shown to its own lane only (the rule of `retire`: the operator, the Chief of Staff, or the worker's own boss, which the switchboard keeps in `<state>/cloud-boss/<worker>.json` when the record is removed by `retire` or `cloud-clear`: worker, boss and end time, 0600, at most 1 KiB, 500 files, 30 days, pruned only when one is written); a worker removed before this was kept is readable by the operator and the Chief of Staff only. The text is scrubbed by the launcher's one scrub function (before and after the cap) and capped at 4,000 characters, with a closing line saying how many were cut. An absent, unreadable, malformed or empty transcript is one plain line and exit 1. It only reads files: nothing is written, no cluster is called and no path of the run record is printed.
+
 ### Intent lines (PR 6)
 
 The usual pattern for agentic coding is one session per intent. Here the Chief

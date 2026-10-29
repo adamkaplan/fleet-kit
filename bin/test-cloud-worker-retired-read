@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""test-cloud-worker-retired-read: `read NAME` for a retired cloud worker answers from its run record (#1546).
+Offline, like bin/test-cloud-worker (whose fixtures it reuses). Scenarios S2..S7 and U1, U2, U4 of the plan on #1546.
+    bin/test-cloud-worker-retired-read
+"""
+import contextlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import stat
+import subprocess
+import sys
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+BIN = Path(__file__).resolve().parent
+_loader = importlib.machinery.SourceFileLoader("cw_base_tests", str(BIN / "test-cloud-worker"))
+_spec = importlib.util.spec_from_loader("cw_base_tests", _loader)
+cw = importlib.util.module_from_spec(_spec)
+sys.modules["cw_base_tests"] = cw
+_loader.exec_module(cw)
+sb = cw.sb
+
+TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
+HEX = "0123456789abcdef" * 4
+B64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo" * 2 + "=="
+PLANTED = (TOKEN, HEX, B64)
+KIND_OTHER_LANE = ("agent", "other-orch", "orchestrator")
+KIND_BOSS = ("agent", "orch", "orchestrator")
+KIND_COS = ("agent", "cos", "chief-of-staff")
+KIND_PERSON = ("person", "a person at a shell")
+
+
+def msg(kind, text):
+    return {"type": kind, "content": [{"type": "text", "text": text}]}
+
+
+class Retired(cw.Base):
+    def setUp(self):
+        super().setUp()
+        stub = self.stub.read_text()
+        stub = stub.replace('"pushed": True,', '"pod_gone": os.environ.get("STUB_POD_GONE") == "1", "pushed": True,', 1)
+        stub = stub.replace('elif command == "status":', 'elif command == "snapshot":\n    print(json.dumps({"pods": []}))\nelif command == "status":', 1)
+        self.stub.write_text(stub)
+        self.runs = self.home / "runs"
+        self.runs.mkdir()
+        patch = mock.patch.dict(os.environ, {"CW_RUN_RECORD_DIR": str(self.runs)})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.boss_dir = self.state / "cloud-boss"
+
+    def as_caller(self, kind, *argv):
+        with mock.patch.object(sb, "gates_caller_kind", lambda runner, now: kind):
+            return self.main(*argv)
+
+    def run_record(self, worker, ended, lines, suffix="aaaaaa", raw=None):
+        directory = self.runs / ("%s-%s-%s" % (worker, ended.replace("-", "").replace(":", ""), suffix))
+        directory.mkdir(mode=0o700)
+        (directory / "run.json").write_text(json.dumps({"worker": worker, "end": ended, "transcript": "saved"}) + "\n")
+        if raw is not None:
+            (directory / "transcript.jsonl").write_text(raw)
+        elif lines is not None:
+            (directory / "transcript.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+        return directory
+
+    def retire(self, stop_pod_gone=False, name="coder7"):
+        self.assertEqual(self.launch(name)[0], 0)
+        with mock.patch.dict(os.environ, {"STUB_POD_GONE": "1" if stop_pod_gone else "0"}):
+            self.assertEqual(self.main("retire", name)[0], 0)
+
+    def snapshot(self):
+        return {str(p.relative_to(self.home)): (p.read_bytes() if p.is_file() else None) for p in sorted(self.home.rglob("*"))
+                if "tmp" not in p.parts and p.name != "calls.log"}
+
+
+class TestRead(Retired):
+    def test_s2_the_newer_record_is_read_and_the_first_line_says_so(self):
+        self.retire()
+        self.run_record("coder7", "2026-10-28T10:00:00Z", [msg("assistant", "OLDER text")], "bbbbbb")
+        self.run_record("coder7", "2026-10-29T10:00:00Z", [msg("assistant", "first"), msg("user", "q"), msg("assistant", "NEWER text")], "aaaaaa")
+        code, out, err = self.as_caller(KIND_BOSS, "read", "coder7")
+        self.assertEqual(code, 0, err)
+        lines = out.splitlines()
+        self.assertIn("record of a retired run", lines[0])
+        self.assertIn("2026-10-29T10:00:00Z", lines[0])
+        self.assertEqual(lines[1:], ["NEWER text"])
+        self.assertNotIn("OLDER", out)
+
+    def test_s3_who_may_read_it(self):
+        self.retire()
+        self.run_record("coder7", "2026-10-29T10:00:00Z", [msg("assistant", "the answer")])
+        for kind in (KIND_BOSS, KIND_COS, KIND_PERSON):
+            code, out, err = self.as_caller(kind, "read", "coder7")
+            self.assertEqual((code, out.splitlines()[-1]), (0, "the answer"), kind)
+        code, out, err = self.as_caller(KIND_OTHER_LANE, "read", "coder7")
+        self.assertEqual(code, 1)
+        self.assertIn("refused: only the operator, the Chief of Staff or coder7's own boss may read it", err)
+        self.assertNotIn("the answer", out + err)
+
+    def test_s3_a_worker_removed_with_no_boss_on_record_is_for_the_operator_and_the_chief_of_staff(self):
+        self.retire()
+        shutil_rm = list(self.boss_dir.glob("*.json"))
+        self.assertEqual(len(shutil_rm), 1)
+        shutil_rm[0].unlink()
+        self.run_record("coder7", "2026-10-29T10:00:00Z", [msg("assistant", "the answer")])
+        code, out, err = self.as_caller(KIND_BOSS, "read", "coder7")
+        self.assertEqual(code, 1)
+        self.assertIn("no boss on record", err)
+        self.assertNotIn("the answer", out + err)
+        for kind in (KIND_COS, KIND_PERSON):
+            self.assertEqual(self.as_caller(kind, "read", "coder7")[0], 0)
+
+    def test_s4_planted_secrets_never_appear_and_the_text_is_capped(self):
+        self.retire()
+        text = "head %s %s %s " % PLANTED + "x " * 25000 + "tail"
+        self.run_record("coder7", "2026-10-29T10:00:00Z", [msg("assistant", text)])
+        code, out, err = self.as_caller(KIND_BOSS, "read", "coder7")
+        self.assertEqual(code, 0, err)
+        for value in PLANTED:
+            self.assertNotIn(value, out + err)
+        lines = out.splitlines()
+        self.assertRegex(lines[-1], r"^\[\d+ characters cut\]$")
+        self.assertLessEqual(len(lines[1]), 4000)
+        self.assertNotIn("tail", out)
+
+    def test_a_secret_cut_across_the_cap_is_still_removed(self):
+        self.retire()
+        text = "y" * 3990 + TOKEN
+        self.run_record("coder7", "2026-10-29T10:00:00Z", [msg("assistant", text)])
+        out = self.as_caller(KIND_BOSS, "read", "coder7")[1]
+        self.assertNotIn(TOKEN[:12], out)
+
+    def test_s5_nothing_to_show_is_one_plain_line_and_exit_1(self):
+        self.retire()
+        cases = {"no transcript": dict(lines=None), "malformed": dict(lines=None, raw="{not json\n\x00\n[[[\n"),
+                 "no worker text": dict(lines=[msg("user", "hi"), msg("assistant", "   ")]), "empty": dict(lines=None, raw="")}
+        for label, kw in cases.items():
+            directory = self.run_record("coder7", "2026-10-29T10:00:00Z", **kw, suffix="cccccc")
+            code, out, err = self.as_caller(KIND_BOSS, "read", "coder7")
+            self.assertEqual(code, 1, label)
+            self.assertNotIn("Traceback", out + err, label)
+            self.assertEqual(len((out + err).strip().splitlines()), 1, label)
+            for p in directory.iterdir():
+                p.unlink()
+            directory.rmdir()
+        directory = self.run_record("coder7", "2026-10-29T10:00:00Z", None, suffix="dddddd")   # unreadable: a directory where the file belongs
+        (directory / "transcript.jsonl").mkdir()
+        code, out, err = self.as_caller(KIND_BOSS, "read", "coder7")
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", out + err)
+        self.assertEqual(len((out + err).strip().splitlines()), 1)
+
+    def test_u1_a_live_worker_a_local_agent_and_an_unknown_name_are_not_answered_from_a_run_record(self):
+        self.assertEqual(self.launch()[0], 0)
+        self.run_record("coder7", "2026-10-29T10:00:00Z", [msg("assistant", "FROM RECORD")])
+        self.run_record("ghost", "2026-10-29T10:00:00Z", [msg("assistant", "FROM RECORD")])
+        code, out, err = self.as_caller(KIND_BOSS, "read", "coder7")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("FROM RECORD", out)
+        self.assertNotIn("retired run", out)
+        code, out, err = self.as_caller(KIND_BOSS, "read", "nobody-here")   # unknown name, no run record
+        self.assertEqual(code, 1)
+        self.assertIn("is not a fleet agent this switchboard has seen", err)
+
+    def test_u2_the_fallback_writes_nothing_calls_nothing_and_prints_no_path(self):
+        self.retire()
+        directory = self.run_record("coder7", "2026-10-29T10:00:00Z", [msg("assistant", "the answer")])
+        before = self.snapshot()
+        calls = len(self.stub_calls())
+        kube = len(self.jsonl("kubectl.log"))
+        requests = len(self.remote.requests)
+        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
+            code, out, err = self.as_caller(KIND_BOSS, "read", "coder7")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual((len(self.stub_calls()), len(self.jsonl("kubectl.log")), len(self.remote.requests)), (calls, kube, requests))
+        self.assertNotIn(str(directory), out + err)
+        self.assertNotIn(str(self.runs), out + err)
+        self.assertNotIn(directory.name, out + err)
+
+
+class TestKeptBoss(Retired):
+    def kept(self, name="coder7"):
+        return json.loads((self.boss_dir / (name + ".json")).read_text())
+
+    def test_s7_the_boss_is_kept_at_all_three_removal_places(self):
+        self.retire()                                   # retire, pod stopped
+        self.assertEqual(self.kept()["boss"], "orch")
+        self.retire(stop_pod_gone=True, name="coder8")  # retire, pod already gone
+        self.assertEqual(self.kept("coder8")["boss"], "orch")
+        self.assertEqual(self.launch("coder9")[0], 0)   # cloud-clear: deadline passed, pod gone
+        path = self.state / "cloud" / "coder9.json"
+        record = json.loads(path.read_text())
+        record["hard_deadline"] = "2020-01-01T00:00:00Z"
+        path.write_text(json.dumps(record))
+        code, out, err = self.as_caller(KIND_BOSS, "cloud-clear")
+        self.assertEqual(code, 0, err)
+        self.assertIn("cleared coder9", out)
+        self.assertEqual(self.kept("coder9")["boss"], "orch")
+
+    def test_u4_what_is_kept_is_small_private_and_pruned_at_a_write_only(self):
+        self.retire()
+        path = self.boss_dir / "coder7.json"
+        self.assertEqual(oct(stat.S_IMODE(path.stat().st_mode)), "0o600")
+        found = self.kept()
+        self.assertEqual(sorted(found), ["boss", "ended", "worker"])
+        self.assertLessEqual(path.stat().st_size, 1024)
+        text = path.read_text()
+        for secret in (cw.PASSWORD, cw.GIT_TOKEN, cw.CLUSTER_TOKEN, self.remote.url):
+            self.assertNotIn(secret, text)
+        module = sb.load_module("cloud_worker").bind(vars(sb))
+        now = time.time()
+        old = self.boss_dir / "ancient.json"
+        old.write_text(json.dumps({"worker": "ancient", "boss": "x", "ended": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 31 * 86400))}))
+        self.run_record("ancient", "2026-10-29T10:00:00Z", [msg("assistant", "t")])
+        before = self.snapshot()   # a READ of a 31-day-old file: no boss on record, nothing changed
+        self.assertEqual(module.kept_boss(self.state, "ancient"), (None, None))
+        code, out, err = self.as_caller(KIND_BOSS, "read", "ancient")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.snapshot(), before)
+        found["ended"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 2000))   # the oldest of the kept
+        path.write_text(json.dumps(found))
+        for i in range(500):   # at a write: the expired file goes, and the 501st file removes the oldest
+            (self.boss_dir / ("w%03d.json" % i)).write_text(json.dumps({"worker": "w%03d" % i, "boss": "b", "ended": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 1000 + i))}))
+        module.keep_boss(self.state, {"worker": "newest", "reports_to": "orch"}, clock=now)
+        names = sorted(p.name for p in self.boss_dir.glob("*.json"))
+        self.assertEqual(len(names), 500)
+        self.assertNotIn("ancient.json", names)
+        self.assertNotIn("coder7.json", names)   # the oldest end time went first
+        self.assertIn("w002.json", names)
+        self.assertIn("newest.json", names)
+
+    def test_a_refused_retire_keeps_nothing_and_says_what_it_said(self):
+        self.assertEqual(self.launch()[0], 0)
+        code, out, err = self.as_caller(KIND_OTHER_LANE, "retire", "coder7")
+        self.assertEqual(code, 1)
+        self.assertIn("refused: only the operator, the Chief of Staff or coder7's own boss may retire it", err)
+        self.assertFalse(self.boss_dir.exists())
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False, verbosity=1).result
+    print("RESULT: %s" % ("PASS" if result.wasSuccessful() else "FAIL"))
+    sys.exit(0 if result.wasSuccessful() else 1)

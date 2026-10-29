@@ -269,6 +269,65 @@ def remove_record(state, name):
             pass
 
 
+BOSS_DIR = "cloud-boss"       # beside the cloud directory, never inside it: <state>/cloud-boss/<worker>.json
+BOSS_MAX_BYTES = 1024         # one kept boss file
+BOSS_MAX_FILES = 500
+BOSS_KEEP_SECONDS = 30 * 86400
+_STAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _stamp_seconds(text):
+    try:
+        return datetime.datetime.strptime(text, _STAMP).replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def keep_boss(state, record, clock=None):
+    """Keep who the boss of a worker was when its record goes (#1546), for the read of a retired run: ONE small file, 0600, written atomically,
+    holding the worker, the boss and the end time and nothing else. Expired files (30 days) and the oldest beyond 500 are removed HERE, at a write,
+    and nowhere else. Never raises: a boss that cannot be kept is a worker only the operator and the Chief of Staff can read."""
+    try:
+        name, boss = record.get("worker"), record.get("reports_to")
+        if not valid_name(name) or not isinstance(boss, str) or not boss:
+            return
+        now = time.time() if clock is None else clock
+        base = Path(state) / BOSS_DIR
+        base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if base.is_symlink():
+            return
+        _write_private(base / (name + ".json"), json.dumps({"boss": boss[:100], "ended": time.strftime(_STAMP, time.gmtime(now)), "worker": name}, sort_keys=True) + "\n")
+        kept = []
+        for path in base.glob("*.json"):
+            when = None
+            try:
+                found = json.loads(path.read_text()[:BOSS_MAX_BYTES])
+                when = _stamp_seconds(found.get("ended")) if isinstance(found, dict) else None
+            except (OSError, ValueError):
+                pass
+            if when is None or when < now - BOSS_KEEP_SECONDS:
+                path.unlink()
+            else:
+                kept.append((when, path.name, path))
+        for _, _, path in sorted(kept)[:max(0, len(kept) - BOSS_MAX_FILES)]:
+            path.unlink()
+    except (OSError, ValueError, TypeError, CloudError):
+        pass
+
+
+def kept_boss(state, name):
+    """(boss, end time text) kept for `name`, or (None, None): none, unreadable, or older than 30 days all read as no boss on record. Deletes nothing."""
+    if not valid_name(name):
+        return None, None
+    found, why = read_record_file(Path(state) / BOSS_DIR / (name + ".json"), BOSS_MAX_BYTES)
+    if found is None or found.get("worker") != name or not isinstance(found.get("boss"), str) or not found["boss"]:
+        return None, None
+    when = _stamp_seconds(found.get("ended"))
+    if when is None or when < time.time() - BOSS_KEEP_SECONDS:
+        return None, None
+    return found["boss"], found["ended"]
+
+
 def list_records(state):
     base = Path(state) / CLOUD_DIR
     if not base.is_dir():
@@ -1533,6 +1592,102 @@ def message_line(message):
     return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", " ", line).strip()   # a pod's text never reaches the terminal as an escape sequence
 
 
+# ---------------------------------------------------------------- read of a retired run (#1546)
+
+READ_RETIRED_CHARS = 4000
+TRANSCRIPT_READ_MAX = 6 * 1024 * 1024
+
+
+def _runs_root():
+    return Path(os.environ.get("CW_RUN_RECORD_DIR") or _lib().run_record.default_root(os.environ))
+
+
+def _retired_run(name):
+    """(directory, end time text) of the newest run record of `name` (latest end, ties by directory name), or None when there is none. Read only."""
+    root = _runs_root()
+    pattern = re.compile(re.escape(name) + r"-\d{8}T\d{6}Z-[0-9a-f]{6}")
+    best = None
+    try:
+        entries = list(os.scandir(str(root)))
+    except OSError:
+        return None
+    for entry in entries:
+        if not pattern.fullmatch(entry.name) or entry.is_symlink() or not entry.is_dir():
+            continue
+        info, _ = read_record_file(Path(entry.path) / "run.json", 65536)
+        ended = info.get("end") if isinstance(info, dict) else None
+        if not isinstance(ended, str) or _stamp_seconds(ended) is None:
+            ended = ""
+        key = (ended, entry.name)
+        if best is None or key > best[0]:
+            best = (key, entry.path)
+    return None if best is None else (best[1], best[0][0])
+
+
+def _last_worker_text(directory):
+    """The last text of the worker in transcript.jsonl, or (None, why). Never raises."""
+    path = Path(directory) / "transcript.jsonl"
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None, "the run record holds no transcript"
+    except OSError:
+        return None, "the transcript of the run record cannot be read"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "the transcript of the run record cannot be read"
+        raw = b""
+        while len(raw) <= TRANSCRIPT_READ_MAX:
+            chunk = os.read(fd, TRANSCRIPT_READ_MAX + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return None, "the transcript of the run record cannot be read"
+    finally:
+        os.close(fd)
+    if len(raw) > TRANSCRIPT_READ_MAX:
+        return None, "the transcript of the run record is too large to read"
+    found = text = None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        try:
+            message = parse_bounded(line)
+        except (ValueError, TooDeep):
+            continue
+        if isinstance(message, dict) and message.get("type", message.get("role")) == "assistant":
+            text = H["_message_text"](message).strip()
+            if text:
+                found = text
+    if found is None:
+        return None, "the transcript of the run record holds no text from the worker"
+    return found, None
+
+
+def _read_retired(name, retired, state, runner, now):
+    """The last text of a retired cloud worker, from its run record: only for the callers `retire` allows (the operator, the Chief of Staff, the boss kept
+    at its removal), scrubbed before and after the cap. Reads files only: nothing is written, no cluster is called, no path is printed."""
+    LaunchError = H["LaunchError"]
+    kind = H["gates_caller_kind"](runner, now)
+    boss, _ = kept_boss(state, name)
+    if not _may_retire(kind, {"reports_to": boss}):
+        if boss is None and kind[0] == "agent":
+            raise LaunchError("refused: %s was removed with no boss on record: only the operator or the Chief of Staff may read it" % name)
+        raise LaunchError("refused: only the operator, the Chief of Staff or %s's own boss may read it" % name)
+    directory, ended = retired
+    text, why = _last_worker_text(directory)
+    if text is None:
+        raise LaunchError("%s: %s" % (name, why))
+    scrub = _scrub_lib()
+    cut = max(0, len(text) - READ_RETIRED_CHARS)
+    text = scrub(text, (), 2000000)
+    text = scrub(text[:READ_RETIRED_CHARS], (), READ_RETIRED_CHARS)
+    print("[%s: the text of the record of a retired run%s]" % (name, " that ended " + ended if ended else ""))
+    print(text)
+    if cut:
+        print("[%d characters cut]" % cut)
+    return H["EXIT_OK"]
+
+
 @refusals
 def cmd_read(args, runner, now):
     """`read NAME [--limit N]`: the newest messages of an agent's session, oldest first. A cloud worker is read on its endpoint; a local agent on
@@ -1545,6 +1700,10 @@ def cmd_read(args, runner, now):
     if record is None and getattr(args, "cloud_only", False):
         raise LaunchError("%s has no cloud record" % args.name)
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
+    if record is None:
+        retired = _retired_run(args.name)
+        if retired is not None:
+            return _read_retired(args.name, retired, state, runner, now)
     if record is not None:
         session = _session_of(record)
         with Cluster() as cluster, tunnel(cluster, record) as live:
@@ -1822,10 +1981,12 @@ def cmd_retire(args, runner, now, record):
         got = body.get("secrets_removed")
         got = [x for x in got if isinstance(x, str)][:10] if isinstance(got, list) else []
         _audit(engine, "cloud.name_freed", args.name, {"why": "pod gone", "runtime_id": record.get("runtime_id"), "secrets_removed": got})
+        keep_boss(state, record)
         remove_record(state, args.name)
         print("%s is retired: its pod was already gone; the name is free to launch again; %s" % (
             args.name, "Secrets removed: " + ", ".join(got) if got else "no Secrets were left"))
         return H["EXIT_OK"]
+    keep_boss(state, record)
     remove_record(state, args.name)
     print("%s is retired: its pod and scratch volume are deleted%s" % (
         args.name, "; work was pushed to branch %s" % wip if pushed and wip else "; nothing needed pushing" if pushed is False else ""))
@@ -1865,6 +2026,7 @@ def cmd_cloud_clear(args, runner, now):
         if dry_run:
             print("would clear %s (pod gone, deadline %s)" % (name, record.get("hard_deadline")))
             continue
+        keep_boss(state, record)
         remove_record(state, name)
         _audit(engine, "cloud.cleared", name, {"runtime_id": record.get("runtime_id"), "hard_deadline": record.get("hard_deadline")})
         _registry_note(engine, "retire", state, name, "cleared: the pod is gone and the hard deadline has passed")
