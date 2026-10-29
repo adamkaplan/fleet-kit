@@ -26868,6 +26868,14 @@ class DecisionError(Exception):
 GH_ERROR_MAX = 1 << 20   # characters of a failed gh call's own text kept in its error: the audit line's own physical bound
 
 
+def _drop_header(repo, n):
+    """Drop the header-cache entry of one issue (#1520). Nothing escapes: a failed cache never changes what a command decides or writes (PC-1)."""
+    try:
+        load_module("header_cache").drop(state_dir_path(), repo, n)
+    except Exception:
+        pass
+
+
 def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=False):
     """One write through gh with the repo's own account, its token only in the child's environment. The
     configured `gh`, `gh api <path> --method M [--input -]`. IntentError when it fails (a 404 is quiet when
@@ -26883,7 +26891,7 @@ def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=Fa
         extra["env"] = env
     written = re.match(r"repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)", str(path))
     if written:   # EVERY writer drops the entry, an always-fresh command (plan, gates, the merge shim, the clear) too: a command that has just written drops it (a delete of a file that is not there is harmless)
-        load_module("header_cache").drop(state_dir_path(), written.group(1), int(written.group(2)))   # #1520: a write to the issue (comment, edit, label) drops its header entry
+        _drop_header(written.group(1), int(written.group(2)))   # #1520: a write to the issue (comment, edit, label) drops its header entry
     try:
         done = runner(argv, capture_output=True, text=True, timeout=engine.config["call_timeout_seconds"], **extra)
     except subprocess.TimeoutExpired:
@@ -26891,7 +26899,7 @@ def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=Fa
     except OSError as err:
         raise IntentError("unavailable", "cannot run %s: %s" % (engine.config["gh"], err.strerror or err)) from None
     if written:
-        load_module("header_cache").drop(state_dir_path(), written.group(1), int(written.group(2)))   # again once it is done: a read in between cannot keep the old header
+        _drop_header(written.group(1), int(written.group(2)))   # again once it is done: a read in between cannot keep the old header
     if done.returncode != 0:
         detail = _one_line(done.stderr, GH_ERROR_MAX) or _one_line(done.stdout, GH_ERROR_MAX) or "exit %d" % done.returncode   # #967: the failure's own words, whole (the clear's refusal shows them)
         if tolerate_missing and ("404" in detail or "Not Found" in detail):

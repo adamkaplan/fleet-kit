@@ -6232,3 +6232,4 @@ The ask header a message carries (an issue's Intent, Done-when, state, `updated_
 - A cold read stores no validator, so the first refresh after the age is unconditional; a parent entry takes its age from the issue part (a closed issue's parent can be served up to 24 hours).
 - Off switch: `"header_cache": "off"` in the configuration, read at every read by every command: with it off every read is fresh. It is the rollback besides a revert.
 - Restart: the command-line processes use the cache at once, with no restart. The daemon needs a restart only for its own invalidation call (the events above); until then entries age out as stated. The daemon's own reads do not use the file cache.
+- Writers that bypass `_gh_write` (`write_issue_body`, a runner call near line 20343, `handoff.py`, the `switchboard-trial` label edit) leave a stale entry; the age bounds it (10 minutes open, 24 hours closed); a follow-up will give them one drop helper.

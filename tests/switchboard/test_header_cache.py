@@ -611,6 +611,33 @@ class TestIsolation(HeaderCacheBase):   # S11
             self.assertTrue(hc.usable(os.path.join(self.tmp.name, "x")))
 
 
+class TestDropNeverBlocksAWrite(HeaderCacheBase):   # PC-1
+    def run_write(self):
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+        engine = mock.Mock(config=self.config, accounts=None)
+        done = sb._gh_write(engine, runner, self.REPO, "repos/acme/widgets/issues/5/labels", "POST", {"labels": ["x"]})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(done.stdout, "ok")
+
+    def test_state_dir_path_raising(self):
+        with mock.patch.object(sb, "state_dir_path", side_effect=RuntimeError("no home")):
+            self.run_write()
+
+    def test_load_module_raising(self):
+        with mock.patch.object(sb, "load_module", side_effect=ImportError("gone")):
+            self.run_write()
+
+    def test_drop_raising(self):
+        hc = sb.load_module("header_cache")
+        with mock.patch.object(hc, "drop", side_effect=OSError("disk")):
+            self.run_write()
+
+
 class TestDocs(unittest.TestCase):
     def test_docs_say_the_six_facts(self):   # S10
         text = (Path(__file__).resolve().parents[2] / "docs" / "switchboard.md").read_text()
