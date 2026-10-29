@@ -208,6 +208,10 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
+Not yet measured: `cloud/launcher/tests/test_orchestrator_row.py`
+
+A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
 ### macOS (per entry)
 
 | Entry | Seconds | Lane |
