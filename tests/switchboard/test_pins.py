@@ -218,5 +218,124 @@ class TestPinsMutants(PinsRepo):
         self.run_mutant("pins_listing", lambda files, hits, read_lines: real({}, hits, read_lines))
 
 
+class TestPinsReview(PinsRepo):
+    """The strict read's six findings (cut terms, deleted files, bounded scans, blank messages, header look-alikes, subdirectory runs)."""
+
+    def commit(self, msg="more"):
+        self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", msg)
+
+    def many_terms(self):
+        self.write("wide.py", "".join('def widget_fn_%03d(): return "message number %03d here"\n' % (i, i) if i < 302 else "def widget_fn_%03d(): pass\n" % i for i in range(305)))
+        self.commit()
+        self.write("wide.py", "")
+
+    def check_cut_line(self):
+        self.many_terms()
+        code, lines, _ = self.pins()
+        self.assertEqual(code, 0)
+        self.assertEqual([l for l in lines if l.startswith("cut:")], ["cut: 5 names / 2 messages not searched"])
+
+    def test_cut_terms_are_said_with_their_counts(self):   # M1
+        self.check_cut_line()
+
+    def test_a_finder_that_cuts_terms_silently_is_caught(self):   # M1 mutant
+        with mock.patch.object(sb, "pins_term_cut", lambda files: (0, 0)):
+            with self.assertRaises(AssertionError):
+                self.check_cut_line()
+
+    def delete_file(self, runner=None):
+        self.git("rm", "-q", "acme.py")
+        with captured() as (out, err):
+            code = sb.cmd_pins(argparse.Namespace(base="HEAD"), runner or self.runner, lambda: 0.0)
+        return code, self.listed(out.getvalue().splitlines())
+
+    def test_a_deleted_file_lists_the_tests_naming_its_functions(self):   # M2
+        code, found = self.delete_file()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(found), 2, found)
+        self.assertTrue(any("TestAcme::test_total  matched compute_widget_total" in l for l in found), found)
+
+    def test_a_finder_that_skips_a_deleted_file_is_caught(self):   # M2 mutant: the old side's path is hidden, as before the fix
+        def blind(argv, **kwargs):
+            done = self.runner(argv, **kwargs)
+            if argv[1] == "diff":
+                done.stdout = done.stdout.replace("--- a/acme.py", "--- /dev/null")
+            return done
+        _, found = self.delete_file(blind)
+        self.assertEqual(found, [])
+
+    def test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits(self):   # L1
+        lines = ["class TestBig(unittest.TestCase):"]
+        for i in range(20):   # twenty long tests, a hundred hits in each: a rescan walks back through the test for every hit
+            lines += ["    def test_n%04d(self):" % i] + ["        pass  # filler"] * 2499
+        self.assertEqual(len(lines), 50001)
+        hits = [("tests/big.py", 1 + 2500 * t + 25 * h, "x", "compute_widget_total") for t in range(20) for h in range(1, 101)]
+        self.assertEqual(len(hits), 2000)
+        count = [0]
+
+        class Counting:
+            def __init__(self, real):
+                self.real = real
+
+            def match(self, text):
+                count[0] += 1
+                return self.real.match(text)
+        with mock.patch.object(sb, "PINS_ANY_DEF_RE", Counting(sb.PINS_ANY_DEF_RE)), mock.patch.object(sb, "PINS_CLASS_RE", Counting(sb.PINS_CLASS_RE)), \
+                mock.patch.object(sb, "PINS_TEST_DEF_RE", Counting(sb.PINS_TEST_DEF_RE)):
+            listing = sb.pins_listing({}, hits, lambda path: lines)
+        self.assertEqual(len(listing), 20)
+        self.assertLessEqual(count[0], 4 * len(lines), count[0])
+
+    def test_a_finder_that_rescans_per_hit_is_caught(self):   # L1 mutant
+        def rescan(lines, number, index=None):
+            test, test_line, indent = None, None, None
+            for i in range(min(number, len(lines)) - 1, -1, -1):
+                m = sb.PINS_ANY_DEF_RE.match(lines[i])
+                if m and (indent is None or len(m.group(1)) < indent):
+                    if sb.PINS_TEST_DEF_RE.match(lines[i]):
+                        return "TestBig", sb.PINS_TEST_DEF_RE.match(lines[i]).group(2), i + 1
+                    indent = len(m.group(1))
+            return "-", None, None
+        with mock.patch.object(sb, "pins_enclosing", rescan):
+            with self.assertRaises(AssertionError):
+                self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()
+
+    def test_a_blank_quoted_message_is_no_term(self):   # L2
+        self.assertEqual(sb.pins_messages_of('x = "            "'), [])
+        self.assertEqual(sb.pins_messages_of("x = '                '"), [])
+        self.assertEqual(sb.pins_messages_of('x = "a real message here"'), ["a real message here"])
+
+    def test_the_docs_say_a_changed_file_lists_its_own_test(self):   # L2 docs
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        body = re.findall(r"^## `pins`.*?(?=^## |\Z)", text, re.S | re.M)[0]
+        self.assertIn("A test in a file the diff changes lists itself", body)
+
+    def test_a_removed_line_that_looks_like_a_header_is_content(self):   # L3
+        self.write("acme.py", "def compute_widget_total(count):\n-- print(\"a lost message here\")\n    return count * 2\n")
+        self.commit()
+        self.write("acme.py", "def compute_widget_total(count):\n    return count * 2\n")
+        files = sb.pins_read_diff("HEAD", self.runner)
+        self.assertEqual(sorted(files), ["acme.py"])
+        self.assertIn("a lost message here", files["acme.py"]["messages"])
+
+    def test_a_removed_double_dash_line_does_not_end_the_file(self):   # L3, the line itself: `-- x` is removed text, `--- x` its diff line
+        self.write("acme.py", "def alpha_removed_name(a):\n    pass\n-- b/other.py\n+++ b/zz.py\ndef beta_removed_name(a):\n    pass\n")
+        self.commit()
+        self.write("acme.py", "")
+        files = sb.pins_read_diff("HEAD", self.runner)
+        self.assertEqual(sorted(files), ["acme.py"])
+        self.assertTrue({"alpha_removed_name", "beta_removed_name"} <= files["acme.py"]["names"], files)
+
+    def test_a_run_from_a_subdirectory_lists_what_the_root_lists(self):   # L4
+        self.write("acme.py", BASE_SRC.replace("count * 2", "count * 3"))
+        _, root_lines, _ = self.pins()
+        (Path(self.dir) / "pkg" / "deep").mkdir(parents=True)
+        os.chdir(Path(self.dir) / "pkg" / "deep")
+        _, sub_lines, _ = self.pins()
+        self.assertEqual(len(self.listed(root_lines)), 1, root_lines)
+        self.assertEqual(sub_lines, root_lines)
+
+
 if __name__ == "__main__":
     unittest.main()
