@@ -57,6 +57,11 @@ def pr_line(repo, number, check, url, head):
     return "required check (workflow) %s failed on %s#%d at head %s: %s" % (clean(check), repo, number, clean(head, 64), clean(url, 200))
 
 
+def unowned_key(repo, number, head, check):
+    """The dedup key of the unowned alert: (repo, pull request, head, check) and nothing else (#1378: never the run id or the attempt)."""
+    return "pr-unowned:%s#%d:%s:%s" % (repo, number, clean(head, 64).replace(":", "_"), clean(check, 80).replace(":", "_"))
+
+
 def unowned_line(repo, number, check, url, head):
     return "required check (workflow) %s failed on %s#%d at head %s and no worker owns that pull request: %s" % (clean(check), repo, number, clean(head, 64), clean(url, 200))
 

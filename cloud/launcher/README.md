@@ -196,6 +196,156 @@ The script runs each entry once, stops at the first red with `RESULT: FAIL`, and
 
 Residual risk: two members adding names that sort next to each other (the same place in the list) still conflict in git (adjacent inserts), and the first member to add in an empty gap next to the fixed last line conflicts with it. Only entries far apart merge cleanly. A test documents this limit.
 
+## Chain times (ask #1390)
+
+Cause: the whole chain of `bin/test-cloud-launcher` ran one entry after another. On the macOS `test-cloud` leg that took 24 to 30 minutes (24 on the default branch at batch 6, 25.7 on one pull request and 30.2 on another, whose step limit of 30 minutes then cut the leg with no test failing); on Ubuntu it took 15.6 minutes. The cost was the entries themselves, mostly real subprocess starts of the fake cluster client, not fixed sleeps, and the macOS runner is about twice as slow.
+
+The fix is parallel lanes, not removing or moving a test: the entries named in `bin/test-cloud-launcher.parallel` (a subset of the chain, slowest first, each using its own temporary directory and no fixed port) run in three lanes beside the serial loop, each with its own output file replayed whole afterwards. Every chain entry still runs on BOTH systems: there is no macOS-only exception and no Ubuntu-only list, because the 22 entries that start no subprocess total about 150 seconds and moving them would lower macOS coverage for almost no time. A parallel entry that is not in the chain is refused, and `cloud/launcher/tests/test_chain_time.py` checks both lists. Each entry prints `RUN <entry>` and `TIME <entry> <seconds>`.
+
+Chain time after the change: macOS 11.6 minutes, Ubuntu 5.1 minutes (one run of the pull request's head; the step timeout is 20 minutes). The per-entry seconds below are from that run, so they include the slowdown of running beside other entries.
+
+Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_app_token.py` (122 s), `test_driver.py` (120 s).
+
+Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
+
+Not yet measured: none
+
+A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
+### macOS (per entry)
+
+| Entry | Seconds | Lane |
+|---|---|---|
+| `bin/test-cloud-cost-report` | 1 | serial |
+| `bin/test-cloud-retired` | 66 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
+| `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_docs_wording.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_network.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_pod_replaced.py` | 3 | serial |
+| `cloud/launcher/tests/test_cloud_pr_preflight.py` | 25 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_quick.py` | 14 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_wired.py` | 42 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 7 | serial |
+| `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 15 | serial |
+| `cloud/launcher/tests/test_cloud_shapes.py` | 27 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 22 | serial |
+| `cloud/launcher/tests/test_cluster_token_refresh.py` | 37 | serial |
+| `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cw_names.py` | 5 | serial |
+| `cloud/launcher/tests/test_docs_preflight_modes.py` | 0 | serial |
+| `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
+| `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
+| `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
+| `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
+| `cloud/launcher/tests/test_stack_registry_check.py` | 2 | serial |
+| `cloud/launcher/tests/test_stack_registry_pod.py` | 1 | serial |
+| `cloud/launcher/tests/test_token_read_at_call.py` | 1 | serial |
+| `cloud/launcher/tests/test_vault_check_pins.py` | 1 | serial |
+| `cloud/worker/tests/test_cloud_prepush.py` | 30 | serial |
+| `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
+| `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
+| `cloud/worker/tests/test_identity_image.py` | 4 | serial |
+| `cloud/worker/tests/test_question_denied.py` | 0 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 6 | serial |
+| `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
+| `cloud/worker/tests/test_stack_up.py` | 1 | serial |
+| `cloud/worker/tests/test_cloud_prepush_preflight.py` | 21 | serial |
+| `cloud/launcher/tests/test_cloud_prestop.py` | 314 | parallel |
+| `cloud/launcher/tests/test_git_token_renewal.py` | 310 | parallel |
+| `cloud/launcher/tests/test_run_record.py` | 239 | parallel |
+| `cloud/launcher/tests/test_driver.py` | 120 | parallel |
+| `cloud/launcher/tests/test_cloud_stack_wait.py` | 117 | parallel |
+| `cloud/launcher/tests/test_app_token.py` | 122 | parallel |
+| `cloud/launcher/tests/test_orchestrator_hub_session.py` | 74 | parallel |
+| `cloud/launcher/tests/test_cloud_worker.py` | 75 | parallel |
+| `cloud/launcher/tests/test_cloud_k1.py` | 65 | parallel |
+| `cloud/launcher/tests/test_preflight.py` | 65 | parallel |
+| `cloud/launcher/tests/test_cloud_stack.py` | 54 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_bounds.py` | 46 | parallel |
+| `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
+| `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
+| `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
+| `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
+| `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
+| `cloud/worker/tests/test_cw_gh_comments.py` | 37 | parallel |
+| `cloud/worker/tests/test_cloud_prepush_hardening.py` | 34 | parallel |
+| `cloud/worker/tests/test_stack_pull.py` | 35 | parallel |
+
+### Ubuntu (per entry)
+
+| Entry | Seconds | Lane |
+|---|---|---|
+| `bin/test-cloud-cost-report` | 0 | serial |
+| `bin/test-cloud-retired` | 33 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
+| `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_docs_wording.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_network.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_pod_replaced.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_pr_preflight.py` | 10 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_quick.py` | 6 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_wired.py` | 5 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 10 | serial |
+| `cloud/launcher/tests/test_cloud_shapes.py` | 11 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 16 | serial |
+| `cloud/launcher/tests/test_cluster_token_refresh.py` | 7 | serial |
+| `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cw_names.py` | 2 | serial |
+| `cloud/launcher/tests/test_docs_preflight_modes.py` | 0 | serial |
+| `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
+| `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
+| `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
+| `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
+| `cloud/launcher/tests/test_stack_registry_check.py` | 1 | serial |
+| `cloud/launcher/tests/test_stack_registry_pod.py` | 1 | serial |
+| `cloud/launcher/tests/test_token_read_at_call.py` | 0 | serial |
+| `cloud/launcher/tests/test_vault_check_pins.py` | 0 | serial |
+| `cloud/worker/tests/test_cloud_prepush.py` | 15 | serial |
+| `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
+| `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
+| `cloud/worker/tests/test_identity_image.py` | 1 | serial |
+| `cloud/worker/tests/test_question_denied.py` | 0 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 1 | serial |
+| `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
+| `cloud/worker/tests/test_stack_up.py` | 0 | serial |
+| `cloud/worker/tests/test_cloud_prepush_preflight.py` | 15 | serial |
+| `cloud/launcher/tests/test_cloud_prestop.py` | 29 | parallel |
+| `cloud/launcher/tests/test_git_token_renewal.py` | 106 | parallel |
+| `cloud/launcher/tests/test_run_record.py` | 153 | parallel |
+| `cloud/launcher/tests/test_driver.py` | 93 | parallel |
+| `cloud/launcher/tests/test_cloud_stack_wait.py` | 58 | parallel |
+| `cloud/launcher/tests/test_app_token.py` | 31 | parallel |
+| `cloud/launcher/tests/test_orchestrator_hub_session.py` | 4 | parallel |
+| `cloud/launcher/tests/test_cloud_worker.py` | 23 | parallel |
+| `cloud/launcher/tests/test_cloud_k1.py` | 32 | parallel |
+| `cloud/launcher/tests/test_preflight.py` | 28 | parallel |
+| `cloud/launcher/tests/test_cloud_stack.py` | 29 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_bounds.py` | 45 | parallel |
+| `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
+| `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
+| `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
+| `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
+| `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
+| `cloud/worker/tests/test_cw_gh_comments.py` | 1 | parallel |
+| `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
+| `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
+
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
 a cluster Secret scoped to the pod and mounted at `/run/cw/server-password` (0600); Basic auth, as the local v2

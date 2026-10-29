@@ -354,13 +354,8 @@ def recorded_in_window(hours, account, window_start, now):
     return int(round(total))
 
 
-def usage_lines(state_dir, now):
-    """The `status` lines for real usage: per account used, remaining and reset, the calls recorded in the same window and the difference
-    (spent outside the shim and the daemon). A reading older than 5 minutes says so; none says `not recorded`."""
-    body = _read_json(os.path.join(state_dir, USAGE_FILE)) if state_dir else None
-    accounts = body.get("accounts") if body else None
-    if not isinstance(accounts, dict) or not accounts or not _number(body.get("at")):
-        return ["      github     real usage: not recorded"]
+def merged_hours(state_dir):
+    """The hourly record with the agent shells' spool that is not folded yet added in: the one figure `status` and the census both read."""
     hours, _ = load_hours(state_dir)
     unfolded = {}
     for ts, account, _lane_name, _endpoint_name in _spool_lines(os.path.join(state_dir, SPOOL)) + _spool_lines(os.path.join(state_dir, SPOOL + ".fold")):
@@ -371,6 +366,23 @@ def usage_lines(state_dir, now):
         cell = merged.setdefault(str(start), {"agent": {}, "daemon": {}})["agent"]
         for account, n in row["agent"].items():
             cell[account] = cell.get(account, 0) + n
+    return merged
+
+
+def recorded_by_account(state_dir, readings, now):
+    """{account: calls recorded in the window of its real-usage reading}: the same computation as the `status` line (read only)."""
+    merged = merged_hours(state_dir)
+    return {a: recorded_in_window(merged, _account(a), r[3] - 3600, now) for a, r in readings.items()}
+
+
+def usage_lines(state_dir, now):
+    """The `status` lines for real usage: per account used, remaining and reset, the calls recorded in the same window and the difference
+    (spent outside the shim and the daemon). A reading older than 5 minutes says so; none says `not recorded`."""
+    body = _read_json(os.path.join(state_dir, USAGE_FILE)) if state_dir else None
+    accounts = body.get("accounts") if body else None
+    if not isinstance(accounts, dict) or not accounts or not _number(body.get("at")):
+        return ["      github     real usage: not recorded"]
+    merged = merged_hours(state_dir)
     age = now - body["at"]
     lines = []
     for account, row in sorted(accounts.items()):
