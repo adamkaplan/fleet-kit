@@ -57,6 +57,10 @@ NEEDS_LINK = cloud_relay.NEEDS_LINK
 PENDING_CAP = 4 * 1024 * 1024   # bytes of the hub's pending list; larger is refused
 TOKEN_CAP = 4096                # bytes of the token file
 REASON_FIXED = "relay failed"
+RELAY_GH_PER_HOUR = 600         # GitHub calls (not requests) all relay requests may make in a rolling hour (PC-6)
+RELAY_GH_WINDOW = 3600.0        # seconds of that rolling hour
+RELAY_GH_PER_REQUEST = 3        # most calls one request makes: 1 pull request read + at most 2 plan reads
+BUDGET_REASON = "relay GitHub budget"
 PENDING_REASON = "already claimed, never delivered twice: lost or still pending: resend with a NEW call_id"
 PASS_BUDGET = 60.0              # wall-clock seconds of one relay pass; requests not started by then wait for the next pass
 REASON_MAX = 1900               # the hub refuses a reason over 2000 characters; every answer is clipped below that
@@ -209,6 +213,74 @@ def _answer(known):
     return {"seq": known["seq"], "hash": known["hash"]}
 
 
+class RelayBudget:
+    """The hourly cap on the GitHub calls of ALL relay requests (PC-6): a rolling window of call times, safe for two threads."""
+
+    def __init__(self, now, cap=None, window=None):
+        self.now, self.lock, self.times = now, threading.Lock(), []
+        self.cap = RELAY_GH_PER_HOUR if cap is None else cap
+        self.window = RELAY_GH_WINDOW if window is None else window
+
+    def _trim(self):
+        edge = self.now() - self.window
+        while self.times and self.times[0] <= edge:
+            self.times.pop(0)
+
+    def room(self, need=RELAY_GH_PER_REQUEST):
+        """True when `need` more calls fit under the cap: asked BEFORE a request makes any call."""
+        with self.lock:
+            self._trim()
+            return len(self.times) + need <= self.cap
+
+    def take(self):
+        """Counts one call; False (and not counted) when the cap is spent: the hard stop under `room`."""
+        with self.lock:
+            self._trim()
+            if len(self.times) >= self.cap:
+                return False
+            self.times.append(self.now())
+            return True
+
+
+class MeteredRunner:
+    """The runner every relay gh call goes through: it checks the daemon's shared gate (a pause stops the call before a process starts), counts
+    the call in the hourly relay budget, and records it in the shared gate's counter (unless the gate's own `read` already did)."""
+
+    def __init__(self, runner, accounts, budget, now):
+        self.runner, self.accounts, self.budget, self.now = runner, accounts, budget, now
+        self.memo = {}
+
+    def begin_request(self):
+        self.memo = {}
+
+    def __call__(self, argv, *a, **k):
+        key = tuple(argv) if isinstance(argv, (list, tuple)) else None
+        if key is not None and key in self.memo:   # the same read twice in ONE request (the pull request picture, the plan): answered from the first
+            return self.memo[key]
+        done = self._call(argv, *a, **k)
+        if key is not None and getattr(done, "returncode", 1) == 0:
+            self.memo[key] = done
+        return done
+
+    def _call(self, argv, *a, **k):
+        accounts = self.accounts
+        if accounts is not None:
+            with accounts.lock:
+                until = max([u for u in accounts.paused.values()] or [0])
+            if self.now() < until:
+                raise Refuse(429, "GitHub rate limited: the daemon's gate is paused", "relay stopped by the shared GitHub pause")
+        if self.budget is not None and not self.budget.take():
+            raise Refuse(429, BUDGET_REASON)
+        before = len(accounts.calls) if accounts is not None else 0
+        try:
+            return self.runner(argv, *a, **k)
+        finally:
+            if accounts is not None:
+                with accounts.lock:
+                    if len(accounts.calls) == before:   # `read` counts its own; this call did not go through it
+                        accounts.calls.append((self.now(), accounts.describe(None), "relay", False))
+
+
 class Executor:
     """backend needs: live_head(pr), plan(pr) -> {"source","hash","scenarios":{sid:{"evaluator","claim"}}},
     pr_issues(pr) -> {issue numbers the PR is linked to}, pr_facts(pr) -> {"author","notice_senders"}, evaluators(evaluator), holder_of(repo, issue), gates(pr), report(pod, args), audit(kind, pr, detail)."""
@@ -223,6 +295,9 @@ class Executor:
         pod = req.get("pod")
         call = req.get("call") if isinstance(req.get("call"), dict) else {}
         pr = call.get("pr") if isinstance(call.get("pr"), str) else ""
+        begin = getattr(self.backend, "begin_request", None)
+        if begin:
+            begin()   # one context per request: the pull request picture is read once
         try:
             if not isinstance(pod, str) or not pod:
                 raise Refuse(400, "no pod named")
@@ -240,6 +315,9 @@ class Executor:
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
             if command in NEEDS_HEAD and not SHA_RE.fullmatch(str(call.get("head") or "")):
                 raise Refuse(400, "%s needs the head sha it judged" % command)
+            room = getattr(self.backend, "gh_room", None)
+            if room is not None and not room():   # BEFORE any gh call; audited as a refusal, nothing written
+                raise Refuse(429, BUDGET_REASON)
             if command in NEEDS_LINK:   # the PR must be the one linked to the issue this pod is bound to
                 self._check_linked(pr, req)
             if command == "gates":   # read-only and not indexed: nothing to replay
@@ -505,13 +583,41 @@ def http_transport(base, token):
 class SwitchboardBackend:
     """The real world, through the switchboard's own functions (`host` is the fleet-switchboard module; `parts` = (engine, state, config))."""
 
-    def __init__(self, host, parts, runner, now):
-        self.host, self.parts, self.runner, self.now = host, parts, runner, now
+    def __init__(self, host, parts, runner, now, budget=None):
+        import copy
+        self.host, self.now, self.budget = host, now, budget
+        accounts = getattr(parts[0], "accounts", None)
+        accounts = accounts if hasattr(accounts, "calls") and hasattr(accounts, "paused") else None
+        self.runner = MeteredRunner(runner, accounts, budget, now) if runner is not None and (accounts is not None or budget is not None) else runner
+        engine = parts[0]
+        if engine is not None and self.runner is not runner:   # a copy of the engine whose gh runner is the metered one (the shared accounts stay shared)
+            engine = copy.copy(engine)
+            engine.gh_runner = self.runner
+        self.parts = (engine,) + tuple(parts[1:])
+        self.memo = {}
 
-    def _ctx(self, pr, writable=True):
+    def begin_request(self):
+        self.memo = {}
+        if isinstance(self.runner, MeteredRunner):
+            self.runner.begin_request()
+
+    def gh_room(self):
+        return self.budget is None or self.budget.room()
+
+    def _ctx(self, pr, writable=True, plan_read=True):
+        """The ledger context, built ONCE per request and flag set (also a refusal it raised): live_head, plan, pr_facts and pr_issues share it."""
         import types
-        args = types.SimpleNamespace(pr=pr, plan=None, ask=None)
-        return self.host._ledger_context(args, self.runner, self.now, writable, parts=self.parts, floor=not writable)
+        key = (pr, bool(writable), bool(plan_read))
+        if key not in self.memo:
+            args = types.SimpleNamespace(pr=pr, plan=None, ask=None)
+            try:
+                self.memo[key] = (self.host._ledger_context(args, self.runner, self.now, writable, parts=self.parts, floor=not writable, plan_read=plan_read), None)
+            except Exception as err:
+                self.memo[key] = (None, err)
+        ctx, err = self.memo[key]
+        if err is not None:
+            raise err
+        return ctx
 
     def live_head(self, pr):
         return (self._ctx(pr).facts or {}).get("head")
@@ -539,7 +645,7 @@ class SwitchboardBackend:
     def pr_issues(self, pr):
         """Issue numbers the PR is linked to: its closing keywords (Closes/Fixes/Resolves [owner/repo]#N) in the body, and its plan's issue."""
         import re
-        ctx = self._ctx(pr)
+        ctx = self._ctx(pr, plan_read=False)   # the link check needs the body and the plan's SOURCE, not the plan: no plan read
         repo = ctx.repo
         found = set()
         for m in re.finditer(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([0-9]+)", str((ctx.facts or {}).get("body") or ""), re.I):
@@ -563,7 +669,7 @@ class SwitchboardBackend:
             engine.audit.append(engine.actor, kind, pr, detail)
 
 
-def pass_if_configured(engine, host, runner, now, environ=os.environ):
+def pass_if_configured(engine, host, runner, now, environ=os.environ, budget=None):
     """One relay pull and answer, run by the relay loop (RelayLoop.run) on its own engine. Does nothing unless FLEET_RELAY_HUB_URL and FLEET_RELAY_HUB_TOKEN_FILE are set; never raises."""
     url, tokfile = environ.get("FLEET_RELAY_HUB_URL"), environ.get("FLEET_RELAY_HUB_TOKEN_FILE")
     if not url or not tokfile:
@@ -599,7 +705,7 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ):
             engine._note("relay.pass_failed", None, {"error": type(err).__name__})
             return 0
         fetch, post = http_transport(url, token)
-        backend = SwitchboardBackend(host, (engine, engine.state_dir, engine.config), runner, now)
+        backend = SwitchboardBackend(host, (engine, engine.state_dir, engine.config), runner, now, budget)
         return pass_once(Executor(engine.state_dir, backend, now), fetch, post)
     except Exception as err:
         engine._note("relay.pass_failed", None, {"error": " ".join(str(err).split())[:160]})
@@ -623,7 +729,13 @@ class RelayLoop:
         if engine_factory is None:
             raise ValueError("the relay loop needs an engine factory (its own Engine); sharing the pass engine must be explicit: engine_factory=lambda: engine")
         self.engine = engine_factory()
-        self.args = (self.engine, host, runner, now, environ)
+        self.budget = RelayBudget(now)   # one hourly cap for every pass of this loop
+        self.args = (self.engine, host, runner, now, environ, self.budget)
+        shared = getattr(engine, "accounts", None)   # ONE gate: the relay's reads are counted and paused in the pass engine's GhAccounts
+        if self.engine is not engine and self.engine is not None and shared is not None and hasattr(shared, "calls"):
+            self.engine.accounts = shared
+            if getattr(self.engine, "intents", None) is not None:
+                self.engine.intents.accounts = shared
         self.cadence = CADENCE if cadence is None else cadence
         self.stop_flag = threading.Event()
         self.sleep = sleep or self.stop_flag.wait

@@ -3080,7 +3080,7 @@ class TestDaemonRelayLoop(Base):
         orig_pull = relay.pass_if_configured
         done_once = []
 
-        def pull(loop_engine, host, runner, now, environ):
+        def pull(loop_engine, host, runner, now, environ, budget=None):
             if done_once:
                 return 0
             done_once.append(1)
@@ -9392,6 +9392,18 @@ class TestGithubDaemon(Base):
         super().setUp()
         self.world = World(self, agents=("platform",))
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+
+    def test_gh_accounts_is_safe_for_two_threads_and_one_gate_counts_both(self):
+        # PC-6/U10: the pass thread and the relay thread read through ONE GhAccounts: its counter and pause are under its lock
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, self.world.clock.now, environ={})
+        done = subprocess.CompletedProcess([], 0, "{}", "")
+        threads = [threading.Thread(target=lambda: [accounts.read(lambda *a, **k: done, "repos/o/r/pulls/1", "o/r", 5) for _ in range(200)]) for _ in range(4)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(len(accounts.calls), 800)
+        accounts.paused["default"] = self.world.clock.now() + 600
+        with self.assertRaises(sb.GhRateLimited):
+            accounts.read(lambda *a, **k: done, "repos/o/r/pulls/1", "o/r", 5)
 
     def test_the_relay_engine_does_not_own_the_v2_link_file(self):
         daemon = sb.build_engine(self.world.route, self.world.clock.now, "daemon")[0]

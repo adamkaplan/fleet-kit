@@ -16275,9 +16275,10 @@ def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now
     return {"facts": facts, "plan": plan, "plan_problem": problem}
 
 
-def _ledger_context(args, runner, now, writable, parts=None, floor=False):
+def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_read=True):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
-    (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
+    (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built. `plan_read=False` skips the read of the plan
+    (the relay's link check needs only the PR and the plan's source: one GitHub read)."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
@@ -16297,7 +16298,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
     plan, plan_problem = None, None
-    if source:
+    if source and plan_read:
         record_step("a GitHub read of the plan %s" % source)
         try:
             plan = checked_plan(config, source, args.ask, runner, now)

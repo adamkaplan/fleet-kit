@@ -1821,6 +1821,144 @@ class OneWorkerAndCancel(unittest.TestCase):
         self.assertEqual(len(self.late_post_count(mod)), 1)
 
 
+class GhBudget(Fixture):
+    """#1477 PC-6 (U7 to U10): the relay's GitHub budget, on the REAL SwitchboardBackend, Executor, RelayLoop and MeteredRunner over a stub host
+    whose _ledger_context makes the same gh calls the real one does (1 pull request read through engine.gh_runner, 1 plan read through the runner).
+    Mutants (load_backend_module): no memo (U8), no budget (U9), separate gate (U10), a pass that reads at rest (U7)."""
+
+    class Accounts:
+        def __init__(self):
+            self.lock, self.calls, self.paused = threading.Lock(), __import__("collections").deque(), {}
+
+        def describe(self, repo):
+            return "default"
+
+    def world(self, mod=relay, cap=None, accounts=None, now=None):
+        self.clock = [1000.0]
+        now = now or (lambda: self.clock[0])
+        self.gh = []
+        gh = self.gh
+        accounts = accounts if accounts is not None else self.Accounts()
+        engine = types.SimpleNamespace(accounts=accounts, gh_runner=None)
+
+        def runner(argv, *a, **k):
+            gh.append(list(argv))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def ledger_context(args, rn, now_, writable, parts=None, floor=False, plan_read=True):
+            parts[0].gh_runner(["gh", "pr", "view", args.pr])   # the one pull request read
+            if plan_read:
+                rn(["gh", "api", "plan"])                       # one plan read
+            return types.SimpleNamespace(repo=REPO, facts={"head": HEAD, "author": None, "body": "Closes #1"}, source=REPO + "#1",
+                                         plan={"plan_hash": "sha256:" + "b" * 64, "scenarios_parsed": [{"id": "S1", "evaluator": "tester"}]},
+                                         entries=[], problem=None, pr=PR)
+        host = types.SimpleNamespace(_ledger_context=ledger_context, _plan_usable=lambda ctx: None, LedgerCommandError=ValueError)
+        cfg = {"relay_holders": {REPO + "#1": CODER}, "plan_evaluators": {"tester": [TESTER]}}
+        budget = mod.RelayBudget(now, cap=cap) if hasattr(mod, "RelayBudget") and cap is not None else (mod.RelayBudget(now) if hasattr(mod, "RelayBudget") else None)
+        backend = mod.SwitchboardBackend(host, (engine, self.state, cfg), runner, now, budget)
+        backend.audit = lambda kind, pr, detail: self.backend.audits.append((kind, detail))
+        self.engine, self.accounts = engine, accounts
+        return mod.Executor(self.state, backend, now), backend
+
+    def test_u7_no_gh_call_at_rest(self):
+        self.world()
+        calls = []
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"}
+        for _ in range(100):
+            relay.pass_once(self.world()[0], lambda: {"requests": []}, lambda *a: None)
+        self.assertEqual(self.gh, [])
+
+    def test_u7_mutant_that_reads_each_pass_is_caught(self):
+        mod = load_backend_module("    done = 0\n    for req in (pending.get(\"requests\") or [])[:10]:",
+                                  "    done = 0\n    executor.backend._ctx(\"acme-org/widget-service#7\")\n    for req in (pending.get(\"requests\") or [])[:10]:")
+        ex, _ = self.world(mod)
+        for _ in range(100):
+            mod.pass_once(ex, lambda: {"requests": []}, lambda *a: None)
+        self.assertGreater(len(self.gh), 0)
+
+    def one(self, ex, command, **k):
+        hub = FakeHub()
+        rid = hub.submit(k.pop("pod", CODER), command, **k)
+        relay.pass_once(ex, hub.fetch, hub.post)
+        return hub.results[rid]
+
+    def test_u8_calls_per_request(self):
+        ex, _ = self.world()
+        got = self.one(ex, "prove", **PROVE)
+        self.assertEqual(got["status"], 200, got)
+        self.assertLessEqual(len(self.gh), 3)
+        for command, kw in (("verdict", dict(pod=TESTER, head=HEAD, scenario="S1", result="pass", evidence="ok")), ("gates", dict(head=None)), ("report", dict(head=None, state="working", text="x"))):
+            self.gh.clear()
+            self.one(ex, command, **kw)
+            self.assertLessEqual(len(self.gh), 3 if command != "report" else 1, command)
+
+    def test_u8_mutant_that_rebuilds_the_context_per_helper_is_caught(self):
+        mod = load_backend_module("        if key not in self.memo:", "        if True:",
+                                  extra=(("        if key is not None and key in self.memo:", "        if False:"),))
+        ex, _ = self.world(mod)
+        self.one(ex, "verdict", pod=TESTER, head=HEAD, scenario="S1", result="pass", evidence="ok")
+        self.assertGreater(len(self.gh), 3)   # the real build rebuilds 8 or more; this stub context is leaner
+
+    def flood(self, mod):
+        ex, backend = self.world(mod)
+        hub = FakeHub()
+        ids = []
+        for i in range(1000):
+            ids.append(hub.submit("pod%d" % (i % 5), "gates", head=None))
+        for step in range(100):   # a fake hour: 10 requests a pass, 36 s apart
+            self.clock[0] += 36
+            mod.pass_once(ex, hub.fetch, hub.post)
+        return hub, ids
+
+    def test_u9_hourly_budget_and_named_429(self):
+        before = len(self.backend.audits)
+        hub, ids = self.flood(relay)
+        self.assertLessEqual(len(self.gh), 600)
+        refused = [hub.results[r] for r in ids if hub.results[r]["status"] == 429]
+        self.assertGreater(len(refused), 0)
+        self.assertTrue(all(r["reason"] == "relay GitHub budget" and r["record"] is None for r in refused))
+        self.assertEqual(self.raw(), b"")   # nothing written
+
+    def test_u9_mutant_without_a_budget_is_caught(self):
+        mod = load_backend_module("        return self.budget is None or self.budget.room()", "        return True",
+                                  extra=(("        if self.budget is not None and not self.budget.take():\n            raise Refuse(429, BUDGET_REASON)\n", "        pass\n"),))
+        hub, ids = self.flood(mod)
+        self.assertGreaterEqual(len(self.gh), 2000)
+
+    def test_u10_one_gate_counter_and_pause(self):
+        ex, _ = self.world()
+        for _ in range(10):
+            self.one(ex, "gates", head=None)
+        self.assertEqual(len(self.accounts.calls), len(self.gh))
+        self.assertGreater(len(self.gh), 0)
+        n = len(self.gh)
+        self.accounts.paused["default"] = self.clock[0] + 600
+        got = self.one(ex, "gates", head=None)
+        self.assertEqual((got["status"], len(self.gh)), (429, n))   # a pause set by the pass engine stops the relay's calls
+
+    def test_u10_loop_shares_the_pass_engines_accounts(self):
+        shared = types.SimpleNamespace(accounts=self.Accounts(), intents=None)
+        own = types.SimpleNamespace(accounts=self.Accounts(), intents=types.SimpleNamespace(accounts=None))
+        loop = relay.RelayLoop(shared, None, None, None, environ=RelayLoopCadence.ENV, engine_factory=lambda: own)
+        self.assertIs(own.accounts, shared.accounts)
+        self.assertIs(own.intents.accounts, shared.accounts)
+
+    def test_u10_mutant_with_a_separate_gate_is_caught(self):
+        mod = load_backend_module("            self.engine.accounts = shared\n", "            pass\n")
+        shared = types.SimpleNamespace(accounts=self.Accounts(), intents=None)
+        own = types.SimpleNamespace(accounts=self.Accounts(), intents=None)
+        mod.RelayLoop(shared, None, None, None, environ=RelayLoopCadence.ENV, engine_factory=lambda: own)
+        self.assertIsNot(own.accounts, shared.accounts)
+
+    def test_u10_mutant_that_ignores_the_pause_is_caught(self):
+        mod = load_backend_module("            if self.now() < until:", "            if False:")
+        ex, _ = self.world(mod)
+        self.accounts.paused["default"] = self.clock[0] + 600
+        self.one(ex, "gates", head=None)
+        self.assertGreater(len(self.gh), 0)
+
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False).result
     print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")

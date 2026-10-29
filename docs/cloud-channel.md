@@ -58,6 +58,12 @@ One document to set up, run and take down the cloud hub and the pod-side command
     being handled (the 40 context reads above). Claims are in `relay_reports.json`, apart from `relay_calls.json`, so a pruned or missing
     `relay_calls.json` cannot cause a second delivery; only deleting `relay_reports.json` itself, or more than 50000 newer reports, can.
   - A refused relay call writes one audit line (`relay.refused`, `by` and `pr` clipped) on purpose; the ledger and files stay unchanged.
+  - The relay's GitHub cost (PC-6): 0 gh calls at rest (an empty pending list makes none). A request builds its pull request picture ONCE
+    (the same read is answered from the first within the request): at most 3 gh calls for prove, verdict and gates (1 pull request read, at most 2 plan
+    reads) and 1 for report. All relay requests together may make at most `RELAY_GH_PER_HOUR` (600) gh calls in a rolling hour; a request
+    that would pass it is answered 429 "relay GitHub budget" BEFORE any gh call, audited as `relay.refused`, nothing written. The relay's engine
+    shares the pass engine's `GhAccounts` (one counter, one pause, one set of remembered answers): its calls are counted there, and a rate-limit
+    pause set by the pass stops the relay's calls (429).
 
 The sender is always the agent the token proves, never a name in the body: a body naming another sender is refused 403.
 
