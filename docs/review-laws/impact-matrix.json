@@ -402,6 +402,7 @@
         "bin/decision_sync.py",
         "bin/disk_janitor.py",
         "bin/fleet_health.py",
+        "bin/header_cache.py",
         "bin/heavy_slots.py",
         "bin/item_verdicts.py",
         "bin/plan_review.py",
@@ -465,6 +466,7 @@
         "bin/decision_core.py": [
           "one_line"
         ],
+        "bin/header_cache.py": [],
         "bin/disk_janitor.py": [
           "settings",
           "validate"
