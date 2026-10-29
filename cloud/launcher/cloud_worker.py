@@ -1529,6 +1529,10 @@ def failure_of(pod):
             for key in ("state", "lastState"):
                 term = ((cs or {}).get(key) or {}).get("terminated")
                 if isinstance(term, dict):
+                    # A container that ended Completed (a sidecar) is not the cause: skip it. A Failed pod whose ONLY
+                    # terminated container is Completed gets the pod-level reason, else `other`, and no code.
+                    if term.get("reason") == "Completed":
+                        continue
                     if reason is None:
                         reason = term.get("reason")
                     if code is None and isinstance(term.get("exitCode"), int) and not isinstance(term.get("exitCode"), bool) and 0 <= term["exitCode"] <= 255:

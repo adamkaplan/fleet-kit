@@ -251,6 +251,25 @@ class Failed(tcw.Base):
                 self.assertEqual(self.stops()[-1]["failure"], "Error")
                 self.assertNotIn("exit_code", self.stops()[-1])
 
+    def containers(self, *pairs):
+        return {"containerStatuses": [{"name": "c%d" % i, "state": {"terminated": {"reason": r, "exitCode": c}}} for i, (r, c) in enumerate(pairs)]}
+
+    def test_s7_a_completed_sidecar_before_the_worker_does_not_hide_the_cause(self):
+        for pairs in ((("Completed", 0), ("OOMKilled", 137)), (("OOMKilled", 137), ("Completed", 0))):
+            with self.subTest(pairs=pairs):
+                self.assertEqual(cw.failure_of({"status": self.containers(*pairs)}), ("OOMKilled", 137))
+
+    def test_s7_a_pod_with_just_a_completed_container_gives_other_and_no_code(self):
+        self.assertEqual(cw.failure_of({"status": self.containers(("Completed", 0))}), ("other", None))
+
+    def test_s7_two_failed_containers_give_the_first_failed_one(self):
+        self.assertEqual(cw.failure_of({"status": self.containers(("Completed", 0), ("Error", 1), ("OOMKilled", 137))}), ("Error", 1))
+
+    def test_s7_a_mutant_that_keeps_completed_containers_fails_the_sidecar_test(self):
+        mod = self.mutant(('if term.get("reason") == "Completed":\n                        continue\n', 'if False:\n                        continue\n'))
+        self.assertEqual(mod.failure_of({"status": self.containers(("Completed", 0), ("OOMKilled", 137))})[0], "other")
+        self.assertEqual(cw.failure_of({"status": self.containers(("Completed", 0), ("OOMKilled", 137))})[0], "OOMKilled")
+
     def test_s7_the_alert_validates_again_and_a_line_without_the_fields_gives_the_five_fact_text(self):
         line = {"cause": "pod_failed"}
         self.assertIsNone(alert.failure_text(line))
@@ -297,6 +316,23 @@ class FailedDocs(unittest.TestCase):
     def text(self, *parts):
         with open(os.path.join(ROOT, *parts), encoding="utf-8") as f:
             return " ".join(f.read().split())
+
+    INIT_SENTENCE = "The reason is read from the pod's regular containers; a failure of an init container is not read and gives the pod-level reason or other."
+    WINDOW_SENTENCE = "a create that has waited more than 120 seconds can give one extra alert"
+
+    def test_s8_the_init_container_sentence_is_found_once_in_each_document(self):
+        for parts in (("docs", "cloud-worker-interface.md"), ("cloud", "launcher", "README.md")):
+            self.assertEqual(self.text(*parts).count(self.INIT_SENTENCE), 1, parts)
+
+    def test_s8_the_create_window_sentence_is_found_once_in_each_document(self):
+        for parts in (("docs", "cloud-worker-interface.md"), ("cloud", "launcher", "README.md")):
+            self.assertEqual(self.text(*parts).count(self.WINDOW_SENTENCE), 1, parts)
+
+    def test_s8_a_document_without_the_new_sentences_is_caught(self):
+        for sentence in (self.INIT_SENTENCE, self.WINDOW_SENTENCE):
+            text = self.text("docs", "cloud-worker-interface.md")
+            self.assertEqual(text.count(sentence), 1)
+            self.assertEqual(text.replace(sentence, "").count(sentence), 0)
 
     PHRASES = ("a failed pod is ended and alerted within one pass", "the earlier wording",
                "is not recoverable either way", "unpushed work in it is lost with or without this change",
