@@ -128,9 +128,21 @@ class Docs(unittest.TestCase):
 
     def test_the_cost_and_the_prestop_sentences(self):
         for rel, sec in self.sections():
-            for p in ("is not scaled down until the worker ends", "30 minutes by default", "8 hours by default", "plus five minutes",
-                      "has no deadline", "ask 1480 (pull request 1486)", "`cw-prestop`", "`wip` branch", "no stop line"):
+            for p in ("is not scaled down until the worker ends", "at its idle limit (`--idle`)", "8 hours by default", "plus five minutes",
+                      "has no deadline", "once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives", "ask 1480 (pull request 1486)", "`cw-prestop`", "`wip` branch", "no stop line"):
                 self.assertIn(p, sec, rel)
+
+    def test_the_sections_state_no_idle_number(self):
+        for rel, sec in self.sections():
+            self.assertNotIn("30 minutes", sec, rel)
+            self.assertNotIn("30m", sec, rel)
+            self.assertNotIn("minutes by default", sec, rel)
+
+    def test_mutant_the_restored_idle_number_fails(self):
+        for rel, sec in self.sections():
+            mutated = sec.replace("(`--idle`)", "(30 minutes by default)")
+            self.assertNotEqual(mutated, sec, rel)
+            self.assertIn("30 minutes", mutated, rel)
 
     def test_the_command_block_only_reads(self):
         for rel, sec in self.sections():
