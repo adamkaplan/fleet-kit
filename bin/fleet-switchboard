@@ -839,18 +839,22 @@ def validate_default_branches(config, source):
         raise ConfigError("%s: 'default_branches' must be an object of at most 20 repository -> non-empty branch name" % source)
 
 
+RELAY_HOLDER_KEY = re.compile(r"[^/#]+/[^/#]+#[0-9]+")   # the only key shape holder_of builds: '<owner/repo>#<issue number>'
+
+
 def validate_relay_holders(config, source):
-    """`relay_holders`: read by the relay daemon, not here. Absent is fine; present it is an object of "<repo>#<issue>" -> a non-empty pod name ({} is valid)."""
+    """`relay_holders`: read by the relay daemon, not here. Absent is fine; present it is an object of "<owner/repo>#<issue number>" -> a non-empty pod name
+    ({} is valid). The config file is trusted: there is no cap on the number of entries."""
     if "relay_holders" not in config:
         return
     raw = config["relay_holders"]
     if not isinstance(raw, dict):
         raise ConfigError("%s: 'relay_holders' must be an object of repo#issue -> pod name, got %r" % (source, type(raw).__name__))
     for key, pod in raw.items():
-        if "#" not in key:
-            raise ConfigError("%s: 'relay_holders' key %r must look like repo#issue" % (source, key))
+        if not isinstance(key, str) or not RELAY_HOLDER_KEY.fullmatch(key):
+            raise ConfigError("%s: 'relay_holders' key %r must look like owner/repo#<issue number>: fix or remove the entry in config.json" % (source, key))
         if not isinstance(pod, str) or not pod.strip():
-            raise ConfigError("%s: 'relay_holders' entry %r must be a non-empty pod name" % (source, key))
+            raise ConfigError("%s: 'relay_holders' entry %r must be a non-empty pod name: fix or remove the entry in config.json" % (source, key))
 
 
 def validate_plan_evaluators(config, source):

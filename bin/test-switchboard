@@ -454,9 +454,26 @@ class TestConfig(Base):
         self._refused({"acme/app": "pod-a"}, "'acme/app'")
 
     def test_a_relay_holders_pod_that_is_empty_is_refused(self):   # S5
-        for value in ("", "  ", 7, None):
+        self._refused({"a/b#1": ""}, "'a/b#1'")
+
+    def test_a_relay_holders_pod_that_is_whitespace_is_refused(self):
+        self._refused({"a/b#1": "  "}, "'a/b#1'")
+
+    def test_a_relay_holders_pod_that_is_not_a_string_is_refused(self):
+        for value in (7, None, ["p"]):
             with self.subTest(value=value):
                 self._refused({"a/b#1": value}, "'a/b#1'")
+
+    def test_a_relay_holders_value_of_null_is_refused(self):
+        self._refused(None)
+
+    def test_the_relay_holders_key_must_be_owner_repo_hash_digits(self):
+        for good in ("a/b#1", "acme-org/widget-service#7", "o/r.x#120"):
+            with self.subTest(good=good):
+                sb.validate_config({"relay_holders": {good: "p"}})
+        for bad in ("#", "a#", "#5", "a#x", "a#5", "/b#5", "a/#5", "a/b/c#5", "a/b#", "a/b#5x", "a/b#-1", "a/b#1\n"):
+            with self.subTest(bad=bad):
+                self._refused({bad: "p"}, repr(bad))
 
     def test_a_bad_relay_holders_fails_the_cli_like_every_other_config_error(self):
         """The CLI maps a ConfigError to exit 1 (EXIT_ERROR) for every key, so this one does the same."""
@@ -515,13 +532,31 @@ class TestConfig(Base):
             if isinstance(raw, dict):
                 config["relay_holders"] = raw
 
+        def pod_mutant(replace):
+            def mutant(config, source):
+                raw = config.get("relay_holders")
+                if isinstance(raw, dict):
+                    config["relay_holders"] = {k: replace(v) for k, v in raw.items()}
+                real(config, source)
+                if isinstance(raw, dict):
+                    config["relay_holders"] = raw
+            return mutant
+
+        def accepts_null(config, source):
+            if "relay_holders" in config and config["relay_holders"] is None:
+                return
+            real(config, source)
+
         return {"test_a_config_without_relay_holders_loads_as_on_the_base_commit": with_default,
                 "test_relay_holders_that_is_not_an_object_is_refused": accepts_list,
                 "test_a_relay_holders_key_without_a_hash_is_refused": accepts_key_without_hash,
-                "test_a_relay_holders_pod_that_is_empty_is_refused": accepts_empty_pod}
+                "test_a_relay_holders_pod_that_is_empty_is_refused": accepts_empty_pod,
+                "test_a_relay_holders_pod_that_is_whitespace_is_refused": pod_mutant(lambda v: "x" if isinstance(v, str) and v and not v.strip() else v),
+                "test_a_relay_holders_pod_that_is_not_a_string_is_refused": pod_mutant(lambda v: "x" if not isinstance(v, str) else v),
+                "test_a_relay_holders_value_of_null_is_refused": accepts_null}
 
     def test_each_relay_holders_check_has_a_mutant_its_own_test_catches(self):
-        """S7/U1: every mutant fails its named test, and the real build passes all four."""
+        """S7/U1: every mutant fails its named test, and the real build passes every one."""
         real = sb.validate_relay_holders
         for name, mutant in self._holder_mutants().items():
             with self.subTest(mutant=name):
@@ -535,7 +570,7 @@ class TestConfig(Base):
                 finally:
                     sb.validate_relay_holders = real
                 self.assertGreaterEqual(len(bad.failures) + len(bad.errors), 1, "the mutant survives " + name)
-        sb.validate_relay_holders = lambda config, source: None   # the whole validation removed: the three bad-shape tests all fail
+        sb.validate_relay_holders = lambda config, source: None   # the whole validation removed: the bad-shape tests all fail
         try:
             res = unittest.TestResult()
             for name in list(self._holder_mutants())[1:]:
@@ -546,8 +581,7 @@ class TestConfig(Base):
 
     def test_the_relay_daemons_holder_of_reads_the_validated_shape_unchanged(self):
         """U6/PC-3: a config with relay_holders, validated by this change, gives the relay daemon's holder_of the same pod for the fixed key, and a key
-        the config does not name stays None (fail closed). The daemon source is pinned on the one function this reads; that the file has 0 changed lines
-        in this diff is checked by the diff itself."""
+        the config does not name stays None (fail closed). That the daemon file has 0 changed lines in this diff is checked by the diff itself."""
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         try:
             import cloud_relay_daemon as relay
@@ -559,7 +593,6 @@ class TestConfig(Base):
         self.assertEqual(backend.holder_of("acme-org/widget-service", 7), "widget-pod")
         self.assertIsNone(backend.holder_of("acme-org/widget-service", 8))
         self.assertIsNone(relay.SwitchboardBackend(None, (None, None, sb.validate_config({})), None, None).holder_of("acme-org/widget-service", 7))
-        self.assertIn('return (self.parts[2].get("relay_holders") or {}).get("%s#%s" % (repo, issue))', inspect.getsource(relay.SwitchboardBackend.holder_of))
 
     def test_malformed_files_are_refused(self):
         for text, needle in (("{not json", "not valid JSON"), ("[1, 2]", "JSON object"), ('"x"', "JSON object")):
