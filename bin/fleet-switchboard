@@ -11637,7 +11637,7 @@ def _review_comment_item(repo, comment, issue, number, cid, now):
         return None
     signer = signed_by_fleet(body)
     known, lookups = _issue_refs(issue, number)
-    clean = lambda text: _one_line(re.sub(r"[\x00-\x1f\x7f]", "", text), REVIEW_NAME_CAP)   # no control character reaches the line
+    clean = lambda text: _one_line(scrub_signed_links(re.sub(r"[\x00-\x1f\x7f]", "", text)), REVIEW_NAME_CAP)   # no control character reaches the line
     who = clean(login)
     if signer:
         who += " (signed %s)" % clean(signer)
@@ -11660,7 +11660,7 @@ def _comment_item(repo, comment, issue, now):
     if signed_by_fleet(body):
         return None
     known, lookups = _issue_refs(issue, number)
-    summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(comment.get("body") or "", 400))
+    summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(scrub_signed_links(comment.get("body") or ""), 400))
     return GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now,
                       [number], not _is_bot(comment))
 
@@ -11715,7 +11715,7 @@ def _review_item(repo, review, pr, now):
     known, lookups = _pr_refs(pr, number)
     state = str(review.get("state") or "reviewed").lower()
     summary = "@%s reviewed PR #%d (%s): %s" % (_login(review) or "someone", number, state,
-                                                _one_line(review.get("body") or "", 300))
+                                                _one_line(scrub_signed_links(review.get("body") or ""), 300))
     return GitHubItem("github.review:%d" % rid, "github.review", summary, repo, known, lookups, _login(review), now,
                       [number], state == "changes_requested")
 
