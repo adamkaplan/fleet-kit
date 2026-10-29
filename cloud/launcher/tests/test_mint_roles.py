@@ -288,6 +288,89 @@ class Mutants(unittest.TestCase):
         self.assertIn("body worker", table_failures(m))
 
 
+FAKE_MINT = "#!%s\nimport json, sys\nopen(sys.argv[0] + '.argv', 'a').write(json.dumps(sys.argv[1:]) + '\\n')\nprint('tok-' + sys.argv[1].split('/')[-1])\n" % sys.executable
+
+
+class LaunchSideMint(unittest.TestCase):
+    """bin/cloud_worker.py git_token: the FIRST token of a launch is minted under the launch's kind (a copy of the module sits in a temporary tree
+    whose cloud/launcher/app_token.py is a fake that records its argv)."""
+    SRC = "bin/cloud_worker.py"
+
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.mint = os.path.join(tmp.name, "cloud", "launcher", "app_token.py")
+        os.makedirs(os.path.dirname(self.mint))
+        with open(self.mint, "w") as f:
+            f.write(FAKE_MINT)
+        self.log = self.mint + ".argv"
+        self.env = {k: v for k, v in os.environ.items() if k != "CW_GIT_TOKEN_CMD"}
+
+    def load(self, old=None, new=None):
+        src = read(self.SRC)
+        if old is not None:
+            assert src.count(old) == 1, old   # the mutation is applied exactly once
+            mutated = src.replace(old, new, 1)
+            assert mutated != src
+            src = mutated
+        mod = types.ModuleType("launch_side_copy")
+        mod.__file__ = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(self.mint))), "bin", "cloud_worker.py")
+        exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+        mod._capture = lambda argv, env=None: (lambda p: (p.returncode, p.stdout, p.stderr))(
+            subprocess.run(argv, env=env, capture_output=True, text=True))   # the module's own capture needs the switchboard's names: a plain run here
+        return mod
+
+    def run_mint(self, mod, *args, env=None):
+        cluster = types.SimpleNamespace(clean=lambda text, n=200: text)
+        with mock.patch.dict(os.environ, env if env is not None else self.env, clear=True):
+            tok = mod.git_token(REPO, cluster, *args)
+        calls = []
+        if os.path.exists(self.log):
+            calls = [json.loads(line) for line in open(self.log)]
+        return tok, calls
+
+    def test_the_first_token_of_an_orchestrator_launch_carries_its_kind_once(self):
+        tok, calls = self.run_mint(self.load(), "orchestrator")
+        self.assertEqual(tok, "tok-widget-service")
+        self.assertEqual(calls, [[REPO, "--role", "orchestrator"]])
+        self.assertEqual(calls[0].count("--role"), 1)
+
+    def test_a_worker_launch_mints_with_the_argv_it_always_had(self):
+        for extra in ((), ("worker",)):
+            with self.subTest(extra=extra):
+                if os.path.exists(self.log):
+                    os.remove(self.log)
+                _, calls = self.run_mint(self.load(), *extra)
+                self.assertEqual(calls, [[REPO]])
+        mod = self.load()
+        seen = []
+        mod._capture = lambda argv, env=None: seen.append(argv) or (0, "x\n", "")
+        self.run_mint(mod)
+        self.assertEqual(seen, [[sys.executable, self.mint, REPO]])
+
+    def test_a_custom_command_runs_unchanged(self):
+        own = os.path.join(os.path.dirname(self.mint), "own.py")
+        with open(own, "w") as f:
+            f.write(FAKE_MINT)
+        env = dict(self.env, CW_GIT_TOKEN_CMD="%s %s extra" % (sys.executable, own))
+        for kind in ("worker", "orchestrator"):
+            with self.subTest(kind=kind):
+                if os.path.exists(own + ".argv"):
+                    os.remove(own + ".argv")
+                self.run_mint(self.load(), kind, env=env)
+                self.assertEqual([json.loads(x) for x in open(own + ".argv")], [["extra"]])
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_the_launch_passes_its_kind_to_the_mint(self):
+        src = read(self.SRC)
+        self.assertEqual(src.count("token = git_token(repo, cluster, args.agent if args.agent in _lib().AGENTS else \"worker\")"), 1)
+
+    def test_mutant_without_the_kind_in_the_orchestrator_call_is_caught(self):
+        mod = self.load('    if not raw and role != "worker":\n        argv += ["--role", role]\n', "")
+        _, calls = self.run_mint(mod, "orchestrator")
+        self.assertNotEqual(calls, [[REPO, "--role", "orchestrator"]])
+
 LIMIT_A = "A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command."
 LIMIT_B = "An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set."
 
