@@ -288,14 +288,18 @@ class Mutants(unittest.TestCase):
         self.assertIn("body worker", table_failures(m))
 
 
+LIMIT_A = "A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command."
+LIMIT_B = "An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set."
+
+
 class Documents(unittest.TestCase):
     FILES = ["docs/cloud-operator-quickstart.md", "cloud/launcher/README.md", "cloud/README.md"]
 
     def check(self, text):
         flat = " ".join(text.split())
         miss = [w for w in ("--role", "`cw/role: orchestrator`", "`%s`" % WORKER_TEXT, "`%s`" % ORCH_TEXT,
-                            "the owner adds `checks: read` to the App's permissions and accepts it on each installation",
-                            "this change never takes that step",
+                            "The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.",
+                            LIMIT_A, LIMIT_B,
                             "What the orchestrator's token can and cannot do",
                             "It can read issues, pull requests, check results and repository metadata, and it can write to issues only.",
                             "It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.",
@@ -306,6 +310,19 @@ class Documents(unittest.TestCase):
         for rel in self.FILES:
             with self.subTest(rel):
                 self.assertEqual(self.check(read(rel)), [])
+
+    def test_s7_each_limit_sentence_is_found_once_in_every_document(self):
+        for rel in self.FILES:
+            flat = " ".join(read(rel).split())
+            for s in (LIMIT_A, LIMIT_B):
+                with self.subTest(rel=rel, s=s[:20]):
+                    self.assertEqual(flat.count(s), 1)
+
+    def test_s7_a_document_without_the_first_limit_fails(self):
+        text = read(self.FILES[0])
+        mutated = text.replace(LIMIT_A, "")
+        self.assertNotEqual(mutated, text)
+        self.assertTrue(self.check(mutated))
 
     def test_s7_the_check_notices_a_missing_set_or_paragraph(self):
         text = read(self.FILES[0])
