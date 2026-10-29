@@ -145,7 +145,7 @@ class Runbook(unittest.TestCase):
         self.section = text.split("\n## A probe namespace\n", 1)[1].split("\n## ", 1)[0]
 
     def test_the_six_steps_come_in_order(self):
-        marks = ["cloud/k8s/render-namespace cwp > cwp.yaml", "kubectl apply --dry-run=server -f cwp.yaml", "ADMINISTRATOR login",
+        marks = ["cloud/k8s/render-namespace cwp > cwp.yaml", 'kubectl apply --dry-run=server -n "$NS" -f cwp.yaml', "ADMINISTRATOR login",
                  "CW_PULL_SECRET`", "private settings", "smoke launch"]
         steps = ["Step %d" % n for n in range(1, 7)]
         at = [self.section.index(s) for s in steps]
@@ -168,13 +168,13 @@ class Runbook(unittest.TestCase):
         self.assertIn("adds one more hub pod and its Services", self.section)
         self.assertIn("while the namespace exists", self.section)
         self.assertIn("Deleting the namespace removes everything inside it", self.section)
-        for command in ("kubectl delete namespace NAMESPACE_NAME", "kubectl -n NAMESPACE_NAME delete rolebinding cw-minter",
-                        "kubectl -n NAMESPACE_NAME delete secret cw-minter-token", "rm -rf PROBE_CONFIG_DIR", "rm -f TOKEN_FILE"):
+        for command in ('kubectl delete namespace "$NS"', 'kubectl -n "$NS" delete rolebinding cw-minter',
+                        'kubectl -n "$NS" delete secret cw-minter-token', 'rm -rf "${PROBE_CONFIG_DIR:?}"', "rm -f TOKEN_FILE"):
             self.assertIn(command, self.section)
 
 
 DAEMON_ENV = "FL" + "EET_CLOUD_HUB_DAEMON"   # assembled: the neutral-names scan of this folder reads the old prefix
-R1_COMMAND = "kubectl -n NAMESPACE_NAME set env deployment/cloud-hub %s=relay-probe" % DAEMON_ENV
+R1_COMMAND = 'kubectl -n "$NS" set env deployment/cloud-hub %s=relay-probe' % DAEMON_ENV
 
 
 def hub_reserved_names():
@@ -207,7 +207,7 @@ class RelayAppendix(unittest.TestCase):
 
     def test_the_daemon_name_command_is_found_once_and_the_reserved_names_match_the_hub(self):
         self.assertEqual(self.text.count(R1_COMMAND), 1)
-        self.assertIn("kubectl -n NAMESPACE_NAME rollout status deployment/cloud-hub", self.text)
+        self.assertIn('kubectl -n "$NS" rollout status deployment/cloud-hub', self.text)
         line = [l for l in self.text.split("\n") if l.startswith("Reserved names:")]
         self.assertEqual(len(line), 1)
         listed = set(re.findall(r"`([^`]+)`", line[0]))
@@ -220,7 +220,7 @@ class RelayAppendix(unittest.TestCase):
         self.assertIn("mode 0600", self.text)
         self.assertIn("hands ONLY THE DIGEST to the administrator", self.text)
         self.assertIn('{"relay-probe": "DIGEST_VALUE"}', self.text)
-        self.assertIn("kubectl -n NAMESPACE_NAME get secret cloud-hub-registry", self.text)
+        self.assertIn('kubectl -n "$NS" get secret cloud-hub-registry', self.text)
 
     def test_the_session_verb_and_the_entry_change_are_named(self):
         self.assertIn("cloud/launcher/cloud-worker hub-session WORKER_NAME --session SESSION_ID", self.text)
@@ -237,14 +237,19 @@ class RelayAppendix(unittest.TestCase):
 
     def check_probe_teardown_and_secret_order(self):
         self.assertEqual(self.whole.count(self.ONE_SCOPE), 1)
-        listing = self.whole.split("```text", 2)[1]
-        self.assertLess(listing.index("get secret"), listing.index("create secret generic"))
+        blocks = code_blocks(self.whole)
+        listing, missing = blocks[0], blocks[1]
+        self.assertIn("get secret cloud-hub-registry cloud-hub-pw", listing)
+        self.assertNotIn("create secret generic", listing)   # the first block makes no secret: the apply already made both
+        self.assertEqual(missing.count("create secret generic"), 2)
+        self.assertLess(self.whole.index(listing), self.whole.index("Only if `get` reports missing"))
+        self.assertLess(self.whole.index("Only if `get` reports missing"), self.whole.index(missing))
         self.assertEqual(self.whole.count(self.EDITED), 1)
         self.assertLess(self.whole.index("run the `get secret` line first"), self.whole.index("ONLY for a Secret the `get` reports missing"))
         teardown = self.whole.split("Teardown (", 1)[1].split("```", 2)[1]
         self.assertNotIn("delete serviceaccount", teardown)
-        for kept in ("delete rolebinding cw-minter", "delete secret cw-minter-token", "kubectl delete namespace NAMESPACE_NAME",
-                     "rm -f TOKEN_FILE", "rm -rf PROBE_CONFIG_DIR"):
+        for kept in ("delete rolebinding cw-minter", "delete secret cw-minter-token", 'kubectl delete namespace "$NS"',
+                     "rm -f TOKEN_FILE", 'rm -rf "${PROBE_CONFIG_DIR:?}"'):
             self.assertIn(kept, teardown)
 
     def test_the_teardown_scope_the_secret_order_and_the_single_deletes(self):
@@ -283,7 +288,7 @@ def subshells(block):
     return found
 
 
-TOKEN_BARE = "kubectl -n NAMESPACE_NAME create token cw-operator --duration=DURATION"
+TOKEN_BARE = 'kubectl -n "$NS" create token cw-operator --duration=DURATION'
 
 
 class CredentialFileCare(unittest.TestCase):
@@ -298,7 +303,9 @@ class CredentialFileCare(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertIn("umask 077", hits[0])
         self.assertLess(hits[0].index("umask 077"), hits[0].index("> secrets.json"))
-        self.assertIn("rm -f secrets.json", self.relay)
+        self.assertIn("rm -f secrets.json registry-patch.json", hits[0])
+        self.assertIn("trap ", hits[0])
+        self.assertIn("ls secrets.json registry-patch.json", self.relay)
 
     def test_working_copy_sequence_is_in_a_umask_subshell(self):
         self.check_working_copy_in_subshell()
@@ -360,8 +367,11 @@ class CredentialFileCare(unittest.TestCase):
         self.assertNotIn("docker-" + "password", self.doc)
         copies = [l for l in self.doc.split("\n") if "get secret PULL_SECRET_NAME -o json" in l and "create -f -" in l]
         self.assertEqual(len(copies), 1)
-        self.assertIn("kubectl -n NAMESPACE_NAME create -f -", copies[0])
+        self.assertIn('kubectl -n "$NS" create -f -', copies[0])
+        self.assertIn("managedFields", copies[0])
+        self.assertIn('kubectl -n "$SRC" get secret', copies[0])
         self.assertIn("--from-file=.dockerconfigjson=DOCKER_CONFIG_FILE", self.whole)
+        self.assertIn("read only", self.whole)
 
 
 def credential_shapes(text):
@@ -428,15 +438,15 @@ class CredentialShapeSweep(unittest.TestCase):
     def test_the_patch_file_form_replaces_the_command_substitution(self):
         self.assertEqual(self.doc.count("--patch-file registry-patch.json"), 1)
         self.assertNotIn("-p \"$(", self.doc)
-        self.assertIn("rm -f registry-patch.json", self.doc)
+        self.assertIn("rm -f secrets.json registry-patch.json", self.doc)
 
     def test_the_pull_copy_sentence_is_found_once(self):
         sentence = "gives the probe namespace the SAME registry pull value: an administrator step on the same registry"
         self.assertEqual(self.doc.count(sentence), 1)
 
     def test_a_runbook_with_the_old_patch_restored_fails_the_scan(self):
-        new = "kubectl -n NAMESPACE_NAME patch secret cloud-hub-registry --type merge --patch-file registry-patch.json"
-        old = "kubectl -n NAMESPACE_NAME patch secret cloud-hub-registry --type merge -p \"$(cat secrets.json)\""
+        new = 'kubectl -n "$NS" patch secret cloud-hub-registry --type merge --patch-file registry-patch.json'
+        old = 'kubectl -n "$NS" patch secret cloud-hub-registry --type merge -p "$(cat secrets.json)"'
         mutant = self.whole.replace(new, old)
         self.assertNotEqual(mutant, self.whole)   # the mutation is applied
         self.assertEqual(len(credential_shapes(mutant)), 1)
@@ -447,6 +457,93 @@ class CredentialShapeSweep(unittest.TestCase):
         mutant = self.whole.replace(line[0], TOKEN_BARE)
         self.assertNotEqual(mutant, self.whole)   # the mutation is applied
         self.assertEqual(len(credential_shapes(mutant)), 1)
+
+
+LIVE = r"(?<![\w-])cw(?![\w-])"
+GUARD = ': "${NS:?}"'
+
+
+def runbook_shapes(text):
+    """Names of the live-cluster risks found in the code blocks of a runbook text (apart from the credential shapes)."""
+    found = []
+    for block in code_blocks(text):
+        lines = block.split("\n")
+        if any("kubectl" in l for l in lines) and not any(GUARD in l and "!= cw" in l for l in lines):
+            found.append("block without the namespace guard: " + lines[0])
+        for line in lines:
+            if re.search(r"(?:-n|--namespace|namespace)[ =]+\"?" + LIVE, line):
+                found.append("the live namespace on a line: " + line)
+            if re.search(r"\bdelete\b", line) and re.search(LIVE, line):
+                found.append("delete with a literal live name: " + line)
+            if "delete namespace" in line and '"$NS"' not in line:
+                found.append("delete namespace without the variable: " + line)
+            if re.search(r"(?<![\w-])(echo|cat)\s", line) and re.search(r"(?i)token", line):
+                found.append("echo or cat of a token: " + line)
+            if "--from-env-file" in line:
+                found.append("from-env-file: " + line)
+            if re.search(r"get secret\b.*(-o|--output)[ =]*(yaml|json)\b", line) and not re.search(r"(-o|--output)[ =]*(yaml|json)\b.*[|>]", line):
+                found.append("secret in full to a terminal: " + line)
+            if re.search(r"\bkubectl\b.*\b(apply|create)\b.* -f\b", line) and "namespace" not in line.split(" -f")[0].split("kubectl", 1)[1].split()[:2] and ' -n "$NS"' not in line:
+                found.append("apply or create -f without the namespace: " + line)
+            if "rm -rf" in line and not re.search(r'rm -rf "\$\{\w+:\?\}"', line):
+                found.append("rm -rf without a guarded path: " + line)
+    return found
+
+
+class RunbookSweep(unittest.TestCase):
+    def setUp(self):
+        with open(DOCS, encoding="utf-8") as f:
+            self.doc = f.read()
+        self.whole = self.doc.split("\n## A probe namespace\n", 1)[1].split("\n## ", 1)[0]
+
+    def test_the_runbook_has_no_live_cluster_risk(self):
+        self.assertEqual(runbook_shapes(self.whole), [])
+        self.assertGreaterEqual(len(code_blocks(self.whole)), 6)
+
+    def test_every_block_with_kubectl_starts_with_the_guard(self):
+        for block in code_blocks(self.whole):
+            if "kubectl" in block:
+                self.assertIn(GUARD, block.split("\n")[0])
+        self.assertIn('NS=cwp ; : "${NS:?}" ; [ "$NS" != cw ] || exit 1', code_blocks(self.whole)[0])
+        self.assertLess(code_blocks(self.whole)[0].index("kubectl config current-context"), code_blocks(self.whole)[0].index("kubectl create -n"))
+
+    def test_the_scan_sees_each_new_shape(self):
+        guard = GUARD + ' ; [ "$NS" != cw ] || exit 1\n'
+        samples = {
+            "dash n cw": guard + "kubectl -n cw get pods",
+            "namespace cw": guard + "kubectl get namespace cw",
+            "delete literal": guard + "kubectl delete secret cw",
+            "delete namespace literal": guard + "kubectl delete namespace cwp",
+            "cat token": guard + "kubectl get nodes\ncat TOKEN_FILE",
+            "echo token": guard + "kubectl get nodes\necho $TOKEN",
+            "env file": guard + "kubectl create secret generic x --from-env-file=F",
+            "yaml terminal": guard + 'kubectl -n "$NS" get secret x -o yaml',
+            "json terminal": guard + 'kubectl -n "$NS" get secret x -o json',
+            "create without namespace": guard + "kubectl create -f cwp.yaml",
+            "apply without namespace": guard + "kubectl apply --dry-run=server -f cwp.yaml",
+            "unguarded rm": guard + "kubectl get nodes\nrm -rf PROBE_CONFIG_DIR",
+            "no guard": 'kubectl -n "$NS" get nodes',
+        }
+        for name, text in samples.items():
+            self.assertEqual(len(runbook_shapes("```text\n" + text + "\n```")), 1, name)
+        good = guard + 'kubectl -n "$NS" get secret x -o json | python3 -c pass\nkubectl delete namespace "$NS"\nrm -rf "${DIR:?}"\nkubectl create -n "$NS" -f cwp.yaml'
+        self.assertEqual(runbook_shapes("```text\n" + good + "\n```"), [])
+
+    def test_a_runbook_with_a_planted_shape_fails_the_sweep(self):
+        plants = {
+            "-n cw": ('kubectl -n "$NS" get secret cloud-hub-registry cloud-hub-pw', "kubectl -n cw get secret cloud-hub-registry cloud-hub-pw"),
+            "delete literal": ('kubectl delete namespace "$NS"', "kubectl delete namespace cw"),
+            "cat token": ("rm -f TOKEN_FILE\n", "cat TOKEN_FILE\nrm -f TOKEN_FILE\n"),
+            "from-env-file": ('create secret generic cloud-hub-pw', "create secret generic cloud-hub-pw --from-env-file=F"),
+            "terminal secret": (" -o json | python3", " -o json\npython3"),
+            "create without namespace": ('kubectl create -n "$NS" -f cwp.yaml', "kubectl create -f cwp.yaml"),
+            "unguarded rm": ('rm -rf "${PROBE_CONFIG_DIR:?}"', "rm -rf PROBE_CONFIG_DIR"),
+        }
+        for name, (old, new) in plants.items():
+            mutant = self.whole.replace(old, new, 1)
+            self.assertNotEqual(mutant, self.whole, name)   # the mutation is applied
+            self.assertNotEqual(runbook_shapes(mutant), [], name)
+        self.assertEqual(len(plants), 7)
 
 
 class Chained(unittest.TestCase):
