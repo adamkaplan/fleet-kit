@@ -617,10 +617,12 @@ class RelayLoop:
     CONCURRENCY RULE: the Engine is not thread-safe (discovery, the V2Reads caches, per-pass counters, _last). This thread
     never touches the pass thread's engine: `engine_factory` builds the loop's OWN Engine (same config and state dir, own
     caches), in the thread that starts the loop. What the two engines share is only files, each under its own lock (the
-    ledger flock, the audit and report-rider file locks). Without a factory (tests only) the given engine is used."""
+    ledger flock, the audit and report-rider file locks). The factory is REQUIRED (ValueError at start); a test that wants sharing says so: engine_factory=lambda: engine."""
 
     def __init__(self, engine, host, runner, now, environ=os.environ, cadence=None, sleep=None, engine_factory=None):
-        self.engine = engine_factory() if engine_factory is not None else engine
+        if engine_factory is None:
+            raise ValueError("the relay loop needs an engine factory (its own Engine); sharing the pass engine must be explicit: engine_factory=lambda: engine")
+        self.engine = engine_factory()
         self.args = (self.engine, host, runner, now, environ)
         self.cadence = CADENCE if cadence is None else cadence
         self.stop_flag = threading.Event()
@@ -648,7 +650,9 @@ class RelayLoop:
 
     def stop(self, join=2.0):
         """Stops the loop and waits `join` s. A pull can last about 90 s: if the thread is still alive an audit line says so, and
-        the late thread can still write (a ledger append is flock-atomic; a pass cut by its deadline posts nothing)."""
+        the late thread can still write (a ledger append is flock-atomic; a pass cut by its deadline posts nothing).
+        Nothing needs closing: the second engine holds no open file or socket (AuditLog opens, appends and closes per call; V2Client and
+        GhAccounts only run subprocesses per call), so stopping the thread is the whole teardown."""
         self.stop_flag.set()
         if self.thread is not None:
             self.thread.join(join)
@@ -666,6 +670,8 @@ def start_loop(engine, host, runner, now, environ=os.environ, **kw):
         return None
     if host is None:
         raise ValueError("the relay loop needs the switchboard module as its host")
+    if kw.get("engine_factory") is None:
+        raise ValueError("the relay loop needs an engine factory (its own Engine) when a hub is configured")
     loop = RelayLoop(engine, host, runner, now, environ, **kw)
     loop.thread = threading.Thread(target=loop.run, name="relay-loop", daemon=True)
     loop.thread.start()

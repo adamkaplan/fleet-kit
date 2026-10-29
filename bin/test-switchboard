@@ -2925,7 +2925,7 @@ class TestDaemonRelayLoop(Base):
         saved = {k: _os.environ.get(k) for k in env}
         _os.environ.update(env)
         try:
-            self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3), 3)   # returns while the relay is still blocked
+            self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3, relay_engine=lambda: self.world.engine), 3)   # returns while the relay is still blocked
             self.assertTrue(entered.wait(30))   # the relay did run, and was still blocked while the passes completed
         finally:
             gate.set()
@@ -2989,7 +2989,7 @@ class TestDaemonRelayLoop(Base):
             pass_end.append(clock[0])
         engine.run_pass = long_pass
         try:
-            sb.run_daemon(engine, self.world.state, 5, lambda sock, t: None, passes=1)
+            sb.run_daemon(engine, self.world.state, 5, lambda sock, t: None, passes=1, relay_engine=lambda: engine)
         finally:
             relay.pass_if_configured, relay.CADENCE = orig_pull, orig_cadence
             for k, v in saved.items():
@@ -3009,7 +3009,7 @@ class TestDaemonRelayLoop(Base):
         orig_run = relay.RelayLoop.run
         relay.RelayLoop.run = lambda loop: started.append(1)
         try:
-            sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3)
+            sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3, relay_engine=lambda: self.world.engine)
             relay.RelayLoop.run = orig_run
             self.assertEqual(started, [])   # no relay thread ran
             via_daemon = self.world.audit()
@@ -3045,7 +3045,7 @@ class TestDaemonRelayLoop(Base):
             raise RuntimeError("no relay today")
         relay.start_loop = boom
         self.addCleanup(setattr, relay, "start_loop", orig)
-        self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3), 3)
+        self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3, relay_engine=lambda: self.world.engine), 3)
         failures = [e for e in self.world.audit() if e["event"] == "error" and e["detail"].get("step") == "pass"]
         self.assertEqual(len(failures), 1)
 
@@ -3057,9 +3057,16 @@ class TestDaemonRelayLoop(Base):
         relay.start_loop = lambda *a, **k: (loops.append(orig_start(*a, **k)), loops[-1])[1]
         self.addCleanup(setattr, relay, "pass_if_configured", orig_pull)
         self.addCleanup(setattr, relay, "start_loop", orig_start)
-        sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=2)
+        sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=2, relay_engine=lambda: self.world.engine)
         self.assertEqual(len(loops), 1)
         self.assertFalse(loops[0].thread.is_alive())   # stop() ran in the finally and the loop (a 5 s wait) ended at once
+
+    def test_a_hub_without_a_relay_engine_is_audited_and_the_passes_go_on(self):
+        self.relay_env()
+        self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=2), 2)
+        failures = [e for e in self.world.audit() if e["event"] == "error" and e["detail"].get("step") == "pass"]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("engine factory", json.dumps(failures[0]["detail"]))
 
     def relayed_report_during_a_pass(self, relay_engine):
         """The pass thread discovers and holds its result while the relay thread relays a `report` (the real SwitchboardBackend.report on the
@@ -3107,7 +3114,7 @@ class TestDaemonRelayLoop(Base):
         self.assertEqual(len(riders), 1)   # and the rider was recorded
 
     def test_mutant_sharing_the_engine_again_is_caught(self):
-        intact, riders, errors = self.relayed_report_during_a_pass(None)   # the relay thread runs on the pass thread's engine
+        intact, riders, errors = self.relayed_report_during_a_pass(lambda: self.world.engine)   # explicit sharing: the relay thread runs on the pass thread's engine
         self.assertEqual(errors, [])
         self.assertFalse(intact)   # the relay's discover replaced the pass's discovery: the guard above fails
 
@@ -9385,6 +9392,13 @@ class TestGithubDaemon(Base):
         super().setUp()
         self.world = World(self, agents=("platform",))
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+
+    def test_the_relay_engine_does_not_own_the_v2_link_file(self):
+        daemon = sb.build_engine(self.world.route, self.world.clock.now, "daemon")[0]
+        relay = sb.build_engine(self.world.route, self.world.clock.now, "daemon", owns_link=False)[0]
+        self.assertIsNotNone(daemon.v2.state_dir)   # the daemon's own client writes v2-link.json
+        self.assertIsNone(relay.v2.state_dir)   # the relay thread's does not: one writer, no flapping
+        self.assertEqual(relay.actor, "daemon")   # its audit lines are still the daemon's
 
     def test_no_repo_means_a_hub_with_no_watches_that_opens_and_starts_nothing(self):
         # PR 15: the watched set is derived on every pass, so the hub always exists; with nothing to watch it idles

@@ -1465,7 +1465,7 @@ class RelayLoopCadence(unittest.TestCase):
 
     def test_a_hub_without_a_host_module_fails_at_start(self):
         with self.assertRaises(ValueError):
-            relay.start_loop(None, None, None, None, environ=self.ENV)
+            relay.start_loop(None, None, None, None, environ=self.ENV, engine_factory=lambda: None)
 
     def test_cadence_is_well_under_the_hub_wait(self):
         self.assertLessEqual(relay.CADENCE, 5.0)
@@ -1474,7 +1474,7 @@ class RelayLoopCadence(unittest.TestCase):
     def ticking(self, ticks, **kw):
         """A loop whose sleep is injected: it counts ticks and stops the loop at `ticks`. No wall time is read."""
         sleeps = []
-        loop = relay.RelayLoop(types.SimpleNamespace(), None, None, None, environ=self.ENV, cadence=0.02, **kw)
+        loop = relay.RelayLoop(None, None, None, None, environ=self.ENV, cadence=0.02, engine_factory=lambda: types.SimpleNamespace(), **kw)
 
         def sleep(seconds):
             sleeps.append(seconds)
@@ -1499,7 +1499,7 @@ class RelayLoopCadence(unittest.TestCase):
             counter.append(1)
             if len(counter) >= 6:
                 loop.stop_flag.set()
-        loop = relay.start_loop(None, object(), None, None, environ=self.ENV, cadence=0.0, sleep=sleep)
+        loop = relay.start_loop(None, object(), None, None, environ=self.ENV, cadence=0.0, sleep=sleep, engine_factory=lambda: None)
         loop.thread.join(30)   # a generous bound, not a measurement: the loop ends by its own tick count
         self.assertFalse(loop.thread.is_alive())
         self.assertEqual(threads, {loop.thread.ident})
@@ -1509,7 +1509,7 @@ class RelayLoopCadence(unittest.TestCase):
         gate, entered = threading.Event(), threading.Event()
         notes = []
         relay.pass_if_configured = lambda *a: (entered.set(), gate.wait(30))
-        loop = relay.start_loop(types.SimpleNamespace(_note=lambda *a: notes.append(a)), object(), None, None, environ=self.ENV, cadence=0.02)
+        loop = relay.start_loop(None, object(), None, None, environ=self.ENV, cadence=0.02, engine_factory=lambda: types.SimpleNamespace(_note=lambda *a: notes.append(a)))
         self.assertTrue(entered.wait(30))
         loop.stop(join=0.01)   # the caller returns although the thread is stuck, and says so in the audit
         self.assertTrue(loop.thread.is_alive())
@@ -1521,7 +1521,7 @@ class RelayLoopCadence(unittest.TestCase):
     def test_a_stop_that_joins_leaves_no_stop_timeout_line(self):
         notes = []
         relay.pass_if_configured = lambda *a: None
-        loop = relay.start_loop(types.SimpleNamespace(_note=lambda *a: notes.append(a)), object(), None, None, environ=self.ENV, cadence=0.0)
+        loop = relay.start_loop(None, object(), None, None, environ=self.ENV, cadence=0.0, engine_factory=lambda: types.SimpleNamespace(_note=lambda *a: notes.append(a)))
         loop.stop(join=30)
         self.assertEqual(notes, [])
 
@@ -1543,7 +1543,7 @@ class RelayLoopCadence(unittest.TestCase):
     def test_mutant_loop_without_the_guard_dies_on_the_first_failure(self):
         mod = load_backend_module("            except Exception as err:\n                self._record_failure(err)\n", "            except ZeroDivisionError as err:\n                self._record_failure(err)\n")
         mod.pass_if_configured = lambda *a: (_ for _ in ()).throw(RuntimeError("x"))
-        loop = mod.RelayLoop(types.SimpleNamespace(), None, None, None, environ=self.ENV, cadence=0.0, sleep=lambda s: None)
+        loop = mod.RelayLoop(None, None, None, None, environ=self.ENV, cadence=0.0, sleep=lambda s: None, engine_factory=lambda: types.SimpleNamespace())
         with self.assertRaises(RuntimeError):
             loop.run()
 
@@ -1559,7 +1559,20 @@ class RelayLoopCadence(unittest.TestCase):
         shared, own = object(), object()
         loop = relay.RelayLoop(shared, None, None, None, environ=self.ENV, engine_factory=lambda: own)
         self.assertIs(loop.args[0], own)
-        self.assertIs(relay.RelayLoop(shared, None, None, None, environ=self.ENV).args[0], shared)
+        self.assertIs(relay.RelayLoop(shared, None, None, None, environ=self.ENV, engine_factory=lambda: shared).args[0], shared)   # sharing is explicit
+
+    def test_a_hub_without_an_engine_factory_fails_at_start(self):
+        with self.assertRaises(ValueError):
+            relay.start_loop(object(), object(), None, None, environ=self.ENV)
+        with self.assertRaises(ValueError):
+            relay.RelayLoop(object(), object(), None, None, environ=self.ENV)
+
+    def test_string_mutant_without_the_factory_use_is_caught(self):
+        mod = load_backend_module("        self.engine = engine_factory()\n", "        self.engine = engine\n")
+        shared, own = object(), object()
+        loop = mod.RelayLoop(shared, None, None, None, environ=self.ENV, engine_factory=lambda: own)
+        with self.assertRaises(AssertionError):   # the guard of test_the_loop_gets_its_own_engine_from_the_factory
+            self.assertIs(loop.args[0], own)
 
 
 class TwoLoopsTrace(Fixture):

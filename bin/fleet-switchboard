@@ -3769,7 +3769,7 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
     once the lock is held, with this pid: `status` reads it to say what the DAEMON has, not what the shell
     that runs `status` has.
     `relay_engine` builds the relay thread's OWN engine (the Engine is not thread-safe: the relay thread must not share the
-    pass thread's); None means it shares `engine` (tests only; `run` always passes one).
+    pass thread's); REQUIRED when a hub is configured (the relay then fails to start and is audited); a test that shares says so: relay_engine=lambda: engine.
     """
     wait = wait or wait_for_poke
     with single_instance(state_dir):
@@ -13738,13 +13738,13 @@ def identify_caller(herdr, v2, environ):
     return name
 
 
-def build_engine(runner, now, actor, writable=True, socket_call=None):
+def build_engine(runner, now, actor, writable=True, socket_call=None, owns_link=True):
     """The engine over the configured clients. Refuses an unconfigured v2 or a bad fault name."""
     config = load_runnable_config()
     active_faults()
     state = ensure_state_dir()
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
-    if actor == "daemon":
+    if actor == "daemon" and owns_link:   # the relay thread's engine does not (one writer of v2-link.json)
         v2.state_dir = state   # the daemon's link is what `status` reports
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
@@ -13804,7 +13804,7 @@ def cmd_run(args, runner, now, wait):
         run_daemon(engine, state, args.poll or config["poll_seconds"], wait,
                    record=dict(daemon_record(config), config_loaded_at=iso(now())), watch=watch,
                    on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv),
-                   relay_engine=lambda: build_engine(runner, now, "daemon")[0])   # the relay thread's own engine
+                   relay_engine=lambda: build_engine(runner, now, "daemon", owns_link=False)[0])   # the relay thread's own engine
     except KeyboardInterrupt:
         return EXIT_OK
     finally:
