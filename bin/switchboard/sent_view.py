@@ -9,7 +9,7 @@
 SENT_LIMIT_MAX = 20            # messages listed at most
 SENT_AUDIT_TAIL = 4 << 20      # bytes of the end of audit.jsonl read; a message older than that shows its delivered time as `unknown`
 SENT_NOT_YET, SENT_UNKNOWN = "not yet", "unknown"
-SENT_NOTE = ("picked up = the start of the recipient's first turn after the delivery began; it is a turn start, "
+SENT_NOTE = ("picked up = the start of the recipient's first turn after the delivery; it is a turn start, "
              "not proof that the text was understood.")
 
 
@@ -84,12 +84,12 @@ def sent_pickup(engine, session, delivered, now, cache):
 def sent_rows(engine, sender, limit, now):
     """The sender's own messages, newest first, at most `limit`: [{recipient, sent, delivered, picked_up}] where a time is epoch seconds or one of the words.
     ONLY keys that start `send:<sender>:` are listed."""
-    prefix = "send:%s:" % sender
+    wanted = re.compile("send:%s:[0-9a-f]{16}" % re.escape(sender))   # a sender `a:b` is not matched by the keys of a sender `a`
     sessions, unknown = SentLedger(engine.state_dir).load()
     mine = []
     for table in (sessions, unknown):
         for session, entries in table.items():
-            mine += [(at, key, session) for key, at in entries.items() if key.startswith(prefix)]
+            mine += [(at, key, session) for key, at in entries.items() if wanted.fullmatch(key)]
     mine.sort(key=lambda row: (-row[0], row[1]))
     deliveries = sent_deliveries(engine.state_dir)
     cache, rows = {}, []
@@ -125,7 +125,10 @@ def cmd_sent(args, runner, now):
         sender = args.sender
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
-    for row in sent_rows(engine, sender, limit, now()):
+    rows = sent_rows(engine, sender, limit, now())
+    if not rows:
+        print("no messages")
+    for row in rows:
         print("%s  sent %s  delivered %s  picked up %s" % (row["recipient"], sent_text(row["sent"]), sent_text(row["delivered"]), sent_text(row["picked_up"])))
     print(SENT_NOTE)
     return EXIT_OK

@@ -82807,7 +82807,7 @@ class TestSentView(Base):
         return self.main("sent", "--from", sender, *argv)
 
     def lines(self, out):
-        return [line for line in out.splitlines() if line != sb.SENT_NOTE]
+        return [line for line in out.splitlines() if line not in (sb.SENT_NOTE, "no messages")]
 
     def test_s2_the_newest_twenty_of_twenty_five_each_with_its_three_fields(self):
         for n in range(25):
@@ -82930,7 +82930,7 @@ class TestSentView(Base):
     def test_s8_a_listing_that_ignores_the_sender_fails_the_two_sender_test(self):
         self.test_s3_a_message_of_another_sender_is_never_listed()
         self.setUp()
-        with self.mutant("sent_rows", "key.startswith(prefix)", 'key.startswith("send:")'):
+        with self.mutant("sent_rows", "wanted.fullmatch(key)", 'key.startswith("send:")'):
             with self.assertRaises(AssertionError):
                 self.test_s3_a_message_of_another_sender_is_never_listed()
 
@@ -82946,6 +82946,24 @@ class TestSentView(Base):
         with self.mutant("sent_pickup", "min(later) if later", "max(later) if later"):
             with self.assertRaises(AssertionError):
                 self.test_s5_picked_up_is_the_first_turn_at_or_after_the_delivery()
+
+    def test_an_empty_ledger_prints_no_messages_and_the_note(self):
+        code, out, err = self.run_sent()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), ["no messages", sb.SENT_NOTE])
+
+    def test_a_sender_with_a_colon_is_matched_whole_and_a_prefix_sender_is_not(self):
+        self.message("a:b", "platform", self.base - 50, delivered=self.base - 49)
+        self.message("a", "platform", self.base - 40, delivered=self.base - 39)
+        self.assertEqual(len(self.lines(self.run_sent(sender="a:b")[1])), 1)
+        self.assertEqual(len(self.lines(self.run_sent(sender="a")[1])), 1)
+        self.ledger["send:a:b:zzzz"] = (self.world.sessions["platform"], self.base - 30)   # not `<16 hex>`: no sender's
+        self.assertEqual(len(self.lines(self.run_sent(sender="a")[1])), 1)
+
+    def test_the_documentation_names_the_read_cap_and_the_failed_delivery(self):
+        text = " ".join((REPO / "docs" / "switchboard.md").read_text().split())
+        for phrase in ("8th recipient", "delivered unknown", "ok=false"):
+            self.assertIn(phrase, text)
 
     def test_the_documentation_says_what_picked_up_means(self):
         text = " ".join((REPO / "docs" / "switchboard.md").read_text().split())
