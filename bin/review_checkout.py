@@ -32,6 +32,7 @@ import zlib
 MARKER = ".fleet-review-checkout"
 MARKER_TOOL = "fleet-switchboard review checkout"
 PARENT = ".review"
+LAWS_MISSING_FILE = "laws-missing.txt"
 DIFFS_DIR = "diffs"            # #1047: `diffs/<path>.diff`, one per changed file
 MATRIX_FILE = "impact-matrix.txt"   # #1047: the impact matrix words, for a reviewer that cannot run a command
 MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -356,6 +357,61 @@ def _diff_text(path, old, new, late=False):
     return out
 
 
+NOT_WHOLE_MAX = 200     # the files the notice names; the rest are counted
+
+
+def _not_whole(old, new, late):
+    """(longest side in lines, why) of a changed file whose diff `_diff_text` does not hold whole, or None. The same tests, in the same order."""
+    counts = [len(d.splitlines()) for d in (old, new) if d is not None]
+    lines = max(counts) if counts else 0
+    if (old is not None and b"\x00" in old) or (new is not None and b"\x00" in new):
+        return lines, "binary"
+    if counts and max(counts) > MAX_DIFF_LINES:
+        return lines, "line bound %d" % MAX_DIFF_LINES
+    if late:
+        return lines, "time bound %d seconds" % DIFF_SECONDS
+    return None
+
+
+def _not_whole_line(path, lines, why):
+    return "%s: %d lines, %s: the diff is not whole\n" % (_shown(path), lines, why)
+
+
+def _not_whole_block(cut):
+    """The notice at the top of pr.diff: one line for each of the first NOT_WHOLE_MAX files, then how many more; empty when nothing is cut."""
+    if not cut:
+        return ""
+    out = ["review checkout: %d changed file(s) whose diff is not whole (the bounds are unchanged):\n" % len(cut)]
+    out += ["  " + _not_whole_line(*c) for c in cut[:NOT_WHOLE_MAX]]
+    if len(cut) > NOT_WHOLE_MAX:
+        out.append("  and %d more not whole, not named here (the marker field not_whole holds the count)\n" % (len(cut) - NOT_WHOLE_MAX))
+    return "".join(out)
+
+
+def _write_laws(root, laws, touched, used, limits, base_count):
+    """Write the base commit's law files under base/ (same guard and bounds as every base copy; a touched file's merge-base copy is never
+    overwritten). `laws` is ({name: bytes}, missing); `used` the bytes held so far, `base_count` the files in base/. Returns the missing list."""
+    files, missing = laws[0], list(laws[1])
+    for name in sorted(files):
+        data = files[name]
+        why = bad_path(name)
+        if why:
+            missing.append("%s (refused: %s)" % (_shown(name), why))
+        elif name in touched:
+            continue   # the pull request changes it: base/ holds the merge base's copy
+        elif len(data) > limits["file"] or used + len(data) > limits["total"] or base_count + 1 > limits["files"]:
+            missing.append("%s (over a size or count bound)" % _shown(name))
+        else:
+            try:
+                write_file(os.path.join(root, "base"), name, data)
+            except Unsafe as err:
+                missing.append("%s (%s)" % (_shown(name), err))
+                continue
+            used += len(data)
+            base_count += 1
+    return missing
+
+
 def make_readonly(root):
     """Bottom-up: files 0444 (the executable bit is not kept: a reviewer reads), directories 0555, the root last."""
     for current, dirs, names in os.walk(root, topdown=False, followlinks=False):
@@ -370,7 +426,7 @@ def make_readonly(root):
     os.chmod(root, 0o555)
 
 
-def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text: None, archive=None, extra_files=None, sparse=False, result=None):
+def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text: None, archive=None, extra_files=None, sparse=False, result=None, law_files=None):
     """Materialise PR `repo#number` at commit `head` (read ONCE by the caller; every fetch uses it) under `cwd`, diffed against merge base of
     `base`. With `sparse` only the files the pull request changes and the files directly beside them are written (see select_sparse); `result`, a dict, then gets the counts. Returns the directory path. On any failure everything this call made is removed and the exception (Unsafe, OverBound, Problem) is raised."""
     limits = dict({"file": MAX_FILE_BYTES, "files": MAX_FILES, "total": MAX_TOTAL_BYTES}, **(limits or {}))
@@ -474,6 +530,7 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
                 info["written"], info["not_written"], SPARSE_FILE)
             diff.append(head_line)
             written += len(head_line.encode())
+        cut_files = []   # (path, lines, why) of each changed file whose diff is not whole
         for path in touched:
             if time.monotonic() - started > DEADLINE_SECONDS:
                 raise OverBound("the checkout took more than %d seconds (the time limit)" % DEADLINE_SECONDS)
@@ -481,12 +538,18 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
             new = head_text(path) if path in head_files else None
             if old is not None:
                 write_file(os.path.join(root, "base"), path, old)
-            piece = _diff_text(path, old, new, late=time.monotonic() - diff_started > DIFF_SECONDS)
+            late = time.monotonic() - diff_started > DIFF_SECONDS
+            piece = _diff_text(path, old, new, late=late)
+            partial = _not_whole(old, new, late)
+            if partial:
+                cut_files.append((path,) + partial)
+                piece = "review checkout: " + _not_whole_line(path, *partial) + piece
             written += len(piece.encode())
             if written > MAX_DIFF_BYTES:
                 raise OverBound("the diff is over the limit of %d bytes" % MAX_DIFF_BYTES)
             diff.append(piece)
             write_file(root, DIFFS_DIR + "/" + path + ".diff", piece.encode())   # #1047: one diff per changed file, so a reader takes each whole, chunk by chunk
+        diff.insert(0, _not_whole_block(cut_files))
         write_file(root, "pr.diff", "".join(diff).encode())
         if sparse:
             write_file(root, SPARSE_FILE, ("sparse checkout: %d files written, %d files of the head tree not written\n" % (info["written"], info["not_written"])
@@ -496,10 +559,20 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
             write_file(root, name, text.encode())
         fields = {"tool": MARKER_TOOL, "pr": "%s#%d" % (repo, number), "head": head, "base": base,
                   "merge_base": merge_base, "merge_base_fallback": fallback, "touched": len(touched),
-                  "from_blob_api": from_blob, "altered_in_archive": sorted(altered)}
+                  "from_blob_api": from_blob, "altered_in_archive": sorted(altered), "not_whole": len(cut_files)}
+        if law_files is not None:
+            law_missing = _write_laws(root, law_files, set(touched), total, limits, sum(1 for p in touched if p in base_files))
+            fields["laws_missing"] = law_missing
+            if law_missing:
+                write_file(root, LAWS_MISSING_FILE, "".join("%s\n" % m for m in law_missing).encode())
+                notify("the review law files not provided in base/ (see %s): %s" % (LAWS_MISSING_FILE, ", ".join(law_missing)))
         if sparse:
             fields.update({"sparse": True, "sparse_written": info["written"], "sparse_not_written": info["not_written"], "sparse_cut_directories": cut})
         _rewrite_marker(root, _marker_bytes(fields))
+        for c in cut_files[:NOT_WHOLE_MAX]:
+            notify(_not_whole_line(*c).rstrip("\n"))
+        if len(cut_files) > NOT_WHOLE_MAX:
+            notify("%d more changed files not whole, not named (the marker field not_whole holds the count)" % (len(cut_files) - NOT_WHOLE_MAX))
         for path, why in skipped:
             notify("skipped %s: %s (never followed or created)" % (_shown(path), why))
         make_readonly(root)

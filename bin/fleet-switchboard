@@ -19947,6 +19947,22 @@ def review_laws_text(engine, config, runner, now, repo, base_sha):
     return "\n\n".join(parts), missing
 
 
+def review_law_files(config, runner, now, repo, base_sha):
+    """The review law files of `repo` at `base_sha`, one by one, for `review checkout`: ({name: bytes}, missing names). `review_laws_text` is not changed."""
+    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    files, missing = {}, []
+    for name in REVIEW_LAW_FILES:
+        try:
+            got = reader._api("repos/%s/contents/%s?ref=%s" % (repo, name, base_sha), repo)
+            files[name] = base64.b64decode(got["content"]) if got.get("encoding") == "base64" else None
+        except (IntentError, AttributeError, KeyError, TypeError, ValueError):
+            files[name] = None
+        if files[name] is None:
+            del files[name]
+            missing.append(name)
+    return files, missing
+
+
 def local_review_overlay(repo):
     """The operator's own overlay for `repo`, if one exists: $XDG_CONFIG_HOME/fleet-switchboard/review-overlay/<owner>__<repo>.md (capped)."""
     path = config_path().parent / "review-overlay" / (repo.replace("/", "__").lower() + ".md")
@@ -20684,7 +20700,7 @@ def cmd_review_checkout(args, runner, now):
                 matrix_text = None
                 sys.stderr.write("%s: review checkout: the impact matrix cannot be read, so impact-matrix.txt is not written to the checkout: %s\n" % (PROG, _one_line(str(err), 160)))
             sparse_result = {}
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, law_files=review_law_files(config, runner, now, repo, base), notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
