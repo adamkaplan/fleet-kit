@@ -436,6 +436,40 @@ class Lows(Fakes, Base):
                         self.check_clean(check(dirty(name)))
                 self.assertTrue(applied, "the mutation was not applied")
 
+    def test_s14_a_non_ascii_error_note_stays_intact_outside_the_status_rows(self):
+        module = self.cloud()
+        note = "caf\u00e9 \u4e16\u754c failed"
+        shown = module._reason(1, note)
+        self.assertIn(note, shown)
+        self.assertEqual(shown, "exit 1: " + note)
+        self.assertFalse([c for c in shown if ord(c) < 32])
+        self.assertIn("boom", module._reason(1, "boom"))
+
+    def test_s14_the_same_text_in_a_status_row_is_checked_by_the_strict_kind(self):
+        shown = self.one_stderr("boom, nothing else")
+        self.assertIn("boom, nothing else", shown[0])
+        shown = self.one_stderr("caf\u00e9 \u4e16\u754c")
+        self.assertNotIn("caf\u00e9", shown[0] + shown[1])
+
+    def test_s14_a_mutant_that_applies_the_strict_kind_to_the_create_note_fails(self):
+        module = self.cloud()
+        applied = []
+
+        def strict(code, note):
+            applied.append(True)
+            return "exit %d: %s" % (code, module._safe(note, "?", "text"))
+        with mock.patch.object(module, "_reason", strict):
+            with self.assertRaises(AssertionError):
+                self.test_s14_a_non_ascii_error_note_stays_intact_outside_the_status_rows()
+        self.assertTrue(applied, "the mutation was not applied")
+
+    def test_s14_a_value_of_a_shape_the_local_list_lacks_is_replaced_through_the_shared_table(self):
+        module = self.cloud()
+        for text in ("Authorization: Bearer " + "aB3dE5gH7jK9mN1pQ3rS5tU7vW9xY1", "password=hunter2xyz"):
+            self.assertEqual(module._safe(text, "?", "text"), "?", text)
+            self.assertNotIn(text.split("=")[-1].split()[-1], "".join(self.one_stderr(text)))
+        self.assertEqual(module._safe("a plain reason", "?", "text"), "a plain reason")
+
     def check_cost_shows_a_question_mark(self, value):
         module = self.cloud()
         self.names = self.live(1)
@@ -481,7 +515,8 @@ class TestDocs(unittest.TestCase):
                        "status --lane leaves out a record that has a problem (it has no recorded boss)",
                        "for a duplicate worker name in the launcher's list the last record wins",
                        "a runtime id or path is checked by its character set and length, not by its shape",
-                       "the tunnel process of an abandoned probe lives until the status process exits"):
+                       "the tunnel process of an abandoned probe lives until its own 120-second timeout",
+                       "The launcher's status for all workers has one total deadline of 40 seconds; a pod not read by then is shown with its idle time unknown and the rest of its record"):
             self.assertEqual(flat.count(wanted), 1, wanted)
 
 

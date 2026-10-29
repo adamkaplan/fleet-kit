@@ -97,6 +97,38 @@ class LauncherRecords(launcher_tests.Base):
             records = self.ask(launcher)
         self.assertEqual([r["idle_since"] for r in records], [None, None])
 
+    def check_total_deadline(self, pod_seconds, total_seconds):
+        """S13 scaled: 300 pods whose activity read hangs; the whole answer comes within the total deadline plus one second."""
+        pods = self.pods(300)
+        self.SLEEP = 30
+        launcher = self.launcher(pods)
+        with mock.patch.object(self.cw, "STATUS_POD_SECONDS", pod_seconds), mock.patch.object(self.cw, "STATUS_TOTAL_SECONDS", total_seconds):
+            started = time.monotonic()
+            records = self.ask(launcher)
+            took = time.monotonic() - started
+        print("launcher 300 hanging pods took %.2f s" % took, file=sys.stderr)
+        self.assertLess(took, 2 + 1, took)
+        self.assertEqual([r["worker"] for r in records], ["w%d" % i for i in range(300)])
+        unknown = [r for r in records if r["idle_since"] is None and r["deadlines"]["idle"] is None]
+        self.assertGreaterEqual(len(unknown), 1)
+        for r, p in zip(records, pods):
+            self.assertEqual(list(r), ["worker", "runtime_id", "phase", "idle_since", "deadlines", "cost_estimate_usd"])
+            self.assertEqual(r["runtime_id"], "pod/" + p["metadata"]["name"])
+            self.assertEqual(r["phase"], "Running")
+            self.assertEqual(r["deadlines"]["hard"], p["metadata"]["annotations"]["cw/hard-deadline"])
+        return records
+
+    def test_s13_three_hundred_hanging_pods_are_answered_within_the_total_deadline(self):
+        records = self.check_total_deadline(0.2, 2)
+        self.assertEqual(len(records), 300)
+
+    def test_s13_a_mutant_without_the_total_deadline_fails(self):
+        applied = []
+        with self.assertRaises(AssertionError):
+            applied.append(True)   # the mutation: each pod bounded only (the total deadline is far away)
+            self.check_total_deadline(0.08, 10 ** 6)
+        self.assertTrue(applied, "the mutation was not applied")
+
     def test_s10_the_named_worker_form_is_one_serial_record_as_before(self):
         pods = self.pods(1)
         launcher = self.launcher(pods)

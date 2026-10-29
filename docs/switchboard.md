@@ -578,11 +578,11 @@ Each live cloud worker then has one line: its runtime id, its phase, about what 
 through a tunnel opened for that probe only, and when it stops. The launcher's `status` is read ONCE for all workers (not once per worker), and the
 probes run four at a time, each given up after 5 seconds; the probe stage has one deadline (30 seconds) after which the remaining workers are listed
 as not probed; the launcher read has its own bound (15 seconds plus one per record, at most 60), and the launcher answers a status for all workers four
-pods at a time, each pod's activity read given up after 5 seconds (that pod is then shown without its idle fields). The whole summary has one deadline
+pods at a time, each pod's activity read given up after 5 seconds (that pod is then shown without its idle fields). The launcher's status for all workers has one total deadline of 40 seconds; a pod not read by then is shown with its idle time unknown and the rest of its record. The whole summary has one deadline
 of at most 90 seconds: the read (60) plus the probe stage (30). A worker that is
 missing from that read, or whose probe fails, says so on its own line and never empties the others. Notes: status --lane leaves out a record that has a
 problem (it has no recorded boss); for a duplicate worker name in the launcher's list the last record wins; a runtime id or path is checked by its
-character set and length, not by its shape; the tunnel process of an abandoned probe lives until the status process exits. `status --lane NAME` shows only the cloud
+character set and length, not by its shape; the tunnel process of an abandoned probe lives until its own 120-second timeout. `status --lane NAME` shows only the cloud
 workers whose recorded boss is NAME; without the flag every cloud worker is shown.
 The read is bounded: the cluster snapshot step, the login included, is given 30 s; the
 launcher run is killed as a group at that bound. The line is never omitted and

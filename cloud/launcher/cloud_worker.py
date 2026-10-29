@@ -1252,6 +1252,8 @@ REGISTRY_KEYS = ("secrets.json", "agents.json")
 
 STATUS_WORKERS = 4       # pods whose record `status` (no worker name) reads at a time
 STATUS_POD_SECONDS = 5   # each pod's own bound for its record
+# One total deadline for the whole no-name read. Keep it BELOW the switchboard's call cap of 60 seconds, or that call ends first.
+STATUS_TOTAL_SECONDS = 40
 
 
 class Kube:
@@ -2330,7 +2332,9 @@ class Launcher:
     def _records_bounded(self, pods):
         """The records of ALL pods, STATUS_WORKERS at a time, each with its own bound of STATUS_POD_SECONDS; the order is the pods'. A pod whose
         record raises or runs over its bound is answered WITHOUT its activity (idle fields None). Each kubectl call is its own subprocess and
-        Kube keeps no per-call state (it only reads its env and its known-secrets set), so the threads share the one client safely."""
+        Kube keeps no per-call state (it only reads its env and its known-secrets set), so the threads share the one client safely.
+        ONE total deadline (STATUS_TOTAL_SECONDS) covers the whole read: a pod not read when it passes is answered WITHOUT its activity, in its place."""
+        deadline = time.monotonic() + STATUS_TOTAL_SECONDS
         def one(pod):
             box = []
 
@@ -2339,9 +2343,12 @@ class Launcher:
                     box.append(self.record(pod))
                 except BaseException:
                     box.append(None)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._record_with(pod, None)
             worker = threading.Thread(target=run, daemon=True)
             worker.start()
-            worker.join(STATUS_POD_SECONDS)
+            worker.join(min(STATUS_POD_SECONDS, remaining))
             return box[0] if box and box[0] is not None else self._record_with(pod, None)
         pool = futures.ThreadPoolExecutor(max_workers=STATUS_WORKERS)
         try:

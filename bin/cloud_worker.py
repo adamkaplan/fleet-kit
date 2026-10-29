@@ -721,7 +721,6 @@ def _restore_signals(old):
 
 
 def _reason(code, note):
-    note = _safe(note, "?", "text") if note else note   # the launcher's standard error is untrusted text: the ONE helper
     return "%s%s" % (EXIT_REASONS.get(code, "exit %d" % code), (": " + note) if note else "")
 
 
@@ -1594,6 +1593,15 @@ _KINDS = {"stamp": re.compile(r"[0-9TZ:.+-]{1,40}"), "path": re.compile(r"[A-Za-
 _SECRET_SHAPED = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|sk-[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{20,}")
 
 
+def _secret_shaped(value):
+    """True when `value` holds a credential shape: the local list, and the switchboard's shared redaction table (reached through the bound handle `H`,
+    never an import) when the module is bound to it."""
+    if _SECRET_SHAPED.search(value):
+        return True
+    redact = H.get("redact_command_text")
+    return bool(redact) and redact(value) != value
+
+
 def _safe(value, default="Unknown", kind=None):
     """THE ONE scrub of every free-text field a status row takes from the launcher's record or answer (a pool, a size, a phase, a worker name, a
     runtime id, a deadline, an error): the launcher's `safe_value` rule, applied again here (defence in depth). `kind` only widens the letters a
@@ -1602,7 +1610,7 @@ def _safe(value, default="Unknown", kind=None):
     if not value:
         return default
     if kind in _KINDS:
-        ok = isinstance(value, str) and _KINDS[kind].fullmatch(value) and not (kind == "text" and _SECRET_SHAPED.search(value))
+        ok = isinstance(value, str) and _KINDS[kind].fullmatch(value) and not (kind == "text" and _secret_shaped(value))
         return value if ok else "?"
     return _lib().safe_value(value)
 
