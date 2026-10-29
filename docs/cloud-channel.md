@@ -58,12 +58,17 @@ One document to set up, run and take down the cloud hub and the pod-side command
     being handled (the 40 context reads above). Claims are in `relay_reports.json`, apart from `relay_calls.json`, so a pruned or missing
     `relay_calls.json` cannot cause a second delivery; only deleting `relay_reports.json` itself, or more than 50000 newer reports, can.
   - A refused relay call writes one audit line (`relay.refused`, `by` and `pr` clipped) on purpose; the ledger and files stay unchanged.
-  - The relay's GitHub cost (PC-6): 0 gh calls at rest (an empty pending list makes none). A request builds its pull request picture ONCE
-    (the same read is answered from the first within the request): at most 3 gh calls for prove, verdict and gates (1 pull request read, at most 2 plan
-    reads) and 1 for report. All relay requests together may make at most `RELAY_GH_PER_HOUR` (600) gh calls in a rolling hour; a request
-    that would pass it is answered 429 "relay GitHub budget" BEFORE any gh call, audited as `relay.refused`, nothing written. The relay's engine
-    shares the pass engine's `GhAccounts` (one counter, one pause, one set of remembered answers): its calls are counted there, and a rate-limit
-    pause set by the pass stops the relay's calls (429).
+  - The relay's GitHub cost (PC-6): 0 gh calls at rest (an empty pending list makes none). One request builds its pull request picture ONCE: its own
+    context object (never shared with another request, so a late thread of an earlier request cannot write into it), and the same READ is answered from
+    the first within the request (a write is never skipped, and clears that memory). The FINAL head, compared under the ledger flock, is a fresh read under
+    `HEAD_TIMEOUT`, never the memo, and counts as a call. Exactly, per request (the stub of the tests): prove 3 (link read, plan read, fresh head read),
+    verdict 3, gates 2, report 1. Caps in a rolling hour: a SHARE per pod (`RELAY_GH_PER_POD`, 120 calls: one pod cannot spend the hour) and the global
+    `RELAY_GH_PER_HOUR` (600) as a backstop. A request is admitted only while `RELAY_GH_PER_REQUEST` (3) calls of RESERVE are free under both caps
+    (`room`, a separate step before any gh call); each call is then taken one by one (`take`, the hard stop: a request that outgrows its reserve is refused in the
+    middle). The refusal is 429 and names the cap: "relay GitHub budget: pod share" or "relay GitHub budget"; audited as `relay.refused`, nothing written. The link
+    check itself reads once, charged to the pod. The daemon's own pass is not charged to the relay's caps. The relay's engine shares the pass engine's
+    `GhAccounts` (one counter, one pause, one set of remembered answers): every call is counted there exactly once (`GhAccounts.record`, or by `read` itself
+    for a call made inside it), and a rate-limit pause on ANY account stops the relay's calls (429; fail closed, an availability cost only).
 
 The sender is always the agent the token proves, never a name in the body: a body naming another sender is refused 403.
 

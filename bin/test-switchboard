@@ -9393,17 +9393,56 @@ class TestGithubDaemon(Base):
         self.world = World(self, agents=("platform",))
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
 
-    def test_gh_accounts_is_safe_for_two_threads_and_one_gate_counts_both(self):
-        # PC-6/U10: the pass thread and the relay thread read through ONE GhAccounts: its counter and pause are under its lock
-        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, self.world.clock.now, environ={})
-        done = subprocess.CompletedProcess([], 0, "{}", "")
-        threads = [threading.Thread(target=lambda: [accounts.read(lambda *a, **k: done, "repos/o/r/pulls/1", "o/r", 5) for _ in range(200)]) for _ in range(4)]
+    def racing_calls(self, locked):
+        """Two threads record() into a gate whose counter has ONE stale entry. A deque that makes both threads look at the stale head at the same moment
+        (a barrier) forces the check-then-act interleaving a GIL alone does not: with the lock the second thread waits; without it both trim."""
+        barrier = threading.Barrier(2)
+
+        class Racy(collections.deque):
+            def __getitem__(self, i):
+                value = super().__getitem__(i)
+                if i == 0 and value[0] < 500:   # the stale entry: both threads see it before either removes it
+                    try:
+                        barrier.wait(0.5)
+                    except threading.BrokenBarrierError:
+                        pass
+                return value
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, lambda: 1000.0, environ={})
+        accounts.calls = Racy([(0.0, "default", "old", False)])
+        if not locked:
+            accounts.lock = contextlib.nullcontext()   # the mutant: the same gate with its lock removed
+        errors = []
+
+        def work():
+            try:
+                accounts.record("relay")
+            except BaseException as err:
+                errors.append(err)
+        threads = [threading.Thread(target=work) for _ in range(2)]
         [t.start() for t in threads]
         [t.join() for t in threads]
-        self.assertEqual(len(accounts.calls), 800)
-        accounts.paused["default"] = self.world.clock.now() + 600
+        return len(accounts.calls), errors
+
+    def test_gh_accounts_counter_is_safe_for_two_threads(self):
+        # PC-6/U10: the pass thread and the relay thread count through ONE GhAccounts: the check-then-trim of its counter is under its lock
+        self.assertEqual(self.racing_calls(True), (2, []))
+        self.assertNotEqual(self.racing_calls(False), (2, []))   # without the lock one thread's entry is trimmed away (or it raises): the test can fail
+
+    def test_gh_accounts_records_once_inside_read_and_checks_any_pause(self):
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, self.world.clock.now, environ={})
+        done = subprocess.CompletedProcess([], 0, "{}", "")
+
+        def inner(*a, **k):
+            accounts.check_pause()
+            accounts.record("relay")   # a call made by a caller that runs inside `read`: read counts it, not record
+            return done
+        accounts.read(inner, "repos/o/r/pulls/1", "o/r", 5)
+        self.assertEqual(len(accounts.calls), 1)
+        accounts.record("relay")
+        self.assertEqual(len(accounts.calls), 2)
+        accounts.paused["some-account"] = self.world.clock.now() + 600
         with self.assertRaises(sb.GhRateLimited):
-            accounts.read(lambda *a, **k: done, "repos/o/r/pulls/1", "o/r", 5)
+            accounts.check_pause()
 
     def test_the_relay_engine_does_not_own_the_v2_link_file(self):
         daemon = sb.build_engine(self.world.route, self.world.clock.now, "daemon")[0]

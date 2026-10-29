@@ -14855,6 +14855,7 @@ class GhAccounts:
         self.paused = {}                         # account -> epoch until which its reads wait (the limit's reset)
         self.limited_once = set()                # accounts whose pause was audited, so it is said once per episode
         self.lock = threading.Lock()             # the hub's threads and the pass read through one gate
+        self._local = threading.local()          # depth of `read` on this thread: a call inside `read` is checked and counted by `read` itself
         self.audit, self.actor = None, "daemon"
         self.conditional = False                 # ask with `-i` and keep the ETag: the daemon turns it on; a one-shot command or a test reads plainly
 
@@ -14952,7 +14953,11 @@ class GhAccounts:
         env = self.env_for(repo) if repo else None
         if env is not None:
             run_kwargs["env"] = env
-        done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
+        self._local.depth = getattr(self._local, "depth", 0) + 1
+        try:
+            done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
+        finally:
+            self._local.depth -= 1
         status, headers, body = _split_http(done.stdout) if use_head else (None, {}, done.stdout)
         with self.lock:
             self.calls.append((now, account, _endpoint_of(path), status == 304))
@@ -14982,6 +14987,31 @@ class GhAccounts:
             if reset is not None:
                 self._pause(account, reset, status)
         return subprocess.CompletedProcess(argv, done.returncode or 1, body, done.stderr or ("HTTP %d" % status))
+
+    def _inside_read(self):
+        return getattr(self._local, "depth", 0) > 0
+
+    def check_pause(self):
+        """For a caller that runs gh through its own runner (the relay): GhRateLimited when ANY account is paused (fail closed: the relay does not know which
+        account its call would use; the cost is availability only). A call made inside `read` is not checked twice: `read` has checked it."""
+        if self._inside_read():
+            return
+        now = self.now()
+        with self.lock:
+            paused = [(a, u) for a, u in self.paused.items() if now < u]
+        if paused:
+            account, until = max(paused, key=lambda x: x[1])
+            raise GhRateLimited(account, until)
+
+    def record(self, kind):
+        """Counts one gh call of a caller outside `read` (kind: who made it). A call made inside `read` is NOT counted here: `read` counts it once, after it ran."""
+        if self._inside_read():
+            return
+        now = self.now()
+        with self.lock:
+            self.calls.append((now, self.describe(None), kind, False))
+            while self.calls and self.calls[0][0] < now - 600:
+                self.calls.popleft()
 
     def read_usage(self):
         """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
