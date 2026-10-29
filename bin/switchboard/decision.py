@@ -117,14 +117,19 @@ def superseded_by(facts):
 DELAYED_AFTER = 1800                 # seconds: an alert or digest older than this at delivery is marked "delayed: sent HH:MMZ"
 
 
+OWN_LATE_MARK_KINDS = ("reminder",)   # #1564: the kinds whose text already says how late they are (#1285); a queued copy (#1468) joins when it exists
+
+
 def sent_at(fact):
     """When the fact was made: a merged wake fact keeps the oldest of its members (`created` is the newest, so an old digest must not look new)."""
     return getattr(fact, "sent_min", fact.created)
 
 
 def in_late_scope(fact):
-    """An alert or a digest (the triage and sweep items, merged or not, and the load alerts that ride with them): what the delayed mark is about."""
-    return fact.kind in ("alert", "triage", "sweep") or bool(getattr(fact, "members", None)) or bool(getattr(fact, "wake_class", None))
+    """#1564: every delivered kind but the ones that carry their own mark (a plain reminder says "late by N min" itself): what the delayed mark is about.
+    The digests (merged or not) and the load alerts that ride with them stay in scope as before."""
+    return (fact.kind not in OWN_LATE_MARK_KINDS or bool(getattr(fact, "members", None)) or bool(getattr(fact, "wake_class", None))
+            or fact.kind in ("triage", "sweep"))
 
 
 def delayed_since(facts, delivered):
@@ -159,7 +164,12 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     if not facts:
         raise ValueError("nothing to compose")
     if facts[0].orders:  # PR 17: the orders note, whole: every order
-        return orders_note(recipient, facts[0], repos), facts[:1]
+        note = orders_note(recipient, facts[0], repos)
+        late = None if delivered is None or fault("no-sent-time") else delayed_since(facts[:1], delivered)
+        if late is not None:   # #1564: an old order says so in its first line (the one age rule)
+            first, _, rest = note.partition("\n")
+            note = "%s (delayed: sent %s, delivered %s):%s" % (first.rstrip(":"), clock_utc(late), clock_utc(delivered), "\n" + rest if rest else "")
+        return note, facts[:1]
 
     replaced = {}
     if section is not None:   # one answer per ask for the whole compose (the retries under the cap must not turn a full header into a brief one)
