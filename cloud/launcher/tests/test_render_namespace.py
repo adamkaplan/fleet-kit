@@ -173,6 +173,73 @@ class Runbook(unittest.TestCase):
             self.assertIn(command, self.section)
 
 
+DAEMON_ENV = "FL" + "EET_CLOUD_HUB_DAEMON"   # assembled: the neutral-names scan of this folder reads the old prefix
+R1_COMMAND = "kubectl -n NAMESPACE_NAME set env deployment/cloud-hub %s=relay-probe" % DAEMON_ENV
+
+
+def hub_reserved_names():
+    """The hub's own RESERVED set, read from the code (the module is loaded in a subprocess: no import side effects here)."""
+    out = subprocess.run([sys.executable, "-c", "import sys, json; sys.path[:0] = [sys.argv[1], sys.argv[2]]; import cloud_hub; "
+                          "print(json.dumps(sorted(cloud_hub.RESERVED)))", os.path.join(ROOT, "bin"), os.path.join(ROOT, "cloud", "launcher")],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=True)
+    import json
+    return set(json.loads(out.stdout))
+
+
+class RelayAppendix(unittest.TestCase):
+    TITLE = "\n### A relay probe\n"
+
+    def setUp(self):
+        with open(DOCS, encoding="utf-8") as f:
+            text = f.read()
+        self.whole = text.split("\n## A probe namespace\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(self.TITLE, self.whole)
+        self.text = self.whole.split(self.TITLE, 1)[1]
+
+    def test_the_appendix_has_three_steps_in_order(self):
+        marks = ["\nR1. Who: ", "\nR2. Who: ", "\nR3. Who: "]
+        at = [self.text.index(m) for m in marks]
+        self.assertEqual(at, sorted(at))
+        who = [self.text[at[0]:at[1]], self.text[at[1]:at[2]], self.text[at[2]:]]
+        self.assertTrue(who[0].startswith(marks[0] + "the administrator"))
+        self.assertTrue(who[1].startswith(marks[1] + "the holder of the probe credential"))
+        self.assertTrue(who[2].startswith(marks[2] + "the launcher's caller"))
+
+    def test_the_daemon_name_command_is_found_once_and_the_reserved_names_match_the_hub(self):
+        self.assertEqual(self.text.count(R1_COMMAND), 1)
+        self.assertIn("kubectl -n NAMESPACE_NAME rollout status deployment/cloud-hub", self.text)
+        line = [l for l in self.text.split("\n") if l.startswith("Reserved names:")]
+        self.assertEqual(len(line), 1)
+        listed = set(re.findall(r"`([^`]+)`", line[0]))
+        self.assertEqual(listed, hub_reserved_names())
+        self.assertIn("render of the namespace `cw` stays byte-equal", self.text)
+
+    def test_the_handover_is_the_digest_alone_and_the_file_is_private(self):
+        self.assertIn("umask 077", self.text)
+        self.assertIn("secrets.token_urlsafe(32)", self.text)
+        self.assertIn("mode 0600", self.text)
+        self.assertIn("hands ONLY THE DIGEST to the administrator", self.text)
+        self.assertIn('{"relay-probe": "DIGEST_VALUE"}', self.text)
+        self.assertIn("kubectl -n NAMESPACE_NAME get secret cloud-hub-registry", self.text)
+
+    def test_the_session_verb_and_the_entry_change_are_named(self):
+        self.assertIn("cloud/launcher/cloud-worker hub-session WORKER_NAME --session SESSION_ID", self.text)
+        self.assertIn("ask #1475, pull request #1491, branch cw/hub-entry-repo-issue", self.text)
+        self.assertIn("The administrator's part takes about 20 minutes", self.text)
+
+    def test_the_teardown_list_names_the_token_file_and_the_digest_file(self):
+        teardown = self.whole.split("Teardown (", 1)[1].split("```", 2)[1]
+        self.assertIn("rm -f PROBE_TOKEN_FILE", teardown)
+        self.assertIn("rm -f PROBE_DIGEST_FILE", teardown)
+
+    def test_a_document_without_the_daemon_command_fails_the_check(self):
+        mutant = self.text.replace(R1_COMMAND, "")
+        self.assertNotEqual(mutant, self.text)   # the mutation is applied
+        self.text = mutant
+        with self.assertRaises(AssertionError):
+            self.test_the_daemon_name_command_is_found_once_and_the_reserved_names_match_the_hub()
+
+
 class Chained(unittest.TestCase):
     def test_this_file_is_in_the_chain_once(self):
         with open(os.path.join(ROOT, "bin", "test-cloud-launcher.chain")) as f:

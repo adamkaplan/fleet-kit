@@ -369,9 +369,58 @@ kubectl delete namespace NAMESPACE_NAME
 rm -f TOKEN_FILE
 rm -rf PROBE_CONFIG_DIR
 rm -f cwp.yaml
+rm -f PROBE_TOKEN_FILE
+rm -f PROBE_DIGEST_FILE
 ```
 
 Deleting the namespace removes everything inside it (the hub, its Services, the Secrets, the network policies and the accounts). The first three lines revoke the namespace's launcher token and remove the minter binding before that; the token file and the private settings copy are removed from the machine last.
+
+### A relay probe
+
+A relay probe runs the hub's relay with a daemon of its own against the PROBE hub. The administrator's part takes about 20 minutes (the namespace, the apply, the secrets, R1 and the R2 edit). Three steps, in this order, each marked with who does it. NAMESPACE_NAME is the probe namespace; no value of a credential is ever written in a pull request or a log.
+
+R1. Who: the administrator. Set the hub's daemon name on the PROBE hub with one command:
+
+```text
+kubectl -n NAMESPACE_NAME set env deployment/cloud-hub FLEET_CLOUD_HUB_DAEMON=relay-probe
+```
+
+The name must not be a reserved name: the hub refuses to start (a ValueError, nothing bound) when `FLEET_CLOUD_HUB_DAEMON` names one. The hub's reserved names, as `RESERVED` in `bin/cloud_hub.py` holds them, are:
+
+Reserved names: `admin`, `captain`, `fleet-switchboard`, `hub`, `switchboard`.
+
+The command changes the Deployment, so the hub rolls its pod. Wait for it with `kubectl -n NAMESPACE_NAME rollout status deployment/cloud-hub`. The render does NOT set the daemon name (the render of the namespace `cw` stays byte-equal to the manifests): this command is the only place it is set.
+
+R2. Who: the holder of the probe credential (not the administrator, not a pod, not the launcher). The holder makes a NEW random token on the machine that will run the probe daemon, writing it straight to a new file with mode 0600, so it is never printed to a terminal or a log, then computes its SHA-256 digest into a second file and hands ONLY THE DIGEST to the administrator:
+
+```text
+umask 077
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > PROBE_TOKEN_FILE
+python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1]).read().strip().encode()).hexdigest())' PROBE_TOKEN_FILE > PROBE_DIGEST_FILE
+```
+
+The administrator adds the digest as the one entry for `relay-probe` in the `secrets.json` key of the PROBE hub's registry Secret `cloud-hub-registry`, by an in-place edit that keeps every other entry. The hub reads `secrets.json` as one JSON object `{"AGENT_NAME": "sha256 hex of the secret"}` (the key `agents.json` is not touched: the daemon is not a pod). Read it, edit it, patch it back:
+
+```text
+kubectl -n NAMESPACE_NAME get secret cloud-hub-registry -o jsonpath='{.data.secrets\.json}' | base64 -d > secrets.json
+python3 -c 'import json; d = json.load(open("secrets.json")); d["relay-probe"] = open("PROBE_DIGEST_FILE").read().strip(); json.dump(d, open("secrets.json", "w"))'
+kubectl -n NAMESPACE_NAME patch secret cloud-hub-registry --type merge -p "$(python3 -c 'import json; print(json.dumps({"stringData": {"secrets.json": open("secrets.json").read()}}))')"
+rm -f secrets.json
+```
+
+With nothing else registered the file then reads:
+
+```text
+{"relay-probe": "DIGEST_VALUE"}
+```
+
+The token itself is never given to the administrator and never leaves its file; it is used against the probe hub only, and the teardown above removes the token file and the digest file.
+
+R3. Who: the launcher's caller, after the probe pods launch. Each pod's hub entry needs (a) the session and (b) the repository and issue.
+
+(a) The session: the launch writes it with the launcher's hub-session verb; by hand the command line is `cloud/launcher/cloud-worker hub-session WORKER_NAME --session SESSION_ID`.
+
+(b) The repository and issue: until the hub-entry repository and issue change (ask #1475, pull request #1491, branch cw/hub-entry-repo-issue) is in the tree the probe launcher runs from, either include that branch in the probe launcher tree (recommended), or make the entry edit by hand ONLY with the Chief of Staff's word.
 
 ## 5. Known gaps
 
