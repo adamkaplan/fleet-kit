@@ -421,6 +421,7 @@
         "bin/switchboard/import_v1.py",
         "bin/switchboard/decisions_a.py",
         "bin/switchboard/reminders.py",
+        "bin/switchboard/stage_events.py",
         "bin/switchboard/plan_review.py",
         "bin/switchboard/triage.py",
         "bin/switchboard/alert_labels.py",
@@ -541,6 +542,9 @@
           "remove_reminders",
           "wake_class_of",
           "write_reminders"
+        ],
+        "bin/switchboard/stage_events.py": [
+          "stage_redact"
         ],
         "bin/switchboard/plan_review.py": [
           "ReviewError",
