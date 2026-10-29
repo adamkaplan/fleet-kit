@@ -82757,7 +82757,7 @@ class TestBigRegistrarFile(unittest.TestCase):
         self.assertIn("is not a readable file at aaaaaaaa", str(raised.exception))
 
 
-# ---- #1498: every bin/test-* file runs in CI from ONE list (.github/ci-test-files.txt); the files are derived from the directory
+# ---- #1498: every bin/test-* file runs in CI from ONE list (bin/ci-test-files.txt); the files are derived from the directory
 def _ci_list_problems(list_text, files, workflow_text):
     """The problems of the CI test list: a file in neither section, a `run` row with no workflow step, an `exempt` row without a reason of 20+ characters."""
     run, exempt, problems = set(), {}, []
@@ -82785,7 +82785,7 @@ def _ci_list_problems(list_text, files, workflow_text):
 
 
 class TestCiTestFileList(unittest.TestCase):
-    LIST = (REPO / ".github" / "ci-test-files.txt")
+    LIST = (REPO / "bin" / "ci-test-files.txt")
     WORKFLOW = (REPO / ".github" / "workflows" / "test.yml")
 
     def real_files(self):
@@ -82839,7 +82839,7 @@ class TestCiTestFileList(unittest.TestCase):
         self.assertTrue(all("exempt bin/test-impact-brief" in p for p in problems))
 
     def test_the_documentation_names_the_list_file(self):
-        self.assertEqual(sum(1 for l in (REPO / "docs" / "switchboard.md").read_text().splitlines() if ".github/ci-test-files.txt" in l), 1)
+        self.assertEqual(sum(1 for l in (REPO / "docs" / "switchboard.md").read_text().splitlines() if "bin/ci-test-files.txt" in l), 1)
 
 
 if __name__ == "__main__":
