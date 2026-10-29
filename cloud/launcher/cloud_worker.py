@@ -41,6 +41,8 @@ SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": Fal
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
 DEFAULT_ORCHESTRATOR_SHAPE = "S"   # an orchestrator launch that names no shape keeps the size it had before XS existed (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
+PERSISTENT_SPEND_SECONDS = 24 * 3600   # a persistent launch is priced for one day against the spend cap
+PERSISTENT_ANNOTATION = "cw/persistent"   # on the StatefulSet and on its pod: this orchestrator has no deadline and no idle limit
 MAX_TOKEN_SECONDS = 3600
 
 # The cluster login (ONE route, used by the launch wiring and by the reaper's own refresh; the numbers of the refresh live here).
@@ -1318,7 +1320,7 @@ class Kube:
             shutil.rmtree(self.dir, ignore_errors=True)
             self.dir = None
 
-    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
+    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None, answers=None):
         if not self.context:  # never fall back to the active context
             raise CloudError("CW_KUBE_CONTEXT is not set; refusing to run kubectl against an unnamed context", EXIT_USAGE)
         cmd = [self.bin] + (["--kubeconfig", self.kubeconfig] if self.kubeconfig else []) + \
@@ -1330,6 +1332,8 @@ class Kube:
         if p.returncode != 0:
             if keep_stdout and p.stdout.strip():
                 return p.stdout  # the caller reads the failure from the tool's own JSON
+            if answers is not None:   # the caller judges the whole stderr: None means missing, anything else raises
+                return answers(p.stderr)
             if ok_missing and "NotFound" in p.stderr and (missing_what is None or (missing_what in p.stderr and " not found" in p.stderr)):
                 return None
             last = (self.scrub(p.stderr, limit=SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
@@ -1358,6 +1362,42 @@ class Kube:
     def get_pod(self, name):
         out = self.run(["get", "pod", name, "-o", "json"], ok_missing=True, missing_what='pods "%s"' % name)
         return json.loads(out) if out else None
+
+    def get_workload(self, name):
+        """The StatefulSet of that name, or None ONLY when kubectl's whole answer is the NotFound line of that exact object. Forbidden (the whole
+        line of that object) raises a CloudError naming the missing rule; every other answer, a near miss included, raises 'unreadable'."""
+        not_found = 'Error from server (NotFound): statefulsets.apps "%s" not found' % name
+        forbidden = re.compile(r'Error from server \(Forbidden\): statefulsets\.apps "%s" is forbidden: [^\n]*' % re.escape(name))
+        unreadable = "statefulset/%s is unreadable: %%s; nothing was created or judged" % name
+
+        def answers(stderr):
+            line = stderr[:-1] if stderr.endswith("\n") else stderr
+            if line == not_found:
+                return None
+            if forbidden.fullmatch(line):
+                raise CloudError("statefulset/%s cannot be read: the operator's Role lacks the rule for statefulsets in the apps group "
+                                 "(the owner's step: the administrator applies cloud/k8s/operator-rbac.yaml); nothing was created or judged" % name, EXIT_REFUSED)
+            last = (self.scrub(stderr, limit=SCRUB_OUTPUT_MAX).strip().splitlines() or ["no answer"])[-1]
+            raise CloudError(unreadable % ("kubectl said: " + self.scrub(last)))
+        try:
+            out = self.run(["get", "statefulset", name, "-o", "json"], answers=answers)
+        except CloudError as e:
+            if "unreadable" in str(e) or "cannot be read" in str(e):
+                raise
+            raise CloudError(unreadable % self.scrub(e)) from None
+        if out is None:
+            return None
+        try:
+            obj = json.loads(out)
+        except ValueError:
+            raise CloudError(unreadable % "the answer is not JSON") from None
+        if not isinstance(obj, dict) or obj.get("kind") != "StatefulSet" or (obj.get("metadata") or {}).get("name") != name:
+            raise CloudError(unreadable % "the answer is not that StatefulSet")
+        return obj
+
+    def delete_workload(self, name):
+        """Delete the StatefulSet and WAIT for it: its controller would recreate a pod deleted alone."""
+        self.run(["delete", "statefulset", name, "--wait=true", "--timeout=120s"], timeout=150)
 
     def list_pods(self):
         return json.loads(self.run(["get", "pods", "-l", "app=" + LABEL, "-o", "json"]))["items"]
