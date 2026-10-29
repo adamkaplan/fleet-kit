@@ -88296,14 +88296,15 @@ class TestBigRegistrarFile(unittest.TestCase):
 
 class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
     """#1457: the classes that read the set of files under bin/ are derived from the test files themselves (a class that lists bin/ with glob, rglob, iterdir or the reader scan);
-    each is a row of path_suites.NEW_BIN_GUARDS (what `preflight-pr` runs when a change adds a file under bin/) or is named here exempt, with the reason."""
+    each is a row of path_suites.NEW_BIN_GUARDS (what `preflight-pr` runs when a change adds a file under bin/) or is named here exempt, with the reason.
+    A class reading bin/ by an idiom that neither READS nor READS_MORE matches and that is not hand-listed is NOT found; the hand list records known misses, it is not proof of completeness."""
     READS = re.compile(r"(?:\bBIN\b(?:\.parent)?|\(\s*\w+\s*/\s*[\"']bin[\"']\s*\)|\bbin_dir\b)\s*\.\s*(?:glob|rglob|iterdir)\(|os\.listdir\([^)]*bin|[\"']bin[\"']\s*\)\s*\.\s*(?:glob|rglob|iterdir)|\bscan\(self\.BIN\)")
     READS_MORE = re.compile(r"os\.walk\([^)]*\bbin\b|ls-files[\"'],\s*[\"']bin[\"']|\bglob\.glob\([^)]*\bbin\b")   # the os.walk, glob.glob and git ls-files idioms
     HAND_LISTED = {   # rows of the table the derivation cannot see (the class reaches the bin/ listing through a helper or an import), each named with the reason
         "bin/check-public-names": "a script, not a test class: it scans the added lines under bin/ and has no class for the derivation to find",
         "TestArchitectureDocument": "reads the bin/ modules through the architecture tools, not a spelling the derivation matches (it failed on the new module of 1429)",
-        "TestRecordingCommands": "reaches the bin/ listing through a helper the derivation does not read; the reader of PR 1489 removed its row and the test still passed",
-        "TestTheReaperOnlyInstall": "reads the bin/ files through a helper (the Linux-only install checks), not a spelling the derivation matches",
+        "TestRecordingCommands": "reaches the bin/ listing through switchboard_source() (tests/switchboard/support/loader.py, the SWITCHBOARD_SOURCE_FILES manifest), which the derivation does not read; the reader of PR 1489 removed its row and the test still passed",
+        "TestTheReaperOnlyInstall": "reads the bin/ files through sb.Installer (built on REPO, the install checks of the TheReaperOnlyInstall base class), not a spelling the derivation matches",
         "TestDerivedClosure": "lives in tests/switchboard/test_closure.py and reaches the bin/ listing through an import, not a spelling the derivation matches",
     }
     EXEMPT = {   # each ran green against a tree with one planted new file under bin/ (an unlisted module); the reason says what it does with the listing
@@ -88330,6 +88331,13 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
 
     @classmethod
     def derived(cls):
+        """Computed once per class (the scan of every test file takes about a minute): the same dict is returned to every test, which must not change it."""
+        if "_derived" not in cls.__dict__:
+            cls._derived = cls._scan()
+        return cls._derived
+
+    @classmethod
+    def _scan(cls):
         found = {}
         for path in [BIN / "test-switchboard"] + sorted((REPO / "tests" / "switchboard").glob("test_*.py")):
             for name in cls.reading_classes(path.name, path.read_text(errors="replace")):
