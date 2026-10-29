@@ -6220,3 +6220,37 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## The daemon's GitHub reads: call sites and the counting rule
+
+**Counting rule.** One request is counted per HTTP request made, by account and endpoint class: each page of a paginated read counts one (`bin/paged_reads.py` reads the pages itself, `gh api -i`, per_page=100), each request of a batched read counts one. The first page carries the stored ETag; a `304 Not Modified` answers from the stored pages and costs nothing against the budget (shown as `not_modified`). `status` and the 5-minute sample line read the same counter.
+
+**Cause (S1).** Before this change a `gh api --paginate` read had no header block, so `accounts.read` passed it through: counted as ONE call however many pages it cost, never conditional. The catch-up pass (comments, issues, pulls, reviews and check suites per pull, workflow runs) is made of such reads.
+
+Hourly total for a stated fleet: 4 repos without a forwarder, 10 open pulls each, 2 pages per list read: **6720 requests per hour** before the levers (derived by `bin/call_sites.py hourly`; the intervals are the constants named in the table).
+
+| Call site (`bin/fleet-switchboard`) | Reads | Driven by | Runs per hour | Requests per run |
+|---|---|---|---|---|
+| `GhAccounts.read` | the counting layer itself: every named-repo read ends here | every read | 0 | 0 |
+| `GhAccounts.read_usage` | `gh api rate_limit` per account (not counted against the budget) | each status / 5-minute sample | 12 | 0 |
+| `GhAccounts.token_for` | `gh auth token` (a local process, no API request) | per token expiry | 0 | 0 |
+| `GitHubHub._read_one` | one issue, pull or comment read for routing | GITHUB_ROUTE_SECONDS (5 s of lookups per pass) | 0 | 1 |
+| `GitHubHub._start` | `gh webhook forward` child per repo with a forwarder (a stream, not a poll) | once per start | 0 | 0 |
+| `GitHubHub.argv_for` | builds the `gh webhook forward` argv (no request itself) | once per start | 0 | 0 |
+| `GitHubHub.catch_up_items.present_pull` | one pull read when a pull is presented | per changed pull | 0 | 1 |
+| `GitHubHub.gh_api` | the one hub read: every catch-up, sweep and triage read of a repo goes through it | github_poll_seconds (60) | 240 | 28 |
+| `GitHubHub.open_issues_count` | the repo read for its open issue count | per triage pass | 0 | 1 |
+| `GitHubHub.plan_kind` | one issue read to classify a plan | per new plan item | 0 | 1 |
+| `GitHubHub.read_pages` | a bounded paged read (the sweep's pull and issue lists): one request per page | the sweep pass (SWEEP_PASS_SECONDS 8 s budget per pass) | 0 | 2 |
+| `IntentReader._api` | the intent and chain reads: one issue, its comments | the intent / chain pass | 0 | 2 |
+| `IntentReader._api_raw_text` | a raw file read of the intent repo | per intent read | 0 | 1 |
+| `_RedsReader.json` | the red-CI read of a pull request's runs | the red pass | 0 | 1 |
+| `_RedsReader.pull_state` | one GraphQL pull state read (the cloud watch and alerts) | per watched pull per alert pass | 0 | 1 |
+| `_RedsReader.zip` | a run log archive read | per red run | 0 | 1 |
+| `read_open_overlap` | `gh pr list` for the overlap check | per pull review | 0 | 1 |
+| `read_pr_json` | `gh pr view` of one pull request | per merge-gate / clear read | 0 | 1 |
+| `read_ref_state` | `gh issue view` for one item's state | per ref check | 0 | 1 |
+| `verify_account` | `gh api user` to check a login | per account check (start, config change) | 0 | 1 |
+
+Sites that run only when a person or an agent runs a command (not driven by a pass): `_changed_plan`, `_gh_write`, `_review_api`, `_validate_github`, `carry_get.get`, `check_approval`, `check_charter_workspace`, `cmd_plan_template`, `cmd_review_checkout`, `cmd_review_measure`, `gates_suites_finding`, `intent_reader_for`, `load_plan`, `merge_gate_gh.gh`, `plan_peers`, `review_laws_text`, `_ask_facts`, `_plan_ask_problem`.
+The test `test_call_sites` derives the list of sites from the source and fails naming a site that is in no row of `bin/call_sites.py`; this table is generated from the same rows and the test compares them.
