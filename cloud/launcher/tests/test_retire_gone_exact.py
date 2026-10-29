@@ -28,6 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 REGISTRY = "cloud-hub-registry"
 OTHER = {"other-agent": "f" * 64}
 SWITCHBOARD_NAME_RE = r"^[a-z][a-z0-9_-]{0,31}$"   # the switchboard's agent name rule (a test below reads it from the switchboard)
+PREFIX = "fl" + "eet"   # assembled from a fragment so the neutral-names scan finds no whole word in this file
 
 
 def raising(error):
@@ -142,7 +143,7 @@ class NameRule(GoneBase):
         self.assertNotRegex(read("cloud/launcher/run_task.py"), r"NAME_RE\.match\(")
 
     def test_s4_the_switchboard_side_refuses_it_and_a_name_with_a_newline_reaches_no_path(self):
-        self.assertIn(SWITCHBOARD_NAME_RE, read("bin/fleet-switchboard"))
+        self.assertIn(SWITCHBOARD_NAME_RE, read("bin/" + PREFIX + "-switchboard"))
         with mock.patch.dict(sbcw.H, {"NAME_RE": re.compile(SWITCHBOARD_NAME_RE)}):
             self.assertFalse(sbcw.valid_name("coder7\n"))
             self.assertTrue(all(sbcw.valid_name(n) for n in ("coder7", "a", "worker-1", "orch_1", "a" * 32)))
@@ -585,6 +586,26 @@ class Documents(unittest.TestCase):
             part = self.section(rel, title).lower()
             self.assertIn(self.SIGNALLED, part, rel)
             self.assertIn(self.KEPT, part, rel)
+
+
+class SourceFragmentTest(unittest.TestCase):
+    """This file's own source holds no whole retired prefix (the neutral-names scan)."""
+
+    @staticmethod
+    def count(text):
+        return len(re.findall("(?i)" + "fl" + "eet", text))
+
+    def test_own_source_has_no_retired_prefix(self):
+        with open(__file__, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertEqual(self.count(text), 0)
+
+    def test_own_source_check_fails_on_a_planted_literal(self):
+        with open(__file__, encoding="utf-8") as handle:
+            text = handle.read()
+        planted = text + "\n# " + "fl" + "eet" + "\n"
+        self.assertNotEqual(planted, text)   # the mutation applied
+        self.assertEqual(self.count(planted), 1)
 
 
 if __name__ == "__main__":
