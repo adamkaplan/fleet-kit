@@ -2,8 +2,10 @@
 
     POST /message    the channel server's route, unchanged: token review, sender pinned to the token, then DELIVERY here.
     GET  /decisions  the JSON object bin/decisions_pull.py accepts, read from the file named by FLEET_CLOUD_HUB_DECISIONS
-                     ({"decisions": [], "errors": []} when the file is absent). The same token review and the same reserved-name
-                     refusal as POST guard it, except that the captain may read; the answer is scoped (see _scoped).
+                     (503 when the file is absent or unreadable). The answer carries an integer age_seconds: the file's age
+                     from its mtime on the hub's clock, taken by fstat on the same open descriptor the body is read from. The same token
+                     review and the same reserved-name refusal as POST guard it, except that the captain may read; the answer is
+                     scoped (see _scoped), and the age is that of the file the scoped view was cut from.
 
 Identity: an agent's bearer token is posted to the in-cluster TokenReview API (the hub's own service account token and CA);
 the authenticated user is mapped to the agent name by cloud_channel.agent_of (namespace pinned), never from a request body.
@@ -130,6 +132,24 @@ def _read_json(path, default):
     if len(raw) > MAX_FILE:
         raise ValueError("file too large")
     return json.loads(raw.decode("utf-8"))
+
+
+FUTURE_TOLERANCE = 60   # an mtime further ahead of this host's clock than this is unreadable, not age 0
+
+
+def _read_json_aged(path):
+    """(object, age in whole seconds): body and mtime from ONE open descriptor (fstat), age on this host's clock.
+    The age IS the file's mtime on the hub: a backup, copy or remount that touches the mtime makes an old list read fresh. An mtime more
+    than FUTURE_TOLERANCE (60 s) ahead of the clock (a clock step, a copy) raises ValueError: it would otherwise read fresh."""
+    with open(path, "rb") as fh:
+        raw = fh.read(MAX_FILE + 1)
+        mtime = os.fstat(fh.fileno()).st_mtime
+    if len(raw) > MAX_FILE:
+        raise ValueError("file too large")
+    delta = time.time() - mtime
+    if delta < -FUTURE_TOLERANCE:
+        raise ValueError("mtime in the future")
+    return json.loads(raw.decode("utf-8")), max(0, int(delta))
 
 
 def _password(path):
@@ -425,13 +445,16 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
                     audit(line)
                 return self._send(probe["status"], probe)
             try:
-                body = _read_json(decisions_path, {"decisions": [], "errors": []}) if decisions_path else {"decisions": [], "errors": []}
+                if not decisions_path:
+                    raise FileNotFoundError("no decisions file configured")
+                body, age = _read_json_aged(decisions_path)
                 if not isinstance(body, dict):
                     raise ValueError("not an object")
                 body = _scoped(body, cloud_channel.agent_of((review.get("status") or {}).get("user"), namespace))
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 audit("refused status=503 reason=decisions unreadable")
                 return self._send(503, {"status": 503, "error": "decisions unreadable"})
+            body["age_seconds"] = age
             audit("decisions served")
             self._send(200, body)
 
