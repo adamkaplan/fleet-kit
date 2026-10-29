@@ -19,3 +19,4 @@ switchboard/audit.py
 switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
+switchboard/secret_spans.py

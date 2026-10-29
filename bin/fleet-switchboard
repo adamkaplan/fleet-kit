@@ -3408,6 +3408,8 @@ class Switchboard:
         discovery = self.discover(now)
         me = discovery.agents.get(sender)
         if me is None:
+            me = cloud_sender(self.state_dir, sender)   # #1478: a cloud pod has no pane; its own endpoint record (never the request) names it and its boss
+        if me is None:
             raise ReportError(discovery.missing(sender))
         boss = boss_name(discovery, me)  # the role name chief-of-staff resolves to the registered cos agent (#102)
         if boss is None:
@@ -3753,6 +3755,95 @@ def wait_for_poke(sock, timeout):
     return bool(ready)
 
 
+# #1380: the installed tree is the default branch, clean (bin/installed_guard.py). A command refuses on a bad tree (main); the daemon stops its
+# work, alerts by a standalone script, and resumes by itself when the tree is good. Nothing here changes the tree.
+INSTALLED_TREE_RECHECK_SECONDS = 1.0   # a bad reading is read once more this long after, in the same pass, before the daemon stops: a checkout in flight is not a bad tree
+INSTALLED_TREE_ALERT_ENV = "FLEET_SWITCHBOARD_ALERT_NOTIFIER"   # a program that shows the desktop notification (tests); default: the platform's own
+
+
+def installed_guard_module(directory=None):
+    """bin/installed_guard.py, loaded by path from `directory` (default: beside this file), fresh each time: a broken or replaced copy is seen at once, and a
+    module that fails to load raises for every caller (the daemon then treats the tree as not to be trusted). Not `load_module`: the one path-loader of the
+    guard, so the clear's closure never reaches it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("installed_guard", str((Path(directory) if directory else Path(__file__).resolve().parent) / "installed_guard.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def command_records(action, known):
+    """True when the command `action` records a verdict, a gate, a clear, a merge or a proof: DERIVED from the registry, by the flags of its handler
+    (`ledger`: the evidence ledger's commands; `records`: the ONE list of `@recording` functions (`recording_commands()`), never a second one; `guard_records`: the others, set beside the handler). `run` is one: its `--once` pass decides and delivers."""
+    handler = resolve_command(action, known)
+    return handler is not None and (getattr(handler, "ledger", False) is True or isinstance(getattr(handler, "records", None), str)
+                                    or getattr(handler, "guard_records", False) is True)
+
+
+def installed_tree_check(action, state_dir=None, root=None, runner=subprocess.run, daemon=False, records=False):
+    """(refusal, note) of the installed-tree guard for a command: a one-line refusal, or None to run it, and a one-line note for stderr, or None. Only a tree
+    `install` recorded is judged."""
+    if daemon:   # `run` without --once: the daemon checks the tree itself at its start and on every pass, and alerts. Refused here, the service manager would restart it for ever, silently.
+        return None, None
+    state = Path(state_dir) if state_dir is not None else state_dir_path()
+    if not (state / "installed-tree").is_file():
+        return None, None   # a worktree, a CI checkout or a tree install never recorded: nothing to judge
+    try:
+        return installed_guard_module().entry_problem_line(action, state, KIT_ROOT if root is None else root, runner, records)
+    except Exception as err:   # the guard itself is broken: the tree cannot be trusted, and the commands that move it still run
+        return (None if action in ("install", "upgrade", "doctor") else "%s: refused: the installed-tree guard could not run (%s)" % (PROG, _one_line(str(err), 160))), None
+
+
+def installed_tree_refusal(action, state_dir=None, root=None, runner=subprocess.run, daemon=False, records=False):
+    """The refusal line of `installed_tree_check`, or None."""
+    return installed_tree_check(action, state_dir, root, runner, daemon, records)[0]
+
+
+def installed_tree_problem(state_dir, root=None, runner=subprocess.run):
+    """What is wrong with the installed tree, one line, or None (good, or not recorded). The daemon calls this on every pass. A tree git could not read
+    is a problem here too (the pass is skipped and alerted, as for a bad one)."""
+    state = Path(state_dir)
+    if not (state / "installed-tree").is_file():
+        return None
+    try:
+        kind, line, _ = installed_guard_module().judge(state, KIT_ROOT if root is None else root, runner)
+    except Exception as err:   # the guard itself is broken: the tree cannot be trusted
+        return "the installed-tree guard could not run (%s)" % _one_line(str(err), 160)
+    return line if kind in ("bad", "unreadable") else None
+
+
+def installed_tree_script(state_dir):
+    """The alert script: the copy `install` put in the state directory (outside the tree), else the one beside this file."""
+    script = Path(state_dir) / "guard" / "guard_alert.py"
+    return script if script.is_file() else Path(__file__).resolve().parent / "guard_alert.py"
+
+
+def installed_tree_alert(state_dir, line, now, herdr=None, runner=subprocess.run):
+    """Run the standalone alert script (the copy in the state directory, which needs nothing from the tree); it alerts at once the first time and
+    again only after a day. Returns what the script printed, or None when it could not run."""
+    script = installed_tree_script(state_dir)
+    argv = [sys.executable, str(script), "--state", str(state_dir), "--text", line, "--cos", COS_NAME, "--now", repr(float(now()))]
+    found = shutil.which(herdr) if herdr else None
+    if found:
+        argv += ["--herdr", os.path.abspath(found)]
+    if os.environ.get(INSTALLED_TREE_ALERT_ENV):
+        argv += ["--notifier", os.environ[INSTALLED_TREE_ALERT_ENV]]
+    try:
+        done = runner(argv, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        return done.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def installed_tree_clear(state_dir, runner=subprocess.run):
+    script = installed_tree_script(state_dir)
+    if (Path(state_dir) / "installed-tree-alert").is_file() and script.is_file():
+        try:
+            runner([sys.executable, str(script), "--state", str(state_dir), "--text", "", "--clear"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 DAEMON_RECORD = "daemon.json"  # what the running daemon says about itself: its pid, and where its key came from
 
 
@@ -3784,8 +3875,17 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                 if watch is not None and on_reload is not None and watch.check() == "reload":
                     on_reload(watch)  # does not return when the daemon re-executes itself
                 try:
-                    engine.run_pass()
-                    load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
+                    bad = installed_tree_problem(state_dir)   # #1380: at the start and on every pass
+                    if bad is not None:   # two reads in a row before it stops and alerts
+                        time.sleep(INSTALLED_TREE_RECHECK_SECONDS)
+                        bad = installed_tree_problem(state_dir)
+                    if bad is None:
+                        installed_tree_clear(state_dir)
+                        engine.run_pass()
+                        load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
+                    else:   # no verdict, merge or message is decided or delivered; only this re-check goes on
+                        engine._note("installed_tree.stopped", None, {"problem": bad})
+                        installed_tree_alert(state_dir, bad, engine.now, getattr(getattr(engine, "herdr", None), "binary", None))
                 except Exception as err:
                     engine._failed(None, "pass", err, {"errors": []})
                 done += 1
@@ -5857,7 +5957,9 @@ BOSS_READ_SITES = {
     "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
+    "bin/fleet-switchboard:cloud_sender": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record): its reports_to is read from the record and validated by `_cloud_boss`, to name the pane-less sender of its report",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
+    "bin/cloud_retired.py:keep_boss": "keeps the boss of a removed cloud worker from the worker's own endpoint record (not a discovered agent) so `read` can answer for it after the record is gone",
 }
 
 
@@ -7258,6 +7360,9 @@ def cmd_cloud_clear(args, runner, now):
     password file), and every one it removes is named. A record with a pod, or one not past its deadline, is never touched, and it refuses when
     the cluster could not be read: it never removes a record it cannot prove is gone. The caller rule is `retire`'s."""
     return run_cloud("cmd_cloud_clear", args, runner, now)
+
+
+cmd_cloud_clear.guard_records = True   # a clear (#1380)
 
 
 def watch_problem(engine, state, name, discovery):
@@ -8816,7 +8921,11 @@ def record_github_calls(engine):
         last_usage = getattr(engine, "usage_read_at", None)
         if last_usage is None or engine.now() - last_usage >= agent_calls.USAGE_EVERY:
             engine.usage_read_at = engine.now()   # once a minute, tried again next minute whatever happens
-            agent_calls.record_usage(str(engine.state_dir), engine.now(), accounts.read_usage())
+            readings = accounts.read_usage()
+            agent_calls.record_usage(str(engine.state_dir), engine.now(), readings)
+            if readings:   # #1501: the 5-minute sample line, and the census of process kinds when the outside count jumps (read only; own failure handling)
+                census_module = "github_census"   # a name, not a literal: this read-only look stays out of the clear's closure (the loader is by path all the same)
+                load_module(census_module).run(engine, readings, agent_calls.recorded_by_account(str(engine.state_dir), readings, engine.now()), engine.now())
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -13806,6 +13915,7 @@ def cmd_run(args, runner, now, wait):
 
 
 STANDBY_SECONDS = 10  # how often `run --standby` looks again for a free lock
+cmd_run.guard_records = True   # `run --once` decides and delivers (#1380); the daemon itself is not refused at the entry and checks the tree on every pass
 
 
 def cmd_ensure(args, spawn=subprocess.Popen):
@@ -17518,6 +17628,7 @@ def cmd_impact(args, runner, now):
 
 
 cmd_impact.direct = True   # no error mapping, no daemon start
+cmd_impact.guard_records = True   # `impact clear` records a clear (#1380: it refuses on a tree git could not read)
 
 
 IMPACT_MATRIX_PATHS_MAX = 50   # paths printed per floor rule by `impact matrix --for-rater`
@@ -19947,6 +20058,22 @@ def review_laws_text(engine, config, runner, now, repo, base_sha):
     return "\n\n".join(parts), missing
 
 
+def review_law_files(config, runner, now, repo, base_sha):
+    """The review law files of `repo` at `base_sha`, one by one, for `review checkout`: ({name: bytes}, missing names). `review_laws_text` is not changed."""
+    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    files, missing = {}, []
+    for name in REVIEW_LAW_FILES:
+        try:
+            got = reader._api("repos/%s/contents/%s?ref=%s" % (repo, name, base_sha), repo)
+            files[name] = base64.b64decode(got["content"]) if got.get("encoding") == "base64" else None
+        except (IntentError, AttributeError, KeyError, TypeError, ValueError):
+            files[name] = None
+        if files[name] is None:
+            del files[name]
+            missing.append(name)
+    return files, missing
+
+
 def local_review_overlay(repo):
     """The operator's own overlay for `repo`, if one exists: $XDG_CONFIG_HOME/fleet-switchboard/review-overlay/<owner>__<repo>.md (capped)."""
     path = config_path().parent / "review-overlay" / (repo.replace("/", "__").lower() + ".md")
@@ -20057,7 +20184,7 @@ def whole_read_problem(files_read, listed, bounds=None):
         rows[path] = (max(read, rows[path][0]) if path in rows else read, max(total, rows[path][1]) if path in rows else total)
     missing = [p for p in listed if p not in rows]
     if missing:
-        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each)" % ", ".join(_printable_path(p) for p in missing[:10])
+        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each) (each row's path is a repo path as in files.txt, e.g. bin/widget-api/app.py)" % ", ".join(_printable_path(p) for p in missing[:10])
     for path in listed:
         read, total = rows[path]
         bound = (bounds or {}).get(path, 0)
@@ -20281,7 +20408,7 @@ def cmd_review_post(args, runner, now):
         if not text:
             raise ReviewError("the body file is empty: a review says something (nothing was posted)")
         if redact_command_text(text) != text:
-            raise ReviewError("the body holds a secret-shaped value (it is not shown): remove it and post again (nothing was posted)")
+            raise ReviewError("the body holds a secret-shaped value (it is not shown): %s: remove it and post again (nothing was posted)" % secret_where(text))
         name = _review_caller(runner, now)
         seen["name"], seen["head"] = name, args.head
         repo, number, ref, raw = _review_pr(args, engine)
@@ -20362,7 +20489,7 @@ def cmd_review_dismiss(args, runner, now):
         if not reason:
             raise ReviewError("--reason must say why (nothing was dismissed)")
         if redact_command_text(reason) != reason:
-            raise ReviewError("the reason holds a secret-shaped value (it is not shown) (nothing was dismissed)")
+            raise ReviewError("the reason holds a secret-shaped value (it is not shown): %s (nothing was dismissed)" % secret_where(reason))
         name = _review_caller(runner, now)
         seen["name"] = name
         repo, number, ref, raw = _review_pr(args, engine)
@@ -20684,7 +20811,7 @@ def cmd_review_checkout(args, runner, now):
                 matrix_text = None
                 sys.stderr.write("%s: review checkout: the impact matrix cannot be read, so impact-matrix.txt is not written to the checkout: %s\n" % (PROG, _one_line(str(err), 160)))
             sparse_result = {}
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, law_files=review_law_files(config, runner, now, repo, base), notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
@@ -22996,6 +23123,21 @@ def cloud_record_live(record, worker, retired, last_reports, now):
     return True
 
 
+def cloud_sender(state_dir, name):
+    """#1478: the pane-less sender of a cloud worker's report: an Observation built from its endpoint record (the same `reports_to` the lane count
+    reads), or None when `name` has no such record. Only a record of that exact worker counts; nothing in it but name, reports_to, repo is used."""
+    if state_dir is None or not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        return None
+    record, _kind = load_module("cloud_worker").read_record_file(Path(state_dir) / "cloud" / (name + ".json"), CLOUD_LOAD_MAX_BYTES)
+    if record is None or record.get("worker") != name:
+        return None
+    boss = _cloud_boss(record.get("reports_to"))
+    fleet = {"name": name, "role": "cloud-worker", "reports_to": boss or None, "issue": None}
+    if isinstance(record.get("repo"), str):
+        fleet["repo"] = record["repo"]
+    return Observation(name, None, None, "unknown", fleet)
+
+
 def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None, clock=None):
     """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded scan, no GitHub read, no process). A worker
     that is retired, made its final report, or is past its hard deadline is not counted; a record WITHOUT a valid hard_deadline (no evidence of liveness)
@@ -23472,6 +23614,7 @@ def cmd_plan(args, runner, now, socket_call=None):
 
 
 cmd_plan.direct = True   # no error mapping, no daemon start
+cmd_plan.guard_records = True   # the plan ledger's approvals and gates (#1380)
 
 
 def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen, socket_call=None):
@@ -23526,6 +23669,13 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
         sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
         return EXIT_ERROR
+    action = getattr(args, "action", None)
+    refused, noted = installed_tree_check(action, daemon=action == "run" and not getattr(args, "once", False), records=command_records(action, parser.commands))   # #1380: before anything else runs, and for every command but the ones that move the tree
+    if refused:
+        sys.stderr.write(refused + "\n")
+        return EXIT_ERROR
+    if noted:
+        sys.stderr.write(noted + "\n")
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
 
 
@@ -25164,6 +25314,16 @@ class Installer:
             return "stale"
         return "other"
 
+    def step_installed_tree(self):
+        """#1380: record which tree is the installed one, copy the two standalone guard scripts out of it and write the hooks that record a move of its HEAD."""
+        try:
+            steps = installed_guard_module(Path(self.kit_root) / "bin").install(self.kit_root, ensure_state_dir() if not self.dry else state_dir_path(),
+                                                                                  self.kit_root / "bin", sys.executable, dry_run=self.dry, run=self.runner)
+        except (OSError, subprocess.SubprocessError) as err:
+            return self.say("installed tree", "skipped (%s)" % _one_line(str(err), 120))
+        for step, status, detail in steps:
+            self.say(step, ("would be " + status) if self.dry and status == "done" else status, detail)
+
     def step_cli_link(self):
         target = self.cli_target()
         candidates = self.cli_candidates()
@@ -25446,6 +25606,7 @@ class Installer:
         else:
             self.say("herdr plugin", "skipped (--no-herdr-link)")
         self.step_cli_link()
+        self.step_installed_tree()
         if not with_service:
             self.say("service", "skipped (--no-service)")
         elif self.kind is None:

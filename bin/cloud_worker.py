@@ -1547,6 +1547,22 @@ def message_line(message):
     return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", " ", line).strip()   # a pod's text never reaches the terminal as an escape sequence
 
 
+def _retired():
+    """The read of a retired worker and the kept boss (bin/cloud_retired.py, beside this file), bound to the names it works with."""
+    module = H["load_module"]("cloud_retired")
+    module.bind(dict(H, _write_private=_write_private, _read_private=_read_private, read_record_file=read_record_file, parse_bounded=parse_bounded,
+                     TooDeep=TooDeep, CloudError=CloudError, _lib=_lib, _scrub_lib=_scrub_lib, _may_retire=_may_retire))
+    return module
+
+
+def _keep_boss(state, record):
+    """Keep the boss of a worker whose record goes (cloud_retired.keep_boss). A removal never fails for it, not even when the part cannot be loaded."""
+    try:
+        _retired().keep_boss(state, record)
+    except Exception:   # nothing about the boss file may fail a removal
+        pass
+
+
 @refusals
 def cmd_read(args, runner, now):
     """`read NAME [--limit N]`: the newest messages of an agent's session, oldest first. A cloud worker is read on its endpoint; a local agent on
@@ -1568,8 +1584,14 @@ def cmd_read(args, runner, now):
         return H["EXIT_OK"]
     else:   # a local agent, on the local service
         seen = engine.discover(engine.now()).agents.get(args.name)
-        session = seen.session_id if seen else H["known_agent"](state, args.name).get("session")
+        known = {} if seen else H["known_agent"](state, args.name)
+        if known.get("kind") == "cloud":   # a retired cloud worker: its session lived on its own pod, never on this service
+            known = {}
+        session = seen.session_id if seen else known.get("session")
         if not session:
+            retired = _retired().retired_run(args.name)   # nothing live answers to the name: a retired cloud worker's run record, last (#1546)
+            if retired is not None:
+                return _retired().read_run_record(args.name, retired, state, runner, now)
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
         v2 = engine.v2
     messages = v2.message_list(session, limit=limit, order="desc") or []
@@ -1836,10 +1858,12 @@ def cmd_retire(args, runner, now, record):
         got = body.get("secrets_removed")
         got = [x for x in got if isinstance(x, str)][:10] if isinstance(got, list) else []
         _audit(engine, "cloud.name_freed", args.name, {"why": "pod gone", "runtime_id": record.get("runtime_id"), "secrets_removed": got})
+        _keep_boss(state, record)
         remove_record(state, args.name)
         print("%s is retired: its pod was already gone; the name is free to launch again; %s" % (
             args.name, "Secrets removed: " + ", ".join(got) if got else "no Secrets were left"))
         return H["EXIT_OK"]
+    _keep_boss(state, record)
     remove_record(state, args.name)
     print("%s is retired: its pod and scratch volume are deleted%s" % (
         args.name, "; work was pushed to branch %s" % wip if pushed and wip else "; nothing needed pushing" if pushed is False else ""))
@@ -1879,6 +1903,7 @@ def cmd_cloud_clear(args, runner, now):
         if dry_run:
             print("would clear %s (pod gone, deadline %s)" % (name, record.get("hard_deadline")))
             continue
+        _keep_boss(state, record)
         remove_record(state, name)
         _audit(engine, "cloud.cleared", name, {"runtime_id": record.get("runtime_id"), "hard_deadline": record.get("hard_deadline")})
         _registry_note(engine, "retire", state, name, "cleared: the pod is gone and the hard deadline has passed")
