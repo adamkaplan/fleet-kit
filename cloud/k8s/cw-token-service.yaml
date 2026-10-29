@@ -49,7 +49,7 @@ spec:
       containers:
         - name: service
           image: cw-launcher:latest
-          args: ["token-service"]
+          command: ["python3", "/opt/cw/token_service.py", "serve"]
           env:
             - name: CW_APP_KEY_CMD
               value: cat /etc/cw-app/key

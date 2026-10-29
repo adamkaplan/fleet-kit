@@ -12,9 +12,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 REAPER = os.path.join(ROOT, "cloud", "k8s", "cw-cloud-reaper.yaml")
 SERVICE = os.path.join(ROOT, "cloud", "k8s", "cw-token-service.yaml")
 # The (verb, resource) pairs of the reaper's pass, written from the code: list and read pods, stop through the end hook (exec), delete,
-# patch a per-run Secret, hold the lease. To be replaced by the recorded set of the fake pass once the renewal change is on the base.
-LISTED = {("get", "pods"), ("list", "pods"), ("delete", "pods"), ("create", "pods/exec"), ("get", "secrets"), ("patch", "secrets"),
-          ("get", "leases"), ("create", "leases"), ("update", "leases")}
+# patch a per-run Secret, hold the lease. test_cloud_reaper_pass_pairs derives the same set from a recorded fake pass.
+LISTED = {("get", "pods"), ("list", "pods"), ("patch", "pods"), ("delete", "pods"), ("create", "pods/exec"), ("get", "secrets"),
+          ("patch", "secrets"), ("delete", "secrets"), ("get", "leases"), ("create", "leases"), ("update", "leases")}
 FORBIDDEN = ["app key", "app-key", "app_key", "app id", "app_id", "vault", "repository token", "repo-token", "git_token",
              "personal login", "signing key", "az login"]
 
@@ -61,7 +61,7 @@ class TestRightsMatch(unittest.TestCase):
 
     def test_mutant_extra_right_is_caught(self):
         text = read(REAPER)
-        mutant = text.replace('verbs: ["get", "list", "delete"]', 'verbs: ["get", "list", "delete", "create"]', 1)
+        mutant = text.replace('verbs: ["get", "list", "patch", "delete"]', 'verbs: ["get", "list", "patch", "delete", "create"]', 1)
         self.assertNotEqual(mutant, text)
         self.assertEqual(pairs(mutant) - LISTED, {("create", "pods")})
 

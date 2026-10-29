@@ -52,3 +52,49 @@ def serve(body, bearer, env, review, mint, log, audit):
         return 502, {"error": "mint failed"}
     audit("%d served %s" % (time.time(), req["repository"]))
     return 200, {"token": token}
+
+
+SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+
+def kube_review(bearer):
+    """The caller's user name by a TokenReview against the cluster's API (this workload's own service account makes the call)."""
+    import ssl
+    import urllib.request
+    with open(SA_DIR + "/token") as f:
+        mine = f.read().strip()
+    body = json.dumps({"apiVersion": "authentication.k8s.io/v1", "kind": "TokenReview", "spec": {"token": bearer}}).encode()
+    req = urllib.request.Request("https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews", data=body, method="POST",
+                                 headers={"Authorization": "Bearer " + mine, "Content-Type": "application/json"})
+    ctx = ssl.create_default_context(cafile=SA_DIR + "/ca.crt")
+    with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+        st = json.loads(r.read(65536)).get("status", {})
+    return (st.get("user") or {}).get("username") if st.get("authenticated") else None
+
+
+def run_server(env=None, port=8080):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import app_token
+    env = dict(os.environ if env is None else env)
+
+    def log(line):
+        print("token-service: " + line, file=sys.stderr, flush=True)
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = min(int(self.headers.get("Content-Length") or 0), 4096)
+            auth = self.headers.get("Authorization") or ""
+            status, answer = serve(self.rfile.read(n), auth[7:] if auth.startswith("Bearer ") else "", env, kube_review, app_token.mint, log, log)
+            out = json.dumps(answer).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+    HTTPServer(("", port), H).serve_forever()
+
+
+if __name__ == "__main__":
+    run_server()

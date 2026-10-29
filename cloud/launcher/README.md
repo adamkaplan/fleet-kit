@@ -209,7 +209,7 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
-Not yet measured: `cloud/launcher/tests/test_cloud_reaper_docs.py`, `cloud/launcher/tests/test_cloud_reaper_manifests.py`, `cloud/launcher/tests/test_cloud_token_service.py`
+Not yet measured: `cloud/launcher/tests/test_cloud_reaper_docs.py`, `cloud/launcher/tests/test_cloud_reaper_manifests.py`, `cloud/launcher/tests/test_cloud_reaper_pass_pairs.py`, `cloud/launcher/tests/test_cloud_token_service.py`, `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_token_at_limit.py`
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
 
@@ -534,7 +534,7 @@ value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault se
 
 ## The reaper in the cluster (ask #1582)
 
-The cloud reaper runs as one restarting workload in the cluster namespace, under its own service account, beside the Mac's job. It holds exactly these rights: get, list and delete on pods, create on pods/exec, get and patch on Secrets, and get, create and update on Leases; it holds no App key, vault login or repository token, and git tokens come from the token service, which alone mounts the key. To turn the Mac's job off after the live proof, unload the Mac's reaper job (the managed reaper's service) once; the lease keeps one reaper acting until then. To roll back, delete the workload and its lease and reload the Mac's job. The owner's steps are the role, the service account, the token path and the lease permission, applied by the administrator with dry runs first:
+The cloud reaper runs as one restarting workload in the cluster namespace, under its own service account, beside the Mac's job. It holds exactly these rights: get, list, patch and delete on pods, create on pods/exec, get, patch and delete on Secrets, and get, create and update on Leases; it holds no App key, vault login or repository token, and git tokens come from the token service, which alone mounts the key. To turn the Mac's job off after the live proof, unload the Mac's reaper job (the managed reaper's service) once; the lease keeps one reaper acting until then. To roll back, delete the workload and its lease and reload the Mac's job. The owner's steps are the role, the service account, the token path and the lease permission, applied by the administrator with dry runs first:
 
 ```
 kubectl apply --dry-run=server -f cloud/k8s/cw-cloud-reaper.yaml

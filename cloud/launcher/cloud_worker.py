@@ -3243,7 +3243,7 @@ class RenewalTicker:
             self.thread.join(5)   # a tick in flight ends first
 
 
-def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None):
+def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, gate=None):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop).
 
     The reaper's own login is the token file: it is made fresh at the start of every pass (before the cluster is reached), so an installed
@@ -3285,7 +3285,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                 ticker = RenewalTicker(L, refresher, clock, ticker_wait)
                 ticker.start()
             began = clock()
-            work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            work = L.reap() if (L is not None and (gate is None or gate(L))) else []   # the pass's own work; a gate (the lease) that says no: no action
             took = (clock() - began).total_seconds()
             if L is not None:
                 L.note_slow_pass(took)
