@@ -31275,6 +31275,7 @@ class TestGatesMissingWording(LedgerBase):
 
     def test_S7_U2_twelve_ledgers_give_the_same_entries_and_status_as_before(self):
         # the count of missing entries, the status and the ready result (status ok) before this change, computed on its base as data: (proof, verdict) -> (entries, status)
+        # the corpus is a hard-coded table (count and status per ledger), not computed from the old function, and the check does not depend on its order
         before = {("absent", "absent"): (2, "missing"), ("absent", "pass"): (1, "missing"), ("absent", "fail"): (2, "missing"), ("absent", "author"): (2, "missing"),
                   ("pass", "absent"): (1, "missing"), ("pass", "pass"): (0, "ok"), ("pass", "fail"): (1, "missing"), ("pass", "author"): (1, "missing"),
                   ("fail", "absent"): (2, "missing"), ("fail", "pass"): (1, "missing"), ("fail", "fail"): (2, "missing"), ("fail", "author"): (2, "missing")}
@@ -31311,6 +31312,10 @@ class TestGatesMissingWording(LedgerBase):
                         if isinstance(k, ast.Constant) and k.value == "kind" and isinstance(v, ast.Constant) and v.value in ("proof", "verdict"):
                             found.add(v.value)
             self.assertEqual(found, want, name)
+        relay = ast.parse((Path(sb.__file__).resolve().parent / "cloud_relay_daemon.py").read_text())   # the relay's `_write` names its kind as a keyword: dict(base, kind="proof")
+        relay_kinds = {kw.value.value for fn in ast.walk(relay) if isinstance(fn, ast.FunctionDef) and fn.name == "_write" for call in ast.walk(fn)
+                       if isinstance(call, ast.Call) for kw in call.keywords if kw.arg == "kind" and isinstance(kw.value, ast.Constant)}
+        self.assertEqual(relay_kinds, {"proof", "verdict"}, "cloud_relay_daemon._write writes a proof for prove and a verdict for verdict, one each")
 
     def test_S5_S6_a_verdict_that_also_writes_a_proof_is_caught(self):
         real = sb.plan_ledger.append_once
