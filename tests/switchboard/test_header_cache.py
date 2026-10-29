@@ -240,6 +240,50 @@ class TestSets(HeaderCacheBase):
         self.header()
         self.assertGreater(self.count(warm), 0)
 
+    def write_to_issue(self):
+        engine = mock.Mock(config=self.config, accounts=None)
+        sb._gh_write(engine, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "{}", ""), self.REPO, "repos/%s/issues/5/comments" % self.REPO, "POST", {"body": "x"})
+
+    def warm_entry_survives_a_write_by(self, name):
+        """True when a warm entry still serves a read after `name` has written to the issue."""
+        self.action("send")
+        self.header()
+        self.action(name)
+        self.write_to_issue()
+        self.action("send")
+        mark = len(self.gh.requests)
+        self.header()
+        return self.count(mark) == 0
+
+    def test_a_write_by_an_always_fresh_command_drops_a_warm_entry(self):   # done-when 2
+        for name in ("plan", "gates", "merge-gate"):
+            self.assertFalse(self.warm_entry_survives_a_write_by(name), name)
+
+    def test_a_write_by_a_cache_allowed_command_still_drops_it(self):
+        self.assertFalse(self.warm_entry_survives_a_write_by("send"))
+
+    def test_a_write_with_no_command_set_drops_it_too(self):
+        self.assertFalse(self.warm_entry_survives_a_write_by(None))
+
+    def test_a_delete_failure_never_raises(self):
+        self.action("send")
+        self.header()
+        with mock.patch.object(os, "unlink", side_effect=PermissionError("no")):
+            self.write_to_issue()
+        with mock.patch.object(os, "listdir", side_effect=OSError("gone")):
+            self.write_to_issue()
+
+    def test_the_old_behaviour_only_cache_allowed_writers_drop_fails_the_test(self):   # the mutant
+        hc = sb.load_module("header_cache")
+        real = hc.drop
+        hc.drop = lambda *a, **k: real(*a, **k) if sb.HEADER_CACHE_ACTION[0] is not None else 0
+        try:
+            self.action("plan")
+            self.assertIsNone(sb.HEADER_CACHE_ACTION[0])
+            self.assertTrue(self.warm_entry_survives_a_write_by("plan"))   # the mutant keeps the entry: the test above would fail
+        finally:
+            hc.drop = real
+
     def test_every_command_that_reads_the_header_is_in_a_set(self):   # S4
         self.assertEqual(self.unplaced(), [])
 
@@ -484,8 +528,8 @@ class TestReplay(HeaderCacheBase):
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["XDG_STATE_HOME"] = self.tmp.name
         with_cache = self.replay(True, shape)
-        print("\nS7 replay (%s): budget-counted without the cache %d, with it %d (%.2f%%); plain requests without %d, with %d (of which %d answered 304)"
-              % (shape, without[0], with_cache[0], 100.0 * with_cache[0] / without[0], without[1], with_cache[1], with_cache[1] - with_cache[0]))
+        print("\nS7 replay (%s%s): budget-counted without the cache %d, with it %d (%.2f%%); plain requests without %d, with %d (of which %d answered 304)"
+              % (shape, {"burst": ", the burst shape", "uniform": ", evenly spread", "random": ", random spread"}[shape], without[0], with_cache[0], 100.0 * with_cache[0] / without[0], without[1], with_cache[1], with_cache[1] - with_cache[0]))
         return without, with_cache
 
     def test_burst_shape_counted_reads_are_at_most_a_fifth(self):   # S7

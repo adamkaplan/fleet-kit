@@ -26882,7 +26882,7 @@ def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=Fa
     if env is not None:
         extra["env"] = env
     written = re.match(r"repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)", str(path))
-    if written and HEADER_CACHE_ACTION[0] is not None:   # only a CACHE-ALLOWED command's own write: an always-fresh command (the clear included) reads fresh and never touches the cache
+    if written:   # EVERY writer drops the entry, an always-fresh command (plan, gates, the merge shim, the clear) too: a command that has just written drops it (a delete of a file that is not there is harmless)
         load_module("header_cache").drop(state_dir_path(), written.group(1), int(written.group(2)))   # #1520: a write to the issue (comment, edit, label) drops its header entry
     try:
         done = runner(argv, capture_output=True, text=True, timeout=engine.config["call_timeout_seconds"], **extra)
@@ -26890,7 +26890,7 @@ def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=Fa
         raise IntentError("unavailable", "gh did not answer within %ss" % engine.config["call_timeout_seconds"]) from None
     except OSError as err:
         raise IntentError("unavailable", "cannot run %s: %s" % (engine.config["gh"], err.strerror or err)) from None
-    if written and HEADER_CACHE_ACTION[0] is not None:
+    if written:
         load_module("header_cache").drop(state_dir_path(), written.group(1), int(written.group(2)))   # again once it is done: a read in between cannot keep the old header
     if done.returncode != 0:
         detail = _one_line(done.stderr, GH_ERROR_MAX) or _one_line(done.stdout, GH_ERROR_MAX) or "exit %d" % done.returncode   # #967: the failure's own words, whole (the clear's refusal shows them)
