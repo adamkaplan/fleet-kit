@@ -312,6 +312,24 @@ class Documents(unittest.TestCase):
         self.assertTrue(self.check(text.replace(ORCH_TEXT, "")))
         self.assertTrue(self.check(text.replace("it can write to issues only", "")))
 
+    LIMITS = ("a custom mint command (CW_GIT_TOKEN_CMD) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command",
+              "an orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set")
+
+    def limit_misses(self, text):
+        flat = " ".join(text.split()).lower()
+        return [s for s in self.LIMITS if flat.count(s.lower()) != 1]
+
+    def test_s7_each_limit_sentence_is_in_each_document_exactly_once(self):
+        for rel in self.FILES:
+            with self.subTest(rel):
+                self.assertEqual(self.limit_misses(read(rel)), [])
+
+    def test_s7_a_document_without_the_first_limit_sentence_fails(self):
+        text = read(self.FILES[0])
+        mutated = re.sub(re.escape(self.LIMITS[0]), "", text, flags=re.I)
+        self.assertNotEqual(mutated, text)
+        self.assertEqual(self.limit_misses(mutated), [self.LIMITS[0]])
+
 
 if __name__ == "__main__":
     unittest.main()
