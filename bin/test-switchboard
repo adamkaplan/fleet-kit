@@ -544,6 +544,23 @@ class TestConfig(Base):
             sb.validate_relay_holders = real
         self.assertGreaterEqual(len(res.failures), 3)
 
+    def test_the_relay_daemons_holder_of_reads_the_validated_shape_unchanged(self):
+        """U6/PC-3: a config with relay_holders, validated by this change, gives the relay daemon's holder_of the same pod for the fixed key, and a key
+        the config does not name stays None (fail closed). The daemon source is pinned on the one function this reads; that the file has 0 changed lines
+        in this diff is checked by the diff itself."""
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        try:
+            import cloud_relay_daemon as relay
+        finally:
+            sys.path.pop(0)
+        holders = {"acme-org/widget-service#7": "widget-pod"}
+        config = sb.validate_config({"relay_holders": dict(holders)})
+        backend = relay.SwitchboardBackend(None, (None, None, config), None, None)
+        self.assertEqual(backend.holder_of("acme-org/widget-service", 7), "widget-pod")
+        self.assertIsNone(backend.holder_of("acme-org/widget-service", 8))
+        self.assertIsNone(relay.SwitchboardBackend(None, (None, None, sb.validate_config({})), None, None).holder_of("acme-org/widget-service", 7))
+        self.assertIn('return (self.parts[2].get("relay_holders") or {}).get("%s#%s" % (repo, issue))', inspect.getsource(relay.SwitchboardBackend.holder_of))
+
     def test_malformed_files_are_refused(self):
         for text, needle in (("{not json", "not valid JSON"), ("[1, 2]", "JSON object"), ('"x"', "JSON object")):
             with self.subTest(text=text):
