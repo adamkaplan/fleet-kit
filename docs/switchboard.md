@@ -4552,6 +4552,8 @@ them) and to the PR's **head** (a push voids them; the view shows them as void, 
 | `fleet-switchboard verdict <scenario> --pr <repo#N> --as ci\|tester\|reviewer\|owner --result pass\|fail` | a VERDICT, only as the evaluator the scenario names, only by an agent listed for it in the config key `plan_evaluators`, and never by a writer of the PR |
 | `fleet-switchboard gates <repo#N> [--json]` | nothing: it reads |
 
+**What a missing line says (#1545).** Each `missing` line of G1 (in `gates`, the merge refusal and `gates-check`) names the record that is missing and who may record it, as the scenario names its evaluator. A missing proof reads `proof (`prove S1`; the tester judges it, a prover records it)`: the evaluator judges the proof but any prover records it, so a tester does not record it. A missing verdict reads `tester verdict (`verdict S1 --as tester`; only the tester may record it)`. The proof and the verdict are two records written by two commands and are never merged: no command writes both, and the wording changes nothing about which pull request reads ready.
+
 #### What a recording command ends with (#1049)
 
 `prove`, `verdict` and `review record` write the ledger, and each ends with ONE final line, so a call that timed out is never mistaken for one that recorded:
