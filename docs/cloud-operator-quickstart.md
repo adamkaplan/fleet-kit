@@ -357,7 +357,7 @@ kubectl -n SOURCE_NAMESPACE get secret PULL_SECRET_NAME -o json | python3 -c 'im
 
 The order after the apply: run the `get secret` line first. The apply creates the two registry Secrets (`cloud-hub-registry` and `cloud-hub-pw`) empty: they exist from the apply and are EDITED, not created; a `create secret generic` on them can fail with AlreadyExists. Run the `create secret generic` command ONLY for a Secret the `get` reports missing. The pull secret is never in the manifests: it is always created by hand.
 
-The two `create secret generic` lines are for a Secret the `get` reports missing. The pull secret line copies the existing pull secret of the live namespace (`SOURCE_NAMESPACE`) by its own name into the probe namespace: the value goes through a pipe and is never printed and never on a command line (the shell history and the process list). The alternative, when no such secret exists, is `kubectl -n NAMESPACE_NAME create secret generic PULL_SECRET_NAME --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=DOCKER_CONFIG_FILE`, with `DOCKER_CONFIG_FILE` made under `umask 077` by its holder. The last line writes the token of the namespace's launcher account straight to the token file of step 5 (mode 0600, made in a subshell with `umask 077` and noclobber), so the value never reaches the terminal; never paste it anywhere else. The token file is never overwritten (a second run needs the first removed).
+The two `create secret generic` lines are for a Secret the `get` reports missing. The pull secret line copies the existing pull secret of the live namespace (`SOURCE_NAMESPACE`) by its own name into the probe namespace: the value goes through a pipe and is never printed and never on a command line (the shell history and the process list). Copying the live namespace's pull entry into the probe namespace gives the probe namespace the SAME registry pull value: an administrator step on the same registry, with no new access to the registry for anyone else (the probe namespace holds the same pull value; the registry itself is not widened). The alternative, when no such secret exists, is `kubectl -n NAMESPACE_NAME create secret generic PULL_SECRET_NAME --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=DOCKER_CONFIG_FILE`, with `DOCKER_CONFIG_FILE` made under `umask 077` by its holder. The last line writes the token of the namespace's launcher account straight to the token file of step 5 (mode 0600, made in a subshell with `umask 077` and noclobber), so the value never reaches the terminal; never paste it anywhere else. The token file is never overwritten (a second run needs the first removed).
 
 Cost: a probe namespace adds one more hub pod and its Services (`cloud-hub` and the headless `cw-agents`) to the cluster while the namespace exists, plus the pods of the smoke launch while they run.
 
@@ -408,10 +408,14 @@ The administrator adds the digest as the one entry for `relay-probe` in the `sec
 ( umask 077
 kubectl -n NAMESPACE_NAME get secret cloud-hub-registry -o jsonpath='{.data.secrets\.json}' | base64 -d > secrets.json
 python3 -c 'import json; d = json.load(open("secrets.json")); d["relay-probe"] = open("PROBE_DIGEST_FILE").read().strip(); json.dump(d, open("secrets.json", "w"))'
-kubectl -n NAMESPACE_NAME patch secret cloud-hub-registry --type merge -p "$(python3 -c 'import json; print(json.dumps({"stringData": {"secrets.json": open("secrets.json").read()}}))')"
+python3 -c 'import json; json.dump({"stringData": {"secrets.json": open("secrets.json").read()}}, open("registry-patch.json", "w"))'
+kubectl -n NAMESPACE_NAME patch secret cloud-hub-registry --type merge --patch-file registry-patch.json
 )
 rm -f secrets.json
+rm -f registry-patch.json
 ```
+
+The patch is read from a file (`registry-patch.json`, built in the same subshell, mode 0600), so the registry JSON (the digests) is never on a command line and never in the process list.
 
 With nothing else registered the file then reads:
 
