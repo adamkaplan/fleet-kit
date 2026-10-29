@@ -2123,6 +2123,110 @@ class GhBudget(Fixture):
         with self.assertRaises(AssertionError):
             self.late_head_scenario(mod)
 
+    # ---- the memo guard is an ALLOW-list (item 1) and the head read's refusals reach the pod (item 2)
+
+    READS = [["gh"] + ["pr", "view", "7"], ["gh", "api", "repos/o/r/pulls/7"], ["gh", "api", "repos/o/r/pulls/7", "-i"], ["gh", "api", "--paginate", "repos/o/r/x"],
+             ["gh", "api", "repos/o/r/x", "-H", "Accept: x"], ["gh", "api", "repos/o/r/x", "--jq", ".a"], ["gh", "api", "repos/o/r/x", "-q", ".a"],
+             ["gh", "api", "repos/o/r/x", "--cache", "1h"]]
+    WRITES = [["gh", "api", "repos/o/r/x"] + w for w in (
+        ["-X", "POST"], ["-XPOST"], ["-X", "GET"], ["--method", "POST"], ["--method", "GET"], ["--method=POST"], ["--method=GET"],
+        ["-f", "k=v"], ["-fk=v"], ["-f=k=v"], ["-F", "k=v"], ["-Fk=v"], ["--field", "k=v"], ["--field=k=v"], ["--raw-field", "k=v"],
+        ["--raw-field=k=v"], ["--input", "f"], ["--input=f"],
+        ["--field=x"], ["--raw-field=x"], ["-XPOST", "y"], ["-fk=v", "y"], ["--field=x", "y"], ["--raw-field=x", "y"], ["--input=f", "y"], ["--method=POST", "y"], ["-X"], ["--method"], ["-f"], ["-F"], ["--field"], ["--raw-field"], ["--input"], ["--unknown"], ["--jq=.a"], ["--cache=1h"], ["-H"], ["other/path"])] + [
+        ["gh", "pr", "merge", "7"], ["gh", "api"], ["gh", "issue", "view", "1"]]
+    WRITE_FLAGS = ["-X", "-XPOST", "--method", "--method=POST", "-f", "-fk=v", "-F", "--field", "--field=x", "--raw-field", "--raw-field=x", "--input", "--input=f"]
+
+    def guard_failures(self, mod):
+        bad = [a for a in self.READS if not mod._is_read(a)] + [a for a in self.WRITES if mod._is_read(a)]
+        return bad
+
+    def test_memo_guard_is_an_allow_list_one_case_per_flag_spelling(self):
+        self.assertEqual(self.guard_failures(relay), [])
+
+    def test_memo_guard_mutant_per_allow_list_member_is_caught(self):
+        for name, old in (("_READ_FLAGS", '_READ_FLAGS = frozenset({"-i", "--paginate"})'),
+                          ("_READ_VALUE_FLAGS", '_READ_VALUE_FLAGS = frozenset({"-H", "--jq", "-q", "--cache"})')):
+            for flag in self.WRITE_FLAGS:
+                mod = load_backend_module(old, old.replace("})", ', "%s"})' % flag))
+                self.assertNotEqual(self.guard_failures(mod), [], (name, flag))
+
+    def test_a_write_clears_the_memo_whatever_its_flag_spelling(self):
+        for write in self.WRITES[:-3]:
+            runs = []
+            r = relay.MeteredRunner(lambda argv, *a, **k: (runs.append(argv), types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1],
+                                    self.accounts_for_guard(), relay.RelayBudget(lambda: 0.0), lambda: 0.0)
+            read = ["gh", "pr", "view", "7"]
+            r(read)
+            r(write)
+            r(read)
+            self.assertEqual(runs.count(read), 2, write)
+
+    def accounts_for_guard(self):
+        return types.SimpleNamespace(check_pause=lambda *a, **k: None, record=lambda *a, **k: None)
+
+    def refusing_head(self, how, mod=relay):
+        """world whose FINAL head read (3rd context) raises `how`."""
+        ex, backend = self.world(mod)
+        real = self.host._ledger_context
+
+        def ctx(args, rn, now_, writable, parts=None, floor=False, plan_read=True):
+            if not plan_read and not floor and how is not None and self.n_ctx >= 2:   # the live head read: plan_read False, floor False
+                self.n_ctx += 1
+                if how == "hang":
+                    threading.Event().wait(1)
+                raise how
+            return real(args, rn, now_, writable, parts=parts, floor=floor, plan_read=plan_read)
+        self.host._ledger_context = ctx
+        return ex
+
+    def test_head_read_429_reaches_the_pod_by_name(self):
+        for reason in (relay.BUDGET_REASON, relay.POD_BUDGET_REASON):
+            ex = self.refusing_head(relay.Refuse(429, reason))
+            got = self.one(ex, "prove", **dict(PROVE))
+            self.assertEqual((got["status"], got["reason"]), (429, reason))
+            self.assertEqual(self.raw(), b"")
+
+    def test_head_read_timeout_stays_504(self):
+        ex = self.refusing_head("hang")
+        saved, relay.HEAD_TIMEOUT = relay.HEAD_TIMEOUT, 0.1
+        try:
+            got = self.one(ex, "prove", **dict(PROVE))
+        finally:
+            relay.HEAD_TIMEOUT = saved
+        self.assertEqual(got["status"], 504)
+
+    def test_head_read_other_failure_stays_409(self):
+        got = self.one(self.refusing_head(RuntimeError("boom")), "prove", **dict(PROVE))
+        self.assertEqual(got["status"], 409)
+        self.assertIn("stale head", got["reason"])
+
+    def test_head_read_refusal_mutants_are_caught(self):
+        old_a, new_a = "        except Refuse as r:\n            box.append(r)\n", ""
+        mod = load_backend_module(old_a, new_a)   # a Refuse becomes None again: 409
+        ex = self.refusing_head(mod.Refuse(429, mod.BUDGET_REASON), mod)
+        self.assertEqual(self.one(ex, "prove", **dict(PROVE))["status"], 409)
+        mod = load_backend_module("        if isinstance(first, Refuse):\n            raise first\n", "")   # the Refuse is not re-raised
+        ex = self.refusing_head(mod.Refuse(429, mod.BUDGET_REASON), mod)
+        self.assertNotEqual(self.one(ex, "prove", **dict(PROVE))["status"], 429)
+        mod = load_backend_module("            box.append(None)\n    t = threading", "            box.append(_TIMEOUT)\n    t = threading")   # other failures become 504
+        ex = self.refusing_head(RuntimeError("boom"), mod)
+        self.assertEqual(self.one(ex, "prove", **dict(PROVE))["status"], 504)
+
+    def test_engine_has_no_unreviewed_mutable_attribute_for_the_shallow_copy(self):
+        """The relay copies the Switchboard engine with copy.copy (one attribute replaced): every mutable attribute set in __init__ is SHARED by the copy.
+        This pins the list; a new dict/list/set/object attribute fails here until it is reviewed as safe to share across requests (or reset in _parts)."""
+        import ast
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        init = next(f for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "Switchboard" for f in c.body
+                    if isinstance(f, ast.FunctionDef) and f.name == "__init__")
+        found = sorted({n.targets[0].attr for n in ast.walk(init) if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute)
+                        and isinstance(n.targets[0].value, ast.Name) and n.targets[0].value.id == "self"
+                        and isinstance(n.value, (ast.Dict, ast.List, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp))
+                        or isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute) and isinstance(n.value, ast.Call)
+                        and isinstance(n.value.func, ast.Name) and n.value.func.id in ("set", "dict", "list", "V2Reads")})
+        self.assertEqual(found, ["_delivered", "_early_facts", "_last", "_not_fleet", "decision_seeds", "decision_seen", "notice_effects", "notice_facts",
+                                 "pass_toasts", "reads", "stopped_news", "stopped_news_errors", "synthetic_cache", "toasted"])
+
     def test_final_head_is_read_fresh_not_from_the_memo(self):
         ex, _ = self.world(move_after=2)   # the head moves after the link and plan reads
         got = self.one(ex, "prove", **dict(PROVE))

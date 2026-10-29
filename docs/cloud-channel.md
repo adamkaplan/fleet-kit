@@ -61,8 +61,10 @@ One document to set up, run and take down the cloud hub and the pod-side command
   - The relay's GitHub cost (PC-6): 0 gh calls at rest (an empty pending list makes none). One request builds its pull request picture ONCE: its own
     context object (never shared with another request, so a late thread of an earlier request cannot write into it), and the same READ is answered from
     the first within the request (a write is never skipped, and clears that memory). The FINAL head, compared under the ledger flock, is a fresh read under
-    `HEAD_TIMEOUT`, never the memo, and counts as a call. Exactly, per request (the stub of the tests): prove 3 (link read, plan read, fresh head read),
-    verdict 3, gates 2, report 1. Caps in a rolling hour: a SHARE per pod (`RELAY_GH_PER_POD`, 120 calls: one pod cannot spend the hour) and the global
+    `HEAD_TIMEOUT`, never the memo, and counts as a call. Exactly, per request, MEASURED AGAINST A STUB ledger context: prove 3 (link read, plan read, fresh head read),
+    verdict 3, gates 2, report 1. The REAL context adds reads (carries, the ask subject); those are not in these counts and fail closed: the room reserve of 3 and the
+    hard-stop `take` (429 in the middle, nothing written). The memo guard is an allow-list: only `gh pr view` and `gh api <path>` with `-i`, `--paginate`, `-H v`, `--jq v`,
+    `-q v`, `--cache v` are memoized; any other argv counts as a write and clears the memo. A 429 from the head read reaches the pod by name (a timeout is 504, any other failure 409). Caps in a rolling hour: a SHARE per pod (`RELAY_GH_PER_POD`, 120 calls: one pod cannot spend the hour) (the share is not a reservation: five or more pods can still fill the global 600 an hour) and the global
     `RELAY_GH_PER_HOUR` (600) as a backstop. A request is admitted only while `RELAY_GH_PER_REQUEST` (3) calls of RESERVE are free under both caps
     (`room`, a separate step before any gh call); each call is then taken one by one (`take`, the hard stop: a request that outgrows its reserve is refused in the
     middle). The refusal is 429 and names the cap: "relay GitHub budget: pod share" or "relay GitHub budget"; audited as `relay.refused`, nothing written. The link
