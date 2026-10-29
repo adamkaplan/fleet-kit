@@ -31,10 +31,12 @@ EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus ent
 REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
 ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
 CARRY_KINDS = ("carried",)   # #1129: a proof or verdict that holds at a new head (see `carry_decision`); its own line, the original row is never touched
-KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS
+CLAIM_KINDS = ("claim",)   # #976: the claim line of a pull request AS IT WAS when its merge was gated (`claim_text`, or None: it claims every per-PR scenario); the union reads it for a merged sibling
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS + CLAIM_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
+CLAIM_TEXT_LIMIT = 1000   # a `claim` ledger line keeps at most this much of a CLAIMS line (#976)
 EVALUATOR_ALIASES = {"adam": "owner"}
 
 # THE bound of every wait of a recording command (`prove`, `verdict`, `review record`): the ledger lock, each GitHub read, the agent registry. One
@@ -399,7 +401,7 @@ def may_record_verdict(evaluator, caller, allowed, authors):
 
 # ----------------------------------------------------------------------------------- waivers
 
-WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962), at the PR's head
+WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG", "CU")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962); CU: the claim union at an ask's last merge (#976); each at the PR's head
 NEVER_WAIVABLE = {"G6": "the owner's hold on a held PR", "G7": "the epic integration", "G8": "production"}
 WAIVER_REASON_MIN = 20
 WAIVER_SECONDS = 24 * 3600   # a waiver is valid this long (the retroactive-plan due date), and only at the head it names
@@ -411,7 +413,7 @@ def parse_waiver_gates(text):
     for raw in (text or "").replace(" ", "").split(","):
         if not raw:
             continue
-        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3", "mg": "MG"}.get(raw, raw[:1].upper() + raw[1:])
+        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3", "mg": "MG", "cu": "CU"}.get(raw, raw[:1].upper() + raw[1:])
         if gate in NEVER_WAIVABLE:
             return [], "%s is never waived (%s): refused, nothing was recorded" % (gate, NEVER_WAIVABLE[gate])
         if gate not in WAIVABLE:
@@ -464,6 +466,100 @@ UNTRACKED_WHY = {
 PER_PR_NONE_RE = re.compile(r"(?im)^[\s#>*-]*per-pr scenarios:\s*none\s+because\s+(\S.*)$")
 PLAN_LINK_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
 CANON_RE = re.compile(r"(?im)^\s*canon:\s*(\S.*)$")
+HIDDEN_RE = re.compile(r"(?ms)^[ \t]*(```|~~~).*?(?:^[ \t]*\1[^\n]*$|\Z)|<!--.*?(?:-->|\Z)")   # a code fence or an HTML comment: text the reader of the rendered body does not take as the body's own
+PLAN_FIRST_RE = re.compile(r"(?m)^[ \t]*PLAN:[^\n]*")
+CLAIMS_UNDER_RE = re.compile(r"\n[ \t]*CLAIMS:[ \t]*(.*)")
+
+
+def visible_body(body):
+    return HIDDEN_RE.sub("", body or "")
+
+
+def claim_text(body):
+    """The text of the `CLAIMS:` line directly under the FIRST `PLAN:` line outside code fences and HTML comments, or None."""
+    shown = visible_body(body)
+    first = PLAN_FIRST_RE.search(shown)
+    found = CLAIMS_UNDER_RE.match(shown, first.end()) if first else None
+    return found.group(1) if found else None
+
+
+def pr_claim(body, scenarios):
+    """(ids, error) for the claim line of a PR body: a `CLAIMS: S3 S4 S5` line directly under the `PLAN:` line names the scenarios THIS pull request proves.
+    `ids` is None when the body has no claim line (the PR behaves as it always did: every scenario read as `pr` is its own). The error says why a claim is
+    REFUSED: it names a scenario the plan does not declare, one the plan claims at the epic (a claim line only narrows), or names nothing."""
+    text = claim_text(body)
+    if text is None:
+        return None, None
+    names = [n for n in re.split(r"[\s,;]+", text.strip()) if n]
+    if not names:
+        return None, "the `CLAIMS:` line names no scenario: list the scenario ids this pull request proves (`CLAIMS: S3 S4`), or remove the line"
+    by_id = {s.get("id"): s for s in scenarios}
+    unknown = [n for n in names if n not in by_id]
+    if unknown:
+        return None, "the `CLAIMS:` line names %s, which the plan does not declare (it declares %s)" % (", ".join(unknown), ", ".join(sorted(map(str, by_id))[:12]))
+    epic = [n for n in names if claim_of(by_id[n]) != "pr"]
+    if epic:
+        return None, "the `CLAIMS:` line names %s, which the plan claims at the epic: a claim line only narrows what a pull request proves" % ", ".join(epic)
+    return list(dict.fromkeys(names)), None
+
+
+def pr_scenarios(scenarios, body):
+    """(claimed, left, error): the scenarios this PR proves (`claim_of` reads `pr`, narrowed by its claim line), the `pr` ones its claim line leaves to
+    the epic's other pull requests, and the claim line's refusal (then `claimed` is empty)."""
+    mine = [s for s in scenarios if claim_of(s) == "pr"]
+    ids, error = pr_claim(body, scenarios)
+    if error:
+        return [], [], error
+    if ids is None:
+        return mine, [], None
+    return [s for s in mine if s.get("id") in ids], [s for s in mine if s.get("id") not in ids], None
+
+
+def claim_union(scenarios, this_body, others):
+    """(applies, uncovered, last): the claim union of one ask (#976). `others` is [(state, body)] for the OTHER pull requests of the same plan, state `open` or `merged`
+    (one closed without a merge proves nothing and is not passed in). `last` is true when none of them is open: this merge is the ask's last. `applies` is true only when
+    some pull request of the ask has a claim line (a plan nobody narrows behaves exactly as before). `uncovered` lists the per-pull-request scenario ids that the claims of
+    the merged pull requests together with this one (a body with no claim line claims every one) leave out. A claim line that is refused covers nothing."""
+    per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
+    bodies = [this_body] + [body for _, body in others]
+    narrowed = any(pr_claim(body, scenarios)[0] is not None for body in bodies)
+    last = not any(state == "open" for state, _ in others)
+    covered = set()
+    for body in [this_body] + [body for state, body in others if state == "merged"]:
+        claimed, _, error = pr_scenarios(scenarios, body)
+        if not error:
+            covered.update(c.get("id") for c in claimed)
+    return narrowed, [i for i in per if i not in covered], last
+
+
+def claim_line(pr, head, body):
+    """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""
+    text = claim_text(body)
+    return {"kind": "claim", "pr": pr, "head": head, "claim_text": None if text is None else clip(text, CLAIM_TEXT_LIMIT)}   # a refused claim covers nothing, so a clipped one is never wider
+
+
+def recorded_claim(entries, pr, first=False, at=None):
+    """(found, claim_text) from the NEWEST `claim` line of `pr`, or the FIRST with `first`. With `at` (epoch seconds, a merged pull request's `merged_at`): the NEWEST line
+    recorded AT OR BEFORE `at`, the claim in force at the merge; a claim line of `pr` with no usable timestamp reads nothing (found False). found is False when none qualifies."""
+    mine = [e for e in entries if e.get("kind") == "claim" and e.get("pr") == pr]
+    if at is not None:
+        if any(isinstance(e.get("ts"), bool) or not isinstance(e.get("ts"), int) for e in mine):
+            return False, None
+        mine = [e for e in mine if e["ts"] <= at]
+    if not mine:
+        return False, None
+    return True, mine[0 if first else -1].get("claim_text")
+
+
+def claim_body(text, link="PLAN: x#1"):
+    """A body that carries a recorded claim text, to be read by `pr_claim` like any other."""
+    return link + ("\nCLAIMS: %s" % text if text is not None else "")
+
+
+def union_refusal(ref, uncovered):
+    return ("merge of %s refused: it is the last pull request of its ask and the claims of its merged pull requests do not cover %s; a pull request must claim %s "
+            "(`CLAIMS:` under `PLAN:`), or the chief of staff logs a waiver (`waive %s --gates CU`)" % (
+                ref, ", ".join(uncovered), "it" if len(uncovered) == 1 else "them", ref))
 
 
 def canon_status(body):
@@ -708,7 +804,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif not head:
                 row.update(status="missing", missing=["the PR head is unknown"])
             else:
-                claimed = [s for s in plan["scenarios_parsed"] if claim_of(s) == "pr"]
+                claimed, left, claim_error = pr_scenarios(plan["scenarios_parsed"], (facts or {}).get("body"))
                 scen_rows = [scenario_state(s, entries, pr, plan["plan_hash"], head, authors) for s in claimed]
                 if carries and not carries.get("refusal") and carries.get("plan") and carries["plan"].get("result") == "pass" and carries.get("head"):
                     dep_rows, carried_reviews = carried_rows(carries, entries, facts)
@@ -719,7 +815,9 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 bad = [s for s in scen_rows if s["status"] != "ok"]
                 row["detail"] = "%d of %d claimed scenarios proven and judged at %s" % (len(scen_rows) - len(bad), len(scen_rows), head[:8])
                 none_because = PER_PR_NONE_RE.search(plan.get("text") or "")
-                if not claimed:
+                if claim_error:
+                    row.update(status="missing", missing=["refused: " + claim_error])
+                elif not claimed:
                     # G1 never passes vacuously: no per-PR scenario needs an explicit, reasoned statement
                     if none_because and len(none_because.group(1).strip()) >= 20:
                         row.update(status="n/a", detail="no per-PR scenarios: %s (the epic gate applies)" % none_because.group(1).strip()[:80])
@@ -731,6 +829,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 else:
                     row["status"] = "ok"
                 epic = [s["id"] for s in plan["scenarios_parsed"] if claim_of(s) == "epic"]
+                if left:
+                    row["detail"] += "; left to the epic's other pull requests by the CLAIMS line: %s" % ", ".join(s["id"] for s in left)
                 if epic:
                     row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s" % ", ".join(epic)
         elif gid == "G4":
