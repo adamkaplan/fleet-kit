@@ -217,6 +217,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 1 | serial |
+| `bin/test-cloud-retired` | 66 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
@@ -282,6 +283,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 0 | serial |
+| `bin/test-cloud-retired` | 33 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |

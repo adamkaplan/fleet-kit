@@ -86,6 +86,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_cli.py` | 5 | the pod-side command to send and report through the cloud channel | |
 | `cloud_cost_report.py` | 5 | USD per day of the cloud fleet, from the launcher's audit lines (read only) | |
 | `cloud_hub.py` | 5 | the cloud switchboard's front door | |
+| `cloud_retired.py` | 5 | the read of a retired cloud worker from its run record, and the boss kept at its removal (#1546); a part of `cloud_worker.py` | |
 | `cloud_way_back_check.py` | 5 | a read-only check of the way back from the cloud to local | |
 | `cloud_worker.py` | 5 | remote (cloud) workers for the switchboard | |
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
@@ -216,6 +217,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_worker.py` | `_lib:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_walk:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `bind:sys.modules` | 1 | uses `sys` beyond its plain attributes |

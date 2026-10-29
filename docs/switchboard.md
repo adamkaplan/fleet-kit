@@ -627,6 +627,12 @@ line and the registry note that `retire` writes, and makes no `stop` call
 (there is no pod). `retire` of such a record ends it cleanly, as it always
 did.
 
+**`read` of a retired cloud worker (#1546).** After a pod is retired, `read NAME` no longer fails with the tunnel error. It looks for a live cloud record and then for a local agent first; only when nothing answers to the name does it look for a run record of that name under the run-record directory (code: `bin/cloud_retired.py`). It then prints a first line saying the text is from the record of a retired run and when it ended (the time in the run record, or, for a record with no end time, the time in its directory name), then the last text of the worker in the newest run record (the latest end; of two with the same end, the later directory name), and exits 0. `read --cloud` asks for a live cloud record only, so it is not reached by this fallback.
+
+The text is shown to its own lane only (the rule of `retire`: the operator, the Chief of Staff, or the worker's own boss). The switchboard keeps that boss in `<state>/cloud-boss/<worker>.json` when the record is removed by `retire` or `cloud-clear`: worker, boss and end time, 0600, at most 1 KiB, 500 files, 30 days. It is one file per name, overwritten at each removal, and deleted when the removed record has no boss; a leftover temporary file of a write that died goes after a day. All of this is pruned only when a file is written. The file is read only when it is ours and private (the owner and mode check of the record reader): a guard against a mistake, not against another process of the same user. It speaks only for the newest run: a boss file older than the end of the newest run record (a later run of the name that never reached its own removal) is no boss on record. A worker removed before this was kept is readable by the operator and the Chief of Staff only.
+
+The text is scrubbed by the launcher's one scrub function (before and after the cap); the scrub works by shape and flattens non-ASCII characters to `?`. It is capped at 4,000 characters, with a closing line saying how many were cut. An absent, unreadable, malformed or empty transcript is one plain line and exit 1. It only reads files: nothing is written, no cluster is called and no path of the run record is printed.
+
 ### Intent lines (PR 6)
 
 The usual pattern for agentic coding is one session per intent. Here the Chief
