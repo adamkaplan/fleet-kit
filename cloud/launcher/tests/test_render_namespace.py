@@ -232,6 +232,31 @@ class RelayAppendix(unittest.TestCase):
         self.assertIn("rm -f PROBE_TOKEN_FILE", teardown)
         self.assertIn("rm -f PROBE_DIGEST_FILE", teardown)
 
+    ONE_SCOPE = "the render makes no cluster-scoped objects, so deleting the namespace removes everything it created"
+    EDITED = "they exist from the apply and are EDITED, not created"
+
+    def check_probe_teardown_and_secret_order(self):
+        self.assertEqual(self.whole.count(self.ONE_SCOPE), 1)
+        listing = self.whole.split("```text", 2)[1]
+        self.assertLess(listing.index("get secret"), listing.index("create secret generic"))
+        self.assertEqual(self.whole.count(self.EDITED), 1)
+        self.assertLess(self.whole.index("run the `get secret` line first"), self.whole.index("ONLY for a Secret the `get` reports missing"))
+        teardown = self.whole.split("Teardown (", 1)[1].split("```", 2)[1]
+        self.assertNotIn("delete serviceaccount", teardown)
+        for kept in ("delete rolebinding cw-minter", "delete secret cw-minter-token", "kubectl delete namespace NAMESPACE_NAME",
+                     "rm -f TOKEN_FILE", "rm -rf PROBE_CONFIG_DIR"):
+            self.assertIn(kept, teardown)
+
+    def test_the_teardown_scope_the_secret_order_and_the_single_deletes(self):
+        self.check_probe_teardown_and_secret_order()
+
+    def test_a_document_without_the_scope_sentence_fails_the_check(self):
+        mutant = self.whole.replace(self.ONE_SCOPE, "")
+        self.assertNotEqual(mutant, self.whole)   # the mutation is applied
+        self.whole = mutant
+        with self.assertRaises(AssertionError):
+            self.check_probe_teardown_and_secret_order()
+
     def test_a_document_without_the_daemon_command_fails_the_check(self):
         mutant = self.text.replace(R1_COMMAND, "")
         self.assertNotEqual(mutant, self.text)   # the mutation is applied

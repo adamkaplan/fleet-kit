@@ -355,6 +355,8 @@ kubectl -n NAMESPACE_NAME create secret docker-registry PULL_SECRET_NAME --docke
 kubectl -n NAMESPACE_NAME create token cw-operator --duration=DURATION
 ```
 
+The order after the apply: run the `get secret` line first. The apply creates the two registry Secrets (`cloud-hub-registry` and `cloud-hub-pw`) empty: they exist from the apply and are EDITED, not created; a `create secret generic` on them can fail with AlreadyExists. Run the `create secret generic` command ONLY for a Secret the `get` reports missing. The pull secret is never in the manifests: it is always created by hand.
+
 The two `create secret generic` lines are for a Secret the `get` reports missing. The last line prints the token of the namespace's launcher account: write it to the token file of step 5 (mode 0600) and never paste it anywhere else.
 
 Cost: a probe namespace adds one more hub pod and its Services (`cloud-hub` and the headless `cw-agents`) to the cluster while the namespace exists, plus the pods of the smoke launch while they run.
@@ -364,7 +366,6 @@ Teardown (the owner's step; also the administrator's login):
 ```text
 kubectl -n NAMESPACE_NAME delete rolebinding cw-minter
 kubectl -n NAMESPACE_NAME delete secret cw-minter-token
-kubectl -n NAMESPACE_NAME delete serviceaccount cw-operator
 kubectl delete namespace NAMESPACE_NAME
 rm -f TOKEN_FILE
 rm -rf PROBE_CONFIG_DIR
@@ -373,7 +374,7 @@ rm -f PROBE_TOKEN_FILE
 rm -f PROBE_DIGEST_FILE
 ```
 
-Deleting the namespace removes everything inside it (the hub, its Services, the Secrets, the network policies and the accounts). The first three lines revoke the namespace's launcher token and remove the minter binding before that; the token file and the private settings copy are removed from the machine last.
+Deleting the namespace removes everything inside it (the hub, its Services, the Secrets, the network policies and the accounts): the render makes no cluster-scoped objects, so deleting the namespace removes everything it created. The first two lines remove the minter binding and its token Secret before that; the token file and the private settings copy are removed from the machine last.
 
 ### A relay probe
 
