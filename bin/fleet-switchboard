@@ -3780,7 +3780,7 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
         relay_loop = None
         try:
             try:   # the relay is pulled on its own cadence, not after each pass (#1477)
-                relay_loop = load_module("cloud_relay_daemon").start_loop(engine, sys.modules[__name__], subprocess.run, engine.now)
+                relay_loop = load_module("cloud_relay_daemon").start_loop(engine, sys.modules.get(__name__), subprocess.run, engine.now, os.environ)
             except Exception as err:
                 engine._failed(None, "pass", err, {"errors": []})
             done = 0

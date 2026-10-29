@@ -2930,6 +2930,87 @@ class TestDaemonRelayLoop(Base):
             for k, v in saved.items():
                 _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
 
+    def test_twenty_calls_are_answered_inside_the_wait_while_a_45_second_pass_runs(self):
+        """S1/S2 on the real run_daemon with a fake 45 s engine pass (fake clock). Each call is answered by the relay loop while the
+        pass is still running. Mutant: the relay pulled inline after run_pass: the pass waits for an answer that only comes after it,
+        so the first wait times out and fewer than 20 calls are answered."""
+        import os as _os
+        relay = sb.load_module("cloud_relay_daemon")
+        clock, queue, answered, lock = [0.0], [], {}, threading.Lock()
+        stub = types.SimpleNamespace(backend=types.SimpleNamespace(audit=lambda *a: None))
+        replies = {"prove": (200, "ok"), "verdict": (200, "ok"), "gates": (200, "{}"), "report": (403, "refused: not bound")}
+
+        def handle(req):
+            return replies[req["call"]["command"]] + (None,)
+        stub.handle = handle
+
+        def pull(*a, **k):
+            def fetch():
+                with lock:
+                    return {"requests": list(queue)}
+
+            def post(rid, body):
+                with lock:
+                    answered[rid] = clock[0]
+                    queue[:] = [q for q in queue if q["id"] != rid]
+            return relay.pass_once(stub, fetch, post)
+        orig_pull, orig_cadence = relay.pass_if_configured, relay.CADENCE
+        relay.pass_if_configured, relay.CADENCE = pull, 0.01
+        saved = {k: _os.environ.get(k) for k in ("FLEET_RELAY_HUB_URL", "FLEET_RELAY_HUB_TOKEN_FILE")}
+        _os.environ.update({"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"})
+        asked, pass_end = {}, []
+        engine, real = self.world.engine, self.world.engine.run_pass
+
+        def long_pass():
+            if pass_end:
+                return real()
+            for i in range(20):   # a pod call every 2 s of fake time; the pass lasts 45 s of fake time
+                clock[0] = 2.0 * i
+                rid = "%032x" % (i + 1)
+                asked[rid] = clock[0]
+                with lock:
+                    queue.append({"id": rid, "pod": "p", "repo": "r", "call": {"command": ("prove", "verdict", "gates", "report")[i % 4]}})
+                deadline = time.time() + 3   # real seconds: the loop's cadence is 0.01 s
+                while time.time() < deadline and rid not in answered:
+                    time.sleep(0.005)
+            clock[0] = 45.0
+            pass_end.append(clock[0])
+        engine.run_pass = long_pass
+        try:
+            sb.run_daemon(engine, self.world.state, 5, lambda sock, t: None, passes=1)
+        finally:
+            relay.pass_if_configured, relay.CADENCE = orig_pull, orig_cadence
+            for k, v in saved.items():
+                _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
+        self.assertEqual(len(answered), 20)
+        self.assertTrue(all(answered[r] - asked[r] <= 10 for r in asked))   # S2: at most 10 s after pending; S1: inside 30 s
+        self.assertLess(max(answered.values()), pass_end[0])   # all answered while the 45 s pass was still running
+
+    def test_without_a_hub_the_audit_is_that_of_the_bare_passes(self):
+        """U3: FLEET_RELAY_HUB_URL unset: run_daemon writes the audit bytes of the same 3 bare engine passes (the loop body before the
+        relay existed). Mutant: a relay loop started with no hub adds a thread and relay lines."""
+        import os as _os
+        saved = _os.environ.pop("FLEET_RELAY_HUB_URL", None)
+        relay, started = sb.load_module("cloud_relay_daemon"), []
+        orig_run = relay.RelayLoop.run
+        relay.RelayLoop.run = lambda loop: started.append(1)
+        try:
+            sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3)
+            relay.RelayLoop.run = orig_run
+            self.assertEqual(started, [])   # no relay thread ran
+            via_daemon = self.world.audit()
+            other = World(self, agents=("platform",))
+            for _ in range(3):
+                other.engine.run_pass()
+            bare = other.audit()
+        finally:
+            if saved is not None:
+                _os.environ["FLEET_RELAY_HUB_URL"] = saved
+        def lines(rows):   # the clock stamp is real time (and repeats are rate-limited by it): compare what was said, byte for byte
+            return sorted({json.dumps({k: v for k, v in r.items() if k != "ts"}, sort_keys=True) for r in rows})
+        self.assertEqual(lines(via_daemon), lines(bare))
+        self.assertFalse([r for r in via_daemon if str(r.get("event")).startswith("relay.")])
+
     def test_no_relay_thread_without_a_hub(self):
         before = [t.name for t in threading.enumerate()]
         sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=1)

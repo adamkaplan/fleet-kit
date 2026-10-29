@@ -614,9 +614,9 @@ class RelayLoop:
     cannot make the hub's wait run out. One thread means one in-flight pass; each pass keeps its own total
     deadline and PASS_BUDGET (pass_once). The ledger flock is taken by the Executor as before."""
 
-    def __init__(self, engine, host, runner, now, environ=os.environ, cadence=CADENCE, sleep=None):
+    def __init__(self, engine, host, runner, now, environ=os.environ, cadence=None, sleep=None):
         self.args = (engine, host, runner, now, environ)
-        self.cadence = cadence
+        self.cadence = CADENCE if cadence is None else cadence
         self.stop_flag = threading.Event()
         self.sleep = sleep or self.stop_flag.wait
         self.thread = None
