@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""render-namespace NAMESPACE: print the namespaced cloud manifests for another namespace on standard output.
+
+It reads only the four manifest files next to this script, writes no file, makes no cluster call and opens no network connection.
+The files are handled as TEXT: only the lines that name the namespace and the hub's agent namespace value are replaced, so the
+render for the namespace cw is byte-equal to the four files joined by a document separator.
+"""
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FILES = ("cloud-hub.yaml", "cloud-hub-network.yaml", "operator-rbac.yaml", "cw-minter.yaml")
+CLUSTER_KINDS = ("RuntimeClass", "ClusterRole", "ClusterRoleBinding")
+BASE = "cw"
+LABEL = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
+RULE = "a DNS label (lowercase letters, digits and hyphens, at most 63 characters), not default, not starting with kube-"
+
+JSON_LINE = re.compile(r'^(\s*"namespace": ")cw(",?)$')
+YAML_LINE = re.compile(r'^(\s*namespace: )cw$')
+HUB_NAME = "FLEET_CLOUD_AGENT_NAMESPACE"
+HUB_VALUE = re.compile(r'^(\s*"value": ")cw(",?)$')
+COMMENT_FLAG = re.compile(r"^(\s*#.*\bkubectl -n )cw(\b.*)$")
+
+
+def valid(name):
+    return bool(LABEL.fullmatch(name)) and name != "default" and not name.startswith("kube-")
+
+
+def render_text(text, ns):
+    out = []
+    after_hub_name = False
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\n")
+        end = line[len(body):]
+        for pattern in (JSON_LINE, YAML_LINE, COMMENT_FLAG):
+            m = pattern.match(body)
+            if m:
+                body = m.group(1) + ns + (m.group(2) if m.lastindex > 1 else "")
+                break
+        else:
+            if after_hub_name:
+                m = HUB_VALUE.match(body)
+                if m:
+                    body = m.group(1) + ns + m.group(2)
+            after_hub_name = HUB_NAME in body
+        out.append(body + end)
+    return "".join(out)
+
+
+def header(ns, texts):
+    cluster = []
+    for text in texts:
+        for doc in re.split(r"^---\s*$", text, flags=re.M):
+            kind = re.search(r'^\s*"?kind"?:\s*"?(\w+)', doc, flags=re.M)
+            if kind and kind.group(1) in CLUSTER_KINDS:
+                cluster.append(kind.group(1))
+    return "".join("# %s\n" % line for line in (
+        "rendered for namespace %s" % ns,
+        "inputs: " + ", ".join(FILES) + " (read as text, nothing else)",
+        "cluster-wide documents (kinds %s): %s" % (", ".join(CLUSTER_KINDS), ", ".join(cluster) if cluster else "none in these four files"),
+        "already present, once per cluster, not rendered here: runtimeclass.yaml and containerd-fix.yaml",
+        "apply: first kubectl apply --dry-run=server -f FILE, read the output, then the apply by the holder of the administrator login",
+    ))
+
+
+def render(ns):
+    texts = []
+    for name in FILES:
+        with open(os.path.join(HERE, name), encoding="utf-8", newline="") as f:
+            texts.append(f.read())
+    body = "---\n".join(render_text(t, ns) for t in texts)
+    return header(ns, texts) + body
+
+
+def main(argv):
+    if len(argv) != 2 or not valid(argv[1]):
+        sys.stderr.write("render-namespace: the namespace must be %s\n" % RULE)
+        return 2
+    sys.stdout.write(render(argv[1]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

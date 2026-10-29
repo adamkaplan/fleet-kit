@@ -327,6 +327,52 @@ Apply: run a server dry run first, `kubectl -n cw apply --dry-run=server -f clou
 
 Roll back: `kubectl -n cw delete networkpolicy -l app.kubernetes.io/part-of=cloud-hub` removes the four hub policies; `kubectl -n cw delete networkpolicy allow-egress default-deny` removes the two namespace-wide ones. Deleting default-deny without allow-egress, or the reverse, changes the whole namespace's reachability.
 
+## A probe namespace
+
+Cause: the four manifest files `cloud/k8s/cloud-hub.yaml`, `cloud-hub-network.yaml`, `operator-rbac.yaml` and `cw-minter.yaml` name the namespace `cw` as a literal in 21 places (plus the hub's agent namespace value and four example commands in comments), and the hub's agent namespace (`FLEET_CLOUD_AGENT_NAMESPACE`) is one value of its environment. A second namespace, with its own hub, was therefore a hand edit. One script now renders the four files for another namespace:
+
+`cloud/k8s/render-namespace NAMESPACE_NAME` prints the documents on standard output with the namespace of every namespaced document and the hub's agent namespace value replaced. It reads only those four files, writes no file, makes no cluster call and opens no network connection. NAMESPACE_NAME must be a DNS label that is not `default` and does not start with `kube-` (the launcher's own rule); anything else gives one line on standard error, nothing on standard output and exit status 2. The names inside the namespace (`cw-operator`, `cw-worker`, `cw-minter`, `cw-agents`, `cloud-hub`, the pull secret `cw-pull`) are kept. The render for `cw` is byte-equal to the files. The header of the output names the cluster-wide documents (kinds RuntimeClass, ClusterRole and ClusterRoleBinding: none are in these four files) and says that `runtimeclass.yaml` and `containerd-fix.yaml` are not rendered because they are already present, once per cluster.
+
+The steps, in order (the namespace `cwp` is the example):
+
+1. Step 1, render: `cloud/k8s/render-namespace cwp > cwp.yaml`. Read the header and the file.
+2. Step 2, the server-side dry run FIRST: `kubectl apply --dry-run=server -f cwp.yaml`. Read the whole output: every object must say `created (server dry run)` and nothing may be an error. The namespace must exist for the dry run to pass, so the owner creates it first (step 3).
+3. Step 3, the apply: the owner's step, done by the holder of the ADMINISTRATOR login. A pod, the launcher's own account and this change can never do it. The manifests do not create the namespace; the administrator creates it and then creates the objects (the hub file asks for `create`, never a second `apply`, because applying it again resets the registry Secret to empty objects). The command list for the administrator apply is below.
+4. Step 4, the secrets in the namespace: the owner's step. The pull secret named by `CW_PULL_SECRET` (the manifests use the name `cw-pull`), the hub's registry Secret `cloud-hub-registry` and its password Secret `cloud-hub-pw`. The apply of step 3 creates the last two as empty objects: check they exist and create them only when they are missing.
+5. Step 5, the private settings: a COPY of the settings file (never the live file), in its own directory, with four settings changed: `CW_CLOUD_NAMESPACE=cwp`, `CW_HUB_CHANNEL_URL=http://cloud-hub.cwp.svc:8443/message`, `CW_PULL_SECRET=cw-pull` (the name of the pull secret of step 4) and `CW_CLOUD_TOKEN_FILE`, the cluster token file of the namespace's OWN launcher account (`cw-operator` of the probe namespace; a token of the live namespace does not work there). The first three are lines of the copy; `CW_CLOUD_TOKEN_FILE` is set in the shell that runs the launch, as for the reaper. Point the launch at the copy with `XDG_CONFIG_HOME=PROBE_CONFIG_DIR`, where the copy is `PROBE_CONFIG_DIR/fleet-switchboard/cloud.env` (mode 0600).
+6. Step 6, the smoke launch: `launch --cloud` with the private copy, ONE worker, then retire it: `XDG_CONFIG_HOME=PROBE_CONFIG_DIR fleet-switchboard launch probe1 --cloud --agent coder --repo acme-org/widget-service --branch main --role coder --reports-to orch --brief-file BRIEF_FILE`, read it, then `XDG_CONFIG_HOME=PROBE_CONFIG_DIR fleet-switchboard retire probe1`.
+
+The command list for the administrator apply (the owner's steps 3 and 4; WORD_IN_CAPITALS names are placeholders to fill in, never values to paste into a PR):
+
+```text
+kubectl create namespace NAMESPACE_NAME
+kubectl apply --dry-run=server -f cwp.yaml
+kubectl create -f cwp.yaml
+kubectl -n NAMESPACE_NAME get secret cloud-hub-registry cloud-hub-pw
+kubectl -n NAMESPACE_NAME create secret generic cloud-hub-registry --from-literal=secrets.json={} --from-literal=agents.json={}
+kubectl -n NAMESPACE_NAME create secret generic cloud-hub-pw
+kubectl -n NAMESPACE_NAME create secret docker-registry PULL_SECRET_NAME --docker-server=REGISTRY_HOST --docker-username=REGISTRY_USER --docker-password=REGISTRY_PASSWORD
+kubectl -n NAMESPACE_NAME create token cw-operator --duration=DURATION
+```
+
+The two `create secret generic` lines are for a Secret the `get` reports missing. The last line prints the token of the namespace's launcher account: write it to the token file of step 5 (mode 0600) and never paste it anywhere else.
+
+Cost: a probe namespace adds one more hub pod and its Services (`cloud-hub` and the headless `cw-agents`) to the cluster while the namespace exists, plus the pods of the smoke launch while they run.
+
+Teardown (the owner's step; also the administrator's login):
+
+```text
+kubectl -n NAMESPACE_NAME delete rolebinding cw-minter
+kubectl -n NAMESPACE_NAME delete secret cw-minter-token
+kubectl -n NAMESPACE_NAME delete serviceaccount cw-operator
+kubectl delete namespace NAMESPACE_NAME
+rm -f TOKEN_FILE
+rm -rf PROBE_CONFIG_DIR
+rm -f cwp.yaml
+```
+
+Deleting the namespace removes everything inside it (the hub, its Services, the Secrets, the network policies and the accounts). The first three lines revoke the namespace's launcher token and remove the minter binding before that; the token file and the private settings copy are removed from the machine last.
+
 ## 5. Known gaps
 
 - Stopping a worker by name alone: #682.
