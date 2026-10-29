@@ -2674,6 +2674,16 @@ class TestSteerLongTurn(Base):
         (intent,) = self.intents()
         self.assertEqual((intent["detail"]["delivery"], intent["detail"]["busy"]), ("steer", True))
 
+    def test_the_predicate_with_the_key_off_never_steers_a_peer_on_age_alone(self):
+        decision = sb.steers_into_turn
+        working = types.SimpleNamespace(status="working", name="platform", fleet={"reports_to": "cos"})
+        peer = [sb.Fact("send:coder:1", "platform", "send", "hi", EPOCH, sender="coder")]
+        self.assertFalse(decision({"steer_after_minutes": 0}, working, peer, None, 10 ** 6))
+        self.assertFalse(decision({}, working, peer, None, 10 ** 6))
+        self.assertTrue(decision({"steer_after_minutes": 30}, working, peer, None, 31 * 60))
+        self.assertFalse(decision({"steer_after_minutes": 30}, working, peer, None, 30 * 60))
+        self.assertFalse(decision({"steer_after_minutes": 30}, working, peer, None, None))
+
     def test_the_age_restarts_when_the_status_leaves_working(self):
         turn_start = sb.load_module("turn_start")
         parse = sb.load_module("record_json").parse_bounded
