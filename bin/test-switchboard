@@ -30211,7 +30211,7 @@ class TestCloudPodReport(ReportBase):
 
     def executor(self):
         sys.path.insert(0, str(Path(sb.__file__).resolve().parent))
-        import cloud_relay_daemon as relay
+        relay = importlib.import_module("cloud_relay_daemon")
         engine = self.world.engine
         backend = relay.SwitchboardBackend(sb, (engine, None, {}), None, lambda: 1)
         backend.pr_issues = lambda pr: {2}   # the real backend.audit stays: the entries are read from the world's audit
