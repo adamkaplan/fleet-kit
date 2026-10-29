@@ -65940,6 +65940,64 @@ class TestReviewCheckout(LedgerBase):
         over = self.rc._write_laws(str(work), ({"big.md": b"x" * 11}, []), set(), 0, {"file": 10, "files": 10, "total": 1000}, 0)
         self.assertEqual(len(over), 1)
 
+    def test_1551_a_changed_law_file_the_merge_base_lacks_is_named_missing_and_one_it_holds_is_not(self):
+        added, edited = sb.REVIEW_LAW_FILES[0], sb.REVIEW_LAW_FILES[1]
+        self.base_tree = {"a.txt": "one\n", edited: "the merge base copy\n"}
+        self.head_tree = {"a.txt": "one\n", added: "new by the pull request\n", edited: "rewritten\n"}
+        self.serve_laws({added: "the base commit copy\n", edited: "the base commit copy\n"})
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        reason = "changed by this pull request; base/ holds no merge-base copy"
+        self.assertFalse((root / "base" / added).exists())
+        self.assertIn("%r (%s)" % (added, reason), (root / "laws-missing.txt").read_text().splitlines())
+        self.assertEqual(len([l for l in err.splitlines() if reason in l and added in l and "law files not provided" in l]), 1)
+        self.assertTrue(any(reason in m and added in m for m in json.loads((root / ".fleet-review-checkout").read_text())["laws_missing"]))
+        self.assertEqual((root / "base" / edited).read_text(), "the merge base copy\n")
+        self.assertFalse(any(edited in m for m in (root / "laws-missing.txt").read_text().splitlines()))
+
+    def test_1551_the_old_continue_for_a_changed_law_file_is_caught(self):
+        source = Path(self.rc.__file__).read_text()
+        old = "            if not os.path.isfile(os.path.join(root, \"base\", name)):\n                missing.append("
+        self.assertIn(old, source, "the mutant applies")
+        mutated = source.replace(old, "            if False:\n                missing.append(")
+        self.assertNotEqual(mutated, source)
+        space = {"__name__": "mutant_review_checkout"}
+        exec(compile(mutated, "mutant", "exec"), space)
+        applied = []
+        with mock.patch.object(self.rc, "_write_laws", lambda *a, **k: (applied.append(1), space["_write_laws"](*a, **k))[1]):
+            with self.assertRaises(AssertionError):
+                self.test_1551_a_changed_law_file_the_merge_base_lacks_is_named_missing_and_one_it_holds_is_not()
+        self.assertTrue(applied, "the mutant ran")
+
+    def test_1551_a_hostile_path_is_cut_and_escaped_in_the_notice_the_output_and_laws_missing(self):
+        hostile = "line\nbreak\x1b[31m" + "x" * 200 + ".txt"
+        self.base_tree = {hostile: "a\nb\n"}
+        self.head_tree = {hostile: "c\nd\n"}
+        with mock.patch.object(self.rc, "MAX_DIFF_LINES", 1):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        shown = self.rc._shown(hostile)
+        self.assertLessEqual(len(shown), 120)
+        notice = (root / "pr.diff").read_text().splitlines()[:3]
+        for text in (err, "\n".join(notice)):   # the notice, not the diff body: its "diff skipped ... for <path>" line is older wording that shows the raw path
+            self.assertNotIn("\x1b", text)
+            self.assertNotIn("line\nbreak", text)
+            self.assertNotIn("x" * 150, text)
+        self.assertTrue(any(l.startswith("  ") and "\\n" in l for l in notice), notice)
+        self.assertTrue(all("break" not in l or "\\n" in l for l in notice))
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(self.rc.remove_tree, str(work), True)
+        (work / "base").mkdir()
+        missing = self.rc._write_laws(str(work), ({hostile + "/..": b"x"}, []), {hostile}, 0, {"file": 100, "files": 10, "total": 1000}, 0)
+        missing += self.rc._write_laws(str(work), ({hostile: b"x"}, []), {hostile}, 0, {"file": 100, "files": 10, "total": 1000}, 0)
+        for line in missing:
+            self.assertNotIn("\n", line)
+            self.assertNotIn("\x1b", line)
+            self.assertLessEqual(len(line), 400)
+        self.assertEqual(len(missing), 2)
+
     def test_1551_four_mutants_each_fail_a_check(self):
         real_diff = self.rc._diff_text
 

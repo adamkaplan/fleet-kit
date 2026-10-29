@@ -398,7 +398,9 @@ def _write_laws(root, laws, touched, used, limits, base_count):
         if why:
             missing.append("%s (refused: %s)" % (_shown(name), why))
         elif name in touched:
-            continue   # the pull request changes it: base/ holds the merge base's copy
+            # the pull request changes it: base/ holds the merge base's copy when it has one, else the file is named missing
+            if not os.path.isfile(os.path.join(root, "base", name)):
+                missing.append("%s (changed by this pull request; base/ holds no merge-base copy)" % _shown(name))
         elif len(data) > limits["file"] or used + len(data) > limits["total"] or base_count + 1 > limits["files"]:
             missing.append("%s (over a size or count bound)" % _shown(name))
         else:
@@ -549,7 +551,7 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
                 raise OverBound("the diff is over the limit of %d bytes" % MAX_DIFF_BYTES)
             diff.append(piece)
             write_file(root, DIFFS_DIR + "/" + path + ".diff", piece.encode())   # #1047: one diff per changed file, so a reader takes each whole, chunk by chunk
-        diff.insert(0, _not_whole_block(cut_files))
+        diff.insert(0, _not_whole_block(cut_files))   # added after the diff-byte check above: the 5 MiB bound is not exact for this block
         write_file(root, "pr.diff", "".join(diff).encode())
         if sparse:
             write_file(root, SPARSE_FILE, ("sparse checkout: %d files written, %d files of the head tree not written\n" % (info["written"], info["not_written"])
