@@ -148,7 +148,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | `CW_CLUSTER_TOKEN_CMD` | a command that prints a cluster token; when unset the default below is used |
 | `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` | the vault that holds the cluster administrator credential (secret `CW_CLUSTER_ADMIN_SECRET`, default `cw-cluster-admin-kubeconfig`; or a command in `CW_CLUSTER_ADMIN_CMD`) |
 | `CW_CLUSTER_TOKEN_DURATION` | the token's requested life, default `20m`, at most `60m` (kubectl's own floor is 10 minutes) |
-| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
+| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository on stdout (an override's contract); the default is `app_token.py OWNER/NAME --fd N`, which hands the token over a pipe the launcher reads and never prints it (same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
 | `CW_OPENCODE_BIN` | the `opencode` program (default `opencode` on `PATH`); the launcher runs `opencode auth export` (fixed arguments, scrubbed environment, output through a pipe, in memory) and keeps only the one `github-copilot` entry, as a one-entry array. Refused by name: command missing or failing, no entry, two entries, an inactive entry, an entry that is not `oauth`; nothing is created |
 | `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
 | `CW_HUB_CHANNEL_URL` | the address of the hub's channel an orchestrator or hub pod is told (`FLEET_CLOUD_CHANNEL_URL`); an `http` or `https` URL with a host, an optional port and an optional one-segment path; not a secret; default `http://cloud-hub.cw.svc:8443/message`. **Set (this or `CW_HUB_REGISTRY_SECRET`) = the hub setting is on: every launch registers** with the hub (a worker launch included), and a launch needs the headless Service `cw-agents` |
@@ -382,7 +382,7 @@ The managed reaper's loop (`reap --loop`) does it, as one more step of each pass
 
 - **When.** For each running pod, when the token is `GIT_TOKEN_RENEW_AFTER_SECONDS` (1800, so 30 minutes of its life are left) old. The age is the Secret's
   `cw/git-token-minted` annotation, or the Secret's creation time when it has none. A pass that finds the token older than an hour (the machine slept) renews at once.
-- **How.** It mints through the SAME route as the launch (`run_git_token_cmd`: `CW_GIT_TOKEN_CMD`, else `app_token.py OWNER/NAME`), so one repository, the exact
+- **How.** It mints through the SAME route as the launch (`run_git_token_cmd`: `CW_GIT_TOKEN_CMD`, else `app_token.py OWNER/NAME` with a pipe named by `--fd`), so one repository, the exact
   permissions and the 61-minute cap hold by construction, and replaces only the `git-token` key by one merge patch whose body goes on standard input. The patch is bound to the exact Secret that was checked: its body carries that Secret's `metadata.uid` and `metadata.resourceVersion`, so the API server refuses it (Conflict) if the Secret changed or was made again while the mint ran (a relaunch of the same worker gets the same names); the labels are read again after the mint as a second guard. A refusal keeps the old state, writes one audit line (`the secret changed during the mint: not renewed`), names the worker in the report and is retried at the next pass. The token is
   never in an argument, an environment value, a file, an output, an audit line or a record. The pod needs no change: its credential helper and `gh` wrapper read the file at every
   call, and the file is a whole-directory projected volume (no `subPath`) that the kubelet refreshes, usually within a minute or two.
@@ -447,10 +447,18 @@ token file by hand. The reaper does that now, by itself, and runs unattended for
 ## Server-side guards: `app_token.py` and `preflight.py`
 
 A guard is enforced where the action takes effect (the repository's rules, the token's scope), not in a wrapper.
-These two programs are the server side of that. Neither writes a file; neither prints a secret.
+These two programs are the server side of that. The mint writes a file only when a person names `--out` (one new file, mode 0600); the preflight writes none; neither prints a secret.
 
-**`app_token.py OWNER/REPO`** prints a one-hour GitHub App installation token for that one repository, and nothing
-else, on stdout. It refuses (exit 1, one line on stderr naming the key, never a value) to print a token unless:
+**The cause (ask #1043):** the mint printed the one-hour repository token on standard output, where terminals, transcripts and logs capture it; two recorded cases (a misordered redirect, and a debugging run of a clone) each showed a live token.
+**`app_token.py OWNER/REPO`** now mints a one-hour GitHub App installation token for that one repository and writes it only to a route the
+caller names, never to stdout or stderr. The fix removes stdout as a delivery channel. The routes (exactly one per run):
+
+- `--fd N`: a descriptor (3 or more, open, writable, not a terminal) the caller passes down, normally a pipe the launcher reads. No file exists. This is the route for programs.
+- `--out PATH`: a new file, mode 0600, created only after every check passed, in a directory you own with no group or world access; it is refused when PATH exists and never overwritten. This is the route for a person.
+- no route: the token is minted, then revoked (nobody received it), and stderr says one line with the token's byte count; stdout stays empty, exit 0.
+
+A bad route (0, 1 or 2, a closed or read-only descriptor, a terminal, a second descriptor of the very file or pipe that standard output or standard error is (`3>&1`, `3>&2`), both routes, a bad directory, a symbolic link in any part of the directory path) exits 2 before anything is minted. The path route accepts the system's own root-owned links in a directory others cannot write, or a sticky one (such as `/var` and `/tmp` on a Mac); a `..` component and every other link are refused. A delivery
+that fails revokes the token and exits non-zero. Success is silent. It refuses (exit 1, one line on stderr naming the key, never a value) to deliver a token unless:
 
 - the installation is found, not stored: the mint asks GitHub (`GET /repos/OWNER/REPO/installation`, signed with the App's
   own short-lived token) which installation covers the repository, and refuses unless that answer is one installation whose
@@ -470,6 +478,34 @@ accepting the old set). The exact refusal GitHub gives for a permission granted 
 
 The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
 may name a loopback `http` address, for tests).
+
+The revoke covers the whole span from the mint to the end of the delivery: any exception or signal (an interrupt, SIGTERM, SIGHUP, a broken pipe, a full disk, an error in the code between the mint and the route) revokes the token once with its own value, removes the file this run created (only that one) and exits non-zero.
+A path over the file system's name or path limit is refused before anything is minted (exit 2, no request to GitHub); the limit is the smaller of the file system's `PC_NAME_MAX` and `PC_PATH_MAX` names and a fixed cap of 4096 bytes in total.
+A revoke that fails (GitHub refuses the DELETE or the connection fails) prints one line on stderr, `app-token: the token could not be revoked (status N)`, where N is the HTTP status or the word `unreachable` (never the token), and the exit status is non-zero, for the no-route run and the failed-delivery run; a good revoke prints no such line.
+The no-route run revokes the token before it forgets it: the kept token is dropped only after the revoke call has ended, and the token is kept from the moment the mint knows it.
+An interrupt of any kind ends with the token revoked and the interrupted status (130 for Ctrl-C, 143 for SIGTERM, 129 for SIGHUP): an interrupt during the revoke request makes the revoke once more and is then raised again, never swallowed; a revoke that still did not complete prints the one line above.
+Two more same-user limits of the path route, stated: a root-owned link accepted in a directory another non-root user owns is inside the same-user limit F1; a signal between creating the file and its guarding try leaves an empty 0600 file with no token.
+Two same-user limits remain, stated rather than fixed (a complete fix walks every path component with a directory descriptor and touches the link allowance above, so it is not cheap): F1, an ancestor of the path swapped for a link by the same user after the check redirects the delivery, and F2, the cleanup removes whatever is at the file's name. The attacker would already hold the caller's own user id, can read the delivered file and trace the mint: no new access.
+
+### Running the mint by hand
+
+Run it only with the file route, in a private directory you own, and never with a redirect or a command substitution (a slip there is
+how a token reached a screen):
+
+```
+mkdir -m 700 "$HOME/.cw-token-dir"
+python3 cloud/launcher/app_token.py acme-org/widget-service --out "$HOME/.cw-token-dir/token"
+# use the file (for example: read it into the program that needs it), then remove it:
+rm -r "$HOME/.cw-token-dir"
+```
+
+The run prints nothing on success. With no route it only reports a byte count and revokes the token, so it is a safe way to check that the
+mint works. The one line on stderr (here for a token of 49 bytes; the count is the token's own) reads:
+
+```
+app-token: minted a token of 49 bytes and did not deliver it: name a route with --fd N or --out PATH
+```
+ The file is created with mode 0600 and the mint refuses an existing path. Do not print the file in a shared session or a log.
 
 **`preflight.py OWNER/REPO [--branch NAME] [--accept-classic]`** reads, with GET only, whether the default branch
 refuses direct pushes (a `pull_request` rule that requires at least one approving review, or a `merge_queue` rule, in an active ruleset that covers the branch; `evaluate` and `disabled` rulesets and rulesets not covering the branch are refused by name; ref patterns follow GitHub: `*` stops at `/`, `**` crosses it, and a pattern the program does not understand, such as a character class, covers nothing), force-pushes (`non_fast_forward`) and deletion

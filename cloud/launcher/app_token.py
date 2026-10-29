@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""app-token: print a one-hour GitHub App installation token for ONE repository, to stdout, and nothing else.
+"""app-token: mint a one-hour GitHub App installation token for ONE repository and write it to the route the caller names, and nowhere else.
 
-usage: app_token.py OWNER/REPO
+usage: app_token.py OWNER/REPO --fd N       (programs: a pipe descriptor the caller opened and passed down; N is 3 or more, open, writable, not a terminal)
+       app_token.py OWNER/REPO --out PATH   (a person: a new file, mode 0600, in a private directory you own; refused when PATH exists)
+       app_token.py OWNER/REPO              (no route: the token is minted, never shown, revoked, and only its byte count is said on stderr)
+
+The token is never written to standard output or standard error. Why: standard output is the channel that terminals, tool transcripts
+and logs capture by default, so a slip in a redirect or a debugging run showed a one-hour token (twice). Errors go to stderr, never a value.
 
 The App id and private key are read from the vault by commands (stdout of each, in memory only):
   CW_APP_ID_CMD, CW_APP_KEY_CMD
@@ -12,10 +17,10 @@ The installation is NOT read from the vault: GET /repos/OWNER/REPO/installation 
 covers the repository, and its account must be the repository owner. CW_APP_INSTALLATION_CMD and a stored installation id are obsolete:
 accepted, never run, ignored.
 The key goes to `openssl dgst -sha256 -sign /dev/fd/N` through a pipe: never a file, an argument or the environment.
-The 9-minute app JWT and the token are never printed except the token, once, on stdout. Errors go to stderr, never a value.
+The 9-minute app JWT and the token are never printed. A token that could not be delivered to its route is revoked.
 Only https://api.github.com is used; CW_GITHUB_API_BASE may name a loopback http URL (tests).
 The request asks for, and the answer must carry EXACTLY, the permissions of EXPECTED_PERMISSIONS below (no extra key, no
-higher level, none missing), else no token is printed. A missing key is the App not yet granted (or the installation not yet
+higher level, none missing), else no token is delivered. A missing key is the App not yet granted (or the installation not yet
 accepting) a permission: the refusal names it and the owner step.
 CW_OPENSSL names the openssl binary (default openssl).
 """
@@ -92,25 +97,77 @@ def http_error_text(code, retry_after=None):
 MINTED = []  # the one token minted and not yet printed: a refusal after the mint revokes it (never in a message)
 
 
+class Interrupted(SystemExit):
+    """The exit a SIGTERM or SIGHUP makes (128 + the signal number): an interrupt, unlike the exit a refusal makes."""
+
+
+INTERRUPTS = (KeyboardInterrupt, Interrupted)
+
+
 def revoke(token):
-    """Best effort: revoke an installation token (DELETE /installation/token, authorised by that token). True only on HTTP 204."""
+    """Revoke an installation token. An interrupt during the request: one more request, then the interrupt is raised again (the
+    run ends interrupted, never swallowed); a revoke that still did not complete says its one line first. True only on HTTP 204."""
+    interrupt, ok = None, False
+    for _ in range(2):
+        try:
+            ok = revoke_request(token)
+            break
+        except INTERRUPTS as e:
+            interrupt = interrupt or e
+    if interrupt is None:
+        return ok
+    if not ok:
+        say_revoke_failed()
+    raise interrupt
+
+
+def revoke_request(token):
+    """Best effort: one DELETE /installation/token, authorised by that token. True only on HTTP 204. An interrupt passes through."""
+    REVOKE_STATUS[:] = ["unreachable"]
     try:
         req = urllib.request.Request(api_base() + "/installation/token", method="DELETE",
                                      headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                                               "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cw-app-token"})
         with open_url(req, 15) as r:
+            REVOKE_STATUS[:] = [str(r.status)]
             return r.status == 204
+    except urllib.error.HTTPError as e:
+        REVOKE_STATUS[:] = [str(e.code)]
+        return False
+    except INTERRUPTS:
+        raise
     except BaseException:  # any failure (including a redirect or an exit) is "revocation failed", never a crash and never the token
         return False
 
 
+REVOKE_STATUS = ["unreachable"]  # what the last revoke met: an HTTP status, or the word unreachable
+
+
+def say_revoke_failed():
+    """The one line for a revoke that did not succeed: the status or the word unreachable, never the token."""
+    print("app-token: the token could not be revoked (status %s)" % REVOKE_STATUS[0], file=sys.stderr)
+
+
 def die(msg, code=1):
+    failed = False
+    interrupt = None
     if MINTED:
         token = MINTED.pop()
-        msg += (" The token was revoked." if revoke(token)
+        try:
+            ok = revoke(token)
+        except INTERRUPTS as e:   # interrupted during the revoke: it was made once more, and said its line if it failed
+            interrupt, ok = e, REVOKE_STATUS[0] == "204"
+        failed = not ok
+        if interrupt is not None:
+            failed = False
+        msg += (" The token was revoked." if ok
                 else " Revocation failed: the token expires within an hour and was never printed.")
         del token
     print("app-token: " + msg, file=sys.stderr)
+    if failed:
+        say_revoke_failed()
+    if interrupt is not None:   # the interrupt ends the run with its own status
+        code = 130 if isinstance(interrupt, KeyboardInterrupt) else interrupt.code
     sys.exit(code)
 
 
@@ -246,8 +303,9 @@ def find_installation(target, jwt):
     return inst, owner_id
 
 
-def mint(target):
-    """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
+def mint(target, keep=False):
+    """Return a token for target (OWNER/REPO), or exit through die(). Never prints. With keep the token stays in MINTED (so a failure
+    after the return still revokes it) and the one who asked clears it."""
     repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
     if not app_id.isdigit():
@@ -263,10 +321,12 @@ def mint(target):
     ans = github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt,
                       {"repositories": [repo], "permissions": dict(EXPECTED_PERMISSIONS)})
     token = ans.get("token") if isinstance(ans, dict) else None
+    if isinstance(token, str) and token:
+        # kept the moment it is known: the caller never holds a token that is not in the list
+        MINTED.append(token)
     repos = ans.get("repositories") if isinstance(ans, dict) else None
     if not isinstance(token, str) or not token:
         die("the answer has no token")
-    MINTED.append(token)
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
         die("refusing: the token does not cover exactly the one target repository")
     full = repos[0].get("full_name")
@@ -284,15 +344,220 @@ def mint(target):
     if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
         die("refusing: the token lives longer than 61 minutes")
     check_permissions(ans.get("permissions"))
-    MINTED.clear()
+    if not keep:
+        MINTED.clear()
     return token
 
 
+USAGE = "usage: app_token.py OWNER/REPO [--fd N | --out PATH]"
+
+
+def parse_route(rest):
+    """(kind, value) with kind in None, 'fd', 'out'; any other shape is exit 2 and nothing is minted."""
+    if not rest:
+        return None, None
+    if len(rest) != 2 or rest[0] not in ("--fd", "--out"):
+        die(USAGE, 2)
+    if rest[0] == "--fd":
+        if not (rest[1].isascii() and rest[1].isdigit() and len(rest[1]) <= 6):
+            die(USAGE, 2)
+        return "fd", int(rest[1])
+    return "out", rest[1]
+
+
+def check_fd(fd):
+    """Refuse (exit 2) before minting unless fd is 3 or more, open, writable and not a terminal."""
+    import fcntl
+    if fd < 3:
+        die("the route --fd must be 3 or more (0, 1 and 2 are the terminal's)", 2)
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        tty = os.isatty(fd)
+    except OSError:
+        die("the route --fd %d is not an open descriptor" % fd, 2)
+    if flags & os.O_ACCMODE == os.O_RDONLY:
+        die("the route --fd %d is not writable" % fd, 2)
+    if tty:
+        die("the route --fd %d is a terminal" % fd, 2)
+    if same_stream_as_output(fd):
+        die("the route --fd %d is the same open file or pipe as standard output or standard error" % fd, 2)
+
+
+def same_stream_as_output(fd):
+    """True when fd is another descriptor of the same open file or pipe (same device and inode) as descriptor 1 or 2."""
+    try:
+        mine = os.fstat(fd)
+    except OSError:
+        return False
+    for std in (1, 2):
+        try:
+            st = os.fstat(std)
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == (mine.st_dev, mine.st_ino):
+            return True
+    return False
+
+
+def link_is_system_made(link_st, parent_st):
+    """True for a link made by the system itself: owned by uid 0, in a directory others cannot write (or one that is sticky)."""
+    import stat
+    if link_st.st_uid != 0:
+        return False
+    return not parent_st.st_mode & 0o022 or bool(parent_st.st_mode & stat.S_ISVTX)
+
+
+def link_in_parents(path):
+    """True when a component of the directory chain above path is a link that is not made by the system itself, or is not a directory.
+    Each component is judged with lstat from the root down (a link is followed only when it is judged); a missing one is not judged here."""
+    import stat
+    todo = [p for p in path.split("/") if p not in ("", ".")][:-1]
+    cur, budget = "/", 40
+    try:
+        st_cur = os.lstat("/")
+        while todo:
+            part = todo.pop(0)
+            nxt = os.path.join(cur, part)
+            st = os.lstat(nxt)
+            if stat.S_ISLNK(st.st_mode):
+                budget -= 1
+                target = os.readlink(nxt)
+                tparts = [p for p in target.split("/") if p not in ("", ".")]
+                if budget < 0 or ".." in tparts or not link_is_system_made(st, st_cur):
+                    return True
+                if target.startswith("/"):
+                    cur, st_cur = "/", os.lstat("/")
+                todo = tparts + todo
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                return True
+            cur, st_cur = nxt, st
+    except OSError:
+        return False
+    return False
+
+
+def check_length(path):
+    """Refuse (exit 2), before anything is minted, a path over the file system's name or path limit (the smaller of PC_PATH_MAX and 4096)."""
+    try:
+        name_max = os.pathconf("/", "PC_NAME_MAX")
+        path_max = min(os.pathconf("/", "PC_PATH_MAX"), 4096)
+    except (OSError, ValueError):
+        name_max, path_max = 255, 4096
+    raw = os.fsencode(path)
+    if len(raw) >= path_max or any(len(p) > name_max for p in raw.split(b"/")):
+        die("the route --out is longer than the file system allows", 2)
+
+
+def check_out(path):
+    """Refuse (exit 2) before minting unless path is new, in a private directory this user owns (no group or world access, no link but the system's own).
+    Returns the path to create, with every judged link resolved."""
+    import stat
+    if not path or "\0" in path or "\n" in path:
+        die("the route --out needs a path", 2)
+    if ".." in path.split("/"):
+        die("the route --out must not hold a '..' component", 2)
+    if path.endswith("/"):
+        die("the route --out must name a file", 2)
+    path = os.path.join(os.getcwd(), path)
+    check_length(path)
+    d = os.path.dirname(os.path.abspath(path))
+    if link_in_parents(os.path.join(d, "x")):
+        die("the directory of --out is a link or not a directory", 2)
+    d = os.path.realpath(d)   # every link in it was judged above
+    path = os.path.join(d, os.path.basename(path))
+    try:
+        st = os.lstat(d)
+    except OSError:
+        die("the directory of --out does not exist", 2)
+    if not stat.S_ISDIR(st.st_mode):
+        die("the directory of --out is a link or not a directory", 2)
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        die("the directory of --out must be owned by you with no group or world access (mode 0700)", 2)
+    if os.path.lexists(path):
+        die("refusing: --out path exists; the mint never overwrites", 1)
+    return path
+
+
+def write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def deliver(kind, value, token):
+    """Write exactly the token to the route. Raises OSError when it cannot."""
+    data = token.encode()
+    if kind == "fd":
+        write_all(value, data)
+        return
+    d, name = os.path.split(value)
+    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)   # the checked directory itself: nothing can redirect the create
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+    except BaseException:
+        os.close(dfd)
+        raise
+    try:
+        write_all(fd, data)
+        os.fsync(fd)
+    except BaseException:   # any error or interrupt: the file this run created is removed
+        os.close(fd)
+        try:
+            os.unlink(name, dir_fd=dfd)
+        except OSError:
+            pass
+        os.close(dfd)
+        raise
+    os.close(dfd)
+    os.close(fd)
+
+
 def main(argv):
-    if len(argv) != 1 or not valid_target(argv[0]):
-        die("usage: app_token.py OWNER/REPO", 2)
-    sys.stdout.write(mint(argv[0]))
-    sys.stdout.flush()
+    if len(argv) < 1 or not valid_target(argv[0]):
+        die(USAGE, 2)
+    target = argv[0]
+    kind, value = parse_route(argv[1:])
+    if kind == "fd":
+        check_fd(value)
+    elif kind == "out":
+        value = check_out(value)
+    import signal
+
+    def stop(signum, frame):
+        raise Interrupted(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
+    try:   # ONE handler over the whole span: from the mint to the end of the delivery
+        token = mint(target, keep=True)
+        note_minted(token)
+        if kind is None:
+            try:
+                revoke(token)  # nobody received it: revoke first, forget the token after the call has ended
+            finally:
+                MINTED.clear()
+            revoked = REVOKE_STATUS[0] == "204"
+            print("app-token: minted a token of %d bytes and did not deliver it: name a route with --fd N or --out PATH" % len(token), file=sys.stderr)
+            if not revoked:
+                say_revoke_failed()
+                sys.exit(1)
+            return
+        deliver(kind, value, token)
+    except KeyboardInterrupt:   # an interrupt or a signal at any point: revoke, leave nothing, exit non-zero
+        die("the delivery was interrupted", 130)
+    except SystemExit as e:
+        if not MINTED:   # a refusal already revoked, or nothing was minted yet, or the run ended well
+            raise
+        die("the delivery was interrupted", e.code if isinstance(e.code, int) and e.code else 1)
+    except Exception:   # OSError, a full disk, a broken pipe, an error in the code between the mint and the route
+        if not MINTED:   # before any token exists the failure is not this handler's
+            raise
+        die("the token could not be delivered to the route")
+    MINTED.clear()
+
+
+def note_minted(token):
+    """The step right after the mint: nothing to do, the token is already kept in MINTED until its delivery ends."""
+    return token
 
 
 if __name__ == "__main__":

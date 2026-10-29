@@ -197,8 +197,8 @@ cloud/launcher/run_task.py WORKER OWNER/NAME BRANCH BRIEF_FILE [--pull-secret NA
 ```
 
 The target repository is an argument and has no default. The driver reads the model entry (the one `github-copilot` entry of OpenCode's own
-credential store, read with `opencode auth export` in a scrubbed environment through a pipe, in memory; `CW_OPENCODE_BIN` names the program) and a git token (the output of `CW_GIT_TOKEN_CMD`;
-default `app_token.py OWNER/NAME` beside the driver, the one-hour GitHub App token) in memory, creates the pod through
+credential store, read with `opencode auth export` in a scrubbed environment through a pipe, in memory; `CW_OPENCODE_BIN` names the program) and a git token (the stdout of `CW_GIT_TOKEN_CMD`;
+default `app_token.py OWNER/NAME --fd N` beside the driver, which hands the one-hour GitHub App token over a pipe of its own, never standard output or standard error, and never prints it) in memory, creates the pod through
 the launcher with both handed over inherited pipes (`--run-secret-fd`), port-forwards, opens a session, sends the brief,
 waits for idle, then stops the worker (the end hook pushes the work; the pod and its Secrets are deleted).
 
