@@ -1434,7 +1434,10 @@ def _launch(args, runner, now, reserve):
             if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
-    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working", "endpoint": record["url"]})   # a cloud worker is an agent (#903)
+    row = {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"}
+    if hub:   # only an agent the hub delivers to has an endpoint: the hub's own agent address, the SAME value the launcher wrote as its hub entry
+        row["endpoint"] = _lib().hub_agent_url(str(record["runtime_id"]).split("/", 1)[-1], os.environ.get("CW_CLOUD_NAMESPACE", "cw"))
+    _registry_note(engine, "upsert", state, name, row)   # a cloud worker is an agent (#903)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
 
