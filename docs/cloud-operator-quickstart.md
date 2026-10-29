@@ -281,7 +281,7 @@ Do not use plain `--uninstall` (or `--uninstall --no-service`) for that: on a fu
 
 The settings of the service: when your own settings file (`~/.config/fleet-switchboard/cloud.env`) exists, the service carries none of the keys that file holds — the file is then the only source of them, and a key set differently in the file and in the service makes every start of the reaper refuse. Without that file the service copies the non-secret `CW_*` settings of the shell that runs the install, as `--with-cloud-reaper` always did.
 
-## 4c. The cloud hub (cloud/k8s/cloud-hub.yaml)
+## 4c. The cloud hub (cloud/k8s/cloud-hub.yaml): the live hub, namespace `cw`
 
 Cause: the hub (the channel server) exists as code, but nothing started it in the cluster, and the launcher's per-pod registration writes to a registry Secret that did not exist. One file now defines, in the `cw` namespace only: Deployment `cloud-hub` (one replica), Service `cloud-hub` (ClusterIP, 8443), the headless Service `cw-agents` (selector `app=cw-worker`, port 4096, publishes not-ready addresses: pods register a name under this Service, `http://<pod name>.cw-agents.cw.svc.cluster.local:4096`, so the hub can reach them) and Secrets `cloud-hub-registry` (keys `secrets.json` and `agents.json`, each `{}`, mounted read-only at `/etc/hub`) and `cloud-hub-pw` (empty: the launcher adds one key per agent name later; mounted read-only at `/etc/hub/pw`, so an agent's `password_file` is `/etc/hub/pw/<name>`; nested under the Secret mount: this works on the cluster's runtime; if a runtime refuses it use `/etc/hub-pw` and `/etc/hub-pw/<name>`). The container command is `python3 /usr/local/bin/cloud_hub.py` (`cloud/worker/Dockerfile` copies the hub and its modules to `/usr/local/bin`; the manifest, these docs and the test use that real path). The environment is exactly `FLEET_CLOUD_CHANNEL_LISTEN`, `FLEET_CLOUD_HUB_AGENTS`, `FLEET_CLOUD_HUB_SECRETS` (its presence selects the secrets mode), `FLEET_CLOUD_HUB_DECISIONS` and `FLEET_CLOUD_AGENT_NAMESPACE` (value `cw`, the namespace of agent accounts; required, the hub stops at start without it). The container runs non-root (uid 1000, fsGroup 1000, seccomp RuntimeDefault, CPU limit 500m) with a read-only root filesystem; Secret volumes use defaultMode 0440 (JSON form 288: not world readable; 0400 would leave root-owned files unreadable to uid 1000, so group read plus fsGroup); only `/var/hub` and `/tmp` (emptyDirs) are writable. Every object carries the label `app.kubernetes.io/part-of=cloud-hub`. The names live in `cloud/launcher/hub_registry.py` and a test compares them with the manifest.
 
@@ -312,7 +312,7 @@ Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_
 
 State: the decisions file is on an emptyDir at `/var/hub`; it is lost when the pod restarts. Tests (offline, no cluster): `python3 cloud/launcher/tests/test_cloud_hub_manifest.py`.
 
-## 4d. The namespace's network policies
+## 4d. The namespace's network policies (the live hub, namespace `cw`)
 
 Cause: an independent read of the hub's manifest set found no network policy in the repository, while the cluster carried six applied by hand. None was in a file. They are now in `cloud/k8s/cloud-hub-network.yaml`, exactly as applied (a test fails when a rule is widened). The six policies:
 
@@ -342,57 +342,64 @@ The steps, in order (the namespace `cwp` is the example):
 5. Step 5, the private settings: a COPY of the settings file (never the live file), in its own directory, with four settings changed: `CW_CLOUD_NAMESPACE=cwp`, `CW_HUB_CHANNEL_URL=http://cloud-hub.cwp.svc:8443/message`, `CW_PULL_SECRET=cw-pull` (the name of the pull secret of step 4) and `CW_CLOUD_TOKEN_FILE`, the cluster token file of the namespace's OWN launcher account (`cw-operator` of the probe namespace; a token of the live namespace does not work there). The first three are lines of the copy; `CW_CLOUD_TOKEN_FILE` is set in the shell that runs the launch, as for the reaper. Point the launch at the copy with `XDG_CONFIG_HOME=PROBE_CONFIG_DIR`, where the copy is `PROBE_CONFIG_DIR/fleet-switchboard/cloud.env` (mode 0600).
 6. Step 6, the smoke launch: `launch --cloud` with the private copy, ONE worker, then retire it: `XDG_CONFIG_HOME=PROBE_CONFIG_DIR fleet-switchboard launch probe1 --cloud --agent coder --repo acme-org/widget-service --branch main --role coder --reports-to orch --brief-file BRIEF_FILE`, read it, then `XDG_CONFIG_HOME=PROBE_CONFIG_DIR fleet-switchboard retire probe1`.
 
-The blocks below are read as pasted by the holder of the administrator login. Each block starts with the same guard, and every command of every block carries `-n "$NS"`: the namespace is set ONCE, in the first block (`NS=cwp`), and the guard stops the block when `NS` is empty, `cw` (the live namespace), `default` or `kube-*`. The live namespace `cw` is never written on any command line below. Before the first apply, read `kubectl config current-context` and check it is the cluster you mean: no command here names a `--context`, so the current one is used. WORD_IN_CAPITALS names are placeholders to fill in, never values to paste into a PR.
+The blocks below are read as pasted into an interactive shell by the holder of the administrator login. A failed check in such a shell stops only that one command, so the guard is on every command line: each `kubectl` line carries `-n "${NS:?}"` (an unset or empty `NS` fails that command itself and nothing runs with an empty namespace, which kubectl would read as the current one), and the pull copy carries `-n "${SRC:?}"`. The function `ns_ok`, defined once in the first block, only REPORTS: it prints a line and returns non-zero when `NS` is empty, `cw` (the live namespace), `default` or `kube-*`, and never closes the shell. The namespace is set ONCE, in the first block (`NS=cwp`); the live namespace `cw` is never written on any command line below. Before the first apply, read `kubectl config current-context` and check it is the cluster you mean: no command here names a `--context`, so the current one is used. WORD_IN_CAPITALS names are placeholders to fill in, never values to paste into a PR.
 
 The command list for the administrator apply (the owner's steps 3 and 4):
 
 ```text
-NS=cwp ; : "${NS:?}" ; [ "$NS" != cw ] || exit 1 ; case "$NS" in default|kube-*) exit 1 ;; esac
+ns_ok() { case "$NS" in ""|cw|default|kube-*) echo "refused: NS is $NS" >&2; return 1;; esac; }
+NS=cwp
+ns_ok || false
 kubectl config current-context
-kubectl create namespace "$NS"
-kubectl apply --dry-run=server -n "$NS" -f cwp.yaml
-kubectl create -n "$NS" -f cwp.yaml
-kubectl -n "$NS" get secret cloud-hub-registry cloud-hub-pw
-( set -C; umask 077; kubectl -n "$NS" create token cw-operator --duration=DURATION > TOKEN_FILE )
+kubectl create namespace "${NS:?}"
+kubectl apply --dry-run=server -n "${NS:?}" -f cwp.yaml
+kubectl create -n "${NS:?}" -f cwp.yaml
+kubectl -n "${NS:?}" get secret cloud-hub-registry cloud-hub-pw
+( set -C; umask 077; kubectl -n "${NS:?}" create token cw-operator --duration=DURATION > TOKEN_FILE )
 ```
 
 Only if `get` reports missing (the apply above makes both objects, so these two lines fail with AlreadyExists when pasted after it):
 
 ```text
-: "${NS:?}" ; [ "$NS" != cw ] || exit 1 ; case "$NS" in default|kube-*) exit 1 ;; esac
-kubectl -n "$NS" create secret generic cloud-hub-registry --from-literal=secrets.json={} --from-literal=agents.json={}
-kubectl -n "$NS" create secret generic cloud-hub-pw
+ns_ok || false
+kubectl -n "${NS:?}" create secret generic cloud-hub-registry --from-literal=secrets.json={} --from-literal=agents.json={}
+kubectl -n "${NS:?}" create secret generic cloud-hub-pw
 ```
 
 The pull secret copy (read only on the source side: SOURCE_NAMESPACE is read with `get` and nothing else, and `-n cw` is never written on any other line). The two namespaces are two variables, so the source and the target are never 30 characters apart in one line; `managedFields` and the identity fields are stripped:
 
 ```text
-: "${NS:?}" ; [ "$NS" != cw ] || exit 1 ; case "$NS" in default|kube-*) exit 1 ;; esac
-SRC=SOURCE_NAMESPACE ; : "${SRC:?}" ; [ "$SRC" != "$NS" ] || exit 1
-kubectl -n "$SRC" get secret PULL_SECRET_NAME -o json | python3 -c 'import json, sys; d = json.load(sys.stdin); [d["metadata"].pop(k, None) for k in ("namespace", "uid", "resourceVersion", "creationTimestamp", "ownerReferences", "managedFields")]; json.dump(d, sys.stdout)' | kubectl -n "$NS" create -f -
+ns_ok || false
+SRC=SOURCE_NAMESPACE
+[ "$SRC" != "$NS" ] || false
+kubectl -n "${SRC:?}" get secret PULL_SECRET_NAME -o json | python3 -c 'import json, sys; d = json.load(sys.stdin); [d["metadata"].pop(k, None) for k in ("namespace", "uid", "resourceVersion", "creationTimestamp", "ownerReferences", "managedFields")]; json.dump(d, sys.stdout)' | kubectl -n "${NS:?}" create -f -
 ```
 
 The order after the apply: run the `get secret` line first. The apply creates the two registry Secrets (`cloud-hub-registry` and `cloud-hub-pw`) empty: they exist from the apply and are EDITED, not created; a `create secret generic` on them can fail with AlreadyExists. Run the `create secret generic` command ONLY for a Secret the `get` reports missing. The pull secret is never in the manifests: it is always created by hand.
 
-The two `create secret generic` lines (their own block, headed `Only if get reports missing`) are for a Secret the `get` reports missing. `create secret generic cloud-hub-pw` with no data is accepted by kubectl as far as its reference and source show (the generic create has no rule that asks for a `--from-*` option, and the manifest itself holds this Secret empty); it was not run here. The pull secret block copies the existing pull secret of the live namespace (`SOURCE_NAMESPACE`) by its own name into the probe namespace: the value goes through a pipe and is never printed and never on a command line (the shell history and the process list). Copying the live namespace's pull entry into the probe namespace gives the probe namespace the SAME registry pull value: an administrator step on the same registry, with no new access to the registry for anyone else (the probe namespace holds the same pull value; the registry itself is not widened). The alternative, when no such secret exists, is `kubectl -n "$NS" create secret generic PULL_SECRET_NAME --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=DOCKER_CONFIG_FILE`, with `DOCKER_CONFIG_FILE` made under `umask 077` by its holder. The token line of the first block writes the token of the namespace's launcher account straight to the token file of step 5 (mode 0600, made in a subshell with `umask 077` and noclobber), so the value never reaches the terminal; never paste it anywhere else. The token file is never overwritten (a second run needs the first removed).
+The two `create secret generic` lines (their own block, headed `Only if get reports missing`) are for a Secret the `get` reports missing. `create secret generic cloud-hub-pw` with no data is accepted by kubectl as far as its reference and source show (the generic create has no rule that asks for a `--from-*` option, and the manifest itself holds this Secret empty); it was not run here. The pull secret block copies the existing pull secret of the live namespace (`SOURCE_NAMESPACE`) by its own name into the probe namespace: the value goes through a pipe and is never printed and never on a command line (the shell history and the process list). Copying the live namespace's pull entry into the probe namespace gives the probe namespace the SAME registry pull value: an administrator step on the same registry, with no new access to the registry for anyone else (the probe namespace holds the same pull value; the registry itself is not widened). The alternative, when no such secret exists, is `kubectl -n "${NS:?}" create secret generic PULL_SECRET_NAME --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=DOCKER_CONFIG_FILE`, with `DOCKER_CONFIG_FILE` made under `umask 077` by its holder. The token line of the first block writes the token of the namespace's launcher account straight to the token file of step 5 (mode 0600, made in a subshell with `umask 077` and noclobber), so the value never reaches the terminal; never paste it anywhere else. The token file is never overwritten (a second run needs the first removed).
 
 Cost: a probe namespace adds one more hub pod and its Services (`cloud-hub` and the headless `cw-agents`) to the cluster while the namespace exists, plus the pods of the smoke launch while they run.
 
 Teardown (the owner's step; also the administrator's login):
 
 ```text
-NS=cwp ; : "${NS:?}" ; [ "$NS" != cw ] || exit 1 ; case "$NS" in default|kube-*) exit 1 ;; esac
-kubectl -n "$NS" delete rolebinding cw-minter
-kubectl -n "$NS" delete secret cw-minter-token
-kubectl delete namespace "$NS"
+NS=cwp
+ns_ok || false
+echo "will delete: namespace $NS, context $(kubectl config current-context)"
+kubectl -n "${NS:?}" delete rolebinding cw-minter
+kubectl -n "${NS:?}" delete secret cw-minter-token
+kubectl delete namespace "${NS:?}"
 rm -f TOKEN_FILE
-PROBE_CONFIG_DIR=PROBE_CONFIG_DIR_PATH ; rm -rf "${PROBE_CONFIG_DIR:?}"
+PROBE_CONFIG_DIR=PROBE_CONFIG_DIR_PATH
+echo "will remove: $PROBE_CONFIG_DIR"
+case "$PROBE_CONFIG_DIR" in ""|/|"$HOME"|"$HOME"/) echo "refused: PROBE_CONFIG_DIR is $PROBE_CONFIG_DIR" >&2 ;; *) rm -rf "${PROBE_CONFIG_DIR:?}" ;; esac
 rm -f cwp.yaml
 rm -f PROBE_TOKEN_FILE
 rm -f PROBE_DIGEST_FILE
 ```
 
-Set `NS` to the probe namespace again in a new shell (the first line sets it; a filled-in `cw` stops the block, so the live namespace is never deleted by this list). `PROBE_CONFIG_DIR_PATH` is the probe's own settings directory, never a parent of it. Deleting the namespace removes everything inside it (the hub, its Services, the Secrets, the network policies and the accounts): the render makes no cluster-scoped objects, so deleting the namespace removes everything it created. The first two lines remove the minter binding and its token Secret before that; the token file and the private settings copy are removed from the machine last.
+Set `NS` to the probe namespace again in a new shell (the first block sets it and defines `ns_ok`; a filled-in `cw` is reported by `ns_ok`, and an empty `NS` fails each `-n "${NS:?}"` command, so the live namespace is never deleted by this list). Read the line that prints the namespace and the context before the delete lines run. The settings directory is removed only when it is not empty text, `/` or `$HOME`; the path is printed first. `PROBE_CONFIG_DIR_PATH` is the probe's own settings directory, never a parent of it. Deleting the namespace removes everything inside it (the hub, its Services, the Secrets, the network policies and the accounts): the render makes no cluster-scoped objects, so deleting the namespace removes everything it created. The first two lines remove the minter binding and its token Secret before that; the token file and the private settings copy are removed from the machine last.
 
 ### A relay probe
 
@@ -401,8 +408,8 @@ A relay probe runs the hub's relay with a daemon of its own against the PROBE hu
 R1. Who: the administrator. Set the hub's daemon name on the PROBE hub with one command:
 
 ```text
-: "${NS:?}" ; [ "$NS" != cw ] || exit 1 ; case "$NS" in default|kube-*) exit 1 ;; esac
-kubectl -n "$NS" set env deployment/cloud-hub FLEET_CLOUD_HUB_DAEMON=relay-probe
+ns_ok || false
+kubectl -n "${NS:?}" set env deployment/cloud-hub FLEET_CLOUD_HUB_DAEMON=relay-probe
 ```
 
 The name must not be a reserved name: the hub refuses to start (a ValueError, nothing bound) when `FLEET_CLOUD_HUB_DAEMON` names one. The hub's reserved names, as `RESERVED` in `bin/cloud_hub.py` holds them, are:
@@ -424,12 +431,12 @@ The subshell leaves the holder's shell unchanged, and `set -C` (noclobber) makes
 The administrator adds the digest as the one entry for `relay-probe` in the `secrets.json` key of the PROBE hub's registry Secret `cloud-hub-registry`, by an in-place edit that keeps every other entry. The hub reads `secrets.json` as one JSON object `{"AGENT_NAME": "sha256 hex of the secret"}` (the key `agents.json` is not touched: the daemon is not a pod). Read it, edit it, patch it back, with the working copy made in a subshell under `umask 077` (mode 0600 from the first byte); the read, edit and patch of the registry Secret is not atomic: one administrator at a time.
 
 ```text
-: "${NS:?}" ; [ "$NS" != cw ] || exit 1 ; case "$NS" in default|kube-*) exit 1 ;; esac
+ns_ok || false
 ( umask 077 ; set -e ; trap 'rm -f secrets.json registry-patch.json' EXIT
-kubectl -n "$NS" get secret cloud-hub-registry -o jsonpath='{.data.secrets\.json}' | base64 -d > secrets.json
+kubectl -n "${NS:?}" get secret cloud-hub-registry -o jsonpath='{.data.secrets\.json}' | base64 -d > secrets.json
 python3 -c 'import json; d = json.load(open("secrets.json")); d["relay-probe"] = open("PROBE_DIGEST_FILE").read().strip(); json.dump(d, open("secrets.json", "w"))'
 python3 -c 'import json; json.dump({"stringData": {"secrets.json": open("secrets.json").read()}}, open("registry-patch.json", "w"))'
-kubectl -n "$NS" patch secret cloud-hub-registry --type merge --patch-file registry-patch.json
+kubectl -n "${NS:?}" patch secret cloud-hub-registry --type merge --patch-file registry-patch.json
 )
 ls secrets.json registry-patch.json
 ```
