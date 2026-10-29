@@ -366,14 +366,10 @@ def derive_launcher_names(text):
 
 
 def uncovered_names(text, module):
-    return sorted(n for n in derive_launcher_names(text) if n not in module.ACTIONS and n not in module.SKIPPED and n not in KNOWN_GAP)
+    return sorted(n for n in derive_launcher_names(text) if n not in module.ACTIONS and n not in module.SKIPPED)
 
 
-# Written by the launcher's report command through _audited, outside this ask's two names: reported to the ask, not decided here.
-KNOWN_GAP = ("report",)
-
-
-NOT_COSTED = ("create-attempt", "create.failed", "create.interrupted", "renew-git-token", "refresh-cluster-token", "ignored-setting-notice")
+NOT_COSTED = ("create-attempt", "create.failed", "create.interrupted", "renew-git-token", "refresh-cluster-token", "ignored-setting-notice", "report")
 EVERY_LAUNCHER_ACTION = [
     line("2026-10-14T01:00:00Z", "pod/cb-example-1", "create", 0),
     line("2026-10-14T01:01:00Z", "pod/cb-example-1", "create-attempt", 0, ok=False),
@@ -385,6 +381,7 @@ EVERY_LAUNCHER_ACTION = [
     line("2026-10-14T02:31:00Z", "reaper", "ignored-setting-notice", 0, worker=""),
     line("2026-10-14T03:00:00Z", "pod/cb-example-1", "extend", 0),
     line("2026-10-14T04:00:00Z", "pod/cb-example-1", "stop", 0.25),
+    line("2026-10-14T04:30:00Z", "pod/cb-example-1", "report", 0),
     line("2026-10-14T05:00:00Z", "pod/cb-example-4", "delete", 0, ok=False),
 ]
 

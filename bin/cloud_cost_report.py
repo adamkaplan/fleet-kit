@@ -11,7 +11,7 @@ list-price estimate (a stopped pod: its stop line; an open pod: --pod-rate, defa
 price (pod vCPU / node vCPU x node price x pod-hours; shapes S 2, M 4, L 6 vCPU, --shape applies to all pods because the
 audit does not record the shape). A pod created on the day and not stopped on it runs to the end of the day, and the
 report says so. Actions the report does not cost (create.interrupted, create.failed, create-attempt, renew-git-token, refresh-cluster-token,
-ignored-setting-notice) are skipped and counted; any other unknown action is malformed. Lines with ok false are listed, not costed.
+ignored-setting-notice, report: the worker's final one-line report, which prices nothing) are skipped and counted; any other unknown action is malformed. Lines with ok false are listed, not costed.
 Exit 0 on a report, 2 on a malformed line or file. Every float argument must be finite (nan and inf are refused). An audit
 file over 64 MB is refused with a one-line message (it is read with a bounded read, never whole).
 
@@ -30,7 +30,7 @@ import sys
 
 ACTIONS = ("create", "stop", "extend", "delete")
 SKIPPED = ("create.interrupted", "create.failed", "create-attempt", "renew-git-token",
-           "refresh-cluster-token", "ignored-setting-notice")
+           "refresh-cluster-token", "ignored-setting-notice", "report")
 MAX_AUDIT_BYTES = 64 * 1024 * 1024
 SHAPE_VCPU = {"S": 2, "M": 4, "L": 6}
 
