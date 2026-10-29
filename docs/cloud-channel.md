@@ -27,6 +27,12 @@ One document to set up, run and take down the cloud hub and the pod-side command
   - Relay timing: the hub waits 30 s (`cloud_relay.WAIT`) for the daemon's answer. The daemon pulls the relay on its own loop (a
     thread, `cloud_relay_daemon.CADENCE` = 5 s), not after each engine pass, so a long engine pass does not delay an answer. If a pull is
     still late the pod's call gets 504; that is safe: the entry stays queued and the same call_id is replay-safe.
+  - Relay concurrency rule: the Engine is not thread-safe, so the relay thread never touches the pass thread's engine. It runs on its
+    OWN engine (built at start from the same config and state dir, with its own caches); a relayed `report` is still delivered at once
+    ("delivered", not queued). The two engines share only files, each under its own lock (ledger flock, audit and report-rider file locks).
+    A failure in a pass is recorded (`relay.loop_failed`, class name only) and the loop goes on. `stop()` joins 2 s while a pull can last
+    about 90 s: when the thread is still alive an audit line `relay.stop_timeout` says so, and a late thread can still write (the ledger
+    append is flock-atomic; a pass cut at its deadline posts nothing).
   - Relay configuration that must agree: the hub's agents map decides which issue and repo a pod is bound to (pod-binding), and the
     daemon's `relay_holders` config decides which pod may prove for that issue. If they disagree, the prove is refused 403 (fail closed).
   - `FLEET_CLOUD_HUB_DAEMON` must not name a reserved agent (`captain`, `switchboard`, ...): the hub refuses to start with a ValueError
