@@ -168,6 +168,22 @@ class Completeness(unittest.TestCase):
 
     def test_s10_mutant_a_name_in_the_line_that_is_not_in_the_chain_is_refused(self):
         self._mutant(lambda s: s.replace("Not yet measured: none", "Not yet measured: `cloud/launcher/tests/test_gone.py`"), "test_gone.py")
+    # The code's rule: not exactly one 'Not yet measured:' line is an AssertionError naming the line (neither "none" nor first-only nor a union).
+    def test_s11_mutant_a_section_without_the_line_fails_naming_the_line(self):
+        sec = self.real()
+        out = "\n".join(l for l in sec.split("\n") if not l.startswith("Not yet measured:"))
+        self.assertNotEqual(out, sec, "the mutation did not apply")
+        with self.assertRaisesRegex(AssertionError, "exactly one 'Not yet measured:' line"):
+            self.problems(out, base.entries())
+
+    def test_s11_mutant_a_section_with_two_lines_fails_naming_the_line_and_is_not_first_only_or_a_union(self):
+        e = sorted(base.entries())[0]
+        sec = self.real()
+        out = sec.replace("Not yet measured: none", "Not yet measured: none\nNot yet measured: `%s`" % e)
+        self.assertNotEqual(out, sec, "the mutation did not apply")
+        self.assertEqual(sum(l.startswith("Not yet measured:") for l in out.split("\n")), 2)
+        with self.assertRaisesRegex(AssertionError, "exactly one 'Not yet measured:' line"):
+            self.problems(out, base.entries())
 
 
 class Docs(unittest.TestCase):
