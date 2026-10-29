@@ -233,6 +233,40 @@ class Cause(tcw.Base):
         self.reap()
         self.assertEqual(len(self.coder7_stops()), 0)
 
+    def test_s19_a_persistent_worker_whose_pod_is_absent_is_never_stamped(self):
+        self.vanish()
+        self.mark_persistent("coder7")
+        for _ in range(3):
+            self.reap()
+        self.assertEqual(self.coder7_stops(), [])
+
+    def test_s19_a_non_persistent_worker_whose_pod_is_absent_is_stamped_once(self):
+        self.vanish()
+        self.mark_persistent("coder8")   # another worker is persistent; coder7 is not
+        for _ in range(3):
+            self.reap()
+        self.assertEqual(len(self.coder7_stops()), 1)
+
+    def test_s19_a_mutant_without_the_persistent_condition_is_caught(self):
+        mod = self.mutant('if rec.get("persistent") is True:\n                    continue', 'if False:\n                    continue')
+        self.vanish()
+        self.mark_persistent("coder7")
+        for _ in range(3):
+            mod.Launcher(mod.Kube(self.env), self.env, self.clock).reap()
+        self.assertEqual(len(self.coder7_stops()), 1)   # the real code writes 0
+
+    def mark_persistent(self, worker):
+        path = self.env["CW_CLOUD_AUDIT"]
+        out = []
+        with open(path) as f:
+            for raw in f.read().splitlines():
+                rec = json.loads(raw)
+                if rec.get("action") == "create" and rec.get("worker") == worker:
+                    rec["persistent"] = True
+                out.append(json.dumps(rec))
+        with open(path, "w") as f:
+            f.write("\n".join(out) + "\n")
+
     def rid_of(self, worker):
         return [l for l in self.audit_lines() if l["action"] == "create" and l["worker"] == worker][0]["runtime_id"]
 

@@ -2429,6 +2429,8 @@ class Launcher:
                 continue
             rid = rec.get("runtime_id")
             if rec.get("action") == "create" and rec.get("ok") is True and isinstance(rid, str) and rid:
+                if rec.get("persistent") is True:
+                    continue   # a persistent orchestrator's pod is briefly absent while its StatefulSet recreates it: never stamped
                 open_runs[rid] = (rec.get("worker"), when)
             elif rec.get("action") in ("stop", "delete") and rec.get("ok") is True and rid in open_runs:
                 del open_runs[rid]   # only a stop that happened closes the run; a failed stop (the pod was kept) leaves it open

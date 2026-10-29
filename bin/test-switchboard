@@ -116,6 +116,7 @@ TestTheReapersCommandPathIsWalked, TestInstallOwnsWhatAPaneRuns, TestInstallDocs
 LabelGh, TestInstallMakesTheOrdersTemplate, TestExternalAdapterMapping, TestExternalAdapterFeed = (_support_test_cases_04.LabelGh, _support_test_cases_04.TestInstallMakesTheOrdersTemplate, _support_test_cases_04.TestExternalAdapterMapping, _support_test_cases_04.TestExternalAdapterFeed)   # support import
 TestJudgeSample, TestV2Breaker, SlowProbeBreaker, TestV2BreakerEdges = (_support_test_cases_04.TestJudgeSample, _support_test_cases_04.TestV2Breaker, _support_test_cases_04.SlowProbeBreaker, _support_test_cases_04.TestV2BreakerEdges)   # support import
 TestEventFeedStreamEdges, TestCloudWatchTick = (_support_test_cases_04.TestEventFeedStreamEdges, _support_test_cases_04.TestCloudWatchTick)   # support import
+TestEndTickWithoutStateDirectory = _support_test_cases_04.TestEndTickWithoutStateDirectory   # support import
 _support_test_cases_05 = importlib.import_module("test_cases_05")   # support import
 TestFaults, TestMessageId, TestDecide, TestApprovalExemptionGuard = (_support_test_cases_05.TestFaults, _support_test_cases_05.TestMessageId, _support_test_cases_05.TestDecide, _support_test_cases_05.TestApprovalExemptionGuard)   # support import
 TestGithubVerification, TestParseCheckpoint, TestSelfWakeInstructions, TestLabHerdrShim = (_support_test_cases_05.TestGithubVerification, _support_test_cases_05.TestParseCheckpoint, _support_test_cases_05.TestSelfWakeInstructions, _support_test_cases_05.TestLabHerdrShim)   # support import
