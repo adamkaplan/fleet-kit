@@ -782,16 +782,16 @@ class S10Manifest(unittest.TestCase):
         role = [d for d in k1.rbac_docs() if d["kind"] == "Role"][0]
         rules = [(tuple(r["groups"]), tuple(r["resources"]), tuple(r["verbs"])) for r in role["rules"]]
         added = [r for r in rules if r not in self.OLD_RULES]
-        self.assertEqual(added, [(("apps",), ("statefulsets",), ("get", "list", "watch", "create", "delete"))])
+        self.assertEqual(added, [(("apps",), ("statefulsets",), ("get", "list", "create", "delete"))])
         self.assertEqual([r for r in self.OLD_RULES if r not in rules], [])
         self.assertEqual(len(rules), len(self.OLD_RULES) + 1)
-        self.assertEqual(len(added[0][2]), 5)
+        self.assertEqual(len(added[0][2]), 4)
         self.assertNotIn("*", role["text"].replace('apiGroups: [""]', ""))
 
 
 class S10Verbs(unittest.TestCase):
-    """The StatefulSet rule has exactly five verbs: the launcher creates the workload with create -f and never patches one."""
-    EXACT = ["get", "list", "watch", "create", "delete"]
+    """The StatefulSet rule has exactly four verbs: the launcher creates the workload with create -f and never patches one."""
+    EXACT = ["get", "list", "create", "delete"]
 
     def verbs_in(self, text):
         role = [d for d in k1.rbac_docs(text) if d["kind"] == "Role"][0]
@@ -804,12 +804,12 @@ class S10Verbs(unittest.TestCase):
         with open(os.path.join(ROOT, "cloud/k8s/operator-rbac.yaml")) as f:
             return f.read()
 
-    def test_s10_the_statefulset_rule_holds_exactly_five_verbs(self):
+    def test_s10_the_statefulset_rule_holds_exactly_four_verbs(self):
         self.check(self.read())
 
     def test_s10_mutant_a_patch_verb_added_fails_the_check(self):
         text = self.read()
-        changed = text.replace('verbs: ["get", "list", "watch", "create", "delete"]', 'verbs: ["get", "list", "watch", "create", "patch", "delete"]')
+        changed = text.replace('verbs: ["get", "list", "create", "delete"]', 'verbs: ["get", "list", "create", "patch", "delete"]')
         self.assertNotEqual(changed, text)
         with self.assertRaises(AssertionError):
             self.check(changed)
