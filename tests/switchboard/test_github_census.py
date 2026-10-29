@@ -209,7 +209,17 @@ class TestCensus(Rig):
 class FakeChild:
     """A stand-in for subprocess.Popen: stdout is the given bytes; kill and wait are recorded."""
     def __init__(self, data=b"", fail=None):
-        self.stdout = io.BytesIO(data)
+        self.sizes = []   # every size the reader asked for
+        raw = io.BytesIO(data)
+        child = self
+        class Out:
+            def read(self, size=-1):
+                child.sizes.append(size)
+                return raw.read(-1 if size is None else size)
+
+            def close(self):
+                pass
+        self.stdout = Out()
         self.returncode = 0
         self.killed = False
         self.waited = False
@@ -351,11 +361,18 @@ class TestMacosReader(Rig):
             rows = self.gc._run_text(self.gc.PS_ARGV)
         self.assertEqual(rows, ["/usr/bin/p"] * 5)
         self.assertTrue(child.killed and child.waited)
+        self.assertTrue(child.sizes and all(isinstance(n, int) and 0 <= n <= 61 for n in child.sizes), child.sizes)   # MAX_BYTES + 1
         small = FakeChild(b"/usr/bin/p\n")
         with mock.patch.object(self.gc.subprocess, "Popen", lambda *a, **k: small):
             self.assertEqual(self.gc._run_text(self.gc.PS_ARGV), ["/usr/bin/p"])
         self.assertFalse(small.killed)
         self.assertTrue(small.waited)
+
+    def test_the_mutant_read_without_the_bound_is_caught(self):
+        child = FakeChild(b"/usr/bin/p\n" * 100)
+        child.stdout.read()   # the mutant: read(MAX_BYTES + 1) -> read()
+        limit = 60 + 1
+        self.assertFalse(all(isinstance(n, int) and 0 <= n <= limit for n in child.sizes), "the size check must see the unbounded read")
 
     def test_the_parsers_on_the_real_shapes(self):
         self.assertEqual(self.gc.parse_ps(PS_TEXT.splitlines())[:3], ["launchd", "logd", "Some_App"])
