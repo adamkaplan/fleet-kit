@@ -2551,6 +2551,7 @@ class Switchboard:
         self.light = bool(config.get("v2_light"))   # v2_light: no optional read of session history
         self.sent = SentLedger(self.state_dir) if self.light else None
         self._delivered = {}   # session id -> (newest synthetic id, since, keys): what delivered_keys last found; memory only
+        self.turn_start_fresh = True   # #1540: set once per process; the first turn-start pass after a daemon start discards the file
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
         self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
         self.judge_warm, self._warm_due = None, 0.0  # the daemon's policy-context warmer, if the judge is on
@@ -3051,9 +3052,15 @@ class Switchboard:
         resume = plan.action == "wake" or interrupt
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
         age = None
-        if resume and not interrupt and self.config.get("steer_after_minutes") and self.state_dir is not None:
-            age = load_module("turn_start").age(self.state_dir, observation.session_id, self.now(), load_module("record_json").parse_bounded)   # #1540: from the recorded start; None = unknown = young
-        busy = resume and not interrupt and steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age)
+        busy = False
+        if resume and not interrupt:
+            try:
+                if self.config.get("steer_after_minutes") and self.state_dir is not None:
+                    age = load_module("turn_start").age(self.state_dir, observation.session_id, self.now(), load_module("record_json").parse_bounded)   # #1540: from the recorded start; None = unknown = young
+            except Exception as err:   # an unreadable record or module is an unknown age = young = queue
+                age = None
+                self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age)
         if busy:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
@@ -3192,7 +3199,8 @@ class Switchboard:
         if self.config.get("steer_after_minutes") and self.state_dir is not None:   # #1540: only with the key on is the turn-start file touched
             try:
                 load_module("turn_start").note(self.state_dir, [(o.session_id, o.status) for o in discovery.agents.values()], now,
-                                                  load_module("record_json").parse_bounded)
+                                                  load_module("record_json").parse_bounded, fresh=self.turn_start_fresh)
+                self.turn_start_fresh = False
             except Exception as err:   # an unrecorded start is unknown, which counts as young: never stops a pass
                 self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
         early_decisions(self, discovery)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources

@@ -189,7 +189,9 @@ message. A `send` from another agent skips the batch.
   from a recorded turn start (`turn-start.json` in the state directory, written
   only with the key on, dropped when the status leaves `working`); an unknown
   age (no record, a restart) counts as young. Orders, reports and stop or hold
-  orders keep their rules, and an idle recipient is woken as before.
+  orders keep their rules, and an idle recipient is woken as before. With the
+  key on, an old turn steers a boss's `send` too, even when `send_to_working`
+  is `"queue"`. The first pass after a daemon start discards the record.
 
   | config key | default | meaning |
   |---|---|---|

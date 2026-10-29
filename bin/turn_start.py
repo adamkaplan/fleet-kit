@@ -30,14 +30,15 @@ def age(state_dir, session_id, now, parse):
     return None if start is None or start > now else now - start
 
 
-def note(state_dir, sessions, now, parse):
-    """`sessions`: (session id, status) pairs seen this pass. Writes the file only when its content changes."""
-    old = _read(state_dir, parse)
+def note(state_dir, sessions, now, parse, fresh=False):
+    """`sessions`: (session id, status) pairs seen this pass. Writes the file only when its content changes. `fresh`: the first pass of a daemon process (a flag, not a clock): the old file is discarded."""
+    disk = _read(state_dir, parse)
+    old = {} if fresh else disk   # a fresh process trusts no recorded start
     new = {}
     for session_id, status in sessions:
         if status == "working" and isinstance(session_id, str) and session_id:
             new[session_id] = old.get(session_id, now)
-    if new == old:
+    if new == disk:
         return
     path = Path(state_dir) / FILE
     temp = path.with_name("%s.%d.tmp" % (FILE, os.getpid()))
