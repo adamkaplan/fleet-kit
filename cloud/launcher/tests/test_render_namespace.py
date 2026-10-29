@@ -364,6 +364,55 @@ class CredentialFileCare(unittest.TestCase):
         self.assertIn("--from-file=.dockerconfigjson=DOCKER_CONFIG_FILE", self.whole)
 
 
+def credential_shapes(text):
+    """Names of the unsafe credential shapes found in the code blocks of a runbook text."""
+    found = []
+    for block in code_blocks(text):
+        inside = "\n".join(subshells(block))
+        for line in block.split("\n"):
+            for value in re.findall(r"--from-literal=[^=\s]+=(\S*)", line):
+                if value not in ("", "{}"):
+                    found.append("from-literal value: " + line)
+            if "--docker-" + "password" in line:
+                found.append("registry password on a command line: " + line)
+            if "create token" in line and not (line in inside and re.search(r"> \S+", line)):
+                found.append("bare create token: " + line)
+            if "base64 -d" in line and not re.search(r"base64 -d > \S+", line):
+                found.append("base64 -d without a file: " + line)
+            if re.search(r"\bset env\b", line) and re.search(r"(SECRET|PASSWORD|PASSWD|TOKEN|KEY|PW)\w*=\S", line):
+                found.append("set env with a secret value: " + line)
+    return found
+
+
+class CredentialShapeSweep(unittest.TestCase):
+    def setUp(self):
+        with open(DOCS, encoding="utf-8") as f:
+            self.doc = f.read()
+        self.whole = self.doc.split("\n## A probe namespace\n", 1)[1].split("\n## ", 1)[0]
+
+    def test_the_runbook_has_no_unsafe_credential_shape(self):
+        self.assertEqual(credential_shapes(self.whole), [])
+
+    def test_the_scan_sees_each_unsafe_shape(self):
+        samples = {
+            "from-literal": "```text\nkubectl create secret generic X --from-literal=k=VALUE\n```",
+            "password": "```text\nkubectl create secret docker-registry X --docker-" + "password=P\n```",
+            "token": "```text\nkubectl create token cw-operator\n```",
+            "base64": "```text\nkubectl get secret X | base64 -d\n```",
+            "env": "```text\nkubectl set env deployment/x API_TOKEN=VALUE\n```",
+        }
+        for name, text in samples.items():
+            self.assertEqual(len(credential_shapes(text)), 1, name)
+        self.assertEqual(credential_shapes("```text\nkubectl create secret generic X --from-literal=k={}\n```"), [])
+
+    def test_a_runbook_with_the_bare_token_line_fails_the_scan(self):
+        line = [l for l in self.whole.split("\n") if "create token cw-operator" in l and l.startswith("( ")]
+        self.assertEqual(len(line), 1)
+        mutant = self.whole.replace(line[0], TOKEN_BARE)
+        self.assertNotEqual(mutant, self.whole)   # the mutation is applied
+        self.assertEqual(len(credential_shapes(mutant)), 1)
+
+
 class Chained(unittest.TestCase):
     def test_this_file_is_in_the_chain_once(self):
         with open(os.path.join(ROOT, "bin", "test-cloud-launcher.chain")) as f:
