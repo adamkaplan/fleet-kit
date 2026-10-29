@@ -383,7 +383,7 @@ class TestBoundsAndCaps(unittest.TestCase):
             time.sleep(0.01)
 
     def _trickle(self, hub_mod):
-        """Send 1-byte writes 0.4 s apart, stopping when the answer is readable or after 8 bytes; returns (sent, status line or None)."""
+        """Send 1-byte writes 0.4 s apart, stopping when the answer is readable or after 8 bytes; returns (sent, status line or None, inflight after close)."""
         import select, socket
         old = cloud_relay.BODY_DEADLINE
         cloud_relay.BODY_DEADLINE = 1.0
@@ -401,22 +401,24 @@ class TestBoundsAndCaps(unittest.TestCase):
                         line = s.recv(4096).split(b"\r\n")[0]
                         break
                 s.close()
-                return sent, line
+                self.wait_for(lambda: hub.relay.inflight == 0)
+                return sent, line, hub.relay.inflight
         finally:
             cloud_relay.BODY_DEADLINE = old
 
     def test_slow_body_trickle_cut_at_deadline(self):
-        sent, line = self._trickle(cloud_hub)
+        sent, line, inflight = self._trickle(cloud_hub)
         self.assertIsNotNone(line, "no answer before the client had sent %d bytes" % sent)
         self.assertIn(b" 408 ", line)
         self.assertLess(sent, 8)   # the hub cut mid-trickle
+        self.assertEqual(inflight, 0)
 
     def test_slow_body_trickle_mutant_never_cuts(self):
         old = "time.monotonic() + cloud_relay.BODY_DEADLINE"
         self.assertIn(old, Path(cloud_hub.__file__).read_text())
         mod = mutant(cloud_hub, old, "time.monotonic() + 1000")
         self.assertNotEqual(Path(cloud_hub.__file__).read_text().replace(old, "time.monotonic() + 1000"), Path(cloud_hub.__file__).read_text())
-        sent, line = self._trickle(mod)
+        sent, line, _inflight = self._trickle(mod)
         self.assertEqual(sent, 8)
         self.assertIsNone(line)
 
