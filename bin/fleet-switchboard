@@ -14934,6 +14934,9 @@ class GhAccounts:
             if until is not None:
                 raise GhRateLimited(account, until)
             cached = None if paginate else self.etags.get((account, path))
+        if paginate and not extra_flags and self.conditional:   # #1515: every page is a counted request, page 1 is conditional
+            return load_module("paged_reads").read_pages(self, runner, path, repo, timeout, _split_http, _endpoint_of,
+                                                         GH_ETAG_MAX, GH_ETAG_BODY_MAX, GH_ETAG_BYTES_MAX, **run_kwargs)
         use_head = self.conditional and not paginate and not extra_flags   # a raw read of a file is not conditional
         flags = list(extra_flags) if extra_flags else ["--paginate"] if paginate else (["-i"] + (["-H", "If-None-Match: " + cached[0]] if cached else []) if use_head else [])
         argv = [self.config["gh"], "api"] + flags + [path]   # the path stays last
@@ -14992,6 +14995,17 @@ class GhAccounts:
             except Exception:
                 continue
         return found
+
+    def says_rate_limited(self, *texts):
+        return _says_rate_limited(*[t.decode("utf-8", "replace") if isinstance(t, (bytes, bytearray)) else t for t in texts])
+
+    def pause_default(self, account, now):
+        self._pause(account, now + GH_LIMIT_DEFAULT_PAUSE, 0)
+
+    def pause_for(self, account, status, headers, body, now):
+        reset = self._limit_reset(status, headers, body, now)
+        if reset is not None:
+            self._pause(account, reset, status)
 
     def _pause(self, account, until, status):
         with self.lock:

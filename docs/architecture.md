@@ -62,6 +62,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `health_records.py` | 2 | health recorders: what the daemon has already read, turned into records | |
 | `pr_events.py` | 2 | `pr-state` read from the forwarder's webhook events | |
 | `pr_reading.py` | 2 | the one reading of a pull request that `merge-gate` and the clear packet share | |
+| `paged_reads.py` | 2 | paginated account reads: one counted request per page, a conditional first page | |
 | `registry.py` | 2 | the one agent registry (interface frozen in `docs/agent-registry.md`) | |
 | `decision_core.py` | 3 | the pure core of the Decision subsystem | |
 | `cpu_guard.py` | 4 | the CPU guard: numbers, a clock and a state directory in; a verdict out | |

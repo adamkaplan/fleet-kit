@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Requests of the catch-up reads of one repo before and after #1515, over a fake gh (a recorded shape): one pass, then ten passes with nothing changed.
+The shape: comments 3 pages, issues 2, pulls 2, 12 pulls each with reviews 1 and check suites 1 page, workflow runs 2. Before: `--paginate` is ONE counted
+call per read (the account's real cost is its pages); after: one per page request, the first page conditional (a 304 costs nothing)."""
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "switchboard"))
+from support.loader import sb  # noqa: E402
+
+READS = [("comments", 3), ("issues", 2), ("pulls", 2)] + [("pulls/%d/reviews" % n, 1) for n in range(12)] + \
+    [("commits/%d/check-suites" % n, 1) for n in range(12)] + [("actions/runs", 2)]
+
+
+def fake(real):
+    def run(argv, **kw):
+        real[0] += 1
+        path = argv[-1]
+        base = path.split("?")[0].split("repos/o/r/")[1]
+        pages = dict(READS)[base]
+        number = int(path.rsplit("&page=", 1)[1]) if "&page=" in path else 1
+        if any(a.startswith("If-None-Match") for a in argv):
+            return subprocess.CompletedProcess(argv, 0, "HTTP/2.0 304 Not Modified\r\n\r\n", "")
+        link = 'Link: <https://x/n>; rel="next"\r\n' if number < pages else ""
+        return subprocess.CompletedProcess(argv, 0, 'HTTP/2.0 200 OK\r\nEtag: "e-%s"\r\n%s\r\n[]' % (base, link), "")
+    return run
+
+
+def passes(n):
+    accounts = sb.GhAccounts(sb.validate_config({}), None, environ={})
+    accounts.conditional = True
+    real = [0]
+    run = fake(real)
+    for _ in range(n):
+        for name, _pages in READS:
+            accounts.read(run, "repos/o/r/" + name + "?state=all", "o/r", 5, paginate=True)
+    counted = sum(1 for c in accounts.calls if not c[3])
+    return real[0], counted
+
+
+total_pages = sum(p for _, p in READS)
+for n in (1, 10):
+    made, counted = passes(n)
+    print("passes=%d before: %d counted calls (account cost %d requests) | after: %d requests made, %d counted against the budget"
+          % (n, len(READS) * n, total_pages * n, made, counted))
