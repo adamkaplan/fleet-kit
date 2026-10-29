@@ -9372,10 +9372,11 @@ def cloud_audit_path():
 def cloud_end_tick(engine, discovery):
     """#1480: a cloud worker the launcher ended (idle, hard limit, pod gone, failed pod) tells its boss and the Chief of Staff in the same pass, once per run
     and reason. Reads the launcher's audit file from a stored cursor; sends through the daemon's own `send`. Returns what was handed to it."""
-    if engine.state_dir is None:
+    state_dir = getattr(engine, "state_dir", None)
+    if state_dir is None:
         return []
-    return load_module("cloud_end_alert").scan_audit(cloud_audit_path(), Path(engine.state_dir) / CLOUD_END_ALERT_FILE, Path(engine.state_dir) / "cloud",
-                                                     _read_small(engine.state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
+    return load_module("cloud_end_alert").scan_audit(cloud_audit_path(), Path(state_dir) / CLOUD_END_ALERT_FILE, Path(state_dir) / "cloud",
+                                                     _read_small(state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
                                                      load_module("record_json").parse_bounded,
                                                      lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail))
 
