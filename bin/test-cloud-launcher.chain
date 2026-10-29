@@ -28,6 +28,7 @@ cloud/launcher/tests/test_cw_minter_manifest.py
 cloud/launcher/tests/test_cw_names.py
 cloud/launcher/tests/test_docs_preflight_modes.py
 cloud/launcher/tests/test_driver.py
+cloud/launcher/tests/test_failed_pod_stop.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_issues_read.py
 cloud/launcher/tests/test_model_credential.py
