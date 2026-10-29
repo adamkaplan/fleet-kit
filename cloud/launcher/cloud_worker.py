@@ -257,6 +257,8 @@ NODE_POOL_LABELS = ("cw/pool", "agentpool", "kubernetes.azure.com/agentpool", "c
 NODE_SIZE_LABELS = ("node.kubernetes.io/instance-type", "instance-type", "cw/size")
 REPORT_PATH = "/home/worker/report"  # the worker's final one-line report, written here inside the pod (the image's workdir)
 REPORT_MAX = 2000
+EVIDENCE_AUDIT_CAP = 64 * 1024 * 1024   # the most bytes of the audit file the evidence read takes (from the start; over it, the last 1 MiB too)
+EVIDENCE_LINE_MAX = 1048576   # a longer audit line is skipped without being held whole
 # the worker owns the file, and `head` follows a link: refuse anything but a regular file BEFORE reading ($1 the path, $2 the byte limit)
 REPORT_READ = 'if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "not a regular file" >&2; exit 3; fi; head -c "$2" "$1"'
 EXIT_DONE, EXIT_HOOK, EXIT_USAGE, EXIT_CLOUD, EXIT_TIMEOUT, EXIT_CAP, EXIT_REFUSED = 0, 1, 2, 3, 4, 5, 6
@@ -2254,7 +2256,7 @@ class Launcher:
             pod = self._need(worker)
             persistent = False
             workload = None
-            if pod is None and self._persistent_evidence(worker, getattr(a, "record_dir", None)):
+            if pod is None and self._persistent_evidence(worker, getattr(a, "record_dir", None)) is not False:   # True or unreadable: the strict read
                 # EVIDENCE RULE: only a worker with evidence of persistence has its workload read; the strict read's every answer but the exact
                 # not-found (the exact Forbidden line included) fails the stop with everything kept; a plain worker makes no workload read at all
                 try:
@@ -2354,31 +2356,61 @@ class Launcher:
             return None
 
     def _persistent_evidence(self, worker, record_dir=None):
-        """True when at least one of THREE sources says the worker is a persistent orchestrator: its audit create line, its hub registry entry,
-        its run record (each carries persistent true). A missing source is no evidence; an unreadable source (None) counts only when another source
-        says persistent, which is the same as any source saying it; when NO source is readable the worker is treated as plain."""
+        """What the three sources say of a worker whose own pod is absent. The LIVE sources are the audit create line (the file is read in whole, up
+        to a cap) and the hub entry; the run record counts only after a stop (read, never relied on). True: some source says persistent. None: no
+        source says it and some source is unreadable (no proof of plainness: the caller takes the strict read and fails closed). False: every source
+        was read and every one says plain."""
         sources = (lambda: self._evidence_audit(worker), lambda: self._evidence_registry(worker), lambda: self._evidence_record(worker, record_dir))
         answers = [read() for read in sources]
-        return any(x is True for x in answers)
+        if any(x is True for x in answers):
+            return True
+        if any(x is None for x in answers):
+            return None
+        return False
 
     def _evidence_audit(self, worker):
+        """True: a create line of this worker with persistent true, anywhere in the file (streamed, bounded by the cap; over the cap the last 1 MiB too).
+        False: the whole file was scanned within the cap and none. None: unreadable, or longer than the cap with none found."""
+        def scan(f, budget):
+            used = 0
+            while used < budget:
+                line = f.readline(min(EVIDENCE_LINE_MAX + 1, budget - used))
+                if not line:
+                    return False, used, True
+                used += len(line)
+                if len(line) > EVIDENCE_LINE_MAX and not line.endswith(b"\n"):
+                    while used < budget:   # a very long line: skipped, never held whole
+                        rest = f.readline(65536)
+                        used += len(rest)
+                        if not rest or rest.endswith(b"\n"):
+                            break
+                    continue
+                if b'"create"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line.decode(errors="replace"))
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("action") == "create" and rec.get("worker") == worker and rec.get("persistent") is True:
+                    return True, used, False
+            return False, used, False
         try:
             with open(self.audit_path, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                f.seek(max(0, f.tell() - 1048576))
-                lines = f.read().decode(errors="replace").splitlines()
+                found, used, eof = scan(f, EVIDENCE_AUDIT_CAP)
+                if found:
+                    return True
+                if not eof and not f.read(1):
+                    eof = True
+                if eof:
+                    return False
+                size = os.fstat(f.fileno()).st_size
+                f.seek(max(0, size - 1048576))
+                found, _, _ = scan(f, 1048576 + EVIDENCE_LINE_MAX + 2)
+                return True if found else None
         except FileNotFoundError:
             return False
         except OSError:
             return None
-        for raw in lines:
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(rec, dict) and rec.get("action") == "create" and rec.get("worker") == worker and rec.get("persistent") is True:
-                return True
-        return False
 
     def _evidence_registry(self, worker):
         try:
@@ -2526,7 +2558,7 @@ class Launcher:
 
         def go(info):
             pod = self._need(worker)
-            if self._persistent_evidence(worker, getattr(a, "record_dir", None)):   # the same evidence rule as the stop; a plain worker is as before
+            if not pod and self._persistent_evidence(worker, getattr(a, "record_dir", None)) is True:   # the same evidence rule as the stop; a plain worker is as before
                 raise CloudError("worker %s is a persistent orchestrator: delete is refused (even with --force); use the stop command: cloud-worker stop %s"
                                  % (worker, worker), EXIT_USAGE)
             if not pod:

@@ -908,7 +908,7 @@ class Evidence(PBase):
             self.check_persistent()
 
     def test_m1_mutant_reading_the_workload_for_every_worker_fails_the_check(self):
-        self.mod = mutant('if pod is None and self._persistent_evidence(worker, getattr(a, "record_dir", None)):', "if pod is None:")
+        self.mod = mutant('if pod is None and self._persistent_evidence(worker, getattr(a, "record_dir", None)) is not False:', "if pod is None:")
         with self.assertRaises(AssertionError):
             self.check_plain()
 
@@ -951,9 +951,8 @@ class Evidence(PBase):
         self.evidence_only("none")
         self.assertFalse(self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)._persistent_evidence(WORKER))
 
-    def test_m1_when_no_source_is_readable_the_worker_is_treated_as_plain(self):
-        # The audit path is a directory, the record root is a file and the registry body is not JSON: every source is unreadable, so the worker is
-        # plain (an unreadable source counts as evidence only when another source says persistent).
+    def test_m1_when_no_source_is_readable_there_is_no_proof_of_plainness(self):
+        # The audit path is a directory, the record root is a file and the registry body is not JSON: every source is unreadable (None, not False).
         self.launch()
         os.remove(self.env["CW_CLOUD_AUDIT"])
         os.mkdir(self.env["CW_CLOUD_AUDIT"])
@@ -964,7 +963,7 @@ class Evidence(PBase):
         bodies = self.st()["secret_bodies"]
         bodies[REGISTRY]["agents.json"] = "not json"
         self.patch_state(secret_bodies=bodies)
-        self.assertFalse(self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)._persistent_evidence(WORKER))
+        self.assertIsNone(self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)._persistent_evidence(WORKER))
 
     def test_m1_an_unreadable_source_with_another_saying_persistent_is_evidence(self):
         self.launch()   # the registry entry and the audit line say persistent
@@ -1003,9 +1002,212 @@ class Evidence(PBase):
         self.assertEqual([v for v in self.verbs() if v[:2] == ("get", "statefulset")], [])
 
     def test_m2_mutant_the_refusal_removed_fails_the_check(self):
-        self.mod = mutant('if self._persistent_evidence(worker, getattr(a, "record_dir", None)):   # the same evidence rule', "if False:   # the same evidence rule")
+        self.mod = mutant('if not pod and self._persistent_evidence(worker, getattr(a, "record_dir", None)) is True:   # the same evidence rule', "if False:   # the same evidence rule")
         with self.assertRaises(AssertionError):
             self.check_delete_refusal()
+
+
+class EvidenceWhole(PBase):
+    """The evidence reads the whole audit file, an unreadable source is no proof of plainness, and the reads are lazy (ask #1509)."""
+    UNREADABLE_ANSWER = dict(err="Error from server (InternalError): boom\n")
+    STATES = ("yes", "no", "unreadable")
+
+    def sts_reads(self):
+        return [v for v in self.verbs() if v[:2] == ("get", "statefulset")]
+
+    def deletes(self):
+        return [v for v in self.verbs() if v[0] == "delete"]
+
+    def fresh(self):
+        for fd in self.fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds = []
+        self.write_state({"pods": {}})
+        self.patch_state(secrets={REGISTRY: 1, "cloud-hub-pw": 1},
+                         secret_bodies={"cloud-hub-pw": {"keep": "kept-pw"}, REGISTRY: {"secrets.json": json.dumps(OTHER), "agents.json": json.dumps({"other-agent": {"url": "u"}})}},
+                         hook_result={"pushed": False, "wip_branch": None})
+        if os.path.exists(self.env["CW_CLOUD_AUDIT"]):
+            os.remove(self.env["CW_CLOUD_AUDIT"])
+
+    def plain_gone(self):
+        self.launch(WORKER, agent=False, token=False, persistent=False)
+        pods = dict(self.st()["pods"])
+        pods.pop(NAME, None)
+        self.patch_state(pods=pods)
+
+    def stop(self, planted=None):
+        planted = planted or self.UNREADABLE_ANSWER
+        self.patch_state(sts_get_stdout=planted.get("out", ""), sts_get_stderr=planted.get("err", ""), sts_get_code=1)
+        open(self.env["FAKE_KUBE_CALLS"], "w").close()
+        return self.run_cli("stop", WORKER, "--no-record")
+
+    def launcher(self):
+        return self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)
+
+    def table_problems(self):
+        import itertools
+        from unittest import mock
+        problems = []
+        for combo in itertools.product(self.STATES, repeat=3):
+            self.fresh()
+            self.plain_gone()
+            value = {"yes": True, "no": False, "unreadable": None}
+            L = self.mod.Launcher
+            with mock.patch.object(L, "_evidence_audit", lambda s, w, v=value[combo[0]]: v), \
+                    mock.patch.object(L, "_evidence_registry", lambda s, w, v=value[combo[1]]: v), \
+                    mock.patch.object(L, "_evidence_record", lambda s, w, r=None, v=value[combo[2]]: v):
+                code, out, err = self.stop()
+            reads, deletes = len(self.sts_reads()), len(self.deletes())
+            if "yes" in combo or "unreadable" in combo:
+                ok = code == 1 and reads == 1 and not deletes and "pod_gone" not in out
+                ok = ok and NAME + "-pw" in set(self.st()["secrets"])
+                stops = [l for l in self.audit_lines() if l.get("action") == "stop"]
+                ok = ok and bool(stops) and stops[-1].get("ok") is False
+            else:
+                ok = code == 0 and reads == 0 and "pod_gone" in out
+            if not ok:
+                problems.append((combo, code, reads, deletes))
+        return problems
+
+    def test_e_the_27_combinations_of_audit_registry_record(self):
+        self.assertEqual(self.table_problems(), [])
+
+    def test_e_mutant_an_unreadable_source_read_as_no_fails_the_table_on_7_combinations(self):
+        self.mod = mutant("        if any(x is None for x in answers):\n            return None\n", "")
+        problems = self.table_problems()
+        self.assertEqual(len([p for p in problems if "yes" not in p[0]]), 7)   # no yes and some unreadable: 8 of the no-yes 8, minus the all-no one
+        self.assertEqual(len(problems), 7)
+
+    def aged_out(self, registry):
+        self.launch()
+        with open(self.env["CW_CLOUD_AUDIT"], "a") as f:
+            for i in range(1300):
+                f.write(json.dumps({"action": "noise", "worker": "x%d" % i, "pad": "a" * 950}) + "\n")
+        self.assertGreater(os.path.getsize(self.env["CW_CLOUD_AUDIT"]), 1048576 + 1000)
+        bodies = self.st()["secret_bodies"]
+        agents = json.loads(bodies[REGISTRY]["agents.json"])
+        if registry == "absent":
+            agents.pop(WORKER)
+        bodies[REGISTRY]["agents.json"] = "not json" if registry == "unreadable" else json.dumps(agents)
+        self.patch_state(secret_bodies=bodies)
+        return self.stop()
+
+    def aged_out_problems(self):
+        problems = []
+        for registry in ("carries", "absent", "unreadable"):
+            self.fresh()
+            code, out, err = self.aged_out(registry)
+            if code != 1 or "pod_gone" in out or self.deletes() or len(self.sts_reads()) != 1:
+                problems.append((registry, code, "pod_gone" in out, len(self.deletes())))
+        return problems
+
+    def test_e_a_create_line_older_than_one_mebibyte_still_counts(self):
+        self.assertEqual(self.aged_out_problems(), [])
+
+    def test_e_mutant_the_old_last_mebibyte_reader_fails_the_aged_out_check(self):
+        self.mod = mutant("                found, used, eof = scan(f, EVIDENCE_AUDIT_CAP)\n",
+                          "                f.seek(max(0, os.fstat(f.fileno()).st_size - 1048576))\n                found, used, eof = scan(f, EVIDENCE_AUDIT_CAP)\n")
+        problems = self.aged_out_problems()
+        self.assertTrue(problems)
+        self.assertTrue(any(p[2] and p[3] == 2 for p in problems), problems)
+
+    def test_e_a_file_over_the_cap_with_no_create_line_in_it_is_unreadable_and_fails_closed(self):
+        from unittest import mock
+        self.plain_gone()
+        with open(self.env["CW_CLOUD_AUDIT"], "w") as f:
+            for i in range(300):
+                f.write(json.dumps({"action": "noise", "worker": "x%d" % i, "pad": "a" * 100}) + "\n")
+        with mock.patch.object(self.mod, "EVIDENCE_AUDIT_CAP", 4096):
+            self.assertIsNone(self.launcher()._evidence_audit(WORKER))
+            code, out, err = self.stop()
+        self.assertEqual(code, 1, err)
+        self.assertEqual(len(self.sts_reads()), 1)
+        self.assertEqual(self.deletes(), [])
+        self.assertNotIn("pod_gone", out)
+
+    def test_e_a_create_line_in_the_last_mebibyte_of_a_file_over_the_cap_counts(self):
+        from unittest import mock
+        with open(self.env["CW_CLOUD_AUDIT"], "w") as f:
+            for i in range(300):
+                f.write(json.dumps({"action": "noise", "pad": "a" * 100}) + "\n")
+            f.write(json.dumps({"action": "create", "worker": WORKER, "persistent": True}) + "\n")
+        with mock.patch.object(self.mod, "EVIDENCE_AUDIT_CAP", 4096):
+            self.assertTrue(self.launcher()._evidence_audit(WORKER))
+
+    def write_audit(self, *lines):
+        with open(self.env["CW_CLOUD_AUDIT"], "wb") as f:
+            for l in lines:
+                f.write(l if isinstance(l, bytes) else (json.dumps(l) + "\n").encode())
+
+    def test_e_another_worker_with_the_name_as_prefix_is_not_evidence(self):
+        self.write_audit({"action": "create", "worker": WORKER + "-2", "persistent": True})
+        self.assertIs(self.launcher()._evidence_audit(WORKER), False)
+
+    def test_e_a_partial_last_line_a_non_json_line_and_a_huge_line_do_not_break_the_scan(self):
+        create = {"action": "create", "worker": WORKER, "persistent": True}
+        self.write_audit(b"not json at all\n", b"x" * (2 * 1048576) + b"\n", create, b'{"action": "creat')
+        self.assertIs(self.launcher()._evidence_audit(WORKER), True)
+        self.write_audit(b"not json\n", {"action": "create", "worker": WORKER, "persistent": False}, b'{"action": "creat')
+        self.assertIs(self.launcher()._evidence_audit(WORKER), False)
+
+    def test_e_a_missing_file_is_no_and_a_directory_is_unreadable(self):
+        os.remove(self.env["CW_CLOUD_AUDIT"]) if os.path.exists(self.env["CW_CLOUD_AUDIT"]) else None
+        self.assertIs(self.launcher()._evidence_audit(WORKER), False)
+        os.mkdir(self.env["CW_CLOUD_AUDIT"])
+        self.assertIsNone(self.launcher()._evidence_audit(WORKER))
+
+    def test_e_a_plain_worker_with_a_readable_audit_and_registry_makes_no_workload_read(self):
+        for registry in ("absent", "no"):
+            with self.subTest(registry):
+                self.fresh()
+                self.plain_gone()
+                if registry == "no":
+                    bodies = self.st()["secret_bodies"]
+                    bodies[REGISTRY]["agents.json"] = json.dumps({WORKER: {"url": "u", "persistent": False}})
+                    self.patch_state(secret_bodies=bodies)
+                code, out, err = self.stop()
+                self.assertEqual(code, 0, err)
+                self.assertIn("pod_gone", out)
+                self.assertEqual(self.sts_reads(), [])
+
+    def counting(self, action):
+        from unittest import mock
+        self.fresh()
+        self.launch(WORKER, agent=False, token=False, persistent=False)
+        self.assertIn(NAME, self.st()["pods"])
+        count = {"audit": 0, "registry": 0}
+        L = self.mod.Launcher
+        real_a, real_r = L._evidence_audit, L._evidence_registry
+
+        def audit(s, w):
+            count["audit"] += 1
+            return real_a(s, w)
+
+        def registry(s, w):
+            count["registry"] += 1
+            return real_r(s, w)
+        argv = ["stop", WORKER, "--no-record"] if action == "stop" else ["delete", WORKER, "--force"]
+        with mock.patch.object(L, "_evidence_audit", audit), mock.patch.object(L, "_evidence_registry", registry):
+            code, out, err = self.run_cli(*argv)
+        return code, count
+
+    def test_e_a_stop_or_delete_of_a_plain_worker_whose_pod_exists_reads_no_evidence(self):
+        for action in ("stop", "delete"):
+            with self.subTest(action):
+                code, count = self.counting(action)
+                self.assertEqual(code, 0)
+                self.assertEqual(count, {"audit": 0, "registry": 0})
+
+    def test_e_mutant_the_lazy_guard_removed_fails_the_counting_test(self):
+        self.mod = mutant('if not pod and self._persistent_evidence(worker, getattr(a, "record_dir", None)) is True:', 'if self._persistent_evidence(worker, getattr(a, "record_dir", None)) is True:')
+        code, count = self.counting("delete")
+        self.assertNotEqual(count, {"audit": 0, "registry": 0})
+        self.mod = mutant('if pod is None and self._persistent_evidence(worker, getattr(a, "record_dir", None)) is not False:', 'if self._persistent_evidence(worker, getattr(a, "record_dir", None)) is not False:')
+        code, count = self.counting("stop")
+        self.assertNotEqual(count, {"audit": 0, "registry": 0})
 
 
 class S16Docs(unittest.TestCase):
@@ -1019,6 +1221,7 @@ class S16Docs(unittest.TestCase):
         "at 24 hours of its shape",
         "no `cw/role` annotation on the template at this head",
         "a lost read stops renewal",
+        "the evidence that a worker is a persistent orchestrator is its audit create line (the audit file is read in whole, up to a cap) and its hub entry while it runs; the run record counts only after a stop",
     )
 
     def text(self, rel, drop=None):
