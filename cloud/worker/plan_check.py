@@ -750,7 +750,9 @@ def validate(scenarios, clauses, text=""):
         if proof and proof not in PROOFS:
             bad(ident, "bad-proof", "proof %r must be one of %s" % (proof, "|".join(PROOFS)))
         if proof == "review" and REVIEW_CODE_RE.search(_normal(scenario.get("text", "")) + " " + _normal(scenario.get("pass", ""))):
-            bad(ident, "review-for-code", "proof review is a reviewer's read of text, not of code behaviour a test can show: use test")
+            words = list(dict.fromkeys(m.group(0).lower() for m in REVIEW_CODE_RE.finditer(_normal(scenario.get("text", "")) + " " + _normal(scenario.get("pass", "")))))
+            bad(ident, "review-for-code", "proof review is a reviewer's read of text, not of code behaviour a test can show: use test (matched: %s%s)"
+                % (", ".join(words[:8]), " and %d more" % (len(words) - 8) if len(words) > 8 else ""))
         if evaluator in EVALUATOR_ALIASES:
             warnings.append({"id": ident, "code": "evaluator-alias", "message": "%s: evaluator %r is a deprecated alias of "
                              "%r: rename it" % (ident, evaluator, EVALUATOR_ALIASES[evaluator])})
