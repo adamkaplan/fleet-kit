@@ -19,7 +19,7 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_CLOUD_SPEND_CAP_USD": "25", "CW_CLUSTER_TOKEN_CMD": "cat /home/user/token", "CW_CLUSTER_ADMIN_CMD": "cat /home/user/kc",
                     "CW_GIT_TOKEN_CMD": "cat /home/user/git", "CW_APP_ID_CMD": "cat /home/user/id", "CW_APP_INSTALLATION_CMD": "cat /home/user/inst",
                     "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check",
-                    "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m", "CW_STACK_MODEL_SECRET": "acme-stack-model",
+                    "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m", "CW_VAULT_BLOCK_DURATION": "10m", "CW_STACK_MODEL_SECRET": "acme-stack-model",
                     "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry",
                     "CW_STACK_REGISTRY": "acme-registry.azurecr.io", "CW_STACK_PULL_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
                     "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000"}
@@ -75,6 +75,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_STACK_MODEL_SECRET": ["https://vault.example.internal/secrets/x", "/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "$(x)", "-x", "--help"],
     "CW_CLUSTER_ADMIN_SECRET": ["/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "a;b", "$(x)", "a\u00e9", "-x", "--help", "--", "--query", "-", "-a"],
     "CW_CLUSTER_TOKEN_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "20", "m", "20s", "1.5h", "20 m", "/tmp/20m", "20m5s", "\u0662\u0660m", "-1h", "0h"],
+    "CW_VAULT_BLOCK_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "10", "m", "10s", "1.5h", "10 m", "/tmp/10m", "10m5s", "\u0662\u0660m", "-1h", "0h"],
 }
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 

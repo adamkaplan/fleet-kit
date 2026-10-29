@@ -809,6 +809,238 @@ def firewall_refused(ran):
     return any(marker in text for marker in FIREWALL_MARKERS)
 
 
+# ---------------------------------------------------------------- the vault block (ask #1427)
+# After the vault's FIREWALL refuses this machine, every command that needs the vault refuses at once, for a set time, and starts no vault call.
+# The block is ONE small private file in the switchboard's state directory: the time, a one-line reason and the retry time (no secret, no address, no
+# vault name). Only a firewall answer creates it: a timeout, a missing secret, a login problem or a malformed answer never does. After the retry time
+# exactly ONE command probes (the lock file below): success removes the block, a refusal renews it. With no block yet, the callers of one moment also
+# take the lock one at a time, so a refusing vault is asked once and the others find the block.
+VAULT_BLOCK_NAME = "vault-block.json"
+VAULT_BLOCK_LOCK_NAME = "vault-block.lock"
+VAULT_BLOCK_SETTING = "CW" + "_VAULT_BLOCK_DURATION"   # written in two parts: its settings row is a separate commit of ask #1427 (the names guard reads string constants)
+VAULT_BLOCK_DEFAULT_MINUTES = 10
+VAULT_BLOCK_REASON = "the vault refused this machine"
+VAULT_BLOCK_POLL_SECONDS = 0.05
+
+
+def vault_block_dir(env):
+    """The block's folder: the switchboard's state directory ($XDG_STATE_HOME, default ~/.local/state, / the switchboard's directory name), in its
+    `cloud` folder, where the launcher keeps its other records and where its tests already clear their files between two launches."""
+    base = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, CONFIG_DIR_NAME, "cloud")
+
+
+def vault_block_minutes(env):
+    """The block's length in minutes: the setting (1m to 60m, the duration kind), else ten. A value that cannot be read gives the default."""
+    text = (env.get(VAULT_BLOCK_SETTING) or "").strip()
+    found = _DURATION.fullmatch(text) if text else None
+    minutes = int(found.group(1)) * (60 if found.group(2) == "h" else 1) if found else VAULT_BLOCK_DEFAULT_MINUTES
+    return minutes if 1 <= minutes <= 60 else VAULT_BLOCK_DEFAULT_MINUTES
+
+
+def vault_lock_stale_seconds():
+    """A probe lock older than the longest a vault call can last (the read, the access check after a refusal and the second read) is ignored."""
+    return 2 * TOKEN_CMD_SECONDS + VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE
+
+
+VAULT_BLOCK_MAX_BYTES = 65536   # a block file is tiny: a larger one is not ours
+
+
+def _damaged_block(path, base, minutes):
+    """A block file that cannot be trusted FAILS CLOSED: it blocks until the file's own time plus the setting's length (never longer), then one probe runs."""
+    return (base, base + 60 * minutes, path)
+
+
+def read_vault_block(env, now=None):
+    """None when there is no block file; otherwise (refused_at, retry_at, damaged_path) in epoch seconds (damaged_path is None for a good file).
+    A file that is corrupt, empty, huge, a symlink, not ours, with a negative or non-number time blocks too, until the file's time (the earlier of its
+    modification and change time and now, so a future date or a clock set back cannot lengthen it) plus the setting's length. A retry time is capped to it."""
+    path = os.path.join(vault_block_dir(env), VAULT_BLOCK_NAME)
+    try:
+        found = os.lstat(path)
+    except OSError:
+        return None
+    minutes = vault_block_minutes(env)
+    now = time.time() if now is None else now
+    mtime = found.st_mtime
+    if mtime > now and stat.S_ISREG(found.st_mode) and found.st_uid == os.getuid():
+        try:
+            os.utime(path, (now, now), follow_symlinks=False)   # a time ahead of the clock (it was set back): the block starts now, never later
+            mtime = now
+        except OSError:
+            pass
+    # a time ahead of now is not believed: the block ends at most one setting's length from now (and from the first time it was seen so)
+    base = min([t for t in (mtime, found.st_ctime) if t <= now] + [now])
+    if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_size > VAULT_BLOCK_MAX_BYTES:
+        return _damaged_block(path, base, minutes)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(VAULT_BLOCK_MAX_BYTES + 1)
+        if len(raw) > VAULT_BLOCK_MAX_BYTES:
+            return _damaged_block(path, base, minutes)
+        data = json.loads(raw.decode("utf-8"))
+        at, retry = data["at"], data["retry_at"]
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (at, retry)):
+            raise ValueError("not a number")
+        at, retry = float(at), float(retry)
+        if not (math.isfinite(at) and math.isfinite(retry)) or at < 0 or retry < 0:
+            raise ValueError("not a time")
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return _damaged_block(path, base, minutes)
+    retry = min(retry, base + 60 * minutes)
+    return (min(at, retry), retry, None)
+
+
+def _stamp(epoch):
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def vault_block_line(block):
+    """The ONE line a blocked command prints: the reason and the retry time (never a value, an address or a name)."""
+    if len(block) > 2 and block[2]:
+        return "the vault block file %s cannot be trusted (damaged, too large, too far ahead or not a plain file of this user); no vault call is made until %s (delete that file to clear it by hand)" % (
+            block[2], _stamp(block[1]))
+    return "%s at %s; no vault call is made until %s (delete the vault-block file in the switchboard state directory to clear it by hand)" % (
+        VAULT_BLOCK_REASON, _stamp(block[0]), _stamp(block[1]))
+
+
+def write_vault_block(env, now):
+    """Write the block by rename (a private temp file in the same directory, then os.replace). Never raises: a block that cannot be written costs only the saving."""
+    directory = vault_block_dir(env)
+    temp = None
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        body = json.dumps({"at": now, "reason": VAULT_BLOCK_REASON, "retry_at": now + 60 * vault_block_minutes(env)}, sort_keys=True)
+        temp = os.path.join(directory, ".%s.%d.%s.tmp" % (VAULT_BLOCK_NAME, os.getpid(), secrets.token_hex(4)))
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        os.replace(temp, os.path.join(directory, VAULT_BLOCK_NAME))
+        temp = None
+    except OSError:
+        pass
+    finally:
+        if temp is not None:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _inspect_lock(lock):
+    """(mtime, holder_gone) of the probe lock, or None when it is unusable (a FIFO, a symlink, a directory, a file of another user, unreadable).
+    It is opened WITHOUT following a symlink and WITHOUT blocking, then judged by fstat: only a regular file of this user is a lock."""
+    try:
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid():
+            return None
+        try:
+            pid = int(os.read(fd, 20).decode("ascii", "replace").strip())
+            os.kill(pid, 0)
+            gone = False
+        except ProcessLookupError:
+            gone = True
+        except (OSError, ValueError, OverflowError):
+            gone = False   # an empty or unreadable lock is not judged gone: its age decides
+        return (found.st_mtime, gone)
+    finally:
+        os.close(fd)
+
+
+def _clear_unusable_lock(lock):
+    """Replace an unusable lock (one line names it); True when it is gone, False when it cannot be removed (the call then goes on without a lock)."""
+    print("cloud-worker: the vault probe lock %s is not a plain file of this user; ignoring it (delete it by hand to clear it)" % lock, file=sys.stderr)
+    for remove in (os.unlink, os.rmdir):
+        try:
+            remove(lock)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            pass
+    return False
+
+
+class VaultFlight:
+    """ONE vault call in flight at a time. `VaultFlight.enter(env)` raises ClusterLogin("vault-blocked") while a block lasts (its line is `.line`),
+    or when a probe after the block's time is already running; otherwise it holds the lock. `done(ran)` records the final answer (a firewall refusal
+    writes or renews the block; a success removes it; anything else changes nothing) and releases the lock."""
+
+    def __init__(self, env, clock):
+        self.env, self.clock, self.lock = env, clock, None
+
+    @classmethod
+    def enter(cls, env, clock=time.time, sleep=time.sleep):
+        flight = cls(env, clock)
+        directory = vault_block_dir(env)
+        lock = os.path.join(directory, VAULT_BLOCK_LOCK_NAME)
+        while True:
+            block = read_vault_block(env, clock())
+            if block is not None and clock() < block[1]:
+                raise _vault_blocked(block)
+            try:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            except FileExistsError:
+                seen = _inspect_lock(lock)
+                if seen is None:
+                    if not os.path.lexists(lock):
+                        continue   # it went away between the two calls: take it
+                    if _clear_unusable_lock(lock):
+                        continue
+                    return flight   # cannot be removed: no lock is kept, and the call goes on (one call at most)
+                age = clock() - seen[0]
+                if abs(age) > vault_lock_stale_seconds() or seen[1]:   # too old, or dated far from now (a clock set back), or its command was killed
+                    _unlink(lock)   # a stale lock (too old, or its command was killed) is ignored
+                    continue
+                if block is not None:
+                    raise _vault_blocked(block)   # a probe is running: this command uses the block
+                sleep(VAULT_BLOCK_POLL_SECONDS)   # no block yet: the call in flight answers first
+                continue
+            except OSError:
+                return flight   # no state directory: no block can be kept, and the call goes on as before
+            os.write(fd, str(os.getpid()).encode())   # who holds it: a lock of a command that is gone is ignored at once
+            os.close(fd)
+            flight.lock = lock
+            block = read_vault_block(env, clock())   # the holder before us may have just written it
+            if block is not None and clock() < block[1]:
+                flight.release()
+                raise _vault_blocked(block)
+            return flight
+
+    def release(self):
+        if self.lock is not None:
+            _unlink(self.lock)
+            self.lock = None
+
+    def done(self, ran):
+        try:
+            if firewall_refused(ran):
+                write_vault_block(self.env, self.clock())
+            elif ran is not None and ran[0] == 0:
+                _unlink(os.path.join(vault_block_dir(self.env), VAULT_BLOCK_NAME))
+        finally:
+            self.release()
+
+
+def _vault_blocked(block):
+    err = ClusterLogin("vault-blocked", firewall=True)
+    err.line = vault_block_line(block)
+    return err
+
+
 def jwt_claims(token):
     """(exp, iat) of a JWT's claims, or None when the text is not a JWT with a readable exp. Never raises."""
     parts = (token or "").split(".")
@@ -953,11 +1185,16 @@ def cluster_token(env, duration, capture=None, now=None, recovery=None, strict=F
                     "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
         def read():
             return capture(argv, env=child_env)
-        ran = read()
-        recovered = False
-        if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
-            ran = recovery(read, env)
-            recovered = True
+        flight = VaultFlight.enter(env)   # BEFORE any vault call: a block (or a probe in flight) refuses here, at once
+        ran = None
+        try:
+            ran = read()
+            recovered = False
+            if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
+                ran = recovery(read, env)
+                recovered = True
+        finally:
+            flight.done(ran)   # AFTER the final answer: a firewall refusal writes or renews the block, a success removes it
         if ran is None or ran[0] != 0 or not ran[1].strip() or len(ran[1]) > 1000000:
             raise ClusterLogin("admin-unreadable", firewall=firewall_refused(ran), recovered=recovered)
         admin_config = ran[1]
@@ -1047,6 +1284,7 @@ REFRESH_REASONS = {
     "az-refused": "no az of the fixed list is a plain executable file that only its owner can write",
     "namespace-refused": "the namespace is not a DNS label (CW_CLOUD_NAMESPACE)",
     "duration-refused": "the requested token life is not a whole number of minutes",
+    "vault-blocked": "the vault refused this machine and a block is in force (the vault-block file of the switchboard state directory)",
 }
 FIREWALL_REASON = "the vault refused this machine"   # the firewall refused this machine: the launch path's own words
 
@@ -2556,6 +2794,7 @@ SETTINGS = (
     ("CW_STACK_PULL_CLIENT_ID", False, "guid"),    # the client id of the pull identity (not a secret)
     ("CW_STACK_PULL_TENANT_ID", False, "guid"),    # the tenant id (not a secret)
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
+    ("CW_VAULT_BLOCK_DURATION", False, "duration"),   # how long the launcher refuses vault commands after a vault firewall refusal (default 10m, 1m to 60m)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
@@ -2701,6 +2940,7 @@ VALIDATORS = {
     "CW_STACK_PULL_CLIENT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_STACK_PULL_TENANT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
+    "CW_VAULT_BLOCK_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 10m or 1h)", _duration_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
@@ -3045,6 +3285,14 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None):
         refresher = refresher or ClusterTokenRefresher(env, clock)
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         while True:
+            blocked = read_vault_block(env)
+            if blocked is not None and time.time() < blocked[1]:   # the vault block (ask #1427): no pass, no az process, ONE log line
+                print("cloud-worker: reaper pass skipped: %s" % vault_block_line(blocked), file=sys.stderr)
+                if not a.loop:
+                    why = "end of its pass"
+                    return 0
+                sleep(min(a.loop, REAP_FLOOR_SECONDS))
+                continue
             refresh = refresher.run()
             for line in getattr(refresher, "notices", []):
                 print(line, file=sys.stderr)   # the stdout line of a pass is the JSON report; the notice names a setting, never a value
