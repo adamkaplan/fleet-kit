@@ -1434,7 +1434,10 @@ def _launch(args, runner, now, reserve):
             if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
-    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working", "endpoint": record["url"]})   # a cloud worker is an agent (#903)
+    row = {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"}
+    if hub:   # the endpoint is recorded only for an agent the hub delivers to; a plain cloud coder keeps the cloud route
+        row["endpoint"] = record["url"]
+    _registry_note(engine, "upsert", state, name, row)   # a cloud worker is an agent (#903)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
 
