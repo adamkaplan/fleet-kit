@@ -8496,6 +8496,42 @@ class TestIntentEditToldOnce(TestIntentEditWiring):
         self.edit()
         self.assertEqual(self.count(self.hub), 1)
 
+    def count_github_writes(self):
+        """Count every `gh api` call that is not a plain read (a method other than GET, or a body field)."""
+        writes, plain = [], self.gh.runner_plain
+
+        def counting(argv, kwargs):
+            method = argv[argv.index("-X") + 1] if "-X" in argv else argv[argv.index("--method") + 1] if "--method" in argv else "GET"
+            if method.upper() != "GET" or any(a in ("-f", "-F", "--field", "--raw-field", "--input") for a in argv):
+                writes.append(argv[-1])
+            return plain(argv, kwargs)
+        self.gh.runner_plain = counting
+        return writes
+
+    def told_record_read_does_not_write(self, prepare):
+        writes = self.count_github_writes()
+        prepare()
+        self.edit()
+        self.assertEqual(self.count(self.hub), 1)             # the edit still counts once
+        self.deliver(self.hub)                                # the told-record read and write, on state only
+        self.assertEqual(self.count(self.hub), 0)
+        self.assertEqual(writes, [])                          # and GitHub was never written to
+
+    def test_a_corrupt_record_raises_nothing_and_writes_nothing_to_github(self):
+        self.told_record_read_does_not_write(
+            lambda: (Path(self.rig.world.state) / sb.INTENT_TOLD_FILE).write_text("{not json"))
+
+    def test_a_missing_record_raises_nothing_and_writes_nothing_to_github(self):
+        def prepare():
+            self.assertFalse((Path(self.rig.world.state) / sb.INTENT_TOLD_FILE).exists())
+        self.told_record_read_does_not_write(prepare)
+
+    def test_the_write_counter_sees_a_github_write(self):
+        writes = self.count_github_writes()
+        with self.assertRaises(AssertionError):  # the fake has no write route; the call is counted before it answers
+            self.gh.runner(["%s" % GH_BIN, "api", "-X", "POST", "repos/%s/issues/12/comments" % GH_REPO])
+        self.assertEqual(len(writes), 1)
+
 
 class TestIntentEditFilter(TestIntentEditWiring):
     """An Intent edit wakes the Chief of Staff only for our own charters' chain, or by the owner."""
