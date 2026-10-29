@@ -1939,7 +1939,7 @@ class Launcher:
                 if hub:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
                     self._register(worker, run_values[CHANNEL_SECRET_KEY], spec if not persistent else {"metadata": {"name": name + "-0"}},
-                                   self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password)
+                                   self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password, persistent)
                 self._make(made, "sts" if persistent else "pod", self.kube.apply, spec)
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
@@ -2005,11 +2005,13 @@ class Launcher:
     def _registry_secret(self):
         return self.env.get("CW_HUB_REGISTRY_SECRET") or DEFAULT_REGISTRY_SECRET
 
-    def _register(self, agent, channel_secret, spec, domain, password):
+    def _register(self, agent, channel_secret, spec, domain, password, persistent=False):
         """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file}}. Only the hash is stored."""
         digest = hashlib.sha256(channel_secret.encode()).hexdigest()
         name = spec["metadata"]["name"]
         entry = {"url": hub_agent_url(name, self.env.get("CW_CLOUD_NAMESPACE", "cw")), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
+        if persistent:   # only a persistent orchestrator's entry has the key
+            entry["persistent"] = True
 
         def change(sec, agents):
             sec[agent], agents[agent] = digest, entry
@@ -2252,8 +2254,13 @@ class Launcher:
             pod = self._need(worker)
             persistent = False
             workload = None
-            if pod is None:   # a persistent orchestrator's pod is NAME-0: found only through its StatefulSet (read strictly)
-                workload = self._persistent_workload(name)
+            if pod is None and self._persistent_evidence(worker, getattr(a, "record_dir", None)):
+                # EVIDENCE RULE: only a worker with evidence of persistence has its workload read; the strict read's every answer but the exact
+                # not-found (the exact Forbidden line included) fails the stop with everything kept; a plain worker makes no workload read at all
+                try:
+                    workload = self.kube.get_workload(name)
+                except CloudError as e:
+                    raise CloudError("the persistent orchestrator %s has its workload unreadable; nothing was stopped or deleted: %s" % (worker, e), EXIT_HOOK) from None
                 if workload is not None:
                     persistent = True
                     pod = self.kube.get_pod(name + "-0")
@@ -2345,6 +2352,69 @@ class Launcher:
             return self.kube.get_workload(name)
         except WorkloadForbidden:
             return None
+
+    def _persistent_evidence(self, worker, record_dir=None):
+        """True when at least one of THREE sources says the worker is a persistent orchestrator: its audit create line, its hub registry entry,
+        its run record (each carries persistent true). A missing source is no evidence; an unreadable source (None) counts only when another source
+        says persistent, which is the same as any source saying it; when NO source is readable the worker is treated as plain."""
+        sources = (lambda: self._evidence_audit(worker), lambda: self._evidence_registry(worker), lambda: self._evidence_record(worker, record_dir))
+        answers = [read() for read in sources]
+        return any(x is True for x in answers)
+
+    def _evidence_audit(self, worker):
+        try:
+            with open(self.audit_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 1048576))
+                lines = f.read().decode(errors="replace").splitlines()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+        for raw in lines:
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("action") == "create" and rec.get("worker") == worker and rec.get("persistent") is True:
+                return True
+        return False
+
+    def _evidence_registry(self, worker):
+        try:
+            obj = self.kube.get_secret(self._registry_secret())
+            if not obj:
+                return False
+            raw = (obj.get("data") or {}).get(REGISTRY_KEYS[1])
+            agents = json.loads(base64.b64decode(raw).decode()) if raw else {}
+            entry = agents.get(worker) if isinstance(agents, dict) else None
+            return isinstance(entry, dict) and entry.get("persistent") is True
+        except (CloudError, ValueError, UnicodeDecodeError, AttributeError, TypeError):
+            return None
+
+    def _evidence_record(self, worker, record_dir=None):
+        root = self.recorder.root(record_dir)
+        try:
+            names = sorted(os.listdir(root))
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+        found = False
+        for entry in names:
+            if not entry.startswith(worker + "-"):
+                continue
+            try:
+                with open(os.path.join(root, entry, "run.json")) as f:
+                    rec = json.load(f)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                found = None if found is False else found
+                continue
+            if isinstance(rec, dict) and rec.get("worker") == worker and rec.get("persistent") is True:
+                return True
+        return found
 
     def _remove(self, name, nonce, uid=None):
         """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already).
@@ -2456,6 +2526,9 @@ class Launcher:
 
         def go(info):
             pod = self._need(worker)
+            if self._persistent_evidence(worker, getattr(a, "record_dir", None)):   # the same evidence rule as the stop; a plain worker is as before
+                raise CloudError("worker %s is a persistent orchestrator: delete is refused (even with --force); use the stop command: cloud-worker stop %s"
+                                 % (worker, worker), EXIT_USAGE)
             if not pod:
                 return {"worker": worker, "runtime_id": "", "deleted": True}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)

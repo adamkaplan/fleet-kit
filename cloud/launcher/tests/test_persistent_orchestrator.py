@@ -480,9 +480,9 @@ class S14HookResults(PBase):
         self.assertEqual(code, cw.EXIT_HOOK)
         self.assertIn(POD, self.st()["pods"])
         self.assertIn(NAME, self.sts())
-        # delete by name never reaches a persistent pod (its pod is NAME-0), and the reaper never stops one
+        # delete by name never reaches a persistent pod (its pod is NAME-0): it is refused (the evidence rule), and the reaper never stops one
         code, _, err = self.run_cli("delete", WORKER, "--force")
-        self.assertEqual(code, 0, err)
+        self.assertEqual(code, cw.EXIT_USAGE, err)
         self.assertIn(POD, self.st()["pods"])
         self.assertEqual([v for v in self.verbs() if v == ("delete", "pod", POD)], [])
 
@@ -782,11 +782,288 @@ class S10Manifest(unittest.TestCase):
         role = [d for d in k1.rbac_docs() if d["kind"] == "Role"][0]
         rules = [(tuple(r["groups"]), tuple(r["resources"]), tuple(r["verbs"])) for r in role["rules"]]
         added = [r for r in rules if r not in self.OLD_RULES]
-        self.assertEqual(added, [(("apps",), ("statefulsets",), ("get", "list", "watch", "create", "patch", "delete"))])
+        self.assertEqual(added, [(("apps",), ("statefulsets",), ("get", "list", "watch", "create", "delete"))])
         self.assertEqual([r for r in self.OLD_RULES if r not in rules], [])
         self.assertEqual(len(rules), len(self.OLD_RULES) + 1)
-        self.assertEqual(len(added[0][2]), 6)
+        self.assertEqual(len(added[0][2]), 5)
         self.assertNotIn("*", role["text"].replace('apiGroups: [""]', ""))
+
+
+class S10Verbs(unittest.TestCase):
+    """The StatefulSet rule has exactly five verbs: the launcher creates the workload with create -f and never patches one."""
+    EXACT = ["get", "list", "watch", "create", "delete"]
+
+    def verbs_in(self, text):
+        role = [d for d in k1.rbac_docs(text) if d["kind"] == "Role"][0]
+        return [r["verbs"] for r in role["rules"] if r["resources"] == ["statefulsets"]]
+
+    def check(self, text):
+        self.assertEqual(self.verbs_in(text), [self.EXACT])
+
+    def read(self):
+        with open(os.path.join(ROOT, "cloud/k8s/operator-rbac.yaml")) as f:
+            return f.read()
+
+    def test_s10_the_statefulset_rule_holds_exactly_five_verbs(self):
+        self.check(self.read())
+
+    def test_s10_mutant_a_patch_verb_added_fails_the_check(self):
+        text = self.read()
+        changed = text.replace('verbs: ["get", "list", "watch", "create", "delete"]', 'verbs: ["get", "list", "watch", "create", "patch", "delete"]')
+        self.assertNotEqual(changed, text)
+        with self.assertRaises(AssertionError):
+            self.check(changed)
+
+    def test_s10_the_launcher_never_patches_a_statefulset(self):
+        with open(SOURCE) as f:
+            lines = [l for l in f if '"patch"' in l or "'patch'" in l]
+        self.assertTrue(lines)
+        self.assertFalse([l for l in lines if "statefulset" in l.lower()])
+
+
+class Evidence(PBase):
+    """The evidence rule: a worker's workload is read only when its audit create line, hub registry entry or run record says persistent."""
+    def answers(self):
+        base = S7Lookup.table(S7Lookup)
+        table = {}
+        for what, planted in base.items():
+            table[what] = {k: v.replace("orch-ab12", NAME) for k, v in planted.items() if k in ("out", "err")}
+        table["the exact forbidden line"] = dict(err=S7Lookup.FORBIDDEN % (NAME, "cw") + "\n")
+        return table
+
+    def sts_reads(self):
+        return [v for v in self.verbs() if v[:2] == ("get", "statefulset")]
+
+    def plain_worker(self):
+        self.launch(WORKER, agent=False, token=False, persistent=False)
+        st = self.st()
+        pods = dict(st["pods"])
+        pods.pop(NAME, None)
+        self.patch_state(pods=pods)
+
+    def stop_with(self, planted):
+        self.patch_state(sts_get_stdout=planted.get("out", ""), sts_get_stderr=planted.get("err", ""), sts_get_code=1)
+        open(self.env["FAKE_KUBE_CALLS"], "w").close()
+        return self.run_cli("stop", WORKER, "--no-record")
+
+    def deletes(self):
+        return [v for v in self.verbs() if v[0] == "delete"]
+
+    def check_plain(self):
+        problems = []
+        for what, planted in self.answers().items():
+            self.setUp_again()
+            self.plain_worker()
+            code, out, err = self.stop_with(planted)
+            if code != 0 or self.sts_reads() or "pod_gone" not in out:
+                problems.append("%s: exit %s, %d reads" % (what, code, len(self.sts_reads())))
+            if {NAME + "-pw", NAME + "-run"} & set(self.st()["secrets"]):
+                problems.append("%s: a per-run Secret was kept" % what)
+        self.assertEqual(len(self.answers()), 22)
+        self.assertEqual(problems, [])
+
+    def check_persistent(self, sources=None):
+        problems = []
+        for what, planted in self.answers().items():
+            self.setUp_again()
+            self.launch()
+            code, out, err = self.stop_with(planted)
+            if code != 1 or len(self.sts_reads()) != 1 or self.deletes() or "pod_gone" in out:
+                problems.append("%s: exit %s, %d reads, %d deletes" % (what, code, len(self.sts_reads()), len(self.deletes())))
+            st = self.st()
+            if not st.get("sts") or POD not in st["pods"] or not {NAME + "-pw", NAME + "-run"} <= set(st["secrets"]):
+                problems.append("%s: something was not kept" % what)
+            last = [l for l in self.audit_lines() if l.get("action") == "stop"][-1]
+            if last.get("ok") is not False:
+                problems.append("%s: the audit stop line is not ok false" % what)
+        self.assertEqual(problems, [])
+
+    def setUp_again(self):
+        """A fresh cluster state for the next answer (the harness's own reset)."""
+        for fd in self.fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds = []
+        self.reset_cluster()
+
+    def reset_cluster(self):
+        self.write_state({"pods": {}})
+        self.patch_state(secrets={REGISTRY: 1, "cloud-hub-pw": 1},
+                         secret_bodies={"cloud-hub-pw": {"keep": "kept-pw"}, REGISTRY: {"secrets.json": json.dumps(OTHER), "agents.json": json.dumps({"other-agent": {"url": "u"}})}},
+                         hook_result={"pushed": False, "wip_branch": None})
+        if os.path.exists(self.env["CW_CLOUD_AUDIT"]):
+            os.remove(self.env["CW_CLOUD_AUDIT"])
+
+    def test_m1_22_answers_for_a_plain_worker_make_no_read_and_remove_both_secrets(self):
+        self.check_plain()
+
+    def test_m1_22_answers_for_a_persistent_worker_fail_the_stop_and_keep_everything(self):
+        self.check_persistent()
+
+    def test_m1_mutant_forbidden_read_as_no_workload_fails_the_check(self):
+        self.mod = mutant("                    workload = self.kube.get_workload(name)\n", "                    workload = self._persistent_workload(name)\n")
+        with self.assertRaises(AssertionError):
+            self.check_persistent()
+
+    def test_m1_mutant_reading_the_workload_for_every_worker_fails_the_check(self):
+        self.mod = mutant('if pod is None and self._persistent_evidence(worker, getattr(a, "record_dir", None)):', "if pod is None:")
+        with self.assertRaises(AssertionError):
+            self.check_plain()
+
+    def evidence_only(self, keep):
+        """A persistent worker whose three sources are cleared except `keep` (audit, registry or record)."""
+        self.launch()
+        if keep != "audit":
+            os.remove(self.env["CW_CLOUD_AUDIT"])
+        bodies = self.st()["secret_bodies"]
+        agents = json.loads(bodies[REGISTRY]["agents.json"])
+        if keep != "registry":
+            agents[WORKER].pop("persistent", None)
+            bodies[REGISTRY]["agents.json"] = json.dumps(agents)
+            self.patch_state(secret_bodies=bodies)
+        root = cw.run_record.default_root(self.env)
+        if keep == "record":
+            os.makedirs(os.path.join(root, WORKER + "-20260101T000000Z-abc123"))
+            with open(os.path.join(root, WORKER + "-20260101T000000Z-abc123", "run.json"), "w") as f:
+                json.dump({"worker": WORKER, "persistent": True}, f)
+
+    def test_m1_the_exact_not_found_of_a_worker_with_evidence_is_no_workload_and_the_pod_gone_path_runs(self):
+        self.launch()
+        pods = dict(self.st()["pods"])
+        pods.pop(POD, None)
+        self.patch_state(pods=pods, sts={})
+        code, out, err = self.stop_with(dict(err=S7Lookup.NOT_FOUND % NAME + "\n"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("pod_gone", out)
+        self.assertEqual(len(self.sts_reads()), 1)
+
+    def test_m1_each_evidence_source_alone_makes_the_worker_persistent(self):
+        for keep in ("audit", "registry", "record"):
+            with self.subTest(keep):
+                self.setUp_again()
+                self.evidence_only(keep)
+                self.assertTrue(self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)._persistent_evidence(WORKER))
+
+    def test_m1_no_source_is_no_evidence(self):
+        self.setUp_again()
+        self.evidence_only("none")
+        self.assertFalse(self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)._persistent_evidence(WORKER))
+
+    def test_m1_when_no_source_is_readable_the_worker_is_treated_as_plain(self):
+        # The audit path is a directory, the record root is a file and the registry body is not JSON: every source is unreadable, so the worker is
+        # plain (an unreadable source counts as evidence only when another source says persistent).
+        self.launch()
+        os.remove(self.env["CW_CLOUD_AUDIT"])
+        os.mkdir(self.env["CW_CLOUD_AUDIT"])
+        root = cw.run_record.default_root(self.env)
+        os.makedirs(os.path.dirname(root), exist_ok=True)
+        with open(root, "w") as f:
+            f.write("x")
+        bodies = self.st()["secret_bodies"]
+        bodies[REGISTRY]["agents.json"] = "not json"
+        self.patch_state(secret_bodies=bodies)
+        self.assertFalse(self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)._persistent_evidence(WORKER))
+
+    def test_m1_an_unreadable_source_with_another_saying_persistent_is_evidence(self):
+        self.launch()   # the registry entry and the audit line say persistent
+        root = cw.run_record.default_root(self.env)
+        os.makedirs(os.path.dirname(root), exist_ok=True)
+        with open(root, "w") as f:
+            f.write("x")   # the record source is unreadable
+        self.assertTrue(self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)._persistent_evidence(WORKER))
+
+    def delete_force(self):
+        open(self.env["FAKE_KUBE_CALLS"], "w").close()
+        return self.run_cli("delete", WORKER, "--force")
+
+    def check_delete_refusal(self):
+        self.launch()
+        code, out, err = self.delete_force()
+        self.assertEqual(code, 2, err)
+        self.assertIn("persistent orchestrator", err)
+        self.assertIn("stop %s" % WORKER, err)
+        self.assertNotIn('"deleted": true', out)
+        self.assertEqual(self.writes(), [])
+        st = self.st()
+        self.assertTrue(st["sts"] and POD in st["pods"])
+        return err
+
+    def test_m2_delete_force_of_a_persistent_orchestrator_is_refused_naming_the_stop(self):
+        err = self.check_delete_refusal()
+        print("\nthe printed delete refusal: " + err.strip())
+
+    def test_m2_delete_force_of_a_plain_worker_is_as_before(self):
+        self.launch(WORKER, agent=False, token=False, persistent=False)
+        code, out, err = self.delete_force()
+        self.assertEqual(code, 0, err)
+        self.assertIn('"deleted": true', out)
+        self.assertNotIn(NAME, self.st()["pods"])
+        self.assertEqual([v for v in self.verbs() if v[:2] == ("get", "statefulset")], [])
+
+    def test_m2_mutant_the_refusal_removed_fails_the_check(self):
+        self.mod = mutant('if self._persistent_evidence(worker, getattr(a, "record_dir", None)):   # the same evidence rule', "if False:   # the same evidence rule")
+        with self.assertRaises(AssertionError):
+            self.check_delete_refusal()
+
+
+class S16Docs(unittest.TestCase):
+    FILES = ("docs/cloud-operator-quickstart.md", "cloud/launcher/README.md")
+    PHRASES = (
+        "fails the reaper's exit code on every pass until the workload is readable again",
+        "a ceiling checked at launch, not a lock",
+        "two launches at the same moment can each count below the maximum and both succeed",
+        "do-not-evict mark",
+        "only once ask 1519 lands",
+        "at 24 hours of its shape",
+        "no `cw/role` annotation on the template at this head",
+        "a lost read stops renewal",
+    )
+
+    def text(self, rel, drop=None):
+        with open(os.path.join(ROOT, rel)) as f:
+            t = " ".join(f.read().split())
+        if drop is not None:
+            self.assertIn(drop, t)
+            changed = t.replace(drop, "")
+            self.assertNotEqual(changed, t)   # the mutation is applied
+            return changed
+        return t
+
+    def check(self, rel, phrase, drop=None):
+        self.assertIn(phrase, self.text(rel, drop))
+
+    def test_s16_each_sentence_is_in_both_documents(self):
+        for rel in self.FILES:
+            for phrase in self.PHRASES:
+                with self.subTest(rel=rel, phrase=phrase):
+                    self.check(rel, phrase)
+
+    def test_s16_mutant_a_removed_sentence_fails_its_phrase_test(self):
+        for rel in self.FILES:
+            for phrase in self.PHRASES:
+                with self.subTest(rel=rel, phrase=phrase):
+                    with self.assertRaises(AssertionError):
+                        self.check(rel, phrase, drop=phrase)
+
+    def test_s16_no_document_says_the_node_never_scales_down(self):
+        found = []
+        for base in ("README.md", "docs", "cloud"):
+            path = os.path.join(ROOT, base)
+            files = [path] if os.path.isfile(path) else [os.path.join(d, f) for d, _, fs in os.walk(path) for f in fs if f.endswith(".md")]
+            for f in files:
+                with open(f) as fh:
+                    if re.search(r"never scales? down|never be scaled down", fh.read(), re.I):
+                        found.append(f)
+        self.assertEqual(found, [])
+
+    def test_s16_the_docs_say_five_verbs_not_six(self):
+        for rel in self.FILES:
+            with self.subTest(rel):
+                t = self.text(rel)
+                self.assertNotIn("create, patch", t)
+                self.assertNotIn("six verbs", t)
 
 
 if __name__ == "__main__":
