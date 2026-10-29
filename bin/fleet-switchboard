@@ -3425,6 +3425,8 @@ class Switchboard:
         discovery = self.discover(now)
         me = discovery.agents.get(sender)
         if me is None:
+            me = cloud_sender(self.state_dir, sender)   # #1478: a cloud pod has no pane; its own endpoint record (never the request) names it and its boss
+        if me is None:
             raise ReportError(discovery.missing(sender))
         boss = boss_name(discovery, me)  # the role name chief-of-staff resolves to the registered cos agent (#102)
         if boss is None:
@@ -3770,6 +3772,95 @@ def wait_for_poke(sock, timeout):
     return bool(ready)
 
 
+# #1380: the installed tree is the default branch, clean (bin/installed_guard.py). A command refuses on a bad tree (main); the daemon stops its
+# work, alerts by a standalone script, and resumes by itself when the tree is good. Nothing here changes the tree.
+INSTALLED_TREE_RECHECK_SECONDS = 1.0   # a bad reading is read once more this long after, in the same pass, before the daemon stops: a checkout in flight is not a bad tree
+INSTALLED_TREE_ALERT_ENV = "FLEET_SWITCHBOARD_ALERT_NOTIFIER"   # a program that shows the desktop notification (tests); default: the platform's own
+
+
+def installed_guard_module(directory=None):
+    """bin/installed_guard.py, loaded by path from `directory` (default: beside this file), fresh each time: a broken or replaced copy is seen at once, and a
+    module that fails to load raises for every caller (the daemon then treats the tree as not to be trusted). Not `load_module`: the one path-loader of the
+    guard, so the clear's closure never reaches it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("installed_guard", str((Path(directory) if directory else Path(__file__).resolve().parent) / "installed_guard.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def command_records(action, known):
+    """True when the command `action` records a verdict, a gate, a clear, a merge or a proof: DERIVED from the registry, by the flags of its handler
+    (`ledger`: the evidence ledger's commands; `records`: the ONE list of `@recording` functions (`recording_commands()`), never a second one; `guard_records`: the others, set beside the handler). `run` is one: its `--once` pass decides and delivers."""
+    handler = resolve_command(action, known)
+    return handler is not None and (getattr(handler, "ledger", False) is True or isinstance(getattr(handler, "records", None), str)
+                                    or getattr(handler, "guard_records", False) is True)
+
+
+def installed_tree_check(action, state_dir=None, root=None, runner=subprocess.run, daemon=False, records=False):
+    """(refusal, note) of the installed-tree guard for a command: a one-line refusal, or None to run it, and a one-line note for stderr, or None. Only a tree
+    `install` recorded is judged."""
+    if daemon:   # `run` without --once: the daemon checks the tree itself at its start and on every pass, and alerts. Refused here, the service manager would restart it for ever, silently.
+        return None, None
+    state = Path(state_dir) if state_dir is not None else state_dir_path()
+    if not (state / "installed-tree").is_file():
+        return None, None   # a worktree, a CI checkout or a tree install never recorded: nothing to judge
+    try:
+        return installed_guard_module().entry_problem_line(action, state, KIT_ROOT if root is None else root, runner, records)
+    except Exception as err:   # the guard itself is broken: the tree cannot be trusted, and the commands that move it still run
+        return (None if action in ("install", "upgrade", "doctor") else "%s: refused: the installed-tree guard could not run (%s)" % (PROG, _one_line(str(err), 160))), None
+
+
+def installed_tree_refusal(action, state_dir=None, root=None, runner=subprocess.run, daemon=False, records=False):
+    """The refusal line of `installed_tree_check`, or None."""
+    return installed_tree_check(action, state_dir, root, runner, daemon, records)[0]
+
+
+def installed_tree_problem(state_dir, root=None, runner=subprocess.run):
+    """What is wrong with the installed tree, one line, or None (good, or not recorded). The daemon calls this on every pass. A tree git could not read
+    is a problem here too (the pass is skipped and alerted, as for a bad one)."""
+    state = Path(state_dir)
+    if not (state / "installed-tree").is_file():
+        return None
+    try:
+        kind, line, _ = installed_guard_module().judge(state, KIT_ROOT if root is None else root, runner)
+    except Exception as err:   # the guard itself is broken: the tree cannot be trusted
+        return "the installed-tree guard could not run (%s)" % _one_line(str(err), 160)
+    return line if kind in ("bad", "unreadable") else None
+
+
+def installed_tree_script(state_dir):
+    """The alert script: the copy `install` put in the state directory (outside the tree), else the one beside this file."""
+    script = Path(state_dir) / "guard" / "guard_alert.py"
+    return script if script.is_file() else Path(__file__).resolve().parent / "guard_alert.py"
+
+
+def installed_tree_alert(state_dir, line, now, herdr=None, runner=subprocess.run):
+    """Run the standalone alert script (the copy in the state directory, which needs nothing from the tree); it alerts at once the first time and
+    again only after a day. Returns what the script printed, or None when it could not run."""
+    script = installed_tree_script(state_dir)
+    argv = [sys.executable, str(script), "--state", str(state_dir), "--text", line, "--cos", COS_NAME, "--now", repr(float(now()))]
+    found = shutil.which(herdr) if herdr else None
+    if found:
+        argv += ["--herdr", os.path.abspath(found)]
+    if os.environ.get(INSTALLED_TREE_ALERT_ENV):
+        argv += ["--notifier", os.environ[INSTALLED_TREE_ALERT_ENV]]
+    try:
+        done = runner(argv, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        return done.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def installed_tree_clear(state_dir, runner=subprocess.run):
+    script = installed_tree_script(state_dir)
+    if (Path(state_dir) / "installed-tree-alert").is_file() and script.is_file():
+        try:
+            runner([sys.executable, str(script), "--state", str(state_dir), "--text", "", "--clear"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 DAEMON_RECORD = "daemon.json"  # what the running daemon says about itself: its pid, and where its key came from
 
 
@@ -3801,8 +3892,17 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                 if watch is not None and on_reload is not None and watch.check() == "reload":
                     on_reload(watch)  # does not return when the daemon re-executes itself
                 try:
-                    engine.run_pass()
-                    load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
+                    bad = installed_tree_problem(state_dir)   # #1380: at the start and on every pass
+                    if bad is not None:   # two reads in a row before it stops and alerts
+                        time.sleep(INSTALLED_TREE_RECHECK_SECONDS)
+                        bad = installed_tree_problem(state_dir)
+                    if bad is None:
+                        installed_tree_clear(state_dir)
+                        engine.run_pass()
+                        load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
+                    else:   # no verdict, merge or message is decided or delivered; only this re-check goes on
+                        engine._note("installed_tree.stopped", None, {"problem": bad})
+                        installed_tree_alert(state_dir, bad, engine.now, getattr(getattr(engine, "herdr", None), "binary", None))
                 except Exception as err:
                     engine._failed(None, "pass", err, {"errors": []})
                 done += 1
@@ -3832,8 +3932,43 @@ def run_lock_held(state_dir):
 # whichever shell started it, and neither do the processes it starts.
 CALLER_ENV_NAMES = ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "OPENCODE_SESSION_ID",
                     "FLEET_SWITCHBOARD_ROLE", "FLEET_SWITCHBOARD_REPO")
-OWN_GH_ENV = "FLEET_SWITCHBOARD_OWN_GH"   # set in every switchboard process: its gh calls name their own account (GhAccounts);
-                                          # the gh shim leaves such a call's token alone and never re-identifies it
+OWN_GH_ENV = "FLEET_SWITCHBOARD_OWN_GH"   # #1216: NEVER set for a gh call any more (only cleared: pane children, own children); the shim does not read it.
+                                          # The switchboard's own gh calls reach the REAL gh by its resolved path (own_gh_path), so the shim never sees them.
+SHIM_HEAD = b'"""gh, signing what an agent says'
+
+
+def is_shim_file(candidate):
+    """True when `candidate` is the fleet gh shim (its docstring opens with SHIM_HEAD in the first 400 bytes)."""
+    try:
+        with open(candidate, "rb") as handle:
+            return SHIM_HEAD in handle.read(400)
+    except OSError:
+        return False
+
+
+def own_gh_path(name, environ=None):
+    """The gh the switchboard's OWN calls run: the real binary by path, never the shim. An absolute `name` is used as it is, unless it IS the shim (refused:
+    ConfigError 'no real gh behind the shim'). `gh`: FLEET_REAL_GH when it names an executable and is not the shim; else the first `gh` on PATH that is not the shim;
+    when PATH holds only the shim, ConfigError (every own call would be re-identified, counted and audited as an agent's). No gh on PATH at all: `name` as it is."""
+    environ = os.environ if environ is None else environ
+    if name != "gh":
+        if os.sep in name and os.path.isfile(name) and is_shim_file(os.path.abspath(name)):   # absolute or relative (./gh)
+            raise ConfigError("no real gh behind the shim: the configured gh %s is the fleet shim" % name)
+        return name
+    override = environ.get("FLEET_REAL_GH")
+    if override and os.path.isabs(override) and os.access(override, os.X_OK) and not is_shim_file(override):
+        return override
+    seen_shim = False
+    for entry in (environ.get("PATH") or "").split(os.pathsep):
+        candidate = os.path.join(entry, "gh") if entry else ""
+        if not (candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+            continue
+        if not is_shim_file(candidate):
+            return candidate
+        seen_shim = True
+    if seen_shim:
+        raise ConfigError("no real gh behind the shim: PATH holds only the fleet shim (set 'gh' to an absolute path, or FLEET_REAL_GH)")
+    return name
 
 
 # #1066: the OpenCode service is started lazily by whatever process first needs it, and it inherits that process's environment. A service that carries a
@@ -5839,7 +5974,9 @@ BOSS_READ_SITES = {
     "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
+    "bin/fleet-switchboard:cloud_sender": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record): its reports_to is read from the record and validated by `_cloud_boss`, to name the pane-less sender of its report",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
+    "bin/cloud_retired.py:keep_boss": "keeps the boss of a removed cloud worker from the worker's own endpoint record (not a discovered agent) so `read` can answer for it after the record is gone",
 }
 
 
@@ -7240,6 +7377,9 @@ def cmd_cloud_clear(args, runner, now):
     password file), and every one it removes is named. A record with a pod, or one not past its deadline, is never touched, and it refuses when
     the cluster could not be read: it never removes a record it cannot prove is gone. The caller rule is `retire`'s."""
     return run_cloud("cmd_cloud_clear", args, runner, now)
+
+
+cmd_cloud_clear.guard_records = True   # a clear (#1380)
 
 
 def watch_problem(engine, state, name, discovery):
@@ -8798,7 +8938,11 @@ def record_github_calls(engine):
         last_usage = getattr(engine, "usage_read_at", None)
         if last_usage is None or engine.now() - last_usage >= agent_calls.USAGE_EVERY:
             engine.usage_read_at = engine.now()   # once a minute, tried again next minute whatever happens
-            agent_calls.record_usage(str(engine.state_dir), engine.now(), accounts.read_usage())
+            readings = accounts.read_usage()
+            agent_calls.record_usage(str(engine.state_dir), engine.now(), readings)
+            if readings:   # #1501: the 5-minute sample line, and the census of process kinds when the outside count jumps (read only; own failure handling)
+                census_module = "github_census"   # a name, not a literal: this read-only look stays out of the clear's closure (the loader is by path all the same)
+                load_module(census_module).run(engine, readings, agent_calls.recorded_by_account(str(engine.state_dir), readings, engine.now()), engine.now())
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -9147,7 +9291,7 @@ def held_merge_order_hints(decisions, runner, now):
         if len(waited) < 2:
             continue
         try:
-            engine = build_engine(runner, now, "cli", writable=False)[0]
+            engine, state, _ = build_engine(runner, now, "cli", writable=False)
             listing = read_open_overlap(engine, repo, runner)
             if listing:
                 hints.extend(("%s: " % repo if len(by_repo) > 1 else "") + h for h in overlap_waiting_order(listing, sorted(waited.items())))
@@ -11222,6 +11366,12 @@ def _validate_github(config, source):
     if not isinstance(config["gh"], str) or not config["gh"].strip():
         raise ConfigError("%s: 'gh' must be a non-empty string (a path or a command name), got %r"
                           % (source, config["gh"]))
+    try:
+        config["gh_by_name"] = config["gh"]   # #1216: as configured (`gh`: PATH finds the shim); the one merge call of `merge-gate --pass --merge` goes through it, so the shim gates it
+        config["gh"] = own_gh_path(config["gh"])   # #1216: the daemon's own calls name the real gh by path
+        load_module("ci_runs").GH = config["gh"]   # #1216: so does the run-identity read of bin/ci_runs.py
+    except ConfigError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
     if not _is_number(config["github_lookback_hours"]) or config["github_lookback_hours"] <= 0:
         raise ConfigError("%s: 'github_lookback_hours' must be a positive number, got %r"
                           % (source, config["github_lookback_hours"]))
@@ -13844,6 +13994,7 @@ def cmd_run(args, runner, now, wait):
 
 
 STANDBY_SECONDS = 10  # how often `run --standby` looks again for a free lock
+cmd_run.guard_records = True   # `run --once` decides and delivers (#1380); the daemon itself is not refused at the entry and checks the tree on every pass
 
 
 def cmd_ensure(args, spawn=subprocess.Popen):
@@ -14932,7 +15083,7 @@ class GhAccounts:
         account = self.account_for(repo) if repo else None
         if account is None:
             return None
-        return dict(self.environ, GH_TOKEN=self.token_for(account), **{OWN_GH_ENV: "1"})
+        return dict(self.environ, GH_TOKEN=self.token_for(account))   # no marker: own calls reach the real gh, not the shim
 
     def token_env(self, repo):
         """{"GH_TOKEN": token} for an agent working in `repo`, {} when the repo uses the default account."""
@@ -15012,13 +15163,14 @@ class GhAccounts:
     def read_usage(self):
         """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
         token when one is set). That endpoint does not count against the budget, and it is NOT counted here either (it does not go through `read`, and the
-        child carries the switchboard's own marker). Bounded: at most 8 accounts, one call each, each with the call timeout. Never raises; an account that
+        child runs the real gh by path, so the shim never sees it). Bounded: at most 8 accounts, one call each, each with the call timeout. Never raises; an account that
         cannot be read is left out."""
         found = {}
         names = sorted({a for a in (self.config.get("gh_users") or {}).values() if isinstance(a, str) and a})[:agent_calls.USAGE_ACCOUNTS]
         for account in names + ([None] if self.default_available() else []):
             try:
-                env = dict(self.environ, **{OWN_GH_ENV: "1"})
+                env = dict(self.environ)
+                env.pop(OWN_GH_ENV, None)
                 if account is not None:
                     env["GH_TOKEN"] = self.token_for(account)
                 done = self.runner([self.config["gh"], "api", "rate_limit"], capture_output=True, text=True,
@@ -16753,7 +16905,7 @@ def gates_suites_finding(runner, ctx):
     try:
         ps = load_module("path_suites")
         top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-        done = runner(["gh", "pr", "diff", str(ctx.number), "--repo", ctx.repo, "--name-only"], capture_output=True, text=True)
+        done = runner([ctx.config["gh"], "pr", "diff", str(ctx.number), "--repo", ctx.repo, "--name-only"], capture_output=True, text=True)
         if top.returncode != 0 or done.returncode != 0:
             return None
         root, changed = top.stdout.strip(), [p for p in done.stdout.split("\n") if p.strip()]
@@ -17563,6 +17715,7 @@ def cmd_impact(args, runner, now):
 
 
 cmd_impact.direct = True   # no error mapping, no daemon start
+cmd_impact.guard_records = True   # `impact clear` records a clear (#1380: it refuses on a tree git could not read)
 
 
 IMPACT_MATRIX_PATHS_MAX = 50   # paths printed per floor rule by `impact matrix --for-rater`
@@ -18429,38 +18582,206 @@ def cmd_gates_stats(args, runner, now):
     return EXIT_OK
 
 
+PEER_PAGES = 3   # #976: `plan_peers` reads at most this many pages of 100 matching pull requests (300); more is refused naming the `CU` waiver, never truncated
+PEERS_TOO_MANY = "too many pull requests to judge"
+CU_HINT = "; the chief of staff can log a waiver at this head (`waive %s --gates CU`)"
+
+
+class ClaimUnknown(Exception):
+    pass
+
+
+def plan_peers(ctx, runner, now, closed=None):
+    """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing; `closed`, a list, is given
+    (number, body) of those). A MERGED sibling's body is the claim RECORDED in the ledger when it was gated (the NEWEST claim line recorded at or before its `merged_at`, the claim in force at the merge: never its current body, which an author can edit, and never a line recorded after the merge):
+    a merged sibling with no recorded claim raises ClaimUnknown. An open one reads its current body. GETs only. The list is GitHub's search for the pull requests whose body holds
+    the plan link (`GET /search/issues?q=repo:R is:pr "<plan>" in:body`), not the whole repository: at most PEER_PAGES pages of 100, with more the read raises
+    `too many pull requests to judge` (fail closed, never a silent truncation). Raises when the list cannot be read."""
+    repo = ctx.pr.rsplit("#", 1)[0]
+    reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
+    query = urllib.parse.quote_plus('repo:%s is:pr "%s" in:body' % (repo, ctx.source))
+    listed = []
+    for page in range(1, PEER_PAGES + 1):
+        got = reader._api("search/issues?q=%s&per_page=100&page=%d" % (query, page), repo)
+        items = got.get("items") if isinstance(got, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("the pull request search did not come back as a list")
+        listed.extend(dict(i, merged_at=(i.get("pull_request") or {}).get("merged_at")) for i in items if isinstance(i, dict))
+        if len(items) < 100:
+            break
+    else:
+        raise ValueError(PEERS_TOO_MANY)
+    peers = []
+    for other in listed:
+        if not isinstance(other, dict) or other.get("number") == ctx.number:
+            continue
+        link = plan_ledger.PLAN_LINK_RE.search(plan_ledger.visible_body(other.get("body")))
+        if not link or not _same_plan(link.group(1).strip("<>.,"), ctx.source, ctx.config.get("intent_repo")):
+            continue
+        if other.get("state") != "open" and not other.get("merged_at"):
+            if closed is not None:
+                closed.append((other.get("number"), other.get("body")))
+            continue
+        if other.get("state") == "open":
+            peers.append(("open", other.get("body")))
+            continue
+        found, text = plan_ledger.recorded_claim(ctx.entries, "%s#%s" % (repo, other.get("number")), at=_measure_time(other.get("merged_at")) if _measure_time(other.get("merged_at")) is not None else -1)
+        if not found:
+            raise ClaimUnknown("merged pull request #%s has no recorded claim at or before its merge: its claim is unknown" % other.get("number"))
+        peers.append(("merged", plan_ledger.claim_body(text)))
+    return peers
+
+
+class _ClaimRecorded(Exception):
+    pass
+
+
+class _NotOpen(Exception):
+    pass
+
+
+def record_claim(ctx, now):
+    """Bind this pull request's claim line as the merge gate sees it: ONE `claim` ledger line per claim text (`append_checked`). Only an OPEN pull request is recorded: a merged or
+    closed one with no line raises `_NotOpen` (its current body may have been edited since), one with a line writes nothing."""
+    body = (ctx.facts or {}).get("body")
+    state = (ctx.facts or {}).get("state")
+    if state != "open":
+        if plan_ledger.recorded_claim(ctx.entries, ctx.pr)[0]:
+            return
+        raise _NotOpen("the pull request is %s, not open: its claim is not recorded" % (state or "in an unknown state"))
+    line = plan_ledger.claim_line(ctx.pr, (ctx.facts or {}).get("head"), body)
+
+    def build(have, seq):
+        if plan_ledger.recorded_claim(have, ctx.pr) == (True, line["claim_text"]):
+            raise _ClaimRecorded()
+        return line
+    try:
+        plan_ledger.append_checked(ctx.state, now(), build)
+    except _ClaimRecorded:
+        pass
+
+
+def _cu_waived(args, runner, now, what, ctx=None):
+    """True when a `CU` waiver bound to this pull request's head is logged (the existing `valid_waivers` rule); the pass is audited, naming WHAT was waived."""
+    try:
+        if ctx is None:   # the context itself failed: read what the waiver needs on its own
+            engine, state, _ = build_engine(runner, now, "cli", writable=False)
+            repo, number, pr = _ledger_pr(types.SimpleNamespace(pr=args.pr, plan=None, ask=None))
+            entries, problem = plan_ledger.read_ledger(state)
+            head = (pr_picture(engine, repo, number, state)[0] or {}).get("head")
+        else:
+            state, pr, entries, problem, head = ctx.state, ctx.pr, ctx.entries, ctx.problem, (ctx.facts or {}).get("head")
+        if problem or not head or "CU" not in plan_ledger.valid_waivers(entries, pr, head, now()):
+            return False
+        try:   # the read-only engine has no audit log: the pass is written to the state's own
+            AuditLog(state / "audit.jsonl").append("cli", "plan.claim_union.waived", pr, {"pr": pr, "head": head, "waived": what})
+        except OSError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _unjudged(who, runner, now, why, ctx=None):
+    """The plan could not be read or is not `pass`: a pull request WITH a claim line is refused (fail closed), unless a head-bound `CU` waiver is logged; one with NO claim line gets
+    None (it claims every per-PR scenario, so the union is covered whatever the plan says). The body is read from ctx when there is one, else fetched; one that cannot be read counts as a claim line."""
+    try:
+        body = (ctx.facts or {}).get("body") if ctx is not None else None
+        if ctx is None:   # the context itself failed: read the body on its own
+            engine, state, _ = build_engine(runner, now, "cli", writable=False)
+            repo, number, _ = _ledger_pr(types.SimpleNamespace(pr=who.pr, plan=None, ask=None))
+            body = pr_picture(engine, repo, number, state)[1]
+        has_claim = plan_ledger.claim_text(body) is not None
+    except Exception:
+        has_claim = True
+    if not has_claim:
+        return None
+    if _cu_waived(who, runner, now, "claim union not judged: " + why, ctx):
+        return None
+    return "merge of %s refused: claim union could not be judged: %s; the gate fails closed for a pull request with a claim line" % (who.pr, why) + CU_HINT % who.pr
+
+
+def claim_union_refusal(args, runner, now):
+    """#976: the refusal line for the LAST merge of an ask whose claims leave a per-pull-request scenario uncovered, else None. A plan nobody narrows, a merge that is not the
+    ask's last and a pull request with no claim line when a read fails all give None. Every refusal of a pull request WITH a claim line (a read that fails, an unknown sibling, too many
+    pull requests, a claim that cannot be recorded, the uncovered union) is passed by a logged `CU` waiver at the head, consulted BEFORE the refusal, and audited naming what was waived."""
+    try:
+        ctx = _ledger_context(types.SimpleNamespace(pr=args.pr, plan=None, ask=None), runner, now, False)
+    except Exception:
+        return _unjudged(args, runner, now, "the plan could not be read")
+    if ctx.plan is None or ctx.plan.get("result") != "pass":
+        return _unjudged(ctx, runner, now, "the plan check is not pass", ctx)
+    body = (ctx.facts or {}).get("body")
+    scenarios = ctx.plan["scenarios_parsed"]
+    claiming = plan_ledger.pr_claim(body, scenarios)[0] is not None
+
+    def refuse(what, text):
+        if _cu_waived(args, runner, now, what, ctx):
+            return None
+        return "merge of %s refused: %s" % (ctx.pr, text) + CU_HINT % ctx.pr
+    try:
+        record_claim(ctx, now)   # the claim as it stands at this merge gate: a later edit of the merged body binds nothing
+    except Exception as err:
+        if claiming:
+            return refuse("the claim could not be recorded", "the claim could not be recorded (%s); the gate fails closed for a pull request with a claim line" % _one_line(str(err), 100))
+    if (ctx.facts or {}).get("state") == "merged":   # the claim of a merged pull request is the one recorded, never its current body
+        when = None
+        try:
+            engine, _, _ = build_engine(runner, now, "cli", writable=False)
+            repo, _, number = ctx.pr.rpartition("#")
+            when = _measure_time(read_pr_json(engine, repo, int(number), "mergedAt,state").get("mergedAt"))
+        except Exception:
+            when = None
+        found, text = plan_ledger.recorded_claim(ctx.entries, ctx.pr, at=when if when is not None else -1)
+        if not found:
+            return refuse("unknown sibling", "this merged pull request has no claim recorded at or before its merge: its claim is unknown; the gate fails closed for a pull request with a claim line") if claiming else None
+        body = plan_ledger.claim_body(text)
+    try:
+        peers = plan_peers(ctx, runner, now)
+    except Exception as err:
+        if plan_ledger.pr_claim(body, scenarios)[0] is None:
+            return None   # a pull request with no claim line claims every per-PR scenario: the union is covered whatever the peers say (docs/switchboard.md)
+        what = "unknown sibling" if isinstance(err, ClaimUnknown) else "too many pull requests" if PEERS_TOO_MANY in str(err) else "list error"
+        return refuse(what, "the claim union could not be read (%s); the gate fails closed for a pull request with a claim line" % _one_line(str(err), 100))
+    applies, uncovered, last = plan_ledger.claim_union(scenarios, body, peers)
+    if not (applies and last and uncovered):
+        return None
+    if _cu_waived(args, runner, now, "uncovered scenarios: " + ", ".join(uncovered), ctx):
+        return None
+    return plan_ledger.union_refusal(ctx.pr, uncovered)
+
+
 def claim_union_note(report, ctx, runner, now):
     """A pull request whose `CLAIMS:` line leaves scenarios to the epic's other pull requests: `gates` LISTS the ones no other OPEN or MERGED pull request under the same plan claims yet
     (a pull request with no claim line claims every per-PR scenario). Reads GitHub with GETs only, CLI only; a failed read is said, never silent. It enforces nothing: the union gate at the
-    ask's last merge is a follow-up."""
+    ask's last merge is `claim_union_refusal` (#976)."""
     try:
         if ctx.plan is None or ctx.plan.get("result") != "pass":
             return
         mine = (ctx.facts or {}).get("body")
-        _, left, error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], mine)
+        claimed_mine, left, error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], mine)
         row = next((r for r in report["gates"] if r["gate"] == "G1"), None)
         if error or not left or row is None:
             return
-        repo = ctx.pr.rsplit("#", 1)[0]
-        reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
-        listed = reader._api("repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100" % repo, repo)
-        if not isinstance(listed, list):
-            raise ValueError("the pull request list did not come back as a list")
         covered = set()
-        for other in listed:
-            if not isinstance(other, dict) or other.get("number") == ctx.number:
-                continue
-            if other.get("state") != "open" and not other.get("merged_at"):
-                continue   # closed without a merge: it proves nothing
-            link = plan_ledger.PLAN_LINK_RE.search(plan_ledger.visible_body(other.get("body")))
-            if not link or not _same_plan(link.group(1).strip("<>.,"), ctx.source, ctx.config.get("intent_repo")):
-                continue
-            claimed, _, other_error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], other.get("body"))
-            if not other_error:
+        closed, closed_claims = [], []
+        peers = plan_peers(ctx, runner, now, closed)
+        for kind, other_body in [(k, b) for k, b in peers] + [("closed", b) for _, b in closed]:
+            claimed, _, other_error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], other_body)
+            if not other_error and kind != "closed":
                 covered.update(x["id"] for x in claimed)
+            if kind == "closed":
+                closed_claims.append(None if other_error else {x["id"] for x in claimed})
         missing = [x["id"] for x in left if x["id"] not in covered]
         report["unclaimed"] = missing
-        row["detail"] = (row.get("detail") or "") + "; claimed by no other open or merged pull request of this plan yet: %s" % (", ".join(missing) if missing else "none")
+        report["claim_union"] = sorted(covered | {x["id"] for x in claimed_mine})   # the union of the open and merged claims of this ask (#976)
+        row["detail"] = (row.get("detail") or "") + "; claimed by no other pull request (open or merged, same plan) yet: %s" % (", ".join(missing) if missing else "none")
+        lost = []
+        for (number, _), gone in zip(closed, closed_claims):   # M2: a sibling closed without a merge leaves its scenarios unclaimed, and no later merge enforces it
+            lost.extend("%s: its claimant #%s was closed without a merge" % (sid, number) for sid in missing if gone and sid in gone)
+        if lost:
+            report["closed_siblings"] = lost
+            row["detail"] += "; the ask's scenarios left unclaimed: %s" % "; ".join(lost)
     except Exception as err:   # said, never silent
         report["unclaimed_error"] = _one_line("%s: %s" % (type(err).__name__, err), 160)
 
@@ -18755,21 +19076,21 @@ def add_merge_gate_parsers(sub):
 
 
 def merge_gate_gh(config, runner, repo):
-    """`gh(argv, own=True) -> (code, stdout, stderr)` for `repo`'s account, never raising; a call names itself the switchboard's own, so the shim does not probe it,
-    EXCEPT with `own=False` (the one merge call of `--pass --merge`): that call carries no marker, so the shim's own checks (the review check among them) run."""
+    """`gh(argv, own=True) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call runs the real gh by its resolved path (own_gh_path, config['gh']), so it never reaches the shim,
+    EXCEPT with `own=False` (the one merge call of `--pass --merge`): that call goes through the gh as configured (`gh_by_name`: the shim where PATH finds it), so the shim's own checks (the review check among them) run."""
     accounts = GhAccounts(config, runner, time.time)
     try:
         refuse_excluded(config, repo)
         env = accounts.env_for(repo)
     except AccountError as err:
         raise LedgerCommandError(str(err)) from None
-    env = dict(env if env is not None else os.environ, **{OWN_GH_ENV: "1"})
-    plain_env = {k: v for k, v in env.items() if k != OWN_GH_ENV}
+    env = dict(env if env is not None else os.environ)
+    env.pop(OWN_GH_ENV, None)   # no marker: the real gh is reached by its path (own_gh_path), not through the shim
 
     def gh(argv, own=True):
         try:
-            done = runner([config["gh"]] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
-                          env=env if own else plain_env)
+            done = runner([config["gh"] if own else config.get("gh_by_name", config["gh"])] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
+                          env=env)
         except (OSError, subprocess.SubprocessError) as err:
             return 1, "", accounts.scrub(_one_line(str(err), 120))
         return done.returncode, done.stdout or "", accounts.scrub(done.stderr or "")
@@ -18828,6 +19149,14 @@ def cmd_merge_gate(args, runner, now):
     def waived(head):
         entries, problem = plan_ledger.read_ledger(state)
         return not problem and gate.WAIVER_GATE in plan_ledger.valid_waivers(entries, ref, head, now())
+    union = claim_union_refusal(args, runner, now)   # #976: before everything else, the owner's own terminal included; only a logged `CU` waiver passes
+    if union:
+        _gates_audit(engine, "merge_gate.refused", ref, {"by": who, "why": _one_line(union, 300)})
+        if args.json:
+            print(json.dumps({"allowed": False, "reason": union, "head": None, "locked": False}, sort_keys=True))
+        else:
+            sys.stderr.write("%s\n" % union)
+        return plan_ledger.EXIT_REFUSE
     allowed, why, head = gate.check_merge(reading, gh, conf, state, repo, number, who, kind[0] == "person", waived, now)
     _gates_audit(engine, "merge_gate.allowed" if allowed else "merge_gate.refused", ref, {"by": who, "why": _one_line(why, 300)})
     if args.json:
@@ -19665,7 +19994,7 @@ def add_ledger_parsers(sub):
                                        "by a writer of the PR. A ledger entry and an audit line; it lasts 24 hours (the retroactive "
                                        "plan is due then) and a push needs a new one. `gates` shows the gate as waived, not passed.")
     waive.add_argument("pr", help="The pull request: owner/repo#N or its URL")
-    waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5, or MG (the merge gate, #962)")
+    waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5, MG (the merge gate, #962) or CU (the claim union at an ask's last merge, #976)")
     waive.add_argument("--reason", required=True, help="Why (at least %d characters)" % plan_ledger.WAIVER_REASON_MIN)
     waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "
@@ -19816,6 +20145,22 @@ def review_laws_text(engine, config, runner, now, repo, base_sha):
     return "\n\n".join(parts), missing
 
 
+def review_law_files(config, runner, now, repo, base_sha):
+    """The review law files of `repo` at `base_sha`, one by one, for `review checkout`: ({name: bytes}, missing names). `review_laws_text` is not changed."""
+    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    files, missing = {}, []
+    for name in REVIEW_LAW_FILES:
+        try:
+            got = reader._api("repos/%s/contents/%s?ref=%s" % (repo, name, base_sha), repo)
+            files[name] = base64.b64decode(got["content"]) if got.get("encoding") == "base64" else None
+        except (IntentError, AttributeError, KeyError, TypeError, ValueError):
+            files[name] = None
+        if files[name] is None:
+            del files[name]
+            missing.append(name)
+    return files, missing
+
+
 def local_review_overlay(repo):
     """The operator's own overlay for `repo`, if one exists: $XDG_CONFIG_HOME/fleet-switchboard/review-overlay/<owner>__<repo>.md (capped)."""
     path = config_path().parent / "review-overlay" / (repo.replace("/", "__").lower() + ".md")
@@ -19926,7 +20271,7 @@ def whole_read_problem(files_read, listed, bounds=None):
         rows[path] = (max(read, rows[path][0]) if path in rows else read, max(total, rows[path][1]) if path in rows else total)
     missing = [p for p in listed if p not in rows]
     if missing:
-        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each)" % ", ".join(_printable_path(p) for p in missing[:10])
+        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each) (each row's path is a repo path as in files.txt, e.g. bin/widget-api/app.py)" % ", ".join(_printable_path(p) for p in missing[:10])
     for path in listed:
         read, total = rows[path]
         bound = (bounds or {}).get(path, 0)
@@ -20150,7 +20495,7 @@ def cmd_review_post(args, runner, now):
         if not text:
             raise ReviewError("the body file is empty: a review says something (nothing was posted)")
         if redact_command_text(text) != text:
-            raise ReviewError("the body holds a secret-shaped value (it is not shown): remove it and post again (nothing was posted)")
+            raise ReviewError("the body holds a secret-shaped value (it is not shown): %s: remove it and post again (nothing was posted)" % secret_where(text))
         name = _review_caller(runner, now)
         seen["name"], seen["head"] = name, args.head
         repo, number, ref, raw = _review_pr(args, engine)
@@ -20231,7 +20576,7 @@ def cmd_review_dismiss(args, runner, now):
         if not reason:
             raise ReviewError("--reason must say why (nothing was dismissed)")
         if redact_command_text(reason) != reason:
-            raise ReviewError("the reason holds a secret-shaped value (it is not shown) (nothing was dismissed)")
+            raise ReviewError("the reason holds a secret-shaped value (it is not shown): %s (nothing was dismissed)" % secret_where(reason))
         name = _review_caller(runner, now)
         seen["name"] = name
         repo, number, ref, raw = _review_pr(args, engine)
@@ -20553,7 +20898,7 @@ def cmd_review_checkout(args, runner, now):
                 matrix_text = None
                 sys.stderr.write("%s: review checkout: the impact matrix cannot be read, so impact-matrix.txt is not written to the checkout: %s\n" % (PROG, _one_line(str(err), 160)))
             sparse_result = {}
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, law_files=review_law_files(config, runner, now, repo, base), notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
@@ -21490,11 +21835,12 @@ def _changed_plan(args, runner):
         number = str(args.pr).strip().split("#")[-1]
         if not re.fullmatch(r"[0-9]{1,9}", number):
             raise ps.PathSuitesError("--pr %r: the number after '#' must be digits" % str(args.pr)[:60])
-        theirs = runner(["gh", "pr", "view", number, "--json", "headRefOid", "-q", ".headRefOid"], cwd=root, capture_output=True, text=True)
+        real_gh = load_config()["gh"]   # #1216: the real gh by path (own_gh_path), never the bare name the shim answers
+        theirs = runner([real_gh, "pr", "view", number, "--json", "headRefOid", "-q", ".headRefOid"], cwd=root, capture_output=True, text=True)
         mine = runner(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True)
         if theirs.returncode != 0 or (theirs.stdout or "").strip() != (mine.stdout or "").strip() or not (mine.stdout or "").strip():
             raise ps.PathSuitesError("--pr %s: the checked-out HEAD is not the pull request's head (or its head could not be read): check out the pull request's branch" % number)
-        done = runner(["gh", "pr", "diff", number, "--name-only"], cwd=root, capture_output=True, text=True)
+        done = runner([real_gh, "pr", "diff", number, "--name-only"], cwd=root, capture_output=True, text=True)
         if done.returncode == 0 and done.stdout.strip():
             paths = sorted(p for p in done.stdout.split("\n") if p.strip())
     if paths is None:
@@ -22864,6 +23210,21 @@ def cloud_record_live(record, worker, retired, last_reports, now):
     return True
 
 
+def cloud_sender(state_dir, name):
+    """#1478: the pane-less sender of a cloud worker's report: an Observation built from its endpoint record (the same `reports_to` the lane count
+    reads), or None when `name` has no such record. Only a record of that exact worker counts; nothing in it but name, reports_to, repo is used."""
+    if state_dir is None or not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        return None
+    record, _kind = load_module("cloud_worker").read_record_file(Path(state_dir) / "cloud" / (name + ".json"), CLOUD_LOAD_MAX_BYTES)
+    if record is None or record.get("worker") != name:
+        return None
+    boss = _cloud_boss(record.get("reports_to"))
+    fleet = {"name": name, "role": "cloud-worker", "reports_to": boss or None, "issue": None}
+    if isinstance(record.get("repo"), str):
+        fleet["repo"] = record["repo"]
+    return Observation(name, None, None, "unknown", fleet)
+
+
 def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None, clock=None):
     """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded scan, no GitHub read, no process). A worker
     that is retired, made its final report, or is past its hard deadline is not counted; a record WITHOUT a valid hard_deadline (no evidence of liveness)
@@ -23340,6 +23701,7 @@ def cmd_plan(args, runner, now, socket_call=None):
 
 
 cmd_plan.direct = True   # no error mapping, no daemon start
+cmd_plan.guard_records = True   # the plan ledger's approvals and gates (#1380)
 
 
 def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen, socket_call=None):
@@ -23375,7 +23737,7 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
 
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
          socket_call=None):
-    os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
+    os.environ.pop(OWN_GH_ENV, None)   # #1216: an inherited marker means nothing; own gh calls reach the real gh by path (own_gh_path)
     raw = tuple(argv if argv is not None else sys.argv[1:])   # #835: the command line as typed, captured BEFORE any registrar runs: `review record` reads its rating inputs from this, never from the shared parser
     held = {name: (globals()[name], globals()[name].__code__) for name in RATING_PATH_FUNCTIONS if name in globals()}
     parser = build_parser()
@@ -23394,6 +23756,13 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
         sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
         return EXIT_ERROR
+    action = getattr(args, "action", None)
+    refused, noted = installed_tree_check(action, daemon=action == "run" and not getattr(args, "once", False), records=command_records(action, parser.commands))   # #1380: before anything else runs, and for every command but the ones that move the tree
+    if refused:
+        sys.stderr.write(refused + "\n")
+        return EXIT_ERROR
+    if noted:
+        sys.stderr.write(noted + "\n")
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
 
 
@@ -25032,6 +25401,16 @@ class Installer:
             return "stale"
         return "other"
 
+    def step_installed_tree(self):
+        """#1380: record which tree is the installed one, copy the two standalone guard scripts out of it and write the hooks that record a move of its HEAD."""
+        try:
+            steps = installed_guard_module(Path(self.kit_root) / "bin").install(self.kit_root, ensure_state_dir() if not self.dry else state_dir_path(),
+                                                                                  self.kit_root / "bin", sys.executable, dry_run=self.dry, run=self.runner)
+        except (OSError, subprocess.SubprocessError) as err:
+            return self.say("installed tree", "skipped (%s)" % _one_line(str(err), 120))
+        for step, status, detail in steps:
+            self.say(step, ("would be " + status) if self.dry and status == "done" else status, detail)
+
     def step_cli_link(self):
         target = self.cli_target()
         candidates = self.cli_candidates()
@@ -25314,6 +25693,7 @@ class Installer:
         else:
             self.say("herdr plugin", "skipped (--no-herdr-link)")
         self.step_cli_link()
+        self.step_installed_tree()
         if not with_service:
             self.say("service", "skipped (--no-service)")
         elif self.kind is None:

@@ -157,7 +157,7 @@ reach of the agent that must use it.
 **The exact message an agent sees when it is refused** (one line; the gates it names are the enforced ones that failed):
 
 ```
-fleet-switchboard: merge of acme/app#12 refused: missing G1: S2: proof (`prove S2`); tester verdict (`verdict S2 --as tester`). Way out: ask the chief of staff for a logged waiver (`fleet-switchboard waive acme/app#12 --gates G1 --reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow (`fleet-switchboard gates mode acme/app shadow`).
+fleet-switchboard: merge of acme/app#12 refused: missing G1: S2: proof (`prove S2`; the tester judges it, a prover records it); tester verdict (`verdict S2 --as tester`; only the tester may record it). Way out: ask the chief of staff for a logged waiver (`fleet-switchboard waive acme/app#12 --gates G1 --reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow (`fleet-switchboard gates mode acme/app shadow`).
 ```
 
 (`ready` reads the same with `ready of ...`.) `waive` is **not built yet** and the permission that lets cos run it is held for the owner: until both exist the waiver half of this line is a path that errors, which is one more reason the enforcement flip waits for them (section 3, step 1). The agent's next step is to record the missing proof and verdict, or to report to its orchestrator and cos; it does not try to get around the gate.
