@@ -31,6 +31,7 @@ cloud/launcher/tests/test_cw_minter_manifest.py
 cloud/launcher/tests/test_cw_names.py
 cloud/launcher/tests/test_docs_preflight_modes.py
 cloud/launcher/tests/test_driver.py
+cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_issues_read.py
 cloud/launcher/tests/test_model_credential.py
@@ -38,12 +39,14 @@ cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_reaper_managed.py
+cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_retire_gone_pod.py
 cloud/launcher/tests/test_run_record.py
 cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
 cloud/launcher/tests/test_stub_cleanup.py
+cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_token_read_at_call.py
 cloud/launcher/tests/test_vault_check_pins.py
 cloud/worker/tests/test_cloud_prepush.py

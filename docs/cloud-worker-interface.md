@@ -111,6 +111,15 @@ Runs inside the pod on `stop`, a hard deadline, an idle stop and a node drain no
 
 A clean tree whose HEAD is already pushed pushes nothing and reports `pushed: false`.
 
+**The token at its limit (#1354).** **Cause.** Workers ended with unpushed work because the one-hour git token had ended before the push: the reaper's renewal (30 minutes left) can miss, when the reaper sleeps, the vault refuses or the kubelet projects late, and the end hook's push is then refused. Two changes, both on the launcher side; the pod gets no new credential (it holds none for the minter and never will).
+
+- **The note at minute 40.** The reaper's pass sends each worker ONE note when its pod is 40 minutes old (the `cw/wip-note` pod annotation is set before the send, so a second pass sends none): it names the branch `<worker>/wip` and the exact command `git push origin HEAD:refs/heads/<worker>/wip` (plain, never forced). It reaches the worker's own session through `kubectl exec` of a short program that reads the same server password file the activity probe reads; no image change is needed.
+- **One refresh and one retry.** The rule is exactly one refresh and one retry. When the end hook's `fetch` or `push` is refused because the token had ended, the hook answers `refresh: needed` (a fixed word; nothing of the remote's text) and the STOP side, not the pod, mints through the renewal's route (`run_git_token_cmd`), replaces ONLY the `git-token` key of the per-run Secret, waits (at most 120 seconds) until the pod's file shows the new token (a digest comes back, never the token), and runs the hook once more. A refused refresh means no second attempt and no loop; a refusal for any other reason (a rejected ref, a hostile configuration, the network) asks for no refresh. A second token end during the retry loses the work: the pod is kept as for any hook failure.
+- **Scope.** The new token is for the same repository and the same permissions, with the same one-hour life (the minter's own checks and its 61-minute refusal are unchanged) and is checked once more with GitHub before the Secret is patched: exactly the pod's one repository, push and pull, never admin or maintain; anything unreadable is a refusal and the old file is kept. The token is never printed or written to a log, record or audit line. The pod's token file is replaced by a temporary file and a rename: that is the kubelet's own projection of the Secret; nothing added here writes the file.
+- **The word.** The stop's audit line carries one word, refresh: used, refused or none (a word, never a value), and so does the `end_hook` part of the run record.
+
+Not run in a cluster: the live check (a real pod with an ended token, and the note reaching a real session) is the operator's, after merge.
+
 ## 6. Idle and hard limit
 
 - **Idle** = no tool call and no model activity (a running session or step) for `CW_IDLE_SECONDS`. Inbound
