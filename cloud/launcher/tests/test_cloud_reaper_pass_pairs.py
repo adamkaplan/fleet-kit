@@ -147,7 +147,7 @@ class MemStore:
         return True
 
 
-class Fleet:
+class PodSet:
     """12 pods of which 3 are due to stop; a reaper acts only through its gate."""
 
     def __init__(self):
@@ -170,38 +170,38 @@ class TestLease(unittest.TestCase):
     def test_two_reapers_one_lease_each_action_once(self):
         store, now = MemStore(), [T0]
         a, b = mode.LeaseGate(store, "cloud", lambda: now[0]), mode.LeaseGate(store, "mac", lambda: now[0])
-        fleet = Fleet()
+        podset = PodSet()
         for _ in range(3):
-            fleet.reap(a)
+            podset.reap(a)
             now[0] += 1 * MIN
-            fleet.reap(b)
+            podset.reap(b)
             now[0] += 1 * MIN
-        self.assertEqual(sorted(set(fleet.stops)), sorted(fleet.stops))
-        self.assertEqual(len(fleet.stops), 3)
-        self.assertEqual(len(set(fleet.renewals)), 9)
-        self.assertEqual(len(fleet.renewals), 27)   # each live pod is renewed once per pass of the holder: 3 passes of 9 pods
+        self.assertEqual(sorted(set(podset.stops)), sorted(podset.stops))
+        self.assertEqual(len(podset.stops), 3)
+        self.assertEqual(len(set(podset.renewals)), 9)
+        self.assertEqual(len(podset.renewals), 27)   # each live pod is renewed once per pass of the holder: 3 passes of 9 pods
         self.assertEqual(store.cur[0], "cloud")
 
     def test_mac_yields_while_the_lease_is_live_and_takes_over_after_the_lapse(self):
         store, now = MemStore(), [T0]
         cloud, mac = mode.LeaseGate(store, "cloud", lambda: now[0]), mode.LeaseGate(store, "mac", lambda: now[0])
         self.assertTrue(cloud())
-        fleet = Fleet()
+        podset = PodSet()
         now[0] += dt.timedelta(seconds=mode.LEASE_SECONDS - 1)
-        self.assertEqual((fleet.reap(mac), len(fleet.stops)), (0, 0))
+        self.assertEqual((podset.reap(mac), len(podset.stops)), (0, 0))
         now[0] += dt.timedelta(seconds=5)
-        self.assertEqual((fleet.reap(mac), len(fleet.stops)), (1, 3))
+        self.assertEqual((podset.reap(mac), len(podset.stops)), (1, 3))
 
     def test_mutant_without_the_lease_acts_twice(self):
-        fleet = Fleet()
+        podset = PodSet()
         always = lambda: True  # noqa: E731
-        fleet.live = ["p%d" % i for i in range(12)]
-        self.assertEqual(fleet.reap(always), 1)
-        self.assertEqual(len(fleet.stops), 3)
-        fleet2 = Fleet()
-        fleet2.reap(always)
-        fleet2.reap(always)
-        self.assertEqual(len(fleet2.renewals), 18)   # not the 9 of one holder: renewals repeat without the lease
+        podset.live = ["p%d" % i for i in range(12)]
+        self.assertEqual(podset.reap(always), 1)
+        self.assertEqual(len(podset.stops), 3)
+        podset2 = PodSet()
+        podset2.reap(always)
+        podset2.reap(always)
+        self.assertEqual(len(podset2.renewals), 18)   # not the 9 of one holder: renewals repeat without the lease
 
     def test_lease_pairs_are_in_the_rights(self):
         self.assertLessEqual({("get", "leases"), ("create", "leases"), ("update", "leases")}, pairs(read(REAPER)))
