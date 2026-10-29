@@ -22867,6 +22867,8 @@ def build_parser():
     remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed "
                         "(by default a reminder about an issue is dropped, unsent, once the issue is closed)")
     remind.add_argument("--issue", type=issue_arg, help="The issue the reminder is about")
+    remind.add_argument("--ttl", metavar="DURATION", default=None, help="Drop the reminder, unsent and audited, if it cannot be delivered within this long "
+                        "after it is due (30m, 2h; at most 24h)")
     remind.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     remind.add_argument("--until-closed", metavar="OWNER/REPO#N", help="Drop the reminder, unsent, once this issue "
                         "(or pull request) is closed or merged")
