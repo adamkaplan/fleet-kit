@@ -1513,6 +1513,34 @@ def _pod_repo(pod):
     return _pod_env(pod, "CW_REPO")
 
 
+CREATE_GRACE_SECONDS = 120   # a Failed pod younger than this is left to the create path (its _wait_ready failure deletes it)
+FAILURE_LABELS = ("OOMKilled", "Error", "DeadlineExceeded", "Evicted")   # the only words a stop line or a run record may carry for a failed pod
+
+
+def failure_of(pod):
+    """(label, exit code or None) of a Failed pod: the label is chosen from FAILURE_LABELS by EXACT match, else `other`; never a copy of pod text.
+    The code only when it is an int (not a bool) from 0 to 255. Never raises."""
+    try:
+        status = pod.get("status") or {}
+        reason, code = None, None
+        if status.get("reason") == "Evicted":
+            reason = "Evicted"
+        for cs in status.get("containerStatuses") or []:
+            for key in ("state", "lastState"):
+                term = ((cs or {}).get(key) or {}).get("terminated")
+                if isinstance(term, dict):
+                    if reason is None:
+                        reason = term.get("reason")
+                    if code is None and isinstance(term.get("exitCode"), int) and not isinstance(term.get("exitCode"), bool) and 0 <= term["exitCode"] <= 255:
+                        code = term["exitCode"]
+        if reason is None:
+            reason = status.get("reason")
+        label = next((l for l in FAILURE_LABELS if isinstance(reason, str) and reason == l), "other")
+        return label, code
+    except Exception:
+        return "other", None
+
+
 def ann(pod, key, default=None):
     return pod["metadata"].get("annotations", {}).get("cw/" + key, default)
 
@@ -1694,12 +1722,14 @@ class Launcher:
         self.audit_path = audit_path(env)
 
     # -- audit: one line per action, no secret, written before the action returns --
-    def audit(self, worker, runtime_id, action, cost, ok, reason="", cause=None):
+    def audit(self, worker, runtime_id, action, cost, ok, reason="", cause=None, extra=None):
         line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
                 "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name,
                 "reason": self.kube.scrub(reason, limit=1000)}
         if cause:   # a stop the launcher made of its own accord names why: idle, hard, pod_gone or pod_failed (a person's stop has none)
             line["cause"] = cause
+        if extra:   # fixed-label fields only (failure, exit_code), chosen by the launcher, never copied from a pod
+            line.update(extra)
         write_audit(self.audit_path, line)
 
     def cost(self, pod):
@@ -1716,12 +1746,12 @@ class Launcher:
         except CloudError as e:
             if not e.audited:
                 # the failure is never dropped: a caller's own reason (a stop reason, the run-secret names) comes first
-                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("cause"))
+                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("cause"), info.get("extra"))
             raise
         except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
-            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("cause"))
+            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("cause"), info.get("extra"))
             raise CloudError("unexpected cloud data: %s" % self.kube.scrub(e, 200))
-        self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("cause"))
+        self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("cause"), info.get("extra"))
         return result
 
     def _need(self, worker):
@@ -2120,6 +2150,9 @@ class Launcher:
             phase = (pod.get("status") or {}).get("phase")
             if phase == "Failed" and getattr(a, "cause", None):
                 info["cause"] = "pod_failed"
+            if phase == "Failed":   # BEFORE the delete: the pod's own reason goes with it
+                label, code = failure_of(pod)
+                info["extra"] = {"failure": label} if code is None else {"failure": label, "exit_code": code}
             if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
                 # Secrets, and say so.
@@ -2219,7 +2252,10 @@ class Launcher:
     def _hook_record(self, info, hook):
         if info.get("record"):
             try:
-                self.recorder.add_hook(info["record"], hook)
+                if info.get("extra"):
+                    self.recorder.add_hook(info["record"], hook, info["extra"])   # a Failed pod's fixed failure label and code, in the same write
+                else:
+                    self.recorder.add_hook(info["record"], hook)
             except Exception:   # add_hook never raises; a stop is never held back by the record
                 pass
 
@@ -2365,6 +2401,16 @@ class Launcher:
                 print("cloud-worker: WARNING: no usable record for %s; using the pod's own deadline" % ann(pod, "worker"), file=sys.stderr)
         return min(hard, parse_iso(ann(pod, "max-hard", iso(hard))))  # a record never lengthens a life past the cap
 
+    @staticmethod
+    def _failed_to_end(pod, now):
+        """True for a pod whose phase is EXACTLY Failed and that is not kept, not a persistent orchestrator's and older than CREATE_GRACE_SECONDS."""
+        if (pod.get("status") or {}).get("phase") != "Failed" or ann(pod, "kept") == "true" or ann(pod, "persistent") is not None:
+            return False
+        try:
+            return (now - parse_iso(ann(pod, "started"))).total_seconds() >= CREATE_GRACE_SECONDS
+        except (ValueError, TypeError):
+            return False   # no readable start: left as before
+
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now, live = [], self.clock(), []
@@ -2384,13 +2430,15 @@ class Launcher:
             else:
                 live.append(pod)   # before its hard limit and not stopped below: the git token renewal's candidates
                 act = self.activity(pod["metadata"]["name"])
-                if act is None:
+                if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
+                    reason = "idle"   # the hard and idle rules judge FIRST
+                elif self._failed_to_end(pod, now):
+                    reason = "pod failed"   # a Failed pod cannot answer for its activity: it is ended in this pass, never left to its hard limit
+                elif act is None:
                     # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
                     # its hard limit; it is reported so it is not silent.
                     out.append((worker, "activity unreadable", 1))
                     continue
-                if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
-                    reason = "idle"
             if reason:
                 self.last_hook = None
                 if pod in live:
@@ -2398,7 +2446,7 @@ class Launcher:
                 try:
                     # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
                     res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None,
-                                                       cause="hard" if reason == "hard limit" else "idle"), reason)
+                                                       cause={"hard limit": "hard", "pod failed": "pod_failed"}.get(reason, "idle")), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
                 except CloudError as e:

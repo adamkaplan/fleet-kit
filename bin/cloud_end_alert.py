@@ -1,12 +1,11 @@
 """A cloud worker that the launcher ended alerts its boss and the Chief of Staff (ask #1480).
 
-A failed pod is alerted only when the reaper stops it at its idle or hard limit (cause pod_failed): the reaper reads a pod's activity through the pod, a
-failed pod cannot answer, so the reaper does not stop it sooner (a follow-up ask is filed as #1526).
+A failed pod is ended and alerted within one pass (the reaper stops a pod in the Failed phase with cause pod_failed; ask #1526).
 
 The launcher writes one JSON line per action to its audit file. This pass reads the NEW stop lines (from a stored cursor), and for a stop line that carries the field `cause` (idle,
 hard, pod_gone or pod_failed; decided from that field alone), it sends ONE message to the
 Chief of Staff always and ONE to the boss recorded in the worker's cloud record when that name is a valid agent name, unless the worker already
-reported done. The message holds five facts, plus, for pod_failed, the pod's termination reason and exit code (added by a later change): the worker, the reason, the time, pushed (yes, no or unknown) and the run record's name (or
+reported done. The message holds five facts, plus, for pod_failed, the pod's termination reason and exit code (a fixed label and an integer code, validated again here): the worker, the reason, the time, pushed (yes, no or unknown) and the run record's name (or
 unknown); never a branch, an address, a log line or a transcript.
 
 The state is one small private file (0600): {"offset": bytes already read, "sent": [[run id, cause], ...] (the last 500)}. A missing or corrupt
@@ -119,6 +118,20 @@ def pushed_text(record_dir, parse):
     return "yes" if hook["pushed"] else "no"
 
 
+FAILURES = ("OOMKilled", "Error", "DeadlineExceeded", "Evicted", "other")   # the launcher's fixed labels; anything else in a line is not shown
+
+
+def failure_text(line):
+    """`<label>, exit code <n>` (or the label alone) from a pod_failed stop line, validated again; None when the line carries no usable label."""
+    label = line.get("failure")
+    if not isinstance(label, str) or label not in FAILURES:
+        return None
+    code = line.get("exit_code")
+    if isinstance(code, int) and not isinstance(code, bool) and 0 <= code <= 255:
+        return "%s, exit code %d" % (label, code)
+    return label
+
+
 def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
     text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; work pushed: %s; run record: %s."
             % (worker, label, when, pushed, record_name or "unknown"))
@@ -178,7 +191,8 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
         boss = record.get("reports_to") if record and record.get("worker") == worker else None
         name = record_name_of(worker, record_name)
         pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
-        text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
+        text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False,
+                            failure_text(line) if cause == "pod_failed" else None)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         out.extend((to, text, worker, label) for to in reversed(to_list))

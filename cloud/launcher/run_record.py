@@ -355,7 +355,7 @@ class Recorder:
         return directory
 
     @staticmethod
-    def add_hook(directory, hook):
+    def add_hook(directory, hook, extra=None):
         """A second atomic write of run.json once the end hook has answered (#829): adds `end_hook` (pushed, wip_branch,
         skipped, note, error, or why it did not run). Never raises; a record that cannot be updated keeps what it had."""
         try:
@@ -363,6 +363,8 @@ class Recorder:
             with open(path) as f:
                 info = json.load(f)
             info["end_hook"] = hook
+            if extra:   # fixed-label fields of a Failed pod (failure, exit_code), top level, chosen by the launcher
+                info.update(extra)
             write_private(directory, "run.json", json.dumps(info, sort_keys=True) + "\n")
         except Exception as e:   # the stop goes on, but the gap is said once
             print("cloud-worker: run record not updated with the end hook result: %s" % type(e).__name__, file=sys.stderr)
