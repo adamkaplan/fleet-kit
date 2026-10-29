@@ -582,11 +582,9 @@ class TestConfig(Base):
     def test_the_relay_daemons_holder_of_reads_the_validated_shape_unchanged(self):
         """U6/PC-3: a config with relay_holders, validated by this change, gives the relay daemon's holder_of the same pod for the fixed key, and a key
         the config does not name stays None (fail closed). That the daemon file has 0 changed lines in this diff is checked by the diff itself."""
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        try:
-            import cloud_relay_daemon as relay
-        finally:
-            sys.path.pop(0)
+        loader = importlib.machinery.SourceFileLoader("cloud_relay_daemon_u6", str(Path(__file__).resolve().parent / "cloud_relay_daemon.py"))
+        relay = importlib.util.module_from_spec(importlib.util.spec_from_loader("cloud_relay_daemon_u6", loader))
+        loader.exec_module(relay)
         holders = {"acme-org/widget-service#7": "widget-pod"}
         config = sb.validate_config({"relay_holders": dict(holders)})
         backend = relay.SwitchboardBackend(None, (None, None, config), None, None)
