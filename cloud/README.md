@@ -38,6 +38,24 @@ To bump Node: update `NODE_VERSION` (a full 22.x.y release; the only place the v
 `NODE_SHA256_ARM64`) at the top of the Node block in `cloud/worker/Dockerfile`, keep the version equal to the product repository's `.node-version`, then rebuild and publish the image
 (an operator step) and record the previous digest as the rollback.
 
+### PostgreSQL 16 and two extensions in the image (ask #1353)
+
+**Cause.** The recorded case: measurement pods of a product repository spend about 20 of 60 minutes compiling PostgreSQL 16 and two extensions (vector, message queue) from source on every run. The image now carries them, built once.
+
+**What is built.** A separate build stage (`pgbuild`, with the compilers) builds PostgreSQL, the vector extension and the message-queue extension into `/opt/pg`; the `final` stage copies only that directory, root-owned. No compiler is in the final image. PostgreSQL has a version constant and a 64-hex sha256 constant at the top of the block in `cloud/worker/Dockerfile` (`PG_VERSION` / `PG_SHA256`: the project's release tarball, 16.x), checked with `sha256sum -c` BEFORE it is unpacked. Each extension is pinned to an immutable 40-hex git COMMIT, not a tag (a tag can be moved): `PGVECTOR_VERSION` / `PGVECTOR_COMMIT` and `PGMQ_VERSION` / `PGMQ_COMMIT`; the version is only the directory and label. The build clones the publisher's repository, checks out the commit and fails unless `git rev-parse HEAD` equals it, BEFORE any build step (`git` is in the `buildpack-deps` base). To bump PostgreSQL: edit `PG_VERSION` AND `PG_SHA256`. To bump an extension: edit its version AND its commit; find the commit with `git ls-remote https://github.com/pgvector/pgvector refs/tags/v<version>` (for an annotated tag, the commit is the `^{}` line), and confirm it twice (a second `ls-remote`, and the tag's page on GitHub). Then run `python3 cloud/worker/tests/test_dockerfile_postgres.py` and rebuild. The build-time secret scan also reads `/opt/pg`: the `scan` stage copies the built PostgreSQL tree in before it scans.
+
+Versions: PostgreSQL 16.15, vector 0.8.7, message queue (pgmq) 1.13.1. The server is built without readline, ICU, zlib and OpenSSL, so it needs no run-time library beyond the base. Size cost: measured by the operator at the first real build (before and after, and the pod start time). Not measured here for the image; the installed tree `/opt/pg` was 35 MB in a local arm64 build of the build stage (a developer measurement, not the operator's amd64 build).
+
+**Nothing starts at pod start.** The entrypoint is unchanged; no server runs and no port listens until a lane starts it. It runs only as the unprivileged `worker` user, with its data directory on the scratch volume (`/run/cw-tmp`), so the data ends with the pod. The one-line start (initdb, then pg_ctl on a local socket only):
+
+```sh
+/opt/pg/bin/initdb -D /run/cw-tmp/pgdata -U worker --locale=C.UTF-8 -E UTF8 && /opt/pg/bin/pg_ctl -D /run/cw-tmp/pgdata -o "-c listen_addresses= -c unix_socket_directories=/run/cw-tmp" -l /run/cw-tmp/pg.log start
+```
+
+Then `/opt/pg/bin/psql -h /run/cw-tmp -U worker -d postgres -c "create extension vector"` (and `pgmq`). The network policy, the guard and the permission files are unchanged.
+
+**Rollback.** Point the workers at the previous image digest (kept in the registry until the new image has run live).
+
 ## Per-run secrets in the image
 
 The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The entrypoint, which never prints a value:

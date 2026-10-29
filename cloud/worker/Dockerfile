@@ -97,6 +97,34 @@ ENTRYPOINT ["/usr/local/bin/worker-entrypoint"]
 # The launcher sets OPENCODE_SERVER_PASSWORD at run time; it is never in the image.
 CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
 
+# ---- #1353 PostgreSQL build stage: compilers live ONLY here; the worker stage copies the installed files (/opt/pg) and nothing else ----
+# The pins below are the only constants: PostgreSQL 16 = one version + one sha256 (the release tarball from the project's own
+# download area, checked with `sha256sum -c` BEFORE it is unpacked); each extension = one version (directory/label only) + one
+# 40-hex COMMIT (a tag can be moved, a commit cannot): the build clones the publisher's repository, checks out that commit and
+# fails unless `git rev-parse HEAD` equals it, BEFORE any build step. The base (index digest of buildpack-deps:24.04, read from the registry) already holds the compilers,
+# git, curl and bzip2, so the file adds no apt package; a mismatch fails the build. A bump edits that source's version AND its sha256 or commit (cloud/README.md).
+FROM buildpack-deps:24.04@sha256:390065857fa32d431d0e09d2442f16470fbf474337fca5a0113add96db5516ed AS pgbuild
+ARG PG_VERSION=16.15
+ARG PG_SHA256=c1575341fa7bd40f5274ea465b34390f4dc64cdd0770af327005caaeb9f6b7ed
+ARG PGVECTOR_VERSION=0.8.7
+ARG PGVECTOR_COMMIT=f37c13f68b57d2c3472b2214fbcff699d6d34876
+ARG PGMQ_VERSION=1.13.1
+ARG PGMQ_COMMIT=8eab18272e50077ab9f72d9787296655f2849dcc
+RUN set -eu; curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" -o /tmp/pg.tar.bz2 \
+ && echo "${PG_SHA256}  /tmp/pg.tar.bz2" | sha256sum -c - \
+ && mkdir -p /src/pg && tar -xjf /tmp/pg.tar.bz2 -C /src/pg --strip-components=1 && rm /tmp/pg.tar.bz2 \
+ && cd /src/pg && ./configure --prefix=/opt/pg --without-readline --without-icu --without-zlib --without-openssl \
+ && make -j"$(nproc)" && make install
+RUN set -eu; git clone --filter=blob:none https://github.com/pgvector/pgvector /src/pgvector \
+ && cd /src/pgvector && git checkout --detach "${PGVECTOR_COMMIT}" \
+ && test "$(git rev-parse HEAD)" = "${PGVECTOR_COMMIT}" \
+ && make PG_CONFIG=/opt/pg/bin/pg_config && make PG_CONFIG=/opt/pg/bin/pg_config install
+RUN set -eu; git clone --filter=blob:none https://github.com/pgmq/pgmq /src/pgmq \
+ && cd /src/pgmq && git checkout --detach "${PGMQ_COMMIT}" \
+ && test "$(git rev-parse HEAD)" = "${PGMQ_COMMIT}" \
+ && cd pgmq-extension && make PG_CONFIG=/opt/pg/bin/pg_config && make PG_CONFIG=/opt/pg/bin/pg_config install
+# ---- end #1353 PostgreSQL build stage ----
+
 # ---- build-time secret scan (the stages below the line "FROM worker AS scan" are reused by cloud/tests/test-cloud) ----
 # The scan runs INSIDE the (remote, linux/amd64) build, where the files can be read: `docker save` on an arm64
 # workstation cannot export an amd64-only image's layers. It reads the final filesystem of the `worker` stage as root;
@@ -105,6 +133,8 @@ CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
 # credential, and a person who adds one must not write it to disk.
 FROM worker AS scan
 USER root
+# The built PostgreSQL tree is only COPIED into `final`, so the scan stage takes the same copy: the scan below then reads /opt/pg too.
+COPY --from=pgbuild /opt/pg /opt/pg
 COPY worker/scan-secrets.sh worker/scan-files.py worker/scan-allowlist.txt /
 RUN /scan-secrets.sh --dir / --skip proc --skip sys --skip dev --skip scan-secrets.sh --skip scan-files.py && echo ok > /scan-ok
 
@@ -115,3 +145,5 @@ RUN /scan-secrets.sh --dir / --skip proc --skip sys --skip dev --skip scan-secre
 # syntax (no --mount, heredoc, # syntax=, --link, --exclude): cloud/tests/test-cloud fails if one appears.
 FROM worker AS final
 COPY --from=scan /scan-ok /usr/local/share/cw/scan-ok
+# #1353: PostgreSQL 16 and the two extensions, installed files only (root-owned, no compiler, nothing starts them): see the pgbuild stage.
+COPY --from=pgbuild /opt/pg /opt/pg

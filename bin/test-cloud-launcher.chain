@@ -47,6 +47,7 @@ cloud/worker/tests/test_cloud_prepush_hardening.py
 cloud/worker/tests/test_cw_gh_comments.py
 cloud/worker/tests/test_dockerfile_agent.py
 cloud/worker/tests/test_dockerfile_node.py
+cloud/worker/tests/test_dockerfile_postgres.py
 cloud/worker/tests/test_entrypoint_question.py
 cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
