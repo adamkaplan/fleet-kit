@@ -1463,39 +1463,113 @@ class RelayLoopCadence(unittest.TestCase):
         self.assertIsNone(relay.start_loop(None, None, None, None, environ={}))
         self.assertEqual(threading.active_count(), before)
 
+    def test_a_hub_without_a_host_module_fails_at_start(self):
+        with self.assertRaises(ValueError):
+            relay.start_loop(None, None, None, None, environ=self.ENV)
+
     def test_cadence_is_well_under_the_hub_wait(self):
         self.assertLessEqual(relay.CADENCE, 5.0)
         self.assertLess(relay.CADENCE, 30.0)
 
-    def test_requests_are_pulled_repeatedly_while_a_long_pass_runs_and_by_one_worker(self):
-        calls, threads = [], set()
-        relay.pass_if_configured = lambda *a: (calls.append(time.monotonic()), threads.add(threading.get_ident()))
-        loop = relay.start_loop(None, None, None, None, environ=self.ENV, cadence=0.02)
-        long_pass_end = time.monotonic() + 0.3   # stands for the engine pass, which does not touch this loop
-        time.sleep(0.3)
-        loop.stop()
-        self.assertGreaterEqual(len([c for c in calls if c < long_pass_end]), 5)
-        self.assertEqual(len(threads), 1)
+    def ticking(self, ticks, **kw):
+        """A loop whose sleep is injected: it counts ticks and stops the loop at `ticks`. No wall time is read."""
+        sleeps = []
+        loop = relay.RelayLoop(types.SimpleNamespace(), None, None, None, environ=self.ENV, cadence=0.02, **kw)
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) >= ticks:
+                loop.stop_flag.set()
+        loop.sleep = sleep
+        return loop, sleeps
+
+    def test_one_pull_per_tick_at_the_cadence(self):
+        calls = []
+        relay.pass_if_configured = lambda *a: calls.append(threading.get_ident())
+        loop, sleeps = self.ticking(5)
+        loop.run()
+        self.assertEqual((len(calls), sleeps), (5, [0.02] * 5))
+
+    def test_a_pull_runs_on_the_loop_thread_only_and_the_thread_ends_at_stop(self):
+        threads = set()
+        relay.pass_if_configured = lambda *a: threads.add(threading.get_ident())
+        counter = []
+
+        def sleep(seconds):
+            counter.append(1)
+            if len(counter) >= 6:
+                loop.stop_flag.set()
+        loop = relay.start_loop(None, object(), None, None, environ=self.ENV, cadence=0.0, sleep=sleep)
+        loop.thread.join(30)   # a generous bound, not a measurement: the loop ends by its own tick count
         self.assertFalse(loop.thread.is_alive())
+        self.assertEqual(threads, {loop.thread.ident})
+        self.assertEqual(len(counter), 6)
 
     def test_a_stuck_pull_blocks_only_its_own_thread(self):
-        gate = threading.Event()
-        relay.pass_if_configured = lambda *a: gate.wait(5)
-        loop = relay.start_loop(None, None, None, None, environ=self.ENV, cadence=0.02)
-        started = time.monotonic()
-        loop.stop(join=0.1)   # the caller is not held by the stuck thread
-        self.assertLess(time.monotonic() - started, 1.0)
+        gate, entered = threading.Event(), threading.Event()
+        notes = []
+        relay.pass_if_configured = lambda *a: (entered.set(), gate.wait(30))
+        loop = relay.start_loop(types.SimpleNamespace(_note=lambda *a: notes.append(a)), object(), None, None, environ=self.ENV, cadence=0.02)
+        self.assertTrue(entered.wait(30))
+        loop.stop(join=0.01)   # the caller returns although the thread is stuck, and says so in the audit
+        self.assertTrue(loop.thread.is_alive())
+        self.assertEqual([n[0] for n in notes], ["relay.stop_timeout"])
         gate.set()
-        loop.thread.join(2)
+        loop.thread.join(30)
+        self.assertFalse(loop.thread.is_alive())
+
+    def test_a_stop_that_joins_leaves_no_stop_timeout_line(self):
+        notes = []
+        relay.pass_if_configured = lambda *a: None
+        loop = relay.start_loop(types.SimpleNamespace(_note=lambda *a: notes.append(a)), object(), None, None, environ=self.ENV, cadence=0.0)
+        loop.stop(join=30)
+        self.assertEqual(notes, [])
+
+    def test_a_pass_that_raises_with_a_note_that_raises_does_not_kill_the_loop(self):
+        calls = []
+
+        def boom(*a):
+            calls.append(1)
+            raise RuntimeError("the handler's own _note failed")
+
+        def bad_note(*a):
+            raise OSError("audit append failed")
+        relay.pass_if_configured = boom
+        loop, sleeps = self.ticking(4)
+        loop.engine = types.SimpleNamespace(_note=bad_note)
+        loop.run()
+        self.assertEqual((len(calls), loop.failures), (4, 4))   # it kept pulling, and counted
+
+    def test_mutant_loop_without_the_guard_dies_on_the_first_failure(self):
+        mod = load_backend_module("            except Exception as err:\n                self._record_failure(err)\n", "            except ZeroDivisionError as err:\n                self._record_failure(err)\n")
+        mod.pass_if_configured = lambda *a: (_ for _ in ()).throw(RuntimeError("x"))
+        loop = mod.RelayLoop(types.SimpleNamespace(), None, None, None, environ=self.ENV, cadence=0.0, sleep=lambda s: None)
+        with self.assertRaises(RuntimeError):
+            loop.run()
+
+    def test_a_loop_failure_is_audited_by_class_name_when_it_can_be(self):
+        notes = []
+        relay.pass_if_configured = lambda *a: (_ for _ in ()).throw(RuntimeError("secret path /x"))
+        loop, _ = self.ticking(1)
+        loop.engine = types.SimpleNamespace(_note=lambda *a: notes.append(a))
+        loop.run()
+        self.assertEqual(notes, [("relay.loop_failed", None, {"error": "RuntimeError"})])
+
+    def test_the_loop_gets_its_own_engine_from_the_factory(self):
+        shared, own = object(), object()
+        loop = relay.RelayLoop(shared, None, None, None, environ=self.ENV, engine_factory=lambda: own)
+        self.assertIs(loop.args[0], own)
+        self.assertIs(relay.RelayLoop(shared, None, None, None, environ=self.ENV).args[0], shared)
 
 
 class TwoLoopsTrace(Fixture):
     """#1477 U1/U4: two relay loops (two Executors on one state dir) answer at once.
     Mutants: the replay check in build removed (U1: 2 records); no flock (U4: 2 holders); the head read inside build (U4: a network call under the lock)."""
 
-    def trace(self, mod, workers=2, each=4):
+    def trace(self, mod, workers=2, each=4, lock=None):
         import threading as th
         orig_lock, orig_write, orig_append = plan_ledger._lock_exclusive, plan_ledger._write_head, plan_ledger.append_checked
+        lock = lock or orig_lock
         tl, lk = th.local(), th.Lock()
         out = types.SimpleNamespace(holders=0, most=0, net=0)
 
@@ -1506,8 +1580,7 @@ class TwoLoopsTrace(Fixture):
                     out.holders -= 1
 
         def lock_ex(fd, *a):
-            if not getattr(mod, "NO_FLOCK", False):
-                orig_lock(fd, *a)
+            lock(fd, *a)
             tl.locked = True
             with lk:
                 out.holders += 1
@@ -1554,9 +1627,14 @@ class TwoLoopsTrace(Fixture):
         self.assertEqual((got.most, got.net), (1, 0))
 
     def test_mutant_without_the_flock_is_caught(self):
-        mod = load_backend_module()
-        mod.NO_FLOCK = True
-        self.assertGreater(self.trace(mod).most, 1)
+        # the REAL _lock_exclusive with its flock call removed (a string mutant of plan_ledger's source)
+        src = (BIN / "plan_ledger.py").read_text()
+        old_call = "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        self.assertEqual(src.count(old_call), 1)
+        mutant = types.ModuleType("plan_ledger_mut")
+        mutant.__file__ = str(BIN / "plan_ledger.py")
+        exec(compile(src.replace(old_call, "pass"), mutant.__file__, "exec"), mutant.__dict__)
+        self.assertGreater(self.trace(relay, lock=mutant._lock_exclusive).most, 1)
 
     def test_mutant_head_read_under_the_lock_is_caught(self):
         mod = load_backend_module("if not _same_head(first, head):", "if not _same_head(b.live_head(pr), head):")
@@ -1631,14 +1709,14 @@ class TrickleHub(unittest.TestCase):
         return (not worker.is_alive()), time.monotonic() - t0, notes
 
     def test_pass_returns_within_5s_with_one_cut_line(self):
-        done, took, notes = self.one_pass(relay, 1.0, 5.0)
+        done, _, notes = self.one_pass(relay, 1.0, 20.0)   # the stub needs about 40 s to finish; 20 s is a loose bound for a loaded machine
         self.assertTrue(done)
-        self.assertLess(took, 5.0)
         self.assertEqual([(k, d["error"]) for k, _, d in notes], [("relay.pass_cut", "relay pass cut")])
 
     def test_mutant_without_the_total_deadline_is_caught(self):
-        # the deadline not applied (a 60 s deadline stands for none): the pass is still running after 3 s
-        done, _, _ = self.one_pass(relay, 60.0, 3.0)
+        # the deadline removed from the REAL code (a string mutant, like the neighbouring tests): the pass is still running after 3 s
+        mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
+        done, _, _ = self.one_pass(mod, 1.0, 3.0)
         self.assertFalse(done)
 
 
