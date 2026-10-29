@@ -15160,6 +15160,7 @@ class TestClearNotice(Base):
                 sb.clear_notice_pass(self.engine, self.later())
                 self.assertEqual(self.pending(), {}, "the good one is delivered and the poison is gone")
                 self.assertTrue(self.events("gate.clear_notice_quarantined"))
+                self.world.admissions("cos").clear() if False else None
                 self.setUp()
                 self.make_pending("clear")
                 pending = self.pending()
