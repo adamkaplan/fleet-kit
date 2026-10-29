@@ -20163,7 +20163,7 @@ def whole_read_problem(files_read, listed, bounds=None):
         rows[path] = (max(read, rows[path][0]) if path in rows else read, max(total, rows[path][1]) if path in rows else total)
     missing = [p for p in listed if p not in rows]
     if missing:
-        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each)" % ", ".join(_printable_path(p) for p in missing[:10])
+        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each) (each row's path is a repo path as in files.txt, e.g. bin/widget-api/app.py)" % ", ".join(_printable_path(p) for p in missing[:10])
     for path in listed:
         read, total = rows[path]
         bound = (bounds or {}).get(path, 0)
