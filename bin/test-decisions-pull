@@ -6,6 +6,8 @@ source is changed in one place and the same check must then fail.
 
     bin/test-decisions-pull
 """
+import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -48,8 +50,8 @@ def down(module):
     return fetch
 
 
-def pull_quiet(module, state, fetch, now=NOW, err=None):
-    return module.pull(state, fetch, now, err=err or io.StringIO())
+def pull_quiet(module, state, fetch, now=NOW, err=None, age=0, **kw):
+    return module.pull(state, fetch, now, err=err or io.StringIO(), age=None if age is None else (lambda: age), **kw)
 
 
 def fresh_file(state, text="OLD\n", age=5):
@@ -57,6 +59,20 @@ def fresh_file(state, text="OLD\n", age=5):
     path.write_text(text)
     os.utime(path, (NOW - age, NOW - age))
     return path
+
+
+def breaks_as(*kinds):
+    """A check whose wrong build fails by the very error the rule guards against (the mutant lets it escape): that named error is the
+    failed assertion. Any other error (a NameError, a SyntaxError) still escapes and is not a kill."""
+    def wrap(check):
+        def run(module):
+            try:
+                check(module)
+            except kinds as err:
+                raise AssertionError("%s escaped: %s" % (type(err).__name__, err))
+        run.__name__ = check.__name__
+        return run
+    return wrap
 
 
 # ---- the checks: each takes a module and raises AssertionError when the rule is broken
@@ -156,6 +172,7 @@ class FakeProc:
         return -9 if self.killed else self.code
 
 
+@breaks_as(OSError)
 def check_command_failure_is_unreachable(module):
     try:
         module.command_fetch(["x"], popen=lambda argv, **kw: FakeProc(b'{"decisions": [], "errors": []}', 1))
@@ -242,6 +259,7 @@ def check_control_characters_are_stripped(module):
         assert written["decisions"][0]["id"] == "gh:1"
 
 
+@breaks_as(OSError)
 def check_temp_file_is_exclusive_private_and_random(module):
     with tempfile.TemporaryDirectory() as state:
         names = []
@@ -289,6 +307,7 @@ def check_group_is_killed_when_a_grandchild_holds_the_pipe(module):
     assert time.time() - start < 10, "blocked past the deadline"
 
 
+@breaks_as(RecursionError)
 def check_deep_nesting_and_key_collisions_are_garbage(module):
     deep = "[" * 200 + "]" * 200
     collide = '{"decisions": [{"a\\u0001": 1, "a": 2}], "errors": []}'
@@ -308,6 +327,7 @@ def check_deep_nesting_and_key_collisions_are_garbage(module):
         assert path.read_text() == "OLD\n"
 
 
+@breaks_as(RecursionError)
 def check_clean_itself_overflowing_is_garbage(module):
     """clean() (not json.loads) hits the recursion limit: the structure is pre-built, json.loads is replaced by one returning it, the depth cap is
     lifted and the limit lowered only around pull(). Independent of how many frames a comprehension costs in this Python."""
@@ -326,7 +346,7 @@ def check_clean_itself_overflowing_is_garbage(module):
         old = sys.getrecursionlimit()
         sys.setrecursionlimit(frames + 150)
         try:
-            result = module.pull(state, lambda: b"{}", NOW, err=err)
+            result = module.pull(state, lambda: b"{}", NOW, err=err, age=lambda: 0)
         finally:
             sys.setrecursionlimit(old)
         assert result == "untouched", result
@@ -351,24 +371,24 @@ def check_reasons_are_said_on_stderr(module):
     with tempfile.TemporaryDirectory() as state:
         err = io.StringIO()
         fresh_file(state)
-        module.pull(state, lambda: ('{"x": "%s"}' % secret).encode(), NOW, err=err)
+        module.pull(state, lambda: ('{"x": "%s"}' % secret).encode(), NOW, err=err, age=lambda: 0)
         lines = err.getvalue().splitlines()
         assert len(lines) == 1 and "not the daemon's decisions list" in lines[0] and "untouched" in lines[0], lines
         assert secret not in err.getvalue()
         err = io.StringIO()
         def fetch():
             raise module.Unreachable("exit 7")
-        module.pull(state, fetch, NOW, err=err)
+        module.pull(state, fetch, NOW, err=err, age=lambda: 0)
         lines = err.getvalue().splitlines()
         assert len(lines) == 1 and "unreachable (exit 7)" in lines[0] and "marked" in lines[0], lines
     with tempfile.TemporaryDirectory() as state:
         err = io.StringIO()
-        module.pull(state, fetch, NOW, err=err)
+        module.pull(state, fetch, NOW, err=err, age=lambda: 0)
         lines = err.getvalue().splitlines()
         assert len(lines) == 1 and "unreachable (exit 7)" in lines[0] and "no decisions.json to mark stale" in lines[0], lines
     with tempfile.TemporaryDirectory() as state:
         err = io.StringIO()
-        module.pull(state, good(), NOW, err=err)
+        module.pull(state, good(), NOW, err=err, age=lambda: 0)
         assert err.getvalue() == "", err.getvalue()
 
 
@@ -412,6 +432,181 @@ def daemon_source():
     return "\n".join((BIN / n).read_text() for n in lines)
 
 
+# ---- #1158: freshness from the supplied age, not from the body
+OLD_WRITTEN = "2026-10-22T08:00:00Z"   # 2 h before NOW's day is irrelevant: the checks below set written_at explicitly
+
+
+def iso_at(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def body_with(**kw):
+    return dict(BODY, **kw)
+
+
+def held_state(state, **kw):
+    """A held decisions.json written by the pull itself (so its shape is the real one), then aged to 5 s."""
+    load_ = load()
+    pull_quiet(load_, state, good(body_with(**kw)), NOW - 5)
+    return Path(state) / "decisions.json"
+
+
+def check_idle_healthy_daemon_is_fresh(module):          # S3
+    with tempfile.TemporaryDirectory() as state:
+        body = body_with(written_at=iso_at(NOW - 7200))
+        assert pull_quiet(module, state, good(body), NOW, age=20) == "wrote"
+        assert abs((NOW - (Path(state) / "decisions.json").stat().st_mtime) - 20) <= 1
+
+
+def check_stopped_daemon_is_stale(module):               # S4
+    with tempfile.TemporaryDirectory() as state:
+        path = fresh_file(state, age=5)
+        before = path.read_bytes()
+        assert pull_quiet(module, state, good(body_with(written_at=iso_at(NOW))), NOW, age=400) == "marked-stale"
+        assert NOW - path.stat().st_mtime > 180 and path.read_bytes() == before
+
+
+def check_future_written_at_is_not_trusted(module):      # S5
+    with tempfile.TemporaryDirectory() as state:
+        path = fresh_file(state)
+        before = path.read_bytes()
+        assert pull_quiet(module, state, good(body_with(written_at=iso_at(NOW + 600))), NOW, age=0) == "marked-stale"
+        assert path.read_bytes() == before and NOW - path.stat().st_mtime > 180
+
+
+def check_future_tolerance_is_small(module):
+    with tempfile.TemporaryDirectory() as state:
+        assert pull_quiet(module, state, good(body_with(written_at=iso_at(NOW + 30))), NOW) == "wrote"
+
+
+def check_bad_age_is_unreachable(module):                # S6
+    for age in (None, -1, "-5", "abc", "1.5", "", 86401, 10 ** 12 + 1):
+        with tempfile.TemporaryDirectory() as state:
+            path = fresh_file(state)
+            result = pull_quiet(module, state, good(), NOW, age=age)
+            assert result == "marked-stale", (age, result)
+            assert path.read_text() == "OLD\n"
+
+
+def check_restart_at_generation_one_is_accepted(module):  # S7
+    with tempfile.TemporaryDirectory() as state:
+        held_state(state, generation=40, daemon_pid=7)
+        assert pull_quiet(module, state, good(body_with(generation=1, daemon_pid=9)), NOW) == "wrote"
+        got = json.loads((Path(state) / "decisions.json").read_text())
+        assert (got["generation"], got["daemon_pid"]) == (1, 9)
+
+
+def check_same_pid_lower_generation_is_refused(module):   # S8
+    with tempfile.TemporaryDirectory() as state:
+        path = held_state(state, generation=40, daemon_pid=7)
+        assert pull_quiet(module, state, good(body_with(generation=3, daemon_pid=7)), NOW) == "marked-stale"
+        assert json.loads(path.read_text())["generation"] == 40
+
+
+def check_huge_generation_cannot_block(module):          # S9
+    with tempfile.TemporaryDirectory() as state:
+        assert pull_quiet(module, state, good(body_with(generation=2 ** 62)), NOW) == "untouched"
+        assert pull_quiet(module, state, good(body_with(generation=5)), NOW) == "wrote"
+        assert json.loads((Path(state) / "decisions.json").read_text())["generation"] == 5
+
+
+def check_out_of_bound_held_generation_recovers(module):  # S10
+    with tempfile.TemporaryDirectory() as state:
+        path = Path(state) / "decisions.json"
+        path.write_text(json.dumps(body_with(generation=2 ** 62)))
+        assert pull_quiet(module, state, good(body_with(generation=5)), NOW) == "wrote"   # an out-of-bound held generation counts as none
+        assert json.loads(path.read_text())["generation"] == 5
+        path.unlink()
+        assert pull_quiet(module, state, good(body_with(generation=4)), NOW) == "wrote"
+    with tempfile.TemporaryDirectory() as state:     # an in-bound held generation: refused, then the flag accepts once, and the message names it
+        held_state(state, generation=40, daemon_pid=7)
+        err = io.StringIO()
+        assert pull_quiet(module, state, good(body_with(generation=3, daemon_pid=7)), NOW, err=err) == "marked-stale"
+        assert "--reset-generation" in err.getvalue() and "decisions.json" in err.getvalue()
+        assert pull_quiet(module, state, good(body_with(generation=3, daemon_pid=7)), NOW, reset_generation=True) == "wrote"
+
+
+def check_age_limit_matches_the_plugin(module):          # S13
+    for age, want in ((180, "wrote"), (181, "marked-stale")):
+        with tempfile.TemporaryDirectory() as state:
+            fresh_file(state)
+            assert pull_quiet(module, state, good(), NOW, age=age) == want, age
+
+
+def check_equal_generation_is_written(module):           # S14
+    with tempfile.TemporaryDirectory() as state:
+        path = held_state(state, generation=7, daemon_pid=42)
+        assert pull_quiet(module, state, good(body_with(generation=7, daemon_pid=42)), NOW, age=2) == "wrote"
+        assert json.loads(path.read_text())["generation"] == 7 and NOW - path.stat().st_mtime < 5
+
+
+def check_generation_bound_is_exact(module):             # S15
+    for gen, want in ((0, "wrote"), (2 ** 31 - 1, "wrote"), (2 ** 31, "untouched"), (True, "untouched"), (-1, "untouched"), ("3", "untouched")):
+        with tempfile.TemporaryDirectory() as state:
+            assert pull_quiet(module, state, good(body_with(generation=gen)), NOW) == want, gen
+
+
+def check_refusal_does_not_echo_the_body(module):        # S16
+    secret = "SECRET-ghp_abc123"
+    cases = [body_with(generation=2 ** 62, note=secret), body_with(written_at=iso_at(NOW + 999), note=secret),
+             dict(body_with(note=secret), decisions="x"), body_with(daemon_pid=7, generation=1, note=secret)]
+    for case in cases:
+        with tempfile.TemporaryDirectory() as state:
+            held_state(state, generation=40, daemon_pid=7)
+            err = io.StringIO()
+            pull_quiet(module, state, good(case), NOW, err=err)
+            assert secret not in err.getvalue()
+    with tempfile.TemporaryDirectory() as state:
+        err = io.StringIO()
+        pull_quiet(module, state, lambda: secret.encode(), NOW, err=err)
+        assert secret not in err.getvalue()
+
+
+def check_unchanged_fresh_body_is_rewritten_as_before(module):   # U1
+    with tempfile.TemporaryDirectory() as state:
+        pull_quiet(module, state, good(), NOW - 100)
+        path = Path(state) / "decisions.json"
+        assert pull_quiet(module, state, good(), NOW, age=20) == "wrote"
+        assert path.read_text() == json.dumps(BODY, indent=1, sort_keys=True) + "\n"
+        assert (path.stat().st_mode & 0o777) == 0o600 and path.stat().st_mtime == NOW - 20
+
+
+def check_unreachable_and_garbage_as_before(module):     # U2
+    with tempfile.TemporaryDirectory() as state:
+        path = fresh_file(state)
+        assert pull_quiet(module, state, down(module), NOW, age=0) == "marked-stale"
+        assert path.read_text() == "OLD\n"
+    with tempfile.TemporaryDirectory() as state:
+        path = fresh_file(state)
+        before = (path.read_bytes(), path.stat().st_mtime)
+        assert pull_quiet(module, state, lambda: b"garbage", NOW, age=0) == "untouched"
+        assert (path.read_bytes(), path.stat().st_mtime) == before
+
+
+def check_age_command_unreachable_is_stale(module):
+    with tempfile.TemporaryDirectory() as state:
+        path = fresh_file(state)
+        def no_age():
+            raise module.Unreachable("down")
+        assert module.pull(state, good(), NOW, err=io.StringIO(), age=no_age) == "marked-stale"
+        assert NOW - path.stat().st_mtime > 180
+
+
+def check_cli_age_command(module):
+    import contextlib
+    with tempfile.TemporaryDirectory() as state:
+        src = ["--", sys.executable, "-c", "import json,sys; print(json.dumps(%r))" % (BODY,)]
+
+        def run(*extra):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                module.main(["--state", state] + list(extra) + src)
+            return out.getvalue().strip()
+        assert run() == "untouched"      # no age command = a missing age, and there is no file yet to age: exactly "untouched", never "wrote"
+        assert run("--age-command", "%s -c 'print(30)'" % sys.executable) == "wrote"
+        assert run("--age-command", "%s -c 'print(500)'" % sys.executable) == "marked-stale"
+
+
 def daemon_keys():
     """The keys the daemon's DecisionStore.publish writes into decisions.json, read from its source."""
     text = daemon_source()
@@ -429,6 +624,209 @@ def check_kept_keys_are_the_daemons(module):
     assert set(module.KEPT_KEYS) == keys, (set(module.KEPT_KEYS) ^ keys)
 
 
+def hub(body, **extra):
+    """A hub response: the decisions body plus age_seconds in ONE object, the shape the plan (#1158) gives GET /decisions."""
+    return good(dict(body, **extra))
+
+
+def check_hub_age_is_judged_from_the_response(module):    # S26, S3, S4 through the one response
+    cases = (({}, "marked-stale"), ({"age_seconds": "20"}, "marked-stale"), ({"age_seconds": -1}, "marked-stale"),
+             ({"age_seconds": 25.3}, "marked-stale"), ({"age_seconds": True}, "marked-stale"), ({"age_seconds": None}, "marked-stale"),
+             ({"age_seconds": 86401}, "marked-stale"), ({"age_seconds": 400}, "marked-stale"), ({"age_seconds": 20}, "wrote"))
+    for extra, want in cases:
+        with tempfile.TemporaryDirectory() as state:
+            path = fresh_file(state)
+            assert pull_quiet(module, state, hub(BODY, **extra), NOW, age=None) == want, extra
+            if want == "wrote":
+                assert "age_seconds" not in json.loads(path.read_text()), "age_seconds was written"
+                assert path.read_text() == json.dumps(BODY, indent=1, sort_keys=True) + "\n"
+                assert path.stat().st_mtime == NOW - 20
+            else:
+                assert path.read_text() == "OLD\n" and NOW - path.stat().st_mtime > 180, extra
+
+
+def check_hub_idle_daemon_with_old_written_at_is_fresh(module):
+    with tempfile.TemporaryDirectory() as state:
+        body = body_with(written_at=iso_at(NOW - 7200))
+        assert pull_quiet(module, state, hub(body, age_seconds=20), NOW, age=None) == "wrote"
+        assert abs((NOW - (Path(state) / "decisions.json").stat().st_mtime) - 20) <= 1
+
+
+def check_plain_file_body_age_seconds_is_ignored(module):     # panel 4: a plain file's own age_seconds never skips --age-command
+    for body_age, command_age, want in ((0, 400, "marked-stale"), (400, 20, "wrote")):
+        with tempfile.TemporaryDirectory() as state:
+            path = fresh_file(state)
+            err = io.StringIO()
+            assert pull_quiet(module, state, hub(BODY, age_seconds=body_age), NOW, err=err, age=command_age) == want, (body_age, command_age)
+            assert "is ignored" in err.getvalue(), err.getvalue()
+            if want == "wrote":
+                assert "age_seconds" not in json.loads(path.read_text())
+    with tempfile.TemporaryDirectory() as state:         # the command IS run
+        ran = []
+        def command():
+            ran.append(1)
+            return 20
+        assert module.pull(state, hub(BODY, age_seconds=0), NOW, err=io.StringIO(), age=command) == "wrote" and ran == [1]
+
+
+def check_plain_file_source_uses_the_age_command(module):   # S17
+    for age, want in ((20, "wrote"), (400, "marked-stale")):
+        with tempfile.TemporaryDirectory() as state:
+            path = fresh_file(state)
+            err = io.StringIO()
+            assert pull_quiet(module, state, good(), NOW, err=err, age=age) == want, age
+            assert "ignored" not in err.getvalue(), err.getvalue()
+            if want == "wrote":
+                assert abs((NOW - path.stat().st_mtime) - 20) <= 1
+
+
+def check_response_age_edges_and_one_fetch(module):       # panel 6
+    def raw(text):
+        return lambda: text.encode()
+    body = json.dumps(BODY)[:-1]
+    cases = (("NaN", "marked-stale"), ("Infinity", "marked-stale"), ("-Infinity", "marked-stale"),
+             ("86400", "wrote"), ("86401", "marked-stale"), (str(10 ** 12 + 1), "marked-stale"))
+    for text, want in cases:
+        with tempfile.TemporaryDirectory() as state:
+            path = fresh_file(state)
+            calls = []
+            def fetch():
+                calls.append(1)
+                return (body + ', "age_seconds": %s}' % text).encode()
+            if want == "wrote":      # a day old is over the 180 s limit: accepted as an age, then judged stale
+                want = "marked-stale"
+            assert pull_quiet(module, state, fetch, NOW, age=None) == want, text
+            assert calls == [1], "fetch ran %d times" % len(calls)
+            assert path.read_text() == "OLD\n" and NOW - path.stat().st_mtime > 180, text
+    with tempfile.TemporaryDirectory() as state:         # 86400 itself is a believed age (not unreachable): it is judged by the 180 s limit
+        err = io.StringIO()
+        pull_quiet(module, state, raw(body + ', "age_seconds": 86400}'), NOW, err=err, age=None)
+        assert "over a day" not in err.getvalue() and "not an integer" not in err.getvalue() and "86400 s old" in err.getvalue(), err.getvalue()
+    with tempfile.TemporaryDirectory() as state:
+        err = io.StringIO()
+        pull_quiet(module, state, raw(body + ', "age_seconds": %d}' % (10 ** 12 + 1)), NOW, err=err, age=None)
+        assert "over a day" in err.getvalue() or "not a non-negative integer" in err.getvalue(), err.getvalue()
+    with tempfile.TemporaryDirectory() as state:
+        err = io.StringIO()
+        pull_quiet(module, state, raw(body + ', "age_seconds": 86401}'), NOW, err=err, age=None)
+        assert "over a day" in err.getvalue(), err.getvalue()
+
+
+def check_written_at_formats(module):                     # low b
+    for stamp in (iso_at(NOW + 600), iso_at(NOW + 600)[:-1] + "+00:00", iso_at(NOW + 600)[:-1] + ".250Z",
+                  iso_at(NOW + 600)[:-1] + ".123456789+00:00", iso_at(NOW + 600)[:-1] + "+00:00"):
+        with tempfile.TemporaryDirectory() as state:
+            path = fresh_file(state)
+            assert pull_quiet(module, state, good(body_with(written_at=stamp)), NOW, age=5) == "marked-stale", stamp
+    for stamp in (iso_at(NOW + 30)[:-1] + ".5+00:00", iso_at(NOW - 600)[:-1] + "+00:00", "garbage", 5):
+        with tempfile.TemporaryDirectory() as state:
+            assert pull_quiet(module, state, good(body_with(written_at=stamp)), NOW, age=5) == "wrote", stamp
+
+
+def check_interleaved_pulls_cannot_lower_the_generation(module):   # panel 5
+    import threading
+    with tempfile.TemporaryDirectory() as state:
+        held = fresh_file(state, json.dumps(body_with(generation=5, daemon_pid=42)), age=5)
+        real = module.write_atomic
+        started, results = threading.Event(), {}
+        def slow(path, body, now, written=None):
+            if body["generation"] == 9:
+                started.set()
+                time.sleep(0.5)            # pull B runs now; without the lock it checks against the old generation 5
+            return real(path, body, now, written)
+        module.write_atomic = slow
+        def second():
+            started.wait(5)
+            results["b"] = pull_quiet(module, state, good(body_with(generation=7, daemon_pid=42)), NOW, age=5)
+        thread = threading.Thread(target=second)
+        thread.start()
+        try:
+            results["a"] = pull_quiet(module, state, good(body_with(generation=9, daemon_pid=42)), NOW, age=5)
+        finally:
+            thread.join(10)
+            module.write_atomic = real
+        assert results == {"a": "wrote", "b": "marked-stale"}, results
+        assert json.loads(held.read_text())["generation"] == 9, "a lower generation overwrote a higher one"
+
+
+def _hold_lock(state):
+    import fcntl
+    fd = os.open(state, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def check_held_lock_skips_within_the_bound_and_writes_nothing(module):
+    import threading
+    with tempfile.TemporaryDirectory() as state:
+        held = fresh_file(state, "OLD\n", age=5)
+        before = (held.read_bytes(), held.stat().st_mtime_ns)
+        fd = _hold_lock(state)
+        out, err = {}, io.StringIO()
+        def run():
+            start = time.monotonic()
+            out["r"] = pull_quiet(module, state, good(), NOW, err=err, age=5)
+            out["t"] = time.monotonic() - start
+        thread = threading.Thread(target=run, daemon=True)
+        try:
+            thread.start()
+            thread.join(8)
+            assert not thread.is_alive(), "the pull hangs on a held lock"
+        finally:
+            os.close(fd)
+            thread.join(8)   # a blocked pull wakes on release: let it finish before the directory is removed
+        assert out["r"] == "untouched" and out["t"] < 4, out
+        assert "lock" in err.getvalue() and len(err.getvalue().splitlines()) == 1, err.getvalue()
+        assert (held.read_bytes(), held.stat().st_mtime_ns) == before, "the held file changed without the lock"
+
+
+def check_free_lock_writes(module):
+    with tempfile.TemporaryDirectory() as state:
+        fresh_file(state, "OLD\n", age=5)
+        assert pull_quiet(module, state, good(), NOW, age=5) == "wrote"
+        assert json.loads((Path(state) / "decisions.json").read_text())["generation"] == 7
+
+
+def held_with(state, **kw):
+    """A held file written by the pull itself, with the given keys removed (value None in kw removes the key)."""
+    body = {k: v for k, v in body_with(**kw).items() if not (k in kw and kw[k] is _ABSENT)}
+    pull_quiet(load(), state, good(body), NOW - 5)
+    return Path(state) / "decisions.json"
+
+
+_ABSENT = object()
+
+
+def check_unusable_held_pid_is_judged_by_generation_alone(module):   # S18
+    for held_pid in (_ABSENT, None, "7", True, [7], 1.5):
+        for source_pid in (42, _ABSENT, held_pid):
+            for gen, label in ((3, "lower"), (40, "same")):
+                with tempfile.TemporaryDirectory() as state:
+                    path = held_with(state, generation=40, daemon_pid=held_pid)
+                    source = {k: v for k, v in body_with(generation=gen, daemon_pid=source_pid).items() if v is not _ABSENT}
+                    assert pull_quiet(module, state, good(source), NOW) == "wrote", (held_pid, source_pid, label)
+                    assert json.loads(path.read_text())["generation"] == gen
+
+
+def check_pid_change_with_higher_generation_is_written(module):   # S19
+    with tempfile.TemporaryDirectory() as state:
+        path = held_state(state, generation=5, daemon_pid=7)
+        assert pull_quiet(module, state, good(body_with(generation=9, daemon_pid=11)), NOW) == "wrote"
+        got = json.loads(path.read_text())
+        assert (got["generation"], got["daemon_pid"]) == (9, 11)
+
+
+def check_same_pid_restart_at_generation_one(module):     # S20
+    with tempfile.TemporaryDirectory() as state:
+        path = held_state(state, generation=40, daemon_pid=7)
+        again = good(body_with(generation=1, daemon_pid=7))
+        err = io.StringIO()
+        assert pull_quiet(module, state, again, NOW, err=err) == "marked-stale"
+        assert json.loads(path.read_text())["generation"] == 40 and "--reset-generation" in err.getvalue()
+        assert pull_quiet(module, state, again, NOW, reset_generation=True) == "wrote"
+        assert json.loads(path.read_text())["generation"] == 1
+
+
 ALL = [check_shape_is_the_daemons, check_unknown_keys_are_dropped, check_write_is_atomic, check_failed_write_leaves_old_file,
        check_unreachable_marks_stale, check_stale_never_made_fresher, check_unreachable_without_file_creates_none,
        check_garbage_leaves_file_untouched, check_command_failure_is_unreachable, check_real_timeout_is_unreachable,
@@ -437,7 +835,19 @@ ALL = [check_shape_is_the_daemons, check_unknown_keys_are_dropped, check_write_i
        check_reasons_are_said_on_stderr, check_stale_ages_the_descriptor_not_the_path, check_directory_is_fsynced_after_rename,
        check_kept_keys_are_the_daemons, check_temp_file_is_exclusive_private_and_random,
        check_group_is_killed_when_a_grandchild_holds_the_pipe, check_deep_nesting_and_key_collisions_are_garbage,
-       check_clean_itself_overflowing_is_garbage, check_depth_boundary]
+       check_clean_itself_overflowing_is_garbage, check_depth_boundary,
+       check_idle_healthy_daemon_is_fresh, check_stopped_daemon_is_stale, check_future_written_at_is_not_trusted,
+       check_future_tolerance_is_small, check_bad_age_is_unreachable, check_restart_at_generation_one_is_accepted,
+       check_same_pid_lower_generation_is_refused, check_huge_generation_cannot_block, check_out_of_bound_held_generation_recovers,
+       check_age_limit_matches_the_plugin, check_equal_generation_is_written, check_generation_bound_is_exact,
+       check_refusal_does_not_echo_the_body, check_unchanged_fresh_body_is_rewritten_as_before,
+       check_unreachable_and_garbage_as_before, check_age_command_unreachable_is_stale, check_cli_age_command,
+       check_hub_age_is_judged_from_the_response, check_hub_idle_daemon_with_old_written_at_is_fresh,
+       check_plain_file_body_age_seconds_is_ignored, check_plain_file_source_uses_the_age_command,
+       check_unusable_held_pid_is_judged_by_generation_alone, check_pid_change_with_higher_generation_is_written,
+       check_same_pid_restart_at_generation_one, check_response_age_edges_and_one_fetch, check_written_at_formats,
+       check_interleaved_pulls_cannot_lower_the_generation, check_held_lock_skips_within_the_bound_and_writes_nothing,
+       check_free_lock_writes]
 
 
 class RealCode(unittest.TestCase):
@@ -464,9 +874,65 @@ class RealCode(unittest.TestCase):
             self.assertEqual(plugin(state, NOW + 10)[:2], ["stale", 1])
 
 
+def load_switchboard():
+    loader = importlib.machinery.SourceFileLoader("fleet_switchboard_under_test", str(BIN / "fleet-switchboard"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class RealDaemon(unittest.TestCase):
+    """The cause (#1158, DW-1), pinned against the real LocalStore.publish: it is read, never changed."""
+
+    def store(self, state):
+        sb = load_switchboard()
+        engine = types.SimpleNamespace(state_dir=Path(state), decisions_generation=0)
+        return sb.LocalStore(engine)
+
+    def test_s1_unchanged_list_only_moves_the_mtime(self):
+        with tempfile.TemporaryDirectory() as state:
+            store = self.store(state)
+            path = Path(state) / "decisions.json"
+            self.assertTrue(store.publish([], [], NOW))
+            first = json.loads(path.read_text())
+            self.assertFalse(store.publish([], [], NOW + 60))
+            second = json.loads(path.read_text())
+            self.assertEqual((second["written_at"], second["generation"]), (first["written_at"], first["generation"]))
+            self.assertEqual(path.stat().st_mtime, NOW + 60)
+
+    def test_s2_fresh_volume_restarts_at_generation_one(self):
+        with tempfile.TemporaryDirectory() as state:
+            self.store(state).publish([], [], NOW)
+            body = json.loads((Path(state) / "decisions.json").read_text())
+            self.assertEqual((body["generation"], body["daemon_pid"]), (1, os.getpid()))
+
+    def test_s12_real_plugin_follows_the_pull(self):
+        """The held file is written by the pull itself (never by this test); the real plugin then judges the age the pull set.
+        Fails, never skips, when node is missing."""
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required: the plugin round trip must not be skipped")
+        script = ("import {loadSnapshot} from '%s'; const s = loadSnapshot(process.argv[1], Number(process.argv[2])); console.log(s.status)"
+                  % (BIN.parent / "plugins/fleet-decisions-tui/decisions.mjs"))
+
+        def status(state):
+            out = subprocess.run([node, "--input-type=module", "-e", script, state, str(int(NOW * 1000))], stdout=subprocess.PIPE, check=True).stdout
+            return out.decode().strip()
+        module = load()
+        with tempfile.TemporaryDirectory() as state:
+            self.assertEqual(pull_quiet(module, state, hub(BODY, age_seconds=0), NOW, age=None), "wrote")   # the pull pre-writes the file
+            self.assertEqual(status(state), "ok")
+            self.assertEqual(pull_quiet(module, state, hub(BODY, age_seconds=400), NOW, age=None), "marked-stale")
+            self.assertEqual(status(state), "stale")
+            self.assertEqual(pull_quiet(module, state, hub(BODY, age_seconds=180), NOW, age=None), "wrote")
+            self.assertEqual(status(state), "ok")
+            self.assertEqual(pull_quiet(module, state, hub(BODY, age_seconds=181), NOW, age=None), "marked-stale")
+            self.assertEqual(status(state), "stale")
+
+
 class Mutants(unittest.TestCase):
     def failing(self, check, module):
-        with self.assertRaises(Exception):
+        with self.assertRaises(AssertionError):     # only a failed check counts as a kill: a NameError or a crash does not
             check(module)
 
     def test_indent_changed(self):
@@ -500,7 +966,7 @@ class Mutants(unittest.TestCase):
         self.failing(check_unreachable_without_file_creates_none, mutant("    except OSError:\n        return False", "    except OSError:\n        path.write_text('{}')\n        return False"))
 
     def test_garbage_overwrites(self):
-        self.failing(check_garbage_leaves_file_untouched, mutant("        return UNTOUCHED\n    write_atomic(path, body, now)", "        body = {'decisions': [], 'errors': []}\n    write_atomic(path, body, now)"))
+        self.failing(check_garbage_leaves_file_untouched, mutant("        return UNTOUCHED\n    if seconds > STALE_SECONDS:", "        body = {'decisions': [], 'errors': []}\n    if seconds > STALE_SECONDS:"))
 
     def test_shape_not_checked(self):
         self.failing(check_garbage_leaves_file_untouched, mutant("isinstance(body.get(\"decisions\"), list) and ", ""))
@@ -545,16 +1011,16 @@ class Mutants(unittest.TestCase):
         self.failing(check_reasons_are_said_on_stderr, mutant('        say(err, "source answered something', '        pass  # say(err, "source answered something'))
 
     def test_unreachable_reason_not_said(self):
-        self.failing(check_reasons_are_said_on_stderr, mutant('            say(err, "source unreachable (%s); marked', '            pass  # say(err, "source unreachable (%s); marked'))
+        self.failing(check_reasons_are_said_on_stderr, mutant('            say(err, "%s; marked', '            pass  # say(err, "%s; marked'))
 
     def test_no_file_reason_not_said(self):
-        self.failing(check_reasons_are_said_on_stderr, mutant('        say(err, "source unreachable (%s); no', '        pass  # say(err, "source unreachable (%s); no'))
+        self.failing(check_reasons_are_said_on_stderr, mutant('        say(err, "%s; no', '        pass  # say(err, "%s; no'))
 
     def test_reason_prints_the_body(self):
         self.failing(check_reasons_are_said_on_stderr, mutant('(%s); %s untouched" % (why, DECISIONS_FILE))', '(%s); %s untouched" % (raw, DECISIONS_FILE))'))
 
     def test_exit_code_not_in_reason(self):
-        self.failing(check_reasons_are_said_on_stderr, mutant('"source unreachable (%s); marked %s stale" % (why, DECISIONS_FILE)', '"source unreachable; marked %s stale" % DECISIONS_FILE'))
+        self.failing(check_reasons_are_said_on_stderr, load(SOURCE.replace('"source unreachable (%s)" % why', '"source unreachable"')))
 
     def test_stale_by_path_not_descriptor(self):
         self.failing(check_stale_ages_the_descriptor_not_the_path, mutant("os.utime(fd, (older, older))", "os.utime(str(path), (older, older))"))
@@ -609,6 +1075,116 @@ class Mutants(unittest.TestCase):
 
     def test_key_collision_accepted(self):
         self.failing(check_deep_nesting_and_key_collisions_are_garbage, mutant("        if len(out) != len(value):", "        if False:"))
+
+
+    def test_m1_judged_by_written_at(self):
+        self.failing(check_idle_healthy_daemon_is_fresh, mutant("    if seconds > STALE_SECONDS:", '    if now - datetime.datetime.strptime(body["written_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp() > STALE_SECONDS:'))
+
+    def test_m2_future_accepted(self):
+        self.failing(check_future_written_at_is_not_trusted, mutant("    return stamp > now + FUTURE_TOLERANCE", "    return False"))
+
+    def test_m3_any_lower_generation_refused(self):
+        self.failing(check_restart_at_generation_one_is_accepted, mutant(" and same_daemon(held, body)", ""))
+
+    def test_m4_generation_not_bounded(self):
+        self.failing(check_huge_generation_cannot_block, mutant("0 <= generation <= MAX_GENERATION", "0 <= generation"))
+
+    def test_m5_missing_age_defaults_to_zero(self):
+        self.failing(check_bad_age_is_unreachable, mutant('raise Unreachable("no age supplied")', "return 0"))
+
+    def test_m6_mtime_set_to_now(self):
+        self.failing(check_stopped_daemon_is_stale, load(SOURCE.replace("    if seconds > STALE_SECONDS:\n", "    if False:\n").replace("write_atomic(path, body, now - seconds, now)", "write_atomic(path, body, now, now)")))
+        self.failing(check_idle_healthy_daemon_is_fresh, mutant("write_atomic(path, body, now - seconds, now)", "write_atomic(path, body, now, now)"))
+
+    def test_m7_stale_limit_changed(self):
+        self.failing(check_age_limit_matches_the_plugin, mutant("    if seconds > STALE_SECONDS:", "    if seconds > 300:"))
+
+    def test_m8_equal_generation_refused(self):
+        self.failing(check_equal_generation_is_written, mutant('new < held["generation"]', 'new <= held["generation"]'))
+
+    def test_m9_same_pid_lower_accepted(self):
+        self.failing(check_same_pid_lower_generation_is_refused, mutant("new < held[\"generation\"] and not reset_generation and", "False and"))
+
+    def test_m10_bound_off_by_one(self):
+        self.failing(check_generation_bound_is_exact, mutant("<= MAX_GENERATION", "< MAX_GENERATION"))
+        self.failing(check_generation_bound_is_exact, mutant("<= MAX_GENERATION", "<= MAX_GENERATION + 1"))
+
+    def test_m11_bool_generation_accepted(self):
+        self.failing(check_generation_bound_is_exact, mutant("isinstance(generation, int) and not isinstance(generation, bool)", "isinstance(generation, int)"))
+
+    def test_m12_no_reset_flag(self):
+        self.failing(check_out_of_bound_held_generation_recovers, mutant(" and not reset_generation", ""))
+
+    def test_m13_recovery_not_named(self):
+        self.failing(check_out_of_bound_held_generation_recovers, mutant("to accept it once run with \"\n                         \"--reset-generation, or delete %s", "to accept it once \"\n                         \"%s"))
+
+    def test_m14_out_of_bound_held_counts(self):
+        self.failing(check_out_of_bound_held_generation_recovers, mutant("or not in_bound(body.get(\"generation\")):\n        return None", "or False:\n        return None"))
+
+    def test_m15_refusal_echoes_body(self):
+        self.failing(check_refusal_does_not_echo_the_body, mutant('raise Garbage("generation outside 0 to %d" % MAX_GENERATION)', 'raise Garbage("generation %r" % (body,))'))
+
+    def test_m16_garbage_with_fresh_age_writes_placeholder(self):
+        self.failing(check_unreachable_and_garbage_as_before, mutant('        return UNTOUCHED\n    if seconds > STALE_SECONDS:', '        write_atomic(path, {"decisions": [], "errors": []}, now)\n        return UNTOUCHED\n    if seconds > STALE_SECONDS:'))
+
+    def test_m18_negative_age_believed(self):
+        self.failing(check_bad_age_is_unreachable, mutant('r"[0-9]{1,12}"', 'r"-?[0-9]{1,12}"'))
+
+    def test_m19_future_tolerance_zero(self):
+        self.failing(check_future_tolerance_is_small, mutant("FUTURE_TOLERANCE = 60", "FUTURE_TOLERANCE = 0"))
+
+    def test_m20_age_command_failure_believed(self):
+        self.failing(check_age_command_unreachable_is_stale, mutant("            seconds = parse_age(age())", "            seconds = 0"))
+
+    def test_m21_cli_ignores_age_command(self):
+        self.failing(check_cli_age_command, mutant("age=age, reset_generation", "age=None, reset_generation"))
+
+
+    def test_m22_command_age_preferred_over_response(self):
+        self.failing(check_plain_file_body_age_seconds_is_ignored, mutant('        if age is not None:                                  # a plain-file source', '        if False:                                            # a plain-file source'))
+
+    def test_m23_missing_response_age_is_zero(self):
+        self.failing(check_hub_age_is_judged_from_the_response, mutant('raise Unreachable("age_seconds is not an integer")', "return 0"))
+
+    def test_m24_response_age_type_not_checked(self):
+        self.failing(check_hub_age_is_judged_from_the_response, mutant("    if not isinstance(value, int) or isinstance(value, bool):", "    if False:"))
+
+    def test_m25_age_seconds_written_to_the_file(self):
+        self.failing(check_hub_age_is_judged_from_the_response, load(SOURCE.replace('KEPT_KEYS = ("generation"', 'KEPT_KEYS = ("age_seconds", "generation"').replace(
+            'seconds = response_age(body.pop("age_seconds"))', 'seconds = response_age(body["age_seconds"])')))
+
+    def test_m26_age_command_removed(self):
+        self.failing(check_plain_file_source_uses_the_age_command, mutant("            seconds = parse_age(age())", "            seconds = parse_age(None)"))
+
+    def test_m27_missing_pid_equals_missing_pid(self):
+        self.failing(check_unusable_held_pid_is_judged_by_generation_alone, mutant('    return isinstance(pid, int) and not isinstance(pid, bool) and body.get("daemon_pid") == pid', '    return body.get("daemon_pid") == held.get("daemon_pid")'))
+
+    def test_m28_odd_pid_is_a_pid(self):
+        self.failing(check_unusable_held_pid_is_judged_by_generation_alone, mutant("isinstance(pid, int) and not isinstance(pid, bool) and", "pid is not None and"))
+
+    def test_m29_any_pid_change_refused(self):
+        self.failing(check_pid_change_with_higher_generation_is_written, mutant('new < held["generation"] and not reset_generation and same_daemon(held, body)', 'not reset_generation and not same_daemon(held, body)'))
+
+    def test_m30_reuse_of_pid_accepted_without_flag(self):
+        self.failing(check_same_pid_restart_at_generation_one, mutant("new < held[\"generation\"] and not reset_generation and", "False and"))
+
+    def test_m31_no_lock(self):
+        self.failing(check_interleaved_pulls_cannot_lower_the_generation, mutant("                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB) ", "                pass "))
+
+    def test_m33_blocking_flock_hangs_on_a_held_lock(self):
+        self.failing(check_held_lock_skips_within_the_bound_and_writes_nothing, mutant("fcntl.LOCK_EX | fcntl.LOCK_NB", "fcntl.LOCK_EX"))
+
+    def test_m34_skip_writes_without_the_lock(self):
+        self.failing(check_held_lock_skips_within_the_bound_and_writes_nothing, mutant("            return UNTOUCHED\n        held", "            pass\n        held"))
+
+    def test_m32_written_at_strict_format(self):
+        self.failing(check_written_at_formats, load(SOURCE.replace("when = datetime.datetime.fromisoformat(text)", "when = datetime.datetime.strptime(text, '%Y-%m-%dT%H:%M:%S+00:00')")))
+
+    def test_m33_fetch_twice(self):
+        self.failing(check_response_age_edges_and_one_fetch, mutant("        raw = fetch()\n", "        fetch()\n        raw = fetch()\n"))
+
+    def test_m34_day_age_not_an_integer_check(self):
+        self.failing(check_response_age_edges_and_one_fetch, mutant("    if age > MAX_AGE_SECONDS:", "    if age > 86401:"))
 
 
 if __name__ == "__main__":

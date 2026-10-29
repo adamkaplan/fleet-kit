@@ -404,6 +404,7 @@ class Executor:
                 # only the state and the text come from the pod; the issue is the hub's, and `everything` is dropped
                 backend.report(pod, {"state": args.get("state"), "text": clean_text(args.get("text")), "issue": req.get("issue")})
                 self.reports.put(pod, cid, dict(mine, state="done"))
+                self.backend.audit("report.delivered", pr, {"by": clean_text(pod, 80), "call_id": clean_text(cid, 64)})   # #1478: the owner sees the pod's report
                 return 200, "reported", None
             known = self.index.get(pod, cid)
             if known:
@@ -745,7 +746,10 @@ class SwitchboardBackend:
         return plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") else None, ctx.pr, now=self.now())
 
     def report(self, pod, args):
-        self.parts[0].report(pod, args.get("state"), args.get("text") or "", args.get("issue"), False)
+        try:
+            self.parts[0].report(pod, args.get("state"), args.get("text") or "", args.get("issue"), False)
+        except self.host.ReportError as err:   # #1478: a refusal of the report (no boss, bad state, unknown pod) is audited as a refusal naming the pod
+            raise Refuse(400, "the report was refused", clean_text(err)) from None
 
     def audit(self, kind, pr, detail):
         engine = self.parts[0]
