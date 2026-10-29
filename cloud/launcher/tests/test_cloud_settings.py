@@ -19,8 +19,10 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_CLOUD_SPEND_CAP_USD": "25", "CW_CLUSTER_TOKEN_CMD": "cat /home/user/token", "CW_CLUSTER_ADMIN_CMD": "cat /home/user/kc",
                     "CW_GIT_TOKEN_CMD": "cat /home/user/git", "CW_APP_ID_CMD": "cat /home/user/id", "CW_APP_INSTALLATION_CMD": "cat /home/user/inst",
                     "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check",
-                    "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m",
-                    "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry"}
+                    "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m", "CW_STACK_MODEL_SECRET": "acme-stack-model",
+                    "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry",
+                    "CW_STACK_REGISTRY": "acme-registry.azurecr.io", "CW_STACK_PULL_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
+                    "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000"}
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -64,8 +66,13 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
     "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
+    "CW_STACK_REGISTRY": ["https://acme-registry.azurecr.io", "acme-registry.azurecr.io/x", "acme-registry.azurecr.io:443", "10.0.0.1", "azurecr.io", "acme-registry",
+                          "acme.example.com", "-acme.azurecr.io", "Acme.azurecr.io", "user@acme.azurecr.io", "ghp_" + "A1b2C3d4E5f6G7h8.azurecr.io", "0x7f000001"],
+    "CW_STACK_PULL_CLIENT_ID": ["x", "1111", "-1111-2222"],
+    "CW_STACK_PULL_TENANT_ID": ["x", "1111", "-1111-2222"],
     "CW_HUB_CHANNEL_URL": ["ftp://hub.example", "http://user@hub.example", "http://hub.example/x?y=1", "hub.example", "http://hub example", "$(x)"],
     "CW_HUB_REGISTRY_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
+    "CW_STACK_MODEL_SECRET": ["https://vault.example.internal/secrets/x", "/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "$(x)", "-x", "--help"],
     "CW_CLUSTER_ADMIN_SECRET": ["/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "a;b", "$(x)", "a\u00e9", "-x", "--help", "--", "--query", "-", "-a"],
     "CW_CLUSTER_TOKEN_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "20", "m", "20s", "1.5h", "20 m", "/tmp/20m", "20m5s", "\u0662\u0660m", "-1h", "0h"],
 }
@@ -104,7 +111,7 @@ class Tables(unittest.TestCase):
     def test_every_setting_has_a_known_kind_and_the_samples_cover_the_table(self):
         self.assertEqual({k for k, _, _ in cw.SETTINGS}, set(GOOD) | set(OPTIONAL_SAMPLES))
         self.assertEqual(set(cw.SETTING_REQUIRED), set(GOOD))
-        self.assertLessEqual({kind for _, _, kind in cw.SETTINGS}, {"name", "path", "command", "digest-ref", "number", "secret-name", "duration"})
+        self.assertLessEqual({kind for _, _, kind in cw.SETTINGS}, {"name", "path", "command", "digest-ref", "number", "secret-name", "duration", "guid", "registry-host"})
         self.assertEqual(len(cw.SETTINGS), len({k for k, _, _ in cw.SETTINGS}))
         self.assertIn(("CW_VAULT_CHECK_DIR", False, "path"), cw.SETTINGS)   # reserved for the pre-check, optional
 
@@ -316,6 +323,8 @@ class Reader(Dir):
         self.assertNotIn("CW_TOOLING_REPO", env)
         self.assertNotIn("CW_GIT_TOKEN_CMD", env)
 
+    # the refusal text names the temporary file's path, and a random directory name can contain a short fixture value
+    # (the two-letter namespace), so the value is looked for in the text with the file's own path removed (#1212).
     def test_a_key_in_both_with_a_different_value_is_refused_naming_both_sources_and_no_value(self):
         for key in GOOD:
             with self.subTest(key):
@@ -325,7 +334,7 @@ class Reader(Dir):
                 self.assertIn(self.path, err)
                 self.assertIn("environment", err)
                 self.assertNotIn("other-value-zz", err)
-                self.assertNotIn(GOOD[key], err)
+                self.assertNotIn(GOOD[key], err.replace(self.path, ""))
 
     def test_a_key_in_both_with_the_same_value_is_accepted(self):
         self.write(body(GOOD))
@@ -781,6 +790,82 @@ class Complete(unittest.TestCase):
         for name in sorted(NOT_SETTINGS):
             with self.subTest(listed=name):
                 self.assertEqual(unaccounted(derived(), listed=set(NOT_SETTINGS) - {name}), [name])
+
+CHANGED_TEST = "test_a_key_in_both_with_a_different_value_is_refused_naming_both_sources_and_no_value"
+
+
+def run_changed_test(setup=None, wrap=None):
+    """Run the real key-in-both test (never a copy of its check) and return its result; `wrap` replaces cw.apply_settings."""
+    cls = type("Probe", (Reader,), {"setUp": setup} if setup else {})
+    result = unittest.TestResult()
+    with mock.patch.object(cw, "apply_settings", wrap(cw.apply_settings)) if wrap else contextlib.nullcontext():
+        cls(CHANGED_TEST).run(result)
+    return result
+
+
+class KeyInBothValueCheck(unittest.TestCase):
+    """#1212: the key-in-both test must not fail on a random temporary directory name, and must still catch a leaked value."""
+
+    def test_s1_the_comment_above_the_changed_test_names_the_cause(self):
+        with open(__file__) as f:
+            lines = f.read().splitlines()
+        at = next(i for i, line in enumerate(lines) if line.startswith("    def " + CHANGED_TEST))
+        comment = []
+        while lines[at - 1 - len(comment)].lstrip().startswith("#"):
+            comment.append(lines[at - 1 - len(comment)])
+        self.assertIn("the refusal text names the temporary file's path", " ".join(comment))
+
+    def test_s2_the_changed_test_passes_against_the_real_product(self):
+        result = run_changed_test()
+        self.assertEqual((result.failures, result.errors), ([], []))
+        self.assertEqual(result.testsRun, 1)
+
+    def _mutant_fails(self, make_text):
+        applied = []
+
+        def wrap(real):
+            def apply_settings(env, path):
+                try:
+                    return real(env, path)
+                except cw.CloudError as e:
+                    (key,) = env
+                    e.args = (make_text(str(e), path, GOOD[key]),) + e.args[1:]
+                    applied.append(GOOD[key] in str(e))
+                    raise
+            return apply_settings
+
+        result = run_changed_test(wrap=wrap)
+        self.assertEqual(applied, [True] * len(GOOD))                  # the mutation was applied to every refusal
+        self.assertEqual(len(result.failures), len(GOOD))              # and the check failed once per setting
+        self.assertEqual(result.errors, [])
+
+    def test_s3_a_mutant_printing_the_value_away_from_the_path_fails(self):
+        self._mutant_fails(lambda err, path, value: err + " value " + value)
+
+    def test_s3_a_mutant_printing_the_value_right_after_the_path_fails(self):
+        self._mutant_fails(lambda err, path, value: err.replace(path, path + value))
+
+    def test_s3_a_mutant_printing_the_value_right_before_the_path_fails(self):
+        self._mutant_fails(lambda err, path, value: err.replace(path, value + path))
+
+    def test_s4_a_path_holding_every_short_fixture_value_does_not_fail(self):
+        def setUp(case):
+            tmp = tempfile.TemporaryDirectory()
+            case.addCleanup(tmp.cleanup)
+            names = [GOOD[k] for k in sorted(GOOD)]
+            case.dir = os.path.realpath(tmp.name)
+            for name in names:                                       # a slash in a value makes it several directories
+                for part in [p for p in name.split("/") if p]:
+                    case.dir = os.path.join(case.dir, part)
+                    os.mkdir(case.dir, 0o700)
+            case.path = os.path.join(case.dir, "cloud.env")
+            for value in GOOD.values():
+                if "//" not in value:
+                    self.assertIn(value, case.path)
+
+        result = run_changed_test(setup=setUp)
+        self.assertEqual((result.failures, result.errors), ([], []))
+        self.assertEqual(result.testsRun, 1)
 
 
 if __name__ == "__main__":

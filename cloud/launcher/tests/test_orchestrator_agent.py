@@ -232,7 +232,7 @@ class Entrypoint(unittest.TestCase):
         share, run, tmpdir = (os.path.join(d, x) for x in ("share", "run", "tmp"))
         for p in (share, run, tmpdir):
             os.mkdir(p)
-        for name, text in (("worker.md", "worker agent\n"), ("orchestrator.md", "orchestrator agent\n"), ("opencode-worker.json", "{\n}\n")):
+        for name, text in (("worker.md", "worker agent\n"), ("orchestrator.md", "---\npermission:\n  question: allow\n---\norchestrator agent\n"), ("opencode-worker.json", "{\n}\n")):
             open(os.path.join(share, name), "w").write(text)
         with open(os.path.join(run, "channel-secret"), "w") as f:
             f.write("c" * 64)
@@ -273,7 +273,8 @@ class Entrypoint(unittest.TestCase):
 # S3: each copy under cloud/worker equals its source when the source is in this checkout; a missing source is skipped by name
 COPIES = {"bin/cloud_cli.py": "cloud/worker/bin/cloud_cli.py", "bin/cloud_client.py": "cloud/worker/bin/cloud_client.py",
           "agents/opencode/orchestrator.md": "cloud/worker/agents/orchestrator.md", "bin/cloud_hub.py": "cloud/worker/bin/cloud_hub.py",
-          "bin/cloud_channel.py": "cloud/worker/bin/cloud_channel.py", "bin/cloud_channel_server.py": "cloud/worker/bin/cloud_channel_server.py"}
+          "bin/cloud_channel.py": "cloud/worker/bin/cloud_channel.py", "bin/cloud_channel_server.py": "cloud/worker/bin/cloud_channel_server.py",
+          "bin/cloud_relay.py": "cloud/worker/bin/cloud_relay.py"}
 
 
 def drift(root, source, copy):
@@ -302,7 +303,7 @@ class Drift(unittest.TestCase):
     def test_the_dockerfile_copies_each_file(self):
         text = open(os.path.join(ROOT, "cloud", "worker", "Dockerfile")).read()
         for needle in ("worker/agents/orchestrator.md", "worker/bin/cloud_cli.py /usr/local/bin/cw-cloud", "worker/bin/cloud_client.py",
-                       "worker/bin/cloud_hub.py", "worker/bin/cloud_channel.py", "worker/bin/cloud_channel_server.py"):
+                       "worker/bin/cloud_hub.py", "worker/bin/cloud_channel.py", "worker/bin/cloud_channel_server.py", "worker/bin/cloud_relay.py"):
             self.assertIn(needle, text)
 
 

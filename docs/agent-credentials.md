@@ -30,7 +30,7 @@ Names below are neutral (`acme-org/widget-api`, `acme-bot`, used only to describ
 | 3 | Token in the shell environment (`GH_TOKEN`, `GITHUB_TOKEN` and the two enterprise names) | Inherited from whoever started the pane | On the machine read: a broad classic token (repository, workflow and organisation administration scopes). The shim replaces it for a repository with a mapping; reads and unmapped repositories fall back to it | Yes (admin of repositories it owns, and organisation administration) |
 | 4 | Keyring logins of `gh` | `gh auth login`, stored by the operating system keyring | Broad classic tokens: the owner-account login includes organisation administration; a login for another account has repository access without it | Yes for repositories where that account is admin. The other-account login must stay unused for settings by policy, not by its scope |
 | 5 | Cloud token mint (#450; the permission check is in the launcher: #545, merged) | An App installation token for one repository, one hour at most, minted inside the pod from the pod's federated identity | Exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read` (the mint asks for these and checks the answer). The mint refuses an answer with an extra key, a higher level or a missing key. The worker can read issues and their comments of its repository and cannot write issues, labels, merges or settings | No. There is no `Administration` permission. A token a cloud worker holds cannot reach settings |
-| 6 | The switchboard's own calls (daemon, sweeps, intent reads) | The same per-account tokens as row 1, marked `FLEET_SWITCHBOARD_OWN_GH` | Same as row 4 | Yes in scope, but it is the daemon's own process, not an agent's shell |
+| 6 | The switchboard's own calls (daemon, sweeps, intent reads) | The same per-account tokens as row 1, the real `gh` run by its path (never through the shim, no marker) | Same as row 4 | Yes in scope, but it is the daemon's own process, not an agent's shell |
 
 Reading the table:
 
@@ -152,3 +152,13 @@ These are the only credential-creating or credential-changing steps. No command 
 6. Remove the broad inherited token from the agents' shells for in-scope repositories.
 7. Put the key's rotation date in a calendar; at rotation, generate a new key in the App's settings and replace the stored one.
 8. Leave the fleet-kit repository itself and any repository without the App alone.
+
+## Cloud stack pod: registry pull identity (row 7, ask #1022)
+
+This row is added; rows 1 to 6 (the table above ends at row 6) and the default pod are unchanged. A cloud stack pod that pulls prebuilt images holds one extra short-lived credential path:
+
+| # | Path | Where it comes from | Real scope | Can change repository settings? |
+|---|------|---------------------|------------|---------------------------------|
+| 7 | Stack registry pull | A projected service-account token (service account `cw-stack-puller`, audience `api://AzureADTokenExchange`, 600 seconds, mode 0400) mounted only at `/opt/cw-registry/token` (root-only parent), exchanged by a root-run step for a registry credential kept in a 0700 tmpfs directory and removed afterwards | Pull from one registry (`AcrPull` for the identity's principal id, granted by the registry's owner); no write access, no long-lived key. A role of `AcrPull` or `Reader` at the registry is read as pull-only; any other role is reported as write-capable | No |
+
+Owner steps, in order: (1) create the user-assigned identity and give the operator its principal id; (2) create the federated credential for the subject `system:serviceaccount:<ns>:cw-stack-puller` on the cluster issuer, audience `api://AzureADTokenExchange`; (3) the registry's owner grants `AcrPull` at the registry only; (4) apply the service account and set the three `CW_STACK_` settings. `cloud-worker stack-registry-check` reads and reports which step is missing before any pod exists. Residual risk: the coder is in the docker group, which inside the pod is root-equivalent, so a coder who deliberately builds a container can read the token file; it is a 10 minute token good only for a pull from one registry. See `cloud/README.md`.

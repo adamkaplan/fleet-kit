@@ -2,7 +2,7 @@
 
 Launcher, reaper, end hook and token mint for cloud workers, built to `docs/cloud-worker-interface.md`.
 
-- `cloud-worker create|stop|extend|delete|status|reap` (`cloud_worker.py`): reaches the cloud only through `kubectl`
+- `cloud-worker create|stop|extend|delete|status|snapshot|reap` (`cloud_worker.py`): reaches the cloud only through `kubectl`
   (`CW_KUBECTL`, `CW_CLOUD_NAMESPACE`); writes one audit line per action to `CW_CLOUD_AUDIT`
   (default `~/.local/state/cw-cloud/audit.jsonl`, mode 0600). `reap` is one pass (or `--loop SECONDS`, never slower
   than 60); run it from a cron-like scheduler. It stops a pod past its hard deadline, or idle (not busy, last
@@ -66,7 +66,7 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   renewed at each retry gap (at most every 5 minutes). After a failed refresh the next try is no sooner than 300 s later; a clock that
   jumps back counts as expired and retries. `main` calls the refresh once before the loop and the loop's first pass checks again: harmless
   (the second is a no-op, the file is fresh).
-- `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line.
+- `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line. `--prestop` (used by the container's `cw-prestop` hook) pushes with a plain push, never forced, and prints one plain line. The hook does not trust the repository's configuration: it refuses a repository whose local configuration has any key outside a CLOSED allow-list of named inert keys (no wildcard: `gc.*` and `pack.*` are refused because `gc.recentObjectsHook` runs a command; the keys are core.repositoryformatversion/filemode/bare/logallrefupdates/ignorecase/precomposeunicode/symlinks, user.name/email, remote.origin.url/pushurl/fetch, init.defaultbranch, receive.denycurrentbranch and the exact forms branch.NAME.remote (origin or .) and branch.NAME.merge (refs/heads/...); a clone made with `--filter` (partial clone) or git-lfs writes other keys and is therefore refused: no push for those repositories), runs every git call by an absolute path with automatic gc and maintenance pinned off, and prints one `cw-prestop:` line (it names the key and up to 50 unpushed file names, never a value; The line is the only trace of a refused run; it lives in the pod's log and ends with the pod unless the cluster ships logs elsewhere (nothing in the repository keeps it); the remote url is compared after userinfo is stripped, and the push goes to the URL built from CW_REPO whatever the remote says), ignores every global/system configuration, and pushes only to the explicit address of the worker's own repository with the pod's own credential helper; the honest limit: the pod token lives 60 minutes (until the reaper renews tokens) and the hook runs only while the token is valid. If the repository's configuration is odd or hostile the hook pushes nothing and the unpushed work is LOST when the pod ends (the work is NOT retained: the pod is deleted after the hook; the trade-off for not trusting that configuration); the one output line names the key only, never a value.
 - `token_mint.py`, installed as `cw-token-mint`: mints a token at start and on demand, refuses more than 3600 s,
   writes it to a tmpfs file only.
 - Tests: `bin/test-cloud-launcher` (fake `kubectl`, fake clock, real `git`, loopback HTTP; no cloud).
@@ -92,6 +92,8 @@ descriptor `N`, pipes it to `kubectl` on stdin into one Secret `<pod>-run`, and 
 The Secret goes with the pod at `stop`, `delete` and a failed or interrupted `create`; a pod kept because the end hook failed keeps it.
 
 Accepted scope of the role: `cw-operator` can get and list every secret in the workers namespace (a Role cannot limit `list` by label), so the namespace must hold only worker pods and their per-pod secrets; that is enforced in the deployment repository, not here.
+
+**The one-verb node rule (`list` on `nodes`).** The `cw-operator` role of `cloud/k8s/operator-rbac.yaml` is namespaced: pods, their logs, exec, port-forward and secrets in the workers' namespace, and nothing cluster-wide. Reading the cluster's NODES needs one more rule, and it cannot live in that Role: a namespaced Role cannot grant a cluster-scoped resource. It is a `ClusterRole` with exactly ONE rule, `list` on `nodes` (the core API group), bound to the `cw-operator` service account by a `ClusterRoleBinding`: `list` on `nodes`, and nothing else (no `get`, no `watch`, no write, no wildcard). `kubectl get nodes -o json` is a list, so that verb is enough. It is the OWNER's step, applied apart from the code (its own manifest, its own pull request), and the code works with or without it: `cloud-worker snapshot` reads the pods either way, and when the node list is refused it says so (`nodes_read` false) instead of failing, and the switchboard's `status` then counts the nodes by the **pod placement** (the distinct node names of the pods) and says that in the line: it cannot see the idle nodes. Nothing else is asked of the cluster: the status read makes no write call at all.
 
 Everything that renders `kubectl` output (errors, the end hook's text, audit reasons) passes through one `scrub()`: this run's secret values and any 8+ character piece of one, token-shaped strings, long base64/hex runs, an `Authorization` header of any scheme (any case and spacing) and the `user:password@` of a URL of any scheme are removed, then the text is cut (the launcher, the run record and the driver all use this one function). Limits: the Authorization shape removes the rest of its header line and its folded continuation lines; the URL shape removes the userinfo of a `scheme://` URL only inside its own part (the user and the password hold no `/ ? # @ :`, so host, path, query and fragment survive: scoped packages, `@user` paths, `?email=a@b`, a port), and an unencoded password with those characters only when a `:` follows the user and what follows is not a bare port (every quantifier bounded, so hostile text cannot slow the scan); a secret split by a newline is caught only for pieces of 8 or more characters (the existing rule); two known slip-throughs: a password that starts with digits and then holds `/`, `?` or `#` (it reads as a port), and a user part over 200 characters; a credential that is not in either shape and is not a registered value is not recognised. A failed `create`, `stop` or `delete` that leaves a per-run Secret says so once (audit and stderr) with its name and the exact `kubectl ... delete secret NAME` command, never a value.
 
@@ -183,6 +185,162 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   a cloud record has it, so `send`, `read` and `retire` by name cannot be routed to the wrong one. A failed or cut `launch --cloud` stops
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
+
+## How a member adds a test to the chain
+
+Cause of the old merge rounds: the whole chain of `bin/test-cloud-launcher` was ONE shell line of more than forty commands joined by `&&`, and every member that added a test appended to that same line, so every pair of concurrent members conflicted on it.
+
+The chain is now `bin/test-cloud-launcher.chain`, one path per line, sorted alphabetically, followed by one fixed last line (`cloud/worker/tests/test_cloud_prepush_preflight.py`) that no member edits. To add a test, add one line to bin/test-cloud-launcher.chain at its alphabetical place, above the fixed last line. A new entry that sorts AFTER the fixed last line still goes ABOVE it; the script fails if the last line is anything else. The order is deliberately sorted alphabetically for conflict-freedom, NOT the order of the old one-line chain; it changes which test fails first (the first red stops the run). The list holds the `bin/test-cloud-*` scripts too (the hub, relay and cost scripts), run without arguments.
+
+The script runs each entry once, stops at the first red with `RESULT: FAIL`, and prints `ran N entries` and `RESULT: PASS` otherwise. Arguments given to the script are passed only to the ten entries that took them in the old one-line chain; every other entry runs without arguments. Its checks: every `test_*.py` is listed or named in `EXCEPTIONS` with a reason; every `bin/test-cloud-cost-*` script is listed; every `bin/test-cloud-*` script is listed or named in `BIN_EXCEPTIONS` (`own-ci-step` means a workflow step runs that script. Hub-relay, relay and relay-daemon are workflow steps since ask #1377, so they carry `own-ci-step` too. A test derives the reasons from the workflow files and fails when a reason is untrue); a list entry that is a symlink is refused; every listed entry exists, is not a duplicate and stays inside the repository; the list is not empty (an empty list is a failure, not a pass).
+
+Residual risk: two members adding names that sort next to each other (the same place in the list) still conflict in git (adjacent inserts), and the first member to add in an empty gap next to the fixed last line conflicts with it. Only entries far apart merge cleanly. A test documents this limit.
+
+## Chain times (ask #1390)
+
+Cause: the whole chain of `bin/test-cloud-launcher` ran one entry after another. On the macOS `test-cloud` leg that took 24 to 30 minutes (24 on the default branch at batch 6, 25.7 on one pull request and 30.2 on another, whose step limit of 30 minutes then cut the leg with no test failing); on Ubuntu it took 15.6 minutes. The cost was the entries themselves, mostly real subprocess starts of the fake cluster client, not fixed sleeps, and the macOS runner is about twice as slow.
+
+The fix is parallel lanes, not removing or moving a test: the entries named in `bin/test-cloud-launcher.parallel` (a subset of the chain, slowest first, each using its own temporary directory and no fixed port) run in three lanes beside the serial loop, each with its own output file replayed whole afterwards. Every chain entry still runs on BOTH systems: there is no macOS-only exception and no Ubuntu-only list, because the 22 entries that start no subprocess total about 150 seconds and moving them would lower macOS coverage for almost no time. A parallel entry that is not in the chain is refused, and `cloud/launcher/tests/test_chain_time.py` checks both lists. Each entry prints `RUN <entry>` and `TIME <entry> <seconds>`.
+
+Chain time after the change: macOS 11.6 minutes, Ubuntu 5.1 minutes (one run of the pull request's head; the step timeout is 20 minutes). The per-entry seconds below are from that run, so they include the slowdown of running beside other entries.
+
+Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_app_token.py` (122 s), `test_driver.py` (120 s).
+
+Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
+
+Not yet measured: none
+
+A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
+### macOS (per entry)
+
+| Entry | Seconds | Lane |
+|---|---|---|
+| `bin/test-cloud-cost-report` | 1 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
+| `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_docs_wording.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_network.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_pod_replaced.py` | 3 | serial |
+| `cloud/launcher/tests/test_cloud_pr_preflight.py` | 25 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_quick.py` | 14 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_wired.py` | 42 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 7 | serial |
+| `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 15 | serial |
+| `cloud/launcher/tests/test_cloud_shapes.py` | 27 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 22 | serial |
+| `cloud/launcher/tests/test_cluster_token_refresh.py` | 37 | serial |
+| `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cw_names.py` | 5 | serial |
+| `cloud/launcher/tests/test_docs_preflight_modes.py` | 0 | serial |
+| `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
+| `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
+| `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
+| `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
+| `cloud/launcher/tests/test_stack_registry_check.py` | 2 | serial |
+| `cloud/launcher/tests/test_stack_registry_pod.py` | 1 | serial |
+| `cloud/launcher/tests/test_token_read_at_call.py` | 1 | serial |
+| `cloud/launcher/tests/test_vault_check_pins.py` | 1 | serial |
+| `cloud/worker/tests/test_cloud_prepush.py` | 30 | serial |
+| `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
+| `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
+| `cloud/worker/tests/test_identity_image.py` | 4 | serial |
+| `cloud/worker/tests/test_question_denied.py` | 0 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 6 | serial |
+| `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
+| `cloud/worker/tests/test_stack_up.py` | 1 | serial |
+| `cloud/worker/tests/test_cloud_prepush_preflight.py` | 21 | serial |
+| `cloud/launcher/tests/test_cloud_prestop.py` | 314 | parallel |
+| `cloud/launcher/tests/test_git_token_renewal.py` | 310 | parallel |
+| `cloud/launcher/tests/test_run_record.py` | 239 | parallel |
+| `cloud/launcher/tests/test_driver.py` | 120 | parallel |
+| `cloud/launcher/tests/test_cloud_stack_wait.py` | 117 | parallel |
+| `cloud/launcher/tests/test_app_token.py` | 122 | parallel |
+| `cloud/launcher/tests/test_orchestrator_hub_session.py` | 74 | parallel |
+| `cloud/launcher/tests/test_cloud_worker.py` | 75 | parallel |
+| `cloud/launcher/tests/test_cloud_k1.py` | 65 | parallel |
+| `cloud/launcher/tests/test_preflight.py` | 65 | parallel |
+| `cloud/launcher/tests/test_cloud_stack.py` | 54 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_bounds.py` | 46 | parallel |
+| `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
+| `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
+| `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
+| `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
+| `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
+| `cloud/worker/tests/test_cw_gh_comments.py` | 37 | parallel |
+| `cloud/worker/tests/test_cloud_prepush_hardening.py` | 34 | parallel |
+| `cloud/worker/tests/test_stack_pull.py` | 35 | parallel |
+
+### Ubuntu (per entry)
+
+| Entry | Seconds | Lane |
+|---|---|---|
+| `bin/test-cloud-cost-report` | 0 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
+| `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_docs_wording.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_network.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_pod_replaced.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_pr_preflight.py` | 10 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_quick.py` | 6 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_wired.py` | 5 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 10 | serial |
+| `cloud/launcher/tests/test_cloud_shapes.py` | 11 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 16 | serial |
+| `cloud/launcher/tests/test_cluster_token_refresh.py` | 7 | serial |
+| `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cw_names.py` | 2 | serial |
+| `cloud/launcher/tests/test_docs_preflight_modes.py` | 0 | serial |
+| `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
+| `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
+| `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
+| `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
+| `cloud/launcher/tests/test_stack_registry_check.py` | 1 | serial |
+| `cloud/launcher/tests/test_stack_registry_pod.py` | 1 | serial |
+| `cloud/launcher/tests/test_token_read_at_call.py` | 0 | serial |
+| `cloud/launcher/tests/test_vault_check_pins.py` | 0 | serial |
+| `cloud/worker/tests/test_cloud_prepush.py` | 15 | serial |
+| `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
+| `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
+| `cloud/worker/tests/test_identity_image.py` | 1 | serial |
+| `cloud/worker/tests/test_question_denied.py` | 0 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 1 | serial |
+| `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
+| `cloud/worker/tests/test_stack_up.py` | 0 | serial |
+| `cloud/worker/tests/test_cloud_prepush_preflight.py` | 15 | serial |
+| `cloud/launcher/tests/test_cloud_prestop.py` | 29 | parallel |
+| `cloud/launcher/tests/test_git_token_renewal.py` | 106 | parallel |
+| `cloud/launcher/tests/test_run_record.py` | 153 | parallel |
+| `cloud/launcher/tests/test_driver.py` | 93 | parallel |
+| `cloud/launcher/tests/test_cloud_stack_wait.py` | 58 | parallel |
+| `cloud/launcher/tests/test_app_token.py` | 31 | parallel |
+| `cloud/launcher/tests/test_orchestrator_hub_session.py` | 4 | parallel |
+| `cloud/launcher/tests/test_cloud_worker.py` | 23 | parallel |
+| `cloud/launcher/tests/test_cloud_k1.py` | 32 | parallel |
+| `cloud/launcher/tests/test_preflight.py` | 28 | parallel |
+| `cloud/launcher/tests/test_cloud_stack.py` | 29 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_bounds.py` | 45 | parallel |
+| `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
+| `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
+| `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
+| `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
+| `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
+| `cloud/worker/tests/test_cw_gh_comments.py` | 1 | parallel |
+| `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
+| `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
 
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
