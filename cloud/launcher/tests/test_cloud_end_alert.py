@@ -484,16 +484,17 @@ class TestDocs(unittest.TestCase):
         with open(DOC, encoding="utf-8") as f:
             text = " ".join(f.read().split())
         if old_phrase:
-            new = "a pod found in the Failed phase when the reaper stops it at its idle or hard limit;"
+            new = "`pod_failed` (a pod in the Failed phase that the reaper stops)."
             self.assertEqual(text.count(new), 1, "the mutation did not apply")
-            text = text.replace(new, "a pod found in the Failed phase)")
+            text = text.replace(new, "`pod_failed` (a pod found in the Failed phase when the reaper stops it at its idle or hard limit; the reaper does not stop a Failed pod sooner, so a failed pod is alerted only then).")
         return text
 
     def check_failed_pod_wording(self, text):
-        for phrase in ("a pod found in the Failed phase when the reaper stops it at its idle or hard limit; the reaper does not stop a Failed pod sooner, so a failed pod is alerted only then)",
-                       "A follow-up ask (the reaper ending a failed pod within one pass) is filed as #1526."):
+        for phrase in ("a pod in the Failed phase that the reaper stops",
+                       "A failed pod is ended and alerted within one pass"):
             self.assertEqual(text.count(phrase), 1, phrase)
-        self.assertEqual(text.count("a pod found in the Failed phase)"), 0)
+        for old in ("alerted only then", "a pod found in the Failed phase when the reaper stops it at its idle or hard limit", "filed as #1526"):
+            self.assertEqual(text.count(old), 0, old)
 
     def test_failed_pod_is_alerted_at_the_reapers_limit_says_the_doc(self):
         self.check_failed_pod_wording(self.doc_text())
