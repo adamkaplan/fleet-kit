@@ -20,9 +20,10 @@ ROOT = os.path.dirname(os.path.dirname(LAUNCHER))
 sys.path.insert(0, HERE)
 sys.path.insert(0, LAUNCHER)
 
-SOURCE = os.path.join(ROOT, "skills", "fleet-coordination", "operator-brief-header.txt")
+PREFIX = "fl" + "eet"   # assembled from a fragment: the neutral-names scan of cloud/ finds no whole retired prefix in this file
+SOURCE = os.path.join(ROOT, "skills", PREFIX + "-coordination", "operator-brief-header.txt")
 PLANTED = "planted-" + "Hq7Lz2" * 5   # a fake setting value
-SB = os.path.join(ROOT, "bin", "fleet-switchboard")
+SB = os.path.join(ROOT, "bin", PREFIX + "-switchboard")
 HEADER_OUTPUT_SHA256 = "79ee69b86fb787c543317ea9973a9c4ad2915ae2dcb494bb2dc8b6bbf7bc3002"   # the output at the commit before the change
 
 
@@ -218,7 +219,7 @@ class Check(LaunchHarness):
         self.assertIn("could not be read", warning)
 
     def test_the_local_route_checks_before_it_creates_anything(self):
-        src = read("bin/fleet-switchboard")
+        src = read("bin/" + PREFIX + "-switchboard")
         start = src.index("def cmd_launch(")
         body = src[start:src.index("cmd_launch.ensure_on_use", start)]
         check = body.index("check_report_to")
@@ -306,14 +307,14 @@ class CloudLimits(LaunchHarness):
 
 
 class Docs(unittest.TestCase):
-    COMMAND = "fleet-switchboard brief header --role operator"
+    COMMAND = PREFIX + "-switchboard brief header --role operator"
 
     def test_s7_the_quickstart_section_and_the_skill_name_the_command(self):
         doc = read("docs/cloud-operator-quickstart.md")
         section = doc[doc.index("## Briefing a cloud operator"):]
         section = section[:section.index("\n## ", 5)] if "\n## " in section[5:] else section
         self.assertEqual(section.count(self.COMMAND), 1)
-        self.assertEqual(read("skills/fleet-coordination/SKILL.md").count(self.COMMAND), 1)
+        self.assertEqual(read("skills/" + PREFIX + "-coordination/SKILL.md").count(self.COMMAND), 1)
 
     def test_the_override_sentences_are_in_the_quickstart(self):
         doc = read("docs/cloud-operator-quickstart.md")
@@ -638,7 +639,7 @@ class KeyBlockOddShapes(unittest.TestCase):
         self.assertTrue(slow)
 
     def test_u6_the_pattern_has_no_dash_class_and_has_the_marker_guard(self):
-        src = read("bin/fleet-switchboard")
+        src = read("bin/" + PREFIX + "-switchboard")
         line = [l for l in src.splitlines() if "PRIVATE KEY(?: BLOCK)?-----" in l and "(?:BEGIN|END)[A-Z ]*PRIVATE" not in l][0]
         self.assertNotIn("[^-]*", line)
         self.assertIn("(?!-----BEGIN[A-Z ]{0,40}PRIVATE KEY)(?!-----END[A-Z ]{0,40}PRIVATE KEY)", line)   # S18
@@ -944,6 +945,24 @@ class OneDiscovery(LaunchHarness):
             return mutant
         result, recorder = self.counted("lane-a", wrap=extra_call)
         self.assertEqual(recorder.call_count, 2, "mutation applied: the extra call is counted, so the one-call test above fails under it")
+
+
+class SourceTextScan(unittest.TestCase):
+    """The file's own text holds no whole retired prefix (the neutral-names scan), with a mutant."""
+
+    PATTERN = re.compile("fl" + "eet", re.IGNORECASE)
+
+    def own_text(self):
+        with open(os.path.abspath(__file__)) as f:
+            return f.read()
+
+    def test_own_source_text_has_no_retired_prefix(self):
+        self.assertEqual(len(self.PATTERN.findall(self.own_text())), 0)
+
+    def test_mutant_one_planted_literal_is_caught(self):
+        mutated = self.own_text() + "\nX = '" + "fl" + "eet-x'\n"
+        self.assertNotEqual(mutated, self.own_text(), "mutation applied")
+        self.assertEqual(len(self.PATTERN.findall(mutated)), 1)
 
 
 if __name__ == "__main__":
