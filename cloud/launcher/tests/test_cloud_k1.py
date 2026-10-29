@@ -289,8 +289,8 @@ class S3S7Manifest(unittest.TestCase):
         role = roles[0]
         self.assertEqual(role["ns"], "cw")
         self.assertEqual(sorted(r for rule in role["rules"] for r in rule["resources"]),
-                         sorted(["pods", "pods/log", "pods/exec", "pods/portforward", "secrets"]))
-        self.assertEqual({g for rule in role["rules"] for g in rule["groups"]}, {""})
+                         sorted(["pods", "pods/log", "pods/exec", "pods/portforward", "secrets", "statefulsets"]))
+        self.assertEqual({g for rule in role["rules"] for g in rule["groups"]}, {"", "apps"})
         self.assertNotIn("*", "".join(role["text"].split()).replace('apiGroups:[""]', ""))
         self.assertEqual([r["verbs"] for r in role["rules"] if r["resources"] == ["pods/portforward"]], [["create"]])
         for rule in role["rules"]:

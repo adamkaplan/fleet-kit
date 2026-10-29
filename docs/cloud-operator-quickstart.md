@@ -67,6 +67,7 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_APP_INSTALLATION_CMD` | no | command | obsolete: accepted and ignored, never run. The installation is looked up per repository (see the next paragraph); the vault no longer needs `cw-app-installation-id` |
 | `CW_STACK_REGISTRY` | no | registry-host | the stack registry (lower case, ending `.azurecr.io`; no scheme, path, port or IP); with the next two, a stack pod pulls prebuilt images (see `cloud/README.md`); all three or none |
 | `CW_STACK_PULL_CLIENT_ID`, `CW_STACK_PULL_TENANT_ID` | no | guid | the pull identity's client id and tenant id (GUIDs, not secrets); set together with `CW_STACK_REGISTRY` |
+| `CW_MAX_PERSISTENT` | no | number | the most persistent orchestrators the namespace holds (an integer from 1 to 20, default 2; see "A persistent orchestrator") |
 | `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
 
 How the installation is found: the mint signs a short-lived App token and asks GitHub which installation covers the repository (`GET /repos/OWNER/REPO/installation`), then mints the one-repository token for that installation. The answer must be one installation whose account is the repository's owner. A repository the App is not installed on is refused before any pod is created, with a message that says so. To cover a new repository, install the App on the account that owns it (an App installed on two accounts serves both) and add the repository to the installation; nothing in the vault changes.
@@ -113,6 +114,8 @@ CW_CLOUD_NAMESPACE=cw
 # CW_APP_KEY_CMD=/home/user/bin/print-app-key
 # optional, but needed when the vault refuses this machine: the vault access check's checkout
 # CW_VAULT_CHECK_DIR=/home/user/vault-check
+# optional: the most persistent orchestrators the namespace holds (1 to 20, default 2)
+# CW_MAX_PERSISTENT=2
 ```
 
 Before reading the vault, do whatever your deployment requires (for example a sign-in or an access request). This repository does not
@@ -201,6 +204,18 @@ A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), th
 - Belongs in `XS`: a reader (code reading and review), a planner, a tester running short tests, a small edit and commit.
 - Does not belong in `XS`: a nested Docker stack (`--stack` refuses `XS`), an image build, a long full test suite or a build with a large memory peak: name `--shape S` or `M` for those.
 - A pod killed for memory is fixed afterwards: raise the shape for that work with `--shape S`.
+
+### A persistent orchestrator (`launch --cloud --agent orchestrator --persistent`)
+
+An orchestrator launched with `--persistent` is an always-on pod: ONE StatefulSet of one replica (its pod is `NAME-0`), restart policy Always, no hard deadline and no idle limit. It ends only on an explicit stop (`retire NAME`, or `cloud-worker stop NAME`): the stop runs the end hook, deletes the StatefulSet FIRST and waits for it (a delete that does not finish within 120 seconds makes the stop fail and keeps the pod, both Secrets and the hub entry; stop again to retry), then the pod, both per-run Secrets and the hub entry. It keeps every other limit of a worker: the shape row, the per-run Secrets, the forbidden-field and stored-credential guards, the repository allow-list and the spend cap (priced for one day of the shape). `--persistent` is valid only with `--agent orchestrator` and the per-run git-token Secret; a worker, a `--stack` launch or a launch without that route is refused with exit status 2 and nothing is created.
+
+- What the reaper does: it leaves a persistent orchestrator alone (never a stop by deadline or idle). It judges the pod only through its StatefulSet (read by name, exact answer only); a StatefulSet it cannot read, or that does not own the pod, leaves the pod untouched and the pass reports one line, `persistent workload unreadable: left alone`, with the worker's name; that report fails the reaper's exit code on every pass until the workload is readable again (loud on purpose; nothing is stopped). The reaper still renews the pod's git token (the Secret is found by the worker's name).
+- Cost: 24 times the hourly estimate of the orchestrator's shape row per day: with the default orchestrator shape (`S`, USD 0.10 an hour) that is USD 2.40 a day, plus the node's own price. The cost is UNBOUNDED IN TIME by design: only an explicit stop ends an always-on orchestrator. The status shows each running one under the worker's name as persistent with its age and its accrued cost, and the daily cost report prints it as an open pod. The launch's spend cap counts the persistent pod at 24 hours of its shape. The node that holds it is NOT protected from an autoscaler scale-down by this change: the autoscaler's do-not-evict mark is not set here, and the node is protected only once ask 1519 lands.
+- A maximum: `CW_MAX_PERSISTENT` (a setting of the table above: an integer from 1 to 20, default 2) is the most persistent orchestrators (StatefulSets of the launcher's label) the namespace holds; a launch above it, or when the count cannot be read, is refused with exit status 2 and nothing is created. The maximum is a ceiling checked at launch, not a lock: two launches at the same moment can each count below the maximum and both succeed.
+- There is no `cw/role` annotation on the template at this head (the token role of ask 1508 composes in a plain merge). Renewal runs only for a pod judged owned by a readable StatefulSet, so a lost read stops renewal.
+- `delete NAME --force` refuses a persistent orchestrator (exit status 2, naming the stop command); only the stop ends it. A stop or a delete of a worker whose pod is absent takes ONE strict read of the StatefulSet named like the worker and refuses, keeping everything, on every answer but the exact not-found; the Role rule for StatefulSets (the administrator's step) must therefore be applied BEFORE this change is installed, or every stop of a worker with a gone pod, a plain one too, fails until it is.
+- Unpushed work in the pod's own scratch volume is lost if the pod is rescheduled to another node (a restart in place keeps it): a persistent orchestrator must push before it ends.
+- OWNER STEP: the operator's Role (`cloud/k8s/operator-rbac.yaml`) gains ONE rule, the `apps` group, resource `statefulsets`, verbs get, list, watch, create and delete (five verbs; the launcher creates the StatefulSet with create and never patches one). The administrator applies it to the cluster; this change never does, and a launch without the rule is refused with the missing rule named.
 
 ### A worker with a nested Docker stack
 
