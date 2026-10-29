@@ -5620,7 +5620,7 @@ Safety: only a `cmd_<action>` function of the module is ever run, and only for a
 
 A key in `config.json` that this tool does not read (at the top level or inside `policy`, `jev`, `sweep`, `triage`, `report_triage`, `friction_wake` or `external_decisions`) is **warned about once per process on stderr and ignored**, never refused, so a newer config does not break an older CLI (a worktree branched before a key existed). A wrong type or value on a key it does read still refuses, and an unknown key never hides that error. Names of plan evaluators are not config keys: an unknown evaluator name still refuses. `status` shows each unknown key on a `WARN  config` line (`section.key is not read by this tool`, with `(did you mean <nearest>?)` when a known key is close), so a typo is not only a line on a daemon's stderr. There is no separate doctor command: `status` is the check.
 
-`relay_holders` is a known key that the relay daemon reads (`holder_of`); the switchboard only checks its shape when the config loads: an object of `"<repo>#<issue>"` -> a non-empty pod name (`{}` is valid, nothing is trimmed). Anything else (not an object, a key without `#`, a value that is not a non-empty string) is a `ConfigError` naming `relay_holders` and the entry; the CLI exits with status 2.
+`relay_holders` is a known key that the relay daemon reads (`holder_of`); the switchboard only checks its shape when the config loads: an object of `"<repo>#<issue>"` -> a non-empty pod name (`{}` is valid, nothing is trimmed). Anything else (not an object, a key without `#`, a value that is not a non-empty string) is a `ConfigError` naming `relay_holders` and the entry; the CLI exits with status 1.
 
 ### A module declares its own config key
 
