@@ -83,7 +83,8 @@ def sent_pickup(engine, session, delivered, now, cache):
 
 def sent_rows(engine, sender, limit, now):
     """The sender's own messages, newest first, at most `limit`: [{recipient, sent, delivered, picked_up}] where a time is epoch seconds or one of the words.
-    ONLY keys that start `send:<sender>:` are listed."""
+    ONLY keys that match `send:<sender>:<16 hex>` as a whole are listed."""
+    import re   # the standard library, imported here: the part has no module-level import
     wanted = re.compile("send:%s:[0-9a-f]{16}" % re.escape(sender))   # a sender `a:b` is not matched by the keys of a sender `a`
     sessions, unknown = SentLedger(engine.state_dir).load()
     mine = []
