@@ -344,12 +344,16 @@ class MeteredRunner:
         return self.runner(argv, *a, **k)
 
 
+TREE_REFUSAL = "installed tree is not the default branch: nothing is decided"
+
+
 class Executor:
     """backend needs: live_head(pr), plan(pr) -> {"source","hash","scenarios":{sid:{"evaluator","claim"}}},
     pr_issues(pr) -> {issue numbers the PR is linked to}, pr_facts(pr) -> {"author","notice_senders"}, evaluators(evaluator), holder_of(repo, issue), gates(pr), report(pod, args), audit(kind, pr, detail)."""
 
-    def __init__(self, state_dir, backend, now):
+    def __init__(self, state_dir, backend, now, blocked=None):
         self.state, self.backend, self.now = state_dir, backend, now
+        self.blocked = blocked   # #1380: a callable, True while the installed tree is not the default branch and clean
         self.index = Index(state_dir)
         self.reports = Index(state_dir, REPORT_FILE, REPORT_MAX, strict=True)
 
@@ -358,6 +362,10 @@ class Executor:
         pod = req.get("pod")
         call = req.get("call") if isinstance(req.get("call"), dict) else {}
         pr = call.get("pr") if isinstance(call.get("pr"), str) else ""
+        if self.blocked is not None and self.blocked():   # before anything: no backend context, no gh call, no write, no message
+            with contextlib.suppress(Exception):
+                self.backend.audit("relay.refused", clean_text(pr, 80), {"by": clean_text(pod, 80), "status": 503, "why": TREE_REFUSAL})
+            return 503, TREE_REFUSAL, None
         begin = getattr(self.backend, "begin_request", None)
         backend = begin(req) if begin else self.backend   # ONE context per request, held by the request itself: a late thread of an earlier request cannot reach it
         try:
@@ -794,7 +802,7 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ, budget=Non
             return 0
         fetch, post = http_transport(url, token)
         backend = SwitchboardBackend(host, (engine, engine.state_dir, engine.config), runner, now, budget)
-        return pass_once(Executor(engine.state_dir, backend, now), fetch, post)
+        return pass_once(Executor(engine.state_dir, backend, now, getattr(budget, "blocked", None)), fetch, post)
     except Exception as err:
         engine._note("relay.pass_failed", None, {"error": " ".join(str(err).split())[:160]})
         return 0
@@ -813,12 +821,18 @@ class RelayLoop:
     caches), in the thread that starts the loop. What the two engines share is only files, each under its own lock (the
     ledger flock, the audit and report-rider file locks). The factory is REQUIRED (ValueError at start); a test that wants sharing says so: engine_factory=lambda: engine."""
 
-    def __init__(self, engine, host, runner, now, environ=os.environ, cadence=None, sleep=None, engine_factory=None):
+    def __init__(self, engine, host, runner, now, environ=os.environ, cadence=None, sleep=None, engine_factory=None, guarded=False):
         if engine_factory is None:
             raise ValueError("the relay loop needs an engine factory (its own Engine); sharing the pass engine must be explicit: engine_factory=lambda: engine")
         self.engine = engine_factory()
         self.budget = RelayBudget(now)   # one hourly cap for every pass of this loop
+        # #1380: the pass loop (the only reader of the tree guard) sets this through set_blocked on every pass. A loop built with
+        # guarded=True (run_daemon does) starts BLOCKED and serves nothing until the first guard check says clear; a loop built without it is never blocked.
+        self.blocked = threading.Event()
+        if guarded:
+            self.blocked.set()
         self.args = (self.engine, host, runner, now, environ, self.budget)
+        self.budget.blocked = self.blocked.is_set   # rides on the loop's budget object into each pass's Executor
         shared = getattr(engine, "accounts", None)   # ONE gate: the relay's reads are counted and paused in the pass engine's GhAccounts
         if self.engine is not engine and self.engine is not None and shared is not None and hasattr(shared, "calls"):
             self.engine.accounts = shared
@@ -829,6 +843,10 @@ class RelayLoop:
         self.sleep = sleep or self.stop_flag.wait
         self.thread = None
         self.failures = 0
+
+    def set_blocked(self, bad):
+        """Called by the pass loop with the guard's verdict: True (set) while the installed tree is bad, False (cleared) when clean."""
+        (self.blocked.set if bad else self.blocked.clear)()
 
     def _record_failure(self, err):
         """Counts the failure, and audits it if it can; never raises (the audit append itself may be what failed)."""

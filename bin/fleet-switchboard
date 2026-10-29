@@ -3876,7 +3876,7 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
         try:
             try:   # the relay is pulled on its own cadence, not after each pass (#1477)
                 relay_loop = load_module("cloud_relay_daemon").start_loop(
-                    engine, sys.modules[__name__], subprocess.run, engine.now, os.environ, engine_factory=relay_engine)
+                    engine, sys.modules[__name__], subprocess.run, engine.now, os.environ, engine_factory=relay_engine, guarded=True)
             except Exception as err:
                 engine._failed(None, "pass", err, {"errors": []})
             done = 0
@@ -3889,6 +3889,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                     if bad is not None:   # two reads in a row before it stops and alerts
                         time.sleep(INSTALLED_TREE_RECHECK_SECONDS)
                         bad = installed_tree_problem(state_dir)
+                    if relay_loop is not None:
+                        relay_loop.set_blocked(bad is not None)   # the relay thread obeys this verdict; it never reads the tree itself
                     if bad is None:
                         installed_tree_clear(state_dir)
                         engine.run_pass()

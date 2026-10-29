@@ -74,6 +74,7 @@ One document to set up, run and take down the cloud hub and the pod-side command
     being handled (the 40 context reads above). Claims are in `relay_reports.json`, apart from `relay_calls.json`, so a pruned or missing
     `relay_calls.json` cannot cause a second delivery; only deleting `relay_reports.json` itself, or more than 50000 newer reports, can.
   - A refused relay call writes one audit line (`relay.refused`, `by` and `pr` clipped) on purpose; the ledger and files stay unchanged.
+  - While the installed tree is not the default branch and clean (#1380), the relay answers every call with a named refusal (503, "installed tree is not the default branch: nothing is decided") and decides nothing: no verdict, proof, ledger write, GitHub call or message. The pass loop alone reads the guard and tells the relay thread each pass; a relay started by the daemon is blocked until the first guard check says clear.
   - The relay's GitHub cost (PC-6): 0 gh calls at rest (an empty pending list makes none). One request builds its pull request picture ONCE: its own
     context object (never shared with another request, so a late thread of an earlier request cannot write into it), and the same READ is answered from
     the first within the request (a write is never skipped, and clears that memory). The FINAL head, compared under the ledger flock, is a fresh read under
