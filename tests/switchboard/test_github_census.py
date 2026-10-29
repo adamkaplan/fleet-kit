@@ -6,6 +6,7 @@ values and the command lines: each must fail a test here."""
 import io
 import json
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -208,8 +209,18 @@ class TestCensus(Rig):
 
 class FakeChild:
     """A stand-in for subprocess.Popen: stdout is the given bytes; kill and wait are recorded."""
+    class _Sized(io.BytesIO):
+        """Honours the requested size and records every size asked for (None for an unbounded read)."""
+        def read(self, size=-1):
+            self.asked.append(None if size is None or size < 0 else size)
+            return super().read(size)
+
+        def __init__(self, data):
+            super().__init__(data)
+            self.asked = []
+
     def __init__(self, data=b"", fail=None):
-        self.stdout = io.BytesIO(data)
+        self.stdout = self._Sized(data)
         self.returncode = 0
         self.killed = False
         self.waited = False
@@ -341,7 +352,7 @@ class TestMacosReader(Rig):
         self.assertGreaterEqual(clock() - started, 1, "without a bound the call waits for the resolver")
 
     def test_a_resolver_that_answers_gives_the_addresses(self):
-        answer = [(2, 1, 6, "", ("140.82.112.5", 443))]
+        answer = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("140.82.112.5", 443))]
         _c, outcome, _s = self._census_under(lambda *a, **k: answer)
         self.assertEqual(outcome, {"140.82.112.5"})
 
@@ -351,11 +362,20 @@ class TestMacosReader(Rig):
             rows = self.gc._run_text(self.gc.PS_ARGV)
         self.assertEqual(rows, ["/usr/bin/p"] * 5)
         self.assertTrue(child.killed and child.waited)
+        self.assertTrue(child.stdout.asked)
+        self.assertTrue(all(n is not None and n <= 60 + 1 for n in child.stdout.asked), child.stdout.asked)
         small = FakeChild(b"/usr/bin/p\n")
         with mock.patch.object(self.gc.subprocess, "Popen", lambda *a, **k: small):
             self.assertEqual(self.gc._run_text(self.gc.PS_ARGV), ["/usr/bin/p"])
         self.assertFalse(small.killed)
         self.assertTrue(small.waited)
+
+    def test_the_mutant_with_an_unbounded_read_is_caught(self):
+        child = FakeChild(b"/usr/bin/p\n" * 100)
+        child.stdout.read()  # the mutant: a copy of the read call without the bound
+        self.assertEqual(child.stdout.asked, [None])
+        self.assertFalse(all(n is not None and n <= 60 + 1 for n in child.stdout.asked),
+                         "the size assertion fails an unbounded read")
 
     def test_the_parsers_on_the_real_shapes(self):
         self.assertEqual(self.gc.parse_ps(PS_TEXT.splitlines())[:3], ["launchd", "logd", "Some_App"])
