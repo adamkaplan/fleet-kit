@@ -7712,13 +7712,13 @@ class TestGithubConfig(Base):
         self.assertEqual((config["github_repos"], config["gh"], config["github_lookback_hours"],
                           config["github_port"]), ([], "gh", 24, None))
         self.assertEqual(config["github_events"], ["issues", "issue_comment", "sub_issues", "pull_request",
-                                                   "pull_request_review", "check_suite", "workflow_run", "push"])
+                                                   "pull_request_review", "check_suite", "workflow_run", "push", "check_run"])
 
     def test_a_config_gets_its_own_lists(self):
         first = self.cfg()
         first["github_repos"].append("a/b")
         first["github_events"].append("push")
-        self.assertEqual((self.cfg()["github_repos"], len(self.cfg()["github_events"])), ([], 8))
+        self.assertEqual((self.cfg()["github_repos"], len(self.cfg()["github_events"])), ([], 9))
         self.assertEqual(sb.DEFAULTS["github_repos"], [])
 
     def test_good_values(self):
