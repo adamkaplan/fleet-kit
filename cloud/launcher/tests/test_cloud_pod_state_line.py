@@ -1348,5 +1348,45 @@ class TestDocsKeepToNeutralNames(unittest.TestCase):
                 self.assertEqual(retired_hits(mutant), 1)
 
 
+class TestEveryCapIsPinned(unittest.TestCase):
+    """Ask #1397: each cap of the status line is pinned at its edge, so a cap set higher (or lower) fails here and not only in a broad test."""
+
+    @staticmethod
+    def vocabulary_text(size):
+        """A text of exactly `size` characters made only of words that print ('a' and 'as')."""
+        text = "a " * ((size - 1) // 2) + "a" if size % 2 else "a " * ((size - 2) // 2) + "as"
+        assert len(text) == size
+        return text
+
+    def test_text_of_159_160_and_161_characters_is_cut_at_160(self):
+        for size, want in ((159, 159), (160, 160), (161, 160), (401, 160)):
+            with self.subTest(size=size):
+                text = self.vocabulary_text(size)
+                out = CLOUD.redact_error(text)
+                self.assertEqual(len(out), want)
+                self.assertEqual(out, text[:160])
+
+    def test_cap_of_the_shown_line_is_exactly_160(self):
+        self.assertEqual(CLOUD.ERROR_LINE_MAX, 160)
+        self.assertEqual(len(CLOUD.redact_error(self.vocabulary_text(301))), 160)
+
+    def test_a_run_of_three_digits_prints_and_of_four_is_hidden(self):
+        self.assertEqual(CLOUD.redact_error("failed 1 2 3"), "failed 1 2 3")
+        self.assertEqual(CLOUD.redact_error("failed 1 2 3 4"), "failed [redacted]")
+
+    def test_a_run_of_two_marks_prints_and_of_three_is_hidden(self):
+        self.assertEqual(CLOUD.redact_error("failed .."), "failed ..")
+        self.assertEqual(CLOUD.redact_error("failed ..."), "failed [redacted]")
+
+    def test_text_at_the_size_limit_is_read_and_one_past_it_is_not(self):
+        limit = 2000000   # the size the product reads (ERROR_TEXT_MAX of bin/pod_state_line.py)
+        self.assertNotEqual(CLOUD.redact_error("a" * limit), "[error text too long to show]")
+        self.assertEqual(CLOUD.redact_error("a" * (limit + 1)), "[error text too long to show]")
+
+    def test_the_wait_of_the_launch_line_is_sixty_seconds(self):
+        self.assertEqual(CLOUD.STATE_WAIT_SECONDS, 60)
+        self.assertEqual(CLOUD.launch_state_line.__defaults__[-1], 60)
+
+
 if __name__ == "__main__":
     unittest.main()
