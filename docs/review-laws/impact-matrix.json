@@ -396,6 +396,7 @@
         "bin/agent_presence.py",
         "bin/awaiting_live.py",
         "bin/ci_runs.py",
+        "bin/cloud_worker.py",
         "bin/cpu_guard.py",
         "bin/dead_hint.py",
         "bin/decision_core.py",
@@ -455,6 +456,9 @@
           "latest_runs",
           "newest",
           "own_repo"
+        ],
+        "bin/cloud_worker.py": [
+          "read_record_file"
         ],
         "bin/red_ci.py": [
           "*"
@@ -759,7 +763,6 @@
         "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
-        "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
         "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
         "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
