@@ -415,6 +415,7 @@
         "bin/report_fold.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
+        "bin/turn_start.py",
         "bin/work_sync.py",
         "bin/switchboard/v2_transport.py",
         "bin/switchboard/facts.py",
