@@ -70,6 +70,8 @@ IGNORED_NOTICE = ("cluster login: %s is ignored in the unattended refresh (the r
 # renewal's numbers and names are here.
 GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh wrapper read at every call
 GIT_TOKEN_RENEW_AFTER_SECONDS = 1800             # renew when the token is this old: 30 minutes of its life are left (a failed pass or two, a kubelet delay, a short sleep)
+SAFE_TO_EVICT_KEY = "cluster-autoscaler.kubernetes.io/safe-to-evict"   # not a cw/ key: nothing reads it; the autoscaler does. Set on every pod render_pod makes
+SAFE_TO_EVICT_VALUE = "false"
 GIT_TOKEN_MINTED = "cw/git-token-minted"         # the Secret annotation that says when the token was minted (the Secret's creation time stands in when it is absent)
 GIT_TOKEN_MINT_SECONDS = 60                      # the mint child's run limit
 GIT_TOKEN_MAX_CHARS = 4096                       # the most a token may be
@@ -1637,7 +1639,8 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
-                        **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
+                        **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
+                        SAFE_TO_EVICT_KEY: SAFE_TO_EVICT_VALUE}},
         "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
                  "terminationGracePeriodSeconds": POD_TERMINATION_GRACE_SECONDS,
                  "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
