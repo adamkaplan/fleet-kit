@@ -1434,7 +1434,7 @@ def _launch(args, runner, now, reserve):
             if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
-    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
+    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working", "endpoint": record["url"]})   # a cloud worker is an agent (#903)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
 
@@ -1442,13 +1442,27 @@ def _launch(args, runner, now, reserve):
 def _registry_note(engine, what, state, name, *args):
     """The cloud launcher and reaper are WRITERS of the agent registry: `upsert` on launch, `retire` once the pod is stopped. The stop itself stays
     this launcher's act; a registry that cannot be written is said in the audit, never raised (the pod's own record is still the launcher's)."""
+    fields = args[0] if what == "upsert" else {}
+    endpoint = str(fields.get("endpoint") or "")
+
+    def say(why):
+        text = str(why)
+        if endpoint:
+            text = text.replace(endpoint, "<endpoint>")
+        try:
+            text = _scrub_lib()(text)
+        except Exception:
+            text = "unreadable"
+        text = _one(text, 120)
+        _audit(engine, "cloud.registry_error", name, {"why": text})
+        print("registry: %s: %s" % (name, text), file=sys.stderr)
     try:
         registry = H["load_module"]("registry")
         got = registry.upsert(state, name, args[0]) if what == "upsert" else registry.retire(state, name, "cloud-worker", args[0])
         if got["problem"]:
-            _audit(engine, "cloud.registry_error", name, {"why": _one(got["problem"], 120)})
+            say(got["problem"])
     except Exception as err:
-        _audit(engine, "cloud.registry_error", name, {"why": _one(str(err), 120)})
+        say(str(err))
 
 
 def _record_from_create(name, body):

@@ -185,6 +185,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   a cloud record has it, so `send`, `read` and `retire` by name cannot be routed to the wrong one. A failed or cut `launch --cloud` stops
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
+- **The registry row (#1510).** The switchboard-side launch writes the agent's registry row at launch through the registry's own write function (`kind` cloud, no pane, the worker's own address as `endpoint`); `retire` and `cloud-clear` retire it once; the reaper's own stop of a pod writes nothing, the clear retires the row later. A registry failure never refuses a launch or keeps a pod: it is one line on standard error and one audit line.
 
 ## How a member adds a test to the chain
 
@@ -235,6 +236,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 2 | serial |
@@ -300,6 +302,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 1 | serial |
