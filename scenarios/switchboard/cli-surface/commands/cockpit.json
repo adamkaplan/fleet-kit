@@ -1,0 +1,4 @@
+{
+ "command": "cockpit",
+ "help": "usage: fleet-switchboard cockpit [-h] [--json] Prints the document the daemon writes to $STATE/cockpit.json: a read-only, plain-text projection of the state files the daemon already keeps (no network, no credential, nothing is changed). See docs/cockpit-feed.md. options: -h, --help show this help message and exit --json Print the document as JSON (the only format)"
+}
