@@ -159,6 +159,10 @@ def config_refusal(workdir, repo, ctx):
             raise ConfigRefused(shown)
 
 
+class NothingToPush(dict):
+    """The result of a run that decided from local references that there was nothing to push (a dict like any other result)."""
+
+
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
     url = HOST_URL + "%s.git" % repo if prestop else None
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout
@@ -171,6 +175,10 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
             if git(workdir, "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", check=False, ctx=ctx).returncode != 0:
                 git(workdir, "-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid",
                     "commit", *(["--no-verify"] if prestop else []), "-m", "WIP: work in progress saved by %s at the end of the worker" % worker, ctx=ctx)
+    # Nothing to push, decided from LOCAL references only (no network call, so a token that has ended cannot fail it): the tree held nothing to
+    # save above, and no commit of HEAD lies beyond the remote-tracking refs. One unpushed commit goes on to the push below, as before.
+    if git(workdir, "log", "--max-count=1", "--format=%H", "HEAD", "--not", "--remotes", check=False, ctx=ctx).stdout.strip() == "":
+        return NothingToPush({"pushed": False, "wip_branch": None, "skipped": skipped})
     # refs must be current: a stale one could call unpushed work safe. prestop fetches from the explicit URL, never the configured origin
     if prestop:
         git(workdir, "fetch", "--prune", url, "+refs/heads/*:refs/remotes/origin/*", ctx=ctx)
@@ -265,6 +273,8 @@ def prestop_main():
         res = run(workdir, worker, prestop=True, repo=repo, ctx=ctx)
         if res["pushed"]:
             print("cw-prestop: saved work to %s" % res["wip_branch"])
+        elif isinstance(res, NothingToPush):
+            print("cw-prestop: nothing to push")
         return 0
     except OriginElsewhere:
         return report(workdir, "origin points elsewhere", ctx)
