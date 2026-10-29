@@ -439,6 +439,9 @@
         "bin/record_json.py": [
           "*"
         ],
+        "bin/turn_start.py": [
+          "*"
+        ],
         "bin/awaiting_live.py": [
           "validate"
         ],
