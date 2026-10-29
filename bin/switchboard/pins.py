@@ -8,6 +8,7 @@
 PINS_MAX_LINES = 200
 PINS_MIN_MESSAGE = 12   # a quoted string shorter than this is noise
 PINS_MIN_NAME = 4
+PINS_MAX_TERMS = 300   # of each kind: a bound on what one search is given
 PINS_SEARCH_PATHS = ("tests", "bin/test-*", "cloud/launcher/tests", "cloud/worker/tests", "cloud/tests")
 PINS_COMMON_WORDS = frozenset((
     "self", "args", "kwargs", "main", "name", "test", "tests", "data", "value", "values", "result", "results", "items", "item", "text", "line", "lines",
@@ -71,10 +72,8 @@ def pins_read_diff(base, runner):
             continue
         entry = files[path]
         if raw.startswith("+"):
-            entry["added"].add(new_line)
+            entry["added"].add(new_line)   # an added line cannot be named by a test that already exists: only the removed side and the hunk's own function are searched
             new_line += 1
-            entry["names"].update(pins_names_of(raw[1:]))
-            entry["messages"].update(pins_messages_of(raw[1:]))
         elif raw.startswith("-"):
             entry["names"].update(pins_names_of(raw[1:]))
             entry["messages"].update(pins_messages_of(raw[1:]))
@@ -83,7 +82,8 @@ def pins_read_diff(base, runner):
 
 def pins_terms(files):
     """(names, messages): every term the diff changes or removes, sorted."""
-    return sorted(set().union(*[f["names"] for f in files.values()])), sorted(set().union(*[f["messages"] for f in files.values()]))
+    return (sorted(set().union(*[f["names"] for f in files.values()]))[:PINS_MAX_TERMS],
+            sorted(set().union(*[f["messages"] for f in files.values()]))[:PINS_MAX_TERMS])
 
 
 def pins_search(names, messages, runner):
@@ -93,10 +93,11 @@ def pins_search(names, messages, runner):
     terms = list(names) + list(messages)
     if not terms:
         return []
-    cmd = ["git", "grep", "-n", "-I", "-F", "--no-color"]
-    for term in terms:
-        cmd += ["-e", term]
-    done = runner(cmd + ["--"] + list(PINS_SEARCH_PATHS), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+    try:   # the terms go in on standard input (`-f -`), never as arguments
+        done = runner(["git", "grep", "-n", "-I", "-F", "--no-color", "-f", "-", "--"] + list(PINS_SEARCH_PATHS), input="\n".join(terms) + "\n",
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as err:
+        raise PinsError("could not search the tests: %s" % _pins_one_line(str(err), 200))
     if done.returncode not in (0, 1):
         raise PinsError("could not search the tests: %s" % _pins_one_line(done.stderr or "git grep failed", 200))
     name_res = {n: re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(n)) for n in names}
