@@ -30891,6 +30891,112 @@ class LedgerBase(Base):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
 
 
+class TestGatesMissingWording(LedgerBase):
+    """#1545: each `missing` line of G1 names the record (the proof or the verdict) and who may record it; the two records stay two records, and which PR reads ready does not change."""
+
+    EVALUATORS = ("ci", "tester", "reviewer", "owner")
+
+    def scen(self, sid, evaluator):
+        return {"id": sid, "evaluator": evaluator, "proof": "test", "claim": "pr"}
+
+    def state(self, evaluator, entries=(), authors=()):
+        return sb.plan_ledger.scenario_state(self.scen("S1", evaluator), list(entries), "acme/app#9", "sha256:p", "h1", set(authors))
+
+    def entry(self, kind, evaluator="tester", result="pass", plan="sha256:p", head="h1", by="coder", seq=1):
+        return {"kind": kind, "pr": "acme/app#9", "scenario": "S1", "plan_hash": plan, "head": head, "result": result, "by": by, "seq": seq,
+                **({"evaluator": evaluator} if kind == "verdict" else {})}
+
+    def test_S2_each_missing_line_names_its_record_and_its_own_evaluator(self):
+        for ev in self.EVALUATORS:
+            proof_line, verdict_line = self.state(ev)["missing"]
+            self.assertTrue(proof_line.startswith("proof (`prove S1`"), proof_line)
+            self.assertIn("the %s judges it, a prover records it" % ev, proof_line)
+            self.assertTrue(verdict_line.startswith("%s verdict (`verdict S1 --as %s`" % (ev, ev)), verdict_line)
+            self.assertIn("only the %s may record it" % ev, verdict_line)
+            for other in set(self.EVALUATORS) - {ev}:
+                self.assertNotIn(other, proof_line + verdict_line)
+
+    def test_S3_the_other_cases_still_name_their_record_and_evaluator(self):
+        ev = "reviewer"
+        lines = [
+            self.state(ev, [self.entry("proof", result="fail"), self.entry("verdict", ev)])["missing"][0],
+            self.state(ev, [self.entry("proof", seq=1), self.entry("verdict", ev, result="fail", seq=2)])["missing"][0],
+            self.state(ev, [self.entry("proof", seq=1), self.entry("verdict", ev, by="coder", seq=2)], authors=("coder",))["missing"][0]]
+        self.assertEqual([(("proof" in l) or ("verdict" in l), "reviewer" in l) for l in lines], [(True, True), (True, True), (True, True)], lines)
+        self.assertIn("verdict says fail", lines[1])
+        self.assertIn("by an author", lines[2])
+        plan_voided = self.state(ev, [self.entry("proof", plan="sha256:old", seq=1), self.entry("verdict", ev, plan="sha256:old", seq=2)])
+        head_voided = self.state(ev, [self.entry("proof", head="h0", seq=1), self.entry("verdict", ev, head="h0", seq=2)])
+        self.assertEqual(plan_voided["void"], ["proof #1 void: plan changed", "reviewer verdict #2 void: plan changed"])
+        self.assertEqual(head_voided["void"], ["proof #1 void: head moved", "reviewer verdict #2 void: head moved"])
+
+    def test_S7_U2_twelve_ledgers_give_the_same_entries_and_status_as_before(self):
+        # the count of missing entries, the status and the ready result (status ok) before this change, computed on its base as data: (proof, verdict) -> (entries, status)
+        # the corpus is a hard-coded table (count and status per ledger), not computed from the old function, and the check does not depend on its order
+        before = {("absent", "absent"): (2, "missing"), ("absent", "pass"): (1, "missing"), ("absent", "fail"): (2, "missing"), ("absent", "author"): (2, "missing"),
+                  ("pass", "absent"): (1, "missing"), ("pass", "pass"): (0, "ok"), ("pass", "fail"): (1, "missing"), ("pass", "author"): (1, "missing"),
+                  ("fail", "absent"): (2, "missing"), ("fail", "pass"): (1, "missing"), ("fail", "fail"): (2, "missing"), ("fail", "author"): (2, "missing")}
+        got = {}
+        for pr_kind, v_kind in before:
+            entries = []
+            if pr_kind != "absent":
+                entries.append(self.entry("proof", result=pr_kind, seq=1))
+            if v_kind != "absent":
+                entries.append(self.entry("verdict", "tester", result="fail" if v_kind == "fail" else "pass", by="coder" if v_kind == "author" else "tst", seq=2))
+            state = self.state("tester", entries, authors=("coder",))
+            got[(pr_kind, v_kind)] = (len(state["missing"]), state["status"])
+        self.assertEqual(got, before)
+        self.assertEqual(len(got), 12)
+
+    def kinds(self, argv_who, *argv):
+        code, out, err = self.run_as(argv_who, *argv)
+        self.assertEqual(code, 0, (out, err))
+        return [e["kind"] for e in self.ledger() if e["kind"] in ("proof", "verdict")]
+
+    def test_S4_a_proof_writes_no_verdict_and_a_verdict_writes_no_proof(self):
+        self.assertEqual(self.kinds("coder", "prove", "S2", "--pr", self.PR, "--evidence", "ran it", "--result", "pass"), ["proof"])
+        self.assertEqual(self.kinds("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged"), ["proof", "verdict"])
+        self.assertEqual(self.kinds("rev", "verdict", "--all", "--head", LEDGER_HEAD, "--pr", self.PR, "--as", "reviewer", "--result", "pass", "--evidence", "judged"), ["proof", "verdict", "verdict"])
+
+    def test_S4_the_item_and_ci_writers_each_write_one_kind_derived_from_the_code(self):
+        writers = {"cmd_prove": {"proof"}, "cmd_verdict": {"verdict"}, "cmd_item_prove": {"proof"}, "cmd_item_verdict": {"verdict"},
+                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"verdict"}}
+        for name, want in writers.items():
+            found = set()
+            for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(getattr(sb, name))))):
+                if isinstance(node, ast.Dict):
+                    for k, v in zip(node.keys, node.values):
+                        if isinstance(k, ast.Constant) and k.value == "kind" and isinstance(v, ast.Constant) and v.value in ("proof", "verdict"):
+                            found.add(v.value)
+            self.assertEqual(found, want, name)
+        relay = ast.parse((Path(sb.__file__).resolve().parent / "cloud_relay_daemon.py").read_text())   # the relay's `_write` names its kind as a keyword: dict(base, kind="proof")
+        relay_kinds = {kw.value.value for fn in ast.walk(relay) if isinstance(fn, ast.FunctionDef) and fn.name == "_write" for call in ast.walk(fn)
+                       if isinstance(call, ast.Call) for kw in call.keywords if kw.arg == "kind" and isinstance(kw.value, ast.Constant)}
+        self.assertEqual(relay_kinds, {"proof", "verdict"}, "cloud_relay_daemon._write writes a proof for prove and a verdict for verdict, one each")
+
+    def test_S5_S6_a_verdict_that_also_writes_a_proof_is_caught(self):
+        real = sb.plan_ledger.append_once
+
+        def both(state, entries, now):
+            return real(state, list(entries) + [dict(e, kind="proof") for e in entries if e.get("kind") == "verdict"], now)
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        with mock.patch.object(sb.plan_ledger, "append_once", both):
+            code, out, err = self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged")
+        self.assertEqual(code, 0, (out, err))
+        self.assertEqual([e["kind"] for e in self.ledger()], ["proof", "verdict", "proof"], "the S4 check sees the proof the mutant writes")
+
+    def test_S6_a_build_naming_the_tester_on_every_verdict_line_is_caught(self):
+        real = sb.plan_ledger.scenario_state
+
+        def always_tester(scenario, *rest):
+            out = real(scenario, *rest)
+            out["missing"] = [m.replace("%s verdict" % out["evaluator"], "tester verdict") for m in out["missing"]]
+            return out
+        with mock.patch.object(sb.plan_ledger, "scenario_state", always_tester):
+            wrong = [self.state(ev)["missing"][1] for ev in self.EVALUATORS]
+        self.assertEqual(sum(1 for ev, line in zip(self.EVALUATORS, wrong) if not line.startswith("%s verdict" % ev)), 3)
+
+
 # (plan hash, scenario hash) of five plan texts with a tester measure scenario, computed BEFORE the change to how G1 reads an unwritten claim (the checker is not touched by it): an unwritten claim and a
 # written `claim: pr` share one scenario hash because the canonical text has always filled `pr` in.
 PINNED_G1_HASHES = [
