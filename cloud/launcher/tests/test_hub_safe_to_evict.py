@@ -50,9 +50,15 @@ def mark_lines_removed(text):
 
 
 def bullet(text):
-    for l in text.splitlines():
+    lines = text.splitlines()
+    for n, l in enumerate(lines):
         if KEY in l and l.startswith("- "):
-            return l
+            out = [l]
+            for m in lines[n + 1:]:
+                if not m.startswith("  - "):
+                    break
+                out.append(m.strip()[2:])
+            return " ".join(out)
     return ""
 
 
@@ -73,6 +79,10 @@ def doc_problems(par):
     if re.search(r"\bis a fix\b|\bthe fix\b|\bfixes the outage", low):
         bad.append("calls it a fix")
     return bad
+
+
+def not_stopped_missing(par):
+    return [w for w in ("node upgrade", "node failure", "spot eviction", "reboot or drain") if w not in par.lower()]
 
 
 class T(unittest.TestCase):
@@ -152,6 +162,17 @@ class Docs(unittest.TestCase):
         m = self.par.replace("it is not a fix of the outage", "it is a fix")
         self.assertNotEqual(m, self.par)
         self.assertNotEqual(doc_problems(m), [])
+
+    def test_names_what_the_mark_does_not_stop(self):
+        self.assertEqual(not_stopped_missing(self.par), [])
+
+    def test_mutant_spot_eviction_removed_fails(self):
+        m = self.par.replace("spot eviction", "")
+        self.assertNotEqual(m, self.par)
+        self.assertNotEqual(not_stopped_missing(m), [])
+
+    def test_later_whole_template_apply_sentence_once(self):
+        self.assertEqual(self.par.count("a later apply of the whole template from the file would carry the mark"), 1)
 
 
 if __name__ == "__main__":
