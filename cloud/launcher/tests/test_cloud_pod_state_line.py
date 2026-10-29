@@ -1317,5 +1317,36 @@ class TestLaunchCommand(tcw.Base):
             self.check_bounded()
 
 
+RETIRED_WORD = re.compile("fl" + "eet", re.IGNORECASE)
+
+
+RETIRED_ALLOWED = tuple(("fl" + "eet").upper() + x for x in ("_AGENT_NAME", "_BOSS", "_CLOUD_CHANNEL_URL", "_CLOUD_TOKEN_FILE", "_CLOUD_CHANNEL_LISTEN",
+                                                                "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS", "_CLOUD_AGENT_NAMESPACE"))
+
+
+def retired_hits(text):
+    """Occurrences of the retired prefix in any case, the nine channel environment names the scan allows taken out first."""
+    for name in RETIRED_ALLOWED:
+        text = text.replace(name, " ")
+    return len(RETIRED_WORD.findall(text))
+
+
+class TestDocsKeepToNeutralNames(unittest.TestCase):
+    """The two documents of this change print no retired prefix (any case); a planted one is seen."""
+
+    def test_the_two_documents_hold_no_retired_prefix(self):
+        for rel in DOCS:
+            with self.subTest(rel=rel):
+                self.assertEqual(retired_hits(read(rel)), 0)
+
+    def test_a_planted_occurrence_is_seen(self):
+        for rel in DOCS:
+            with self.subTest(rel=rel):
+                text = read(rel)
+                mutant = text + "\n`" + "fl" + "eet" + "-switchboard status NAME`\n"
+                self.assertNotEqual(mutant, text)   # the mutation is applied
+                self.assertEqual(retired_hits(mutant), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

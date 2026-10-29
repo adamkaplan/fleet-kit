@@ -192,7 +192,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 
 **What the launcher can read.** The pod phase, the agent service's session state and its last message time: nothing else.
 
-**The line.** `fleet-switchboard status NAME` prints ONE line for a cloud worker of yours:
+**The line.** the `status NAME` command of the switchboard prints ONE line for a cloud worker of yours:
 
 ```text
 cloud coder7: running; last tool call or message 2026-10-27T10:04:12Z; last error none
