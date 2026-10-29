@@ -65280,6 +65280,261 @@ class TestReviewCheckout(LedgerBase):
         self.assertIn("review checkout --sparse", skill)
         self.assertIn("over the 5,000-file limit", skill)
 
+    # ---- #1551: the checkout names each changed file whose diff it does not hold whole, and holds the base commit's law files in base/
+
+    def serve_laws(self, present):
+        """Answer the contents API for the base commit with `present` ({name: text}); every other law file is not found."""
+        plain = self.route
+
+        def route(argv, **kwargs):
+            found = re.search(r"/contents/([^?]+)\?ref=([0-9a-f]+)", argv[2]) if argv[0] == FAKE_GH and argv[1] == "api" and "/contents/" in argv[2] else None
+            if found:
+                text = present.get(found.group(1))
+                if text is None:
+                    return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"encoding": "base64", "content": base64.b64encode(text.encode()).decode()}), "")
+            return plain(argv, **kwargs)
+        self.route = route
+
+    def big_trees(self):
+        self.base_tree = {"big.py": "x\n" * 3, "small.py": "one\n" * 20}
+        self.head_tree = {"big.py": "".join("line %d\n" % i for i in range(6000)), "small.py": "two\n" * 20}
+
+    def test_1551_a_6000_line_file_is_named_not_whole_in_the_output_pr_diff_and_its_own_diff_and_a_20_line_file_is_not(self):
+        self.big_trees()
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual(len(out.strip().splitlines()), 1, "the printed path is the one stdout line")
+        named = [l for l in err.splitlines() if "not whole" in l and "big.py" in l]
+        self.assertEqual(len(named), 1, err)
+        self.assertIn("6000 lines", named[0])
+        self.assertIn("line bound 4000", named[0])
+        self.assertEqual([l for l in err.splitlines() if "small.py" in l and "not whole" in l], [])
+        for name in ("pr.diff", "diffs/big.py.diff"):
+            with self.subTest(name=name):
+                text = (root / name).read_text()
+                head = text.splitlines()[:4]
+                self.assertTrue(any("big.py" in l and "6000 lines" in l and "line bound 4000" in l and "not whole" in l for l in head), head)
+                self.assertIn("diff skipped: too large to compare here (6000 lines) for big.py", text)
+        self.assertNotIn("not whole", (root / "diffs" / "small.py.diff").read_text())
+        self.assertEqual(json.loads((root / ".fleet-review-checkout").read_text())["not_whole"], 1)
+
+    def test_1551_a_checkout_within_the_bounds_has_a_pr_diff_with_no_notice_and_a_marker_count_of_0(self):
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        text = (root / "pr.diff").read_text()
+        self.assertTrue(text.startswith("--- a/a.txt\n"), text[:80])
+        self.assertNotIn("not whole", text + err)
+        self.assertEqual(json.loads((root / ".fleet-review-checkout").read_text())["not_whole"], 0)
+
+    def test_1551_the_files_after_the_time_bound_are_named_with_the_reason_and_the_files_before_are_not(self):
+        names = ["f%02d.txt" % i for i in range(40)]
+        self.base_tree = {n: "old\n" for n in names}
+        self.head_tree = {n: "new\n" for n in names}
+        real, calls = self.rc._diff_text, [0]
+
+        def spend(*a, **k):
+            result = real(*a, **k)
+            calls[0] += 1
+            if calls[0] == 10:
+                self.rc.DIFF_SECONDS = -1
+            return result
+        with mock.patch.object(self.rc, "DIFF_SECONDS", self.rc.DIFF_SECONDS), mock.patch.object(self.rc, "_diff_text", spend):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        text = (Path(out.strip()) / "pr.diff").read_text()
+        for index, name in enumerate(names):
+            with self.subTest(name=name):
+                line = [l for l in err.splitlines() if "'%s'" % name in l and "not whole" in l]
+                self.assertEqual(len(line), 1 if index >= 10 else 0)
+                if index >= 10:
+                    self.assertIn("time bound -1 seconds", line[0])
+                self.assertEqual(any("'%s'" % name in l and "not whole" in l for l in text.splitlines()[:45]), index >= 10)
+
+    def test_1551_a_binary_file_is_named_and_a_3999_line_file_is_not_and_its_diff_is_whole(self):
+        self.base_tree = {"pic.bin": "a\x00b", "long.txt": "".join("old %d\n" % i for i in range(3999))}
+        self.head_tree = {"pic.bin": "c\x00d", "long.txt": "".join("new %d\n" % i for i in range(3999))}
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual([l for l in err.splitlines() if "not whole" in l and "pic.bin" in l and "binary" in l].__len__(), 1, err)
+        self.assertEqual([l for l in err.splitlines() if "long.txt" in l and "not whole" in l], [])
+        text = (root / "diffs" / "long.txt.diff").read_text()
+        self.assertEqual(sum(1 for l in text.splitlines() if l.startswith("+new ")), 3999)
+        self.assertNotIn("not whole", text)
+
+    def test_1551_the_notice_names_the_first_200_files_says_how_many_were_cut_and_the_marker_holds_the_full_count(self):
+        names = ["g%03d.txt" % i for i in range(205)]
+        self.base_tree = {n: "a\nb\n" for n in names}
+        self.head_tree = {n: "c\nd\n" for n in names}
+        with mock.patch.object(self.rc, "MAX_DIFF_LINES", 1):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual(len([l for l in err.splitlines() if "the diff is not whole" in l]), 200)
+        self.assertEqual(len([l for l in err.splitlines() if "5 more" in l]), 1)
+        top = (root / "pr.diff").read_text().splitlines()[:203]
+        self.assertEqual(len([l for l in top if l.startswith("  '")]), 200)
+        self.assertEqual(len([l for l in top if "and 5 more not whole" in l]), 1)
+        self.assertEqual(json.loads((root / ".fleet-review-checkout").read_text())["not_whole"], 205)
+
+    def test_1551_base_holds_each_law_file_the_base_commit_has_and_the_missing_one_is_named_in_three_places(self):
+        present = {name: "law of %s\n" % name for name in sb.REVIEW_LAW_FILES if name != "REVIEW_OVERLAY.md"}
+        self.serve_laws(present)
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        for name, text in present.items():
+            self.assertEqual((root / "base" / name).read_text(), text)
+        self.assertEqual((root / "base" / "a.txt").read_text(), "one\n")
+        self.assertEqual((root / "laws-missing.txt").read_text(), "REVIEW_OVERLAY.md\n")
+        self.assertEqual(len([l for l in err.splitlines() if "REVIEW_OVERLAY.md" in l and "law files not provided" in l]), 1)
+        self.assertEqual(json.loads((root / ".fleet-review-checkout").read_text())["laws_missing"], ["REVIEW_OVERLAY.md"])
+
+    def test_1551_a_base_with_no_law_file_lists_them_all_and_a_changed_law_file_keeps_the_merge_base_copy(self):
+        self.serve_laws({})
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual((root / "laws-missing.txt").read_text().split(), list(sb.REVIEW_LAW_FILES))
+        self.assertEqual(self.files(root / "base"), ["a.txt"])
+        self.run_as("coder", "review", "checkout", "--remove", str(root))
+        changed = sb.REVIEW_LAW_FILES[0]
+        self.base_tree = {"a.txt": "one\n", changed: "the merge base copy\n"}
+        self.head_tree = {"a.txt": "one\n", changed: "the pull request rewrote it\n"}
+        self.serve_laws({changed: "the base commit copy\n"})
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((Path(out.strip()) / "base" / changed).read_text(), "the merge base copy\n")
+
+    def test_1551_a_hostile_law_file_path_is_refused_named_missing_and_writes_nothing_outside(self):
+        data = {"../outside.md": b"x", "/etc/law.md": b"x", "back\\slash.md": b"x", ".git/config": b"x", "ok/law.md": b"fine"}
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(self.rc.remove_tree, str(work), True)
+        (work / "base").mkdir()
+        missing = self.rc._write_laws(str(work), (data, ["gone.md"]), set(), 0, {"file": 100, "files": 10, "total": 1000}, 0)
+        self.assertEqual((work / "base" / "ok" / "law.md").read_bytes(), b"fine")
+        self.assertEqual(sorted(p.name for p in work.rglob("*") if p.is_file()), ["law.md"])
+        self.assertFalse((work / "outside.md").exists() or (self.work / "outside.md").exists())
+        self.assertEqual(len(missing), 5, missing)
+        self.assertEqual(missing[0], "gone.md")
+        self.assertEqual(len([m for m in missing if "refused" in m]), 4)
+        over = self.rc._write_laws(str(work), ({"big.md": b"x" * 11}, []), set(), 0, {"file": 10, "files": 10, "total": 1000}, 0)
+        self.assertEqual(len(over), 1)
+
+    def test_1551_a_changed_law_file_the_merge_base_lacks_is_named_missing_and_one_it_holds_is_not(self):
+        added, edited = sb.REVIEW_LAW_FILES[0], sb.REVIEW_LAW_FILES[1]
+        self.base_tree = {"a.txt": "one\n", edited: "the merge base copy\n"}
+        self.head_tree = {"a.txt": "one\n", added: "new by the pull request\n", edited: "rewritten\n"}
+        self.serve_laws({added: "the base commit copy\n", edited: "the base commit copy\n"})
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        reason = "changed by this pull request; base/ holds no merge-base copy"
+        self.assertFalse((root / "base" / added).exists())
+        self.assertIn("%r (%s)" % (added, reason), (root / "laws-missing.txt").read_text().splitlines())
+        self.assertEqual(len([l for l in err.splitlines() if reason in l and added in l and "law files not provided" in l]), 1)
+        self.assertTrue(any(reason in m and added in m for m in json.loads((root / ".fleet-review-checkout").read_text())["laws_missing"]))
+        self.assertEqual((root / "base" / edited).read_text(), "the merge base copy\n")
+        self.assertFalse(any(edited in m for m in (root / "laws-missing.txt").read_text().splitlines()))
+
+    def test_1551_the_old_continue_for_a_changed_law_file_is_caught(self):
+        source = Path(self.rc.__file__).read_text()
+        old = "            if not os.path.isfile(os.path.join(root, \"base\", name)):\n                missing.append("
+        self.assertIn(old, source, "the mutant applies")
+        mutated = source.replace(old, "            if False:\n                missing.append(")
+        self.assertNotEqual(mutated, source)
+        space = {"__name__": "mutant_review_checkout"}
+        exec(compile(mutated, "mutant", "exec"), space)
+        applied = []
+        with mock.patch.object(self.rc, "_write_laws", lambda *a, **k: (applied.append(1), space["_write_laws"](*a, **k))[1]):
+            with self.assertRaises(AssertionError):
+                self.test_1551_a_changed_law_file_the_merge_base_lacks_is_named_missing_and_one_it_holds_is_not()
+        self.assertTrue(applied, "the mutant ran")
+
+    def test_1551_a_hostile_path_is_cut_and_escaped_in_the_notice_the_output_and_laws_missing(self):
+        hostile = "line\nbreak\x1b[31m" + "x" * 200 + ".txt"
+        self.base_tree = {hostile: "a\nb\n"}
+        self.head_tree = {hostile: "c\nd\n"}
+        with mock.patch.object(self.rc, "MAX_DIFF_LINES", 1):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        shown = self.rc._shown(hostile)
+        self.assertLessEqual(len(shown), 120)
+        notice = (root / "pr.diff").read_text().splitlines()[:3]
+        for text in (err, "\n".join(notice)):   # the notice, not the diff body: its "diff skipped ... for <path>" line is older wording that shows the raw path
+            self.assertNotIn("\x1b", text)
+            self.assertNotIn("line\nbreak", text)
+            self.assertNotIn("x" * 150, text)
+        self.assertTrue(any(l.startswith("  ") and "\\n" in l for l in notice), notice)
+        self.assertTrue(all("break" not in l or "\\n" in l for l in notice))
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(self.rc.remove_tree, str(work), True)
+        (work / "base").mkdir()
+        missing = self.rc._write_laws(str(work), ({hostile + "/..": b"x"}, []), {hostile}, 0, {"file": 100, "files": 10, "total": 1000}, 0)
+        missing += self.rc._write_laws(str(work), ({hostile: b"x"}, []), {hostile}, 0, {"file": 100, "files": 10, "total": 1000}, 0)
+        for line in missing:
+            self.assertNotIn("\n", line)
+            self.assertNotIn("\x1b", line)
+            self.assertLessEqual(len(line), 400)
+        self.assertEqual(len(missing), 2)
+
+    def test_1551_four_mutants_each_fail_a_check(self):
+        real_diff = self.rc._diff_text
+
+        def not_named(*a, **k):
+            return None
+
+        def words_dropped(path, lines, why):
+            return "%s: %d lines, %s\n" % (path, lines, why)
+
+        def old_wording_removed(*a, **k):
+            out = real_diff(*a, **k)
+            return "" if out.startswith("diff skipped") else out
+        mutants = {
+            "a skipped file not named": ("_not_whole", not_named),
+            "the words not whole dropped": ("_not_whole_line", words_dropped),
+            "a missing law file not named": ("_write_laws", lambda *a, **k: []),
+            "the old wording removed": ("_diff_text", old_wording_removed),
+        }
+        self.assertEqual(self.run_scenario_checks(), None, "the real checkout passes the checks")
+        for label, (attr, fake) in mutants.items():
+            with self.subTest(label):
+                applied = []
+                with mock.patch.object(self.rc, attr, lambda *a, _f=fake, **k: (applied.append(1), _f(*a, **k))[1]):
+                    with self.assertRaises(AssertionError):
+                        self.run_scenario_checks()
+                self.assertTrue(applied, "the mutant ran")
+
+    def run_scenario_checks(self):
+        self.big_trees()
+        self.serve_laws({name: "law\n" for name in sb.REVIEW_LAW_FILES if name != "REVIEW_OVERLAY.md"})
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        try:
+            self.assertEqual(len([l for l in err.splitlines() if "big.py" in l and "not whole" in l]), 1)
+            for name in ("pr.diff", "diffs/big.py.diff"):
+                text = (root / name).read_text()
+                self.assertIn("not whole", text)
+                self.assertIn("diff skipped: too large to compare here (6000 lines)", text)
+            self.assertEqual(len([l for l in err.splitlines() if "REVIEW_OVERLAY.md" in l]), 1)
+            self.assertEqual((root / "laws-missing.txt").read_text(), "REVIEW_OVERLAY.md\n")
+        finally:
+            self.run_as("coder", "review", "checkout", "--remove", str(root))
+
+    def test_1551_the_documentation_states_the_three_kinds_the_notice_the_law_files_and_the_unchanged_bounds(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        at = text.index("**`review checkout` names a diff it does not hold whole (#1551).**")
+        section = text[at:text.index("\n", at)]
+        for statement in ("a line bound (", "a time bound (", "a binary file (", "the notice is in the output (stderr", "in the first lines of `pr.diff` and in each per-file diff",
+                          "`laws-missing.txt`", "The bounds are unchanged"):
+            self.assertIn(statement, section)
+        self.assertEqual(text.count("(#1551).**"), 1)
+
 
 class TestPlanReviewCore(unittest.TestCase):
     """#109 part 2, slice R1: the pure core of the plan review engine (docs/plan-review-engine-design.md). No I/O, no commands."""
