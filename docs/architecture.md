@@ -133,9 +133,10 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
 | `bin/test-switchboard` | `-` | size | 85,500 | the one test file; whole classes have moved to `tests/switchboard/test_cases_NN.py` (T1, T1b), and the lanes still add tests until the next split, so the row is the real count plus about 3,000 |
+| `bin/test-cloud-worker` | `-` | size | 3,000 | the cloud worker's one test file; the retired-run read tests of #1546 were added to it (they use its fixtures); a split is owed |
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
-| `cloud_worker.py` | `-` | size | 2,000 | grew past the limit in a merged change; to be split |
+| `cloud_worker.py` | `-` | size | 2,500 | grew past the limit in a merged change; to be split; `read` of a retired run and the kept boss (#1546) added about 160 lines (ceiling raised on purpose, the split is still owed) |
 | `impact_hold.py` | `-` | size | 2,000 | the brief-bound clear (#1215) took it past the limit; to be split (ceiling = the test's own formula: 1510 lines, plus 500, rounded up to a multiple of 500) |
 | `delegated_clear.py` | `-` | size | 1,900 | the registrar lint lives with the clear it protects; a follow-up slice moves it to its own part and lowers the ceiling |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |

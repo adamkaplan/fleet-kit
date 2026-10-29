@@ -299,12 +299,8 @@ def keep_boss(state, record, clock=None):
         _write_private(base / (name + ".json"), json.dumps({"boss": boss[:100], "ended": time.strftime(_STAMP, time.gmtime(now)), "worker": name}, sort_keys=True) + "\n")
         kept = []
         for path in base.glob("*.json"):
-            when = None
-            try:
-                found = json.loads(path.read_text()[:BOSS_MAX_BYTES])
-                when = _stamp_seconds(found.get("ended")) if isinstance(found, dict) else None
-            except (OSError, ValueError):
-                pass
+            found, _ = read_record_file(path, BOSS_MAX_BYTES)
+            when = _stamp_seconds(found.get("ended")) if found else None
             if when is None or when < now - BOSS_KEEP_SECONDS:
                 path.unlink()
             else:
