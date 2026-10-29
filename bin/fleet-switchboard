@@ -20408,7 +20408,7 @@ def cmd_review_post(args, runner, now):
         if not text:
             raise ReviewError("the body file is empty: a review says something (nothing was posted)")
         if redact_command_text(text) != text:
-            raise ReviewError("the body holds a secret-shaped value (it is not shown): remove it and post again (nothing was posted)")
+            raise ReviewError("the body holds a secret-shaped value (it is not shown): %s: remove it and post again (nothing was posted)" % secret_where(text))
         name = _review_caller(runner, now)
         seen["name"], seen["head"] = name, args.head
         repo, number, ref, raw = _review_pr(args, engine)
@@ -20489,7 +20489,7 @@ def cmd_review_dismiss(args, runner, now):
         if not reason:
             raise ReviewError("--reason must say why (nothing was dismissed)")
         if redact_command_text(reason) != reason:
-            raise ReviewError("the reason holds a secret-shaped value (it is not shown) (nothing was dismissed)")
+            raise ReviewError("the reason holds a secret-shaped value (it is not shown): %s (nothing was dismissed)" % secret_where(reason))
         name = _review_caller(runner, now)
         seen["name"] = name
         repo, number, ref, raw = _review_pr(args, engine)

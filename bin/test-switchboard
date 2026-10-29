@@ -63839,6 +63839,130 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.assertRegex(section, r"cloud reader.*token allows")
 
 
+class TestReviewRefusalNamesRule(TestReviewPostAndDismiss):
+    """#1544: a refusal of `review post` / `review dismiss` names a fixed rule label and the line and columns of the first match, and shows no matched character."""
+
+    @staticmethod
+    def key(chars="QJXZ", n=24):   # built at run time: no key-shaped literal in the file
+        return "gh" + "p_" + (chars * n)[:n]
+
+    def where(self, text):
+        return sb.find_secret_span(text)
+
+    def check_names(self, text, want):
+        """`want` = (rule, line, first column, last column); both commands refuse and say it, nothing posted or dismissed."""
+        self.reset()
+        self.blocking(77, by="rdr1")
+        said = "rule %s, line %d, columns %d to %d" % want
+        code, out, err = self.post(text=text)
+        self.assertNotEqual(code, 0)
+        self.assertIn(said, err)
+        self.assertEqual(self.posted, [])
+        code, out, err = self.dismiss(77, text)
+        self.assertNotEqual(code, 0)
+        self.assertIn(said, err)
+        self.assertEqual(self.dismissed, [])
+
+    def test_the_refusal_names_the_rule_the_line_and_the_columns(self):   # S2, S3
+        text = "one\ntwo\nsee value: %s and more\nfour\nfive\n" % self.key()
+        self.assertEqual(self.where(text), ("known-key-prefix", 3, 12, 39))
+        self.check_names(text, ("known-key-prefix", 3, 12, 39))
+
+    def test_the_match_first_in_the_file_wins_whichever_rule_it_is(self):   # S4
+        text = "see value: %s\nlater: Bearer %s\n" % (self.key(), "Q" * 12)
+        self.assertEqual(self.where(text)[:2], ("known-key-prefix", 1))
+        text = "Bearer %s\nlater: %s\n" % ("Q" * 12, self.key())
+        self.assertEqual(self.where(text), ("bearer-or-basic-token", 1, 1, 19))
+
+    def test_positions_count_characters_from_one_and_a_carriage_return_is_no_column(self):   # U2
+        key = self.key()
+        for text, want in (("a\tb %s\n" % key, (1, 5, 32)), ("caf\u00e9 \u00fc %s" % key, (1, 8, 35)), ("x\r\ny\r\n\tz %s\r\n" % key, (3, 4, 31))):
+            with self.subTest(text=text):
+                self.assertEqual(self.where(text), ("known-key-prefix",) + want)
+        crlf = "token: Q\r\nnext"
+        self.assertEqual(self.where(crlf), ("credential-word-value", 1, 1, 8))
+
+    def corpus(self):
+        key, jwt = self.key(), "ey" + "J" + "Q" * 8 + "." + "Z" * 8 + "." + "X" * 4
+        return [("Bearer " + "Q" * 8, "bearer-or-basic-token"), ("Bearer Q", None), ("[redacted]", None),
+                ("password: " + "Q" * 5, "credential-word-value"), ("one token", None), ("token: [redacted]", None),
+                (key, "known-key-prefix"), ("gh" + "p_short", None),
+                ("https://acme:" + "Q" * 6 + "@host/x", "url-password"), ("https://acme@host/x", None),
+                (jwt, "jwt-shape"), ("ey" + "J" + "Q", None)]
+
+    def test_the_finder_agrees_with_the_old_test_on_a_fixed_corpus_and_always_answers(self):   # S6, S7, U1
+        refused = 0
+        for text, rule in self.corpus():
+            with self.subTest(text=text):
+                old = sb.redact_command_text(text) != text
+                found = self.where(text)
+                self.assertEqual(found is not None, old)
+                if old:
+                    refused += 1
+                    self.assertIn(found[0], sb.SECRET_RULE_NAMES + (sb.SECRET_RULE_SEQUENCE,))
+                    self.assertEqual(found[0], rule)
+        self.assertGreater(refused, 4)
+        self.assertEqual(sb.redact_command_text("Bearer " + "Q" * 8), "Bearer [redacted]")   # the redaction itself is unchanged
+
+    def test_a_body_changed_only_by_the_sequence_still_gets_a_rule_and_a_position(self):   # S7
+        for text in ("auth Bearer " + "Q" * 8, "x\ntoken " + "Bearer " + "Z" * 9):
+            found = self.where(text)
+            self.assertIsNotNone(found, text)
+            self.assertTrue(1 <= found[1] <= 2 and 1 <= found[2] <= found[3], found)
+
+    def check_no_matched_character(self):
+        self.reset()
+        self.blocking(77, by="rdr1")
+        text = "intro\n\nsee value: %s\n" % self.key()
+        shown = []
+        for code, out, err in (self.post(text=text), self.dismiss(77, text)):
+            self.assertNotEqual(code, 0)
+            shown += [out, err]
+        shown.append(self.audit_path.read_text())
+        body = self.world.state / "review-body.txt"
+        for path in self.world.state.rglob("*"):
+            if path.is_file() and path != body:
+                shown.append(path.read_bytes().decode("utf-8", "replace"))
+        blob = "\n".join(shown)
+        for window in ("QJX", "JXZ", "XZQ", "ZQJ"):
+            self.assertNotIn(window, blob)
+        for char in "QJXZ":
+            self.assertNotIn(char, blob)
+        self.assertIn("line 3, columns 12 to 39", shown[1])
+        return blob
+
+    def test_no_character_of_the_matched_value_reaches_any_output_audit_or_state(self):   # S5
+        self.check_no_matched_character()
+
+    def test_mutants_each_fail_a_test(self):   # S8
+        real = sb.find_secret_span
+        def leak(text):
+            found = real(text)
+            return (found[0] + " QJX",) + tuple(found[1:]) if found else found
+        def off(index):
+            def mutant(text):
+                found = real(text)
+                return tuple(v + 1 if i == index and found else v for i, v in enumerate(found)) if found else found
+            return mutant
+        for name, mutant, checks in (("text printed", leak, (self.check_no_matched_character,)),
+                                     ("line off by one", off(1), (self.test_the_refusal_names_the_rule_the_line_and_the_columns,)),
+                                     ("columns off by one", off(3), (self.test_the_refusal_names_the_rule_the_line_and_the_columns,))):
+            with self.subTest(mutant=name), mock.patch.object(sb, "find_secret_span", mutant):
+                failed = 0
+                for check in checks:
+                    try:
+                        check()
+                    except AssertionError:
+                        failed += 1
+                self.assertEqual(failed, 1, name)
+
+
+for _name in dir(TestReviewPostAndDismiss):   # the parent's tests run in their own class
+    if _name.startswith("test_") and _name not in TestReviewRefusalNamesRule.__dict__:
+        setattr(TestReviewRefusalNamesRule, _name, None)
+
+
+
 class TestReviewerSubagents(LedgerBase):
     """#179 slice L2: the four reviewer agents, `review laws` (from the base commit) and `review record` with its shadow line in `gates`."""
 
