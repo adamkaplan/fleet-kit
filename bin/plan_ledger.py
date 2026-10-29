@@ -589,19 +589,19 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
             out.setdefault("carried", []).append(carried_view(newest, carried[newest["seq"]]))
         if not newest and mine:
             why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
-            out["void"].append("%s #%d void: %s" % (kind, mine[-1]["seq"], why))
+            out["void"].append("%s #%d void: %s" % (kind if kind == "proof" else evaluator + " verdict", mine[-1]["seq"], why))
         out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by")}
     proof, verdict = out["proof"], out["verdict"]
     if not proof:
-        out["missing"].append("proof (`prove %s`)" % sid)
+        out["missing"].append("proof (`prove %s`; the %s judges it, a prover records it)" % (sid, evaluator))
     elif proof["result"] != "pass":
-        out["missing"].append("proof says fail")
+        out["missing"].append("proof says fail (the %s judges it, a prover records a new one)" % evaluator)
     if not verdict:
-        out["missing"].append("%s verdict (`verdict %s --as %s`)" % (evaluator, sid, evaluator))
+        out["missing"].append("%s verdict (`verdict %s --as %s`; only the %s may record it)" % (evaluator, sid, evaluator, evaluator))
     elif verdict["result"] != "pass":
-        out["missing"].append("%s verdict says fail" % evaluator)
+        out["missing"].append("%s verdict says fail (only the %s may record a new one)" % (evaluator, evaluator))
     elif verdict["by"] in authors:
-        out["missing"].append("the verdict is by an author of the PR (not accepted)")
+        out["missing"].append("the %s verdict is by an author of the PR (not accepted; only the %s, who is not an author, may record it)" % (evaluator, evaluator))
     out["status"] = "ok" if not out["missing"] else "missing"
     return out
 
