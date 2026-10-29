@@ -1,9 +1,12 @@
-"""A cloud worker that the launcher ended alerts its boss and the Chief of Staff at once (ask #1480).
+"""A cloud worker that the launcher ended alerts its boss and the Chief of Staff (ask #1480).
+
+A failed pod is alerted only when the reaper stops it at its idle or hard limit (cause pod_failed): the reaper reads a pod's activity through the pod, a
+failed pod cannot answer, so the reaper does not stop it sooner (a follow-up ask is filed as #1526).
 
 The launcher writes one JSON line per action to its audit file. This pass reads the NEW stop lines (from a stored cursor), and for a stop line that carries the field `cause` (idle,
 hard, pod_gone or pod_failed; decided from that field alone), it sends ONE message to the
 Chief of Staff always and ONE to the boss recorded in the worker's cloud record when that name is a valid agent name, unless the worker already
-reported done. The message holds exactly five facts: the worker, the reason, the time, pushed (yes, no or unknown) and the run record's name (or
+reported done. The message holds five facts, plus, for pod_failed, the pod's termination reason and exit code (added by a later change): the worker, the reason, the time, pushed (yes, no or unknown) and the run record's name (or
 unknown); never a branch, an address, a log line or a transcript.
 
 The state is one small private file (0600): {"offset": bytes already read, "sent": [[run id, cause], ...] (the last 500)}. A missing or corrupt
@@ -116,11 +119,13 @@ def pushed_text(record_dir, parse):
     return "yes" if hook["pushed"] else "no"
 
 
-def message_text(worker, label, when, pushed, record_name, kept=False):
+def message_text(worker, label, when, pushed, record_name, kept=False, failure=None):
     text = ("[cloud worker ended] %s was ended by the launcher: reason %s; at %s; work pushed: %s; run record: %s."
             % (worker, label, when, pushed, record_name or "unknown"))
     if kept:
         text += " The end hook could not push: the pod was kept and the work may be unpushed."
+    if failure is not None:
+        text += " Pod termination: %s." % failure
     return text
 
 

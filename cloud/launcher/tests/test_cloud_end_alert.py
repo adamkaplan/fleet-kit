@@ -66,7 +66,7 @@ class World(unittest.TestCase):
 
 
 class TestAlerts(World):
-    def test_s2_three_stops_make_six_messages_naming_five_facts(self):
+    def test_s2_three_stops_make_six_messages_naming_the_facts(self):
         for name, reason, pushed in (("worker1", "idle", True), ("worker2", "hard limit", False), ("worker3", "idle", True)):
             self.worker(name, pushed=pushed)
             self.stop(name, reason, run="r" + name)
@@ -479,6 +479,53 @@ class TestDocs(unittest.TestCase):
                        "pod_gone` is written only by the reaper", "a person's retire writes no cause", "lost, never repeated, when a send fails after the state is saved", "drains one megabyte per pass", "a corrupt cursor skips the lines written meanwhile"):
             self.assertIn(phrase, text)
         self.assertEqual(text.count("a retire that found the pod gone"), 0)
+
+    def doc_text(self, old_phrase=False):
+        with open(DOC, encoding="utf-8") as f:
+            text = " ".join(f.read().split())
+        if old_phrase:
+            new = "a pod found in the Failed phase when the reaper stops it at its idle or hard limit;"
+            self.assertEqual(text.count(new), 1, "the mutation did not apply")
+            text = text.replace(new, "a pod found in the Failed phase)")
+        return text
+
+    def check_failed_pod_wording(self, text):
+        for phrase in ("a pod found in the Failed phase when the reaper stops it at its idle or hard limit; the reaper does not stop a Failed pod sooner, so a failed pod is alerted only then)",
+                       "A follow-up ask (the reaper ending a failed pod within one pass) is filed as #1526."):
+            self.assertEqual(text.count(phrase), 1, phrase)
+        self.assertEqual(text.count("a pod found in the Failed phase)"), 0)
+
+    def test_failed_pod_is_alerted_at_the_reapers_limit_says_the_doc(self):
+        self.check_failed_pod_wording(self.doc_text())
+
+    def test_failed_pod_wording_mutant_with_the_old_phrase_is_caught(self):
+        with self.assertRaises(AssertionError):
+            self.check_failed_pod_wording(self.doc_text(old_phrase=True))
+
+
+class TestMessageSlot(unittest.TestCase):
+    OLD = {False: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; work pushed: yes; run record: unknown.",
+           True: "[cloud worker ended] worker7 was ended by the launcher: reason idle limit; at 2026-01-01T10:00:00Z; work pushed: yes; run record: unknown."
+                 " The end hook could not push: the pod was kept and the work may be unpushed."}
+
+    def text(self, module=real, **more):
+        return module.message_text("worker7", "idle limit", "2026-01-01T10:00:00Z", "yes", None, **more)
+
+    def test_without_the_argument_the_text_is_the_old_text_byte_for_byte(self):
+        self.assertEqual(self.text(), self.OLD[False])
+        self.assertEqual(self.text(kept=True), self.OLD[True])
+        self.assertEqual(self.text(failure=None), self.OLD[False])
+
+    def test_with_a_failure_the_text_ends_with_the_termination_and_holds_the_facts(self):
+        text = self.text(failure="OOMKilled, exit code 137")
+        self.assertTrue(text.endswith(" Pod termination: OOMKilled, exit code 137."))
+        self.assertTrue(text.startswith(self.OLD[False]))
+        self.assertTrue(self.text(kept=True, failure="x").startswith(self.OLD[True]))
+
+    def test_a_mutant_whose_text_changes_when_the_argument_is_none_is_caught(self):
+        broken = mutant("if failure is not None:", "if True:")
+        with self.assertRaises(AssertionError):
+            self.assertEqual(self.text(broken), self.OLD[False])
 
 
 if __name__ == "__main__":
