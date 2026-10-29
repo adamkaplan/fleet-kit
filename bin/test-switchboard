@@ -2581,6 +2581,120 @@ def plan_body(clauses=PLAN_CLAUSES, extra=""):
     return "## Plan (scenarios)\n\nsize: S\n%s\n\n```yaml\nclauses:\n%s\n```\n" % (extra, lines)
 
 
+
+class TestSteerLongTurn(Base):
+    """#1540: with `steer_after_minutes` on, a peer send and a reminder to a recipient whose turn has lasted longer go in as steer
+    (audited busy true with the turn age); off, a young turn or an unknown age: as before."""
+
+    build, work, send, admission = (TestSteerToWorking.build, TestSteerToWorking.work, TestSteerToWorking.send,
+                                    TestSteerToWorking.admission)   # the same world, one more class
+
+    def setUp(self):
+        super().setUp()
+        self.build({})
+
+    def on(self, minutes=30):
+        self.build({"steer_after_minutes": minutes})
+
+    def long_turn(self, minutes):
+        self.work(lasts=minutes * 60 + 600, steps=3)
+        self.world.engine.run_pass()   # the pass that first sees it working records the turn start
+        self.world.tick(minutes * 60)
+
+    def intents(self):
+        return [e for e in self.world.audit() if e["event"] == "v2.synthetic" and e["phase"] == "intent"]
+
+    def peer(self):
+        return self.send(sender="coder")
+
+    def remind(self):
+        fact = sb.Fact("reminder:long1", "platform", "reminder", "check the build", EPOCH, batch=False)
+        return fact
+
+    def turn_file(self):
+        return self.world.engine.state_dir / "turn-start.json"
+
+    def test_a_peer_send_to_a_long_turn_steers_with_busy_and_the_age(self):
+        self.on(30)
+        self.long_turn(60)
+        self.assertTrue(self.peer()["sent"])
+        (intent,) = self.intents()
+        self.assertEqual((intent["detail"]["delivery"], intent["detail"]["busy"]), ("steer", True))
+        self.assertGreaterEqual(intent["detail"]["turn_age_seconds"], 60 * 60)
+        self.assertEqual(self.admission()["delivery"], "steer")
+
+    def test_a_reminder_to_a_long_turn_steers(self):
+        self.on(30)
+        self.long_turn(60)
+        plan = self.world.engine.plan("platform", [self.remind()], self.world.engine.discover(self.world.engine.now()), self.world.engine.now())
+        self.assertEqual(plan.action, "wake")
+        self.assertTrue(self.world.engine.deliver(plan)["sent"])
+        (intent,) = self.intents()
+        self.assertEqual((intent["detail"]["delivery"], intent["detail"]["busy"]), ("steer", True))
+        self.assertIn("turn_age_seconds", intent["detail"])
+
+    def test_the_key_off_queues_a_peer_send_to_a_very_long_turn(self):
+        self.build({})
+        self.long_turn(600)
+        self.assertTrue(self.peer()["sent"])
+        (intent,) = self.intents()
+        self.assertEqual(intent["detail"]["delivery"], "queue")
+        self.assertNotIn("busy", intent["detail"])
+        self.assertFalse(self.turn_file().exists())   # off: nothing is read or written
+
+    def test_a_young_turn_queues(self):
+        self.on(30)
+        self.long_turn(10)
+        self.assertTrue(self.peer()["sent"])
+        (intent,) = self.intents()
+        self.assertEqual(intent["detail"]["delivery"], "queue")
+        self.assertNotIn("busy", intent["detail"])
+
+    def test_an_unknown_age_counts_as_young(self):
+        self.on(30)
+        self.long_turn(60)
+        self.turn_file().unlink()   # a restart that lost the record
+        self.assertTrue(self.peer()["sent"])
+        (intent,) = self.intents()
+        self.assertEqual(intent["detail"]["delivery"], "queue")
+        self.assertNotIn("busy", intent["detail"])
+
+    def test_an_idle_recipient_is_woken_and_nothing_is_steered(self):
+        self.on(30)
+        self.assertTrue(self.peer()["sent"])
+        (intent,) = self.intents()
+        self.assertEqual(intent["detail"]["delivery"], "queue")
+        self.assertNotIn("busy", intent["detail"])
+        self.assertEqual([c["phase"] for c in self.world.model_calls("platform")], ["turn_start"])
+
+    def test_the_boss_rule_is_unchanged_with_the_key_on(self):
+        self.on(30)
+        self.work()
+        self.assertTrue(self.send()["sent"])
+        (intent,) = self.intents()
+        self.assertEqual((intent["detail"]["delivery"], intent["detail"]["busy"]), ("steer", True))
+
+    def test_the_age_restarts_when_the_status_leaves_working(self):
+        turn_start = sb.load_module("turn_start")
+        parse = sb.load_module("record_json").parse_bounded
+        state = self.world.engine.state_dir
+        turn_start.note(state, [("s1", "working")], 1000, parse)
+        turn_start.note(state, [("s1", "working")], 2000, parse)
+        self.assertEqual(turn_start.age(state, "s1", 2500, parse), 1500)
+        turn_start.note(state, [("s1", "idle")], 3000, parse)
+        self.assertIsNone(turn_start.age(state, "s1", 3100, parse))
+        turn_start.note(state, [("s1", "working")], 4000, parse)
+        self.assertEqual(turn_start.age(state, "s1", 4000, parse), 0)
+        self.assertEqual(oct(self.turn_file().stat().st_mode & 0o777), oct(0o600))
+        self.assertEqual(list(json.loads(self.turn_file().read_text())), ["s1"])
+
+    def test_the_setting_is_validated(self):
+        for bad in (-1, "30", True, None):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"steer_after_minutes": bad})
+        self.assertEqual(sb.validate_config({})["steer_after_minutes"], 0)
+        self.assertEqual(sb.validate_config({"steer_after_minutes": 30})["steer_after_minutes"], 30)
+
 class ApprovalGH:
     """A gh that serves GETs of one issue, its comments and its parent; records every call; a write raises."""
 
