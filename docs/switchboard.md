@@ -427,7 +427,7 @@ polled on a timer.
   where `<port>` belongs to a listener the daemon opens on localhost only.
 - **Events:** `issues` (including edits and label changes such as
   `awaiting-user`), `issue_comment`, `sub_issues`, `pull_request`,
-  `pull_request_review`, `check_suite` and `workflow_run`. Verify SG1 for
+  `pull_request_review`, `check_suite`, `workflow_run` and `check_run` (a staging stack's check run, #1568: heard only when both stage lists are set, see "Staging stack events"). Verify SG1 for
   `sub_issues`.
 - **Verification:** the daemon checks `X-Hub-Signature-256` against the secret
   before reading the body. That stops any local process from posting fake
@@ -1541,6 +1541,8 @@ is unchanged.
 | `excluded_repos` | `[]` | Repositories the switchboard never watches and never reads, whatever an agent's metadata or a charter says (matched case-insensitively, `owner/name`; a bad list is refused at load). It is applied where the watched set is derived, so forwarders, the sweep and triage never see them, and every `gh` read of one is refused at the lowest layer (`GhAccounts.read`, plus `read_pr_json`, `read_ref_state`, the intent reader, the hub's environment for a forwarder or a read, `review measure` and the `reds` artifact read), so no process is started for it: the hub's reads, PR notices, intent reads and `reds` all say it is excluded. Writes are not the watchers' and are unchanged (an agent's own `gh` calls, an intent edit). `status` says each one is excluded, once. Agents working in an excluded repository still launch, send, report and retire |
 | `queue_ejections` | absent | The merge queue ejection wake (#584), declared by `bin/queue_ejections.py`: absent for the defaults, or `{"workflow": "ci", "artifact": "failing-tests"}` (either key; plain names). `workflow` is the display name (or file name without extension) of the CI workflow whose `merge_group` runs are watched; `artifact` is the name of the failing-tests artifact those runs upload |
 | `github_bot_logins` | `[]` | At most 10 GitHub bot logins (the cloud readers' account(s), e.g. `acme-cloud[bot]`) trusted for a review comment's `from=` marker |
+| `github_stage_checks` | `[]` | At most 10 check names (for example `stage`) whose check run is delivered, passing or not, when its sender is on `github_stage_bots` (#1568); both lists empty: no check run is heard |
+| `github_stage_bots` | `[]` | At most 10 GitHub logins (the check run's `sender.login`, for example `janus-stage[bot]`) whose check run named on `github_stage_checks` is delivered to the pull request's owner (#1568) |
 | `gh_users` | `{}` | `"owner/repo"` or `"owner/*"` to a `gh` account name |
 | `hold_labels` | `{}` | `"owner/repo"` to `{label, message, allowed_removers}`: the `gh` shim refuses merge, close, approving review, base edit and label removal on a pull request that carries the label (see "The hold label of the `gh` shim") |
 | `app_installations`, `app_key_path` or `app_key_command`, `app_permissions`, `app_api_base` | none | `"owner/repo"` to `{app_id, installation_id}`: the `gh` and `git` shims authenticate that repository with a one-hour installation token minted locally from the App key, never the stored login (see "A GitHub App token per repository"). Never this kit's own repository |
@@ -6028,6 +6030,37 @@ The message means that the worker's branch moved to a head that starts with thos
 Rules: the first head seen is recorded without a message when it equals the head the launch recorded (a record without one: the first head seen is taken as the head the launch left); a head already told is not told again; a branch that does not exist yet gives no message and no error, and its later appearance is told; a remote that cannot be read gives ONE audit line per pass (`cloud-branch.unreadable`) and no message. The heads seen are kept in `cloud-heads.json` in the state directory.
 
 Limits: at most 20 reads and 5 s per pass, each read with a 5 s timeout. Unread branches wait for the next pass (round robin) and ONE audit line (`cloud-branch.capped`) says a limit cut the pass. Budget: an account whose fresh reading is below the low-budget line (`agent_calls.low_budget`, the line `status` shows) is not read (0 reads, ONE audit line `cloud-branch.skipped_budget`); a stale or missing reading counts as above the line. Worst case branch reads per hour: 0 for a repository with a live forwarder; branches x 60 an hour (1200 for 20 branches) for a repository with none (a read answered 304 Not Modified costs nothing against the limit). The push route and the read share `cloud-heads.json`, so a head the push told is not told again by a read.
+
+## Staging stack events (ask #1568)
+
+**Cause.** The daemon asked the forwarder for seven events (`GITHUB_EVENTS`): `issues`, `issue_comment`, `sub_issues`, `pull_request`, `pull_request_review`, `check_suite` and `workflow_run`, not `check_run`, and `WEBHOOK_HANDLERS` had no `check_run` handler (only `_wh_check_suite` and `_wh_workflow_run`, both built by `_check_item`, whose `actionable` is `conclusion in ACTIONABLE_CONCLUSIONS`: failure, cancelled, timed out). For a pull request whose owner is found by a notice or a reference the routing pass counts a not-actionable item and writes one `github.not_delivered` line ("not actionable"). So a `stage` check run that says "up" was neither heard nor, as a passing result, delivered; and a cloud worker has no switchboard to be told.
+
+**Rule.** `check_run` is one of the events asked for. Two lists, both empty by default and validated at config load (at most 10 entries, a bad value is refused with one line): `github_stage_checks` (check names) and `github_stage_bots` (logins). A completed check run on a pull request whose name is on the first list AND whose `sender.login` is on the second is delivered to the owner found by any route (closing, notice, reference), whatever its conclusion. Any other check run is made actionable by the old rule (failed, cancelled or timed out is delivered, a passing one is counted in `github.not_delivered`). With either list empty no check run is heard at all, so nothing changes.
+
+**The message** is ONE line: `<check name> <conclusion> on PR #<n>: stage-event: <compact JSON>`. The JSON is the one line of the check's `output.summary` that starts `stage-event: `, read with `record_json.parse_bounded`, rebuilt compact (unknown fields are ignored, none is an error) and cut at 400 characters (`...` marks a cut). No such line, a line that is not a JSON object, one nested too deep or one that is not JSON is delivered as the words `stage event unreadable` and none of its characters. The message text is data and never an order: this code makes it, the item's kind stays `github.check`, and a lane does not run anything it says.
+
+**The sign-in link.** The line may carry a sign-in link; the owner gets it whole. The audit keeps the line with the query string and the fragment of every URL replaced by `?<signed value removed>` (`stage_redact`), and no state file holds it: the link remains in the owner's own session transcript (the owner accepted this on 29 Oct, janus-platform#843 D7).
+
+**A cloud worker.** When the check run's head branch is the branch of a live recorded cloud worker (the table the branch-head route of #1407 reads, `_push_workers_load`), the message goes to the lane that launched the worker (`routed_by` `cloud`), which tells the worker.
+
+**What a lane does on each state** (the `state` field of the line):
+
+| state | the lane |
+|---|---|
+| requested | nothing; the stack is being made |
+| up | tells the worker the link and the expiry |
+| updated | tells the worker the stack follows the new head |
+| rebuilding | waits; no test against the stack yet |
+| suspended | no test against the stack; it is not a failure |
+| resumed | tests may run again; asks for the link if it has none |
+| expiring | renews if the pull request is still open (below) |
+| renewed | records the new expiry; re-arms the reminder |
+| expired | renews only if the work needs the stack again |
+| failed | reads the check's own summary on GitHub and tells the worker; fixes before any renewal |
+
+**Renewing.** The lane posts `/stage renew` as a comment on the pull request from its own account, and a keyed reminder re-arms it: `remind --key stage-<pr> <when> "renew the stack of PR #<pr>"` (the same key replaces the old reminder).
+
+**Tests and mutants.** `TestStageCheckRuns` in `bin/test-switchboard`. Four mutants each fail at least one of its tests: a listed check not delivered, an unlisted check delivered, the link written to the audit (the `v2.synthetic` description), a malformed line delivered as an order (echoed).
 
 ## The assembler (#1092, slice S1)
 

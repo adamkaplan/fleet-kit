@@ -72,6 +72,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `queue_ejections.py` | 4 | a pull request ejected from the merge queue wakes its orchestrator | |
 | `spotlight_guard.py` | 4 | is each guarded folder still kept out of the Spotlight index | |
 | `switchboard/reminders.py` | 4 | the reminders file, `remind`, checkpoint reminders, budget notice and the GitHub event constants | |
+| `switchboard/stage_events.py` | 4 | a staging stack's check run: the handler, the one machine line read bounded, and the redaction of a sign-in link for the audit (#1568) | |
 | `triage_digest.py` | 4 | the stale digest's memory and rules | |
 | `triage_ownerless.py` | 4 | ownerless, quiet issues of a team repository | |
 | `triage_plan_open.py` | 4 | a plan or work-item issue still open after the pull request that implements it merged | |
@@ -181,6 +182,8 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 27 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/pr_explain.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/reminders.py` | `fleet-switchboard` | namespace | 25 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; two reads of untrusted JSON now go through `load_module("record_json")`, one name of the entry more (#1314) |
+| `switchboard/stage_events.py` | `fleet-switchboard` | entry-import | 2 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/stage_events.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 
 ## Dynamic imports not followed
 
