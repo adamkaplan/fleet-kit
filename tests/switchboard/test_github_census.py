@@ -213,7 +213,7 @@ class TestMacosReader(Rig):
     def test_s2b_the_macos_text_gives_the_kinds_with_a_count_and_none_of_the_planted_values(self):
         calls = []
         with mock.patch.object(self.gc.subprocess, "run", self.fake_run(record=calls)), \
-                mock.patch.object(self.gc, "read_table", lambda: self._real_read_table("/nonexistent-proc-root")), \
+                mock.patch.object(self.gc, "read_table", self.gc.read_table_macos), \
                 mock.patch.object(self.gc, "github_addresses", lambda: set()):
             self.read_users()
             self.step(60)
@@ -230,6 +230,70 @@ class TestMacosReader(Rig):
             self.assertIn(argv, (self.gc.PS_ARGV, self.gc.LSOF_ARGV), "no flag that prints environments")
             self.assertIn("timeout", kw)
 
+    ENV_FLAG = re.compile(r"^-?[A-Za-z]*[eE][A-Za-z]*$")
+
+    def env_flag_problems(self, argv):
+        """Elements of an argv that are a ps flag cluster holding e or E, or the word ww. `-o comm=` and `-axo` are allowed."""
+        bad = []
+        for i, arg in enumerate(argv[1:], 1):
+            if arg in ("ww", "-ww") or "ww" in arg.lstrip("-") and not arg.startswith("-o") and "=" not in arg and ":" not in arg:
+                bad.append(arg)
+            elif arg.startswith("-") and not arg.startswith("--") and "=" not in arg and ":" not in arg and not arg.startswith("-i") \
+                    and not arg.startswith("-s") and not arg.startswith("-n") and self.ENV_FLAG.match(arg):
+                bad.append(arg)
+        return bad
+
+    def test_s2b_no_argv_constant_holds_an_environment_flag(self):
+        for argv in (self.gc.PS_ARGV, self.gc.LSOF_ARGV):
+            self.assertEqual(self.env_flag_problems(argv), [], argv)
+
+    def test_s2b_the_argv_actually_run_holds_no_environment_flag(self):
+        calls = []
+        with mock.patch.object(self.gc.subprocess, "run", self.fake_run(record=calls)):
+            self.gc.read_table_macos()
+        self.assertEqual(len(calls), 2)
+        for argv, _kw in calls:
+            self.assertEqual(self.env_flag_problems(argv), [], argv)
+
+    def test_s2b_the_mutant_argv_is_caught(self):
+        for mutant in (["/bin/ps", "-axeww", "-o", "comm="], ["/bin/ps", "-axE", "-o", "comm="], ["/bin/ps", "-ax", "ww", "-o", "comm="]):
+            self.assertTrue(self.env_flag_problems(mutant), mutant)
+        self.assertEqual(self.env_flag_problems(["/bin/ps", "-axo", "comm="]), [])
+        calls = []
+        with mock.patch.object(self.gc, "PS_ARGV", ["/bin/ps", "-axeww", "-o", "comm="]), \
+                mock.patch.object(self.gc.subprocess, "run", self.fake_run(record=calls)):
+            self.gc.read_table_macos()
+        self.assertTrue(any(self.env_flag_problems(a) for a, _ in calls))
+
+    def test_the_reader_is_chosen_by_platform(self):
+        with tempfile.TemporaryDirectory() as root:   # a /proc without net
+            calls = []
+            with mock.patch.object(self.gc.sys, "platform", "linux"), \
+                    mock.patch.object(self.gc.subprocess, "run", self.fake_run(record=calls)):
+                with self.assertRaises(self.gc.NoProcNet):
+                    self._real_read_table(root)
+            self.assertEqual(calls, [], "linux never falls back to ps and lsof")
+            (Path(root) / "net").mkdir()
+            with mock.patch.object(self.gc.sys, "platform", "linux"), \
+                    mock.patch.object(self.gc.subprocess, "run", self.fake_run(record=calls)):
+                self._real_read_table(root)
+            self.assertEqual(calls, [])
+            for plat in ("darwin", "freebsd14"):   # even with a /proc/net present
+                with mock.patch.object(self.gc.sys, "platform", plat), \
+                        mock.patch.object(self.gc.subprocess, "run", self.fake_run(record=calls)):
+                    self._real_read_table(root)
+                self.assertEqual(len(calls), 2)
+                del calls[:]
+
+    def test_linux_without_proc_net_is_one_failed_line_naming_it(self):
+        with mock.patch.object(self.gc.sys, "platform", "linux"), \
+                mock.patch.object(self.gc, "read_table", lambda: self._real_read_table("/nonexistent-proc-root")):
+            self.read_users()
+            self.step(60)
+            self.step(60, {"acme-a": 150})
+            self.step(60, {"acme-a": 150})
+        self.assertEqual([l["detail"] for l in self.lines("github.census_failed")], [{"error": "NoProcNet", "reason": "no /proc/net"}])
+
     def test_the_parsers_on_the_real_shapes(self):
         self.assertEqual(self.gc.parse_ps(PS_TEXT.splitlines())[:3], ["launchd", "logd", "Some_App"])
         found = self.gc.parse_lsof(LSOF_TEXT.splitlines())
@@ -241,7 +305,7 @@ class TestMacosReader(Rig):
         def hang(argv, **kw):
             raise subprocess.TimeoutExpired(argv, kw["timeout"])
         with mock.patch.object(self.gc.subprocess, "run", hang), \
-                mock.patch.object(self.gc, "read_table", lambda: self._real_read_table("/nonexistent-proc-root")):
+                mock.patch.object(self.gc, "read_table", self.gc.read_table_macos):
             self.read_users()
             self.step(60)
             self.step(60, {"acme-a": 150})

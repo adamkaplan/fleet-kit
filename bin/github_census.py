@@ -18,6 +18,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import time
 
 WINDOW = 300                # seconds: the sample interval, the census interval and the window of the outside count
@@ -32,6 +33,10 @@ SUBPROCESS_TIMEOUT = 10     # seconds each of ps and lsof may run: a hang is one
 GITHUB_RANGES = tuple(ipaddress.ip_network(n) for n in ("140.82.0.0/16", "192.30.252.0/22", "185.199.108.0/22"))   # IPv4 only
 PS_ARGV = ["/bin/ps", "-axo", "comm="]                          # command NAME column only: never a flag that prints environments or arguments
 LSOF_ARGV = ["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED"]
+
+
+class NoProcNet(OSError):
+    """Linux without /proc/net: the census says so (one github.census_failed line) and does not fall back to the macOS reader."""
 
 
 def kind_of(comm):
@@ -163,9 +168,11 @@ def read_table_macos():
 def read_table(proc_root="/proc"):
     """The real process table, reduced at the source: `comm`, the NAMES of the GitHub token variables (their values are never kept: each is
     the empty string) and the remote addresses of the connections. The command line is never opened. Raises OSError when the table cannot be listed.
-    Without /proc (macOS) the ps and lsof reader is used. At most MAX_PROCESSES processes are scanned."""
-    if not os.path.isdir(os.path.join(proc_root, "net")):
+    The reader is chosen by sys.platform: linux uses /proc (and raises NoProcNet when /proc/net is absent); darwin and others use ps and lsof. At most MAX_PROCESSES processes are scanned."""
+    if not sys.platform.startswith("linux"):
         return read_table_macos()
+    if not os.path.isdir(os.path.join(proc_root, "net")):
+        raise NoProcNet("no /proc/net")
     peers = _socket_peers(proc_root)
     table = []
     for entry in os.listdir(proc_root):
@@ -247,7 +254,10 @@ def run(engine, readings, recorded, now):
             except Exception as err:
                 if not state["failed"]:
                     state["failed"] = True
-                    audit.append(actor, "github.census_failed", worst[0], {"error": type(err).__name__})
+                    detail = {"error": type(err).__name__}
+                    if isinstance(err, NoProcNet):
+                        detail["reason"] = "no /proc/net"
+                    audit.append(actor, "github.census_failed", worst[0], detail)
                 return
             audit.append(actor, "github.census", worst[0], {"outside": worst[1], "window_seconds": WINDOW,
                                                             "kinds": found["kinds"], "processes": found["processes"]})
