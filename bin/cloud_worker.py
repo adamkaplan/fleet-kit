@@ -1326,6 +1326,9 @@ def _launch(args, runner, now, reserve):
     if load_record(state, name) is not None:
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
     brief = H["read_brief"](args.brief_file, sys.stdin)
+    needs = next((ln for ln in str(brief).splitlines() if re.fullmatch(r"\s*NEEDS:\s*docker\s*", ln, re.I)), None)   # #1488: the XS/S/M shapes without --stack have no docker
+    if needs is not None and not getattr(args, "stack", False):
+        raise LaunchError("the brief line %r needs docker, which only the --stack pod has: launch again with --stack; nothing was created" % needs.strip())
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
     options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
     for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):

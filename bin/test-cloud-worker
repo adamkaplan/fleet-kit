@@ -2391,6 +2391,46 @@ class TestVaultCheckProcess(VaultBase):
         holder.join(30)
 
 
+class TestNeedsDocker(Base):   # #1488
+    LINE = "NEEDS: docker"
+
+    def run_launch(self, text, *extra, cloud=True):
+        brief = self.home / "brief.txt"
+        brief.write_text(text)
+        argv = ["launch", "coder7", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "coder",
+                "--reports-to", "orch", "--brief-file", str(brief), *extra]
+        return self.main(*argv, *(["--cloud"] if cloud else []))
+
+    def test_s2_a_docker_brief_without_stack_is_refused_before_any_pod(self):
+        code, out, err = self.run_launch("Build.\n" + self.LINE + "\n")
+        self.assertEqual(code, 1)
+        refusal = [l for l in err.splitlines() if "needs docker" in l]
+        self.assertEqual(len(refusal), 1)
+        self.assertIn(self.LINE, refusal[0])
+        self.assertIn("--stack", refusal[0])
+        self.assertEqual(self.stub_calls(), [])
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+
+    def test_s3_a_docker_brief_with_stack_is_accepted(self):
+        code, out, err = self.run_launch("Build.\n" + self.LINE + "\n", "--stack")
+        self.assertNotIn("needs docker", err)
+        self.assertTrue([c for c in self.stub_calls()])
+
+    def test_s4_an_unmarked_brief_and_a_non_cloud_launch_are_unchanged(self):
+        code, out, err = self.run_launch("Build.\n")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("needs docker", err)
+        code, out, err = self.run_launch(self.LINE + "\n", cloud=False)
+        self.assertNotIn("needs docker", err)
+
+    def test_s5_a_check_that_ignores_the_line_is_caught(self):
+        src = (BIN / "cloud_worker.py").read_text()
+        self.assertEqual(src.count("if needs is not None and not getattr(args, \"stack\", False):"), 1)
+        mutant = src.replace("if needs is not None and not getattr(args, \"stack\", False):", "if False:")
+        self.assertNotEqual(mutant, src)
+        self.assertNotIn("needs is not None", mutant)   # the refusal test above fails on this source: it has no other way to refuse
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=1).result
     print("RESULT: %s" % ("PASS" if result.wasSuccessful() else "FAIL"))

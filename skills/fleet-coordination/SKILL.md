@@ -32,6 +32,7 @@ STOP:       <holds and exclusions — what you must not touch>
 NEXT:       <the next deliverable and who owns it>
 AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
+NEEDS:      docker   <only if the work needs docker; `launch --cloud` then refuses a pod without --stack>
 ```
 
 A pull request for an ask, or for a work item with a live check, says `Refs #N`, never `Closes`, `Fixes` or `Resolves`; `Closes #N` only where the plan says so.
