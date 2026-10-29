@@ -275,5 +275,53 @@ class TestLostWorkerReadRound(unittest.TestCase):
         self.assertIn("possibly lost", r.passes(at=NOW + 10)[0]["text"])
 
 
+class TestLostWorkerMemoryOnly(unittest.TestCase):
+    def setUp(self):
+        self.mod = load()
+        self.r = Rig(self.mod)
+        os.unlink(os.path.join(self.r.dir, "lost-workers.json"))
+        os.mkdir(os.path.join(self.r.dir, "lost-workers.json"))   # a directory at the memory path: neither written nor set aside
+        for name, age in (("recent", 300), ("old", 3 * 3600)):
+            line(self.r.engine.audit.path, ts=stamp(NOW - age), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(NOW - 60)})
+
+    def corrupt_lines(self):
+        with open(self.r.engine.audit.path) as handle:
+            return len([x for x in handle if "lost_worker.memory_corrupt" in x])
+
+    def check(self, r):
+        self.assertEqual([x["name"] for x in r.passes()], ["recent"])
+        self.assertEqual(self.corrupt_lines(), 1)
+        self.assertEqual(r.passes(), [])
+        self.assertEqual(self.corrupt_lines(), 1)
+        self.assertEqual(len([m for m in r.engine.sent if m[0] == "chief-of-staff"]), 1)
+
+    def test_s11b_memory_only_alerts_once_and_audits_once(self):
+        self.check(self.r)
+
+    def test_mutant_that_audits_every_pass_and_alerts_nothing_is_caught(self):
+        real = self.mod.run_pass
+
+        def mutant(sb, engine, now, alive=None, launcher_audit=None):
+            engine.audit.append(engine.actor, "lost_worker.memory_corrupt", None, {})
+            return []
+        self.mod.run_pass = mutant
+        with self.assertRaises(AssertionError):
+            self.check(self.r)
+        self.mod.run_pass = real
+
+    def test_failed_save_does_not_repeat_the_first_run_rule(self):
+        r = Rig(self.mod)
+        os.unlink(os.path.join(r.dir, "lost-workers.json"))
+        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="recent", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 60)})
+        real = self.mod._save
+        self.mod._save = lambda path, state: (_ for _ in ()).throw(OSError("disk full"))
+        self.assertEqual([x["name"] for x in r.passes()], ["recent"])
+        self.assertEqual(r.passes(), [])   # not re-alerted
+        self.mod._save = real
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="newer", detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual([x["name"] for x in r.passes()], ["newer"])
+
+
 if __name__ == "__main__":
     unittest.main()

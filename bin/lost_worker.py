@@ -37,6 +37,9 @@ SEEN_MAX = 500
 EVIDENCE_MAX = 200
 REAPER_ID = "reaper"
 
+_PROC_ALERTED = {}            # per memory path: keys this process already alerted or skipped: survives a memory file that cannot be saved or set aside
+_PROC_AUDITED = []            # the memory-only audit line is written once per process
+
 NEEDS = ("parse_iso", "_one_line", "parse_bounded")
 
 
@@ -215,15 +218,24 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         # An unreadable memory: this pass alerts nothing and says so once. The file is set aside, so the NEXT pass finds no memory, reads afresh
         # and writes a new one (offsets at the end of what it read, alerted empty): a corrupt file never silences alerts for ever.
         try:
+            if os.path.isdir(path):
+                raise OSError("a directory is not set aside")   # S11b: a directory at the memory path is memory-only mode
             os.replace(path, path + ".corrupt")
         except OSError:
             try:
                 os.unlink(path)
             except OSError:
                 pass
-        engine.audit.append(engine.actor, "lost_worker.memory_corrupt", None, {"file": STATE_FILE, "action": "nothing alerted this pass; fresh memory next pass"})
-        return []
-    first = status == "none"
+        if os.path.lexists(path):
+            # S11b: corrupt AND neither written nor set aside: memory-only mode at once, one audit line per process, alerts as a first pass now.
+            if not _PROC_AUDITED:
+                _PROC_AUDITED.append(True)
+                engine.audit.append(engine.actor, "lost_worker.memory_corrupt", None, {"file": STATE_FILE, "action": "cannot be set aside; memory-only mode, alerting as a first pass"})
+            status = "memory_only"
+        else:
+            engine.audit.append(engine.actor, "lost_worker.memory_corrupt", None, {"file": STATE_FILE, "action": "nothing alerted this pass; fresh memory next pass"})
+            return []
+    first = status in ("none", "memory_only")
     before = json.dumps(state, sort_keys=True)
     _fold(state, sb, _read_new(sb, str(engine.audit.path), state, "switchboard"), "switchboard")
     _fold(state, sb, _read_new(sb, launcher_audit or launcher_audit_path(), state, "launcher"), "launcher")
@@ -232,6 +244,7 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         if isinstance(r, dict) and isinstance(r.get("worker"), str):
             records[r["worker"]] = r
     alerted = state.setdefault("alerted", {})
+    alerted.update({k: v for k, v in _PROC_ALERTED.get(path, {}).items() if k not in alerted})   # what this process already alerted is never skipped or repeated
     losses = [x for x in _losses(state, sb, engine, alive, now, records) if x["key"] not in alerted]
     losses.sort(key=lambda x: (x["at"], x["key"]))
     if first:
@@ -253,6 +266,9 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         _deliver(engine, sb, {"name": "roll-up", "kind": "roll_up"}, ["chief-of-staff"], text)
     while len(alerted) > ALERTED_MAX:
         alerted.pop(min(alerted, key=lambda k: alerted[k]["at"]))
+    _PROC_ALERTED.setdefault(path, {}).update(alerted)
+    if status == "memory_only":
+        return raised   # the memory file is not written in memory-only mode
     if first or json.dumps(state, sort_keys=True) != before:
         try:
             _save(path, state)
