@@ -215,6 +215,9 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `bin/test-cloud-cost-report` | 1 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_end_alert.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_turn_end.py` | 0 | serial |
+| `cloud/launcher/tests/test_stop_cause.py` | 0 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_docs_wording.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
@@ -280,6 +283,9 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `bin/test-cloud-cost-report` | 0 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_end_alert.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_turn_end.py` | 0 | serial |
+| `cloud/launcher/tests/test_stop_cause.py` | 0 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_docs_wording.py` | 0 | serial |
 | `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |

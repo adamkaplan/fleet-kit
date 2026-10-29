@@ -22,6 +22,7 @@ cloud/launcher/tests/test_cloud_shapes.py
 cloud/launcher/tests/test_cloud_stack.py
 cloud/launcher/tests/test_cloud_stack_wait.py
 cloud/launcher/tests/test_cloud_status_summary.py
+cloud/launcher/tests/test_cloud_turn_end.py
 cloud/launcher/tests/test_cloud_worker.py
 cloud/launcher/tests/test_cluster_token_refresh.py
 cloud/launcher/tests/test_cw_minter_manifest.py

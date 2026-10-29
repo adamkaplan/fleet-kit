@@ -13,6 +13,7 @@ The state is one small private file (0600): {"offset": bytes already read, "sent
 file starts at the END of the audit file, so old history is never replayed. The state is saved BEFORE the messages go: a crash loses a message,
 it never sends one twice. Pure of the daemon: the send function, the paths, the last reports and the shared bounded parse (record_json.parse_bounded) are handed in.
 """
+import datetime
 import json
 import os
 import re
@@ -198,3 +199,64 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
             except Exception:
                 pass
     return [(to, text) for to, text, _w, _l in out]
+
+
+# ---- ask #1484: a cloud worker that ended its turn and waits tells its recorded boss (the same sender, state file, keys and bound as above) ----
+TURN_HOLD = 60          # seconds a turn end is held: a new turn within it cancels the message (a tool-driven continuation)
+TURN_CAUSE = "turn_end"  # the second half of the stored key (worker@last update, turn_end)
+
+
+def turn_message_text(worker, when):
+    """Five facts: the worker, the time, the fixed words, how to read the answer and the idle limit. Never the worker's own text."""
+    return ("[cloud worker waiting] %s ended its turn and waits for an instruction; at %s; read its answer with: fleet-switchboard read %s;"
+            " the idle limit will stop it if nothing is sent." % (worker, when, worker))
+
+
+def scan_turns(workers, activity, state_file, audit_file, send, parse, now, memory, hold=TURN_HOLD):
+    """One pass over the live cloud workers [(worker, boss)]. `activity(worker)` gives (busy, last update in epoch seconds) or None (unreadable: skipped).
+    `memory` is the daemon's own dict, kept between passes. One message per turn end, held `hold` seconds; sent through `send(recipient, text)`
+    to the recorded boss when it is a valid agent name, else to the Chief of Staff alone. Returns [(recipient, text)] handed to it."""
+    try:
+        size = os.stat(str(audit_file)).st_size
+    except OSError:
+        size = 0
+    offset, keys, _fresh = load_state(state_file, size, parse)
+    due = []
+    for worker, boss in workers:
+        if not isinstance(worker, str) or not WORKER_NAME.fullmatch(worker):
+            continue
+        try:
+            act = activity(worker)
+        except Exception:
+            act = None
+        if not act:
+            continue
+        busy, updated = act
+        mem = memory.setdefault(worker, {"busy": False, "seen": None, "pending": None})
+        if busy:
+            mem["busy"], mem["pending"] = True, None   # a new turn cancels a pending message
+            continue
+        if isinstance(updated, bool) or not isinstance(updated, (int, float)):
+            continue
+        ended = mem["busy"] or (mem["seen"] is not None and updated > mem["seen"])
+        mem["busy"], mem["seen"] = False, updated
+        if ended and mem["pending"] is None:
+            mem["pending"] = (updated, now)
+        pending = mem["pending"]
+        if pending and now - pending[1] >= hold:
+            mem["pending"] = None
+            key = ("%s@%d" % (worker, pending[0]), TURN_CAUSE)
+            if key in tuple(keys):
+                continue
+            keys.append(key)
+            when = datetime.datetime.fromtimestamp(pending[0], datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            to = boss if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) else CHIEF
+            due.append((to, turn_message_text(worker, when)))
+    if due:
+        save_state(state_file, offset, keys)   # saved BEFORE the messages go, as above
+        for to, text in due:
+            try:
+                send(to, text)
+            except Exception:
+                pass
+    return due

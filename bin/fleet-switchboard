@@ -5857,6 +5857,7 @@ BOSS_READ_SITES = {
     "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
+    "bin/fleet-switchboard:cloud_turn_tick": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the watch's record and handed to scan_turns, which sends to that lane or, with no valid name, to the Chief of Staff alone (#1484)",
     "bin/cloud_end_alert.py:scan_audit": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record; the message goes to the lane name `send` resolves (the same lookup), with the Chief of Staff as the second recipient",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
 }
@@ -9381,6 +9382,34 @@ def cloud_end_tick(engine, discovery):
                                                      lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail))
 
 
+def cloud_turn_activity(worker):
+    """#1484: (busy, last update in epoch seconds) of a cloud worker, from the launcher's own `status` (which reads the worker's activity script in the pod); None when unreadable."""
+    import datetime as _dt
+    cloud = load_module("cloud_worker").bind(globals())
+    code, data, _err = cloud.run_launcher(None, "status", worker, timeout=60)
+    rec = data[0] if code == 0 and isinstance(data, list) and data and isinstance(data[0], dict) else None
+    if rec is None:
+        return None
+    since = rec.get("idle_since")
+    if not since:
+        return True, 0
+    return False, _dt.datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc).timestamp()
+
+
+def cloud_turn_tick(engine, discovery, activity=None):
+    """#1484: a cloud worker whose turn ended and who waits tells its recorded boss, once per turn end (the sender, state file and keys of #1480)."""
+    state_dir = getattr(engine, "state_dir", None)
+    watch = getattr(engine, "cloud_watch", None)
+    if state_dir is None or not watch:
+        return []
+    workers = [(r.get("worker"), r.get("reports_to")) for r in watch.get("records", []) if isinstance(r, dict)]
+    if not hasattr(engine, "_cloud_turn_memory"):
+        engine._cloud_turn_memory = {}
+    return load_module("cloud_end_alert").scan_turns(workers, activity or cloud_turn_activity, Path(state_dir) / CLOUD_END_ALERT_FILE, cloud_audit_path(),
+                                                     lambda to, text: engine.send("switchboard", to, text), load_module("record_json").parse_bounded,
+                                                     time.time(), engine._cloud_turn_memory)
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -9408,6 +9437,10 @@ def finish_pass(engine, discovery, report):
         cloud_end_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-end-alert", "cloud-end-alert", err, report)
+    try:
+        cloud_turn_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:
