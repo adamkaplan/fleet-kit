@@ -57,10 +57,10 @@ def header(ns, texts):
                 cluster.append(kind.group(1))
     return "".join("# %s\n" % line for line in (
         "rendered for namespace %s" % ns,
-        "inputs: " + ", ".join(FILES) + " (read as text, nothing else)",
+        "inputs (the unrendered files, never apply them): " + ", ".join(FILES) + " (read as text, nothing else)",
         "cluster-wide documents (kinds %s): %s" % (", ".join(CLUSTER_KINDS), ", ".join(cluster) if cluster else "none in these four files"),
         "already present, once per cluster, not rendered here: runtimeclass.yaml and containerd-fix.yaml",
-        "apply: first kubectl apply --dry-run=server -f FILE, read the output, then the apply by the holder of the administrator login",
+        "apply the saved copy of this rendered output, not the inputs: first kubectl apply --dry-run=server -n NAMESPACE -f RENDERED_FILE, read the output, then the apply by the holder of the administrator login",
     ))
 
 
