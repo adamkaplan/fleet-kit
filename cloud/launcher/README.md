@@ -235,6 +235,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_refusal_label.py` | 3 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 2 | serial |
@@ -300,6 +301,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_refusal_label.py` | 3 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 1 | serial |
