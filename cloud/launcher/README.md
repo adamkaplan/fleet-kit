@@ -186,7 +186,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   a cloud record has it, so `send`, `read` and `retire` by name cannot be routed to the wrong one. A failed or cut `launch --cloud` stops
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
-- **The registry row (#1510).** The switchboard-side launch writes the agent's registry row at launch through the registry's own write function (`kind` cloud, no pane, the worker's own address as `endpoint`; the registry's rule does not refuse a fragment or a non-http scheme, the launcher's own record check does); `retire` and `cloud-clear` retire it once; the reaper's own stop of a pod writes nothing, the clear retires the row later. A registry failure never refuses a launch or keeps a pod: it is one line on standard error and one audit line.
+- **The registry row (#1510).** The switchboard-side launch writes the agent's registry row at launch through the registry's own write function (`kind` cloud, no pane, the worker's own address as `endpoint`; the registry's rule does not refuse a fragment or a non-http scheme, the launcher's own record check does); `retire` and `cloud-clear` retire it once; the reaper retires the row of a worker it ends, once; cloud-clear remains for a pod that disappeared without the reaper. The endpoint is recorded for an agent the hub delivers to; a plain cloud coder has no endpoint and keeps the cloud route. A registry failure never refuses a launch or keeps a pod: it is one line on standard error and one audit line.
 
 ## How a member adds a test to the chain
 
@@ -210,7 +210,7 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
-Not yet measured: none
+Not yet measured: `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_reaper_registry_retire.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_token_at_limit.py`
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
 

@@ -36,6 +36,7 @@ cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_reaper_managed.py
+cloud/launcher/tests/test_reaper_registry_retire.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_registry_endpoint.py
 cloud/launcher/tests/test_retire_gone_pod.py

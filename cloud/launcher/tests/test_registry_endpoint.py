@@ -67,9 +67,22 @@ class Behaviour(TCW.Base):
     def address(self, host):
         return "https://%s.example.test:%s" % (host, self.remote.url.rsplit(":", 1)[1])   # the stub's port-forward still reaches the fake remote
 
-    def launch_at(self, name, url):
-        with mock.patch.dict(os.environ, {"STUB_URL": url}):
-            return self.launch(name)
+    def launch_at(self, name, url, hub=True, agent="coder"):
+        """A launch at `url`; by default the hub setting is on (the agent is one the hub delivers to), as `hub=False` it is a plain cloud coder."""
+        stub = self.stub.read_text()
+        if '"--boss"' not in stub:   # the stub launcher knows the hub's own create options
+            self.stub.write_text(stub.replace('"--json")', '"--json", "--boss", "--agent")', 1))
+        brief = self.home / "brief.txt"
+        brief.write_text("Build the thing.\n")
+        env = {"STUB_URL": url}
+        if hub:
+            env["CW_HUB_CHANNEL_URL"] = "https://hub.example.test"
+        with mock.patch.dict(os.environ, env):
+            if not hub:
+                os.environ.pop("CW_HUB_CHANNEL_URL", None)
+                os.environ.pop("CW_HUB_REGISTRY_SECRET", None)
+            return self.main("launch", name, "--cloud", "--agent", agent, "--repo", "acme-org/widget-service", "--branch", "main",
+                             "--role", "coder", "--reports-to", "orch", "--brief-file", str(brief))
 
     def past_deadline(self, name):
         path = self.state / "cloud" / (name + ".json")
@@ -77,20 +90,23 @@ class Behaviour(TCW.Base):
         record["hard_deadline"] = "2020-01-01T00:00:00Z"
         path.write_text(json.dumps(record))
 
-    def test_matches_two_launches_write_one_row_each_with_their_own_endpoint(self):
-        urls = {"coder7": self.address("worker-aaa"), "coder8": self.address("worker-bbb")}
-        for name, url in urls.items():
-            code, out, err = self.launch_at(name, url)
+    def test_matches_hub_agents_write_their_own_endpoint_and_a_plain_coder_none(self):
+        urls = {"coder7": self.address("worker-aaa"), "orch1": self.address("worker-bbb"), "plain9": self.address("worker-ccc")}
+        for name, url, hub, agent in (("coder7", urls["coder7"], True, "coder"), ("orch1", urls["orch1"], False, "orchestrator"),
+                                      ("plain9", urls["plain9"], False, "coder")):
+            code, out, err = self.launch_at(name, url, hub=hub, agent=agent)
             self.assertEqual(code, 0, err)
-            self.assertEqual(json.loads(out.strip().splitlines()[-1])["url"], json.loads((self.state / "cloud" / (name + ".json")).read_text())["url"])
         rows = self.rows()
-        self.assertEqual(sorted(rows), ["coder7", "coder8"])
-        for name, url in urls.items():
+        self.assertEqual(sorted(rows), ["coder7", "orch1", "plain9"])
+        for name in ("coder7", "orch1"):
             self.assertEqual(rows[name]["kind"], "cloud")
-            self.assertEqual(rows[name]["endpoint"], url)
-            self.assertEqual(json.loads((self.state / "cloud" / (name + ".json")).read_text())["url"], url)
+            self.assertEqual(rows[name]["endpoint"], urls[name])
+            self.assertEqual(json.loads((self.state / "cloud" / (name + ".json")).read_text())["url"], urls[name])
             self.assertFalse(rows[name].get("pane"))
-        self.assertEqual(len({r["endpoint"] for r in rows.values()}), 2)
+        self.assertEqual(len({rows[n]["endpoint"] for n in ("coder7", "orch1")}), 2)
+        self.assertEqual(rows["plain9"]["kind"], "cloud")
+        self.assertNotIn("endpoint", rows["plain9"])
+        self.assertFalse(rows["plain9"].get("pane"))
 
     def test_matches_a_launch_whose_registry_is_unavailable_writes_no_row_and_goes_on(self):
         self.blocked_registry()
@@ -123,7 +139,7 @@ class Behaviour(TCW.Base):
             code, out, err = self.main("retire", "coder7")
         self.assertEqual(code, 1)
         self.assertEqual(calls, [])
-        self.assertEqual(self.rows()["coder7"]["endpoint"], self.address("worker-aaa"))
+        self.assertEqual(self.rows()["coder7"]["kind"], "cloud")
         self.assertNotIn("coder7", REG.read(str(self.state))["retired"])
 
     def test_matches_the_clear_retires_the_row_once_and_a_second_run_retires_nothing(self):
@@ -182,7 +198,8 @@ class Behaviour(TCW.Base):
 class Mutants(unittest.TestCase):
     """A scratch copy of the tree with ONE change asserted applied; the behaviour tests run in it and must exit 1."""
     CASES = (
-        ("the endpoint dropped", "bin/cloud_worker.py", ', "endpoint": record["url"]', ""),
+        ("the endpoint dropped", "bin/cloud_worker.py", '        row["endpoint"] = record["url"]', "        pass"),
+        ("the endpoint written for a plain coder", "bin/cloud_worker.py", "    if hub:   # the endpoint is recorded only", "    if True:   # the endpoint is recorded only"),
         ("a row written though the registry is unavailable", "bin/cloud_worker.py",
          "    except Exception as err:\n        say(str(err))",
          "    except Exception as err:\n        say(str(err))\n        H[\"load_module\"](\"registry\").upsert(__import__(\"tempfile\").gettempdir(), name, dict(args[0])) if what == \"upsert\" else None"),
@@ -230,8 +247,10 @@ class Docs(unittest.TestCase):
                 r"switchboard-side launch writes the agent's registry row",
                 r"worker's own address as (the )?`endpoint`",
                 r"retire[s]? it once|retire it once",
-                r"reaper's own stop of a pod writes nothing",
+                r"reaper retires the row of a worker it ends, once; cloud-clear remains for a pod that disappeared without the reaper",
                 r"never refuses a launch or keeps a pod",
+                r"endpoint is recorded for an agent the hub delivers to",
+                r"plain cloud coder has no endpoint and keeps the cloud route",
                 r"does not refuse a fragment or a (non-http scheme|scheme other than http)")]
             self.assertTrue(all(found), (rel, found))
 

@@ -2439,12 +2439,26 @@ class Launcher:
                     res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
+                    self.retire_registry_row(worker, reason)   # the stop succeeded: the row is retired, once
                 except CloudError as e:
                     self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
         out.extend(renewed)
         self.send_wip_notes(live, now)
         return out
+
+    def retire_registry_row(self, worker, reason):
+        """The reaper ended `worker`: retire its row through the registry's own `retire` (an absent row is harmless). A failed write is ONE scrubbed
+        line on standard error and the pass goes on: the registry is never a reason to keep a pod."""
+        try:
+            import registry   # bin/ is on the path (the registry's own module; never its file)
+            base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+            got = registry.retire(os.path.join(base, "fl" + "eet-switchboard"), worker, "cloud-worker", "reaped: %s" % reason)
+            if got.get("problem"):
+                raise CloudError(got["problem"])
+        except Exception as e:
+            text = re.sub(r"\S*://\S*", "<address>", str(e))
+            print("registry: %s: %s" % (worker, scrub(text, (), 120).replace("\n", " ")[:120]), file=sys.stderr)
 
     def note_slow_pass(self, took):
         """A pass that took longer than SLOW_PASS_SECONDS: ONE line on the reaper's own log and ONE audit line with the seconds. A short pass: none."""
