@@ -196,7 +196,9 @@ fleet-switchboard retire coder7
 
 ### The light shape (`XS`) and the other shapes
 
-A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), the light shape and the default (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB) and `M` (4 CPU, 8 GiB) are chosen only by name: `--shape S`. A worker gets `XS` and an orchestrator (`--agent orchestrator`) gets `S` when `--shape` is not given.
+A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), the light shape and the default (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB) and `M` (4 CPU, 8 GiB) are chosen only by name: `--shape S`. A worker gets `XS` and an orchestrator (`--agent orchestrator`) gets `O` when `--shape` is not given.
+
+The orchestrator row is `O` (250m CPU, 768 MiB, 0.02 USD/hour), a list-price estimate (requests equal limits, no nested Docker). The one rule that chooses it: an orchestrator launch with no `--shape` takes `O`; an explicit `--shape S` (or `XS` or `M`) still wins; a worker launch and a stack launch are unchanged. `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory. Cost per day of one always-on orchestrator: 24 x 0.02 = 0.48 USD a day (a list-price estimate, not a billed figure; the node's own price is not included).
 
 - Belongs in `XS`: a reader (code reading and review), a planner, a tester running short tests, a small edit and commit.
 - Does not belong in `XS`: a nested Docker stack (`--stack` refuses `XS`), an image build, a long full test suite or a build with a large memory peak: name `--shape S` or `M` for those.
