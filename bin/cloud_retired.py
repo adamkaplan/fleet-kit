@@ -187,7 +187,7 @@ def _last_worker_text(directory):
     return found, None
 
 
-def read_retired(name, retired, state, runner, now):
+def read_run_record(name, retired, state, runner, now):
     """The last text of a retired cloud worker, from its run record: only for the callers `retire` allows (the operator, the Chief of Staff, the boss kept
     at its removal, and only when the kept file is not older than the run it would speak for), scrubbed before and after the cap."""
     LaunchError = D["LaunchError"]

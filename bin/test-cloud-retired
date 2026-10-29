@@ -204,10 +204,13 @@ class TestRead(Retired):
         self.assertNotIn("tail", out)
 
     def test_a_secret_cut_across_the_cap_is_still_removed(self):
+        run = "Qx7Lm2Vb9Nc4Zk1Wd8Hs3Jf6Rt5Yp0Ae" * 2   # 66 characters of one base64 run: the shape needs 40, so a cut piece of 20 shows no shape
         self.retire()
-        self.run_record("coder7", stamp(-5), [msg("assistant", "y" * 3990 + TOKEN)])
+        self.run_record("coder7", stamp(-5), [msg("assistant", "y " * 1990 + run)])
         out = self.as_caller(KIND_BOSS, "read", "coder7")[1]
-        self.assertNotIn(TOKEN[:12], out)
+        self.assertIn("y y y y", out)   # the text is shown, cut at the cap
+        self.assertNotIn(run[:12], out)
+        self.assertNotIn(run[:10], out)
 
     def test_s5_nothing_to_show_is_one_plain_line_and_exit_1(self):
         self.retire()

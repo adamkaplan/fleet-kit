@@ -5858,6 +5858,7 @@ BOSS_READ_SITES = {
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
+    "bin/cloud_retired.py:keep_boss": "keeps the boss of a removed cloud worker from the worker's own endpoint record (not a discovered agent) so `read` can answer for it after the record is gone",
 }
 
 

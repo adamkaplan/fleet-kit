@@ -1577,7 +1577,7 @@ def cmd_read(args, runner, now):
         if not session:
             retired = _retired().retired_run(args.name)   # nothing live answers to the name: a retired cloud worker's run record, last (#1546)
             if retired is not None:
-                return _retired().read_retired(args.name, retired, state, runner, now)
+                return _retired().read_run_record(args.name, retired, state, runner, now)
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
         v2 = engine.v2
     messages = v2.message_list(session, limit=limit, order="desc") or []

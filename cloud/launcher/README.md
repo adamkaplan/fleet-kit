@@ -213,6 +213,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 1 | serial |
+| `bin/test-cloud-retired` | 66 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
@@ -278,6 +279,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 0 | serial |
+| `bin/test-cloud-retired` | 33 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
