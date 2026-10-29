@@ -33,6 +33,14 @@ def plain(value, limit=80):
     return SAFE.sub("", str(value))[:limit]
 
 
+ISO_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+
+def when_text(value):
+    """The launcher's own ISO UTC time, or the word unknown (a shape check, never a copy of other text)."""
+    return value if isinstance(value, str) and ISO_UTC.fullmatch(value) else "unknown"
+
+
 def read_small(path, parse):
     """A small regular file's JSON dict, or None (a link, a FIFO, a big or unreadable file all give None). Never blocks, never raises."""
     try:
@@ -165,7 +173,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
         boss = record.get("reports_to") if record and record.get("worker") == worker else None
         name = record_name_of(worker, record_name)
         pushed = pushed_text(raw_dir(reason), parse) if name else "unknown"
-        text = message_text(worker, label, plain(line.get("ts"), 30), pushed, name, line["ok"] is False)
+        text = message_text(worker, label, when_text(line.get("ts")), pushed, name, line["ok"] is False)
         keys.append(key)
         to_list = [CHIEF] + ([boss] if isinstance(boss, str) and AGENT_NAME.fullmatch(boss) and boss != CHIEF else [])
         out.extend((to, text, worker, label) for to in reversed(to_list))

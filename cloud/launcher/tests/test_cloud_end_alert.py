@@ -352,6 +352,31 @@ class TestCauseRules(World):
         self.assertEqual(len(self.sent), 4)   # the real code sends 2
 
 
+class TestTimeShape(World):
+    def sent_text(self, ts, module=real):
+        self.worker("worker7")
+        self.stop("worker7", "idle", ts=ts)
+        self.run_pass(module)
+        return " ".join(t for _, t in self.sent)
+
+    def test_s17_a_bad_time_shows_as_unknown_and_is_never_copied(self):
+        for bad in ("sk-" + "abcdefghijklmnopqrstuvwx", "2026-01-01T10:00:00Z" + "9" * 40, "2026-01-01T10:00:00Z\nx", "2026-01-01T10:00:00+02:00"):
+            with self.subTest(bad=bad):
+                self.setUp()
+                text = self.sent_text(bad)
+                self.assertTrue(self.sent)
+                self.assertIn("unknown", text)
+                self.assertEqual(text.count(bad), 0)
+
+    def test_s17_a_good_time_is_kept(self):
+        self.assertIn("2026-01-01T10:00:00Z", self.sent_text("2026-01-01T10:00:00Z"))
+
+    def test_s17_a_mutant_that_copies_the_time_text_is_caught(self):
+        broken = mutant('return value if isinstance(value, str) and ISO_UTC.fullmatch(value) else "unknown"', "return str(value)")
+        bad = "sk-" + "abcdefghijklmnopqrstuvwx"
+        self.assertGreater(self.sent_text(bad, broken).count(bad), 0)   # the real code: 0
+
+
 class TestDocs(unittest.TestCase):
     def test_s6_the_interface_doc_says_what_is_sent_to_whom_and_when(self):
         with open(DOC, encoding="utf-8") as f:
@@ -359,8 +384,9 @@ class TestDocs(unittest.TestCase):
         for phrase in ("within one pass of the launcher's stop",
                        "once per run id and cause", "the worker, the reason, the time, whether the work was pushed", "the run record's name",
                        "the field `cause`", "`idle`, `hard`, `pod_gone`", "`pod_failed`", "decides from `cause` alone", "alerts on its FIRST line", "a vanished pod is noticed one reaper pass late", "before the audit's last 24 hours is not noticed", "confirmed by reading it by its own name", "older than 10 minutes, so a pod gone within 10 minutes is noticed on a later pass", "a failed stop does not close the run", "ONE message to the Chief of Staff always", "send nothing, because they carry no `cause`",
-                       "lost, never repeated, when a send fails after the state is saved", "drains one megabyte per pass", "a corrupt cursor skips the lines written meanwhile"):
+                       "pod_gone` is written only by the reaper", "a person's retire writes no cause", "lost, never repeated, when a send fails after the state is saved", "drains one megabyte per pass", "a corrupt cursor skips the lines written meanwhile"):
             self.assertIn(phrase, text)
+        self.assertEqual(text.count("a retire that found the pod gone"), 0)
 
 
 if __name__ == "__main__":

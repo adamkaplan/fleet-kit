@@ -112,6 +112,57 @@ class Cause(tcw.Base):
         self.assertNotIn("cause", stops[0])
         self.assertTrue(stops[0]["reason"].startswith("idle"))
 
+    # ask #1480 S11: a reaper stop of a pod found gone or failed names that, not idle or hard
+    def make_stop(self, hard, phase=None, gone=False, module=None):
+        """One reaper stop of coder7 (hard or idle); the pod read says NotFound (gone) or the pod is in `phase`."""
+        if hard:
+            self.create("coder7", "--hard", "1h")
+            self.set_activity("coder7", True, T0)
+            self.clock.advance(minutes=61)
+        else:
+            self.create()
+            self.set_activity("coder7", False, self.clock())
+            self.clock.advance(minutes=12)
+        if phase:
+            st = self.st()
+            st["pods"][cw.pod_name("coder7")].setdefault("status", {})["phase"] = phase
+            self.write_state(st)
+        mod = module or cw
+        if gone:
+            real_get = mod.Kube.get_pod
+            target = cw.pod_name("coder7")
+            patch = mock.patch.object(mod.Kube, "get_pod", lambda kube, name: None if name == target else real_get(kube, name))
+            patch.start()
+            self.addCleanup(patch.stop)
+        mod.Launcher(mod.Kube(self.env), self.env, self.clock).reap()
+        return [l["cause"] for l in self.stops()]
+
+    def test_s11_a_reaper_idle_stop_of_a_gone_pod_carries_pod_gone(self):
+        self.assertEqual(self.make_stop(False, gone=True), ["pod_gone"])
+
+    def test_s11_a_reaper_hard_stop_of_a_gone_pod_carries_pod_gone(self):
+        self.assertEqual(self.make_stop(True, gone=True), ["pod_gone"])
+
+    def test_s11_a_reaper_idle_stop_of_a_failed_pod_carries_pod_failed(self):
+        self.assertEqual(self.make_stop(False, phase="Failed"), ["pod_failed"])
+
+    def test_s11_a_reaper_hard_stop_of_a_failed_pod_carries_pod_failed(self):
+        self.assertEqual(self.make_stop(True, phase="Failed"), ["pod_failed"])
+
+    def test_s11_a_reaper_stop_of_a_healthy_pod_still_carries_idle_and_hard(self):
+        self.assertEqual(self.make_stop(False), ["idle"])
+
+    def test_s11_a_reaper_hard_stop_of_a_healthy_pod_still_carries_hard(self):
+        self.assertEqual(self.make_stop(True), ["hard"])
+
+    def test_m11_a_gone_branch_that_keeps_the_idle_or_hard_cause_is_caught(self):
+        mod = self.mutant('info["cause"] = "pod_gone"', "pass")
+        self.assertEqual(self.make_stop(True, gone=True, module=mod), ["hard"])   # the real code writes pod_gone
+
+    def test_m12_a_failed_branch_that_does_not_set_pod_failed_is_caught(self):
+        mod = self.mutant('info["cause"] = "pod_failed"', "pass")
+        self.assertEqual(self.make_stop(True, phase="Failed", module=mod), ["hard"])   # the real code writes pod_failed
+
     def test_s11_a_failed_end_hook_still_names_the_cause(self):
         self.create("coder7", "--hard", "1h")
         self.set_activity("coder7", True, T0)
