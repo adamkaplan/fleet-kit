@@ -347,7 +347,30 @@ class LaunchSideMint(unittest.TestCase):
         seen = []
         mod._capture = lambda argv, env=None: seen.append(argv) or (0, "x\n", "")
         self.run_mint(mod)
-        self.assertEqual(seen, [[sys.executable, self.mint, REPO]])
+        self.assertEqual([[os.path.realpath(a) for a in argv] for argv in seen],
+                         [[os.path.realpath(a) for a in (sys.executable, self.mint, REPO)]])
+
+    def test_a_launch_through_a_symlinked_temporary_directory_compares_resolved_paths(self):
+        import tempfile
+        real = tempfile.TemporaryDirectory()
+        self.addCleanup(real.cleanup)
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        link = os.path.join(other.name, "linked")
+        os.symlink(real.name, link)
+        self.mint = os.path.join(link, "cloud", "launcher", "app_token.py")
+        os.makedirs(os.path.dirname(self.mint))
+        with open(self.mint, "w") as f:
+            f.write(FAKE_MINT)
+        self.log = self.mint + ".argv"
+        mod = self.load()
+        seen = []
+        mod._capture = lambda argv, env=None: seen.append(argv) or (0, "x\n", "")
+        self.run_mint(mod)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(os.path.realpath(seen[0][1]), os.path.realpath(self.mint))
+        self.assertEqual([os.path.realpath(a) for a in seen[0]],
+                         [os.path.realpath(a) for a in (sys.executable, self.mint, REPO)])
 
     def test_a_custom_command_runs_unchanged(self):
         own = os.path.join(os.path.dirname(self.mint), "own.py")
