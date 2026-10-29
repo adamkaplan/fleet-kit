@@ -695,3 +695,4 @@ def cmd_remind(args, runner, now):
 
 
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
+cmd_remind.header_cache = True    # #1520

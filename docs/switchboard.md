@@ -6220,3 +6220,14 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## Header cache (#1520)
+
+The ask header a message carries (an issue's Intent, Done-when, state, `updated_at`, and its parent's number) is read from a file cache shared by the commands, so a burst of `send`, `report`, `comment`, `pending`, `remind` and `status` does not make two or three fresh GitHub requests each (every command is a new process: the reader's own in-memory cache lives for one command).
+
+- Where: `<state directory>/header-cache/`, one file per issue (named by hashes of account, repository and issue number), mode 0600 in a 0700 directory, written whole and renamed into place (no locks), at most 2000 files of 8 KB (the oldest go first). Only the named fields are stored: no token, header or other body. A corrupt, oversized, unreadable or unwritable cache is ignored and the read is made. The allowed-repository check and the account check run before the cache; the key includes the account.
+- Two sets of commands, both derived from the code. CACHE-ALLOWED (display and routing only): a command whose handler says `header_cache = True` (`send`, `report`, `comment`, `pending`, `remind`, `status`). ALWAYS-FRESH (approve, merge, clear or record evidence): every command whose handler is flagged `ledger`, marked `@recording` or flagged `guard_records` (the way the recording guard of #1380 derives its commands), plus `plan`, `gates`, `gates-check`, `merge-gate`, `impact` and the merge shim: they read from GitHub even when an entry is warm. A test fails when a command that reads the header is in neither set.
+- Ages: an open issue is served for at most 10 minutes, a closed issue for at most 24 hours (issues are reopened), then the read is made again. The daemon's events `reopened`, `edited`, `closed`, `transferred` and `deleted` of an issue drop its entry at once; with the webhook down only the ages bound the staleness.
+- `--fresh` (on `send`, `pending`, `status`) reads from GitHub now and replaces the entry; a write by a command to the issue (a comment, an edit, a label) drops it.
+- Off switch: `"header_cache": "off"` in the configuration, read at every read by every command: with it off every read is fresh. It is the rollback besides a revert.
+- Restart: the command-line processes use the cache at once, with no restart. The daemon needs a restart only for its own invalidation call (the events above); until then entries age out as stated. The daemon's own reads do not use the file cache.

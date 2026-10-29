@@ -472,7 +472,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "header_cache", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -12132,6 +12132,12 @@ class GitHubHub:
                 if reader is not None and isinstance(number, int):
                     reader.invalidate(number, repo)
             return
+        if event == "issues" and payload.get("action") in ("reopened", "closed", "transferred", "deleted"):   # #1520: the file entry of the header goes at once; these events go no further here
+            number = (payload.get("issue") or {}).get("number")
+            reader = getattr(self.engine, "intents", None)
+            if reader is not None and isinstance(number, int):
+                reader.invalidate(number, repo)
+            return
         if event != "issues" or payload.get("action") != "edited":
             return
         try:
@@ -13602,6 +13608,7 @@ def cmd_status(args, runner=subprocess.run, now=time.time):
 
 
 cmd_status.direct = True   # no error mapping, no daemon start
+cmd_status.header_cache = True    # #1520
 
 
 class CallerError(Exception):
@@ -14328,6 +14335,7 @@ def cmd_send(args, runner, now):
 
 
 cmd_send.ensure_on_use = True   # the daemon is alive when it runs
+cmd_send.header_cache = True    # #1520: its header banner may be served from the shared file cache
 
 
 def _send_by_registry(args, runner, now):
@@ -14500,6 +14508,7 @@ def cmd_report(args, runner, now):
 
 
 cmd_report.ensure_on_use = True   # the daemon is alive when it runs
+cmd_report.header_cache = True    # #1520
 
 
 def notice_boss(engine, sender):
@@ -14654,6 +14663,9 @@ def cmd_pending(args, runner, now):
     for problem in entry["source_problems"]:
         print("  problem: %s" % problem)
     return EXIT_OK
+
+
+cmd_pending.header_cache = True    # #1520: its header banner may be served from the shared file cache
 
 
 # ============================================================================
@@ -15212,8 +15224,37 @@ def work_lines(issue, tag=None):
     return [_header_line("Work item %s Intent: %s" % (tag or "#%d" % issue.number, issue.intent or NO_INTENT))]
 
 
+HEADER_CACHE_ACTION = [None]   # the command being run (set by `dispatch`): the file cache of the header serves only a CACHE-ALLOWED one
+HEADER_CACHE_FRESH = [False]   # `--fresh` was given: the entry is dropped and the read is made
+
+
+def always_fresh_commands():
+    """The ALWAYS-FRESH set (#1520), derived from the command registry the way the guard of #1380 derives its recording commands: every command whose handler is
+    flagged `ledger`, marked `@recording` (`records`) or flagged `guard_records`, plus the approving and gating ones named in HEADER_FRESH_EXTRA."""
+    found = set(HEADER_FRESH_EXTRA)
+    for name, fn in list(globals().items()):
+        if name.startswith("cmd_") and callable(fn) and (getattr(fn, "ledger", False) is True or isinstance(getattr(fn, "records", None), str)
+                                                          or getattr(fn, "guard_records", False) is True):
+            found.add(name[4:].replace("_", "-"))
+    return found
+
+
+def cache_allowed_commands():
+    """The CACHE-ALLOWED set: the commands whose handler says `header_cache = True` (display and routing only)."""
+    return {name[4:].replace("_", "-") for name, fn in list(globals().items()) if name.startswith("cmd_") and callable(fn) and getattr(fn, "header_cache", False) is True}
+
+
+def header_cache_action(name):
+    """`name` when the command may be served from the file cache (CACHE-ALLOWED and not ALWAYS-FRESH), else None: what `dispatch` stores, so the reader never derives the sets."""
+    return name if name in cache_allowed_commands() and name not in always_fresh_commands() else None
+
+
+HEADER_FRESH_EXTRA = ("plan", "gates", "gates-check", "merge-gate", "impact", "merge", "charter", "orders")   # approval and check, the gates, the impact floor and the merge shim; the charter set decides from the issue and its parent (#1249), the orders are read fresh
+
+
 class IntentReader:
-    """Reads Intent lines from GitHub, with an in-memory cache.
+    """Reads Intent lines from GitHub, with an in-memory cache (one process only: every command is a new process, so #1520 adds the shared file cache
+    of the header for the CACHE-ALLOWED commands, behind this one).
 
     Only ever runs `<gh> api <path>`: a GET, with no method, field or input
     flag, so there is nothing here that can write. Entries are keyed by repo
@@ -15344,6 +15385,46 @@ class IntentReader:
         except Exception:
             return None
 
+    # -- the file cache of the header (#1520): bin/header_cache.py, loaded lazily by path
+
+    def _file_layer(self, repo):
+        """(state dir, account) when this read may use the shared file cache, else None. Only a CACHE-ALLOWED command, with the setting not off, and only AFTER the
+        exclusion and the account have been checked (a repo or account this process may not read never reaches the cache: IntentError as for a fresh read)."""
+        if HEADER_CACHE_ACTION[0] is None:   # `dispatch` sets it only for a CACHE-ALLOWED command (header_cache_action): any other process, command or daemon reads fresh
+            return None
+        config = self.config if self.config is not None else getattr(self.accounts, "config", None)
+        if not isinstance(config, dict) or not load_module("header_cache").enabled(config):
+            return None
+        if load_module("repo_exclusion").is_excluded(config, repo or self.repo):
+            raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))
+        self.env_for(repo)   # raises IntentError when the account has no token: no cached body for an account this process cannot use
+        account = self.accounts.describe(repo) if self.accounts is not None and repo else "default"
+        return state_dir_path(), account
+
+    def _filed(self, kind, repo, number, fetch, encode, decode):
+        """`fetch` behind the file cache: the stored part when it is young enough, else fetch (never cached when it fails) and store it."""
+        layer = self._file_layer(repo)
+        if layer is None:
+            return fetch
+        state, account = layer
+        hc = load_module("header_cache")
+
+        def run():
+            if HEADER_CACHE_FRESH[0]:
+                hc.drop(state, repo, number)
+            else:
+                found = hc.load(state, account, repo, number, kind, self.now())
+                if found is not None:
+                    try:
+                        return decode(found)
+                    except (KeyError, TypeError, ValueError):
+                        pass
+            value = fetch()
+            hc.store(state, account, repo, number, kind, encode(value), self.now())
+            return value
+
+        return run
+
     def _cached(self, key, fetch):
         hit = self._cache.get(key)
         if hit is not None:
@@ -15360,6 +15441,7 @@ class IntentReader:
         repo = repo or self.repo
         for kind in ("issue", "parent", "orders"):
             self._cache.pop((kind, repo, issue), None)
+        load_module("header_cache").drop(state_dir_path(), repo, issue)   # #1520: the shared file entry too (the daemon's events reach here)
 
     # -- reading
 
@@ -15371,7 +15453,16 @@ class IntentReader:
             found.repo = repo
             return found
 
-        return self._cached(("issue", repo, number), fetch)
+        def encode(found):
+            return {k: getattr(found, k, None) for k in load_module("header_cache").ISSUE_FIELDS}
+
+        def decode(stored):
+            found = IssueIntent(stored["number"], stored["state"], "", stored["intent"], stored["done_when"], stored["updated_at"], bool(stored["charter"]))
+            found.workspace, found.pull_request, found.repo = stored.get("workspace"), bool(stored.get("pull_request")), repo
+            found.labels, found.parked_until = [], None
+            return found
+
+        return self._cached(("issue", repo, number), self._filed("issue", repo, number, fetch, encode, decode))
 
     def charter_orders(self, number, repo=None):
         """PR 17: the charter's standing orders (a list), read like the rest: cached for `ttl` seconds."""
@@ -15395,7 +15486,9 @@ class IntentReader:
                 raise
             return IssueIntent.from_api(found).number
 
-        return self._cached(("parent", repo, number), fetch)
+        if strict:   # the charter set's strict read tells "no parent" from an odd 404: it is never answered from the file
+            return self._cached(("parent", repo, number), fetch)
+        return self._cached(("parent", repo, number), self._filed("parent", repo, number, fetch, lambda found: {"parent": found}, lambda stored: stored["parent"]))
 
     def ask_of(self, number, repo=None):
         """(ask, work item) for an issue: a work item's ask is its parent.
@@ -15721,6 +15814,7 @@ def cmd_intent(args, runner, now):
 
 
 cmd_intent.ensure_on_use = True   # the daemon is alive when it runs
+cmd_intent.header_cache = True    # #1520: it only displays the header
 
 
 def caller_fleet(herdr, v2, environ):
@@ -22776,6 +22870,7 @@ def build_parser():
     sub = parser.add_subparsers(dest="action", required=True)
     status = sub.add_parser("status", help="Config, clients, and every fleet agent with what is pending for it")
     status.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
+    status.add_argument("--fresh", action="store_true", help="Read the ask header from GitHub now (drop the cached one)")
     run = sub.add_parser("run", help="The daemon: observe, derive, decide, deliver, every poll seconds")
     run.add_argument("--once", action="store_true", help="One pass, then exit")
     run.add_argument("--poll", type=float, help="Seconds between passes (default: config poll_seconds)")
@@ -22786,6 +22881,7 @@ def build_parser():
     send.add_argument("name", help="The recipient's fleet name")
     send.add_argument("text", nargs="+", help="The message")
     send.add_argument("--issue", type=issue_arg, help="The issue the message is about")
+    send.add_argument("--fresh", action="store_true", help="Read the ask header from GitHub now (drop the cached one)")
     send.add_argument("--interrupt", action="store_true",
                       help="Stop and hold orders only: abort the recipient's running turn (its in-flight tool call "
                            "is cut), then deliver the message as a wake. Only a boss to its own worker.")
@@ -22857,6 +22953,7 @@ def build_parser():
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
+    pending.add_argument("--fresh", action="store_true", help="Read the ask header from GitHub now (drop the cached one)")
     remind = sub.add_parser("remind", help="A message to an agent that is due later")
     remind.add_argument("name", nargs="?", help="The recipient's fleet name")
     remind.add_argument("when", nargs="?", help="A delay (30m, 2h, 1d) or an ISO time with a zone")
@@ -23477,6 +23574,15 @@ cmd_plan.direct = True   # no error mapping, no daemon start
 def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen, socket_call=None):
     """Run the parsed command: the exit code. `known` is the set of registered subcommands (parser.commands)."""
     available = {"args": args, "runner": runner, "now": now, "spawn": spawn, "socket_call": socket_call, "wait": wait}
+    HEADER_CACHE_ACTION[0], HEADER_CACHE_FRESH[0] = header_cache_action(args.action), bool(getattr(args, "fresh", False))   # #1520
+    try:
+        return _dispatch(args, known, available)
+    finally:
+        HEADER_CACHE_ACTION[0], HEADER_CACHE_FRESH[0] = None, False
+
+
+def _dispatch(args, known, available):
+    runner, now, wait, spawn, socket_call = (available[k] for k in ("runner", "now", "wait", "spawn", "socket_call"))
     if args.action == "version":
         print("%s %s" % (PROG, VERSION))
         return EXIT_OK
@@ -26733,12 +26839,17 @@ def _gh_write(engine, runner, repo, path, method, data=None, tolerate_missing=Fa
     extra = {"input": json.dumps(data)} if data is not None else {}
     if env is not None:
         extra["env"] = env
+    written = re.match(r"repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)", str(path))
+    if written:
+        load_module("header_cache").drop(state_dir_path(), written.group(1), int(written.group(2)))   # #1520: a write to the issue (comment, edit, label) drops its header entry
     try:
         done = runner(argv, capture_output=True, text=True, timeout=engine.config["call_timeout_seconds"], **extra)
     except subprocess.TimeoutExpired:
         raise IntentError("unavailable", "gh did not answer within %ss" % engine.config["call_timeout_seconds"]) from None
     except OSError as err:
         raise IntentError("unavailable", "cannot run %s: %s" % (engine.config["gh"], err.strerror or err)) from None
+    if written:
+        load_module("header_cache").drop(state_dir_path(), written.group(1), int(written.group(2)))   # again once it is done: a read in between cannot keep the old header
     if done.returncode != 0:
         detail = _one_line(done.stderr, GH_ERROR_MAX) or _one_line(done.stdout, GH_ERROR_MAX) or "exit %d" % done.returncode   # #967: the failure's own words, whole (the clear's refusal shows them)
         if tolerate_missing and ("404" in detail or "Not Found" in detail):

@@ -42,6 +42,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_quick.py` | 0 | the shared selection helper of the cloud pre-push quick mode: picks the tests that read the changed files, holds the scan list and the heavy-test list, resolves a scan selector (standard library only) | |
 | `closed_labels.py` | 0 | a closed issue never keeps asking for an answer | |
 | `dead_hint.py` | 0 | what is known about a dead agent and what to do about it (pure text) | |
+| `header_cache.py` | 0 | the shared file cache of the ask header (Intent, Done-when, state, updated_at, parent): one file per issue, ages, bounds (#1520) | |
 | `impact_brief.py` | 0 | the impact brief: what a held change can do, built from the diff and the records only (pure, no clock, no network) (#1215) | |
 | `merged_labels.py` | 0 | a merged pull request does not keep its hold | |
 | `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
