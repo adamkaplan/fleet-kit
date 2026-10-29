@@ -4,12 +4,7 @@
 # changes or removes, or a quoted message (12 characters or more) of a removed or changed line, so a builder runs those classes before it pushes. It never
 # lists a test the diff itself adds. Exit 0 whatever it finds; non-zero only when the diff cannot be read. The command is registered by name, here.
 
-import keyword
-import re
-import subprocess
-import sys
-from pathlib import Path
-
+# (standard-library modules are imported inside the functions that use them: a module-level import is a binding the clear's closure would read.)
 PINS_MAX_LINES = 200
 PINS_MIN_MESSAGE = 12   # a quoted string shorter than this is noise
 PINS_MIN_NAME = 4
@@ -36,6 +31,7 @@ def _pins_one_line(text, limit=300):
 
 
 def _pins_name_ok(name):
+    import keyword
     return len(name) >= PINS_MIN_NAME and not keyword.iskeyword(name) and name.lower() not in PINS_COMMON_WORDS
 
 
@@ -51,6 +47,7 @@ def pins_messages_of(line):
 
 def pins_read_diff(base, runner):
     """{path: {"added": set of new-side line numbers, "names": set, "messages": set}} for `git diff -U0 base`; PinsError when git cannot read it."""
+    import subprocess
     try:
         done = runner(["git", "diff", "-U0", "--no-color", "--no-ext-diff", base, "--"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as err:
@@ -91,6 +88,8 @@ def pins_terms(files):
 
 def pins_search(names, messages, runner):
     """[(path, line number, line text, term)] for every line of the existing tests that holds a term (git grep over tracked files only)."""
+    import re
+    import subprocess
     terms = list(names) + list(messages)
     if not terms:
         return []
@@ -157,6 +156,8 @@ def pins_listing(files, hits, read_lines):
 
 def cmd_pins(args, runner, now):
     """`pins [--base REF]`: the existing tests that name a function, class or constant the diff changes or removes, or a quoted message of a removed or changed line."""
+    import sys
+    from pathlib import Path
     base = args.base
     try:
         files = pins_read_diff(base, runner)
