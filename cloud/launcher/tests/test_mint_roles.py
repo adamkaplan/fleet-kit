@@ -312,6 +312,41 @@ class Documents(unittest.TestCase):
         self.assertTrue(self.check(text.replace(ORCH_TEXT, "")))
         self.assertTrue(self.check(text.replace("it can write to issues only", "")))
 
+    LIMITS = (
+        "a custom mint command (CW_GIT_TOKEN_CMD) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command",
+        "an orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set",
+    )
+
+    def limit_failures(self, text):
+        flat = " ".join(text.split()).lower()
+        return [s for s in self.LIMITS if flat.count(s.lower()) != 1]
+
+    def test_s7_each_limit_sentence_is_found_once_in_each_document(self):
+        for rel in self.FILES:
+            with self.subTest(rel):
+                self.assertEqual(self.limit_failures(read(rel)), [])
+
+    def test_s7_a_document_without_the_first_limit_sentence_fails(self):
+        text = read(self.FILES[0])
+        first = "A custom mint command (CW_GIT_TOKEN_CMD) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command."
+        mutated = text.replace(first, "")
+        self.assertNotEqual(mutated, text)
+        self.assertEqual(self.limit_failures(mutated), [self.LIMITS[0]])
+        self.assertEqual(self.limit_failures(text + " " + first), [self.LIMITS[0]])
+
+
+class LocalNames(unittest.TestCase):
+    def test_no_function_of_the_mint_assigns_a_local_named_expected_permissions(self):
+        import ast
+        tree = ast.parse(read("cloud/launcher/app_token.py"))
+        bad = []
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for n in ast.walk(fn):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == "EXPECTED_PERMISSIONS":
+                        bad.append(fn.name)
+        self.assertEqual(bad, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -183,13 +183,13 @@ def api_base():
 
 def check_permissions(perms, role="worker"):
     """Refuse unless perms is exactly the role's set. Names a key, never a value."""
-    EXPECTED_PERMISSIONS = PERMISSIONS_BY_ROLE[role]  # local: the set of this role (the worker's by default)
+    wanted = PERMISSIONS_BY_ROLE[role]  # local: the set of this role (the worker's by default)
     if not isinstance(perms, dict):
         die("refusing: the answer carries no permissions object")
     for k in sorted(perms):
-        if k not in EXPECTED_PERMISSIONS:
+        if k not in wanted:
             die("refusing: the token carries an extra permission: %s" % str(k)[:40])
-    for k, want in EXPECTED_PERMISSIONS.items():
+    for k, want in wanted.items():
         if k not in perms:
             die("refusing: the token lacks the permission: %s (%s)" % (k, owner_step(role)))
         if perms[k] != want:
