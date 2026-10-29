@@ -68,6 +68,11 @@ class Rig:
         open(self.launcher, "a").close()
         self.sb = types.SimpleNamespace(parse_iso=parse, parse_bounded=json.loads, _one_line=lambda t, n=200: str(t)[:n], retired=lambda e, n: False)
         self.alive = {}
+        self.remember()
+
+    def remember(self):   # a valid memory with no offsets: the cases below are not first passes
+        with open(os.path.join(self.dir, "lost-workers.json"), "w") as handle:
+            json.dump({"offsets": {}, "alerted": {}}, handle)
 
     def created(self, name, deadline=NOW - 60, lane="lane-a", branch="ask-7"):
         line(self.engine.audit.path, ts=stamp(NOW - 7200), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(deadline)})
@@ -186,6 +191,88 @@ class TestLostWorker(unittest.TestCase):
         self.assertIn("[lost worker]", section)
         for kind in load().KINDS:
             self.assertIn("`%s`" % kind, section)
+
+
+class TestLostWorkerReadRound(unittest.TestCase):
+    def rig(self, memory=True):
+        r = Rig(load())
+        if not memory:
+            os.unlink(os.path.join(r.dir, "lost-workers.json"))
+        return r
+
+    def alerts(self, r):
+        return [m for m in r.engine.sent if m[0] == "lane-a"]
+
+    def test_s9_cap_and_backlog(self):
+        r = self.rig()
+        for n in range(25):
+            r.created("w%02d" % n)
+        counts = []
+        for _ in range(3):
+            r.engine.sent.clear()
+            got = r.passes()
+            rolls = [m[1] for m in r.engine.sent if "more lost worker" in m[1]]
+            counts.append((len(got), [x.split(" more")[0].split()[-1] for x in rolls]))
+        self.assertEqual(counts, [(10, ["15"]), (10, ["5"]), (5, [])])
+        r.engine.sent.clear()
+        self.assertEqual(r.passes(), [])
+        self.assertEqual(r.engine.sent, [])
+
+    def test_s10_first_pass_alerts_only_recent(self):
+        r = self.rig(memory=False)
+        for n in range(40):
+            r.created("old%d" % n)
+        for n in range(2):
+            line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="new%d" % n, detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual(sorted(x["name"] for x in r.passes()), ["new0", "new1"])
+        self.assertEqual(r.passes(), [])
+
+    def test_s10b_valid_memory_alerts_across_a_restart_gap(self):
+        r = self.rig()
+        r.passes()
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual([x["name"] for x in r.passes()], ["gap"])
+
+    def test_mutant_that_applies_the_one_hour_rule_with_a_valid_memory_is_caught(self):
+        mod = load()
+        real = mod._load
+        mod._load = lambda sb, path: (real(sb, path)[0], "none")
+        r = Rig(mod)
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual(r.passes(), [])   # the mutant alerts nothing: the s10b case above fails on it
+
+    def test_s11_name_cleaned_and_corrupt_memory(self):
+        r = self.rig()
+        name = "bad\x00\x07" + "n" * 100000
+        r.created(name)
+        r.passes()
+        text = r.engine.sent[0][1]
+        self.assertFalse(any(ord(c) < 32 for c in text))
+        self.assertLessEqual(text.split(" (ask")[0].count("n"), 80)
+        r = self.rig()
+        with open(os.path.join(r.dir, "lost-workers.json"), "w") as handle:
+            handle.write("{not json")
+        r.created("w1")
+        self.assertEqual(r.passes(), [])
+        self.assertEqual(r.engine.sent, [])
+        with open(r.engine.audit.path) as handle:
+            self.assertEqual(len([x for x in handle if "lost_worker.memory_corrupt" in x]), 1)
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="w2", detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual([x["name"] for x in r.passes()], ["w2"])
+        self.assertTrue(json.load(open(os.path.join(r.dir, "lost-workers.json")))["offsets"])
+
+    def test_memory_file_is_private(self):
+        r = self.rig()
+        r.created("w1")
+        r.passes()
+        self.assertEqual(os.stat(os.path.join(r.dir, "lost-workers.json")).st_mode & 0o777, 0o600)
+
+    def test_local_worker_is_possibly_lost(self):
+        r = self.rig()
+        r.alive["loc"] = {"lane": "boss", "ask": "ask-9"}
+        r.passes()
+        r.alive.clear()
+        self.assertIn("possibly lost", r.passes(at=NOW + 10)[0]["text"])
 
 
 if __name__ == "__main__":

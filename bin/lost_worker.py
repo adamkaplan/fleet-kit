@@ -30,6 +30,9 @@ KINDS = ("pod_no_stop", "local_worker", "refused_launch", "reaper_missed")
 READ_BYTES = 1 << 20          # most one audit file gives a pass
 FIRST_BYTES = 4 << 20         # a first pass looks at most this far back
 ALERTED_MAX = 2000
+PASS_CAP = 10                 # individual alerts a pass sends; the rest are rolled up and alerted on the following passes
+RECENT_SECONDS = 3600         # with no usable memory, only workers created in the last hour are alerted
+NAME_MAX = 80
 SEEN_MAX = 500
 EVIDENCE_MAX = 200
 REAPER_ID = "reaper"
@@ -46,21 +49,33 @@ def _clean(text, limit=EVIDENCE_MAX):
     return re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", str(text)).strip()[:limit]
 
 
+def _name(text):
+    """A worker name for a message: control characters (NUL included) removed, at most NAME_MAX characters."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]+", "", str(text))[:NAME_MAX]
+
+
 def _load(sb, path):
+    """(state, status): status is `none` (no file: the first pass ever), `corrupt` (a file that cannot be read as a memory) or `ok`."""
+    if not os.path.lexists(path):
+        return {}, "none"
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = sb.parse_bounded(handle.read(READ_BYTES))
-        if isinstance(data, dict):
-            return data
+        if isinstance(data, dict) and isinstance(data.get("offsets"), dict) and isinstance(data.get("alerted", {}), dict):
+            return data, "ok"
     except Exception:
         pass
-    return {}
+    return {}, "corrupt"
 
 
 def _save(path, state):
     tmp = "%s.tmp" % path
-    with open(tmp, "w", encoding="utf-8") as handle:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(state, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
@@ -164,7 +179,6 @@ def _losses(state, sb, engine, alive, now, records):
                 continue
             out.append({"key": "local_worker:%s:%s" % (name, s["at"]), "kind": "local_worker", "name": name, "ask": s["ask"], "at": s["at"],
                         "lane": s["lane"], "line": "seen alive at %s, absent from discovery and not retired" % _iso(s["at"])})
-            state.setdefault("gone", {})[name] = now
         while len(seen) > SEEN_MAX:
             seen.pop(min(seen, key=lambda k: seen[k]["at"]))
     return out
@@ -185,8 +199,9 @@ def _iso(epoch):
 
 def text_of(loss, earlier):
     repeat = ("repeat: %d earlier lost worker(s) of this ask" % earlier) if earlier else "first loss of this ask"
+    kind = loss["kind"] + (" (possibly lost: absent from discovery, not known to be dead)" if loss["kind"] == "local_worker" else "")
     return "[lost worker] %s (ask %s) kind=%s, last event %s. Evidence: %s. %s." % (
-        loss["name"], loss["ask"], loss["kind"], _iso(loss["at"]), _clean(loss["line"]), repeat)
+        _name(loss["name"]), loss["ask"], kind, _iso(loss["at"]), _clean(loss["line"]), repeat)
 
 
 def run_pass(sb, engine, now, alive=None, launcher_audit=None):
@@ -195,7 +210,20 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         return []   # no audit file to read (a stub, or none): nothing to do, nothing created
     state_dir = os.path.dirname(str(engine.audit.path))
     path = os.path.join(state_dir, STATE_FILE)
-    state = _load(sb, path)
+    state, status = _load(sb, path)
+    if status == "corrupt":
+        # An unreadable memory: this pass alerts nothing and says so once. The file is set aside, so the NEXT pass finds no memory, reads afresh
+        # and writes a new one (offsets at the end of what it read, alerted empty): a corrupt file never silences alerts for ever.
+        try:
+            os.replace(path, path + ".corrupt")
+        except OSError:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        engine.audit.append(engine.actor, "lost_worker.memory_corrupt", None, {"file": STATE_FILE, "action": "nothing alerted this pass; fresh memory next pass"})
+        return []
+    first = status == "none"
     before = json.dumps(state, sort_keys=True)
     _fold(state, sb, _read_new(sb, str(engine.audit.path), state, "switchboard"), "switchboard")
     _fold(state, sb, _read_new(sb, launcher_audit or launcher_audit_path(), state, "launcher"), "launcher")
@@ -204,27 +232,41 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         if isinstance(r, dict) and isinstance(r.get("worker"), str):
             records[r["worker"]] = r
     alerted = state.setdefault("alerted", {})
+    losses = [x for x in _losses(state, sb, engine, alive, now, records) if x["key"] not in alerted]
+    losses.sort(key=lambda x: (x["at"], x["key"]))
+    if first:
+        # No usable memory: only workers created in the last hour are alerted; the older ones are marked, never sent (a valid memory alerts every loss since).
+        old = [x for x in losses if x["at"] < now - RECENT_SECONDS]
+        for x in old:
+            alerted[x["key"]] = {"ask": x["ask"], "at": now, "skipped": True}
+        losses = [x for x in losses if x["at"] >= now - RECENT_SECONDS]
+    batch, rest = losses[:PASS_CAP], losses[PASS_CAP:]
     raised = []
-    for loss in _losses(state, sb, engine, alive, now, records):
-        if loss["key"] in alerted:
-            continue
+    for loss in batch:
         earlier = sum(1 for a in alerted.values() if a.get("ask") == loss["ask"] and loss["ask"] != "-")
         alerted[loss["key"]] = {"ask": loss["ask"], "at": now}   # marked BEFORE the send: a send that fails is not tried again (once per loss)
         text = text_of(loss, earlier)
-        for recipient in dict.fromkeys([r for r in (loss.get("lane"), "chief-of-staff") if isinstance(r, str) and r]):
-            try:
-                outcome = engine.send("switchboard", recipient, text)
-                if not outcome.get("sent"):
-                    raise RuntimeError("%s (%s)" % (outcome.get("action"), outcome.get("reason")))
-            except Exception as err:
-                engine.audit.append(engine.actor, "lost_worker.alert_not_sent", loss["name"],
-                                    {"to": recipient, "kind": loss["kind"], "why": sb._one_line(str(err), 160)})
+        _deliver(engine, sb, loss, [loss.get("lane"), "chief-of-staff"], text)
         raised.append(dict(loss, text=text, earlier=earlier))
+    if rest:
+        text = "[lost worker] %d more lost worker(s) found; they are alerted on the following passes, %d at a time." % (len(rest), PASS_CAP)
+        _deliver(engine, sb, {"name": "roll-up", "kind": "roll_up"}, ["chief-of-staff"], text)
     while len(alerted) > ALERTED_MAX:
         alerted.pop(min(alerted, key=lambda k: alerted[k]["at"]))
-    if json.dumps(state, sort_keys=True) != before:
+    if first or json.dumps(state, sort_keys=True) != before:
         try:
             _save(path, state)
         except OSError as err:
             engine.audit.append(engine.actor, "lost_worker.state_not_saved", None, {"why": sb._one_line(str(err), 160)})
     return raised
+
+
+def _deliver(engine, sb, loss, recipients, text):
+    for recipient in dict.fromkeys([r for r in recipients if isinstance(r, str) and r]):
+        try:
+            outcome = engine.send("switchboard", recipient, text)
+            if not outcome.get("sent"):
+                raise RuntimeError("%s (%s)" % (outcome.get("action"), outcome.get("reason")))
+        except Exception as err:
+            engine.audit.append(engine.actor, "lost_worker.alert_not_sent", _name(loss["name"]),
+                                {"to": recipient, "kind": loss["kind"], "why": sb._one_line(str(err), 160)})
