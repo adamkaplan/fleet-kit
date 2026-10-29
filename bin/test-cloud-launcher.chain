@@ -1,4 +1,5 @@
 bin/test-cloud-cost-report
+bin/test-cloud-retired
 cloud/launcher/tests/test_app_token.py
 cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_chain_time.py
@@ -52,6 +53,7 @@ cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
 cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
+cloud/worker/tests/test_push_rules.py
 cloud/worker/tests/test_question_denied.py
 cloud/worker/tests/test_root_scanner.py
 cloud/worker/tests/test_scan_allowlist_node.py

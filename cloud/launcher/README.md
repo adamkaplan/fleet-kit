@@ -208,11 +208,16 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
+Not yet measured: none
+
+A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
 ### macOS (per entry)
 
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 1 | serial |
+| `bin/test-cloud-retired` | 66 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
@@ -266,6 +271,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
@@ -278,6 +284,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 0 | serial |
+| `bin/test-cloud-retired` | 33 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
@@ -331,6 +338,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
