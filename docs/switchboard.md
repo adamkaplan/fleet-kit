@@ -1346,6 +1346,10 @@ says that GitHub is not read yet, rather than passing for empty. A read-only loo
 **Staleness.** A file older than 180 s, missing or unreadable is never shown as
 current: the command says "the daemon is not updating this list" (and `status`
 shows it), and the plugin shows a row `daemon not updating` (scenario D5).
+For a cloud daemon the pull (`bin/decisions_pull.py`) judges staleness from `age_seconds`, the integer age of the file on the hub taken
+from the file's mtime in the same response as the list (not from `written_at`); an absent file is a 503 there, read as stale. The age is
+the hub file's mtime, so a backup, copy or remount that touches it makes an old list read fresh. A lower generation from the same
+daemon is refused as a stale replay; `--reset-generation` accepts it once (see docs/cloud-channel.md).
 
 **The TUI plugin** is `plugins/fleet-decisions-tui/`: `tui.tsx`, a thin layer over
 `decisions.mjs`, whose pure functions (read the file, staleness, rows) are tested
