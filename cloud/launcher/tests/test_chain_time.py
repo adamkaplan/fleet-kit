@@ -121,10 +121,29 @@ class Parallel(base.Scratch):
 class Completeness(unittest.TestCase):
     """Every chain entry is a row in BOTH tables or is named in the 'Not yet measured' line (and never both)."""
     @staticmethod
+    def line_idx(sec):
+        return [i for i, l in enumerate(sec.split("\n")) if l.startswith("Not yet measured:")]
+
+    @classmethod
+    def with_line(cls, sec, value):
+        """A scratch copy of the section whose one real line reads value, whatever it read before."""
+        ls = sec.split("\n")
+        ls[cls.line_idx(sec)[0]] = value
+        return "\n".join(ls)
+
+    @classmethod
+    def with_copy(cls, sec):
+        """A scratch copy with the real line repeated right after itself (same content)."""
+        ls = sec.split("\n")
+        i = cls.line_idx(sec)[0]
+        ls.insert(i + 1, ls[i])
+        return "\n".join(ls)
+
+    @staticmethod
     def parts(sec):
         mac, ub = sec.split("### macOS (per entry)")[1].split("### Ubuntu (per entry)")
         rows = [{r.split("`")[1] for r in t.split("\n") if r.startswith("| `")} for t in (mac, ub)]
-        lines = [l for l in sec.split("\n") if l.startswith("Not yet measured:")]
+        lines = [sec.split("\n")[i] for i in Completeness.line_idx(sec)]
         assert len(lines) == 1, "the section needs exactly one 'Not yet measured:' line"
         rest = lines[0].split(":", 1)[1].strip().rstrip(".")
         return rows[0], rows[1], ([] if rest == "none" else re.findall(r"`([^`]+)`", rest))
@@ -164,10 +183,10 @@ class Completeness(unittest.TestCase):
 
     def test_s10_mutant_an_entry_in_a_table_and_in_the_line_is_refused(self):
         e = sorted(base.entries())[0]
-        self._mutant(lambda s: s.replace("Not yet measured: none", "Not yet measured: `%s`" % e), e)
+        self._mutant(lambda s: self.with_line(s, "Not yet measured: `%s`" % e), e)
 
     def test_s10_mutant_a_name_in_the_line_that_is_not_in_the_chain_is_refused(self):
-        self._mutant(lambda s: s.replace("Not yet measured: none", "Not yet measured: `cloud/launcher/tests/test_gone.py`"), "test_gone.py")
+        self._mutant(lambda s: self.with_line(s, "Not yet measured: `cloud/launcher/tests/test_gone.py`"), "test_gone.py")
     # The code's rule: not exactly one 'Not yet measured:' line is an AssertionError naming the line (neither "none" nor first-only nor a union).
     def test_s11_mutant_a_section_without_the_line_fails_naming_the_line(self):
         sec = self.real()
@@ -177,13 +196,30 @@ class Completeness(unittest.TestCase):
             self.problems(out, base.entries())
 
     def test_s11_mutant_a_section_with_two_lines_fails_naming_the_line_and_is_not_first_only_or_a_union(self):
-        e = sorted(base.entries())[0]
         sec = self.real()
-        out = sec.replace("Not yet measured: none", "Not yet measured: none\nNot yet measured: `%s`" % e)
+        out = self.with_copy(sec)
         self.assertNotEqual(out, sec, "the mutation did not apply")
-        self.assertEqual(sum(l.startswith("Not yet measured:") for l in out.split("\n")), 2)
+        self.assertEqual(len(self.line_idx(out)), 2)
         with self.assertRaisesRegex(AssertionError, "exactly one 'Not yet measured:' line"):
             self.problems(out, base.entries())
+
+    def test_s12_both_line_mutants_fail_and_the_parser_accepts_any_one_line_value(self):
+        sec = self.real()
+        e = sorted(base.entries())[:2]
+        values = ["Not yet measured: none", "Not yet measured: `%s`" % e[0], "Not yet measured: `%s`, `%s`" % (e[0], e[1])]
+        for v in values:
+            scratch = self.with_line(sec, v)
+            self.assertEqual(len(self.line_idx(scratch)), 1)
+            self.assertEqual(self.with_line(scratch, v), scratch)
+            self.assertEqual(self.parts(scratch)[2], re.findall(r"`([^`]+)`", v))
+            two = self.with_copy(scratch)
+            self.assertNotEqual(two, scratch, "the mutation did not apply")
+            self.assertEqual(len(self.line_idx(two)), 2)
+            none = "\n".join(l for l in scratch.split("\n") if not l.startswith("Not yet measured:"))
+            self.assertNotEqual(none, scratch, "the mutation did not apply")
+            for bad in (two, none):
+                with self.assertRaisesRegex(AssertionError, "exactly one 'Not yet measured:' line"):
+                    self.problems(bad, base.entries())
 
 
 class Docs(unittest.TestCase):
