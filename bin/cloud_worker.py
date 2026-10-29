@@ -56,6 +56,10 @@ SETUP_PREAMBLE = """Setup (do this first, before the task below):
 
 Task:
 """
+# The TEMPORARY launch rule (ask #1046): the only place it is written; it names the ask whose merge removes it.
+TEMP_ISSUE_LINK_WARNING = True   # a worker cannot read issues yet: removed when ask #1019 (issue reading by workers) merges
+POD_SHAPE_DEFAULT = "XS"
+POD_SHAPE_DEFAULT_WIDE = "S"   # with --stack, and for an orchestrator
 RECORD_MAX = 8192
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
@@ -1279,6 +1283,64 @@ def cmd_launch(args, runner, now):
         return _launch(args, runner, now, lambda state: stack.enter_context(reservation(state, args.name)))
 
 
+def unknown_report_to(state, name, agents, alias):
+    """(problem, warning) for a `--reports-to` name: `problem` is the text that stops a launch when no registry entry (running, recorded or retired), no
+    cloud record and not the role alias `alias` carries the name; `warning` is said when the registry could not be read (then nothing is refused:
+    a read that cannot be trusted never stops a launch)."""
+    if not name or name in agents or name == alias:
+        return None, None
+    registry = H["load_module"]("registry")
+    found = registry.read(state)
+    if not found.get("whole"):
+        return None, "the agent registry could not be read (%s); the name %s was not checked" % (_one(str(found.get("problem") or "unknown"), 100), _one(name, 60))
+    if name in found["agents"] or name in found["retired"]:
+        return None, None
+    try:
+        if load_record(state, name) is not None:
+            return None, None
+    except (CloudError, KeyError, OSError):
+        pass
+    import difflib
+    known = sorted(set(found["agents"]) | set(found["retired"]) | set(agents))
+    near = difflib.get_close_matches(name, known, n=5, cutoff=0.0) or known[:5]
+    first = ("" if known else " The registry holds no name yet: a first launch of a new installation may pass --boss-unregistered REASON (the reason is audited).")
+    return ("--reports-to %s is not a registered identity (no agent, retired agent, cloud worker or role alias has it); nothing was created. Use one of: %s, "
+            "or register the lane first, or pass --boss-unregistered REASON.%s" % (_one(name, 60), ", ".join(near[:5]) or "(no registered name yet)", first)), None
+
+
+def check_report_to(engine, state, args, local_agents):
+    """The report-to check of a launch, local or cloud: stops it (a LaunchError) before anything is created when `--reports-to` names no registered identity,
+    unless `--boss-unregistered REASON` is given (then one audit line). A registry that cannot be read warns and goes on."""
+    problem, warning = unknown_report_to(state, args.reports_to, local_agents, H["COS_ALIAS"])
+    if warning:
+        print("%s: launch: warning: %s" % (H["PROG"], warning), file=sys.stderr)
+    if not problem:
+        return
+    reason = getattr(args, "boss_unregistered", None)
+    if reason is None:
+        raise H["LaunchError"](problem)
+    if not reason.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", reason):
+        raise H["LaunchError"]("--boss-unregistered needs a reason: non-empty text on one line, no control characters; nothing was created")
+    _audit(engine, "launch.boss_unregistered", args.name, {"reports_to": H["scrubbed_flag_text"](args.reports_to, 60), "reason": H["scrubbed_flag_text"](reason)})
+
+
+def pod_shape(args):
+    """The pod shape the launch gets: the one named, else the launcher's default (S with --stack or for an orchestrator, XS otherwise)."""
+    if args.shape:
+        return str(args.shape)
+    return POD_SHAPE_DEFAULT_WIDE if getattr(args, "stack", False) or args.agent == "orchestrator" else POD_SHAPE_DEFAULT
+
+
+def brief_warnings(args, repo, brief):
+    """The one-line warnings a brief earns (each at most once): it names docker or buildx while --stack is not given, or it links an issue of the repository."""
+    notes = []
+    if not getattr(args, "stack", False) and re.search(r"\b(docker|buildx|lane stack|lane-stack|stack-up)\b", brief or "", re.I):
+        notes.append("warning: the brief names docker, buildx or the lane stack tooling but --stack is not given: the worker would have no nested Docker (pod shape %s)" % pod_shape(args))
+    if TEMP_ISSUE_LINK_WARNING and re.search(r"(github\.com/%s/issues/\d+|(?<![\w/.-])%s#\d+)" % (re.escape(repo), re.escape(repo)), brief or "", re.I):
+        notes.append("warning: the brief links an issue of %s: the worker cannot read issues yet (ask #1019); put what it needs in the brief" % repo)
+    return notes
+
+
 def _launch(args, runner, now, reserve):
     """`launch NAME --cloud --repo OWNER/REPO --branch B --agent A`: the allow-list first, then (with a cluster token minted for this command) the
     model entry and a one-hour git token go to the launcher as per-run secrets, the pod is created, and the session and the brief are sent through
@@ -1319,13 +1381,18 @@ def _launch(args, runner, now, reserve):
         raise Refusal(str(err)) from None
     engine, state, _ = H["build_engine"](runner, now, "cli")
     reserve(state)
-    local = engine.discover(engine.now()).agents.get(name)
+    found = engine.discover(engine.now())   # the launch's first discovery: the report-to check reuses its answer
+    local = found.agents.get(name)
     if local is not None:   # `route` prefers a cloud record: every later send/read/retire for the local agent would go INTO the pod
         raise LaunchError("a local fleet agent named %s exists: a cloud worker cannot take its name (send, read and retire by name would reach "
                           "the pod instead of the local agent); retire it or pick another name; nothing was created" % name)
     if load_record(state, name) is not None:
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
+    if args.reports_to:
+        check_report_to(engine, state, args, local_agents=found.agents)
     brief = H["read_brief"](args.brief_file, sys.stdin)
+    for note in brief_warnings(args, repo, brief):   # before anything is created: one line each, then the launch goes on
+        print("%s: %s" % (H["PROG"], note), file=sys.stderr)
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
     options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
     for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
@@ -1435,7 +1502,7 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
-    print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
+    print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True, "shape": pod_shape(args)}, sort_keys=True))
     return H["EXIT_OK"]
 
 

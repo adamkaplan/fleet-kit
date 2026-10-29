@@ -272,6 +272,9 @@ class Base(unittest.TestCase):
         config.parent.mkdir(parents=True)
         config.write_text(json.dumps({"opencode": str(fake_opencode), "herdr": str(self.home / "no-herdr")}))
         self.state = self.home / "state" / "fleet-switchboard"
+        self.state.mkdir(parents=True, mode=0o700)
+        sb.load_module("registry").upsert(str(self.state), "orch", {"session": "ses_example_orch", "pane": None, "role": "orchestrator", "repo": None,
+                                                                    "workspace": None, "cwd": None, "charter": None})   # #1046: the launches below pass --reports-to orch, a registered name
         for target, value in ((sb, "ENSURE_ON_USE"),):
             patch = mock.patch.object(target, value, False)
             patch.start()
