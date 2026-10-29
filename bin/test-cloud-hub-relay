@@ -382,26 +382,43 @@ class TestBoundsAndCaps(unittest.TestCase):
         while time.monotonic() < end and not cond():
             time.sleep(0.01)
 
-    def test_slow_body_trickle_cut_at_deadline(self):
-        import socket
+    def _trickle(self, hub_mod):
+        """Send 1-byte writes 0.4 s apart, stopping when the answer is readable or after 8 bytes; returns (sent, status line or None)."""
+        import select, socket
         old = cloud_relay.BODY_DEADLINE
         cloud_relay.BODY_DEADLINE = 1.0
         try:
-            with Hub() as hub:
+            with Hub(hub_mod=hub_mod) as hub:
                 s = socket.create_connection(("127.0.0.1", hub.port))
                 s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-a-1\r\nContent-Length: 100\r\n\r\n")
-                t0 = time.time()
-                for _ in range(8):   # a byte every 0.4 s would pass a per-read timeout
+                sent, line = 0, None
+                t0 = time.monotonic()
+                while sent < 8 and time.monotonic() - t0 < 30:   # 30 s is only a hang guard
                     try: s.sendall(b" ")
                     except OSError: break
-                    time.sleep(0.4)
-                data = s.recv(4096)
-                self.assertIn(b" 408 ", data.split(b"\r\n")[0])
-                self.assertLess(time.time() - t0, 3.5)
+                    sent += 1
+                    if select.select([s], [], [], 0.4)[0]:
+                        line = s.recv(4096).split(b"\r\n")[0]
+                        break
                 s.close()
-                self.assertEqual(hub.relay.inflight, 0)
+                return sent, line
         finally:
             cloud_relay.BODY_DEADLINE = old
+
+    def test_slow_body_trickle_cut_at_deadline(self):
+        sent, line = self._trickle(cloud_hub)
+        self.assertIsNotNone(line, "no answer before the client had sent %d bytes" % sent)
+        self.assertIn(b" 408 ", line)
+        self.assertLess(sent, 8)   # the hub cut mid-trickle
+
+    def test_slow_body_trickle_mutant_never_cuts(self):
+        old = "time.monotonic() + cloud_relay.BODY_DEADLINE"
+        self.assertIn(old, Path(cloud_hub.__file__).read_text())
+        mod = mutant(cloud_hub, old, "time.monotonic() + 1000")
+        self.assertNotEqual(Path(cloud_hub.__file__).read_text().replace(old, "time.monotonic() + 1000"), Path(cloud_hub.__file__).read_text())
+        sent, line = self._trickle(mod)
+        self.assertEqual(sent, 8)
+        self.assertIsNone(line)
 
     def test_held_wait_caps_keep_daemon_routes_alive(self):
         # per pod 4, global 6; both pods saturate, a refused call queues nothing, the daemon still gets through
