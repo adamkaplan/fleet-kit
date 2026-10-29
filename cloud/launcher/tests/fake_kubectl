@@ -261,11 +261,13 @@ elif cmd == "delete" and args[1] == "statefulset":
     st.get("sts", {}).pop(name, None)
     st.get("pods", {}).pop(name + "-0", None)   # its pod goes with it
     save()
+elif cmd == "delete" and args[1] == "pod" and st.get("pods", {}).get(args[2], {}).get("metadata", {}).get("ownerReferences"):   # a pod with an owner reference comes back
+    sts_recreate(st["pods"].pop(args[2]))
+    save()
 elif cmd == "delete":
     kind, name = args[1], args[2]
-    gone = (st.get("pods", {}).pop(name, None)) if kind == "pod" else (st.get("secrets", {}).pop(name, None) and None)
+    (st.get("pods" if kind == "pod" else "secrets", {})).pop(name, None)
     if kind == "secret": st.get("secret_labels", {}).pop(name, None)
-    if kind == "pod": sts_recreate(gone)
     save()
 elif cmd == "exec":
     name, tool = args[1], args[3]
