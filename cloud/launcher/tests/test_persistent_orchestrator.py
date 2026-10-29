@@ -663,6 +663,28 @@ class S11Maximum(PBase):
             self.check_maximum()
 
 
+class MaximumValueForm(unittest.TestCase):
+    """The value form of CW_MAX_PERSISTENT: an integer 1 to 20 written without leading zeros (ask #1509)."""
+    GOOD = ("1", "20", "7")
+    BAD = ("0", "21", "00", "01", "05", "+5", "-5", "1.5", "abc", "\u0662")
+
+    def check_form(self, mod):
+        check = mod.VALIDATORS["CW_MAX_PERSISTENT"][1]
+        for v in self.GOOD:
+            self.assertTrue(check(v), v)
+        for v in self.BAD:
+            self.assertFalse(check(v), v)
+
+    def test_form_accepts_one_twenty_seven_and_refuses_the_rest(self):
+        self.check_form(cw)
+
+    def test_form_mutant_the_looser_rule_is_caught(self):
+        old = 'bool(re.fullmatch(r"[1-9][0-9]?", v))'
+        mod = mutant(old, 'bool(re.fullmatch(r"[0-9]{1,2}", v))')
+        with self.assertRaises(AssertionError):
+            self.check_form(mod)
+
+
 class S12Status(PBase):
     def test_s12_status_shows_the_worker_name_persistent_with_age_and_cost(self):
         self.launch()

@@ -2944,7 +2944,7 @@ VALIDATORS = {
     "CW_STACK_PULL_CLIENT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_STACK_PULL_TENANT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
-    "CW_MAX_PERSISTENT": ("an integer from 1 to 20", lambda v: bool(re.fullmatch(r"[0-9]{1,2}", v)) and 1 <= int(v) <= PERSISTENT_MAX_LIMIT),
+    "CW_MAX_PERSISTENT": ("an integer from 1 to 20", lambda v: bool(re.fullmatch(r"[1-9][0-9]?", v)) and 1 <= int(v) <= PERSISTENT_MAX_LIMIT),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
