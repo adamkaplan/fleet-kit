@@ -1655,6 +1655,81 @@ class HubFilesUnchanged(unittest.TestCase):
                 self.assertEqual(other.read_bytes(), (BIN / other.name).read_bytes(), other.name)
 
 
+class OneWorkerAndCancel(unittest.TestCase):
+    """#1477 S4: one in-flight hub worker, and no POST after a cut. Slow DNS keeps the first worker alive past its cut.
+    Mutants: the in-flight check removed (2 workers start); the cancel flag not set at the cut (the late thread POSTs)."""
+
+    def slow_dns(self, seconds):
+        import socket
+        real, calls = socket.getaddrinfo, []
+
+        def gai(*a, **k):
+            calls.append(1)
+            time.sleep(seconds)
+            return real(*a, **k)
+        socket.getaddrinfo = gai
+        self.addCleanup(setattr, socket, "getaddrinfo", real)
+        return calls
+
+    def cut_transport(self, mod, url="http://127.0.0.1:9", deadline=0.3):
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, deadline
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        return mod.http_transport(url, "tok")
+
+    def second_pull(self, mod):
+        calls = self.slow_dns(1.5)
+        fetch, _ = self.cut_transport(mod)
+        errors = []
+        for _ in range(2):
+            try:
+                fetch()
+            except Exception as err:
+                errors.append(err)
+        return calls, errors
+
+    def test_a_second_pull_while_a_worker_is_in_flight_starts_no_second_worker(self):
+        calls, errors = self.second_pull(relay)
+        self.assertEqual([str(e) for e in errors], ["relay pass cut", "previous request still running"])
+        self.assertEqual(len(calls), 1)
+
+    def test_mutant_without_the_in_flight_check_is_caught(self):
+        mod = load_backend_module("if inflight and inflight[0].is_alive():", "if False:")
+        calls, _ = self.second_pull(mod)
+        self.assertEqual(len(calls), 2)
+
+    def late_post_count(self, mod):
+        import http.server
+        seen = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.path)
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        self.slow_dns(1.0)
+        _, post = self.cut_transport(mod, "http://127.0.0.1:%d" % srv.server_address[1])
+        with self.assertRaises(mod.PassCut):
+            post("0" * 32, {"status": 200, "reason": "ok", "record": None})
+        time.sleep(1.8)   # the abandoned thread wakes from DNS and finds the cut
+        return seen
+
+    def test_no_post_is_made_after_the_cut(self):
+        self.assertEqual(self.late_post_count(relay), [])
+
+    def test_mutant_without_the_cancel_flag_is_caught(self):
+        mod = load_backend_module("cancel.set()   # the pass is cut: a late thread must not POST", "pass")
+        self.assertEqual(len(self.late_post_count(mod)), 1)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False).result
     print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")

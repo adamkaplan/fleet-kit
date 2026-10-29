@@ -2916,7 +2916,8 @@ class TestDaemonRelayLoop(Base):
         import os as _os
         relay = sb.load_module("cloud_relay_daemon")
         gate, orig = threading.Event(), relay.pass_if_configured
-        relay.pass_if_configured = lambda *a, **k: gate.wait(30)
+        entered = []
+        relay.pass_if_configured = lambda *a, **k: (entered.append(1), gate.wait(20))
         env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"}
         saved = {k: _os.environ.get(k) for k in env}
         _os.environ.update(env)
@@ -2924,6 +2925,7 @@ class TestDaemonRelayLoop(Base):
             started = time.time()
             self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3), 3)
             self.assertLess(time.time() - started, 5)
+            self.assertTrue(entered)   # the relay did run, and was still blocked while the passes completed
         finally:
             gate.set()
             relay.pass_if_configured = orig
@@ -2936,29 +2938,30 @@ class TestDaemonRelayLoop(Base):
         so the first wait times out and fewer than 20 calls are answered."""
         import os as _os
         relay = sb.load_module("cloud_relay_daemon")
-        clock, queue, answered, lock = [0.0], [], {}, threading.Lock()
-        stub = types.SimpleNamespace(backend=types.SimpleNamespace(audit=lambda *a: None))
-        replies = {"prove": (200, "ok"), "verdict": (200, "ok"), "gates": (200, "{}"), "report": (403, "refused: not bound")}
-
-        def handle(req):
-            return replies[req["call"]["command"]] + (None,)
-        stub.handle = handle
+        import importlib.machinery, importlib.util, tempfile
+        loader = importlib.machinery.SourceFileLoader("t_relay_daemon_tests", str(Path(sb.__file__).parent / "test-cloud-relay-daemon"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        rt = importlib.util.module_from_spec(spec)
+        loader.exec_module(rt)   # its FakeBackend and FakeHub; the Executor is the REAL one, on a temp ledger
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        backend, hub = rt.FakeBackend(), rt.FakeHub()
+        real_exec = rt.relay.Executor(tmp.name, backend, lambda: 1000)
+        clock, answered = [0.0], {}
+        pending_cid = "r-pending"   # a report claimed and never delivered, as in the S13 proof: its replay is refused 409
+        real_exec.reports.claim(rt.CODER, pending_cid, {"command": "report", "pr": rt.PR, "args": rt.relay.args_digest({"state": "done", "text": "x"}), "state": "pending"})
 
         def pull(*a, **k):
-            def fetch():
-                with lock:
-                    return {"requests": list(queue)}
-
             def post(rid, body):
-                with lock:
-                    answered[rid] = clock[0]
-                    queue[:] = [q for q in queue if q["id"] != rid]
-            return relay.pass_once(stub, fetch, post)
+                answered[rid] = (clock[0], body)
+                hub.post(rid, body)
+            return relay.pass_once(real_exec, hub.fetch, post)
         orig_pull, orig_cadence = relay.pass_if_configured, relay.CADENCE
         relay.pass_if_configured, relay.CADENCE = pull, 0.01
         saved = {k: _os.environ.get(k) for k in ("FLEET_RELAY_HUB_URL", "FLEET_RELAY_HUB_TOKEN_FILE")}
         _os.environ.update({"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"})
         asked, pass_end = {}, []
+        lock = threading.Lock()
         engine, real = self.world.engine, self.world.engine.run_pass
 
         def long_pass():
@@ -2966,10 +2969,16 @@ class TestDaemonRelayLoop(Base):
                 return real()
             for i in range(20):   # a pod call every 2 s of fake time; the pass lasts 45 s of fake time
                 clock[0] = 2.0 * i
-                rid = "%032x" % (i + 1)
+                kind = i % 4
+                if kind == 0:
+                    rid = hub.submit(rt.CODER, "prove", cid="c%d" % i, **rt.PROVE)
+                elif kind == 1:
+                    rid = hub.submit(rt.TESTER, "verdict", cid="c%d" % i, **rt.VERDICT)
+                elif kind == 2:
+                    rid = hub.submit(rt.CODER, "gates", head=None, cid="c%d" % i)
+                else:
+                    rid = hub.submit(rt.CODER, "report", head=None, cid=pending_cid if i == 3 else "c%d" % i, state="done", text="x")
                 asked[rid] = clock[0]
-                with lock:
-                    queue.append({"id": rid, "pod": "p", "repo": "r", "call": {"command": ("prove", "verdict", "gates", "report")[i % 4]}})
                 deadline = time.time() + 3   # real seconds: the loop's cadence is 0.01 s
                 while time.time() < deadline and rid not in answered:
                     time.sleep(0.005)
@@ -2983,8 +2992,11 @@ class TestDaemonRelayLoop(Base):
             for k, v in saved.items():
                 _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
         self.assertEqual(len(answered), 20)
-        self.assertTrue(all(answered[r] - asked[r] <= 10 for r in asked))   # S2: at most 10 s after pending; S1: inside 30 s
-        self.assertLess(max(answered.values()), pass_end[0])   # all answered while the 45 s pass was still running
+        statuses = [answered[r][1]["status"] for r in sorted(asked)]
+        self.assertEqual(statuses, [409 if i == 3 else 200 for i in range(20)])   # the pending report is refused as the real executor does
+        self.assertEqual(answered["%032x" % 4][1]["reason"], rt.relay.PENDING_REASON)
+        self.assertTrue(all(answered[r][0] - asked[r] <= 10 for r in asked))   # S2: at most 10 s after pending; S1: inside 30 s
+        self.assertLess(max(v[0] for v in answered.values()), pass_end[0])   # all answered while the 45 s pass was still running
 
     def test_without_a_hub_the_audit_is_that_of_the_bare_passes(self):
         """U3: FLEET_RELAY_HUB_URL unset: run_daemon writes the audit bytes of the same 3 bare engine passes (the loop body before the
