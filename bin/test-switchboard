@@ -29722,6 +29722,138 @@ class TestPlanWake(Base):
         self.assertEqual(len({f.key for f in facts}), 1)
 
 
+class TestCloudPodReport(ReportBase):
+    """#1478: a cloud pod (an endpoint record, no pane, no session) reports to the boss its record names, through the REAL engine and the relay executor."""
+    TOKEN = "tok-secret-1478-xyz"
+
+    def record(self, name="probe-pod", **extra):
+        base = self.world.engine.state_dir / "cloud"
+        base.mkdir(parents=True, exist_ok=True)
+        rec = {"worker": name, "url": "https://pod.example/x", "runtime_id": "r1", "reports_to": "platform", "repo": "acme/api", "auth_ref": "file:/x/" + self.TOKEN}
+        rec.update(extra)
+        rec = {k: v for k, v in rec.items() if v is not None}
+        (base / (name + ".json")).write_text(json.dumps(rec))
+
+    def executor(self):
+        sys.path.insert(0, str(Path(sb.__file__).resolve().parent))
+        relay = importlib.import_module("cloud_relay_daemon")
+        engine = self.world.engine
+        backend = relay.SwitchboardBackend(sb, (engine, None, {}), None, lambda: 1)
+        backend.pr_issues = lambda pr: {2}   # the real backend.audit stays: the entries are read from the world's audit
+        return relay, relay.Executor(str(self.world.engine.state_dir), backend, lambda: 1000), backend
+
+    def call(self, ex, relay, pod="probe-pod", cid="c1", state="done", text="all done"):
+        req = {"pod": pod, "repo": "acme/api", "issue": 2, "call": {"call_id": cid, "command": "report", "pr": "acme/api#7", "args": {"state": state, "text": text}}}
+        return ex.handle(req)
+
+    def test_s1_s3_s7_a_paneless_pod_reports_to_its_boss_and_the_audit_names_it(self):
+        self.record()
+        relay, ex, _ = self.executor()
+        status, reason, _r = self.call(ex, relay)
+        self.assertEqual((status, reason), (200, "reported"))
+        (message,) = self.world.admissions("platform")
+        self.assertIn("done: all done", message["text"])
+        self.assertRegex(message["keys"][0], r"^report:probe-pod:[0-9a-f]{16}$")
+        (delivered,) = [e for e in self.world.audit() if e["event"] == "report.delivered"]   # report.claimed is only the replay-of-a-pending-claim line
+        self.assertEqual(delivered["detail"]["by"], "probe-pod")
+        self.assertEqual(delivered["detail"]["call_id"], "c1")
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "relay.failed"], [])
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "relay.refused"], [])
+        self.assertNotIn(self.TOKEN, json.dumps(message) + json.dumps(self.world.audit()))
+
+    def test_s2_one_call_id_three_times_delivers_once(self):
+        self.record()
+        relay, ex, _ = self.executor()
+        outs = [self.call(ex, relay)[:2] for _ in range(3)]
+        self.assertEqual(outs, [(200, "reported"), (200, "replay: already reported"), (200, "replay: already reported")])
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+
+    def test_s4_a_progress_state_is_a_rider_and_does_not_wake(self):
+        self.record()
+        out = self.world.engine.report("probe-pod", "working", "halfway")
+        self.assertEqual(out["action"], "rider")
+        riders = [f for f in sb.report_rider_facts(self.world.engine) if f.recipient == "platform"]
+        self.assertEqual([f.sender for f in riders], ["probe-pod"])
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_s5_an_unknown_name_with_no_cloud_record_is_refused_not_found(self):
+        self.record("someone-else", worker="another-name")   # a file under the wrong worker name is no record
+        for name in ("ghost", "someone-else", "../x"):
+            with self.assertRaises(sb.ReportError) as got:
+                self.world.engine.report(name, "done", "x")
+            self.assertIn("not found", str(got.exception))
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.assertEqual(sb.report_rider_facts(self.world.engine), [])
+
+    def test_s6_a_record_with_no_boss_reports_to_nobody_and_the_audit_names_the_pod(self):
+        self.record(reports_to=None)
+        relay, ex, _ = self.executor()
+        status, reason, _r = self.call(ex, relay)
+        self.assertEqual((status, reason), (400, "the report was refused"))
+        (refused,) = [e["detail"] for e in self.world.audit() if e["event"] == "relay.refused"]
+        self.assertEqual(refused["by"], "probe-pod")
+        self.assertIn("reports to nobody", refused["why"])
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "relay.failed"], [])
+        with self.assertRaises(sb.ReportError) as got:
+            self.world.engine.report("probe-pod", "done", "x")
+        self.assertIn("reports to nobody", str(got.exception))
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_u1_a_local_agent_still_uses_its_pane_and_an_unknown_local_name_keeps_its_text(self):
+        self.record("coder", reports_to="other-boss")   # a stale cloud file of the same name never replaces a pane sender, nor names its boss
+        self.report()
+        (message,) = self.world.admissions("platform")   # the pane agent's boss, not "other-boss" (which has no session at all)
+        self.assertRegex(message["keys"][0], r"^report:coder:[0-9a-f]{16}$")
+        with self.assertRaises(sb.ReportError) as got:
+            self.world.engine.report("nobody", "done", "x")
+        self.assertIn("not found", str(got.exception))
+
+    def test_a_malformed_cloud_record_is_not_found_and_delivers_nothing(self):
+        base = self.world.engine.state_dir / "cloud"
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "bad-json.json").write_text("{not json")
+        (base / "num-worker.json").write_text(json.dumps({"worker": 5, "reports_to": "platform"}))
+        (base / "real.json").write_text(json.dumps({"worker": "linked", "reports_to": "platform"}))
+        os.symlink(base / "real.json", base / "linked.json")
+        for name in ("bad-json", "num-worker", "linked"):
+            self.assertIsNone(sb.cloud_sender(self.world.engine.state_dir, name), name)
+            with self.assertRaises(sb.ReportError) as got:
+                self.world.engine.report(name, "done", "x")
+            self.assertIn("not found", str(got.exception))
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.assertEqual(sb.report_rider_facts(self.world.engine), [])
+
+    def test_m2_a_report_that_raises_after_the_claim_is_never_delivered_twice(self):
+        self.record()
+        relay, ex, backend = self.executor()
+        real, calls = backend.report, []
+        def flaky(pod, args):
+            calls.append(1)
+            real(pod, args)          # the delivery happened ...
+            if len(calls) == 1:
+                raise RuntimeError("killed after delivering")   # ... and the process died before `done`
+        backend.report = flaky
+        with self.assertRaises(RuntimeError):
+            self.call(ex, relay)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        status, reason, _r = self.call(ex, relay)
+        self.assertEqual((status, reason), (409, relay.PENDING_REASON))
+        self.assertIn("NEW call_id", reason)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.call(ex, relay, cid="c2")[:2], (200, "reported"))   # a NEW call id is the way to resend
+
+    def test_a_relay_level_progress_report_is_a_rider_and_wakes_nobody(self):
+        self.record()
+        relay, ex, _ = self.executor()
+        status, reason, _r = self.call(ex, relay, state="working", text="halfway")
+        self.assertEqual((status, reason), (200, "reported"))
+        riders = [f for f in sb.report_rider_facts(self.world.engine) if f.recipient == "platform"]
+        self.assertEqual([f.sender for f in riders], ["probe-pod"])
+        self.assertEqual(self.world.admissions("platform"), [])
+        self.assertEqual(self.world.model_calls("platform"), [])
+
+
 class TestRiders(ReportBase):
     def test_a_fact_is_not_a_rider_unless_it_says_so_and_the_field_round_trips(self):
         self.assertIn("rider", sb.Fact.FIELDS)
