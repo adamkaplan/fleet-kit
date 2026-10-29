@@ -271,6 +271,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
@@ -337,6 +338,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
