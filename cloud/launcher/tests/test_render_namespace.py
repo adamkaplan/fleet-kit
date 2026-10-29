@@ -264,6 +264,41 @@ class RelayAppendix(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.test_the_daemon_name_command_is_found_once_and_the_reserved_names_match_the_hub()
 
+    def blocks(self, text=None):
+        return (text or self.text).split("```text\n")[1:]
+
+    def check_working_copy_is_private(self, text=None):
+        block = [b.split("```", 1)[0] for b in self.blocks(text) if "> secrets.json" in b][0].strip().split("\n")
+        self.assertTrue(block[0].startswith("( umask 077"))
+        self.assertEqual(block[-1], ")")
+        self.assertTrue(any("base64 -d > secrets.json" in l for l in block[1:-1]))
+        self.assertEqual(block[-2], "rm -f secrets.json")
+
+    def test_the_working_copy_sequence_sits_in_a_subshell_with_umask(self):
+        self.check_working_copy_is_private()
+
+    def test_a_document_without_the_working_copy_umask_fails_the_check(self):
+        mutant = self.text.replace("( umask 077\nkubectl", "( \nkubectl")
+        self.assertNotEqual(mutant, self.text)   # the mutation is applied
+        with self.assertRaises(AssertionError):
+            self.check_working_copy_is_private(mutant)
+
+    def test_the_token_step_is_in_a_subshell_and_no_bare_umask_remains(self):
+        block = [b.split("```", 1)[0] for b in self.blocks() if "PROBE_TOKEN_FILE" in b][0].strip().split("\n")
+        self.assertTrue(block[0].startswith("( umask 077;"))
+        self.assertEqual(block[-1], ")")
+        for line in self.text.split("\n"):
+            if "umask 077" in line:
+                self.assertTrue(line.startswith("( umask 077"), line)
+
+    def test_the_not_atomic_sentence_is_found_once(self):
+        self.assertEqual(self.text.count("read, edit and patch of the registry Secret is not atomic: one administrator at a time"), 1)
+
+    def test_the_token_step_refuses_an_existing_file_and_says_so_once(self):
+        block = [b.split("```", 1)[0] for b in self.blocks() if "PROBE_TOKEN_FILE" in b][0]
+        self.assertIn("set -C", block)
+        self.assertEqual(self.text.count("an existing file is never overwritten"), 1)
+
 
 class Chained(unittest.TestCase):
     def test_this_file_is_in_the_chain_once(self):

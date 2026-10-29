@@ -395,19 +395,26 @@ The command changes the Deployment, so the hub rolls its pod. Wait for it with `
 R2. Who: the holder of the probe credential (not the administrator, not a pod, not the launcher). The holder makes a NEW random token on the machine that will run the probe daemon, writing it straight to a new file with mode 0600, so it is never printed to a terminal or a log, then computes its SHA-256 digest into a second file and hands ONLY THE DIGEST to the administrator:
 
 ```text
-umask 077
+( umask 077; set -C
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > PROBE_TOKEN_FILE
 python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1]).read().strip().encode()).hexdigest())' PROBE_TOKEN_FILE > PROBE_DIGEST_FILE
+)
 ```
+
+The parentheses make a subshell, so the `umask` changes nothing in the holder's own shell, and `set -C` (noclobber) makes a redirect onto an existing file fail: an existing file is never overwritten (a second run needs the first file removed by its holder).
 
 The administrator adds the digest as the one entry for `relay-probe` in the `secrets.json` key of the PROBE hub's registry Secret `cloud-hub-registry`, by an in-place edit that keeps every other entry. The hub reads `secrets.json` as one JSON object `{"AGENT_NAME": "sha256 hex of the secret"}` (the key `agents.json` is not touched: the daemon is not a pod). Read it, edit it, patch it back:
 
 ```text
+( umask 077
 kubectl -n NAMESPACE_NAME get secret cloud-hub-registry -o jsonpath='{.data.secrets\.json}' | base64 -d > secrets.json
 python3 -c 'import json; d = json.load(open("secrets.json")); d["relay-probe"] = open("PROBE_DIGEST_FILE").read().strip(); json.dump(d, open("secrets.json", "w"))'
 kubectl -n NAMESPACE_NAME patch secret cloud-hub-registry --type merge -p "$(python3 -c 'import json; print(json.dumps({"stringData": {"secrets.json": open("secrets.json").read()}}))')"
 rm -f secrets.json
+)
 ```
+
+The subshell sets the owner-only mask first, so the working copy `secrets.json` is mode 0600 from its first byte. The read, edit and patch of the registry Secret is not atomic: one administrator at a time.
 
 With nothing else registered the file then reads:
 
