@@ -2439,12 +2439,39 @@ class Launcher:
                     res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
+                    self.retire_row(worker, reason)   # only a stop that succeeded; the pod is gone, so no later pass reaches this line again
                 except CloudError as e:
                     self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
         out.extend(renewed)
         self.send_wip_notes(live, now)
         return out
+
+    def registry_module(self):
+        """The registry's own module, loaded by path from bin/ beside the launcher's tree (never the whole switchboard)."""
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "bin", "registry.py")
+        spec = importlib.util.spec_from_file_location("registry", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def registry_state_dir(self):
+        base = self.env.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+        return os.path.join(base, "fl" + "eet-switchboard")   # the same directory the switchboard-side launch writes
+
+    def retire_row(self, worker, reason):
+        """The row of a worker the reaper just ended is retired through the registry's own retire (an absent row is harmless). A failure is
+        ONE line on standard error and the pass goes on: the registry is never a reason to keep a pod."""
+        try:
+            registry = getattr(self, "registry", None) or self.registry_module()
+            got = registry.retire(self.registry_state_dir(), worker, "cloud-worker", "the reaper ended the pod: %s" % reason)
+            problem = (got or {}).get("problem") if isinstance(got, dict) else None
+        except Exception as e:
+            problem = str(e) or type(e).__name__
+        if problem:
+            text = re.sub(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+", "<address>", self.kube.scrub(str(problem), 200))
+            print("cloud-worker: registry: %s: %s" % (worker, " ".join(text.split())[:120]), file=sys.stderr)
 
     def note_slow_pass(self, took):
         """A pass that took longer than SLOW_PASS_SECONDS: ONE line on the reaper's own log and ONE audit line with the seconds. A short pass: none."""
