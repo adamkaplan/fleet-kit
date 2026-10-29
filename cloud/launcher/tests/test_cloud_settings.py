@@ -22,7 +22,7 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m", "CW_STACK_MODEL_SECRET": "acme-stack-model",
                     "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry",
                     "CW_STACK_REGISTRY": "acme-registry.azurecr.io", "CW_STACK_PULL_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
-                    "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000"}
+                    "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000", "CW_MAX_PERSISTENT": "3"}
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -75,6 +75,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_STACK_MODEL_SECRET": ["https://vault.example.internal/secrets/x", "/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "$(x)", "-x", "--help"],
     "CW_CLUSTER_ADMIN_SECRET": ["/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "a;b", "$(x)", "a\u00e9", "-x", "--help", "--", "--query", "-", "-a"],
     "CW_CLUSTER_TOKEN_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "20", "m", "20s", "1.5h", "20 m", "/tmp/20m", "20m5s", "\u0662\u0660m", "-1h", "0h"],
+    "CW_MAX_PERSISTENT": ["0", "21", "00", "01", "+5", "-5", "-1", "\u0662", "\u0661\u0662", "2\x01", "2\t", "1.5", "abc", "100"],
 }
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
