@@ -1,4 +1,4 @@
 {
  "command": "status",
- "help": "usage: fleet-switchboard status [-h] [--json] options: -h, --help show this help message and exit --json Emit machine-readable JSON instead"
+ "help": "usage: fleet-switchboard status [-h] [--json] [--lane NAME] options: -h, --help show this help message and exit --json Emit machine-readable JSON instead --lane NAME Show only the cloud workers whose boss is NAME"
 }

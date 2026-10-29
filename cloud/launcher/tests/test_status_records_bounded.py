@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""The real launcher's `status` for all workers reads the pods four at a time, each with its own bound (ask #1493, S10); the named form stays serial.
+
+Offline: the launcher's own fake kubectl; the activity read is a fake that sleeps (scaled).
+"""
+import os
+import sys
+import threading
+import time
+import unittest
+from unittest import mock
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import test_cloud_worker as launcher_tests   # noqa: E402  (the launcher's own fake cluster)
+
+
+class LauncherRecords(launcher_tests.Base):
+    """S10: the real launcher's `status` for all workers reads the pods four at a time, each with its own bound; the named form stays serial."""
+    SLEEP = 0.3
+
+    def setUp(self):
+        super().setUp()
+        self.cw = launcher_tests.cw
+        self.calls = []
+        self.lock = threading.Lock()
+        self.running, self.peak = 0, 0   # the reads in flight now, and the most seen at once
+
+    def pods(self, count):
+        started = self.cw.iso(launcher_tests.T0)
+        return [{"metadata": {"name": "cw-w%d" % i, "annotations": {"cw/worker": "w%d" % i, "cw/hard-deadline": started, "cw/started": started}},
+                 "status": {"phase": "Running"}} for i in range(count)]
+
+    def launcher(self, pods, fail=()):
+        launcher = self.cw.Launcher(self.cw.Kube(self.env), self.env, self.clock)
+        launcher.kube.list_pods = lambda: pods
+        launcher.kube.get_pod = lambda name: pods[0]
+        sleep, calls, lock = self.SLEEP, self.calls, self.lock
+
+        def activity(name):
+            with lock:
+                calls.append(name)
+                self.running += 1
+                self.peak = max(self.peak, self.running)
+            time.sleep(sleep)
+            with lock:
+                self.running -= 1
+            if name in fail:
+                raise RuntimeError("the exec failed")
+            return False, launcher_tests.T0
+        launcher.activity = activity
+        return launcher
+
+    def ask(self, launcher, worker=None):
+        return launcher.status(launcher_tests.argparse.Namespace(worker=worker))
+
+    def check_concurrent(self, serial=False):
+        pods = self.pods(15)
+        launcher = self.launcher(pods)
+        with mock.patch.object(self.cw, "STATUS_POD_SECONDS", 1):
+            if serial:   # the mutant: the old loop
+                self.applied = True
+                records = [launcher.record(p) for p in pods]
+            else:
+                records = self.ask(launcher)
+        print("launcher 15 pods: %d reads at once at most" % self.peak, file=sys.stderr)
+        self.assertGreater(self.peak, 1, "the pods were read one after another")
+        self.assertLessEqual(self.peak, self.cw.STATUS_WORKERS, "more reads at once than the number of workers")
+        self.assertEqual([r["worker"] for r in records], ["w%d" % i for i in range(15)])
+        return records
+
+    def test_s10_fifteen_pods_are_read_four_at_a_time_not_one_after_another(self):
+        records = self.check_concurrent()
+        self.assertTrue(all(r["idle_since"] is not None for r in records))
+        self.assertEqual(len(self.calls), 15)
+
+    def test_s10_a_mutant_with_the_serial_loop_fails_the_concurrency_test(self):
+        self.applied = False
+        with self.assertRaises(AssertionError):
+            self.check_concurrent(serial=True)
+        self.assertTrue(self.applied, "the mutation was not applied")
+
+    def test_s10_a_pod_whose_activity_raises_has_empty_idle_fields_and_the_other_fourteen_are_complete(self):
+        pods = self.pods(15)
+        records = self.ask(self.launcher(pods, fail=("cw-w3",)))
+        self.assertEqual([r["worker"] for r in records], ["w%d" % i for i in range(15)])
+        bad = records[3]
+        self.assertIsNone(bad["idle_since"])
+        self.assertIsNone(bad["deadlines"]["idle"])
+        self.assertEqual(bad["deadlines"]["hard"], pods[3]["metadata"]["annotations"]["cw/hard-deadline"])
+        self.assertEqual(bad["phase"], "Running")
+        self.assertEqual(list(bad), ["worker", "runtime_id", "phase", "idle_since", "deadlines", "cost_estimate_usd"])
+        self.assertEqual(len([r for r in records if r["idle_since"] is not None and r["deadlines"]["idle"] is not None]), 14)
+
+    def test_s10_a_pod_over_its_bound_is_answered_without_its_activity(self):
+        pods = self.pods(2)
+        self.SLEEP = 1.0
+        launcher = self.launcher(pods)
+        with mock.patch.object(self.cw, "STATUS_POD_SECONDS", 0.1):
+            records = self.ask(launcher)
+        self.assertEqual([r["idle_since"] for r in records], [None, None])
+
+    def test_s10_the_named_worker_form_is_one_serial_record_as_before(self):
+        pods = self.pods(1)
+        launcher = self.launcher(pods)
+        answer = self.ask(launcher, "w0")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(answer, [launcher.record(pods[0])])
+
+    def test_s10_the_kube_client_keeps_no_state_a_call_writes(self):
+        launcher = self.cw.Launcher(self.cw.Kube(self.env), self.env, self.clock)
+        before = (dict(launcher.kube.env), set(launcher.kube.known), launcher.kube.kubeconfig, launcher.kube.dir)
+        self.assertEqual(self.ask(launcher), [])
+        self.assertEqual(before, (dict(launcher.kube.env), set(launcher.kube.known), launcher.kube.kubeconfig, launcher.kube.dir))
+
+
+class TotalDeadline(launcher_tests.Base):
+    """S13: the read for all workers has ONE total deadline (STATUS_TOTAL_SECONDS), under the switchboard's call cap; no record is dropped."""
+    SLEEP = 0.3
+    pods, launcher, ask = LauncherRecords.pods, LauncherRecords.launcher, LauncherRecords.ask
+
+    def setUp(self):
+        super().setUp()
+        self.cw = launcher_tests.cw
+        self.calls = []
+        self.lock = threading.Lock()
+
+    def hanging(self, count):
+        pods = self.pods(count)
+        launcher = self.launcher(pods)
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def activity(name):
+            with self.lock:
+                self.calls.append(name)
+            release.wait(60)   # far past every bound
+            return False, launcher_tests.T0
+        launcher.activity = activity
+        return pods, launcher
+
+    def check_total(self, count=300, remove_total=False):
+        pods, launcher = self.hanging(count)
+        answer = []
+        with mock.patch.object(self.cw, "STATUS_POD_SECONDS", 0.2), mock.patch.object(self.cw, "STATUS_TOTAL_SECONDS", 1e9 if remove_total else 2):
+            if remove_total:
+                self.applied = True   # the mutant: each pod bounded alone, no total deadline
+            started = time.monotonic()
+            thread = threading.Thread(target=lambda: answer.append(self.ask(launcher)), daemon=True)
+            thread.start()
+            thread.join(30)   # a hang guard only: the expected answer is at 2 s, 30 s is a factor 15
+            took = time.monotonic() - started
+        print("launcher %d hanging pods answered after %.2f s" % (count, took), file=sys.stderr)
+        self.assertTrue(answer, "no answer within 30 s")
+        records = answer[0]
+        self.assertEqual([r["worker"] for r in records], ["w%d" % i for i in range(count)])
+        self.assertGreaterEqual(len([r for r in records if r["idle_since"] is None and r["deadlines"]["idle"] is None]), 1)
+        with self.lock:
+            begun = len(self.calls)
+        print("launcher %d hanging pods: %d reads begun" % (count, begun), file=sys.stderr)
+        self.assertLess(begun, count, "every read was begun: the total deadline did not stop the starts")
+        for record, pod in zip(records, pods):
+            self.assertEqual(list(record), ["worker", "runtime_id", "phase", "idle_since", "deadlines", "cost_estimate_usd"])
+            self.assertEqual(record["phase"], "Running")
+            self.assertEqual(record["deadlines"]["hard"], pod["metadata"]["annotations"]["cw/hard-deadline"])
+
+    def test_s13_three_hundred_hanging_pods_answer_within_the_total_deadline_with_every_record_in_order(self):
+        self.check_total()
+
+    def test_s13_a_mutant_without_the_total_deadline_fails_the_three_hundred_pod_test(self):
+        self.applied = False
+        with self.assertRaises(AssertionError):
+            self.check_total(remove_total=True)
+        self.assertTrue(self.applied, "the mutation was not applied")
+
+    def check_no_start_after(self, count=40, drop_guard=False):
+        pods = self.pods(count)
+        launcher = self.launcher(pods)
+        starts = []
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def activity(name):
+            with self.lock:
+                starts.append(time.monotonic())
+            release.wait(5)   # far past every bound
+            return False, launcher_tests.T0
+        launcher.activity = activity
+        pod_bound, total, margin = 0.2, 1, 0.05
+        with mock.patch.object(self.cw, "STATUS_POD_SECONDS", pod_bound), mock.patch.object(self.cw, "STATUS_TOTAL_SECONDS", total):
+            if drop_guard:   # the mutant: the real source with the guard `if left <= 0` replaced by `if False`
+                import inspect
+                import textwrap
+                source = textwrap.dedent(inspect.getsource(self.cw.Launcher._records_bounded))
+                self.assertIn("if left <= 0:", source)
+                mutant = {}
+                exec(source.replace("if left <= 0:", "if False:"), self.cw.__dict__, mutant)
+                self.applied = True
+                patcher = mock.patch.object(self.cw.Launcher, "_records_bounded", mutant["_records_bounded"])
+            else:
+                patcher = mock.patch.object(self.cw.Launcher, "_records_bounded", self.cw.Launcher._records_bounded)
+            with patcher:
+                begin = time.monotonic()
+                records = self.ask(launcher)
+        self.assertEqual([r["worker"] for r in records], ["w%d" % i for i in range(count)])
+        with self.lock:
+            late = [t - begin for t in starts if t - begin > total + margin]
+            number = len(starts)
+        most = int(total / pod_bound) * self.cw.STATUS_WORKERS + self.cw.STATUS_WORKERS
+        print("launcher %d pods: %d reads started, %d after the deadline" % (count, number, len(late)), file=sys.stderr)
+        self.assertEqual(late, [], "reads started after the total deadline")
+        self.assertLessEqual(number, most)
+        self.assertLess(number, count)
+
+    def test_s13_a_pod_after_the_total_deadline_starts_no_read_at_all(self):
+        self.check_no_start_after()
+
+    def test_s13_a_mutant_without_the_expired_guard_starts_reads_after_the_deadline(self):
+        self.applied = False
+        with self.assertRaises(AssertionError) as caught:
+            self.check_no_start_after(drop_guard=True)
+        self.assertTrue(self.applied, "the mutation was not applied")
+        print("mutant failure: %s" % str(caught.exception)[:200], file=sys.stderr)
+
+    def test_s13_the_total_deadline_is_a_named_constant_below_the_switchboard_call_cap(self):
+        self.assertEqual(self.cw.STATUS_TOTAL_SECONDS, 40)
+
+
+if __name__ == "__main__":
+    unittest.main()

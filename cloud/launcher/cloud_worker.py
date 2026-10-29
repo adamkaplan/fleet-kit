@@ -10,6 +10,7 @@ secret value is read once from an inherited descriptor and goes to kubectl's std
 """
 import argparse
 import base64
+import concurrent.futures as futures
 import copy
 import fcntl
 import datetime as dt
@@ -1249,6 +1250,12 @@ def scan_credentials(spec):
 REGISTRY_KEYS = ("secrets.json", "agents.json")
 
 
+STATUS_WORKERS = 4       # pods whose record `status` (no worker name) reads at a time
+STATUS_POD_SECONDS = 5   # each pod's own bound for its record
+# One total deadline for the whole no-name read; it stays BELOW the switchboard's call cap of 60 s so the launcher always answers first.
+STATUS_TOTAL_SECONDS = 40
+
+
 class Kube:
     """The only door to the cloud: one kubectl call per method. Never puts a secret on a command line."""
 
@@ -2300,8 +2307,11 @@ class Launcher:
             return None
 
     def record(self, pod):
+        return self._record_with(pod, self.activity(pod["metadata"]["name"]))
+
+    def _record_with(self, pod, act):
+        """The record of `pod` given its activity read `act` (None: unread). The fields and their order are the record's one shape."""
         name = pod["metadata"]["name"]
-        act = self.activity(name)
         idle_for = int(ann(pod, "idle-seconds", "600"))
         since = act[1] if act and not act[0] else None
         return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": pod.get("status", {}).get("phase"),
@@ -2315,7 +2325,35 @@ class Launcher:
         pods = [self.kube.get_pod(pod_name(a.worker))] if a.worker else self.kube.list_pods()
         if a.worker and not pods[0]:
             raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
-        return [self.record(p) for p in pods]
+        if a.worker:
+            return [self.record(p) for p in pods]
+        return self._records_bounded(pods)
+
+    def _records_bounded(self, pods):
+        """The records of ALL pods, STATUS_WORKERS at a time, each with its own bound of STATUS_POD_SECONDS; the order is the pods'. A pod whose
+        record raises or runs over its bound is answered WITHOUT its activity (idle fields None). Each kubectl call is its own subprocess and
+        Kube keeps no per-call state (it only reads its env and its known-secrets set), so the threads share the one client safely."""
+        def one(pod):
+            box = []
+
+            def run():
+                try:
+                    box.append(self.record(pod))
+                except BaseException:
+                    box.append(None)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return self._record_with(pod, None)
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            worker.join(min(STATUS_POD_SECONDS, left))
+            return box[0] if box and box[0] is not None else self._record_with(pod, None)
+        deadline = time.monotonic() + STATUS_TOTAL_SECONDS
+        pool = futures.ThreadPoolExecutor(max_workers=STATUS_WORKERS)
+        try:
+            return list(pool.map(one, pods))
+        finally:
+            pool.shutdown(wait=False)
 
     def snapshot(self, a):
         """ONE read-only look at the cluster: the pods of the namespace (name, worker, phase, node, hard deadline) and, when the login may
