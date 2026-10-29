@@ -50,11 +50,14 @@ issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; forma
 
 ## The form
 
-Put it in the repo the work concerns: **a short issue body** (outcome, Done-when, link to the detail) plus **one detail comment** headed `Plan (scenarios)` with the plan text and the `scenarios:` yaml block. The latest counts. One plan per ask.
+Put it in the repo the work concerns. **a short issue body** (outcome, Done-when, link to the
+detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
+`scenarios:` yaml block. The latest such comment counts. One plan per ask; sections for work items.
 
 ## Challenge it
 
-A `plan review` command (not built yet: ask the Chief of Staff for a hand-run review) launches independent read-only reviewers and records their verdicts. The tier is computed from the ask or epic the plan serves, not chosen per item. Up to three rounds; a standing objection goes to the Chief of Staff, then the owner.
+A `plan review` command launches independent read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
+chosen per item. Up to three rounds; a standing objection then goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
@@ -62,8 +65,8 @@ A `plan review` command (not built yet: ask the Chief of Staff for a hand-run re
 - **Scenario adversary**: a bad build that passes every scenario (an empty or stubbed implementation); an undecidable pass rule; an evaluator who cannot record the proof.
 - **Risk and security**: no rollback or a half-applied state; a contract change; a held-PR area; who can forge a verdict.
 - **Scope and what-not-how**: a step that dictates the design; no out-of-scope; creep; overlap with another plan.
-- **Cost and sequencing**: a smaller plan with the same Done-when; order; an unwarranted integration branch.
-- **The owner's view**: would the owner be surprised; is the asked problem solved.
+- **Cost and sequencing**: a smaller plan that meets the same Done-when; order and parallelism; an unwarranted integration branch.
+- **The owner's view**: would the owner be surprised; does it solve the asked problem.
 
 ## Good and bad
 
