@@ -165,6 +165,55 @@ class TotalDeadline(launcher_tests.Base):
             self.check_total(remove_total=True)
         self.assertTrue(self.applied, "the mutation was not applied")
 
+    def check_no_start_after(self, count=40, drop_guard=False):
+        pods = self.pods(count)
+        launcher = self.launcher(pods)
+        starts = []
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def activity(name):
+            with self.lock:
+                starts.append(time.monotonic())
+            release.wait(5)   # far past every bound
+            return False, launcher_tests.T0
+        launcher.activity = activity
+        pod_bound, total, margin = 0.2, 1, 0.05
+        with mock.patch.object(self.cw, "STATUS_POD_SECONDS", pod_bound), mock.patch.object(self.cw, "STATUS_TOTAL_SECONDS", total):
+            if drop_guard:   # the mutant: the real source with the guard `if left <= 0` replaced by `if False`
+                import inspect
+                import textwrap
+                source = textwrap.dedent(inspect.getsource(self.cw.Launcher._records_bounded))
+                self.assertIn("if left <= 0:", source)
+                mutant = {}
+                exec(source.replace("if left <= 0:", "if False:"), self.cw.__dict__, mutant)
+                self.applied = True
+                patcher = mock.patch.object(self.cw.Launcher, "_records_bounded", mutant["_records_bounded"])
+            else:
+                patcher = mock.patch.object(self.cw.Launcher, "_records_bounded", self.cw.Launcher._records_bounded)
+            with patcher:
+                begin = time.monotonic()
+                records = self.ask(launcher)
+        self.assertEqual([r["worker"] for r in records], ["w%d" % i for i in range(count)])
+        with self.lock:
+            late = [t - begin for t in starts if t - begin > total + margin]
+            number = len(starts)
+        most = int(total / pod_bound) * self.cw.STATUS_WORKERS + self.cw.STATUS_WORKERS
+        print("launcher %d pods: %d reads started, %d after the deadline" % (count, number, len(late)), file=sys.stderr)
+        self.assertEqual(late, [], "reads started after the total deadline")
+        self.assertLessEqual(number, most)
+        self.assertLess(number, count)
+
+    def test_s13_a_pod_after_the_total_deadline_starts_no_read_at_all(self):
+        self.check_no_start_after()
+
+    def test_s13_a_mutant_without_the_expired_guard_starts_reads_after_the_deadline(self):
+        self.applied = False
+        with self.assertRaises(AssertionError) as caught:
+            self.check_no_start_after(drop_guard=True)
+        self.assertTrue(self.applied, "the mutation was not applied")
+        print("mutant failure: %s" % str(caught.exception)[:200], file=sys.stderr)
+
     def test_s13_the_total_deadline_is_a_named_constant_below_the_switchboard_call_cap(self):
         self.assertEqual(self.cw.STATUS_TOTAL_SECONDS, 40)
 
