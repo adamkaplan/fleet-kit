@@ -322,6 +322,67 @@ class TestLostWorkerMemoryOnly(unittest.TestCase):
         line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="newer", detail={"hard_deadline": stamp(NOW - 60)})
         self.assertEqual([x["name"] for x in r.passes()], ["newer"])
 
+    def load_mutant(self, *pairs):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        for old, new in zip(pairs[::2], pairs[1::2]):
+            self.assertIn(old, src)
+            src = src.replace(old, new)
+        module = types.ModuleType("lost_worker_mutant")
+        exec(compile(src, "lost_worker_mutant", "exec"), module.__dict__)
+        return module
+
+    def check_proc_cap(self):
+        r = Rig(self.mod)
+        path = os.path.join(r.dir, "lost-workers.json")
+        os.unlink(path)
+        os.mkdir(path)
+        self.mod.ALERTED_MAX, self.mod.PASS_CAP = 30, 10 ** 6
+        for i in range(100):
+            line(r.engine.audit.path, ts=stamp(NOW - 300 - i), actor="x", event="cloud.created", subject="k%03d" % i, detail={"hard_deadline": stamp(NOW - 60)})
+        r.passes()
+        mem = self.mod._PROC_ALERTED[path]
+        self.assertEqual(len(mem), 30)
+        self.assertTrue(any("k000" in k for k in mem))   # the newest is kept
+
+    def test_in_process_memory_is_capped_and_keeps_the_newest(self):
+        self.check_proc_cap()
+
+    def test_mutant_that_never_prunes_the_in_process_memory_is_caught(self):
+        self.mod = self.load_mutant("    _PROC_ALERTED[path] = dict(alerted)", "    pass", "    while len(alerted) > ALERTED_MAX:", "    _PROC_ALERTED.setdefault(path, {}).update(alerted)\n    while len(alerted) > ALERTED_MAX:")
+        with self.assertRaises(AssertionError):
+            self.check_proc_cap()
+
+    def check_audit_per_path(self):
+        a, b = Rig(self.mod), Rig(self.mod)
+        for r in (a, b):
+            os.unlink(os.path.join(r.dir, "lost-workers.json"))
+            with open(os.path.join(r.dir, "lost-workers.json"), "w") as h:
+                h.write("{not json")
+            os.chmod(r.dir, 0o500) if False else None
+        # a corrupt file that cannot be set aside: replace by a directory-free trick: make the file undeletable via patched os
+        real_replace, real_unlink = os.replace, os.unlink
+        os.replace = lambda *x, **k: (_ for _ in ()).throw(OSError("no"))
+        os.unlink = lambda *x, **k: (_ for _ in ()).throw(OSError("no"))
+        try:
+            for r in (a, b, a, b):
+                r.passes()
+        finally:
+            os.replace, os.unlink = real_replace, real_unlink
+        for r in (a, b):
+            with open(r.engine.audit.path) as h:
+                self.assertEqual(len([x for x in h if "lost_worker.memory_corrupt" in x]), 1)
+
+    def test_audit_line_is_once_per_path(self):
+        self.check_audit_per_path()
+
+    def test_mutant_with_one_process_wide_audit_flag_is_caught(self):
+        class OnePath(set):
+            def __contains__(self, item):
+                return len(self) > 0
+        self.mod._PROC_AUDITED = OnePath()
+        with self.assertRaises(AssertionError):
+            self.check_audit_per_path()
+
 
 if __name__ == "__main__":
     unittest.main()

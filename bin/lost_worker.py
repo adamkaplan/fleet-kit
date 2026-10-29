@@ -38,7 +38,7 @@ EVIDENCE_MAX = 200
 REAPER_ID = "reaper"
 
 _PROC_ALERTED = {}            # per memory path: keys this process already alerted or skipped: survives a memory file that cannot be saved or set aside
-_PROC_AUDITED = []            # the memory-only audit line is written once per process
+_PROC_AUDITED = set()          # memory paths whose memory-only audit line this process already wrote (once per path)
 
 NEEDS = ("parse_iso", "_one_line", "parse_bounded")
 
@@ -228,8 +228,8 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
                 pass
         if os.path.lexists(path):
             # S11b: corrupt AND neither written nor set aside: memory-only mode at once, one audit line per process, alerts as a first pass now.
-            if not _PROC_AUDITED:
-                _PROC_AUDITED.append(True)
+            if path not in _PROC_AUDITED:
+                _PROC_AUDITED.add(path)
                 engine.audit.append(engine.actor, "lost_worker.memory_corrupt", None, {"file": STATE_FILE, "action": "cannot be set aside; memory-only mode, alerting as a first pass"})
             status = "memory_only"
         else:
@@ -266,7 +266,7 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         _deliver(engine, sb, {"name": "roll-up", "kind": "roll_up"}, ["chief-of-staff"], text)
     while len(alerted) > ALERTED_MAX:
         alerted.pop(min(alerted, key=lambda k: alerted[k]["at"]))
-    _PROC_ALERTED.setdefault(path, {}).update(alerted)
+    _PROC_ALERTED[path] = dict(alerted)   # the trimmed set (it already holds this process's earlier keys): capped like the persisted memory
     if status == "memory_only":
         return raised   # the memory file is not written in memory-only mode
     if first or json.dumps(state, sort_keys=True) != before:
