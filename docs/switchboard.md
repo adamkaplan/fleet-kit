@@ -5940,7 +5940,7 @@ Its ask stays open, with a comment naming the batch pull request. Its live-check
 
 1. A change is planned and reviewed as usual, and its pull request is opened into `integration` (`gh pr create --base integration`); CI runs on it. A top-tier change is held for the owner and cleared on its own pull request (`impact clear <repo#N> --reason ...`).
 2. After the independent review passes at the head and the gates read `gates <repo#N>`, the change merges into `integration` (`gh pr merge <N>`) unless a batch is out of draft (ready); then it waits.
-3. After every direct merge to the default branch: `git fetch origin`, `git checkout integration`, `git merge origin/<default>` (never a rebase), push.
+3. After every direct merge to the default branch, in a worktree or a clone of your own that is not the installed tree (see "The installed tree is the default branch, clean"): `git fetch origin`, `git checkout integration`, `git merge origin/<default>` (never a rebase), push.
 4. At the day's hour the Chief of Staff's lane opens the batch pull request (`gh pr create --base <default> --head integration --draft`), with the body template below, one row per change.
 5. It re-syncs (step 3), refreshes the table, runs the independent review of the batch at its head, then marks it ready (`gh pr ready <N>`, and a title that says `ready for the owner's clear`) and tells the owner (`fleet-switchboard notice pr <repo#N>`).
 6. The owner clears at the exact head and the batch merges. The lane merges the default branch into `integration` (step 3), and the owning orchestrators close the asks that were carried.
@@ -6220,3 +6220,48 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## The installed tree is the default branch, clean (#1380)
+
+The tree the fleet's commands and the daemon run from (the checkout `fleet-switchboard install` was run from) must be the default branch, clean, so no command, verdict or merge gate is computed by code from an unmerged branch.
+
+### What happened (26 to 27 Oct)
+
+- The installed checkout left the default branch at 19:09Z, when a scratch loop of an orchestrator ran a checkout of the integration branch with that tree as its working directory.
+- It was then fast-forwarded to the integration branch three times (21:37Z, 23:06Z, 03:43Z) by a `git merge origin/integration` run from another session whose working directory was that tree. The commands ran integration code for about nine hours.
+- It was found by a floor verdict that no installed code could give.
+- Who can run git there: every session whose working directory is the tree (an orchestrator or the Chief of Staff started in it), and the person.
+- Which step could do it: no code of `bin/`, `cloud/`, `shims/` or `plugins/` runs a checkout, a switch, a merge or a pull of a branch (`review checkout` writes a tree elsewhere). The candidate was the sync step of the batching steps above ("After every direct merge..."), which names `git checkout integration` and `git merge origin/<default>` without saying where: run with the installed tree as the working directory it does exactly this. The step now says it is done in a worktree or a clone that is not the installed tree, and a test (`TestAdviceNamesAWorktree`) holds every such line of `docs/`, `skills/` and `agents/` to that.
+
+### What the guard allows
+
+The installed tree is allowed when it is on the default branch, at a commit that is an ancestor of (or equal to) the remote default branch (`origin/<default>`), and has no uncommitted change to a tracked file (an untracked file is not judged). A detached head is allowed only at such an ancestor. When `origin/<default>` is not fetched yet (a fresh clone), a clean tree on the default branch is allowed with the one-line note "ancestry unverified". The guard reads only (`git status`, `git rev-parse`, `git merge-base`: at most three calls, no fetch, no network, no write).
+
+It judges only the tree `install` recorded (`installed-tree` in the state directory): a worktree, a CI checkout or a test tree is never refused. Every command refuses with one line naming the branch, the commit and the dirty paths, with exit status 1, before it does anything else. The commands the operator moves the tree with are exempt: `install`, `upgrade` and `doctor`. The daemon (`run` without `--once`) is not refused at the entry either, because a refusal there would make the service manager restart it for ever without a word: it checks the tree itself at its start and on every pass. `run --once` decides and delivers on its own, so it stays guarded.
+
+The daemon checks at its start and on every pass, and acts on a bad tree only when two reads in a row, a second apart, both say so. On a bad tree it stays alive but decides and delivers nothing (no verdict, merge or message), re-checks on each pass and resumes by itself when the tree is good. The first alert goes at once, a repeat after a day, through a standalone script the install copied into the state directory (`guard/guard_alert.py`, standard library only, nothing from the tree): an audit line, a herdr toast addressed to the Chief of Staff, a desktop notification for the person on every alert, and a line in `installed-tree-alerts.txt`.
+
+### A tree git cannot read
+
+When a git read fails without a plain answer (a lock, a corrupt `HEAD`, a timeout, git missing), the tree is neither good nor bad: it is unreadable. This reverses the earlier rule that a failed read is no evidence, for the commands that matter:
+
+- A command that records a verdict, a gate, a clear, a merge or a proof refuses with one line saying the tree could not be read. These are the commands whose handler is flagged `ledger`, marked `@recording` (the one list `recording_commands()` reads) or flagged `guard_records` in the command registry (`prove`, `verdict`, `waive`, `gates`, `gates-check`, `merge-gate`, `item-prove`, `item-verdict`, `impact`, `cloud-clear`, `review`, `plan` and `run --once`); a test holds every command whose name says it records one of those things to the flags, so a new one cannot be forgotten.
+- Any other command runs, with one note on stderr that it ran without the check.
+- The daemon skips that pass and alerts, as for a bad tree, and resumes by itself when the tree can be read.
+
+### How the operator moves the tree
+
+Save your work, put the tree back on the default branch and fast-forward it to `origin/<default>` yourself in a terminal of your own (no agent does this), and run `fleet-switchboard install` again: it records the tree and its default branch, copies the two guard scripts and writes the `post-checkout` and `post-merge` hooks in the tree's `.git/hooks` (a hook that is not ours is left alone). Each hook appends one `installed_tree.head_moved` line to the audit (under the audit's own append lock) with the old and new commit and the chain of ancestor processes (pid, parent pid and executable names only, never their arguments: a command line can carry a path or a secret), so the next move names who made it.
+
+The install records the tree it is run from. Run from a feature-branch worktree it records that worktree, so run it from the checkout the commands are linked to (`install` prints the tree it recorded). It records the default branch from `origin/HEAD`, else the one of `main` and `master` that exists on origin; when that is not known it records nothing and says so (`git remote set-head origin -a` fixes it).
+
+### What the guard does not do
+
+- The guard lives in the tree it guards: it protects against an accident (a checkout, a merge, a stray edit), not against an agent or a person who edits the guard's own code there, and `installed-tree` in the state directory is the switch: deleting `installed-tree` turns the guard off, and nothing audits that.
+- It reads the remote default branch as `origin/<default>` by that literal remote name, from the last fetch; a clone whose remote has another name is not judged correctly.
+- It reads tracked files only (an untracked file is not judged), and what git calls a change follows the clone's own settings (`core.autocrlf`, `core.fileMode`): a tree that git reports as changed for those reasons is refused, and one that git hides is not.
+- The hooks are written to the tree's own hooks directory. A `core.hooksPath` setting makes git run the hooks from elsewhere, so the moves of such a tree are not recorded, and a hook that is not ours is left alone and said so.
+- The guard finds its record in the state directory (`XDG_STATE_HOME`, else `HOME`): a process started with either pointing at an empty directory finds no `installed-tree` and is not judged. That is a way around the guard, not an accident, and nothing audits it.
+- The daemon stops only when the tree is bad twice in a row: it reads again one second after the first bad reading, in the same pass, so a checkout in flight does not stop it.
+- A local default branch ahead of `origin/<default>` is refused as not an ancestor; the message says to push it or reset the branch, and that the origin ref may be stale (`git fetch origin`).
+- It never changes the tree: the operator does (see above).
