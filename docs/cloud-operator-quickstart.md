@@ -351,13 +351,13 @@ kubectl create -f cwp.yaml
 kubectl -n NAMESPACE_NAME get secret cloud-hub-registry cloud-hub-pw
 kubectl -n NAMESPACE_NAME create secret generic cloud-hub-registry --from-literal=secrets.json={} --from-literal=agents.json={}
 kubectl -n NAMESPACE_NAME create secret generic cloud-hub-pw
-kubectl -n NAMESPACE_NAME create secret docker-registry PULL_SECRET_NAME --docker-server=REGISTRY_HOST --docker-username=REGISTRY_USER --docker-password=REGISTRY_PASSWORD
-kubectl -n NAMESPACE_NAME create token cw-operator --duration=DURATION
+kubectl -n SOURCE_NAMESPACE get secret PULL_SECRET_NAME -o json | python3 -c 'import json, sys; d = json.load(sys.stdin); [d["metadata"].pop(k, None) for k in ("namespace", "uid", "resourceVersion", "creationTimestamp", "ownerReferences")]; json.dump(d, sys.stdout)' | kubectl -n NAMESPACE_NAME create -f -
+( set -C; umask 077; kubectl -n NAMESPACE_NAME create token cw-operator --duration=DURATION > TOKEN_FILE )
 ```
 
 The order after the apply: run the `get secret` line first. The apply creates the two registry Secrets (`cloud-hub-registry` and `cloud-hub-pw`) empty: they exist from the apply and are EDITED, not created; a `create secret generic` on them can fail with AlreadyExists. Run the `create secret generic` command ONLY for a Secret the `get` reports missing. The pull secret is never in the manifests: it is always created by hand.
 
-The two `create secret generic` lines are for a Secret the `get` reports missing. The last line prints the token of the namespace's launcher account: write it to the token file of step 5 (mode 0600) and never paste it anywhere else.
+The two `create secret generic` lines are for a Secret the `get` reports missing. The pull secret line copies the existing pull secret of the live namespace (`SOURCE_NAMESPACE`) by its own name into the probe namespace: the value goes through a pipe and is never printed and never on a command line (the shell history and the process list). The alternative, when no such secret exists, is `kubectl -n NAMESPACE_NAME create secret generic PULL_SECRET_NAME --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=DOCKER_CONFIG_FILE`, with `DOCKER_CONFIG_FILE` made under `umask 077` by its holder. The last line writes the token of the namespace's launcher account straight to the token file of step 5 (mode 0600, made in a subshell with `umask 077` and noclobber), so the value never reaches the terminal; never paste it anywhere else. The token file is never overwritten (a second run needs the first removed).
 
 Cost: a probe namespace adds one more hub pod and its Services (`cloud-hub` and the headless `cw-agents`) to the cluster while the namespace exists, plus the pods of the smoke launch while they run.
 
@@ -395,17 +395,21 @@ The command changes the Deployment, so the hub rolls its pod. Wait for it with `
 R2. Who: the holder of the probe credential (not the administrator, not a pod, not the launcher). The holder makes a NEW random token on the machine that will run the probe daemon, writing it straight to a new file with mode 0600, so it is never printed to a terminal or a log, then computes its SHA-256 digest into a second file and hands ONLY THE DIGEST to the administrator:
 
 ```text
-umask 077
+( umask 077; set -C
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > PROBE_TOKEN_FILE
-python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1]).read().strip().encode()).hexdigest())' PROBE_TOKEN_FILE > PROBE_DIGEST_FILE
+python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1]).read().strip().encode()).hexdigest())' PROBE_TOKEN_FILE > PROBE_DIGEST_FILE )
 ```
 
-The administrator adds the digest as the one entry for `relay-probe` in the `secrets.json` key of the PROBE hub's registry Secret `cloud-hub-registry`, by an in-place edit that keeps every other entry. The hub reads `secrets.json` as one JSON object `{"AGENT_NAME": "sha256 hex of the secret"}` (the key `agents.json` is not touched: the daemon is not a pod). Read it, edit it, patch it back:
+The subshell leaves the holder's shell unchanged, and `set -C` (noclobber) makes a redirect onto an existing file fail: an existing probe file is never overwritten (a second run needs the first file removed by its holder). The same holds for the digest file.
+
+The administrator adds the digest as the one entry for `relay-probe` in the `secrets.json` key of the PROBE hub's registry Secret `cloud-hub-registry`, by an in-place edit that keeps every other entry. The hub reads `secrets.json` as one JSON object `{"AGENT_NAME": "sha256 hex of the secret"}` (the key `agents.json` is not touched: the daemon is not a pod). Read it, edit it, patch it back, with the working copy made in a subshell under `umask 077` (mode 0600 from the first byte); the read, edit and patch of the registry Secret is not atomic: one administrator at a time.
 
 ```text
+( umask 077
 kubectl -n NAMESPACE_NAME get secret cloud-hub-registry -o jsonpath='{.data.secrets\.json}' | base64 -d > secrets.json
 python3 -c 'import json; d = json.load(open("secrets.json")); d["relay-probe"] = open("PROBE_DIGEST_FILE").read().strip(); json.dump(d, open("secrets.json", "w"))'
 kubectl -n NAMESPACE_NAME patch secret cloud-hub-registry --type merge -p "$(python3 -c 'import json; print(json.dumps({"stringData": {"secrets.json": open("secrets.json").read()}}))')"
+)
 rm -f secrets.json
 ```
 

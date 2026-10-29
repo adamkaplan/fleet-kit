@@ -265,6 +265,105 @@ class RelayAppendix(unittest.TestCase):
             self.test_the_daemon_name_command_is_found_once_and_the_reserved_names_match_the_hub()
 
 
+def code_blocks(text):
+    return re.findall(r"```text\n(.*?)```", text, flags=re.S)
+
+
+def subshells(block):
+    """The parenthesised blocks of a code block: a line that is '(' alone or starts '( ', up to the line that is ')' or ends ' )'."""
+    found, current = [], None
+    for line in block.split("\n"):
+        if current is None and (line == "(" or line.startswith("( ")):
+            current = []
+        if current is not None:
+            current.append(line)
+            if line == ")" or line.endswith(" )"):
+                found.append("\n".join(current))
+                current = None
+    return found
+
+
+TOKEN_BARE = "kubectl -n NAMESPACE_NAME create token cw-operator --duration=DURATION"
+
+
+class CredentialFileCare(unittest.TestCase):
+    def setUp(self):
+        with open(DOCS, encoding="utf-8") as f:
+            self.doc = f.read()
+        self.whole = self.doc.split("\n## A probe namespace\n", 1)[1].split("\n## ", 1)[0]
+        self.relay = self.whole.split("\n### A relay probe\n", 1)[1]
+
+    def check_working_copy_in_subshell(self):
+        hits = [s for b in code_blocks(self.relay) for s in subshells(b) if "> secrets.json" in s]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("umask 077", hits[0])
+        self.assertLess(hits[0].index("umask 077"), hits[0].index("> secrets.json"))
+        self.assertIn("rm -f secrets.json", self.relay)
+
+    def test_working_copy_sequence_is_in_a_umask_subshell(self):
+        self.check_working_copy_in_subshell()
+
+    def test_a_document_without_the_working_copy_umask_fails_the_check(self):
+        old = self.relay
+        parts = [b for b in code_blocks(old) if "> secrets.json" in b]
+        self.assertEqual(len(parts), 1)
+        mutant_block = parts[0].replace("umask 077", "")
+        self.assertNotEqual(mutant_block, parts[0])   # the mutation is applied
+        self.relay = old.replace(parts[0], mutant_block)
+        with self.assertRaises(AssertionError):
+            self.check_working_copy_in_subshell()
+
+    def test_token_step_is_in_a_umask_subshell_and_no_bare_umask_remains(self):
+        step = self.relay.split("\nR2. Who: ", 1)[1].split("\nR3. Who: ", 1)[0]
+        block = [b for b in code_blocks(step) if "PROBE_TOKEN_FILE" in b][0]
+        self.assertTrue(block.startswith("( umask 077;"))
+        for text in code_blocks(self.doc):
+            inside = "".join(subshells(text))
+            for line in text.split("\n"):
+                if line.strip().startswith("umask"):
+                    self.assertIn(line, inside)
+
+    def test_not_atomic_sentence_found_once(self):
+        self.assertEqual(self.doc.count("the read, edit and patch of the registry Secret is not atomic: one administrator at a time"), 1)
+
+    def test_token_step_has_noclobber_and_never_overwrites(self):
+        step = self.relay.split("\nR2. Who: ", 1)[1].split("\nR3. Who: ", 1)[0]
+        block = [b for b in code_blocks(step) if "PROBE_TOKEN_FILE" in b][0]
+        self.assertIn("set -C", block)
+        self.assertIn("PROBE_DIGEST_FILE", block)
+        self.assertEqual(self.doc.count("an existing probe file is never overwritten (a second run needs the first file removed by its holder)"), 1)
+
+    def check_token_command(self):
+        self.assertNotIn("\n" + TOKEN_BARE + "\n", self.doc)
+        listing = code_blocks(self.whole)[0]
+        hits = [s for s in subshells(listing) if "create token cw-operator" in s]
+        self.assertEqual(len(hits), 1)
+        for need in ("set -C", "umask 077", "> TOKEN_FILE"):
+            self.assertIn(need, hits[0])
+        self.assertEqual(self.doc.count("The token file is never overwritten (a second run needs the first removed)"), 1)
+
+    def test_the_cluster_token_command_writes_to_a_file_inside_a_subshell(self):
+        self.check_token_command()
+
+    def test_a_document_with_the_bare_token_line_fails_the_check(self):
+        listing = code_blocks(self.whole)[0]
+        line = [s for s in listing.split("\n") if "create token cw-operator" in s]
+        self.assertEqual(len(line), 1)
+        mutant = self.doc.replace(line[0], TOKEN_BARE)
+        self.assertNotEqual(mutant, self.doc)   # the mutation is applied
+        self.doc = mutant
+        self.whole = self.doc.split("\n## A probe namespace\n", 1)[1].split("\n## ", 1)[0]
+        with self.assertRaises(AssertionError):
+            self.check_token_command()
+
+    def test_the_pull_secret_is_copied_by_name_and_no_value_is_on_a_command_line(self):
+        self.assertNotIn("docker-" + "password", self.doc)
+        copies = [l for l in self.doc.split("\n") if "get secret PULL_SECRET_NAME -o json" in l and "create -f -" in l]
+        self.assertEqual(len(copies), 1)
+        self.assertIn("kubectl -n NAMESPACE_NAME create -f -", copies[0])
+        self.assertIn("--from-file=.dockerconfigjson=DOCKER_CONFIG_FILE", self.whole)
+
+
 class Chained(unittest.TestCase):
     def test_this_file_is_in_the_chain_once(self):
         with open(os.path.join(ROOT, "bin", "test-cloud-launcher.chain")) as f:
