@@ -6,6 +6,7 @@ values and the command lines: each must fail a test here."""
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -30,8 +31,28 @@ def fake_table():
     ]
 
 
+PS_TEXT = "\n".join([
+    "/sbin/launchd", "/usr/libexec/logd", "/Applications/Some App.app/Contents/MacOS/Some App",
+    "/Applications/Slack.app/Contents/MacOS/Slack Helper (Renderer)", "/usr/libexec/identityservicesd",
+    "/Applications/" + "Deep/" * 40 + "tool-with-a-long-path", "/usr/bin/" + PLANTED_CMD, ""])
+LSOF_TEXT = "\n".join([
+    "COMMAND     PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME",
+    "identitys   612 someuser   34u  IPv6 0x3c15b55e50c02f91      0t0  TCP [fe80:17::aa:bb]:1024->[fe80:17::cc:dd]:1024 (ESTABLISHED)",
+    "Some\\x20App  4321 someuser   18u  IPv4 0xab12cd      0t0  TCP 192.168.1.5:51234->140.82.112.6:443 (ESTABLISHED)",
+    "Some\\x20App  4321 someuser   19u  IPv4 0xab12ce      0t0  TCP 192.168.1.5:51235->140.82.112.6:443 (ESTABLISHED)",
+    "Slack\\x20   777 someuser   20u  IPv4 0xab12cf      0t0  TCP 192.168.1.5:51236->192.30.253.9:443 (ESTABLISHED)",
+    "Safari      888 someuser   21u  IPv4 0xab12d0      0t0  TCP 192.168.1.5:51237->17.253.1.1:443 (ESTABLISHED)",
+    "Safari      889 someuser   22u  IPv6 0xab12d1      0t0  TCP [fe80::1]:51238->[2606:50c0:8000::154]:443 (ESTABLISHED)",
+    "toolrun     890 someuser   23u  IPv4 0xab12d2      0t0  TCP 192.168.1.5:51239->140.82.112.6:443 (ESTABLISHED) " + PLANTED_ARG, ""])
+
+
 class Rig(unittest.TestCase):
     def setUp(self):
+        # process-wide caches keyed by path (state_write's last-written memory, the audit fsync clock) must not carry one test into the next
+        v2 = sys.modules.get("switchboard.v2_transport")
+        if v2 is not None:
+            v2._STATE_LAST.clear()
+        sb.AuditLog._synced.clear()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name)
@@ -176,6 +197,70 @@ class TestCensus(Rig):
             table = self._real_read_table(str(proc))
         self.assertEqual(table, [{"comm": "toolrun", "environ": {"GH_TOKEN": ""}, "peers": ["127.0.0.1"]}])
         self.assertNotIn(PLANTED_TOKEN + PLANTED_ARG, json.dumps(table))
+
+
+class TestMacosReader(Rig):
+    """S2b: the macOS reader on OUTPUT TEXT in the real shapes (the pod has no macOS: the real run is done on the Mac)."""
+
+    def fake_run(self, ps=PS_TEXT, lsof=LSOF_TEXT, record=None):
+        def run(argv, **kw):
+            if record is not None:
+                record.append((argv, kw))
+            text = ps if argv[0].endswith("ps") else lsof
+            return subprocess.CompletedProcess(argv, 0, text.encode(), b"")
+        return run
+
+    def test_s2b_the_macos_text_gives_the_kinds_with_a_count_and_none_of_the_planted_values(self):
+        calls = []
+        with mock.patch.object(self.gc.subprocess, "run", self.fake_run(record=calls)), \
+                mock.patch.object(self.gc, "read_table", lambda: self._real_read_table("/nonexistent-proc-root")), \
+                mock.patch.object(self.gc, "github_addresses", lambda: set()):
+            self.read_users()
+            self.step(60)
+            self.step(60, {"acme-a": 150})
+        found = self.lines("github.census")
+        self.assertEqual(len(found), 1, self.lines())
+        kinds = {k["kind"]: (k["count"], k["via"]) for k in found[0]["detail"]["kinds"]}
+        self.assertEqual(sorted(kinds), ["Slack_Helper__Renderer_", "Some_App", "toolrun"])
+        self.assertTrue(all(v == (1, ["connection"]) for v in kinds.values()), kinds)
+        text = self.audit_path.read_text() + self.whole_state_text()
+        for planted in PLANTED + ("140.82.112.6", "4321", "someuser", "192.168.1.5"):
+            self.assertNotIn(planted, text)
+        for argv, kw in calls:
+            self.assertIn(argv, (self.gc.PS_ARGV, self.gc.LSOF_ARGV), "no flag that prints environments")
+            self.assertIn("timeout", kw)
+
+    def test_the_parsers_on_the_real_shapes(self):
+        self.assertEqual(self.gc.parse_ps(PS_TEXT.splitlines())[:3], ["launchd", "logd", "Some_App"])
+        found = self.gc.parse_lsof(LSOF_TEXT.splitlines())
+        self.assertEqual(found["4321"], ("Some App", ["140.82.112.6", "140.82.112.6"], True))
+        self.assertNotIn("612", found, "IPv6 peers are never counted")
+        self.assertEqual(found["888"][1], [], "a non GitHub peer is not counted")
+
+    def test_a_hang_or_a_missing_command_is_one_failed_line_and_the_pass_goes_on(self):
+        def hang(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        with mock.patch.object(self.gc.subprocess, "run", hang), \
+                mock.patch.object(self.gc, "read_table", lambda: self._real_read_table("/nonexistent-proc-root")):
+            self.read_users()
+            self.step(60)
+            self.step(60, {"acme-a": 150})
+            self.step(60, {"acme-a": 150})
+        self.assertEqual([l["detail"] for l in self.lines("github.census_failed")], [{"error": "TimeoutExpired"}])
+
+    def test_the_rows_read_and_the_processes_scanned_are_capped(self):
+        many = "\n".join("/usr/bin/p%d" % i for i in range(self.gc.MAX_ROWS + 50))
+        with mock.patch.object(self.gc.subprocess, "run", self.fake_run(ps=many)):
+            self.assertEqual(len(self.gc._run_text(self.gc.PS_ARGV)), self.gc.MAX_ROWS)
+        self.assertEqual(len(self.gc.parse_ps(many.splitlines())), self.gc.MAX_PROCESSES)
+        with tempfile.TemporaryDirectory() as root:
+            proc = Path(root)
+            (proc / "net").mkdir()
+            for n in range(1, 8):
+                (proc / str(n)).mkdir()
+                (proc / str(n) / "comm").write_text("x\n")
+            with mock.patch.object(self.gc, "MAX_PROCESSES", 3):
+                self.assertEqual(len(self._real_read_table(str(proc))), 3)
 
 
 class TestDocumentation(unittest.TestCase):

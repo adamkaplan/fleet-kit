@@ -12,10 +12,12 @@ A failure is recorded once and never stops the pass. Python 3.9+, standard libra
 """
 
 import collections
+import ipaddress
 import os
 import re
 import socket
 import struct
+import subprocess
 import time
 
 WINDOW = 300                # seconds: the sample interval, the census interval and the window of the outside count
@@ -24,12 +26,27 @@ MAX_KINDS = 20
 TOKEN_VAR = re.compile(r"^(GH|GITHUB)_[A-Z0-9_]*TOKEN$")
 KIND_OK = re.compile(r"[^A-Za-z0-9._+-]")
 GITHUB_HOST = "api.github.com"
+MAX_PROCESSES = 5000        # processes scanned per census, by either reader (the rest are not read)
+MAX_ROWS = 20000            # rows read from the output of ps or lsof (the rest is dropped)
+SUBPROCESS_TIMEOUT = 10     # seconds each of ps and lsof may run: a hang is one github.census_failed line
+GITHUB_RANGES = tuple(ipaddress.ip_network(n) for n in ("140.82.0.0/16", "192.30.252.0/22", "185.199.108.0/22"))   # IPv4 only
+PS_ARGV = ["/bin/ps", "-axo", "comm="]                          # command NAME column only: never a flag that prints environments or arguments
+LSOF_ARGV = ["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED"]
 
 
 def kind_of(comm):
     """A process kind: its short name, reduced to a safe, short word. Never a path or an argument."""
     name = os.path.basename(str(comm or "").strip())
     return (KIND_OK.sub("_", name)[:32]) or "unknown"
+
+
+def in_github_range(peer):
+    """True when `peer` is an IPv4 address in a GitHub range (140.82.0.0/16, 192.30.252.0/22, 185.199.108.0/22). IPv6 and anything else: False."""
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return address.version == 4 and any(address in net for net in GITHUB_RANGES)
 
 
 def census(table, github_addresses):
@@ -42,7 +59,7 @@ def census(table, github_addresses):
         via = []
         if any(isinstance(n, str) and TOKEN_VAR.match(n) for n in (proc.get("environ") or {})):
             via.append("env")
-        if any(peer in github_addresses for peer in (proc.get("peers") or [])):
+        if any(peer in github_addresses or in_github_range(peer) for peer in (proc.get("peers") or [])):
             via.append("connection")
         if not via:
             continue
@@ -91,14 +108,71 @@ def _socket_peers(proc_root):
     return found
 
 
+LSOF_ESCAPE = re.compile(r"\\x([0-9a-fA-F]{2})")
+
+
+def _run_text(argv):
+    """The text output of a read-only command, with a timeout, a minimal environment and at most MAX_ROWS rows. Raises on a hang, a missing
+    command or a failure with no output (the census records that as one github.census_failed line)."""
+    done = subprocess.run(argv, capture_output=True, timeout=SUBPROCESS_TIMEOUT, stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin:/usr/sbin"})
+    text = done.stdout.decode("utf-8", "replace")
+    if done.returncode != 0 and not text.strip() and not (done.returncode == 1 and not done.stderr.strip()):   # lsof exits 1 for "no match"
+        raise OSError("%s exited %d" % (os.path.basename(argv[0]), done.returncode))
+    return text.splitlines()[:MAX_ROWS]
+
+
+def parse_ps(lines):
+    """The kinds from `ps -axo comm=` text: each line is the FULL PATH of an executable (spaces possible): its basename, whole line, never split."""
+    return [kind_of(line) for line in lines[:MAX_PROCESSES] if line.strip()]
+
+
+def parse_lsof(lines):
+    """{pid: (command, [GitHub peers], cut)} from `lsof -nP -iTCP -sTCP:ESTABLISHED` text. COMMAND is truncated to 9 characters, spaces are `\\x20`;
+    IPv6 peers are in brackets and never counted. Only the command, the pid (to group) and a peer that is in a GitHub range are kept."""
+    found = collections.OrderedDict()
+    for line in lines:
+        cols = line.split()
+        if len(cols) < 9 or cols[0] == "COMMAND" or not cols[1].isdigit() or "(ESTABLISHED)" not in line:
+            continue
+        link = next((c for c in cols if "->" in c), None)
+        if link is None:
+            continue
+        peer = link.split("->", 1)[1]
+        if peer.startswith("["):
+            continue
+        peer = peer.rsplit(":", 1)[0]
+        if cols[1] not in found and len(found) >= MAX_PROCESSES:
+            continue
+        cell = found.setdefault(cols[1], (LSOF_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), cols[0]), [], len(cols[0]) >= 9))
+        if in_github_range(peer):
+            cell[1].append(peer)
+    return found
+
+
+def read_table_macos():
+    """The macOS table (no /proc): kinds from ps, connections from lsof. There is NO environment-name signal here (`ps eww` would print values and is
+    never run). The lsof name is cut to 9 characters: it is widened to the full name from ps when exactly one ps name starts with it."""
+    names = parse_ps(_run_text(PS_ARGV))
+    table = []
+    for command, peers, cut in parse_lsof(_run_text(LSOF_ARGV)).values():
+        full = sorted({n for n in names if n.startswith(kind_of(command))}) if cut else []
+        table.append({"comm": full[0] if len(full) == 1 else command, "environ": {}, "peers": peers})
+    return table
+
+
 def read_table(proc_root="/proc"):
     """The real process table, reduced at the source: `comm`, the NAMES of the GitHub token variables (their values are never kept: each is
-    the empty string) and the remote addresses of the connections. The command line is never opened. Raises OSError when the table cannot be listed."""
+    the empty string) and the remote addresses of the connections. The command line is never opened. Raises OSError when the table cannot be listed.
+    Without /proc (macOS) the ps and lsof reader is used. At most MAX_PROCESSES processes are scanned."""
+    if not os.path.isdir(os.path.join(proc_root, "net")):
+        return read_table_macos()
     peers = _socket_peers(proc_root)
     table = []
     for entry in os.listdir(proc_root):
         if not entry.isdigit():
             continue
+        if len(table) >= MAX_PROCESSES:
+            break
         base = os.path.join(proc_root, entry)
         try:
             with open(os.path.join(base, "comm")) as handle:
