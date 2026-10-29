@@ -62,6 +62,20 @@ def bullet(text):
     return ""
 
 
+NEW_SENTENCE = "The annotation put by hand on the RUNNING hub pod protects THAT pod only, and it is lost when that pod is replaced"
+OLD_SENTENCE = "The interim pod annotation set by hand stays until the patch is applied, because a restarted pod loses it."
+
+
+def wording_problems(par):
+    bad = []
+    if par.count(NEW_SENTENCE) != 1:
+        bad.append("new sentence not found once")
+    for old in (OLD_SENTENCE, "a restarted pod loses it", "interim pod annotation"):
+        if old in par:
+            bad.append("old wording present: " + old)
+    return bad
+
+
 def sentences(par):
     return [s for s in re.split(r"(?<=\.)\s+", par) if s]
 
@@ -138,8 +152,9 @@ class Docs(unittest.TestCase):
             "administrator's step", "launcher's own account cannot change a Deployment",
             "patch deployment cloud-hub --type merge", "--dry-run=server",
             "rolls the hub pod once", "one more restart for every lane",
-            "registry Secrets and digests are untouched", "interim pod annotation",
-            "a restarted pod loses it", "protects only against the autoscaler's scale-down",
+            "registry Secrets and digests are untouched", NEW_SENTENCE[:60],
+            "protects THAT pod only", "every pod made afterwards carries it",
+            "replacement pod is unmarked until the next marking", "protects only against the autoscaler's scale-down",
             "no disruption budget", "blocks every drain and upgrade of its node indefinitely",
             "second replica with a budget is a separate ask",
             "dedupe keys (memory only, bounded)", "claimed but not yet delivered",
@@ -162,6 +177,16 @@ class Docs(unittest.TestCase):
         m = self.par.replace("it is not a fix of the outage", "it is a fix")
         self.assertNotEqual(m, self.par)
         self.assertNotEqual(doc_problems(m), [])
+
+    def test_by_hand_wording_is_exact(self):
+        self.assertEqual(wording_problems(self.par), [])
+
+    def test_mutant_old_sentence_restored_fails(self):
+        start = self.par.index(NEW_SENTENCE)
+        end = self.par.index("a replacement pod is unmarked until the next marking.") + len("a replacement pod is unmarked until the next marking.")
+        m = self.par[:start] + OLD_SENTENCE + self.par[end:]
+        self.assertNotEqual(m, self.par)
+        self.assertNotEqual(wording_problems(m), [])
 
     def test_names_what_the_mark_does_not_stop(self):
         self.assertEqual(not_stopped_missing(self.par), [])
