@@ -18,6 +18,8 @@ import re
 import socket
 import struct
 import subprocess
+import sys
+import threading
 import time
 
 WINDOW = 300                # seconds: the sample interval, the census interval and the window of the outside count
@@ -32,6 +34,12 @@ SUBPROCESS_TIMEOUT = 10     # seconds each of ps and lsof may run: a hang is one
 GITHUB_RANGES = tuple(ipaddress.ip_network(n) for n in ("140.82.0.0/16", "192.30.252.0/22", "185.199.108.0/22"))   # IPv4 only
 PS_ARGV = ["/bin/ps", "-axo", "comm="]                          # command NAME column only: never a flag that prints environments or arguments
 LSOF_ARGV = ["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED"]
+MAX_BYTES = 4 << 20         # bytes read from the output of ps or lsof (then the child is killed and reaped)
+DNS_TIMEOUT = 3             # seconds the lookup of api.github.com may take: a miss is one github.census_failed line
+
+
+class ProcUnavailable(OSError):
+    """Linux without /proc/net: recorded as one github.census_failed line naming "no /proc/net" (never the macOS reader)."""
 
 
 def kind_of(comm):
@@ -75,10 +83,19 @@ def census(table, github_addresses):
 
 def github_addresses():
     """The addresses api.github.com resolves to now (a name lookup, not a GitHub call). Empty when it cannot be resolved."""
-    try:
-        return {info[4][0] for info in socket.getaddrinfo(GITHUB_HOST, 443, proto=socket.IPPROTO_TCP)}
-    except OSError:
-        return set()
+    out = []
+
+    def look():
+        try:
+            out.append({info[4][0] for info in socket.getaddrinfo(GITHUB_HOST, 443, proto=socket.IPPROTO_TCP)})
+        except OSError:
+            out.append(set())
+    worker = threading.Thread(target=look, daemon=True)
+    worker.start()
+    worker.join(DNS_TIMEOUT)
+    if not out:
+        raise TimeoutError("lookup of %s took longer than %d s" % (GITHUB_HOST, DNS_TIMEOUT))
+    return out[0]
 
 
 def _peer(hexaddr):
@@ -112,12 +129,30 @@ LSOF_ESCAPE = re.compile(r"\\x([0-9a-fA-F]{2})")
 
 
 def _run_text(argv):
-    """The text output of a read-only command, with a timeout, a minimal environment and at most MAX_ROWS rows. Raises on a hang, a missing
-    command or a failure with no output (the census records that as one github.census_failed line)."""
-    done = subprocess.run(argv, capture_output=True, timeout=SUBPROCESS_TIMEOUT, stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin:/usr/sbin"})
-    text = done.stdout.decode("utf-8", "replace")
-    if done.returncode != 0 and not text.strip() and not (done.returncode == 1 and not done.stderr.strip()):   # lsof exits 1 for "no match"
-        raise OSError("%s exited %d" % (os.path.basename(argv[0]), done.returncode))
+    """The text output of a read-only command, with a timeout, a minimal environment, at most MAX_BYTES bytes (then the child is killed and reaped)
+    and at most MAX_ROWS rows. Raises on a hang, a missing command or a failure with no output (one github.census_failed line)."""
+    child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin:/usr/sbin"})
+    timed_out = []
+
+    def expire():
+        timed_out.append(True)
+        child.kill()
+    timer = threading.Timer(SUBPROCESS_TIMEOUT, expire)
+    timer.start()
+    try:
+        raw = child.stdout.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            raw = raw[:MAX_BYTES].rsplit(b"\n", 1)[0]   # the cut line is dropped
+            child.kill()
+    finally:
+        timer.cancel()
+        child.stdout.close()
+        child.wait()
+    if timed_out:
+        raise subprocess.TimeoutExpired(argv, SUBPROCESS_TIMEOUT)
+    text = raw.decode("utf-8", "replace")
+    if child.returncode not in (0, 1) and not text.strip():   # lsof exits 1 for "no match"
+        raise OSError("%s exited %d" % (os.path.basename(argv[0]), child.returncode))
     return text.splitlines()[:MAX_ROWS]
 
 
@@ -163,9 +198,11 @@ def read_table_macos():
 def read_table(proc_root="/proc"):
     """The real process table, reduced at the source: `comm`, the NAMES of the GitHub token variables (their values are never kept: each is
     the empty string) and the remote addresses of the connections. The command line is never opened. Raises OSError when the table cannot be listed.
-    Without /proc (macOS) the ps and lsof reader is used. At most MAX_PROCESSES processes are scanned."""
-    if not os.path.isdir(os.path.join(proc_root, "net")):
+    Chosen by sys.platform: linux reads /proc (no /proc/net: ProcUnavailable, never the macOS reader); darwin and any other platform use ps and lsof. At most MAX_PROCESSES processes are scanned."""
+    if not sys.platform.startswith("linux"):
         return read_table_macos()
+    if not os.path.isdir(os.path.join(proc_root, "net")):
+        raise ProcUnavailable("no /proc/net")
     peers = _socket_peers(proc_root)
     table = []
     for entry in os.listdir(proc_root):
@@ -247,7 +284,10 @@ def run(engine, readings, recorded, now):
             except Exception as err:
                 if not state["failed"]:
                     state["failed"] = True
-                    audit.append(actor, "github.census_failed", worst[0], {"error": type(err).__name__})
+                    detail = {"error": type(err).__name__}
+                    if isinstance(err, ProcUnavailable):
+                        detail["reason"] = "no /proc/net"
+                    audit.append(actor, "github.census_failed", worst[0], detail)
                 return
             audit.append(actor, "github.census", worst[0], {"outside": worst[1], "window_seconds": WINDOW,
                                                             "kinds": found["kinds"], "processes": found["processes"]})

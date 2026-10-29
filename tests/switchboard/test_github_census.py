@@ -3,11 +3,14 @@
 A fake process table holds a planted token value in an environment, a planted command line argument and a planted connection; the audit
 line must name the three kinds with a count and hold none of the planted values. The two mutants at the end print the environment
 values and the command lines: each must fail a test here."""
+import io
 import json
 import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -59,6 +62,7 @@ class Rig(unittest.TestCase):
         self.audit_path = self.state / "audit.jsonl"
         self.gc = sb.load_module("github_census")
         self._real_read_table = self.gc.read_table
+        self._real_github_addresses = self.gc.github_addresses
         self.clock = [1_011_610.0]
         self.reset = 1_015_200
         self.used = {"acme-a": 0, "acme-b": 0}
@@ -184,6 +188,9 @@ class TestCensus(Rig):
         self.assertTrue((self.state / "github-usage.json").exists(), "the pass finished")
 
     def test_the_real_table_reader_keeps_names_never_values_or_command_lines(self):
+        patcher = mock.patch.object(sys, "platform", "linux")
+        patcher.start()
+        self.addCleanup(patcher.stop)
         with tempfile.TemporaryDirectory() as root:
             proc = Path(root)
             (proc / "net").mkdir()
@@ -199,20 +206,51 @@ class TestCensus(Rig):
         self.assertNotIn(PLANTED_TOKEN + PLANTED_ARG, json.dumps(table))
 
 
+class FakeChild:
+    """A stand-in for subprocess.Popen: stdout is the given bytes; kill and wait are recorded."""
+    def __init__(self, data=b"", fail=None):
+        self.stdout = io.BytesIO(data)
+        self.returncode = 0
+        self.killed = False
+        self.waited = False
+        self.fail = fail
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+
+def env_flags(argv):
+    """The flag clusters of an argv that print environments or widen lines: any `e`, `E` or `ww`."""
+    return [a for a in argv[1:] if re.fullmatch(r"-[A-Za-z]+", a) and (re.search(r"[eE]", a) or "ww" in a)]
+
+
 class TestMacosReader(Rig):
     """S2b: the macOS reader on OUTPUT TEXT in the real shapes (the pod has no macOS: the real run is done on the Mac)."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(sys, "platform", "darwin")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def fake_run(self, ps=PS_TEXT, lsof=LSOF_TEXT, record=None):
         def run(argv, **kw):
             if record is not None:
                 record.append((argv, kw))
             text = ps if argv[0].endswith("ps") else lsof
-            return subprocess.CompletedProcess(argv, 0, text.encode(), b"")
+            return FakeChild(text.encode())
         return run
 
     def test_s2b_the_macos_text_gives_the_kinds_with_a_count_and_none_of_the_planted_values(self):
         calls = []
-        with mock.patch.object(self.gc.subprocess, "run", self.fake_run(record=calls)), \
+        with mock.patch.object(self.gc.subprocess, "Popen", self.fake_run(record=calls)), \
                 mock.patch.object(self.gc, "read_table", lambda: self._real_read_table("/nonexistent-proc-root")), \
                 mock.patch.object(self.gc, "github_addresses", lambda: set()):
             self.read_users()
@@ -228,7 +266,96 @@ class TestMacosReader(Rig):
             self.assertNotIn(planted, text)
         for argv, kw in calls:
             self.assertIn(argv, (self.gc.PS_ARGV, self.gc.LSOF_ARGV), "no flag that prints environments")
-            self.assertIn("timeout", kw)
+            self.assertEqual(kw["env"], {"PATH": "/usr/bin:/bin:/usr/sbin"})
+
+    def test_no_argv_holds_an_environment_printing_flag(self):
+        self.assertEqual(env_flags(self.gc.PS_ARGV), [])
+        self.assertEqual(env_flags(self.gc.LSOF_ARGV), [])
+        self.assertEqual(self.gc.PS_ARGV, ["/bin/ps", "-axo", "comm="])
+
+    def test_the_argv_the_macos_reader_really_passes_holds_no_such_flag(self):
+        calls = []
+        with mock.patch.object(self.gc.subprocess, "Popen", self.fake_run(record=calls)):
+            self._real_read_table()
+        self.assertEqual(len(calls), 2)
+        for argv, _kw in calls:
+            self.assertEqual(env_flags(argv), [], argv)
+
+    def test_the_mutant_argv_with_axeww_is_caught(self):
+        self.assertEqual(env_flags(["/bin/ps", "-axeww", "-o", "comm="]), ["-axeww"])
+        calls = []
+        with mock.patch.object(self.gc, "PS_ARGV", ["/bin/ps", "-axeww", "-o", "comm="]), \
+                mock.patch.object(self.gc.subprocess, "Popen", self.fake_run(record=calls)):
+            self._real_read_table()
+        self.assertTrue(any(env_flags(argv) for argv, _kw in calls), "the recorded-argv check must see the mutant")
+
+    def test_the_platform_picks_the_reader(self):
+        with tempfile.TemporaryDirectory() as root:
+            for platform in ("linux", "linux2"):
+                with mock.patch.object(sys, "platform", platform), \
+                        mock.patch.object(self.gc.subprocess, "Popen", side_effect=AssertionError("macOS reader on linux")):
+                    with self.assertRaises(self.gc.ProcUnavailable) as caught:
+                        self._real_read_table(root)
+                    self.assertIn("no /proc/net", str(caught.exception))
+            (Path(root) / "net").mkdir()
+            for platform in ("darwin", "freebsd13"):
+                calls = []
+                with mock.patch.object(sys, "platform", platform), \
+                        mock.patch.object(self.gc.subprocess, "Popen", self.fake_run(record=calls)):
+                    self._real_read_table(root)
+                self.assertEqual(len(calls), 2, "ps and lsof on " + platform)
+
+    def test_linux_without_proc_net_is_one_failed_line_naming_it(self):
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(self.gc.subprocess, "Popen", side_effect=AssertionError("macOS reader")), \
+                mock.patch.object(self.gc, "read_table", lambda: self._real_read_table("/nonexistent-proc-root")):
+            self.read_users()
+            self.step(60)
+            self.step(60, {"acme-a": 150})
+            self.step(60, {"acme-a": 150})
+        self.assertEqual([l["detail"] for l in self.lines("github.census_failed")],
+                         [{"error": "ProcUnavailable", "reason": "no /proc/net"}])
+
+    def _census_under(self, resolver):
+        with mock.patch.object(self.gc.socket, "getaddrinfo", resolver):
+            started = time.monotonic()
+            try:
+                return time.monotonic, self._real_github_addresses(), started
+            except TimeoutError as err:
+                return time.monotonic, err, started
+
+    def test_a_hanging_resolver_returns_within_the_bound(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with mock.patch.object(self.gc, "DNS_TIMEOUT", 0.3):
+            clock, outcome, started = self._census_under(lambda *a, **k: release.wait(5) or [])
+        self.assertLess(clock() - started, 2)
+        self.assertIsInstance(outcome, TimeoutError)
+
+    def test_the_mutant_without_a_bound_is_caught(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        unbounded = lambda: {i[4][0] for i in self.gc.socket.getaddrinfo(self.gc.GITHUB_HOST, 443)}
+        with mock.patch.object(self.gc, "github_addresses", unbounded):
+            clock, _outcome, started = self._census_under(lambda *a, **k: release.wait(1) or [])
+        self.assertGreaterEqual(clock() - started, 1, "without a bound the call waits for the resolver")
+
+    def test_a_resolver_that_answers_gives_the_addresses(self):
+        answer = [(2, 1, 6, "", ("140.82.112.5", 443))]
+        _c, outcome, _s = self._census_under(lambda *a, **k: answer)
+        self.assertEqual(outcome, {"140.82.112.5"})
+
+    def test_the_bytes_read_are_capped_and_the_child_is_killed_and_reaped(self):
+        child = FakeChild(b"/usr/bin/p\n" * 100)
+        with mock.patch.object(self.gc, "MAX_BYTES", 60), mock.patch.object(self.gc.subprocess, "Popen", lambda *a, **k: child):
+            rows = self.gc._run_text(self.gc.PS_ARGV)
+        self.assertEqual(rows, ["/usr/bin/p"] * 5)
+        self.assertTrue(child.killed and child.waited)
+        small = FakeChild(b"/usr/bin/p\n")
+        with mock.patch.object(self.gc.subprocess, "Popen", lambda *a, **k: small):
+            self.assertEqual(self.gc._run_text(self.gc.PS_ARGV), ["/usr/bin/p"])
+        self.assertFalse(small.killed)
+        self.assertTrue(small.waited)
 
     def test_the_parsers_on_the_real_shapes(self):
         self.assertEqual(self.gc.parse_ps(PS_TEXT.splitlines())[:3], ["launchd", "logd", "Some_App"])
@@ -239,8 +366,8 @@ class TestMacosReader(Rig):
 
     def test_a_hang_or_a_missing_command_is_one_failed_line_and_the_pass_goes_on(self):
         def hang(argv, **kw):
-            raise subprocess.TimeoutExpired(argv, kw["timeout"])
-        with mock.patch.object(self.gc.subprocess, "run", hang), \
+            raise subprocess.TimeoutExpired(argv, 10)
+        with mock.patch.object(self.gc.subprocess, "Popen", hang), \
                 mock.patch.object(self.gc, "read_table", lambda: self._real_read_table("/nonexistent-proc-root")):
             self.read_users()
             self.step(60)
@@ -250,7 +377,7 @@ class TestMacosReader(Rig):
 
     def test_the_rows_read_and_the_processes_scanned_are_capped(self):
         many = "\n".join("/usr/bin/p%d" % i for i in range(self.gc.MAX_ROWS + 50))
-        with mock.patch.object(self.gc.subprocess, "run", self.fake_run(ps=many)):
+        with mock.patch.object(self.gc.subprocess, "Popen", self.fake_run(ps=many)):
             self.assertEqual(len(self.gc._run_text(self.gc.PS_ARGV)), self.gc.MAX_ROWS)
         self.assertEqual(len(self.gc.parse_ps(many.splitlines())), self.gc.MAX_PROCESSES)
         with tempfile.TemporaryDirectory() as root:
@@ -260,7 +387,8 @@ class TestMacosReader(Rig):
                 (proc / str(n)).mkdir()
                 (proc / str(n) / "comm").write_text("x\n")
             with mock.patch.object(self.gc, "MAX_PROCESSES", 3):
-                self.assertEqual(len(self._real_read_table(str(proc))), 3)
+                with mock.patch.object(sys, "platform", "linux"):
+                    self.assertEqual(len(self._real_read_table(str(proc))), 3)
 
 
 class TestDocumentation(unittest.TestCase):
