@@ -1439,6 +1439,19 @@ def _launch(args, runner, now, reserve):
     return H["EXIT_OK"]
 
 
+def _endpoint_forms(endpoint):
+    """The endpoint as it may show in a registry or exception text: whole, percent-encoded, and its host part (longest first)."""
+    if not endpoint:
+        return []
+    forms = {endpoint, urllib.parse.quote(endpoint, safe=""), urllib.parse.quote(endpoint)}
+    try:
+        parts = urllib.parse.urlsplit(endpoint)
+        forms.update(x for x in (parts.netloc, parts.hostname) if x)
+    except ValueError:
+        pass
+    return sorted(forms, key=len, reverse=True)
+
+
 def _registry_note(engine, what, state, name, *args):
     """The cloud launcher and reaper are WRITERS of the agent registry: `upsert` on launch, `retire` once the pod is stopped. The stop itself stays
     this launcher's act; a registry that cannot be written is said in the audit, never raised (the pod's own record is still the launcher's)."""
@@ -1447,8 +1460,8 @@ def _registry_note(engine, what, state, name, *args):
 
     def say(why):
         text = str(why)
-        if endpoint:
-            text = text.replace(endpoint, "<endpoint>")
+        for part in _endpoint_forms(endpoint):
+            text = re.sub(re.escape(part), "<endpoint>", text, flags=re.I)
         try:
             text = _scrub_lib()(text)
         except Exception:
