@@ -373,8 +373,19 @@ def credential_shapes(text):
             for value in re.findall(r"--from-literal=[^=\s]+=(\S*)", line):
                 if value not in ("", "{}"):
                     found.append("from-literal value: " + line)
-            if "--docker-" + "password" in line:
+            words = line.split()
+            for i, word in enumerate(words):
+                if word == "--from-literal":
+                    nxt = words[i + 1] if i + 1 < len(words) else ""
+                    if "=" in nxt:
+                        if nxt.split("=", 1)[1] not in ("", "{}"):
+                            found.append("spaced from-literal value: " + line)
+                    elif nxt:
+                        found.append("from-literal value in the next word: " + line)
+            if re.search(r"(?<!\S)--(docker-)?pass" + "word\\b", line):
                 found.append("registry password on a command line: " + line)
+            if re.search(r"(?<!\S)-p(=|\s+)\S", line):
+                found.append("short password option with a value: " + line)
             if "create token" in line and not (line in inside and re.search(r"> \S+", line)):
                 found.append("bare create token: " + line)
             if "base64 -d" in line and not re.search(r"base64 -d > \S+", line):
@@ -401,9 +412,34 @@ class CredentialShapeSweep(unittest.TestCase):
             "base64": "```text\nkubectl get secret X | base64 -d\n```",
             "env": "```text\nkubectl set env deployment/x API_TOKEN=VALUE\n```",
         }
+        samples.update({
+            "spaced from-literal": "```text\nkubectl create secret generic X --from-literal k=VALUE\n```",
+            "from-literal next word": "```text\nkubectl create secret generic X --from-literal k VALUE\n```",
+            "bare password option": "```text\nsometool login --pass" + "word P\n```",
+            "short option": "```text\nsometool login -p P\n```",
+            "old patch form": "```text\nkubectl patch secret X --type merge -p \"$(cat f)\"\n```",
+        })
         for name, text in samples.items():
             self.assertEqual(len(credential_shapes(text)), 1, name)
         self.assertEqual(credential_shapes("```text\nkubectl create secret generic X --from-literal=k={}\n```"), [])
+        self.assertEqual(credential_shapes("```text\nkubectl create secret generic X --from-literal k={}\n```"), [])
+        self.assertEqual(credential_shapes("```text\nkubectl patch secret X --type merge --patch-file FILE\n```"), [])
+
+    def test_the_patch_file_form_replaces_the_command_substitution(self):
+        self.assertEqual(self.doc.count("--patch-file registry-patch.json"), 1)
+        self.assertNotIn("-p \"$(", self.doc)
+        self.assertIn("rm -f registry-patch.json", self.doc)
+
+    def test_the_pull_copy_sentence_is_found_once(self):
+        sentence = "gives the probe namespace the SAME registry pull value: an administrator step on the same registry"
+        self.assertEqual(self.doc.count(sentence), 1)
+
+    def test_a_runbook_with_the_old_patch_restored_fails_the_scan(self):
+        new = "kubectl -n NAMESPACE_NAME patch secret cloud-hub-registry --type merge --patch-file registry-patch.json"
+        old = "kubectl -n NAMESPACE_NAME patch secret cloud-hub-registry --type merge -p \"$(cat secrets.json)\""
+        mutant = self.whole.replace(new, old)
+        self.assertNotEqual(mutant, self.whole)   # the mutation is applied
+        self.assertEqual(len(credential_shapes(mutant)), 1)
 
     def test_a_runbook_with_the_bare_token_line_fails_the_scan(self):
         line = [l for l in self.whole.split("\n") if "create token cw-operator" in l and l.startswith("( ")]
