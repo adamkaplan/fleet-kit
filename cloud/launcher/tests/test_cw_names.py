@@ -61,7 +61,7 @@ def files():
 
 
 # Platform and third-party keys the launcher sets: never renamed, never in the table above.
-PLATFORM_KEYS = ["azure.workload.identity/use"]
+PLATFORM_KEYS = ["azure.workload.identity/use", "cluster-autoscaler.kubernetes.io/safe-to-evict"]
 
 
 class S5Names(base.Base):
@@ -119,7 +119,7 @@ class S5Names(base.Base):
         pod = [p for p in self.st()["applied"] if p["kind"] == "Pod"][0]
         c = pod["spec"]["containers"][0]
         emitted = {e["name"] for e in c["env"]}
-        emitted |= (set(pod["metadata"]["labels"]) - {"app"} - set(PLATFORM_KEYS)) | set(pod["metadata"]["annotations"])
+        emitted |= (set(pod["metadata"]["labels"]) - {"app"} - set(PLATFORM_KEYS)) | (set(pod["metadata"]["annotations"]) - set(PLATFORM_KEYS))
         emitted.add(pod["metadata"]["labels"]["app"])
         emitted.add(pod["spec"]["serviceAccountName"])
         calls = [json.loads(x) for x in open(self.env["FAKE_KUBE_CALLS"])]
