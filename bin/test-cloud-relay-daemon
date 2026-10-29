@@ -1556,6 +1556,39 @@ class RelayLoopCadence(unittest.TestCase):
         loop.run()
         self.assertEqual(notes, [("relay.loop_failed", None, {"error": "RuntimeError"})])
 
+    def _timeout_loop(self, mod):
+        """A loop whose pass is pass_once with a hub fetch that raises a plain TimeoutError (not PassCut); a second pass answers nothing."""
+        notes, fetches = [], []
+
+        def fetch():
+            fetches.append(1)
+            if len(fetches) == 1:
+                raise TimeoutError("the hub read timed out: secret path /x")
+            return {"requests": []}
+        mod.pass_if_configured = lambda *a: mod.pass_once(types.SimpleNamespace(backend=types.SimpleNamespace(audit=lambda *x: notes.append(("pass_cut",)))), fetch, lambda *x: None)
+        loop = mod.RelayLoop(None, None, None, None, environ=self.ENV, cadence=0.02, engine_factory=lambda: types.SimpleNamespace(_note=lambda *a: notes.append(a)))
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                loop.stop_flag.set()
+        loop.sleep = sleep
+        return loop, notes, fetches, sleeps
+
+    def test_a_plain_timeout_from_the_hub_fetch_leaves_one_loop_failed_line_and_the_loop_goes_on(self):
+        loop, notes, fetches, sleeps = self._timeout_loop(relay)
+        loop.run()
+        self.assertEqual(notes, [("relay.loop_failed", None, {"error": "TimeoutError"})])   # one line, the class name only
+        self.assertEqual((len(fetches), sleeps, loop.failures), (2, [0.02, 0.02], 1))   # a later pass ran after the cadence
+
+    def test_mutant_loop_that_does_not_record_a_failure_is_caught_by_the_timeout_test(self):
+        mod = load_backend_module('            self.engine._note("relay.loop_failed", None, {"error": type(err).__name__})\n', "            pass\n")
+        loop, notes, fetches, sleeps = self._timeout_loop(mod)
+        loop.run()
+        self.assertEqual(notes, [])   # the mutant leaves no line: the test above fails on it
+        self.assertEqual(len(fetches), 2)
+
     def test_the_loop_gets_its_own_engine_from_the_factory(self):
         shared, own = object(), object()
         loop = relay.RelayLoop(shared, None, None, None, environ=self.ENV, engine_factory=lambda: own)
