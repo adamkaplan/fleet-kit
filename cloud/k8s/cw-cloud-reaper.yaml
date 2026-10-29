@@ -1,0 +1,72 @@
+# The in-cluster reaper (ask #1582). APPLIED BY THE ADMINISTRATOR, NEVER BY THIS CHANGE: nothing here is applied by a script of the repository.
+# Its service account holds exactly the rights the reaper's pass makes (a test compares them) and no wildcard. It holds no App key, App id,
+# vault login, repository token or personal login: git tokens come from the token service (cw-token-service.yaml), asked by repository and role.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cw-cloud-reaper
+  namespace: cw
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cw-cloud-reaper
+  namespace: cw
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cw-cloud-reaper
+  namespace: cw
+subjects:
+  - kind: ServiceAccount
+    name: cw-cloud-reaper
+    namespace: cw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cw-cloud-reaper
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cw-cloud-reaper
+  namespace: cw
+  labels:
+    app: cw-cloud-reaper
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cw-cloud-reaper
+  template:
+    metadata:
+      labels:
+        app: cw-cloud-reaper
+    spec:
+      serviceAccountName: cw-cloud-reaper
+      restartPolicy: Always
+      containers:
+        - name: reaper
+          image: cw-launcher:latest
+          args: ["reap", "--cluster-mode"]
+          env:
+            - name: CW_CLUSTER_TOKEN_FILE
+              value: /var/run/secrets/kubernetes.io/serviceaccount/token
+            - name: CW_TOKEN_SERVICE_URL
+              value: http://cw-token-service.cw.svc:8080

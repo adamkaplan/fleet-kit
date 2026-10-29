@@ -1,0 +1,83 @@
+# The token service (option (i), ask #1582). APPLIED BY THE ADMINISTRATOR, NEVER BY THIS CHANGE, and only if the owner chooses to put the
+# App key in the cluster. It is the ONLY workload that mounts the key Secret; the network policy admits only the reaper.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cw-token-service
+  namespace: cw
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cw-token-service-review
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cw-token-service-review
+subjects:
+  - kind: ServiceAccount
+    name: cw-token-service
+    namespace: cw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cw-token-service-review
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cw-token-service
+  namespace: cw
+  labels:
+    app: cw-token-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cw-token-service
+  template:
+    metadata:
+      labels:
+        app: cw-token-service
+    spec:
+      serviceAccountName: cw-token-service
+      containers:
+        - name: service
+          image: cw-launcher:latest
+          args: ["token-service"]
+          env:
+            - name: CW_APP_KEY_CMD
+              value: cat /etc/cw-app/key
+            - name: CW_APP_ID_CMD
+              value: cat /etc/cw-app/id
+          volumeMounts:
+            - name: app-key
+              mountPath: /etc/cw-app
+              readOnly: true
+      volumes:
+        - name: app-key
+          secret:
+            secretName: cw-app-key
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cw-token-service
+  namespace: cw
+spec:
+  podSelector:
+    matchLabels:
+      app: cw-token-service
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: cw-cloud-reaper
+      ports:
+        - port: 8080

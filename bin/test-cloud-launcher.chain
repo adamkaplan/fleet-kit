@@ -17,11 +17,14 @@ cloud/launcher/tests/test_cloud_quick_bounds.py
 cloud/launcher/tests/test_cloud_quick_guards.py
 cloud/launcher/tests/test_cloud_quick_scans_run.py
 cloud/launcher/tests/test_cloud_quick_selector.py
+cloud/launcher/tests/test_cloud_reaper_docs.py
+cloud/launcher/tests/test_cloud_reaper_manifests.py
 cloud/launcher/tests/test_cloud_settings.py
 cloud/launcher/tests/test_cloud_shapes.py
 cloud/launcher/tests/test_cloud_stack.py
 cloud/launcher/tests/test_cloud_stack_wait.py
 cloud/launcher/tests/test_cloud_status_summary.py
+cloud/launcher/tests/test_cloud_token_service.py
 cloud/launcher/tests/test_cloud_worker.py
 cloud/launcher/tests/test_cluster_token_refresh.py
 cloud/launcher/tests/test_cw_minter_manifest.py

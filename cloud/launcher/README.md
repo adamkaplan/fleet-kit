@@ -208,7 +208,7 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
-Not yet measured: none
+Not yet measured: `cloud/launcher/tests/test_cloud_reaper_docs.py`, `cloud/launcher/tests/test_cloud_reaper_manifests.py`, `cloud/launcher/tests/test_cloud_token_service.py`
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
 
@@ -520,3 +520,15 @@ value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault se
 `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
 
 **Repository allow-list.** `create` (and the driver, `run-task`, through the same function `check_repo_allowed`) launches only for a repository the owner listed. `CW_ALLOWED_REPOS` is a comma-separated list of `OWNER/NAME`, compared exactly and case-insensitively; no wildcard. Unset, empty, or any entry that is not `OWNER/NAME` shaped (a dot segment, a space, a `*`, an extra slash) refuses everything (fail closed). `CW_TOOLING_REPO` (`OWNER/NAME`) names the tooling's own repository, which is refused even when it is listed; unset adds no extra check, malformed refuses. A refused repository exits `2` with `refused: <repo> is not on the cloud allow-list` before any `kubectl` call, so nothing is created. Both settings are read from the environment of whoever runs the launcher or the driver, like the other `CW_` settings: the operator exports them in the shell (or the service unit) that starts it. An agent running as the same user could set them for a command it runs, so the list is a mistake-guard for the operator, not a boundary; the stops are the token's one-repository scope and the repository's own rules. The check compares spellings: a renamed or transferred repository is not matched by its old name, and an entry or tooling value ending in `.git` is malformed and refuses. The guard table is `docs/cloud-guard-parity.md`.
+
+
+## The reaper in the cluster (ask #1582)
+
+The cloud reaper runs as one restarting workload in the cluster namespace, under its own service account, beside the Mac's job. It holds exactly these rights: get, list and delete on pods, create on pods/exec, get and patch on Secrets, and get, create and update on Leases; it holds no App key, vault login or repository token, and git tokens come from the token service, which alone mounts the key. To turn the Mac's job off after the live proof, unload the Mac's reaper job (the managed reaper's service) once; the lease keeps one reaper acting until then. To roll back, delete the workload and its lease and reload the Mac's job. The owner's steps are the role, the service account, the token path and the lease permission, applied by the administrator with dry runs first:
+
+```
+kubectl apply --dry-run=server -f cloud/k8s/cw-cloud-reaper.yaml
+kubectl apply --dry-run=server -f cloud/k8s/cw-token-service.yaml
+# then, only after the owner chooses to put the App key in the cluster: the same two commands without --dry-run
+# rollback: kubectl delete -f cloud/k8s/cw-cloud-reaper.yaml; kubectl delete -f cloud/k8s/cw-token-service.yaml
+```

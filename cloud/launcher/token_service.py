@@ -1,0 +1,54 @@
+"""The in-cluster token service (option (i) of ask #1582): the ONLY holder of the App key.
+
+It serves one caller (the in-cluster reaper's service account, checked by a TokenReview), one role (worker) and
+only repositories on the launcher's own allow-list. It mints through app_token.mint (unchanged). The key is read by
+app_token's own command from a Secret file only this workload mounts. Nothing here logs, audits or answers with
+the key or a signed value. Nothing here is applied to a cluster by this change.
+"""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+ROLE = "worker"
+REAPER_IDENTITY = "system:serviceaccount:cw:cw-cloud-reaper"
+
+
+class Refused(Exception):
+    pass
+
+
+def serve(body, bearer, env, review, mint, log, audit):
+    """Answer one request. review(bearer) -> the caller's user name or None (the TokenReview); mint(repo) -> token.
+    Returns (status, answer dict). Lines to log and audit hold names only, never a token."""
+    from cloud_worker import check_repo_allowed, CloudError
+    who = None
+    try:
+        who = review(bearer)
+        if who != env.get("CW_TOKEN_SERVICE_CALLER", REAPER_IDENTITY):
+            raise Refused("caller")
+        try:
+            req = json.loads(body)
+        except ValueError:
+            raise Refused("body")
+        if not isinstance(req, dict) or set(req) != {"repository", "role"} or not isinstance(req["repository"], str):
+            raise Refused("body")
+        if req["role"] != ROLE:
+            raise Refused("role")
+        try:
+            check_repo_allowed(req["repository"], env)
+        except CloudError:
+            raise Refused("repository")
+        token = mint(req["repository"])
+    except Refused as e:
+        log("refused: %s" % e)
+        audit("%d refused %s %s" % (time.time(), who and "caller" or "unknown", e))
+        return 403, {"error": "refused"}
+    except SystemExit:
+        log("mint failed")
+        audit("%d mint-failed" % time.time())
+        return 502, {"error": "mint failed"}
+    audit("%d served %s" % (time.time(), req["repository"]))
+    return 200, {"token": token}
