@@ -60,7 +60,7 @@ REASON_FIXED = "relay failed"
 RELAY_GH_PER_HOUR = 600         # GitHub calls (not requests) all relay requests may make in a rolling hour (PC-6)
 RELAY_GH_WINDOW = 3600.0        # seconds of that rolling hour
 RELAY_GH_PER_POD = 120          # of those, the most ONE pod may spend in the rolling hour (a share: one pod cannot starve the others)
-RELAY_GH_PER_REQUEST = 3        # most calls one request makes: 1 pull request read + at most 2 plan reads
+RELAY_GH_PER_REQUEST = 4        # most calls one request makes: 1 link read + 2 plan reads + 1 fresh head read (prove/verdict)
 BUDGET_REASON = "relay GitHub budget"
 POD_BUDGET_REASON = "relay GitHub budget: pod share"
 PENDING_REASON = "already claimed, never delivered twice: lost or still pending: resend with a NEW call_id"
@@ -269,6 +269,8 @@ class RelayBudget:
 _READ_FLAGS = frozenset({"-i", "--paginate"})                       # known read flags without a value
 _READ_VALUE_FLAGS = frozenset({"-H", "--jq", "-q", "--cache"})      # known read flags that take one value
 
+_METHOD_OVERRIDES = ("x-http-method-override", "x-method-override", "x-http-method")
+
 
 def _is_read(argv):
     """An ALLOW-list: only `gh pr view ...` and `gh api <path>` whose other args are all known read flags are memoized within a request.
@@ -289,6 +291,8 @@ def _is_read(argv):
         elif x in _READ_VALUE_FLAGS:
             if i + 1 >= len(rest):
                 return False
+            if x == "-H" and (not isinstance(rest[i + 1], str) or any(m in rest[i + 1].lower() for m in _METHOD_OVERRIDES)):
+                return False   # a header that overrides the HTTP method makes the call a write
             i += 2
         elif x.startswith("-"):
             return False

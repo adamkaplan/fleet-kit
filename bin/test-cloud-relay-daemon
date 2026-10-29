@@ -1846,7 +1846,7 @@ class GhBudget(Fixture):
     (the same argv: memoized after the first) and one plan read through accounts.read (the gate's own path).
     The per-command counts below (prove 3, verdict 3, gates 2, report 1) are measured against this STUB ledger context (one pull request read, at most
     one plan read, one fresh head read). The REAL context adds more reads (carries, the ask subject): those are not in these counts and fail closed
-    through the room reserve of 3 (RELAY_GH_PER_REQUEST) and the hard-stop `take` (429 in the middle, nothing written). The per-pod share (120) is NOT a
+    through the room reserve of 4 (RELAY_GH_PER_REQUEST) and the hard-stop `take` (429 in the middle, nothing written). The per-pod share (120) is NOT a
     reservation: five or more pods can still fill the global 600 an hour, and then every pod gets 429 "relay GitHub budget".
     Exact calls per request on a clean build (stub): prove 3 (link pr read, plan read, FRESH head read), verdict 3, gates 2, report 1."""
 
@@ -1977,7 +1977,7 @@ class GhBudget(Fixture):
         hub, ids = self.flood(relay)
         ok = [r for r in ids if hub.results[r]["status"] == 200]
         refused = [hub.results[r] for r in ids if hub.results[r]["status"] == 429]
-        # a pod's share is 120 calls; a gates request makes 2 and needs 3 free to start: 59 served per pod, 5 pods
+        # a pod's share is 120 calls; a gates request makes 2 and needs 4 free to start: 59 served per pod, 5 pods
         self.assertEqual((len(ok), len(refused), len(self.gh)), (295, 705, 590))
         self.assertEqual(len(self.gh), 2 * len(ok))   # per CALL, not per request
         self.assertTrue(all(r["reason"] == "relay GitHub budget: pod share" and r["record"] is None for r in refused))
@@ -2002,7 +2002,7 @@ class GhBudget(Fixture):
         b = hub.submit("podB", "gates", head=None)
         for _ in range(4):
             relay.pass_once(ex, hub.fetch, hub.post)
-        self.assertEqual(len([r for r in a if hub.results[r]["status"] == 200]), 5)   # 5 x 2 calls; the 6th needs 3 free of 12
+        self.assertEqual(len([r for r in a if hub.results[r]["status"] == 200]), 5)   # 5 x 2 calls; the 6th needs 4 free of 12
         self.assertEqual({hub.results[r]["reason"] for r in a if hub.results[r]["status"] == 429}, {"relay GitHub budget: pod share"})
         self.assertEqual(hub.results[b]["status"], 200)
 
@@ -2132,7 +2132,7 @@ class GhBudget(Fixture):
         ["-X", "POST"], ["-XPOST"], ["-X", "GET"], ["--method", "POST"], ["--method", "GET"], ["--method=POST"], ["--method=GET"],
         ["-f", "k=v"], ["-fk=v"], ["-f=k=v"], ["-F", "k=v"], ["-Fk=v"], ["--field", "k=v"], ["--field=k=v"], ["--raw-field", "k=v"],
         ["--raw-field=k=v"], ["--input", "f"], ["--input=f"],
-        ["--field=x"], ["--raw-field=x"], ["-XPOST", "y"], ["-fk=v", "y"], ["--field=x", "y"], ["--raw-field=x", "y"], ["--input=f", "y"], ["--method=POST", "y"], ["-X"], ["--method"], ["-f"], ["-F"], ["--field"], ["--raw-field"], ["--input"], ["--unknown"], ["--jq=.a"], ["--cache=1h"], ["-H"], ["other/path"])] + [
+        ["--field=x"], ["--raw-field=x"], ["-XPOST", "y"], ["-fk=v", "y"], ["--field=x", "y"], ["--raw-field=x", "y"], ["--input=f", "y"], ["--method=POST", "y"], ["-X"], ["--method"], ["-f"], ["-F"], ["--field"], ["--raw-field"], ["--input"], ["--unknown"], ["--jq=.a"], ["--cache=1h"], ["-H"], ["other/path"], ["-H", "X-HTTP-Method-Override: DELETE"], ["-H", "x-method-override:PATCH"], ["-H", "X-Http-Method: PUT"], ["-H", "Accept: x", "-H", "X-HTTP-METHOD-OVERRIDE: POST"])] + [
         ["gh", "pr", "merge", "7"], ["gh", "api"], ["gh", "issue", "view", "1"]]
     WRITE_FLAGS = ["-X", "-XPOST", "--method", "--method=POST", "-f", "-fk=v", "-F", "--field", "--field=x", "--raw-field", "--raw-field=x", "--input", "--input=f"]
 
@@ -2149,6 +2149,18 @@ class GhBudget(Fixture):
             for flag in self.WRITE_FLAGS:
                 mod = load_backend_module(old, old.replace("})", ', "%s"})' % flag))
                 self.assertNotEqual(self.guard_failures(mod), [], (name, flag))
+
+    def test_memo_guard_mutant_without_the_override_header_check_is_caught(self):
+        mod = load_backend_module('_METHOD_OVERRIDES = ("x-http-method-override", "x-method-override", "x-http-method")', "_METHOD_OVERRIDES = ()")
+        self.assertNotEqual(self.guard_failures(mod), [])
+
+    def test_reserve_is_four_free_passes_three_free_is_refused(self):
+        self.assertEqual(relay.RELAY_GH_PER_REQUEST, 4)
+        for free, ok in ((4, True), (3, False)):
+            b = relay.RelayBudget(lambda: 0.0, cap=100, pod_cap=100)
+            for _ in range(100 - free):
+                self.assertIsNone(b.take("p"))
+            self.assertEqual(b.room("p") is None, ok, free)
 
     def test_a_write_clears_the_memo_whatever_its_flag_spelling(self):
         for write in self.WRITES[:-3]:

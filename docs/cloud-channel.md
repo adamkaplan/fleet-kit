@@ -32,8 +32,9 @@ One document to set up, run and take down the cloud hub and the pod-side command
     reads config (`relay_holders`, `plan_evaluators`) only then. `reload_in_place` re-execs the whole process, so it is never staler than the
     pass engine's config. A failed factory means no relay for that process lifetime (audited through `engine._failed`, not retried).
     It shares only files (ledger flock, audit, report riders) and does NOT write `v2-link.json` (built with `owns_link=False`: one writer,
-    so `status` cannot flap). Known limit: it DUPLICATES `GhAccounts` (its own GitHub rate-limit gate: its own pause, counter and remembered
-    answers, apart from the pass engine's) and a V2Client. Neither holds a resource that needs closing.
+    so `status` cannot flap). It SHARES the pass engine's `GhAccounts` (one GitHub rate-limit gate: one pause, counter and remembered
+    answers for both) and has its own V2Client. Neither holds a resource that needs closing.
+  - The per-request Engine is a SHALLOW copy (`copy.copy`): any new MUTABLE attribute added to the Engine is shared by all requests (state leaks across them). The pin test covers today's attribute set only; review a new attribute by hand.
   - Relay concurrency rule: the Engine is not thread-safe, so the relay thread never touches the pass thread's engine. It runs on its
     OWN engine (built at start from the same config and state dir, with its own caches); a relayed `report` is still delivered at once
     ("delivered", not queued). The two engines share only files, each under its own lock (ledger flock, audit and report-rider file locks).
@@ -62,10 +63,10 @@ One document to set up, run and take down the cloud hub and the pod-side command
     context object (never shared with another request, so a late thread of an earlier request cannot write into it), and the same READ is answered from
     the first within the request (a write is never skipped, and clears that memory). The FINAL head, compared under the ledger flock, is a fresh read under
     `HEAD_TIMEOUT`, never the memo, and counts as a call. Exactly, per request, MEASURED AGAINST A STUB ledger context: prove 3 (link read, plan read, fresh head read),
-    verdict 3, gates 2, report 1. The REAL context adds reads (carries, the ask subject); those are not in these counts and fail closed: the room reserve of 3 and the
+    verdict 3, gates 2, report 1. The REAL context adds reads (carries, the ask subject); those are not in these counts and fail closed: the room reserve of 4 and the
     hard-stop `take` (429 in the middle, nothing written). The memo guard is an allow-list: only `gh pr view` and `gh api <path>` with `-i`, `--paginate`, `-H v`, `--jq v`,
     `-q v`, `--cache v` are memoized; any other argv counts as a write and clears the memo. A 429 from the head read reaches the pod by name (a timeout is 504, any other failure 409). Caps in a rolling hour: a SHARE per pod (`RELAY_GH_PER_POD`, 120 calls: one pod cannot spend the hour) (the share is not a reservation: five or more pods can still fill the global 600 an hour) and the global
-    `RELAY_GH_PER_HOUR` (600) as a backstop. A request is admitted only while `RELAY_GH_PER_REQUEST` (3) calls of RESERVE are free under both caps
+    `RELAY_GH_PER_HOUR` (600) as a backstop. A request is admitted only while `RELAY_GH_PER_REQUEST` (4: link, plan x2, fresh head) calls of RESERVE are free under both caps
     (`room`, a separate step before any gh call); each call is then taken one by one (`take`, the hard stop: a request that outgrows its reserve is refused in the
     middle). The refusal is 429 and names the cap: "relay GitHub budget: pod share" or "relay GitHub budget"; audited as `relay.refused`, nothing written. The link
     check itself reads once, charged to the pod. The daemon's own pass is not charged to the relay's caps. The relay's engine shares the pass engine's
