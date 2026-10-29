@@ -320,6 +320,129 @@ class TestMutants(unittest.TestCase):
         self.assertTrue(self.fails(src, case))
 
 
+import ast
+import importlib.util
+
+LAUNCHER_PATH = BIN.parent / "cloud" / "launcher" / "cloud_worker.py"
+LAUNCHER_TEXT = LAUNCHER_PATH.read_text()
+
+
+def derive_launcher_names(text):
+    """Every audit action name the launcher source can write: the literal action of each audit(...) call, the action of each
+    record dict given to write_audit(...), and every module constant whose name ends in _ACTION."""
+    tree = ast.parse(text)
+    consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    consts[target.id] = node.value.value
+
+    def strings(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, ast.Name) and node.id in consts:
+            return {consts[node.id]}
+        if isinstance(node, ast.IfExp):
+            return strings(node.body) | strings(node.orelse)
+        return set()
+
+    names = {value for name, value in consts.items() if name.endswith("_ACTION")}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        if func == "audit" and len(node.args) >= 3:   # audit(worker, runtime_id, action, cost, ok, reason)
+            names |= strings(node.args[2])
+        if func == "_audited" and len(node.args) >= 2:   # _audited(worker, action, fn, ...) writes the audit line
+            names |= strings(node.args[1])
+        if func == "write_audit":
+            for arg in node.args:
+                if isinstance(arg, ast.Dict):
+                    for key, value in zip(arg.keys, arg.values):
+                        if isinstance(key, ast.Constant) and key.value == "action":
+                            names |= strings(value)
+    return names
+
+
+def uncovered_names(text, module):
+    return sorted(n for n in derive_launcher_names(text) if n not in module.ACTIONS and n not in module.SKIPPED and n not in KNOWN_GAP)
+
+
+# Written by the launcher's report command through _audited, outside this ask's two names: reported to the ask, not decided here.
+KNOWN_GAP = ("report",)
+
+
+NOT_COSTED = ("create-attempt", "create.failed", "create.interrupted", "renew-git-token", "refresh-cluster-token", "ignored-setting-notice")
+EVERY_LAUNCHER_ACTION = [
+    line("2026-10-14T01:00:00Z", "pod/cb-example-1", "create", 0),
+    line("2026-10-14T01:01:00Z", "pod/cb-example-1", "create-attempt", 0, ok=False),
+    line("2026-10-14T01:02:00Z", "pod/cb-example-1", "create-attempt", 0, ok=True),
+    line("2026-10-14T01:03:00Z", "pod/cb-example-2", "create.failed", 0, ok=False),
+    line("2026-10-14T01:04:00Z", "pod/cb-example-3", "create.interrupted", 0, ok=False),
+    line("2026-10-14T02:00:00Z", "pod/cb-example-1", "renew-git-token", 0),
+    line("2026-10-14T02:30:00Z", "reaper", "refresh-cluster-token", 0, ok=False, worker=""),
+    line("2026-10-14T02:31:00Z", "reaper", "ignored-setting-notice", 0, worker=""),
+    line("2026-10-14T03:00:00Z", "pod/cb-example-1", "extend", 0),
+    line("2026-10-14T04:00:00Z", "pod/cb-example-1", "stop", 0.25),
+    line("2026-10-14T05:00:00Z", "pod/cb-example-4", "delete", 0, ok=False),
+]
+
+
+def load_launcher():
+    spec = importlib.util.spec_from_file_location("launcher_under_test_for_names", LAUNCHER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestLauncherNamesAreKnown(unittest.TestCase):
+    def test_every_action_name_the_launcher_writes_is_costed_or_skipped(self):
+        names = sorted(derive_launcher_names(LAUNCHER_TEXT))
+        print("launcher audit action names (%d): %s" % (len(names), ", ".join(names)))
+        self.assertGreaterEqual(len(names), 10)
+        self.assertEqual(uncovered_names(LAUNCHER_TEXT, REAL), [])
+
+    def test_a_new_launcher_action_is_named_by_the_derivation_test(self):
+        old = '"create-attempt", 0.0, True, "attempt %d: ready"'
+        self.assertEqual(LAUNCHER_TEXT.count(old), 1)
+        scratch = LAUNCHER_TEXT.replace(old, '"a-new-action", 0.0, True, "attempt %d: ready"')
+        self.assertNotEqual(scratch, LAUNCHER_TEXT)
+        self.assertEqual(uncovered_names(scratch, REAL), ["a-new-action"])
+
+    def test_a_fixture_audit_of_the_real_shape_gives_a_report_and_counts_the_skipped_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, text = run(REAL, write(tmp, "audit.jsonl", EVERY_LAUNCHER_ACTION))
+        self.assertEqual(code, 0, text)
+        self.assertIn("cloud cost %s:" % DAY, text)
+        self.assertEqual({l["action"] for l in EVERY_LAUNCHER_ACTION if l["action"] in NOT_COSTED}, set(NOT_COSTED))
+        self.assertIn("skipped lines: %d\n" % len([l for l in EVERY_LAUNCHER_ACTION if l["action"] in NOT_COSTED]), text)
+
+    def test_an_unknown_action_fails_in_one_line_naming_it(self):
+        bad = EVERY_LAUNCHER_ACTION + [line("2026-10-14T06:00:00Z", "pod/cb-example-4", "reboot", 0)]
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, mock_stderr(err):
+            code, _ = run(REAL, write(tmp, "audit.jsonl", bad))
+        self.assertEqual(code, 2)
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.assertIn("reboot", err.getvalue())
+
+    def test_the_launcher_tail_reader_neither_raises_nor_takes_an_unknown_action_for_a_stop(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(tmp, "audit.jsonl", [line("2026-10-14T06:00:00Z", "pod/cb-example-4", "a-new-action", 0, ok=False)],
+                         raw=json.dumps(line("2026-10-14T06:00:00Z", "pod/cb-example-4", "a-new-action", 0, ok=False)) + "\nnot json\n")
+            self.assertIsNone(launcher.last_audit_line(path, "stop"))
+            self.assertIsNone(launcher.last_audit_line(path, "refresh-cluster-token", "reaper"))
+            self.assertEqual(launcher.last_audit_line(path, "a-new-action"), (False, None))
+
+
+def mock_stderr(stream):
+    import contextlib
+    return contextlib.redirect_stderr(stream)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=1).result
     ok_ = result.wasSuccessful()
