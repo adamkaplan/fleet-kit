@@ -208,7 +208,7 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
-Not yet measured: `cloud/launcher/tests/test_mint_roles.py`
+Not yet measured: `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_preflight_role.py`
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
 
@@ -522,3 +522,7 @@ value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault se
 The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
 
 **What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
+
+**The `preflight` role (ask #1573).** The third row of the same table is the `preflight` role: read-only, used only by the launch preflight, never by a pod. It asks for, and accepts, exactly `administration: read, metadata: read`. The cause it answers: the worker's token cannot read an organization ruleset (HTTP 403), so the preflight counts none of its rules and refuses a repository whose protection comes only from one, by design (it fails closed); the owner approval entry in `repo-approvals.json` is the escape. With the role, the preflight reads `/orgs/.../rulesets/<id>` with a token of the `preflight` role (minted in its own process, once, only when an organization ruleset is met) and, when that read answers, counts the ruleset's rules and prints `organization ruleset <id>: read with the preflight token`; the repository then passes with no `NOT VERIFIED` line. Everything else keeps failing closed: a 403 on the preflight-role token fails as before and the owner approval entry still works as before; a 404 or a 500 is exit 2. If the role cannot be minted (the owner has not yet granted it), the preflight says so and reads with the worker's token, so the behaviour is exactly the earlier one.
+
+The owner's step: the owner adds `administration: read, metadata: read` to the App's permissions and accepts them on each installation (organization administration: read, with metadata read). What it grants: read access to the organization's settings that GitHub files under administration, among them its rulesets, to a token of the preflight role only; it grants no write, no push, no merge, no secret and no setting change. A pod never holds this token: it is not in a pod spec, a run Secret, an environment, the audit or a run record (a planted-token test scans each), and the preflight child never inherits `CW_PREFLIGHT_ORG_TOKEN_CMD` (a test-only setting) from the caller. The App's permission is the App's, not the pod's: the worker and orchestrator roles still ask for and accept exactly their own sets.

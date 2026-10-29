@@ -7,7 +7,9 @@ Reads with GET only (https://api.github.com; CW_GITHUB_API_BASE may name a loopb
   /repos/{o}/{r}                       the default branch
   /repos/{o}/{r}/rules/branches/{b}    the rulesets that apply to the branch
   /repos/{o}/{r}/branches/{b}          the `protected` flag
-The token comes from app_token.py, or from the command CW_PREFLIGHT_TOKEN_CMD when set (tests).
+The token comes from app_token.py, or from the command CW_PREFLIGHT_TOKEN_CMD when set (tests). Reads of ORGANIZATION rulesets (/orgs/...)
+use a token of the read-only `preflight` role (organization administration: read, with metadata read), minted here and never handed to a pod
+(#1573); CW_PREFLIGHT_ORG_TOKEN_CMD gives it in tests. Without that grant the worker's token is used and the 403 fails closed as before.
 
 An ORGANIZATION ruleset the token cannot read (HTTP 403 on its GET: an App token never can) is not counted, one line
 each. If everything that is then missing would be supplied by the rules such rulesets carry, the repository fails
@@ -130,6 +132,37 @@ def get_token(target):
     if p.returncode != 0 or not p.stdout.strip():
         raise Unreadable("the token command failed or printed nothing")
     return p.stdout.strip()
+
+
+ORG_TOKEN_CMD = "CW_PREFLIGHT_ORG_TOKEN_CMD"   # tests only: a command that prints the token of the preflight role
+
+
+def org_token_reader(target, token):
+    """(read, state): read() gives the token for GETs under /orgs/ (organization rulesets), minted lazily and once.
+    With the real mint it is a token of the preflight role (#1573), held only inside this program and never handed on. With a test token
+    command (CW_PREFLIGHT_TOKEN_CMD) it is CW_PREFLIGHT_ORG_TOKEN_CMD's output when set, else the worker's token (as before). If the preflight role
+    cannot be minted (the owner has not yet granted it) the worker's token is used: the 403 then fails closed exactly as it always did."""
+    state = {"token": None, "role": False}
+
+    def read():
+        if state["token"] is None:
+            state["token"] = token
+            cmd = os.environ.get(ORG_TOKEN_CMD)
+            try:
+                if cmd:
+                    p = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=60)
+                    if p.returncode == 0 and p.stdout.strip():
+                        state["token"], state["role"] = p.stdout.strip(), True
+                elif not os.environ.get("CW_PREFLIGHT_TOKEN_CMD"):
+                    state["token"], state["role"] = app_token.mint(target, "preflight"), True
+            except SystemExit:   # app_token already said why, on stderr
+                pass
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if not state["role"]:
+                say("no preflight-role token could be minted: organization rulesets are read with the worker's token")
+        return state["token"]
+    return read, state
 
 
 def _glob(pat):
@@ -339,7 +372,16 @@ def main(argv):
         return 2
     unreadable = {}
     bypass = []
-    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token), unreadable, bypass)
+    org_read, org_state = org_token_reader(target, token)
+
+    def fetch(path):
+        if not path.startswith("/orgs/"):
+            return get(base, path, token)
+        answer = get(base, path, org_read())
+        if org_state["role"]:
+            say("organization ruleset %s: read with the preflight token" % path.rsplit("/", 1)[-1])
+        return answer
+    problems, valid = judge(rules, branch, repo.get("default_branch"), fetch, unreadable, bypass)
     if valid is None:
         return 2
     missing, has_pr, types, review_problem = evaluate(valid)

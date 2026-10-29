@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """app-token: print a one-hour GitHub App installation token for ONE repository, to stdout, and nothing else.
 
-usage: app_token.py OWNER/REPO [--role worker|orchestrator]
+usage: app_token.py OWNER/REPO [--role worker|orchestrator|preflight]
 
 The App id and private key are read from the vault by commands (stdout of each, in memory only):
   CW_APP_ID_CMD, CW_APP_KEY_CMD
@@ -45,6 +45,9 @@ MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output t
 PERMISSIONS_BY_ROLE = {
     "worker": {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"},
     "orchestrator": {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"},
+    # The preflight's own role (#1573): read-only, used only by the launch preflight, never by a pod. Organization administration: read is
+    # what lets an installation token read an organization's rulesets; metadata: read reads the repository's default branch and rules.
+    "preflight": {"administration": "read", "metadata": "read"},
 }
 EXPECTED_PERMISSIONS = PERMISSIONS_BY_ROLE["worker"]  # the worker's set: the name every existing importer uses
 
