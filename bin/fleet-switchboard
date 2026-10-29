@@ -15488,7 +15488,7 @@ class IntentReader:
         repo = repo or self.repo
 
         def fetch(meta=None):
-            body = self._api("repos/%s/issues/%d" % (repo, number), repo, meta)
+            body = self._api("repos/%s/issues/%d" % (repo, number), repo, meta) if meta is not None else self._api("repos/%s/issues/%d" % (repo, number), repo)
             if meta is not None and meta.get("not_modified"):
                 return None
             found = IssueIntent.from_api(body)
@@ -15520,7 +15520,7 @@ class IntentReader:
 
         def fetch(meta=None):
             try:
-                found = self._api("repos/%s/issues/%d/parent" % (repo, number), repo, meta)
+                found = self._api("repos/%s/issues/%d/parent" % (repo, number), repo, meta) if meta is not None else self._api("repos/%s/issues/%d/parent" % (repo, number), repo)
                 if meta is not None and meta.get("not_modified"):
                     return None
             except IntentError as err:

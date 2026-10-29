@@ -202,6 +202,16 @@ class TestSets(HeaderCacheBase):
             self.header()
             self.assertGreater(self.count(before), 0, "%s served the warm entry" % name)
 
+    def test_charter_set_is_always_fresh_and_never_cache_allowed(self):   # S3/S4: the charter-set guard's label and parent reads decide the charter set
+        self.assertIn("charter", sb.always_fresh_commands())
+        self.assertNotIn("charter", sb.cache_allowed_commands())
+        self.action("send")
+        self.header()
+        before = len(self.gh.requests)
+        self.action("charter")
+        self.header()
+        self.assertGreater(self.count(before), 0, "charter served the warm entry")
+
     def test_mutant_that_lets_an_always_fresh_command_use_the_cache_fails(self):   # S3
         self.action("send")
         self.header()
