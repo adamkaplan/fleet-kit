@@ -8920,7 +8920,11 @@ def record_github_calls(engine):
         last_usage = getattr(engine, "usage_read_at", None)
         if last_usage is None or engine.now() - last_usage >= agent_calls.USAGE_EVERY:
             engine.usage_read_at = engine.now()   # once a minute, tried again next minute whatever happens
-            agent_calls.record_usage(str(engine.state_dir), engine.now(), accounts.read_usage())
+            readings = accounts.read_usage()
+            agent_calls.record_usage(str(engine.state_dir), engine.now(), readings)
+            if readings:   # #1501: the 5-minute sample line, and the census of process kinds when the outside count jumps (read only; own failure handling)
+                census_module = "github_census"   # a name, not a literal: this read-only look stays out of the clear's closure (the loader is by path all the same)
+                load_module(census_module).run(engine, readings, agent_calls.recorded_by_account(str(engine.state_dir), readings, engine.now()), engine.now())
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})

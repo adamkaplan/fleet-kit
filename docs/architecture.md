@@ -56,6 +56,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_client.py` | 1 | the sending end of a message or report through the cloud channel | |
 | `external_adapter.py` | 1 | a generic client for an outside system that holds decisions and work items | |
 | `agent_calls.py` | 2 | GitHub calls made from agents' shells, counted per account and per hour | |
+| `github_census.py` | 2 | the 5-minute sample line per account and the census of process kinds behind GitHub calls the records do not count (read only) | |
 | `agent_presence.py` | 2 | the one rule for the presence of a worker that has no terminal | |
 | `agent_reconcile.py` | 2 | what a view does with an agent that has no live data | |
 | `endpoint_liveness.py` | 2 | the liveness of an agent row that has no pane to judge (on demand only) | |
@@ -269,6 +270,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `fleet-switchboard` | `validate_app_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_hold_labels_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `validate_hold_labels_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `record_github_calls:load_module(non-constant)` | 1 | a dynamic load (the census module, by a name kept out of the clear's closure) |
 | `fleet-switchboard` | `run_daemon:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `lanes.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `merged_labels.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
