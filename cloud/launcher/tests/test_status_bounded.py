@@ -24,7 +24,8 @@ def real_shape(name, phase="Running"):
             "runtime_id": "pod/cw-" + name, "worker": name}
 
 
-class Bounded(Base):
+class Fakes:
+    """The fakes the status tests share (a mixin: it holds helpers only, no test method)."""
     DELAY = 0.0
 
     def setUp(self):
@@ -68,6 +69,8 @@ class Bounded(Base):
             patch.start()
             self.addCleanup(patch.stop)
 
+
+class Bounded(Fakes, Base):
     def check_real_shape(self):
         """The S2 claims, a function so the mutant can run it."""
         self.names = self.live(1)
@@ -170,6 +173,88 @@ class Bounded(Base):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all("unavailable" in l for l in rows), rows)
 
+    # ---- S9 the probe stage has one deadline
+
+    def check_stage_deadline(self, count=300, stage=2, probe=1, mutate=False):
+        """`count` live workers whose probes all hang: the whole status ends within the stage deadline + 2 s, some lines say `not probed`, nothing raises.
+        `mutate`: the stage deadline is switched off (each probe bounded only) and the probes are short so the mutant stays quick."""
+        self.names = self.live(count)
+        self.fakes(real_shape)
+        module = self.cloud()
+        hang = lambda state, cluster, record, timeout: time.sleep(30)
+        stage_now, probe_now = (10 ** 6, 0.1) if mutate else (stage, probe)
+        with mock.patch.object(module, "PROBE_STAGE_SECONDS", stage_now), mock.patch.object(module, "PROBE_SECONDS", probe_now), \
+                mock.patch.object(module, "_answers", hang):
+            started = time.monotonic()
+            lines, rows = self.status()
+            took = time.monotonic() - started
+        print("stage %s took %.1f s" % ("mutant" if mutate else "real", took), file=sys.stderr)
+        self.assertEqual(len(rows), count)
+        self.assertLess(took, stage + 2, took)
+        mine = [l for l in lines if l.strip().startswith("cloud w")]
+        self.assertEqual(len(mine), count)
+        self.assertTrue(any("not probed" in l for l in mine), "no line says not probed")
+        return mine
+
+    def test_s9_three_hundred_hanging_workers_end_at_the_stage_deadline_with_not_probed_lines(self):
+        mine = self.check_stage_deadline()
+        self.assertTrue(any("does not answer" in l for l in mine))   # a probe running at the deadline is given up
+        self.assertEqual([l.split()[1].rstrip(":") for l in mine], sorted(self.names))   # the records' order
+
+    def test_s9_a_mutant_without_the_stage_deadline_fails_the_three_hundred_test(self):
+        with self.assertRaises(AssertionError):
+            self.check_stage_deadline(mutate=True)
+
+    def test_s9_the_stage_deadline_is_a_named_thirty_second_constant(self):
+        module = self.cloud()
+        self.assertEqual(module.PROBE_STAGE_SECONDS, 30)
+        self.assertEqual(module.SNAPSHOT_SECONDS, 90)
+
+    # ---- S10 the launcher read is bounded by the number of records
+
+    def check_read_timeouts(self, count=60):
+        """`count` live records, the launcher read takes 0.05 s a record (scaled): the derived timeout holds it, a fixed one does not."""
+        self.names = self.live(count)
+        self.fakes(real_shape)
+        module = self.cloud()
+        seen = []
+
+        def launcher(runner, command, worker, options=(), timeout=0, *a, **k):
+            if command != "status":
+                return real(runner, command, worker, options, timeout, *a, **k)
+            need = 0.05 * count
+            seen.append(timeout)
+            if timeout < need:
+                raise module.CloudError("the launcher did not finish status within %s s" % timeout)
+            time.sleep(need)
+            return 0, [real_shape(n) for n in self.names], ""
+        real = module.run_launcher
+        with mock.patch.object(module, "run_launcher", launcher), mock.patch.object(module, "STATUS_SECONDS", 1), \
+                mock.patch.object(module, "STATUS_PER_RECORD", 0.1), mock.patch.object(module, "_answers", lambda *a: True):
+            lines, _ = self.status()
+        timeouts = [l for l in lines if "did not finish" in l]
+        self.assertEqual(len(timeouts), 0, timeouts[:1])
+        self.assertTrue(seen, "the read was not made")
+
+    def test_s10_sixty_records_show_no_timeout_reason_with_the_derived_timeout(self):
+        self.check_read_timeouts()
+
+    def test_s10_a_mutant_with_the_fixed_timeout_fails_the_sixty_record_test(self):
+        module = self.cloud()
+        applied = []
+
+        def fixed(count):
+            applied.append(True)
+            return module.STATUS_SECONDS
+        with mock.patch.object(module, "_read_timeout", fixed):
+            with self.assertRaises(AssertionError):
+                self.check_read_timeouts()
+        self.assertTrue(applied, "the mutation was not applied")
+
+    def test_s10_the_timeout_is_fifteen_plus_one_a_record_at_most_sixty(self):
+        module = self.cloud()
+        self.assertEqual([module._read_timeout(n) for n in (0, 1, 13, 45, 46, 300)], [15, 16, 28, 60, 60, 60])
+
     # ---- S6 mutants
 
     def test_s6_a_mutant_that_keeps_just_an_object_fails_s2(self):
@@ -186,7 +271,7 @@ class Bounded(Base):
         module = self.cloud()
         applied = []
 
-        def one_by_one(state, cluster, records, timeout):
+        def one_by_one(state, cluster, records, timeout, *more):
             applied.append(True)
             out = []
             for record in records:   # a read and a probe per worker, in turn
@@ -217,7 +302,7 @@ def dirty(field):
     return "\x1b[31m" + field + DIRTY_TAIL
 
 
-class Scrubbed(Bounded):
+class Scrubbed(Fakes, Base):
     """Every free-text field of a status row goes through the one helper, in the text row and in the JSON row, and a value that is not text raises nothing."""
 
     mine = contextlib.ExitStack()
@@ -292,11 +377,112 @@ class Scrubbed(Bounded):
                 self.assertTrue(applied, "the mutation was not applied")
 
 
+class Lows(Fakes, Base):
+    """S11: the record's problem and the launcher's standard error go through the one helper; a non-finite cost shows `?`."""
+
+    def one_problem(self, text):
+        module = self.cloud()
+        self.names = ["w0"]
+        self.fakes(real_shape)
+        with mock.patch.object(module, "list_records", lambda state: [{"worker": "w0", "problem": text}]):
+            lines, rows = self.status()
+        return "\n".join(l for l in lines if l), json.dumps(rows)
+
+    def one_stderr(self, text):
+        module = self.cloud()
+        self.names = self.live(1)
+        self.fakes(real_shape)
+        real = module.run_launcher
+        stub = lambda runner, command, worker, *a, **k: (3, None, text) if command == "status" else real(runner, command, worker, *a, **k)
+        with mock.patch.object(module, "run_launcher", stub):
+            lines, rows = self.status()
+        return "\n".join(l for l in lines if l), json.dumps(rows)
+
+    def check_clean(self, shown):
+        for bad in ("\x1b", "\\u001b", "ghp_", "AKIA"):
+            self.assertNotIn(bad, shown[0] + shown[1])
+        self.assertNotIn("\n      cloud w0: \n", shown[0])
+
+    def test_s11_a_record_problem_with_an_escape_a_newline_and_a_secret_shape_shows_none_of_them(self):
+        shown = self.one_problem(dirty("problem"))
+        self.check_clean(shown)
+        self.assertIn("cloud w0: ?", shown[0])
+
+    def test_s11_a_clean_record_problem_is_kept(self):
+        self.assertIn("cloud w0: the record is broken", self.one_problem("the record is broken")[0])
+
+    def test_s11_the_launchers_standard_error_with_an_escape_a_newline_and_a_secret_shape_shows_none_of_them(self):
+        shown = self.one_stderr(dirty("stderr"))
+        self.check_clean(shown)
+        self.assertIn("unavailable", shown[0])
+
+    def test_s11_a_clean_launcher_error_is_kept(self):
+        self.assertIn("boom", self.one_stderr("boom")[0])
+
+    def test_s11_a_mutant_that_skips_the_helper_for_either_text_fails_that_texts_test(self):
+        module = self.cloud()
+        real = module._safe
+        for name, check in (("problem", self.one_problem), ("stderr", self.one_stderr)):
+            with self.subTest(text=name):
+                applied = []
+
+                def skipping(value, default="Unknown", kind=None, name=name):
+                    if isinstance(value, str) and ("\x1b[31m" + name + "\n") in value:
+                        applied.append(True)
+                        return value
+                    return real(value, default, kind)
+                with mock.patch.object(module, "_safe", skipping):
+                    with self.assertRaises(AssertionError):
+                        self.check_clean(check(dirty(name)))
+                self.assertTrue(applied, "the mutation was not applied")
+
+    def check_cost_shows_a_question_mark(self, value):
+        module = self.cloud()
+        self.names = self.live(1)
+        self.fakes(lambda n: dict(real_shape(n), cost_estimate_usd=value))
+        lines, rows = self.status()
+        line = [l for l in lines if "cloud w0" in l][0]
+        self.assertIn("about $? so far", line)
+        self.assertEqual(json.loads(json.dumps(rows))[0]["cost_estimate_usd"], "?")
+        self.assertNotIn("NaN", json.dumps(rows))
+        self.assertNotIn("Infinity", json.dumps(rows))
+
+    def test_s11_a_cost_that_is_not_finite_prints_a_question_mark_in_the_text_and_the_json_row(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=repr(value)):
+                self.check_cost_shows_a_question_mark(value)
+
+    def test_s11_a_mutant_that_lets_a_non_finite_cost_through_fails(self):
+        module = self.cloud()
+        applied = []
+
+        def loose(value):
+            applied.append(True)
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        with mock.patch.object(module, "_finite_number", loose):
+            with self.assertRaises(AssertionError):
+                self.check_cost_shows_a_question_mark(float("nan"))
+        self.assertTrue(applied, "the mutation was not applied")
+
+
 class TestDocs(unittest.TestCase):
     def test_the_status_document_says_what_each_line_shows_and_the_lane_flag(self):
         flat = " ".join(Path(os.path.join(KIT, "docs", "switchboard.md")).read_text().split())
         for wanted in ("its idle deadline", "read ONCE for all workers", "four at a time", "status --lane NAME", "missing from that read"):
             self.assertIn(wanted, flat)
+
+    def test_the_status_document_says_the_probe_stage_has_one_deadline_and_the_lows(self):
+        flat = " ".join(Path(os.path.join(KIT, "docs", "switchboard.md")).read_text().split())
+        section = flat[flat.index("The cloud workers in `status`"):][:6000]   # this change's paragraph
+        self.assertEqual(section.count("however many"), 0)
+        for wanted in ("the probe stage has one deadline (30 seconds) after which the remaining workers are listed as not probed",
+                       "the launcher read has its own bound",
+                       "the launcher answers a status for all workers four pods at a time",
+                       "status --lane leaves out a record that has a problem (it has no recorded boss)",
+                       "for a duplicate worker name in the launcher's list the last record wins",
+                       "a runtime id or path is checked by its character set and length, not by its shape",
+                       "the tunnel process of an abandoned probe lives until the status process exits"):
+            self.assertEqual(flat.count(wanted), 1, wanted)
 
 
 if __name__ == "__main__":

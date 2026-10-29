@@ -19,6 +19,7 @@ import fcntl
 import http.client
 import importlib.util
 import json
+import math
 import os
 import re
 import shlex
@@ -61,7 +62,9 @@ RECORD_MAX = 8192
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
 STOP_SECONDS = 600
-STATUS_SECONDS = 15
+STATUS_SECONDS = 15   # the launcher read of `status`: this much, plus STATUS_PER_RECORD for each record (see _read_timeout)
+STATUS_PER_RECORD = 1
+STATUS_MAX_SECONDS = 60
 MESSAGE_MAX = 20000
 RECORD_FIELDS = ("worker", "url", "runtime_id", "idle_deadline", "hard_deadline")
 EXIT_REASONS = {2: "bad usage or unknown worker", 3: "the cloud refused (quota, identity or cap)", 4: "timed out waiting for the worker",
@@ -718,6 +721,7 @@ def _restore_signals(old):
 
 
 def _reason(code, note):
+    note = _safe(note, "?", "text") if note else note   # the launcher's standard error is untrusted text: the ONE helper
     return "%s%s" % (EXIT_REASONS.get(code, "exit %d" % code), (": " + note) if note else "")
 
 
@@ -1580,11 +1584,14 @@ def _ended(record, clock=None):
 
 # ---------------------------------------------------------------- the one cluster read (the status summary)
 
-SNAPSHOT_SECONDS = 30   # the bound of the WHOLE cloud summary read, ONE monotonic deadline: each step (the vault read, the token create, the launcher
+SNAPSHOT_STEP_SECONDS = 30   # the most one step (the cluster snapshot read) is given, inside the one deadline below
+SNAPSHOT_SECONDS = 90   # the bound of the WHOLE cloud summary read (the launcher read at most 60 + the probe stage 30), ONE monotonic deadline: each step (the vault read, the token create, the launcher
 #                         run) gets what is left of it, so the login and the launcher together never pass it (a step that starts after it refuses)
 
 
-_KINDS = {"stamp": re.compile(r"[0-9TZ:.+-]{1,40}"), "path": re.compile(r"[A-Za-z0-9._/-]{1,127}", re.ASCII)}
+_KINDS = {"stamp": re.compile(r"[0-9TZ:.+-]{1,40}"), "path": re.compile(r"[A-Za-z0-9._/-]{1,127}", re.ASCII),
+          "text": re.compile(r"[ -~]{1,500}")}   # "text": one line of printable ASCII (a reason, a loader message)
+_SECRET_SHAPED = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|sk-[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{20,}")
 
 
 def _safe(value, default="Unknown", kind=None):
@@ -1595,7 +1602,8 @@ def _safe(value, default="Unknown", kind=None):
     if not value:
         return default
     if kind in _KINDS:
-        return value if isinstance(value, str) and _KINDS[kind].fullmatch(value) else "?"
+        ok = isinstance(value, str) and _KINDS[kind].fullmatch(value) and not (kind == "text" and _SECRET_SHAPED.search(value))
+        return value if ok else "?"
     return _lib().safe_value(value)
 
 
@@ -1692,7 +1700,7 @@ def _summary_line(snapshot, now):
     return "cloud: %s; pods %d (%s)" % (nodes_text, len(pods), pod_text)
 
 
-def status_lines(runner, state, timeout=STATUS_SECONDS, lane=None):
+def status_lines(runner, state, timeout=None, lane=None):
     """(lines, rows) for `status`: ONE cloud summary line from ONE cluster read, then per cloud worker its record and, from the launcher's
     read-only `status`, phase and cost, and whether the worker answers through a tunnel that exists only for that probe. A record whose hard
     deadline has passed and whose pod is gone is ENDED (the deadline is the time it ended); a record whose pod still stands says so. A trouble is
@@ -1711,7 +1719,7 @@ def status_lines(runner, state, timeout=STATUS_SECONDS, lane=None):
             cluster = Cluster(timeout=left).__enter__()
             if left() <= 0:
                 raise CloudError("the read ran out of its %d s" % SNAPSHOT_SECONDS)
-            snapshot = _cluster_snapshot(runner, cluster, max(1, int(left())))
+            snapshot = _cluster_snapshot(runner, cluster, max(1, min(SNAPSHOT_STEP_SECONDS, int(left()))))
         except CloudError as err:
             reason = _one(str(err), 300)
         if snapshot is None:
@@ -1722,8 +1730,8 @@ def status_lines(runner, state, timeout=STATUS_SECONDS, lane=None):
         for record in records:
             row = {"worker": _safe(record["worker"], "?")}
             if "problem" in record:
-                row["problem"] = record["problem"]
-                lines.append("      cloud %s: %s" % (row["worker"], record["problem"]))
+                row["problem"] = _safe(record["problem"], "?", "text")
+                lines.append("      cloud %s: %s" % (row["worker"], row["problem"]))
                 rows.append(row)
                 continue
             row.update({"runtime_id": _row_value(record.get("runtime_id"), "path"), "idle_deadline": _row_value(record.get("idle_deadline"), "stamp"),
@@ -1759,8 +1767,9 @@ def status_lines(runner, state, timeout=STATUS_SECONDS, lane=None):
             rows.append(row)
             live.append((len(lines) - 1, row, record))
         if live:
-            code, found, note = _read_all(runner, cluster, timeout)
-            answers = _probe_all(state, cluster, [record for _, _, record in live], timeout)
+            read_for = max(1, min(_read_timeout(len(live)) if timeout is None else timeout, int(left())))   # the read's own bound, inside the one deadline
+            code, found, note = _read_all(runner, cluster, read_for)
+            answers = _probe_all(state, cluster, [record for _, _, record in live], read_for, deadline)
             for (at, row, record), answered in zip(live, answers):
                 body = found.get(record["worker"]) if found is not None and isinstance(record["worker"], str) else None
                 if body is not None and body.get("error"):   # the launcher read this one pod and said why it could not
@@ -1769,30 +1778,41 @@ def status_lines(runner, state, timeout=STATUS_SECONDS, lane=None):
                 elif body is not None:
                     cost = body.get("cost_estimate_usd")
                     row.update({"phase": _row_value(body.get("phase")), "idle_since": _row_value(body.get("idle_since"), "stamp"),
-                                "cost_estimate_usd": cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else _row_value(cost)})
+                                "cost_estimate_usd": cost if _finite_number(cost) else _row_value(cost)})
                     idle = (body.get("deadlines") or {}).get("idle") if isinstance(body.get("deadlines"), dict) else body.get("idle_deadline")
                     row["idle_deadline"] = _row_value(idle, "stamp") if idle is not None else row.get("idle_deadline")
                     extra = "phase %s, about $%s so far" % (_safe(body.get("phase"), "?"), _cost(body.get("cost_estimate_usd")))
                     if idle is not None:
                         extra += ", idle deadline %s" % _safe(idle, "?", "stamp")
                 else:
-                    row["launcher_status"] = _reason(code, note) if found is None else "not in the launcher's status"
+                    row["launcher_status"] = _safe(_reason(code, note), "?", "text") if found is None else "not in the launcher's status"
                     extra = "launcher status unavailable (%s)" % _one(row["launcher_status"], 100)
-                row["answers"] = answered
+                row["answers"] = answered   # None: not probed (the stage deadline came first)
                 lines[at] = "      cloud %s: %s, %s; %s; stops at %s" % (row["worker"], _safe(record.get("runtime_id"), "?", "path"), extra,
-                                                                       "answers" if answered else "does not answer", _safe(record.get("hard_deadline"), "?", "stamp"))
+                                                                       "not probed" if answered is None else "answers" if answered else "does not answer",
+                                                                       _safe(record.get("hard_deadline"), "?", "stamp"))
     finally:
         if cluster is not None:
             cluster.close()
     return lines, rows
 
 
+def _finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def _cost(value):
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else "?"
+    return value if _finite_number(value) else "?"
+
+
+def _read_timeout(count):
+    """The ONE call timeout of the launcher's `status` for all workers: STATUS_SECONDS plus STATUS_PER_RECORD a record, at most STATUS_MAX_SECONDS."""
+    return min(STATUS_MAX_SECONDS, STATUS_SECONDS + STATUS_PER_RECORD * count)
 
 
 PROBE_WORKERS = 4      # live workers probed at a time
 PROBE_SECONDS = 5      # each probe's own bound
+PROBE_STAGE_SECONDS = 30   # ONE deadline for the whole probe stage (monotonic, taken when the stage starts)
 
 
 def _read_all(runner, cluster, timeout):
@@ -1821,9 +1841,13 @@ class _Everyone(dict):
         return self.body
 
 
-def _probe_one(state, cluster, record, timeout):
-    """_answers for one worker, in its own thread, given up after PROBE_SECONDS: a raise or a timeout is False for that worker only."""
+def _probe_one(state, cluster, record, timeout, stop=None):
+    """_answers for one worker, in its own thread, given up after PROBE_SECONDS or at `stop` (a monotonic time), whichever is first: a raise or a
+    timeout is False for that worker only. None: not probed (`stop` had passed before it started)."""
     box = []
+    wait = PROBE_SECONDS if stop is None else min(PROBE_SECONDS, stop - time.monotonic())
+    if wait <= 0:
+        return None
 
     def run():
         try:
@@ -1833,14 +1857,18 @@ def _probe_one(state, cluster, record, timeout):
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    thread.join(PROBE_SECONDS)
+    thread.join(wait)
     return box[0] if box else False
 
 
-def _probe_all(state, cluster, records, timeout):
-    """The probes of the live workers, PROBE_WORKERS at a time; the answers come back in the order of `records`."""
+def _probe_all(state, cluster, records, timeout, outer=None):
+    """The probes of the live workers, PROBE_WORKERS at a time, ALL inside ONE deadline (PROBE_STAGE_SECONDS from now, and not past `outer`); the
+    answers come back in the order of `records`; a worker whose probe had not started by then is None (not probed)."""
+    stop = time.monotonic() + PROBE_STAGE_SECONDS
+    if outer is not None:
+        stop = min(stop, outer)
     with futures.ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
-        return list(pool.map(lambda record: _probe_one(state, cluster, record, timeout), records))
+        return list(pool.map(lambda record: _probe_one(state, cluster, record, timeout, stop), records))
 
 
 def _answers(state, cluster, record, timeout):
@@ -1935,8 +1963,8 @@ def cmd_cloud_clear(args, runner, now):
         print("no cloud worker records")
         return H["EXIT_OK"]
     try:
-        with Cluster(timeout=SNAPSHOT_SECONDS) as cluster:
-            snapshot = _cluster_snapshot(runner, cluster, SNAPSHOT_SECONDS)
+        with Cluster(timeout=SNAPSHOT_STEP_SECONDS) as cluster:
+            snapshot = _cluster_snapshot(runner, cluster, SNAPSHOT_STEP_SECONDS)
     except CloudError as err:
         raise H["LaunchError"]("the cluster could not be read (%s); nothing was cleared" % _one(str(err), 200)) from None
     dry_run = bool(getattr(args, "dry_run", False))
