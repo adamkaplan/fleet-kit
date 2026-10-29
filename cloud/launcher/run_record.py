@@ -318,11 +318,13 @@ class Recorder:
         sha = (out.strip().splitlines() or [""])[0]
         return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
-    def record(self, worker, pod, reason, repo="", started="", root=None):
+    def record(self, worker, pod, reason, repo="", started="", root=None, persistent=False):
         """Save the run's record. Returns the record directory ('' when none could be made). Never raises an Exception."""
         run_id = "%s-%s-%s" % (worker, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), secrets.token_hex(3))
         info = {"worker": worker, "repository": repo, "run_id": run_id, "start": started, "end": None,
                 "exit_reason": "", "head_sha": None, "transcript": "unavailable", "reason": "the record was not finished"}
+        if persistent:   # only a persistent orchestrator's record has the key
+            info["persistent"] = True
         directory = ""
         try:
             info["exit_reason"] = self.kube.scrub(reason, limit=300)

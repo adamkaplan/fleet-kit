@@ -13966,6 +13966,9 @@ def cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
+    if getattr(args, "persistent", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
+        sys.stderr.write("%s: --persistent needs --cloud: an always-on orchestrator is a cloud pod; nothing was created\n" % PROG)
+        return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
@@ -22854,6 +22857,7 @@ def build_parser():
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
     launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack) or M (4 CPU, 8 GiB)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
+    launch.add_argument("--persistent", action="store_true", help="With --cloud and --agent orchestrator: an always-on orchestrator (one StatefulSet, restart always, no hard or idle limit; only an explicit stop ends it, and its cost is unbounded in time). Refused for a worker or a --stack launch")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
@@ -23577,7 +23581,7 @@ CLOUD_ENV_SETTING_NAMES = ("CW_ALLOWED_REPOS", "CW_TOOLING_REPO", "CW_CLOUD_IMAG
                             "CW_OPENCODE_BIN", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
                             "CW_CLUSTER_ADMIN_CMD", "CW_GIT_TOKEN_CMD", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD",
                             "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_HUB_CHANNEL_URL",
-                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR")
+                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR", "CW_MAX_PERSISTENT")
 REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs (the token file: the install's environment, else a default)
 REAPER_VAULT_NAMES = ("CW_VAULT_NAME", "CW_VAULT_SUBSCRIPTION")   # the vault names (CW_CLUSTER_ADMIN_SECRET has a default: optional)
 # The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a

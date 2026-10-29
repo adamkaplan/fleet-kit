@@ -53,8 +53,33 @@ def missing(what):
     print('Error from server (NotFound): %s not found' % what, file=sys.stderr); sys.exit(1)
 def exists(what):
     print('Error from server (AlreadyExists): %s already exists' % what, file=sys.stderr); sys.exit(1)
+def sts_pod(sts):   # the pod the StatefulSet's controller makes: NAME-0, owned by it, the template's labels, annotations and spec
+    tmpl, name = sts["spec"]["template"], sts["metadata"]["name"]
+    st["uid_counter"] = st.get("uid_counter", 0) + 1
+    st.setdefault("pods", {})[name + "-0"] = {
+        "metadata": {"name": name + "-0", "labels": dict(tmpl["metadata"].get("labels", {})), "annotations": dict(tmpl["metadata"].get("annotations", {})),
+                     "uid": "uid-%d" % st["uid_counter"], "ownerReferences": [{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": name, "uid": sts["metadata"]["uid"], "controller": True}]},
+        "spec": dict(tmpl["spec"], hostname=name + "-0", subdomain=sts["spec"]["serviceName"]),
+        "status": {"phase": "Pending" if st.get("never_ready") else "Running", "conditions": [] if st.get("never_ready") else [{"type": "Ready", "status": "True"}], "podIP": "10.1.2.4"}}
+def sts_recreate(pod):   # a pod deleted ALONE comes back: its controller is still there
+    for ref in (pod or {}).get("metadata", {}).get("ownerReferences", []):
+        if ref.get("kind") == "StatefulSet" and ref["name"] in st.get("sts", {}):
+            sts_pod(st["sts"][ref["name"]])
+            st.setdefault("recreated", []).append(pod["metadata"]["name"])
 if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` is exclusive, like a real cluster; `apply` replaces
     obj = json.load(sys.stdin)
+    if st.get("fail_apply") and obj["kind"] == "StatefulSet":
+        print("Error from server (Forbidden): quota exceeded", file=sys.stderr); sys.exit(1)
+    if obj["kind"] == "StatefulSet":   # the controller makes the one pod NAME-0 at once
+        if obj["metadata"]["name"] in st.get("sts", {}):
+            exists('statefulsets.apps "%s"' % obj["metadata"]["name"])
+        st.setdefault("applied", []).append(obj)
+        st["uid_counter"] = st.get("uid_counter", 0) + 1
+        obj["metadata"]["uid"] = "sts-uid-%d" % st["uid_counter"]
+        st.setdefault("sts", {})[obj["metadata"]["name"]] = obj
+        if not st.get("sts_no_pod"):
+            sts_pod(obj)
+        save(); sys.exit(0)
     if st.get("fail_apply"):
         print("Error from server (Forbidden): quota exceeded", file=sys.stderr); sys.exit(1)
     if cmd == "create":
@@ -152,6 +177,19 @@ elif cmd == "get" and args[1] == "secret":
 elif cmd == "get" and args[1] == "events":
     name = args[3].split("involvedObject.name=")[1]
     print(json.dumps({"items": [e for e in st.get("events", []) if e["involvedObject"]["name"] == name]}))
+elif cmd == "get" and args[1] == "statefulset":
+    if st.get("sts_get_stdout") is not None or st.get("sts_get_stderr") is not None:   # a planted answer, whatever the name (the near-miss table)
+        sys.stdout.write(st.get("sts_get_stdout") or ""); sys.stderr.write(st.get("sts_get_stderr") or ""); sys.exit(st.get("sts_get_code", 1))
+    if args[2] not in st.get("sts", {}): missing('statefulsets.apps "%s"' % args[2])
+    print(json.dumps(st["sts"][args[2]]))
+elif cmd == "get" and args[1] == "statefulsets":
+    if st.get("sts_list_fail"):
+        print('Error from server (Forbidden): statefulsets.apps is forbidden: User "cw-operator" cannot list resource "statefulsets" in API group "apps" in the namespace "cw"', file=sys.stderr); sys.exit(1)
+    items = list(st.get("sts", {}).values())
+    if "-l" in args:
+        k, v = args[args.index("-l") + 1].split("=", 1)
+        items = [s for s in items if s["metadata"].get("labels", {}).get(k) == v]
+    print(json.dumps({"items": items}))
 elif cmd == "get" and args[1] == "pod":
     if args[2] not in st.get("pods", {}) or st.get("hide_pod"): missing('pods "%s"' % args[2])   # hide_pod: the pod was never visible to a get
     pod = st["pods"][args[2]]
@@ -213,11 +251,21 @@ elif cmd == "delete" and args[1] == "--raw":   # a delete bound to a uid (Delete
     if opts.get("preconditions", {}).get("uid") not in (None, real_uid):
         sys.stderr.write('Error from server (Conflict): Precondition failed: UID in precondition: %s, UID in object meta: %s\n' % (opts["preconditions"]["uid"], real_uid)); sys.exit(1)
     del st["pods"][name]
+    sts_recreate(pod)
+    save()
+elif cmd == "delete" and args[1] == "statefulset":
+    name = args[2]
+    st.setdefault("sts_deletes", []).append(name)
+    if st.get("sts_delete_hang"):   # the delete does not finish within its timeout: kubectl says so and the object stays
+        save(); print('error: timed out waiting for the condition on statefulsets/%s' % name, file=sys.stderr); sys.exit(1)
+    st.get("sts", {}).pop(name, None)
+    st.get("pods", {}).pop(name + "-0", None)   # its pod goes with it
     save()
 elif cmd == "delete":
     kind, name = args[1], args[2]
-    (st.get("pods" if kind == "pod" else "secrets", {})).pop(name, None)
+    gone = (st.get("pods", {}).pop(name, None)) if kind == "pod" else (st.get("secrets", {}).pop(name, None) and None)
     if kind == "secret": st.get("secret_labels", {}).pop(name, None)
+    if kind == "pod": sts_recreate(gone)
     save()
 elif cmd == "exec":
     name, tool = args[1], args[3]
