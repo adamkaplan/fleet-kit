@@ -6225,7 +6225,7 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 
 **Counting rule.** One request is counted per HTTP request made, by account and endpoint class: each page of a paginated read counts one (`bin/paged_reads.py` reads the pages itself, `gh api -i`, per_page=100), each request of a batched read counts one. The first page carries the stored ETag; a `304 Not Modified` answers from the stored pages and costs nothing against the budget (shown as `not_modified`). `status` and the 5-minute sample line read the same counter.
 
-**Cause (S1).** Before this change a `gh api --paginate` read had no header block, so `accounts.read` passed it through: counted as ONE call however many pages it cost, never conditional. The catch-up pass (comments, issues, pulls, reviews and check suites per pull, workflow runs) is made of such reads.
+**Cause (S1), as found in the code.** `accounts.read` passed through any answer with no header block (`gh api --paginate`): one call counted however many pages it cost, never conditional. In this tree no hub read asks for `--paginate` (every `gh_api` call passes `paginate=False` and `GitHubHub.read_pages` pages itself, so each page is already counted); `bin/paged_reads.py` closes the pass-through for any caller that does. What stays uncounted or unconditional: `_RedsReader.zip` and `_RedsReader.pull_state` (GraphQL) run `gh` without `accounts.read`; reads with `since=` are never conditional (a moving window); a page answer over 256 KB is not stored.
 
 Hourly total for a stated fleet: 4 repos without a forwarder, 10 open pulls each, 2 pages per list read: **6720 requests per hour** before the levers (derived by `bin/call_sites.py hourly`; the intervals are the constants named in the table).
 
