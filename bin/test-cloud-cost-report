@@ -3,6 +3,8 @@
 
 Each rule has a mutant: the module source is changed in one place and the same case must then fail.
 
+The audit writer guard is a syntactic net for the common shapes: it does not see a path built by a helper function, and the first test lists every file that names the audit path so that a new one is seen and read by a reviewer. Limits it does not fully cover: a path returned by a helper function, a copy or move whose destination is built elsewhere, a subprocess whose command text is assembled away from the call.
+
     bin/test-cloud-cost-report
 """
 import io
@@ -564,6 +566,11 @@ def audit_writes(text):
             hits.append((node.lineno, "os.open with a write flag"))
         elif name in ("write_text", "write_bytes") and isinstance(node.func, ast.Attribute) and holds(node.func.value):
             hits.append((node.lineno, name))
+        elif dotted in ("shutil.copy", "shutil.copyfile", "shutil.copy2", "shutil.move") and len(node.args) > 1 and holds(node.args[1]):  # ext-copy
+            hits.append((node.lineno, "copy or move into the audit path"))  # ext-copy
+        elif (dotted.startswith("subprocess.") or dotted in ("os.system", "os.popen")) and node.args and holds(node.args[0]) and any(  # ext-proc
+                t in ast.unparse(node.args[0]) for t in ("tee", ">>")):  # ext-proc
+            hits.append((node.lineno, "subprocess with tee or >> on the audit path"))  # ext-proc
         elif name == "open" and isinstance(node.func, ast.Attribute) and holds(node.func.value) and write_flag(node, 0):
             hits.append((node.lineno, "Path.open for writing"))
     return hits
@@ -636,7 +643,12 @@ def call_findings(files):
 
 class TestOtherWritersAndCallers(unittest.TestCase):
     """The names walk reads cloud_worker.py. This guards the rest: no other file writes the audit file, and every call of the
-    forwarding functions passes its action as a literal."""
+    forwarding functions passes its action as a literal.
+
+    The guard is a syntactic net for the common shapes: it does not see a path built by a helper function, and the first test lists
+    every file that names the audit path so that a new one is seen and read by a reviewer. Limits not fully covered: a path returned
+    by a helper function, a copy or move whose destination is built elsewhere, and a subprocess whose command text is assembled
+    away from the call."""
 
     @classmethod
     def setUpClass(cls):
@@ -682,6 +694,52 @@ class TestOtherWritersAndCallers(unittest.TestCase):
         for variant in ('f"s{a}"', "a if x else b", "name"):
             again = self.worker_text.replace(old, "return self._audited(worker, %s, go, audit_reason)" % variant)
             self.assertEqual(len(call_findings([(WRITER_FILE, again)])), 1, variant)
+
+
+COPY_SAMPLES = {
+    "shutil.copy": "import shutil, os\nTARGET = os.environ['CW_CLOUD_AUDIT']\nshutil.copy('x', TARGET)\n",
+    "shutil.copyfile": "import shutil\nshutil.copyfile('x', '/var/cw-cloud/audit.jsonl')\n",
+    "shutil.copy2": "import shutil, os\nshutil.copy2('x', os.environ['CW_CLOUD_AUDIT'])\n",
+    "shutil.move": "import shutil, os\nshutil.move('x', os.environ['CW_CLOUD_AUDIT'])\n",
+}
+PROC_SAMPLES = {
+    "tee list": "import subprocess, os\nsubprocess.run(['tee', '-a', os.environ['CW_CLOUD_AUDIT']])\n",
+    "sh -c redirect": "import subprocess, os\nsubprocess.run(['sh', '-c', 'echo x >> ' + os.environ['CW_CLOUD_AUDIT']])\n",
+    "os.system redirect": "import os\nos.system('echo x >> /var/cw-cloud/audit.jsonl')\n",
+}
+HELPER_SAMPLE = "import os\n\ndef path():\n    return os.environ['CW_CLOUD_AUDIT']\n\nopen(path(), 'a')\n"
+
+
+class TestWriterGuardShapes(unittest.TestCase):
+    def test_copy_and_move_into_the_audit_path_are_flagged(self):
+        for shape, text in COPY_SAMPLES.items():
+            hits = audit_writes(text)
+            self.assertEqual([h[0] for h in hits], [text.count("\n")], shape)
+            self.assertIn("copy or move", hits[0][1])
+
+    def test_a_subprocess_with_tee_or_redirect_on_the_audit_path_is_flagged(self):
+        for shape, text in PROC_SAMPLES.items():
+            hits = audit_writes(text)
+            self.assertEqual([h[0] for h in hits], [text.count("\n")], shape)
+            self.assertIn("subprocess", hits[0][1])
+        self.assertEqual(audit_writes("import subprocess\nsubprocess.run(['tee', '-a', '/tmp/other'])\n"), [])
+
+    def test_the_extension_mutants_are_not_flagged(self):
+        import inspect
+        source = inspect.getsource(audit_writes)
+        for mark, samples in (("ext-copy", COPY_SAMPLES), ("ext-proc", PROC_SAMPLES)):
+            lines = source.splitlines()
+            kept = [l for l in lines if "# " + mark not in l]
+            self.assertLess(len(kept), len(lines))
+            scope = dict(globals())
+            exec("\n".join(kept).replace("elif name == \"open\" and", "elif name == \"open\" and", 1), scope)
+            for shape, text in samples.items():
+                self.assertTrue(audit_writes(text), shape)
+                self.assertEqual(scope["audit_writes"](text), [], "%s: mutant must not flag" % shape)
+
+    def test_a_path_built_by_a_helper_function_is_not_seen(self):
+        # a stated limit: the guard is syntactic and does not follow a helper's return value
+        self.assertEqual(audit_writes(HELPER_SAMPLE), [])
 
 
 def mock_stderr(stream):
