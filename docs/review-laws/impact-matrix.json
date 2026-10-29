@@ -466,7 +466,7 @@
         "bin/decision_core.py": [
           "one_line"
         ],
-        "bin/header_cache.py": [],
+        "bin/header_cache.py": ["_dir", "_h", "drop", "usable"],
         "bin/disk_janitor.py": [
           "settings",
           "validate"
