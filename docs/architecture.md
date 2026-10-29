@@ -82,6 +82,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_cli.py` | 5 | the pod-side command to send and report through the cloud channel | |
 | `cloud_cost_report.py` | 5 | USD per day of the cloud fleet, from the launcher's audit lines (read only) | |
 | `cloud_hub.py` | 5 | the cloud switchboard's front door | |
+| `cloud_retired.py` | 5 | the read of a retired cloud worker from its run record, and the boss kept at its removal (#1546); a part of `cloud_worker.py` | |
 | `cloud_way_back_check.py` | 5 | a read-only check of the way back from the cloud to local | |
 | `cloud_worker.py` | 5 | remote (cloud) workers for the switchboard | |
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
@@ -133,10 +134,9 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
 | `bin/test-switchboard` | `-` | size | 85,500 | the one test file; whole classes have moved to `tests/switchboard/test_cases_NN.py` (T1, T1b), and the lanes still add tests until the next split, so the row is the real count plus about 3,000 |
-| `bin/test-cloud-worker` | `-` | size | 3,000 | the cloud worker's one test file; the retired-run read tests of #1546 were added to it (they use its fixtures); a split is owed |
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
-| `cloud_worker.py` | `-` | size | 2,500 | grew past the limit in a merged change; to be split; `read` of a retired run and the kept boss (#1546) added about 160 lines (ceiling raised on purpose, the split is still owed) |
+| `cloud_worker.py` | `-` | size | 2,000 | grew past the limit in a merged change; to be split |
 | `impact_hold.py` | `-` | size | 2,000 | the brief-bound clear (#1215) took it past the limit; to be split (ceiling = the test's own formula: 1510 lines, plus 500, rounded up to a multiple of 500) |
 | `delegated_clear.py` | `-` | size | 1,900 | the registrar lint lives with the clear it protects; a follow-up slice moves it to its own part and lowers the ceiling |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -213,6 +213,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_worker.py` | `_lib:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_walk:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `bind:sys.modules` | 1 | uses `sys` beyond its plain attributes |
