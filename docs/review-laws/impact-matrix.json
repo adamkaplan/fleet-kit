@@ -429,7 +429,8 @@
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
-        "bin/switchboard/jev.py"
+        "bin/switchboard/jev.py",
+        "bin/switchboard/secret_spans.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -641,6 +642,11 @@
           "jev_key_file",
           "locate_jev_key",
           "validate_jev_config"
+        ],
+        "bin/switchboard/secret_spans.py": [
+          "_secret_position",
+          "find_secret_span",
+          "secret_where"
         ]
       },
       "registrar_allow": {

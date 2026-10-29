@@ -217,6 +217,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 1 | serial |
+| `bin/test-cloud-retired` | 66 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
@@ -270,6 +271,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
@@ -282,6 +284,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 0 | serial |
+| `bin/test-cloud-retired` | 33 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
@@ -335,6 +338,7 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
