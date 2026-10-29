@@ -113,6 +113,28 @@ def _rate_limited(e):
         return True  # cannot tell: refuse
 
 
+REFUSAL_LINE_MAX = 160
+
+
+def refusal_label():
+    """The label the mint chose where it refused (the closed list app_token.LABELS), never matched from text."""
+    label = app_token.REFUSAL.get("label")
+    return label if label in app_token.LABELS else "other"
+
+
+def refusal_line():
+    """The mint's own reason as ONE line of at most 160 printable characters through the launcher's scrub (the same
+    function that scrubs the launcher's output). A scrub that cannot be loaded leaves a fixed line, never the raw one."""
+    try:
+        from cloud_worker import scrub
+    except Exception:  # a copy of this program without the launcher beside it
+        return "the reason is on the standard error of the mint"
+    line = " ".join(str(app_token.REFUSAL.get("line", ""))[:2000].split())
+    line = re.sub(r"\d{1,3}(?:\.\d{1,3}){3}|(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}", "[address]", line)  # an address
+    line = re.sub(r"\d{5,}", "[id]", line)  # an identifier
+    return scrub(line, (), REFUSAL_LINE_MAX)
+
+
 def get_token(target):
     cmd = os.environ.get("CW_PREFLIGHT_TOKEN_CMD")
     if not cmd:
@@ -120,8 +142,8 @@ def get_token(target):
             token = app_token.mint(target)
             say("token permissions: " + app_token.render_permissions())  # the mint refused anything else
             return token
-        except SystemExit:  # app_token already said why, on stderr; a mint that fails is an unreadable answer
-            raise Unreadable("no token could be minted")
+        except SystemExit:  # app_token said why on stderr and recorded its label; a mint that fails is an unreadable answer
+            raise Unreadable("no token could be minted (%s): %s" % (refusal_label(), refusal_line())) from None
     try:
         p = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
