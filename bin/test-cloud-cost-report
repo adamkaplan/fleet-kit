@@ -505,6 +505,185 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
             self.assertEqual(launcher.last_audit_line(path, "a-new-action"), (False, None))
 
 
+ROOT = BIN.parent
+WRITER_FILE = "cloud/launcher/cloud_worker.py"
+FORWARDING = ("audit", "_audited")   # the two functions that forward their own action parameter
+ACTION_CALLS = {"audit": 2, "_audited": 1, "write_audit": None}   # name -> index of the action argument (None: a record dict)
+WRITE_MODES = ("a", "w", "x", "ab", "wb", "a+", "w+", "r+")
+
+
+CLOUD_AUDIT_MARKS = ("CW_CLOUD_AUDIT", "write_audit", "audit_path(", "cw-cloud")   # how a source names the launcher's audit file
+
+
+def audit_scan_files():
+    """The files that can name the launcher's audit file: cloud/launcher/*.py, bin/*.py and bin/ scripts without extension that hold one of
+    CLOUD_AUDIT_MARKS (a narrowing of git grep -l audit: the switchboard's own audit log and other tools' audit(...) are other files).
+    Test scripts (bin/test-*) are left out: they write fixture files, not the launcher's."""
+    found = []
+    for path in sorted(list((ROOT / "cloud" / "launcher").glob("*.py")) + list(BIN.glob("*.py")) + [p for p in BIN.iterdir() if p.is_file() and not p.suffix and not p.name.startswith("test-")]):
+        try:
+            text = path.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        if any(m in text for m in CLOUD_AUDIT_MARKS):
+            found.append((str(path.relative_to(ROOT)), text))
+    return found
+
+
+def audit_writes(text):
+    """(line, what) of each write_audit(...) call and each write-mode open / os.open / write_text / append whose path holds the audit path."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    tainted = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(m in ast.unparse(node.value) for m in CLOUD_AUDIT_MARKS):
+            tainted |= {ast.unparse(t) for t in node.targets}
+
+    def holds(expr):
+        source = ast.unparse(expr)
+        return any(m in source for m in CLOUD_AUDIT_MARKS) or any(t in source for t in tainted)
+
+    def write_flag(call, index):
+        modes = [a for a in call.args[index:index + 1] + [k.value for k in call.keywords if k.arg == "mode"]]
+        return any(isinstance(m, ast.Constant) and isinstance(m.value, str) and any(c in m.value for c in "awx+") for m in modes)
+
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        dotted = ast.unparse(node.func)
+        if name == "write_audit":
+            hits.append((node.lineno, "write_audit"))
+        elif dotted == "open" and node.args and holds(node.args[0]) and write_flag(node, 1):
+            hits.append((node.lineno, "open for writing"))
+        elif dotted == "os.open" and node.args and holds(node.args[0]) and "O_" in ast.unparse(node.args[1:2]) and any(
+                f in ast.unparse(node.args[1]) for f in ("WRONLY", "RDWR", "APPEND", "CREAT")):
+            hits.append((node.lineno, "os.open with a write flag"))
+        elif name in ("write_text", "write_bytes") and isinstance(node.func, ast.Attribute) and holds(node.func.value):
+            hits.append((node.lineno, name))
+        elif name == "open" and isinstance(node.func, ast.Attribute) and holds(node.func.value) and write_flag(node, 0):
+            hits.append((node.lineno, "Path.open for writing"))
+    return hits
+
+
+def other_writer_files(files):
+    return sorted(rel for rel, text in files if rel != WRITER_FILE and audit_writes(text))
+
+
+def action_call_findings(text):
+    """(line, call, source) of each audit(...) / _audited(...) / write_audit(...) call whose action is not a literal string, a literal
+    ternary (both branches literal) or a *_ACTION constant. Inside audit() and _audited() themselves only their own action parameter passes."""
+    tree = ast.parse(text)
+    consts = {t.id for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name) and t.id.endswith("_ACTION")}
+    seen = []
+
+    def literal(node, params):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id in consts or node.id in params
+        return isinstance(node, ast.IfExp) and literal(node.body, params) and literal(node.orelse, params)
+
+    def visit(node, params):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            params = {a.arg for a in node.args.args if a.arg == "action"} if node.name in FORWARDING and "action" in {a.arg for a in node.args.args} else set()
+        if isinstance(node, ast.Call):
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            if name in ACTION_CALLS:
+                exprs = []
+                index = ACTION_CALLS[name]
+                if index is not None:
+                    keyword = [k.value for k in node.keywords if k.arg == "action"]
+                    if keyword:
+                        exprs = keyword
+                    elif len(node.args) > index:
+                        exprs = [node.args[index]]
+                    elif name != "audit" or len(node.args) >= 3:
+                        exprs = [None]
+                else:
+                    for arg in node.args:
+                        if isinstance(arg, ast.Dict):
+                            exprs += [v for k, v in zip(arg.keys, arg.values) if isinstance(k, ast.Constant) and k.value == "action"]
+                    if not exprs:
+                        exprs = [None]
+                for expr in exprs:
+                    seen.append((node.lineno, name, "<missing>" if expr is None else ast.unparse(expr), expr is not None and literal(expr, params)))
+        for child in ast.iter_child_nodes(node):
+            visit(child, params)
+
+    visit(tree, set())
+    return seen
+
+
+# Callers that may pass something else than a literal, with the reason. It stays empty.
+ALLOWED_CALL_FINDINGS = {}
+
+
+def call_findings(files):
+    """The calls of cloud_worker.py and of every other file that writes the audit file (by audit_writes)."""
+    out = []
+    for rel, text in files:
+        if rel != WRITER_FILE and not audit_writes(text):
+            continue
+        for lineno, name, source, ok_ in action_call_findings(text):
+            if not ok_ and (rel, lineno) not in ALLOWED_CALL_FINDINGS:
+                out.append("%s line %d: %s(... %s ...)" % (rel, lineno, name, source))
+    return out
+
+
+class TestOtherWritersAndCallers(unittest.TestCase):
+    """The names walk reads cloud_worker.py. This guards the rest: no other file writes the audit file, and every call of the
+    forwarding functions passes its action as a literal."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.files = audit_scan_files()
+        cls.worker_text = dict(cls.files)[WRITER_FILE]
+
+    def test_no_other_file_writes_the_audit_file(self):
+        writers = sorted(rel for rel, text in self.files if audit_writes(text))
+        print("files that name the audit file (%d): %s" % (len(self.files), ", ".join(rel for rel, _ in self.files)))
+        print("files that write it: %s" % ", ".join(writers))
+        self.assertEqual(writers, [WRITER_FILE])
+        self.assertEqual(other_writer_files(self.files), [], "another file writes the audit file")
+
+    def test_a_write_in_another_file_is_caught(self):
+        run_record_text = (ROOT / "cloud" / "launcher" / "run_record.py").read_text()
+        scratch = run_record_text + "\n\ndef scratch_write(path):\n    write_audit(path, {'action': 'stop'})\n"
+        self.assertNotEqual(scratch, run_record_text)
+        files = [(rel, scratch if rel == "cloud/launcher/run_record.py" else text) for rel, text in self.files]
+        self.assertEqual(other_writer_files(files), ["cloud/launcher/run_record.py"])
+        opened = run_record_text + "\n\ndef scratch_open(env):\n    audit = env['CW_CLOUD_AUDIT']\n    return open(audit, 'a')\n"
+        self.assertEqual(other_writer_files([("cloud/launcher/run_record.py", opened)]), ["cloud/launcher/run_record.py"])
+
+    def test_every_call_passes_its_action_as_a_literal(self):
+        for rel, text in self.files:
+            if rel != WRITER_FILE and not audit_writes(text):
+                continue
+            for lineno, name, source, ok_ in action_call_findings(text):
+                print("%s line %d: %s action %s%s" % (rel, lineno, name, source, "" if ok_ else "  FINDING"))
+        self.assertEqual(call_findings(self.files), [], "an audit action that is not a literal")
+        self.assertEqual(ALLOWED_CALL_FINDINGS, {})
+        self.assertGreaterEqual(len(action_call_findings(self.worker_text)), 15)
+
+    def test_a_call_with_a_variable_action_is_caught(self):
+        old = 'return self._audited(worker, "stop", go, audit_reason)'
+        self.assertEqual(self.worker_text.count(old), 1)
+        scratch = self.worker_text.replace(old, 'action = "stop"\n        return self._audited(worker, action, go, audit_reason)')
+        self.assertNotEqual(scratch, self.worker_text)
+        found = call_findings([(WRITER_FILE, scratch)])
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("%s line " % WRITER_FILE, found[0])
+        self.assertIn("_audited(... action ...)", found[0])
+        print("mutant finding: %s" % found[0])
+        for variant in ('f"s{a}"', "a if x else b", "name"):
+            again = self.worker_text.replace(old, "return self._audited(worker, %s, go, audit_reason)" % variant)
+            self.assertEqual(len(call_findings([(WRITER_FILE, again)])), 1, variant)
+
+
 def mock_stderr(stream):
     import contextlib
     return contextlib.redirect_stderr(stream)
