@@ -6220,3 +6220,11 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## `pins`: the existing tests your diff may contradict (#1543)
+
+A cloud pod has no `heavy` and cannot run the whole suite, so an existing test that pins the old behaviour first fails in the full CI run, and each case then costs a plan amendment, a new approval and a new pod.
+
+- **What it lists.** `fleet-switchboard pins [--base REF]` (default `origin/integration`) reads the `git diff` of the checkout against the base. For each existing test under `tests/`, the `bin/test-*` files, `cloud/launcher/tests/`, `cloud/worker/tests/` and `cloud/tests/` that names a function, class or constant the diff changes or removes, or a quoted message of 12 characters or more of a removed or changed line, it prints one line: `file:line  Class::test  matched <term>`, then a count line. It never lists a test the diff itself adds, prints at most 200 lines and says when it cut. A diff with no match prints `no existing test names a changed definition or message`.
+- **It only reads.** It runs `git diff` and `git grep` over the checkout: no network, no write. It exits 0 whatever it finds, and non-zero only when the diff cannot be read. It does not run the tests and does not decide that a listed test is contradicted.
+- **What a builder does.** Run the listed classes before you push (`fleet-switchboard heavy --short -- ...`), and say in the pull request which listed tests the change legitimately contradicts.

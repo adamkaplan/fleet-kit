@@ -108,6 +108,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/judge_request.py` | 5 | the policy judge's request: what is asked and with what context | |
 | `switchboard/plan_review.py` | 5 | the `plan review` command family (slice R2) | |
 | `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
+| `switchboard/pins.py` | 5 | `pins`: the existing tests that name what the diff changes or removes (read-only) | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
 | `switchboard/audit.py` | 2 | the audit log | |

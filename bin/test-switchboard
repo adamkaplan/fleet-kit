@@ -155,6 +155,8 @@ FakeQueueGh, TestClosingKeywordWarning, TestPreflightPr, TestFocusedLocalRuns = 
 TestBatchingDocs, FakePullFiles, TestCloudWatchBounds, TestArchTools = (_support_test_cases_08.TestBatchingDocs, _support_test_cases_08.FakePullFiles, _support_test_cases_08.TestCloudWatchBounds, _support_test_cases_08.TestArchTools)   # support import
 _support_test_cases_09 = importlib.import_module("test_cases_09")   # support import
 TestItemVerdicts, ReviewCommentLineTests = (_support_test_cases_09.TestItemVerdicts, _support_test_cases_09.ReviewCommentLineTests)   # support import
+_support_test_pins = importlib.import_module("test_pins")   # support import
+TestPins, TestPinsMutants = (_support_test_pins.TestPins, _support_test_pins.TestPinsMutants)   # support import
 
 
 def daemon_text(path):
