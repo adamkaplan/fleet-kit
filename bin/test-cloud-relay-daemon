@@ -1722,16 +1722,26 @@ class TrickleHub(unittest.TestCase):
         worker.join(limit)
         return (not worker.is_alive()), time.monotonic() - t0, notes
 
+    # The transport's OWN deadlines (socket timeouts, `end`, the watchdog Timer) are stretched x30 in these two tests, so that the ONLY
+    # wall-clock cut left is the worker join at READ_DEADLINE (1.0 s). With all of them at 1.0 s the outcome depended on which timer fired
+    # first (a TimeoutError from the transport, or the cut): that is speed, not behaviour. Now the outcome is the observation: the pass
+    # ended through the cut path (one relay.pass_cut line) or it did not end.
+    STRETCH = (("end = time.monotonic() + READ_DEADLINE", "end = time.monotonic() + READ_DEADLINE * 30"),
+               ("conn = conn_class(parts.netloc, timeout=READ_DEADLINE)", "conn = conn_class(parts.netloc, timeout=READ_DEADLINE * 30)"),
+               ("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(READ_DEADLINE * 30, cut)"))
+
     def test_pass_returns_within_5s_with_one_cut_line(self):
-        done, _, notes = self.one_pass(relay, 1.0, 20.0)   # the stub needs about 40 s to finish; 20 s is a loose bound for a loaded machine
+        mod = load_backend_module(*self.STRETCH[0], extra=self.STRETCH[1:])
+        done, _, notes = self.one_pass(mod, 1.0, 20.0)   # the stub needs about 40 s to finish; 20 s is a loose bound for a loaded machine
         self.assertTrue(done)
         self.assertEqual([(k, d["error"]) for k, _, d in notes], [("relay.pass_cut", "relay pass cut")])
 
     def test_mutant_without_the_total_deadline_is_caught(self):
-        # the deadline removed from the REAL code (a string mutant, like the neighbouring tests): the pass is still running after 3 s
-        mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
-        done, _, _ = self.one_pass(mod, 1.0, 3.0)
+        # the join cut removed from the REAL code (a string mutant, like the neighbouring tests): the pass is still running after 3 s
+        mod = load_backend_module(*self.STRETCH[0], extra=self.STRETCH[1:] + (("worker.join(READ_DEADLINE)", "worker.join()"),))
+        done, _, notes = self.one_pass(mod, 1.0, 3.0)
         self.assertFalse(done)
+        self.assertEqual(notes, [])
 
 
 class HubFilesUnchanged(unittest.TestCase):
