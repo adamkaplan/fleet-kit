@@ -377,6 +377,98 @@ class TestTimeShape(World):
         self.assertGreater(self.sent_text(bad, broken).count(bad), 0)   # the real code: 0
 
 
+FULL_WIDTH_ONE, ARABIC_INDIC_ONE, KELVIN = "\uff11", "\u0661", "\u212a"
+GOOD_TS = "2026-01-01T10:00:00Z"
+ISO_OLD = 're.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")'
+ISO_BAD = 're.compile(r"\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z")'
+STAMP_OLD = 'r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}"'
+STAMP_BAD = 'r"\\d{8}T\\d{6}Z-[0-9a-f]{6}"'
+HOUR_OLD = 'r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}"'
+HOUR_BAD = 'r"\\d{4}-\\d\\d-\\d\\dT\\d\\d"'
+
+
+class TestAsciiFields(World):
+    """Every pattern that guards a field reaching a message, a recipient or a dedupe key matches ASCII only."""
+
+    def texts(self, module=real):
+        self.run_pass(module)
+        return " ".join(t for _, t in self.sent)
+
+    def test_s18_a_non_ascii_digit_in_the_time_shows_as_unknown(self):
+        for digit in (FULL_WIDTH_ONE, ARABIC_INDIC_ONE):
+            with self.subTest(digit=digit):
+                self.setUp()
+                bad = GOOD_TS.replace("2026", "20" + digit + "6", 1)
+                self.worker("worker7")
+                self.stop("worker7", "idle", ts=bad)
+                text = self.texts()
+                self.assertTrue(self.sent)
+                self.assertIn("at unknown;", text)
+                self.assertNotIn(bad, text)
+
+    def test_s18_the_ascii_time_still_passes(self):
+        self.worker("worker7")
+        self.stop("worker7", "idle", ts=GOOD_TS)
+        self.assertIn("at " + GOOD_TS + ";", self.texts())
+
+    def test_s18_a_non_ascii_digit_in_the_record_stamp_shows_as_unknown(self):
+        for digit in (FULL_WIDTH_ONE, ARABIC_INDIC_ONE):
+            with self.subTest(digit=digit):
+                self.setUp()
+                self.worker("worker7")
+                bad = os.path.join(self.dir, "runs", "worker7-2026010%sT000000Z-0f1e2d" % digit)
+                self.line({"ts": GOOD_TS, "action": "stop", "worker": "worker7", "ok": True, "cause": "idle", "reason": "idle; run-id=q; run record " + bad})
+                text = self.texts()
+                self.assertEqual(len(self.sent), 2)
+                self.assertIn("run record: unknown.", text)
+
+    def test_s18_a_non_ascii_digit_in_the_hour_does_not_make_a_dedupe_key(self):
+        for digit in (FULL_WIDTH_ONE, ARABIC_INDIC_ONE):
+            with self.subTest(digit=digit):
+                self.setUp()
+                self.worker("worker7")
+                self.line({"ts": "2026-01-01T1%s:00:00Z" % digit, "action": "stop", "worker": "worker7", "ok": True, "cause": "pod_gone", "reason": "pod gone"})
+                self.run_pass()
+                self.assertEqual(self.sent, [])   # no run id and no valid hour: no line to count
+
+    def test_s18_a_non_ascii_worker_name_sends_nothing(self):
+        for name in ("worker" + FULL_WIDTH_ONE, "worker" + ARABIC_INDIC_ONE, "wor" + KELVIN + "er"):
+            with self.subTest(name=name):
+                self.setUp()
+                self.line({"ts": GOOD_TS, "action": "stop", "worker": name, "ok": True, "cause": "idle", "reason": "idle; run-id=q"})
+                self.run_pass()
+                self.assertEqual(self.sent, [])
+
+    def test_s18_a_non_ascii_chief_name_in_the_record_gets_no_message(self):
+        for boss in ("coder-lead" + FULL_WIDTH_ONE, "coder-lead" + ARABIC_INDIC_ONE, "coder-" + KELVIN):
+            with self.subTest(boss=boss):
+                self.setUp()
+                self.worker("worker7", boss=boss)
+                self.stop("worker7", "idle")
+                self.run_pass()
+                self.assertEqual([to for to, _ in self.sent], [real.CHIEF])
+
+    def test_s18_a_mutant_with_d_in_a_pattern_is_caught(self):
+        bad_stamp = "worker7-2026010%sT000000Z-0f1e2d" % FULL_WIDTH_ONE
+        for old, new, scenario in (
+                (ISO_OLD, ISO_BAD, "time"), (STAMP_OLD, STAMP_BAD, "stamp"), (HOUR_OLD, HOUR_BAD, "hour")):
+            with self.subTest(pattern=scenario):
+                self.setUp()
+                broken = mutant(old, new)
+                self.worker("worker7")
+                if scenario == "time":
+                    self.stop("worker7", "idle", ts=GOOD_TS.replace("2026", "20" + FULL_WIDTH_ONE + "6", 1))
+                    self.assertNotIn("at unknown;", self.texts(broken))   # the real code shows unknown
+                elif scenario == "stamp":
+                    bad = os.path.join(self.dir, "runs", bad_stamp)
+                    self.line({"ts": GOOD_TS, "action": "stop", "worker": "worker7", "ok": True, "cause": "idle", "reason": "idle; run-id=q; run record " + bad})
+                    self.assertNotIn("run record: unknown.", self.texts(broken))
+                else:
+                    self.line({"ts": "2026-01-01T1%s:00:00Z" % FULL_WIDTH_ONE, "action": "stop", "worker": "worker7", "ok": True, "cause": "pod_gone", "reason": "pod gone"})
+                    self.run_pass(broken)
+                    self.assertTrue(self.sent)   # the real code sends nothing
+
+
 class TestDocs(unittest.TestCase):
     def test_s6_the_interface_doc_says_what_is_sent_to_whom_and_when(self):
         with open(DOC, encoding="utf-8") as f:

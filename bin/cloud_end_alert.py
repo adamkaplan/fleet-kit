@@ -24,7 +24,7 @@ FILE_BYTES = 65536       # the most a record file may be
 CAUSES = {"idle": "idle limit", "hard": "hard limit", "pod_gone": "pod gone", "pod_failed": "pod failed"}
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")   # the switchboard's own agent-name pattern (NAME_RE in bin/fleet-switchboard)
 WORKER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-RECORD_STAMP = r"\d{8}T\d{6}Z-[0-9a-f]{6}"   # the launcher's run record name: <worker>-<UTC stamp>-<6 hex> (cloud/launcher/run_record.py)
+RECORD_STAMP = r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}"   # the launcher's run record name: <worker>-<UTC stamp>-<6 hex> (cloud/launcher/run_record.py)
 SAFE = re.compile(r"[^A-Za-z0-9._/:+@=-]")
 
 
@@ -33,7 +33,7 @@ def plain(value, limit=80):
     return SAFE.sub("", str(value))[:limit]
 
 
-ISO_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+ISO_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
 
 def when_text(value):
@@ -161,7 +161,7 @@ def scan_audit(audit_file, state_file, cloud_dir, last_reports, send, parse, aud
         if label is None or not isinstance(worker, str) or not WORKER_NAME.fullmatch(worker):
             continue
         run_id, record_name = parse_reason(reason)
-        hour = re.match(r"\d{4}-\d\d-\d\dT\d\d", str(line.get("ts")))
+        hour = re.match(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}", str(line.get("ts")))
         if not run_id and not hour:
             continue
         key = (run_id or "%s@%s" % (worker, hour.group(0)), cause)   # no run id: worker, cause and the hour
