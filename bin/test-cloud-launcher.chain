@@ -30,6 +30,7 @@ cloud/launcher/tests/test_cw_names.py
 cloud/launcher/tests/test_docs_preflight_modes.py
 cloud/launcher/tests/test_driver.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
+cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_issues_read.py
 cloud/launcher/tests/test_mint_roles.py
@@ -37,6 +38,7 @@ cloud/launcher/tests/test_model_credential.py
 cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
+cloud/launcher/tests/test_orphan_secrets.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_reaper_managed.py
