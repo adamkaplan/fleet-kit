@@ -79875,7 +79875,11 @@ class TestCiTestFileList(unittest.TestCase):
         self.assertEqual(self._exempt_claim_problems(Path(__file__).read_text(), globals()), [])
 
     def test_a_switchboard_that_stops_loading_test_impact_brief_fails_naming_the_row(self):
-        source = Path(__file__).read_text().replace(', "test-impact-brief")}', ')}', 1)
+        original = Path(__file__).read_text()
+        source = original.replace('"test-impact-brief", ', '', 1)
+        if source == original:
+            source = original.replace(', "test-impact-brief")', ')', 1)
+        self.assertNotEqual(source, original)
         problems = self._exempt_claim_problems(source, {k: v for k, v in globals().items() if not k.startswith("Brief_impact_brief_")})
         self.assertEqual(len(problems), 3)
         self.assertTrue(all("exempt bin/test-impact-brief" in p for p in problems))
