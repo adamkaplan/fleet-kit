@@ -135,6 +135,26 @@ class PendingJobs(unittest.TestCase):
         self.assertEqual(jobs[0][2], 5)
         self.assertEqual(sorted(j[3] for j in jobs), ["in_progress", "queued"])
 
+    def test_s7_through_ci_record_core_the_refusal_names_the_two_pending_jobs(self):
+        import types
+        entries = [self.job("lint", 5, "COMPLETED", "SUCCESS"), self.job("audit", 5, "IN_PROGRESS", ""), self.job("build", 5, "QUEUED", "")]
+        facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": entries})
+        ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1)
+        ci = ci_runs()
+        old = ci.READER
+        ci.READER = lambda repo, run: (1, "push")
+        ci._CACHE.clear()
+        ci._FAILED.clear()
+        try:
+            why = sb.ci_record_core(ctx, lambda: 0, quiet=True)["why"]
+        finally:
+            ci.READER = old
+            ci._CACHE.clear()
+            ci._FAILED.clear()
+        self.assertIn('"Run Unit Tests" job "audit" run 5 is in_progress', why)
+        self.assertIn('"Run Unit Tests" job "build" run 5 is queued', why)
+        self.assertNotIn("lint", why)
+
     def test_s8_the_recorded_case_is_green(self):
         entries = [self.job("Check the audit instrument can fire", 7, "COMPLETED", "SUCCESS", "2026-10-30T09:00:00Z"),
                    self.job("Check the audit instrument can fire", 7, "IN_PROGRESS", "SUCCESS", "2026-10-30T10:00:00Z")]
@@ -203,3 +223,36 @@ class BotMutants(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BotSize(unittest.TestCase):
+    """U6 and U7 (#1625)."""
+    def added(self, path):
+        import subprocess
+        base = None
+        for ref in ("origin/integration", "integration"):
+            if subprocess.run(["git", "-C", str(REPO), "rev-parse", "--verify", "-q", ref], capture_output=True).returncode == 0:
+                base = ref
+                break
+        if base is None:
+            self.skipTest("no integration ref to diff against")
+        out = subprocess.run(["git", "-C", str(REPO), "diff", base + "...HEAD", "-U0", "--no-color", "--", path], capture_output=True, text=True, timeout=60).stdout
+        return [l[1:] for l in out.splitlines() if l.startswith("+") and not l.startswith("+++")]
+
+    def test_u6_the_entry_adds_at_most_15_lines_and_the_test_runner_at_most_3_beyond_the_pin(self):
+        self.assertLessEqual(len(self.added("bin/fleet-switchboard")), 15)
+        pin = 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" job "build" run 101 is queued]'
+        self.assertLessEqual(len([l for l in self.added("bin/test-switchboard") if pin not in l]), 3)
+
+    def test_u7_a_bot_finding_does_not_reach_the_verdict_or_the_exit_status(self):
+        import re
+        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        body = source[source.index("def cmd_gates(args, runner, now):"):source.index("def cmd_gates_ask_close(")]
+        uses = [l.strip() for l in body.splitlines() if re.search(r"\bbots\b", l)]
+        self.assertEqual(len(uses), 3, uses)   # the assignment, the JSON key and the one text extension: none reads a verdict
+        self.assertFalse([l for l in uses if "ready" in l or "verdict" in l or "EXIT" in l])
+        rows = [review("reviewer-a[bot]", 1)]
+        lines = sb.bot_review_lines(rows, HEAD)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("5 FIX", lines[0])
+        self.assertNotRegex("\n".join(lines), r"READY|NOT READY|blocking review")
