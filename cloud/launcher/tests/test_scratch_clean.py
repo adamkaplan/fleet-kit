@@ -240,16 +240,38 @@ class ZombieChild(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stderr[-800:])
 
 
+PLACE_RE = re.compile(r"(?:TemporaryDirectory|mkdtemp)\((?:[^()\n]*,\s*)?dir\s*=\s*(?:str\(\s*)?(?:ROOT|BIN\.parent)\b")
+
+
+def find_places(source):
+    """The scratch directories a source makes under the repository root or its bin directory."""
+    return PLACE_RE.findall(source)
+
+
 class Places(unittest.TestCase):
+    KNOWN = ["bin/test-cloud-worker", "bin/test-cloud-retired", "cloud/launcher/tests/test_orchestrator_hub_session.py"]
+
     def test_s2_every_place_that_makes_a_scratch_directory_under_the_root(self):
         out = subprocess.run(["git", "grep", "-l", "-E", "SourceFileLoader.*test-cloud-worker", "--", "bin", "cloud"], cwd=ROOT, capture_output=True, text=True).stdout.split()
         found = sorted((set(out) | {"bin/test-cloud-worker"}) - {"cloud/launcher/tests/test_scratch_clean.py", "cloud/launcher/tests/test_fixture_root.py"})   # these files are tests of the fixture itself
-        src = (ROOT / "bin" / "test-cloud-worker").read_text()
-        places = re.findall(r"TemporaryDirectory\(dir=str\(BIN\.parent\)\)|mkdtemp\(dir=str\(BIN\.parent\)\)", src)
+        places = []
+        for f in found:
+            places += [(f, m) for m in find_places((ROOT / f).read_text())]
         print("S2: places under the repository root %d, loading files %d" % (len(places), len(found)))
         self.assertEqual(places, [])
-        self.assertEqual(found, sorted(["bin/test-cloud-worker", "bin/test-cloud-retired", "cloud/launcher/tests/test_orchestrator_hub_session.py"]))
+        self.assertTrue(set(self.KNOWN) <= set(found), found)
         print("S2: the evidence decides: the test judged the whole root (certain); the fixture's children are the probable origin")
+
+    def test_s2_mutant_a_root_scratch_line_is_found(self):
+        src = (ROOT / "bin" / "test-cloud-worker").read_text()
+        mutant = src + "\ntempfile.mkdtemp(dir=str(BIN.parent))\n"
+        n = len(find_places(mutant))
+        print("S2 mutant: places found %d of 1 (mutation applied %s)" % (n, mutant != src))
+        self.assertEqual(n, 1)
+        self.assertEqual(len(find_places(src)), 0)
+        self.assertEqual(len(find_places("x = 1\ntempfile.mkdtemp()\n")), 0)
+        for form in ("TemporaryDirectory(dir=ROOT)", "tempfile.mkdtemp(prefix='a', dir=str(ROOT))", "TemporaryDirectory(dir=BIN.parent)"):
+            self.assertEqual(len(find_places(form)), 1, form)
 
 
 class Docs(unittest.TestCase):
