@@ -290,12 +290,13 @@ def read_result(arg):
     """--read FILE: print the lines the foreground run prints; 0 finished clean, 1 difference, 4 running, 2 unreadable."""
     path = os.path.join(arg, "result.json") if os.path.isdir(arg) else arg
     try:
+        import record_json  # the shared bounded-depth parse, found next to this file (sys.path above)
         with open(path) as fh:
-            doc = json.load(fh)
+            doc = record_json.parse_bounded(fh.read())
         files = doc["files"]
         status = doc["status"]
         assert isinstance(files, list) and status in ("running", "finished")
-    except (OSError, ValueError, KeyError, AssertionError, TypeError):
+    except (OSError, ValueError, KeyError, AssertionError, TypeError, ImportError):
         print("cloud-prepush: cannot read the result file " + arg, file=sys.stderr)
         return 2
     for l in doc.get("notes", []):

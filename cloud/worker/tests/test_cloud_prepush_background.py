@@ -66,6 +66,7 @@ class Base(unittest.TestCase):
         d = os.path.join(self.tmp, "bin")
         os.makedirs(d, exist_ok=True)
         shutil.copy(script or SCRIPT, os.path.join(d, "cloud-prepush"))
+        shutil.copy(os.path.join(ROOT, "bin", "record_json.py"), os.path.join(d, "record_json.py"))
         with open(os.path.join(d, "cloud-pr-preflight"), "w") as f:
             f.write("import sys\nsys.exit(0)\n")
         return os.path.join(d, "cloud-prepush")
@@ -260,7 +261,7 @@ class Reads(Base):
                 rec.set("f%d" % (i % 200), branch="pass", text="x" * 2000)
                 i += 1
 
-        t = threading.Thread(target=writer)
+        t = threading.Thread(target=writer, daemon=True)
         t.start()
         ok = 0
         try:

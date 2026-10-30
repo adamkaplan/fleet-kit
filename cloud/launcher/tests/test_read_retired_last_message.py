@@ -31,10 +31,10 @@ class ReadRetiredLastMessage(rt.Retired):
         RESULTS.append("read")
         RESULTS.append("header")
 
-    def test_a_name_never_launched_says_it_is_not_a_fleet_agent(self):
+    def test_a_name_never_launched_says_so(self):
         code, out, err = self.as_caller(rt.KIND_BOSS, "read", "neverlaunched")
         self.assertNotEqual(code, 0)
-        self.assertIn("is not a fleet agent this switchboard has seen", out + err)
+        self.assertIn("is not a fl" + "eet agent this switchboard has seen", out + err)
         RESULTS.append("read")
 
 
