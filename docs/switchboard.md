@@ -2869,6 +2869,8 @@ On a crossing the Chief of Staff gets ONE reminder (the ordinary delivery rule; 
 
 **What is still refused, and what is not queued.** A recipient that is gone (`not found`) or retired, one claimed by two sessions (`conflict`), a state that could not be read, a `report` (only `send` queues), the cloud endpoint route and every send made by the daemon itself keep their refusal, with its reason; nothing is queued for them. The queue is bounded per recipient: 50 messages, 120000 bytes, and one message of at most 3000 characters. A full queue refuses the next message with the reason and never drops an earlier one unseen.
 
+There is no expiry: a queue for a pane that is held forever stays until the hold ends or it is full and refuses. A retired recipient keeps its queue file.
+
 | Item | Value | What it bounds or refuses | Test | Mutant |
 | --- | --- | --- | --- | --- |
 | a held pane's message | queued, exit 0 | the old refusal | `test_a_message_to_a_blocked_pane_is_queued_and_the_sender_is_told` | `a held pane's message is dropped` |

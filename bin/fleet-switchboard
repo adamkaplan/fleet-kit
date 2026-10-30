@@ -14575,7 +14575,7 @@ def _cmd_send(args, runner, now):
         return EXIT_USAGE
     verdict = check_approval(config, runner, now, text, repo, number)   # #951: only a message that starts `Approved at sha256:`; GETs only; never raises
     try:
-        outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt, queue_held=True)
+        outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt, queue_held=not args.interrupt)
     except InterruptRefused as err:
         sys.stderr.write("%s: not interrupted, nothing sent: %s\n" % (PROG, err))
         return EXIT_USAGE

@@ -79856,6 +79856,18 @@ class TestHoldQueue(Base):
         file.write_text('{"items": ' + "[" * depth + "]" * depth + "}")
         self.assertEqual(hq._read(file), {"seq": 0, "items": [], "delivered": []})
 
+    def test_an_interrupt_send_to_a_held_pane_stays_refused_and_a_plain_send_is_queued(self):
+        self.world.add_agent("helper", fleet={"role": "coder", "reports_to": "coder"})
+        self.world.herdr.panes[self.world.panes["helper"]]["status"] = "blocked"
+        code, _, err = self.main("send", "helper", "--from", "coder", "--interrupt", "stop")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("blocked", err)
+        self.assertEqual(sorted(Path(self.world.state).glob("hold-queue-*.json")), [])
+        self.assertEqual(self.queued("helper"), [])
+        code, _, err = self.send("plain", to="helper")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([i["text"] for i in self.queued("helper")], ["plain"])
+
     def test_a_pane_claimed_by_two_sessions_is_refused_not_queued(self):
         other = self.world.v2.create_session({"fleet": {"name": "platform", "role": "coder"}})
         self.world.herdr.add(self.world.herdr.new_pane_id(), other)

@@ -1,4 +1,4 @@
-"""The hold queue: a message sent to a pane that is on hold is kept in the recipient's own queue until the hold ends.
+"""The queued sends: a message sent to a pane that is on hold is kept in the recipient's own queue until the hold ends.
 
 One file per recipient in the state directory (`hold-queue-<name>.json`, mode 0600, written through a temp file and a rename, under one lock),
 bounded in count and in bytes. The queue never drops an unseen message to make room: a full queue refuses the next one, with the reason.
