@@ -24,8 +24,9 @@ SOURCE = (REPO / "bin" / "size_ceilings.py").read_text()
 BIG = "bin/big"
 ROW = "| `bin/big` | `-` | size | %s | a fixture file |\n"
 DOC = "# Fixture\n\n## Units\n\n| Unit | Layer |\n|---|---|\n| `x.py` | 1 |\n\n## Known violations\n\n| From | To | Kind | Count | Why |\n|---|---|---|---|---|\n%s\n## Next\n\nText.\n"
+_EMPTY_HOME = tempfile.mkdtemp(prefix="size-ceilings-home-")   # an empty home: the fixture's git reads no user configuration
 ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com",
-           GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+           HOME=_EMPTY_HOME, XDG_CONFIG_HOME=_EMPTY_HOME, GIT_CONFIG_NOSYSTEM="1")
 
 
 def git(root, *argv):

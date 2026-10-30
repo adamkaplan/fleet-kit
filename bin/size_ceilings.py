@@ -12,6 +12,7 @@ The merge result is made here, from the head sha and the CURRENT tip (`git merge
 no working tree, no comment). The ceilings are read from the document AT THE MERGE RESULT. A file fails only when it is over its ceiling after the
 merge AND the pull request makes it longer; a file that is over and not made longer by the pull request passes (it is not made worse).
 Fails closed: a merge that conflicts cannot be sized (one line naming the conflict), and an unreadable size row is a problem line naming the row.
+A pull request that RAISES its own ceiling in the same diff passes (the raise is an owner-visible diff of docs/architecture.md).
 Known limit: a file with no `size` row is held only by the default limits in the architecture test, on the merge ref; this check does not see it.
 Standard library only.
 """
