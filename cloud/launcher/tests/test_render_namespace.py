@@ -741,5 +741,66 @@ class Chained(unittest.TestCase):
             self.assertEqual(f.readline(), "#!/usr/bin/env python3\n")
 
 
+class OnceAndLabel(unittest.TestCase):
+    STALE = ("The blocks below are read as pasted into an interactive shell by the holder of the administrator login. "
+             "The function `ns_ok`, defined once in the first block, only REPORTS: it prints a line.")
+
+    def setUp(self):
+        with open(DOCS, encoding="utf-8") as f:
+            self.whole = probe_section(f.read())
+        self.first = code_blocks(self.whole)[0].split("\n")[0]
+
+    def counts(self, text):
+        return [text.count("%d. Step %d, " % (n, n)) for n in range(1, 7)] + [text.count("The blocks below")]
+
+    def test_each_step_and_each_blocks_below_paragraph_is_found_once(self):
+        self.assertEqual(self.counts(self.whole), [1] * 7)
+        mutant = self.whole.replace("\nThe command list for the administrator apply (the owner's steps 3 and 4):",
+                                    "\n" + self.STALE + "\n\nThe command list for the administrator apply (the owner's steps 3 and 4):", 1)
+        self.assertNotEqual(mutant, self.whole)   # the mutation is applied
+        self.assertEqual(self.counts(mutant)[6], 2)
+        self.assertNotEqual(self.counts(mutant), [1] * 7)
+        step = [l for l in self.whole.split("\n") if l.startswith("4. Step 4, ")][0]
+        mutant = self.whole.replace("\nThe command list for the administrator apply (the owner's steps", "\n" + step + "\nThe command list for the administrator apply (the owner's steps", 1)
+        self.assertNotEqual(mutant, self.whole)   # the mutation is applied
+        self.assertNotEqual(self.counts(mutant), [1] * 7)
+
+    def test_the_empty_token_file_sentence_is_found_once(self):
+        sentence = "If the command was refused, remove the empty token file before running it again: `rm -f \"${TOKEN_FILE:?}\"`"
+        self.assertEqual(self.whole.count(sentence), 1)
+        self.assertEqual(self.whole.replace(sentence, "", 1).count(sentence), 0)
+
+    def calls_for(self, value):
+        text = self.first + "\nNS=\"$1\"\nkc() { ns_ok && kubectl -n \"${NS:?}\" \"$@\"; }\nkc get pods\n"
+        with tempfile.TemporaryDirectory() as scratch:
+            bindir = os.path.join(scratch, "bin")
+            os.mkdir(bindir)
+            log = os.path.join(scratch, "calls.txt")
+            with open(os.path.join(bindir, "kubectl"), "w") as f:
+                f.write('#!/bin/sh\necho "$*" >> "$STUB_LOG"\nexit 0\n')
+            os.chmod(os.path.join(bindir, "kubectl"), 0o755)
+            env = {"PATH": bindir + ":/usr/bin:/bin", "STUB_LOG": log}
+            subprocess.run(["sh", "-c", text, "sh", value], env=env, capture_output=True, text=True, timeout=30)
+            if not os.path.exists(log):
+                return 0
+            with open(log) as f:
+                return len(f.read().splitlines())
+
+    def test_the_guard_matches_a_dns_label_with_the_stub(self):
+        for value in ("cw ", "CW", "Cwp", "cwp --all-namespaces", "-n", "a" * 64, "c.p", "c/p", "-cwp", "cwp-"):
+            self.assertEqual(self.calls_for(value), 0, repr(value))
+        self.assertEqual(self.calls_for("cwp"), 1)
+        self.assertEqual(self.calls_for("a" * 63), 1)
+
+    def test_a_guard_without_the_label_check_lets_a_trailing_space_through(self):
+        old = 'ns_ok() { case "$NS" in ""|cw|default|kube-*) echo "refused: NS is $NS" >&2; return 1;; esac; }'
+        self.first, saved = old, self.first
+        try:
+            self.assertEqual(self.calls_for("cw "), 1)   # the deny-list alone passes it
+        finally:
+            self.first = saved
+        self.assertEqual(self.calls_for("cw "), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
