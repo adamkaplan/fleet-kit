@@ -32,17 +32,29 @@ def _signed_part(part):
     return any(_signed_name(pair.split("=", 1)[0]) for pair in re.split(r"[&;?#]", part) if pair)
 
 
+RUN_CAP = 2000
+
+
+def _has_mark(text):
+    decoded = _decode(text)
+    return "?" in decoded or "#" in decoded
+
+
 def _scrub_one_url(match):
     url = match.group(0)
-    decoded = _decode(url)
+    judged = url[:RUN_CAP]   # only the first RUN_CAP characters of a run are judged; the summary cap cuts the rest
+    decoded = _decode(judged)
     cut = [i for i in (decoded.find("?"), decoded.find("#")) if i >= 0]
     if not cut or not _signed_part(decoded[min(cut) + 1:]):
         return url
-    head = url
-    for i in range(1, len(url) + 1):
-        if "?" in _decode(url[:i]) or "#" in _decode(url[:i]):
-            head = url[:i]
-            break
+    lo, hi = 1, len(judged)   # smallest prefix whose decoded copy holds a mark: about 11 decodes, not one per index
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _has_mark(judged[:mid]):
+            hi = mid
+        else:
+            lo = mid + 1
+    head = judged[:lo]
     found = _TRAILING_ESCAPE_RE.search(head)
     head = head[:found.start()] if found and head[-1] not in _MARKS else head[:-1]
     return head + QUERY_REMOVED

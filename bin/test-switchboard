@@ -79966,6 +79966,49 @@ class TestSignedLinkScrub(Base):
         self.assertEqual(sum(everything.count(v) for v in values), 0)
         self.assertEqual(everything.count(_planted(90)[:6]), 0)
 
+    def test_c1_a_long_run_with_the_signed_pair_after_2100_characters_never_reaches_a_message_or_the_audit(self):
+        value = _planted(5)
+        url = "https://h.example/" + "a" * 2100 + "?token=" + value
+        for body in (url, "x" * 350 + " " + url):
+            with self.subTest(start=body.index("https")):
+                for summary in self._kinds(body):
+                    self.assertNotIn(value[:6], summary)
+        rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1}})
+        rig.gh.issue(1)
+        rig.gh.issue(12, parent=1)
+        rig.hub.tick()
+        rig.gh.comment(12, "x" * 350 + " " + url, 7200)
+        rig.pump(60)
+        rig.hub.tick()
+        everything = rig.state_text() + json.dumps(rig.world.admissions("platform")) + json.dumps(rig.world.audit())
+        self.assertEqual(everything.count(value[:6]), 0)
+
+    def test_c2_the_2000_character_cap_of_one_run(self):
+        value = _planted(6)
+        tail = "?token=" + value
+        inside = "https://h.example/" + "a" * (1999 - len("https://h.example/") - len(tail)) + tail
+        self.assertEqual(len(inside), 1999)
+        out = sb.scrub_signed_links(inside)
+        self.assertNotIn(value[:6], out)
+        self.assertTrue(out.endswith("[query removed]"))
+        beyond = "https://h.example/" + "a" * (2000 - len("https://h.example/")) + tail
+        self.assertEqual(beyond.index("?"), 2000)
+        self.assertEqual(sb.scrub_signed_links(beyond), beyond)   # the scrub leaves it; the summary cap cuts it
+        for summary in self._kinds(beyond):
+            self.assertNotIn(value[:6], summary)
+
+    def test_c3_a_100000_character_encoded_run_is_scrubbed_in_under_a_second(self):
+        import time
+        value = _planted(7)
+        text = "https://a.com/" + "%25" * 100000 + "?token=" + value
+        start = time.monotonic()
+        out = sb.scrub_signed_links(text)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(out, text)   # no mark in the first 2,000 characters: the scrub leaves the run, the summary cap cuts it
+        for summary in self._kinds(text):
+            self.assertFalse(value[:6] in summary)
+
 
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
