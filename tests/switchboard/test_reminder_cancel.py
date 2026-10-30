@@ -1,4 +1,4 @@
-"""The #1401 reminder-cancel tests, moved out of bin/test-switchboard (its line ceiling). World and PR4Base are set by bin/test-switchboard before this file runs."""
+"""The #1401 reminder-cancel tests, moved out of bin/test-switchboard (its line ceiling). World and PR4Base are set by bin/test-switchboard before this file runs (injected into the module, not imported)."""
 import json
 from pathlib import Path
 from unittest import mock
@@ -6,7 +6,6 @@ from support.loader import captured, sb
 from support.wire_fakes import EPOCH, FAKE_HERDR, FAKE_OPENCODE
 
 World = None     # set by bin/test-switchboard: World lives in the entry file
-PR4Base = None   # set by bin/test-switchboard: PR4Base lives in the entry file
 
 
 class TestReminderCancel(PR4Base):
