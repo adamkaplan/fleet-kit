@@ -109,6 +109,9 @@ class StopNoCheckout(base.Base):
         work = os.path.join(self.tmp.name, "co")
         subprocess.run(["git", "init", "-q", work], check=True)
         subprocess.run(["git", "-C", work, "remote", "add", "origin", os.path.join(self.tmp.name, "gone.git")], check=True)
+        # one unpushed commit: integration's rule skips a push when nothing is unpushed (an empty repository has nothing)
+        subprocess.run(["git", "-C", work, "-c", "user.name=t", "-c", "user.email=t@invalid", "commit", "-q",
+                        "--allow-empty", "-m", "unpushed"], check=True)
         return work
 
     def test_a_real_checkout_with_an_unreachable_remote_keeps_the_pod(self):
