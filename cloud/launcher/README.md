@@ -189,7 +189,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 
 ## Where the test fixtures make their scratch directory
 
-The fixtures of `bin/test-cloud-worker` make their scratch directory under the repository root. The launcher tests make theirs in the platform's temporary directory. At cleanup the fixture ends every child process that names its directory (end signal, wait at most 15 seconds, kill) and then removes the directory.
+The fixtures of `bin/test-cloud-worker` make their scratch directory in the platform's temporary directory and never in the repository root, because an entry that judges the root runs beside the entries that load the fixture. At cleanup the fixture ends every child process that names its directory (end signal, wait at most 15 seconds, kill) and then removes the directory.
 
 ## How a member adds a test to the chain
 

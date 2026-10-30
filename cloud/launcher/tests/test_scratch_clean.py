@@ -243,9 +243,11 @@ class ZombieChild(unittest.TestCase):
 class Places(unittest.TestCase):
     def test_s2_every_place_that_makes_a_scratch_directory_under_the_root(self):
         out = subprocess.run(["git", "grep", "-l", "-E", "SourceFileLoader.*test-cloud-worker", "--", "bin", "cloud"], cwd=ROOT, capture_output=True, text=True).stdout.split()
-        found = sorted((set(out) | {"bin/test-cloud-worker"}) - {"cloud/launcher/tests/test_scratch_clean.py"})   # this file is the test itself
-        print("S2: places: " + ", ".join(found))
-        # the plan named five; shapes and stub_cleanup do not load Base (shapes uses test_cloud_worker's, stub_cleanup only reads the file)
+        found = sorted((set(out) | {"bin/test-cloud-worker"}) - {"cloud/launcher/tests/test_scratch_clean.py", "cloud/launcher/tests/test_fixture_root.py"})   # these files are tests of the fixture itself
+        src = (ROOT / "bin" / "test-cloud-worker").read_text()
+        places = re.findall(r"TemporaryDirectory\(dir=str\(BIN\.parent\)\)|mkdtemp\(dir=str\(BIN\.parent\)\)", src)
+        print("S2: places under the repository root %d, loading files %d" % (len(places), len(found)))
+        self.assertEqual(places, [])
         self.assertEqual(found, sorted(["bin/test-cloud-worker", "bin/test-cloud-retired", "cloud/launcher/tests/test_orchestrator_hub_session.py"]))
         print("S2: the evidence decides: the test judged the whole root (certain); the fixture's children are the probable origin")
 
@@ -253,8 +255,8 @@ class Places(unittest.TestCase):
 class Docs(unittest.TestCase):
     def test_s8_the_documentation_says_where_the_scratch_goes(self):
         text = " ".join((ROOT / "cloud" / "launcher" / "README.md").read_text().lower().split())
-        phrases = ("the fixtures of `bin/test-cloud-worker` make their scratch directory under the repository root",
-                   "the launcher tests make theirs in the platform's temporary directory",
+        phrases = ("make their scratch directory in the platform's temporary directory and never in the repository root",
+                   "an entry that judges the root runs beside the entries that load the fixture",
                    "at cleanup the fixture ends every child process that names its directory (end signal, wait at most 15 seconds, kill) and then removes the directory")
         found = [p for p in phrases if p in text]
         print("S8: %d of 3 sentences found" % len(found))
