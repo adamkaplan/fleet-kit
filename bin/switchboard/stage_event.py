@@ -70,7 +70,7 @@ def stage_parse(first):
     return fields
 
 
-def stage_item_parts(repo, comment, number, cid):
+def stage_item_parts(repo, comment, number, cid, kind=None):
     """(key, summary) of a stage comment, or None when it is not one (the old path). Reads ONLY the first line of the body, cut at 401 characters first."""
     if not STAGE_LISTS["repos"] or not STAGE_LISTS["bots"]:
         return None
@@ -86,7 +86,8 @@ def stage_item_parts(repo, comment, number, cid):
     if fields is None:
         return "github.stage:%d:unreadable:%s" % (cid, hashlib.sha256(first.encode("utf-8", "replace")).hexdigest()[:12]), STAGE_UNREADABLE
     key = "github.stage:%d:%s:%s:%s" % (cid, fields["status"], fields["head"], fields["until"] or "")
-    text = "stage %s on PR #%d, head %s" % (fields["status"], number, fields["head"][:7])
+    what = {"pr": "PR #", "issue": "issue #"}.get(kind, "#")   # #1591: only this word depends on what the number is (None: unknown, neither word)
+    text = "stage %s on %s%d, head %s" % (fields["status"], what, number, fields["head"][:7])
     if fields["url"]:
         text += ", " + fields["url"]
     if fields["until"]:
