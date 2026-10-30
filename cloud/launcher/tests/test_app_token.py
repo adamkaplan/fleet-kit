@@ -382,7 +382,7 @@ class Mint(unittest.TestCase):
             Stub.retry_after = hdr
             p = self.run_mint()
             Stub.retry_after = None
-            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (75, "", []))
             for w in ("rate limit", "refused", "nothing was minted", want):
                 self.assertIn(w, p.stderr, (hdr, w))
             self.assertNotIn("GMT", p.stderr)
