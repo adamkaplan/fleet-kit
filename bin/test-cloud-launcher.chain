@@ -11,6 +11,7 @@ cloud/launcher/tests/test_cloud_pr_preflight.py
 cloud/launcher/tests/test_cloud_preflight_quick.py
 cloud/launcher/tests/test_cloud_preflight_wired.py
 cloud/launcher/tests/test_cloud_prestop.py
+cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_cloud_quick_bounds.py
 cloud/launcher/tests/test_cloud_quick_guards.py
 cloud/launcher/tests/test_cloud_quick_scans_run.py
