@@ -8559,7 +8559,7 @@ def pr_ci_of(rollup):
         verdict = str(check.get("conclusion") or check.get("state") or "").upper()
         if verdict in failing:
             return "failing"
-        if check.get("status") not in (None, "COMPLETED") or verdict in ("PENDING", "EXPECTED", ""):
+        if (check.get("status") not in (None, "COMPLETED") and verdict != "SUCCESS") or verdict in ("PENDING", "EXPECTED", ""):
             pending = True
     return "pending" if pending else "green"
 
@@ -11818,6 +11818,9 @@ def _review_item(repo, review, pr, now):
         return None
     known, lookups = _pr_refs(pr, number)
     state = str(review.get("state") or "reviewed").lower()
+    bot = bot_wake_item(repo, review, pr, now, known, lookups, number)   # a review bot's finding at the current head: one item per bot and head (#1625)
+    if bot:
+        return bot
     summary = "@%s reviewed PR #%d (%s): %s" % (_login(review) or "someone", number, state,
                                                 _one_line(review.get("body") or "", 300))
     return GitHubItem("github.review:%d" % rid, "github.review", summary, repo, known, lookups, _login(review), now,
@@ -16990,10 +16993,11 @@ def cmd_gates(args, runner, now):
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
-    standing_lines = []   # #1404: every call lists each standing change request by the shim's rule, whatever the decision field says (the decision only widens the rule, as at the shim)
+    standing_lines, seen = [], []   # #1404: every call lists each standing change request by the shim's rule, whatever the decision field says (the decision only widens the rule, as at the shim)
     if isinstance(ctx.facts, dict) and not ctx.unreadable and not getattr(ctx, "ask_issue", False):   # an issue subject has no pull request: no reviews to list
         standing_lines = blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head"),
-                                               "CHANGES_REQUESTED" if ctx.facts.get("review") == "changes requested" else "", gates_caller_name(runner, now))
+                                               "CHANGES_REQUESTED" if ctx.facts.get("review") == "changes requested" else "", gates_caller_name(runner, now), seen)
+    bots = bot_review_lines(seen, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else []   # #1625: information only
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
     if args.json:
@@ -17005,11 +17009,13 @@ def cmd_gates(args, runner, now):
             report["shares"] = shares
         if standing_lines:
             report["blocking_reviews"] = standing_lines
+        report.update(bot_reviews=bots) if bots else None   # a pull request with no bot review keeps its keys
         print(json.dumps(report, sort_keys=True))
     else:
         lines = plan_ledger.render_gates(report, ctx.pr)
         if shares:
             lines.append(shares)
+        lines.extend(bots)
         if suites_finding:
             lines.append(suites_finding)
         if ctx.unreadable:
@@ -20692,7 +20698,7 @@ def rest_review_as_view(review):
             "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id"), "submitted_at": review.get("submitted_at")}
 
 
-def standing_requests(engine, runner, now, repo, number, head="", decision="", fresh=False):
+def standing_requests(engine, runner, now, repo, number, head="", decision="", fresh=False, seen=None):
     """(rows, problem): the standing CHANGES_REQUESTED reviews of ONE pull request, by the SAME rule as the merge shim (`shims/review_rule.py`, never a copy), each
     row {login, name, id, commit, age}; `problem` is a one-line cause when the list could not be read whole or the rule file is unreadable (never an empty `rows`)."""
     try:
@@ -20701,6 +20707,8 @@ def standing_requests(engine, runner, now, repo, number, head="", decision="", f
         ok, reviews, why = False, None, type(err).__name__
     if not ok:
         return [], "the reviews could not be read whole (%s): not listed" % why
+    if seen is not None:
+        seen.extend(reviews)   # #1625: the bot lines share this one read
     try:
         rule = load_review_rule()
     except Exception:
@@ -20718,10 +20726,10 @@ def review_age_text(seconds):
     return "unknown age" if seconds is None else "%dd" % (seconds // 86400) if seconds >= 172800 else _age_text(seconds)
 
 
-def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED", caller=None):
+def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED", caller=None, seen=None):
     """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks.
     Each names the review id, the commit, the author's fleet name and its age (#1404)."""
-    rows, problem = standing_requests(engine, runner, now, repo, number, head, decision)
+    rows, problem = standing_requests(engine, runner, now, repo, number, head, decision, seen=seen)
     if problem:
         return ["blocking review: " + problem]
     def how(row):   # the command is named only for the caller's OWN review (`caller` None: no identity given, the command is named for each)

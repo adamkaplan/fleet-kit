@@ -69632,6 +69632,9 @@ RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
 RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
+# The review bots at the head (#1625).
+_bot_reviews = importlib.import_module("test_bot_reviews")
+BotLines, BotWake, PendingJobs, BotDocumentation, BotMutants = _bot_reviews.BotLines, _bot_reviews.BotWake, _bot_reviews.PendingJobs, _bot_reviews.BotDocumentation, _bot_reviews.BotMutants
 # The size ceilings on the merge result (#1605).
 _size_ceilings = importlib.import_module("test_size_ceilings")
 TestTheCheck, TestSizeMutants, TestTheMergeGate, TestSizeDocumentation = _size_ceilings.TestTheCheck, _size_ceilings.TestMutants, _size_ceilings.TestTheMergeGate, _size_ceilings.TestDocumentation

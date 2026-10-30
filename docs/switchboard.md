@@ -6355,3 +6355,12 @@ The install records the tree it is run from. Run from a feature-branch worktree 
 - The daemon stops only when the tree is bad twice in a row: it reads again one second after the first bad reading, in the same pass, so a checkout in flight does not stop it.
 - A local default branch ahead of `origin/<default>` is refused as not an ancestor; the message says to push it or reset the branch, and that the origin ref may be stale (`git fetch origin`).
 - It never changes the tree: the operator does (see above).
+
+## Review bots at the head (#1625)
+
+A review bot is an account of type Bot (or a login ending `[bot]`); no list and no name is kept. Four statements:
+
+1. `gates` prints one `bot review:` line per bot: the login, its latest review state, the FIX and BLOCK counts and the head it was made at. A bot whose latest review is at an older head prints `older than the head ..., does not count`. The counts come from the `- [FIX]` and `- [BLOCK]` lines, checked against the first line (`<Name>: N findings (B BLOCK, F FIX, K NOTE)`); if they differ both are printed and the line says so; a body with neither prints `findings not read`, never zero. The lines come from the one reviews read `gates` already makes, and are information: the verdict, the READY text and the exit status do not change.
+2. A bot review with FIX or BLOCK findings at the pull request's current head wakes the orchestrator once per bot and head (the item is keyed by the bot and the head, not the review id; the summary is fixed words, never review text).
+3. The `gates ci-record` refusal names the pending job (workflow, job name, run id, state), through `ci_runs.not_green_jobs`.
+4. A check whose conclusion is success is never pending, whatever its status says; a check with no conclusion that is unfinished stays pending.
