@@ -70,3 +70,9 @@ def launch_model_note(fleet):
     fleet = fleet if isinstance(fleet, dict) else {}
     model, level = fleet.get("model"), fleet.get("reasoning")
     return "  model %s%s" % (model, " reasoning %s" % level if level else "") if isinstance(model, str) else ""
+
+
+def launch_model_cloud_refusal(args):
+    """Until the cloud route carries the options: a cloud launch given one is refused, never silently run on another model."""
+    if getattr(args, "cloud", False) and (getattr(args, "model", None) or getattr(args, "reasoning", None)):
+        raise LaunchError("--model and --reasoning are not carried by --cloud yet: launch locally, or drop them")
