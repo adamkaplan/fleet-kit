@@ -24,6 +24,7 @@ EVENT = "cloud.renewal.alarm"
 STATE_FILE = "cloud-renewal-alarm.json"
 READ_BYTES = 262144
 SERIES_SECONDS = 30 * 60
+FUTURE_SLACK_SECONDS = 300   # a line dated further ahead than this is ignored: it must never move the cursor ahead of the real lines
 MAX_AGE = 3600            # a failure older than this is history: its token lapsed long ago
 REASON_CHARS = 160
 NAMES_MAX = 10
@@ -135,7 +136,7 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
     now = engine.now()
     state_path = os.path.join(str(engine.state_dir), STATE_FILE)
     state = _read_state(state_path)
-    lines = read_tail(audit_path(env))
+    lines = [l for l in read_tail(audit_path(env)) if l[0] <= now + FUTURE_SLACK_SECONDS]
     if not lines:
         return []
     cursor, edge = state["cursor"], set(state["edge"])

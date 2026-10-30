@@ -195,7 +195,28 @@ def s16b(module):
         w.close()
 
 
-SCENARIOS = {"s16b": s16b, "s16": s16, "s17": s17, "s18": s18, "s19": s19}
+def s16d(module):
+    w = World(module, {"worker-9": "lane-a", "worker-8": "lane-a"})
+    w2 = World(module, {"worker-7": "lane-a"})
+    try:
+        w.line(T0 + 7200, "worker-9", False, "clock jump")
+        w.line(T0 - 10, "worker-8", False, "real failure")
+        w.tick()
+        alarmed = 1 if not any("worker-9" in m[1] for m in w.messages) else 0
+        with open(os.path.join(w.dir, module.STATE_FILE)) as handle:
+            cursor = json.load(handle)["cursor"]
+        assert cursor == T0 - 10 and len(w.to("lane-a")) == 1 and len(w.to("cos-1")) == 1, (cursor, w.messages)
+        w2.line(T0 + 240, "worker-7", False, "slightly ahead")
+        w2.tick()
+        within = len(w2.to("cos-1"))
+        assert within == 1, w2.messages
+        print("S16d: future-dated lines ignored 1, real failures alarmed %d of 1, within-slack lines handled %d" % (alarmed, within))
+    finally:
+        w.close()
+        w2.close()
+
+
+SCENARIOS = {"s16d": s16d, "s16b": s16b, "s16": s16, "s17": s17, "s18": s18, "s19": s19}
 
 
 def run(name, path=None):
@@ -205,6 +226,7 @@ def run(name, path=None):
 
 MUTANTS = {
     "s16": ("sends nothing", "item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)", "item = None"),
+    "s16d": ("no future guard", "if l[0] <= now + FUTURE_SLACK_SECONDS]", "if True]"),
     "s16b": ("keeps no record of a failed write", "_MEMORY[state_path] = copy.deepcopy(state)", "pass"),
     "s17": ("alarms every failure line", "if last is not None and 0 <= at - last < SERIES_SECONDS:", "if False:"),
     "s18": ("one lane message per pod", "if len(by_reason[reason]) == 1:", "if True:"),
@@ -218,6 +240,9 @@ class TestCloudRenewalAlarm(unittest.TestCase):
 
     def test_s16_one_message_to_the_boss_and_one_to_the_lane_and_none_on_the_second_tick(self):
         s16(self.module)
+
+    def test_s16d_a_future_dated_line_is_ignored_and_never_moves_the_cursor(self):
+        s16d(self.module)
 
     def test_s16b_a_failing_state_write_and_a_failing_send_never_repeat_an_alarm_and_a_held_lane_is_skipped(self):
         s16b(self.module)
