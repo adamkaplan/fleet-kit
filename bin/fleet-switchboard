@@ -3232,6 +3232,10 @@ class Switchboard:
         except Exception as err:
             self._failed("blocked-alert", "blocked-alert", err, report)
         try:
+            self.release_held(discovery, report)
+        except Exception as err:
+            self._failed("hold-release", "hold-release", err, report)
+        try:
             undelivered_wake_tick(self, discovery)
         except Exception as err:
             self._failed("undelivered-wake", "undelivered-wake", err, report)
@@ -3338,8 +3342,9 @@ class Switchboard:
 
     # -- the CLI's entry points
 
-    def send(self, sender, recipient, text, issue=None, repo=None, interrupt=False):
-        """Deliver `text` to `recipient` now, by the rule, without batching. Stores nothing. `interrupt`: only a
+    def send(self, sender, recipient, text, issue=None, repo=None, interrupt=False, queue_held=False):
+        """Deliver `text` to `recipient` now, by the rule, without batching. Stores nothing, except with `queue_held` (the `send` command only): a message
+        for a pane that is on hold is kept in the recipient's own queue (`queued_sends`) and delivered when the hold ends. `interrupt`: only a
         boss to its own worker; raises InterruptRefused otherwise."""
         now = self.now()
         discovery = self.discover(now)
@@ -3356,7 +3361,7 @@ class Switchboard:
                     issue=None if issue is None else int(issue), batch=False, sender=sender,
                     repo=repo or issue_repo(issue))
         fact.supersedes = self.waiting_earlier(discovery, recipient, sender, fact.repo, fact.issue, now)
-        outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
+        outcome = self.send_fact(fact, discovery, now, interrupt=interrupt, queue_held=queue_held)
         if outcome.get("sent") and sender != recipient and sender in discovery.agents and self.state_dir is not None:
             # Beside `report`'s record: both count as being in touch with that boss. #352: only a send that woke the boss is one a report folds
             # into, and under v2_light nothing folds, so no issue is kept there.
@@ -3370,7 +3375,7 @@ class Switchboard:
         discovery = getattr(self, "discovery", None)
         return watched_repos(self.config, discovered_fleets(discovery))
 
-    def send_fact(self, fact, discovery, now, carried=(), interrupt=False, folded=False):
+    def send_fact(self, fact, discovery, now, carried=(), interrupt=False, folded=False, queue_held=False):
         """The one delivery path of `send` and `report`: `fact` (and any `carried` riders) now, by the rule. `folded` (#352): a report that
         follows the sender's own earlier send is delivered as a note: it never wakes the boss a second time."""
         recipient = fact.recipient
@@ -3380,9 +3385,63 @@ class Switchboard:
         if plan.action == "hold":
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
+            if queue_held and fact.kind == "send":
+                queued = self.queue_held_send(fact, plan, now)
+                if queued is not None:
+                    return queued
             note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan, interrupt=interrupt)
+
+    def queue_held_send(self, fact, plan, now):
+        """A `send` to a pane that is on hold is kept in its recipient's queue. None (the refusal stands, nothing is stored) for a recipient that is
+        gone or retired, one claimed by two sessions, one whose state could not be read, and a message the queue cannot take (full or too long)."""
+        observation = plan.observation
+        if self.state_dir is None or observation is None or observation.conflict or hold_reason(observation) is None:
+            return None
+        if retired_agent(_read_small(self.state_dir, RETIRED_FILE), fact.recipient, observation.session_id):
+            return None
+        queue = load_module("queued_sends")
+        kept, how = queue.enqueue(self.state_dir, fact.recipient, fact.key, fact.sender, fact.summary, now, fact.issue, fact.repo)
+        if not kept:
+            return {"sent": False, "action": "hold", "reason": "%s; %s" % (plan.reason, how)}
+        if self.audit is not None:
+            self.audit.append(self.actor, "hold.queued", fact.recipient, {"key": fact.key, "from": fact.sender, "queued": how, "reason": plan.reason})
+        return {"sent": False, "queued": True, "action": "queued", "reason": "queued (the pane is on hold)", "key": fact.key, "why": plan.reason}
+
+    def release_held(self, discovery, report=None):
+        """The end of the hold: each recipient's queue (`queued_sends`) whose pane no longer holds is delivered in the order the messages were sent, each
+        once, by the ordinary delivery path (one message each). A message that cannot be delivered now stops that recipient's release (the order is
+        kept) and is tried again next pass. Returns [(recipient, key)] delivered."""
+        if self.state_dir is None:
+            return []
+        queue = load_module("queued_sends")
+        out = []
+        for name in queue.recipients(self.state_dir):
+            seen = discovery.agents.get(name)
+            if seen is None or hold_reason(seen) is not None:
+                continue   # still held, or gone: the queue waits (a gone pane is refused at the send, never here)
+            for item in queue.waiting(self.state_dir, name):
+                now = self.now()
+                fact = Fact(item["key"], name, "send", queue.marked(item, now), item["at"], issue=item.get("issue"), batch=False,
+                            sender=item.get("from") if isinstance(item.get("from"), str) else None, repo=item.get("repo"))
+                try:
+                    plan = self.plan(name, [fact], discovery, now)
+                    if plan is None:   # its key is already in the recipient's transcript: delivered before, never again
+                        queue.done(self.state_dir, name, item["key"])
+                        continue
+                    outcome = self.send_fact(fact, discovery, now) if plan.action != "wait" else {"sent": False}
+                except Exception as err:
+                    if report is not None:
+                        self._failed(name, "hold-release", err, report)
+                    break
+                if not outcome.get("sent"):
+                    break
+                queue.done(self.state_dir, name, item["key"])
+                out.append((name, item["key"]))
+                if self.audit is not None:
+                    self.audit.append(self.actor, "hold.released", name, {"key": item["key"], "from": item.get("from"), "sent_at": item["at"]})
+        return out
 
     def report(self, sender, state, text, issue=None, everything=False):
         """PR 13: `sender` tells the one it reports to what happened. An attention report (done, failed, blocked,
@@ -14517,13 +14576,17 @@ def _cmd_send(args, runner, now):
         return EXIT_USAGE
     verdict = check_approval(config, runner, now, text, repo, number)   # #951: only a message that starts `Approved at sha256:`; GETs only; never raises
     try:
-        outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt)
+        outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt, queue_held=not args.interrupt)
     except InterruptRefused as err:
         sys.stderr.write("%s: not interrupted, nothing sent: %s\n" % (PROG, err))
         return EXIT_USAGE
     except MessageTooLong as err:
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
+    if outcome.get("queued"):
+        print(outcome["key"])
+        sys.stderr.write("%s: %s for %s: %s; it is delivered, in order, when the hold ends\n" % (PROG, outcome["reason"], args.name, outcome["why"]))
+        return EXIT_OK
     if not outcome["sent"]:
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
         return EXIT_HELD

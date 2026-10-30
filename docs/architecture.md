@@ -61,6 +61,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `agent_reconcile.py` | 2 | what a view does with an agent that has no live data | |
 | `endpoint_liveness.py` | 2 | the liveness of an agent row that has no pane to judge (on demand only) | |
 | `health_records.py` | 2 | health recorders: what the daemon has already read, turned into records | |
+| `queued_sends.py` | 2 | the queue of messages sent to a pane on hold, kept in order and bounded until the hold ends | |
 | `pr_events.py` | 2 | `pr-state` read from the forwarder's webhook events | |
 | `pr_reading.py` | 2 | the one reading of a pull request that `merge-gate` and the clear packet share | |
 | `registry.py` | 2 | the one agent registry (interface frozen in `docs/agent-registry.md`) | |
@@ -281,6 +282,9 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `orders_copy.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `queue_ejections.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `reassign.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `queued_sends.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `queued_sends.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `queued_sends.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `registry.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `registry.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `registry.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
