@@ -6090,6 +6090,7 @@ BOSS_READ_SITES = {
     "bin/fleet-switchboard:cloud_sender": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record): its reports_to is read from the record and validated by `_cloud_boss`, to name the pane-less sender of its report",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
     "bin/cloud_retired.py:keep_boss": "keeps the boss of a removed cloud worker from the worker's own endpoint record (not a discovered agent) so `read` can answer for it after the record is gone",
+    "bin/cloud_worker.py:lane_m_workers": "the lane of a record, for the M cap: a cloud worker's own endpoint record (not a discovered agent), read as written",
 }
 
 
