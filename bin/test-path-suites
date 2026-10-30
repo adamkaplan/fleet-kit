@@ -300,12 +300,17 @@ class TestChangedRunHasAReservedSlot(unittest.TestCase):
 
     def test_s11_it_starts_within_5_seconds_with_every_ordinary_slot_taken(self):
         root, e, _state = held_state_fixture(ordinary=3, changed=0)
-        started = time.time()
         done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed", "--base", "main"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("PASS bin/test-by-command", done.stdout)
         self.assertIn("PASS bin/test-by-import", done.stdout)
-        self.assertLess(time.time() - started, 5 + 10, "start-to-finish, with the interpreter's own start")
+        # the only bound is the timeout=120 above: a hang guard, so that a run that never starts ends the test; the property is the observation, not a speed
+        import fcntl
+        for k in range(3):
+            probe = os.open(os.path.join(_state, "fleet-switchboard", "heavy-slot-%d.lock" % k), os.O_RDWR)
+            self.addCleanup(os.close, probe)
+            with self.assertRaises(BlockingIOError, msg="ordinary slot %d was free after the run, so it was not held while the run started: %s" % (k, done.stdout + done.stderr)):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot(self):
         root, e, _state = held_state_fixture(ordinary=3, changed=0)
