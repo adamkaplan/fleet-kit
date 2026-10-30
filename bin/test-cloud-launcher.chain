@@ -33,6 +33,7 @@ cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_issues_read.py
+cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
 cloud/launcher/tests/test_orchestrator_agent.py
@@ -44,6 +45,7 @@ cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_read_retired_last_message.py
 cloud/launcher/tests/test_reaper_managed.py
 cloud/launcher/tests/test_reaper_renewal.py
+cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_retire_gone_pod.py
 cloud/launcher/tests/test_run_record.py

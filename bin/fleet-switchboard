@@ -365,6 +365,7 @@ DEFAULTS = {
     "batch_seconds": 90,
     "launch_default": "headless",   # #433: what a plain `launch` starts: "headless" (no terminal) or "terminal" (a herdr tab)
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
+    "steer_after_minutes": 0,       # #1540: 0 = off; else a turn longer than this many minutes takes a peer `send` and a reminder as `steer` too
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
     "call_timeout_seconds": 20,
@@ -2573,6 +2574,7 @@ class Switchboard:
         self.light = bool(config.get("v2_light"))   # v2_light: no optional read of session history
         self.sent = SentLedger(self.state_dir) if self.light else None
         self._delivered = {}   # session id -> (newest synthetic id, since, keys): what delivered_keys last found; memory only
+        self.turn_start_fresh = True   # #1540: set once per process; the first turn-start pass after a daemon start discards the file
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
         self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
         self.judge_warm, self._warm_due = None, 0.0  # the daemon's policy-context warmer, if the judge is on
@@ -3039,6 +3041,37 @@ class Switchboard:
                 note_unreachable(self, plan.recipient, fresh, why)
                 return {"sent": False, "action": again.action, "reason": again.reason}
             observation = fresh
+        source = next((s for s in self.sources if isinstance(s, ReminderFacts)), None)
+        if source is not None and any(str(f.key).startswith("reminder:") for f in plan.pending):
+            # #1401: a reminder superseded by a re-arm or cancelled after it became a fact is not delivered; the drop names both reminders
+            kept_facts = []
+            for fact in plan.pending:
+                try:
+                    replaced = source.recheck_delivery(fact)
+                except ReminderError as err:   # as the other reads of the file: the pass step fails, the reminder stays queued, the next pass decides again
+                    why = "the reminders file could not be read (%s)" % type(err).__name__   # no reminder text: str(err) can carry the bad item
+                    self._note("source.error", "reminders", {"error": why})
+                    return {"sent": False, "action": "deferred", "reason": why}
+                if replaced is None:
+                    kept_facts.append(fact)
+                elif self.audit is not None:
+                    self.audit.append(self.actor, "reminder.drop_in_flight", plan.recipient,
+                                      {"dropped": fact.key[len("reminder:"):], "kept": replaced})
+            if len(kept_facts) != len(plan.pending):
+                plan.pending = kept_facts
+                if not kept_facts:
+                    return {"sent": False, "action": "dropped", "reason": "every reminder on its way was superseded or cancelled"}
+                # the plan is decided again from what remains: a wake planned for a dropped fact does not carry the lower-class rest
+                redone = decide(plan.recipient, kept_facts, observation, self.now(), self.batch_seconds, self.engaged_seconds)
+                if plan.folded and redone.action == "wake":
+                    redone.action = "note"
+                if redone.action != plan.action and not (interrupt and redone.action in ("note", "wake")):
+                    if self.audit is not None:
+                        self.audit.append(self.actor, "recheck", plan.recipient, {"was": plan.action, "now": redone.action, "reason": redone.reason,
+                                                                                  "keys": [fact.key for fact in kept_facts]})
+                    if redone.action not in ("note", "wake"):
+                        return {"sent": False, "action": redone.action, "reason": redone.reason}
+                    plan.action = redone.action
         repos = self.repos_in_play()
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
             self.intents.discard_told()
@@ -3084,13 +3117,24 @@ class Switchboard:
         message_id = derive_message_id(observation.session_id, keys)
         resume = plan.action == "wake" or interrupt
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
-        busy = resume and not interrupt and steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None))
+        age = None
+        busy = False
+        if resume and not interrupt:
+            try:
+                if self.config.get("steer_after_minutes") and self.state_dir is not None:
+                    age = load_module("turn_start").age(self.state_dir, observation.session_id, self.now(), load_module("record_json").parse_bounded)   # #1540: from the recorded start; None = unknown = young
+            except Exception as err:   # an unreadable record or module is an unknown age = young = queue
+                age = None
+                self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age)
         if busy:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
                   "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
         if busy:
             detail["busy"] = True
+            if age is not None:
+                detail["turn_age_seconds"] = int(age)
         description = None if fault("no-description") else describe_items(plan.recipient, carried, repos)
         detail["description"] = description
         if interrupt:
@@ -3250,6 +3294,13 @@ class Switchboard:
         self._early_facts = {}   # #467: facts the early decisions step reads for this pass only; never carried over from an earlier one
         self.reads.begin_pass()
         discovery = self.discover(now)
+        if self.config.get("steer_after_minutes") and self.state_dir is not None:   # #1540: only with the key on is the turn-start file touched
+            try:
+                load_module("turn_start").note(self.state_dir, [(o.session_id, o.status) for o in discovery.agents.values()], now,
+                                                  load_module("record_json").parse_bounded, fresh=self.turn_start_fresh)
+                self.turn_start_fresh = False
+            except Exception as err:   # an unrecorded start is unknown, which counts as young: never stops a pass
+                self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
         early_decisions(self, discovery)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
@@ -8241,6 +8292,10 @@ def validate_decisions_config(config, source):
     if not _is_number(grace) or grace < 0:
         raise ConfigError("%s: 'decisions_cos_grace_seconds' must be a number of seconds, 0 or more, got %r"
                           % (source, grace))
+    steer_after = config["steer_after_minutes"]
+    if not _is_number(steer_after) or isinstance(steer_after, bool) or steer_after < 0:
+        raise ConfigError("%s: 'steer_after_minutes' must be a number of minutes, 0 (off, the default) or more, got %r"
+                          % (source, steer_after))
     hold = config["pr_notice_hold_minutes"]
     if not _is_number(hold) or hold < 0:
         raise ConfigError("%s: 'pr_notice_hold_minutes' must be a number of minutes, 0 (no hold, the default) or "
@@ -18745,7 +18800,7 @@ def _unjudged(who, runner, now, why, ctx=None):
             engine, state, _ = build_engine(runner, now, "cli", writable=False)
             repo, number, _ = _ledger_pr(types.SimpleNamespace(pr=who.pr, plan=None, ask=None))
             body = pr_picture(engine, repo, number, state)[1]
-        has_claim = plan_ledger.claim_text(body) is not None
+        has_claim = plan_ledger.claim_text(body) is not None or plan_ledger.misplaced_claim(body) is not None
     except Exception:
         has_claim = True
     if not has_claim:
@@ -18767,7 +18822,7 @@ def claim_union_refusal(args, runner, now):
         return _unjudged(ctx, runner, now, "the plan check is not pass", ctx)
     body = (ctx.facts or {}).get("body")
     scenarios = ctx.plan["scenarios_parsed"]
-    claiming = plan_ledger.pr_claim(body, scenarios)[0] is not None
+    claiming = plan_ledger.pr_claim(body, scenarios) != (None, None)   # a refused claim line is a claim line: a misplaced one fails the gate closed
 
     def refuse(what, text):
         if _cu_waived(args, runner, now, what, ctx):
@@ -18804,7 +18859,7 @@ def unclaimed_verdict(args, ctx, runner, now, body=None):
     try:
         peers = plan_peers(ctx, runner, now, closed if body is None else None)   # the merge gate's union read stays the plain one
     except Exception as err:
-        if body is not None and plan_ledger.pr_claim(body, scenarios)[0] is None:
+        if body is not None and plan_ledger.pr_claim(body, scenarios) == (None, None):
             return None   # a pull request with no claim line claims every per-PR scenario: the union is covered whatever the peers say (docs/switchboard.md)
         what = "unknown sibling" if isinstance(err, ClaimUnknown) else "too many pull requests" if PEERS_TOO_MANY in str(err) else "list error"
         found = (what, "the claim union could not be read (%s); the gate fails closed for a pull request with a claim line" % _one_line(str(err), 100), [], [])
@@ -23183,6 +23238,7 @@ def build_parser():
     remind.add_argument("text", nargs="*", help="The reminder")
     remind.add_argument("--list", dest="list_mine", action="store_true", help="Show your own pending reminders (id, time, recipient, issue, text)")
     remind.add_argument("--cancel", metavar="ID", help="Cancel one of your pending reminders by its id (see --list)")
+    remind.add_argument("--cancel-key", metavar="KEY", help="Cancel every waiting reminder of yours with this key (a chain armed with --key); a delivered one is not recalled")
     remind.add_argument("--key", default=None, help="Name the purpose: arming again with the same key replaces your pending reminder of that key.")
     remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed "
                         "(by default a reminder about an issue is dropped, unsent, once the issue is closed)")
@@ -23850,7 +23906,7 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     try:
         args, extra = parser.parse_known_args(list(raw))
         args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
-        if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
+        if extra and args.action == "remind" and not (args.list_mine or args.cancel or getattr(args, "cancel_key", None)) and not any(word.startswith("-") for word in extra):
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))

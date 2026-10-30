@@ -181,6 +181,21 @@ message. A `send` from another agent skips the batch.
   events, reminders and orders keep the rules above, and so does a `send`
   from anyone but the boss. The config key `send_to_working` (`"steer"`, the
   default, or `"queue"` for the old behaviour) is the one switch.
+- **Long turn.** The config key `steer_after_minutes` (default `0`, off) names
+  a number of minutes. When it is on and the recipient's current turn has
+  lasted longer than that, a `send` from a peer and a reminder to it steer into
+  the long turn like a boss's (audited with `"busy": true` and
+  `turn_age_seconds`), instead of waiting for the turn to end. The age is read
+  from a recorded turn start (`turn-start.json` in the state directory, written
+  only with the key on, dropped when the status leaves `working`); an unknown
+  age (no record, a restart) counts as young. Orders, reports and stop or hold
+  orders keep their rules, and an idle recipient is woken as before. With the
+  key on, an old turn steers a boss's `send` too, even when `send_to_working`
+  is `"queue"`. The first pass after a daemon start discards the record.
+
+  | config key | default | meaning |
+  |---|---|---|
+  | `steer_after_minutes` | `0` (off) | a peer send and a reminder steer into a long turn once it has lasted more than this many minutes |
 - **Explicit interrupt.** `fleet-switchboard send --interrupt <agent> "text"`
   is for stop and hold orders only, from a boss to its own worker, and is
   never automatic. It calls `session.interrupt` with `resume=false` (the
@@ -544,6 +559,7 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard orders remove --charter <n or owner/repo#n> <number>` | Chief of Staff only (PR 17) | Removes the order with that number in `orders list`; the last one takes the section with it. The legacy `Standing authority:` line is numbered but lies outside the section, so it is refused (edit it on GitHub) |
 | `fleet-switchboard orders copy --source <charter> --charter <charter>` | Chief of Staff only (#347); anyone else is refused, audited | Copies every order bullet of the source charter's `## Standing orders` section to the target, word for word with its original `(ordered by ..., date)` (nothing re-dated), one order at a time through the same writer, with the same read-back. Orders the target already holds are skipped, so a second run copies only what is missing. It ALWAYS prints a result: one line per order, one line per failure and one summary line; a failed order is named, the rest are still copied, and any failure exits 1. The 20-order limit applies (the overflow is reported as failures). The legacy `Standing authority:` line is not a bullet and is not copied (the output says so). Each copied order gets the owner's heads-up as an added one does, and one comment on the target charter. The source is never changed. Code: `bin/orders_copy.py` |
 | `fleet-switchboard pending <name>` | Anyone | What is pending for an agent, and why anything is held |
+| `fleet-switchboard sent [--limit N]` | The sender, for its own messages only | Your own last messages (at most 20, newest first): to whom, when each was sent, delivered and picked up, or `not yet` (#1550). No GitHub call, no write |
 | `fleet-switchboard cloud-clear [--dry-run]` | The operator, the Chief of Staff, or the worker's own boss (the same rule as `retire`); anyone else is refused and the refusal audited | Removes every cloud worker record whose pod is gone AND whose hard deadline has passed, and names each one it removes (`cleared <name> (pod gone, deadline <time>)`). It never touches a record whose pod still stands, nor one that is not past its deadline, and it refuses (exit 1) when the cluster could not be read: it never removes a record it cannot prove is gone. `--dry-run` lists what it would clear (`would clear <name>`) and removes nothing. It makes no `stop` call: there is no pod. Code: `bin/cloud_worker.py` |
 
 Each agent definition gains one paragraph: what a `[switchboard]` message is,
@@ -2793,6 +2809,14 @@ another agent's reminder is not shown and is refused as unknown. Reminders live 
 read by the daemon on every pass and are only removed once delivered, dropped or cancelled, so a daemon restart loses none
 (a test arms one, starts a new engine over the same state and sees it fire).
 
+**Cancel a chain, and a copy on its way (#1401).** `remind --cancel-key <key>` cancels every waiting reminder (pending or fired) of yours with
+that key in one locked step and writes ONE audit line, `reminder.cancelled` (key, owner, count); another owner's or another key's
+reminder is never matched, and a copy already delivered is not recalled. At the delivery step each reminder fact is checked once more
+against `reminders.json`: a copy that fired and became a fact, and was then cancelled or superseded by a newer due copy of the same
+owner and key while it was on its way, is not delivered, and `reminder.drop_in_flight` names the dropped id and the replacing id (or `cancelled`).
+When some facts of a plan are dropped this way the plan is decided again from the facts left (a wake planned for a dropped fact does not
+carry the rest); a changed action is audited as `recheck`. A reminders file that cannot be read at this step defers the delivery to the next pass: nothing is sent or lost. The audit line `source.error` for it names the file and the error class only, never reminder text.
+
 **Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
 ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
 still carried. A worker that failed, errored or was aborted is never folded: its line is shown in full. A stop after a
@@ -4834,6 +4858,7 @@ unchanged.
 - The parent ask's Done-when is read live, with no hash. A parent edited after approval changes the required Done-when silently.
 - A merged sibling's `PLAN:` link, omitted or forged, makes the gate stricter, never looser: a sibling that does not link the plan is not counted at all.
 - The plan is read from the visible body only: a `PLAN:` line in a code fence or an HTML comment is read by no gate and not by the claim.
+- **A `CLAIMS:` line that is not read is refused (#1617).** A `CLAIMS:` line must stand directly under the `PLAN:` line. Any other line that starts with `CLAIMS:` (any case, after spaces or tabs, in the raw body, so also in a code fence or an HTML comment) makes `pr_claim` return an error, and every reader of the claim (G1, `prove`, `verdict`, `ci-record`, the claim listing, the merge gate and the union) refuses through it. The error names the line number of the body and the place: after a blank line, after another opening line, above the `PLAN:` line, no `PLAN:` line, a second line, inside a code fence, inside an HTML comment. The merge gate counts the refusal as a claim line, so it fails closed (the `CU` waiver applies). To fix a body that quotes the rule, write the example inline, not at the start of a line (for a fence or a comment). A body with no such line behaves as before, and the held-PR opening check skips the claim line, so a well placed `CLAIMS:` line does not hide the `Rationale:` line.
 - **The claims are bound as merged.** The merge gate writes one `claim` ledger line for the pull request (its `CLAIMS:` text, or none) before it judges the union. The union reads, for a MERGED sibling, the NEWEST claim line recorded at or before the sibling's `merged_at` (the claim in force at the merge), never its current body and never a line recorded after the merge. A merged sibling with no such line, a line with no usable timestamp, or no `merged_at` is refused as unknown (`merged pull request #N has no recorded claim at or before its merge: its claim is unknown`). An OPEN sibling is read from its current body.
 - **The list is GitHub's search, bounded.** `plan_peers` reads `GET /search/issues?q=repo:<owner/repo> is:pr "<the plan link>" in:body`, not the whole repository: only the pull requests whose body holds the plan link, at most 3 pages of 100 (300 matching). Beyond that the read is refused with `too many pull requests to judge`. It is never silently truncated. A body that spells the link another way is not found by the search, which only makes the gate stricter. The code sends the link quoted, with the `#` percent-encoded (`%23`); a test pins that shape. A peer the search does not find makes the gate STRICTER (an unfound open sibling is not counted, so the union is judged sooner against what is found; an unfound merged sibling covers nothing). Search-index lag can hide a just-opened sibling, so the "last merge" call can be too early.
 - **Every refusal of a claiming pull request can be waived.** The refusals `claim union could not be read` (a list error, too many pull requests), `merged pull request #N has no recorded claim: unknown`, `the claim could not be recorded` and `claim union could not be judged` each name the waiver (`waive <pr> --gates CU`). The `CU` waiver (chief of staff only, bound to the head, 24 h) is consulted BEFORE the refusal, and a pass is audited as `plan.claim_union.waived` naming what was waived.
@@ -6292,6 +6317,17 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## `sent`: what became of the messages you sent (#1550)
+
+Cause: a peer sent a time-boxed message to another lane and could not tell whether, or when, it was read: the sender saw only that its `send` was accepted. The facts existed in three places and were shown to nobody: the moment a send was admitted is in `sent-keys.json` (the sent-keys ledger: session id, then `send:<sender>:<16 hex>`, then an epoch); the moment it was delivered is the `ts` of the `v2.synthetic` audit line with `phase` `result` whose `call` matches the `intent` line that carries the key in `detail.keys` (its `subject` is the recipient); whether the recipient has taken it up is in the recipient's own transcript, which the daemon reads through `message_list`. #583 shows the RECEIVER the sent and delivered times in the message header, and #1540 lets a peer send steer into a long turn, which shortens the delay but shows the sender nothing. What was left is a sender-side listing.
+
+`fleet-switchboard sent [--limit N]` lists the caller's own last messages (N from 1 to 20, default 20), newest first, one line each: the recipient, `sent HH:MMZ`, `delivered HH:MMZ` and `picked up HH:MMZ` (UTC). The caller is resolved as `send` resolves its sender (the pane; `--from` only in the Lab), and only keys that start `send:<caller>:` are listed: a message of another sender is never shown. It makes no GitHub call, writes nothing and prints no message text.
+
+- **delivered** is the `ts` of the matching audit result line. `not yet` when the intent line has no result line; `unknown` when the line is older than the last 4 MB of `audit.jsonl` or the result records a failed call (a send of unknown fate).
+- **picked up** is the start of the recipient's first turn after the delivery: the earliest assistant message of the recipient's session whose `time.created` is not earlier than the delivery, in the newest page (`READ_LIMIT` messages) of ONE `message_list` per distinct recipient session. It goes through the daemon's bounded read path (`v2_reads_per_pass`, `v2_reads_per_minute`), never a loop of raw reads. `not yet` when the page was read and holds no such turn; `unknown` when the session cannot be read, the read budget is spent, or the page starts after the delivery (the turn may be older than the page). It is never estimated from the delivery time.
+- **Caps.** `v2_reads_per_pass` is 8, so the reads of one run stop there: rows for sessions past the 8th recipient show `unknown` for picked up, though up to 20 lines are listed. A delivery whose audit result is `ok=false` (a 409) shows `delivered unknown`, and so `picked up unknown`. An empty ledger prints `no messages` and the note.
+- picked up is a turn start, **not proof that the text was understood**: the first turn after a delivery may be about something else, and a message steered into a running turn is taken up inside it.
 
 ## A lost worker is announced to its lane and the Chief of Staff (#1481)
 
