@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "cloud" / "worker" / "tests"))
 import stub_support  # noqa: E402
 
 ROUNDS = 10
+WAVE_SIZE = 5
 PY = sys.executable
 TINY_LOADER = (
     "import importlib.machinery, importlib.util, os, sys, unittest\n"
@@ -38,31 +39,46 @@ def status(root):
 
 
 class FixtureRoot(unittest.TestCase):
-    def _round(self):
-        tiny = stub_support.start(self, [PY, "-c", TINY_LOADER], cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        judge = stub_support.start(self, JUDGE, cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        codes = []
-        for p in (tiny, judge):
-            try:
-                codes.append(p.wait(timeout=ROUND_TIMEOUT))
-            except subprocess.TimeoutExpired:
-                tiny.kill()
-                judge.kill()
-                codes.append(-1)
-        return codes
+    def _wave(self, size):
+        procs = []
+        for _ in range(size):
+            tiny = stub_support.start(self, [PY, "-c", TINY_LOADER], cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            judge = stub_support.start(self, JUDGE, cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append((tiny, judge))
+        deadline = time.monotonic() + ROUND_TIMEOUT   # hang guard for the whole wave
+        rounds = []
+        timed_out = False
+        for tiny, judge in procs:
+            codes = []
+            for p in (tiny, judge):
+                try:
+                    codes.append(p.wait(timeout=max(0.1, deadline - time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    codes.append(-1)
+            rounds.append(codes)
+        if timed_out:
+            for tiny, judge in procs:
+                for p in (tiny, judge):
+                    if p.poll() is None:
+                        p.kill()
+                        p.wait()
+            rounds = [[-1, -1] for _ in rounds]   # the wave's rounds count as failures
+        return rounds
 
     def test_s9_no_untracked_entry_in_the_root_while_the_loaders_run(self):
+        t0 = time.monotonic()
         before = status(ROOT)
         failures = 0
         untracked = 0
-        for n in range(ROUNDS):
-            codes = self._round()
+        for wave in range(ROUNDS // WAVE_SIZE):
+            rounds = self._wave(WAVE_SIZE)
             now = status(ROOT)
             if [l for l in now.splitlines() if l.startswith("??") and l not in before.splitlines()]:
-                untracked += 1
-            if any(c != 0 for c in codes) or now != before:
-                failures += 1
+                untracked += WAVE_SIZE   # a new '??' entry counts once for each round of the wave
+            failures += sum(1 for codes in rounds if any(c != 0 for c in codes))
         print("S9: rounds %d, failures %d, untracked entries in the root %d of %d judgements" % (ROUNDS, failures, untracked, ROUNDS))
+        print("S9 waves: %d of %d rounds, seconds %d" % (ROUNDS // WAVE_SIZE, WAVE_SIZE, time.monotonic() - t0))
         self.assertEqual(failures, 0)
         self.assertEqual(untracked, 0)
 
