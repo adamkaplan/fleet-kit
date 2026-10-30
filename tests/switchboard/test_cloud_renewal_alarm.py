@@ -15,8 +15,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BIN = HERE.parent.parent / "bin"
-sys.path.insert(0, str(HERE.parent.parent / "cloud" / "worker" / "tests"))
-import stub_support   # noqa: E402
 sys.path.insert(0, str(HERE))
 from support.core import Base   # noqa: E402
 from support.loader import sb   # noqa: E402
@@ -261,6 +259,8 @@ class TestCloudRenewalAlarmMutants(unittest.TestCase):
     """Each mutant is a scratch copy OUTSIDE the repository with one applied change, run as a child process: its scenario exits 1; the real module exits 0."""
 
     def child(self, scenario, module_path):
+        sys.path.insert(0, str(HERE.parent.parent / "cloud" / "worker" / "tests"))
+        import stub_support   # the one starter of a child process (its cleanup is registered before anything waits)
         code = "import sys; sys.path.insert(0, %r); import test_cloud_renewal_alarm as t; t.run(%r, %r)" % (str(HERE), scenario, str(module_path))
         proc = stub_support.start(self, [sys.executable, "-c", code], stdout=-1, stderr=-1)
         proc.communicate(timeout=60)
