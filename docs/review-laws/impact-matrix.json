@@ -431,7 +431,10 @@
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
         "bin/switchboard/jev.py",
-        "bin/switchboard/secret_spans.py"
+        "bin/switchboard/secret_spans.py",
+        "bin/switchboard/caches.py",
+        "bin/switchboard/profile_pieces.py",
+        "bin/switchboard/installer.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -655,6 +658,17 @@
           "_secret_position",
           "find_secret_span",
           "secret_where"
+        ],
+        "bin/switchboard/caches.py": [
+          "BoundedFileCache",
+          "_audit_tail",
+          "_valid_context"
+        ],
+        "bin/switchboard/profile_pieces.py": [
+          "InstallError"
+        ],
+        "bin/switchboard/installer.py": [
+          "reaper_only_conflict"
         ]
       },
       "registrar_allow": {
