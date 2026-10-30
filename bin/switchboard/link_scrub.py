@@ -6,38 +6,54 @@ import urllib.parse
 
 SIGNED_NAMES = ("token", "access_token", "id_token", "refresh_token", "sig", "signature", "key", "api_key", "apikey", "secret",
                 "client_secret", "password", "passwd", "code", "expires", "expiry", "x-amz-signature", "x-amz-credential",
-                "x-amz-security-token", "auth", "jwt")
+                "x-amz-security-token", "auth", "jwt", "sid", "ticket", "sas", "pwd", "credential")
 SIGNED_SUBSTRINGS = ("token", "secret", "password", "signature")
 QUERY_REMOVED = "[query removed]"
-_SCRUB_URL_RE = re.compile(r"(?i)(?:https?://|https?%3A%2F%2F)[^\s<>\"'`()\[\]{}|\\^]+")
+_SCRUB_URL_RE = re.compile(r"(?i)https?(?::\/\/|%3A%2F%2F)[^\s<>\"'`]*")
+_MARKS = "?#\uff1f\uff03"
+_TRAILING_ESCAPE_RE = re.compile(r"%(?:25)*[0-9A-Fa-f]{2}$")
+
+
+def _decode(text):
+    for _ in range(3):
+        again = urllib.parse.unquote(text)
+        if again == text:
+            break
+        text = again
+    return text.replace("\uff1f", "?").replace("\uff03", "#")
 
 
 def _signed_name(name):
-    lowered = urllib.parse.unquote(name).strip().lower()
+    lowered = _decode(name).strip().lower()
     return lowered in SIGNED_NAMES or any(part in lowered for part in SIGNED_SUBSTRINGS)
 
 
 def _signed_part(part):
-    return any(_signed_name(pair.split("=", 1)[0]) for pair in re.split(r"[&;]", part) if pair)
+    return any(_signed_name(pair.split("=", 1)[0]) for pair in re.split(r"[&;?#]", part) if pair)
 
 
 def _scrub_one_url(match):
     url = match.group(0)
-    encoded = url[:3].lower() != "htt" or "://" not in url[:9]
-    text = urllib.parse.unquote(url) if encoded else url
-    cut = [i for i in (text.find("?"), text.find("#")) if i >= 0]
-    if not cut:
+    decoded = _decode(url)
+    cut = [i for i in (decoded.find("?"), decoded.find("#")) if i >= 0]
+    if not cut or not _signed_part(decoded[min(cut) + 1:]):
         return url
-    head, tail = text[:min(cut)], text[min(cut):]
-    query, _, fragment = tail.partition("#")
-    if not (_signed_part(query[1:]) or _signed_part(fragment)):
-        return url
+    head = url
+    for i in range(1, len(url) + 1):
+        if "?" in _decode(url[:i]) or "#" in _decode(url[:i]):
+            head = url[:i]
+            break
+    found = _TRAILING_ESCAPE_RE.search(head)
+    head = head[:found.start()] if found and head[-1] not in _MARKS else head[:-1]
     return head + QUERY_REMOVED
 
 
 def scrub_signed_links(text):
-    """`text` with, in every URL whose query or fragment holds a name of SIGNED_NAMES (or a name containing a SIGNED_SUBSTRINGS word), both replaced by
-    `[query removed]`. A percent-encoded URL is decoded first. Scheme, host, path and every other character stay."""
-    if not isinstance(text, str) or ("?" not in text and "#" not in text and "%3F" not in text.upper() and "%23" not in text):
-        return text if isinstance(text, str) else ""
+    """`text` with, in every http or https URL run (up to whitespace, `<`, `>`, a quote or a backtick) whose names after the first `?` or `#` (read
+    after up to 3 rounds of percent-decoding, U+FF1F as `?`, U+FF03 as `#`) hold a name of SIGNED_NAMES (or one containing a SIGNED_SUBSTRINGS
+    word), everything from that first `?` or `#` replaced by `[query removed]`. Scheme, host, path and every other character stay."""
+    if not isinstance(text, str):
+        return ""
+    if not any(c in text for c in "?#%\uff1f\uff03"):
+        return text
     return _SCRUB_URL_RE.sub(_scrub_one_url, text)
