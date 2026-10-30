@@ -901,7 +901,7 @@ class LiveHead(Fixture):
         self.addCleanup(release.set)   # no thread of this test outlives it
 
         def blocked(pr):
-            release.wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
+            release.wait()   # the test's release event ONLY, set after the join has observed the outcome: no timer competes with the join (t.join(10) bounds a hang)
             return HEAD
         self.backend.live_head = blocked
         answer, audits = [], len(self.backend.audits)
