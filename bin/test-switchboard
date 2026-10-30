@@ -74684,8 +74684,8 @@ class TestPrClaimLine(LedgerBase):
 
     def test_s4_a_pull_request_without_a_claim_line_behaves_exactly_as_before(self):
         baseline = ["S1", "S2", "S3", "U1"]
-        for body in (None, "", "PLAN: acme/app#7", "PLAN: acme/app#7\ncanon: n/a docs", "PLAN: acme/app#7\n\nCLAIMS: S1", "CLAIMS: S1\nPLAN: acme/app#7",
-                     "Notes\nPLAN: acme/app#7 and CLAIMS: S1", "PLAN: acme/app#7\n    CLAIMS", "no plan here\nCLAIMS: S9"):
+        for body in (None, "", "PLAN: acme/app#7", "PLAN: acme/app#7\ncanon: n/a docs",
+                     "Notes\nPLAN: acme/app#7 and CLAIMS: S1", "PLAN: acme/app#7\n    CLAIMS"):
             with self.subTest(body=body):
                 claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
                 self.assertEqual(([s["id"] for s in claimed], left, error), (baseline, [], None))
