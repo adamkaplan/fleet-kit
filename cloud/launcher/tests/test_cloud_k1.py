@@ -222,7 +222,7 @@ class S2StopDelete(K1Base):
         self.assertIsNone(self.pod())
         self.assertEqual(self.st()["secrets"], {})
 
-    def test_a_succeeded_pod_is_deleted_but_a_kept_failed_pod_is_not(self):
+    def test_a_succeeded_pod_is_deleted_and_a_kept_failed_pod_is_deleted_too(self):
         self.assertEqual(self.create_with_secrets()[0], 0)
         st = self.st()
         pod = st["pods"][cw.pod_name("coder7")]
@@ -231,9 +231,9 @@ class S2StopDelete(K1Base):
         self.write_state(st)
         self.patch_state(hook_env={"CW_WORKDIR": os.path.join(self.tmp.name, "nowhere"), "CW_WORKER": "coder7"})
         self.run_cli("stop", "coder7")
-        self.assertIsNotNone(self.pod())  # kept work is not discarded by the dead-pod branch
+        self.assertIsNone(self.pod())  # #1619: no command can run in a dead pod, so the kept mark does not keep it
+        self.assertEqual(self.create_with_secrets()[0], 0)
         st = self.st()
-        st["pods"][cw.pod_name("coder7")]["metadata"]["annotations"].pop("cw/kept")
         st["pods"][cw.pod_name("coder7")]["status"]["phase"] = "Succeeded"
         self.write_state(st)
         self.assertEqual(self.run_cli("stop", "coder7")[0], 0)
