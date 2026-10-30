@@ -60,6 +60,7 @@ rebuilt from another record.
 | `bin/switchboard/v2_transport.py:24` | `pane-health.json` | comment only: the heartbeat-health bound is named for the derived file; nothing reads its time here | nobody | nobody | derived |
 | `bin/switchboard/agents_verify.py:155` | `discovery.agents` | `agents verify` reads the discovered agents to compare each with its registration | nobody | the moved code's own reader | derived (reader) |
 | `bin/switchboard/alert_labels.py:83` | `discovery.agents` | the alert-label wake finds a repository's orchestrators among the discovered agents | nobody | the moved code's own reader | derived (reader) |
+| `bin/switchboard/bootstrap.py:60` | `discovery.agents` | `bootstrap` reads the discovered agents to find the chief of staff | nobody | the moved code's own reader | derived (reader) |
 | `bin/switchboard/answer_delivery.py:592` | `decisions.json` | comment only: the delivery paths wait for the daemon's next write of the projection | nobody | the moved code's own reader | derived (reader) |
 | `bin/switchboard/handoff.py:587` | `boss-resolution` | the stop triage resolves a worker's boss by its registered name (`boss_name`) | nobody | the moved code's own reader | derived (reader) |
 | `bin/switchboard/handoff.py:325` | `decisions.json` | the handoff reads the decisions file for the open decisions of a worker | nobody | the moved code's own reader | derived (reader) |

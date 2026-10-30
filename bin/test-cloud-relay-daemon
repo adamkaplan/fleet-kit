@@ -841,7 +841,7 @@ class LiveHead(Fixture):
 
     def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
         import threading
-        calls = []
+        calls, free = [], []
         first_in, settled = threading.Event(), threading.Event()
         release = [threading.Event(), threading.Event()]   # one per call: the TEST releases them
         for ev in release:
@@ -850,6 +850,7 @@ class LiveHead(Fixture):
         def slow(pr):   # every call blocks until the test releases it: a call made under the flock would hold every other writer
             n = len(calls)
             calls.append(pr)
+            free.append(self.lock_free())   # the verdict: is the ledger lock free at the moment of THIS call
             (first_in if n == 0 else settled).set()
             release[min(n, 1)].wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
             return HEAD
@@ -884,6 +885,10 @@ class LiveHead(Fixture):
         t.join(10)
         for w in threads:
             w.join(10)   # same guard
+        for number, was_free in enumerate(list(free), 1):   # the verdict is the lock probe at every call; the writers below are a secondary check
+            self.assertTrue(was_free, "live-head call %d was made with the ledger lock held (lock free at each call: %s)" % (number, free))
+        self.assertEqual(len(free), len(calls))
+        print("S13: calls with the lock free %d of %d" % (sum(free), len(free)))
         self.assertTrue(while_blocked, "the append did not finish while the live-head call was blocked")   # no writer waited for GitHub
         self.assertTrue(after, "the append did not finish while a second live-head call was blocked")
 
@@ -971,7 +976,8 @@ sys.exit(0)
         done = self.run_child("test_a_slow_live_head_does_not_block_another_ledger_writer", "if not _same_head(first, head):   # the ONLY",
                               "first = b.live_head(pr)\n            if not _same_head(first, head):   # the ONLY")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("the append did not finish while a second live-head call was blocked", done.stdout)
+        self.assertIn("live-head call 2 was made with the ledger lock held", done.stdout)
+        print("S13: real-code calls with the lock free 2 of 2, mutant calls finding the lock held %d of 1" % done.stdout.count("live-head call 2 was made with the ledger lock held"))
 
     def test_the_wait_without_the_head_timeout_is_caught(self):
         done = self.run_child("test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)",
@@ -1087,7 +1093,14 @@ class HubReadAndTransport(unittest.TestCase):
         gate = threading.Event()
         real = http.client.HTTPConnection.connect
         slow_for = {"post": True}
-        http.client.HTTPConnection.connect = lambda conn: (gate.wait(20) if slow_for["post"] and slow_for.get("armed") else None, real(conn))[1]
+        ran_connect = []   # the threads that ran a held connect: the post's connection is made by the late thread itself
+        def connect_hook(conn):
+            if slow_for["post"] and slow_for.get("armed"):
+                if not gate.is_set(): ran_connect.append(threading.current_thread())
+                gate.wait(20)
+                conn.timeout = 30   # once released the 0.4 s cut no longer binds: 30 s (product default, 75 times the cut) so a loaded runner cannot time out
+            return real(conn)
+        http.client.HTTPConnection.connect = connect_hook
         self.addCleanup(setattr, http.client.HTTPConnection, "connect", real)
         self.addCleanup(gate.set)
         old = mod.READ_DEADLINE
@@ -1099,7 +1112,6 @@ class HubReadAndTransport(unittest.TestCase):
         pending = fetch()
         gate.clear()
         status, reason, record = ex.handle(pending["requests"][0])   # pass 1 executes: one ledger record
-        before = set(threading.enumerate())
         mod.READ_DEADLINE = 0.4   # short deadline only for the post that must be cut
         try:
             with self.assertRaises(mod.PassCut):
@@ -1107,10 +1119,8 @@ class HubReadAndTransport(unittest.TestCase):
         finally:
             mod.READ_DEADLINE = old
         gate.set()   # the late thread now completes after the cut
-        import time
-        end = time.monotonic() + 5
-        while time.monotonic() < end and any(t.is_alive() for t in set(threading.enumerate()) - before):
-            threading.Event().wait(0.01)
+        late = ran_connect[-1]; late.join(10)   # the thread that held the POST connect   # a guard so a broken mechanism fails instead of hanging: the slowest honest case is about 0.1 s, the guard 100 times that; never what the test judges
+        self.assertFalse(late.is_alive(), "the late thread did not end")
         slow_for["armed"] = False
         status2, _, record2 = ex.handle(fetch()["requests"][0])   # next pass: the same request is a replay
         post(req["id"], {"status": status2, "reason": "", "record": record2})
@@ -2313,6 +2323,7 @@ def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
     took, _ = self.timed(mod, self.full_backlog(), 2.0)
     self.assertGreater(took, 5.0)
 """,
+        "_late_post_scenario": "\ndef _late_post_scenario(self, mod):\n    before = set(threading.enumerate())\n    gate.set()\n    end = time.monotonic() + 5\n    while time.monotonic() < end and any(t.is_alive() for t in set(threading.enumerate()) - before):\n        threading.Event().wait(0.01)\n",
     }
     NEW_UNLISTED = """
 def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
@@ -2321,11 +2332,8 @@ def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
     took = time.monotonic() - t0
     self.assertLess(took, 3.0)
 """
-    # KEPT with a reason (three places): a function of the file or an OLD text above. Any other flagged comparison fails the scan.
+    # KEPT with a reason (two places): a function of the file or an OLD text above. Any other flagged comparison fails the scan.
     KEPT = {
-        "_late_post_scenario": "the poll that waits at most 5 seconds for the threads of a pass to end: a generous hang guard (the slowest honest case is "
-                               "about 0.1 s, the guard 50 times that) that exits at the first observation; a broken mechanism fails instead of hanging, "
-                               "and the poll is never what the test judges",
         "OLD[test_a_trickling_hub_is_cut_at_the_total_deadline]": "the literal OLD text of a test converted by #1417: the input of that scan's mutant "
                                                                   "check, never run as a test",
         "OLD[test_mutant_without_the_total_deadline_is_caught]": "the literal OLD text of a test converted by #1417: the input of that scan's mutant "
@@ -2444,11 +2452,11 @@ def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
         self.assertEqual(self.unlisted(found), {}, "a comparison of a measured duration under 10 seconds (test name: lines)")
 
     def test_the_kept_places_are_flagged_and_each_has_a_reason(self):
-        self.assertEqual(len(self.KEPT), 3)
+        self.assertEqual(len(self.KEPT), 2)
         for key, reason in self.KEPT.items():
             self.assertGreater(len(reason), 40, key)
         found = self.flagged_in_file(self.own_text())
-        self.assertIn("_late_post_scenario", found)   # the kept poll is really found: the entry is not stale
+        self.assertNotIn("_late_post_scenario", found)   # the helper no longer polls: it is not kept
         helpers = self.helpers_returning_a_difference(__import__("ast").parse(self.own_text()))
         for name in self.NAMES:
             self.assertTrue(self.flagged_in_text(self.OLD[name], helpers), name)
@@ -2465,10 +2473,15 @@ def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
         new = sum(1 for src in (self.NEW_UNLISTED,) if self.flagged_in_text(src, helpers))
         variant = sum(1 for src in self.OLD_1521.values() if self.flagged_in_text(src, helpers, follow_derived=False))
         print("S8: old forms flagged %d of %d, new unlisted flagged %d of 1, kept %d" % (old, len(self.OLD_1521), new, len(self.KEPT)))
-        self.assertEqual((len(self.OLD_1521), old, new), (8, 8, 1))
+        self.assertEqual((len(self.OLD_1521), old, new), (9, 9, 1))
         self.assertEqual(variant, 0)   # the variant that skips names derived from a clock difference sees none of the 8: the full scan is not vacuous
         self.assertEqual(self.unlisted({"test_a_new_comparison_of_a_measured_duration_without_a_reason": [1]}),
                          {"test_a_new_comparison_of_a_measured_duration_without_a_reason": [1]})
+
+    def test_the_late_post_helper_no_longer_polls(self):
+        src = TestLatePostNoWallClock.scenario_source(self)
+        self.assertEqual((src.count("enumerate" + "("), src.count("monotonic")), (0, 0))
+        print("S11: real (1, 1), mutant (1, 2), enumerations of the thread set in the helper %d" % src.count("enumerate" + "("))
 
     def test_a_bound_of_ten_seconds_or_more_on_a_measured_duration_is_not_flagged_by_the_file_scan(self):
         import ast

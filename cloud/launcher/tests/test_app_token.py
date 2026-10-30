@@ -340,7 +340,7 @@ class Mint(unittest.TestCase):
         for cls in ("RecursionError", "ValueError", "UnicodeDecodeError", "MemoryError"):
             Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10 + b"]" * 10, []
             p = self.run_mint(runner=RAISE_ON_NESTING, RAISE_CLASS=cls)
-            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []), cls)
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (75, "", []), cls)
             self.assertIn("nothing was minted", p.stderr, cls)
             self.assertIn("not usable JSON", p.stderr, cls)
             self.assertNotIn("Traceback", p.stderr, cls)
@@ -350,7 +350,7 @@ class Mint(unittest.TestCase):
         refusals are accepted: the parse refusal ("not usable JSON") or the wrong-shape refusal. Never a crash, never a mint."""
         Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
         p = self.run_mint()
-        self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+        self.assertEqual((p.returncode, p.stdout, Stub.seen), (75 if "not usable JSON" in p.stderr else 1, "", []))
         self.assertTrue("not usable JSON" in p.stderr or "something other than one installation" in p.stderr, p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
@@ -374,7 +374,7 @@ class Mint(unittest.TestCase):
                 app_token.github_json("GET", "/x", "jwt")
         finally:
             app_token.open_url = orig
-        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(cm.exception.code, 75)
 
     def test_a_rate_limit_says_so_and_when_to_retry(self):
         for hdr, want in (("30", "Retry after 30 seconds"), ("Wed, 21 Oct 2026 07:28:00 GMT", "Retry later"), (None, "Retry later")):
@@ -382,7 +382,7 @@ class Mint(unittest.TestCase):
             Stub.retry_after = hdr
             p = self.run_mint()
             Stub.retry_after = None
-            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (75, "", []))
             for w in ("rate limit", "refused", "nothing was minted", want):
                 self.assertIn(w, p.stderr, (hdr, w))
             self.assertNotIn("GMT", p.stderr)
@@ -500,13 +500,13 @@ class Mint(unittest.TestCase):
         for name, status, body in (("404", 404, {}), ("301", 301, {}), ("403", 403, {}), ("500", 500, {})):
             Stub.lookup, Stub.seen = (status, body), []
             p = self.run_mint()
-            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []), name)
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (75 if status == 500 else 1, "", []), name)
             self.assertNotIn(Stub.gets[-1][1].split()[1], p.stderr)
             self.assertNotIn(self.keymark, p.stderr)
         Stub.lookup = (301, {})
         self.assertIn("redirect", self.run_mint().stderr)
         down = self.run_mint(CW_GITHUB_API_BASE="http://127.0.0.1:1")  # a network error
-        self.assertEqual((down.returncode, down.stdout), (1, ""))
+        self.assertEqual((down.returncode, down.stdout), (75, ""))
         self.assertIn("failed", down.stderr)
 
     def test_a_token_call_for_an_unselected_repository_says_to_add_it_to_the_installation(self):
@@ -580,7 +580,7 @@ class Mint(unittest.TestCase):
             if answer == "nested":
                 Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
                 p = self.run_copy(text, runner=RAISE_ON_NESTING)
-                return p.returncode == 1 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
+                return p.returncode == 75 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
             if answer == "kelvin":
                 Stub.lookup, Stub.seen = (200, {"id": 5, "account": {"id": 9, "login": "\u212a" + "ite-org"}}), []
                 p = self.run_copy(text, "kite-org/widget-service")
