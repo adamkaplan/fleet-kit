@@ -153,6 +153,7 @@
         "bin/impact_floor.py",
         "bin/chat_clear.py",
         "bin/merge_gate.py",
+        "bin/size_ceilings.py",
         "bin/clear_carry.py",
         "bin/reassign.py",
         "bin/item_verdicts.py",
@@ -204,6 +205,7 @@
           "bin/impact_floor.py",
           "bin/chat_clear.py",
           "bin/merge_gate.py",
+          "bin/size_ceilings.py",
           "bin/clear_carry.py",
           "bin/reassign.py",
           "bin/item_verdicts.py",
@@ -396,6 +398,7 @@
         "bin/agent_presence.py",
         "bin/awaiting_live.py",
         "bin/ci_runs.py",
+        "bin/cloud_worker.py",
         "bin/cpu_guard.py",
         "bin/dead_hint.py",
         "bin/decision_core.py",
@@ -416,6 +419,7 @@
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
         "bin/work_sync.py",
+        "bin/switchboard/plan_input.py",
         "bin/switchboard/v2_transport.py",
         "bin/switchboard/facts.py",
         "bin/switchboard/import_v1.py",
@@ -428,7 +432,8 @@
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
-        "bin/switchboard/jev.py"
+        "bin/switchboard/jev.py",
+        "bin/switchboard/secret_spans.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -454,6 +459,9 @@
           "latest_runs",
           "newest",
           "own_repo"
+        ],
+        "bin/cloud_worker.py": [
+          "read_record_file"
         ],
         "bin/red_ci.py": [
           "*"
@@ -498,6 +506,13 @@
           "settings",
           "validate"
         ],
+        "bin/switchboard/plan_input.py": [
+          "_parent_ask_done_when",
+          "fetch_plan",
+          "load_plan",
+          "parse_plan_source",
+          "plan_comment_choice"
+        ],
         "bin/switchboard/v2_transport.py": [
           "V2Breaker",
           "V2Client",
@@ -531,8 +546,13 @@
           "ReminderFacts",
           "_clean_line",
           "add_reminder",
+          "alert_stale",
+          "alert_subject",
+          "digest_replaced",
           "drop_superseded_item",
           "found_reason",
+          "is_digest",
+          "judge_delivery",
           "merge_wake",
           "merge_wake_facts",
           "read_record_file",
@@ -554,9 +574,12 @@
           "_alert_not_a_map",
           "_alert_repo_not_read",
           "_check_sla",
+          "_standing_day",
           "parked_until",
           "read_mark",
+          "standing_line",
           "triage_awaiting_labels",
+          "triage_body_standing",
           "triage_says_reviewed",
           "validate_triage_config",
           "whole",
@@ -609,10 +632,13 @@
           "compose",
           "compose_order",
           "decide",
+          "delayed_since",
           "describe_items",
           "hold_reason",
+          "in_late_scope",
           "is_withdrawal",
           "orders_note",
+          "sent_at",
           "steers_into_turn",
           "superseded_by"
         ],
@@ -637,6 +663,11 @@
           "jev_key_file",
           "locate_jev_key",
           "validate_jev_config"
+        ],
+        "bin/switchboard/secret_spans.py": [
+          "_secret_position",
+          "find_secret_span",
+          "secret_where"
         ]
       },
       "registrar_allow": {
@@ -757,7 +788,6 @@
         "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
-        "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
         "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
         "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
