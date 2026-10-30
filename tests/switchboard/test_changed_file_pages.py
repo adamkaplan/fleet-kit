@@ -1,13 +1,17 @@
 """#1098: the whole-read check of `review record` on a pull request of more than 100 files (moved out of bin/test-switchboard, size ceiling).
 
-The fixtures are those of bin/test-switchboard (its loader block calls load with that module)."""
+The fixtures are those of bin/test-switchboard (HOST, set by its loader block)."""
 import json
 import re
 import subprocess
 from unittest import mock
 
 
-def load(host):
+HOST = None   # set by bin/test-switchboard
+
+
+def load():
+    host = HOST
     LedgerBase, TestWholeRead, FLOOR_CONFIG = host.LedgerBase, host.TestWholeRead, host.FLOOR_CONFIG
     FAKE_GH, LEDGER_HEAD, sb = host.FAKE_GH, host.LEDGER_HEAD, host.sb
 

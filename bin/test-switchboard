@@ -69688,7 +69688,8 @@ _claim_placement = importlib.import_module("test_claim_placement"); _claim_place
 TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
 # The whole-read check of a pull request of more than 100 files (#1098); the host module gives the class its fixtures.
 _changed_file_pages = importlib.import_module("test_changed_file_pages")
-TestWholeReadOfALargePullRequest = _changed_file_pages.load(sys.modules[__name__])
+_changed_file_pages.HOST = sys.modules[__name__]
+TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
