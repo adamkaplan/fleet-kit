@@ -700,6 +700,7 @@ NOT_SETTINGS = {
     "CW_LAUNCHER": "test hook: the driver runs another program as the launcher",
     "CW_GITHUB_API_BASE": "test hook: points the App mint at a fake GitHub (and is withheld from the preflight child for that reason)",
     "CW_PREFLIGHT_TOKEN_CMD": "test hook: points the preflight at a fake token command (withheld from the preflight child)",
+    "CW_PREFLIGHT_ORG_TOKEN_CMD": "a test hook of the preflight, never a launcher setting: points the preflight's organization-ruleset read at a fake token command",
     "CW_OPENSSL": "the openssl program, kept only when an absolute executable file; a tooling path of the machine, not a lane choice",
     "CW_TMPDIR": "where the driver's private temp directory goes; a machine setting, default the system temp directory",
     # the switchboard's own variable (S18)
