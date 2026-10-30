@@ -93,7 +93,12 @@ class ScratchCleanup(unittest.TestCase):
         src = (ROOT / "bin" / "test-cloud-worker").read_text()
         mutant = src.replace("self.addCleanup(end_children_and_remove, tmp, self.home)", "self.addCleanup(tmp.cleanup)", 1)
         applied = mutant != src
-        copy = ROOT / "bin" / ("zz_s3_mutant_%d.py" % os.getpid())
+        old_bin = "BIN = Path(__file__).resolve().parent\n"
+        mutant = mutant.replace(old_bin, "BIN = Path(%r)\n" % str(ROOT / "bin"), 1)   # the copy lives outside the repository: its BIN is the real bin directory
+        applied = applied and old_bin not in mutant and ("BIN = Path(%r)" % str(ROOT / "bin")) in mutant
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        copy = Path(scratch.name) / "zz_s3_mutant.py"
         script = (
             "import importlib.util, os, sys, time, unittest\n"
             "sys.path.insert(0, %r)\n"
@@ -118,7 +123,7 @@ class ScratchCleanup(unittest.TestCase):
             copy.write_text(mutant)
             p = subprocess.run([sys.executable, "-c", script], cwd=str(HERE), capture_output=True, text=True)
         finally:
-            copy.unlink()
+            scratch.cleanup()
         print("S3 mutant (the old bare cleanup): exit %d, mutation applied %s" % (p.returncode, applied))
         self.assertTrue(applied)
         self.assertEqual(p.returncode, 1, p.stderr[-800:])
@@ -133,49 +138,52 @@ class ScratchCleanup(unittest.TestCase):
 
 
 class RepoRootJudgement(unittest.TestCase):
-    def _copy_run(self, mutate):
+    # Finding (read, not assumed): nothing in bin/test-cloud-launcher.parallel (the 3 parallel lanes) judges the repository root's status:
+    # test_cloud_worker.py U1Scope diffs tracked paths and is skipped without CW_CHECK_SCOPE; test_stub_cleanup.py walks only cloud/*/tests and
+    # bin/test-cloud-worker; no step of .github/workflows/test.yml reads the root's status. Only test_orchestrator_agent.py RepoRootClean
+    # judges it ('git status'), and it is a serial-loop entry, as this file is. Even so the planted directory and the leaker's file are written
+    # into a temporary git repository, never the real root, and the copy of RepoRootClean is pointed at that repository: no run can overlap another.
+    def _copy_run(self, mutate=None, plant=False):
         src = AGENT_TEST.read_text()
-        out = mutate(src)
-        applied = out != src
-        mod = "zzscratchcopy%d" % os.getpid()
-        copy = HERE / (mod + ".py")
-        try:
-            copy.write_text(out)
-            p = subprocess.run([sys.executable, "-m", "unittest", mod + ".RepoRootClean"], cwd=str(HERE), capture_output=True, text=True)
-        finally:
-            copy.unlink()
+        with tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryDirectory() as fake_root:
+            subprocess.run(["git", "init", "-q", fake_root], check=True, capture_output=True)
+            if plant:
+                planted = Path(fake_root) / ("zz-planted-%d-%d" % (os.getpid(), int(time.time())))
+                planted.mkdir()
+                (planted / "file").write_text("x")
+            out = mutate(src, fake_root) if mutate else src
+            applied = out != src or mutate is None   # a mutant must change the text; the unmutated run is judged by the rewrites below
+            old_here = "HERE = os.path.dirname(os.path.abspath(__file__))\n"
+            out = out.replace(old_here, "HERE = %r\n" % str(HERE), 1)   # the copy lives outside the repository: HERE (and so LAUNCHER, ROOT) is the real path
+            applied = applied and old_here not in out and ("HERE = %r" % str(HERE)) in out
+            old_status = '"--untracked-files=all"], cwd=ROOT,'
+            out2 = out.replace(old_status, '"--untracked-files=all"], cwd=%r,' % fake_root, 1)   # the judged root is the temporary repository
+            applied = applied and out2 != out
+            mod = "zzscratchcopy%d" % os.getpid()
+            (Path(scratch) / (mod + ".py")).write_text(out2)
+            env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(HERE)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])))
+            p = subprocess.run([sys.executable, "-m", "unittest", mod + ".RepoRootClean"], cwd=scratch, env=env, capture_output=True, text=True)
         return applied, p
 
     def test_s5_a_planted_directory_does_not_fail_it(self):
-        name = "zz-planted-%d-%d" % (os.getpid(), int(time.time()))
-        planted = ROOT / name
-        planted.mkdir()
-        (planted / "file").write_text("x")
-        try:
-            p = subprocess.run([sys.executable, "-m", "unittest", "test_orchestrator_agent.RepoRootClean"], cwd=str(HERE), capture_output=True, text=True)
-        finally:
-            shutil.rmtree(planted, ignore_errors=True)
+        applied, p = self._copy_run(plant=True)
         print("S5: planted directory, exit %d" % p.returncode)
+        self.assertTrue(applied)
         self.assertEqual(p.returncode, 0, p.stderr[-800:])
 
-    def _leaker(self, src):
-        # a class of its own suite that leaves a file in the repository root
+    def _leaker(self, src, root):
+        # a class of its own suite that leaves a file in the judged root
         return src.replace("        for cls in (Orchestrator, Entrypoint):\n",
-                           "        open(os.path.join(ROOT, 'zz-leak-%d' % os.getpid()), 'w').write('x')\n        for cls in (Orchestrator, Entrypoint):\n", 1)
+                           "        open(os.path.join(%r, 'zz-leak-%%d' %% os.getpid()), 'w').write('x')\n        for cls in (Orchestrator, Entrypoint):\n" % root, 1)
 
     def test_s5_a_file_left_by_its_own_classes_fails_it(self):
         applied, p = self._copy_run(self._leaker)
-        leaks = [f for f in os.listdir(ROOT) if f.startswith("zz-leak-")]
-        for f in leaks:
-            os.remove(ROOT / f)
         print("S5: mutant exit %d, mutation applied %s" % (p.returncode, applied))
         self.assertTrue(applied)
         self.assertEqual(p.returncode, 1, p.stderr[-800:])
 
     def test_s6_the_first_assertion_catches_the_mutant(self):
         applied, p = self._copy_run(self._leaker)
-        for f in [f for f in os.listdir(ROOT) if f.startswith("zz-leak-")]:
-            os.remove(ROOT / f)
         print("S6: 1 of 1 mutants exit %d, 1 of 1 mutations applied %s" % (p.returncode, applied))
         self.assertTrue(applied)
         self.assertIn("scratch left in the repository root", p.stderr)
