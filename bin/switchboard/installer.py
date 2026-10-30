@@ -383,6 +383,16 @@ class Installer:
             return "stale"
         return "other"
 
+    def step_installed_tree(self):
+        """#1380: record which tree is the installed one, copy the two standalone guard scripts out of it and write the hooks that record a move of its HEAD."""
+        try:
+            steps = installed_guard_module(Path(self.kit_root) / "bin").install(self.kit_root, ensure_state_dir() if not self.dry else state_dir_path(),
+                                                                                  self.kit_root / "bin", sys.executable, dry_run=self.dry, run=self.runner)
+        except (OSError, subprocess.SubprocessError) as err:
+            return self.say("installed tree", "skipped (%s)" % _one_line(str(err), 120))
+        for step, status, detail in steps:
+            self.say(step, ("would be " + status) if self.dry and status == "done" else status, detail)
+
     def step_cli_link(self):
         target = self.cli_target()
         candidates = self.cli_candidates()
@@ -665,6 +675,7 @@ class Installer:
         else:
             self.say("herdr plugin", "skipped (--no-herdr-link)")
         self.step_cli_link()
+        self.step_installed_tree()
         if not with_service:
             self.say("service", "skipped (--no-service)")
         elif self.kind is None:

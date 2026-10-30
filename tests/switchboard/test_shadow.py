@@ -259,7 +259,7 @@ class FakeGitHub:
         if "/pulls/7/files" in path:
             return [{k: v for k, v in f.items() if k not in ("base", "head")} for f in self.files]
         if path.endswith("/pulls/7"):
-            return {"head": {"sha": "H1"}, "base": {"sha": "B1"}}
+            return {"head": {"sha": "H1"}, "base": {"sha": "B1"}, "changed_files": len(self.files)}
         if "/compare/" in path:
             return {"merge_base_commit": {"sha": "MB"}}
         raise AssertionError("unexpected read: " + path)
@@ -279,7 +279,7 @@ def inputs_for(testcase, hold, module, files):
     state = Path(tempfile.mkdtemp(prefix="shadow-state-"))
     testcase.addCleanup(shutil.rmtree, str(state), True)
     engine = types.SimpleNamespace(state_dir=state)
-    report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "head": "H1", "changed_paths": [f["filename"] for f in files]}
+    report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "registrar_reasons": [], "head": "H1", "changed_paths": [f["filename"] for f in files]}
     with mock.patch.object(hold, "impact_carry_get", lambda e, r, repo: github.get, create=True), mock.patch.object(hold, "_gh_json", github.blob):
         got, why = hold.delegated_clear_inputs(engine, None, "o/r", 7, False, report)
     testcase.assertIsNone(why, why)
@@ -361,7 +361,7 @@ class TestReasonsAreOneCleanLine(unittest.TestCase):
         self.hold.load_module = lambda name: self.m
 
     def reasons(self, files, closure=None):
-        report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "changed_paths": [f["filename"] for f in files]}
+        report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "registrar_reasons": [], "changed_paths": [f["filename"] for f in files]}
         return self.m.refusals(RULE, report, files, impact_floor.matches, closure or {})
 
     def assertOneCleanLine(self, got, kind):
@@ -400,7 +400,7 @@ class TestReasonsAreOneCleanLine(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         module.__dict__["__file__"] = str(REPO / "bin" / "delegated_clear.py")
         exec(compile(source.replace(old, "return text", 1), "delegated_clear_dirty", "exec"), module.__dict__)
-        report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "changed_paths": []}
+        report = {"owner_decision": "hold", "complete": True, "top_tier_hits": {}, "review_action": "go", "review_class": None, "registrar_reasons": [], "changed_paths": []}
         got = module.refusals(RULE, report, [{"filename": "bin/switchboard/" + self.DIRTY, "status": "changed"}], impact_floor.matches, {})
         self.assertFalse(all(r.isprintable() for r in got), "without the cleaning the escape reaches the reason")
 

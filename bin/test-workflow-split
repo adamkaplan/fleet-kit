@@ -119,7 +119,13 @@ OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
            suite("bin/test-cloud-neutral-names"), suite("cloud/tests/test-cloud", "", "10"),
            ("bin/fleet-scenario validate", "bin/fleet-scenario validate", None),
            ("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4", None)]
-NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", "30")]
+# The seven cloud suites added by ask #1301 (hub, channel, channel-server, client, way-back, decisions-pull, cli), in this order after the launcher.
+ADDED = [("bin/test-cloud-hub", "10"), ("bin/test-cloud-channel", None), ("bin/test-cloud-channel-server", None), ("bin/test-cloud-client", None),
+         ("bin/test-cloud-way-back", None), ("bin/test-decisions-pull", "10"), ("bin/test-cloud-cli", "10")]
+# The three relay suites added by ask #1376, after the seven, in this order (a timeout sized from a measured run on both systems).
+RELAY = [("bin/test-cloud-relay", "10"), ("bin/test-cloud-hub-relay", "10"), ("bin/test-cloud-relay-daemon", "10")]
+LAUNCHER_TIMEOUT = "20"   # the cloud launcher step's timeout-minutes; the one pinned figure (ask #1390)
+NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", LAUNCHER_TIMEOUT)] + [suite(n, "", t) for n, t in ADDED + RELAY]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
 CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
@@ -166,12 +172,16 @@ TEST_STEPS = [CHECKOUT, PYTHON,
               step("bin/test-heartbeat", always=False), step("bin/test-health-records"), step("bin/test-fleet-doctor"),
               step("bin/test-fleet-doctor-config"), step("bin/test-fleet-doctor-heartbeat"), step("bin/test-switchboard"),
               step("bin/test-workflow-split"), step("bin/test-gh-hold", "-hold"), step("bin/test-app-mint", "-app"),
+              {"name": "Size ceilings on the merge result", "if": "${{ github.event_name == 'pull_request' && github.base_ref == 'integration' && !cancelled() }}",
+               "env": {"BASE": "${{ github.base_ref }}", "HEAD_SHA": "${{ github.event.pull_request.head.sha }}"},
+               "run": "git fetch origin \"$BASE\"\npython3 bin/size_ceilings.py check --tip \"origin/$BASE\" --head \"$HEAD_SHA\""},
               step("bin/test-cloud-neutral-names"),
               step("cloud/tests/test-cloud", **{"timeout-minutes": "10", "env": {"CLOUD_TEST_SKIP_DOCKER": "1"}}),
               plain("node --test plugins/fleet-decisions-tui/health.test.mjs", "node --test plugins/fleet-decisions-tui/health.test.mjs"),
               plain("bin/fleet-scenario validate", "bin/fleet-scenario validate"),
               plain("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4")]
-CLOUD_STEPS = [CHECKOUT, PYTHON, step("bin/test-cloud-worker"), step("bin/test-cloud-launcher", **{"timeout-minutes": "30"})]
+CLOUD_STEPS = [CHECKOUT, PYTHON, step("bin/test-cloud-worker"), step("bin/test-cloud-launcher", **{"timeout-minutes": LAUNCHER_TIMEOUT})] + [
+    step(n, **({"timeout-minutes": t} if t else {})) for n, t in ADDED + RELAY]
 STEP_LISTS = {"test": TEST_STEPS, "test-cloud": CLOUD_STEPS}
 # The step schema of GitHub Actions: every key class that can skip, soften, redirect or widen a step.
 STEP_KEYS = {"id": "id: x", "name": "name: x", "if": "if: false", "uses": "uses: x/y@z", "run": "run: echo x", "shell": "shell: sh",
@@ -226,7 +236,7 @@ class Pins(unittest.TestCase):
         for name in MOVED:
             self.assertNotIn(name, [n for n, _, _ in commands(jobs["test"])])
         launcher = [s for s in jobs["test-cloud"]["steps"] if s.get("name") == "bin/test-cloud-launcher"]
-        self.assertEqual([s.get("timeout-minutes") for s in launcher], ["30"])
+        self.assertEqual([s.get("timeout-minutes") for s in launcher], [LAUNCHER_TIMEOUT])
 
     def test_s7_the_old_job_keeps_its_id_and_check_names(self):
         job = self.jobs()["test"]
@@ -252,6 +262,12 @@ class Pins(unittest.TestCase):
             self.assertEqual(both.count(name), 1, name)
         for _, run, _ in only_suites(got) + commands(self.jobs()["test-cloud"]):
             self.assertIn("grep -qx 'RESULT: PASS'", run)
+
+    def test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step(self):
+        steps = self.jobs()["test-cloud"]["steps"]
+        for name, _ in ADDED + RELAY:
+            hits = [x for x in steps if re.search(r"(^|[\s/])%s(\s|$)" % re.escape(name), x.get("run", ""))]
+            self.assertEqual(len(hits), 1, name)
 
     def test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own(self):
         self.assertEqual(self.wf["concurrency"], CONCURRENCY)
@@ -332,7 +348,7 @@ class Mutants(unittest.TestCase):
         self.fails("    name: ${{ matrix.cloud }}\n", "    name: ${{ matrix.name }}\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
 
     def test_s1_launcher_limit_changed(self):
-        self.fails("timeout-minutes: 30", "timeout-minutes: 20", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+        self.fails("timeout-minutes: %s" % LAUNCHER_TIMEOUT, "timeout-minutes: 25", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
 
     def test_s7_old_job_given_a_name(self):
         self.fails("    name: ${{ matrix.name }}\n", "    name: unit\n", "test_s7_the_old_job_keeps_its_id_and_check_names")
@@ -348,6 +364,22 @@ class Mutants(unittest.TestCase):
     def test_u3_old_matrix_loses_macos(self):
         self.fails("        include: ${{ fromJSON(needs.plan.outputs.matrix) }}", "        os: [ubuntu-latest]", "test_u3_the_old_job_keeps_its_matrix_runner_and_shell")
 
+    def test_s7_one_of_the_seven_steps_removed(self):
+        step = "      - name: bin/test-cloud-way-back\n        if: ${{ !cancelled() }}\n        run: |\n          bin/test-cloud-way-back 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+        self.assertIn(step, WORKFLOW.read_text())
+        self.fails("\n" + step, "", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+
+    def test_s9_a_suite_whose_name_is_a_prefix_of_another_is_not_counted_by_it(self):
+        channel = "          bin/test-cloud-channel 2>&1 | tee"
+        self.assertIn(channel, WORKFLOW.read_text())
+        # channel-server twice and channel zero fails the exactly-one check
+        self.fails(channel, "          bin/test-cloud-channel-server 2>&1 | tee", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+
+    def test_s9_the_channel_step_removed_alone_fails_the_exactly_one_check(self):
+        step = "      - name: bin/test-cloud-channel\n        if: ${{ !cancelled() }}\n        run: |\n          bin/test-cloud-channel 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+        self.assertIn(step, WORKFLOW.read_text())
+        self.fails("\n" + step, "", "test_s9_each_of_the_seven_cloud_suites_runs_in_exactly_one_test_cloud_step")
+
     def test_u1_a_command_edited(self):
         self.fails("bin/test-heartbeat 2>&1", "bin/test-heartbeat -q 2>&1", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
 
@@ -356,7 +388,7 @@ class Mutants(unittest.TestCase):
 
     def test_u1_launcher_left_in_the_old_job(self):
         text = WORKFLOW.read_text()
-        step = "      - name: bin/test-cloud-launcher\n        if: ${{ !cancelled() }}\n        timeout-minutes: 30\n        run: |\n          bin/test-cloud-launcher 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+        step = "      - name: bin/test-cloud-launcher\n        if: ${{ !cancelled() }}\n        timeout-minutes: " + LAUNCHER_TIMEOUT + "\n        run: |\n          bin/test-cloud-launcher 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
         self.assertIn(step, text)
         text = text.replace(step, "") .replace("      - name: bin/test-switchboard\n", step + "\n      - name: bin/test-switchboard\n", 1)
         for t in ("test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep"):
@@ -469,6 +501,24 @@ class Mutants(unittest.TestCase):
         self.killed(text[:i] + text[i:].replace("    steps:\n", "    steps:\n      - run: echo x\n", 1), self.STEPS)
         self.killed(mutate(text, "\n  # The cloud suites run beside", "\n      - run: echo x\n\n  # The cloud suites run beside"), self.STEPS)
 
+    def relay_step(self, name):
+        return "      - name: %s\n        if: ${{ !cancelled() }}\n        timeout-minutes: 10\n        run: |\n          %s 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n" % (name, name)
+
+    def test_s5_each_of_the_three_relay_steps_removed_fails_the_shape_test(self):
+        text = WORKFLOW.read_text()
+        for name, _ in RELAY:
+            step_ = "\n" + self.relay_step(name)
+            with self.subTest(step=name):
+                self.assertIn(step_, text)
+                self.killed(text.replace(step_, "", 1), self.STEPS, "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+
+    def test_s5_one_relay_step_name_swapped_for_another_fails_the_shape_test(self):
+        text = WORKFLOW.read_text()
+        first, second = RELAY[0][0], RELAY[1][0]
+        self.assertIn("- name: %s\n" % first, text)
+        self.killed(text.replace("- name: %s\n" % first, "- name: %s\n" % second, 1), self.STEPS)
+        self.killed(text.replace("          %s 2>&1" % first, "          %s 2>&1" % second, 1), self.STEPS)
+
     def test_shape_job_permissions_write_all(self):
         self.killed(mutate(WORKFLOW.read_text(), "  test-cloud:\n", "  test-cloud:\n    permissions: write-all\n"), self.SHAPE)
 
@@ -488,8 +538,30 @@ class Mutants(unittest.TestCase):
         self.killed(text[:i] + text[i:].replace("include: ${{ fromJSON(needs.plan.outputs.matrix) }}", "os: [ubuntu-latest, macos-latest, windows-latest]", 1), self.SHAPE)
 
 
+class RelayDocs(unittest.TestCase):
+    """S8: cloud/README.md names the three relay steps and the measured time of each (ask #1376)."""
+
+    README = WORKFLOW.parent.parent.parent / "cloud" / "README.md"
+
+    @staticmethod
+    def states(text):
+        para = next((p for p in text.split("\n\n") if "ask #1376" in p), "")
+        named = all(re.search(r"%s(?![\w-])" % re.escape(n), para) for n, _ in RELAY)
+        return named and re.search(r"Measured .*\d+ / \d+", para) is not None and "timeout-minutes: 10" in para
+
+    def test_s8_the_readme_names_the_three_steps_and_their_time(self):
+        self.assertTrue(self.states(self.README.read_text()))
+
+    def test_s8_a_readme_without_a_step_or_the_time_is_refused(self):
+        text = self.README.read_text()
+        for n, _ in RELAY:
+            self.assertFalse(self.states(text.replace(n + "`", "x`", 1)), n)
+        self.assertFalse(self.states(text.replace("Measured", "Seen")))
+        self.assertFalse(self.states(text.replace("ask #1376", "ask")))
+
+
 if __name__ == "__main__":
     loader = unittest.defaultTestLoader
-    result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite([loader.loadTestsFromTestCase(Pins), loader.loadTestsFromTestCase(Mutants)]))
+    result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite([loader.loadTestsFromTestCase(Pins), loader.loadTestsFromTestCase(Mutants), loader.loadTestsFromTestCase(RelayDocs)]))
     print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
     sys.exit(0 if result.wasSuccessful() else 1)

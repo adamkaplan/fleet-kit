@@ -8,7 +8,7 @@ replaces the hand-written rule of which tests to pick.
 It lists the files changed since the merge base with <base>, selects every test file whose text names a changed file
 (basename match) plus the scan tests of SCAN_TESTS, runs each on the branch and on a clean worktree of the base (under the
 temporary directory, removed at the end, never forced), and prints only the differences.
-An EMPTY change exits 0 before the preflight runs. Exit: 0 no difference; 1 a difference, a test that could not run, or no test selected for a non-empty change; 2 refused input.
+An EMPTY change exits 0 before the preflight runs. Exit: 0 no difference; 1 a difference, a test that could not run, or no test selected for a non-empty change; 2 refused input; 3 the quick budget was spent (NOT RUN (budget): not a failing test; see CLOUD_PREFLIGHT_QUICK_TOTAL).
 Continuous integration stays the gate; its result is the only evidence. Uses git and python3 only, local.
 """
 import os
@@ -22,7 +22,15 @@ import time
 
 # Repository-wide scan tests (one list). Entries that do not exist in a repository are skipped there; --check-list
 # verifies that every entry exists in this one.
-SCAN_TESTS = ["bin/test-switchboard"]
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    import cloud_quick  # noqa: E402  (the shared list and selection, bin/cloud_quick.py)
+    SCAN_TESTS = cloud_quick.SCAN_TESTS  # (file, selector) pairs; one list for both commands
+except ImportError:  # a copy of this script placed alone (an offline test): the whole-file scan of before
+    cloud_quick = None
+    SCAN_TESTS = [("bin/test-switchboard", None)]
+PREFLIGHT_MODE = ["quick"]  # set from CLOUD_PREPUSH_PREFLIGHT (quick by default, or full)
+SCAN_SELECTOR = {}  # file -> selector, set by select() for a scan picked only as a scan
 # Bounds: CLOUD_PREPUSH_TIMEOUT seconds per test and side (default 120); CLOUD_PREPUSH_TOTAL seconds overall (default 1500).
 # A timeout, or a test not reached when the overall deadline expires, counts as "could not run". Invalid value: exit 2.
 # The two sides run one after the other, one test at a time (a pod has a hard memory limit): no parallelism.
@@ -35,7 +43,11 @@ PREFLIGHT_TIMEOUT = 900
 MAX_SECONDS = 86400
 # Memory-heavy tests: never run here (a pod has a hard memory limit); reported as "skipped: memory-heavy" and counted as
 # "could not run" (exit 1). Continuous integration runs them. Repository-relative paths, one literal tuple.
-HEAVY = ("cloud/worker/tests/test_root_scanner.py",)
+HEAVY = ("cloud/worker/tests/test_root_scanner.py",)  # fallback of a lone copy; with the helper, cloud_quick.HEAVY rules
+if cloud_quick is not None:
+    HEAVY = cloud_quick.HEAVY
+BUDGET_STATUS = 3  # the preflight's status for a spent quick budget (see bin/cloud-pr-preflight)
+BUDGET_SPENT = [False]
 PREFLIGHT = "cloud-pr-preflight"  # found next to this file by path, never through PATH
 
 
@@ -112,31 +124,45 @@ def git(args, cwd, check=False):
     return p
 
 
-def is_test(rel):
+READERS = [0]  # number of reader tests of the last select()
+READ_LIST = []  # the reader tests of the last select(), all of them
+
+
+def _is_test(rel):  # only a fallback of a lone copy without the helper
     base = os.path.basename(rel)
-    parts = rel.split("/")
-    if rel.startswith("bin/test-"):
-        return True
-    return base.startswith("test_") and base.endswith(".py") and "tests" in parts[:-1]
+    return rel.startswith("bin/test-") or (base.startswith("test_") and base.endswith(".py") and "tests" in rel.split("/")[:-1])
 
 
 def select(root, changed):
     tracked = git(["ls-files"], root).stdout.split("\n")
+    if cloud_quick is not None:
+        reads = cloud_quick.readers(root, tracked, set(changed))
+    else:
+        reads = cloud_quick_lone_readers(root, tracked, changed)
+    READERS[0] = len(reads)
+    READ_LIST[:] = reads
+    picked = list(reads)
+    SCAN_SELECTOR.clear()
+    for rel, sel in SCAN_TESTS:
+        if os.path.isfile(os.path.join(root, rel)) and rel not in picked:
+            picked.append(rel)
+            SCAN_SELECTOR[rel] = sel
+    return sorted(picked)
+
+
+def cloud_quick_lone_readers(root, tracked, changed):
     names = {os.path.basename(c) for c in changed}
-    picked = []
+    out = []
     for rel in tracked:
-        if not rel or not is_test(rel) or not os.path.isfile(os.path.join(root, rel)):
+        if not rel or not _is_test(rel) or not os.path.isfile(os.path.join(root, rel)):
             continue
         try:
             text = open(os.path.join(root, rel), errors="replace").read()
         except OSError:
             continue
         if rel in changed or any(n in text for n in names):
-            picked.append(rel)
-    for rel in SCAN_TESTS:
-        if os.path.isfile(os.path.join(root, rel)) and rel not in picked:
-            picked.append(rel)
-    return sorted(picked)
+            out.append(rel)
+    return out
 
 
 def run_one(root, rel, tmp, limit):
@@ -144,6 +170,8 @@ def run_one(root, rel, tmp, limit):
     if not os.path.isfile(path):
         return ("absent", None)
     cmd = [sys.executable, path] if rel.endswith(".py") else [path]
+    if SCAN_SELECTOR.get(rel):
+        cmd.append(SCAN_SELECTOR[rel])  # a scan runs one class or method, never the whole suite
     env = child_env(tmp)
     try:
         rc, text, timed_out = run_group(cmd, root, env, limit)
@@ -165,6 +193,8 @@ def preflight(root, base, scratch, limit):
         return False, ["could not run the preflight: " + path + " is missing"]
     env = child_env(scratch)
     env["CLOUD_PREFLIGHT_BASE"] = base  # the preflight takes its base from this variable, never from an option
+    if PREFLIGHT_MODE[0] == "quick":
+        env["CLOUD_PREFLIGHT_MODE"] = "quick"  # the preflight reads the quick mode from this variable (same as --quick)
     state = {"next": 0}
 
     def tick(el):
@@ -179,6 +209,8 @@ def preflight(root, base, scratch, limit):
     if timed_out:
         return False, ["could not run the preflight: timed out after %ds" % limit]
     lines = text.splitlines()
+    if rc == BUDGET_STATUS:
+        BUDGET_SPENT[0] = True  # a spent quick budget (not a failing test): the same status 3 is passed on
     if rc != 0:
         return False, lines or ["the preflight exited %d with no output" % rc]
     return True, lines
@@ -189,13 +221,25 @@ def refuse(msg):
     return 2
 
 
+def _sibling_needs_helper():
+    """True when the preflight next to this script is the real one (it imports cloud_quick)."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cloud-pr-preflight")) as fh:
+            return "cloud_quick" in fh.read()
+    except OSError:
+        return False
+
+
 def main(argv):
+    if cloud_quick is None and _sibling_needs_helper():  # a real install lost its helper (a lone copy or a stub sibling does not)
+        print("cloud_quick helper missing", file=sys.stderr)
+        return 2
     if argv and argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
     if len(argv) == 1 and argv[0] == "--check-list":
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        bad = [s for s in SCAN_TESTS if not os.path.isfile(os.path.join(root, s))]
+        bad = [s for s, _ in SCAN_TESTS if not os.path.isfile(os.path.join(root, s))]
         for s in bad:
             print("listed scan test missing: " + s)
         return 1 if bad else 0
@@ -208,6 +252,9 @@ def main(argv):
         TIMEOUT_S = positive("CLOUD_PREPUSH_TIMEOUT", TIMEOUT)
         TOTAL_S = positive("CLOUD_PREPUSH_TOTAL", TOTAL)
         PF_S = positive("CLOUD_PREPUSH_PREFLIGHT_TIMEOUT", PREFLIGHT_TIMEOUT)
+        MODE = os.environ.get("CLOUD_PREPUSH_PREFLIGHT", "quick")
+        if MODE not in ("quick", "full"):
+            return refuse("CLOUD_PREPUSH_PREFLIGHT must be quick or full")
     except ValueError as e:
         return refuse("%s must be a whole number of seconds (1 or more)" % e)
     started = time.monotonic()
@@ -233,22 +280,47 @@ def main(argv):
     os.mkdir(os.path.join(tmp, "tb"))
     signal.signal(signal.SIGTERM, _term)
     try:
-        return stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S)
+        return stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S, MODE)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S):
+def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S, MODE="quick"):
     # Step 1: the preflight of the pod, before any test.
-    ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
+    PREFLIGHT_MODE[0] = MODE
+    print("cloud-prepush: preflight mode: " + MODE, file=sys.stderr, flush=True)
+    reason = None
+    if MODE == "quick" and changed:  # decide "no reader" at once with the preflight's own rule: nothing is started
+        select(root, changed)
+        if cloud_quick is not None:
+            reason = cloud_quick.not_run_reason(READ_LIST, changed)
+        elif not READERS[0]:
+            reason = "no check reads " + ", ".join(sorted(changed))
+    if reason:
+        ok, plines = True, []
+    else:
+        ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
     if not ok:
         for l in plines:
             print(l)
+        if BUDGET_SPENT[0]:
+            print("cloud-prepush: the quick budget was spent (NOT RUN (budget), not a failing test); no test was run (advice only)")
+            return BUDGET_STATUS
         print("cloud-prepush: the preflight did not pass; no test was run (advice only)")
         return 1
-    print("cloud-prepush: preflight passed", file=sys.stderr)
+    if not reason:
+        print("cloud-prepush: preflight passed", file=sys.stderr)
     picked = select(root, changed)
-    if not picked:
+    if MODE == "full" and changed and not READERS[0]:
+        reason = "no check reads " + ", ".join(sorted(changed))  # full mode: only an empty reader set is a verdict
+    if reason:
+        print("NOT RUN: " + reason)
+        if cloud_quick is not None:
+            for line in cloud_quick.cannot_lines(READ_LIST):
+                print(line)
+    if cloud_quick is not None:
+        print("cloud-prepush: %s" % cloud_quick.mode_line(READERS[0], len(changed)), file=sys.stderr)
+    if not picked or reason:
         print("cloud-prepush: %d changed file(s) but NO test was selected; this is not a clean result (advice only)" % len(changed))
         return 1
     wt = os.path.join(tmp, "base")
@@ -259,6 +331,10 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
     diffs = []
     try:
         for i, rel in enumerate(picked, 1):
+            if MODE == "quick" and cloud_quick is not None and cloud_quick.cannot_run_quick(rel) and rel in READ_LIST:
+                noRun += 1
+                diffs.append("NOT RUN: %s cannot run in quick" % rel)
+                continue
             if rel in HEAVY:
                 noRun += 1
                 diffs.append("skipped: memory-heavy " + rel)

@@ -19,6 +19,11 @@ import os
 import time
 from pathlib import Path
 
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("record_json", str(Path(__file__).resolve().parent / "record_json.py"))
+_record_json = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_record_json)   # the shared bounded-depth parse (#1314): registry.json and retired.json are record files another process can write
+
 VERSION = 1
 FILE = "registry.json"
 LOCK = "registry.lock"
@@ -84,7 +89,7 @@ def _parse(raw):
     if len(raw) > MAX_BYTES:
         return _empty(False, "%s is too large: nothing read" % FILE)
     try:
-        doc = json.loads(raw.decode("utf-8"))
+        doc = _record_json.parse_bounded(raw.decode("utf-8"))
     except (ValueError, UnicodeError):
         return _empty(False, "%s is not valid JSON: nothing read" % FILE)
     if not isinstance(doc, dict) or not _is_int(doc.get("version")):
@@ -130,7 +135,7 @@ def _old_retired(state_dir):
     except OSError as err:
         return {}, "%s cannot be read (%s)" % (RETIRED_DERIVED, getattr(err, "strerror", None) or type(err).__name__)
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = _record_json.parse_bounded(raw.decode("utf-8"))
     except (ValueError, UnicodeError):
         return {}, "%s is not valid JSON" % RETIRED_DERIVED
     if not isinstance(data, dict) or len(raw) > 1000000 or not all(isinstance(v, dict) for v in data.values()):
@@ -438,6 +443,13 @@ def upsert(state_dir, name, agent, now=None):
         if covers(doc["retired"].get(name), (agent or {}).get("session")):
             return False, [], "%s is retired for this session" % name
         fields = dict(agent or {})
+        if (fields.get("kind") or (old or {}).get("kind") or "local") != "local" and fields.get("pane"):
+            return False, [], "%s is not a local agent: a cloud worker has no pane (refused pane %s)" % (name, fields["pane"])
+        if fields.get("pane"):
+            for other, row in doc["agents"].items():   # a pane bound to a LIVE agent is never rebound to another (#1066)
+                if other != name and isinstance(row, dict) and row.get("pane") == fields["pane"] and (row.get("kind") or "local") == "local" \
+                        and row.get("state") not in ("dead", "detached"):
+                    return False, [], "pane %s is bound to the live agent %s: refused to bind it to %s" % (fields["pane"], other, name)
         refused = endpoint_problem(fields)
         if refused:
             return False, [], refused

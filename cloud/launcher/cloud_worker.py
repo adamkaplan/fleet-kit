@@ -36,10 +36,13 @@ import run_record  # noqa: E402  (the run record: one module, one function the s
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
 SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": False},   # the light shape: no nested Docker (the default of a non-stack worker)
+          # the orchestrator row: it reads and relays, it builds nothing; no nested Docker. The estimate is the larger of the ratios 0.25 (cpu) and 0.375 (memory) against XS 0.05 = 0.01875, rounded up
+          "O": {"cpu": "250m", "memory": "768Mi", "usd_per_hour": 0.02, "stack": False},
           "S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10, "stack": True},
           "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True}}  # list-price estimates, not billed figures
+
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
-DEFAULT_ORCHESTRATOR_SHAPE = "S"   # an orchestrator launch that names no shape keeps the size it had before XS existed (the role table carries no shape: this is the one place)
+DEFAULT_ORCHESTRATOR_SHAPE = "O"   # an orchestrator launch that names no shape takes its own small row (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 MAX_TOKEN_SECONDS = 3600
 
@@ -59,6 +62,14 @@ _NAMESPACE_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")   # a DNS-1
 FIREWALL_MARKERS = ("client address is not authorized and caller is not a trusted service", "forbiddenbyfirewall")
 REAPER_RUNTIME_ID = "reaper"           # the reaper's own runtime id in the audit (it acts on no worker)
 REFRESH_ACTION = "refresh-cluster-token"   # the audit action of the reaper's own login refresh
+SLOW_PASS_SECONDS = 600                 # a reaper pass that takes longer than this is named on the reaper's log and in the audit (a pass is normally seconds)
+SLOW_PASS_ACTION = "slow-reap-pass"     # the audit action of that note (its reason holds the seconds)
+ORPHAN_SECRET_AFTER_SECONDS = 3600      # a per-run Secret whose pod is absent is removed by the pass once it is older than this (set once; not a CW_ setting)
+ORPHAN_SECRET_ACTION = "orphan-secret-removed"   # the audit action of that removal (one line per Secret; its reason holds the name and the age)
+ORPHAN_SECRET_REASON = "orphan secret: its pod is absent"
+PW_SECRET_NAME = re.compile(r"(.+-[0-9a-f]{4})-pw")   # '<worker>-<4 hex digits>-pw': the password Secret of the pod named by the group
+RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
+RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
 IGNORED_NOTICE_SECONDS = 3600          # each ignored name is named on the first pass and then at most once an hour
@@ -73,6 +84,39 @@ GIT_TOKEN_RENEW_AFTER_SECONDS = 1800             # renew when the token is this 
 GIT_TOKEN_MINTED = "cw/git-token-minted"         # the Secret annotation that says when the token was minted (the Secret's creation time stands in when it is absent)
 GIT_TOKEN_MINT_SECONDS = 60                      # the mint child's run limit
 GIT_TOKEN_MAX_CHARS = 4096                       # the most a token may be
+# The token at its limit (#1354). The pod holds NO credential for the minter and never gets one: when the end hook's push is refused because
+# the token had ended, the STOP side mints through the same route as the renewal (run_git_token_cmd), replaces ONLY the git-token key of the
+# per-run Secret, waits (bounded) for the kubelet to project it, and runs the hook once more. One refresh, one retry, never a loop.
+REFRESH_USED, REFRESH_REFUSED, REFRESH_NONE = "used", "refused", "none"   # the one word the stop's audit line and run record carry (never a value)
+GIT_TOKEN_PROJECTION_SECONDS = 120               # the most the stop waits for the kubelet to project the new token into the pod
+GIT_TOKEN_PROJECTION_POLL_SECONDS = 5
+SCOPE_PROBE_SECONDS = 20
+# The minute-40 note (new text): the worker is asked, once, to save its work to <worker>/wip with a plain push while its token still lives.
+WIP_NOTE_AFTER_SECONDS = 40 * 60
+WIP_NOTE_MARK = "wip_note"                      # the pod annotation (cw/wip-note) that says the note was sent: once, never twice
+
+
+def wip_note(worker):
+    """The note sent to the worker at minute 40: names the branch and the exact command (plain, never forced)."""
+    return ("Your git token ends in about 20 minutes. Save your work now: commit it, then push it to your work-in-progress branch %s/wip "
+            "with exactly this command (plain, never forced): git push origin HEAD:refs/heads/%s/wip" % (worker, worker))
+
+
+def wip_note_due(started, now, already):
+    """True once the pod is 40 minutes old and the note was not sent yet. started: a datetime or None; already: the annotation's value."""
+    return not already and started is not None and (now - started).total_seconds() >= WIP_NOTE_AFTER_SECONDS
+
+
+# Run INSIDE the pod by `kubectl exec python3 -c <this> <text>`: the pod's own headless server, the password file the activity probe reads.
+# It prompts the newest session with the note (queued). It prints nothing and holds no credential beyond the server password it already reads.
+NOTE_SENDER_CODE = (
+    "import base64,json,sys,urllib.request as u\n"
+    "pw=open('/run/cw/server-password').read().strip()\n"
+    "h={'Authorization':'Basic '+base64.b64encode(('opencode:'+pw).encode()).decode(),'Content-Type':'application/json'}\n"
+    "g=lambda p,d=None:json.loads(u.urlopen(u.Request('http://127.0.0.1:4096'+p,data=d,headers=h),timeout=10).read().decode() or 'null')\n"
+    "s=[x for x in g('/api/session')['data'] if isinstance(x,dict)]\n"
+    "s.sort(key=lambda x:(x.get('time') or {}).get('updated') or 0)\n"
+    "g('/api/session/'+s[-1]['id']+'/prompt',json.dumps({'text':sys.argv[1],'delivery':'queue'}).encode())\n")
 
 # The pod shape of a worker that runs a nested Docker stack (`create --stack`, opt-in; the default pod is unchanged).
 # Shape S (2 CPU, 4 GiB limits) is the smallest existing shape that holds the stack lane's measured peak (1.0-1.35 GiB,
@@ -457,11 +501,14 @@ def check_repo_allowed(repo, env):
         raise CloudError("refused: %s is not on the cloud allow-list" % scrub(repo, (), 120), EXIT_USAGE)
 
 
-def git_token_cmd(repo, env):
+def git_token_cmd(repo, env, role="worker"):
     """The command that mints the git token for ONE repository: CW_GIT_TOKEN_CMD, else app_token.py beside this file. The launch (run_task.py)
     and the renewal run the same command; the renewal builds it here and the driver's own line in run_task.py is pinned equal by a test."""
-    raw = env.get("CW_GIT_TOKEN_CMD")
-    return shlex.split(raw) if raw else [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py"), repo]
+    raw = env.get("CW_GIT_TOKEN_CMD")   # an operator's own command is run as it is: the role is passed to the default command only
+    if raw:
+        return shlex.split(raw)
+    cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py"), repo]
+    return cmd + ["--role", role] if role != "worker" else cmd
 
 
 def run_git_token_cmd(cmd, repo, env, register=None):
@@ -1154,17 +1201,18 @@ class ClusterTokenRefresher:
     def path(self):
         return (self.env.get("CW_CLOUD_TOKEN_FILE") or "").strip()
 
-    def run(self):
-        """One attempt: make the file fresh when it is due. Returns a TokenRefresh (never raises)."""
+    def run(self, force=False):
+        """One attempt: make the file fresh when it is due (force: now, whatever the file's life and the retry gap say).
+        Returns a TokenRefresh (never raises)."""
         if not self.enabled():
             return TokenRefresh("skipped")   # another login kind: nothing is read and nothing is written
         now = self.clock().timestamp()
         self.note_ignored(now)
-        if self.last_failure is not None and 0 <= now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS:   # a negative gap (the clock went back) counts as expired
+        if not force and self.last_failure is not None and 0 <= now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS:   # a negative gap (the clock went back) counts as expired
             return TokenRefresh("waiting", self.last_failure[1])   # the retry gap: no new attempt yet
         path = self.path()
         life = token_file_life_left(path, now)
-        if life is not None and life >= CLUSTER_TOKEN_REFRESH_MARGIN_SECONDS:
+        if not force and life is not None and life >= CLUSTER_TOKEN_REFRESH_MARGIN_SECONDS:
             return TokenRefresh("fresh")   # the file has life left: it is left alone
         try:
             token = cluster_token(self.env, duration=CLUSTER_TOKEN_DURATION, capture=self.capture, now=now, strict=True)
@@ -1318,7 +1366,7 @@ class Kube:
             shutil.rmtree(self.dir, ignore_errors=True)
             self.dir = None
 
-    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120):
+    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
         if not self.context:  # never fall back to the active context
             raise CloudError("CW_KUBE_CONTEXT is not set; refusing to run kubectl against an unnamed context", EXIT_USAGE)
         cmd = [self.bin] + (["--kubeconfig", self.kubeconfig] if self.kubeconfig else []) + \
@@ -1330,7 +1378,7 @@ class Kube:
         if p.returncode != 0:
             if keep_stdout and p.stdout.strip():
                 return p.stdout  # the caller reads the failure from the tool's own JSON
-            if ok_missing and "NotFound" in p.stderr:
+            if ok_missing and "NotFound" in p.stderr and (missing_what is None or (missing_what in p.stderr and " not found" in p.stderr)):
                 return None
             last = (self.scrub(p.stderr, limit=SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
             raise CloudError("kubectl %s: %s" % (args[0], self.scrub(last)))
@@ -1356,7 +1404,7 @@ class Kube:
         return json.loads(out) if out else None
 
     def get_pod(self, name):
-        out = self.run(["get", "pod", name, "-o", "json"], ok_missing=True)
+        out = self.run(["get", "pod", name, "-o", "json"], ok_missing=True, missing_what='pods "%s"' % name)
         return json.loads(out) if out else None
 
     def list_pods(self):
@@ -1405,6 +1453,22 @@ class Kube:
     def pod_events(self, name):
         out = self.run(["get", "events", "--field-selector", "involvedObject.kind=Pod,involvedObject.name=" + name, "-o", "json"])
         return json.loads(out)["items"]
+
+    def list_secrets(self, selector):
+        """The Secrets that match a label selector, WITHOUT any value: an output form that names only the name, the labels cw/pod and app and
+        the creation time (never the whole object). Returns [(name, cw/pod, app, creationTimestamp)]; an answer that cannot be read raises."""
+        tmpl = (r'{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.cw/pod}{"\t"}{.metadata.labels.app}{"\t"}'
+                r'{.metadata.creationTimestamp}{"\n"}{end}')
+        out = self.run(["get", "secrets", "-l", selector, "-o", "jsonpath=" + tmpl])
+        rows = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            f = line.split("\t")
+            if len(f) != 4 or not f[0]:
+                raise CloudError("kubectl get: the Secret list could not be read")
+            rows.append(tuple(f))
+        return rows
 
     def delete_secret(self, name):
         self.run(["delete", "secret", name + "-pw", "--ignore-not-found"])
@@ -1637,7 +1701,8 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
-                        **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
+                        **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
+                        **({"cw/role": agent} if agent == "orchestrator" else {})}},   # a worker pod's spec is byte-for-byte what it was: no annotation means worker
         "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
                  "terminationGracePeriodSeconds": POD_TERMINATION_GRACE_SECONDS,
                  "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
@@ -1686,12 +1751,17 @@ class Launcher:
         self.recorder = run_record.Recorder(kube, env)
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.audit_path = audit_path(env)
+        self.relogin = None   # set by the reaper's loop: a function that refreshes the reaper's own login now; True when it did
+        self.renew_lock = threading.RLock()   # the pass and the renewal thread never renew at the same moment
 
     # -- audit: one line per action, no secret, written before the action returns --
-    def audit(self, worker, runtime_id, action, cost, ok, reason=""):
-        write_audit(self.audit_path, {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
-                                      "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name,
-                                      "reason": self.kube.scrub(reason, limit=1000)})
+    def audit(self, worker, runtime_id, action, cost, ok, reason="", refresh=None):
+        line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
+                "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name,
+                "reason": self.kube.scrub(reason, limit=1000)}
+        if refresh in (REFRESH_USED, REFRESH_REFUSED, REFRESH_NONE):   # a stop that ran the hook: ONE word, never a value
+            line["refresh"] = refresh
+        write_audit(self.audit_path, line)
 
     def cost(self, pod):
         hours = (self.clock() - parse_iso(ann(pod, "started"))).total_seconds() / 3600
@@ -1707,12 +1777,12 @@ class Launcher:
         except CloudError as e:
             if not e.audited:
                 # the failure is never dropped: a caller's own reason (a stop reason, the run-secret names) comes first
-                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e))
+                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("refresh"))
             raise
         except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
-            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300])
+            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("refresh"))
             raise CloudError("unexpected cloud data: %s" % self.kube.scrub(e, 200))
-        self.audit(worker, info["rid"], action, info["cost"], True, why())
+        self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("refresh"))
         return result
 
     def _need(self, worker):
@@ -2089,7 +2159,14 @@ class Launcher:
             if not pod:
                 if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
                     self._remove(name, nonce)
-                return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None}
+                # The pod read said NotFound (an operator deleted it); any other read error raised in _need above and never reaches here.
+                removed = []
+                if not nonce:   # by name, pod NotFound: only this worker's own two Secrets (exact names) may be left over; nothing else is touched
+                    for full, fn in ((name + "-pw", self.kube.delete_secret), (name + "-run", self.kube.delete_run_secret)):
+                        if self.kube.get_secret(full):
+                            fn(name)
+                            removed.append(full)
+                return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None, "pod_gone": True, "secrets_removed": removed}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
                 where = self.recorder.record(worker, name, reason or "stop", repo=_pod_repo(pod), started=ann(pod, "started") or "",
@@ -2106,13 +2183,23 @@ class Launcher:
                 self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was %s; end hook not run" % phase})
                 return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
+            info["refresh"] = REFRESH_NONE
             try:
                 res = self.run_hook(name)
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
+            if res.get("refresh") == "needed" and res.get("error") and not res.get("pushed"):
+                # The push was refused because the token had ended: ONE refresh here, on the stop side (the pod holds no minter credential),
+                # and ONE more run of the hook. A refused refresh means no second attempt; the second answer is never refreshed again.
+                info["refresh"] = self.refresh_for_stop(pod, self.clock())
+                if info["refresh"] == REFRESH_USED:
+                    try:
+                        res = self.run_hook(name)
+                    except CloudError as e:
+                        res = {"pushed": False, "wip_branch": None, "error": str(e)}
             view = self._hook_view(res)   # every field text from the pod: a string, scrubbed, short
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
-            self._hook_record(info, dict(view, ran=True))
+            self._hook_record(info, dict(view, ran=True, refresh=info["refresh"]))
             if view["error"]:
                 note = self._mark(name, uid, kept="true")  # the pod is kept: the commit is not safe yet
                 raise CloudError("end hook could not push, pod kept: %s%s; %s" % (view["error"], "; " + note if note else "", RECOVERY_ROUTE), EXIT_HOOK)
@@ -2347,7 +2434,10 @@ class Launcher:
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now, live = [], self.clock(), []
         self.reap_results, self.last_hook = {}, None
-        for pod in self.kube.list_pods():
+        pods = self.kube.list_pods()
+        # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
+        renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
+        for pod in pods:
             worker = ann(pod, "worker")
             reason = None
             try:
@@ -2376,22 +2466,133 @@ class Launcher:
                     res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
+                    self.retire_row(worker, reason)   # the pod is ended: its registry row is retired, once (DW-3)
                 except CloudError as e:
                     self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
-        out.extend(self.renew_git_tokens(live, now))
+        out.extend(renewed)
+        self.remove_orphan_secrets(pods, now)
+        self.send_wip_notes(live, now)
         return out
+
+    def remove_orphan_secrets(self, pods, now):
+        """Remove each per-run Secret (`<pod>-run`, label cw/pod; `<pod>-pw`, label app=cw-worker) whose pod is absent from THIS pass's pod list and
+        that is more than ORPHAN_SECRET_AFTER_SECONDS old by its creation time (an upper bound of how long the pod has been gone). Each goes by its
+        exact name through the launcher's own delete, with ONE audit line. A kept Secret: its pod is listed (or that name plus `-0`, a persistent
+        orchestrator's pod; this branch has no workload list, so that rule alone stands in for the workload), a Secret younger than the time, any
+        Secret without the launcher's label (the hub's). An unreadable list deletes nothing and is said once. No value is ever read."""
+        if not hasattr(self.kube, "list_secrets"):
+            return []   # a cluster object that cannot list Secrets (an earlier test's fake): the step does not run; the real Kube always can
+        try:
+            run_rows = self.kube.list_secrets("cw/pod")
+            pw_rows = self.kube.list_secrets("app=" + LABEL)
+        except (CloudError, ValueError, OSError) as e:
+            print("cloud-worker: orphan secrets: the Secret list could not be read: %s" % scrub(str(e), (), 120).replace("\n", " "), file=sys.stderr)
+            return []
+        names = {(p.get("metadata") or {}).get("name") for p in pods}
+        found = []
+        for name, pod, app, created in run_rows:
+            if pod and name == pod + "-run":
+                found.append((name, pod, created, self.kube.delete_run_secret))
+        for name, pod, app, created in pw_rows:
+            m = PW_SECRET_NAME.fullmatch(name)
+            if m and app == LABEL:
+                found.append((name, m.group(1), created, self.kube.delete_secret))
+        done = []
+        for name, pod, created, delete in found:
+            if pod in names or pod + "-0" in names:
+                continue
+            try:
+                age = int((now - parse_iso(created)).total_seconds())
+            except (ValueError, TypeError):
+                continue
+            if age <= ORPHAN_SECRET_AFTER_SECONDS:
+                continue
+            try:
+                delete(pod)
+            except CloudError as e:
+                print("cloud-worker: orphan secrets: %s was not removed: %s" % (name, scrub(str(e), (), 120).replace("\n", " ")), file=sys.stderr)
+                continue
+            self.audit(pod, REAPER_RUNTIME_ID, ORPHAN_SECRET_ACTION, 0.0, True, "%s age %d seconds: %s" % (name, age, ORPHAN_SECRET_REASON))
+            done.append(name)
+        return done
+
+    def retire_row(self, worker, reason):
+        """The reaper retires the registry row of a worker it ended, through the registry's own `retire` (the state directory is the switchboard's
+        own). A registry that cannot be written is ONE line on standard error and never a reason to keep the pod (the pod is already ended)."""
+        try:
+            import registry
+            base = self.env.get("XDG_STATE_HOME")
+            base = base if base and os.path.isabs(base) else os.path.join(os.path.expanduser("~"), ".local", "state")
+            got = registry.retire(os.path.join(base, "fl" + "eet-switchboard"), worker, "cloud-worker", "reaped: %s" % reason)
+            why = got.get("problem") if isinstance(got, dict) else None
+        except Exception as e:  # noqa: BLE001  (any registry failure is said, never raised)
+            why = str(e) or e.__class__.__name__
+        if why:
+            print("registry: %s: %s" % (worker, scrub(why, (), 120).replace("\n", " ")), file=sys.stderr)
+
+    def note_slow_pass(self, took):
+        """A pass that took longer than SLOW_PASS_SECONDS: ONE line on the reaper's own log and ONE audit line with the seconds. A short pass: none."""
+        if took <= SLOW_PASS_SECONDS:
+            return False
+        text = "the pass took %d seconds (limit %d)" % (took, SLOW_PASS_SECONDS)
+        print("cloud-worker: slow reaper pass: %s" % text, file=sys.stderr)
+        self.audit("", REAPER_RUNTIME_ID, SLOW_PASS_ACTION, 0.0, False, text)
+        return True
+
+    def _before_hard_limit(self, pods, now):
+        """The pods whose hard limit has not passed (a bad deadline is left to the pass's own report)."""
+        out = []
+        for pod in pods:
+            try:
+                if now < self.hard_deadline(pod):
+                    out.append(pod)
+            except (ValueError, TypeError):
+                pass
+        return out
+
+    def send_wip_notes(self, pods, now):
+        """At minute 40 of a pod's life, ONE note asks its worker to push <worker>/wip (the text is wip_note). The pod's cw/wip-note annotation
+        is set BEFORE the note goes, so a failed send is not repeated and a second pass never sends a second note. Never raises."""
+        for pod in pods:
+            try:
+                worker, name = ann(pod, "worker"), pod["metadata"]["name"]
+                if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
+                    continue
+                if not wip_note_due(parse_iso(ann(pod, "started")), now, ann(pod, "wip-note")):
+                    continue
+                self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), **{WIP_NOTE_MARK: "sent"})
+                self.send_note(name, wip_note(worker))
+                self.audit(worker, "pod/" + name, "wip-note", self._cost_or_zero(pod), True, "")
+            except Exception as e:
+                print("cloud-worker: the 40-minute note was not sent: %s" % self.kube.scrub(e, 120), file=sys.stderr)
+
+    def send_note(self, name, text):
+        self.kube.exec(name, "python3", "-c", NOTE_SENDER_CODE, text)
 
     # -- the git token's renewal (one more step of the reaper's pass) --
     def renew_git_tokens(self, pods, now):
         """For each running pod this launcher made, renew its git token when it is GIT_TOKEN_RENEW_AFTER_SECONDS old. Returns report entries:
         (worker, "git token renewed", 0) or (worker, "git token not renewed: WHY", 1). A pod that needs nothing (no per-run Secret, not due)
         adds nothing. One pod's trouble never stops the pass; the old token stays until a patch has landed."""
-        out = []
+        with self.renew_lock:
+            return self._renew_locked(pods, now)
+
+    def _renew_locked(self, pods, now):
+        out, relogged = [], False
         for pod in pods:
             worker = ann(pod, "worker")
             try:
-                done = self._renew_git_token(pod, now)
+                try:
+                    done = self._renew_git_token(pod, now)
+                except (_NotRenewed, CloudError) as first:
+                    # The reaper's own login lapsed: refresh it and retry THIS renewal once, in the same pass (never a loop).
+                    if relogged or self.relogin is None or "unauthorized" not in str(first).lower():
+                        raise
+                    relogged = True
+                    if not self.relogin():
+                        raise
+                    done = self._renew_git_token(pod, now)
             except _NotRenewed as e:
                 why = self.kube.scrub(str(e), 200)
                 self._audit_renewal_failure(worker, pod, why)
@@ -2439,8 +2640,9 @@ class Launcher:
             raise _NotRenewed("the worker record names no repository")
         return repo
 
-    def _renew_git_token(self, pod, now):
-        """True: renewed. False: nothing to do (quietly). Raises _NotRenewed(reason): refused or failed, the old token untouched."""
+    def _renew_git_token(self, pod, now, force=False):
+        """True: renewed. False: nothing to do (quietly). Raises _NotRenewed(reason): refused or failed, the old token untouched.
+        force: the stop's own refresh (#1354): the age check is skipped and the new token's scope is probed before the Secret is patched."""
         name, worker = pod["metadata"]["name"], ann(pod, "worker")
         if (pod.get("status") or {}).get("phase") != "Running":
             return False
@@ -2461,7 +2663,7 @@ class Launcher:
             age = None   # an age that cannot be read is renewed, never trusted
         if age is not None and age < 0:
             age = None   # a stamp from the future (a clock step, or an edited annotation) is not trusted either
-        if age is not None and age < GIT_TOKEN_RENEW_AFTER_SECONDS:
+        if not force and age is not None and age < GIT_TOKEN_RENEW_AFTER_SECONDS:
             return False
         self.kube.add_secrets(*[self._b64_text(v) for v in (secret.get("data") or {}).values() if isinstance(v, str)])   # every value of the Secret is known to the scrubber before anything can echo it
         repo = _pod_repo(pod)
@@ -2472,12 +2674,16 @@ class Launcher:
         except CloudError:
             raise _NotRenewed("repository not on the allow-list") from None
         try:
-            token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=self.kube.add_secrets)
+            role = ann(pod, "role", "worker")   # the role the pod was made under; a pod made before the annotation is a worker
+            role = role if role in AGENTS else "worker"
+            cmd = git_token_cmd(repo, self.env, role) if role != "worker" else git_token_cmd(repo, self.env)
+            token = run_git_token_cmd(cmd, repo, dict(os.environ, **self.env), register=self.kube.add_secrets)
         except CloudError as e:
             raise _NotRenewed("the mint failed: %s" % e) from None
         self.kube.add_secrets(token)
         if re.search(r"\s", token):
             raise _NotRenewed("the mint gave a token with whitespace in it")
+        self._require_same_scope(force, token, repo)
         # The mint took up to a minute: the Secret may have been replaced by a relaunch of the same worker (same name, new run). The patch is
         # bound to the exact object that was checked (uid + resourceVersion in the patch body: the API server refuses it on a mismatch), and the
         # labels are read again as a second guard.
@@ -2502,6 +2708,66 @@ class Launcher:
                 or (ameta.get("annotations") or {}).get(GIT_TOKEN_MINTED) != minted:
             raise _NotRenewed("the Secret patch was not confirmed on read-back")
         return True
+
+    def scope_probe(self, token, repo):
+        """What the token can reach, asked of GitHub with the token itself (a test replaces this method): the repositories it lists, each as
+        {full_name, permissions}. The token goes in one header and nowhere else. Raises on any failure (the caller refuses: fail closed)."""
+        import urllib.request
+        import token_mint   # the cloud programs' one opener: it never follows a redirect, so the header stays on api.github.com
+        req = urllib.request.Request("https://api.github.com/installation/repositories?per_page=5",
+                                     headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "User-Agent": "cw-launcher"})
+        with token_mint.open_no_redirect(req, SCOPE_PROBE_SECONDS) as r:
+            body = json.loads(r.read(1000000).decode())
+        return body["repositories"]
+
+    def _require_same_scope(self, force, token, repo):
+        """The stop's refresh only: a token that is not the same scope as the first is refused (_NotRenewed), and the old file is kept."""
+        if force and not self._scope_is_same(token, repo):
+            raise _NotRenewed("the new token is not the same scope as the first: refused")
+
+    def _scope_is_same(self, token, repo):
+        """True only when the new token reaches exactly the one repository of the pod and holds no more than push and pull on it (never admin
+        or maintain). Anything unreadable is a no. The first token passed the same minter checks (app_token.py: one repository, the
+        exact permission table, the 61-minute cap); this is the second look at the new one."""
+        try:
+            repos = self.scope_probe(token, repo)
+            if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict):
+                return False
+            only = repos[0]
+            perms = only.get("permissions") or {}
+            return _repo_key(only.get("full_name") or "") == _repo_key(repo) and perms.get("push") is True \
+                and not perms.get("admin") and not perms.get("maintain")
+        except Exception:
+            return False
+
+    def _projected(self, name, token):
+        """True when the pod's token file already holds this token: only a digest comes back, never the token."""
+        want = hashlib.sha256(token.encode()).hexdigest()
+        code = ("import hashlib,os;print(hashlib.sha256(open(os.path.join(os.environ.get('CW_RUN_DIR','/run/cw'),'git-token'),'rb').read().strip())"
+                ".hexdigest())")
+        try:
+            return self.kube.exec(name, "python3", "-c", code).strip() == want
+        except CloudError:
+            return False
+
+    def refresh_for_stop(self, pod, now):
+        """The stop's one refresh: REFRESH_USED once the Secret holds a new same-scope token (and the pod's file shows it, or the wait ran
+        out), REFRESH_REFUSED otherwise. Never raises, never holds a value. The mint is the renewal's (run_git_token_cmd)."""
+        name = pod["metadata"]["name"]
+        try:
+            if not self._renew_git_token(pod, now, force=True):
+                return REFRESH_REFUSED
+        except Exception:
+            return REFRESH_REFUSED
+        waited = 0
+        while waited < GIT_TOKEN_PROJECTION_SECONDS:
+            secret = self.kube.get_run_secret(name)
+            raw = ((secret or {}).get("data") or {}).get(GIT_TOKEN_KEY)
+            if raw and self._projected(name, self._b64_text(raw)):
+                break
+            self._nap(GIT_TOKEN_PROJECTION_POLL_SECONDS)
+            waited += GIT_TOKEN_PROJECTION_POLL_SECONDS
+        return REFRESH_USED
 
     @staticmethod
     def _b64_text(value):
@@ -2917,7 +3183,7 @@ def build_parser():
     c.add_argument("--idle", default="10m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
-    c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack or --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE))
+    c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack, %s with --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE, DEFAULT_ORCHESTRATOR_SHAPE))
     c.add_argument("--image")
     c.add_argument("--stack", action="store_true",
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")
@@ -3020,7 +3286,52 @@ def reaper_lock(identity, root=None):
     return fd
 
 
-def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None):
+class RenewalTicker:
+    """The renewal and the reaper's own login refresh on their own cadence: a thread that, at least every RENEW_CADENCE_SECONDS of the clock,
+    refreshes the login and renews every due token, whatever the pass is doing (a stop that waits, an activity read that hangs). `wait` is the
+    thread's pause (a test replaces it); it never raises out of the thread."""
+
+    def __init__(self, launcher, refresher, clock, wait=None):
+        self.L, self.refresher, self.clock = launcher, refresher, clock
+        self.wait = wait or (lambda: self._stop.wait(RENEW_POLL_SECONDS))
+        self._stop, self.thread, self.last = threading.Event(), None, clock()
+        self.ticks = 0
+
+    def due(self):
+        return (self.clock() - self.last).total_seconds() >= RENEW_CADENCE_SECONDS
+
+    def tick(self):
+        now = self.clock()
+        self.last = now
+        self.ticks += 1
+        try:
+            with self.L.renew_lock:
+                refresh = self.refresher.run()
+                if self.L.kube is not None and refresh.token:
+                    self.L.kube.add_secrets(refresh.token)
+                self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
+        except Exception as e:   # the thread goes on: the next tick tries again
+            print("cloud-worker: the renewal thread: %s" % scrub(e, (), 200), file=sys.stderr)
+
+    def _run(self):
+        while not self._stop.is_set():
+            self.wait()
+            if self._stop.is_set():
+                return
+            if self.due():
+                self.tick()
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name="cw-renewal", daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self._stop.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(5)   # a tick in flight ends first
+
+
+def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop).
 
     The reaper's own login is the token file: it is made fresh at the start of every pass (before the cluster is reached), so an installed
@@ -3031,12 +3342,13 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None):
     fails the pass: the pass's exit code is the result of the pass's own work. The old token file still serves the login while it lasts, and a
     login that is not ready is fatal by itself (the token file missing, empty or unreadable: `token unavailable`). A real failure still shows
     up where it belongs: in the workers' own results."""
-    old, why, lock = Launcher._catch_signals(), None, None
+    old, why, lock, ticker = Launcher._catch_signals(), None, None, None
     clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
     try:
         lock = reaper_lock(reaper_identity(env.get("CW_CLOUD_NAMESPACE", "cw")))   # BEFORE the first pass: two reapers would both run an end hook for one pod
         refresher = refresher or ClusterTokenRefresher(env, clock)
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
+        ticker = None
         while True:
             refresh = refresher.run()
             for line in getattr(refresher, "notices", []):
@@ -3051,7 +3363,20 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None):
                     L = Launcher(kube, env, clock, sleep)
                 except CloudError as e:
                     note = note or ("cluster login failed: %s" % scrub(e, (), 120))
+            if L is not None and ticker is None:
+                def relogin(refresher=refresher, L=L):
+                    r = refresher.run(force=True)
+                    if r.token:
+                        L.kube.add_secrets(r.token)
+                    return r.state == "written"
+                L.relogin = relogin
+                ticker = RenewalTicker(L, refresher, clock, ticker_wait)
+                ticker.start()
+            began = clock()
             work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            took = (clock() - began).total_seconds()
+            if L is not None:
+                L.note_slow_pass(took)
             res = work
             if note:
                 res = res + [("", note, 1)]   # the reaper's own login note: named in the report, never a worker's result
@@ -3071,6 +3396,8 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None):
         why = "error: %s" % scrub(e, (), 200)
         raise
     finally:
+        if ticker is not None:
+            ticker.close()
         if lock is not None:
             os.close(lock)
         if kube is not None:

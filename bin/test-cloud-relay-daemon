@@ -33,6 +33,7 @@ import cloud_relay_daemon as relay  # noqa: E402
 import plan_ledger  # noqa: E402
 
 PR, REPO, HEAD = "acme-org/widget-service#7", "acme-org/widget-service", "a" * 40
+HEAD2 = "b" * 40
 CODER, TESTER = "widget-api-coder", "widget-api-tester"
 
 
@@ -840,33 +841,78 @@ class LiveHead(Fixture):
 
     def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
         import threading
-        import time
+        calls = []
+        first_in, settled = threading.Event(), threading.Event()
+        release = [threading.Event(), threading.Event()]   # one per call: the TEST releases them
+        for ev in release:
+            self.addCleanup(ev.set)   # no thread of this test outlives it
 
-        def slow(pr):   # every call is slow: a call made under the flock would hold every other writer for this long
-            time.sleep(0.7)
+        def slow(pr):   # every call blocks until the test releases it: a call made under the flock would hold every other writer
+            n = len(calls)
+            calls.append(pr)
+            (first_in if n == 0 else settled).set()
+            release[min(n, 1)].wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
             return HEAD
         self.backend.live_head = slow
-        t = threading.Thread(target=lambda: self.run_one(CODER, "prove", **PROVE))
+
+        def prove():
+            try:
+                self.run_one(CODER, "prove", **PROVE)
+            finally:
+                settled.set()
+        t = threading.Thread(target=prove, daemon=True)
         t.start()
-        worst, end = 0.0, time.monotonic() + 1.6
-        while time.monotonic() < end:
-            t0 = time.monotonic()
-            plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
-                kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e"))
-            worst = max(worst, time.monotonic() - t0)
-            time.sleep(0.05)
+        self.assertTrue(first_in.wait(10))   # same guard: the first call (made before the flock) is blocked now
+
+        threads = []   # every writer thread is joined at the end, so none writes into a directory that is already removed
+
+        def writer():
+            done = []
+            w = threading.Thread(target=lambda: (plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
+                kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e")),
+                done.append(True)), daemon=True)
+            threads.append(w)
+            w.start()
+            w.join(10)   # same guard
+            return bool(done)
+        while_blocked = writer()   # appended while the first call is blocked
+        release[0].set()
+        settled.wait(10)   # same guard: the prove call went on into its second call (a mutant, under the flock) or ended
+        after = writer()   # appended while a second call (if one was made) is still blocked
+        release[1].set()
+        release[0].set()
         t.join(10)
-        self.assertLess(worst, 0.3)   # no writer waited for GitHub
+        for w in threads:
+            w.join(10)   # same guard
+        self.assertTrue(while_blocked, "the append did not finish while the live-head call was blocked")   # no writer waited for GitHub
+        self.assertTrue(after, "the append did not finish while a second live-head call was blocked")
 
     def test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing(self):
-        import time
+        import threading
         old = relay.HEAD_TIMEOUT
         relay.HEAD_TIMEOUT = 0.2
         self.addCleanup(setattr, relay, "HEAD_TIMEOUT", old)
-        self.backend.live_head = lambda pr: (time.sleep(2), HEAD)[1]
-        t0 = time.monotonic()
-        self.refused(504, "could not be read in time", CODER, "prove", **PROVE)
-        self.assertLess(time.monotonic() - t0, 1.5)
+        release = threading.Event()
+        self.addCleanup(release.set)   # no thread of this test outlives it
+
+        def blocked(pr):
+            release.wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
+            return HEAD
+        self.backend.live_head = blocked
+        answer, audits = [], len(self.backend.audits)
+        t = threading.Thread(target=lambda: answer.append(self.run_one(CODER, "prove", **PROVE)), daemon=True)
+        t.start()
+        t.join(10)   # same guard
+        answered, still_blocked = bool(answer), not release.is_set()
+        release.set()
+        t.join(10)
+        self.assertTrue(answered, "the prove call was not answered while the live-head call was blocked")
+        self.assertTrue(still_blocked)
+        got = answer[0]
+        self.assertEqual(got["status"], 504, got)
+        self.assertIn("could not be read in time", got["reason"])
+        self.assertIsNone(got["record"])
+        self.assertEqual(len(self.backend.audits), audits + 1)
         self.assertEqual(self.raw(), b"")
 
     def test_a_different_live_head_is_refused(self):
@@ -886,6 +932,59 @@ class LiveHead(Fixture):
             finally:
                 case.doCleanups()
                 case.tmp.cleanup()
+
+
+class LiveHeadMutantsInAChildProcess(unittest.TestCase):
+    """#1521: the mutant of each live-head test is applied to a scratch copy of the product module and the guard test is run on it in a CHILD
+    process: it must fail (exit 1) for its diagnosing reason, with the mutation asserted applied (load_backend_module asserts the anchor
+    occurs once). The guards are 10 s waits inside the tests (a blocked mechanism fails instead of hanging)."""
+    CHILD = """
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("daemon_tests_under_mutation", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+guard, old, new = sys.argv[2:5]
+case = mod.LiveHead(guard)
+case.setUp()
+mod.make_mutant_executor(case, old, new)
+print("MUTATION APPLIED")
+sys.stdout.flush()
+try:
+    getattr(case, guard)()
+except AssertionError as err:
+    print("DIAGNOSIS: " + str(err))
+    sys.exit(1)
+finally:
+    case.doCleanups()
+sys.exit(0)
+"""
+
+    def run_child(self, guard, old, new):
+        import subprocess
+        done = subprocess.run([sys.executable, "-c", self.CHILD, str(Path(__file__).resolve()), guard, old, new],
+                              capture_output=True, text=True, timeout=120)
+        self.assertIn("MUTATION APPLIED", done.stdout, done.stderr)
+        return done
+
+    def test_the_call_made_under_the_ledger_lock_is_caught(self):
+        done = self.run_child("test_a_slow_live_head_does_not_block_another_ledger_writer", "if not _same_head(first, head):   # the ONLY",
+                              "first = b.live_head(pr)\n            if not _same_head(first, head):   # the ONLY")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("the append did not finish while a second live-head call was blocked", done.stdout)
+
+    def test_the_wait_without_the_head_timeout_is_caught(self):
+        done = self.run_child("test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)",
+                              "b.live_head(pr)")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("the prove call was not answered while the live-head call was blocked", done.stdout)
+
+
+def describe_stub_state(error, finished, written, total):
+    """#1417: the failure message of the total-deadline tests: what the call raised, whether the stub had finished writing, the live threads."""
+    raised = "none" if error is None else type(error).__name__ + ": " + str(error)
+    names = sorted(t.name for t in threading.enumerate())[:20]
+    return "call raised: %s; stub finished writing: %s (%d of %d bytes written); live threads: %s" % (raised, finished.is_set(), written[0], total, ", ".join(names))
 
 
 class HubReadAndTransport(unittest.TestCase):
@@ -945,6 +1044,10 @@ class HubReadAndTransport(unittest.TestCase):
         mod = load_backend_module("if inflight and inflight[0].is_alive():", "if False:")
         self.assertGreater(self._threads_hanging(mod), 2)
 
+    # Cause of the failure on a loaded runner (ask #1406): the scenario once set the product's wall-clock
+    # deadline READ_DEADLINE to 0.4 seconds for the whole run, so
+    # the plain request ran under the shortened deadline and a slow loopback GET was cut with a timeout.
+    # The product default of 30 seconds is unchanged; now only the post that must be cut runs under 0.4 seconds.
     def _late_post_scenario(self, mod):
         import json
         import threading
@@ -987,7 +1090,7 @@ class HubReadAndTransport(unittest.TestCase):
         http.client.HTTPConnection.connect = lambda conn: (gate.wait(20) if slow_for["post"] and slow_for.get("armed") else None, real(conn))[1]
         self.addCleanup(setattr, http.client.HTTPConnection, "connect", real)
         self.addCleanup(gate.set)
-        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.4
+        old = mod.READ_DEADLINE
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, post = mod.http_transport("http://127.0.0.1:%d" % srv.server_port, "tok")
         ex = relay.Executor(tmp.name, FakeBackend(), lambda: 1000)
@@ -996,11 +1099,18 @@ class HubReadAndTransport(unittest.TestCase):
         pending = fetch()
         gate.clear()
         status, reason, record = ex.handle(pending["requests"][0])   # pass 1 executes: one ledger record
-        with self.assertRaises(mod.PassCut):
-            post(req["id"], {"status": status, "reason": reason, "record": record})   # the POST connect hangs: cut
+        before = set(threading.enumerate())
+        mod.READ_DEADLINE = 0.4   # short deadline only for the post that must be cut
+        try:
+            with self.assertRaises(mod.PassCut):
+                post(req["id"], {"status": status, "reason": reason, "record": record})   # the POST connect hangs: cut
+        finally:
+            mod.READ_DEADLINE = old
         gate.set()   # the late thread now completes after the cut
         import time
-        time.sleep(0.5)
+        end = time.monotonic() + 5
+        while time.monotonic() < end and any(t.is_alive() for t in set(threading.enumerate()) - before):
+            threading.Event().wait(0.01)
         slow_for["armed"] = False
         status2, _, record2 = ex.handle(fetch()["requests"][0])   # next pass: the same request is a replay
         post(req["id"], {"status": status2, "reason": "", "record": record2})
@@ -1019,25 +1129,36 @@ class HubReadAndTransport(unittest.TestCase):
         old = relay.READ_DEADLINE
         relay.READ_DEADLINE = 1.0
         self.addCleanup(setattr, relay, "READ_DEADLINE", old)
+        finished = threading.Event()
+        written = [0]
 
         def trickle(h):
             h.send_response(200)
             h.send_header("Content-Length", "100000")
             h.end_headers()
-            for _ in range(200):   # a byte every 0.2 s: every single read succeeds well inside the 20 s socket timeout
+            for _ in range(200):   # a byte every 0.2 s for 40 s: every single read succeeds well inside the 20 s socket timeout
                 h.wfile.write(b" ")
                 h.wfile.flush()
+                written[0] += 1
                 time.sleep(0.2)
+            finished.set()
         fetch, _ = relay.http_transport(self._serve(trickle), "tok")
-        t0 = time.monotonic()
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(TimeoutError) as caught:
             fetch()
-        self.assertLess(time.monotonic() - t0, 2.5)
+        # decided by an observation, not by a measured duration: the real code returns at the 1 s deadline while the 40 s stub is still writing
+        self.assertFalse(finished.is_set(), describe_stub_state(caught.exception, finished, written, 200))
 
+    # Cause of #1417: this test once compared the measured time of the call with 2.5 s (assertGreater, a lower bound on a measured duration);
+    # on a loaded machine the monotonic clock read 2.27 s for a stub that writes a byte every 0.2 s fifteen times, and the test failed
+    # although nothing was wrong. It now decides by whether the stub had finished writing when the call returned.
+    # The cause of the 2.27 s reading is not found: it is known only that a lower bound on a measured duration depends on the machine's speed,
+    # and that the cause is not found, so the test no longer depends on any measured duration.
     def test_mutant_without_the_total_deadline_is_caught(self):
         mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
         old, mod.READ_DEADLINE = relay.READ_DEADLINE, 1.0
         import time
+        finished = threading.Event()
+        written = [0]
 
         def trickle(h):
             h.send_response(200)
@@ -1046,12 +1167,71 @@ class HubReadAndTransport(unittest.TestCase):
             for _ in range(15):
                 h.wfile.write(b" ")
                 h.wfile.flush()
+                written[0] += 1
                 time.sleep(0.2)
+            finished.set()
         fetch, _ = mod.http_transport(self._serve(trickle), "tok")
-        t0 = time.monotonic()
-        with self.assertRaises(Exception):
-            fetch()   # it ends only when the stub stops (ValueError from the empty JSON), after 3 s: not at the deadline
-        self.assertGreater(time.monotonic() - t0, 2.5)
+        with self.assertRaises(Exception) as caught:
+            fetch()   # it ends only when the stub stops (ValueError from the empty JSON): not at the deadline
+        self.assertTrue(finished.is_set(), describe_stub_state(caught.exception, finished, written, 15))   # the mutant returned only after the stub finished writing
+
+    def forced_failure_message(self, describe):
+        """The mutant of #1417 returns before the stub finishes (here the real code, cut at the 1 s deadline); run the observation of the
+        mutant test on it and return the message of the AssertionError."""
+        import time
+        old = relay.READ_DEADLINE
+        relay.READ_DEADLINE = 1.0
+        self.addCleanup(setattr, relay, "READ_DEADLINE", old)
+        finished = threading.Event()
+        written = [0]
+
+        def trickle(h):
+            h.send_response(200)
+            h.send_header("Content-Length", "100000")
+            h.end_headers()
+            for _ in range(60):
+                h.wfile.write(b" ")
+                h.wfile.flush()
+                written[0] += 1
+                time.sleep(0.2)
+            finished.set()
+        fetch, _ = relay.http_transport(self._serve(trickle), "tok")
+        with self.assertRaises(TimeoutError) as caught:
+            fetch()
+        self.assertFalse(finished.is_set())   # the mutation is applied: the call returned before the stub finished
+        with self.assertRaises(AssertionError) as failure:
+            self.assertTrue(finished.is_set(), describe(caught.exception, finished, written, 60))
+        return str(failure.exception), written[0], type(caught.exception).__name__ + ": " + str(caught.exception)
+
+    def message_holds_all_items(self, message, written, raised):
+        self.assertIn("call raised: " + raised, message)
+        self.assertIn("stub finished writing: False", message)
+        self.assertIn("%d of 60 bytes" % written, message)
+        self.assertIn("live threads: ", message)
+        self.assertIn("MainThread", message)
+
+    def test_the_failure_message_names_the_error_the_stub_and_the_threads(self):
+        message, written, raised = self.forced_failure_message(describe_stub_state)
+        self.message_holds_all_items(message, written, raised)
+
+    def test_a_message_holding_only_numbers_fails_that_test(self):
+        def numbers_only(error, finished, written, total):
+            return "%d of %d" % (written[0], total)
+        message, written, raised = self.forced_failure_message(numbers_only)
+        with self.assertRaises(AssertionError):
+            self.message_holds_all_items(message, written, raised)
+
+    def test_the_thread_list_is_sorted_and_cut_at_20_names(self):
+        gate = threading.Event()
+        threads = [threading.Thread(target=gate.wait, name="zz%02d" % i, daemon=True) for i in range(25)]
+        for t in threads:
+            t.start()
+        self.addCleanup(gate.set)
+        done = threading.Event()
+        listed = describe_stub_state(None, done, [0], 1).split("live threads: ")[1].split(", ")
+        self.assertEqual(len(listed), 20)
+        self.assertEqual(listed, sorted(listed))
+        self.assertIn("call raised: none", describe_stub_state(None, done, [0], 1))
 
     def test_endless_stream_without_a_length_is_cut(self):
         def endless(h):
@@ -1178,15 +1358,18 @@ class Round2(Fixture):
     def serve(self, handler):
         return HubReadAndTransport._serve(self, handler)
 
-    @staticmethod
-    def header_trickle(h):
+    def header_trickle(self, h):
         import time
-        for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 60:   # one byte per 0.2 s: every socket read succeeds
-            h.wfile.write(bytes([byte]))
-            h.wfile.flush()
-            time.sleep(0.2)
+        try:
+            for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 60:   # one byte per 0.2 s: every socket read succeeds
+                h.wfile.write(bytes([byte]))
+                h.wfile.flush()
+                time.sleep(0.2)
+        finally:
+            self.trickle_finished.set()   # #1521: what the tests observe: had the handler finished when the fetch answered?
 
     def timed_fetch(self, mod):
+        self.trickle_finished = threading.Event()
         old, mod.READ_DEADLINE = mod.READ_DEADLINE, 1.0
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, _ = mod.http_transport(self.serve(self.header_trickle), "tok")
@@ -1198,14 +1381,16 @@ class Round2(Fixture):
         return time.monotonic() - t0, None
 
     def test_trickling_headers_are_cut_at_the_total_deadline(self):
-        took, err = self.timed_fetch(relay)
+        _, err = self.timed_fetch(relay)
+        finished = self.trickle_finished.is_set()   # the trickle (about 17 s of bytes) is still running when the cut comes
         self.assertIsInstance(err, TimeoutError)
-        self.assertLess(took, 2.0)
+        self.assertFalse(finished, "the fetch was cut only after the hub's handler had finished")
 
     def test_mutant_without_the_watchdog_is_caught(self):
         mod = load_backend_module("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)", extra=(("worker.join(READ_DEADLINE)", "worker.join()"),))
-        took, _ = self.timed_fetch(mod)
-        self.assertGreater(took, 2.0)
+        self.timed_fetch(mod)
+        # the fetch of the mutant returns only when the trickle has ended (about 17 s: it waits for it, the 1 s deadline does not cut it)
+        self.assertTrue(self.trickle_finished.is_set(), "the mutant fetch returned before the hub's handler had finished")
 
     def test_pass_budget_leaves_later_requests_pending(self):
         t = [0.0]
@@ -1346,6 +1531,7 @@ class OneWallClock(unittest.TestCase):
     def setUp(self):
         import socket
         self.socket = socket
+        self.lookup_release = threading.Event()
         self.real_gai = socket.getaddrinfo
         self.addCleanup(setattr, socket, "getaddrinfo", self.real_gai)
 
@@ -1361,8 +1547,12 @@ class OneWallClock(unittest.TestCase):
         return time.monotonic() - t0, None
 
     def slow_dns(self):
+        self.lookup_returned = threading.Event()   # #1521: what the tests observe: had the lookup returned when the fetch answered?
+        self.addCleanup(self.lookup_release.set)
+
         def gai(*a, **k):
-            time.sleep(10)
+            self.lookup_release.wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; the test releases it at its end
+            self.lookup_returned.set()
             return self.real_gai(*a, **k)
         self.socket.getaddrinfo = gai
         return "http://127.0.0.1:9"
@@ -1372,32 +1562,39 @@ class OneWallClock(unittest.TestCase):
         socket = self.socket
         self.addCleanup(setattr, socket, "create_connection", socket.create_connection)
 
+        self.finished_attempts = []   # #1521: what the tests observe: how many attempts had finished when the fetch answered?
+
         def dead(address, timeout=None, *a, **k):
             for _ in range(n):
                 time.sleep(timeout if timeout is not None else 2.0)
+                self.finished_attempts.append(True)
             raise TimeoutError("timed out")
         socket.create_connection = dead
         return "http://localhost:9"
 
     def test_slow_dns_is_cut_at_the_deadline(self):
-        took, err = self.timed(relay, self.slow_dns(), 1.0)
+        _, err = self.timed(relay, self.slow_dns(), 1.0)
+        returned = self.lookup_returned.is_set()   # the lookup is blocked on an Event the test controls
         self.assertIsInstance(err, relay.PassCut)
-        self.assertLess(took, 2.0)
+        self.assertFalse(returned, "the fetch was cut only after the name lookup had returned")
 
     def test_mutant_without_the_thread_cut_is_caught_by_dns(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
-        took, _ = self.timed(mod, self.slow_dns(), 1.0)
-        self.assertGreater(took, 5.0)
+        self.timed(mod, self.slow_dns(), 1.0)
+        # the mutant joins without the deadline: it waits for the lookup (the 10 s guard of slow_dns), so the lookup has returned
+        self.assertTrue(self.lookup_returned.is_set(), "the mutant fetch returned before the name lookup had returned")
 
     def test_four_dead_addresses_share_one_deadline(self):
-        took, err = self.timed(relay, self.full_backlog(), 2.0)
+        _, err = self.timed(relay, self.full_backlog(), 2.0)
+        finished = len(self.finished_attempts)   # the four attempts need about 8 s together: the cut comes before they have all ended
         self.assertIsInstance(err, TimeoutError)
-        self.assertLess(took, 3.5)
+        self.assertLess(finished, 4, "the fetch was cut only after all four attempts had finished")
 
     def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
-        took, _ = self.timed(mod, self.full_backlog(), 2.0)
-        self.assertGreater(took, 5.0)
+        self.timed(mod, self.full_backlog(), 2.0)
+        # the mutant joins without the deadline: it waits for the whole loop, so all four attempts have finished
+        self.assertEqual(len(self.finished_attempts), 4, "the mutant fetch returned before all four attempts had finished")
 
     def test_pass_records_the_cut(self):
         notes = []
@@ -1446,5 +1643,840 @@ class OneWallClock(unittest.TestCase):
         self.assertIsNone(err)   # the mutant parses the cut body as complete
 
 
+def load_gh_accounts():
+    """The REAL GhAccounts (bin/fleet-switchboard), loaded once."""
+    global _SB
+    if _SB is None:
+        import importlib.machinery
+        import importlib.util
+        os.environ.setdefault("FLEET_SWITCHBOARD_UNDER_TEST", "1")
+        loader = importlib.machinery.SourceFileLoader("fsb_for_gh_budget", str(BIN / "fleet-switchboard"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        _SB = importlib.util.module_from_spec(spec)
+        sys.modules[loader.name] = _SB
+        loader.exec_module(_SB)
+    return _SB.GhAccounts
+
+
+_SB = None
+
+
+class GhBudget(Fixture):
+    """#1477 PC-6 (U7 to U10): the relay's GitHub budget, on the REAL SwitchboardBackend, Executor, RelayLoop, MeteredRunner and a REAL GhAccounts
+    over a stub host whose _ledger_context makes the same kinds of gh calls the real one does: `repeat` pull request reads through engine.gh_runner
+    (the same argv: memoized after the first) and one plan read through accounts.read (the gate's own path).
+    The per-command counts below (prove 3, verdict 3, gates 2, report 1) are measured against this STUB ledger context (one pull request read, at most
+    one plan read, one fresh head read). The REAL context adds more reads (carries, the ask subject): those are not in these counts and fail closed
+    through the room reserve of 4 (RELAY_GH_PER_REQUEST) and the hard-stop `take` (429 in the middle, nothing written). The per-pod share (120) is NOT a
+    reservation: five or more pods can still fill the global 600 an hour, and then every pod gets 429 "relay GitHub budget".
+    Exact calls per request on a clean build (stub): prove 3 (link pr read, plan read, FRESH head read), verdict 3, gates 2, report 1."""
+
+    def setUp(self):
+        super().setUp()
+        from unittest import mock
+        patch = mock.patch.object(plan_ledger, "evaluate_gates", lambda *a, **k: {"ready": True})   # the stub plan is not a real one: the gates RULE is not under test here
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def world(self, mod=relay, cap=None, pod_cap=None, repeat=1, move_after=None, block=None):
+        self.clock = [1000.0]
+        now = lambda: self.clock[0]   # noqa: E731
+        self.gh = []
+        gh = self.gh
+        self.accounts = accounts = load_gh_accounts()({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, now, environ={})
+        engine = types.SimpleNamespace(accounts=accounts, gh_runner=None, state_dir=self.state, audit=None, report=lambda *a: None)
+        self.n_ctx, self.late = 0, []
+        self.blocked_done = threading.Event()
+
+        def runner(argv, *a, **k):
+            gh.append(list(argv))
+            return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        def ledger_context(args, rn, now_, writable, parts=None, floor=False, plan_read=True):
+            self.n_ctx += 1
+            head = HEAD2 if move_after is not None and self.n_ctx > move_after else HEAD
+            blocked = block is not None and self.n_ctx == block[0]
+            if blocked:
+                block[1].wait(5)
+            for _ in range(repeat):
+                parts[0].gh_runner(["gh", "pr", "view", args.pr])   # the pull request read
+            if plan_read:
+                parts[0].accounts.read(parts[0].gh_runner, "repos/o/r/plan", REPO, 5)   # one plan read, through the gate
+            if blocked:
+                self.blocked_done.set()   # the abandoned late read has made all its calls
+            return types.SimpleNamespace(repo=REPO, facts={"head": head, "author": None, "body": "Closes #1"}, source=REPO + "#1",
+                                         plan={"plan_hash": "sha256:" + "b" * 64, "scenarios_parsed": [{"id": "S1", "evaluator": "tester"}]},
+                                         entries=[], problem=None, pr=PR)
+        host = types.SimpleNamespace(_ledger_context=ledger_context, _plan_usable=lambda ctx: None, LedgerCommandError=ValueError)
+        cfg = {"relay_holders": {REPO + "#1": CODER}, "plan_evaluators": {"tester": [TESTER]}}
+        kw = {k: v for k, v in (("cap", cap), ("pod_cap", pod_cap)) if v is not None}
+        budget = mod.RelayBudget(now, **kw)
+        engine.config = cfg
+        backend = mod.SwitchboardBackend(host, (engine, self.state, cfg), runner, now, budget)
+        backend.audit = lambda kind, pr, detail: self.backend.audits.append((kind, detail))
+        self.engine, self.host, self.cfg, self.runner_fn, self.now_fn = engine, host, cfg, runner, now
+        return mod.Executor(self.state, backend, now), backend
+
+    def test_u7_no_gh_call_at_rest(self):
+        for _ in range(100):
+            relay.pass_once(self.world()[0], lambda: {"requests": []}, lambda *a: None)
+        self.assertEqual(self.gh, [])
+
+    def test_u7_mutant_that_reads_each_pass_is_caught(self):
+        mod = load_backend_module("    done = 0\n    for req in (pending.get(\"requests\") or [])[:10]:",
+                                  "    done = 0\n    executor.backend.begin_request({})._ctx(\"acme-org/widget-service#7\")\n    for req in (pending.get(\"requests\") or [])[:10]:")
+        ex, _ = self.world(mod)
+        for _ in range(100):
+            with contextlib.suppress(relay.Refuse, mod.Refuse):   # the mutant's own reads soon hit the pod share
+                mod.pass_once(ex, lambda: {"requests": []}, lambda *a: None)
+        self.assertGreater(len(self.gh), 0)
+
+    def one(self, ex, command, **k):
+        hub = FakeHub()
+        rid = hub.submit(k.pop("pod", CODER), command, **k)
+        relay.pass_once(ex, hub.fetch, hub.post)
+        return hub.results[rid]
+
+    COMMANDS = (("prove", dict(PROVE), 3), ("verdict", dict(pod=TESTER, head=HEAD, scenario="S1", result="pass", evidence="ok"), 3),
+                ("gates", dict(head=None), 2), ("report", dict(head=None, state="working", text="x"), 1))
+
+    def counts(self, mod, repeat):
+        """The gh calls each command makes, on a fresh world (a fresh ledger for each)."""
+        out = {}
+        for command, kw, _ in self.COMMANDS:
+            self.tmp.cleanup()
+            self.tmp = tempfile.TemporaryDirectory()
+            self.state = self.tmp.name
+            ex, _b = self.world(mod, repeat=repeat)
+            if command == "verdict":   # a verdict needs a known writer: the coder's proof first (not measured)
+                self.one(ex, "prove", **dict(PROVE))
+                self.gh.clear()
+                self.accounts.calls.clear()
+            got = self.one(ex, command, **dict(kw))
+            self.assertEqual(got["status"], 200, (command, got))
+            out[command] = len(self.gh)
+            self.assertEqual(len(self.accounts.calls), len(self.gh), command)   # exactly one entry in the gate per gh process
+        return out
+
+    def test_u8_exact_calls_per_request(self):
+        for repeat in (1, 3):   # a stub that reads the pull request 3 times per context still costs 1
+            self.assertEqual(self.counts(relay, repeat), {c: n for c, _, n in self.COMMANDS}, repeat)
+
+    def test_u8_mutant_without_the_runner_memo_is_caught_for_every_command(self):
+        mod = load_backend_module("        if key is not None and key in self.memo:", "        if False:")
+        got = self.counts(mod, 3)
+        for command, _, n in self.COMMANDS:
+            self.assertGreater(got[command], n, command)
+
+    def test_u8_mutant_that_rebuilds_the_context_per_helper_is_caught(self):
+        mod = load_backend_module("        if key not in self.memo:", "        if True:",
+                                  extra=(("        if key is not None and key in self.memo:", "        if False:"),))
+        ex, _ = self.world(mod)
+        self.one(ex, "verdict", pod=TESTER, head=HEAD, scenario="S1", result="pass", evidence="ok")
+        self.assertGreater(len(self.gh), 3)
+
+    def test_memo_only_for_reads_and_a_write_clears_it(self):
+        def run(mod):
+            seen = []
+            rn = mod.MeteredRunner(lambda argv, *a, **k: seen.append(list(argv)) or types.SimpleNamespace(returncode=0, stdout="", stderr=""), None, None, lambda: 1)
+            for argv in (["gh", "api", "x"], ["gh", "api", "x"], ["gh", "api", "-X", "POST", "y"], ["gh", "api", "-X", "POST", "y"], ["gh", "api", "x"]):
+                rn(argv)
+            return seen
+        self.assertEqual(len(run(relay)), 4)   # the second read is memoized; both writes run; the read after a write runs again
+        mod = load_backend_module("    if not isinstance(argv, (list, tuple)) or len(argv) < 3:", "    return True\n    if False:")
+        self.assertLess(len(run(mod)), 4)
+
+    def flood(self, mod, pods=5, total=1000, **kw):
+        ex, backend = self.world(mod, **kw)
+        hub = FakeHub()
+        ids = [hub.submit("pod%d" % (i % pods), "gates", head=None) for i in range(total)]
+        for step in range(total // 10):   # the clock stands still: one hour
+            mod.pass_once(ex, hub.fetch, hub.post)
+        return hub, ids
+
+    def test_u9_exact_ok_and_refused_counts_charged_per_call(self):
+        hub, ids = self.flood(relay)
+        ok = [r for r in ids if hub.results[r]["status"] == 200]
+        refused = [hub.results[r] for r in ids if hub.results[r]["status"] == 429]
+        # a pod's share is 120 calls; a gates request makes 2 and needs 4 free to start: 59 served per pod, 5 pods
+        self.assertEqual((len(ok), len(refused), len(self.gh)), (295, 705, 590))
+        self.assertEqual(len(self.gh), 2 * len(ok))   # per CALL, not per request
+        self.assertTrue(all(r["reason"] == "relay GitHub budget: pod share" and r["record"] is None for r in refused))
+        self.assertEqual(self.raw(), b"")
+
+    def test_u9_mutant_without_a_budget_is_caught(self):
+        mod = load_backend_module("        return None if self.budget is None else self.budget.room(self.pod)", "        return None",
+                                  extra=(("            why = self.budget.take(self.pod)\n            if why:\n                raise Refuse(429, why)\n", "            pass\n"),))
+        hub, ids = self.flood(mod)
+        self.assertEqual(len(self.gh), 2000)
+
+    def test_u9_mutant_that_charges_per_request_is_caught(self):
+        mod = load_backend_module("            why = self.budget.take(self.pod)\n", "            why = None if self.gh_once() else self.budget.take(self.pod)\n",
+                                  extra=(("        self.memo = {}\n\n    def for_request", "        self.memo = {}\n        self.seen = False\n\n    def gh_once(self):\n        was, self.seen = self.seen, True\n        return was\n\n    def for_request"),))
+        hub, ids = self.flood(mod)
+        self.assertGreater(len([r for r in ids if hub.results[r]["status"] == 200]), 295)
+
+    def test_u9_one_pod_cannot_starve_the_others(self):
+        ex, _ = self.world(cap=40, pod_cap=12)
+        hub = FakeHub()
+        a = [hub.submit("podA", "gates", head=None) for _ in range(30)]
+        b = hub.submit("podB", "gates", head=None)
+        for _ in range(4):
+            relay.pass_once(ex, hub.fetch, hub.post)
+        self.assertEqual(len([r for r in a if hub.results[r]["status"] == 200]), 5)   # 5 x 2 calls; the 6th needs 4 free of 12
+        self.assertEqual({hub.results[r]["reason"] for r in a if hub.results[r]["status"] == 429}, {"relay GitHub budget: pod share"})
+        self.assertEqual(hub.results[b]["status"], 200)
+
+    def test_u9_mutant_with_only_a_global_cap_starves_the_second_pod(self):
+        mod = load_backend_module("        if len(self.pods.get(pod, ())) + need > self.pod_cap:", "        if False:")
+        ex, _ = self.world(mod, cap=40, pod_cap=12)
+        hub = FakeHub()
+        [hub.submit("podA", "gates", head=None) for _ in range(30)]
+        b = hub.submit("podB", "gates", head=None)
+        for _ in range(4):
+            mod.pass_once(ex, hub.fetch, hub.post)
+        self.assertEqual(hub.results[b]["status"], 429)
+
+    def test_u9_the_global_cap_is_a_named_backstop(self):
+        ex, _ = self.world(cap=10, pod_cap=100)
+        hub = FakeHub()
+        ids = [hub.submit("pod%d" % i, "gates", head=None) for i in range(10)]
+        relay.pass_once(ex, hub.fetch, hub.post)
+        refused = [hub.results[r] for r in ids if hub.results[r]["status"] == 429]
+        self.assertEqual(len(self.gh), 8)
+        self.assertEqual({r["reason"] for r in refused}, {"relay GitHub budget"})
+
+    def test_u10_one_gate_counter_and_pause(self):
+        ex, _ = self.world()
+        for _ in range(10):
+            self.one(ex, "gates", head=None)
+        self.assertEqual(len(self.accounts.calls), len(self.gh))   # one entry per gh process, whichever path made it
+        self.assertEqual(len(self.gh), 20)
+        self.accounts.paused["otheraccount"] = self.clock[0] + 600   # ANY paused account stops the relay (fail closed)
+        got = self.one(ex, "gates", head=None)
+        self.assertEqual((got["status"], len(self.gh)), (429, 20))
+
+    def test_u10_mutant_that_counts_twice_is_caught(self):
+        mod = load_backend_module('            accounts.record("relay")', '            accounts.calls.append((self.now(), "default", "relay", False))')
+        ex, _ = self.world(mod)
+        self.one(ex, "gates", head=None)
+        self.assertNotEqual(len(self.accounts.calls), len(self.gh))
+
+    def test_u10_mutant_that_ignores_the_pause_is_caught(self):
+        mod = load_backend_module("                accounts.check_pause()   # ANY paused account stops the call (fail closed)", "                pass")
+        ex, _ = self.world(mod)
+        self.accounts.paused["default"] = self.clock[0] + 600
+        self.one(ex, "gates", head=None)
+        self.assertGreater(len(self.gh), 0)
+
+    def loop_pass(self, mod):
+        """RelayLoop with a factory-built engine: one pass through pass_if_configured (the hub transport is the FakeHub) on the real path."""
+        ex, backend = self.world(mod)
+        shared = types.SimpleNamespace(accounts=self.accounts, intents=None)
+        own_accounts = load_gh_accounts()({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, self.now_fn, environ={})
+        own = types.SimpleNamespace(accounts=own_accounts, intents=types.SimpleNamespace(accounts=None), gh_runner=None, state_dir=self.state,
+                                    config=self.cfg, audit=None, _note=lambda *a, **k: None)
+        tok = Path(self.state) / "tok"
+        tok.write_text("x")
+        tok.chmod(0o600)
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(tok)}
+        hub = FakeHub()
+        hub.submit(CODER, "gates", head=None)
+        from unittest import mock
+        patch = mock.patch.object(mod, "http_transport", lambda base, token: (hub.fetch, hub.post))
+        patch.start()
+        self.addCleanup(patch.stop)
+        loop = mod.RelayLoop(shared, self.host, self.runner_fn, self.now_fn, environ=env, engine_factory=lambda: own)
+        self.assertEqual(mod.pass_if_configured(*loop.args), 1)
+        return shared, own, hub
+
+    def test_u10_loop_calls_reach_the_pass_engines_gate(self):
+        shared, own, hub = self.loop_pass(relay)
+        self.assertEqual(list(hub.results.values())[0]["status"], 200)
+        self.assertEqual(len(self.gh), 2)
+        self.assertEqual(len(shared.accounts.calls), 2)   # through MeteredRunner and a real GhAccounts.read
+        self.assertEqual(len(own.accounts.calls), 2)      # the same object
+        self.assertIs(own.accounts, shared.accounts)
+
+    def test_u10_mutant_with_a_separate_gate_is_caught(self):
+        mod = load_backend_module("            self.engine.accounts = shared\n", "            pass\n")
+        shared, own, hub = self.loop_pass(mod)
+        self.assertEqual(len(shared.accounts.calls), 0)
+
+    def test_stale_late_thread_cannot_touch_the_next_request(self):
+        def scenario(mod):
+            gate = threading.Event()
+            ex, backend = self.world(mod, block=(1, gate))
+            v1 = backend.begin_request({"pod": CODER})
+            late = threading.Thread(target=lambda: v1._ctx(PR), daemon=True)   # abandoned: finishes after the next request began
+            late.start()
+            v2 = backend.begin_request({"pod": CODER})
+            gate.set()
+            late.join(5)
+            return v1, v2
+        v1, v2 = scenario(relay)
+        self.assertEqual((len(v1.memo), v2.memo), (1, {}))
+        mod = load_backend_module("        view = copy.copy(self)\n        view.memo = {}", "        view = self\n        view.memo = {}")
+        v1, v2 = scenario(mod)
+        self.assertNotEqual(v2.memo, {})
+
+    def test_a_late_head_read_of_an_earlier_request_does_not_serve_the_next(self):
+        self.late_head_scenario(relay)
+
+    def late_head_scenario(self, mod=relay):
+        gate = threading.Event()
+        ex, backend = self.world(mod, block=(3, gate))   # the third context of request 1 is its final head read
+        saved, relay.HEAD_TIMEOUT = relay.HEAD_TIMEOUT, 0.1
+        try:
+            got = self.one(ex, "prove", **dict(PROVE))
+        finally:
+            relay.HEAD_TIMEOUT = saved
+        self.assertEqual(got["status"], 504)
+        self.n_ctx = 10   # later reads are never blocked
+        gate.set()
+        self.assertTrue(self.blocked_done.wait(5))   # the late read has finished (an event, not a sleep)
+        self.gh.clear()
+        self.assertEqual(self.one(ex, "prove", **dict(PROVE, cid="c-next"))["status"], 200)
+        self.assertEqual(len(self.gh), 3)   # the next request makes its own 3 calls: nothing of the late one is memoized for it
+
+    def test_u8_mutant_with_a_memo_shared_across_requests_fails_the_late_head_test(self):
+        mod = load_backend_module("            view.runner = self.runner.for_request(view.pod)\n", "            view.runner = self.runner\n")
+        with self.assertRaises(AssertionError):
+            self.late_head_scenario(mod)
+
+    # ---- the memo guard is an ALLOW-list (item 1) and the head read's refusals reach the pod (item 2)
+
+    READS = [["gh"] + ["pr", "view", "7"], ["gh", "api", "repos/o/r/pulls/7"], ["gh", "api", "repos/o/r/pulls/7", "-i"], ["gh", "api", "--paginate", "repos/o/r/x"],
+             ["gh", "api", "repos/o/r/x", "-H", "Accept: x"], ["gh", "api", "repos/o/r/x", "--jq", ".a"], ["gh", "api", "repos/o/r/x", "-q", ".a"],
+             ["gh", "api", "repos/o/r/x", "--cache", "1h"]]
+    WRITES = [["gh", "api", "repos/o/r/x"] + w for w in (
+        ["-X", "POST"], ["-XPOST"], ["-X", "GET"], ["--method", "POST"], ["--method", "GET"], ["--method=POST"], ["--method=GET"],
+        ["-f", "k=v"], ["-fk=v"], ["-f=k=v"], ["-F", "k=v"], ["-Fk=v"], ["--field", "k=v"], ["--field=k=v"], ["--raw-field", "k=v"],
+        ["--raw-field=k=v"], ["--input", "f"], ["--input=f"],
+        ["--field=x"], ["--raw-field=x"], ["-XPOST", "y"], ["-fk=v", "y"], ["--field=x", "y"], ["--raw-field=x", "y"], ["--input=f", "y"], ["--method=POST", "y"], ["-X"], ["--method"], ["-f"], ["-F"], ["--field"], ["--raw-field"], ["--input"], ["--unknown"], ["--jq=.a"], ["--cache=1h"], ["-H"], ["other/path"], ["-H", "X-HTTP-Method-Override: DELETE"], ["-H", "x-method-override:PATCH"], ["-H", "X-Http-Method: PUT"], ["-H", "Accept: x", "-H", "X-HTTP-METHOD-OVERRIDE: POST"])] + [
+        ["gh", "pr", "merge", "7"], ["gh", "api"], ["gh", "issue", "view", "1"]]
+    WRITE_FLAGS = ["-X", "-XPOST", "--method", "--method=POST", "-f", "-fk=v", "-F", "--field", "--field=x", "--raw-field", "--raw-field=x", "--input", "--input=f"]
+
+    def guard_failures(self, mod):
+        bad = [a for a in self.READS if not mod._is_read(a)] + [a for a in self.WRITES if mod._is_read(a)]
+        return bad
+
+    def test_memo_guard_is_an_allow_list_one_case_per_flag_spelling(self):
+        self.assertEqual(self.guard_failures(relay), [])
+
+    def test_memo_guard_mutant_per_allow_list_member_is_caught(self):
+        for name, old in (("_READ_FLAGS", '_READ_FLAGS = frozenset({"-i", "--paginate"})'),
+                          ("_READ_VALUE_FLAGS", '_READ_VALUE_FLAGS = frozenset({"-H", "--jq", "-q", "--cache"})')):
+            for flag in self.WRITE_FLAGS:
+                mod = load_backend_module(old, old.replace("})", ', "%s"})' % flag))
+                self.assertNotEqual(self.guard_failures(mod), [], (name, flag))
+
+    def test_memo_guard_mutant_without_the_override_header_check_is_caught(self):
+        mod = load_backend_module('_METHOD_OVERRIDES = ("x-http-method-override", "x-method-override", "x-http-method")', "_METHOD_OVERRIDES = ()")
+        self.assertNotEqual(self.guard_failures(mod), [])
+
+    def test_reserve_is_four_free_passes_three_free_is_refused(self):
+        self.assertEqual(relay.RELAY_GH_PER_REQUEST, 4)
+        for free, ok in ((4, True), (3, False)):
+            b = relay.RelayBudget(lambda: 0.0, cap=100, pod_cap=100)
+            for _ in range(100 - free):
+                self.assertIsNone(b.take("p"))
+            self.assertEqual(b.room("p") is None, ok, free)
+
+    def test_a_write_clears_the_memo_whatever_its_flag_spelling(self):
+        for write in self.WRITES[:-3]:
+            runs = []
+            r = relay.MeteredRunner(lambda argv, *a, **k: (runs.append(argv), types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1],
+                                    self.accounts_for_guard(), relay.RelayBudget(lambda: 0.0), lambda: 0.0)
+            read = ["gh", "pr", "view", "7"]
+            r(read)
+            r(write)
+            r(read)
+            self.assertEqual(runs.count(read), 2, write)
+
+    def accounts_for_guard(self):
+        return types.SimpleNamespace(check_pause=lambda *a, **k: None, record=lambda *a, **k: None)
+
+    def refusing_head(self, how, mod=relay):
+        """world whose FINAL head read (3rd context) raises `how`."""
+        ex, backend = self.world(mod)
+        real = self.host._ledger_context
+
+        def ctx(args, rn, now_, writable, parts=None, floor=False, plan_read=True):
+            if not plan_read and not floor and how is not None and self.n_ctx >= 2:   # the live head read: plan_read False, floor False
+                self.n_ctx += 1
+                if how == "hang":
+                    threading.Event().wait(1)
+                raise how
+            return real(args, rn, now_, writable, parts=parts, floor=floor, plan_read=plan_read)
+        self.host._ledger_context = ctx
+        return ex
+
+    def test_head_read_429_reaches_the_pod_by_name(self):
+        for reason in (relay.BUDGET_REASON, relay.POD_BUDGET_REASON):
+            ex = self.refusing_head(relay.Refuse(429, reason))
+            got = self.one(ex, "prove", **dict(PROVE))
+            self.assertEqual((got["status"], got["reason"]), (429, reason))
+            self.assertEqual(self.raw(), b"")
+
+    def test_head_read_timeout_stays_504(self):
+        ex = self.refusing_head("hang")
+        saved, relay.HEAD_TIMEOUT = relay.HEAD_TIMEOUT, 0.1
+        try:
+            got = self.one(ex, "prove", **dict(PROVE))
+        finally:
+            relay.HEAD_TIMEOUT = saved
+        self.assertEqual(got["status"], 504)
+
+    def test_head_read_other_failure_stays_409(self):
+        got = self.one(self.refusing_head(RuntimeError("boom")), "prove", **dict(PROVE))
+        self.assertEqual(got["status"], 409)
+        self.assertIn("stale head", got["reason"])
+
+    def test_head_read_refusal_mutants_are_caught(self):
+        old_a, new_a = "        except Refuse as r:\n            box.append(r)\n", ""
+        mod = load_backend_module(old_a, new_a)   # a Refuse becomes None again: 409
+        ex = self.refusing_head(mod.Refuse(429, mod.BUDGET_REASON), mod)
+        self.assertEqual(self.one(ex, "prove", **dict(PROVE))["status"], 409)
+        mod = load_backend_module("        if isinstance(first, Refuse):\n            raise first\n", "")   # the Refuse is not re-raised
+        ex = self.refusing_head(mod.Refuse(429, mod.BUDGET_REASON), mod)
+        self.assertNotEqual(self.one(ex, "prove", **dict(PROVE))["status"], 429)
+        mod = load_backend_module("            box.append(None)\n    t = threading", "            box.append(_TIMEOUT)\n    t = threading")   # other failures become 504
+        ex = self.refusing_head(RuntimeError("boom"), mod)
+        self.assertEqual(self.one(ex, "prove", **dict(PROVE))["status"], 504)
+
+    def test_engine_has_no_unreviewed_mutable_attribute_for_the_shallow_copy(self):
+        """The relay copies the Switchboard engine with copy.copy (one attribute replaced): every mutable attribute set in __init__ is SHARED by the copy.
+        This pins the list; a new dict/list/set/object attribute fails here until it is reviewed as safe to share across requests (or reset in _parts)."""
+        import ast
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        init = next(f for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "Switchboard" for f in c.body
+                    if isinstance(f, ast.FunctionDef) and f.name == "__init__")
+        found = sorted({n.targets[0].attr for n in ast.walk(init) if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute)
+                        and isinstance(n.targets[0].value, ast.Name) and n.targets[0].value.id == "self"
+                        and isinstance(n.value, (ast.Dict, ast.List, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp))
+                        or isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute) and isinstance(n.value, ast.Call)
+                        and isinstance(n.value.func, ast.Name) and n.value.func.id in ("set", "dict", "list", "V2Reads")})
+        self.assertEqual(found, ["_delivered", "_early_facts", "_last", "_not_fleet", "decision_seeds", "decision_seen", "notice_effects", "notice_facts",
+                                 "pass_toasts", "reads", "stopped_news", "stopped_news_errors", "synthetic_cache", "toasted"])
+
+    def test_final_head_is_read_fresh_not_from_the_memo(self):
+        ex, _ = self.world(move_after=2)   # the head moves after the link and plan reads
+        got = self.one(ex, "prove", **dict(PROVE))
+        self.assertEqual((got["status"], self.raw()), (409, b""))
+        self.assertIn("stale head", got["reason"])
+
+    def test_u8_mutant_that_reads_the_final_head_from_the_memo_is_caught(self):
+        mod = load_backend_module("""        import types
+        runner = self.runner.for_request(self.pod) if isinstance(self.runner, MeteredRunner) else self.runner
+        args = types.SimpleNamespace(pr=pr, plan=None, ask=None)
+        ctx = self.host._ledger_context(args, runner, self.now, True, parts=self._parts(runner), floor=False, plan_read=False)
+        return""", "        ctx = self._ctx(pr)\n        return")
+        ex, _ = self.world(mod, move_after=2)
+        self.assertEqual(self.one(ex, "prove", **dict(PROVE))["status"], 200)   # the mutant compares a stale head and records
+
+
+class TestLatePostNoWallClock(unittest.TestCase):
+    def scenario_source(self):
+        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
+        start = text.index("    def _late_post_scenario")
+        return text[start:text.index("    def test_late_post_after_the_cut", start)]
+
+    def test_short_deadline_is_set_only_around_the_cut_post(self):
+        src = self.scenario_source()
+        sets = [l for l in src.splitlines() if "READ_DEADLINE = 0.4" in l]
+        self.assertEqual(len(sets), 1)
+        self.assertLess(src.index("READ_DEADLINE = 0.4"), src.index("post(req"))
+        self.assertLess(src.index("PassCut"), src.index("READ_DEADLINE = old"))
+        self.assertLess(src.index("READ_DEADLINE = old"), src.index("gate.set()   # the late"))
+
+    def test_no_fixed_sleep_remains_in_the_scenario(self):
+        self.assertEqual(self.scenario_source().count("time.sleep" + "("), 0)
+
+    @staticmethod
+    def comment_block_above_scenario(text):
+        lines = text.split("\n")
+        at = [i for i, l in enumerate(lines) if l.lstrip().startswith("def _late_post_scenario")]
+        if not at:
+            return ""
+        block, i = [], at[0] - 1
+        while i >= 0 and lines[i].lstrip().startswith("#"):
+            block.insert(0, lines[i])
+            i -= 1
+        return "\n".join(block)
+
+    def comment_names_the_cause(self, text):
+        block = self.comment_block_above_scenario(text)
+        return ("the plain request ran under the shortened deadline" in block) and ("30 seconds" in block)
+
+    def own_text(self):
+        return open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
+
+    def test_the_comment_names_the_cause(self):
+        self.assertTrue(self.comment_names_the_cause(self.own_text()))
+
+    def test_the_comment_check_is_not_vacuous(self):
+        text = self.own_text()
+        block = self.comment_block_above_scenario(text)
+        self.assertNotEqual(block, "")
+        scratch = text.replace(block + "\n", "")
+        self.assertNotEqual(scratch, text)   # the mutation applied
+        self.assertFalse(self.comment_names_the_cause(scratch))
+
+
+class TotalDeadlineTestsDecideByObservation(unittest.TestCase):
+    """#1417: the two total-deadline tests must not compare a measured duration with a bound below 10 seconds (a lower or an upper
+    bound on a measured duration depends on the machine's speed). The scan reads the source of the tests; its mutant checks run it on
+    the OLD text of the two tests, which it must flag."""
+
+    NAMES = ("test_a_trickling_hub_is_cut_at_the_total_deadline", "test_mutant_without_the_total_deadline_is_caught")
+    CLOCKS = ("monotonic", "time", "perf_counter")
+    OLD = {
+        "test_a_trickling_hub_is_cut_at_the_total_deadline": """
+def test_a_trickling_hub_is_cut_at_the_total_deadline(self):
+    t0 = time.monotonic()
+    with self.assertRaises(TimeoutError):
+        fetch()
+    self.assertLess(time.monotonic() - t0, 2.5)
+""",
+        "test_mutant_without_the_total_deadline_is_caught": """
+def test_mutant_without_the_total_deadline_is_caught(self):
+    t0 = time.monotonic()
+    with self.assertRaises(Exception):
+        fetch()
+    self.assertGreater(time.monotonic() - t0, 2.5)
+""",
+    }
+
+    @classmethod
+    def source_of(cls, text, name):
+        import ast
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.get_source_segment(text, node)
+        raise AssertionError("test not found: " + name)
+
+    @classmethod
+    def small_bound_comparisons(cls, src):
+        """Count the comparisons (operators or assert helpers) of an elapsed time with a number below 10."""
+        import ast
+        tree = ast.parse(__import__("textwrap").dedent(src))
+
+        def reads_clock(n):
+            return any(isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in cls.CLOCKS for x in ast.walk(n)) or \
+                any(isinstance(x, ast.Name) and x.id in ("elapsed", "took") for x in ast.walk(n))
+
+        def small(n):
+            return any(isinstance(x, ast.Constant) and isinstance(x.value, (int, float)) and not isinstance(x.value, bool) and x.value < 10
+                       for x in ast.walk(n))
+        count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                parts = [node.left] + list(node.comparators)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr.startswith("assert") and node.func.attr not in ("assertRaises", "assertIsNone", "assertIsNotNone"):
+                parts = list(node.args)
+            else:
+                continue
+            if any(reads_clock(x) for x in parts) and any(small(x) for x in parts):
+                count += 1
+        return count
+
+    def own_text(self):
+        return Path(__file__).read_text()
+
+    def test_the_two_tests_have_no_small_bound_on_a_measured_duration(self):
+        text = self.own_text()
+        for name in self.NAMES:
+            self.assertEqual(self.small_bound_comparisons(self.source_of(text, name)), 0, name)
+
+    def test_the_two_tests_decide_by_whether_the_stub_was_still_writing(self):
+        text = self.own_text()
+        for name in self.NAMES:
+            src = self.source_of(text, name)
+            self.assertIn("finished", src, name)
+            self.assertIn("is_set()", src, name)
+
+    def test_the_mutant_test_names_its_cause(self):
+        text = self.own_text()
+        head = text[:text.index("def test_mutant_without_the_total_deadline_is_caught")].rsplit("\n\n", 1)[-1]
+        self.assertIn("a lower bound on a measured duration", head)
+        self.assertIn("2.27", head)
+
+    @staticmethod
+    def comment_block_above(text, name):
+        """Only the comment lines directly above 'def <name>' (no blank line, no code between)."""
+        lines = text.split("\n")
+        at = next(i for i, ln in enumerate(lines) if ln.strip().startswith("def " + name))
+        block = []
+        i = at - 1
+        while i >= 0 and lines[i].strip().startswith("#"):
+            block.insert(0, lines[i])
+            i -= 1
+        return "\n".join(block)
+
+    def test_the_comment_block_directly_above_the_mutant_test_says_the_cause_is_not_found(self):
+        block = self.comment_block_above(self.own_text(), "test_mutant_without_the_total_deadline_is_caught")
+        for phrase in ("a lower bound on a measured duration", "2.27", "not found"):
+            self.assertIn(phrase, block)
+
+    def test_the_comment_check_fails_when_the_block_is_removed(self):
+        text = self.own_text()
+        block = self.comment_block_above(text, "test_mutant_without_the_total_deadline_is_caught")
+        self.assertTrue(block)
+        stripped = text.replace(block + "\n", "")
+        self.assertNotEqual(stripped, text)
+        empty = self.comment_block_above(stripped, "test_mutant_without_the_total_deadline_is_caught")
+        for phrase in ("a lower bound on a measured duration", "2.27", "not found"):
+            self.assertNotIn(phrase, empty)
+
+    def test_the_scan_finds_the_old_comparisons(self):
+        for name, old in self.OLD.items():
+            self.assertEqual(self.small_bound_comparisons(old), 1, name)
+
+    def test_a_build_that_only_lowers_the_bound_is_still_found(self):
+        for name, old in self.OLD.items():
+            self.assertEqual(self.small_bound_comparisons(old.replace("2.5", "2.0")), 1, name)
+
+    def test_a_bound_of_ten_seconds_or_more_is_allowed(self):
+        old = self.OLD[self.NAMES[0]].replace("2.5", "10.0")
+        self.assertEqual(self.small_bound_comparisons(old), 0)
+
+    # ---- #1521: the scan reads EVERY function of the file, not two tests ----
+    # The OLD text of each of the eight tests converted by #1521 (kept as constants, like OLD above: inputs of the mutant checks, never run).
+    OLD_1521 = {
+        "test_a_slow_live_head_does_not_block_another_ledger_writer": """
+def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
+    import threading
+    import time
+
+    def slow(pr):   # every call is slow: a call made under the flock would hold every other writer for this long
+        time.sleep(0.7)
+        return HEAD
+    self.backend.live_head = slow
+    t = threading.Thread(target=lambda: self.run_one(CODER, "prove", **PROVE))
+    t.start()
+    worst, end = 0.0, time.monotonic() + 1.6
+    while time.monotonic() < end:
+        t0 = time.monotonic()
+        plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
+            kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e"))
+        worst = max(worst, time.monotonic() - t0)
+        time.sleep(0.05)
+    t.join(10)
+    self.assertLess(worst, 0.3)
+""",
+        "test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing": """
+def test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing(self):
+    import time
+    old = relay.HEAD_TIMEOUT
+    relay.HEAD_TIMEOUT = 0.2
+    self.addCleanup(setattr, relay, "HEAD_TIMEOUT", old)
+    self.backend.live_head = lambda pr: (time.sleep(2), HEAD)[1]
+    t0 = time.monotonic()
+    self.refused(504, "could not be read in time", CODER, "prove", **PROVE)
+    self.assertLess(time.monotonic() - t0, 1.5)
+    self.assertEqual(self.raw(), b"")
+""",
+        "test_trickling_headers_are_cut_at_the_total_deadline": """
+def test_trickling_headers_are_cut_at_the_total_deadline(self):
+    took, err = self.timed_fetch(relay)
+    self.assertIsInstance(err, TimeoutError)
+    self.assertLess(took, 2.0)
+""",
+        "test_mutant_without_the_watchdog_is_caught": """
+def test_mutant_without_the_watchdog_is_caught(self):
+    mod = load_backend_module("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)", extra=(("worker.join(READ_DEADLINE)", "worker.join()"),))
+    took, _ = self.timed_fetch(mod)
+    self.assertGreater(took, 2.0)
+""",
+        "test_slow_dns_is_cut_at_the_deadline": """
+def test_slow_dns_is_cut_at_the_deadline(self):
+    took, err = self.timed(relay, self.slow_dns(), 1.0)
+    self.assertIsInstance(err, relay.PassCut)
+    self.assertLess(took, 2.0)
+""",
+        "test_mutant_without_the_thread_cut_is_caught_by_dns": """
+def test_mutant_without_the_thread_cut_is_caught_by_dns(self):
+    mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
+    took, _ = self.timed(mod, self.slow_dns(), 1.0)
+    self.assertGreater(took, 5.0)
+""",
+        "test_four_dead_addresses_share_one_deadline": """
+def test_four_dead_addresses_share_one_deadline(self):
+    took, err = self.timed(relay, self.full_backlog(), 2.0)
+    self.assertIsInstance(err, TimeoutError)
+    self.assertLess(took, 3.5)
+""",
+        "test_mutant_without_the_thread_cut_is_caught_by_addresses": """
+def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
+    mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
+    took, _ = self.timed(mod, self.full_backlog(), 2.0)
+    self.assertGreater(took, 5.0)
+""",
+    }
+    NEW_UNLISTED = """
+def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
+    t0 = time.monotonic()
+    self.work()
+    took = time.monotonic() - t0
+    self.assertLess(took, 3.0)
+"""
+    # KEPT with a reason (three places): a function of the file or an OLD text above. Any other flagged comparison fails the scan.
+    KEPT = {
+        "_late_post_scenario": "the poll that waits at most 5 seconds for the threads of a pass to end: a generous hang guard (the slowest honest case is "
+                               "about 0.1 s, the guard 50 times that) that exits at the first observation; a broken mechanism fails instead of hanging, "
+                               "and the poll is never what the test judges",
+        "OLD[test_a_trickling_hub_is_cut_at_the_total_deadline]": "the literal OLD text of a test converted by #1417: the input of that scan's mutant "
+                                                                  "check, never run as a test",
+        "OLD[test_mutant_without_the_total_deadline_is_caught]": "the literal OLD text of a test converted by #1417: the input of that scan's mutant "
+                                                                 "check, never run as a test",
+    }
+
+    @classmethod
+    def clock_call(cls, x):
+        import ast
+        return isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in cls.CLOCKS and \
+            isinstance(x.func.value, ast.Name) and x.func.value.id == "time"
+
+    @classmethod
+    def helpers_returning_a_difference(cls, tree):
+        """The functions of the file whose body returns a clock difference (timed_fetch, timed): their value is a measured duration."""
+        import ast
+        found = set()
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef):
+                for ret in ast.walk(fn):
+                    if isinstance(ret, ast.Return) and ret.value is not None and any(
+                            isinstance(b, ast.BinOp) and isinstance(b.op, ast.Sub) and any(cls.clock_call(c) for c in ast.walk(b)) for b in ast.walk(ret.value)):
+                        found.add(fn.name)
+        return found
+
+    @classmethod
+    def measured_comparison_lines(cls, fn, helpers, follow_derived=True):
+        """The line numbers, inside the function node fn, of a comparison of a measured duration with a number under 10 seconds. A value is
+        measured when it is a clock call, a name assigned from an expression holding a measured value, or the value of a helper that returns a
+        clock difference. follow_derived=False is the scan variant that skips everything derived from a clock difference (differences, the
+        names assigned from them, the helpers' values) and the tests of loops: it must flag nothing in the old forms (not vacuous)."""
+        import ast
+
+        def is_difference(x, names):
+            return isinstance(x, ast.BinOp) and isinstance(x.op, ast.Sub) and any(cls.clock_call(c) or (isinstance(c, ast.Name) and c.id in names) for c in ast.walk(x))
+
+        def is_helper_call(x):
+            return isinstance(x, ast.Call) and ((isinstance(x.func, ast.Attribute) and x.func.attr in helpers) or (isinstance(x.func, ast.Name) and x.func.id in helpers))
+
+        def measured(x, names):
+            if not follow_derived and (is_difference(x, names) or is_helper_call(x)):
+                return False
+            if cls.clock_call(x) or (isinstance(x, ast.Name) and x.id in names) or (follow_derived and is_helper_call(x)):
+                return True
+            return any(measured(c, names) for c in ast.iter_child_nodes(x))
+
+        def has_small(x):
+            return any(isinstance(c, ast.Constant) and isinstance(c.value, (int, float)) and not isinstance(c.value, bool) and c.value < 10 for c in ast.walk(x))
+        names, bounds = set(), set()   # measured names; names holding a clock plus a small number (a deadline of a loop)
+        pairs = []   # (targets, value): a tuple assigned from a tuple of the same length is taken element by element
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                if isinstance(node.targets[0], ast.Tuple) and isinstance(node.value, ast.Tuple) and len(node.targets[0].elts) == len(node.value.elts):
+                    pairs.extend(([t], v) for t, v in zip(node.targets[0].elts, node.value.elts))
+                else:
+                    pairs.append((node.targets, node.value))
+        for _ in range(6):   # fixpoint over the assignments of the function
+            for targets, value in pairs:
+                if measured(value, names):
+                    if is_helper_call(value) and isinstance(targets[0], ast.Tuple):
+                        targets = [targets[0].elts[0]]   # the first value of a helper's pair is the measured time
+                    for tgt in targets:
+                        for n in ast.walk(tgt):
+                            if isinstance(n, ast.Name):
+                                names.add(n.id)
+                                if has_small(value):
+                                    bounds.add(n.id)
+        skipped = set()
+        if not follow_derived:
+            for node in ast.walk(fn):
+                if isinstance(node, ast.While):
+                    skipped.update(id(c) for c in ast.walk(node.test))
+        lines = []
+        for node in ast.walk(fn):
+            if id(node) in skipped:
+                continue
+            if isinstance(node, ast.Compare):
+                parts = [node.left] + list(node.comparators)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in (
+                    "assertLess", "assertGreater", "assertLessEqual", "assertGreaterEqual"):
+                parts = list(node.args[:2])
+            else:
+                continue
+            if any(i != j and measured(a, names) and (has_small(b) or any(isinstance(c, ast.Name) and c.id in bounds for c in ast.walk(b)))
+                   for i, a in enumerate(parts) for j, b in enumerate(parts)):
+                lines.append(node.lineno)
+        return lines
+
+    @classmethod
+    def flagged_in_text(cls, src, helpers, follow_derived=True):
+        import ast
+        import textwrap
+        return cls.measured_comparison_lines(ast.parse(textwrap.dedent(src)), helpers, follow_derived)
+
+    @classmethod
+    def flagged_in_file(cls, text, follow_derived=True):
+        """{outermost function name: [lines]} for every function of the file (a test, a helper of a test)."""
+        import ast
+        tree = ast.parse(text)
+        helpers = cls.helpers_returning_a_difference(tree)
+        found = {}
+        for outer in ast.walk(tree):
+            if isinstance(outer, (ast.ClassDef, ast.Module)):
+                for fn in outer.body:
+                    if isinstance(fn, ast.FunctionDef):
+                        lines = cls.measured_comparison_lines(fn, helpers, follow_derived)
+                        if lines:
+                            found[fn.name] = lines
+        return found
+
+    def unlisted(self, found):
+        return {k: v for k, v in found.items() if k not in self.KEPT}
+
+    def test_no_function_of_the_file_compares_a_measured_duration_with_a_small_bound_except_the_kept(self):
+        found = self.flagged_in_file(self.own_text())
+        self.assertEqual(self.unlisted(found), {}, "a comparison of a measured duration under 10 seconds (test name: lines)")
+
+    def test_the_kept_places_are_flagged_and_each_has_a_reason(self):
+        self.assertEqual(len(self.KEPT), 3)
+        for key, reason in self.KEPT.items():
+            self.assertGreater(len(reason), 40, key)
+        found = self.flagged_in_file(self.own_text())
+        self.assertIn("_late_post_scenario", found)   # the kept poll is really found: the entry is not stale
+        helpers = self.helpers_returning_a_difference(__import__("ast").parse(self.own_text()))
+        for name in self.NAMES:
+            self.assertTrue(self.flagged_in_text(self.OLD[name], helpers), name)
+            self.assertIn("OLD[%s]" % name, self.KEPT)
+
+    def test_the_helpers_that_return_a_measured_time_are_followed(self):
+        helpers = self.helpers_returning_a_difference(__import__("ast").parse(self.own_text()))
+        self.assertLessEqual({"timed_fetch", "timed"}, helpers)
+
+    def test_the_scan_flags_the_old_forms_and_a_new_unlisted_comparison_and_is_not_vacuous(self):
+        import ast
+        helpers = self.helpers_returning_a_difference(ast.parse(self.own_text()))
+        old = sum(1 for src in self.OLD_1521.values() if self.flagged_in_text(src, helpers))
+        new = sum(1 for src in (self.NEW_UNLISTED,) if self.flagged_in_text(src, helpers))
+        variant = sum(1 for src in self.OLD_1521.values() if self.flagged_in_text(src, helpers, follow_derived=False))
+        print("S8: old forms flagged %d of %d, new unlisted flagged %d of 1, kept %d" % (old, len(self.OLD_1521), new, len(self.KEPT)))
+        self.assertEqual((len(self.OLD_1521), old, new), (8, 8, 1))
+        self.assertEqual(variant, 0)   # the variant that skips names derived from a clock difference sees none of the 8: the full scan is not vacuous
+        self.assertEqual(self.unlisted({"test_a_new_comparison_of_a_measured_duration_without_a_reason": [1]}),
+                         {"test_a_new_comparison_of_a_measured_duration_without_a_reason": [1]})
+
+    def test_a_bound_of_ten_seconds_or_more_on_a_measured_duration_is_not_flagged_by_the_file_scan(self):
+        import ast
+        helpers = self.helpers_returning_a_difference(ast.parse(self.own_text()))
+        self.assertEqual(self.flagged_in_text(self.NEW_UNLISTED.replace("3.0", "10.0"), helpers), [])
+
+
 if __name__ == "__main__":
-    unittest.main()
+    result = unittest.main(exit=False).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)
