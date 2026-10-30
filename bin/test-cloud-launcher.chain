@@ -37,6 +37,7 @@ cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_reaper_managed.py
+cloud/launcher/tests/test_refusal_label.py
 cloud/launcher/tests/test_retire_gone_pod.py
 cloud/launcher/tests/test_run_record.py
 cloud/launcher/tests/test_stack_model_key.py
