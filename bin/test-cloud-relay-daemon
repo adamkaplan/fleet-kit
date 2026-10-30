@@ -841,23 +841,45 @@ class LiveHead(Fixture):
 
     def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
         import threading
-        import time
+        calls = []
+        first_in, settled = threading.Event(), threading.Event()
+        release = [threading.Event(), threading.Event()]   # one per call: the TEST releases them
+        for ev in release:
+            self.addCleanup(ev.set)   # no thread of this test outlives it
 
-        def slow(pr):   # every call is slow: a call made under the flock would hold every other writer for this long
-            time.sleep(0.7)
+        def slow(pr):   # every call blocks until the test releases it: a call made under the flock would hold every other writer
+            n = len(calls)
+            calls.append(pr)
+            (first_in if n == 0 else settled).set()
+            release[min(n, 1)].wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
             return HEAD
         self.backend.live_head = slow
-        t = threading.Thread(target=lambda: self.run_one(CODER, "prove", **PROVE))
+
+        def prove():
+            try:
+                self.run_one(CODER, "prove", **PROVE)
+            finally:
+                settled.set()
+        t = threading.Thread(target=prove, daemon=True)
         t.start()
-        worst, end = 0.0, time.monotonic() + 1.6
-        while time.monotonic() < end:
-            t0 = time.monotonic()
-            plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
-                kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e"))
-            worst = max(worst, time.monotonic() - t0)
-            time.sleep(0.05)
+        self.assertTrue(first_in.wait(10))   # same guard: the first call (made before the flock) is blocked now
+
+        def writer():
+            done = []
+            w = threading.Thread(target=lambda: (plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
+                kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e")),
+                done.append(True)), daemon=True)
+            w.start()
+            w.join(10)   # same guard
+            return bool(done)
+        while_blocked = writer()   # appended while the first call is blocked
+        release[0].set()
+        settled.wait(10)   # same guard: the prove call went on into its second call (a mutant, under the flock) or ended
+        after = writer()   # appended while a second call (if one was made) is still blocked
+        release[1].set()
         t.join(10)
-        self.assertLess(worst, 0.3)   # no writer waited for GitHub
+        self.assertTrue(while_blocked, "the append did not finish while the live-head call was blocked")   # no writer waited for GitHub
+        self.assertTrue(after, "the append did not finish while a second live-head call was blocked")
 
     def test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing(self):
         import time
