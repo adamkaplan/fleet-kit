@@ -26,3 +26,4 @@ switchboard/caches.py
 switchboard/bootstrap.py
 switchboard/profile_pieces.py
 switchboard/installer.py
+switchboard/sent_view.py

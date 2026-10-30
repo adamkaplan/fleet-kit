@@ -69,6 +69,8 @@ ORPHAN_SECRET_ACTION = "orphan-secret-removed"   # the audit action of that remo
 ORPHAN_SECRET_REASON = "orphan secret: its pod is absent"
 PW_SECRET_NAME = re.compile(r"(.+-[0-9a-f]{4})-pw")   # '<worker>-<4 hex digits>-pw': the password Secret of the pod named by the group
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
+RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
+CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
@@ -3286,6 +3288,24 @@ def reaper_lock(identity, root=None):
     return fd
 
 
+def code_identity(tree=None):
+    """A sha256 over the bytes of the reaper's code on DISK (CODE_IDENTITY_FILES under `tree`, the kit root by default). A missing file is part of
+    the identity (its name and a marker), not an error."""
+    tree = tree or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    h = hashlib.sha256()
+    for rel in CODE_IDENTITY_FILES:
+        try:
+            with open(os.path.join(tree, rel), "rb") as f:
+                data = b"present:" + f.read()
+        except OSError:
+            data = b"missing"
+        h.update(rel.encode() + b"\0" + hashlib.sha256(data).digest())
+    return h.hexdigest()
+
+
+START_IDENTITY = code_identity()   # taken once when this module is imported: a file changed after Python read the modules is seen at the first compare
+
+
 class RenewalTicker:
     """The renewal and the reaper's own login refresh on their own cadence: a thread that, at least every RENEW_CADENCE_SECONDS of the clock,
     refreshes the login and renews every due token, whatever the pass is doing (a stop that waits, an activity read that hangs). `wait` is the
@@ -3295,10 +3315,10 @@ class RenewalTicker:
         self.L, self.refresher, self.clock = launcher, refresher, clock
         self.wait = wait or (lambda: self._stop.wait(RENEW_POLL_SECONDS))
         self._stop, self.thread, self.last = threading.Event(), None, clock()
-        self.ticks = 0
+        self.ticks, self.retry = 0, False
 
     def due(self):
-        return (self.clock() - self.last).total_seconds() >= RENEW_CADENCE_SECONDS
+        return self.retry or (self.clock() - self.last).total_seconds() >= RENEW_CADENCE_SECONDS
 
     def tick(self):
         now = self.clock()
@@ -3307,6 +3327,9 @@ class RenewalTicker:
         try:
             with self.L.renew_lock:
                 refresh = self.refresher.run()
+                self.retry = refresh.state in ("failed", "waiting")   # tried again at each look until the refresher's own retry gap has passed and it has tried
+                if refresh.state == "failed":   # one line per failure, not one per look
+                    print("cloud-worker: the login refresh failed: %s" % scrub(getattr(refresh, "reason", ""), (), 200), file=sys.stderr)
                 if self.L.kube is not None and refresh.token:
                     self.L.kube.add_secrets(refresh.token)
                 self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
@@ -3331,7 +3354,7 @@ class RenewalTicker:
             self.thread.join(5)   # a tick in flight ends first
 
 
-def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None):
+def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, tree=None):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop).
 
     The reaper's own login is the token file: it is made fresh at the start of every pass (before the cluster is reached), so an installed
@@ -3349,6 +3372,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
         refresher = refresher or ClusterTokenRefresher(env, clock)
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         ticker = None
+        identity = code_identity(tree) if tree else START_IDENTITY
         while True:
             refresh = refresher.run()
             for line in getattr(refresher, "notices", []):
@@ -3384,6 +3408,12 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
             if not a.loop:
                 why = "end of its pass"
                 return EXIT_HOOK if any(c for _, _, c in work) else 0
+            if code_identity(tree) != identity:   # between two passes only: a stop and its end hook have finished
+                why = "end of its pass"   # the pass ended; the line above says why the loop does not go on
+                print("cloud-worker: the installed code changed: the reaper exits to be started again", file=sys.stderr)
+                if L is not None:
+                    L.audit("", REAPER_RUNTIME_ID, RESTART_ACTION, 0.0, True, "the installed code changed")
+                return 0
             sleep(min(a.loop, REAP_FLOOR_SECONDS))
     except (Interrupted, KeyboardInterrupt) as e:
         why = "stopped by %s" % (e if isinstance(e, Interrupted) else "interrupt")
