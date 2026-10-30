@@ -483,10 +483,58 @@ def claim_text(body):
     return found.group(1) if found else None
 
 
+CLAIMS_LINE_RE = re.compile(r"(?im)^[ \t]*CLAIMS:")
+
+
+def misplaced_claim(body):
+    """The error for the first `CLAIMS:` line (a line that starts with it, any case, in the RAW body, also in a fence or a comment) other than the one `claim_text`
+    reads, naming its line number and place; None when there is none."""
+    raw = body or ""
+    kept, last = [], 0
+    spans = []
+    for m in HIDDEN_RE.finditer(raw):
+        kept.extend(range(last, m.start()))
+        spans.append((m.start(), m.end(), bool(m.group(1))))
+        last = m.end()
+    kept.extend(range(last, len(raw)))
+    shown = "".join(raw[i] for i in kept)
+    first = PLAN_FIRST_RE.search(shown)
+    found = CLAIMS_UNDER_RE.match(shown, first.end()) if first else None
+    read = kept[found.start() + 1] if found else None
+    plan_at = kept[first.start()] if first else None
+    for m in CLAIMS_LINE_RE.finditer(raw):
+        at = m.start()
+        if at == read:
+            continue
+        line = raw.count("\n", 0, at) + 1
+        hidden = [f for a, b, f in spans if a <= at < b]
+        prev = raw[:at].rsplit("\n", 2)
+        if hidden:
+            place = "inside a code fence" if hidden[0] else "inside an HTML comment"
+            fix = "; write the example inline, not at the start of a line"
+        else:
+            fix = ""
+            if read is not None:
+                place = "a second `CLAIMS:` line"
+            elif plan_at is None:
+                place = "in a body with no `PLAN:` line"
+            elif at < plan_at:
+                place = "above the `PLAN:` line"
+            elif len(prev) < 2 or not prev[-2].strip():
+                place = "after a blank line"
+            else:
+                place = "after another opening line"
+        return "line %d of the body holds a `CLAIMS:` line %s, where it is not read: the `CLAIMS:` line must stand directly under the `PLAN:` line%s" % (line, place, fix)
+    return None
+
+
 def pr_claim(body, scenarios):
     """(ids, error) for the claim line of a PR body: a `CLAIMS: S3 S4 S5` line directly under the `PLAN:` line names the scenarios THIS pull request proves.
     `ids` is None when the body has no claim line (the PR behaves as it always did: every scenario read as `pr` is its own). The error says why a claim is
     REFUSED: it names a scenario the plan does not declare, one the plan claims at the epic (a claim line only narrows), or names nothing."""
+    misplaced = misplaced_claim(body)
+    if misplaced:
+        return None, misplaced
     text = claim_text(body)
     if text is None:
         return None, None
@@ -532,7 +580,7 @@ def claim_union(scenarios, this_body, others):
     the merged pull requests together with this one (a body with no claim line claims every one) leave out. A claim line that is refused covers nothing."""
     per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
     bodies = [this_body] + [body for _, body in others]
-    narrowed = any(pr_claim(body, scenarios)[0] is not None for body in bodies)
+    narrowed = any(pr_claim(body, scenarios) != (None, None) for body in bodies)
     last = not any(state == "open" for state, _ in others)
     covered = covered_ids(scenarios, [this_body] + [body for state, body in others if state == "merged"])
     return narrowed, [i for i in per if i not in covered], last
@@ -576,7 +624,7 @@ def closed_unclaimed(scenarios, peers, closed):
     if not closed or any(state == "open" for state, _ in peers):
         return [], []
     bodies = [b for _, b in peers] + [b for _, b in closed]
-    if not any(pr_claim(b, scenarios)[0] is not None for b in bodies):
+    if not any(pr_claim(b, scenarios) != (None, None) for b in bodies):
         return [], []
     per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
     covered = covered_ids(scenarios, [body for state, body in peers if state == "merged"])
