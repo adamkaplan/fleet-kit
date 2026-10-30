@@ -852,7 +852,7 @@ class LiveHead(Fixture):
             calls.append(pr)
             free.append(self.lock_free())   # the verdict: is the ledger lock free at the moment of THIS call
             (first_in if n == 0 else settled).set()
-            release[min(n, 1)].wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
+            release[min(n, 1)].wait()   # the test releases it (and addCleanup at the end): no timer
             return HEAD
         self.backend.live_head = slow
 
