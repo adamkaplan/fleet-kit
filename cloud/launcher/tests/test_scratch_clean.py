@@ -142,41 +142,35 @@ class RepoRootJudgement(unittest.TestCase):
 
 
 class ZombieChild(unittest.TestCase):
-    def _zombie_gone(self):
-        child = subprocess.Popen(["sleep", "300"], cwd=tempfile.gettempdir())
-        try:
-            child.send_signal(signal.SIGKILL)   # ended, never waited for: a zombie
-            end = time.time() + 5
-            while time.time() < end and alive(child.pid):
-                time.sleep(0.05)
-            return not alive(child.pid)
-        finally:
-            child.wait()
+    def _killed_zombie_gone(self, p):
+        p.send_signal(signal.SIGKILL)   # ended, never waited for by the test: a zombie until _alive reaps it; the helper's cleanup is registered for the end
+        end = time.time() + 5
+        while time.time() < end and alive(p.pid):
+            time.sleep(0.05)
+        return not alive(p.pid)
 
     def test_s9_a_zombie_child_counts_gone_and_a_live_child_alive(self):
-        live = subprocess.Popen(["sleep", "300"])
-        try:
-            live_ok = alive(live.pid) is True
-            live.kill()
-            live.wait()
-            live_ok = live_ok and alive(live.pid) is False
-        finally:
-            live.kill()
-            live.wait()
-        gone = self._zombie_gone()
+        live = stub_support.start(self, ["sleep", "300"], cwd=tempfile.gettempdir())
+        live_ok = alive(live.pid) is True
+        live.kill()
+        live.wait()
+        live_ok = live_ok and alive(live.pid) is False
+        zombie = stub_support.start(self, ["sleep", "300"], cwd=tempfile.gettempdir())
+        gone = self._killed_zombie_gone(zombie)
         print("zombie counted gone: %s, live child alive: %s" % (gone, live_ok))
         self.assertTrue(gone)
         self.assertTrue(live_ok)
 
     def test_s9_a_zombie_child_counts_gone_without_proc(self):
         real_open = open
+        zombie = stub_support.start(self, ["sleep", "300"], cwd=tempfile.gettempdir())
 
         def no_proc(path, *a, **k):
             if str(path).startswith("/proc/"):
                 raise OSError("unreadable")
             return real_open(path, *a, **k)
         with mock.patch("builtins.open", no_proc):
-            gone = self._zombie_gone()
+            gone = self._killed_zombie_gone(zombie)
         print("zombie counted gone without /proc: %s" % gone)
         self.assertTrue(gone)
 
@@ -186,10 +180,12 @@ class ZombieChild(unittest.TestCase):
         real = m.group(0)
         mutant = real[:real.index("    try:   # our own child")] + "    return True\n"
         applied = mutant != real
-        script = ("import os, signal, subprocess, sys, time\n" + mutant +
-                  "c = subprocess.Popen(['sleep', '300'])\nc.send_signal(signal.SIGKILL)\ntime.sleep(1)\n"
-                  "assert not _alive(c.pid), 'zombie counted alive'\n")
-        p = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+        zombie = stub_support.start(self, ["sleep", "300"], cwd=tempfile.gettempdir())
+        zombie.send_signal(signal.SIGKILL)   # a zombie: the mutant process (not its parent) asks about it
+        time.sleep(1)
+        script = ("import os, subprocess, sys\n" + mutant +
+                  "assert not _alive(int(sys.argv[1])), 'zombie counted alive'\n")
+        p = subprocess.run([sys.executable, "-c", script, str(zombie.pid)], capture_output=True, text=True)
         print("S9: mutant exit %d, mutation applied %s" % (p.returncode, applied))
         self.assertTrue(applied)
         self.assertEqual(p.returncode, 1, p.stderr[-800:])
