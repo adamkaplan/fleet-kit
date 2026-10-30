@@ -33,6 +33,25 @@ def mutant_copy(directory):
     return path
 
 
+def local_only_copy(directory):
+    """The real hook deciding from the local references WITHOUT the fetch first (refresh_refs always reports a failure without running git)."""
+    with open(os.path.join(LAUNCHER, "end_hook.py")) as f:
+        src = f.read()
+    old = "    refreshed = refresh_refs(workdir, url if prestop else \"origin\", ctx)\n"
+    assert src.count(old) == 1
+    path = os.path.join(directory, "end_hook.py")
+    with open(path, "w") as f:
+        f.write(src.replace(old, "    refreshed = False\n"))
+    return path
+
+
+DRIVER = (
+    "import importlib.util, sys\n"
+    "sp = importlib.util.spec_from_file_location('h', sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)\n"
+    "m.HOST_URL = sys.argv[2]; m.HELPER_DIR = sys.argv[3]\n"
+    "sys.exit(m.prestop_main())\n")
+
+
 class Scratch(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -96,6 +115,75 @@ class S7NothingToPush(Scratch):
         self.assertEqual((p.returncode, self.attempts()), (1, 1))
 
 
+class S7Fetch(Scratch):
+    """The prestop path: HOST_URL is a file:// prefix, the remote is a bare repository o/r.git under it, origin names the repository on the host."""
+    def setUp(self):
+        super().setUp()
+        t = self.tmp.name
+        os.makedirs(os.path.join(t, "o"))
+        self.remote = os.path.join(t, "o", "r.git")
+        os.rename(self.bare, self.remote)
+        self.bare = self.remote
+        git(self.work, "remote", "set-url", "origin", "https://github.com/o/r.git")
+        git(self.work, "fetch", "-q", self.remote, "+refs/heads/*:refs/remotes/origin/*")
+        helper_dir = os.path.join(t, "bin")
+        os.makedirs(helper_dir)
+        h = os.path.join(helper_dir, "git-credential-cw")
+        with open(h, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(h, 0o755)
+        self.helper_dir, self.driver = helper_dir, os.path.join(t, "driver.py")
+        with open(self.driver, "w") as f:
+            f.write(DRIVER)
+
+    def prestop(self, hook_path=None):
+        env = dict(os.environ, CW_WORKDIR=self.work, CW_WORKER="coder7", CW_REPO="o/r", **GIT_ENV)
+        path = hook_path or os.environ.get(HOOK_ENV) or os.path.join(LAUNCHER, "end_hook.py")
+        env.pop(HOOK_ENV, None)
+        return subprocess.run([sys.executable, self.driver, path, "file://" + self.tmp.name + "/", self.helper_dir], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90)
+
+    def lines(self, p):
+        return [l for l in p.stdout.splitlines() if l.startswith("cw-prestop:")]
+
+    def test_a_clean_tree_with_a_working_fetch_says_nothing_to_push(self):
+        p = self.prestop()
+        print("count (a): attempts=%d lines=%r exit=%d" % (self.attempts(), self.lines(p), p.returncode))
+        self.assertEqual((p.returncode, self.attempts(), self.lines(p)), (0, 0, ["cw-prestop: nothing to push"]))
+
+    def test_a_refused_fetch_decides_from_local_references_in_one_line(self):
+        os.rename(self.remote, self.remote + ".moved")   # the remote is unreachable: the fetch fails
+        p = self.prestop()
+        print("count (b): attempts=%d lines=%r exit=%d" % (self.attempts(), self.lines(p), p.returncode))
+        self.assertEqual((p.returncode, len(self.lines(p))), (0, 1))
+        self.assertIn("local references", self.lines(p)[0])
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_a_stale_remote_tracking_ref_after_the_remote_branch_is_deleted_tries_the_push(self):
+        git(self.remote, "update-ref", "-d", "refs/heads/base")   # deleted after the last fetch: origin/base is STALE
+        p = self.prestop()
+        print("count (c): attempts=%d exit=%d" % (self.attempts(), p.returncode))
+        self.assertEqual(self.attempts(), 1)
+
+    def test_one_unpushed_commit_against_a_remote_that_blocks_every_push_keeps_the_pod(self):
+        with open(os.path.join(self.work, "b.txt"), "w") as f:
+            f.write("b\n")
+        git(self.work, "add", "-A")
+        git(self.work, "commit", "-q", "-m", "second")
+        p = self.prestop()
+        print("count (d): attempts=%d exit=%d" % (self.attempts(), p.returncode))
+        self.assertEqual(self.attempts(), 1)
+        self.assertTrue(any("not pushed" in l for l in self.lines(p)))
+
+    def test_no_line_carries_the_marker_token(self):
+        marker = "MARKER-TOKEN-0123"
+        with open(os.path.join(self.helper_dir, "git-credential-cw"), "w") as f:
+            f.write("#!/bin/sh\necho password=%s\n" % marker)
+        os.rename(self.remote, self.remote + ".moved")
+        p = self.prestop()
+        self.assertEqual((p.stdout + p.stderr).count(marker), 0)
+
+
 class S8HookMutant(unittest.TestCase):
     def test_the_unpushed_commit_test_fails_on_the_skip_mutant(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -107,6 +195,16 @@ class S8HookMutant(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stdout)
 
 
+    def test_the_stale_fetch_test_fails_on_the_local_only_mutant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = local_only_copy(tmp)   # asserts the edit applied
+            env = dict(os.environ, **{HOOK_ENV: path})
+            p = subprocess.run([sys.executable, "-m", "unittest",
+                                "test_end_hook_nothing_to_push.S7Fetch.test_a_stale_remote_tracking_ref_after_the_remote_branch_is_deleted_tries_the_push"],
+                               cwd=HERE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+        self.assertEqual(p.returncode, 1, p.stdout)
+
+
 class S9Docs(unittest.TestCase):
     def test_the_readme_states_the_four_sentences(self):
         with open(os.path.join(LAUNCHER, "README.md")) as f:
@@ -114,7 +212,8 @@ class S9Docs(unittest.TestCase):
         phrases = ("at least every 10 minutes (`RENEW_CADENCE_SECONDS`)",
                    "writes one line on the reaper's own log and one audit line (action `slow-reap-pass`) with its seconds",
                    "runs today on the operator's Mac as a launchd job, so a stalled reaper is seen within one pass",
-                   "decides from local references only (no network call")
+                   "fetches first and falls back to the local references only when the fetch fails",
+                   "holds the reaper's renewal lock for as long as the call's own timeout (120 seconds)")
         self.assertEqual([p for p in phrases if p not in text], [])
 
 
