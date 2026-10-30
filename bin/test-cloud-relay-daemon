@@ -953,6 +953,10 @@ class HubReadAndTransport(unittest.TestCase):
         mod = load_backend_module("if inflight and inflight[0].is_alive():", "if False:")
         self.assertGreater(self._threads_hanging(mod), 2)
 
+    # Cause of the failure on a loaded runner (ask #1406): the scenario once set the product's wall-clock
+    # deadline READ_DEADLINE to 0.4 seconds for the whole run, so
+    # the plain request ran under the shortened deadline and a slow loopback GET was cut with a timeout.
+    # The product default of 30 seconds is unchanged; now only the post that must be cut runs under 0.4 seconds.
     def _late_post_scenario(self, mod):
         import json
         import threading
@@ -995,7 +999,7 @@ class HubReadAndTransport(unittest.TestCase):
         http.client.HTTPConnection.connect = lambda conn: (gate.wait(20) if slow_for["post"] and slow_for.get("armed") else None, real(conn))[1]
         self.addCleanup(setattr, http.client.HTTPConnection, "connect", real)
         self.addCleanup(gate.set)
-        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.4
+        old = mod.READ_DEADLINE
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, post = mod.http_transport("http://127.0.0.1:%d" % srv.server_port, "tok")
         ex = relay.Executor(tmp.name, FakeBackend(), lambda: 1000)
@@ -1004,11 +1008,18 @@ class HubReadAndTransport(unittest.TestCase):
         pending = fetch()
         gate.clear()
         status, reason, record = ex.handle(pending["requests"][0])   # pass 1 executes: one ledger record
-        with self.assertRaises(mod.PassCut):
-            post(req["id"], {"status": status, "reason": reason, "record": record})   # the POST connect hangs: cut
+        before = set(threading.enumerate())
+        mod.READ_DEADLINE = 0.4   # short deadline only for the post that must be cut
+        try:
+            with self.assertRaises(mod.PassCut):
+                post(req["id"], {"status": status, "reason": reason, "record": record})   # the POST connect hangs: cut
+        finally:
+            mod.READ_DEADLINE = old
         gate.set()   # the late thread now completes after the cut
         import time
-        time.sleep(0.5)
+        end = time.monotonic() + 5
+        while time.monotonic() < end and any(t.is_alive() for t in set(threading.enumerate()) - before):
+            threading.Event().wait(0.01)
         slow_for["armed"] = False
         status2, _, record2 = ex.handle(fetch()["requests"][0])   # next pass: the same request is a replay
         post(req["id"], {"status": status2, "reason": "", "record": record2})
@@ -2373,6 +2384,54 @@ class GhBudget(Fixture):
         return""", "        ctx = self._ctx(pr)\n        return")
         ex, _ = self.world(mod, move_after=2)
         self.assertEqual(self.one(ex, "prove", **dict(PROVE))["status"], 200)   # the mutant compares a stale head and records
+
+
+class TestLatePostNoWallClock(unittest.TestCase):
+    def scenario_source(self):
+        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
+        start = text.index("    def _late_post_scenario")
+        return text[start:text.index("    def test_late_post_after_the_cut", start)]
+
+    def test_short_deadline_is_set_only_around_the_cut_post(self):
+        src = self.scenario_source()
+        sets = [l for l in src.splitlines() if "READ_DEADLINE = 0.4" in l]
+        self.assertEqual(len(sets), 1)
+        self.assertLess(src.index("READ_DEADLINE = 0.4"), src.index("post(req"))
+        self.assertLess(src.index("PassCut"), src.index("READ_DEADLINE = old"))
+        self.assertLess(src.index("READ_DEADLINE = old"), src.index("gate.set()   # the late"))
+
+    def test_no_fixed_sleep_remains_in_the_scenario(self):
+        self.assertEqual(self.scenario_source().count("time.sleep" + "("), 0)
+
+    @staticmethod
+    def comment_block_above_scenario(text):
+        lines = text.split("\n")
+        at = [i for i, l in enumerate(lines) if l.lstrip().startswith("def _late_post_scenario")]
+        if not at:
+            return ""
+        block, i = [], at[0] - 1
+        while i >= 0 and lines[i].lstrip().startswith("#"):
+            block.insert(0, lines[i])
+            i -= 1
+        return "\n".join(block)
+
+    def comment_names_the_cause(self, text):
+        block = self.comment_block_above_scenario(text)
+        return ("the plain request ran under the shortened deadline" in block) and ("30 seconds" in block)
+
+    def own_text(self):
+        return open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
+
+    def test_the_comment_names_the_cause(self):
+        self.assertTrue(self.comment_names_the_cause(self.own_text()))
+
+    def test_the_comment_check_is_not_vacuous(self):
+        text = self.own_text()
+        block = self.comment_block_above_scenario(text)
+        self.assertNotEqual(block, "")
+        scratch = text.replace(block + "\n", "")
+        self.assertNotEqual(scratch, text)   # the mutation applied
+        self.assertFalse(self.comment_names_the_cause(scratch))
 
 
 class TotalDeadlineTestsDecideByObservation(unittest.TestCase):
