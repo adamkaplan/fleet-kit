@@ -305,6 +305,7 @@ class TestChangedRunHasAReservedSlot(unittest.TestCase):
         self.assertIn("PASS bin/test-by-command", done.stdout)
         self.assertIn("PASS bin/test-by-import", done.stdout)
         # the only bound is the timeout=120 above: a hang guard, so that a run that never starts ends the test; the property is the observation, not a speed
+        # the probe cannot fail by itself: this test holds the slots, so it shows only that its own holders are alive and the competing slots stayed held while the run happened; the status and output assertions above are what fail on a regression, not the probe
         import fcntl
         for k in range(3):
             probe = os.open(os.path.join(_state, "fleet-switchboard", "heavy-slot-%d.lock" % k), os.O_RDWR)
@@ -359,6 +360,7 @@ class TestQuickSlot(unittest.TestCase):
         err = __import__("io").StringIO()
         status = heavy_slots.run_quick([str(self.script)], self.state, wait_max=5, out=err, environ={"HOME": self.state})
         self.assertEqual(status, 0, err.getvalue())
+        # the probe cannot fail by itself: this test holds the full slots, so it shows only that its own holders are alive and the competing slots stayed held while the run happened; the status assertion above is what fails on a regression, not the probe
         import fcntl
         for i in range(heavy_slots.DEFAULT_SLOTS):
             probe = os.open(heavy_slots.slot_path(self.state, i), os.O_RDWR)
@@ -897,8 +899,30 @@ class TestObservationsHaveMutants(unittest.TestCase):
         real = run_one(TestChangedRunHasAReservedSlot, "test_s11_it_starts_within_5_seconds_with_every_ordinary_slot_taken")
         self.assertEqual((real.testsRun, real.failures, real.errors), (1, [], []))
 
+    def test_the_reserved_slot_mutant_run_changed_on_the_ordinary_slots_fails_the_s11_test_on_its_status(self):
+        # the probe of the converted test cannot fail by itself; this mutant makes its status assertion the discriminator: a copy of bin/ whose run_changed takes the ordinary slots (the held ones, waiting 2 s) instead of the reserved ones
+        import shutil
+        copy = tempfile.mkdtemp(prefix="ps-mutant-")
+        self.addCleanup(shutil.rmtree, copy, True)
+        shutil.copytree(REPO / "bin", Path(copy, "bin"))
+        module = Path(copy, "bin", "heavy_slots.py")
+        text = module.read_text()
+        old = "code = run(command, changed_dir(state_dir), CHANGED_SLOTS, wait, name,"
+        self.assertEqual(text.count(old), 1, "the mutation cannot be applied: the line of run_changed moved")
+        module.write_text(text.replace(old, "code = run(command, state_dir, DEFAULT_SLOTS, min(wait, 2), name,"))
+        self.assertIn("state_dir, DEFAULT_SLOTS, min(wait, 2)", module.read_text(), "the mutation was not applied")
+        name = "test_s11_it_starts_within_5_seconds_with_every_ordinary_slot_taken"
+        with mock.patch.dict(globals(), {"SWITCHBOARD": Path(copy, "bin", "fleet-switchboard")}):
+            result = run_one(TestChangedRunHasAReservedSlot, name)
+        self.assertEqual((result.testsRun, len(result.errors)), (1, 0), result.errors)
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn("AssertionError", result.failures[0][1])
+        self.assertIn("3 != 0", result.failures[0][1])   # the status assertion failed, not the probe
+        self.assertIn("the command was not run", result.failures[0][1])
+
 
 CLOCK_CALLS = {("time", "time"), ("time", "monotonic"), ("time", "perf_counter")}
+MIN_REASON = 20
 BOUND_ASSERTS = {"assertLess", "assertLessEqual", "assertGreater", "assertGreaterEqual"}
 
 
@@ -925,9 +949,12 @@ def clock_bounds(source):
 
 
 def unexplained_clock_bounds(source):
-    """The lines of clock_bounds with no written reason: a comment of the line above (a line that starts with #) or a comment on the line itself."""
+    """The lines of clock_bounds with no written reason: a comment of the line above (a line that starts with #) or a comment on the line itself, of at least MIN_REASON characters after the #."""
     text = source.splitlines()
-    return [n for n in clock_bounds(source) if not text[n - 2].strip().startswith("#") and "#" not in text[n - 1]]
+
+    def reason(line):
+        return len(line.partition("#")[2].strip()) >= MIN_REASON if "#" in line else False
+    return [n for n in clock_bounds(source) if not (text[n - 2].strip().startswith("#") and reason(text[n - 2])) and not reason(text[n - 1])]
 
 
 class TestWallClockBoundsAreExplained(unittest.TestCase):
@@ -945,8 +972,16 @@ class TestWallClockBoundsAreExplained(unittest.TestCase):
         line = planted.count("\n", 0, planted.rindex("self.assertLess(time.time() - started, 5)")) + 1
         self.assertEqual(unexplained_clock_bounds(planted), [line])
         head, sep, last = planted.rpartition("        self.assertLess(time.time() - started, 5)")
-        explained = head + "        # a reason\n" + sep + last
+        explained = head + "        # a reason of more than twenty characters\n" + sep + last
         self.assertEqual(unexplained_clock_bounds(explained), [])
+
+    def test_a_reason_shorter_than_20_characters_is_not_a_reason(self):
+        bound = "        self.assertLess(time.time() - started, 5)\n"
+        head = "class Planted(unittest.TestCase):\n    def test_x(self):\n        started = time.time()\n"
+        self.assertEqual(unexplained_clock_bounds(head + "        # x\n" + bound), [5])
+        self.assertEqual(unexplained_clock_bounds(head + bound.rstrip("\n") + "  # x\n"), [4])
+        self.assertEqual(unexplained_clock_bounds(head + "        # a hang guard for a stuck run\n" + bound), [])
+        self.assertEqual(unexplained_clock_bounds(head + bound.rstrip("\n") + "  # a hang guard for a stuck run\n"), [])
 
     def test_a_comparison_and_a_monotonic_clock_are_found_too_and_the_fake_clock_is_not(self):
         self.assertEqual(clock_bounds("import time\nx = 1\nassert time.monotonic() - x < 5\n"), [3])
