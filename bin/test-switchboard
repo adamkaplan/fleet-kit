@@ -69675,6 +69675,9 @@ TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
+# The CI test-file list tests of #1498.
+_ci_test_files = importlib.import_module("test_ci_test_files")
+TestCiTestFileList = _ci_test_files.TestCiTestFileList
 
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
