@@ -417,6 +417,7 @@
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
         "bin/work_sync.py",
+        "bin/switchboard/plan_input.py",
         "bin/switchboard/v2_transport.py",
         "bin/switchboard/facts.py",
         "bin/switchboard/import_v1.py",
@@ -502,6 +503,13 @@
         "bin/spotlight_guard.py": [
           "settings",
           "validate"
+        ],
+        "bin/switchboard/plan_input.py": [
+          "_parent_ask_done_when",
+          "fetch_plan",
+          "load_plan",
+          "parse_plan_source",
+          "plan_comment_choice"
         ],
         "bin/switchboard/v2_transport.py": [
           "V2Breaker",

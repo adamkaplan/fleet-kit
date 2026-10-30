@@ -760,6 +760,30 @@ class TestRealExitCodesAreResults(unittest.TestCase):
         self.assertNotIn("NOSLOT", done.stdout)
 
 
+class TestHandKeptRowMutant(unittest.TestCase):
+    """S4: dropping the added name from the path_suites.py row makes the hand-kept check name it; the real row passes."""
+
+    NAME = "tests/switchboard/test_cases_10.py"
+
+    def test_removing_the_name_from_the_row_is_named_by_check_manual(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "copy")
+            done = sh(tmp, "git", "clone", "-q", "--no-hardlinks", str(REPO), root)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            table = os.path.join(root, ps.MANUAL)
+            with open(table, encoding="utf-8") as handle:
+                data = json.load(handle)
+            rows = [r for r in data["rows"] if r.get("glob") == "bin/path_suites.py"]
+            self.assertEqual(len(rows), 1)
+            self.assertIn(self.NAME, rows[0]["suites"])
+            self.assertEqual(ps.check_manual(root), [])
+            rows[0]["suites"].remove(self.NAME)
+            with open(table, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+            problems = ps.check_manual(root)
+            self.assertIn("bin/path_suites.py: misses %s, which the derivation finds for bin/path_suites.py" % self.NAME, problems)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=1).result
     ok = result.wasSuccessful()
