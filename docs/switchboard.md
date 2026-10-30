@@ -2793,6 +2793,14 @@ another agent's reminder is not shown and is refused as unknown. Reminders live 
 read by the daemon on every pass and are only removed once delivered, dropped or cancelled, so a daemon restart loses none
 (a test arms one, starts a new engine over the same state and sees it fire).
 
+**Cancel a chain, and a copy on its way (#1401).** `remind --cancel-key <key>` cancels every waiting reminder (pending or fired) of yours with
+that key in one locked step and writes ONE audit line, `reminder.cancelled` (key, owner, count); another owner's or another key's
+reminder is never matched, and a copy already delivered is not recalled. At the delivery step each reminder fact is checked once more
+against `reminders.json`: a copy that fired and became a fact, and was then cancelled or superseded by a newer due copy of the same
+owner and key while it was on its way, is not delivered, and `reminder.drop_in_flight` names the dropped id and the replacing id (or `cancelled`).
+When some facts of a plan are dropped this way the plan is decided again from the facts left (a wake planned for a dropped fact does not
+carry the rest); a changed action is audited as `recheck`. A reminders file that cannot be read at this step defers the delivery to the next pass: nothing is sent or lost. The audit line `source.error` for it names the file and the error class only, never reminder text.
+
 **Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
 ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
 still carried. A worker that failed, errored or was aborted is never folded: its line is shown in full. A stop after a
