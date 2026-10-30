@@ -74,7 +74,28 @@ LATE_NOTE_SECONDS = 300
 TEXT_CAP = 4000  # mirrors MESSAGE_CAP in bin/fleet-switchboard
 
 
-def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, key=None, wake_class=None):
+REMINDER_TTL_MAX = 86400   # #1563: the longest ttl `remind --ttl` takes
+
+
+def parse_ttl(text):
+    """`--ttl 30m` (seconds, minutes, hours, days) as whole seconds, 1 to 24 hours; ReminderError otherwise (one line)."""
+    match = re.fullmatch(r"([0-9]{1,9})([smhd])", str(text).strip())
+    seconds = int(match.group(1)) * REMINDER_UNITS[match.group(2)] if match else 0
+    if not match or seconds < 1 or seconds > REMINDER_TTL_MAX:
+        raise ReminderError("--ttl must be a duration such as 30m or 2h, from 1s to 24h, got %r" % str(text)[:40])
+    return seconds
+
+
+def ttl_text(seconds):
+    """1800 as `30m`: the largest unit that divides it exactly."""
+    seconds = int(seconds)
+    for unit, size in (("h", 3600), ("m", 60)):
+        if seconds % size == 0:
+            return "%d%s" % (seconds // size, unit)
+    return "%ds" % seconds
+
+
+def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, key=None, wake_class=None, ttl=None):
     if not isinstance(to, str) or not to.strip():
         raise ReminderError("a reminder needs the name of the agent it is for")
     if not text.strip():
@@ -89,6 +110,8 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
         item["condition"] = dict(condition)  # checked when it is due: {"unless_report_from", "since"} or {"while_running"}
     if key:
         item["key"] = key
+    if ttl:
+        item["ttl"] = int(ttl)   # #1563: seconds after `at` past which the copy is dropped, audited
     with reminders_lock(state_dir):
         items = read_reminders(state_dir)
         if key and isinstance(sender, str) and sender.strip():   # one pending per owner and key; another owner or key, a fired one and a sender-less one are never touched
@@ -552,6 +575,12 @@ class ReminderFacts:
         facts = []
         everything = read_reminders(self.state_dir)
         for item in self.due():
+            ttl = item.get("ttl")
+            if _is_number(ttl) and ttl > 0 and (self.engine.now() if self.engine else time.time()) - item["at"] > ttl:
+                if remove_reminders(self.state_dir, {item["id"]}) and self.engine is not None and self.engine.audit is not None:
+                    self.engine.audit.append(self.engine.actor, "reminder.drop_ttl", item["to"],
+                                             {"id": item["id"], "due": iso(item["at"]), "ttl": int(ttl)})
+                continue
             kept = self.superseded(item, everything)
             if kept is not None and kept.get("condition") and self.verdict(kept) != "deliver":
                 kept = None   # the newer one is gated or unresolved: it may not be delivered, so deliver the older
@@ -768,7 +797,8 @@ def remind_manage(args, engine, state, sender, moment):
     if args.list_mine:
         mine.sort(key=lambda item: item["at"])
         for item in mine[:REMIND_LIST_MAX]:
-            print("%s  %s  to=%s  issue=%s  key=%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item.get("key") or "-", 80), _one_line(item["text"], 120)))
+            ttl = " ttl %s" % ttl_text(item["ttl"]) if _is_number(item.get("ttl")) and item["ttl"] > 0 else ""
+            print("%s  %s  to=%s  issue=%s  key=%s%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item.get("key") or "-", 80), ttl, _one_line(item["text"], 120)))
         if len(mine) > REMIND_LIST_MAX:
             print("(%d more not shown)" % (len(mine) - REMIND_LIST_MAX))
         if not mine:
@@ -809,6 +839,13 @@ def cmd_remind(args, runner, now):
     if args.key and not (isinstance(sender, str) and sender.strip()):
         sys.stderr.write("%s: --key needs a known sender (an unidentified caller would replace other callers' reminders); nothing armed\n" % PROG)
         return EXIT_USAGE
+    ttl = None
+    if getattr(args, "ttl", None) is not None:
+        try:
+            ttl = parse_ttl(args.ttl)
+        except ReminderError as err:
+            sys.stderr.write("%s: remind: %s\n" % (PROG, err))
+            return EXIT_USAGE
     condition = {}
     for flag, key in ((args.until_closed, "until_closed"), (args.until_merged, "until_merged")):
         if flag:
@@ -832,7 +869,7 @@ def cmd_remind(args, runner, now):
                    "use --keep-if-closed to keep it\n" % (PROG, repo, number))
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
                         " ".join(args.text).strip(), number, sender, repo, condition=condition or None,
-                        key=_one_line(args.key, 80) if args.key else None)
+                        key=_one_line(args.key, 80) if args.key else None, ttl=ttl)
     if len(item["text"]) > TEXT_CAP:
         sys.stderr.write("%s: warning: text is cut at %d characters: %d characters over\n" % (PROG, TEXT_CAP, len(item["text"]) - TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),

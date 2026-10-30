@@ -2793,6 +2793,14 @@ own gets `--until-closed` for that issue by default, so a reminder about finishe
 request merges, unless it was set with `--keep-if-closed`. `remind --issue N` says so at creation ("dropped if it closes")
 and names `--keep-if-closed`.
 
+**A reminder too old to matter is dropped (#1563).** `remind ... --ttl <duration>` (`30m`, `2h`; 1 second to 24 hours; a
+longer value or a non-duration is refused at arming with one line) stores the ttl in seconds on the reminder, and
+`remind --list` shows it (`ttl 30m`). On every pass a due reminder that carries a ttl and is more than that ttl past its
+due time is removed unsent, and one `reminder.drop_ttl` audit line names its id, its due time and the ttl; a copy queued
+but not yet delivered is not delivered either. A reminder without `--ttl` behaves as before (the late note after 5
+minutes stays), and the rule reads only the reminder's own ttl, so another owner's or another key's reminder is never
+dropped by it. Re-arming with `--key` stores the new ttl (or none). Tests: `TestReminderTtl`.
+
 `remind --key <text>` names the purpose: arming again with the same key replaces your pending reminder of that key (one pending per
 owner and key; another owner's or another key's reminder is never touched), and `remind --list` shows the key. A fired, undelivered
 reminder is dropped when a newer one of the same owner and key is due and will be delivered (one `reminder.drop_superseded` audit line names both ids). A
@@ -6316,6 +6324,7 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | mutant results (run by hand) | restore the old drop rule: killed; drop without re-checking the kept item in the lock: killed | `TestReminders` |
 | `remove_reminders` / `prune_delivered_reminders` | cancel, condition drop, prune of delivered items | `--cancel` and condition tests |
 | `reminder.drop` / `reminder.drop_notice` | the issue closed or the pull request merged | `--keep-if-closed` |
+| `reminder.drop_ttl` / `--ttl` | a reminder past its own ttl is dropped unsent, audited | `TestReminderTtl` |
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |

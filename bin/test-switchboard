@@ -10951,6 +10951,21 @@ class TestReminders(PR4Base):
         self.assertEqual(self.world.engine.run_pass()["sent"], [])
 
 
+class TestReminderTtl(PR4Base):
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+    def arm(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(["remind"] + list(argv), self.world.route, self.world.clock.now, lambda s: None)
+        return code, err.getvalue()
+    def test_s8_a_re_arm_stores_its_own_ttl(self):
+        self.assertEqual(self.arm("platform", "1h", "--key", "k", "--ttl", "30m", "--from", "coder", "x")[0], 0)
+        self.assertEqual(self.arm("platform", "1h", "--key", "k", "--ttl", "2h", "--from", "coder", "x")[0], 0)
+        (item,) = sb.read_reminders(self.world.state)
+        self.assertEqual(item["ttl"], 7200)
+
+
 class TestRemindCLI(PR4Base):
     def setUp(self):
         super().setUp()
@@ -69673,6 +69688,7 @@ TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAll
 # The steer-after-minutes tests of #1540, moved under the line ceiling.
 _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
+TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
