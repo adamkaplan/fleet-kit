@@ -928,6 +928,52 @@ class LiveHead(Fixture):
                 case.tmp.cleanup()
 
 
+class LiveHeadMutantsInAChildProcess(unittest.TestCase):
+    """#1521: the mutant of each live-head test is applied to a scratch copy of the product module and the guard test is run on it in a CHILD
+    process: it must fail (exit 1) for its diagnosing reason, with the mutation asserted applied (load_backend_module asserts the anchor
+    occurs once). The guards are 10 s waits inside the tests (a blocked mechanism fails instead of hanging)."""
+    CHILD = """
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("daemon_tests_under_mutation", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+guard, old, new = sys.argv[2:5]
+case = mod.LiveHead(guard)
+case.setUp()
+mod.make_mutant_executor(case, old, new)
+print("MUTATION APPLIED")
+sys.stdout.flush()
+try:
+    getattr(case, guard)()
+except AssertionError as err:
+    print("DIAGNOSIS: " + str(err))
+    sys.exit(1)
+finally:
+    case.doCleanups()
+sys.exit(0)
+"""
+
+    def run_child(self, guard, old, new):
+        import subprocess
+        done = subprocess.run([sys.executable, "-c", self.CHILD, str(Path(__file__).resolve()), guard, old, new],
+                              capture_output=True, text=True, timeout=120)
+        self.assertIn("MUTATION APPLIED", done.stdout, done.stderr)
+        return done
+
+    def test_the_call_made_under_the_ledger_lock_is_caught(self):
+        done = self.run_child("test_a_slow_live_head_does_not_block_another_ledger_writer", "if not _same_head(first, head):   # the ONLY",
+                              "first = b.live_head(pr)\n            if not _same_head(first, head):   # the ONLY")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("the append did not finish while a second live-head call was blocked", done.stdout)
+
+    def test_the_wait_without_the_head_timeout_is_caught(self):
+        done = self.run_child("test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)",
+                              "b.live_head(pr)")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("the prove call was not answered while the live-head call was blocked", done.stdout)
+
+
 def describe_stub_state(error, finished, written, total):
     """#1417: the failure message of the total-deadline tests: what the call raised, whether the stub had finished writing, the live threads."""
     raised = "none" if error is None else type(error).__name__ + ": " + str(error)
