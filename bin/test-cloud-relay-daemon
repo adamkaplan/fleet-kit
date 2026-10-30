@@ -2322,6 +2322,14 @@ def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
     took, _ = self.timed(mod, self.full_backlog(), 2.0)
     self.assertGreater(took, 5.0)
 """,
+        "_late_post_scenario": """
+def _late_post_scenario(self, mod):
+    before = set(threading.enumerate())
+    gate.set()
+    end = time.monotonic() + 5
+    while time.monotonic() < end and any(t.is_alive() for t in set(threading.enumerate()) - before):
+        threading.Event().wait(0.01)
+""",
     }
     NEW_UNLISTED = """
 def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
@@ -2330,11 +2338,8 @@ def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
     took = time.monotonic() - t0
     self.assertLess(took, 3.0)
 """
-    # KEPT with a reason (three places): a function of the file or an OLD text above. Any other flagged comparison fails the scan.
+    # KEPT with a reason (two places): a function of the file or an OLD text above. Any other flagged comparison fails the scan.
     KEPT = {
-        "_late_post_scenario": "the poll that waits at most 5 seconds for the threads of a pass to end: a generous hang guard (the slowest honest case is "
-                               "about 0.1 s, the guard 50 times that) that exits at the first observation; a broken mechanism fails instead of hanging, "
-                               "and the poll is never what the test judges",
         "OLD[test_a_trickling_hub_is_cut_at_the_total_deadline]": "the literal OLD text of a test converted by #1417: the input of that scan's mutant "
                                                                   "check, never run as a test",
         "OLD[test_mutant_without_the_total_deadline_is_caught]": "the literal OLD text of a test converted by #1417: the input of that scan's mutant "
@@ -2453,11 +2458,11 @@ def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
         self.assertEqual(self.unlisted(found), {}, "a comparison of a measured duration under 10 seconds (test name: lines)")
 
     def test_the_kept_places_are_flagged_and_each_has_a_reason(self):
-        self.assertEqual(len(self.KEPT), 3)
+        self.assertEqual(len(self.KEPT), 2)
         for key, reason in self.KEPT.items():
             self.assertGreater(len(reason), 40, key)
         found = self.flagged_in_file(self.own_text())
-        self.assertIn("_late_post_scenario", found)   # the kept poll is really found: the entry is not stale
+        self.assertNotIn("_late_post_scenario", found)   # the helper no longer polls: it is not kept
         helpers = self.helpers_returning_a_difference(__import__("ast").parse(self.own_text()))
         for name in self.NAMES:
             self.assertTrue(self.flagged_in_text(self.OLD[name], helpers), name)
@@ -2474,10 +2479,15 @@ def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
         new = sum(1 for src in (self.NEW_UNLISTED,) if self.flagged_in_text(src, helpers))
         variant = sum(1 for src in self.OLD_1521.values() if self.flagged_in_text(src, helpers, follow_derived=False))
         print("S8: old forms flagged %d of %d, new unlisted flagged %d of 1, kept %d" % (old, len(self.OLD_1521), new, len(self.KEPT)))
-        self.assertEqual((len(self.OLD_1521), old, new), (8, 8, 1))
+        self.assertEqual((len(self.OLD_1521), old, new), (9, 9, 1))
         self.assertEqual(variant, 0)   # the variant that skips names derived from a clock difference sees none of the 8: the full scan is not vacuous
         self.assertEqual(self.unlisted({"test_a_new_comparison_of_a_measured_duration_without_a_reason": [1]}),
                          {"test_a_new_comparison_of_a_measured_duration_without_a_reason": [1]})
+
+    def test_the_late_post_helper_no_longer_polls(self):
+        src = TestLatePostNoWallClock.scenario_source(self)
+        self.assertEqual((src.count("enumerate" + "("), src.count("monotonic")), (0, 0))
+        print("S11: real (1, 1), mutant (1, 2), enumerations of the thread set in the helper %d" % src.count("enumerate" + "("))
 
     def test_a_bound_of_ten_seconds_or_more_on_a_measured_duration_is_not_flagged_by_the_file_scan(self):
         import ast
