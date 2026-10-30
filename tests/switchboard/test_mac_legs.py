@@ -74,7 +74,7 @@ def planned(text, event, base="", draft=False, action="", labels=(), files=("doc
 
 UBUNTU, MAC = "test (ubuntu-latest)", "test (macos-latest)"
 # case name -> (arguments of `planned`, whether the macOS leg is in)
-CASES = {
+PLAN_CASES = {
     "a platform path": (dict(event="pull_request", base="main", files=("shims/gh",)), True),
     "a docs-only change": (dict(event="pull_request", base="main"), False),
     "the label needs-mac": (dict(event="pull_request", base="main", action="synchronize", labels=("needs-mac",)), True),
@@ -86,20 +86,20 @@ CASES = {
 
 
 def decisions(text):
-    return {name: (MAC in planned(text, **args) or any("macos-latest" in n for n in planned(text, **args))) for name, (args, _) in CASES.items()}
+    return {name: (MAC in planned(text, **args) or any("macos-latest" in n for n in planned(text, **args))) for name, (args, _) in PLAN_CASES.items()}
 
 
 class TestPlanningDecision(unittest.TestCase):
     def test_s2_each_case_gives_the_expected_matrix(self):
         got = decisions(WORKFLOW.read_text())
-        self.assertEqual(got, {name: want for name, (_, want) in CASES.items()})
+        self.assertEqual(got, {name: want for name, (_, want) in PLAN_CASES.items()})
         self.assertEqual((sum(1 for v in got.values() if v), len(got)), (5, 7))   # the plan's "4 in, 3 out" does not add up to 7: platform path, label, reopened, push, nightly are in; docs-only and draft are out
 
     def test_s2_ubuntu_is_in_every_case_and_a_docs_only_run_has_no_macos_name(self):
         text = WORKFLOW.read_text()
-        for name, (args, _) in CASES.items():
+        for name, (args, _) in PLAN_CASES.items():
             self.assertTrue(any("ubuntu-latest" in n for n in planned(text, **args)), name)
-        self.assertEqual(planned(text, **CASES["a docs-only change"][0]), [UBUNTU])
+        self.assertEqual(planned(text, **PLAN_CASES["a docs-only change"][0]), [UBUNTU])
 
     def test_s10_the_nightly_and_the_push_keep_both_macos_legs(self):
         text = WORKFLOW.read_text()
@@ -116,14 +116,14 @@ class TestPlanningDecision(unittest.TestCase):
     def test_s2_the_stub_that_returns_both_macos_legs_for_every_case_fails(self):
         mutant = WORKFLOW.read_text().replace('oses = ["ubuntu-latest"] + (["macos-latest"] if macos else [])', 'oses = ["ubuntu-latest", "macos-latest"]', 1)
         self.assertNotEqual(mutant, WORKFLOW.read_text())
-        self.assertNotEqual(decisions(mutant), {name: want for name, (_, want) in CASES.items()})
+        self.assertNotEqual(decisions(mutant), {name: want for name, (_, want) in PLAN_CASES.items()})
 
     def test_s2_a_mutant_that_ignores_the_label_or_the_reopened_action_fails(self):
         text = WORKFLOW.read_text()
         for old, new in (('"needs-mac" in json.loads', '"needs-mac-x" in json.loads'), ('os.environ.get("ACTION") == "reopened"', 'os.environ.get("ACTION") == "nope"')):
             mutant = text.replace(old, new, 1)
             self.assertNotEqual(mutant, text)
-            self.assertNotEqual(decisions(mutant), {name: want for name, (_, want) in CASES.items()}, old)
+            self.assertNotEqual(decisions(mutant), {name: want for name, (_, want) in PLAN_CASES.items()}, old)
 
 
 class TestConcurrencyGroup(unittest.TestCase):
