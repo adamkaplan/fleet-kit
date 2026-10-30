@@ -69635,9 +69635,7 @@ RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCanc
 # The size ceilings on the merge result (#1605).
 _size_ceilings = importlib.import_module("test_size_ceilings")
 TestTheCheck, TestSizeMutants, TestTheMergeGate, TestSizeDocumentation = _size_ceilings.TestTheCheck, _size_ceilings.TestMutants, _size_ceilings.TestTheMergeGate, _size_ceilings.TestDocumentation
-# The wired-tests rule: every test file is imported and has a class bound (#1618).
-_wired_tests = importlib.import_module("test_wired_tests")
-TestEveryTestFileIsWired, TestWiredCheckPlanted = _wired_tests.TestEveryTestFileIsWired, _wired_tests.TestWiredCheckPlanted
+TestEveryTestFileIsWired, TestWiredCheckPlanted, TestMutantIsCaught = (_wm := importlib.import_module("test_wired_tests")).TestEveryTestFileIsWired, _wm.TestWiredCheckPlanted, _wm.TestMutantIsCaught
 
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
