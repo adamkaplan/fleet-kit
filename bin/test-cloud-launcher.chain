@@ -1,6 +1,7 @@
 bin/test-cloud-cost-report
 bin/test-cloud-retired
 cloud/launcher/tests/test_app_token.py
+cloud/launcher/tests/test_chain_all_entries.py
 cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_chain_time.py
 cloud/launcher/tests/test_cloud_allowlist.py

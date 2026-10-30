@@ -2,6 +2,7 @@
 # test-cloud-launcher: offline tests for the cloud-worker launcher (fake kubectl, fake clock). Prints RESULT: PASS.
 # The chain is the list file bin/test-cloud-launcher.chain, ONE entry per line (a path), sorted, with one fixed last line.
 # (It used to be ONE shell line of more than forty commands joined by &&; every member appended to it and every pair conflicted.)
+# Every entry runs even when one fails: each failure is named in a FAILED line and in the closing line `failed entries: N: <names>`, then RESULT: FAIL (exit 1). The completeness checks (NOT RUN) stop the run before any entry.
 # To add a test: add one line to bin/test-cloud-launcher.chain at its alphabetical place, ABOVE the fixed last line (even if it sorts after it).
 cd "$(dirname "$0")/.." || exit 1
 LIST=bin/test-cloud-launcher.chain
@@ -86,11 +87,15 @@ lane() { # $1 = lane number: every 3rd entry of $PAR, one after the other, outpu
 pids=""
 for l in 0 1 2; do lane "$l" "$@" & pids="$pids $!"; done
 ran=0
-fail=0
+failed=""   # every failing entry runs to the end of the chain and is named here (#1547); a hung entry is ended by the workflow step's time limit
+killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; kill "$1" 2>/dev/null; }
+trap 'for p in $pids; do killtree "$p"; done; killtree $$; exit 143' TERM INT
 while IFS= read -r e; do
   [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
   is_parallel "$e" && continue
-  run_entry "$e" "$@" || { echo "RESULT: FAIL"; kill $pids 2>/dev/null; exit 1; }
+  run_entry "$e" "$@" & sp=$!   # in the background so that the trap above acts at once while the entry runs
+  pids="$pids $sp"
+  wait $sp || failed="$failed $e"
   ran=$((ran + 1))
 done < "$LIST"
 wait
@@ -98,8 +103,14 @@ while IFS= read -r e; do
   [ -n "$e" ] || continue
   f=$(printf %s "$e" | tr / _)
   cat "$OUT/$f.out"
-  [ "$(cat "$OUT/$f.rc" 2>/dev/null)" = 0 ] || { echo "RESULT: FAIL"; exit 1; }
+  [ "$(cat "$OUT/$f.rc" 2>/dev/null)" = 0 ] || failed="$failed $e"
   ran=$((ran + 1))
 done < "$PAR"
 echo "ran $ran entries"
+if [ -n "$failed" ]; then
+  nf=0; for x in $failed; do nf=$((nf + 1)); done
+  echo "failed entries: $nf:$failed"
+  echo "RESULT: FAIL"
+  exit 1
+fi
 echo "RESULT: PASS"
