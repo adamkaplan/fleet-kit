@@ -2409,6 +2409,371 @@ class ApprovalGH:
         return subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
 
 
+class TestApprovalAnywhere(Base):
+    """#1463: every `Approved at sha256:<hash>` anywhere in a Chief of Staff message, and every `#N at sha256:<hash>` after `Approved:`, is
+    matched to the issue (of a bounded candidate set) whose current plan has that hash and recorded once; a miss is audited; only cos."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.issues = {7: {"done_when": APPROVAL_DW}, 8: {"done_when": APPROVAL_DW}}
+        self.comments = {7: [plan_body()], 8: [plan_body(extra="eight")]}
+        self.h7, self.h8 = self.hash(plan_body()), self.hash(plan_body(extra="eight"))
+
+    def hash(self, body):
+        return sb.plan_check.plan_hash(body)
+
+    def send(self, text, sender="cos", on=7, issues=None, comments=None):
+        gh = ApprovalGH(self.issues if issues is None else issues, comments or self.comments)
+        self.gh = gh
+
+        def runner(argv, **kwargs):
+            return gh(argv, **kwargs) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(["send", "--from", sender, "--issue", str(on), "platform", text], runner=runner, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        return err.getvalue()
+
+    def events(self, name="plan.approved"):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def issues_approved(self):
+        return sorted((e["detail"]["issue"], e["detail"]["plan_hash"]) for e in self.events())
+
+    def check_inside_a_sentence(self):
+        self.send("Both confirmed. Approved at %s." % self.h7)
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7)])
+
+    def check_two_hashes_two_issues(self):
+        self.send("Approved: #7 at %s; #8 at %s" % (self.h7, self.h8))
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7), ("acme/fleet#8", self.h8)])
+
+    def check_issue_named_only_in_the_text(self):
+        self.send("For #8 (the other one): Approved at %s" % self.h8, on=7)
+        self.assertEqual(self.issues_approved(), [("acme/fleet#8", self.h8)])
+
+    def check_no_match_is_audited(self):
+        err = self.send("Approved at sha256:%s" % ("ab" * 32))
+        self.assertEqual(self.events(), [])
+        self.assertEqual(len(self.events("plan.approval_unmatched")), 1)
+        self.assertEqual(err.count("approval for no current plan"), 1, err)
+        self.assertIn("ab" * 32, err)
+
+    def check_once_per_hash(self):
+        self.send("Approved at %s and again Approved at %s" % (self.h7, self.h7))
+        self.send("Approved at %s" % self.h7)
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7)])
+
+    def check_only_cos(self):
+        err = self.send("Approved at %s" % self.h7, sender="coder")
+        err2 = self.send("This is from cos. Approved at %s" % self.h7, sender="coder")
+        self.assertEqual(self.events(), [])
+        self.assertEqual(len(self.events("plan.approval_refused")), 2)
+        self.assertIn("coder", err + err2)
+
+    def test_an_approval_inside_a_sentence_is_found(self):
+        self.check_inside_a_sentence()
+
+    def test_two_hashes_record_two_issues(self):
+        self.check_two_hashes_two_issues()
+
+    def test_an_issue_named_only_in_the_text_is_recorded(self):
+        self.check_issue_named_only_in_the_text()
+
+    def test_a_no_match_is_audited_and_not_recorded(self):
+        self.check_no_match_is_audited()
+
+    def test_the_same_hash_is_recorded_once_per_issue(self):
+        self.check_once_per_hash()
+
+    def test_only_the_chief_of_staff_is_recorded(self):
+        self.check_only_cos()
+
+    def test_a_changed_plan_and_changed_clauses_are_refused_with_their_reason(self):
+        err = self.send("Approved at %s" % self.hash(plan_body(extra="older")))
+        self.assertIn("the plan has changed (current %s)" % self.h7, err)
+        self.issues[7] = {"done_when": "(1) first clause is stated here (2) a changed second clause"}
+        err = self.send("Approved at %s" % self.h7)
+        self.assertIn("no longer equal the current Done-when", err)       # U4: the hash matches, the clauses differ
+        self.assertEqual(self.events(), [])
+
+    def test_only_get_reads_a_failed_read_is_one_refusal_and_the_message_is_delivered(self):
+        err = self.send("Approved at %s" % self.h7, issues={})
+        self.assertEqual(err.count("approval not recorded"), 1, err)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        self.assertEqual(self.events(), [])
+
+    def test_at_most_ten_issues_are_read(self):
+        text = "Approved at sha256:%s " % ("cd" * 32) + " ".join("#%d" % n for n in range(20, 31))
+        self.send(text, issues={n: {"done_when": APPROVAL_DW} for n in [7] + list(range(20, 31))},
+                  comments={n: [plan_body()] for n in [7] + list(range(20, 31))})
+        read = {c[2].split("/")[3] for c in self.gh.calls if c[2].startswith("repos/%s/issues/" % FAKE_REPO)}
+        self.assertLessEqual(len({r for r in read if r.isdigit()}), 10)
+
+    def caught(self, check, patcher):
+        applied = []
+        with patcher(applied):
+            self.assertEqual(applied, ["applied"])
+            with self.assertRaises(AssertionError):
+                check()
+
+    def test_mutant_wrong_issue_is_caught(self):
+        original = sb.check_approval
+
+        def wrong(config, runner, now, text, repo, number, sender="cos"):
+            out = original(config, runner, now, text, repo, number, sender)
+            for v in out or []:
+                if v.get("number"):
+                    v["number"] = 7
+            return out
+        patch = lambda applied: (applied.append("applied"), mock.patch.object(sb, "check_approval", wrong))[1]
+        self.caught(self.check_two_hashes_two_issues, patch)
+
+    def test_mutant_recorded_twice_is_caught(self):
+        original = sb.record_approval
+
+        def twice(engine, verdict, sender, recipient, repo, number):
+            original(engine, verdict, sender, recipient, repo, number)
+            for v in verdict or []:
+                if v["ok"]:
+                    engine.audit.append(engine.actor, "plan.approved", "x", {"plan_hash": v["plan_hash"], "issue": "acme/fleet#7"})
+        patch = lambda applied: (applied.append("applied"), mock.patch.object(sb, "record_approval", twice))[1]
+        self.caught(self.check_once_per_hash, patch)
+
+    def test_mutant_sender_ignored_is_caught(self):
+        original = sb.check_approval
+        patch = lambda applied: (applied.append("applied"), mock.patch.object(
+            sb, "check_approval", lambda config, runner, now, text, repo, number, sender="cos": original(config, runner, now, text, repo, number, "cos")))[1]
+        self.caught(self.check_only_cos, patch)
+
+    def test_mutant_start_anchored_reader_is_caught(self):
+        module = sb.load_module("plan_approval")
+        original = module.find_approvals
+        patch = lambda applied: (applied.append("applied"), mock.patch.object(
+            module, "find_approvals", lambda text: [{"value": module.approval_value(text), "ref": None}] if module.approval_value(text) is not None else []))[1]
+        self.caught(self.check_inside_a_sentence, patch)
+
+    def test_the_documentation_states_the_forms_the_candidates_the_audit_and_the_sender(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        section = text[text.index("**An approval is checked when it is sent (#951)"):]
+        section = section[:section.index("\n\n")]
+        for words in ("ANYWHERE", "`#N at sha256:<64 hex>`", "at most 10", "approval for no current plan", "Only the Chief of Staff"):
+            self.assertIn(words, section)
+
+
+class TestApprovalRefusals(Base):
+    """#1463: an approval form that is negated or quoted is REFUSED: one check (`plan_approval.REFUSALS`, a family of members, tested by
+    `refusal_of`); a refused form prints `approval not recorded: negated or quoted` once, is audited, records nothing and reads no issue.
+    The negation window is the 5 words before the form on the same line and does NOT stop at a sentence boundary."""
+    def setUp(self):
+        Base.setUp(self)
+        self.world = World(self, agents=("platform", "coder"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.issues = {7: {"done_when": APPROVAL_DW}, 8: {"done_when": APPROVAL_DW}}
+        self.comments = {7: [plan_body()], 8: [plan_body(extra="eight")]}
+        self.h7, self.h8 = self.hash(plan_body()), self.hash(plan_body(extra="eight"))
+
+    hash = TestApprovalAnywhere.hash
+    send = TestApprovalAnywhere.send
+    events = TestApprovalAnywhere.events
+    issues_approved = TestApprovalAnywhere.issues_approved
+    LINE = "approval not recorded: negated or quoted"
+    SAMPLES = {
+        "negation: not": "not {A}", "negation: no": "no {A}", "negation: never": "never {A}", "negation: n't": "we haven't, isn't {A}",
+        "negation: do not": "do not {A}", "negation: did not": "did not {A}", "negation: have not": "have not {A}",
+        "negation: has not": "has not {A}", "negation: cannot": "cannot {A}", "negation: without": "without {A}", "negation: not yet": "not yet {A}",
+        "quote: > line": "  > {A}", "quote: code span": "see `{A}` ok", "quote: fenced block": "```\n{A}\n```",
+        "quote: straight double quotes": 'she wrote "{A}" once', "quote: curly double quotes": "she wrote \u201c{A}\u201d once"}
+
+    def text(self, member):
+        return self.SAMPLES[member].replace("{A}", "Approved at %s" % self.h7)
+
+    def check_member(self, member):
+        text = self.text(member)
+        module = sb.load_module("plan_approval")
+        test = dict(module.REFUSALS)[member]
+        self.assertTrue(test(text, text.index("Approved")), member)
+        before = len(self.events("plan.approval_negated_or_quoted"))
+        err = self.send(text)
+        self.assertEqual(self.events(), [], member)
+        self.assertEqual(err.count(self.LINE), 1, err)
+        self.assertEqual(len(self.events("plan.approval_negated_or_quoted")), before + 1)
+        self.assertEqual([c for c in self.gh.calls if "comments" in c[2]], [], member)      # a refused form reads no issue
+
+    def test_the_members_are_derived_from_the_code_and_each_has_a_sample(self):
+        module = sb.load_module("plan_approval")
+        names = [name for name, _ in module.REFUSALS]
+        self.assertEqual(len(names), 16)
+        self.assertEqual(sorted(names), sorted(self.SAMPLES), "a member without a test (or a test without a member)")
+        self.assertEqual(len(module.NEGATION_WORDS), 11)
+
+    def test_every_member_is_refused_once_and_records_nothing(self):
+        for member in [name for name, _ in sb.load_module("plan_approval").REFUSALS]:
+            with self.subTest(member=member):
+                self.check_member(member)
+
+    def test_every_member_mutant_is_caught(self):
+        module = sb.load_module("plan_approval")
+        for member, _ in list(module.REFUSALS):
+            with self.subTest(member=member):
+                mutant = [(n, (lambda text, pos: False) if n == member else t) for n, t in module.REFUSALS]
+                with mock.patch.object(module, "REFUSALS", mutant):
+                    with self.assertRaises(AssertionError, msg=member):
+                        self.check_member(member)
+
+    def test_the_window_does_not_stop_at_a_sentence_and_is_five_words(self):
+        err = self.send("No issues found. Approved at %s" % self.h7)       # the documented false refusal
+        self.assertEqual(self.events(), [])
+        self.assertEqual(err.count(self.LINE), 1, err)
+        self.send("not a b c d e Approved at %s" % self.h7)                  # 5 words between the negation and the form: out of the window? it is the 6th word back
+        self.assertEqual(len(self.events()), 1)
+        err = self.send("not\nApproved at %s" % self.h7)                    # another line: not the same line
+        self.assertNotIn(self.LINE, err)
+
+    def test_a_clean_form_in_the_same_message_still_records_whichever_comes_first(self):
+        err = self.send("> Approved at %s\nApproved at %s #8" % (self.h8, self.h7))
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7)])
+        self.assertEqual(err.count(self.LINE), 1, err)
+        err = self.send("Approved at %s\n> Approved at %s" % (self.h8, self.h7), on=8)     # the clean one first
+        self.assertEqual(self.issues_approved(), [("acme/fleet#7", self.h7), ("acme/fleet#8", self.h8)])
+        self.assertEqual(err.count(self.LINE), 1, err)
+
+    def test_combinations_are_refused(self):
+        for text in ('> not Approved at %s' % self.h7, '"never ' + "Approved at %s\"" % self.h7, "`no` %s" % ("Approved at %s" % self.h7),
+                     'he said "ok" and did not Approved at %s' % self.h7, '"x" without Approved at %s' % self.h7):
+            err = self.send(text)
+            self.assertEqual(err.count(self.LINE), 1, (text, err))
+        self.assertEqual(self.events(), [])
+
+    def test_the_documentation_states_the_refusals(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        section = text[text.index("**An approval is checked when it is sent (#951)"):]
+        section = section[:section.index("\n\n")]
+        for words in ("approval not recorded: negated or quoted", "5 words", "No issues found. Approved at sha256:", "false refusal", "fenced code block"):
+            self.assertIn(words, section)
+
+
+class TestApprovalFinderCost(Base):
+    """#1463: the refusal finder reads a message ONCE (ranges built once, `_sightings` once per `check_approval`), counted, not timed; and it
+    agrees with the old per-form algorithm (kept here as the reference) on a table of hostile messages."""
+    H = "a" * 64
+    G = "b" * 64
+
+    def module(self):
+        return sb.load_module("plan_approval")
+
+    # the OLD algorithm, per form, kept as the reference
+    def old_refusal(self, text, pos):
+        module = self.module()
+        def line_of(t, p):
+            return t[t.rfind("\n", 0, p) + 1:(t.find("\n", p) if t.find("\n", p) >= 0 else len(t))]
+        def code_span(t, p):
+            return any(m.start() <= p < m.end() for m in re.finditer(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", t, re.DOTALL))
+        def fenced(t, p):
+            fence, offset = None, 0
+            for line in t.splitlines(True):
+                mark = module.FENCE_RE.match(line)
+                inside = fence is not None
+                if mark:
+                    fence = None if fence == mark.group(1) else (fence or mark.group(1))
+                if offset <= p < offset + len(line):
+                    return inside and not mark
+                offset += len(line)
+            return False
+        def between(opening, closing):
+            def test(t, p):
+                line = line_of(t, p)
+                col = p - (t.rfind("\n", 0, p) + 1)
+                before, after = line[:col], line[col:]
+                if opening == closing:
+                    return before.count(opening) % 2 == 1 and closing in after
+                return before.rfind(opening) > before.rfind(closing) and opening in before and closing in after
+            return test
+        def negation(word):
+            body = r"n['\u2019]t" if word == "n't" else r"\s+".join(re.escape(w) for w in word.split())
+            pattern = re.compile((r"(?<![\w'\u2019])" if word != "n't" else r"(?<=\w)") + body + r"(?![\w'\u2019])", re.IGNORECASE)
+            return lambda t, p: pattern.search(" ".join(t[t.rfind("\n", 0, p) + 1:p].split()[-5:])) is not None
+        tests = [negation(w) for w in module.NEGATION_WORDS] + [lambda t, p: line_of(t, p).lstrip().startswith(">"), code_span, fenced,
+                                                                 between('"', '"'), between("\u201c", "\u201d")]
+        return any(t(text, pos) for t in tests)
+
+    def old_sightings(self, text):
+        module = self.module()
+        spans = []
+        lead = module.APPROVAL_RE.match(text)
+        if lead is not None:
+            spans.append((lead.start(1) - len("Approved at sha256:"), module.approval_value(text), None))
+        spans += [(m.start(), m.group(1), None) for m in module.ANYWHERE_RE.finditer(text)]
+        colon = module.APPROVED_COLON_RE.search(text)
+        if colon:
+            for m in module.LIST_RE.finditer(text, colon.end()):
+                spans.append((m.start(), m.group(3), (m.group(1), int(m.group(2)))))
+        clean, refused = [], []
+        for span in sorted(spans, key=lambda x: x[0]):
+            (refused if self.old_refusal(text, span[0]) else clean).append(span)
+        return clean, refused
+
+    def hostile(self):
+        A, B = "Approved at sha256:" + self.H, "Approved at sha256:" + self.G
+        words = ["not", "no", "never", "don't", "do not", "did not", "cannot", "without", "not yet", "nothing"]
+        out = ["%s %s" % (w, A) for w in words]
+        out += ["`%s`" % A, "``%s``" % A, "`stray\n%s\n` and %s" % (A, B), "```\n%s\n```\n%s" % (A, B), "~~~\n%s\n```\n%s\n~~~" % (A, B),
+                "> %s\n%s" % (A, B), "\"%s\" %s" % (A, B), "\u201c%s\u201d %s" % (A, B), "\"%s %s" % (A, B), "x\" %s \"y" % A,
+                "\u200bnot %s" % A, "n\u043ft %s" % A, "%s, not yet" % A, "%s %s" % (A, B), "Approved: #7 at sha256:%s; #8 at sha256:%s" % (self.H, self.G),
+                "`Approved: #7 at sha256:%s`; #8 at sha256:%s" % (self.H, self.G), "no\n%s" % A, "a b c d e no f %s" % A, "no a b c d e %s" % A,
+                "```\n```\n%s" % A, "  > %s" % A, "`a` %s `b`" % A, "``a` %s `b``" % A, "%s\n" % A * 3, "\u201cx\u201d \u201d%s" % A,
+                "Approved at sha256:" + "c" * 10, "", "hello", "%s\n`\n%s\n`" % (A, B), "No issues found. %s" % A]
+        return out
+
+    def test_the_new_finder_equals_the_old_per_form_algorithm_on_40_hostile_messages(self):
+        module = self.module()
+        messages = self.hostile()
+        self.assertGreaterEqual(len(messages), 40)
+        for text in messages:
+            self.assertEqual(module._sightings(text), self.old_sightings(text), repr(text))
+            old_clean, old_refused = self.old_sightings(text)
+            self.assertEqual(module.refused_forms(text), [v for _, v, _ in old_refused], repr(text))
+            self.assertEqual([f["value"] for f in module.find_approvals(text)],
+                             list(dict.fromkeys((v.lower() if module.HEX64_RE.match(v) else v) for _, v, _ in old_clean)), repr(text))
+
+    def big_messages(self):
+        form = "Approved at sha256:%064x"
+        plain = " ".join(form % i for i in range(3000))
+        fenced = "```\n" + "\n".join(form % i for i in range(3000)) + "\n```"
+        spans = " ".join("`" + form % i + "`" for i in range(3000))
+        return {"plain": plain, "fenced": fenced, "spans": spans}
+
+    def count_one_check(self, text):
+        module = self.module()
+        calls = []
+        real = module._sightings
+        before = module.Ranges.built
+        with mock.patch.object(module, "_sightings", lambda *a, **k: calls.append(1) or real(*a, **k)):
+            sb.check_approval({}, None, None, text, "acme/fleet", None)
+        return len(calls), module.Ranges.built - before
+
+    def test_3000_forms_are_read_once_per_message_counted_and_a_per_form_rescan_is_caught(self):
+        module = self.module()
+        for kind, text in self.big_messages().items():
+            self.assertEqual(self.count_one_check(text), (1, 1), kind)
+            self.assertGreaterEqual(sum(map(len, module._sightings(text))), 3000, kind)
+
+            real = module.refusal_of
+            small = "\n".join(text.split("\n")[:30]) if kind == "fenced" else " ".join(text.split(" ")[:90])
+            with mock.patch.object(module, "refusal_of", lambda t, pos, ranges=None: real(t, pos, module.Ranges(t))):   # MUTANT: a rescan per form
+                self.assertGreater(self.count_one_check(small)[1], 3, kind)
+            self.assertEqual(self.count_one_check(small)[1], 1, kind)
+
+    def test_the_documentation_states_the_four_limits_of_the_refusals(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        section = text[text.index("**An approval is checked when it is sent (#951)"):]
+        section = section[:section.index("\n\n")]
+        for words in ("zero-width character or a homoglyph", "odd number of quotes", "negation AFTER the form", "stray backtick pairs with a later one across lines"):
+            self.assertIn(words, section)
+
+
 class TestApprovalCheck(Base):
     """#951: `Approved at sha256:X` is recorded only for the plan's current hash and the issue's current Done-when."""
 
@@ -2499,13 +2864,25 @@ class TestApprovalCheck(Base):
         self.assertIn("full 64-character hash", err)
 
     def test_a_message_without_an_approval_reads_nothing(self):
-        for text in ("hello", "I Approved at %s" % self.current(), "not Approved at sha256:%s" % ("a" * 64)):
+        for text in ("hello",):
             code, err = self.send(text)
             self.assertEqual(code, 0, err)
             self.assertEqual(err.count("\n"), 1, err)
             self.assertNotIn("approval", err)
             self.assertEqual([c for c in self.gh.calls if "comments" in c[2]], [], text)   # the message path's own intent reads stay; the check adds none
         self.assertEqual(self.approved(), [])
+
+    def test_an_approval_inside_a_sentence_is_recorded(self):
+        code, err = self.send("I Approved at %s" % self.current())
+        self.assertEqual(code, 0, err)
+        (event,) = self.approved()
+        self.assertEqual(event["detail"]["plan_hash"], self.current())
+
+    def test_a_sentence_approval_of_no_current_plan_records_nothing_and_says_so_once(self):
+        code, err = self.send("I Approved at sha256:%s" % ("a" * 64))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.approved(), [])
+        self.assertEqual(err.count("approval for no current plan"), 1, err)
 
     def test_the_documentation_shows_the_check_and_every_answer(self):
         text = (BIN.parent / "docs" / "switchboard.md").read_text()
@@ -2702,6 +3079,220 @@ class TestDaemon(Base):
 
 
 # -------------------------------------------------- the poke socket, ensure, the plugin
+
+
+class TestDaemonRelayLoop(Base):
+    """#1477: the relay is not pulled inline after run_pass; it has its own loop, so a stuck relay does not stall passes."""
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.dict(sys.modules, {sb.__name__: sb})   # run_daemon looks its own module up by name (strictly: a missing host fails the start)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.world = World(self, agents=("platform",))
+
+    def test_a_blocked_relay_does_not_stop_the_engine_passes(self):
+        import os as _os
+        relay = sb.load_module("cloud_relay_daemon")
+        gate, orig = threading.Event(), relay.pass_if_configured
+        entered = threading.Event()
+        relay.pass_if_configured = lambda *a, **k: (entered.set(), gate.wait(20))
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"}
+        saved = {k: _os.environ.get(k) for k in env}
+        _os.environ.update(env)
+        try:
+            self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3, relay_engine=lambda: self.world.engine), 3)   # returns while the relay is still blocked
+            self.assertTrue(entered.wait(30))   # the relay did run, and was still blocked while the passes completed
+        finally:
+            gate.set()
+            relay.pass_if_configured = orig
+            for k, v in saved.items():
+                _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
+
+    def test_twenty_calls_are_answered_inside_the_wait_while_a_45_second_pass_runs(self):
+        """S1/S2 on the real run_daemon with a fake 45 s engine pass (fake clock). Each call is answered by the relay loop while the
+        pass is still running. Mutant: the relay pulled inline after run_pass: the pass waits for an answer that only comes after it,
+        so the first wait times out and fewer than 20 calls are answered."""
+        import os as _os
+        relay = sb.load_module("cloud_relay_daemon")
+        import importlib.machinery, importlib.util, tempfile
+        loader = importlib.machinery.SourceFileLoader("t_relay_daemon_tests", str(Path(sb.__file__).parent / "test-cloud-relay-daemon"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        rt = importlib.util.module_from_spec(spec)
+        loader.exec_module(rt)   # its FakeBackend and FakeHub; the Executor is the REAL one, on a temp ledger
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        backend, hub = rt.FakeBackend(), rt.FakeHub()
+        real_exec = rt.relay.Executor(tmp.name, backend, lambda: 1000)
+        clock, answered = [0.0], {}
+        pending_cid = "r-pending"   # a report claimed and never delivered, as in the S13 proof: its replay is refused 409
+        real_exec.reports.claim(rt.CODER, pending_cid, {"command": "report", "pr": rt.PR, "args": rt.relay.args_digest({"state": "done", "text": "x"}), "state": "pending"})
+
+        got = threading.Event()
+
+        def pull(*a, **k):
+            def post(rid, body):
+                answered[rid] = (clock[0], body)
+                hub.post(rid, body)
+                got.set()
+            return relay.pass_once(real_exec, hub.fetch, post)
+        orig_pull, orig_cadence = relay.pass_if_configured, relay.CADENCE
+        relay.pass_if_configured, relay.CADENCE = pull, 0.01
+        saved = {k: _os.environ.get(k) for k in ("FLEET_RELAY_HUB_URL", "FLEET_RELAY_HUB_TOKEN_FILE")}
+        _os.environ.update({"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"})
+        asked, pass_end = {}, []
+        lock = threading.Lock()
+        engine, real = self.world.engine, self.world.engine.run_pass
+
+        def long_pass():
+            if pass_end:
+                return real()
+            for i in range(20):   # a pod call every 2 s of fake time; the pass lasts 45 s of fake time
+                clock[0] = 2.0 * i
+                kind = i % 4
+                if kind == 0:
+                    rid = hub.submit(rt.CODER, "prove", cid="c%d" % i, **rt.PROVE)
+                elif kind == 1:
+                    rid = hub.submit(rt.TESTER, "verdict", cid="c%d" % i, **rt.VERDICT)
+                elif kind == 2:
+                    rid = hub.submit(rt.CODER, "gates", head=None, cid="c%d" % i)
+                else:
+                    rid = hub.submit(rt.CODER, "report", head=None, cid=pending_cid if i == 3 else "c%d" % i, state="done", text="x")
+                asked[rid] = clock[0]
+                got.wait(60)   # a loose bound (the loop answers by its own cadence): the assertions below count answers, not seconds
+                got.clear()
+            clock[0] = 45.0
+            pass_end.append(clock[0])
+        engine.run_pass = long_pass
+        try:
+            sb.run_daemon(engine, self.world.state, 5, lambda sock, t: None, passes=1, relay_engine=lambda: engine)
+        finally:
+            relay.pass_if_configured, relay.CADENCE = orig_pull, orig_cadence
+            for k, v in saved.items():
+                _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
+        self.assertEqual(len(answered), 20)
+        statuses = [answered[r][1]["status"] for r in sorted(asked)]
+        self.assertEqual(statuses, [409 if i == 3 else 200 for i in range(20)])   # the pending report is refused as the real executor does
+        self.assertEqual(answered["%032x" % 4][1]["reason"], rt.relay.PENDING_REASON)
+        self.assertLess(max(v[0] for v in answered.values()), pass_end[0])   # all answered while the 45 s pass was still running
+
+    def test_without_a_hub_the_audit_is_that_of_the_bare_passes(self):
+        """U3: FLEET_RELAY_HUB_URL unset: run_daemon writes the audit bytes of the same 3 bare engine passes (the loop body before the
+        relay existed). Mutant: a relay loop started with no hub adds a thread and relay lines."""
+        import os as _os
+        saved = _os.environ.pop("FLEET_RELAY_HUB_URL", None)
+        relay, started = sb.load_module("cloud_relay_daemon"), []
+        orig_run = relay.RelayLoop.run
+        relay.RelayLoop.run = lambda loop: started.append(1)
+        try:
+            sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3, relay_engine=lambda: self.world.engine)
+            relay.RelayLoop.run = orig_run
+            self.assertEqual(started, [])   # no relay thread ran
+            via_daemon = self.world.audit()
+            other = World(self, agents=("platform",))
+            for _ in range(3):
+                other.engine.run_pass()
+            bare = other.audit()
+        finally:
+            if saved is not None:
+                _os.environ["FLEET_RELAY_HUB_URL"] = saved
+        def lines(rows):   # the clock stamp is real time (and repeats are rate-limited by it): compare what was said, byte for byte
+            return sorted({json.dumps({k: v for k, v in r.items() if k != "ts"}, sort_keys=True) for r in rows})
+        self.assertEqual(lines(via_daemon), lines(bare))
+        self.assertFalse([r for r in via_daemon if str(r.get("event")).startswith("relay.")])
+
+    def relay_env(self):
+        import os as _os
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"}
+        saved = {k: _os.environ.get(k) for k in env}
+        _os.environ.update(env)
+
+        def restore():
+            for k, v in saved.items():
+                _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
+        self.addCleanup(restore)
+
+    def test_a_start_loop_that_raises_does_not_stop_the_daemon(self):
+        self.relay_env()
+        relay = sb.load_module("cloud_relay_daemon")
+        orig = relay.start_loop
+
+        def boom(*a, **k):
+            raise RuntimeError("no relay today")
+        relay.start_loop = boom
+        self.addCleanup(setattr, relay, "start_loop", orig)
+        self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3, relay_engine=lambda: self.world.engine), 3)
+        failures = [e for e in self.world.audit() if e["event"] == "error" and e["detail"].get("step") == "pass"]
+        self.assertEqual(len(failures), 1)
+
+    def test_the_relay_loop_is_stopped_when_run_daemon_returns(self):
+        self.relay_env()
+        relay = sb.load_module("cloud_relay_daemon")
+        orig_pull, orig_start, loops = relay.pass_if_configured, relay.start_loop, []
+        relay.pass_if_configured = lambda *a, **k: 0
+        relay.start_loop = lambda *a, **k: (loops.append(orig_start(*a, **k)), loops[-1])[1]
+        self.addCleanup(setattr, relay, "pass_if_configured", orig_pull)
+        self.addCleanup(setattr, relay, "start_loop", orig_start)
+        sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=2, relay_engine=lambda: self.world.engine)
+        self.assertEqual(len(loops), 1)
+        self.assertFalse(loops[0].thread.is_alive())   # stop() ran in the finally and the loop (a 5 s wait) ended at once
+
+    def test_a_hub_without_a_relay_engine_is_audited_and_the_passes_go_on(self):
+        self.relay_env()
+        self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=2), 2)
+        failures = [e for e in self.world.audit() if e["event"] == "error" and e["detail"].get("step") == "pass"]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("engine factory", json.dumps(failures[0]["detail"]))
+
+    def relayed_report_during_a_pass(self, relay_engine):
+        """The pass thread discovers and holds its result while the relay thread relays a `report` (the real SwitchboardBackend.report on the
+        engine the loop was given). Returns (the pass's discovery is still the engine's, the riders recorded, the errors)."""
+        self.relay_env()
+        world = self.world
+        world.add_agent("coder", fleet={"role": "coder", "reports_to": "platform"})
+        relay = sb.load_module("cloud_relay_daemon")
+        engine, seen, errors = world.engine, {}, []
+        discovered, reported = threading.Event(), threading.Event()
+        orig_pull = relay.pass_if_configured
+        done_once = []
+
+        def pull(loop_engine, host, runner, now, environ, budget=None):
+            if done_once:
+                return 0
+            done_once.append(1)
+            try:
+                if not discovered.wait(60):
+                    errors.append("the pass never discovered")
+                relay.SwitchboardBackend(host, (loop_engine, world.state, world.config), runner, now).report("coder", {"state": "working", "text": "half way"})
+            except Exception as err:
+                errors.append(repr(err))
+            finally:
+                reported.set()
+            return 0
+
+        def fake_pass():
+            mine = engine.discover(world.clock.now())
+            discovered.set()
+            reported.wait(60)
+            seen["intact"] = engine.discovery is mine
+            return {}
+        relay.pass_if_configured = pull
+        self.addCleanup(setattr, relay, "pass_if_configured", orig_pull)
+        engine.run_pass = fake_pass
+        sb.run_daemon(engine, world.state, 5, lambda sock, t: None, passes=1, relay_engine=relay_engine)
+        riders = [r for r in sb.read_report_riders(world.state) if r["from"] == "coder"]
+        return seen.get("intact"), riders, errors
+
+    def test_a_relayed_report_does_not_touch_the_pass_threads_engine(self):
+        intact, riders, errors = self.relayed_report_during_a_pass(lambda: self.world.new_engine())
+        self.assertEqual(errors, [])
+        self.assertTrue(intact)   # the pass's discovery was not replaced under it
+        self.assertEqual(len(riders), 1)   # and the rider was recorded
+
+    def test_mutant_sharing_the_engine_again_is_caught(self):
+        intact, riders, errors = self.relayed_report_during_a_pass(lambda: self.world.engine)   # explicit sharing: the relay thread runs on the pass thread's engine
+        self.assertEqual(errors, [])
+        self.assertFalse(intact)   # the relay's discover replaced the pass's discovery: the guard above fails
 
 
 class TestDaemonWaits(Base):
@@ -8935,6 +9526,64 @@ class TestGithubDaemon(Base):
         super().setUp()
         self.world = World(self, agents=("platform",))
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+
+    def racing_calls(self, locked):
+        """Two threads record() into a gate whose counter has ONE stale entry. A deque that makes both threads look at the stale head at the same moment
+        (a barrier) forces the check-then-act interleaving a GIL alone does not: with the lock the second thread waits; without it both trim."""
+        barrier = threading.Barrier(2)
+
+        class Racy(collections.deque):
+            def __getitem__(self, i):
+                value = super().__getitem__(i)
+                if i == 0 and value[0] < 500:   # the stale entry: both threads see it before either removes it
+                    try:
+                        barrier.wait(0.5)
+                    except threading.BrokenBarrierError:
+                        pass
+                return value
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, lambda: 1000.0, environ={})
+        accounts.calls = Racy([(0.0, "default", "old", False)])
+        if not locked:
+            accounts.lock = contextlib.nullcontext()   # the mutant: the same gate with its lock removed
+        errors = []
+
+        def work():
+            try:
+                accounts.record("relay")
+            except BaseException as err:
+                errors.append(err)
+        threads = [threading.Thread(target=work) for _ in range(2)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        return len(accounts.calls), errors
+
+    def test_gh_accounts_counter_is_safe_for_two_threads(self):
+        # PC-6/U10: the pass thread and the relay thread count through ONE GhAccounts: the check-then-trim of its counter is under its lock
+        self.assertEqual(self.racing_calls(True), (2, []))
+        self.assertNotEqual(self.racing_calls(False), (2, []))   # without the lock one thread's entry is trimmed away (or it raises): the test can fail
+
+    def test_gh_accounts_records_once_inside_read_and_checks_any_pause(self):
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, self.world.clock.now, environ={})
+        done = subprocess.CompletedProcess([], 0, "{}", "")
+
+        def inner(*a, **k):
+            accounts.check_pause()
+            accounts.record("relay")   # a call made by a caller that runs inside `read`: read counts it, not record
+            return done
+        accounts.read(inner, "repos/o/r/pulls/1", "o/r", 5)
+        self.assertEqual(len(accounts.calls), 1)
+        accounts.record("relay")
+        self.assertEqual(len(accounts.calls), 2)
+        accounts.paused["some-account"] = self.world.clock.now() + 600
+        with self.assertRaises(sb.GhRateLimited):
+            accounts.check_pause()
+
+    def test_the_relay_engine_does_not_own_the_v2_link_file(self):
+        daemon = sb.build_engine(self.world.route, self.world.clock.now, "daemon")[0]
+        relay = sb.build_engine(self.world.route, self.world.clock.now, "daemon", owns_link=False)[0]
+        self.assertIsNotNone(daemon.v2.state_dir)   # the daemon's own client writes v2-link.json
+        self.assertIsNone(relay.v2.state_dir)   # the relay thread's does not: one writer, no flapping
+        self.assertEqual(relay.actor, "daemon")   # its audit lines are still the daemon's
 
     def test_no_repo_means_a_hub_with_no_watches_that_opens_and_starts_nothing(self):
         # PR 15: the watched set is derived on every pass, so the hub always exists; with nothing to watch it idles
@@ -24786,7 +25435,7 @@ class TestSweep(Base):
         untested = self.docs_fact_rows() - {c[0] for c in self.BOARD_ROWS}
         self.assertEqual(sorted(untested), sorted(self.NOT_PROBED))
 
-    NOT_PROBED = ["facts", "now", "pr"]   # always set, or the whole view (the `unreadable` row is probed)
+    NOT_PROBED = ["facts", "now", "pr", "review"]   # always set, or the whole view (the `unreadable` row is probed); `review` only widens the listing of standing change requests (#1404)
 
     def test_986_a_mutant_per_row_class_fails_the_real_board_probe(self):
         for rows, where, old, new in self.BOARD_MUTANTS:
@@ -43722,6 +44371,406 @@ class TestLaunchMemoryGate(TwoRepoCase):
         self.assertEqual(code, 0)
         text = " ".join(out.getvalue().split())
         self.assertRegex(text, r"lanes' safety check, not the owner's rule.*--memory-ok")
+
+
+class TestLaunchRefusedMessage(TestLaunchMemoryGate):
+    """#1464: a refused launch tells the caller ONE `[switchboard]` message `launch of NAME refused: <reason>`; a launch that succeeds tells nothing.
+    The refusal exits of `_cmd_launch` are DERIVED from its source (ast): every raise and every non-OK refusal return, and a table row runs each."""
+
+    NAME = "web-new"
+    TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4"
+
+    def setUp(self):
+        super().setUp()
+        self.as_agent("web-orch")
+
+    def base(self, *drop):
+        argv = ["launch", self.NAME, "--agent", "coder", "--dir", str(self.work), "--workspace", "w1", "--role", "coder", "--repo", ACME_WEB, "--memory-ok", "t"]
+        return argv
+
+    def sent(self):
+        return [t for t in self.texts("web-orch") if re.search(r"launch of \S+ refused:", t)]
+
+    def derived_exits(self):
+        """(id, lineno) of every refusal exit of `_cmd_launch`: a raise (not a bare re-raise) and a return of EXIT_USAGE or EXIT_MEMORY, from the source."""
+        source = Path(SWITCHBOARD).read_text()
+        tree = ast.parse(source)
+        (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_cmd_launch"]
+        found = []
+
+        def walk(body, ctx):
+            for st in body:
+                if (isinstance(st, ast.Raise) and st.exc is not None) or (isinstance(st, ast.Return) and isinstance(st.value, ast.Name) and st.value.id in ("EXIT_USAGE", "EXIT_MEMORY")):
+                    found.append((ctx + "|" + ast.get_source_segment(source, st)[:40].replace("\n", " "), st.lineno))
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, field, None)
+                    if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                        walk(sub, ctx + (" > " + ast.get_source_segment(source, st.test)[:30].replace("\n", " ") if isinstance(st, ast.If) and field == "body" else ""))
+                for handler in getattr(st, "handlers", []):
+                    walk(handler.body, ctx + " > except")
+        walk(fn.body, "")
+        return found
+
+    def rows(self):
+        """One row per derived exit: the argv and the patches that reach it."""
+        B = self.base()
+        no_memory_ok = B[:-2]
+        resume = B + ["--resume", "ses_x"]
+        brief = self.home / "brief.txt"
+        P = lambda name, **kw: mock.patch.object(sb, name, **kw)
+        stored = mock.patch.object(sb.V2Client, "session_get", lambda self, sid: {"metadata": {"fleet": {"name": "web-orch", "repo": ACME_WEB}}})
+        no_ws = [a for a in B if a not in ("--workspace", "w1")]
+        newws = no_ws + ["--new-workspace", "lab"]
+        return {
+            ' > getattr(args, "read_repo", Non|raise LaunchError("--read-repo needs a t': (B + ["--resume", "ses_x", "--read-repo", "acme/api"], []),
+            ' > getattr(args, "stack", False) |return EXIT_USAGE': (B + ["--stack"], []),
+            ' > getattr(args, "terminal", Fals|raise LaunchError("--terminal and --head': (B + ["--terminal", "--headless"], []),
+            ' > args.resume > given > stored and given != stored|raise LaunchError("--repo %s differs fro': (
+                resume[:-2] + ["--resume", "ses_x"] , [mock.patch.object(sb.V2Client, "session_get", lambda self, sid: {"metadata": {"fleet": {"name": "web-orch", "repo": ACME_API}}})]),
+            ' > args.resume > who|raise LaunchError("refused: %s" % who)': (resume, [stored, P("reattach_caller_problem", return_value="not yours")]),
+            ' > args.resume > args.brief_file is not None > except|return EXIT_USAGE': (resume + ["--brief-file", str(self.home / "nobrief.txt")], [stored, P("reattach_caller_problem", return_value=None)]),
+            ' > args.resume > except|raise LaunchError("another reattach of %': (resume, [stored, P("reattach_caller_problem", return_value=None), P("agent_lock", side_effect=sb.ImpactStateBusy("busy"))]),
+            ' > not args.agent or not args.dir|raise LaunchError("--agent and --dir are': (["launch", self.NAME], []),
+            ' > getattr(args, "memory_ok", Non|return EXIT_USAGE': (no_memory_ok + ["--memory-ok", "  "], []),
+            ' > refusal|return EXIT_MEMORY': (no_memory_ok, [mock.patch.object(sb, "launch_memory_check", lambda *a, **k: "memory: free 31%")]),
+            ' > getattr(args, "headless", Fals|raise LaunchError("--headless opens no t': (B + ["--headless"], []),
+            ' > (args.name or "").startswith(L|raise LaunchError("names starting %r are': (["launch", sb.LANE_NAME_PREFIX + "x"] + B[2:], []),
+            ' > problem|raise LaunchError(problem)': (B, [P("launch_agent_problem", return_value="the agent is not known")]),
+            ' > args.new_workspace > args.workspace|raise LaunchError("--new-workspace makes': (B + ["--new-workspace", "lab"], []),
+            ' > args.new_workspace > problems|raise LaunchError("; ".join(problems))': (newws, [P("launch_problems", return_value=["p1", "p2"])]),
+            ' > args.new_workspace > problem|raise LaunchError(problem)': (newws, [P("launch_account_problem", return_value="no account")]),
+            ' > use_headless > except > except|raise LaunchError("headless refused (%s)': (no_ws, [P("launch_headless", side_effect=sb.HeadlessRefused("no")), P("caller_workspace", side_effect=RuntimeError("none"))]),
+            ' > except > created|raise LaunchError("%s (workspace %s was ': (newws, [P("launch_agent", side_effect=sb.LaunchError("the tab did not open"))]),
+        }
+
+    def run_row(self, argv, patches):
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            return self.main(*argv)
+
+    def check_refused(self, argv, patches, label=""):
+        before = len(self.sent())
+        code, out, err = self.run_row(argv, patches)
+        got = self.sent()[before:]
+        self.assertNotEqual(code, 0, "%s: %s" % (label, err))
+        self.assertEqual(len(got), 1, "%s: %d messages, stderr: %s" % (label, len(got), err))
+        (text,) = got
+        self.assertIn("launch of %s refused: " % argv[1], text)
+        return text, err
+
+    # -- DW-3 / S6: derived
+
+    def test_s6_every_refusal_exit_derived_from_the_source_has_a_row_and_sends_exactly_one_message(self):
+        derived = self.derived_exits()
+        rows = self.rows()
+        self.assertEqual(sorted(i for i, _ in derived), sorted(rows), "a derived exit has no row, or a row no exit")
+        self.assertGreaterEqual(len(derived), 18)
+        for ident, line in derived:
+            argv, patches = rows[ident]
+            with self.subTest(exit=ident, line=line):
+                self.check_refused(argv, patches, ident)
+
+    # -- S2
+
+    def test_s2_the_memory_test_refusal_sends_one_message_with_the_reason_on_one_line(self):
+        (self.fake / "free").write_text("31")
+        code, _, err = self.main(*self.base()[:-2])
+        self.assertEqual(code, sb.EXIT_MEMORY)
+        (text,) = self.sent()
+        self.assertIn("launch of web-new refused: ", text)
+        self.assertIn("free 31%", text)
+        self.assertIn("launch of web-new refused: memory:", text)
+        print(repr(text))
+
+    # -- S3
+
+    def test_s3_the_preflight_the_brief_header_a_missing_brief_and_the_clouds_refusal_each_send_one_message(self):
+        timeout = sb.LaunchError("the cloud refused the worker: Unable to connect to the server: i/o timeout")
+        cases = {
+            "preflight": (["launch", self.NAME, "--cloud", "--repo", ACME_WEB],
+                          [mock.patch.object(sb, "run_cloud", side_effect=sb.LaunchError("refused: the repository preflight for acme/web did not pass: x; nothing was created"))]),
+            "cloud": (["launch", self.NAME, "--cloud", "--repo", ACME_WEB], [mock.patch.object(sb, "run_cloud", side_effect=timeout)]),
+            "brief header": (self.base() + ["--resume", "ses_x", "--brief-file", str(self.home / "nobrief.txt")], [mock.patch.object(sb.V2Client, "session_get", lambda self, sid: {"metadata": {"fleet": {"name": "web-orch", "repo": ACME_WEB}}}), mock.patch.object(sb, "reattach_caller_problem", return_value=None)]),
+            "missing brief": (self.base() + ["--brief-file", str(self.home / "nobrief.txt")], []),
+        }
+        self.assertEqual(len(cases), 4)
+        for label, (argv, patches) in cases.items():
+            with self.subTest(label):
+                text, _ = self.check_refused(argv, patches, label)
+        self.assertEqual(len(self.sent()), 4)
+
+    def test_s3b_a_cloud_route_that_returns_a_refusal_code_after_printing_its_line_sends_the_line(self):
+        def refuse(function, *args):
+            sys.stderr.write("%s: the cloud refused the worker: Unable to connect to the server: i/o timeout\n" % sb.PROG)
+            return sb.EXIT_USAGE
+        text, err = self.check_refused(["launch", self.NAME, "--cloud", "--repo", ACME_WEB], [mock.patch.object(sb, "run_cloud", refuse)])
+        self.assertIn("i/o timeout", text)
+        self.assertIn("the cloud refused the worker", err)   # PC-1: what is printed stays
+
+    # -- S4
+
+    def test_s4_a_launch_that_meets_two_refusals_sends_one_message(self):
+        argv = self.base() + ["--new-workspace", "lab"]
+        argv = [a for a in argv if a not in ("--workspace", "w1")]
+        first = sb.LaunchError("the tab did not open")
+        # the launch's own refusal is re-raised with the workspace note: two refusals on one path
+        text, _ = self.check_refused(argv, [mock.patch.object(sb, "launch_agent", side_effect=first)])
+        self.assertIn("the tab did not open", text)
+        self.assertEqual(len(self.sent()), 1)
+
+    # -- S5 / U2
+
+    def test_s5_a_launch_that_succeeds_sends_no_refusal_message(self):
+        code, out, err = self.main(*self.base())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.sent(), [])
+        self.assertNotIn("refusal was not sent", err)
+
+    # -- U3
+
+    def test_u3_a_long_reason_with_a_token_is_bounded_and_scrubbed(self):
+        reason = ("x" * 1000) + " " + self.TOKEN + " " + ("y" * 1000)
+        text, err = self.check_refused(self.base(), [mock.patch.object(sb, "launch_agent_problem", return_value=reason)])
+        self.assertNotIn(self.TOKEN, text)
+        self.assertNotIn(self.TOKEN, err.replace(reason, ""))
+        body = text.split("launch of %s refused: " % self.NAME, 1)[1].strip().splitlines()[0]
+        self.assertLessEqual(len(body), sb.LAUNCH_REFUSED_REASON_MAX)
+        self.assertLessEqual(len(sb.launch_refusal_reason(reason)), 300)
+        self.assertEqual(sb.launch_refusal_reason("a\nb\tc"), "a b c")
+
+    def test_a_caller_that_cannot_be_identified_is_told_nothing_and_nothing_more_is_printed(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, _, err = self.main(*self.base() + ["--headless"])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertNotIn("not sent", err)
+        self.assertEqual(len([l for l in err.strip().splitlines() if l.strip()]), 1)
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "launch.refusal_unsent"][0]["subject"], self.NAME)
+
+    # -- S7: mutants
+
+    def mutant(self, name, target, replacement, expect):
+        original = getattr(sb, target)
+        with mock.patch.object(sb, target, replacement):
+            self.assertIsNot(getattr(sb, target), original, "mutant %s is applied" % name)
+            with self.assertRaises(AssertionError, msg="mutant %s was not caught" % name):
+                expect()
+
+    def refused_once(self):
+        self.check_refused(self.base() + ["--headless"], [])
+
+    def succeeded_silently(self):
+        before = len(self.sent())
+        code, _, err = self.main(*self.base() + ["--name-unused"] if False else self.base())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.sent()), before)
+
+    def refused_scrubbed(self):
+        text, _ = self.check_refused(self.base(), [mock.patch.object(sb, "launch_agent_problem", return_value="x" * 2000 + " " + self.TOKEN)])
+        self.assertNotIn(self.TOKEN, text)
+        body = text.split("launch of %s refused: " % self.NAME, 1)[1].strip().splitlines()[0]
+        self.assertLessEqual(len(body), 300)
+
+    def test_s7_a_refusal_that_sends_nothing_is_caught(self):
+        self.mutant("silent", "tell_launch_refused", lambda *a, **k: None, self.refused_once)
+
+    def test_s7_a_refusal_that_sends_twice_is_caught(self):
+        real = sb.tell_launch_refused
+
+        def twice(*a, **k):
+            real(*a, **k)
+            real(*a, **k)
+        self.mutant("twice", "tell_launch_refused", twice, self.refused_once)
+
+    def test_s7_a_success_that_sends_one_is_caught(self):
+        real_inner, real_tell = sb._cmd_launch, sb.tell_launch_refused
+
+        def chatty(args, runner, now, socket_call=None):
+            code = real_inner(args, runner, now, socket_call)
+            real_tell(runner, now, args.name, "it went fine")
+            return code
+        self.mutant("chatty", "_cmd_launch", chatty, self.succeeded_silently)
+
+    def test_s7_a_reason_with_an_unscrubbed_token_is_caught(self):
+        self.mutant("unscrubbed", "launch_refusal_reason", lambda text: str(text), self.refused_scrubbed)
+
+    def test_s7_the_unmutated_build_passes_each_check(self):
+        self.refused_once()
+        self.succeeded_silently()
+        self.refused_scrubbed()
+
+    # -- S8
+
+    def test_s8_the_documentation_states_the_message_and_its_absence_on_success(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        sections = [s for s in re.split(r"\n(?=#{2,4} )", text) if s.startswith(("### `launch` tells the caller", "## `launch` tells the caller"))]
+        self.assertEqual(len(sections), 1)
+        self.assertIn("launch of NAME refused:", sections[0])
+        self.assertIn("none is sent", sections[0])
+
+    # -- S9: a failure after the worker was created is FAILED, never refused
+
+    def created_exits(self):
+        """(id, format text) of every raise in cloud_worker.py whose message carries the marker the code writes (`the worker was created`), from the source."""
+        source = (BIN / "cloud_worker.py").read_text()
+        found = {}
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Raise) and node.exc is not None:
+                for part in ast.walk(node.exc):
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str) and sb.LAUNCH_AFTER_CREATED.search(part.value.replace("%s ", "")):
+                        found[part.value[:30]] = part.value
+        for node in ast.walk(ast.parse(source)):   # a literal split over several parts of one raise: the whole raise text
+            if isinstance(node, ast.Raise) and node.exc is not None and sb.LAUNCH_AFTER_CREATED.search(ast.get_source_segment(source, node)) and not any(
+                    sb.LAUNCH_AFTER_CREATED.search(c.value.replace("%s ", "")) for c in ast.walk(node.exc) if isinstance(c, ast.Constant) and isinstance(c.value, str)):
+                found["raise@%d" % node.lineno] = ast.get_source_segment(source, node)
+        return found
+
+    def render(self, template):
+        return re.sub(r"%s", "the-reason", template)
+
+    def check_failed(self, argv, patches, label=""):
+        before = len(self.texts("web-orch"))
+        code, out, err = self.run_row(argv, patches)
+        got = [t for t in self.texts("web-orch")[before:] if "launch of " in t]
+        self.assertNotEqual(code, 0, label)
+        self.assertEqual(len(got), 1, "%s: %s" % (label, got))
+        self.assertIn("launch of %s FAILED after the worker was created: " % argv[1], got[0], label)
+        self.assertNotIn("refused", got[0], label)
+        self.assertLessEqual(len(got[0].split("created: ", 1)[1].strip().splitlines()[0]), 300)
+        return got[0]
+
+    def created_rows(self):
+        return {"the worker was created but its re": "the worker was created but its record could not be stored (%s); stop was requested",
+                "%s: %s (the worker %s was created; %": "%s: %s (the worker %s was created; %s)",
+                "%s (the worker was created; %s)": "%s (the worker was created; %s)"}
+
+    def test_s9_every_raise_carrying_the_created_marker_has_a_row_and_sends_one_failed_message(self):
+        derived = self.created_exits()
+        rows = self.created_rows()
+        self.assertEqual(len(derived), len(rows), "a raise with the marker has no row (or a row has none): %s" % sorted(derived))
+        self.assertEqual(sorted(derived.values()), sorted(rows.values()))
+        for template in derived.values():
+            with self.subTest(template=template):
+                text = self.render(template).replace("the-reason", "x" * 400 if "(%s)" in template else "the-reason")
+                self.check_failed(["launch", self.NAME, "--cloud", "--repo", ACME_WEB], [mock.patch.object(sb, "run_cloud", side_effect=sb.LaunchError(text))], template)
+
+    def test_s9_a_resume_brief_that_is_not_delivered_after_the_pane_opened_is_FAILED_not_refused(self):
+        stored = mock.patch.object(sb.V2Client, "session_get", lambda self, sid: {"metadata": {"fleet": {"name": "web-orch", "repo": ACME_WEB}}})
+        brief = self.home / "brief.txt"
+        brief.write_text("do the work\n")
+        with mock.patch.object(sb, "reattach_caller_problem", return_value=None), mock.patch.object(sb, "resume_agent", return_value={"name": self.NAME, "session": "ses_x"}), \
+                mock.patch.object(sb, "send_brief", side_effect=RuntimeError("no route")):
+            self.check_failed(self.base() + ["--resume", "ses_x", "--brief-file", str(brief)], [stored], "resume")
+
+    def test_s9_a_mutant_that_handles_only_the_first_site_is_caught(self):
+        def first_only(reason):
+            return None
+        original = sb.LAUNCH_AFTER_CREATED
+        only_first = re.compile(r"the worker was created but")
+        with mock.patch.object(sb, "LAUNCH_AFTER_CREATED", only_first):
+            with self.assertRaises(AssertionError):
+                self.test_s9_every_raise_carrying_the_created_marker_has_a_row_and_sends_one_failed_message()
+        self.assertIsNot(sb.LAUNCH_AFTER_CREATED, only_first)
+        self.assertIs(sb.LAUNCH_AFTER_CREATED, original)
+
+    # A raise that says "created" about something else than the worker (checked before any pod exists); first 30 characters -> reason.
+    CREATED_EXEMPT = {
+        'the launch reservation of %s i': 'refused before any pod exists: it says nothing was created',
+        '%s is not on the cloud allow-l': 'refused before any pod exists: it says nothing was created',
+        'CW_ALLOWED_REPOS has an entry ': 'refused before any pod exists: it says nothing was created',
+        'CW_TOOLING_REPO is not OWNER/N': 'refused before any pod exists: it says nothing was created',
+        'the stack model secret %s %s; ': 'refused before any pod exists: it says nothing was created',
+        'the git token command gave no ': 'refused before any pod exists: it says nothing was created',
+        '--agent orchestrator needs --r': 'refused before any pod exists: it says nothing was created',
+        '--shape %r is not a pod shape ': 'refused before any pod exists: it says nothing was created',
+        'a local fleet agent named %s e': 'refused before any pod exists: it says nothing was created',
+        '--dir %r is not a path in the ': 'refused before any pod exists: it says nothing was created',
+        'the launch reservation of %s c': 'refused before any pod exists: it says nothing was created',
+        '%s is being launched by anothe': 'refused before any pod exists: it says nothing was created',
+        'the vault check lock %s was no': 'refused before any pod exists: it says nothing was created',
+        'the vault access check stopped': 'refused before any pod exists: it says nothing was created',
+        'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
+    }
+
+    def other_created_words(self, source):
+        """first 30 characters of every raise in `source` whose text says 'created' and is not a marker site and not in CREATED_EXEMPT."""
+        stray = []
+        for node in ast.walk(ast.parse(source)):
+            if not (isinstance(node, ast.Raise) and node.exc is not None):
+                continue
+            consts = [c.value for c in ast.walk(node.exc) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+            text = "".join(consts) + " " + ast.get_source_segment(source, node)
+            if not re.search("created", text, re.I):
+                continue
+            if sb.LAUNCH_AFTER_CREATED.search(text.replace("%s ", "")) or sb.LAUNCH_AFTER_CREATED.search(ast.get_source_segment(source, node)):
+                continue
+            if (consts[0] if consts else "")[:30] in self.CREATED_EXEMPT:
+                continue
+            stray.append((consts[0] if consts else "")[:30])
+        return stray
+
+    def test_s9_no_raise_of_the_launcher_mentions_a_created_worker_in_other_words(self):
+        self.assertEqual(self.other_created_words((BIN / "cloud_worker.py").read_text()), [])
+
+    def test_s9_a_mutant_raise_that_says_created_in_other_words_is_caught(self):
+        source = (BIN / "cloud_worker.py").read_text()
+        mutant = source + '\n\ndef _fake():\n    raise LaunchError("the pod was created but the pin failed")\n'
+        self.assertNotEqual(mutant, source)   # applied
+        self.assertEqual(self.other_created_words(source), [])
+        self.assertEqual(self.other_created_words(mutant), ["the pod was created but the pin"[:30]])   # caught
+
+    # -- S10: sys.stderr is the real stream after every ending
+
+    def stderr_after(self, patch, launch=None):
+        """True when sys.stderr, read right after `cmd_launch` ends (inside the test's own capture), is the stream it had when it began."""
+        seen, inner = [], launch or sb.cmd_launch
+
+        def watch(args, runner, now, socket_call=None):
+            before = sys.stderr
+            try:
+                return inner(args, runner, now, socket_call)
+            finally:
+                seen.append(sys.stderr is before)
+                sys.stderr = before
+        watch.ensure_on_use = True
+        with patch, mock.patch.object(sb, "cmd_launch", watch):
+            try:
+                self.main(*self.base())
+            except BaseException:
+                pass
+        return seen == [True]
+
+    def stderr_checks(self, launch=None):
+        self.assertTrue(self.stderr_after(contextlib.nullcontext(), launch), "after a success")
+        self.assertTrue(self.stderr_after(mock.patch.object(sb, "launch_agent_problem", return_value="no"), launch), "after a LaunchError")
+        self.assertTrue(self.stderr_after(mock.patch.object(sb, "_cmd_launch", return_value=sb.EXIT_USAGE), launch), "after a non-OK return")
+        self.assertTrue(self.stderr_after(mock.patch.object(sb, "_cmd_launch", side_effect=KeyboardInterrupt), launch), "after a KeyboardInterrupt")
+
+    def test_s10_sys_stderr_is_the_real_stream_after_a_success_a_non_ok_return_and_a_keyboard_interrupt(self):
+        self.stderr_checks()
+
+    def test_s10_a_cmd_launch_without_the_finally_is_caught(self):
+        def no_finally(args, runner, now, socket_call=None):
+            sys.stderr = sb._StderrTee(sys.stderr)
+            return sb._cmd_launch(args, runner, now, socket_call)
+        with self.assertRaises(AssertionError):
+            self.stderr_checks(no_finally)
+
+    # -- S11
+
+    def test_s11_the_documentation_states_the_five_things(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        (section,) = [s for s in re.split(r"\n(?=#{2,4} )", text) if s.startswith(("### `launch` tells the caller", "## `launch` tells the caller"))]
+        flat = " ".join(section.split())
+        for needle in ("untrusted text sent as data", "the last line the launch printed", "a trailing warning", "`exit code N`", "opaque by design",
+                       "FAILED after the worker was created", "not as refused", "no timeout of their own"):
+            self.assertIn(needle, flat)
+
+
+for _name in dir(TestLaunchMemoryGate):   # the memory gate's own tests run in its class, not again here
+    if _name.startswith("test_") and _name not in vars(TestLaunchRefusedMessage):
+        setattr(TestLaunchRefusedMessage, _name, None)
 
 
 class TestLaunchNewWorkspace(TwoRepoCase):
@@ -63566,7 +64615,7 @@ class TestReviewPostAndDismiss(LedgerBase):
     def check_gates_line(self):
         self.reset()
         self.blocking(77, by="rdr1", head=self.OLD)
-        code, out, err = self.run_as("coder", "gates", self.PR)
+        code, out, err = self.run_as("rdr1", "gates", self.PR)
         lines = [l for l in out.splitlines() if l.startswith("blocking review:")]
         self.assertEqual(len(lines), 1, out)
         self.assertIn("rdr1 CHANGES_REQUESTED at %s" % self.OLD[:12], lines[0])
@@ -63739,6 +64788,201 @@ class TestReviewPostAndDismiss(LedgerBase):
                 stack.enter_context(mock.patch.object(sb, name, value))
             with self.assertRaises(AssertionError):
                 check()
+
+    # -- #1404: every standing change request is listed by `gates` from the first call; dismissal is only offered
+
+    def standing(self, decision=""):
+        """A standing request of rdr1 at the CURRENT head, followed only by a comment-form approval; the decision field does not read changes requested."""
+        self.reset()
+        self.blocking(77, by="rdr1")
+        self.reviews[-1]["submitted_at"] = "2020-01-01T00:00:00Z"
+        self.reviews.append({"id": 78, "user": {"login": "shared"}, "state": "COMMENTED", "commit_id": self.HEAD,
+                             "body": "Review of %s: APPROVE\n\nfine\n\n%s" % (self.HEAD, sb.fleet_mark("rdr1"))})
+        self.pr["reviewDecision"] = decision
+
+    def gate_lines(self):
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        return out, [l for l in out.splitlines() if l.startswith("blocking review:")]
+
+    def check_standing_listed(self):
+        self.standing()
+        out, lines = self.gate_lines()
+        self.assertEqual(len(lines), 1, out)
+        self.assertRegex(lines[0], r"rdr1 CHANGES_REQUESTED at %s \(review 77, \d+d old;" % self.HEAD[:12])
+
+    def check_verdict_names_it(self):
+        self.standing()
+        out, lines = self.gate_lines()
+        verdict = [l for l in out.splitlines() if l.startswith("  BLOCKED:")]
+        self.assertEqual(len(verdict), 1, out)
+        self.assertIn("review 77", verdict[0])
+
+    def check_other_pr_not_listed(self):
+        self.reset()
+        out, lines = self.gate_lines()
+        self.assertEqual(lines, [], out)
+
+    def check_no_dismissal(self):
+        self.standing()
+        self.reviews[0]["commit_id"] = self.OLD
+        self.reviews.pop()   # no earlier review of the reader at the head: the approve is posted
+        for argv in (("gates", self.PR), ("review", "post", self.PR, "--head", self.HEAD, "--verdict", "approve", "--body-file", self.body_file()),
+                     ("review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--head", self.HEAD)):
+            self.run_as("rdr1" if argv[0] == "review" and argv[1] == "post" else "coder", *argv)
+        self.assertEqual(self.dismissed, [])
+
+    def test_gates_lists_a_standing_request_whatever_the_decision_field_says(self):
+        self.check_standing_listed()
+
+    def test_the_verdict_list_names_the_pull_request_as_blocked_by_it(self):
+        self.check_verdict_names_it()
+
+    def test_a_pull_request_with_no_request_shows_none_and_another_pull_requests_is_not_listed(self):
+        self.check_other_pr_not_listed()
+
+    def test_an_approve_at_a_later_head_prints_the_exact_dismiss_command_and_says_it_ran_nothing(self):
+        self.standing()
+        self.reviews[0]["commit_id"] = self.OLD
+        self.reviews.pop()
+        code, out, err = self.post()
+        self.assertEqual(code, 0, err)
+        offers = [l for l in out.splitlines() if "fleet-switchboard review dismiss" in l]
+        self.assertEqual(len(offers), 1, out)
+        self.assertIn("review dismiss %s --review 77 --reason TEXT" % self.PR, offers[0])
+        self.assertIn("did not dismiss it", offers[0])
+        self.assertEqual(self.dismissed, [])
+        self.reset()
+        self.blocking(77, by="rdr2", head=self.OLD)   # another reader's request is not offered to this one
+        self.assertNotIn("review dismiss", self.post()[1])
+
+    def test_no_command_sends_a_dismissal(self):
+        self.check_no_dismissal()
+
+    def test_the_dismissal_endpoint_has_one_call_site_and_it_is_review_dismiss(self):
+        source = Path(sb.__file__).read_text() if getattr(sb, "__file__", None) else (REPO / "bin" / "fleet-switchboard").read_text()
+        sites = [m.start() for m in re.finditer(r'"/dismissals"', source)]
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(re.findall(r"\ndef (\w+)\(", source[:sites[0]])[-1], "cmd_review_dismiss")
+
+    def test_an_unreadable_review_list_says_so_and_never_reads_as_none(self):
+        self.standing()
+        self.fail_read = (1, {}, "reviews")
+        out, lines = self.gate_lines()
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("could not be read whole", lines[0])
+        self.assertNotIn("none", lines[0])
+
+    def test_a_pull_request_with_no_request_prints_what_it_printed_before(self):
+        self.reset()
+        self.reviews.append({"id": 5, "user": {"login": "shared"}, "state": "APPROVED", "commit_id": self.HEAD, "body": "x\n\n" + sb.fleet_mark("rdr1")})
+        now_out = self.run_as("coder", "gates", self.PR)[1]
+        with mock.patch.object(sb, "blocking_review_lines", lambda *a, **k: []):
+            before = self.run_as("coder", "gates", self.PR)[1]
+        self.assertEqual(now_out, before)
+
+    def test_the_listing_and_the_merge_shims_rule_agree_on_every_combination(self):
+        rule = sb.load_review_rule()
+        source = (REPO / "shims" / "review_rule.py").read_text()
+        states = sorted(set(re.search(r'state in \(([^)]*)\)', source).group(1).replace('"', "").replace(" ", "").split(","))) + ["COMMENTED"]
+        self.assertEqual(len(states), 4)
+        one = [(s, c) for s in states for c in (self.HEAD, self.OLD)]
+        seqs = [[a] for a in one] + [[a, b] for a in one for b in one]
+        def build(logins):
+            return [{"id": 100 * i + j, "user": {"login": login}, "state": st, "commit_id": c, "body": ""} for i, (login, seq) in enumerate(logins) for j, (st, c) in enumerate(seq)]
+        count = 0
+        for decision in ("", "CHANGES_REQUESTED"):
+            for first in seqs:
+                for second in [None] + seqs:
+                    reviews = build([("a", first)] + ([("b", second)] if second else []))
+                    with mock.patch.object(sb, "_review_pages", lambda *a, **k: (True, reviews, "")):
+                        rows, problem = sb.standing_requests(None, None, lambda: 0, "acme/app", 9, self.HEAD, decision)
+                    views = [{"author": {"login": r["user"]["login"]}, "state": r["state"], "commit": {"oid": r["commit_id"]}} for r in reviews]
+                    self.assertEqual((problem, [r["login"] for r in rows]), ("", [w for w, _ in rule.blocking_reviews(views, self.HEAD, decision)]))
+                    count += 1
+        self.assertEqual(count, 2 * len(seqs) * (1 + len(seqs)))
+
+    def two_requests(self):
+        self.reset()
+        self.blocking(77, by="rdr1")
+        self.blocking(78, by="rdr2")
+        self.reviews[0]["user"] = {"login": "login-one"}   # the rule is per login
+        self.reviews[1]["user"] = {"login": "login-two"}
+
+    def check_dismiss_command_only_for_own(self):
+        self.two_requests()
+        code, out, err = self.run_as("rdr1", "gates", self.PR)
+        lines = {l.split()[2]: l for l in out.splitlines() if l.startswith("blocking review:")}
+        self.assertEqual(sorted(lines), ["rdr1", "rdr2"], out)
+        self.assertIn("review dismiss %s --review 77 --reason TEXT" % self.PR, lines["rdr1"])
+        self.assertNotIn("review dismiss", lines["rdr2"])
+        self.assertIn("ask rdr2 or a person to dismiss it", lines["rdr2"])
+
+    def test_the_dismiss_command_is_named_only_for_the_callers_own_request(self):
+        self.check_dismiss_command_only_for_own()
+
+    def test_the_mutant_that_names_the_command_for_every_author_fails(self):
+        real = sb.blocking_review_lines
+        self.mutant_fails(self.check_dismiss_command_only_for_own, blocking_review_lines=lambda *a, **k: real(*a[:7]))
+
+    def test_a_caller_that_is_not_a_fleet_agent_is_told_to_ask_for_every_request(self):
+        self.two_requests()
+        code, out, err = self.run_as(None, "gates", self.PR)
+        lines = [l for l in out.splitlines() if l.startswith("blocking review:")]
+        self.assertEqual(len(lines), 2, out)
+        for line in lines:
+            self.assertNotIn("review dismiss", line)
+            self.assertRegex(line, r"ask rdr[12] or a person to dismiss it")
+
+    def test_the_blocked_line_says_other_ways_of_requesting_are_not_covered(self):
+        self.standing()
+        out, lines = self.gate_lines()
+        verdict = [l for l in out.splitlines() if l.startswith("  BLOCKED:")][0]
+        self.assertIn("no BLOCKED line is not proof that a merge passes", verdict)
+
+    def check_offer_skips_a_superseded_request(self):
+        self.standing()
+        self.reviews[0]["commit_id"] = self.OLD
+        self.reviews.pop()
+        out = self.post()[1]
+        self.assertIn("your earlier change request 77 (at %s): dismiss it if it is fixed: fleet-switchboard review dismiss" % self.OLD[:12], out)
+        self.assertIn("(this approve did not dismiss it and nothing here does)", out)
+        self.assertNotIn("still stands", out)
+        self.reviews.append({"id": 90, "user": {"login": "shared"}, "state": "APPROVED", "commit_id": self.HEAD, "body": "ok\n\n" + sb.fleet_mark("rdr1")})
+        self.assertNotIn("review dismiss", self.post()[1])   # superseded by the same login's approval: the rule no longer lists it
+
+    def test_the_offer_never_offers_a_request_a_later_approval_superseded(self):
+        self.check_offer_skips_a_superseded_request()
+
+    def test_the_mutant_that_offers_every_own_request_fails(self):
+        def every(engine, runner, now, repo, number, ref, name, head):
+            return ["note: your earlier change request 77 (at %s): dismiss it if it is fixed: fleet-switchboard review dismiss %s --review 77 --reason TEXT" % (self.OLD[:12], ref)]
+        self.mutant_fails(self.check_offer_skips_a_superseded_request, review_dismiss_offer=every)
+
+    def test_the_mutant_that_lists_no_standing_request_fails(self):
+        self.mutant_fails(self.check_standing_listed, standing_requests=lambda *a, **k: ([], ""))
+        self.mutant_fails(self.check_verdict_names_it, standing_requests=lambda *a, **k: ([], ""))
+
+    def test_the_mutant_that_lists_a_request_of_another_pull_request_fails(self):
+        real = sb._review_pages
+        other = {"id": 91, "user": {"login": "shared"}, "state": "CHANGES_REQUESTED", "commit_id": self.HEAD, "body": "x\n\n" + sb.fleet_mark("rdr2")}
+        def every_pull_request(*a, **k):
+            ok, got, why = real(*a, **k)
+            return ok, (got or []) + [other], why
+        self.mutant_fails(self.check_other_pr_not_listed, _review_pages=every_pull_request)
+
+    def test_the_mutant_that_dismisses_in_the_approve_fails(self):
+        real = sb.review_dismiss_offer
+        def dismissing(engine, runner, now, repo, number, ref, name, head):
+            sb._review_api(engine, runner, now, repo, "repos/%s/pulls/%d/reviews/77/dismissals" % (repo, number), "PUT", {"message": "x", "event": "DISMISS"})
+            return real(engine, runner, now, repo, number, ref, name, head)
+        self.mutant_fails(self.check_no_dismissal, review_dismiss_offer=dismissing)
+
+    def test_the_documentation_holds_one_section_with_the_three_statements(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        sections = [s for s in re.split(r"\n(?=#{2,3} )", text) if s.startswith("### Standing change requests are listed by `gates`")]
+        self.assertEqual(len(sections), 1)
+        for statement in ("`gates` lists, in every call, each standing CHANGES_REQUESTED", "this approve did not dismiss it", "Dismissal stays the reader's own act or a person's"):
+            self.assertIn(statement, " ".join(sections[0].split()))
 
     def test_the_mutant_that_skips_the_head_check_fails(self):
         self.mutant_fails(self.check_post_head_refusals, review_head_problem=lambda given, current: None)
@@ -63948,7 +65192,7 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.reset()
         self.reviews = [{"id": 1000 + i, "user": {"login": "u%d" % i}, "state": "COMMENTED", "commit_id": self.HEAD, "body": "c"} for i in range(100)]
         self.blocking(77, by="rdr1")
-        code, out, err = self.run_as("coder", "gates", self.PR)
+        code, out, err = self.run_as("rdr1", "gates", self.PR)
         self.assertIn("--review 77", out)
         self.assertTrue(any(p.endswith("&page=2") for p in self.reads))
         self.assertNotIn("latest[author] = (state", (REPO / "shims" / "gh").read_text())   # the rule is not restated in the shim
@@ -68382,9 +69626,21 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+# The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
+_relay_tree_guard = importlib.import_module("test_relay_tree_guard")
+RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
+# The relay-loop tests of #1477, moved under the architecture cap.
+_relay_loop = importlib.import_module("test_relay_loop_cadence")
+RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
+
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
+
+# The delivery-lag tests of #1402.
+_delivery_lag = importlib.import_module("test_delivery_lag")
+_delivery_lag.World = World
+PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -73514,6 +74770,76 @@ class TestPrClaimLine(LedgerBase):
         text = (BIN / "fleet-switchboard").read_text()
         self.assertEqual(text.count("plan_ledger.pr_scenarios("), 5)   # prove/verdict S, verdict --all, the ci recorder, and the two reads of the union note
         self.assertEqual((BIN / "plan_ledger.py").read_text().count("pr_scenarios("), 3)   # its definition, the G1 call and the claim union
+
+
+class TestClosedUnmergedLastPr(unittest.TestCase):
+    """#1347: an ask whose last other pull request is closed unmerged with a per-PR scenario claimed by no merged one is flagged (`plan_ledger.closed_unclaimed`). Table-derived."""
+
+    SCEN = [{"id": "S1", "proof": "test", "evaluator": "ci", "claim": "pr"}, {"id": "S2", "proof": "test", "evaluator": "ci", "claim": "pr"}, {"id": "S3", "proof": "test", "evaluator": "ci", "claim": "pr"}]
+    BODY = {"line": "PLAN: acme/app#7\nCLAIMS: S1 S2", "rest": "PLAN: acme/app#7\nCLAIMS: S3", "none": "PLAN: acme/app#7"}
+
+    def judge(self, peers, closed, fn=None):
+        return (fn or sb.plan_ledger.closed_unclaimed)(self.SCEN, [(s, self.BODY[b]) for s, b in peers], [(9, self.BODY[b]) for b in closed])
+
+    def table(self):
+        """Every state of the ask's other pull requests: one merged claim in (line, rest, none, absent) x one closed claim (line, none, absent) x an open one (yes, no)."""
+        for merged in ("line", "rest", "none", None):
+            for closed in ("line", "none", None):
+                for opened in (False, True):
+                    expect = bool(closed and not opened and merged != "none" and (merged == "line" or closed == "line") and merged != "rest")
+                    if merged == "rest":
+                        expect = bool(closed and not opened)   # S1 S2 left: unclaimed
+                    if merged is None:
+                        expect = bool(closed == "line" and not opened)
+                    yield merged, closed, opened, expect
+
+    def check(self, fn=None):
+        rows = list(self.table())
+        wrong = []
+        for merged, closed, opened, expect in rows:
+            peers = ([("merged", merged)] if merged else []) + ([("open", "line")] if opened else [])
+            got = bool(self.judge(peers, [closed] if closed else [], fn)[0])
+            if got != expect:
+                wrong.append((merged, closed, opened))
+        return len(rows), wrong
+
+    def test_s7_every_combination_gives_the_table_outcome(self):
+        count, wrong = self.check()
+        self.assertEqual((count, wrong), (24, []))
+
+    def test_s2_the_closed_last_pr_with_an_unclaimed_scenario_is_flagged_naming_it_and_the_closed_number(self):
+        self.assertEqual(self.judge([("merged", "rest")], ["line"]), (["S1", "S2"], [9]))
+
+    def test_s3_u4_the_same_with_full_coverage_or_no_claim_lines_is_not_flagged(self):
+        self.assertEqual(self.judge([("merged", "line"), ("merged", "rest")], ["line"]), ([], []))
+        self.assertEqual(self.judge([("merged", "none")], ["none"]), ([], []))
+
+    def narrowing_by_closed_claim(self, fn=None):
+        self.assertEqual(self.judge([], ["line"], fn), (["S1", "S2", "S3"], [9]))   # only the closed pull request's claim line narrows the plan
+
+    def test_s13_a_closed_prs_claim_line_counts_as_narrowing(self):
+        self.narrowing_by_closed_claim()
+
+    def test_s13_a_mutant_that_ignores_the_closed_claim_line_for_narrowing_fails(self):
+        real = sb.plan_ledger.closed_unclaimed
+        ignores = lambda scen, peers, closed: real(scen, peers, [(n, "PLAN: acme/app#7") for n, _ in closed])
+        with self.assertRaises(AssertionError):
+            self.narrowing_by_closed_claim(ignores)
+
+    def test_s8_the_mutant_that_ignores_closed_prs_fails(self):
+        ignore = lambda scen, peers, closed: sb.plan_ledger.closed_unclaimed(scen, peers, [])
+        self.assertNotEqual(self.check(ignore)[1], [])
+
+    def test_s8_the_mutant_that_counts_a_closed_claim_as_covered_fails(self):
+        def counts(scen, peers, closed):
+            return sb.plan_ledger.closed_unclaimed(scen, peers + [("merged", b) for _, b in closed], closed)
+        self.assertNotEqual(self.check(counts)[1], [])
+
+    def test_s4_the_refusal_names_the_closed_pull_request_and_the_waiver(self):
+        text = sb.plan_ledger.union_refusal("acme/app#5", ["S3"], [9])
+        self.assertIn("#9", text)
+        self.assertIn("S3", text)
+        self.assertIn("--gates CU", text)
 
 
 class TestClaimUnionAtLastMerge(LedgerBase):
@@ -79177,6 +80503,202 @@ class TestProofCarry(LedgerBase):
             self.assertIn(item, section)
 
 
+class TestProofNamesFilesByDefault(LedgerBase):
+    """#1405: `prove` names the existing files its command and evidence name; `gates` says per scenario proven, carried or void by a named file."""
+
+    OLD, NEW = LEDGER_HEAD, LEDGER_NEW_HEAD
+
+    def prove_with(self, sid, command=None, evidence="ran the suite: 12 passed", *more):
+        argv = ["prove", sid, "--pr", self.PR, "--evidence", evidence] + (["--command", command] if command else []) + list(more)
+        return self.run_as("coder", *argv)
+
+    def test_S2_prove_names_the_existing_files_of_the_command_and_the_evidence(self):
+        code, out, err = self.prove_with("S2", "bin/test-switchboard tools/derive-closure", "read `docs/switchboard.md` and `docs/no-such-file.md`")
+        self.assertEqual(code, 0, err)
+        row = [e for e in self.ledger() if e["kind"] == "proof"][-1]
+        self.assertEqual(row["files"], ["bin/test-switchboard", "docs/switchboard.md", "tools/derive-closure"])
+        self.assertIn("S2 names 3 file(s): bin/test-switchboard, docs/switchboard.md, tools/derive-closure", err)
+        self.assertNotIn("no-such-file", json.dumps(row["files"]))
+
+    def test_S3_and_U3_prove_with_no_existing_file_still_records_and_says_it_will_not_carry(self):
+        code, out, err = self.prove("coder", "S2")
+        self.assertEqual(code, 0, err)
+        rows = [e for e in self.ledger() if e["kind"] == "proof"]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("files", rows[0])
+        self.assertEqual(err.count("names"), 0)   # its output stays as it was (pinned by TestPlanLedger); `gates` says it names no file
+        self.assertTrue(out.splitlines()[-1].startswith("recorded #"))   # the last line stays the final line of #1049
+
+    def test_U3_an_explicit_file_is_recorded_as_before_and_nothing_new_is_refused(self):
+        code, out, err = self.prove("coder", "S2", "--file", "src/widget.py")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "proof"][0]["files"], ["src/widget.py"])
+        self.assertNotIn("names no file", out + err)
+        self.assertEqual(self.prove("coder", "NOPE")[0], sb.EXIT_PARTIAL)
+
+    def test_a_path_outside_the_tree_or_a_directory_is_never_named(self):
+        exists = sb.tree_file_exists()
+        for path in ("../etc/passwd", "/etc/passwd", "bin", "bin/"):
+            self.assertEqual(sb.plan_ledger.proof_files(path, path, exists), [], path)
+
+    # ---- gates: one line per scenario
+    def entries(self):
+        def proof(seq, sid, head, files):
+            return {"seq": seq, "kind": "proof", "pr": self.PR, "scenario": sid, "plan_hash": "h", "head": head, "result": "pass", **({"files": files} if files else {})}
+        old = "1" * 40
+        return [proof(1, "A", self.NEW, ["a.py"]), proof(2, "B", old, ["b.py"]), proof(3, "C", old, ["c.py", "d.py"]), proof(4, "D", old, None), proof(5, "E", "2" * 40, ["e.py"]),
+                {"seq": 6, "kind": "carried", "pr": self.PR, "proof": 2, "scenario": "B", "plan_hash": "h", "old_head": old, "new_head": self.NEW}]
+
+    def views(self):
+        def between(old):
+            return None if old == "2" * 40 else ["d.py", "docs/x.md"]
+        entries = self.entries()
+        return {sid: sb.plan_ledger.head_view(sid, "tester", entries, self.PR, "h", self.NEW, between) for sid in "ABCDE"}
+
+    def check_views(self, got):
+        self.assertIn("A: proven at this head", got["A"])
+        self.assertIn("B: carried", got["B"])
+        self.assertIn("C: void: d.py changed", got["C"])
+        self.assertIn("D: void: the proof names no file", got["D"])
+        self.assertIn("E: unknown", got["E"])
+
+    def test_S4_gates_says_per_scenario_proven_carried_void_by_a_file_names_no_file_or_unknown(self):
+        got = self.views()
+        self.check_views(got)
+        self.assertEqual(len(got), 5)
+
+    def test_S4_the_real_gates_lines_come_from_the_plan_and_one_compare_per_old_head(self):
+        self.prove("coder", "S2", "--file", "src/widget.py")
+        ctx = types.SimpleNamespace(facts={"head": self.NEW}, plan=None, unreadable=None)
+        self.assertEqual(sb.gates_head_lines(ctx, {}), [])   # no plan: no line, never a guess
+        entries = [e for e in self.ledger()]
+        plan = {"result": "pass", "plan_hash": entries[0]["plan_hash"], "scenarios_parsed": [{"id": "S2", "evaluator": "tester"}]}
+        reads = []
+
+        def get(path):
+            reads.append(path)
+            if "/compare/" in path:
+                return {"status": "ahead", "files": [{"filename": "src/widget.py"}]}
+            return {"parents": [], "check_runs": []}
+        ctx = types.SimpleNamespace(facts={"head": self.NEW}, plan=plan, unreadable=None, entries=entries, pr=self.PR, repo="acme/app")
+        lines = sb.gates_head_lines(ctx, {}, get=get)
+        self.assertEqual(lines, ["S2: void: src/widget.py changed since %s" % self.OLD[:8]])
+
+    def test_U2_a_compare_that_cannot_be_read_is_unknown_and_never_carried(self):
+        for name, get in (("fails", lambda p: (_ for _ in ()).throw(sb.GitHubUnavailable("down"))),
+                          ("300 files", lambda p: {"status": "ahead", "files": [{"filename": "f%d" % n} for n in range(300)]}),
+                          ("not a descendant", lambda p: {"status": "diverged", "files": []})):
+            with self.subTest(name):
+                entries = self.entries()
+                ctx = types.SimpleNamespace(facts={"head": self.NEW}, plan={"result": "pass", "plan_hash": "h", "scenarios_parsed": [{"id": "C", "evaluator": "tester"}]},
+                                            unreadable=None, entries=entries, pr=self.PR, repo="acme/app")
+                self.assertTrue(sb.gates_head_lines(ctx, {}, get=get)[0].startswith("C: unknown"))
+
+    # ---- the carry rule
+    def decide(self, named, changed, merge=True):
+        return sb.plan_ledger.carry_decision({"files": named}, "tester", changed, merge, True)[0]
+
+    def check_rule(self):
+        got = [self.decide(["a.py", "b.py"], ["b.py"]), self.decide(["a.py", "b.py"], ["docs/x.md"], merge=False), self.decide(["a.py", "b.py"], ["z.py"], merge=True)]
+        self.assertEqual(got, ["void", "carry", "carry"])
+        self.assertEqual(self.decide(["a.py"], ["bin/other.py"], merge=False), "refuse")   # S6: code outside a merge
+        self.assertEqual(self.decide([], ["z.py"]), "refuse")                              # a proof naming no file never carries
+
+    def test_S5_S6_and_U4_one_changed_named_file_voids_and_the_rest_carry(self):
+        self.check_rule()
+        self.assertIn("code outside a merge", sb.plan_ledger.carry_decision({"files": ["a.py"]}, "tester", ["bin/other.py"], False, True)[1])
+
+    def test_a_merge_of_the_integration_branch_carries(self):
+        def get(path):
+            if path.endswith("/compare/old...new"):
+                return {"status": "ahead", "files": [{"filename": "x.py"}]}
+            if "/commits/new/check-runs" in path:
+                return {"check_runs": [{"status": "completed", "conclusion": "success"}]}
+            if "/commits/new" in path:
+                return {"parents": [{"sha": "p1"}, {"sha": "p2"}]}
+            if path == "repos/acme/app":
+                return {"default_branch": "main"}
+            if path.endswith("/compare/main...p2"):
+                return {"status": "diverged"}
+            if path.endswith("/compare/integration...p2"):
+                return {"status": "behind"}
+            raise AssertionError(path)
+        self.assertFalse(sb.carry_head_facts(get, "acme/app", "old", "new")["merge_of_default"])
+        self.assertTrue(sb.carry_head_facts(get, "acme/app", "old", "new", "integration")["merge_of_default"])
+
+    # ---- mutants: each applied, asserted applied, caught
+    def mutate(self, **override):
+        real = sb.plan_ledger.carry_decision
+        applied = []
+
+        def mutated(row, evaluator, files_changed, merge, ci):
+            applied.append(1)
+            row = dict(row, files=override.get("files", row.get("files")))
+            return real(row, evaluator, override.get("changed", files_changed), merge, ci)
+        return mock.patch.object(sb.plan_ledger, "carry_decision", mutated), applied
+
+    def test_S7_the_three_mutants_each_fail_the_rule_check(self):
+        for name, override in (("a changed named file does not void", {"changed": []}), ("an unchanged file voids", {"changed": ["a.py", "b.py", "z.py"]}),
+                               ("a proof naming no file carries", {"files": ["z.py"]})):
+            with self.subTest(name):
+                patch, applied = self.mutate(**override)
+                with patch:
+                    # the rule check goes through the module attribute, as the mutant is applied there
+                    with self.assertRaises(AssertionError):
+                        self.mutated_check()
+                self.assertTrue(applied, name)
+
+    def mutated_check(self):
+        decide = lambda named, changed, merge=True: sb.plan_ledger.carry_decision({"files": named}, "tester", changed, merge, True)[0]
+        self.assertEqual(decide(["a.py", "b.py"], ["b.py"]), "void")
+        self.assertEqual(decide(["a.py", "b.py"], ["z.py"]), "carry")
+        self.assertEqual(decide([], ["z.py"]), "refuse")
+
+    def test_S7_the_head_view_mutant_that_reads_no_change_fails_the_gates_check(self):
+        real = sb.plan_ledger.head_view
+
+        def blind(scenario_id, evaluator, entries, pr, plan_hash, head, files_between):
+            return real(scenario_id, evaluator, entries, pr, plan_hash, head, lambda old: [])
+        with mock.patch.object(sb.plan_ledger, "head_view", blind), self.assertRaises(AssertionError):
+            self.check_views(self.views())
+
+    def test_S4_a_failed_proof_is_never_read_as_proven_or_carried(self):
+        failed = [{"seq": 1, "kind": "proof", "pr": self.PR, "scenario": "A", "plan_hash": "h", "head": self.NEW, "result": "fail", "files": ["a.py"]},
+                  {"seq": 2, "kind": "proof", "pr": self.PR, "scenario": "B", "plan_hash": "h", "head": "1" * 40, "result": "fail", "files": ["b.py"]},
+                  {"seq": 3, "kind": "carried", "pr": self.PR, "proof": 2, "scenario": "B", "plan_hash": "h", "old_head": "1" * 40, "new_head": self.NEW}]
+        for sid in "AB":
+            line = sb.plan_ledger.head_view(sid, "tester", failed, self.PR, "h", self.NEW, lambda old: ["z.py"])
+            self.assertIn("says fail", line)
+            self.assertNotIn("proven", line)
+            self.assertNotIn("carried (", line)
+        self.assertIn("A: proven at this head", self.views()["A"])
+
+    def test_S4_the_result_blind_head_view_mutant_is_caught(self):
+        real = sb.plan_ledger.head_view
+
+        def blind(scenario_id, evaluator, entries, pr, plan_hash, head, files_between):
+            return real(scenario_id, evaluator, [dict(e, result="pass") if e.get("kind") == "proof" else e for e in entries], pr, plan_hash, head, files_between)
+        failed = [{"seq": 1, "kind": "proof", "pr": self.PR, "scenario": "A", "plan_hash": "h", "head": self.NEW, "result": "fail", "files": ["a.py"]}]
+        with mock.patch.object(sb.plan_ledger, "head_view", blind), self.assertRaises(AssertionError):
+            self.assertIn("says fail", sb.plan_ledger.head_view("A", "tester", failed, self.PR, "h", self.NEW, lambda old: []))
+
+    def test_S8_the_documentation_says_a_named_file_is_not_the_full_dependency_set(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("## A proof names its files by default")
+        section = text[start:text.index("\n## ", start + 5)]
+        self.assertIn("a named file is not the proof's full dependency set: a proof carries when the files it names are unchanged, not when everything it depends on is", section)
+        self.assertIn("working tree the command runs in", section)
+        self.assertIn("a symlink is named under its own name", section)
+        self.assertIn("a quoted docs file in the evidence makes the proof depend on it", section)
+
+    def test_S8_the_documentation_names_the_three_statements(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("## A proof names its files by default")
+        section = text[start:text.index("\n## ", start + 5)]
+        for item in ("`prove` names the existing files it finds", "`gates` shows, per scenario", "The conditions of the carry rule stay"):
+            self.assertIn(item, section)
+
+
 class TestCiRecordCarry(LedgerBase):
     """#1217: the CI-verdict recording step (`gates ci-record`, and the daemon pass through the same `ci_record_core`) carries the proofs the #1213 rule allows, one `carried` line each.
     Fakes only: GitHub's compare, commit and default-branch reads are served here."""
@@ -79625,6 +81147,7 @@ class TestAskIssueSubject(unittest.TestCase):
         self.assertIn("3 of 3 claimed scenarios proven and judged", g1["detail"])
 
     def test_s5_the_closing_command_names_what_was_recorded_or_refuses_naming_the_unjudged_scenario(self):
+        self.enterContext(mock.patch.object(sb, "unclaimed_verdict", lambda *a, **k: None))
         self.record_all(("S1", "S2"))
         self.assertEqual(self.prove("S3")[0], sb.EXIT_OK)
         code, why, out, err = self.run_cmd("cmd_gates_ask_close")
@@ -79854,6 +81377,380 @@ class TestAskIssueSubject(unittest.TestCase):
         report = json.loads(self.run_cmd("cmd_gates", subject=self.PR, json=True)[2])
         g1 = next(g for g in report["gates"] if g["gate"] == "G1")
         self.assertNotIn("S1", " ".join(g1["missing"]))   # test_x2 fails on it: it wants S1 missing
+
+
+class TestClosedUnmergedFamily(LedgerBase):
+    """#1347: the ask-close refusal, the bound and the waiver are members of ONE family with the merge refusal (`unclaimed_verdict`). Merge side through `claim_union_refusal`."""
+
+    body = TestClaimUnionAtLastMerge.body
+    record = TestClaimUnionAtLastMerge.record
+    merged_iso = TestClaimUnionAtLastMerge.merged_iso
+    refusal = TestClaimUnionAtLastMerge.refusal
+    waive = TestClaimUnionAtLastMerge.waive
+
+    def setUp(self):
+        LedgerBase.setUp(self)
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.peers = []
+
+    def flag_every_closed(self):
+        real = sb.unclaimed_verdict
+        def mutant(args, ctx, runner, now, body=None):
+            got = real(args, ctx, runner, now, body)
+            closed = []
+            if got is None:
+                sb.plan_peers(ctx, runner, now, closed)
+                if closed:
+                    return ("uncovered scenarios: S3", None, ["S3"], [n for n, _ in closed])
+            return got
+        return mock.patch.object(sb, "unclaimed_verdict", mutant)
+
+    def baseline(self):
+        self.body(None)
+        self.assertIsNone(self.refusal([("merged", None), ("closed", None)]))
+        self.assertIsNone(self.refusal([("merged", None)], base=300))
+        self.body("S1")
+        self.assertIsNone(self.refusal([("merged", "S2 U1 S3"), ("closed", "S3")], base=400))
+        self.assertIsNone(self.refusal([("merged", "S2 U1 S3")], base=500))
+
+    def test_s6_u4_the_merge_gate_gives_the_baseline_for_no_claim_lines_and_full_coverage(self):
+        self.baseline()
+
+    def test_s6_u4_a_mutant_that_flags_every_ask_with_a_closed_pull_request_fails(self):
+        with self.flag_every_closed():
+            with self.assertRaises(AssertionError):
+                self.baseline()
+
+    def test_the_merge_refusal_names_the_unclaimed_scenario_and_the_closed_pull_request(self):
+        self.body("S1")
+        why = self.refusal([("merged", "S2 U1"), ("closed", "S3")])
+        self.assertIn("S3", why or "")
+        self.assertIn("#101", why or "")
+
+    def test_the_merge_refusal_member_a_mutant_without_the_rule_fails(self):
+        with mock.patch.object(sb, "unclaimed_verdict", lambda *a, **k: None):
+            with self.assertRaises(AssertionError):
+                self.test_the_merge_refusal_names_the_unclaimed_scenario_and_the_closed_pull_request()
+
+    def second_read_fails(self):
+        self.body("S1")
+        real = sb.plan_peers
+        def flaky(ctx, runner, now, closed=None):
+            if closed is not None:
+                raise RuntimeError("the second read failed")
+            return real(ctx, runner, now, closed)
+        with mock.patch.object(sb, "plan_peers", flaky):
+            why = self.refusal([("merged", "S2 U1"), ("closed", "S3")])
+        self.assertIn("S3", why or "")
+        self.assertIn("the closed pull requests could not be read", why or "")
+
+    def test_s11_a_failed_second_read_still_refuses_and_says_the_closed_pull_requests_could_not_be_read(self):
+        self.second_read_fails()
+
+    def test_s11_a_mutant_that_swallows_the_second_read_silently_is_caught(self):
+        real = sb.plan_ledger.union_refusal
+        with mock.patch.object(sb.plan_ledger, "union_refusal", lambda ref, unc, closed=(): real(ref, unc, closed or ())):
+            with self.assertRaises(AssertionError):
+                self.second_read_fails()
+
+    def test_the_bound_refuses_naming_the_waiver_and_a_head_bound_waiver_passes_only_for_that_head(self):
+        self.body("S1")
+        many = [dict(number=3000 + n, state="open", merged_at=None, body="no plan") for n in range(100 * sb.PEER_PAGES)]
+        why = self.refusal([], pages=many)
+        self.assertIn("too many pull requests to judge", why or "")
+        self.assertIn("--gates CU", why or "")
+        sb.plan_ledger.append_checked(self.world.state, self.world.clock.now(), lambda have, seq: {"kind": "waiver", "pr": self.PR, "head": "e" * 40, "gates": ["CU"],
+                                                                                                    "expires": self.world.clock.now() + 86400, "by": "cos", "result": "pass", "reason": "other head"})
+        self.assertIn("too many pull requests to judge", self.refusal([], pages=many) or "")     # another head's waiver does not pass
+        self.assertEqual(self.waive()[0], 0)
+        self.assertIsNone(self.refusal([], pages=many))
+
+    def test_the_bound_and_waiver_members_have_mutants_that_fail(self):
+        with mock.patch.object(sb, "_cu_waived", lambda *a, **k: False):    # the waiver ignored
+            with self.assertRaises(AssertionError):
+                self.test_the_bound_refuses_naming_the_waiver_and_a_head_bound_waiver_passes_only_for_that_head()
+        real = sb.plan_peers
+        def unbounded(ctx, runner, now, closed=None):
+            try:
+                return real(ctx, runner, now, closed)
+            except ValueError:
+                return []
+        with mock.patch.object(sb, "plan_peers", unbounded):    # the bound swallowed
+            with self.assertRaises(AssertionError):
+                self.test_the_bound_refuses_naming_the_waiver_and_a_head_bound_waiver_passes_only_for_that_head()
+
+
+class TestClosedUnmergedAskClose(unittest.TestCase):
+    """#1347: `gates ask-close` through the real command with fakes: the refusal, the baseline, the bound and the waiver. Borrows the fakes of TestAskIssueSubject (its own tests are not repeated)."""
+
+    REPO, ASK, PR, HEAD, SCEN = (TestAskIssueSubject.REPO, TestAskIssueSubject.ASK, TestAskIssueSubject.PR, TestAskIssueSubject.HEAD, TestAskIssueSubject.SCEN)
+    api, plan, now, entries, run_cmd, prove, judge, record_all = (TestAskIssueSubject.api, TestAskIssueSubject.plan, TestAskIssueSubject.now, TestAskIssueSubject.entries,
+                                                                  TestAskIssueSubject.run_cmd, TestAskIssueSubject.prove, TestAskIssueSubject.judge, TestAskIssueSubject.record_all)
+
+    def setUp(self):
+        TestAskIssueSubject.setUp(self)
+        self.found = []
+        self.too_many = False
+        self.broken = None
+        self.seen_pages = []
+
+    def merged(self, number, claim):
+        sb.plan_ledger.append_checked(self.state, self.now(), lambda have, seq: {"kind": "claim", "pr": "acme-org/widget-service#%d" % number, "head": "a" * 40, "claim_text": claim})
+        return dict(number=number, state="closed", merged_at="1970-01-12T14:06:40Z" if False else _dt.datetime.fromtimestamp(self.now() + 1000, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    body="PLAN: %s\nCLAIMS: %s" % (self.ASK, claim), pull_request={"merged_at": _dt.datetime.fromtimestamp(self.now() + 1000, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+
+    def closed(self, number, claim):
+        return dict(number=number, state="closed", merged_at=None, body="PLAN: %s\nCLAIMS: %s" % (self.ASK, claim), pull_request={"merged_at": None})
+
+    def ask_close(self):
+        test = self
+        class Reader:
+            def __init__(self, *a, **k):
+                pass
+            def _api(self, path, repo=None):
+                page = int(re.search(r"&page=(\d+)", path).group(1))
+                test.seen_pages.append(page)
+                if test.broken == "list error":
+                    raise RuntimeError("the search failed")
+                if test.broken == "bad shape":
+                    return {"items": "not a list"}
+                items = [dict(number=3000 + n, state="open", body="no plan", pull_request={"merged_at": None}) for n in range(300)] if test.too_many else test.found
+                return {"total_count": len(items), "items": items[(page - 1) * 100:page * 100]}
+        real = sb._ledger_context
+        def ctx(*a, **k):
+            got = real(*a, **k)
+            got.config = dict(got.config, gh="gh", call_timeout_seconds=5)
+            return got
+        with mock.patch.object(sb, "IntentReader", Reader), mock.patch.object(sb, "GhAccounts", lambda *a, **k: None), mock.patch.object(sb, "_ledger_context", ctx):
+            return self.run_cmd("cmd_gates_ask_close")
+
+    def waiver(self, head):
+        sb.plan_ledger.append_checked(self.state, self.now(), lambda have, seq: {"kind": "waiver", "pr": self.ASK, "head": head, "gates": ["CU"], "expires": self.now() + 86400, "by": "cos", "result": "pass", "reason": "ship"})
+
+    def test_s5_the_refusal_names_the_unclaimed_scenarios_and_the_closed_pull_request(self):
+        self.record_all()
+        self.found = [self.merged(11, "S1"), self.closed(12, "S2 S3")]
+        code, why, out, err = self.ask_close()
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("S2, S3 unclaimed by any merged pull request", err)
+        self.assertIn("#12", err)
+        self.assertEqual(out, "")
+
+    def test_s5_a_mutant_without_the_refusal_is_caught(self):
+        with mock.patch.object(sb, "unclaimed_verdict", lambda *a, **k: None):
+            with self.assertRaises(AssertionError):
+                self.test_s5_the_refusal_names_the_unclaimed_scenarios_and_the_closed_pull_request()
+
+    def baseline(self):
+        for claims in (None, "S1 S2 S3"):
+            self.found = [self.merged(21, claims or ""), self.merged(22, "S2 S3")] if claims else []
+            plain = self.ask_close()
+            self.found = self.found + [self.closed(23, "S1")] if claims else [self.closed(23, "")]
+            self.assertEqual(self.ask_close(), plain)      # the closed pull request changes nothing
+            self.assertNotIn("unclaimed by any merged", plain[3])
+            self.assertEqual(plain[0], sb.EXIT_OK)
+
+    def test_s6_u4_ask_close_behaves_as_before_for_no_claim_lines_and_full_coverage(self):
+        self.record_all()
+        self.baseline()
+
+    def test_s6_u4_a_mutant_that_flags_every_ask_with_a_closed_pull_request_is_caught(self):
+        real = sb.unclaimed_verdict
+        def mutant(args, ctx, runner, now, body=None):
+            got = real(args, ctx, runner, now, body)
+            closed = []
+            if got is None:
+                sb.plan_peers(ctx, runner, now, closed)
+                if closed:
+                    return ("uncovered scenarios: S3", None, ["S3"], [n for n, _ in closed])
+            return got
+        with mock.patch.object(sb, "unclaimed_verdict", mutant):
+            with self.assertRaises(AssertionError):
+                self.test_s6_u4_ask_close_behaves_as_before_for_no_claim_lines_and_full_coverage()
+
+    def bound_and_waiver(self):
+        self.record_all()
+        self.too_many = True
+        code, why, out, err = self.ask_close()
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("too many pull requests to judge", err)
+        self.assertIn("--gates CU", err)
+        self.assertLessEqual(max(self.seen_pages), sb.PEER_PAGES)
+        self.waiver("e" * 40)       # another head
+        self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR)
+        self.waiver(sb.plan_ledger.ask_head(self.hash))
+        code, why, out, err = self.ask_close()
+        self.assertEqual(code, sb.EXIT_OK, err)
+
+    def test_the_bound_refuses_and_only_a_waiver_for_the_head_passes(self):
+        self.bound_and_waiver()
+
+    def test_the_bound_and_waiver_mutants_are_caught(self):
+        with mock.patch.object(sb, "_cu_waived", lambda *a, **k: False):
+            with self.assertRaises(AssertionError):
+                self.bound_and_waiver()
+
+    def failed_read(self, kind):
+        self.record_all()
+        if kind == "too many pull requests":
+            self.too_many = True
+        elif kind == "unknown sibling":   # merged, and no claim line was ever recorded for it
+            self.found = [dict(number=31, state="closed", merged_at="2026-01-01T00:00:00Z", body="PLAN: %s\nCLAIMS: S1" % self.ASK, pull_request={"merged_at": "2026-01-01T00:00:00Z"})]
+        else:
+            self.broken = kind
+
+    KINDS = ("too many pull requests", "list error", "unknown sibling", "bad shape")
+
+    def every_failed_read_refuses_and_the_waiver_passes(self):
+        for kind in self.KINDS:
+            self.setUp()
+            self.failed_read(kind)
+            code, why, out, err = self.ask_close()
+            self.assertEqual(code, sb.EXIT_ERROR, (kind, err))
+            self.assertIn("list error" if kind == "bad shape" else kind, err)   # a bad shape is a list error of the one rule
+            self.assertIn("--gates CU", err)
+            self.assertEqual(out, "")
+            self.waiver("e" * 40)      # another head: still refused
+            self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR, kind)
+            self.waiver(sb.plan_ledger.ask_head(self.hash))
+            self.assertEqual(self.ask_close()[0], sb.EXIT_OK, (kind, self.ask_close()[3]))
+
+    def test_s10_a_failed_read_of_each_kind_refuses_the_close_and_only_the_head_bound_waiver_passes(self):
+        self.every_failed_read_refuses_and_the_waiver_passes()
+
+    def test_s10_a_mutant_that_fails_open_on_a_failed_read_is_caught(self):
+        real = sb.unclaimed_verdict
+        def open_again(args, ctx, runner, now, body=None):
+            got = real(args, ctx, runner, now, body)
+            return got if got is None or got[2] or got[0] == "too many pull requests" else None   # the old behaviour: only the bound refused
+        with mock.patch.object(sb, "unclaimed_verdict", open_again):
+            with self.assertRaises(AssertionError):
+                self.every_failed_read_refuses_and_the_waiver_passes()
+
+    def test_a_plain_pull_request_and_a_non_ask_issue_never_raise(self):
+        self.pr_readable = True
+        for command in ("cmd_gates", "cmd_gates_ask_close"):
+            for subject in (self.PR, None):
+                self.run_cmd(command, subject=subject)
+        self.issue["body"] = "just text"
+        for command in ("cmd_gates", "cmd_gates_ask_close"):
+            self.assertTrue(self.run_cmd(command) is not None)
+        self.assertIn("not an ask issue", self.run_cmd("cmd_gates_ask_close", subject=self.PR)[1] or "")
+
+
+class TestAskWaive(unittest.TestCase):
+    """#1347 S14, S15: `waive` for an ASK issue through the real `cmd_waive`; the waiver is bound to the plan hash and clears the refusal of `gates ask-close`."""
+
+    T = TestClosedUnmergedAskClose
+    REPO, ASK, PR = T.REPO, T.ASK, T.PR
+    api, plan, now, entries, run_cmd, prove, judge, record_all = (TestAskIssueSubject.api, TestAskIssueSubject.plan, TestAskIssueSubject.now, TestAskIssueSubject.entries,
+                                                                  TestAskIssueSubject.run_cmd, TestAskIssueSubject.prove, TestAskIssueSubject.judge, TestAskIssueSubject.record_all)
+    SCEN, HEAD = TestAskIssueSubject.SCEN, TestAskIssueSubject.HEAD
+    ask_close = T.ask_close
+    failed_read = T.failed_read
+    REASON = "the pull requests of the ask cannot be read: reviewed by hand"
+
+    def setUp(self):
+        TestAskIssueSubject.setUp(self)
+        self.found, self.too_many, self.broken, self.seen_pages = [], False, None, []
+        self.kind = ("agent", "cos", "chief-of-staff")
+
+    def waive(self, subject=None, gates="CU", reason=None):
+        test = self
+        class Reader:
+            def __init__(self, *a, **k):
+                pass
+            def _api(self, path, repo=None):
+                if test.broken:
+                    raise RuntimeError("the search failed")
+                return {"total_count": 0, "items": []}
+        real = sb._ledger_context
+        def ctx(*a, **k):
+            got = real(*a, **k)
+            got.config = dict(got.config, gh="gh", call_timeout_seconds=5)
+            return got
+        with mock.patch.object(sb, "gates_caller_kind", lambda *a: self.kind), mock.patch.object(sb, "IntentReader", Reader), mock.patch.object(sb, "GhAccounts", lambda *a, **k: None), \
+                mock.patch.object(sb, "_ledger_context", ctx):
+            return self.run_cmd("cmd_waive", subject=subject, gates=gates, reason=self.REASON if reason is None else reason)
+
+    def waivers(self):
+        return [e for e in self.entries() if e["kind"] == "waiver"]
+
+    def refused_ask(self):
+        self.record_all()
+        self.failed_read("list error")
+        self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR)
+
+    def happy(self):
+        self.refused_ask()
+        code, why, out, err = self.waive()
+        self.assertEqual(code, sb.EXIT_OK, (why, err))
+        (row,) = self.waivers()
+        self.assertEqual((row["pr"], row["head"], row["gates"], row["by"]), (self.ASK, sb.plan_ledger.ask_head(self.hash), ["CU"], "cos"))
+        self.assertEqual(self.ask_close()[0], sb.EXIT_OK)
+        self.hash = "sha256:" + "2" * 64      # the plan is revised: the waiver is void
+        self.record_all()                     # every scenario is proven and judged again at the new hash, so only the failed read can refuse
+        self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR)
+
+    def test_s14_the_chief_of_staff_waives_the_ask_and_a_revised_plan_voids_it(self):
+        self.happy()      # the issue author (a shared login) is not the chief of staff's fleet name: not a writer by accident
+
+    def test_s14_a_writer_of_the_ask_and_a_plain_agent_cannot_waive(self):
+        self.refused_ask()
+        self.kind = ("agent", "coder1", "chief-of-staff")      # coder1 recorded the proofs of the ask
+        self.assertIn("a writer cannot waive", self.waive()[1] or "")
+        self.kind = ("agent", "coder2", "coder")
+        self.assertIn("may not waive", self.waive()[1])
+        self.assertEqual(self.waivers(), [])
+        self.assertEqual(self.ask_close()[0], sb.EXIT_ERROR)
+
+    def test_s15_gate_other_than_cu_short_reason_and_work_item_are_refused(self):
+        self.refused_ask()
+        self.assertIn("only CU", self.waive(gates="G1")[1])
+        self.assertIn("at least", self.waive(reason="short")[1])
+        with mock.patch.object(sb, "item_entry_refusal", lambda *a, **k: "%s is a work item" % self.ASK):
+            self.assertIn("work item", self.waive()[1])
+        self.assertEqual(self.waivers(), [])
+
+    def test_s15_an_ask_that_is_not_refused_records_nothing_new(self):
+        self.record_all()
+        code, why, out, err = self.waive()
+        self.assertEqual(code, sb.EXIT_OK)
+        self.assertIn("nothing recorded", out)
+        self.assertEqual(self.waivers(), [])
+
+    def test_the_mutants_are_caught(self):
+        for patch, case in ((mock.patch.object(sb, "ask_subject", lambda *a, **k: None), "happy"),                       # any issue number refused: no waiver recorded
+                            (mock.patch.object(sb.plan_ledger, "authors_of", lambda *a, **k: set()), "test_s14_a_writer_of_the_ask_and_a_plain_agent_cannot_waive"),   # no writer check
+                            (mock.patch.object(sb.plan_ledger, "ask_head", lambda h: "e" * 40), "happy")):               # head not the plan hash: a revised plan keeps the waiver
+            self.setUp()
+            with patch:
+                with self.assertRaises(AssertionError, msg=case):
+                    getattr(self, case)()
+
+
+class TestClosedUnmergedDocs(unittest.TestCase):
+    """#1347 S9: the documentation says plainly that a closed-unmerged last pull request is a defect and what clears it."""
+
+    def test_the_union_check_section_names_the_defect_the_refusals_and_the_waiver(self):
+        text = (REPO / "docs/switchboard.md").read_text()
+        item = [l for l in text.split("\n") if l.startswith("- **A closed-unmerged last pull request is a defect")]
+        self.assertEqual(len(item), 1)
+        for needle in ("`gates ask-close` refuses the ask and names the unclaimed scenarios and the closed pull requests", "the next pull request's merge is refused too",
+                       "a pull request claims the scenario", "head-bound `CU` waiver"):
+            self.assertIn(needle, item[0])
+
+
+class TestUnionCheckLimitsDocs(unittest.TestCase):
+    """#1347 S12: the union-check section states its three limits plainly."""
+
+    def test_the_section_states_the_three_limits(self):
+        text = (REPO / "docs/switchboard.md").read_text()
+        for needle in ("An ask whose only pull request closed unmerged with no claim line and no narrowing claim anywhere passes.",
+                       "A last merge made before the union gate existed is not caught at `gates ask-close`.",
+                       "A failed read refuses the close, and only the head-bound `CU` waiver clears it."):
+            self.assertEqual(text.count(needle), 1, needle)
 
 
 class TestNoPaneToJudge(StandInPids, Base):
