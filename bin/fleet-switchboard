@@ -1034,6 +1034,9 @@ KNOWN_FAULTS = (
     "cos-orders-unfed",        # PR 18: the judge ignores the Chief of Staff's orders file
     "anyone-edits-cos-orders",  # PR 18: no agent is stopped from writing the Chief of Staff's orders file
     "answer-unjudged",         # PR 18: `decisions answer` and `decisions resolve` skip the judge
+    "no-sent-time",            # #1402: a delivered message says nothing of when its facts were sent or that they are late
+    "deliver-stale-alert",     # #1402: an alert whose subject is no longer true is delivered anyway
+    "keep-old-digest",         # #1402: a digest older than 6 hours is delivered beside the current one
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -3039,6 +3042,17 @@ class Switchboard:
         repos = self.repos_in_play()
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
             self.intents.discard_told()
+        kept, dropped = judge_delivery(plan.pending, self.now(), self.delivery_reader(), triage_body_standing)   # #1402: a stale alert and an old digest are dropped here, audited and acknowledged
+        if dropped:
+            self.drop_stale(plan.recipient, dropped)
+            plan = copy.copy(plan)
+            plan.pending = kept
+            if not kept:
+                return {"sent": False, "action": "dropped", "reason": "every pending fact was stale or replaced",
+                        "keys": [fact.key for fact, _k, _w in dropped]}
+        else:
+            plan = copy.copy(plan)
+            plan.pending = kept
         pending = merge_wake_facts(plan.recipient, plan.pending)   # #1275: the sweep, triage and load-alert items of one wake are ONE message
         text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
                                 repos=repos, delivered=self.now())
@@ -3117,6 +3131,38 @@ class Switchboard:
             self.intents.commit_told()
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
+
+    def delivery_reader(self):
+        """#1402: read(subject) -> the present record of an alert's subject, through the hub's one present-state read (the read #1378 uses); None when this
+        process has no hub (no judgement then: the alert is delivered as made). One read per subject per delivery, at most MAX_PRESENT_READS."""
+        hub = getattr(self, "hub", None)
+        if hub is None or not hasattr(hub, "present_record"):
+            return None
+        seen = {}
+        def read(subject):
+            kind, repo, number, _expected = subject
+            slot = (SUBJECT_ENDPOINT[kind], repo, number)
+            if slot not in seen:
+                if len(seen) >= MAX_PRESENT_READS:
+                    return None
+                try:
+                    seen[slot] = hub.present_record(repo, slot[0], number)
+                except Exception:
+                    seen[slot] = None
+            return seen[slot]
+        return read
+
+    def drop_stale(self, recipient, dropped):
+        """Audit each dropped fact (what, why, when it was sent) and tell the fact sources to forget it, so it does not return."""
+        for fact, kind, why in dropped:
+            if self.audit is not None:
+                self.audit.append(self.actor, "stale.dropped", recipient, {
+                    "fact": fact.key, "kind": kind, "why": why, "sent": clock_utc(sent_at(fact)), "age_seconds": int(self.now() - sent_at(fact))})
+        keys = [fact.key for fact, _k, _w in dropped]
+        for source in self.sources:
+            forget = getattr(source, "drop_stale", None)
+            if forget is not None:
+                forget(keys)
 
     @staticmethod
     def _send_meta(carried):
@@ -12927,6 +12973,11 @@ class GitHubHub:
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
 
+    def present_record(self, repo, endpoint, number):
+        """The present record of one pull request (`pulls`) or issue (`issues`), or None: the ONE present-state read of #1378, which #1402 reuses at delivery."""
+        got = [v for v in self.gh_api("repos/%s/%s/%d" % (repo, endpoint, number), paginate=False) if isinstance(v, dict)]
+        return got[0] if got else None
+
     def gh_api(self, path, paginate=True, timeout=None):
         argv = [self.config["gh"], "api"] + (["--paginate"] if paginate else []) + [path]
         named = re.match(r"^repos/([^/]+/[^/]+)/", path)
@@ -13051,8 +13102,7 @@ class GitHubHub:
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
         def present_pull(number):   # #1378: the pull request's present head and state, read only for an unowned red run not yet told
-            got = [v for v in self.gh_api(base + "pulls/%d" % number, paginate=False) if isinstance(v, dict)]
-            return got[0] if got else None
+            return self.present_record(repo, "pulls", number)
         red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now, present_pull)   # #1141: the same runs
         self.last_failed_primary = bool(failed)
         self.last_incomplete = bool(stopped or failed)   # #494: a step is still to do: the caller keeps the cursor and the marker where they are

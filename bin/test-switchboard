@@ -69637,6 +69637,11 @@ RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCanc
 _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
 
+# The delivery-lag tests of #1402.
+_delivery_lag = importlib.import_module("test_delivery_lag")
+_delivery_lag.World = World
+PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
     """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a

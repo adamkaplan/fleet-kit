@@ -6096,6 +6096,20 @@ The config key `no_multiplexer` (default `false`, so nothing changes) turns that
 
 With the key on, the toast step and the badge writes are skipped too (a toast is a multiplexer call; a badge needs a pane), with no error. The tests (`TestNoMultiplexer`) carry one mutant per scenario that names one: the S2 mutant keeps calling `agent_list`, the S3 mutant drops the toast guard, the U1 mutant makes the switch-off path behave as on; each is killed by its own check.
 
+## Late and stale alerts and digests (#1402)
+
+Cause: an alert sent at 17:16Z reached the Chief of Staff the next morning, and hours-old digests arrived as fresh. A fact is made at one time and delivered at another, and nothing between the two looked at the gap or at whether the fact was still true. The delay arises in the recipient's queue: `decide` holds a pending fact while the recipient is busy, idle-batched or unreachable, and the daemon retries on later passes, and the fact keeps the `created` time it was made with the whole while. `deliver` then merged the facts (`merge_wake_facts`, which gave a merged fact the NEWEST member's time, so an old digest looked new) and `compose` wrote only a "(sent X, delivered Y)" range. #1378 covers only the duplicate, stale-head and closed-pull-request alert (once per pull request, head and check); it does not cover the delivery lag: a first, unique alert on the current head still arrived hours late and unmarked, and it says nothing of an issue alert, a standing line or a digest.
+
+At delivery, and only there, each alert or digest is judged once:
+
+- **Sent time first.** The first line of every delivered message gives when its facts were sent before when it was delivered: `(sent 12:00Z, delivered 12:10Z)`. A merged wake fact keeps the sent time of its oldest member.
+- **Delayed.** An alert or digest older than 30 minutes at delivery marks the first line `delayed: sent HH:MMZ` (the oldest late one), for example `(delayed: sent 17:16Z, delivered 08:00Z)`. The lag is made visible, not removed: the hold, batch and retry rules are unchanged.
+- **Stale alerts are dropped.** The alert's subject is read once at delivery through the one present-state read #1378 uses (`present_record`, a pull request or an issue; one read per subject, at most 10 per delivery, never a write). It is dropped when it is no longer true: a red check on a head that is no longer the head, or on a pull request now closed or merged; an issue alert whose issue is now closed or lacks the label; a standing-line alert whose issue now has a standing line in its body. A dropped fact is audited (`stale.dropped`: the fact, why, when it was sent), acknowledged (its source forgets it) and never delivered. A message made only of dropped facts is not sent.
+- **A read that fails delivers, never drops.** The alert is delivered marked `[unverified: its present state could not be read]`. A process with no GitHub hub reads nothing and delivers as made.
+- **A digest older than 6 hours is replaced.** When a newer digest is pending for the same recipient, a digest older than 6 hours is dropped with a `stale.dropped` audit line (kind `digest`, the old digest's key). With no newer digest it is delivered marked delayed: nothing is lost.
+
+Not changed: the once-per-key memory of alerts (#1378), the ordering and cap of `compose`, acknowledgement of delivered keys, the digest cadence gate, and messages of kind `send` or `report`. Lab faults for the controls: `no-sent-time`, `deliver-stale-alert` and `keep-old-digest`; `TestDeliveryLag` runs each as a mutant.
+
 ## The retired `FLEET_SWITCHBOARD_OWN_GH` marker and the own-call path (#1216)
 
 **What the variable does now:** nothing in `shims/gh`: no code in it reads or sets the name. The switchboard only *clears* it (an agent's pane children, its own children),
