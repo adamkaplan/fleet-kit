@@ -2464,6 +2464,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | `body` | NOT READY when empty (G5 missing); NOT CHECKED when it is not text | an empty body is a state, a body that is not text is a failed read |
 | `body_unreadable` | NOT CHECKED | the body is unread, not empty |
 | `captain` | None and no floor hold: G6 is not open, NOT READY (tested) | a pull request that is not held is not waiting on the owner |
+| `captain_findings` | absent or empty: no finding, so a held PR stays waiting for the owner at G6 (tested: no change) | the findings of the held-PR check (for example `marker-without-label`); only G6 in `plan_ledger.py` reads it, and only to word a marker without a hold; it opens no gate on its own |
 | `holds` | None means no hold label; only G6b reads it (tested: no change) | same |
 | `carries` | a dependency (`CARRIES: #N`) that could not be read is NOT CHECKED; a refused one (closed unmerged, head not in the branch, no plan, a compare that fails) is NOT READY | a read error is not a refusal; a refusal opens a gate (tested) |
 | `floor` | NOT CHECKED when None-decision (with or without a hold-all or re-hold), unreadable, re-hold unreadable or not a dict; absent with the label set: the label alone holds, the reading goes on; absent with no label: G6 not open, NOT READY | an unreadable floor would say G6 waiting, a false ready |

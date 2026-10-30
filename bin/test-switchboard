@@ -24635,6 +24635,7 @@ class TestSweep(Base):
         ("body", "the body is None", {"body": None}, {}, "not ready"),
         ("body_unreadable", "the body is not text", {"body_unreadable": True}, {}, "not checked"),
         ("captain", "captain None and no floor: G6 is not open", {"captain": None}, {}, "not ready"),
+        ("captain_findings", "captain_findings absent: the baseline stays ready", {"captain_findings": KeyError}, {}, "ready"),
         ("holds", "holds None (only the label of a hold)", {"holds": None}, {}, "ready"),
         ("holds", "holds absent", {"holds": KeyError}, {}, "ready"),
         ("author", "author None: the proof writers still exclude", {"author": None}, {}, "ready"),
