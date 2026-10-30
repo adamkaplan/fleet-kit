@@ -752,9 +752,9 @@ class TestGhShim(Base):
         for flag, path in (("--body-file", "/tmp/x.md"), ("-F", "/private/tmp/y.md"), ("--body-file", str(root / "z.md"))):
             with self.subTest(path=path):
                 done, seen, lines = self.shim_warnings("issue", "comment", "2", flag, path, env=env)
-                self.assertEqual((done.returncode, len(lines)), (0, 1))
+                self.assertEqual((done.returncode, len(lines)), (1, 1))
                 self.assertIn("$TMPDIR", lines[0])
-                self.assertEqual(seen["argv"][:3], ["issue", "comment", "2"])
+                self.assertIsNone(seen)
         done, seen, lines = self.shim_warnings("pr", "create", "--body-file=/tmp/a.md", env=env)
         self.assertEqual(len(lines), 1)
         done, seen, lines = self.shim_warnings("pr", "create", "-F/tmp/a.md", env=env)
@@ -770,7 +770,7 @@ class TestGhShim(Base):
         for path in (str(root / "coder" / "x.md"), "/tmp/tmp.AbC123/x.md", "body.md", "./body.md", "/tmp/sub/../tmp.d/x.md"):
             with self.subTest(path=path):
                 done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", path, env=env)
-                self.assertEqual((done.returncode, lines), (0, []))
+                self.assertEqual((done.returncode, lines), (1, []))
 
     def test_s5_the_path_is_never_opened_stat_ed_or_read(self):
         spec = importlib.util.spec_from_loader("gh_shim_767", importlib.machinery.SourceFileLoader("gh_shim_767", str(SHIM)))
@@ -794,7 +794,7 @@ class TestGhShim(Base):
                 self.assertEqual(shim.shared_body_file(["issue", "comment", "2", "--body-file", path], {}), path)
         self.assertEqual(calls, [])
         done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", paths[1])
-        self.assertEqual((done.returncode, len(lines)), (0, 1))
+        self.assertEqual((done.returncode, len(lines)), (1, 1))
 
     def test_the_warning_shows_no_control_characters(self):
         done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/a\x1b[31m\rb.md")
@@ -804,7 +804,7 @@ class TestGhShim(Base):
 
     def test_the_unchanged_exit_code_and_gh_api_fields(self):
         done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/x.md", env={"FAKE_GH_EXIT": "3"})
-        self.assertEqual((done.returncode, len(lines)), (3, 1))
+        self.assertEqual((done.returncode, len(lines)), (1, 1))
         done, seen, lines = self.shim_warnings("api", "x", "-F", "/tmp/x.md")
         self.assertEqual(lines, [])
 
@@ -892,7 +892,7 @@ class TestGhShim(Base):
         self.assertEqual(seen["argv"][4].count("fleet-switchboard:from"), 1)
 
     def test_everything_else_runs_the_real_gh_with_exactly_the_same_arguments(self):
-        for args in (("issue", "view", "2", "--json", "body"), ("pr", "list"), ("api", "repos/o/r/issues/2/comments",
+        for args in (("issue", "view", "2", "--json", "body"), ("pr", "list"), ("api", "repos/o/r/issues/2",
                      "-f", "body=x"), ("issue", "comment", "2"), ("issue", "comment", "2", "--editor"),
                      ("issue", "comment"), ("--version",), ()):
             with self.subTest(args=args):
@@ -922,9 +922,9 @@ class TestGhShim(Base):
         self.assertEqual(done.returncode, 127)
         self.assertIn("no real gh", done.stderr)
 
-    def test_an_unreadable_body_file_runs_the_command_unchanged(self):
+    def test_an_unreadable_body_file_is_refused_and_nothing_is_posted(self):
         done, seen = self.run_shim("issue", "comment", "2", "--body-file", "/no/such/file.md")
-        self.assertEqual(seen["argv"], ["issue", "comment", "2", "--body-file", "/no/such/file.md"])
+        self.assertEqual((done.returncode, seen), (1, None))
 
     # ---- readable text: the shim warns on stderr, never refuses (ask #401, shims/body_warn.py)
     WARN = "may be hard to read"
