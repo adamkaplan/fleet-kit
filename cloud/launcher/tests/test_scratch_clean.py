@@ -240,16 +240,40 @@ class ZombieChild(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stderr[-800:])
 
 
+# A tempfile call whose dir= is the repository root or its bin directory: ROOT, BIN.parent, with or without str(...), on one line.
+PLACE = re.compile(r"(?:TemporaryDirectory|mkdtemp|mkstemp|NamedTemporaryFile|TemporaryFile|SpooledTemporaryFile)\([^\n]*?\bdir\s*=\s*(?:str\(\s*)?(?:ROOT|BIN\.parent)\b")
+
+
+def places_in(source):
+    """The places in a source text that make a scratch directory (or file) under the repository root."""
+    return PLACE.findall(source)
+
+
 class Places(unittest.TestCase):
+    KNOWN = ["bin/test-cloud-worker", "bin/test-cloud-retired", "cloud/launcher/tests/test_orchestrator_hub_session.py"]
+
     def test_s2_every_place_that_makes_a_scratch_directory_under_the_root(self):
         out = subprocess.run(["git", "grep", "-l", "-E", "SourceFileLoader.*test-cloud-worker", "--", "bin", "cloud"], cwd=ROOT, capture_output=True, text=True).stdout.split()
         found = sorted((set(out) | {"bin/test-cloud-worker"}) - {"cloud/launcher/tests/test_scratch_clean.py", "cloud/launcher/tests/test_fixture_root.py"})   # these files are tests of the fixture itself
-        src = (ROOT / "bin" / "test-cloud-worker").read_text()
-        places = re.findall(r"TemporaryDirectory\(dir=str\(BIN\.parent\)\)|mkdtemp\(dir=str\(BIN\.parent\)\)", src)
+        places = []
+        for name in found:
+            places += [(name, m) for m in places_in((ROOT / name).read_text())]
         print("S2: places under the repository root %d, loading files %d" % (len(places), len(found)))
+        self.assertTrue(set(self.KNOWN) <= set(found), found)
         self.assertEqual(places, [])
-        self.assertEqual(found, sorted(["bin/test-cloud-worker", "bin/test-cloud-retired", "cloud/launcher/tests/test_orchestrator_hub_session.py"]))
         print("S2: the evidence decides: the test judged the whole root (certain); the fixture's children are the probable origin")
+
+    def test_s2_a_scratch_directory_in_the_root_is_found_and_a_clean_source_is_not(self):
+        src = (ROOT / "bin" / "test-cloud-worker").read_text()
+        mutant = src + "\nx = tempfile.mkdtemp(dir=str(BIN.parent))\n"
+        applied = mutant != src
+        print("S2 mutant: places found %d of 1 (mutation applied %s)" % (len(places_in(mutant)), applied))
+        self.assertTrue(applied)
+        self.assertEqual(len(places_in(mutant)), 1)
+        for form in ("tempfile.TemporaryDirectory(dir=str(ROOT))", "tempfile.mkdtemp(dir=ROOT)", "tempfile.TemporaryDirectory(prefix='a', dir=BIN.parent)"):
+            self.assertEqual(len(places_in(form)), 1, form)
+        self.assertEqual(places_in(src), [])
+        self.assertEqual(places_in("d = tempfile.mkdtemp(dir=tempfile.gettempdir())\n"), [])
 
 
 class Docs(unittest.TestCase):
