@@ -209,7 +209,7 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
-Not yet measured: `cloud/launcher/tests/test_cloud_reaper_docs.py`, `cloud/launcher/tests/test_cloud_reaper_manifests.py`, `cloud/launcher/tests/test_cloud_reaper_pass_pairs.py`, `cloud/launcher/tests/test_cloud_token_service.py`, `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_token_at_limit.py`
+Not yet measured: `cloud/launcher/tests/test_cloud_reaper_docs.py`, `cloud/launcher/tests/test_cloud_reaper_manifests.py`, `cloud/launcher/tests/test_cloud_reaper_pass_pairs.py`, `cloud/launcher/tests/test_cloud_token_service.py`, `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_token_at_limit.py`
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
 
@@ -369,7 +369,7 @@ the create's own clock, so the floor can trail the stored cap by scheduling time
 exceeding the hard limit and alerting is not decided: it exits 1 from `reap` so a scheduler can alert). The spend cap
 is read from `CW_CLOUD_SPEND_CAP_USD`; unset or empty means the prototype's USD 25, and zero, negative, non-numeric,
 `nan`, `inf` or a cost that cannot be read refuses `create` (exit 5). The check adds this launch's estimate (hard limit times the shape's rate) to what the running pods already cost. A worker name with `_` maps to `-` plus a 4-hex
-hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `S`); `create` refuses a spec with a stored credential.
+hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `O`, the orchestrator row: `O` (250m CPU, 768 MiB, 0.02 USD/hour), requests equal limits, no nested Docker; cost per day of one always-on orchestrator: 24 x 0.02 = 0.48 USD a day, a list-price estimate, not a billed figure, the node's own price not included; `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory); `create` refuses a spec with a stored credential.
 
 **Not in this slice.** Automatic detection of a node drain notice: the end hook runs on `stop`, the idle stop and the hard limit; a drain is handled today by the operator running `stop --reason "node drain"`. The `cw-worker` service account's cloud identity and what it may do belong to the image/cluster setup (slice A and the platform), not here. `bin/test-cloud-launcher` is not yet wired into CI (the suite lists are CI's own).
 
@@ -543,3 +543,9 @@ kubectl apply --dry-run=server -f cloud/k8s/cw-token-service.yaml
 # then, only after the owner chooses to put the App key in the cluster: the same two commands without --dry-run
 # rollback: kubectl delete -f cloud/k8s/cw-cloud-reaper.yaml; kubectl delete -f cloud/k8s/cw-token-service.yaml
 ```
+
+**Token roles.** The mint takes a role (`app_token.py OWNER/REPO --role ROLE`, default `worker`; an unknown role is refused before any network call) from one table of permission sets, `PERMISSIONS_BY_ROLE` in `cloud/launcher/app_token.py`. The worker role asks for, and accepts, exactly `contents: write, pull_requests: write, issues: read, metadata: read`. The orchestrator role asks for, and accepts, exactly `issues: write, pull_requests: read, checks: read, metadata: read` (no `contents` key at all). A launch with `--agent orchestrator` mints under the orchestrator role and records it on the pod as the annotation `cw/role: orchestrator` (a worker pod carries no annotation: its spec is unchanged); the reaper's renewal mints under the role the annotation names, and a pod made before the annotation renews as a worker. A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command. An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set. The orchestrator pod holds no App key, App id, vault setting or mint command.
+
+The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
+
+**What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
