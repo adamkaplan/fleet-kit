@@ -80149,6 +80149,202 @@ class TestProofCarry(LedgerBase):
             self.assertIn(item, section)
 
 
+class TestProofNamesFilesByDefault(LedgerBase):
+    """#1405: `prove` names the existing files its command and evidence name; `gates` says per scenario proven, carried or void by a named file."""
+
+    OLD, NEW = LEDGER_HEAD, LEDGER_NEW_HEAD
+
+    def prove_with(self, sid, command=None, evidence="ran the suite: 12 passed", *more):
+        argv = ["prove", sid, "--pr", self.PR, "--evidence", evidence] + (["--command", command] if command else []) + list(more)
+        return self.run_as("coder", *argv)
+
+    def test_S2_prove_names_the_existing_files_of_the_command_and_the_evidence(self):
+        code, out, err = self.prove_with("S2", "bin/test-switchboard tools/derive-closure", "read `docs/switchboard.md` and `docs/no-such-file.md`")
+        self.assertEqual(code, 0, err)
+        row = [e for e in self.ledger() if e["kind"] == "proof"][-1]
+        self.assertEqual(row["files"], ["bin/test-switchboard", "docs/switchboard.md", "tools/derive-closure"])
+        self.assertIn("S2 names 3 file(s): bin/test-switchboard, docs/switchboard.md, tools/derive-closure", err)
+        self.assertNotIn("no-such-file", json.dumps(row["files"]))
+
+    def test_S3_and_U3_prove_with_no_existing_file_still_records_and_says_it_will_not_carry(self):
+        code, out, err = self.prove("coder", "S2")
+        self.assertEqual(code, 0, err)
+        rows = [e for e in self.ledger() if e["kind"] == "proof"]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("files", rows[0])
+        self.assertEqual(err.count("names"), 0)   # its output stays as it was (pinned by TestPlanLedger); `gates` says it names no file
+        self.assertTrue(out.splitlines()[-1].startswith("recorded #"))   # the last line stays the final line of #1049
+
+    def test_U3_an_explicit_file_is_recorded_as_before_and_nothing_new_is_refused(self):
+        code, out, err = self.prove("coder", "S2", "--file", "src/widget.py")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "proof"][0]["files"], ["src/widget.py"])
+        self.assertNotIn("names no file", out + err)
+        self.assertEqual(self.prove("coder", "NOPE")[0], sb.EXIT_PARTIAL)
+
+    def test_a_path_outside_the_tree_or_a_directory_is_never_named(self):
+        exists = sb.tree_file_exists()
+        for path in ("../etc/passwd", "/etc/passwd", "bin", "bin/"):
+            self.assertEqual(sb.plan_ledger.proof_files(path, path, exists), [], path)
+
+    # ---- gates: one line per scenario
+    def entries(self):
+        def proof(seq, sid, head, files):
+            return {"seq": seq, "kind": "proof", "pr": self.PR, "scenario": sid, "plan_hash": "h", "head": head, "result": "pass", **({"files": files} if files else {})}
+        old = "1" * 40
+        return [proof(1, "A", self.NEW, ["a.py"]), proof(2, "B", old, ["b.py"]), proof(3, "C", old, ["c.py", "d.py"]), proof(4, "D", old, None), proof(5, "E", "2" * 40, ["e.py"]),
+                {"seq": 6, "kind": "carried", "pr": self.PR, "proof": 2, "scenario": "B", "plan_hash": "h", "old_head": old, "new_head": self.NEW}]
+
+    def views(self):
+        def between(old):
+            return None if old == "2" * 40 else ["d.py", "docs/x.md"]
+        entries = self.entries()
+        return {sid: sb.plan_ledger.head_view(sid, "tester", entries, self.PR, "h", self.NEW, between) for sid in "ABCDE"}
+
+    def check_views(self, got):
+        self.assertIn("A: proven at this head", got["A"])
+        self.assertIn("B: carried", got["B"])
+        self.assertIn("C: void: d.py changed", got["C"])
+        self.assertIn("D: void: the proof names no file", got["D"])
+        self.assertIn("E: unknown", got["E"])
+
+    def test_S4_gates_says_per_scenario_proven_carried_void_by_a_file_names_no_file_or_unknown(self):
+        got = self.views()
+        self.check_views(got)
+        self.assertEqual(len(got), 5)
+
+    def test_S4_the_real_gates_lines_come_from_the_plan_and_one_compare_per_old_head(self):
+        self.prove("coder", "S2", "--file", "src/widget.py")
+        ctx = types.SimpleNamespace(facts={"head": self.NEW}, plan=None, unreadable=None)
+        self.assertEqual(sb.gates_head_lines(ctx, {}), [])   # no plan: no line, never a guess
+        entries = [e for e in self.ledger()]
+        plan = {"result": "pass", "plan_hash": entries[0]["plan_hash"], "scenarios_parsed": [{"id": "S2", "evaluator": "tester"}]}
+        reads = []
+
+        def get(path):
+            reads.append(path)
+            if "/compare/" in path:
+                return {"status": "ahead", "files": [{"filename": "src/widget.py"}]}
+            return {"parents": [], "check_runs": []}
+        ctx = types.SimpleNamespace(facts={"head": self.NEW}, plan=plan, unreadable=None, entries=entries, pr=self.PR, repo="acme/app")
+        lines = sb.gates_head_lines(ctx, {}, get=get)
+        self.assertEqual(lines, ["S2: void: src/widget.py changed since %s" % self.OLD[:8]])
+
+    def test_U2_a_compare_that_cannot_be_read_is_unknown_and_never_carried(self):
+        for name, get in (("fails", lambda p: (_ for _ in ()).throw(sb.GitHubUnavailable("down"))),
+                          ("300 files", lambda p: {"status": "ahead", "files": [{"filename": "f%d" % n} for n in range(300)]}),
+                          ("not a descendant", lambda p: {"status": "diverged", "files": []})):
+            with self.subTest(name):
+                entries = self.entries()
+                ctx = types.SimpleNamespace(facts={"head": self.NEW}, plan={"result": "pass", "plan_hash": "h", "scenarios_parsed": [{"id": "C", "evaluator": "tester"}]},
+                                            unreadable=None, entries=entries, pr=self.PR, repo="acme/app")
+                self.assertTrue(sb.gates_head_lines(ctx, {}, get=get)[0].startswith("C: unknown"))
+
+    # ---- the carry rule
+    def decide(self, named, changed, merge=True):
+        return sb.plan_ledger.carry_decision({"files": named}, "tester", changed, merge, True)[0]
+
+    def check_rule(self):
+        got = [self.decide(["a.py", "b.py"], ["b.py"]), self.decide(["a.py", "b.py"], ["docs/x.md"], merge=False), self.decide(["a.py", "b.py"], ["z.py"], merge=True)]
+        self.assertEqual(got, ["void", "carry", "carry"])
+        self.assertEqual(self.decide(["a.py"], ["bin/other.py"], merge=False), "refuse")   # S6: code outside a merge
+        self.assertEqual(self.decide([], ["z.py"]), "refuse")                              # a proof naming no file never carries
+
+    def test_S5_S6_and_U4_one_changed_named_file_voids_and_the_rest_carry(self):
+        self.check_rule()
+        self.assertIn("code outside a merge", sb.plan_ledger.carry_decision({"files": ["a.py"]}, "tester", ["bin/other.py"], False, True)[1])
+
+    def test_a_merge_of_the_integration_branch_carries(self):
+        def get(path):
+            if path.endswith("/compare/old...new"):
+                return {"status": "ahead", "files": [{"filename": "x.py"}]}
+            if "/commits/new/check-runs" in path:
+                return {"check_runs": [{"status": "completed", "conclusion": "success"}]}
+            if "/commits/new" in path:
+                return {"parents": [{"sha": "p1"}, {"sha": "p2"}]}
+            if path == "repos/acme/app":
+                return {"default_branch": "main"}
+            if path.endswith("/compare/main...p2"):
+                return {"status": "diverged"}
+            if path.endswith("/compare/integration...p2"):
+                return {"status": "behind"}
+            raise AssertionError(path)
+        self.assertFalse(sb.carry_head_facts(get, "acme/app", "old", "new")["merge_of_default"])
+        self.assertTrue(sb.carry_head_facts(get, "acme/app", "old", "new", "integration")["merge_of_default"])
+
+    # ---- mutants: each applied, asserted applied, caught
+    def mutate(self, **override):
+        real = sb.plan_ledger.carry_decision
+        applied = []
+
+        def mutated(row, evaluator, files_changed, merge, ci):
+            applied.append(1)
+            row = dict(row, files=override.get("files", row.get("files")))
+            return real(row, evaluator, override.get("changed", files_changed), merge, ci)
+        return mock.patch.object(sb.plan_ledger, "carry_decision", mutated), applied
+
+    def test_S7_the_three_mutants_each_fail_the_rule_check(self):
+        for name, override in (("a changed named file does not void", {"changed": []}), ("an unchanged file voids", {"changed": ["a.py", "b.py", "z.py"]}),
+                               ("a proof naming no file carries", {"files": ["z.py"]})):
+            with self.subTest(name):
+                patch, applied = self.mutate(**override)
+                with patch:
+                    # the rule check goes through the module attribute, as the mutant is applied there
+                    with self.assertRaises(AssertionError):
+                        self.mutated_check()
+                self.assertTrue(applied, name)
+
+    def mutated_check(self):
+        decide = lambda named, changed, merge=True: sb.plan_ledger.carry_decision({"files": named}, "tester", changed, merge, True)[0]
+        self.assertEqual(decide(["a.py", "b.py"], ["b.py"]), "void")
+        self.assertEqual(decide(["a.py", "b.py"], ["z.py"]), "carry")
+        self.assertEqual(decide([], ["z.py"]), "refuse")
+
+    def test_S7_the_head_view_mutant_that_reads_no_change_fails_the_gates_check(self):
+        real = sb.plan_ledger.head_view
+
+        def blind(scenario_id, evaluator, entries, pr, plan_hash, head, files_between):
+            return real(scenario_id, evaluator, entries, pr, plan_hash, head, lambda old: [])
+        with mock.patch.object(sb.plan_ledger, "head_view", blind), self.assertRaises(AssertionError):
+            self.check_views(self.views())
+
+    def test_S4_a_failed_proof_is_never_read_as_proven_or_carried(self):
+        failed = [{"seq": 1, "kind": "proof", "pr": self.PR, "scenario": "A", "plan_hash": "h", "head": self.NEW, "result": "fail", "files": ["a.py"]},
+                  {"seq": 2, "kind": "proof", "pr": self.PR, "scenario": "B", "plan_hash": "h", "head": "1" * 40, "result": "fail", "files": ["b.py"]},
+                  {"seq": 3, "kind": "carried", "pr": self.PR, "proof": 2, "scenario": "B", "plan_hash": "h", "old_head": "1" * 40, "new_head": self.NEW}]
+        for sid in "AB":
+            line = sb.plan_ledger.head_view(sid, "tester", failed, self.PR, "h", self.NEW, lambda old: ["z.py"])
+            self.assertIn("says fail", line)
+            self.assertNotIn("proven", line)
+            self.assertNotIn("carried (", line)
+        self.assertIn("A: proven at this head", self.views()["A"])
+
+    def test_S4_the_result_blind_head_view_mutant_is_caught(self):
+        real = sb.plan_ledger.head_view
+
+        def blind(scenario_id, evaluator, entries, pr, plan_hash, head, files_between):
+            return real(scenario_id, evaluator, [dict(e, result="pass") if e.get("kind") == "proof" else e for e in entries], pr, plan_hash, head, files_between)
+        failed = [{"seq": 1, "kind": "proof", "pr": self.PR, "scenario": "A", "plan_hash": "h", "head": self.NEW, "result": "fail", "files": ["a.py"]}]
+        with mock.patch.object(sb.plan_ledger, "head_view", blind), self.assertRaises(AssertionError):
+            self.assertIn("says fail", sb.plan_ledger.head_view("A", "tester", failed, self.PR, "h", self.NEW, lambda old: []))
+
+    def test_S8_the_documentation_says_a_named_file_is_not_the_full_dependency_set(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("## A proof names its files by default")
+        section = text[start:text.index("\n## ", start + 5)]
+        self.assertIn("a named file is not the proof's full dependency set: a proof carries when the files it names are unchanged, not when everything it depends on is", section)
+        self.assertIn("working tree the command runs in", section)
+        self.assertIn("a symlink is named under its own name", section)
+        self.assertIn("a quoted docs file in the evidence makes the proof depend on it", section)
+
+    def test_S8_the_documentation_names_the_three_statements(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("## A proof names its files by default")
+        section = text[start:text.index("\n## ", start + 5)]
+        for item in ("`prove` names the existing files it finds", "`gates` shows, per scenario", "The conditions of the carry rule stay"):
+            self.assertIn(item, section)
+
+
 class TestCiRecordCarry(LedgerBase):
     """#1217: the CI-verdict recording step (`gates ci-record`, and the daemon pass through the same `ci_record_core`) carries the proofs the #1213 rule allows, one `carried` line each.
     Fakes only: GitHub's compare, commit and default-branch reads are served here."""

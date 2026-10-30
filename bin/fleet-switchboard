@@ -16661,6 +16661,24 @@ def _record(ctx, args, now, entry):
     return stored, already
 
 
+def tree_file_exists(runner=None):
+    """(#1405) `exists(path)` for `plan_ledger.proof_files`: True for a regular file of the working tree the command runs in (not the pull request head's tree), found under the git top level (else the current directory),
+    never outside it. Any trouble reading is "no such file"."""
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+        root = Path(top.stdout.strip() if top.returncode == 0 and top.stdout.strip() else os.getcwd()).resolve()
+    except (OSError, subprocess.SubprocessError):
+        root = Path(os.getcwd()).resolve()
+
+    def exists(path):
+        try:
+            found = (root / path).resolve()
+            return root in found.parents and found.is_file()
+        except (OSError, ValueError):
+            return False
+    return exists
+
+
 def _evidence(args):
     text = plan_ledger.clip(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT)
     if not text:
@@ -16699,10 +16717,13 @@ def cmd_prove(args, runner, now):
             head = _head_of(ctx, args)
             common = (head, _evidence(args))
         head, evidence = common
+        files = sorted(set(args.file)) if getattr(args, "file", None) else None
+        if files is None:   # #1405: no --file: name the existing files of the tree the command or the evidence names
+            files = plan_ledger.proof_files(args.command, evidence, tree_file_exists(runner))
         entry = {"kind": "proof", "pr": ctx.pr, "scenario": sid, "plan_ref": ctx.source,
                  "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                  "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
-                 **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {}),
+                 **({"files": files} if files else {}),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
         try:
             stored, already = _record(ctx, args, now, entry)
@@ -16713,6 +16734,8 @@ def cmd_prove(args, runner, now):
         outcomes.append((stored, already))
         print("%s proof #%d: %s %s at %s (%s), bound to plan %s" % ("already recorded" if already else "recorded", stored["seq"], sid, args.result,
                                                                     head[:8], ctx.pr, entry["plan_hash"][:19]))
+        if files and not getattr(args, "file", None):   # a note on stderr, only when a file was found: the existing output of a proof that names none is pinned by TestPlanLedger
+            print("%s names %d file(s): %s" % (sid, len(files), ", ".join(files)), file=sys.stderr)
     if outcomes:
         print(recorded_line("proof", ctx.pr, common[0], outcomes))
     if refused:
@@ -17017,6 +17040,9 @@ def cmd_gates(args, runner, now):
     carry_refused = (ctx.facts.get("carries") or {}).get("refusal")
     report["impact_rating"] = gate_impact_rating(ctx.state, ctx.pr, ctx.facts.get("head"))   # #892: output text only; no gate reads it
     gates_carried_note(report, ctx)
+    head_lines = gates_head_lines(ctx, report)
+    if head_lines:
+        report["head_lines"] = head_lines
     claim_union_note(report, ctx, runner, now)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
@@ -18877,7 +18903,7 @@ class _CarryDone(Exception):
     pass
 
 
-def carry_head_facts(get, repo, old_head, new_head):
+def carry_head_facts(get, repo, old_head, new_head, base=None):
     """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
     "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
@@ -18893,6 +18919,9 @@ def carry_head_facts(get, repo, old_head, new_head):
         default = get("repos/%s" % repo).get("default_branch")
         inside = get("repos/%s/compare/%s...%s" % (repo, default, parents[1]))
         merge = isinstance(inside, dict) and inside.get("status") in ("behind", "identical")
+        if not merge and base and base != default:   # #1405: a merge of the pull request's own base (an integration branch) counts as the default branch does
+            inside = get("repos/%s/compare/%s...%s" % (repo, base, parents[1]))
+            merge = isinstance(inside, dict) and inside.get("status") in ("behind", "identical")
     runs = (get("repos/%s/commits/%s/check-runs" % (repo, new_head)) or {}).get("check_runs") or []
     green = bool(runs) and all(r.get("status") == "completed" and r.get("conclusion") in ("success", "neutral", "skipped") for r in runs)
     return {"files": files, "merge_of_default": merge, "ci_green": green}
@@ -18931,6 +18960,34 @@ def carry_proofs(state, pr, plan, old_head, new_head, facts, now):
                 continue
         out.append({"proof": row["seq"], "scenario": sid, "verdict": verdict, "reason": reason})
     return out
+
+
+def gates_head_lines(ctx, report, get=None):
+    """(#1405) One line per scenario of the plan that has a proof: proven at this head, carried, or void naming the first named file that changed (see `plan_ledger.head_view`).
+    Reads GitHub with GETs only, one compare per old head, through the same `carry_head_facts` the carry uses (so a compare of 300 files or more, or a head that is not a
+    descendant, is `unknown`). Any read that fails is `unknown`, never a change or no change."""
+    head = (ctx.facts or {}).get("head")
+    if not head or ctx.plan is None or ctx.plan.get("result") != "pass" or ctx.unreadable:
+        return []
+    reader, cache = get, {}
+
+    def files_between(old):
+        if old not in cache:
+            try:
+                nonlocal reader
+                reader = reader or carry_get(ctx.engine, ctx.repo)
+                cache[old] = carry_head_facts(reader, ctx.repo, old, head)["files"]
+            except Exception:
+                cache[old] = None
+        return cache[old]
+    lines = []
+    for scenario in ctx.plan["scenarios_parsed"]:
+        if plan_ledger.claim_of(scenario) != "pr":
+            continue
+        line = plan_ledger.head_view(scenario["id"], plan_ledger.evaluator_of(scenario), ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, files_between)
+        if line:
+            lines.append(line)
+    return lines
 
 
 def gates_carried_note(report, ctx):
@@ -19565,7 +19622,13 @@ def carry_at_green(ctx, now, get=None, green=True):
     if not old:
         return []
     try:
-        facts = carry_head_facts(get or carry_get(ctx.engine, ctx.repo), ctx.repo, old, head)
+        reader = get or carry_get(ctx.engine, ctx.repo)
+        base = None
+        try:   # #1405: the pull request's base branch (an integration branch): a merge of it carries like a merge of the default branch; a failed read is the default branch alone
+            base = ((reader("repos/%s/pulls/%d" % (ctx.repo, ctx.number)) or {}).get("base") or {}).get("ref")
+        except Exception:
+            base = None
+        facts = carry_head_facts(reader, ctx.repo, old, head, base) if isinstance(base, str) and base else carry_head_facts(reader, ctx.repo, old, head)
         facts["ci_green"] = green and (ctx.facts or {}).get("ci") == "green"
         ci_ids = {x["id"] for x in ctx.plan["scenarios_parsed"] if plan_ledger.evaluator_of(x) == "ci"}   # re-recorded at each green head, never carried: not a refusal to print
         return [d for d in carry_proofs(ctx.state, ctx.pr, ctx.plan, old, head, facts, now()) if d["scenario"] not in ci_ids]
