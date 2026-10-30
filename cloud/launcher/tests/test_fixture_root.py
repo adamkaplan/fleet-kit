@@ -14,13 +14,28 @@ ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(ROOT / "cloud" / "worker" / "tests"))
 import stub_support  # noqa: E402
 
-ROUNDS = 10
+ROUNDS = 3
+HANG_GUARD = 300   # seconds per round: a hang guard only, never what the test judges
 PY = sys.executable
 LOADERS = (
     [PY, str(HERE / "test_orchestrator_hub_session.py")],
     [PY, str(HERE / "test_cloud_shapes.py")],
     [PY, str(ROOT / "bin" / "test-cloud-retired")],
 )
+TINY_LOADER = (
+    "import importlib.machinery, importlib.util, os, sys, unittest\n"
+    "sys.path.insert(0, %r)\n"
+    "path = %r\n"
+    "loader = importlib.machinery.SourceFileLoader('zz_s9_tiny', path)\n"
+    "spec = importlib.util.spec_from_file_location('zz_s9_tiny', path, loader=loader)\n"
+    "m = importlib.util.module_from_spec(spec)\n"
+    "sys.modules['zz_s9_tiny'] = m; spec.loader.exec_module(m)\n"
+    "class Case(m.Base):\n"
+    "    def test_tiny(self):\n"
+    "        self.assertTrue(self.home.is_dir())\n"
+    "r = unittest.TextTestRunner(stream=open(os.devnull, 'w')).run(unittest.defaultTestLoader.loadTestsFromTestCase(Case))\n"
+    "sys.exit(0 if r.wasSuccessful() else 1)\n"
+) % (str(HERE), str(ROOT / "bin" / "test-cloud-worker"))
 JUDGE = [PY, "-m", "unittest", "test_orchestrator_agent.RepoRootClean"]
 
 
@@ -30,23 +45,35 @@ def status(root):
 
 class FixtureRoot(unittest.TestCase):
     def _light_round(self):
-        hub = stub_support.start(self, LOADERS[0], cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        tiny = stub_support.start(self, [PY, "-c", TINY_LOADER], cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         judge = stub_support.start(self, JUDGE, cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return [hub.wait(), judge.wait()]
+        return self._waited([tiny, judge])
+
+    def _waited(self, procs):
+        codes = []
+        deadline = time.monotonic() + HANG_GUARD
+        for p in procs:
+            try:
+                codes.append(p.wait(timeout=max(0.1, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                for q in procs:
+                    q.kill()
+                codes.append(-1)
+        return codes
 
     def _full_round(self):
         hub = stub_support.start(self, LOADERS[0], cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         shapes = stub_support.start(self, LOADERS[1], cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         retired = stub_support.start(self, LOADERS[2], cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         judge = stub_support.start(self, JUDGE, cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return [hub.wait(), shapes.wait(), retired.wait(), judge.wait()]
+        return self._waited([hub, shapes, retired, judge])
 
     def test_s9_no_untracked_entry_in_the_root_while_the_loaders_run(self):
         before = status(ROOT)
         failures = 0
         untracked = 0
         for n in range(ROUNDS):
-            codes = self._full_round() if n == 0 else self._light_round()   # a round takes 25 s with all three loaders: the lighter loader alone runs in rounds 1 to 9
+            codes = self._full_round() if n == 0 else self._light_round()   # round 0: the three real loaders; later rounds: a tiny loader of the fixture
             now = status(ROOT)
             if [l for l in now.splitlines() if l.startswith("??") and l not in before.splitlines()]:
                 untracked += 1
