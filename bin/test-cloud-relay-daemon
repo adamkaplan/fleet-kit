@@ -1510,9 +1510,12 @@ class OneWallClock(unittest.TestCase):
         socket = self.socket
         self.addCleanup(setattr, socket, "create_connection", socket.create_connection)
 
+        self.finished_attempts = []   # #1521: what the tests observe: how many attempts had finished when the fetch answered?
+
         def dead(address, timeout=None, *a, **k):
             for _ in range(n):
                 time.sleep(timeout if timeout is not None else 2.0)
+                self.finished_attempts.append(True)
             raise TimeoutError("timed out")
         socket.create_connection = dead
         return "http://localhost:9"
@@ -1530,9 +1533,10 @@ class OneWallClock(unittest.TestCase):
         self.assertTrue(self.lookup_returned.is_set(), "the mutant fetch returned before the name lookup had returned")
 
     def test_four_dead_addresses_share_one_deadline(self):
-        took, err = self.timed(relay, self.full_backlog(), 2.0)
+        _, err = self.timed(relay, self.full_backlog(), 2.0)
+        finished = len(self.finished_attempts)   # the four attempts need about 8 s together: the cut comes before they have all ended
         self.assertIsInstance(err, TimeoutError)
-        self.assertLess(took, 3.5)
+        self.assertLess(finished, 4, "the fetch was cut only after all four attempts had finished")
 
     def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
