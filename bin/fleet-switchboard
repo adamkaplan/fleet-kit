@@ -19518,7 +19518,7 @@ def ci_record_core(ctx, now, quiet=False):
     if ci != "green":
         if not quiet:
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
-        named = "; ".join("%s run %s is %s" % (w or "status", r, st) for w, r, st in load_module("ci_runs").not_green_runs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
+        named = "; ".join("%s%s run %s is %s" % (w or "status", " job " + j if j else "", r, st) for w, j, r, st in load_module("ci_runs").not_green_jobs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
         return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)%s" % (ci, head[:8], " [%s]" % named if named else ""))
     out["carry"] = carry_at_green(ctx, now)   # the carry does not depend on whether any ci verdict is wanted
     for d in out["carry"]:
