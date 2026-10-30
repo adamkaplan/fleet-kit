@@ -6368,6 +6368,26 @@ The four kinds it sends for:
 A worker the cloud launcher ends (idle, hard limit, pod gone, failed pod) is announced by the launcher's sender (#1480), not here. Tests: `tests/switchboard/test_lost_worker.py`.
 
 **Bounds of the alert (read round, #1481).** At most 10 individual alerts a pass; one more message to the Chief of Staff says how many more there are (`N more lost worker(s)`), and those are alerted on the following passes, 10 at a time, with the count left; none is dropped or repeated (the mark is written before the send). With no usable memory (the first pass ever, or after a corrupt memory) only workers created in the last hour are alerted; with a valid memory every loss since it is alerted, a restart gap included. An unreadable `lost-workers.json` makes that pass alert nothing and write one audit line (`lost_worker.memory_corrupt`); the file is set aside as `lost-workers.json.corrupt` and the next pass writes a fresh memory, so later losses are alerted. A worker name is cleaned (control characters removed) and capped at 80 characters in every message. A local worker is worded `possibly lost` (absent from discovery, not known dead). The memory file is mode 0600 and synced before it replaces the old one.
+**Recency on every pass, one outage one message (#1658).** Cause, from the case of 30 Oct: the detector reads each audit at most `READ_BYTES` (1 MiB) a pass, so a 3 MiB launcher audit is caught up over three passes, and the recency window `RECENT_SECONDS` (one hour) applied only on the one pass that found no memory file; the failed reaper lines of the second and third chunks were each alerted as a new `reaper_missed` message. Closed rule, known limits first: a failed reaper line is a new alert only when its own time is younger than `RECENT_SECONDS`, on every pass; a malformed reaper record gives no alert (fails closed); a line that is only late by more than an hour is summed, not alerted.
+
+- One outage, one message: failed lines read in a pass, and those of later passes before the reaper passes again, are one outage (`reaper_outage` in the memory: first, latest, count, reason, sent, closed_by). The first pass with a recent failure sends ONE message with the count, the first and latest time and the latest reason; later failures of the outage update the stored count and send nothing; an `ok` reaper line later than the latest failure closes it, and the next failure opens a new one with a new message.
+- Gap summary: older failed lines are summed in `reaper_gap` (count, first, latest, reason) and ONE message `[lost worker] reaper: N failed reaper line(s) while the detector was down or before this pass, first T, latest T, latest reason R` is sent when a pass has read both audits to their end; the record is then cleared. A daemon down for more than an hour still says, once, how many failures it missed.
+- The other kinds: during a catch-up the same window applies (to the time the memory holds for the loss: the pod's creation line, the refused line, the last time a local worker was seen alive). A catch-up is a pass with no usable memory and every later pass until both files are read to their end: the `catchup` flag of the memory is set on such a pass and cleared only by a pass that reads both files to their end. Outside a catch-up a valid memory alerts every loss since, a restart gap included.
+- A memory written by earlier code (a `reaper` table, `reaper_missed:` keys) loads and is never alerted from.
+
+| Before | After |
+|---|---|
+| a restart on an old audit replays each old failed reaper line as a new alert | old lines are one gap summary message; none alerted of its own |
+| 5 failed lines read in one pass: 5 messages | one message naming 5, first, latest, reason |
+| failure, then later failures of the same outage: a message each | nothing until an `ok` line and a new failure |
+
+| Input or outside call | Test | Run-by-hand mutant |
+|---|---|---|
+| launcher audit reaper lines (`runtime_id` `reaper`, ok or failed), read in chunks of `READ_BYTES` | `test_s2_old_failed_reaper_lines_are_never_alerted_on_any_pass`, `test_s3_one_outage_one_message_until_the_reaper_passes_again` | the window applied only on the first pass; one message per line |
+| switchboard audit lines (created, create_failed) in a catch-up | `test_s4_catch_up_applies_the_recency_rule_to_every_kind` | never clearing `catchup` |
+| `lost-workers.json` (`reaper_outage`, `reaper_gap`, `catchup`, old `reaper` table) | `test_s6_a_detector_down_for_hours_says_once_how_many_it_missed`, `test_u1_a_memory_written_by_the_old_code_is_never_re_alerted_from` | old lines dropped with no summary; one message per old line |
+| the sends to the lane and the Chief of Staff | the same tests, through the fake engine | `test_the_new_tests_pass_on_the_real_module_and_each_mutant_is_caught` plants the four mutants on a copy |
+
 ## The installed tree is the default branch, clean (#1380)
 
 The tree the fleet's commands and the daemon run from (the checkout `fleet-switchboard install` was run from) must be the default branch, clean, so no command, verdict or merge gate is computed by code from an unmerged branch.
