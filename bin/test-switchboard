@@ -69710,6 +69710,8 @@ TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
 TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
 
+TestLaunchModel = importlib.import_module("test_launch_model").build(sys.modules[__name__])   # #1642
+
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
     """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a

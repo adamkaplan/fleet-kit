@@ -4216,9 +4216,10 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None, head
     return problems
 
 
-def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None, read_repo=None):
+def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None, read_repo=None, choice=None):
     fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": None if issue is None else int(issue),
              "charter": charter, "repo": repo, "launched_by": launched_by, "read_repo": read_repo}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell
+    fleet.update(choice or {})   # #1642: `model` and `reasoning`, only when launch was given them
     return {key: value for key, value in fleet.items() if value is not None}
 
 
@@ -4437,7 +4438,7 @@ def record_launch_charter(engine, name, session_id, fleet, pane=None):
 
 
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
-                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None, read_repo=None):
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None, read_repo=None, choice=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
 
     Nothing is typed. The tab's program is started by argv through herdr's
@@ -4452,7 +4453,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     taken = engine.discover(engine.now()).agents.get(name)
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
-    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, read_repo)
+    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, read_repo, choice)
     env = launch_base_env(engine.config)
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
@@ -4469,7 +4470,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
             raise LaunchError(str(err)) from None
     with engine._external("v2.session.create", name, {"agent": agent, "directory": directory,
                                                       "fleet": fleet}) as result:
-        session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+        session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet}, **launch_model_kwargs(choice))["id"]
         result["session"] = session_id
         record_launch_charter(engine, name, session_id, fleet)
     argv = [engine.config["opencode"], "-s", session_id]
@@ -4511,7 +4512,7 @@ def register_launch_worktree(engine, name, directory, repo):
         engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
 
 
-def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None, launched_by=None):
+def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None, launched_by=None, choice=None):
     """Create a fleet agent with NO terminal (#433): a v2 session in the OpenCode service, a private record (state-dir/headless/<name>.json) and the
     brief through the API. Nothing is opened in herdr. Presence is proved by the service: the new session must answer and carry the worker's name
     before the brief is sent. Returns {"name", "session", "pane": None, "tab": None, "headless": True}.
@@ -4537,11 +4538,11 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
             identity = headless_identity(engine, repo)   # a repo that maps to a named gh account is refused unless the route can be proved (below, once the session exists)
             account = engine.accounts.account_for(repo) if repo and getattr(engine, "accounts", None) is not None else None
-            fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
+            fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, None, choice)
             fleet["headless"] = True
             try:
                 with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
-                    session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+                    session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet}, **launch_model_kwargs(choice))["id"]
                     result["session"] = session_id
             except LaunchError:
                 raise
@@ -13743,7 +13744,7 @@ def _agent_line(entry):
         return "%-14s (not found)  %s" % (entry["name"], _plan_line(entry))
     return "%-14s %-8s %s  pane %s  your last prompt %s  %s" % (
         seen["name"], seen["status"], seen["session"], seen["pane"] or ("(headless)" if seen.get("headless") else "-"),
-        seen["last_human_prompt"] or "not in the window", _plan_line(entry))
+        seen["last_human_prompt"] or "not in the window", _plan_line(entry)) + launch_model_note(seen.get("fleet"))
 
 
 def sweep_status_lines(sweep):
@@ -14239,10 +14240,13 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
+    if getattr(args, "cloud", False) and (getattr(args, "model", None) or getattr(args, "reasoning", None)):   # #1642: until the cloud route carries them
+        raise LaunchError("--model and --reasoning are not carried by --cloud yet: launch locally, or drop them")
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    choice = launch_model_choice(args, engine)   # #1642: before any session or pane
     if getattr(args, "terminal", False) and getattr(args, "headless", False):
         raise LaunchError("--terminal and --headless contradict each other: pick one")
     # #433: a plain launch takes its mode from `launch_default` (shipped: headless). A terminal is asked for by --terminal, or implied by --workspace/--new-workspace.
@@ -14335,7 +14339,7 @@ def _cmd_launch(args, runner, now, socket_call=None):
             try:
                 done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
                                        None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
-                                       launched_by=launched_by)
+                                       launched_by=launched_by, choice=choice)
             except HeadlessRefused as err:
                 if getattr(args, "headless", False):
                     raise   # asked for by name: the refusal is the answer
@@ -14353,7 +14357,7 @@ def _cmd_launch(args, runner, now, socket_call=None):
         if done is None:
             done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
                                 None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
-                                launched_by=launched_by, read_repo=read_repo)
+                                launched_by=launched_by, read_repo=read_repo, choice=choice)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
@@ -23210,6 +23214,8 @@ def build_parser():
     launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")
     launch.add_argument("--repo", help="metadata.fleet.repo, OWNER/REPO: the project the agent works in. Its gh "
                                        "account (config gh_users) is the agent's GH_TOKEN")
+    launch.add_argument("--model", metavar="PROVIDER/MODEL", help="The model this worker runs, for this launch only (checked against the local service's model list before anything starts)")
+    launch.add_argument("--reasoning", metavar="LEVEL", help="The model's own level (its variant, such as low or high); needs --model")
     launch.add_argument("--read-repo", dest="read_repo", metavar="OWNER/NAME",
                         help="ONE extra repository the worker may READ (issue view, pr view, api GET...) as that repository's gh_users account; every write "
                              "there, every command that names another repository and `gh search|gist|status|...` are refused by the gh and git shims. Exact lower-case owner/name. A shim guard, not a GitHub guard")
