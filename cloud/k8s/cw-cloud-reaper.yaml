@@ -1,0 +1,110 @@
+# The in-cluster reaper (ask #1582). APPLIED BY THE ADMINISTRATOR, NEVER BY THIS CHANGE: nothing here is applied by a script of the repository.
+# Its service account holds exactly the rights the reaper's pass makes (a test compares them) and no wildcard. It holds no App key, App id,
+# vault login, repository token or personal login: git tokens come from the token service (cw-token-service.yaml), asked by repository and role.
+# The token service lives in the namespace cw-tokens, outside every right of this account (the key Secret is out of reach).
+# The image is a PLACEHOLDER digest of zeros that cannot run: the administrator replaces it with the launcher image's digest (an owner step;
+# the real digest is private). The reaper writes its audit, run records and lock under /tmp (HOME and XDG_STATE_HOME point there; an emptyDir
+# is mounted); the image needs a user entry for uid 10001 with home /tmp (the lock directory comes from the password database).
+# No probe: the reaper has no endpoint and an exec probe needs a command the image does not offer; its liveness is the Lease's renew time.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cw-cloud-reaper
+  namespace: cw
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cw-cloud-reaper
+  namespace: cw
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cw-cloud-reaper
+  namespace: cw
+subjects:
+  - kind: ServiceAccount
+    name: cw-cloud-reaper
+    namespace: cw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cw-cloud-reaper
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cw-cloud-reaper
+  namespace: cw
+  labels:
+    app: cw-cloud-reaper
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cw-cloud-reaper
+  template:
+    metadata:
+      labels:
+        app: cw-cloud-reaper
+    spec:
+      serviceAccountName: cw-cloud-reaper
+      restartPolicy: Always
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reaper
+          image: registry.example.internal/cw/launcher@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          command: ["python3", "/opt/cw/cloud_reaper_mode.py", "serve"]
+          env:
+            - name: CW_CLUSTER_TOKEN_FILE
+              value: /var/run/secrets/kubernetes.io/serviceaccount/token
+            - name: CW_TOKEN_SERVICE_URL
+              value: http://cw-token-service.cw-tokens.svc:8080
+            - name: HOME
+              value: /tmp
+            - name: XDG_STATE_HOME
+              value: /tmp/state
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -2414,6 +2414,7 @@ class Launcher:
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now, live = [], self.clock(), []
         self.reap_results, self.last_hook = {}, None
+        self.lease_lost = False
         pods = self.kube.list_pods()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
@@ -2438,6 +2439,8 @@ class Launcher:
                 if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
                     reason = "idle"
             if reason:
+                if not self._beat():   # the lease is renewed during a long pass (ask #1582): before each stop; lost: no further stop
+                    break
                 self.last_hook = None
                 if pod in live:
                     live.remove(pod)
@@ -2450,8 +2453,28 @@ class Launcher:
                     self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
         out.extend(renewed)
-        self.send_wip_notes(live, now)
+        if not self.lease_lost:
+            self.send_wip_notes(live, now)
         return out
+
+    lease_lost = False
+
+    def _beat(self):
+        """The hook of the lease holder (set by the cloud reaper's gate, None otherwise). Returns False once the lease is lost (a failed
+        renewal, a conflict, another holder): the pass then does no further stop and no renewal, and says so once. Never raises."""
+        if self.lease_lost:
+            return False
+        beat = getattr(self, "beat", None)
+        if beat:
+            try:
+                ok = beat()
+            except Exception:
+                ok = False
+            if ok is False:
+                self.lease_lost = True
+                print("cloud-reaper: lease lost, pass ended", file=sys.stderr)
+                return False
+        return True
 
     def note_slow_pass(self, took):
         """A pass that took longer than SLOW_PASS_SECONDS: ONE line on the reaper's own log and ONE audit line with the seconds. A short pass: none."""
@@ -2503,6 +2526,8 @@ class Launcher:
     def _renew_locked(self, pods, now):
         out, relogged = [], False
         for pod in pods:
+            if not self._beat():   # the lease is renewed during a long pass: before each renewal; lost: no further renewal
+                break
             worker = ann(pod, "worker")
             try:
                 try:
@@ -3213,8 +3238,9 @@ class RenewalTicker:
     refreshes the login and renews every due token, whatever the pass is doing (a stop that waits, an activity read that hangs). `wait` is the
     thread's pause (a test replaces it); it never raises out of the thread."""
 
-    def __init__(self, launcher, refresher, clock, wait=None):
+    def __init__(self, launcher, refresher, clock, wait=None, renewal_allowed=None):
         self.L, self.refresher, self.clock = launcher, refresher, clock
+        self.renewal_allowed = renewal_allowed   # None: always; else called with the launcher: False = the lease is another's, renew nothing
         self.wait = wait or (lambda: self._stop.wait(RENEW_POLL_SECONDS))
         self._stop, self.thread, self.last = threading.Event(), None, clock()
         self.ticks = 0
@@ -3231,6 +3257,10 @@ class RenewalTicker:
                 refresh = self.refresher.run()
                 if self.L.kube is not None and refresh.token:
                     self.L.kube.add_secrets(refresh.token)
+                # The login refresh above is the reaper's OWN login, not an action on pods: it runs whatever the lease says.
+                # The renewal patches pods' Secrets: it runs only where the lease check allows (fail open on the Mac, as the stop path).
+                if self.renewal_allowed is not None and not self.renewal_allowed(self.L):
+                    return
                 self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
         except Exception as e:   # the thread goes on: the next tick tries again
             print("cloud-worker: the renewal thread: %s" % scrub(e, (), 200), file=sys.stderr)
@@ -3253,7 +3283,7 @@ class RenewalTicker:
             self.thread.join(5)   # a tick in flight ends first
 
 
-def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None):
+def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, gate=None):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop).
 
     The reaper's own login is the token file: it is made fresh at the start of every pass (before the cluster is reached), so an installed
@@ -3269,6 +3299,10 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
     try:
         lock = reaper_lock(reaper_identity(env.get("CW_CLOUD_NAMESPACE", "cw")))   # BEFORE the first pass: two reapers would both run an end hook for one pod
         refresher = refresher or ClusterTokenRefresher(env, clock)
+        if gate is None:
+            # The Mac's (non-cluster) mode yields to the cloud reaper's Lease. FAILS OPEN: a Lease that cannot be read acts as today.
+            from cloud_reaper_mode import MacYieldGate
+            gate = MacYieldGate(clock)
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         ticker = None
         while True:
@@ -3292,10 +3326,10 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                         L.kube.add_secrets(r.token)
                     return r.state == "written"
                 L.relogin = relogin
-                ticker = RenewalTicker(L, refresher, clock, ticker_wait)
+                ticker = RenewalTicker(L, refresher, clock, ticker_wait, getattr(gate, "renewal_allowed", None))
                 ticker.start()
             began = clock()
-            work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            work = L.reap() if (L is not None and (gate is None or gate(L))) else []   # the pass's own work; a gate (the lease) that says no: no action
             took = (clock() - began).total_seconds()
             if L is not None:
                 L.note_slow_pass(took)
