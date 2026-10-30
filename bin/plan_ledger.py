@@ -580,7 +580,7 @@ def claim_union(scenarios, this_body, others):
     the merged pull requests together with this one (a body with no claim line claims every one) leave out. A claim line that is refused covers nothing."""
     per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
     bodies = [this_body] + [body for _, body in others]
-    narrowed = any(pr_claim(body, scenarios) != (None, None) for body in bodies)
+    narrowed = any(pr_claim(body, scenarios)[0] is not None for body in bodies)
     last = not any(state == "open" for state, _ in others)
     covered = covered_ids(scenarios, [this_body] + [body for state, body in others if state == "merged"])
     return narrowed, [i for i in per if i not in covered], last
@@ -624,7 +624,7 @@ def closed_unclaimed(scenarios, peers, closed):
     if not closed or any(state == "open" for state, _ in peers):
         return [], []
     bodies = [b for _, b in peers] + [b for _, b in closed]
-    if not any(pr_claim(b, scenarios) != (None, None) for b in bodies):
+    if not any(pr_claim(b, scenarios)[0] is not None for b in bodies):
         return [], []
     per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
     covered = covered_ids(scenarios, [body for state, body in peers if state == "merged"])
