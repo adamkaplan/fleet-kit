@@ -6283,7 +6283,6 @@ The four kinds it sends for:
 A worker the cloud launcher ends (idle, hard limit, pod gone, failed pod) is announced by the launcher's sender (#1480), not here. Tests: `tests/switchboard/test_lost_worker.py`.
 
 **Bounds of the alert (read round, #1481).** At most 10 individual alerts a pass; one more message to the Chief of Staff says how many more there are (`N more lost worker(s)`), and those are alerted on the following passes, 10 at a time, with the count left; none is dropped or repeated (the mark is written before the send). With no usable memory (the first pass ever, or after a corrupt memory) only workers created in the last hour are alerted; with a valid memory every loss since it is alerted, a restart gap included. An unreadable `lost-workers.json` makes that pass alert nothing and write one audit line (`lost_worker.memory_corrupt`); the file is set aside as `lost-workers.json.corrupt` and the next pass writes a fresh memory, so later losses are alerted. A worker name is cleaned (control characters removed) and capped at 80 characters in every message. A local worker is worded `possibly lost` (absent from discovery, not known dead). The memory file is mode 0600 and synced before it replaces the old one.
-=======
 ## The installed tree is the default branch, clean (#1380)
 
 The tree the fleet's commands and the daemon run from (the checkout `fleet-switchboard install` was run from) must be the default branch, clean, so no command, verdict or merge gate is computed by code from an unmerged branch.
@@ -6328,4 +6327,3 @@ The install records the tree it is run from. Run from a feature-branch worktree 
 - The daemon stops only when the tree is bad twice in a row: it reads again one second after the first bad reading, in the same pass, so a checkout in flight does not stop it.
 - A local default branch ahead of `origin/<default>` is refused as not an ancestor; the message says to push it or reset the branch, and that the origin ref may be stale (`git fetch origin`).
 - It never changes the tree: the operator does (see above).
->>>>>>> origin/integration
