@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent.parent
@@ -138,6 +139,60 @@ class RepoRootJudgement(unittest.TestCase):
         self.assertTrue(applied)
         self.assertIn("scratch left in the repository root", p.stderr)
         self.assertEqual(p.returncode, 1)
+
+
+class ZombieChild(unittest.TestCase):
+    def _zombie_gone(self):
+        child = subprocess.Popen(["sleep", "300"], cwd=tempfile.gettempdir())
+        try:
+            child.send_signal(signal.SIGKILL)   # ended, never waited for: a zombie
+            end = time.time() + 5
+            while time.time() < end and alive(child.pid):
+                time.sleep(0.05)
+            return not alive(child.pid)
+        finally:
+            child.wait()
+
+    def test_s9_a_zombie_child_counts_gone_and_a_live_child_alive(self):
+        live = subprocess.Popen(["sleep", "300"])
+        try:
+            live_ok = alive(live.pid) is True
+            live.kill()
+            live.wait()
+            live_ok = live_ok and alive(live.pid) is False
+        finally:
+            live.kill()
+            live.wait()
+        gone = self._zombie_gone()
+        print("zombie counted gone: %s, live child alive: %s" % (gone, live_ok))
+        self.assertTrue(gone)
+        self.assertTrue(live_ok)
+
+    def test_s9_a_zombie_child_counts_gone_without_proc(self):
+        real_open = open
+
+        def no_proc(path, *a, **k):
+            if str(path).startswith("/proc/"):
+                raise OSError("unreadable")
+            return real_open(path, *a, **k)
+        with mock.patch("builtins.open", no_proc):
+            gone = self._zombie_gone()
+        print("zombie counted gone without /proc: %s" % gone)
+        self.assertTrue(gone)
+
+    def test_s9_the_mutant_that_trusts_the_signal_alone_fails(self):
+        src = (ROOT / "bin" / "test-cloud-worker").read_text()
+        m = re.search(r"def _alive\(pid\):\n.*?\n\n\n", src, re.S)
+        real = m.group(0)
+        mutant = real[:real.index("    try:   # our own child")] + "    return True\n"
+        applied = mutant != real
+        script = ("import os, signal, subprocess, sys, time\n" + mutant +
+                  "c = subprocess.Popen(['sleep', '300'])\nc.send_signal(signal.SIGKILL)\ntime.sleep(1)\n"
+                  "assert not _alive(c.pid), 'zombie counted alive'\n")
+        p = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+        print("S9: mutant exit %d, mutation applied %s" % (p.returncode, applied))
+        self.assertTrue(applied)
+        self.assertEqual(p.returncode, 1, p.stderr[-800:])
 
 
 class Places(unittest.TestCase):
