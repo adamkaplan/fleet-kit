@@ -69,10 +69,16 @@ def generate_all():
     return out
 
 
+def order_rows(rules):
+    """#1562: a stable partition: every allow row first in its present order, then every deny row in its present order."""
+    items = list(rules.items())
+    return dict([i for i in items if i[1] == "allow"] + [i for i in items if i[1] != "allow"])
+
+
 def write_conf(conf):
-    """Put the generated rules at the END of both blocks, after every other rule."""
+    """Put every allow row first, then every other row, then the generated push rules at the END of both blocks."""
     for b in blocks(conf):
-        keep = {k: v for k, v in b.items() if not k.startswith(PREFIX)}
+        keep = order_rows({k: v for k, v in b.items() if not k.startswith(PREFIX)})
         b.clear()
         b.update(keep)
         b.update(generate_all())

@@ -71,6 +71,7 @@ cloud/worker/tests/test_pr_edit_hardening.py
 cloud/worker/tests/test_push_rules.py
 cloud/worker/tests/test_question_denied.py
 cloud/worker/tests/test_root_scanner.py
+cloud/worker/tests/test_rule_position.py
 cloud/worker/tests/test_scan_allowlist_node.py
 cloud/worker/tests/test_stack_pull.py
 cloud/worker/tests/test_stack_up.py
