@@ -724,6 +724,24 @@ def _audit(engine, event, name, detail):
         engine.audit.append(engine.actor, event, name, detail)
 
 
+def _audit_refused_preflight(name, err):
+    """A launch refused because no token could be minted writes ONE line in the launcher's own audit file (its audit_path and write_audit,
+    the Launcher.audit line shape), action create.failed; the launch has no Launcher object yet. Never raises, never a value."""
+    text = str(err)
+    if "no token could be minted" not in text:
+        return
+    try:
+        lib = _lib()
+        reason = text[text.index("no token could be minted"):]
+        reason = "preflight: " + lib.scrub(reason, (), 400).split("; nothing was created")[0]
+        import pwd
+        lib.write_audit(lib.audit_path(os.environ), {"ts": lib.iso(datetime.datetime.now(datetime.timezone.utc)),
+                                                     "worker": name, "runtime_id": "", "action": "create.failed", "cost_estimate_usd": 0.0,
+                                                     "ok": False, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": reason})
+    except Exception:
+        pass
+
+
 def _read_password(read_fd):
     chunks = b""
     while len(chunks) <= PASSWORD_MAX + 1:
@@ -1319,6 +1337,7 @@ def _launch(args, runner, now, reserve):
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
+        _audit_refused_preflight(name, err)
         raise Refusal(str(err)) from None
     engine, state, _ = H["build_engine"](runner, now, "cli")
     reserve(state)

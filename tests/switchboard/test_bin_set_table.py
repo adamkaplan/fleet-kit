@@ -34,6 +34,7 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
         "HubFilesUnchanged": "lists cloud/worker/bin (the derivation matches its spelling), not bin/: it compares each worker copy with the file of the same name in bin/, so a new file under bin/ with no copy is never read",
         "TestGitShim": "lists bin/test-* for the suites that must route git through the shim; a new bin file that is not a test-* file is not read",
         "TestConflictCarry": "lists the modules of bin/ whose names contain clear, hold or floor to compare them with its carried table; a name outside that pattern is not read (the classes could not run in the pod: the git wrapper refuses their setUp; named so)",
+        "TestCiTestFileList": "derives every bin/test-* file from the directory and judges the CI list (bin/ci-test-files.txt) against it, so a new bin file is judged by its own derivation, and it passed with a planted unlisted module",
     }
     FAILED_ON_1429 = ("TestArchitectureDocument", "TestAuthorityModulesGuard", "TestImpactHold", "TestRecordJsonReaders", "TestTheReaperOnlyInstall", "TestRecordingCommands", "TestDerivedClosure")
 
