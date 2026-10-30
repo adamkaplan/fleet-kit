@@ -14484,9 +14484,9 @@ class TestOneCharter(CharterRig, Base):
         # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
         ("bin/fleet-switchboard", "guard"): "registry: the charter set guard, on the registry lock's own read",
         ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
-        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/fleet-switchboard", "plan_wake_route"): "registry: the orchestrator a plan wakes",
+        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/switchboard/plan_notice.py", "plan_wake_route"): "registry: the orchestrator a plan wakes",
         ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
-        ("bin/fleet-switchboard", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
+        ("bin/switchboard/heavy_budget.py", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
         ("bin/fleet-switchboard", "charter_or_first_seen"): "registry: the row's charter, else the launch value of an agent with no row yet",
         ("bin/fleet-switchboard", "registry_retired_owners"): "registry: the charter a retired orchestrator's record kept",
         ("bin/registry.py", "orchestrator_charters"): "registry: the one reading", ("bin/registry.py", "duplicate_charters"): "registry: duplicates", ("bin/registry.py", "set_charter"): "writer: the audited setter",
@@ -18807,8 +18807,8 @@ class TestDecorationIsAFact(ActingCase):
     def test_the_source_is_registered_and_the_engine_has_no_second_way_to_write(self):
         self.assertIsNotNone(sb.foreground_source(self.world.engine))
         source = switchboard_source()
-        # the section runs on into the handoff part, where its closing marker now sits
-        section = (SWITCHBOARD.read_text().split("# PR 8: foreground and background", 1)[1].split("# ---- PR 13: workers report", 1)[0]
+        # the section runs on into the handoff part, where its closing marker now sits (S9: the PR 13 block that followed it moved to workers_report.py; the next marker in the entry is #96)
+        section = (SWITCHBOARD.read_text().split("# PR 8: foreground and background", 1)[1].split("# ---- #96: a worker.stopped that would wake", 1)[0]
                    + (BIN / "switchboard" / "handoff.py").read_text().split("# Worker events, reminders", 1)[0])
         for forbidden in ("v2.synthetic(", "v2.prompt(", "herdr.agent_prompt"):
             self.assertNotIn(forbidden, section.split("def launch_agent")[0], forbidden)
@@ -68319,7 +68319,7 @@ class TestLoadAlert(Base):
         def figures(latest):
             return {k: (latest[k]["busy"], latest[k]["idle"], latest[k]["cloud"]) for k in ("orch", "orchb")}
         self.assertEqual(figures(self._cloud_run()), {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         import re as _re
         body = _re.search(r"def load_tick\(.*?\n\n\n", source, _re.S).group(0)
         old = '"busy": sum(1 for c in coders if c.status == "working"),'
@@ -71554,7 +71554,8 @@ class TestAdoption(LanesCase):
         return self.scan({rel: (REPO / rel).read_text() for rel in names})
 
     def test_every_reader_of_a_workers_boss_is_in_the_table_and_the_table_has_no_stale_member(self):   # S15
-        self.assertEqual(self.sites(), set(sb.BOSS_READ_SITES), "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
+        moved = {"bin/fleet-switchboard:live_cloud_by_lane": "bin/switchboard/heavy_budget.py:live_cloud_by_lane", "bin/fleet-switchboard:cloud_sender": "bin/switchboard/heavy_budget.py:cloud_sender"}   # S9: the daemon's table still names the entry for these; the functions moved, the table's text is not edited in a move
+        self.assertEqual(self.sites(), {moved.get(k, k) for k in sb.BOSS_READ_SITES}, "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
 
     def test_the_scan_finds_a_raw_reader_when_one_is_planted(self):   # S15 mutant: the real scan, fed a planted source, reports it
         planted = {"bin/planted.py": "def load_row(o):\n    return o.fleet.get('reports_to') == 'x'\n\ndef other(o):\n    return o.fleet['reports_to']\n\ndef safe(o):\n    return boss_name(o)\n"}

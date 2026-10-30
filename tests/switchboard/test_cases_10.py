@@ -1087,7 +1087,7 @@ class TestCloudLoad(Base):
 
     def mutant(self, old, new):
         import re as _re
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         body = _re.search(r"def live_cloud_by_lane.*?\n\n\n", source, _re.S).group(0)
         helper = _re.search(r"def cloud_record_live.*?\n\n\n", source, _re.S).group(0)   # #1066: the shared liveness helper holds the liveness lines
         self.assertIn(old, body + helper)
@@ -1315,7 +1315,7 @@ class TestCloudLoad(Base):
         self.assertNotEqual(self.count(mutant), out)
 
     def test_the_shared_helper_is_the_only_place_the_liveness_test_lives(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         for line in ('seen is None or seen > now or', '(last_reports.get(worker) or {}).get("state") in ("done", "failed")', 'if ends is None or ends < now:'):
             self.assertEqual(source.count(line), 1, line)   # once: inside cloud_record_live
         helper = source[source.index("def cloud_record_live"):source.index("def live_cloud_by_lane")]
