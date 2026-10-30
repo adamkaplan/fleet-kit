@@ -69653,6 +69653,9 @@ TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine =
 # The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
 _relay_tree_guard = importlib.import_module("test_relay_tree_guard")
 RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
+_sent_view = importlib.import_module("test_sent_view")
+_sent_view.World = World
+TestSentView = _sent_view.TestSentView
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
 RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
@@ -82352,6 +82355,7 @@ class ReviewCommentEndToEndTests(Base):
             self.assertIn("def " + name, src)
             self.assertIn(name if name != "_unowned_seen" else "review-unowned.json", table)
         self.assertTrue(paths)
+
 
 
 if __name__ == "__main__":
