@@ -705,7 +705,7 @@ NOT_SETTINGS = {
     # set by the in-cluster reaper's manifest (cloud/k8s/cw-cloud-reaper.yaml, cw-token-service.yaml)
     "CW_CLUSTER_TOKEN_FILE": "set by the in-cluster reaper's manifest, never a launcher setting: the path of the service account's token file",
     "CW_TOKEN_SERVICE_URL": "set by the in-cluster reaper's manifest, never a launcher setting: the address of the token service the reaper asks for a git token",
-    "CW_TOKEN_SERVICE_CALLER": "set by the in-cluster reaper's manifest, never a launcher setting: the one service-account identity the token service answers",
+    "CW_TOKEN_SERVICE_CALLER": "set by the token service's manifest, never a launcher setting: the one service-account identity the token service answers",
     # the switchboard's own variable (S18)
     SWITCHBOARD_PREFIX + "WORKER_BIN": "the launcher program, found by a lookup order (the variable when set, else the launcher of the switchboard's own checkout, else `cloud-worker` on the PATH), not a settings key: a path in the file would be one more thing to keep in step with the checkout, and an environment override that wins is what tests and a second install need",
 }
