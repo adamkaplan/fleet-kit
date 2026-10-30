@@ -430,7 +430,9 @@
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
         "bin/switchboard/jev.py",
-        "bin/switchboard/secret_spans.py"
+        "bin/switchboard/secret_spans.py",
+        "bin/switchboard/plan_input.py",
+        "bin/switchboard/review_laws_install.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -647,6 +649,16 @@
           "_secret_position",
           "find_secret_span",
           "secret_where"
+        ],
+        "bin/switchboard/plan_input.py": [
+          "PlanInputError",
+          "_parent_ask_done_when",
+          "fetch_plan",
+          "load_plan",
+          "parse_plan_source",
+          "plan_comment_choice"
+        ],
+        "bin/switchboard/review_laws_install.py": [
         ]
       },
       "registrar_allow": {
