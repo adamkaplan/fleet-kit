@@ -350,7 +350,7 @@ class Mint(unittest.TestCase):
         refusals are accepted: the parse refusal ("not usable JSON") or the wrong-shape refusal. Never a crash, never a mint."""
         Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
         p = self.run_mint()
-        self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+        self.assertEqual((p.returncode, p.stdout, Stub.seen), (75, "", []))
         self.assertTrue("not usable JSON" in p.stderr or "something other than one installation" in p.stderr, p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
