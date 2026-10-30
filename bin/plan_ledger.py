@@ -31,10 +31,12 @@ EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus ent
 REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
 ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
 CARRY_KINDS = ("carried",)   # #1129: a proof or verdict that holds at a new head (see `carry_decision`); its own line, the original row is never touched
-KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS
+CLAIM_KINDS = ("claim",)   # #976: the claim line of a pull request AS IT WAS when its merge was gated (`claim_text`, or None: it claims every per-PR scenario); the union reads it for a merged sibling
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS + CLAIM_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
+CLAIM_TEXT_LIMIT = 1000   # a `claim` ledger line keeps at most this much of a CLAIMS line (#976)
 EVALUATOR_ALIASES = {"adam": "owner"}
 
 # THE bound of every wait of a recording command (`prove`, `verdict`, `review record`): the ledger lock, each GitHub read, the agent registry. One
@@ -399,7 +401,7 @@ def may_record_verdict(evaluator, caller, allowed, authors):
 
 # ----------------------------------------------------------------------------------- waivers
 
-WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962), at the PR's head
+WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG", "CU")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962); CU: the claim union at an ask's last merge (#976); each at the PR's head
 NEVER_WAIVABLE = {"G6": "the owner's hold on a held PR", "G7": "the epic integration", "G8": "production"}
 WAIVER_REASON_MIN = 20
 WAIVER_SECONDS = 24 * 3600   # a waiver is valid this long (the retroactive-plan due date), and only at the head it names
@@ -411,7 +413,7 @@ def parse_waiver_gates(text):
     for raw in (text or "").replace(" ", "").split(","):
         if not raw:
             continue
-        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3", "mg": "MG"}.get(raw, raw[:1].upper() + raw[1:])
+        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3", "mg": "MG", "cu": "CU"}.get(raw, raw[:1].upper() + raw[1:])
         if gate in NEVER_WAIVABLE:
             return [], "%s is never waived (%s): refused, nothing was recorded" % (gate, NEVER_WAIVABLE[gate])
         if gate not in WAIVABLE:
@@ -513,6 +515,75 @@ def pr_scenarios(scenarios, body):
     return [s for s in mine if s.get("id") in ids], [s for s in mine if s.get("id") not in ids], None
 
 
+def covered_ids(scenarios, bodies):
+    """The ids the claims of these pull request bodies cover; a refused claim line covers nothing. The ONE reader of claimed scenarios for the union and #1347."""
+    covered = set()
+    for body in bodies:
+        claimed, _, error = pr_scenarios(scenarios, body)
+        if not error:
+            covered.update(c.get("id") for c in claimed)
+    return covered
+
+
+def claim_union(scenarios, this_body, others):
+    """(applies, uncovered, last): the claim union of one ask (#976). `others` is [(state, body)] for the OTHER pull requests of the same plan, state `open` or `merged`
+    (one closed without a merge proves nothing and is not passed in). `last` is true when none of them is open: this merge is the ask's last. `applies` is true only when
+    some pull request of the ask has a claim line (a plan nobody narrows behaves exactly as before). `uncovered` lists the per-pull-request scenario ids that the claims of
+    the merged pull requests together with this one (a body with no claim line claims every one) leave out. A claim line that is refused covers nothing."""
+    per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
+    bodies = [this_body] + [body for _, body in others]
+    narrowed = any(pr_claim(body, scenarios)[0] is not None for body in bodies)
+    last = not any(state == "open" for state, _ in others)
+    covered = covered_ids(scenarios, [this_body] + [body for state, body in others if state == "merged"])
+    return narrowed, [i for i in per if i not in covered], last
+
+
+def claim_line(pr, head, body):
+    """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""
+    text = claim_text(body)
+    return {"kind": "claim", "pr": pr, "head": head, "claim_text": None if text is None else clip(text, CLAIM_TEXT_LIMIT)}   # a refused claim covers nothing, so a clipped one is never wider
+
+
+def recorded_claim(entries, pr, first=False, at=None):
+    """(found, claim_text) from the NEWEST `claim` line of `pr`, or the FIRST with `first`. With `at` (epoch seconds, a merged pull request's `merged_at`): the NEWEST line
+    recorded AT OR BEFORE `at`, the claim in force at the merge; a claim line of `pr` with no usable timestamp reads nothing (found False). found is False when none qualifies."""
+    mine = [e for e in entries if e.get("kind") == "claim" and e.get("pr") == pr]
+    if at is not None:
+        if any(isinstance(e.get("ts"), bool) or not isinstance(e.get("ts"), int) for e in mine):
+            return False, None
+        mine = [e for e in mine if e["ts"] <= at]
+    if not mine:
+        return False, None
+    return True, mine[0 if first else -1].get("claim_text")
+
+
+def claim_body(text, link="PLAN: x#1"):
+    """A body that carries a recorded claim text, to be read by `pr_claim` like any other."""
+    return link + ("\nCLAIMS: %s" % text if text is not None else "")
+
+
+def union_refusal(ref, uncovered, closed=()):
+    tail = "; the closed-unmerged pull request%s %s left %s unclaimed (#1347)" % ("s" if len(closed) > 1 else "", ", ".join("#%s" % n for n in closed), "it" if len(uncovered) == 1 else "them") if closed else "; the closed pull requests could not be read" if closed is None else ""
+    return ("merge of %s refused: it is the last pull request of its ask and the claims of its merged pull requests do not cover %s%s; a pull request must claim %s "
+            "(`CLAIMS:` under `PLAN:`), or the chief of staff logs a waiver (`waive %s --gates CU`)" % (
+                ref, ", ".join(uncovered), tail, "it" if len(uncovered) == 1 else "them", ref))
+
+
+def closed_unclaimed(scenarios, peers, closed):
+    """(uncovered, closed_numbers) of one ask with NO subject pull request (#1347): `peers` is [(state, body)] of its `open` and `merged` pull requests, `closed` [(number, body)] of
+    those closed without a merge. Flagged only when the ask has a closed-unmerged pull request, none is open, some claim line narrows a pull request, and a per-pull-request
+    scenario is claimed by no merged one. A closed pull request's claim covers nothing. Otherwise ([], [])."""
+    if not closed or any(state == "open" for state, _ in peers):
+        return [], []
+    bodies = [b for _, b in peers] + [b for _, b in closed]
+    if not any(pr_claim(b, scenarios)[0] is not None for b in bodies):
+        return [], []
+    per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
+    covered = covered_ids(scenarios, [body for state, body in peers if state == "merged"])
+    uncovered = [i for i in per if i not in covered]
+    return (uncovered, [n for n, _ in closed]) if uncovered else ([], [])
+
+
 def canon_status(body):
     """(ok, detail) for the G5 checklist line: `canon: <what was updated>`, or `canon: n/a <reason>` with a reason."""
     found = CANON_RE.search(body or "")
@@ -540,19 +611,19 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
             out.setdefault("carried", []).append(carried_view(newest, carried[newest["seq"]]))
         if not newest and mine:
             why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
-            out["void"].append("%s #%d void: %s" % (kind, mine[-1]["seq"], why))
+            out["void"].append("%s #%d void: %s" % (kind if kind == "proof" else evaluator + " verdict", mine[-1]["seq"], why))
         out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by")}
     proof, verdict = out["proof"], out["verdict"]
     if not proof:
-        out["missing"].append("proof (`prove %s`)" % sid)
+        out["missing"].append("proof (`prove %s`; the %s judges it, a prover records it)" % (sid, evaluator))
     elif proof["result"] != "pass":
-        out["missing"].append("proof says fail")
+        out["missing"].append("proof says fail (the %s judges it, a prover records a new one)" % evaluator)
     if not verdict:
-        out["missing"].append("%s verdict (`verdict %s --as %s`)" % (evaluator, sid, evaluator))
+        out["missing"].append("%s verdict (`verdict %s --as %s`; only the %s may record it)" % (evaluator, sid, evaluator, evaluator))
     elif verdict["result"] != "pass":
-        out["missing"].append("%s verdict says fail" % evaluator)
+        out["missing"].append("%s verdict says fail (only the %s may record a new one)" % (evaluator, evaluator))
     elif verdict["by"] in authors:
-        out["missing"].append("the verdict is by an author of the PR (not accepted)")
+        out["missing"].append("the %s verdict is by an author of the PR (not accepted; only the %s, who is not an author, may record it)" % (evaluator, evaluator))
     out["status"] = "ok" if not out["missing"] else "missing"
     return out
 
@@ -601,6 +672,51 @@ def carry_decision(row, evaluator, files_changed, merge_of_default, ci_green):
     if ci_green is not True:
         return "refuse", "CI is not green at the new head"
     return "carry", "carried"
+
+
+PATH_TOKEN_RE = re.compile(r"[^\s`'\"<>()\[\]{},;:=|]+")   # a word of a command or of evidence, cut at quotes, brackets and separators
+
+
+def proof_files(command, evidence, exists):
+    """(#1405) The files a proof names when `--file` was not given: sorted, the words of `command` (its arguments) and of `evidence` (the paths quoted in it) that look like a
+    path (a `/` or a `.` inside) and for which `exists(path)` says it is a file of the tree. Nothing else is named, so a word that is no dependency cannot carry a proof."""
+    found = set()
+    for text in (command, evidence):
+        for word in PATH_TOKEN_RE.findall(str(text or "")):
+            word = word.rstrip(".").removeprefix("./")
+            if word and not word.startswith(("/", "-", "..")) and ("/" in word or "." in word[1:]) and exists(word):
+                found.add(word)
+    return sorted(found)
+
+
+def head_view(scenario_id, evaluator, entries, pr, plan_hash, head, files_between):
+    """(#1405) The one `gates` line of a scenario's proof at `head`, or None when it has no proof of this plan: `proven at this head`, `carried ...`, or `void: ...` naming the
+    first named file that changed, that the proof names no file, or `unknown` when the difference cannot be read. `files_between(old_head)` returns the changed files or None
+    (never read as no change). It reuses `carry_decision`'s own reading of the named files."""
+    rows = [e for e in entries if e.get("pr") == pr and e.get("kind") == "proof" and e.get("scenario") == scenario_id and e.get("plan_hash") == plan_hash]
+    if not rows:
+        return None
+    row = rows[-1]
+    if row.get("result") != "pass":   # a failed proof is never proven and never carried
+        return "%s: proof at this head says %s" % (scenario_id, row.get("result") or "fail") if row.get("head") == head else \
+            "%s: void: the proof recorded at %s says %s, so it is never carried" % (scenario_id, str(row.get("head"))[:8], row.get("result") or "fail")
+    if row.get("head") == head:
+        return "%s: proven at this head" % scenario_id
+    named = sorted({f for f in (row.get("files") or ()) if isinstance(f, str) and f})
+    if row["seq"] in carried_seqs(entries, pr, head, plan_hash):
+        return "%s: carried (%s unchanged since %s)" % (scenario_id, ", ".join(named), str(row.get("head"))[:8])
+    if evaluator not in CARRY_EVALUATORS:
+        return "%s: void: head moved (a %s proof is re-recorded at each green head, never carried)" % (scenario_id, evaluator)
+    if not named:
+        return "%s: void: the proof names no file, so it is never carried" % scenario_id
+    changed = files_between(row.get("head"))
+    if changed is None:
+        return "%s: unknown: the difference since %s cannot be read, so nothing is carried" % (scenario_id, str(row.get("head"))[:8])
+    first = next((f for f in named if f in set(changed)), None)
+    if first:
+        return "%s: void: %s changed since %s" % (scenario_id, first, str(row.get("head"))[:8])
+    return "%s: void: the named files are unchanged since %s but it is not carried (it needs a merge of the default branch or tests and documentation only, and green CI)" % (
+        scenario_id, str(row.get("head"))[:8])
 
 
 def carry_line(row, scenario, old_head, new_head, merge_of_default, pr):
@@ -921,6 +1037,7 @@ def render_gates(report, pr):
             lines.append("  %s: %s" % (s["id"], note))
         for view in s.get("carried") or ():   # #1129: a carried proof is shown with the head it was recorded at
             lines.append("  %s: carried: row #%d recorded at %s, held here by carried line #%d" % (s["id"], view["proof"], str(view["original_head"])[:8], view["carried_line"]))
+    lines.extend("  proof: %s" % l for l in report.get("head_lines") or ())   # #1405: per scenario, proven / carried / void by a named file
     rating = report.get("impact_rating")
     if isinstance(rating, dict):
         lines.append("  " + impact_rating_line(rating, report.get("head")))

@@ -8,7 +8,7 @@ replaces the hand-written rule of which tests to pick.
 It lists the files changed since the merge base with <base>, selects every test file whose text names a changed file
 (basename match) plus the scan tests of SCAN_TESTS, runs each on the branch and on a clean worktree of the base (under the
 temporary directory, removed at the end, never forced), and prints only the differences.
-An EMPTY change exits 0 before the preflight runs. Exit: 0 no difference; 1 a difference, a test that could not run, or no test selected for a non-empty change; 2 refused input.
+An EMPTY change exits 0 before the preflight runs. Exit: 0 no difference; 1 a difference, a test that could not run, or no test selected for a non-empty change; 2 refused input; 3 the quick budget was spent (NOT RUN (budget): not a failing test; see CLOUD_PREFLIGHT_QUICK_TOTAL).
 Continuous integration stays the gate; its result is the only evidence. Uses git and python3 only, local.
 """
 import os
@@ -46,6 +46,8 @@ MAX_SECONDS = 86400
 HEAVY = ("cloud/worker/tests/test_root_scanner.py",)  # fallback of a lone copy; with the helper, cloud_quick.HEAVY rules
 if cloud_quick is not None:
     HEAVY = cloud_quick.HEAVY
+BUDGET_STATUS = 3  # the preflight's status for a spent quick budget (see bin/cloud-pr-preflight)
+BUDGET_SPENT = [False]
 PREFLIGHT = "cloud-pr-preflight"  # found next to this file by path, never through PATH
 
 
@@ -207,6 +209,8 @@ def preflight(root, base, scratch, limit):
     if timed_out:
         return False, ["could not run the preflight: timed out after %ds" % limit]
     lines = text.splitlines()
+    if rc == BUDGET_STATUS:
+        BUDGET_SPENT[0] = True  # a spent quick budget (not a failing test): the same status 3 is passed on
     if rc != 0:
         return False, lines or ["the preflight exited %d with no output" % rc]
     return True, lines
@@ -299,6 +303,9 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
     if not ok:
         for l in plines:
             print(l)
+        if BUDGET_SPENT[0]:
+            print("cloud-prepush: the quick budget was spent (NOT RUN (budget), not a failing test); no test was run (advice only)")
+            return BUDGET_STATUS
         print("cloud-prepush: the preflight did not pass; no test was run (advice only)")
         return 1
     if not reason:

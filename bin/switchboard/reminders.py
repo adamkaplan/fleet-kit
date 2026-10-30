@@ -262,8 +262,109 @@ def merge_wake_facts(recipient, facts, budget=None):
                   merge_wake([(wake_class_of(f), f.summary) for f in group]), max(f.created for f in group),
                   batch=all(f.batch for f in group), sender="switchboard")
     merged.members = keys
+    merged.sent_min = min(f.created for f in group)   # #1402: the oldest member, so an old digest does not look new
     merged.member_lines = {f.key: "- %s: %s" % (_clean_line(wake_class_of(f)), _clean_line(f.summary)) for f in group}
     return [f for f in facts if not wake_class_of(f)] + rest + [merged]
+
+
+# ---- #1402: what is dropped at delivery
+DIGEST_REPLACE_AFTER = 6 * 3600      # seconds: a digest older than this is replaced by the current one
+MAX_PRESENT_READS = 10               # present-state reads per delivery (one per subject); the rest are delivered unverified
+DIGEST_KEY_RE = re.compile(r"^triage:[0-9a-f]{10}:[0-9]+$")
+PULL_ALERT_RE = re.compile(r"^red-ci:pr(?:-unowned)?:([^#:\s]+/[^#:\s]+)#([0-9]+):([^:]*):")
+ISSUE_ALERT_RE = re.compile(r"^alert:([^#:\s]+/[^#:\s]+)#([0-9]+) (.+):[^:]+$")
+STANDING_ALERT_RE = re.compile(r"^alert-standing:([^#:\s]+/[^#:\s]+)#([0-9]+):")
+UNVERIFIED_MARK = "[unverified: its present state could not be read] "
+
+
+def is_digest(fact):
+    return fact.kind == "triage" and bool(DIGEST_KEY_RE.match(fact.key))
+
+
+def alert_subject(fact):
+    """(kind, repo, number, expected) of what an alert says is true, or None when it names no subject:
+    ("pull", repo, n, head) a red check on that head of an open pull request; ("issue", repo, n, label) an open issue carrying that label;
+    ("standing", repo, n, None) an issue with no standing line yet. One table: every member has a reader in `alert_stale`."""
+    if fact.kind != "alert":
+        return None
+    found = PULL_ALERT_RE.match(fact.key)
+    if found:
+        return ("pull", found.group(1), int(found.group(2)), found.group(3))
+    found = STANDING_ALERT_RE.match(fact.key)
+    if found:
+        return ("standing", found.group(1), int(found.group(2)), None)
+    found = ISSUE_ALERT_RE.match(fact.key)
+    if found and fact.issue == int(found.group(2)):
+        label = found.group(3).split(" ", 1)[1] if " " in found.group(3) else None
+        return ("issue", found.group(1), int(found.group(2)), label)
+    return None
+
+
+SUBJECT_ENDPOINT = {"pull": "pulls", "issue": "issues", "standing": "issues"}   # the present record each subject kind is read from
+
+
+def alert_stale(subject, record, fact, standing):
+    """Why the alert is no longer true against its present record, or "" when it still is. Pure."""
+    kind, _repo, _number, expected = subject
+    if kind == "pull":
+        sha = ((record.get("head") or {}).get("sha")) if isinstance(record.get("head"), dict) else None
+        if record.get("merged") or record.get("merged_at"):
+            return "the pull request is merged"
+        if record.get("state") != "open":
+            return "the pull request is closed"
+        if isinstance(sha, str) and expected and sha.lower() != expected.lower():
+            return "the head moved on to %s" % sha[:12]
+        return ""
+    if record.get("state") == "closed":
+        return "the issue is closed"
+    if kind == "issue":
+        names = [l.get("name") if isinstance(l, dict) else l for l in record.get("labels") or []]
+        if expected and "labels" in record and expected not in names:
+            return "the label %s is gone" % expected
+    if kind == "standing" and standing(record.get("body"), fact.created) is not None:
+        return "a standing line is already posted"
+    return ""
+
+
+def digest_replaced(facts, delivered):
+    """{key: the current digest} for each digest older than DIGEST_REPLACE_AFTER that a newer digest for the same recipient replaces."""
+    newest = {}
+    for fact in facts:
+        if is_digest(fact):
+            top = newest.get(fact.recipient)
+            if top is None or (fact.created, fact.key) > (top.created, top.key):
+                newest[fact.recipient] = fact
+    return {f.key: newest[f.recipient] for f in facts
+            if is_digest(f) and newest[f.recipient] is not f and delivered - f.created > DIGEST_REPLACE_AFTER}
+
+
+def judge_delivery(facts, delivered, read, standing):
+    """(kept, dropped [(fact, kind, why)]) for the facts about to be delivered. `read(subject)` is the present record of an alert's subject, None when
+    unreadable (it is called at most once per subject by the caller's cache). A read that fails keeps the alert, marked unverified: never a silent drop."""
+    kept, dropped, reads = [], [], 0
+    replaced = {} if fault("keep-old-digest") else digest_replaced(facts, delivered)
+    for fact in facts:
+        if fact.key in replaced:
+            dropped.append((fact, "digest", "replaced by the current digest %s" % replaced[fact.key].key))
+            continue
+        subject = alert_subject(fact) if read is not None else None
+        if subject is None:
+            kept.append(fact)
+            continue
+        try:
+            record = read(subject)
+        except Exception:
+            record = None
+        if not isinstance(record, dict):
+            kept.append(Fact(fact.key, fact.recipient, fact.kind, UNVERIFIED_MARK + fact.summary, fact.created, issue=fact.issue, batch=fact.batch,
+                             sender=fact.sender, rider=fact.rider, repo=fact.repo))
+            continue
+        why = alert_stale(subject, record, fact, standing)
+        if why and not fault("deliver-stale-alert"):
+            dropped.append((fact, "alert", why))
+        else:
+            kept.append(fact)
+    return kept, dropped
 
 
 def remove_reminders(state_dir, ids):
