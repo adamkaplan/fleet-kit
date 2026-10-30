@@ -1087,7 +1087,18 @@ class HubReadAndTransport(unittest.TestCase):
         gate = threading.Event()
         real = http.client.HTTPConnection.connect
         slow_for = {"post": True}
-        http.client.HTTPConnection.connect = lambda conn: (gate.wait(20) if slow_for["post"] and slow_for.get("armed") else None, real(conn))[1]
+        ran_connect = []   # the threads that ran a held connect: the post's connection is made by the late thread itself
+
+        def connect_hook(conn):
+            if slow_for["post"] and slow_for.get("armed"):
+                if not gate.is_set():
+                    ran_connect.append(threading.current_thread())
+                gate.wait(20)
+                # Once released, the connection is no longer bound by the 0.4 s deadline of the cut: 30 s (the product default,
+                # about 75 times the cut) so a loaded runner cannot time the late round trip out with nothing posted.
+                conn.timeout = 30
+            return real(conn)
+        http.client.HTTPConnection.connect = connect_hook
         self.addCleanup(setattr, http.client.HTTPConnection, "connect", real)
         self.addCleanup(gate.set)
         old = mod.READ_DEADLINE
@@ -1099,7 +1110,6 @@ class HubReadAndTransport(unittest.TestCase):
         pending = fetch()
         gate.clear()
         status, reason, record = ex.handle(pending["requests"][0])   # pass 1 executes: one ledger record
-        before = set(threading.enumerate())
         mod.READ_DEADLINE = 0.4   # short deadline only for the post that must be cut
         try:
             with self.assertRaises(mod.PassCut):
@@ -1107,10 +1117,9 @@ class HubReadAndTransport(unittest.TestCase):
         finally:
             mod.READ_DEADLINE = old
         gate.set()   # the late thread now completes after the cut
-        import time
-        end = time.monotonic() + 5
-        while time.monotonic() < end and any(t.is_alive() for t in set(threading.enumerate()) - before):
-            threading.Event().wait(0.01)
+        late = ran_connect[-1]   # the thread that held the POST connect (recorded while the gate was closed)
+        late.join(10)   # a guard so a broken mechanism fails instead of hanging: the slowest honest case is about 0.1 s, the guard 100 times that; never what the test judges
+        self.assertFalse(late.is_alive(), "the late thread did not end")
         slow_for["armed"] = False
         status2, _, record2 = ex.handle(fetch()["requests"][0])   # next pass: the same request is a replay
         post(req["id"], {"status": status2, "reason": "", "record": record2})
