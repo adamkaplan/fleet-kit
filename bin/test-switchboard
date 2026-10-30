@@ -69636,6 +69636,9 @@ RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCanc
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
+# The bin-set table test (#1457).
+_bin_set_table = importlib.import_module("test_bin_set_table")
+TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
