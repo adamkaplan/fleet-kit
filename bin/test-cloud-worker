@@ -1140,9 +1140,9 @@ class TestNameCollision(Base):
     def test_the_cloud_record_is_the_only_route_so_the_other_kind_cannot_be_made(self):
         self.assertEqual(self.launch()[0], 0)
         self.assertEqual(sb.load_module("cloud_worker").bind(sb.__dict__).route("coder7")["worker"], "coder7")
-        code, out, err = self.launch()   # and a second cloud worker of that name is refused too
-        self.assertEqual(code, 1)
-        self.assertIn("already exists", err)
+        code, out, err = self.launch()   # and a second launch of that name returns the worker (#1619)
+        self.assertEqual(code, 0)
+        self.assertIn("exists: returned", err)
 
 
 class TestLocalLaunchIsNeverBrokenByTheCloudModule(Base):
@@ -1261,7 +1261,7 @@ class TestStopAndStatus(Base):
         os.makedirs(str(cloud), mode=0o700, exist_ok=True)
         (cloud / "coder7.launching").write_text("")   # empty, or from a killed command: nothing holds its lock
         self.assertEqual(self.launch()[0], 0)
-        self.assertEqual(self.launch()[0], 1)   # the second is refused for the record, and the reservation was released
+        self.assertEqual(self.launch()[0], 0)   # the second returns the worker for the record (#1619), and the reservation was released
         self.assertFalse(sb.load_module("cloud_worker").bind(sb.__dict__)._reserved("coder7"))
 
     def test_status_probes_no_worker_past_its_hard_deadline(self):
