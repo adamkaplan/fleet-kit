@@ -56,6 +56,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_client.py` | 1 | the sending end of a message or report through the cloud channel | |
 | `external_adapter.py` | 1 | a generic client for an outside system that holds decisions and work items | |
 | `agent_calls.py` | 2 | GitHub calls made from agents' shells, counted per account and per hour | |
+| `github_census.py` | 2 | the 5-minute sample line per account and the census of process kinds behind GitHub calls the records do not count (read only) | |
 | `agent_presence.py` | 2 | the one rule for the presence of a worker that has no terminal | |
 | `agent_reconcile.py` | 2 | what a view does with an agent that has no live data | |
 | `endpoint_liveness.py` | 2 | the liveness of an agent row that has no pane to judge (on demand only) | |
@@ -85,6 +86,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_cli.py` | 5 | the pod-side command to send and report through the cloud channel | |
 | `cloud_cost_report.py` | 5 | USD per day of the cloud fleet, from the launcher's audit lines (read only) | |
 | `cloud_hub.py` | 5 | the cloud switchboard's front door | |
+| `cloud_retired.py` | 5 | the read of a retired cloud worker from its run record, and the boss kept at its removal (#1546); a part of `cloud_worker.py` | |
 | `cloud_way_back_check.py` | 5 | a read-only check of the way back from the cloud to local | |
 | `cloud_worker.py` | 5 | remote (cloud) workers for the switchboard | |
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
@@ -121,6 +123,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/alert_labels.py` | 4 | an alert label on an open issue wakes that repository's orchestrator | |
 | `switchboard/handoff.py` | 5 | the handoff: a brief, not a fork | |
 | `switchboard/agents_verify.py` | 5 | `agents verify`: did the service register our agents as written | |
+| `switchboard/secret_spans.py` | 5 | where the first secret-shaped match is: a fixed rule label and numbers, never the text | |
 | `switchboard/answer_delivery.py` | 5 | how an answer reaches the asker, behind the AnswerDelivery port | |
 | `cloud_relay_daemon.py` | 5 | the daemon half of the cloud hub relay: pulls pod requests from the hub and runs them with the same rules as the local commands | |
 | `fleet-switchboard` | 6 | the entry: today also every section not yet moved to a part (the assembler, the engine, the commands) | |
@@ -158,6 +161,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/facts.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/facts.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/handoff.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/secret_spans.py` | `fleet-switchboard` | namespace | 2 | one namespace: the finder reads the entry's `_SECRET_PATTERNS` and `redact_command_text` (it must see the very patterns the net applies) |
 | `switchboard/handoff.py` | `fleet-switchboard` | namespace | 48 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/jev.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/jev.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
@@ -215,6 +219,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `cloud_worker.py` | `_lib:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_walk:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `bind:sys.modules` | 1 | uses `sys` beyond its plain attributes |
@@ -269,6 +274,7 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `fleet-switchboard` | `validate_app_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_hold_labels_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `validate_hold_labels_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `record_github_calls:load_module(non-constant)` | 1 | a dynamic load (the census module, by a name kept out of the clear's closure) |
 | `fleet-switchboard` | `run_daemon:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `lanes.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `merged_labels.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |

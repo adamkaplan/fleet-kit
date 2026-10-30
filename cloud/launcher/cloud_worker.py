@@ -460,11 +460,14 @@ def check_repo_allowed(repo, env):
         raise CloudError("refused: %s is not on the cloud allow-list" % scrub(repo, (), 120), EXIT_USAGE)
 
 
-def git_token_cmd(repo, env):
+def git_token_cmd(repo, env, role="worker"):
     """The command that mints the git token for ONE repository: CW_GIT_TOKEN_CMD, else app_token.py beside this file. The launch (run_task.py)
     and the renewal run the same command; the renewal builds it here and the driver's own line in run_task.py is pinned equal by a test."""
-    raw = env.get("CW_GIT_TOKEN_CMD")
-    return shlex.split(raw) if raw else [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py"), repo]
+    raw = env.get("CW_GIT_TOKEN_CMD")   # an operator's own command is run as it is: the role is passed to the default command only
+    if raw:
+        return shlex.split(raw)
+    cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py"), repo]
+    return cmd + ["--role", role] if role != "worker" else cmd
 
 
 def run_git_token_cmd(cmd, repo, env, register=None):
@@ -1640,7 +1643,8 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
-                        **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
+                        **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}),
+                        **({"cw/role": agent} if agent == "orchestrator" else {})}},   # a worker pod's spec is byte-for-byte what it was: no annotation means worker
         "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
                  "terminationGracePeriodSeconds": POD_TERMINATION_GRACE_SECONDS,
                  "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
@@ -2482,7 +2486,10 @@ class Launcher:
         except CloudError:
             raise _NotRenewed("repository not on the allow-list") from None
         try:
-            token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=self.kube.add_secrets)
+            role = ann(pod, "role", "worker")   # the role the pod was made under; a pod made before the annotation is a worker
+            role = role if role in AGENTS else "worker"
+            cmd = git_token_cmd(repo, self.env, role) if role != "worker" else git_token_cmd(repo, self.env)
+            token = run_git_token_cmd(cmd, repo, dict(os.environ, **self.env), register=self.kube.add_secrets)
         except CloudError as e:
             raise _NotRenewed("the mint failed: %s" % e) from None
         self.kube.add_secrets(token)
