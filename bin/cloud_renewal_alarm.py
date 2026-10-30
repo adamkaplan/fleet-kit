@@ -172,7 +172,7 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
     try:
         _write_state(state_path, state)
         _MEMORY.pop(state_path, None)
-    except OSError:
+    except Exception:
         _MEMORY[state_path] = copy.deepcopy(state)
     sent = []
     lane = [n for n in _lane(engine.config, discovery, default_lane) if not hold_reason(discovery.agents[n])]

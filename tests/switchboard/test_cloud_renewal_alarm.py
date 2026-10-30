@@ -216,7 +216,23 @@ def s16d(module):
         w2.close()
 
 
-SCENARIOS = {"s16d": s16d, "s16b": s16b, "s16": s16, "s17": s17, "s18": s18, "s19": s19}
+def s16e(module):
+    w = World(module, {"worker-1": "lane-a"})
+    try:
+        def failing(path, state):
+            raise TypeError("not serialisable")
+        module._write_state = failing
+        w.line(T0 - 60, "worker-1", False, "no network")
+        for n in range(5):
+            w.tick(T0 + n)
+        counts = [len(w.to(r)) for r in ("lane-a", "cos-1")]
+        print("S16e: passes 5, alarms per recipient with a state write raising TypeError %d" % max(counts))
+        assert counts == [1, 1], counts
+    finally:
+        w.close()
+
+
+SCENARIOS = {"s16e": s16e, "s16d": s16d, "s16b": s16b, "s16": s16, "s17": s17, "s18": s18, "s19": s19}
 
 
 def run(name, path=None):
@@ -228,6 +244,7 @@ MUTANTS = {
     "s16": ("sends nothing", "item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)", "item = None"),
     "s16d": ("no future guard", "if l[0] <= now + FUTURE_SLACK_SECONDS]", "if True]"),
     "s16b": ("keeps no record of a failed write", "_MEMORY[state_path] = copy.deepcopy(state)", "pass"),
+    "s16e": ("catches only OSError on the state write", "_MEMORY.pop(state_path, None)\n    except Exception:", "_MEMORY.pop(state_path, None)\n    except OSError:"),
     "s17": ("alarms every failure line", "if last is not None and 0 <= at - last < SERIES_SECONDS:", "if False:"),
     "s18": ("one lane message per pod", "if len(by_reason[reason]) == 1:", "if True:"),
     "s19": ("copies the whole audit line", 'scrub(rec.get("reason"))', "json.dumps(rec)"),
@@ -246,6 +263,9 @@ class TestCloudRenewalAlarm(unittest.TestCase):
 
     def test_s16b_a_failing_state_write_and_a_failing_send_never_repeat_an_alarm_and_a_held_lane_is_skipped(self):
         s16b(self.module)
+
+    def test_s16e_a_state_write_raising_any_exception_never_repeats_an_alarm(self):
+        s16e(self.module)
 
     def test_s17_the_same_pod_within_thirty_minutes_sends_nothing_more_and_a_success_ends_the_series(self):
         s17(self.module)

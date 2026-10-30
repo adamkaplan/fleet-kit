@@ -38,6 +38,7 @@ rebuilt from another record.
 | `bin/lanes.py:55` | `discovery.agents` | looks up lanes by agent | nobody | lane resolution | derived (reader) |
 | `bin/queue_ejections.py:365` | `discovery.agents` | routes an ejection to an owner | nobody | `route_of` | derived (reader) |
 | `bin/reassign.py:164` | `discovery.agents` | finds the worker to reassign | nobody | `reassign` | derived (reader) |
+| `bin/cloud_renewal_alarm.py:127` | `discovery.agents` | the renewal alarm reads the discovered agents to find the worker's boss and the lane recipients | nobody | the renewal alarm | derived (reader) |
 | `bin/fleet-switchboard:138` | `health-records.json` | per agent tool calls, tokens, context, pushes (derived figures) | the daemon via `health_records.Recorder` and `state_write` | the sidebar plugin | derived |
 | `bin/health_records.py:5` | `health-records.json` | defines the file and its shape | `Recorder` (called by the daemon) | the sidebar plugin | derived |
 | `plugins/fleet-decisions-tui/health.mjs:3` | `health-records.json` | reads it for the sidebar's health block | nobody (reader only) | sidebar health view | derived (reader) |
