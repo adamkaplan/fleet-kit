@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 LEASE_NAME = "cw-reaper"
 LEASE_SECONDS = 180          # a holder that has not renewed for this long has lapsed
+LEASE_READ_SECONDS = 10      # the Mac's one lease read
 BEAT_SECONDS = 30            # the lease is renewed during a pass whenever this long has passed (well inside the 60 s the plan asks)
 MISSING_PASS_MINUTES = 10    # a renew time older than this is an alert
 ROLE = "worker"
@@ -47,14 +48,23 @@ class LeaseGate:
         else:
             holder, renewed, version = cur
             ok = (holder == self.holder or (now - renewed).total_seconds() > self.seconds) and self.store.write(self.holder, now, version)
-        if ok:
-            self.last = now
+        self.last = now if ok else None   # a failed write, a conflict or another holder: this holder does not hold it
         return ok
 
+    def holds(self):
+        """True while this holder's last write is younger than the lease time."""
+        return self.last is not None and (self.clock() - self.last).total_seconds() <= self.seconds
+
     def beat(self):
-        """Called before each stop and each renewal of a pass: renews the lease when BEAT_SECONDS have passed since the last renewal."""
+        """Called before each stop and each renewal of a pass: renews the lease when BEAT_SECONDS have passed since the last renewal.
+        Returns whether this holder still holds it (a failed write, a conflict or a read showing another holder: False)."""
         if self.last is None or (self.clock() - self.last).total_seconds() >= BEAT_SECONDS:
-            self()
+            try:
+                return bool(self())
+            except Exception:
+                self.last = None
+                return False
+        return True
 
 
 class MacYieldGate:
@@ -65,9 +75,11 @@ class MacYieldGate:
     def __init__(self, clock, holder="mac", seconds=LEASE_SECONDS):
         self.clock, self.holder, self.seconds = clock, holder, seconds
 
+    renewal_allowed = None   # set below: the ticker's check, the same read
+
     def __call__(self, launcher):
         try:
-            cur = KubectlLeaseStore(launcher.kube).get()
+            cur = KubectlLeaseStore(launcher.kube).get(timeout=LEASE_READ_SECONDS)   # a short bound: a hung read fails open in 10 s, not 120
             if cur is None:
                 return True
             holder, renewed, _ = cur
@@ -76,14 +88,17 @@ class MacYieldGate:
             return True
 
 
+MacYieldGate.renewal_allowed = lambda self, launcher: self(launcher)  # noqa: E731
+
+
 class KubectlLeaseStore:
     """The Lease through the launcher's own Kube door: get, create and replace (the rights get, create, update)."""
 
     def __init__(self, kube, name=LEASE_NAME):
         self.kube, self.name = kube, name
 
-    def get(self):
-        out = self.kube.run(["get", "lease", self.name, "-o", "json"], ok_missing=True)
+    def get(self, timeout=120):
+        out = self.kube.run(["get", "lease", self.name, "-o", "json"], ok_missing=True, timeout=timeout)
         if not out:
             return None
         d = json.loads(out)
@@ -146,8 +161,9 @@ def run_cluster_reaper(env=None, holder="cloud", loop=60, sleep=None, clock=None
     def gate(launcher):
         if not lease:
             lease.append(LeaseGate(KubectlLeaseStore(launcher.kube), holder, clock))
-        launcher.beat = lease[0].beat   # renewed again during the pass, before each stop and renewal
+        launcher.beat = lease[0].beat   # renewed again during the pass, before each stop and renewal; its result says whether the lease is still held
         return lease[0]()
+    gate.renewal_allowed = lambda launcher: bool(lease) and lease[0].holds()   # the renewal thread yields: no renewal while this reaper does not hold the lease
     import cloud_worker
     return cloud_worker._reap_main(env, argparse.Namespace(loop=loop), sleep or time.sleep, clock=clock,
                                    refresher=ClusterModeRefresher(env), gate=gate)

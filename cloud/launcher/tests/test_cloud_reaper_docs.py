@@ -5,7 +5,8 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 README = os.path.join(os.path.dirname(HERE), "README.md")
 PHRASES = ["runs as one restarting workload in the cluster namespace", "It holds exactly these rights", "To turn the Mac's job off",
-           "To roll back", "The owner's steps are"]
+           "To roll back", "The owner's steps are",
+           "could reach the token service: a known limit, low risk", "A lost lease ends the pass", "the renewal thread yields to the lease"]
 
 
 def missing(text):

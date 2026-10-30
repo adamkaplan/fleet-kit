@@ -346,5 +346,135 @@ class TestLeaseDuringPass(unittest.TestCase):
             self.assertGreaterEqual(renewals, 5)
 
 
+# ---- S8 (renewals counted) and S19 (a lost lease ends the pass), and the 10 s bound of the Mac's lease read ----
+def mac_run(lease, ticker_ignores_lease=False):
+    """One real Mac-mode _reap_main over 3 pods past their hard limit and 4 live pods with due tokens; the ticker's tick runs once, in line.
+    Returns (stops, renewals) counted over the tick and the pass."""
+    import argparse
+    import io
+    import contextlib
+    stops, renewals = [], []
+
+    class Refresher:
+        kube = None
+
+        def run(self, force=False):
+            return cw.TokenRefresh("skipped")
+    with tempfile.TemporaryDirectory() as tmp:
+        pods = [pod("w%d" % i, 120) for i in range(3)] + [pod("l%d" % i, 30) for i in range(4)]
+        kube = LeaseKube(env_for(tmp), pods, lease)
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.object(cw, "reaper_lock", return_value=devnull))
+            st.enter_context(mock.patch.object(cw.Launcher, "stop", lambda self, a, reason: stops.append(a.worker) or {}))
+            st.enter_context(mock.patch.object(cw.Launcher, "_renew_git_token", lambda self, p, now, force=False: renewals.append(p) or False))
+            st.enter_context(mock.patch.object(cw.RenewalTicker, "start", lambda self: self.tick()))
+            if ticker_ignores_lease:
+                st.enter_context(mock.patch.object(mode.MacYieldGate, "renewal_allowed", lambda self, launcher: True))
+            st.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            st.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            cw._reap_main(env_for(tmp), argparse.Namespace(loop=0), lambda s: None, clock=lambda: T0, refresher=Refresher(), kube=kube)
+    return len(stops), len(renewals)
+
+
+def check_mac_renewals_yield():
+    stops, renewals = mac_run(lease_doc("cloud", T0 - dt.timedelta(seconds=30)))
+    if (stops, renewals) != (0, 0):
+        raise AssertionError("held: stops %d, renewals %d" % (stops, renewals))
+    return stops, renewals
+
+
+class TestMacRenewalsYield(unittest.TestCase):
+    def test_mac_ticker_renews_nothing_while_the_lease_is_held(self):
+        held = check_mac_renewals_yield()
+        lapsed = mac_run(lease_doc("cloud", T0 - dt.timedelta(seconds=mode.LEASE_SECONDS + 5)))
+        forbidden = mac_run(cw.CloudError("Error from server (Forbidden): leases is forbidden", 1))
+        print("S8: lease held: stops %d, renewals %d; lapsed: stops %d, renewals %d; forbidden: stops %d, renewals %d (fail open)"
+              % (held + lapsed + forbidden))
+        self.assertEqual(lapsed, (3, 8))   # the tick and the pass renew the 4 live pods each
+        self.assertEqual(forbidden, (3, 8))
+
+    def test_mutant_ticker_that_ignores_the_lease_renews_while_held(self):
+        stops, renewals = mac_run(lease_doc("cloud", T0 - dt.timedelta(seconds=30)), ticker_ignores_lease=True)
+        self.assertGreater(renewals, 0)   # the mutation applied: the tick renewed although the lease is held
+        real = mac_run
+        globals()["mac_run"] = lambda lease: real(lease, ticker_ignores_lease=True)
+        try:
+            with self.assertRaises(AssertionError):
+                check_mac_renewals_yield()
+        finally:
+            globals()["mac_run"] = real
+
+
+class TimeoutKube(LeaseKube):
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.timeouts = []
+
+    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
+        if args[:2] == ["get", "lease"]:
+            self.timeouts.append(timeout)
+        return super().run(args, stdin, ok_missing, keep_stdout, timeout, missing_what)
+
+
+class TestLeaseReadBound(unittest.TestCase):
+    def test_mac_lease_read_uses_a_ten_second_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kube = TimeoutKube(env_for(tmp), [], lease_doc("cloud", T0))
+            self.assertFalse(mode.MacYieldGate(lambda: T0)(mock.Mock(kube=kube)))
+            self.assertEqual(kube.timeouts, [10])
+
+
+def lost_pass(honour=True, takeover_after=4):
+    """A pass of 12 stops of 40 fake seconds; after the 4th a second holder takes the lease. Returns (stops after, renewals after, stderr lines)."""
+    import io
+    now, stops, renewals = [T0], [], []
+    store = MemStore()
+    clock = lambda: now[0]  # noqa: E731
+    gate = mode.LeaseGate(store, "cloud", clock)
+    err = io.StringIO()
+    with tempfile.TemporaryDirectory() as tmp:
+        kube = RecordingKube(env_for(tmp), [pod("w%d" % i, 120) for i in range(12)])
+        L = cw.Launcher(kube, env_for(tmp), clock, lambda s: None)
+        L.beat = gate.beat if honour else (lambda: gate.beat() or True)
+
+        def stop(args, reason):
+            now[0] += dt.timedelta(seconds=40)
+            stops.append(args.worker)
+            if len(stops) == takeover_after:
+                store.cur, store.version = ("mac", now[0]), store.version + 1   # the lease lapsed and a second holder took it
+            return {}
+        L.stop = stop
+        L._renew_git_token = lambda p, n, force=False: renewals.append(p) or False
+        assert gate(L)
+        with mock.patch("sys.stderr", err):
+            L.reap()
+            L.renew_git_tokens([pod("l0", 30)], now[0])   # a renewal asked for after the loss, in the same pass
+    lines = [x for x in err.getvalue().splitlines() if "lease lost" in x]
+    return len(stops) - takeover_after, len(renewals), lines
+
+
+class TestLostLease(unittest.TestCase):
+    def test_a_pass_that_lost_the_lease_stops_and_renews_nothing_more(self):
+        stops, renewals, lines = lost_pass()
+        print("S19: stops after the loss %d, renewals after the loss %d, lines %d" % (stops, renewals, len(lines)))
+        self.assertEqual((stops, renewals, len(lines)), (0, 0, 1))
+        self.assertEqual(lines, ["cloud-reaper: lease lost, pass ended"])
+
+    def test_mutant_that_ignores_the_renewal_result_keeps_stopping(self):
+        stops, _, lines = lost_pass(honour=False)
+        self.assertEqual(stops, 8)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(stops, 0)
+        self.assertEqual(lines, [])
+
+    def test_the_cloud_renewal_thread_yields_when_the_lease_is_not_held(self):
+        gate = mode.LeaseGate(MemStore(), "cloud", lambda: T0)
+        self.assertFalse(gate.holds())
+        self.assertTrue(gate())
+        self.assertTrue(gate.holds())
+        self.assertFalse(mode.LeaseGate(gate.store, "mac", lambda: T0)())
+
+
 if __name__ == "__main__":
     unittest.main()
