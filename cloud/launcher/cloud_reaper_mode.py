@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 LEASE_NAME = "cw-reaper"
 LEASE_SECONDS = 180          # a holder that has not renewed for this long has lapsed
+BEAT_SECONDS = 30            # the lease is renewed during a pass whenever this long has passed (well inside the 60 s the plan asks)
 MISSING_PASS_MINUTES = 10    # a renew time older than this is an alert
 ROLE = "worker"
 
@@ -36,16 +37,43 @@ class LeaseGate:
 
     def __init__(self, store, holder, clock, seconds=LEASE_SECONDS):
         self.store, self.holder, self.clock, self.seconds = store, holder, clock, seconds
+        self.last = None   # when this holder last wrote the lease
 
     def __call__(self, _launcher=None):
         now = self.clock()
         cur = self.store.get()
         if cur is None:
-            return self.store.write(self.holder, now, None)
-        holder, renewed, version = cur
-        if holder == self.holder or (now - renewed).total_seconds() > self.seconds:
-            return self.store.write(self.holder, now, version)
-        return False
+            ok = self.store.write(self.holder, now, None)
+        else:
+            holder, renewed, version = cur
+            ok = (holder == self.holder or (now - renewed).total_seconds() > self.seconds) and self.store.write(self.holder, now, version)
+        if ok:
+            self.last = now
+        return ok
+
+    def beat(self):
+        """Called before each stop and each renewal of a pass: renews the lease when BEAT_SECONDS have passed since the last renewal."""
+        if self.last is None or (self.clock() - self.last).total_seconds() >= BEAT_SECONDS:
+            self()
+
+
+class MacYieldGate:
+    """The Mac's (non-cluster) pass: it reads the one Lease through its own cluster login and acts on nothing while another holder has it
+    and it has not lapsed. FAIL OPEN: a Lease that cannot be read (no right, not found, the cluster unreachable, any error) leaves the
+    Mac acting as it always did. It never writes the Lease (it holds no right to)."""
+
+    def __init__(self, clock, holder="mac", seconds=LEASE_SECONDS):
+        self.clock, self.holder, self.seconds = clock, holder, seconds
+
+    def __call__(self, launcher):
+        try:
+            cur = KubectlLeaseStore(launcher.kube).get()
+            if cur is None:
+                return True
+            holder, renewed, _ = cur
+            return holder == self.holder or (self.clock() - renewed).total_seconds() > self.seconds
+        except Exception:
+            return True
 
 
 class KubectlLeaseStore:
@@ -113,8 +141,13 @@ def run_cluster_reaper(env=None, holder="cloud", loop=60, sleep=None, clock=None
     env.setdefault("CW_GIT_TOKEN_CMD", "%s %s" % (sys.executable, os.path.abspath(__file__)))
     clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
 
+    lease = []
+
     def gate(launcher):
-        return LeaseGate(KubectlLeaseStore(launcher.kube), holder, clock)()
+        if not lease:
+            lease.append(LeaseGate(KubectlLeaseStore(launcher.kube), holder, clock))
+        launcher.beat = lease[0].beat   # renewed again during the pass, before each stop and renewal
+        return lease[0]()
     import cloud_worker
     return cloud_worker._reap_main(env, argparse.Namespace(loop=loop), sleep or time.sleep, clock=clock,
                                    refresher=ClusterModeRefresher(env), gate=gate)

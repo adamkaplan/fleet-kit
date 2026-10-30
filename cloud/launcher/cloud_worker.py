@@ -2438,6 +2438,7 @@ class Launcher:
                 if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
                     reason = "idle"
             if reason:
+                self._beat()   # the lease is renewed during a long pass (ask #1582): before each stop
                 self.last_hook = None
                 if pod in live:
                     live.remove(pod)
@@ -2452,6 +2453,15 @@ class Launcher:
         out.extend(renewed)
         self.send_wip_notes(live, now)
         return out
+
+    def _beat(self):
+        """The hook of the lease holder (set by the cloud reaper's gate, None otherwise): never raises, never stops a pass."""
+        beat = getattr(self, "beat", None)
+        if beat:
+            try:
+                beat()
+            except Exception:
+                pass
 
     def note_slow_pass(self, took):
         """A pass that took longer than SLOW_PASS_SECONDS: ONE line on the reaper's own log and ONE audit line with the seconds. A short pass: none."""
@@ -2503,6 +2513,7 @@ class Launcher:
     def _renew_locked(self, pods, now):
         out, relogged = [], False
         for pod in pods:
+            self._beat()   # the lease is renewed during a long pass: before each renewal
             worker = ann(pod, "worker")
             try:
                 try:
@@ -3269,6 +3280,10 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
     try:
         lock = reaper_lock(reaper_identity(env.get("CW_CLOUD_NAMESPACE", "cw")))   # BEFORE the first pass: two reapers would both run an end hook for one pod
         refresher = refresher or ClusterTokenRefresher(env, clock)
+        if gate is None:
+            # The Mac's (non-cluster) mode yields to the cloud reaper's Lease. FAILS OPEN: a Lease that cannot be read acts as today.
+            from cloud_reaper_mode import MacYieldGate
+            gate = MacYieldGate(clock)
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         ticker = None
         while True:

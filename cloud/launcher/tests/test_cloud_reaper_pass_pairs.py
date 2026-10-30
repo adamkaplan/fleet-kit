@@ -216,5 +216,135 @@ class TestLiveness(unittest.TestCase):
         self.assertEqual(mode.status_line(T0 - 3 * MIN), "cloud reaper last pass: 2026-10-29T20:57:00Z")
 
 
+# ---- S8 strengthened: the REAL default path of _reap_main in the Mac's mode; S18: the lease during a long pass ----
+class LeaseKube(RecordingKube):
+    """A fake cluster: the Lease reads as `lease` (a dict), or raises the error named; every other call is recorded by RecordingKube."""
+
+    def __init__(self, env, pods, lease):
+        super().__init__(env, pods)
+        self.lease = lease
+
+    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
+        if args[:2] == ["get", "lease"]:
+            self.calls.append(("get", "leases"))
+            if isinstance(self.lease, Exception):
+                raise self.lease
+            return json.dumps(self.lease) if self.lease else ""
+        return super().run(args, stdin, ok_missing, keep_stdout, timeout, missing_what)
+
+
+def lease_doc(holder, renewed):
+    return {"metadata": {"resourceVersion": "7"}, "spec": {"holderIdentity": holder, "renewTime": renewed.strftime("%Y-%m-%dT%H:%M:%S.000000Z")}}
+
+
+def mac_pass(lease, ignore_lease=False):
+    """One real Mac-mode pass over 3 pods past their hard limit; returns the number of stops. The lease is never written by the Mac."""
+    import argparse
+    import io
+    import contextlib
+    stops = []
+
+    class Refresher:
+        kube = None
+
+        def run(self, force=False):
+            return cw.TokenRefresh("skipped")
+    with tempfile.TemporaryDirectory() as tmp:
+        kube = LeaseKube(env_for(tmp), [pod("w%d" % i, 120) for i in range(3)], lease)
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        patches = [mock.patch.object(cw, "reaper_lock", return_value=devnull),
+                   mock.patch.object(cw.Launcher, "stop", lambda self, a, reason: stops.append(a.worker) or {})]
+        if ignore_lease:
+            patches.append(mock.patch.object(mode, "MacYieldGate", lambda clock: (lambda launcher: True)))
+        with contextlib.ExitStack() as st:
+            for p in patches:
+                st.enter_context(p)
+            st.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            st.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            cw._reap_main(env_for(tmp), argparse.Namespace(loop=0), lambda s: None, clock=lambda: T0, refresher=Refresher(), kube=kube,
+                          ticker_wait=lambda: __import__("time").sleep(0.01))
+        writes = [c for c in kube.calls if c[0] in ("create", "update", "patch") and c[1] == "leases"]
+    return len(stops), len(writes)
+
+
+def check_mac_yields():
+    held, _ = mac_pass(lease_doc("cloud", T0 - 30 * dt.timedelta(seconds=1)))
+    if held != 0:
+        raise AssertionError("the Mac acted %d times while the lease is held" % held)
+    return held
+
+
+class TestMacYields(unittest.TestCase):
+    def test_mac_default_path_yields_to_a_live_lease_and_fails_open(self):
+        held = check_mac_yields()
+        lapsed, w1 = mac_pass(lease_doc("cloud", T0 - dt.timedelta(seconds=mode.LEASE_SECONDS + 5)))
+        forbidden, w2 = mac_pass(cw.CloudError("Error from server (Forbidden): leases is forbidden", 1))
+        missing, w3 = mac_pass(None)
+        unreadable, _ = mac_pass(OSError("cluster unreachable"))
+        print("S8: lease held %d actions, lapsed %d, forbidden %d (fail open), not found %d, unreachable %d" % (held, lapsed, forbidden, missing, unreadable))
+        self.assertEqual((held, lapsed, forbidden, missing, unreadable), (0, 3, 3, 3, 3))
+        self.assertEqual((w1, w2, w3), (0, 0, 0))   # the Mac never writes the lease
+
+    def test_mutant_mac_pass_that_ignores_the_lease_fails(self):
+        real = mac_pass
+        globals()["mac_pass"] = lambda lease: real(lease, ignore_lease=True)
+        try:
+            with self.assertRaises(AssertionError):
+                check_mac_yields()
+        finally:
+            globals()["mac_pass"] = real
+
+
+def long_pass(beats=True):
+    """A cloud reaper pass of 300 fake seconds over 12 pods past their hard limit (a stop takes 25 s); a second holder tries the lease at each stop."""
+    now, renewals, takeovers = [T0], [0], [0]
+
+    class Store(MemStore):
+        def write(self, holder, when, version):
+            ok = super().write(holder, when, version)
+            renewals[0] += ok and holder == "cloud"
+            return ok
+    store = Store()
+    clock = lambda: now[0]  # noqa: E731
+    gate, rival = mode.LeaseGate(store, "cloud", clock), mode.LeaseGate(store, "mac", clock)
+    if not beats:
+        gate.beat = lambda: None   # the mutant: renewed only when the pass starts
+    with tempfile.TemporaryDirectory() as tmp:
+        kube = RecordingKube(env_for(tmp), [pod("w%d" % i, 120) for i in range(12)])
+        L = cw.Launcher(kube, env_for(tmp), clock, lambda s: None)
+        L.beat = gate.beat
+
+        def stop(args, reason):
+            now[0] += dt.timedelta(seconds=25)
+            takeovers[0] += bool(rival())   # a second holder tries to take the lease during the pass: the cluster refuses it
+            return {}
+        L.stop = stop
+        self_assert = gate(L)
+        assert self_assert
+        with mock.patch("sys.stderr"):
+            L.reap()
+    return renewals[0], takeovers[0], (now[0] - T0).total_seconds()
+
+
+class TestLeaseDuringPass(unittest.TestCase):
+    def test_renewed_during_a_long_pass_and_no_takeover(self):
+        renewals, takeovers, secs = long_pass()
+        print("S18: renewals %d in %d s, takeovers %d" % (renewals, secs, takeovers))
+        self.assertEqual(secs, 300)
+        self.assertGreaterEqual(renewals, 5)
+        self.assertEqual(takeovers, 0)
+
+    def test_a_stale_version_write_loses_the_lease(self):
+        store = MemStore()
+        self.assertTrue(store.write("cloud", T0, None))
+        self.assertFalse(store.write("mac", T0, "0"))
+
+    def test_mutant_renewal_only_at_the_start_fails(self):
+        renewals, takeovers, _ = long_pass(beats=False)
+        self.assertEqual(renewals, 1)
+        with self.assertRaises(AssertionError):
+            self.assertGreaterEqual(renewals, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

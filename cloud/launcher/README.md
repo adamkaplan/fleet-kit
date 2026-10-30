@@ -535,7 +535,25 @@ value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault se
 
 ## The reaper in the cluster (ask #1582)
 
-The cloud reaper runs as one restarting workload in the cluster namespace, under its own service account, beside the Mac's job. It holds exactly these rights: get, list, patch and delete on pods, create on pods/exec, get, patch and delete on Secrets, and get, create and update on Leases; it holds no App key, vault login or repository token, and git tokens come from the token service, which alone mounts the key. To turn the Mac's job off after the live proof, unload the Mac's reaper job (the managed reaper's service) once; the lease keeps one reaper acting until then. To roll back, delete the workload and its lease and reload the Mac's job. The owner's steps are the role, the service account, the token path and the lease permission, applied by the administrator with dry runs first:
+The cloud reaper runs as one restarting workload in the cluster namespace, under its own service account, beside the Mac's job. It holds exactly these rights: get, list, patch and delete on pods, create on pods/exec, get, patch and delete on Secrets, and get, create and update on Leases; it holds no App key, vault login or repository token, and git tokens come from the token service, which alone mounts the key. The token service, its service account, its Service, its network policy and the key Secret live in a namespace of their own, `cw-tokens`, so that no right of the reaper's account (all in `cw`) reaches the key: the reaper's call crosses namespaces by the full address in `CW_TOKEN_SERVICE_URL`, and the network policy of `cw-tokens` admits ingress only from pods labelled `app=cw-cloud-reaper` in the namespace `cw`. Both workloads run as a non-root user with a read-only root filesystem, no privilege escalation, all capabilities dropped, the runtime's default seccomp profile, and requests and limits; each has a writable emptyDir at `/tmp` (the reaper's audit, run records and lock go under `/tmp`: `HOME` and `XDG_STATE_HOME` point there, so the image needs a user entry for uid 10001 whose home is `/tmp`). The image reference of both is a placeholder digest of zeros (`registry.example.internal/cw/launcher@sha256:0000...0000`, which cannot run): the administrator replaces it with the launcher image's digest (an owner step; the real digest is private). The token service has a TCP liveness and readiness probe and a 10-second socket timeout (a client that sends nothing is cut); the reaper has no probe, as it has no endpoint and an exec probe needs a command, and its liveness is the Lease's renew time. The lease is renewed at the start of a pass and again before each stop and each renewal whenever 30 seconds have passed since the last renewal (inside the 60 seconds the plan asks), so a long pass keeps it; a second holder's write of a stale version is refused by the cluster.
+
+Known limits, stated plainly: the bearer travels over plain http inside the cluster, and the TokenReview carries no audience; the network policy is the barrier and needs a network plugin that enforces it (the administrator checks that it does); the reaper's account can patch pods in its namespace, so it can relabel one (low risk, noted).
+
+**The Mac yields.** In its own mode the Mac's reaper reads the one Lease the cloud reaper holds (`cw-reaper`) through its own cluster login before each pass: a Lease held by another holder and not lapsed makes the pass act on nothing; a Lease that cannot be read (no right, not found, the cluster unreachable, any error) leaves the Mac acting as it always did (it FAILS OPEN). So the Mac yields only after the administrator adds the right to read Leases to the operator's Role (one more owner step; `cloud/k8s/operator-rbac.yaml` is not changed by this branch). The rule, as a copy-paste block with its dry run and its way back:
+
+```
+# the rule to add to the Role cw-operator (namespace cw): get on the one Lease
+#   - apiGroups: ["coordination.k8s.io"]
+#     resources: ["leases"]
+#     resourceNames: ["cw-reaper"]
+#     verbs: ["get"]
+kubectl -n cw get role cw-operator -o yaml > /tmp/cw-operator-role.yaml      # edit the file to add the rule above
+kubectl apply --dry-run=server -f /tmp/cw-operator-role.yaml                  # the dry run
+kubectl apply -f /tmp/cw-operator-role.yaml                                   # the step
+# way back: remove the rule from the file and apply it again (the Mac then acts as before: it fails open)
+```
+
+To turn the Mac's job off after the live proof, unload the Mac's reaper job (the managed reaper's service) once; the lease keeps one reaper acting until then. To roll back, delete the workload and its lease and reload the Mac's job. The owner's steps are the role, the service account, the token path and the lease permission, applied by the administrator with dry runs first. The namespace steps: the administrator applies `cloud/k8s/cw-token-service.yaml` (its first document creates the namespace `cw-tokens`), the owner creates the key Secret `cw-app-key` in `cw-tokens` (it is not defined in the file), and the administrator replaces both image placeholders with the launcher image's digest:
 
 ```
 kubectl apply --dry-run=server -f cloud/k8s/cw-cloud-reaper.yaml

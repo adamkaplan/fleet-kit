@@ -185,7 +185,7 @@ class TestKeyNamespace(unittest.TestCase):
         print("S16: rights reaching the key namespace %d, key secrets outside the reaper namespace %d" % (reaching, outside))
         self.assertEqual((reaching, outside), (0, 1))
 
-    def test_network_policy_admits_only_the_reaper_namespace_and_pods(self):
+    def test_network_policy_names_the_reaper_namespace_and_pods(self):
         pol = [d for d in parse(read(SERVICE)) if d.get("kind") == "NetworkPolicy"][0]
         frm = pol["spec"]["ingress"][0]["from"]
         self.assertEqual(len(frm), 1)
@@ -211,7 +211,7 @@ class TestHardening(unittest.TestCase):
         print("S17: mutable images %d, workloads with the security settings %d of 2" % (mutable, ok))
         self.assertEqual((mutable, ok), (0, 2))
 
-    def test_the_token_service_has_both_probes_and_the_caller_setting(self):
+    def test_the_token_service_has_both_probes_and_the_identity_setting(self):
         c = deployment(read(SERVICE))["spec"]["template"]["spec"]["containers"][0]
         self.assertEqual(c["livenessProbe"]["tcpSocket"]["port"], "8080")
         self.assertEqual(c["readinessProbe"]["tcpSocket"]["port"], "8080")
