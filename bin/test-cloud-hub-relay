@@ -42,11 +42,12 @@ class Hub:
         (t / "agents.json").write_text(json.dumps(agents or {
             "pod-a": {"url": "http://127.0.0.1:1", "session": "s1", "password_file": "x", "repo": "acme-org/widget-service", "issue": 7},
             "pod-b": {"url": "http://127.0.0.1:1", "session": "s2", "password_file": "x", "repo": "acme-org/widget-api", "issue": 8}}))
+        (t / "decisions.json").write_text('{"decisions": [], "errors": []}')   # GET /decisions answers 503 without a file since #1158
         self.lines = []
         agents_path = str(t / "agents.json")
         self.relay = relay_mod.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=wait, **relay_kw)
         self.server = hub_mod.make_hub(("127.0.0.1", 0), cloud_hub.make_secrets_reviewer(str(t / "secrets.json"), "fleet-agents"),
-                                         cloud_hub.Inbox(agents_path), self.lines.append, relay=self.relay, daemon="daemon", max_handlers=max_handlers, namespace="fleet-agents")
+                                         cloud_hub.Inbox(agents_path), self.lines.append, str(t / "decisions.json"), relay=self.relay, daemon="daemon", max_handlers=max_handlers, namespace="fleet-agents")
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.port = self.server.server_address[1]
 
@@ -391,17 +392,38 @@ class TestBoundsAndCaps(unittest.TestCase):
                 s = socket.create_connection(("127.0.0.1", hub.port))
                 s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-a-1\r\nContent-Length: 100\r\n\r\n")
                 t0 = time.time()
+                import select
+                sent, readable_at = 0, None
                 for _ in range(8):   # a byte every 0.4 s would pass a per-read timeout
                     try: s.sendall(b" ")
                     except OSError: break
                     time.sleep(0.4)
+                    sent += 1
+                    if readable_at is None and select.select([s], [], [], 0)[0]: readable_at = sent
+                self.assertTrue(readable_at is not None and readable_at < 8, readable_at)   # the 408 was readable mid-trickle, before the 8th byte
                 data = s.recv(4096)
                 self.assertIn(b" 408 ", data.split(b"\r\n")[0])
-                self.assertLess(time.time() - t0, 3.5)
+                self.assertLess(time.time() - t0, 20.0)   # a hang guard only (20x the 1.0 s body deadline); the observation is the 408 itself
                 s.close()
                 self.assertEqual(hub.relay.inflight, 0)
         finally:
             cloud_relay.BODY_DEADLINE = old
+
+    def test_slow_body_trickle_mutant_never_cuts(self):
+        old_src = "time.monotonic() + cloud_relay.BODY_DEADLINE"
+        src = Path(cloud_hub.__file__).read_text()
+        self.assertIn(old_src, src)
+        self.assertNotEqual(src.replace(old_src, "time.monotonic() + 1000"), src)
+        mod = mutant(cloud_hub, old_src, "time.monotonic() + 1000")
+        orig = cloud_hub.make_hub
+        cloud_hub.make_hub = mod.make_hub
+        case = TestBoundsAndCaps("test_slow_body_trickle_cut_at_deadline")
+        try:
+            with self.assertRaises(AssertionError):
+                case.test_slow_body_trickle_cut_at_deadline()
+        finally:
+            cloud_hub.make_hub = orig
+            case.doCleanups()
 
     def test_held_wait_caps_keep_daemon_routes_alive(self):
         # per pod 4, global 6; both pods saturate, a refused call queues nothing, the daemon still gets through
