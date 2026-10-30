@@ -1,6 +1,10 @@
 """#1642: `launch --model PROVIDER/MODEL --reasoning LEVEL`. build(host) gives the tests the fixtures of bin/test-switchboard."""
+import importlib.machinery
+import importlib.util
 import io
 import json
+import os
+from pathlib import Path
 import re
 import sys
 from unittest import mock
@@ -171,3 +175,67 @@ def build():
             self.assertEqual(self.reads, [])
 
     return TestLaunchModel
+
+
+def build_cloud():
+    """S8, U8: the cloud route, on the fixtures of bin/test-cloud-worker (a fake pod service and a stub launcher); only the class below is exposed."""
+    path = Path(__file__).resolve().parents[2] / "bin" / "test-cloud-worker"
+    loader = importlib.machinery.SourceFileLoader("cw_for_launch_model", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("cw_for_launch_model", loader))
+    sys.modules["cw_for_launch_model"] = module
+    loader.exec_module(module)
+
+    class TestLaunchModelCloud(module.Base):
+        """The pod's session carries the model; another provider is refused before any token or cluster call; the pod's refusal of a level is reported."""
+
+        def session_bodies(self):
+            return [body for method, path, body in self.remote.bodies if method == "POST" and path == "/api/session"]
+
+        def test_s8_the_pod_session_carries_the_model_and_a_launch_without_options_does_not(self):
+            code, out, err = self.launch_with("--cloud", "--model", "github-copilot/model-a", "--reasoning", "medium")
+            self.assertEqual(code, 0, err)
+            (body,) = self.session_bodies()
+            self.assertEqual(body["model"], {"providerID": "github-copilot", "id": "model-a", "variant": "medium"})
+            self.assertEqual(body["agent"], "cloud-worker" if "cloud-worker" in body["agent"] else body["agent"])
+            record = body["metadata"]["fleet"]
+            self.assertEqual((record["model"], record["reasoning"]), ("github-copilot/model-a", "medium"))
+
+        def test_s8_a_launch_with_neither_option_has_no_model_key_and_no_record_keys(self):
+            code, out, err = self.launch_with("--cloud")
+            self.assertEqual(code, 0, err)
+            (body,) = self.session_bodies()
+            self.assertNotIn("model", body)
+            self.assertFalse({"model", "reasoning"} & set(body["metadata"]["fleet"]))
+
+        def test_u8_another_providers_model_is_refused_before_any_token_or_cluster_call(self):
+            code, out, err = self.launch_with("--cloud", "--model", "acme-provider/model-a")
+            self.assertNotEqual(code, 0)
+            lines = [line for line in err.splitlines() if "--model" in line]
+            self.assertEqual(len(lines), 1, err)
+            self.assertIn("a cloud worker holds credentials for the provider github-copilot only", lines[0])
+            self.assertIn("#1085", lines[0])
+            self.assertEqual(self.stub_calls(), [])
+            self.assertEqual(self.remote.requests, [])
+
+        def test_u8_a_level_the_pod_does_not_list_is_the_pods_refusal_in_one_line(self):
+            handler = self.remote.server.RequestHandlerClass
+            real = handler.do_POST
+
+            def post(h):
+                if h.path == "/api/session":
+                    length = int(h.headers.get("Content-Length") or 0)
+                    body = json.loads(h.rfile.read(length))
+                    self.remote.bodies.append(("POST", h.path, body))
+                    if (body.get("model") or {}).get("variant") == "xhigh":
+                        return h._answer(400, {"message": "variant xhigh is not listed for model-a"})
+                    return h._answer(200, {"data": {"id": "ses_remote1"}})
+                return real(h)
+            handler.do_POST = post
+            code, out, err = self.launch_with("--cloud", "--model", "github-copilot/model-a", "--reasoning", "xhigh")
+            self.assertNotEqual(code, 0)
+            lines = [line for line in err.splitlines() if "xhigh" in line]
+            self.assertEqual(len(lines), 1, err)
+            self.assertIn("variant xhigh is not listed for model-a", lines[0])
+            self.assertFalse((self.state / "cloud" / "coder7.json").exists(), "the launch was undone")
+
+    return TestLaunchModelCloud

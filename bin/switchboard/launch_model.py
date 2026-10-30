@@ -72,7 +72,16 @@ def launch_model_note(fleet):
     return "  model %s%s" % (model, " reasoning %s" % level if level else "") if isinstance(model, str) else ""
 
 
-def launch_model_cloud_refusal(args):
-    """Until the cloud route carries the options: a cloud launch given one is refused, never silently run on another model."""
-    if getattr(args, "cloud", False) and (getattr(args, "model", None) or getattr(args, "reasoning", None)):
-        raise LaunchError("--model and --reasoning are not carried by --cloud yet: launch locally, or drop them")
+def launch_model_cloud(args, provider):
+    """The choice of a cloud launch ({} when none): the same shape rules as a local launch, and a model of another provider than the launcher's `provider`
+    is refused with one line (the pod holds that provider's credentials only). The level is NOT checked here: the pod's own model list decides, on session.create."""
+    model, level = getattr(args, "model", None), getattr(args, "reasoning", None)
+    if model is None and level is None:
+        return {}
+    if model is None:
+        raise LaunchError("--reasoning needs --model PROVIDER/MODEL: the level is one of that model's own levels; add --model or drop --reasoning")
+    choice = launch_model_syntax(model, level)
+    if model.partition("/")[0] != provider:
+        raise LaunchError("refused: --model PROVIDER/MODEL: a cloud worker holds credentials for the provider %s only (a model of another provider needs the provider "
+                          "credential work, #1085): use a %s model or launch locally" % (provider, provider))
+    return choice

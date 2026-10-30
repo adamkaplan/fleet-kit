@@ -14240,7 +14240,6 @@ def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
-    launch_model_cloud_refusal(args)   # #1642: until the cloud route carries the options
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)

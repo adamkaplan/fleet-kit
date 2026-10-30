@@ -1329,6 +1329,7 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
+    choice = H["launch_model_cloud"](args, MODEL_PROVIDER)   # #1642: before any setting, token or cluster call
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
@@ -1432,12 +1433,13 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise LaunchError("%s: %s (the worker %s was created; %s)" % (
                 name, problem, name, "it was stopped and its record dropped" if stopped else "the stop failed: the pod and its record are kept; stop it with `%s retire %s`" % (H["PROG"], name)))
-        fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo)
+        fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo, None, None, choice)
         try:
             with tunnel(cluster, record) as live:
                 v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
                 session = v2.session_create(args.agent if args.agent == "orchestrator" else CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
-                                            {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}})["id"]
+                                            {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}},
+                                            **H["launch_model_kwargs"](choice))["id"]
                 record["session"] = session
                 save_record(state, record)
                 if hub:   # the hub entry gets the session id (the launcher's one verb for it; the cluster login is the launcher's own)
