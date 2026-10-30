@@ -641,7 +641,7 @@ class PastedBlockGuard(unittest.TestCase):
             env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
             if value is not None:
                 env["NS"] = value
-            r = subprocess.run(["sh", "-c", first + '\nns_ok\nrc=$?\necho "rc=$rc still-open"'],
+            r = subprocess.run(["bash", "-c", first + '\nns_ok\nrc=$?\necho "rc=$rc still-open"'],
                                env=env, capture_output=True, text=True, timeout=30)
             self.assertIn("rc=%d still-open" % want, r.stdout, name)
             self.assertEqual(r.returncode, 0, name)
@@ -672,7 +672,7 @@ def stub_calls(section, ns_line, only=None, teardown=False):
         work = os.path.join(scratch, "work")
         os.mkdir(work)
         env = {"PATH": bindir + ":/usr/bin:/bin", "STUB_LOG": log, "HOME": scratch}
-        subprocess.run(["sh", "-c", text], cwd=work, env=env, capture_output=True, text=True, timeout=60)
+        subprocess.run(["bash", "-c", text], cwd=work, env=env, capture_output=True, text=True, timeout=60)
         if not os.path.exists(log):
             return []
         with open(log) as f:
@@ -780,7 +780,7 @@ class OnceAndLabel(unittest.TestCase):
                 f.write('#!/bin/sh\necho "$*" >> "$STUB_LOG"\nexit 0\n')
             os.chmod(os.path.join(bindir, "kubectl"), 0o755)
             env = {"PATH": bindir + ":/usr/bin:/bin", "STUB_LOG": log}
-            subprocess.run(["sh", "-c", text, "sh", value], env=env, capture_output=True, text=True, timeout=30)
+            subprocess.run(["bash", "-c", text, "sh", value], env=env, capture_output=True, text=True, timeout=30)
             if not os.path.exists(log):
                 return 0
             with open(log) as f:
@@ -800,6 +800,32 @@ class OnceAndLabel(unittest.TestCase):
         finally:
             self.first = saved
         self.assertEqual(self.calls_for("cw "), 0)
+
+
+class HistoryExpansion(unittest.TestCase):
+    def hits(self, text):
+        blocks = code_blocks(text)
+        n = 0
+        for b in blocks:
+            for line in b.split("\n"):
+                for i, c in enumerate(line):
+                    if c == "!" and line[i + 1:i + 2] not in ("", " ", "=", "("):
+                        n += 1
+        return n, len(blocks)
+
+    def test_every_code_block_of_the_runbook_has_no_history_expansion_trigger(self):
+        with open(DOCS, encoding="utf-8") as f:
+            doc = f.read()
+        n, blocks = self.hits(doc)
+        print("S-hist: exclamation marks that could expand %d in %d code blocks" % (n, blocks))
+        self.assertEqual(n, 0)
+
+    def test_mutant_the_old_negated_bracket_is_one_hit(self):
+        with open(DOCS, encoding="utf-8") as f:
+            doc = f.read()
+        mutant = doc.replace("*[^abcdefghijklmnopqrstuvwxyz", "*[!abcdefghijklmnopqrstuvwxyz")
+        self.assertNotEqual(mutant, doc)
+        self.assertEqual(self.hits(mutant)[0], 1)
 
 
 if __name__ == "__main__":
