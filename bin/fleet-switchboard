@@ -18776,7 +18776,7 @@ def _unjudged(who, runner, now, why, ctx=None):
             engine, state, _ = build_engine(runner, now, "cli", writable=False)
             repo, number, _ = _ledger_pr(types.SimpleNamespace(pr=who.pr, plan=None, ask=None))
             body = pr_picture(engine, repo, number, state)[1]
-        has_claim = plan_ledger.claim_text(body) is not None
+        has_claim = plan_ledger.claim_text(body) is not None or plan_ledger.misplaced_claim(body) is not None
     except Exception:
         has_claim = True
     if not has_claim:
@@ -18798,7 +18798,7 @@ def claim_union_refusal(args, runner, now):
         return _unjudged(ctx, runner, now, "the plan check is not pass", ctx)
     body = (ctx.facts or {}).get("body")
     scenarios = ctx.plan["scenarios_parsed"]
-    claiming = plan_ledger.pr_claim(body, scenarios)[0] is not None
+    claiming = plan_ledger.pr_claim(body, scenarios) != (None, None)   # a refused claim line is a claim line: a misplaced one fails the gate closed
 
     def refuse(what, text):
         if _cu_waived(args, runner, now, what, ctx):
@@ -18835,7 +18835,7 @@ def unclaimed_verdict(args, ctx, runner, now, body=None):
     try:
         peers = plan_peers(ctx, runner, now, closed if body is None else None)   # the merge gate's union read stays the plain one
     except Exception as err:
-        if body is not None and plan_ledger.pr_claim(body, scenarios)[0] is None:
+        if body is not None and plan_ledger.pr_claim(body, scenarios) == (None, None):
             return None   # a pull request with no claim line claims every per-PR scenario: the union is covered whatever the peers say (docs/switchboard.md)
         what = "unknown sibling" if isinstance(err, ClaimUnknown) else "too many pull requests" if PEERS_TOO_MANY in str(err) else "list error"
         found = (what, "the claim union could not be read (%s); the gate fails closed for a pull request with a claim line" % _one_line(str(err), 100), [], [])
