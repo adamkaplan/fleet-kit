@@ -398,6 +398,7 @@
         "bin/agent_presence.py",
         "bin/awaiting_live.py",
         "bin/ci_runs.py",
+        "bin/cloud_renewal_alarm.py",
         "bin/cloud_worker.py",
         "bin/cpu_guard.py",
         "bin/dead_hint.py",
@@ -459,6 +460,9 @@
           "latest_runs",
           "newest",
           "own_repo"
+        ],
+        "bin/cloud_renewal_alarm.py": [
+          "validate"
         ],
         "bin/cloud_worker.py": [
           "read_record_file"

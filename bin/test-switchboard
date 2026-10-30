@@ -69645,6 +69645,9 @@ TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAll
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
+# The alarm on a failed token renewal (#1579).
+_renewal_alarm = importlib.import_module("test_cloud_renewal_alarm")
+TestCloudRenewalAlarm, TestCloudRenewalAlarmWired, TestCloudRenewalAlarmMutants = _renewal_alarm.TestCloudRenewalAlarm, _renewal_alarm.TestCloudRenewalAlarmWired, _renewal_alarm.TestCloudRenewalAlarmMutants
 
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")

@@ -69,6 +69,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `guard_alert.py` | 2 | the standalone alert of a bad installed tree, run from the state directory with nothing of the kit (#1380) | |
 | `guard_record_head_move.py` | 2 | the standalone recorder a git hook runs at each move of the installed tree's HEAD (#1380) | |
 | `decision_core.py` | 3 | the pure core of the Decision subsystem | |
+| `cloud_renewal_alarm.py` | 4 | the alarm on a failed git-token renewal of a cloud pod, read from the launcher's audit tail (#1579) | |
 | `cpu_guard.py` | 4 | the CPU guard: numbers, a clock and a state directory in; a verdict out | |
 | `decision_sync.py` | 4 | the sync engine between the Decision list and an external decision system | |
 | `decisions_pull.py` | 4 | rewrite the local decisions file from a remote source | |

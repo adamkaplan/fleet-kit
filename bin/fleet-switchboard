@@ -9547,6 +9547,15 @@ def cloud_watch_tick(engine, discovery):
     return result
 
 
+def cloud_renewal_alarm_tick(engine, discovery):
+    """#1579: the alarm on a failed token renewal of a cloud pod, from the launcher's audit tail (bin/cloud_renewal_alarm.py)."""
+    def boss_of(worker):
+        sender = cloud_sender(engine.state_dir, worker)
+        return boss_name(discovery, sender) if sender is not None else None
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None) if discovery is not None else None
+    return load_module("cloud_renewal_alarm").tick(engine, discovery, add_repeat_reminder, hold_reason, boss_of, cos)
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -9570,6 +9579,10 @@ def finish_pass(engine, discovery, report):
         cloud_watch_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-watch", "cloud-watch", err, report)
+    try:
+        cloud_renewal_alarm_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("cloud-renewal-alarm", "cloud-renewal-alarm", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:
