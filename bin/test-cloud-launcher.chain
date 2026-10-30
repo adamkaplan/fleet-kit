@@ -33,6 +33,7 @@ cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_issues_read.py
+cloud/launcher/tests/test_m_cap.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
