@@ -231,7 +231,7 @@ def build():
             end = source.index("    path = root")
             mutated = source[:start] + source[end:]
             self.assertNotEqual(mutated, source)   # applied
-            scope = dict(globals())
+            scope = {"Path": Path, "importlib": importlib, "sys": sys, "unittest": unittest}
             exec(mutated, scope)
             with tempfile.TemporaryDirectory() as tmp:
                 with self.assertRaises(Exception):
