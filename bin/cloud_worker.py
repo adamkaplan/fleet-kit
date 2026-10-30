@@ -44,7 +44,7 @@ DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch 
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret"}
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret", "no_wait": "--no-wait"}
 LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
@@ -57,6 +57,7 @@ SETUP_PREAMBLE = """Setup (do this first, before the task below):
 Task:
 """
 RECORD_MAX = 8192
+BRIEF_MAX = 4_000_000   # the kept text of a no-wait launch's brief (the file read_brief already bounded)
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
 STOP_SECONDS = 600
@@ -262,7 +263,7 @@ def save_record(state, record):
 
 
 def remove_record(state, name):
-    for path in (record_path(state, name), password_path(state, name)):
+    for path in (record_path(state, name), password_path(state, name), brief_path(state, name)):
         try:
             os.unlink(str(path))
         except FileNotFoundError:
@@ -1326,8 +1327,11 @@ def _launch(args, runner, now, reserve):
     if local is not None:   # `route` prefers a cloud record: every later send/read/retire for the local agent would go INTO the pod
         raise LaunchError("a local fleet agent named %s exists: a cloud worker cannot take its name (send, read and retire by name would reach "
                           "the pod instead of the local agent); retire it or pick another name; nothing was created" % name)
-    if load_record(state, name) is not None:
-        raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
+    existing = load_record(state, name)
+    if existing is not None:   # a second launch of a name (#1619): returned, finished (no-wait), refused or (a gone pod) the name is freed
+        done = _launch_again(args, runner, engine, state, existing, repo, branch)
+        if done is not None:
+            return done
     brief = H["read_brief"](args.brief_file, sys.stdin)
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
     options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
@@ -1341,6 +1345,11 @@ def _launch(args, runner, now, reserve):
         options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
         options.append(CREATE_OPTION["stack"])
+    no_wait = bool(getattr(args, "no_wait", False))
+    if no_wait:   # only on request: the launcher requests the pod and returns; the same launch command finishes it later
+        if getattr(args, "stack", False):
+            raise LaunchError("--no-wait does not combine with --stack (a stack pod's start is its own wait); nothing was created")
+        options.append(CREATE_OPTION["no_wait"])
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
     stack_model = stack_model_secret() if getattr(args, "stack", False) else None   # before any cluster call; without --stack the setting is ignored
@@ -1413,6 +1422,19 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise LaunchError("%s: %s (the worker %s was created; %s)" % (
                 name, problem, name, "it was stopped and its record dropped" if stopped else "the stop failed: the pod and its record are kept; stop it with `%s retire %s`" % (H["PROG"], name)))
+        if no_wait:   # the pod is requested: keep what the finishing call needs (the run id, the brief once) and return at once
+            try:
+                record["state"], record["run_id"] = "starting", run_id
+                if brief:
+                    _write_private(brief_path(state, name), brief)
+                save_record(state, record)
+            except (CloudError, OSError) as err:
+                remove_record(state, name)
+                _stop_after_failure(engine, runner, name, run_id, "launch: record not stored", cluster)
+                raise LaunchError("the worker was requested but its record could not be stored (%s); stop was requested" % _one(cluster.clean(str(err), 100), 100)) from None
+            print("starting: %s requested; run the same launch command again to finish it, or read %s / status to poll" % (name, name), file=sys.stderr)
+            print(json.dumps(_launch_line(record), sort_keys=True))
+            return H["EXIT_OK"]
         fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo)
         try:
             with tunnel(cluster, record) as live:
@@ -1439,6 +1461,98 @@ def _launch(args, runner, now, reserve):
             raise
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
+    return H["EXIT_OK"]
+
+
+def brief_path(state, name):
+    return cloud_dir(state) / (name + ".brief")
+
+
+def _launch_line(record, **extra):
+    """The one JSON line of a launch (name, session, runtime_id, url, cloud) for a record; `extra` adds keys (existing, state)."""
+    line = {"name": record["worker"], "session": record.get("session"), "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}
+    if record.get("state") == "starting":
+        line["state"] = "starting"
+    line.update(extra)
+    return line
+
+
+def _launch_again(args, runner, engine, state, record, repo, branch):
+    """A launch of a name that has a record. Returns the exit code when the launch is decided here (the worker returned, still starting, finished,
+    or refused), or None when the record was cleared (its pod is gone and its hard deadline passed) and a new worker is to be made."""
+    LaunchError = H["LaunchError"]
+    name = args.name
+    if not _ended(record):
+        if record.get("state") == "starting":
+            return _finish_starting(args, runner, engine, state, record, repo, branch)
+        print("exists: returned worker %s (pod %s)" % (name, record["runtime_id"]), file=sys.stderr)
+        print(json.dumps(_launch_line(record, existing=True), sort_keys=True))
+        return H["EXIT_OK"]
+    refuse = LaunchError("a cloud worker named %s already exists, past its hard deadline, and its pod is still there (`%s retire %s` ends it)" % (name, H["PROG"], name))
+    if not _pod_known(record):
+        raise refuse
+    try:
+        with Cluster(timeout=SNAPSHOT_SECONDS) as cluster:
+            snapshot = _cluster_snapshot(runner, cluster, SNAPSHOT_SECONDS)
+    except CloudError as err:
+        raise LaunchError("a cloud worker named %s already exists and the cluster could not be read (%s); nothing was created" % (name, _one(str(err), 200))) from None
+    if _pod_of(record, snapshot) is not None:
+        raise refuse
+    _keep_boss(state, record)   # exactly what cloud-clear does
+    remove_record(state, name)
+    _audit(engine, "cloud.cleared", name, {"runtime_id": record.get("runtime_id"), "hard_deadline": record.get("hard_deadline")})
+    _registry_note(engine, "retire", state, name, "cleared: the pod is gone and the hard deadline has passed")
+    print("cleared %s (pod gone, deadline %s)" % (name, record.get("hard_deadline")), file=sys.stderr)
+    return None
+
+
+def _finish_starting(args, runner, engine, state, record, repo, branch):
+    """The same launch command again for a worker in the state starting: read the pod; not ready: say so and create nothing; ready: the session, the
+    hub entry and the brief, ONCE. ORDER (a crash must never deliver the brief twice): the session id is saved as soon as it exists (a retry
+    makes no second session); the record is marked ready and the brief file removed BEFORE the brief is sent (a crash after that loses the brief, it
+    never sends it twice; the failure is said and the brief can be sent with `send`)."""
+    LaunchError = H["LaunchError"]
+    name = args.name
+    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip() or args.agent == "orchestrator")
+    recovery = VaultRecovery(cloud_dir(state) / VAULT_LOCK_NAME, lambda detail: _audit(engine, "cloud.vault_check", name, detail))
+    try:
+        with Cluster(recovery) as cluster:
+            pod = _pod_of(record, _cluster_snapshot(runner, cluster, SNAPSHOT_SECONDS)) if _pod_known(record) else None
+            phase = (pod or {}).get("phase")
+            if pod is None or phase in ("Failed", "Succeeded"):
+                raise LaunchError("the pod of %s is %s: `%s retire %s` frees the name" % (name, "gone" if pod is None else phase, H["PROG"], name))
+            if not pod.get("ready"):
+                print("still starting: %s" % name, file=sys.stderr)
+                print(json.dumps(_launch_line(record), sort_keys=True))
+                return H["EXIT_OK"]
+            fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo)
+            with tunnel(cluster, record) as live:
+                v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
+                if not record.get("session"):
+                    record["session"] = v2.session_create(args.agent if args.agent == "orchestrator" else CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
+                                                          {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}})["id"]
+                    save_record(state, record)
+                if hub:
+                    hcode, _, hnote = run_launcher(runner, "hub-session", name, ["--session", record["session"]], 120, cluster=cluster)
+                    if hcode != 0:
+                        raise CloudError("the hub entry could not be given the session: %s" % _reason(hcode, hnote))
+                brief = None
+                try:
+                    brief = _read_private(brief_path(state, name), BRIEF_MAX) if brief_path(state, name).exists() else None
+                except (OSError, ValueError):
+                    brief = None
+                record["state"] = "ready"
+                save_record(state, record)   # before the brief: see the order above
+                try:
+                    brief_path(state, name).unlink()
+                except OSError:
+                    pass
+                if brief:
+                    v2.prompt(record["session"], SETUP_PREAMBLE % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
+    except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
+        raise LaunchError("%s (the worker %s is kept: launch again, or `%s retire %s`)" % (_one(str(err), 200), name, H["PROG"], name)) from None
+    _registry_note(engine, "upsert", state, name, {"session": record["session"], "repo": repo, "role": args.role, "kind": "cloud", "run_id": record.get("run_id"), "state": "working"})
+    print(json.dumps(_launch_line(record), sort_keys=True))
     return H["EXIT_OK"]
 
 

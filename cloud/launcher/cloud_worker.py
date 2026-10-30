@@ -1860,7 +1860,9 @@ class Launcher:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
                     self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password)
                 self._make(made, "pod", self.kube.apply, spec)
-                if getattr(a, "stack", False):
+                if getattr(a, "no_wait", False):
+                    pass   # the caller asked to return once the pod is requested: it reads the pod's readiness itself
+                elif getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
                 else:
                     self._wait_ready(name, a.wait)
@@ -2175,7 +2177,7 @@ class Launcher:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
             phase = (pod.get("status") or {}).get("phase")
-            if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
+            if phase in ("Failed", "Succeeded"):   # whatever its kept mark (#1619): no command can run in it, so nothing can be saved from it
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
                 # Secrets, and say so.
                 self._remove(name, nonce, uid)
@@ -2406,7 +2408,8 @@ class Launcher:
             meta = pod.get("metadata") or {}
             pods.append({"name": meta.get("name"), "worker": ann(pod, "worker"),
                          "phase": safe_value((pod.get("status") or {}).get("phase")) if (pod.get("status") or {}).get("phase") else None,
-                         "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline")})
+                         "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline"),
+                         "ready": any(c.get("type") == "Ready" and c.get("status") == "True" for c in ((pod.get("status") or {}).get("conditions") or []) if isinstance(c, dict))})
         nodes, nodes_read, nodes_error = [], True, None
         try:
             for node in self.kube.list_nodes():
@@ -3191,6 +3194,7 @@ def build_parser():
     c.add_argument("--agent", help="worker (default) or orchestrator: the agent the pod runs (CW_AGENT); any other value is refused before anything is made")
     c.add_argument("--boss", help="with --agent orchestrator: the name of its boss (FLEET_BOSS)")
     c.add_argument("--wait", type=int, default=300)
+    c.add_argument("--no-wait", action="store_true", help="return once the pod is requested, without waiting for it to be ready (the caller reads the pod's state later)")
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
                    help="repeatable; the value is read from inherited descriptor N and piped to kubectl's stdin into the run's one Secret, mounted read-only at /run/cw/NAME (0400), deleted with the pod")
