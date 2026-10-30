@@ -41,6 +41,7 @@ cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_probe_redirect.py
+cloud/launcher/tests/test_read_retired_last_message.py
 cloud/launcher/tests/test_reaper_managed.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_row.py
@@ -55,6 +56,7 @@ cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_token_read_at_call.py
 cloud/launcher/tests/test_vault_check_pins.py
 cloud/worker/tests/test_cloud_prepush.py
+cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_cloud_prepush_hardening.py
 cloud/worker/tests/test_cw_gh_comments.py
 cloud/worker/tests/test_dockerfile_agent.py

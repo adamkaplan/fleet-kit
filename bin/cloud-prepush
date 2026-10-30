@@ -9,8 +9,13 @@ It lists the files changed since the merge base with <base>, selects every test 
 (basename match) plus the scan tests of SCAN_TESTS, runs each on the branch and on a clean worktree of the base (under the
 temporary directory, removed at the end, never forced), and prints only the differences.
 An EMPTY change exits 0 before the preflight runs. Exit: 0 no difference; 1 a difference, a test that could not run, or no test selected for a non-empty change; 2 refused input; 3 the quick budget was spent (NOT RUN (budget): not a failing test; see CLOUD_PREFLIGHT_QUICK_TOTAL).
+Background: cloud-prepush --background <base> starts the same run detached (per file 300 s, total 7200 s unless
+CLOUD_PREPUSH_TIMEOUT / CLOUD_PREPUSH_TOTAL say otherwise), prints the result file and log paths and exits 0 at once;
+CLOUD_PREPUSH_RESULT names the result directory. cloud-prepush --read FILE|DIR prints the lines of the foreground run
+from result.json: exit 0 finished without a difference, 1 a difference, 4 still running, 2 unreadable.
 Continuous integration stays the gate; its result is the only evidence. Uses git and python3 only, local.
 """
+import json
 import os
 import re
 import shutil
@@ -216,8 +221,135 @@ def preflight(root, base, scratch, limit):
     return True, lines
 
 
+# ---- the background run: a result file (result.json) written atomically after the start and after every file ----
+BACKGROUND_TIMEOUT = 300  # per file, when the run is detached (CLOUD_PREPUSH_TIMEOUT overrides)
+BACKGROUND_TOTAL = 7200  # overall, when the run is detached (CLOUD_PREPUSH_TOTAL overrides)
+RESULT_VERSION = 1
+IN_PROGRESS = "running"  # the result of a side that has started and not ended
+REC = [None]
+
+
+class Recorder:
+    def __init__(self, directory, pid=None):
+        self.path = os.path.join(directory, "result.json")
+        self.doc = {"version": RESULT_VERSION, "pid": pid if pid is not None else os.getpid(), "started": time.time(), "finished": None, "selection": [],
+                    "status": "running", "files": [], "notes": [], "exit": None}
+        self.write()
+
+    def write(self):
+        tmpf = self.path + ".tmp%d" % os.getpid()
+        with open(tmpf, "w") as fh:
+            json.dump(self.doc, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmpf, self.path)
+
+    def entry(self, rel):
+        for f in self.doc["files"]:
+            if f["file"] == rel:
+                return f
+        return None
+
+    def select(self, picked):
+        self.doc["selection"] = list(picked)
+        self.doc["files"] = [{"file": r, "branch": "not started", "base": "not started", "branch_seconds": None,
+                              "base_seconds": None, "kind": None, "text": ""} for r in picked]
+        self.write()
+
+    def set(self, rel, **kw):
+        e = self.entry(rel)
+        if e is not None:
+            e.update(kw)
+            self.write()
+
+    def note(self, line):
+        self.doc["notes"].append(line)
+
+    def finish(self, rc):
+        self.doc["exit"] = rc
+        self.doc["status"] = "finished"
+        self.doc["finished"] = time.time()
+        self.write()
+
+
+def note(line):
+    print(line)
+    if REC[0]:
+        REC[0].note(line)
+
+
+def side_result(r):
+    if r[0] == "noRun":
+        return "could not run"
+    if r[0] == "absent":
+        return "absent"
+    return "pass" if r[1][0] == 0 else "fail"
+
+
+def read_result(arg):
+    """--read FILE: print the lines the foreground run prints; 0 finished clean, 1 difference, 4 running, 2 unreadable."""
+    path = os.path.join(arg, "result.json") if os.path.isdir(arg) else arg
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+        files = doc["files"]
+        status = doc["status"]
+        assert isinstance(files, list) and status in ("running", "finished")
+    except (OSError, ValueError, KeyError, AssertionError, TypeError):
+        print("cloud-prepush: cannot read the result file " + arg, file=sys.stderr)
+        return 2
+    for l in doc.get("notes", []):
+        print(l)
+    for f in files:
+        if f.get("kind") in ("diff", "noRun") and f.get("text"):
+            print(f["text"])
+    for f in files:
+        if f.get("kind") == "both_fail":
+            print("FAILS ON BOTH SIDES with the same tail (a new failure inside it would hide): " + f["file"])
+    if status == "running":
+        done = 0
+        for f in files:
+            if f.get("kind"):
+                done += 1
+            elif "running" in (f.get("branch"), f.get("base")):
+                print("RUNNING %s (%s)" % (f["file"], "branch" if f.get("branch") == "running" else "base"))
+        print("cloud-prepush: still running: %d of %d files done" % (done, len(files)))
+        return 4
+    if files:
+        kinds = [f.get("kind") for f in files]
+        run = sum(1 for k in kinds if k in ("identical", "both_fail", "diff"))
+        same = sum(1 for k in kinds if k in ("identical", "both_fail"))
+        print("cloud-prepush: run %d, identical: %d (of which failing on both sides: %d), could not run %d"
+              % (run, same, kinds.count("both_fail"), kinds.count("noRun")))
+        print("cloud-prepush: advice only; continuous integration stays the gate and its result is the only evidence")
+    rc = doc.get("exit")
+    return rc if isinstance(rc, int) and rc else 0
+
+
+def start_background(argv):
+    """Start the same run detached: its own session, no stdin, output in run.log beside result.json. Returns at once."""
+    directory = os.environ.get("CLOUD_PREPUSH_RESULT")
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    else:
+        directory = tempfile.mkdtemp(prefix="cloud-prepush-result-")
+    directory = os.path.abspath(directory)
+    log = os.path.join(directory, "run.log")
+    Recorder(directory, pid=0)  # the result file exists when this command returns; the run takes it over at once
+    env = dict(os.environ)
+    env["CLOUD_PREPUSH_RESULT"] = directory
+    with open(os.devnull) as nul, open(log, "ab") as out:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--detached"] + argv, cwd=os.getcwd(), env=env,
+                         stdin=nul, stdout=out, stderr=out, start_new_session=True, close_fds=True)
+    print("result file: " + os.path.join(directory, "result.json"))
+    print("log file: " + log)
+    return 0
+
+
 def refuse(msg):
     print("cloud-prepush: refused: " + msg, file=sys.stderr)
+    if REC[0]:
+        REC[0].note("cloud-prepush: refused: " + msg)
     return 2
 
 
@@ -231,6 +363,22 @@ def _sibling_needs_helper():
 
 
 def main(argv):
+    if len(argv) == 2 and argv[0] == "--read":
+        return read_result(argv[1])
+    if len(argv) == 2 and argv[0] == "--background":
+        return start_background(argv[1:])
+    if len(argv) == 2 and argv[0] == "--detached":  # internal: the detached run itself
+        REC[0] = Recorder(os.environ["CLOUD_PREPUSH_RESULT"])
+        rc = 2
+        try:
+            rc = main2(argv[1:], BACKGROUND_TIMEOUT, BACKGROUND_TOTAL)
+        finally:
+            REC[0].finish(rc)
+        return rc
+    return main2(argv, TIMEOUT, TOTAL)
+
+
+def main2(argv, TIMEOUT, TOTAL):
     if cloud_quick is None and _sibling_needs_helper():  # a real install lost its helper (a lone copy or a stub sibling does not)
         print("cloud_quick helper missing", file=sys.stderr)
         return 2
@@ -272,7 +420,7 @@ def main(argv):
     mbase = mb.stdout.strip()
     changed = [c for c in git(["diff", "--name-only", mbase, "HEAD"], root).stdout.split("\n") if c]
     if not changed:
-        print("cloud-prepush: no changed files since the merge base; nothing to run (advice only)")
+        note("cloud-prepush: no changed files since the merge base; nothing to run (advice only)")
         return 0
     tmp = tempfile.mkdtemp(prefix="cloud-prepush-")
     scratch = os.path.join(tmp, "t")  # branch side; the base side has its own, tmp/tb
@@ -302,11 +450,11 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
         ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
     if not ok:
         for l in plines:
-            print(l)
+            note(l)
         if BUDGET_SPENT[0]:
-            print("cloud-prepush: the quick budget was spent (NOT RUN (budget), not a failing test); no test was run (advice only)")
+            note("cloud-prepush: the quick budget was spent (NOT RUN (budget), not a failing test); no test was run (advice only)")
             return BUDGET_STATUS
-        print("cloud-prepush: the preflight did not pass; no test was run (advice only)")
+        note("cloud-prepush: the preflight did not pass; no test was run (advice only)")
         return 1
     if not reason:
         print("cloud-prepush: preflight passed", file=sys.stderr)
@@ -314,18 +462,21 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
     if MODE == "full" and changed and not READERS[0]:
         reason = "no check reads " + ", ".join(sorted(changed))  # full mode: only an empty reader set is a verdict
     if reason:
-        print("NOT RUN: " + reason)
+        note("NOT RUN: " + reason)
         if cloud_quick is not None:
             for line in cloud_quick.cannot_lines(READ_LIST):
-                print(line)
+                note(line)
     if cloud_quick is not None:
         print("cloud-prepush: %s" % cloud_quick.mode_line(READERS[0], len(changed)), file=sys.stderr)
     if not picked or reason:
-        print("cloud-prepush: %d changed file(s) but NO test was selected; this is not a clean result (advice only)" % len(changed))
+        note("cloud-prepush: %d changed file(s) but NO test was selected; this is not a clean result (advice only)" % len(changed))
         return 1
     wt = os.path.join(tmp, "base")
     if git(["worktree", "add", "--detach", wt, mbase], root).returncode:
         return refuse("cannot create the base worktree")
+    rec = REC[0]
+    if rec:
+        rec.select(picked)
     run = same = noRun = 0
     both_fail = []
     diffs = []
@@ -334,43 +485,72 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
             if MODE == "quick" and cloud_quick is not None and cloud_quick.cannot_run_quick(rel) and rel in READ_LIST:
                 noRun += 1
                 diffs.append("NOT RUN: %s cannot run in quick" % rel)
+                if rec:
+                    rec.set(rel, branch="could not run", base="could not run", kind="noRun", text=diffs[-1])
                 continue
             if rel in HEAVY:
                 noRun += 1
                 diffs.append("skipped: memory-heavy " + rel)
+                if rec:
+                    rec.set(rel, branch="could not run", base="could not run", kind="noRun", text=diffs[-1])
                 continue
             left = TOTAL_S - (time.monotonic() - started)
             if left <= 0:
                 noRun += 1
                 diffs.append("COULD NOT RUN %s: the overall deadline of %ds expired" % (rel, TOTAL_S))
+                if rec:
+                    rec.set(rel, branch="could not run", base="could not run", kind="noRun", text=diffs[-1])
                 continue
             print("[%d/%d] %s branch" % (i, len(picked), rel), file=sys.stderr, flush=True)
+            if rec:
+                rec.set(rel, branch=IN_PROGRESS)
+            t1 = time.monotonic()
             b = run_one(root, rel, scratch, min(TIMEOUT_S, max(1, int(left))))
+            t2 = time.monotonic()
+            if rec:
+                rec.set(rel, branch=side_result(b), branch_seconds=round(t2 - t1, 1), base=IN_PROGRESS)
             print("[%d/%d] %s base" % (i, len(picked), rel), file=sys.stderr, flush=True)
             left = TOTAL_S - (time.monotonic() - started)
             a = run_one(wt, rel, os.path.join(tmp, "tb"), min(TIMEOUT_S, max(1, int(left)))) if left > 0 else ("noRun", "the overall deadline expired")
+            if rec:
+                rec.set(rel, base=side_result(a), base_seconds=round(time.monotonic() - t2, 1))
+            n0 = len(diffs)
+            kind = "identical"
             if b[0] == "noRun" or a[0] == "noRun":
                 noRun += 1
                 diffs.append("COULD NOT RUN %s: %s" % (rel, b[1] if b[0] == "noRun" else a[1]))
+                if rec:
+                    rec.set(rel, kind="noRun", text=diffs[-1])
                 continue
             run += 1
             if b[0] == "absent":
                 same += 1
+                if rec:
+                    rec.set(rel, kind="identical")
                 continue
             if a[0] == "absent":  # new test: only the branch side exists
                 if b[1][0] == 0:
                     same += 1
                 else:
                     diffs.append("FAILS on the branch (new test, no base side): %s" % rel)
+                    kind = "diff"
+                if rec:
+                    rec.set(rel, kind=kind, text=diffs[-1] if kind == "diff" else "")
                 continue
             if b[1] == a[1]:
                 same += 1
                 if b[1][0] != 0:
                     both_fail.append(rel)
-            elif b[1][0] != 0 and a[1][0] == 0:
+                    kind = "both_fail"
+                if rec:
+                    rec.set(rel, kind=kind)
+                continue
+            if b[1][0] != 0 and a[1][0] == 0:
                 diffs.append("FAILS on the branch, passes on the base: %s\n%s" % (rel, b[1][1][-600:]))
             else:
                 diffs.append("DIFFERS (exit %d branch, %d base): %s\n%s" % (b[1][0], a[1][0], rel, b[1][1][-600:]))
+            if rec:
+                rec.set(rel, kind="diff", text=diffs[-1])
     finally:
         # never forced: git's own option is not used. If the plain removal is refused, the script's own temporary tree is
         # deleted and the metadata pruned.
