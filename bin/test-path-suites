@@ -215,17 +215,17 @@ class TestNewBinFileGuards(unittest.TestCase):
         root = new_bin_fixture()
         done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertEqual(guard_count(done.stdout), 4, done.stdout)
-        self.assertEqual(len(ps.NEW_BIN_GUARDS), 4)
+        self.assertEqual(guard_count(done.stdout), len(ps.NEW_BIN_GUARDS), done.stdout)
+        self.assertEqual(len(ps.NEW_BIN_GUARDS), len(ps.guard_rows(["bin/newtool"])))   # pin change of #1457: the rows the plan returns, not a literal
         for name in ("TestAuthorityModulesGuard", "TestAgentRegistryInventory", "TestImpactHold", "bin/check-public-names"):
             self.assertIn(name, done.stdout)
         rows, _none = ps.plan(root, ["bin/newtool"], added=ps.added_paths(root, "main"))
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), len(ps.NEW_BIN_GUARDS))   # pin change of #1457: derived from the table, not a literal
 
     def test_s10_the_mutant_that_names_only_the_files_own_suite_shows_zero_of_the_four(self):
         root = new_bin_fixture()
         self.assertEqual(guard_count(plan_of_own_suite_only(root, "main")), 0)
-        self.assertEqual(guard_count(ps.render(*ps.plan(root, ["bin/newtool"], added=ps.added_paths(root, "main")))), 4)
+        self.assertEqual(guard_count(ps.render(*ps.plan(root, ["bin/newtool"], added=ps.added_paths(root, "main")))), len(ps.NEW_BIN_GUARDS))
 
     def test_s10_a_change_that_adds_no_bin_file_names_none_of_the_guards(self):
         root = new_bin_fixture(add=False)
@@ -236,14 +236,14 @@ class TestNewBinFileGuards(unittest.TestCase):
         root = new_bin_fixture()
         done = run_switchboard(root, "preflight-pr", "--merged")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertEqual(done.stdout.count("CANNOT RUN"), 4, done.stdout)
-        self.assertEqual(guard_count(done.stdout), 4)
+        self.assertEqual(done.stdout.count("CANNOT RUN"), len(ps.NEW_BIN_GUARDS), done.stdout)
+        self.assertEqual(guard_count(done.stdout), len(ps.NEW_BIN_GUARDS))
 
     def test_s10_heavy_changed_run_says_plainly_the_guards_it_could_not_run(self):
         root = new_bin_fixture()
         done = run_switchboard(root, "heavy", "--changed", "--base", "main")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertEqual(done.stdout.count("CANNOT RUN"), 4, done.stdout)
+        self.assertEqual(done.stdout.count("CANNOT RUN"), len(ps.NEW_BIN_GUARDS), done.stdout)
 
 
 class TestListAndRefusal(unittest.TestCase):
@@ -712,9 +712,9 @@ class TestPreflightGuardsNotRunMarker(unittest.TestCase):
 
     def test_a_guard_that_exits_75_without_the_marker_is_a_failure_and_with_it_not_run(self):
         failed, words = self.verdicts(marker=False)
-        self.assertEqual((failed, set(words)), (4, {"FAIL"}))
+        self.assertEqual((failed, set(words)), (len(ps.NEW_BIN_GUARDS), {"FAIL"}))
         failed, words = self.verdicts(marker=True)
-        self.assertEqual((failed, set(words)), (4, {"NOSLOT"}))
+        self.assertEqual((failed, set(words)), (len(ps.NEW_BIN_GUARDS), {"NOSLOT"}))
 
     def test_added_files_that_cannot_be_listed_are_said_not_silently_dropped(self):
         def broken(*a, **k):
@@ -758,6 +758,94 @@ class TestRealExitCodesAreResults(unittest.TestCase):
         done = run_switchboard(root, "heavy", "--changed", "--base", "main")
         self.assertIn("FAIL bin/test-by-command: exit 1", done.stdout, (done.stdout, done.stderr))
         self.assertNotIn("NOSLOT", done.stdout)
+
+
+class TestHandKeptRowMutant(unittest.TestCase):
+    """S4: dropping the added name from the path_suites.py row makes the hand-kept check name it; the real row passes."""
+
+    NAME = "tests/switchboard/test_cases_10.py"
+
+    def test_removing_the_name_from_the_row_is_named_by_check_manual(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "copy")
+            done = sh(tmp, "git", "clone", "-q", "--no-hardlinks", str(REPO), root)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            table = os.path.join(root, ps.MANUAL)
+            with open(table, encoding="utf-8") as handle:
+                data = json.load(handle)
+            rows = [r for r in data["rows"] if r.get("glob") == "bin/path_suites.py"]
+            self.assertEqual(len(rows), 1)
+            self.assertIn(self.NAME, rows[0]["suites"])
+            self.assertEqual(ps.check_manual(root), [])
+            rows[0]["suites"].remove(self.NAME)
+            with open(table, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+            problems = ps.check_manual(root)
+            self.assertIn("bin/path_suites.py: misses %s, which the derivation finds for bin/path_suites.py" % self.NAME, problems)
+
+
+def table_stub():
+    """A bin/test-switchboard of one class per row of the table: every class passes, except TestArchitectureDocument, which fails when bin/ holds a file the stub's own table does not name (the class that reads the bin/ file set)."""
+    parts = ["#!/usr/bin/env python3\nimport os, sys, unittest\n\nKNOWN = {'calc-cli', 'test-by-import', 'test-by-command', 'test-switchboard', 'check-public-names'}\n"]
+    for g in ps.NEW_BIN_GUARDS:
+        if not g[2] or g[1] != "bin/test-switchboard":
+            continue
+        cls = g[2] + ("OnLinux" if g[2] == "TestTheReaperOnlyInstall" else "")
+        body = "assertEqual(sorted(set(os.listdir('bin')) - KNOWN), [])" if g[2] == "TestArchitectureDocument" else "assertTrue(True)"
+        parts.append("\nclass %s(unittest.TestCase):\n    def %s(self):\n        self.%s\n" % (cls, g[3] or "test_it", body))
+    parts.append("\nif __name__ == '__main__':\n    unittest.main()\n")
+    return "".join(parts)
+
+
+def table_fixture(add=True):
+    """`feature` ADDS bin/newtool (in no derived table) to a base whose bin/test-switchboard holds one stub class per row of the table; add=False edits lib/calc.py only."""
+    root = fixture()
+    write(root, "bin/test-switchboard", table_stub(), 0o755)
+    write(root, "bin/check-public-names", "#!/bin/sh\nexit 0\n", 0o755)
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "stub table")
+    git(root, "checkout", "-q", "-b", "feature")
+    write(root, "bin/newtool" if add else "lib/calc.py", "#!/usr/bin/env python3\nprint('new')\n" if add else "VERSION = 1\ndef add(a, b):\n    return a + b + 0\n", 0o755 if add else None)
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "change")
+    return root
+
+
+def table_lines(text):
+    """The PASS or FAIL lines the table printed: its rows' names, in the order printed."""
+    names = [g[0] for g in ps.NEW_BIN_GUARDS]
+    return [l for l in text.splitlines() if l.split(" ")[0] in ("PASS", "FAIL") and any(l.split(" ", 1)[1].startswith(n + " (") for n in names)]
+
+
+class TestOneTableOfTheBinSetClasses(unittest.TestCase):
+    """#1457 (S2, S3, S5, U1): preflight-pr runs the one table NEW_BIN_GUARDS when the change adds a file under bin/, with and without --merged."""
+
+    def test_s2_without_merged_one_pass_or_fail_line_per_row_of_the_table(self):
+        root = table_fixture()
+        done = run_switchboard(root, "preflight-pr")
+        lines = table_lines(done.stdout)
+        self.assertEqual(len(lines), len(ps.NEW_BIN_GUARDS), done.stdout + done.stderr)
+        self.assertEqual(done.returncode, 1)
+
+    def test_s3_with_merged_the_same_one_line_per_row(self):
+        root = table_fixture()
+        done = run_switchboard(root, "preflight-pr", "--merged")
+        self.assertEqual(len(table_lines(done.stdout)), len(ps.NEW_BIN_GUARDS), done.stdout + done.stderr)
+        names = lambda text: [(l.split(" ")[0], l.split(" ")[1]) for l in table_lines(text)]
+        self.assertEqual(names(done.stdout), names(run_switchboard(root, "preflight-pr").stdout))
+
+    def test_s5_the_class_the_new_file_breaks_prints_fail_and_the_others_pass(self):
+        root = table_fixture()
+        lines = table_lines(run_switchboard(root, "preflight-pr").stdout)
+        self.assertEqual([l.split(" ")[1] for l in lines if l.startswith("FAIL")], ["TestArchitectureDocument"], lines)
+        self.assertEqual(sum(1 for l in lines if l.startswith("PASS")), len(ps.NEW_BIN_GUARDS) - 1)
+
+    def test_u1_a_change_that_adds_no_bin_file_prints_no_table_line_and_the_lines_are_the_same_as_without_the_table(self):
+        root = table_fixture(add=False)
+        done = run_switchboard(root, "preflight-pr")
+        self.assertEqual(table_lines(done.stdout), [])
+        self.assertNotIn("new file under bin/", done.stdout)
+        self.assertNotIn("CANNOT RUN", done.stdout)
 
 
 if __name__ == "__main__":

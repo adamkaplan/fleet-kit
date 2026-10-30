@@ -43,6 +43,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `closed_labels.py` | 0 | a closed issue never keeps asking for an answer | |
 | `dead_hint.py` | 0 | what is known about a dead agent and what to do about it (pure text) | |
 | `impact_brief.py` | 0 | the impact brief: what a held change can do, built from the diff and the records only (pure, no clock, no network) (#1215) | |
+| `lost_worker.py` | 0 | a lost worker is told once to its lane and the Chief of Staff, with its cause (#1481) | |
 | `merged_labels.py` | 0 | a merged pull request does not keep its hold | |
 | `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
 | `record_json.py` | 0 | the one bounded-depth parse of untrusted record JSON, shared by every reader of it (#1314) | |
@@ -64,6 +65,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `health_records.py` | 2 | health recorders: what the daemon has already read, turned into records | |
 | `pr_events.py` | 2 | `pr-state` read from the forwarder's webhook events | |
 | `pr_reading.py` | 2 | the one reading of a pull request that `merge-gate` and the clear packet share | |
+| `size_ceilings.py` | 2 | the one reading of the `size` rows of Known violations and of a file's line count, and the check of a merge result against them (#1605) | |
 | `registry.py` | 2 | the one agent registry (interface frozen in `docs/agent-registry.md`) | |
 | `installed_guard.py` | 2 | is the installed tree the default branch, clean: the one reading of its git state, the entry check and the install of its hooks (#1380) | |
 | `guard_alert.py` | 2 | the standalone alert of a bad installed tree, run from the state directory with nothing of the kit (#1380) | |
@@ -113,7 +115,10 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/judge.py` | 5 | the policy judge's socket, request handling and replies | |
 | `switchboard/judge_request.py` | 5 | the policy judge's request: what is asked and with what context | |
 | `switchboard/plan_review.py` | 5 | the `plan review` command family (slice R2) | |
+| `switchboard/plan_input.py` | 5 | `plan check` and `plan template`: where a plan is read from, and the plan loaded | |
+| `switchboard/review_laws_install.py` | 5 | `review-laws install`: the review laws copied into a repository | |
 | `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
+| `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
 | `switchboard/audit.py` | 2 | the audit log | |
@@ -179,16 +184,22 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/judge.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/judge_request.py` | `fleet-switchboard` | entry-import | 8 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/plan_review.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/plan_input.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/review_laws_install.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/pr_explain.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/sent_view.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/reminders.py` | `fleet-switchboard` | entry-import | 12 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 34 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decisions_b.py` | `fleet-switchboard` | namespace | 30 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 17 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/judge.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 26 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 27 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 25 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/plan_input.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/review_laws_install.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/pr_explain.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/reminders.py` | `fleet-switchboard` | namespace | 25 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; two reads of untrusted JSON now go through `load_module("record_json")`, one name of the entry more (#1314) |
+| `switchboard/sent_view.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part reads the entry's names (`build_engine`, `identify_caller`, `SentLedger`, `READ_LIMIT`, `_created`); its rewiring gives it imports |
+| `switchboard/reminders.py` | `fleet-switchboard` | namespace | 26 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports; two reads of untrusted JSON now go through `load_module("record_json")`, one name of the entry more (#1314); the delivery-time judgement of late and stale alerts reads one name of the entry more (#1402) |
 
 ## Dynamic imports not followed
 
@@ -271,6 +282,9 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `fleet-switchboard` | `load_module:sys.modules` | 4 | uses `sys` beyond its plain attributes |
 | `fleet-switchboard` | `load_review_rule:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `load_review_rule:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `lost_worker_tick:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `fleet-switchboard` | `lost_worker_tick:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `fleet-switchboard` | `lost_worker_tick:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_app_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `validate_app_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_hold_labels_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |

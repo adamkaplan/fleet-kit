@@ -8,6 +8,7 @@ import ast
 import contextlib
 import io
 import json
+import threading
 import os
 import re
 import stat
@@ -590,6 +591,64 @@ class TestTheDaemon(TreeCase):
         git(self.tree, "switch", "-q", "scratch")
         self.run_passes(1)   # a new bad time after a good one alerts at once, whatever the day
         self.assertEqual(self.fakes.count(self.fakes.notifier_log), 2)
+
+    def test_the_relay_thread_goes_quiet_on_a_bad_tree_and_resumes_when_clear(self):
+        """#1380 over the relay thread: the real RelayLoop thread, told by run_daemon's guard check each pass, refuses by name while the tree is bad."""
+        relay = sb.load_module("cloud_relay_daemon")
+        answers, finished, go, loops = [], threading.Condition(), threading.Semaphore(0), []
+        seen = {"n": 0}
+
+        class Backend:
+            reached = []
+
+            def __getattr__(self, name):
+                Backend.reached.append(name)   # only the optional begin_request/gh_room lookups of a served request
+                raise AttributeError(name)
+
+            def audit(self, *a):
+                pass
+
+        def pull(engine, host, runner, now, environ, budget=None):
+            ex = relay.Executor(str(self.state), Backend(), now, getattr(budget, "blocked", None))
+            req = {"id": "%032x" % (seen["n"] + 1), "pod": "p", "repo": "o/r", "issue": 1,
+                   "call": {"call_id": "c%d" % seen["n"], "command": "bogus", "pr": "o/r#1"}}
+            seen["n"] += 1
+            result = ex.handle(req)[:2]
+            with finished:
+                answers.append(result)   # a clear tree reaches the validation (400 for a bogus command), never a backend call
+            with finished:
+                finished.notify_all()
+            return 0
+
+        def sleep(seconds):
+            go.acquire(timeout=30)
+
+        real_start = relay.start_loop
+
+        def start(*a, **k):
+            loops.append(real_start(*a, cadence=0.0, sleep=sleep, **k))
+            return loops[-1]
+        self.addCleanup(os.environ.pop, "FLEET_RELAY_HUB_URL", None)
+        self.addCleanup(os.environ.pop, "FLEET_RELAY_HUB_TOKEN_FILE", None)
+        os.environ.update({"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"})
+        git(self.tree, "switch", "-q", "-c", "scratch", "origin/integration")
+        ticks = []
+
+        def wait(sock, timeout):
+            self.clock[0] += 60.0
+            go.release()                       # one more relay pass, on the relay thread, after this guard check
+            ticks.append(1)
+            with finished:
+                self.assertTrue(finished.wait_for(lambda: len(answers) >= len(ticks) + 1, 30), (answers, self.engine.notes))   # the first pull plus one per tick
+            if len(ticks) == 2:
+                git(self.tree, "switch", "-q", "main")
+        with mock.patch.object(relay, "pass_if_configured", pull), mock.patch.object(relay, "start_loop", start), \
+                mock.patch.object(sb, "next_poll", lambda engine, poll: poll):
+            sb.run_daemon(self.engine, self.state, 60, wait=wait, passes=5, relay_engine=lambda: self.engine)
+        self.assertEqual(answers[0], (503, relay.TREE_REFUSAL))
+        self.assertEqual(answers[1:3], [(503, relay.TREE_REFUSAL)] * 2)   # two bad passes: refused by name
+        self.assertEqual([a[0] for a in answers[3:5]], [400, 400])   # clear: served (reaches validation, never the backend)
+        self.assertEqual(self.engine.passes, 3)
 
     def test_a_good_tree_alerts_nobody(self):
         self.run_passes(3)
