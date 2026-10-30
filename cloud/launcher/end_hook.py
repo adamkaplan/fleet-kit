@@ -181,6 +181,24 @@ def refresh_refs(workdir, remote, ctx):
     return p.returncode == 0
 
 
+NO_CHECKOUT_NOTE = "no checkout: nothing to save"
+
+
+def has_checkout(workdir):
+    """True when the work directory exists and it or a directory above it holds a .git entry (git itself works from a subdirectory of a
+    checkout); only the existence of those is read, never a listing or a file."""
+    d = os.path.abspath(workdir)
+    if not os.path.isdir(d):
+        return False
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
     url = HOST_URL + "%s.git" % repo if prestop else None
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout
@@ -316,6 +334,9 @@ def main():
     if not worker:
         print(json.dumps({"pushed": False, "wip_branch": None, "error": "CW_WORKER is not set"}))
         return 1
+    if not has_checkout(workdir):
+        print(json.dumps({"pushed": False, "wip_branch": None, "skipped": [], "note": NO_CHECKOUT_NOTE}))
+        return 0
     try:
         print(json.dumps(run(workdir, worker)))
         return 0
