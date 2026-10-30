@@ -45,7 +45,12 @@ def _imports(node):
 
 
 def loader_facts(source):
-    """(modules imported, {module: classes bound at module level}) read from the runner's source by ast."""
+    """(modules imported, {module: names bound at module level}) read from the runner's source by ast.
+
+    A module-level assignment whose right side is a CALL on the imported module (`X = alias.build(Base)` or `X = importlib.import_module("m").build(Base)`)
+    binds the module too: the assigned target names are recorded for it, and `problems` accepts the file (see call_bound).
+    Known limit: a bare assignment of a non-class attribute (`X = alias.CONSTANT`) is NOT claimed to be handled; only a call is read as building a class.
+    """
     tree = ast.parse(source)
     alias = {}      # variable or import name -> module
     imported = set()
@@ -79,12 +84,40 @@ def loader_facts(source):
                 mod = alias.get(sub.value.id) if isinstance(sub.value, ast.Name) else _imports(sub.value)
                 if mod:
                     bound.setdefault(mod, set()).add(sub.attr)
+    for mod, names in call_bound(source).items():
+        bound.setdefault(mod, set()).update(names)
     return imported, bound
+
+
+def call_bound(source):
+    """{module: target names} of module-level assignments whose value is a call on the module (an attribute call on its alias or on import_module(...))."""
+    tree = ast.parse(source)
+    alias = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.NamedExpr)) and _imports(node.value):
+            for t in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                if isinstance(t, ast.Name):
+                    alias[t.id] = _imports(node.value)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                alias[a.asname or a.name] = a.name
+    out = {}
+    for node in tree.body:
+        if not (isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)):
+            continue
+        base = node.value.func.value
+        mod = alias.get(base.id) if isinstance(base, ast.Name) else _imports(base)
+        if mod and node.value.func.attr != "import_module":
+            for t in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                out.setdefault(mod, set()).update(n.id for n in ast.walk(t) if isinstance(n, ast.Name))
+    return out
 
 
 def problems(tests_dir, source, exempt):
     """The wiring failures, one message each."""
     imported, bound = loader_facts(source)
+    built = call_bound(source)
     out = []
     for name, reason in exempt.items():
         if not isinstance(reason, str) or len(reason.strip()) < MIN_REASON:
@@ -96,6 +129,8 @@ def problems(tests_dir, source, exempt):
         mod = name[:-3]
         if mod not in imported:
             out.append("%s: not imported by bin/test-switchboard" % name)
+        elif built.get(mod) and not test_classes(Path(tests_dir) / name):
+            continue    # the class is built by a call on the module: no module-level ClassDef to match
         elif not (test_classes(Path(tests_dir) / name) & bound.get(mod, set())):
             out.append("%s: no class bound at module level by bin/test-switchboard" % name)
     return out
@@ -169,6 +204,15 @@ class TestWiredCheckPlanted(unittest.TestCase):
         self.assertEqual(problems(self.tmp, one, only), [])
         self.assertTrue(any("test_x.py" in m and "not imported" in m for m in problems(self.tmp, "import importlib\n", only)))
         self.assertTrue(any("test_x.py" in m and "no class bound" in m for m in problems(self.tmp, "import importlib\nimportlib.import_module('test_x')\n", only)))
+
+    def test_a_class_built_by_a_call_on_the_module_is_accepted(self):
+        (self.tmp / "test_x.py").write_text("def build(base):\n    return base\n")
+        only = {p.name: "a helper that holds no test of its own" for p in self.tmp.glob("test_*.py") if p.name != "test_x.py"}
+        src = 'import importlib\n_x = importlib.import_module("test_x")\nTestX = _x.build(Base)\n'
+        self.assertEqual(problems(self.tmp, src, only), [])
+        out = problems(self.tmp, 'import importlib\n_x = importlib.import_module("test_x")\n', only)
+        self.assertEqual(len(out), 1, out)
+        self.assertIn("test_x.py", out[0])
 
 
 # Both lines are built from halves so that each appears once, in `problems`, never as one literal in this file.
