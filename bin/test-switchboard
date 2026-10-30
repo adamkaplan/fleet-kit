@@ -74703,7 +74703,7 @@ class TestPrClaimLine(LedgerBase):
                      "<!--PLAN: x-->\n<!--\nPLAN: y\nCLAIMS: S2\n-->PLAN: real#1", "PLAN: real#1\n```\nCLAIMS: S1\n```"):
             with self.subTest(body=body):
                 claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
-                self.assertEqual(([s["id"] for s in claimed], left, error), (["S1", "S2", "S3", "U1"], [], None))
+                hidden = next(n for n, text in enumerate(body.split("\n"), 1) if text.startswith("CLAIMS:")); self.assertEqual(claimed, []); self.assertIn("line %d" % hidden, error); self.assertIn("must stand directly under the `PLAN:` line", error)
         claimed = sb.plan_ledger.pr_scenarios(self.scenarios, "```\nignored\n```\nPLAN: real#1\nCLAIMS: S1")[0]
         self.assertEqual([s["id"] for s in claimed], ["S1"])
 
