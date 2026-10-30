@@ -31,10 +31,12 @@ EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus ent
 REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
 ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
 CARRY_KINDS = ("carried",)   # #1129: a proof or verdict that holds at a new head (see `carry_decision`); its own line, the original row is never touched
-KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS
+CLAIM_KINDS = ("claim",)   # #976: the claim line of a pull request AS IT WAS when its merge was gated (`claim_text`, or None: it claims every per-PR scenario); the union reads it for a merged sibling
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS + CLAIM_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
+CLAIM_TEXT_LIMIT = 1000   # a `claim` ledger line keeps at most this much of a CLAIMS line (#976)
 EVALUATOR_ALIASES = {"adam": "owner"}
 
 # THE bound of every wait of a recording command (`prove`, `verdict`, `review record`): the ledger lock, each GitHub read, the agent registry. One
@@ -399,7 +401,7 @@ def may_record_verdict(evaluator, caller, allowed, authors):
 
 # ----------------------------------------------------------------------------------- waivers
 
-WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962), at the PR's head
+WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG", "CU")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962); CU: the claim union at an ask's last merge (#976); each at the PR's head
 NEVER_WAIVABLE = {"G6": "the owner's hold on a held PR", "G7": "the epic integration", "G8": "production"}
 WAIVER_REASON_MIN = 20
 WAIVER_SECONDS = 24 * 3600   # a waiver is valid this long (the retroactive-plan due date), and only at the head it names
@@ -411,7 +413,7 @@ def parse_waiver_gates(text):
     for raw in (text or "").replace(" ", "").split(","):
         if not raw:
             continue
-        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3", "mg": "MG"}.get(raw, raw[:1].upper() + raw[1:])
+        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3", "mg": "MG", "cu": "CU"}.get(raw, raw[:1].upper() + raw[1:])
         if gate in NEVER_WAIVABLE:
             return [], "%s is never waived (%s): refused, nothing was recorded" % (gate, NEVER_WAIVABLE[gate])
         if gate not in WAIVABLE:
@@ -513,6 +515,53 @@ def pr_scenarios(scenarios, body):
     return [s for s in mine if s.get("id") in ids], [s for s in mine if s.get("id") not in ids], None
 
 
+def claim_union(scenarios, this_body, others):
+    """(applies, uncovered, last): the claim union of one ask (#976). `others` is [(state, body)] for the OTHER pull requests of the same plan, state `open` or `merged`
+    (one closed without a merge proves nothing and is not passed in). `last` is true when none of them is open: this merge is the ask's last. `applies` is true only when
+    some pull request of the ask has a claim line (a plan nobody narrows behaves exactly as before). `uncovered` lists the per-pull-request scenario ids that the claims of
+    the merged pull requests together with this one (a body with no claim line claims every one) leave out. A claim line that is refused covers nothing."""
+    per = [s.get("id") for s in scenarios if claim_of(s) == "pr"]
+    bodies = [this_body] + [body for _, body in others]
+    narrowed = any(pr_claim(body, scenarios)[0] is not None for body in bodies)
+    last = not any(state == "open" for state, _ in others)
+    covered = set()
+    for body in [this_body] + [body for state, body in others if state == "merged"]:
+        claimed, _, error = pr_scenarios(scenarios, body)
+        if not error:
+            covered.update(c.get("id") for c in claimed)
+    return narrowed, [i for i in per if i not in covered], last
+
+
+def claim_line(pr, head, body):
+    """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""
+    text = claim_text(body)
+    return {"kind": "claim", "pr": pr, "head": head, "claim_text": None if text is None else clip(text, CLAIM_TEXT_LIMIT)}   # a refused claim covers nothing, so a clipped one is never wider
+
+
+def recorded_claim(entries, pr, first=False, at=None):
+    """(found, claim_text) from the NEWEST `claim` line of `pr`, or the FIRST with `first`. With `at` (epoch seconds, a merged pull request's `merged_at`): the NEWEST line
+    recorded AT OR BEFORE `at`, the claim in force at the merge; a claim line of `pr` with no usable timestamp reads nothing (found False). found is False when none qualifies."""
+    mine = [e for e in entries if e.get("kind") == "claim" and e.get("pr") == pr]
+    if at is not None:
+        if any(isinstance(e.get("ts"), bool) or not isinstance(e.get("ts"), int) for e in mine):
+            return False, None
+        mine = [e for e in mine if e["ts"] <= at]
+    if not mine:
+        return False, None
+    return True, mine[0 if first else -1].get("claim_text")
+
+
+def claim_body(text, link="PLAN: x#1"):
+    """A body that carries a recorded claim text, to be read by `pr_claim` like any other."""
+    return link + ("\nCLAIMS: %s" % text if text is not None else "")
+
+
+def union_refusal(ref, uncovered):
+    return ("merge of %s refused: it is the last pull request of its ask and the claims of its merged pull requests do not cover %s; a pull request must claim %s "
+            "(`CLAIMS:` under `PLAN:`), or the chief of staff logs a waiver (`waive %s --gates CU`)" % (
+                ref, ", ".join(uncovered), "it" if len(uncovered) == 1 else "them", ref))
+
+
 def canon_status(body):
     """(ok, detail) for the G5 checklist line: `canon: <what was updated>`, or `canon: n/a <reason>` with a reason."""
     found = CANON_RE.search(body or "")
@@ -540,19 +589,19 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
             out.setdefault("carried", []).append(carried_view(newest, carried[newest["seq"]]))
         if not newest and mine:
             why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
-            out["void"].append("%s #%d void: %s" % (kind, mine[-1]["seq"], why))
+            out["void"].append("%s #%d void: %s" % (kind if kind == "proof" else evaluator + " verdict", mine[-1]["seq"], why))
         out[kind] = None if not newest else {"seq": newest["seq"], "result": newest["result"], "by": newest.get("by")}
     proof, verdict = out["proof"], out["verdict"]
     if not proof:
-        out["missing"].append("proof (`prove %s`)" % sid)
+        out["missing"].append("proof (`prove %s`; the %s judges it, a prover records it)" % (sid, evaluator))
     elif proof["result"] != "pass":
-        out["missing"].append("proof says fail")
+        out["missing"].append("proof says fail (the %s judges it, a prover records a new one)" % evaluator)
     if not verdict:
-        out["missing"].append("%s verdict (`verdict %s --as %s`)" % (evaluator, sid, evaluator))
+        out["missing"].append("%s verdict (`verdict %s --as %s`; only the %s may record it)" % (evaluator, sid, evaluator, evaluator))
     elif verdict["result"] != "pass":
-        out["missing"].append("%s verdict says fail" % evaluator)
+        out["missing"].append("%s verdict says fail (only the %s may record a new one)" % (evaluator, evaluator))
     elif verdict["by"] in authors:
-        out["missing"].append("the verdict is by an author of the PR (not accepted)")
+        out["missing"].append("the %s verdict is by an author of the PR (not accepted; only the %s, who is not an author, may record it)" % (evaluator, evaluator))
     out["status"] = "ok" if not out["missing"] else "missing"
     return out
 
