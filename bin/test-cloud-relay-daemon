@@ -1479,6 +1479,7 @@ class OneWallClock(unittest.TestCase):
     def setUp(self):
         import socket
         self.socket = socket
+        self.lookup_release = threading.Event()
         self.real_gai = socket.getaddrinfo
         self.addCleanup(setattr, socket, "getaddrinfo", self.real_gai)
 
@@ -1494,8 +1495,12 @@ class OneWallClock(unittest.TestCase):
         return time.monotonic() - t0, None
 
     def slow_dns(self):
+        self.lookup_returned = threading.Event()   # #1521: what the tests observe: had the lookup returned when the fetch answered?
+        self.addCleanup(self.lookup_release.set)
+
         def gai(*a, **k):
-            time.sleep(10)
+            self.lookup_release.wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; the test releases it at its end
+            self.lookup_returned.set()
             return self.real_gai(*a, **k)
         self.socket.getaddrinfo = gai
         return "http://127.0.0.1:9"
@@ -1513,9 +1518,10 @@ class OneWallClock(unittest.TestCase):
         return "http://localhost:9"
 
     def test_slow_dns_is_cut_at_the_deadline(self):
-        took, err = self.timed(relay, self.slow_dns(), 1.0)
+        _, err = self.timed(relay, self.slow_dns(), 1.0)
+        returned = self.lookup_returned.is_set()   # the lookup is blocked on an Event the test controls
         self.assertIsInstance(err, relay.PassCut)
-        self.assertLess(took, 2.0)
+        self.assertFalse(returned, "the fetch was cut only after the name lookup had returned")
 
     def test_mutant_without_the_thread_cut_is_caught_by_dns(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
