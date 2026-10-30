@@ -1254,10 +1254,13 @@ def stack_model_secret(env=None):
     return name, ran[1].strip()
 
 
-def git_token(repo, cluster):
-    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does."""
+def git_token(repo, cluster, role="worker"):
+    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does.
+    The default mint gets `--role ROLE` for any role but the worker's (the same rule as the launcher's git_token_cmd); a custom command runs unchanged."""
     raw = os.environ.get("CW_GIT_TOKEN_CMD")
     argv = shlex.split(raw) if raw else [sys.executable, str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "app_token.py"), repo]
+    if not raw and role != "worker":
+        argv += ["--role", role]
     env = {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}
     ran = _capture(argv, env=dict(env, GH_REPO=repo))
     token = (ran[1] if ran and ran[0] == 0 else "").strip()
@@ -1348,7 +1351,7 @@ def _launch(args, runner, now, reserve):
     with Cluster(recovery) as cluster:
         model = model_entry()
         cluster.add(model)
-        token = git_token(repo, cluster)
+        token = git_token(repo, cluster, args.agent if args.agent in _lib().AGENTS else "worker")   # the first token is minted under the role of the launch
         cluster.add(token)
         run_secrets = [("model-auth", model), ("git-token", token)]
         if stack_model:

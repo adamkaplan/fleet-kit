@@ -30,6 +30,7 @@ cloud/launcher/tests/test_docs_preflight_modes.py
 cloud/launcher/tests/test_driver.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_issues_read.py
+cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
 cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
