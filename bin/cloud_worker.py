@@ -1329,7 +1329,7 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
-    choice = H["launch_model_cloud"](args, MODEL_PROVIDER) if (getattr(args, "model", None) or getattr(args, "reasoning", None)) else {}   # #1642: before any setting, token or cluster call
+    choice = H["launch_model_cloud"](args, MODEL_PROVIDER) if (getattr(args, "model", None) is not None or getattr(args, "reasoning", None) is not None) else {}   # #1642: before any setting, token or cluster call
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created

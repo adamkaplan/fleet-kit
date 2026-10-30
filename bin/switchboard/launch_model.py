@@ -2,7 +2,7 @@
 # exists (no call to a model provider); the level is the model's own variant. The choice is a dict of the record keys it adds (`model`, `reasoning`): empty
 # when nothing was asked, so a launch with neither option is what it was.
 
-LAUNCH_MODEL_RE = re.compile(r"[A-Za-z0-9._:+/-]{1,120}")
+LAUNCH_MODEL_RE = re.compile(r"(?!-)(?!.*(?:\.\.|//))[A-Za-z0-9._:+/-]{1,120}")
 LAUNCH_LEVEL_RE = re.compile(r"[a-z0-9_-]{1,24}")
 LAUNCH_MODEL_LIST_MAX = 2000   # models read from the list; the reply itself is already bounded by the transport
 
@@ -48,9 +48,9 @@ def launch_model_choice(args, engine):
     if entry is None:
         raise LaunchError("--model %s: the local service lists no such model; use a listed PROVIDER/MODEL (a model added after OpenCode started is listed after the service reloads)" % model)
     if level is not None:
-        levels = sorted({v.get("id") for v in entry.get("variants") or [] if isinstance(v, dict) and isinstance(v.get("id"), str)})
+        levels = sorted({v.get("id") for v in entry.get("variants") or [] if isinstance(v, dict) and isinstance(v.get("id"), str) and LAUNCH_LEVEL_RE.fullmatch(v.get("id"))})[:12]
         if level not in levels:
-            raise LaunchError("--reasoning %s: %s lists %s; pick one of them%s" % (level, model, ", ".join(levels) or "no levels", "" if levels else " or drop --reasoning"))
+            raise LaunchError("--reasoning %s: %s lists %s; pick one of them%s" % (level, model, _one_line(", ".join(levels) or "no levels", 200), "" if levels else " or drop --reasoning"))
     return choice
 
 

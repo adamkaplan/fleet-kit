@@ -135,6 +135,46 @@ def build():
                     for raw in case[1::2]:
                         self.assertNotIn(raw, seen)
 
+        def test_m1_an_empty_model_or_level_is_refused_in_one_line(self):
+            for case in (("--model", ""), ("--model", "acme-provider/model-a", "--reasoning", ""), ("--reasoning", "")):
+                with self.subTest(case=case):
+                    code, out, err = self.launch(*case)
+                    self.assertNotEqual(code, 0)
+                    self.nothing_started(err)
+
+        def test_low_a_leading_dash_dotdot_and_empty_segment_are_refused(self):
+            for bad in ("-a/b", "a/../b", "a//b"):
+                with self.subTest(bad=bad):
+                    self.assertFalse(sb.LAUNCH_MODEL_RE.fullmatch(bad))
+            self.assertTrue(sb.LAUNCH_MODEL_RE.fullmatch("acme-provider/model-a.1"))
+
+        def hostile(self):
+            hostile = "x\nINJECT line\x1b[31m"
+            ids = [hostile] + ["lv%d" % i for i in range(30)]
+            self.listing = [{"providerID": "acme-provider", "id": "model-a", "variants": [{"id": i} for i in ids]}]
+            return self.launch("--model", "acme-provider/model-a", "--reasoning", "max")
+
+        def test_m2_the_levels_a_refusal_lists_are_cut_and_clean(self):
+            code, out, err = self.hostile()
+            self.assertNotEqual(code, 0)
+            self.nothing_started(err)
+            self.assertNotIn("INJECT", err)
+            self.assertFalse([c for c in err.rstrip("\n") if ord(c) < 32 or ord(c) == 127], repr(err))
+            self.assertLessEqual(err.count("lv"), 12)
+
+        def test_m2_mutant_the_raw_join_is_applied_and_caught(self):
+            import inspect, textwrap
+            real = sb.launch_model_choice
+            source = textwrap.dedent(inspect.getsource(real))
+            raw = source.replace(' and LAUNCH_LEVEL_RE.fullmatch(v.get("id"))', "").replace("})[:12]", "})").replace('_one_line(", ".join(levels) or "no levels", 200)', '", ".join(levels) or "no levels"')
+            applied = raw != source
+            scope = dict(real.__globals__)
+            exec(raw, scope)
+            with mock.patch.object(sb, "launch_model_choice", scope["launch_model_choice"]):
+                code, out, err = self.hostile()
+            self.assertTrue(applied)
+            self.assertTrue("INJECT" in err or err.count("lv") > 12 or len(err.splitlines()) != 1, "the mutant must break an expectation of test_m2")
+
         def test_the_choice_is_checked_by_pure_functions_too(self):
             self.assertEqual(sb.launch_model_kwargs({}), {})
             self.assertEqual(sb.launch_model_kwargs({"model": "a/b/c"}), {"model": {"providerID": "a", "id": "b/c"}})
@@ -206,6 +246,15 @@ def build_cloud():
             (body,) = self.session_bodies()
             self.assertNotIn("model", body)
             self.assertFalse({"model", "reasoning"} & set(body["metadata"]["fleet"]))
+
+        def test_m1_an_empty_model_or_level_is_refused_in_one_line_in_the_cloud_route(self):
+            for case in (("--model", ""), ("--model", "github-copilot/model-a", "--reasoning", ""), ("--reasoning", "")):
+                with self.subTest(case=case):
+                    code, out, err = self.launch_with("--cloud", *case)
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(len([l for l in err.splitlines() if l.strip()]), 1, err)
+                    self.assertEqual(self.session_bodies(), [])
+                    self.assertEqual(self.remote.requests, [])
 
         def test_u8_another_providers_model_is_refused_before_any_token_or_cluster_call(self):
             code, out, err = self.launch_with("--cloud", "--model", "acme-provider/model-a")
