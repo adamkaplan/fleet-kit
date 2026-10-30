@@ -247,5 +247,45 @@ class TestMintRetryDocs(unittest.TestCase):
         print("S8: %d of 2 sentences found" % (found // 2))
 
 
+class TestMintRetryForwarded(unittest.TestCase):
+    """S3b: the preflight child's 'mint try ' lines reach the launch's own standard error, nothing else of the child's does."""
+    def _load(self):
+        spec = importlib.util.spec_from_file_location("cw_forward_under_test", os.path.join(LAUNCHER, "cloud_worker.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_retry_lines_are_forwarded_and_other_lines_are_not(self):
+        cw = self._load()
+        one, two = "mint try 1 of 4 failed: the vault did not answer; trying again in 2 seconds", "mint try 2 of 4 failed: the vault did not answer; trying again in 5 seconds"
+        script = "echo '%s' >&2; echo 'some other child line' >&2; echo '%s' >&2; echo 'preflight ok'" % (one, two)
+        err = io.StringIO()
+        with mock.patch.object(cw, "PREFLIGHT_ARGV", ["sh", "-c", script]), redirect_stderr(err):
+            cw.check_repo_preflight(TARGET, {})
+        got = err.getvalue().splitlines()
+        sent = sum(got.count(x) for x in (one, two))
+        other = sum("other child line" in x for x in got)
+        self.assertEqual(got, [one, two])
+        self.assertEqual(other, 0)
+        print("S3b: retry lines forwarded to the launch output %d of 2, other child lines forwarded %d" % (sent, other))
+
+    def test_mutant_that_forwards_nothing_fails(self):
+        with tempfile.TemporaryDirectory(prefix="mutant-") as scratch:
+            for f in os.listdir(os.path.dirname(HERE)):
+                if f.endswith(".py"):
+                    shutil.copy(os.path.join(os.path.dirname(HERE), f), scratch)
+            old = 'if x.startswith("mint try "):'
+            path = os.path.join(scratch, "cloud_worker.py")
+            src = open(path).read()
+            self.assertEqual(src.count(old), 1)
+            open(path, "w").write(src.replace(old, 'if False:'))
+            env = dict(os.environ, MINT_RETRY_SRC=scratch)
+            p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_mint_retry.TestMintRetryForwarded.test_retry_lines_are_forwarded_and_other_lines_are_not"],
+                                   cwd=HERE, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            p.communicate(timeout=120)
+            self.assertEqual(p.returncode, 1)
+            print("S3b mutant: forwards nothing, test fails (exit 1), mutation applied 1 of 1")
+
+
 if __name__ == "__main__":
     unittest.main()

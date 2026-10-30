@@ -598,6 +598,9 @@ def check_repo_preflight(repo, env):
             p = subprocess.run(argv, capture_output=True, text=True, timeout=PREFLIGHT_SECONDS, stdin=subprocess.DEVNULL, env=_preflight_env(env, home), cwd=home)
     except (OSError, subprocess.TimeoutExpired, ValueError):
         raise CloudError("refused: the repository preflight for %s could not be run; nothing was created" % scrub(repo, (), 120), EXIT_USAGE) from None
+    for x in (p.stderr or "").splitlines():   # only the child's own retry lines (already scrubbed texts), once each, in order
+        if x.startswith("mint try "):
+            print(scrub(x.strip(), (), 300), file=sys.stderr)
     lines = [x.strip() for x in p.stdout.splitlines() if x.strip()]
     if p.returncode != 0:
         said = " | ".join(lines[-4:]) or "no message (exit %d)" % p.returncode
