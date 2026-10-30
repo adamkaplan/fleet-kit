@@ -187,6 +187,10 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
 
+## Where the test fixtures make their scratch directory
+
+The fixtures of `bin/test-cloud-worker` make their scratch directory under the repository root. The launcher tests make theirs in the platform's temporary directory. At cleanup the fixture ends every child process that names its directory (end signal, wait at most 15 seconds, kill) and then removes the directory.
+
 ## How a member adds a test to the chain
 
 Cause of the old merge rounds: the whole chain of `bin/test-cloud-launcher` was ONE shell line of more than forty commands joined by `&&`, and every member that added a test appended to that same line, so every pair of concurrent members conflicted on it.
@@ -209,7 +213,7 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
-Not yet measured: `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_token_at_limit.py`
+Not yet measured: `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_scratch_clean.py`, `cloud/launcher/tests/test_token_at_limit.py`
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
 
