@@ -3,7 +3,7 @@ and the held-body rationale line. No I/O. Python 3.9 standard library only."""
 import re
 
 RATIONALE_PREFIX = "Rationale:"
-_OPENING = re.compile(r"^(?:PLAN|MERGE|canon):", re.I)
+_OPENING = re.compile(r"^(?:PLAN|MERGE|canon|CLAIMS):", re.I)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 

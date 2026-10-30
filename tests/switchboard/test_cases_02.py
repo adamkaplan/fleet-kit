@@ -506,6 +506,41 @@ class TestPlanCheckFeedback(unittest.TestCase):
             sb.plan_check.declared_clauses("```yaml\nclauses:\n  DW-1: a\n```\n```yaml\nclauses:\n  DW-1: b\n```")
         self.assertIsNone(sb.plan_check.declared_clauses("no block"))
 
+    SCENARIOS = ("```yaml\nscenarios:\n  - id: S1\n    covers: DW-1\n    text: a scenario that is long enough\n    proof: test\n"
+                 "    pass: exit status is 0 and count equals 3\n    discriminates: a stub shows count equals 0 and fails\n    evaluator: ci\n```\n")
+
+    def test_a_number_in_parentheses_outside_the_done_when_line_is_not_a_clause(self):
+        body = ("## Intent\nMake the check readable.\nDone when: (1) first part; (2) second part; (3) third part.\n\n"
+                "## Facts\nThe old list (2) and the example (3) are only prose here.\n\n" + self.SCENARIOS)
+        done_when = sb.parse_intent(body)[1]
+        self.assertEqual(sb.plan_check.clauses_of(done_when), ["first part", "second part", "third part."])
+        got = sb.plan_check.check(body, done_when)
+        self.assertEqual(len(got["clauses"]), 3)
+        self.assertNotIn("out of order", " ".join(d["message"] for d in got["defects"]))
+
+    def test_an_out_of_order_declared_clause_names_its_text_and_its_line(self):
+        long_text = "the second clause says a great deal " + "more than eighty characters " * 4
+        body = "Facts line one.\nFacts line two.\n\n```yaml\nclauses:\n  DW-1: first\n  DW-3: " + long_text + "\n```\n"
+        with self.assertRaises(sb.plan_check.PlanFormatError) as caught:
+            sb.plan_check.declared_clauses(body)
+        message = str(caught.exception)
+        self.assertIn("clauses line 3 (plan line 7)", message)
+        self.assertIn("DW-3 is out of order, expected DW-2", message)
+        self.assertIn(repr(" ".join(long_text.split())[:80]), message)
+        self.assertNotIn(" ".join(long_text.split())[:81], message)
+
+    def test_a_done_when_value_with_its_label_reads_the_same_as_one_without(self):
+        for clauses in ("a single clause with no number", "(1) first part; (2) second part"):
+            body = "## Intent\nMake it work.\nDone when: " + clauses + "\n\n" + self.SCENARIOS
+            plain = sb.plan_check.check(body, clauses, clauses)
+            labelled = sb.plan_check.check(body, "Done when: " + clauses, "Done when: " + clauses)
+            mixed = sb.plan_check.check(body, "Done when: " + clauses, clauses)
+            with self.subTest(clauses=clauses):
+                for other in (labelled, mixed):
+                    self.assertEqual((other["defects"], other["scenario_hash"], other["plan_hash"], other["clauses"]),
+                                     (plain["defects"], plain["scenario_hash"], plain["plan_hash"], plain["clauses"]))
+                    self.assertNotIn("done-when-differs", [d["code"] for d in other["defects"]])
+
     def test_a_numbered_list_done_when_is_split_one_clause_per_line(self):
         self.assertEqual(sb.plan_check.clauses_of("1. first thing\n2. second thing\n3) third thing"),
                          ["first thing", "second thing", "third thing"])

@@ -65,6 +65,15 @@ def base_other_keys():
     return None if ref is None else strip_question(json.loads(data))
 
 
+def without_ref_rules(cfg):
+    cfg = copy.deepcopy(cfg)
+    gone = ("git*push*main*", "git*push*master*")
+    for b in (cfg["permission"]["bash"], cfg["agent"]["worker"]["permission"]["bash"]):
+        for k in [k for k in b if k in gone or k.startswith("*git*push*")]:
+            del b[k]
+    return cfg
+
+
 def orch_question(text):
     fm = text.split("---", 2)[1]
     m = re.search(r"^  question: (\S+)", fm, re.M)
@@ -81,7 +90,8 @@ class T(unittest.TestCase):
         base = base_other_keys()
         if base is None:
             loud_skip(self, "the base permission file")
-        self.assertEqual(strip_question(load()), base)
+        # pin change of #1549: the push rules for main and master are compared in test_push_rules.py, not here
+        self.assertEqual(without_ref_rules(strip_question(load())), without_ref_rules(base))
 
     def test_s4_empty_agent_block_is_not_dropped(self):
         cfg = load()

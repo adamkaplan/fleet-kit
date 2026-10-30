@@ -113,7 +113,7 @@ if command == "create":
         sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
         sys.exit(2)
     shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "XS"
-    if shape not in ("XS", "S", "M"):
+    if shape not in ("XS", "O", "S", "M"):
         sys.stderr.write("error: shape must be XS, S or M\\n")
         sys.exit(2)
 if command == "create":
@@ -221,11 +221,72 @@ GIT_TOKEN = "ghs_GitInstallationTokenAbCdEf0123456789"
 
 PREFLIGHT_PASS = ["sh", "-c", 'echo "preflight: preflight ok: deletion, non_fast_forward, pull_request"']
 
+CHILD_END_WAIT_SECONDS = 15   # bounded wait for a child to end after the end signal
+
+
+def _children_of(directory):
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    found = []
+    for line in out.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) != os.getpid() and str(directory) in command:
+            found.append(int(pid))
+    return found
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:   # our own child: reaping it tells whether it ended (a zombie is gone)
+        return os.waitpid(pid, os.WNOHANG)[0] == 0
+    except ChildProcessError:
+        pass
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def _wait_gone(pids, seconds):
+    end = time.time() + seconds
+    while time.time() < end and any(_alive(p) for p in pids):
+        time.sleep(0.1)
+    return [p for p in pids if _alive(p)]
+
+
+def end_children_and_remove(tmp, directory):
+    """Cleanup of Base.setUp: end every child naming the scratch directory (SIGTERM, wait, SIGKILL), then remove it."""
+    import signal
+    pids = _children_of(directory)
+    for sig, wait in ((signal.SIGTERM, CHILD_END_WAIT_SECONDS), (signal.SIGKILL, 5)):
+        for p in pids:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass
+        pids = _wait_gone(pids, wait)
+        if not pids:
+            break
+    error = None
+    for _ in range(5):
+        try:
+            tmp.cleanup()
+            error = None
+            break
+        except OSError as e:
+            error = e
+            time.sleep(0.2)
+    if pids or error:
+        raise RuntimeError("scratch cleanup failed: children not ended %s, removal error %s" % (pids, error))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(dir=str(BIN.parent))   # under the worktree, never the shared /tmp
-        self.addCleanup(tmp.cleanup)
+        tmp = tempfile.TemporaryDirectory()   # the platform's temporary directory, never the repository root: an entry that judges the root runs beside the entries that load this fixture
         self.home = Path(tmp.name).resolve()
+        self.addCleanup(end_children_and_remove, tmp, self.home)
         self.stub_dir = self.home / "stub"
         self.stub_dir.mkdir()
         self.stub = self.stub_dir / "cloud-worker"
