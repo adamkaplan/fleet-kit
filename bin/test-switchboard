@@ -69404,7 +69404,7 @@ class TestSupportRebinding(unittest.TestCase):
     def test_the_moved_names_include_the_ones_a_test_rebinds(self):
         moved = self.moved_names()
         self.assertTrue({"sb", "sc", "Base", "FakeRunner", "SimClock", "FakeV2", "class_source", "SWITCHBOARD"} <= moved, sorted(moved)[:20])
-        self.assertTrue({"_MADE_UP_NEXT", "_pid_alive", "made_up_pid", "PidTable"}.isdisjoint(moved), "the pid helpers stay in this file")
+        self.assertTrue({"_MADE_UP_NEXT", "_pid_alive", "made_up_pid", "PidTable"} <= moved, "the pid helpers moved with the world")
 
     FORMS = {   # a source that rebinds a moved name without rebound: each must be reported
         "global": "def f():\n    global sb\n    sb = 1\n",
@@ -69415,6 +69415,7 @@ class TestSupportRebinding(unittest.TestCase):
         "patch.dict in async with": "async def f():\n    async with mock.patch.dict(globals(), {'sb': 1}):\n        pass\n",
         "patch.object on the module": "def f():\n    with mock.patch.object(sys.modules[__name__], 'SimClock', None):\n        pass\n",
         "patch.object, a name decided at run time": "def f(n):\n    with mock.patch.object(sys.modules[__name__], n, None):\n        pass\n",
+            "the pid helper that moved": "def f():\n    with mock.patch.object(sys.modules[__name__], '_MADE_UP_NEXT', [1]):\n        pass\n",
         "setattr on the module": "def f():\n    setattr(sys.modules[__name__], 'FakeRunner', None)\n",
         "globals()[...] =": "def f():\n    globals()['sb'] = 1\n",
         "globals()[...] with a variable key": "def f(k):\n    globals()[k] = 1\n",
@@ -69482,7 +69483,6 @@ class TestSupportRebinding(unittest.TestCase):
             "an import of a moved name inside a function": "def f():\n    from elsewhere import sb\n",
             "a read of the module": "def f():\n    return getattr(sys.modules[__name__], 'sb')\n",
             "the tagged support import": "sb = _support_loader.sb   # support import\n",
-            "the pid helper that stays": "def f():\n    with mock.patch.object(sys.modules[__name__], '_MADE_UP_NEXT', [1]):\n        pass\n",
         }.items():
             with self.subTest(form=name):
                 self.assertEqual(self.rebindings(source, moved), [])
