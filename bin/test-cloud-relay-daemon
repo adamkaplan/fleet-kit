@@ -882,14 +882,31 @@ class LiveHead(Fixture):
         self.assertTrue(after, "the append did not finish while a second live-head call was blocked")
 
     def test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing(self):
-        import time
+        import threading
         old = relay.HEAD_TIMEOUT
         relay.HEAD_TIMEOUT = 0.2
         self.addCleanup(setattr, relay, "HEAD_TIMEOUT", old)
-        self.backend.live_head = lambda pr: (time.sleep(2), HEAD)[1]
-        t0 = time.monotonic()
-        self.refused(504, "could not be read in time", CODER, "prove", **PROVE)
-        self.assertLess(time.monotonic() - t0, 1.5)
+        release = threading.Event()
+        self.addCleanup(release.set)   # no thread of this test outlives it
+
+        def blocked(pr):
+            release.wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
+            return HEAD
+        self.backend.live_head = blocked
+        answer, audits = [], len(self.backend.audits)
+        t = threading.Thread(target=lambda: answer.append(self.run_one(CODER, "prove", **PROVE)), daemon=True)
+        t.start()
+        t.join(10)   # same guard
+        answered, still_blocked = bool(answer), not release.is_set()
+        release.set()
+        t.join(10)
+        self.assertTrue(answered, "the prove call was not answered while the live-head call was blocked")
+        self.assertTrue(still_blocked)
+        got = answer[0]
+        self.assertEqual(got["status"], 504, got)
+        self.assertIn("could not be read in time", got["reason"])
+        self.assertIsNone(got["record"])
+        self.assertEqual(len(self.backend.audits), audits + 1)
         self.assertEqual(self.raw(), b"")
 
     def test_a_different_live_head_is_refused(self):
