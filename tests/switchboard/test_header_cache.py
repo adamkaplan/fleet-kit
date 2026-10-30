@@ -647,5 +647,29 @@ class TestDocs(unittest.TestCase):
             self.assertIn(fact, section)
 
 
+class TestApprovalReadsFresh(HeaderCacheBase):   # #1520: the approval read never takes the file cache, even inside a cache-allowed `send`
+    def test_approval_inside_send_decides_from_the_new_done_when_not_the_warm_entry(self):
+        self.action("send")
+        self.header()   # (1) warms the cache entry of issue 5 under a cache-allowed action
+        self.assertTrue(self.files())
+        new_done = "the approval is read fresh"
+        self.gh.issue(5, done=new_done)   # (2) the Done-when changes on the fake GitHub
+        plan_check = sb.load_plan_check()
+        plan = "## Plan (scenarios)\n\n```yaml\nclauses:\n  DW-1: %s\n```\n" % new_done
+        value = plan_check.plan_hash(plan).split(":", 1)[1]
+        inner = self.gh
+
+        def gh(argv, **kw):
+            if "/comments?" in argv[-1]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps([{"body": plan}]), "")
+            return inner(argv, **kw)
+
+        self.assertIn("the header is shown", " ".join(self.header()[1]))   # the display command still serves the stale entry
+        verdicts = sb.check_approval(self.config, gh, self.clock, "Approved at sha256:" + value, self.REPO, 5)   # (3) still inside `send`
+        self.assertEqual(len(verdicts), 1)
+        self.assertTrue(verdicts[0]["ok"], verdicts[0])   # decided from the NEW Done-when, not the stale entry
+        self.assertEqual(verdicts[0]["number"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()
