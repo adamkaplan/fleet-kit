@@ -2481,10 +2481,12 @@ class Launcher:
         exact name through the launcher's own delete, with ONE audit line. A kept Secret: its pod is listed (or that name plus `-0`, a persistent
         orchestrator's pod; this branch has no workload list, so that rule alone stands in for the workload), a Secret younger than the time, any
         Secret without the launcher's label (the hub's). An unreadable list deletes nothing and is said once. No value is ever read."""
+        if not hasattr(self.kube, "list_secrets"):
+            return []   # a cluster object that cannot list Secrets (an earlier test's fake): the step does not run; the real Kube always can
         try:
             run_rows = self.kube.list_secrets("cw/pod")
             pw_rows = self.kube.list_secrets("app=" + LABEL)
-        except (CloudError, ValueError, OSError, AttributeError) as e:
+        except (CloudError, ValueError, OSError) as e:
             print("cloud-worker: orphan secrets: the Secret list could not be read: %s" % scrub(str(e), (), 120).replace("\n", " "), file=sys.stderr)
             return []
         names = {(p.get("metadata") or {}).get("name") for p in pods}
