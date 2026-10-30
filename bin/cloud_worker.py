@@ -1272,6 +1272,9 @@ def stack_model_secret(env=None):
     return name, ran[1].strip()
 
 
+git_token_sleep = time.sleep   # tests replace it
+
+
 def git_token(repo, cluster, role="worker"):
     """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does.
     The default mint gets `--role ROLE` for any role but the worker's (the same rule as the launcher's git_token_cmd); a custom command runs unchanged."""
@@ -1280,13 +1283,28 @@ def git_token(repo, cluster, role="worker"):
     if not raw and role != "worker":
         argv += ["--role", role]
     env = {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}
-    ran = _capture(argv, env=dict(env, GH_REPO=repo))
+
+    def last(ran):
+        return _one(cluster.clean(ran[2].strip().splitlines()[-1], 200), 200) if ran and ran[2].strip() else "no message"
+
+    # The retry rule (a copy of the launcher's tempfail_tries: this program loads the launcher by path only for other work, and a test
+    # runs this function without it): again ONLY on status 75 (a custom command too), 4 tries, waits of 2, 5 and 10 seconds.
+    tries = 0
+    while True:
+        tries += 1
+        ran = _capture(argv, env=dict(env, GH_REPO=repo))
+        if not ran or ran[0] != 75 or tries >= 4:
+            break
+        wait = (2, 5, 10)[tries - 1]
+        print("git token try %d of 4 failed: %s; trying again in %d seconds" % (tries, last(ran), wait), file=sys.stderr)
+        git_token_sleep(wait)
     token = (ran[1] if ran and ran[0] == 0 else "").strip()
     if not token or len(token) > 4096:
         why = ""
         if ran and ran[2].strip():
-            why = ": " + _one(cluster.clean(ran[2].strip().splitlines()[-1], 200), 200)
-        raise Refusal("the git token command gave no usable token%s; nothing was created" % why)
+            why = ": " + last(ran)
+        after = " after %d tries" % tries if tries > 1 else ""
+        raise Refusal("the git token command gave no usable token%s%s; nothing was created" % (after, why))
     return token
 
 
@@ -1329,6 +1347,7 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
+    choice = H["launch_model_cloud"](args, MODEL_PROVIDER) if (getattr(args, "model", None) is not None or getattr(args, "reasoning", None) is not None) else {}   # #1642: before any setting, token or cluster call
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
@@ -1432,12 +1451,13 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise LaunchError("%s: %s (the worker %s was created; %s)" % (
                 name, problem, name, "it was stopped and its record dropped" if stopped else "the stop failed: the pod and its record are kept; stop it with `%s retire %s`" % (H["PROG"], name)))
-        fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo)
+        fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo, *((None, None, choice) if choice else ()))
         try:
             with tunnel(cluster, record) as live:
                 v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
                 session = v2.session_create(args.agent if args.agent == "orchestrator" else CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
-                                            {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}})["id"]
+                                            {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}},
+                                            **(H["launch_model_kwargs"](choice) if choice else {}))["id"]
                 record["session"] = session
                 save_record(state, record)
                 if hub:   # the hub entry gets the session id (the launcher's one verb for it; the cluster login is the launcher's own)
