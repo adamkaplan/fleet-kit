@@ -1,0 +1,2 @@
+{"cases_12": ["TestAgentShellCalls", "TestShimReadCache", "TestAskIssueSubject", "TestClosedUnmergedAskClose", "TestAskWaive", "TestGhShimGateProbe"],
+ "cases_13": ["WorkflowPlanPins", "TestRegistryEndpoint", "TestApprovalFinderCost", "TestSameNameAccountsAdd", "TestClosedUnmergedLastPr"]}
