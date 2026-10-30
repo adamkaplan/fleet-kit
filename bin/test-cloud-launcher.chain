@@ -44,6 +44,7 @@ cloud/launcher/tests/test_orphan_secrets.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_read_retired_last_message.py
+cloud/launcher/tests/test_reap_concurrent.py
 cloud/launcher/tests/test_reaper_managed.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
