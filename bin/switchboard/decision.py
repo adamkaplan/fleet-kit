@@ -112,6 +112,27 @@ def superseded_by(facts):
     return found
 
 
+# ---- #1402: a fact is made at one time and delivered at another. At delivery each alert or digest shows its sent time and is marked delayed when it is old
+# (what is dropped as stale lives in reminders.py: judge_delivery).
+DELAYED_AFTER = 1800                 # seconds: an alert or digest older than this at delivery is marked "delayed: sent HH:MMZ"
+
+
+def sent_at(fact):
+    """When the fact was made: a merged wake fact keeps the oldest of its members (`created` is the newest, so an old digest must not look new)."""
+    return getattr(fact, "sent_min", fact.created)
+
+
+def in_late_scope(fact):
+    """An alert or a digest (the triage and sweep items, merged or not, and the load alerts that ride with them): what the delayed mark is about."""
+    return fact.kind in ("alert", "triage", "sweep") or bool(getattr(fact, "members", None)) or bool(getattr(fact, "wake_class", None))
+
+
+def delayed_since(facts, delivered):
+    """The oldest sent time among the alerts and digests older than DELAYED_AFTER at `delivered`, or None."""
+    late = [sent_at(f) for f in facts if in_late_scope(f) and delivered - sent_at(f) > DELAYED_AFTER]
+    return min(late) if late else None
+
+
 NEWEST_FIRST_MARK = " [newest first]"
 
 
@@ -159,9 +180,14 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         replaced.clear()
         replaced.update(superseded_by(taken))
         when = ""
-        if delivered is not None:
-            first, last = clock_utc(min(f.created for f in taken)), clock_utc(max(f.created for f in taken))
-            when = " (sent %s, delivered %s)" % (first if first == last else "%s-%s" % (first, last), clock_utc(delivered))
+        if delivered is not None and not fault("no-sent-time"):
+            first, last = clock_utc(min(sent_at(f) for f in taken)), clock_utc(max(f.created for f in taken))
+            late = delayed_since(taken, delivered)   # #1402: the sent time comes first, and an old alert or digest says so in this first line
+            if late is not None:
+                sent = "delayed: sent %s" % clock_utc(late) + ("" if first == last else ", newest sent %s" % last)
+            else:
+                sent = "sent %s" % (first if first == last else "%s-%s" % (first, last))
+            when = " (%s, delivered %s)" % (sent, clock_utc(delivered))
         waiting = sorted({t for f in taken for t in f.supersedes})
         if waiting:   # the earlier messages stay where they are, unchanged: this says only that the newer one replaces them
             names = sorted({f.sender for f in taken if f.supersedes and f.sender})

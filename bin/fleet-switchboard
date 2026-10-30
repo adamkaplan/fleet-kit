@@ -1034,6 +1034,9 @@ KNOWN_FAULTS = (
     "cos-orders-unfed",        # PR 18: the judge ignores the Chief of Staff's orders file
     "anyone-edits-cos-orders",  # PR 18: no agent is stopped from writing the Chief of Staff's orders file
     "answer-unjudged",         # PR 18: `decisions answer` and `decisions resolve` skip the judge
+    "no-sent-time",            # #1402: a delivered message says nothing of when its facts were sent or that they are late
+    "deliver-stale-alert",     # #1402: an alert whose subject is no longer true is delivered anyway
+    "keep-old-digest",         # #1402: a digest older than 6 hours is delivered beside the current one
 )
 
 LAB_ENV = "FLEET_SWITCHBOARD_LAB"
@@ -2510,6 +2513,7 @@ class Switchboard:
     `audit` None makes it read-only: `pending` and `status` use it that way,
     and any write then raises instead of happening unaudited.
     """
+    _note_lock = threading.Lock()   # _note's check-then-set on _last; the relay thread has its own engine, this guards any second caller
 
     # The sweep cache of the worktree in-use checks (`worktree_sweep`) is PER THREAD: the daemon's janitor thread and its main thread (auto-retire reclaim)
     # each hold their own, so one can never read, seed or clear the other's session index (#762).
@@ -2587,10 +2591,11 @@ class Switchboard:
         return self.audit.external(self.actor, event, subject, detail)
 
     def _note(self, event, subject, detail):
-        """Audit a non-write event once per change, not once per pass."""
-        if self.audit is None or self._last.get((event, subject)) == detail:
-            return
-        self._last[(event, subject)] = detail
+        """Audit a non-write event once per change, not once per pass. The check-then-set is under a lock."""
+        with self._note_lock:
+            if self.audit is None or self._last.get((event, subject)) == detail:
+                return
+            self._last[(event, subject)] = detail
         self.audit.append(self.actor, event, subject, detail)
 
     # -- observe
@@ -3037,6 +3042,17 @@ class Switchboard:
         repos = self.repos_in_play()
         if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
             self.intents.discard_told()
+        kept, dropped = judge_delivery(plan.pending, self.now(), self.delivery_reader(), triage_body_standing)   # #1402: a stale alert and an old digest are dropped here, audited and acknowledged
+        if dropped:
+            self.drop_stale(plan.recipient, dropped)
+            plan = copy.copy(plan)
+            plan.pending = kept
+            if not kept:
+                return {"sent": False, "action": "dropped", "reason": "every pending fact was stale or replaced",
+                        "keys": [fact.key for fact, _k, _w in dropped]}
+        else:
+            plan = copy.copy(plan)
+            plan.pending = kept
         pending = merge_wake_facts(plan.recipient, plan.pending)   # #1275: the sweep, triage and load-alert items of one wake are ONE message
         text, carried = compose(plan.recipient, pending, section=section_resolver(self, observation),
                                 repos=repos, delivered=self.now())
@@ -3115,6 +3131,38 @@ class Switchboard:
             self.intents.commit_told()
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
+
+    def delivery_reader(self):
+        """#1402: read(subject) -> the present record of an alert's subject, through the hub's one present-state read (the read #1378 uses); None when this
+        process has no hub (no judgement then: the alert is delivered as made). One read per subject per delivery, at most MAX_PRESENT_READS."""
+        hub = getattr(self, "hub", None)
+        if hub is None or not hasattr(hub, "present_record"):
+            return None
+        seen = {}
+        def read(subject):
+            kind, repo, number, _expected = subject
+            slot = (SUBJECT_ENDPOINT[kind], repo, number)
+            if slot not in seen:
+                if len(seen) >= MAX_PRESENT_READS:
+                    return None
+                try:
+                    seen[slot] = hub.present_record(repo, slot[0], number)
+                except Exception:
+                    seen[slot] = None
+            return seen[slot]
+        return read
+
+    def drop_stale(self, recipient, dropped):
+        """Audit each dropped fact (what, why, when it was sent) and tell the fact sources to forget it, so it does not return."""
+        for fact, kind, why in dropped:
+            if self.audit is not None:
+                self.audit.append(self.actor, "stale.dropped", recipient, {
+                    "fact": fact.key, "kind": kind, "why": why, "sent": clock_utc(sent_at(fact)), "age_seconds": int(self.now() - sent_at(fact))})
+        keys = [fact.key for fact, _k, _w in dropped]
+        for source in self.sources:
+            forget = getattr(source, "drop_stale", None)
+            if forget is not None:
+                forget(keys)
 
     @staticmethod
     def _send_meta(carried):
@@ -3866,7 +3914,7 @@ def installed_tree_clear(state_dir, runner=subprocess.run):
 DAEMON_RECORD = "daemon.json"  # what the running daemon says about itself: its pid, and where its key came from
 
 
-def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, watch=None, on_reload=None):
+def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, watch=None, on_reload=None, relay_engine=None):
     """`run`: a pass on every poke, and at least every `poll` seconds, under the
     single-instance lock.
 
@@ -3876,6 +3924,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
     `wait(sock, timeout)` and `passes` are for tests and `--once`. `record` is written to daemon.json
     once the lock is held, with this pid: `status` reads it to say what the DAEMON has, not what the shell
     that runs `status` has.
+    `relay_engine` builds the relay thread's OWN engine (the Engine is not thread-safe: the relay thread must not share the
+    pass thread's); REQUIRED when a hub is configured (the relay then fails to start and is audited); a test that shares says so: relay_engine=lambda: engine.
     """
     wait = wait or wait_for_poke
     with single_instance(state_dir):
@@ -3887,7 +3937,13 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
         except OSError as err:  # no pokes then; the poll interval still passes
             sock = None
             engine._note("poke.unavailable", None, {"error": _one_line(str(err))})
+        relay_loop = None
         try:
+            try:   # the relay is pulled on its own cadence, not after each pass (#1477)
+                relay_loop = load_module("cloud_relay_daemon").start_loop(
+                    engine, sys.modules[__name__], subprocess.run, engine.now, os.environ, engine_factory=relay_engine, guarded=True)
+            except Exception as err:
+                engine._failed(None, "pass", err, {"errors": []})
             done = 0
             while True:
                 drain_pokes(sock)
@@ -3898,10 +3954,11 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                     if bad is not None:   # two reads in a row before it stops and alerts
                         time.sleep(INSTALLED_TREE_RECHECK_SECONDS)
                         bad = installed_tree_problem(state_dir)
+                    if relay_loop is not None:
+                        relay_loop.set_blocked(bad is not None)   # the relay thread obeys this verdict; it never reads the tree itself
                     if bad is None:
                         installed_tree_clear(state_dir)
                         engine.run_pass()
-                        load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
                     else:   # no verdict, merge or message is decided or delivered; only this re-check goes on
                         engine._note("installed_tree.stopped", None, {"problem": bad})
                         installed_tree_alert(state_dir, bad, engine.now, getattr(getattr(engine, "herdr", None), "binary", None))
@@ -3913,6 +3970,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                 timeout = next_poll(engine, poll)
                 wait(sock, min(timeout, CONFIG_STABLE_SECONDS) if watch is not None and watch.pending else timeout)
         finally:
+            if relay_loop is not None:
+                relay_loop.stop()
             if sock is not None:
                 sock.close()
 
@@ -12914,6 +12973,11 @@ class GitHubHub:
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
 
+    def present_record(self, repo, endpoint, number):
+        """The present record of one pull request (`pulls`) or issue (`issues`), or None: the ONE present-state read of #1378, which #1402 reuses at delivery."""
+        got = [v for v in self.gh_api("repos/%s/%s/%d" % (repo, endpoint, number), paginate=False) if isinstance(v, dict)]
+        return got[0] if got else None
+
     def gh_api(self, path, paginate=True, timeout=None):
         argv = [self.config["gh"], "api"] + (["--paginate"] if paginate else []) + [path]
         named = re.match(r"^repos/([^/]+/[^/]+)/", path)
@@ -13038,8 +13102,7 @@ class GitHubHub:
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
         def present_pull(number):   # #1378: the pull request's present head and state, read only for an unowned red run not yet told
-            got = [v for v in self.gh_api(base + "pulls/%d" % number, paginate=False) if isinstance(v, dict)]
-            return got[0] if got else None
+            return self.present_record(repo, "pulls", number)
         red_ci_runs(self.engine, repo, [r for r in (found_runs or []) if isinstance(r, dict) and fresh(r)], now, present_pull)   # #1141: the same runs
         self.last_failed_primary = bool(failed)
         self.last_incomplete = bool(stopped or failed)   # #494: a step is still to do: the caller keeps the cursor and the marker where they are
@@ -13855,13 +13918,13 @@ def identify_caller(herdr, v2, environ):
     return name
 
 
-def build_engine(runner, now, actor, writable=True, socket_call=None):
+def build_engine(runner, now, actor, writable=True, socket_call=None, owns_link=True):
     """The engine over the configured clients. Refuses an unconfigured v2 or a bad fault name."""
     config = load_runnable_config()
     active_faults()
     state = ensure_state_dir()
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
-    if actor == "daemon":
+    if actor == "daemon" and owns_link:   # the relay thread's engine does not (one writer of v2-link.json)
         v2.state_dir = state   # the daemon's link is what `status` reports
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
@@ -13920,7 +13983,8 @@ def cmd_run(args, runner, now, wait):
     try:
         run_daemon(engine, state, args.poll or config["poll_seconds"], wait,
                    record=dict(daemon_record(config), config_loaded_at=iso(now())), watch=watch,
-                   on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv))
+                   on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv),
+                   relay_engine=lambda: build_engine(runner, now, "daemon", owns_link=False)[0])   # the relay thread's own engine
     except KeyboardInterrupt:
         return EXIT_OK
     finally:
@@ -15110,6 +15174,7 @@ class GhAccounts:
         self.paused = {}                         # account -> epoch until which its reads wait (the limit's reset)
         self.limited_once = set()                # accounts whose pause was audited, so it is said once per episode
         self.lock = threading.Lock()             # the hub's threads and the pass read through one gate
+        self._local = threading.local()          # depth of `read` on this thread: a call inside `read` is checked and counted by `read` itself
         self.audit, self.actor = None, "daemon"
         self.conditional = False                 # ask with `-i` and keep the ETag: the daemon turns it on; a one-shot command or a test reads plainly
 
@@ -15207,7 +15272,11 @@ class GhAccounts:
         env = self.env_for(repo) if repo else None
         if env is not None:
             run_kwargs["env"] = env
-        done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
+        self._local.depth = getattr(self._local, "depth", 0) + 1
+        try:
+            done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
+        finally:
+            self._local.depth -= 1
         status, headers, body = _split_http(done.stdout) if use_head else (None, {}, done.stdout)
         with self.lock:
             self.calls.append((now, account, _endpoint_of(path), status == 304))
@@ -15237,6 +15306,31 @@ class GhAccounts:
             if reset is not None:
                 self._pause(account, reset, status)
         return subprocess.CompletedProcess(argv, done.returncode or 1, body, done.stderr or ("HTTP %d" % status))
+
+    def _inside_read(self):
+        return getattr(self._local, "depth", 0) > 0
+
+    def check_pause(self):
+        """For a caller that runs gh through its own runner (the relay): GhRateLimited when ANY account is paused (fail closed: the relay does not know which
+        account its call would use; the cost is availability only). A call made inside `read` is not checked twice: `read` has checked it."""
+        if self._inside_read():
+            return
+        now = self.now()
+        with self.lock:
+            paused = [(a, u) for a, u in self.paused.items() if now < u]
+        if paused:
+            account, until = max(paused, key=lambda x: x[1])
+            raise GhRateLimited(account, until)
+
+    def record(self, kind):
+        """Counts one gh call of a caller outside `read` (kind: who made it). A call made inside `read` is NOT counted here: `read` counts it once, after it ran."""
+        if self._inside_read():
+            return
+        now = self.now()
+        with self.lock:
+            self.calls.append((now, self.describe(None), kind, False))
+            while self.calls and self.calls[0][0] < now - 600:
+                self.calls.popleft()
 
     def read_usage(self):
         """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
@@ -16338,9 +16432,10 @@ def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now
     return {"facts": facts, "plan": plan, "plan_problem": problem}
 
 
-def _ledger_context(args, runner, now, writable, parts=None, floor=False):
+def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_read=True):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
-    (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
+    (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built. `plan_read=False` skips the read of the plan
+    (the relay's link check needs only the PR and the plan's source: one GitHub read)."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
@@ -16360,7 +16455,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
     plan, plan_problem = None, None
-    if source:
+    if source and plan_read:
         record_step("a GitHub read of the plan %s" % source)
         try:
             plan = checked_plan(config, source, args.ask, runner, now)
@@ -23287,7 +23382,7 @@ def load_tick(engine, discovery):
                   and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
         orchestrators[name] = {"charter": charter_or_first_seen(engine, name, fleet),   # a fallback: the charter is found by the yaml that names the agent; the registry's, never the launch metadata (#969)
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
-                               "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
+                               "busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0), "idle": sum(1 for c in coders if c.status == "idle"),
                                "workers": [o.name for o in coders if getattr(o, "name", None)], "cloud": cloud_live.get(name, 0),
                                "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
