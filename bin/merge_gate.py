@@ -20,9 +20,16 @@ import fcntl
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+except NameError:   # a test runs the source with no file: the module is then already importable
+    pass
+import size_ceilings   # the one reading of the size ceilings of docs/architecture.md (#1605)
 
 CONFIG_KEY = "merge_gate"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
 CONFIG_DEFAULT = None       # None: nothing is enforced and nothing is added to the configuration
@@ -422,6 +429,9 @@ def check_merge(reading, gh, conf, state, repo, number, caller, person, waived_h
     if lock is None or stale or lock.get("holder") != caller:
         who = "nobody holds" if lock is None or stale else "%s holds" % lock.get("holder")
         return False, "merge of %s#%d refused: %s the merge lock on %s; %s" % (repo, number, who, facts["branch"], why), None
+    sizes = size_ceilings.check_merge(os.getcwd(), facts["tip"], facts["head"]) if size_ceilings.available(os.getcwd(), facts["tip"], facts["head"]) else []   # #1605
+    if sizes:
+        return False, "\n".join(["merge of %s#%d refused: it would put a file over its size ceiling in docs/architecture.md" % (repo, number)] + sizes), None
     return True, "%s %s" % (GATE_PASSED, caller), facts["head"]
 
 
