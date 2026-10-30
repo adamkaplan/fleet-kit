@@ -16,6 +16,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent.parent
+sys.path.insert(0, str(ROOT / "cloud" / "worker" / "tests"))
+import stub_support  # noqa: E402
 _loader = importlib.machinery.SourceFileLoader("cw_tests_of_the_worker_scratch", str(ROOT / "bin" / "test-cloud-worker"))
 cwt = importlib.util.module_from_spec(importlib.util.spec_from_loader("cw_tests_of_the_worker_scratch", _loader))
 sys.modules["cw_tests_of_the_worker_scratch"] = cwt
@@ -38,13 +40,28 @@ def run_case(case):
         return unittest.TextTestRunner(stream=null).run(unittest.defaultTestLoader.loadTestsFromTestCase(case))
 
 
+class LateCleanups:
+    """Takes the cleanups stub_support.start registers, so they run after the fixture's own cleanup (which is what is under test), not before it."""
+    def __init__(self):
+        self.calls = []
+
+    def addCleanup(self, fn, *args):
+        self.calls.append((fn, args))
+
+    def run(self):
+        for fn, args in reversed(self.calls):
+            fn(*args)
+
+
 class ScratchCleanup(unittest.TestCase):
     def _run(self, argv_of):
         record = {}
+        late = LateCleanups()
+        self.addCleanup(late.run)
 
         class ChildLeft(cwt.Base):
             def test_leaves_a_child(self):
-                p = subprocess.Popen(argv_of(self.home), cwd=str(self.home))
+                p = stub_support.start(late, argv_of(self.home), cwd=str(self.home))
                 record["pid"] = p.pid
                 record["home"] = str(self.home)
                 record["p"] = p
