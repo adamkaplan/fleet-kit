@@ -7266,6 +7266,9 @@ def decision_repos(engine):
     return watched_repos(engine.config, discovered_fleets(engine.discovery))
 
 
+BATCH_ROWS_MAX = decision_core.BATCH_ROWS_MAX            # rows one batch may carry (the panel draws one line or two per row); kept in the entry: the command table reads it at load
+
+
 # ---- PR notices: a heads-up that an orchestrator opened (or means to merge) a PR
 
 PR_NOTICES = "pr-notices.json"

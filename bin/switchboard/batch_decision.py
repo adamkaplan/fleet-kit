@@ -1,7 +1,6 @@
 # ---- a batch: related findings raised as ONE decision (one issue, one Markdown section per row in its body)
 
 BATCH_FENCE = decision_core.BATCH_FENCE
-BATCH_ROWS_MAX = decision_core.BATCH_ROWS_MAX            # rows one batch may carry (the panel draws one line or two per row)
 BATCH_REF_MAX, BATCH_FINDING_MAX, BATCH_REC_MAX = (decision_core.BATCH_REF_MAX, decision_core.BATCH_FINDING_MAX,
                                                    decision_core.BATCH_REC_MAX)
 BATCH_TITLE_MAX = decision_core.BATCH_TITLE_MAX
