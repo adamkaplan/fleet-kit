@@ -115,7 +115,9 @@ LAST_FAILURE = {}  # the last die(): {'transient': bool, 'reason': text, 'retry_
 
 def _wait_seconds(value):
     """A Retry-After header as whole seconds, or None when it is not a plain number."""
-    return int(value) if isinstance(value, str) and value.isdigit() and len(value) <= 6 else None
+    if not (isinstance(value, str) and value.isascii() and value.isdigit()):
+        return None   # an HTTP date, a sign, a float, a non-ASCII digit (int() would raise on it): not a number
+    return int(value) if len(value) <= 6 else 999999   # a huge wait is over the cap: the retries end at once
 
 
 def die(msg, code=1, transient=False, retry_after=None):
