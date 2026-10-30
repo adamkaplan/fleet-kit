@@ -3,6 +3,7 @@ bin/test-cloud-relay-daemon, loaded from it (it is not a package, and that file 
 import importlib.machinery
 import importlib.util
 import unittest
+from pathlib import Path
 
 from support.paths import REPO
 
@@ -10,8 +11,8 @@ _loader = importlib.machinery.SourceFileLoader("relay_daemon_fixtures_loop", str
 _spec = importlib.util.spec_from_loader(_loader.name, _loader)
 _fx = importlib.util.module_from_spec(_spec)
 _loader.exec_module(_fx)
-globals().update({k: v for k, v in vars(_fx).items() if not k.startswith("__") and not isinstance(v, type(unittest)) or k in ("os", "sys", "time", "json", "threading", "types", "tempfile", "contextlib", "relay", "plan_ledger")})
-Fixture = _fx.Fixture
+BIN, CODER, PROVE, Fixture, json, load_backend_module, plan_ledger, relay, threading, time, types = (
+    _fx.BIN, _fx.CODER, _fx.PROVE, _fx.Fixture, _fx.json, _fx.load_backend_module, _fx.plan_ledger, _fx.relay, _fx.threading, _fx.time, _fx.types)
 
 
 class RelayLoopCadence(unittest.TestCase):
@@ -61,13 +62,16 @@ class RelayLoopCadence(unittest.TestCase):
     def test_a_pull_runs_on_the_loop_thread_only_and_the_thread_ends_at_stop(self):
         threads = set()
         relay.pass_if_configured = lambda *a: threads.add(threading.get_ident())
-        counter = []
+        counter, holder, ready = [], [], threading.Event()
 
         def sleep(seconds):
+            ready.wait(30)   # `loop` is assigned only after start_loop returns: the thread may run first
             counter.append(1)
             if len(counter) >= 6:
-                loop.stop_flag.set()
+                holder[0].stop_flag.set()
         loop = relay.start_loop(None, object(), None, None, environ=self.ENV, cadence=0.0, sleep=sleep, engine_factory=lambda: None)
+        holder.append(loop)
+        ready.set()
         loop.thread.join(30)   # a generous bound, not a measurement: the loop ends by its own tick count
         self.assertFalse(loop.thread.is_alive())
         self.assertEqual(threads, {loop.thread.ident})
@@ -226,7 +230,7 @@ class TwoLoopsTrace(Fixture):
             def work(n):
                 ex = mod.Executor(self.state, backend, lambda: 1000)
                 for i in range(each):
-                    hub = FakeHub()
+                    hub = _fx.FakeHub()
                     rid = hub.submit(CODER, "prove", cid="w%d-%d" % (n, i), **PROVE)
                     mod.pass_once(ex, hub.fetch, hub.post)
             ts = [th.Thread(target=work, args=(n,)) for n in range(workers)]
@@ -267,7 +271,7 @@ class TwoLoopsTrace(Fixture):
         answers = []
 
         def send():
-            hub = FakeHub()
+            hub = _fx.FakeHub()
             hub.submit(CODER, "prove", cid="same", **PROVE)
             mod.pass_once(mod.Executor(self.state, self.backend, lambda: 1000), hub.fetch, hub.post)
             answers.append(list(hub.results.values())[0])
