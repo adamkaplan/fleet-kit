@@ -232,5 +232,41 @@ class Mutants(unittest.TestCase):
         self.child("mutant-12", [("RENEW_CADENCE_SECONDS = 600 ", "RENEW_CADENCE_SECONDS = 10 ** 9 ")], "S12LoginGap")
 
 
+class S13ImportsInIdentity(unittest.TestCase):
+    def test_every_imported_kit_module_is_in_the_identity_list(self):
+        import ast
+        with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
+            tree = ast.parse(f.read())
+        names = set()
+        for node in ast.walk(tree):   # module level and inside functions
+            if isinstance(node, ast.Import):
+                names.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names.add(node.module.split(".")[0])
+        kit = sorted(rel for n in names for rel in ("cloud/launcher/%s.py" % n, "bin/%s.py" % n) if os.path.isfile(os.path.join(ROOT, rel)))
+        listed = target().CODE_IDENTITY_FILES
+        missing = [rel for rel in kit if rel not in listed]
+        print("S13: imported kit modules %d, all in the identity list" % len(kit))
+        self.assertEqual(missing, [])
+
+
+class S13ImportsMutant(unittest.TestCase):
+    def test_the_list_without_token_mint_fails_the_test(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
+                src = f.read()
+            old = ', "cloud/launcher/token_mint.py"'
+            assert src.count(old) == 1
+            d = os.path.join(tmp, "mutant-13b")
+            os.makedirs(d)
+            path = os.path.join(d, "cloud_worker_scratch.py")
+            with open(path, "w") as f:
+                f.write(src.replace(old, ""))
+            p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reaper_restart.S13ImportsInIdentity"], cwd=HERE,
+                                   env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out = p.communicate(timeout=120)[0]
+        self.assertEqual(p.returncode, 1, out)
+
+
 if __name__ == "__main__":
     unittest.main()
