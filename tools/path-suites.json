@@ -1,3 +1,3 @@
 {"rows": [
-  {"glob": "bin/path_suites.py", "suites": ["bin/test-path-suites"], "reason": "the module is exercised by its own suite, which loads it by file path rather than by an import the search would find"}
+  {"glob": "bin/path_suites.py", "suites": ["bin/test-path-suites", "tests/switchboard/test_cases_10.py", "tests/switchboard/test_bin_set_table.py"], "reason": "the module is exercised by its own suite, which loads it by file path rather than by an import the search would find"}
 ]}
