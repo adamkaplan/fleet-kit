@@ -13,9 +13,9 @@ import types
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-BIN = HERE.parent.parent / "bin"
-sys.path.insert(0, str(HERE))
+TESTS_DIR = Path(__file__).resolve().parent
+BIN = TESTS_DIR.parent.parent / "bin"
+sys.path.insert(0, str(TESTS_DIR))
 from support.core import Base   # noqa: E402
 from support.loader import sb   # noqa: E402
 
@@ -148,7 +148,54 @@ def s19(module):
         w.close()
 
 
-SCENARIOS = {"s16": s16, "s17": s17, "s18": s18, "s19": s19}
+def s16b(module):
+    w = World(module, {"worker-1": "lane-a"})
+    try:
+        original = module._write_state
+
+        def failing(path, state):
+            raise OSError("disk full")
+        module._write_state = failing
+        w.line(T0 - 60, "worker-1", False, "no network")
+        for n in range(5):
+            w.tick(T0 + n)
+        counts = [len(w.to(r)) for r in ("lane-a", "cos-1")]
+        print("S16b: passes 5, alarms per recipient with a failing state write %d" % max(counts))
+        assert counts == [1, 1], counts
+        # a send that raises for the second recipient: the first is not repeated on the next pass
+        w2 = World(module, {"worker-1": "lane-a"})
+        module._write_state = original
+        try:
+            w2.line(T0 - 60, "worker-1", False, "other")
+            real = w2.send
+
+            def flaky(state_dir, to, *rest, **more):
+                if to == "cos-1":
+                    raise RuntimeError("send failed")
+                return real(state_dir, to, *rest, **more)
+            w2.tick_with = flaky
+            try:
+                module.tick(w2.engine, types.SimpleNamespace(agents=w2.agents), flaky, lambda seen: None, lambda worker: w2.bosses.get(worker), "cos-1", env=w2.env)
+            except RuntimeError:
+                pass
+            w2.tick(T0 + 5)
+            assert len(w2.to("lane-a")) == 1, w2.messages
+        finally:
+            w2.close()
+        # a lane recipient on hold is skipped like the boss
+        w3 = World(module, {"worker-1": "lane-a"})
+        try:
+            w3.line(T0 - 60, "worker-1", False, "held")
+            module.tick(w3.engine, types.SimpleNamespace(agents=w3.agents), w3.send, lambda seen: "hold" if seen.name == "cos-1" else None, lambda worker: w3.bosses.get(worker), "cos-1", env=w3.env)
+            assert w3.to("cos-1") == [] and len(w3.to("lane-a")) == 1, w3.messages
+            print("S16c: lane recipient on hold skipped, messages %d" % len(w3.messages))
+        finally:
+            w3.close()
+    finally:
+        w.close()
+
+
+SCENARIOS = {"s16b": s16b, "s16": s16, "s17": s17, "s18": s18, "s19": s19}
 
 
 def run(name, path=None):
@@ -158,6 +205,7 @@ def run(name, path=None):
 
 MUTANTS = {
     "s16": ("sends nothing", "item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)", "item = None"),
+    "s16b": ("keeps no record of a failed write", "_MEMORY[state_path] = copy.deepcopy(state)", "pass"),
     "s17": ("alarms every failure line", "if last is not None and 0 <= at - last < SERIES_SECONDS:", "if False:"),
     "s18": ("one lane message per pod", "if len(by_reason[reason]) == 1:", "if True:"),
     "s19": ("copies the whole audit line", 'scrub(rec.get("reason"))', "json.dumps(rec)"),
@@ -170,6 +218,9 @@ class TestCloudRenewalAlarm(unittest.TestCase):
 
     def test_s16_one_message_to_the_boss_and_one_to_the_lane_and_none_on_the_second_tick(self):
         s16(self.module)
+
+    def test_s16b_a_failing_state_write_and_a_failing_send_never_repeat_an_alarm_and_a_held_lane_is_skipped(self):
+        s16b(self.module)
 
     def test_s17_the_same_pod_within_thirty_minutes_sends_nothing_more_and_a_success_ends_the_series(self):
         s17(self.module)
@@ -259,9 +310,9 @@ class TestCloudRenewalAlarmMutants(unittest.TestCase):
     """Each mutant is a scratch copy OUTSIDE the repository with one applied change, run as a child process: its scenario exits 1; the real module exits 0."""
 
     def child(self, scenario, module_path):
-        sys.path.insert(0, str(HERE.parent.parent / "cloud" / "worker" / "tests"))
+        sys.path.insert(0, str(TESTS_DIR.parent.parent / "cloud" / "worker" / "tests"))
         import stub_support   # the one starter of a child process (its cleanup is registered before anything waits)
-        code = "import sys; sys.path.insert(0, %r); import test_cloud_renewal_alarm as t; t.run(%r, %r)" % (str(HERE), scenario, str(module_path))
+        code = "import sys; sys.path.insert(0, %r); import test_cloud_renewal_alarm as t; t.run(%r, %r)" % (str(TESTS_DIR), scenario, str(module_path))
         proc = stub_support.start(self, [sys.executable, "-c", code], stdout=-1, stderr=-1)
         proc.communicate(timeout=60)
         return proc.returncode

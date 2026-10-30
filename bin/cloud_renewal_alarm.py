@@ -9,6 +9,7 @@ SERIES_SECONDS of its alarm sends nothing; a later success of the pod ends its s
 same reason are ONE message to each cloud-lane recipient that names the count and at most NAMES_MAX names, and each pod's boss still gets its own. The
 reason is cut to REASON_CHARS, flattened to printable ASCII and every token-shaped run is replaced by `[redacted]`; no other field of an audit line is copied.
 No cluster access and no credential: the file is read, the daemon's own send is used (handed in by the entry)."""
+import copy
 import json
 import os
 import re
@@ -85,7 +86,12 @@ def read_tail(path):
     return found
 
 
+_MEMORY = {}   # state path -> state that could not be written: the fallback that keeps a failing write from repeating an alarm
+
+
 def _read_state(path):
+    if path in _MEMORY:
+        return copy.deepcopy(_MEMORY[path])
     try:
         with open(path) as handle:
             state = json.load(handle)
@@ -160,8 +166,15 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
         alarms[pod] = (worker, reason)
     if len(state["pods"]) > POD_POOL:
         state["pods"] = dict(sorted(state["pods"].items(), key=lambda kv: kv[1])[-POD_POOL:])
+    # The state is written BEFORE the sends: an alarm lost to a crash between the write and the send is accepted, a repeated alarm is not.
+    # A write that fails is kept in memory (_MEMORY), so the process sends at most one round per pod while the write keeps failing.
+    try:
+        _write_state(state_path, state)
+        _MEMORY.pop(state_path, None)
+    except OSError:
+        _MEMORY[state_path] = copy.deepcopy(state)
     sent = []
-    lane = _lane(engine.config, discovery, default_lane)
+    lane = [n for n in _lane(engine.config, discovery, default_lane) if not hold_reason(discovery.agents[n])]
     by_reason = {}
     for pod, (worker, reason) in alarms.items():
         by_reason.setdefault(reason, []).append(pod)
@@ -190,7 +203,6 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
                 len(names), reason or "no reason given", ", ".join(names[:NAMES_MAX]), ", and %d more" % (len(names) - NAMES_MAX) if len(names) > NAMES_MAX else "")
             for to in lane:
                 tell(to, text, "group:" + names[0], reason)
-    _write_state(state_path, state)
     if engine.audit is not None:
         for pod, (worker, reason) in sorted(alarms.items()):
             engine.audit.append(engine.actor, EVENT, pod, {"told": sorted(set(told.get(pod, []))), "reason": reason, "group": len(by_reason[reason])})
