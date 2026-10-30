@@ -45,7 +45,7 @@ CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agen
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
 CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret"}
-LAUNCHER_SHAPES = ("XS", "S", "M")   # the launcher's SHAPES keys; the launcher's own default (XS, or S with --stack) applies when --shape is not given
+LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
@@ -724,6 +724,24 @@ def _audit(engine, event, name, detail):
         engine.audit.append(engine.actor, event, name, detail)
 
 
+def _audit_refused_preflight(name, err):
+    """A launch refused because no token could be minted writes ONE line in the launcher's own audit file (its audit_path and write_audit,
+    the Launcher.audit line shape), action create.failed; the launch has no Launcher object yet. Never raises, never a value."""
+    text = str(err)
+    if "no token could be minted" not in text:
+        return
+    try:
+        lib = _lib()
+        reason = text[text.index("no token could be minted"):]
+        reason = "preflight: " + lib.scrub(reason, (), 400).split("; nothing was created")[0]
+        import pwd
+        lib.write_audit(lib.audit_path(os.environ), {"ts": lib.iso(datetime.datetime.now(datetime.timezone.utc)),
+                                                     "worker": name, "runtime_id": "", "action": "create.failed", "cost_estimate_usd": 0.0,
+                                                     "ok": False, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": reason})
+    except Exception:
+        pass
+
+
 def _read_password(read_fd):
     chunks = b""
     while len(chunks) <= PASSWORD_MAX + 1:
@@ -1254,10 +1272,13 @@ def stack_model_secret(env=None):
     return name, ran[1].strip()
 
 
-def git_token(repo, cluster):
-    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does."""
+def git_token(repo, cluster, role="worker"):
+    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does.
+    The default mint gets `--role ROLE` for any role but the worker's (the same rule as the launcher's git_token_cmd); a custom command runs unchanged."""
     raw = os.environ.get("CW_GIT_TOKEN_CMD")
     argv = shlex.split(raw) if raw else [sys.executable, str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "app_token.py"), repo]
+    if not raw and role != "worker":
+        argv += ["--role", role]
     env = {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}
     ran = _capture(argv, env=dict(env, GH_REPO=repo))
     token = (ran[1] if ran and ran[0] == 0 else "").strip()
@@ -1316,6 +1337,7 @@ def _launch(args, runner, now, reserve):
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
+        _audit_refused_preflight(name, err)
         raise Refusal(str(err)) from None
     engine, state, _ = H["build_engine"](runner, now, "cli")
     reserve(state)
@@ -1348,7 +1370,7 @@ def _launch(args, runner, now, reserve):
     with Cluster(recovery) as cluster:
         model = model_entry()
         cluster.add(model)
-        token = git_token(repo, cluster)
+        token = git_token(repo, cluster, args.agent if args.agent in _lib().AGENTS else "worker")   # the first token is minted under the role of the launch
         cluster.add(token)
         run_secrets = [("model-auth", model), ("git-token", token)]
         if stack_model:
@@ -1533,6 +1555,22 @@ def message_line(message):
     return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", " ", line).strip()   # a pod's text never reaches the terminal as an escape sequence
 
 
+def _retired():
+    """The read of a retired worker and the kept boss (bin/cloud_retired.py, beside this file), bound to the names it works with."""
+    module = H["load_module"]("cloud_retired")
+    module.bind(dict(H, _write_private=_write_private, _read_private=_read_private, read_record_file=read_record_file, parse_bounded=parse_bounded,
+                     TooDeep=TooDeep, CloudError=CloudError, _lib=_lib, _scrub_lib=_scrub_lib, _may_retire=_may_retire))
+    return module
+
+
+def _keep_boss(state, record):
+    """Keep the boss of a worker whose record goes (cloud_retired.keep_boss). A removal never fails for it, not even when the part cannot be loaded."""
+    try:
+        _retired().keep_boss(state, record)
+    except Exception:   # nothing about the boss file may fail a removal
+        pass
+
+
 @refusals
 def cmd_read(args, runner, now):
     """`read NAME [--limit N]`: the newest messages of an agent's session, oldest first. A cloud worker is read on its endpoint; a local agent on
@@ -1554,8 +1592,14 @@ def cmd_read(args, runner, now):
         return H["EXIT_OK"]
     else:   # a local agent, on the local service
         seen = engine.discover(engine.now()).agents.get(args.name)
-        session = seen.session_id if seen else H["known_agent"](state, args.name).get("session")
+        known = {} if seen else H["known_agent"](state, args.name)
+        if known.get("kind") == "cloud":   # a retired cloud worker: its session lived on its own pod, never on this service
+            known = {}
+        session = seen.session_id if seen else known.get("session")
         if not session:
+            retired = _retired().retired_run(args.name)   # nothing live answers to the name: a retired cloud worker's run record, last (#1546)
+            if retired is not None:
+                return _retired().read_run_record(args.name, retired, state, runner, now)
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
         v2 = engine.v2
     messages = v2.message_list(session, limit=limit, order="desc") or []
@@ -1822,10 +1866,12 @@ def cmd_retire(args, runner, now, record):
         got = body.get("secrets_removed")
         got = [x for x in got if isinstance(x, str)][:10] if isinstance(got, list) else []
         _audit(engine, "cloud.name_freed", args.name, {"why": "pod gone", "runtime_id": record.get("runtime_id"), "secrets_removed": got})
+        _keep_boss(state, record)
         remove_record(state, args.name)
         print("%s is retired: its pod was already gone; the name is free to launch again; %s" % (
             args.name, "Secrets removed: " + ", ".join(got) if got else "no Secrets were left"))
         return H["EXIT_OK"]
+    _keep_boss(state, record)
     remove_record(state, args.name)
     print("%s is retired: its pod and scratch volume are deleted%s" % (
         args.name, "; work was pushed to branch %s" % wip if pushed and wip else "; nothing needed pushing" if pushed is False else ""))
@@ -1865,6 +1911,7 @@ def cmd_cloud_clear(args, runner, now):
         if dry_run:
             print("would clear %s (pod gone, deadline %s)" % (name, record.get("hard_deadline")))
             continue
+        _keep_boss(state, record)
         remove_record(state, name)
         _audit(engine, "cloud.cleared", name, {"runtime_id": record.get("runtime_id"), "hard_deadline": record.get("hard_deadline")})
         _registry_note(engine, "retire", state, name, "cleared: the pod is gone and the hard deadline has passed")

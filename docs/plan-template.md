@@ -29,7 +29,7 @@ Recorded as an issue, or a section of one, **in the repo the work concerns**. Re
 
 1. **Done-when**: the ask's clauses, copied, numbered `(1) ... (2) ...` as in the ask.
    A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
-   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the other pull requests' claims are listed, not yet enforced: #976 adds the check at the ask's last merge).
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused (the union of claims is enforced at the ask's last merge). So every per-pull-request scenario must be claimed by some pull request (else the last merge is refused; a `CU` waiver passes).
 2. **Scenarios**: the yaml block below, including unchanged (U) ones.
 3. **Constraints** (`PC-n`): what must hold, and why.
 4. **Out of scope**.
@@ -135,6 +135,16 @@ There is no yaml library and nothing is evaluated. The parser reads a flat list 
 `'single'` or `"double"` quoted (quote a value that starts with `[ { & * ! | > % @` or a backtick), continued on
 deeper-indented lines, or a `|`/`>` block. Comments (`# ...`) are allowed: a `#` starts an inline comment only when a space (or the end of the value) follows it, so `see #348` and `issue #12` stay whole. Refused, naming the block line: tabs, nested
 lists or maps, flow lists `[a, b]`, anchors and tags, duplicate keys, a second document, over 100 KB or 200 scenarios.
+
+## A plan that adds a file under `bin/`
+
+A new file under `bin/` brings nine guard classes, and some of them demand lines in the impact matrix, the Units table and the closure that the plan must already name. Before the plan is posted run `tools/new-module-demands bin/x.py` (one path per new file) and put its output in the plan as constraints:
+
+- the guard classes it lists (the rows of `NEW_BIN_GUARDS` in `bin/path_suites.py`), each a class that must pass;
+- `authority code:` yes or no. For yes, the two matrix entries it prints, both: the module in `owner_hold.top_tier_paths.authority` AND in the floor globs `owner_hold.floor[<repository>].globs` (never an exempt entry for a file with authority code); for no, that no matrix line is demanded;
+- the row to add to the Units table of `docs/architecture.md`, and the `closure:` state of `derive-closure --check`.
+
+The tool only informs: it runs no guard, and the guard stays the authority, so the build still runs the classes.
 
 ## A good example
 
