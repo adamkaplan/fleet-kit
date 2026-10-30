@@ -409,6 +409,85 @@ class TestLostWorkerReadRound(unittest.TestCase):
         self.assertEqual(r.passes(2), [])
         self.assertEqual(r.engine.sent, [])
 
+    def test_malformed_memory_is_dropped_and_alerting_goes_on(self):
+        import ast
+        module = load()
+        outage = {"first": NOW - 200, "latest": NOW - 100, "count": 2, "reason": "r", "sent": False, "closed_by": None}
+        gap = {"first": NOW - 9000, "latest": NOW - 8000, "count": 2, "reason": "r"}
+        bad_numbers = ["x", True, None, float("nan"), -1, 5e12, [1]]
+        table = [("reaper_outage", "wrong type", {"sent": False}), ("reaper_outage", "wrong type", "x"), ("reaper_outage", "wrong type", 5),
+                 ("reaper_gap", "wrong type", {"count": 3}), ("reaper_gap", "wrong type", [1]),
+                 ("reaper_new", "wrong type", 5), ("reaper_new", "wrong type", "x"), ("reaper_new", "wrong type", {"at": 1, "line": "x"}),
+                 ("reaper_new", "wrong type", [{"at": "x", "line": 1}, 7, [1]])]
+        for record, base, fields in (("reaper_outage", outage, ("first", "latest", "count", "reason", "sent", "closed_by")),
+                                     ("reaper_gap", gap, ("first", "latest", "count", "reason"))):
+            for field in fields:
+                for bad in (bad_numbers if field not in ("sent",) else ["x", 1, None]) + ([10 ** 30, 1.5, 0] if field == "count" else []) + ([5, None] if field == "reason" else []):
+                    table.append((record, field, dict(base, **{field: bad})))
+                if field not in ("closed_by",):
+                    table.append((record, field, {k: v for k, v in base.items() if k != field}))
+        # completeness from the code: every field a stored record is built with must be corrupted by some row above
+        tree = ast.parse((REPO / "bin" / "lost_worker.py").read_text())
+        built = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+                for target in node.targets:
+                    if isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant) and target.slice.value in ("reaper_outage", "reaper_gap"):
+                        built.setdefault(target.slice.value, set()).update(k.value for k in node.value.keys if isinstance(k, ast.Constant))
+        for record, fields in built.items():
+            covered = {f for r, f, shape in table if r == record and f != "wrong type"}
+            self.assertEqual(fields, covered, record)
+        old_memory = [("old", {"reaper": {"k@t": {"at": NOW - 100, "line": "x"}}, "alerted": {"reaper_missed:k@t": {"ask": "-", "at": NOW}}}),
+                      ("old", {"alerted": {"reaper_missed:k@t": 5}})]
+        cases = [(r, shape) for r, f, shape in table] + old_memory
+        for record, shape in cases:
+            r = self.rig()
+            with open(os.path.join(r.dir, "lost-workers.json"), "w") as handle:
+                json.dump({"offsets": {}, "alerted": {}, record if record != "old" else "x": shape} if record != "old" else dict({"offsets": {}, "alerted": {}}, **shape), handle)
+            self.failed(r, 60, "recent")
+            for _ in range(2):
+                got = r.passes()   # a second pass: the memory written by the first must not wedge it either
+                if record != "old":
+                    self.assertTrue(got or self.reaper_texts(r), (record, shape))
+            if record != "old":
+                self.assertTrue(self.reaper_texts(r), (record, shape))
+        r = self.rig()   # a recent failed pod alerts on the same pass as a malformed record
+        with open(os.path.join(r.dir, "lost-workers.json"), "w") as handle:
+            json.dump({"offsets": {}, "alerted": {}, "reaper_outage": {"sent": False}, "reaper_gap": {"count": "x"}, "reaper_new": 5}, handle)
+        r.created("w1")
+        self.assertEqual([x["name"] for x in r.passes()], ["w1"])
+
+    def test_the_catch_up_flag_is_set_only_with_no_usable_memory(self):
+        r = self.rig()   # a valid memory, an audit more than one chunk behind
+        self.pad(r.engine.audit.path, 3 << 19, "switchboard")
+        state_path = os.path.join(r.dir, "lost-workers.json")
+        self.assertEqual(r.passes(), [])
+        self.assertFalse(json.load(open(state_path))["catchup"])
+        r.created("restart-gap")   # an old loss in the second chunk
+        self.assertEqual([x["name"] for x in r.passes()], ["restart-gap"])
+        self.assertFalse(json.load(open(state_path))["catchup"])
+
+    def test_a_launcher_file_that_exists_but_cannot_be_read_is_not_the_end(self):
+        for make in (lambda p: os.symlink(os.path.join(os.path.dirname(p), "nowhere"), p), os.mkdir):
+            r = self.rig(memory=False)
+            os.unlink(r.launcher)
+            make(r.launcher)
+            state_path = os.path.join(r.dir, "lost-workers.json")
+            r.passes()
+            self.assertTrue(json.load(open(state_path))["catchup"])
+            if os.path.isdir(r.launcher):
+                os.rmdir(r.launcher)
+            else:
+                os.unlink(r.launcher)
+            open(r.launcher, "w").close()
+            r.created("oldpod", deadline=NOW - 3 * 3600)
+            self.assertEqual(r.passes(), [])   # read with the rule still on: the old loss is skipped
+            self.assertFalse(json.load(open(state_path))["catchup"])
+        r = self.rig(memory=False)   # a missing file is the end
+        os.unlink(r.launcher)
+        r.passes()
+        self.assertFalse(json.load(open(os.path.join(r.dir, "lost-workers.json")))["catchup"])
+
     def mutant(self, old, new, extra=()):
         src = (REPO / "bin" / "lost_worker.py").read_text()
         for a, b in ((old, new),) + tuple(extra):
@@ -453,6 +532,27 @@ class TestLostWorkerReadRound(unittest.TestCase):
         }
         for label, module in mutants.items():
             self.assertTrue(self.failing_tests(module), label)
+        named = ("test_malformed_memory_is_dropped_and_alerting_goes_on", "test_the_catch_up_flag_is_set_only_with_no_usable_memory",
+                 "test_a_launcher_file_that_exists_but_cannot_be_read_is_not_the_end")
+        self.assertEqual(self.failing_named(load(), named), [])
+        for name, module in (("validation removed", self.mutant("def _sanitize(state):\n", "def _sanitize(state):\n    return\n")),
+                             ("flag set on every pass", self.mutant('(first or state.get("catchup") is True) and not at_end', "not at_end")),
+                             ("unreadable file is the end", self.mutant("return False   # a file that exists", "return True   # a file that exists"))):
+            self.assertTrue(self.failing_named(module, named), name)
+
+    def failing_named(self, module, names):
+        failed = []
+        for name in names:
+            global load
+            real = load
+            load = lambda: module
+            try:
+                getattr(TestLostWorkerReadRound(name), name)()
+            except Exception:
+                failed.append(name)
+            finally:
+                load = real
+        return failed
 
 
 class TestLostWorkerMemoryOnly(unittest.TestCase):

@@ -145,11 +145,55 @@ def _fold(state, sb, lines, source):
             data.pop(min(data, key=lambda k: data[k]["at"] if isinstance(data[k], dict) else data[k]))
 
 
+EPOCH_MAX = 4102444800        # a time in a memory record is a finite number of seconds in 0..EPOCH_MAX
+COUNT_MAX = 1000000
+
+
+def _num(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and 0 <= value <= EPOCH_MAX
+
+
+def _valid_record(rec, outage):
+    """The cleaned `reaper_outage` / `reaper_gap` record, or None when it is malformed (the one place the record's fields are checked)."""
+    if not isinstance(rec, dict) or not _num(rec.get("first")) or not _num(rec.get("latest")):
+        return None
+    count = rec.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= COUNT_MAX or not isinstance(rec.get("reason"), str):
+        return None
+    out = {"first": rec["first"], "latest": rec["latest"], "count": count, "reason": _clean(rec["reason"], 120)}
+    if outage:
+        if not isinstance(rec.get("sent"), bool):
+            return None
+        out["sent"] = rec["sent"]
+        out["closed_by"] = rec.get("closed_by") if _num(rec.get("closed_by")) else None
+    return out
+
+
+def _sanitize(state):
+    """Malformed memory fails closed: a bad record is dropped and the pass goes on (it never raises, so the detector is never wedged by one file)."""
+    for field, outage in (("reaper_outage", True), ("reaper_gap", False)):
+        if field in state:
+            rec = _valid_record(state[field], outage)
+            if rec is None:
+                state.pop(field)
+            else:
+                state[field] = rec
+    new = state.get("reaper_new", [])
+    state["reaper_new"] = [e for e in new if isinstance(e, list) and len(e) == 3 and _num(e[0]) and isinstance(e[1], bool)] if isinstance(new, list) else []
+    if not state["reaper_new"]:
+        state.pop("reaper_new")
+    alerted = state.get("alerted")
+    if isinstance(alerted, dict):
+        for key in [k for k, v in alerted.items() if not isinstance(v, dict) or not _num(v.get("at"))]:
+            alerted.pop(key)
+
+
 def _reaper(state, now):
     """Settle the reaper lines read this pass (closed rule: a failed line younger than RECENT_SECONDS joins the outage; an older one joins the gap
     summary and is never an alert of its own; an ok line closes the outage). Limits: a late line older than the window is summed, not alerted. A malformed
     record is dropped (fails closed: no alert from it)."""
-    events = sorted((e for e in state.pop("reaper_new", []) if isinstance(e, list) and len(e) == 3 and isinstance(e[0], (int, float))), key=lambda e: e[0])
+    _sanitize(state)
+    events = sorted((e for e in state.pop("reaper_new", []) if isinstance(e, list) and len(e) == 3 and _num(e[0])), key=lambda e: e[0])
     for ts, ok, reason in events:
         outage = state.get("reaper_outage")
         if ok:
@@ -174,10 +218,12 @@ def _reaper(state, now):
 
 
 def _at_end(state, path, key):
+    if not os.path.lexists(path):
+        return True   # a missing file has nothing to read
     try:
         return state.get("offsets", {}).get(key, 0) >= os.stat(path).st_size
     except OSError:
-        return True
+        return False   # a file that exists and cannot be read is not at its end
 
 
 def _ask_of(name, record):
@@ -188,6 +234,7 @@ def _ask_of(name, record):
 
 
 def _losses(state, sb, engine, alive, now, records):
+    _sanitize(state)
     out = []
     for name, c in sorted(state.get("created", {}).items()):
         deadline = c.get("deadline")
@@ -281,12 +328,13 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
             return []
     first = status in ("none", "memory_only")
     catchup = first or state.get("catchup") is True   # a catch-up: no usable memory, and every later pass until both audits are read to their end
+    _sanitize(state)   # before the first fold: a record of the wrong type never reaches the code that adds to it
     before = json.dumps(state, sort_keys=True)
     _fold(state, sb, _read_new(sb, str(engine.audit.path), state, "switchboard"), "switchboard")
     _fold(state, sb, _read_new(sb, launcher_audit or launcher_audit_path(), state, "launcher"), "launcher")
     _reaper(state, now)
     at_end = _at_end(state, str(engine.audit.path), "switchboard") and _at_end(state, launcher_audit or launcher_audit_path(), "launcher")
-    state["catchup"] = not at_end   # set on a pass with no usable memory that cannot reach the ends; cleared only by a pass that reads both files to their end
+    state["catchup"] = (first or state.get("catchup") is True) and not at_end   # set only on a pass with no usable memory; cleared only by a pass that reads both files to their end
     state["_gap_ready"] = at_end
     records = {}
     for r in (getattr(engine, "cloud_watch", None) or {}).get("records", []):
