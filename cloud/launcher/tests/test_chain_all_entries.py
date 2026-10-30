@@ -94,9 +94,7 @@ class AllEntries(Chain):
 
 
 class Signals(Chain):
-    HANG = ("import os, subprocess, sys\nc = subprocess.Popen(['sleep', '300'])\n"
-            "open(os.path.join(os.environ['CHAIN_LOG'], 'pids'), 'w').write('%d %d' % (os.getpid(), c.pid))\n"
-            "c.wait()\n")
+    HANG = "#!/bin/sh\necho $$ > \"$CHAIN_LOG/pids\"\nsh -c 'echo $$ >> \"$CHAIN_LOG/pids\"; exec sleep 300'\n"
 
     def alive(self, pid):
         try:
@@ -110,8 +108,9 @@ class Signals(Chain):
             return True
 
     def hang_run(self, wrapper):
-        d = self.tree(["test_hang.py"])
-        self.entry(d, "test_hang.py", self.HANG)
+        d = self.tree([], tests=(), raw="bin/test-hang\n" + base.FIXED_LAST + "\n")
+        self.entry(d, "../../../bin/test-hang", self.HANG)
+        os.chmod(os.path.join(d, "bin", "test-hang"), 0o755)
         log = tempfile.mkdtemp(prefix="chain-log-"); self.addCleanup(shutil.rmtree, log, True)
         p = stub_support.start(self, wrapper + [os.path.join(d, "bin", "test-cloud-launcher")], cwd=d,
                                env=dict(os.environ, CHAIN_LOG=log), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -121,7 +120,7 @@ class Signals(Chain):
         f = os.path.join(log, "pids")
         for _ in range(100):
             text = open(f).read() if os.path.exists(f) else ""
-            if text.count(" "):
+            if len(text.split()) == 2:
                 return [int(x) for x in text.split()]
             time.sleep(0.1)
         self.fail("the hung entry did not start")
