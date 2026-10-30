@@ -363,9 +363,18 @@ def parse_scenarios(lines):
 PROSE_REF_RE = re.compile(r"\b(?:see|per|in|of|clause|item|section|and|or|with|to)\s*\(?\s*$", re.IGNORECASE)
 
 
+DONE_WHEN_LABEL_RE = re.compile(r"^\s*(?:[-*]\s+)?\**done[ -]when\**\s*:\s*\**\s*", re.IGNORECASE)
+
+
+def strip_done_when_label(done_when):
+    """`done_when` without a leading `Done when:` label (a value copied with its label reads the same as one without)."""
+    return DONE_WHEN_LABEL_RE.sub("", done_when, count=1) if done_when else done_when
+
+
 def clauses_of(done_when):
     """[clause text] from the ask's Done-when line: its numbered parts `(1) ... (2) ...`, in order, counting up from
     1 and stopping at the first gap. A line with no `(1)` is one clause. None or empty gives []."""
+    done_when = strip_done_when_label(done_when)
     listed = [re.match(r"^\s*([0-9]+)[.)]\s+(\S.*)$", line) for line in (done_when or "").splitlines() if line.strip()]
     if len(listed) >= 2 and all(listed) and [int(m.group(1)) for m in listed] == list(range(1, len(listed) + 1)):
         return [" ".join(m.group(2).split()) for m in listed]   # a numbered list, one clause per line
@@ -401,11 +410,12 @@ def declared_clauses(text):
     """[clause text] from the plan's own `clauses:` block (a fenced yaml block, `DW-<n>: text` lines numbered from 1), or
     None when the plan has none. A Done-when written as one sentence with several clauses cannot be split reliably, so the
     plan declares them and `verify_declared` checks they say what the ask says. Raises PlanFormatError."""
-    found = []
-    for _, inner in fenced_blocks(text):
+    found, starts = [], []
+    for start, inner in fenced_blocks(text):
         first = next((l for l in inner if l.strip() and not l.lstrip().startswith("#")), None)
         if first is not None and first.strip() == "clauses:":
             found.append(inner)
+            starts.append(start)
     if not found:
         return None
     if len(found) > 1:
@@ -426,7 +436,8 @@ def declared_clauses(text):
         if found_key and (key_indent is None or indent == key_indent):
             key_indent = indent if key_indent is None else key_indent
             if int(found_key.group(1)) != len(out) + 1:
-                raise PlanFormatError("clauses line %d: DW-%s is out of order: number the clauses 1, 2, 3 ..." % (number, found_key.group(1)))
+                raise PlanFormatError("clauses line %d (plan line %d): DW-%s is out of order, expected DW-%d: %r: number the clauses 1, 2, 3 ..."
+                                      % (number, starts[0] + number, found_key.group(1), len(out) + 1, " ".join((found_key.group(2) or "").split())[:80]))
             out.append(_scalar(_strip_comment(found_key.group(2) or ""), "clauses line %d" % number))
         elif key_indent is not None and indent > key_indent and out:
             out[-1] = (out[-1] + " " + _strip_comment(body)).strip()   # a continuation line
@@ -873,6 +884,7 @@ def check(text, done_when, plan_done_when=None):
     `plan_done_when` is the Done-when the plan states for itself, when it does: it must be the same clauses (a plan never
     weakens coverage by copying fewer). Raises PlanFormatError when the plan cannot be read."""
     scenarios = parse_scenarios(scenario_block(text))
+    done_when, plan_done_when = strip_done_when_label(done_when), strip_done_when_label(plan_done_when)
     clauses = clauses_of(done_when)
     declared = declared_clauses(text)
     extra = []
