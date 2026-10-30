@@ -425,6 +425,7 @@
         "bin/switchboard/plan_review.py",
         "bin/switchboard/triage.py",
         "bin/switchboard/alert_labels.py",
+        "bin/switchboard/link_scrub.py",
         "bin/switchboard/handoff.py",
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
@@ -570,6 +571,8 @@
           "AlertWakeFacts",
           "RedCiFacts",
           "TriageFacts"
+        ],
+        "bin/switchboard/link_scrub.py": [
         ],
         "bin/switchboard/handoff.py": [
           "WorkerFacts",
