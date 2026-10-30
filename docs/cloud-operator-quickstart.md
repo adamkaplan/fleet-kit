@@ -349,7 +349,7 @@ The blocks below are read as pasted, line by line, into an interactive shell by 
 The command list for the administrator apply (the owner's steps 3 and 4):
 
 ```text
-ns_ok() { case "$NS" in ""|cw|default|kube-*|*[!abcdefghijklmnopqrstuvwxyz0123456789-]*) echo "refused: NS is $NS" >&2; return 1;; esac; case "$NS" in [a-z0-9]|[a-z0-9]*[a-z0-9]) ;; *) echo "refused: NS is $NS" >&2; return 1;; esac; [ "${#NS}" -le 63 ] || { echo "refused: NS is longer than 63 characters" >&2; return 1; }; }
+ns_ok() { case "$NS" in ""|cw|default|kube-*|*[^abcdefghijklmnopqrstuvwxyz0123456789-]*) echo "refused: NS is $NS" >&2; return 1;; esac; case "$NS" in [a-z0-9]|[a-z0-9]*[a-z0-9]) ;; *) echo "refused: NS is $NS" >&2; return 1;; esac; [ "${#NS}" -le 63 ] || { echo "refused: NS is longer than 63 characters" >&2; return 1; }; }
 kc() { ns_ok && kubectl -n "${NS:?}" "$@"; }
 NS=cwp
 kubectl config current-context

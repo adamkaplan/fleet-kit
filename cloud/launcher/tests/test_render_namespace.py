@@ -802,5 +802,30 @@ class OnceAndLabel(unittest.TestCase):
         self.assertEqual(self.calls_for("cw "), 0)
 
 
+class HistoryExpansion(unittest.TestCase):
+    def setUp(self):
+        with open(DOCS, encoding="utf-8") as f:
+            self.whole = probe_section(f.read())
+
+    @staticmethod
+    def triggers(text):
+        blocks = code_blocks(text)
+        hits = [m for b in blocks for m in re.findall(r"!(?![ =(]|$)", b, flags=re.M)]
+        return hits, len(blocks)
+
+    def test_every_code_block_of_the_runbook_has_no_history_expansion_trigger(self):
+        hits, n = self.triggers(self.whole)
+        self.assertGreater(n, 0)
+        print("S-hist: exclamation marks that could expand %d in %d code blocks" % (len(hits), n))
+        self.assertEqual(hits, [])
+
+    def test_the_old_negated_bracket_is_caught(self):
+        mutant = self.whole.replace("*[^abcdefghijklmnopqrstuvwxyz0123456789-]*", "*[!abcdefghijklmnopqrstuvwxyz0123456789-]*")
+        self.assertNotEqual(mutant, self.whole)   # the mutation is applied
+        hits, n = self.triggers(mutant)
+        print("S-hist mutant: %d hit in %d code blocks" % (len(hits), n))
+        self.assertEqual(len(hits), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
