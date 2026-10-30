@@ -506,7 +506,7 @@ class Mint(unittest.TestCase):
         Stub.lookup = (301, {})
         self.assertIn("redirect", self.run_mint().stderr)
         down = self.run_mint(CW_GITHUB_API_BASE="http://127.0.0.1:1")  # a network error
-        self.assertEqual((down.returncode, down.stdout), (1, ""))
+        self.assertEqual((down.returncode, down.stdout), (75, ""))
         self.assertIn("failed", down.stderr)
 
     def test_a_token_call_for_an_unselected_repository_says_to_add_it_to_the_installation(self):
