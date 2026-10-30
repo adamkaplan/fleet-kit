@@ -618,6 +618,7 @@ class TestBounds(unittest.TestCase):
         done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn("10000 changed paths is more than the %d" % ps.MAX_CHANGED, done.stderr)
+        # a hang guard, kept: the whole test takes about 2.6 s on an idle machine (its 10,000-file fixture included), so 60 s is a factor above 20; the property is that the refusal is bounded, it must not walk the paths or hang
         self.assertLess(time.time() - started, 60)
 
     def test_the_gates_read_is_capped_in_paths_and_in_bytes_with_a_named_note(self):
@@ -855,6 +856,46 @@ class TestOneTableOfTheBinSetClasses(unittest.TestCase):
         self.assertEqual(table_lines(done.stdout), [])
         self.assertNotIn("new file under bin/", done.stdout)
         self.assertNotIn("CANNOT RUN", done.stdout)
+
+
+def run_one(case_class, name):
+    """Run ONE test of this file in a nested runner and return its result (a failure of the nested run is data here, never a failure of the caller)."""
+    result = unittest.TestResult()
+    unittest.TestSuite([case_class(name)]).run(result)
+    return result
+
+
+class TestObservationsHaveMutants(unittest.TestCase):
+    """#1626: the quick-slot test and the reserved-slot test judge by observation, not by a duration; each keeps a mutant that removes the mechanism and must fail for the diagnosing reason."""
+    QUICK = "test_a_focused_run_takes_a_quick_slot_at_once_while_every_full_slot_is_held"
+
+    def test_the_real_run_quick_passes_the_quick_slot_test(self):
+        result = run_one(TestQuickSlot, self.QUICK)
+        self.assertEqual((result.testsRun, result.failures, result.errors), (1, [], []))
+
+    def test_a_run_quick_that_waits_for_a_full_slot_fails_the_quick_slot_test_on_its_status(self):
+        calls = []
+
+        def mutant(command, state_dir, wait_max=5, name=None, environ=None, out=None, **keywords):
+            calls.append(command)   # the mutation: the ordinary slots (the held ones) in place of the quick slots
+            return heavy_slots.run(command, state_dir, heavy_slots.DEFAULT_SLOTS, 1, name, environ=dict(environ or {}), out=out, **keywords)
+        with mock.patch.object(heavy_slots, "run_quick", mutant):
+            result = run_one(TestQuickSlot, self.QUICK)
+        self.assertEqual(len(calls), 1, "the mutation was not applied")
+        self.assertEqual((result.testsRun, len(result.errors)), (1, 0), result.errors)
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn("AssertionError", result.failures[0][1])
+        self.assertIn("75 != 0", result.failures[0][1])   # the status assertion failed, not a later one
+        self.assertIn("the command was not run", result.failures[0][1])   # and its message carries the output
+
+    def test_the_reserved_slot_mutant_is_the_existing_s11_test(self):
+        """Covered, not duplicated: TestChangedRunHasAReservedSlot.test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot runs an ordinary (not --changed) run with every ordinary slot held and asserts exit 75 and 'the command was not run'; the real --changed run is the test it mutates."""
+        names = [n for n in dir(TestChangedRunHasAReservedSlot) if n.startswith("test_s11_")]
+        self.assertIn("test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot", names)
+        result = run_one(TestChangedRunHasAReservedSlot, "test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot")
+        self.assertEqual((result.testsRun, result.failures, result.errors), (1, [], []))
+        real = run_one(TestChangedRunHasAReservedSlot, "test_s11_it_starts_within_5_seconds_with_every_ordinary_slot_taken")
+        self.assertEqual((real.testsRun, real.failures, real.errors), (1, [], []))
 
 
 if __name__ == "__main__":
