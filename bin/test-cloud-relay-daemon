@@ -864,11 +864,14 @@ class LiveHead(Fixture):
         t.start()
         self.assertTrue(first_in.wait(10))   # same guard: the first call (made before the flock) is blocked now
 
+        threads = []   # every writer thread is joined at the end, so none writes into a directory that is already removed
+
         def writer():
             done = []
             w = threading.Thread(target=lambda: (plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
                 kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e")),
                 done.append(True)), daemon=True)
+            threads.append(w)
             w.start()
             w.join(10)   # same guard
             return bool(done)
@@ -877,7 +880,10 @@ class LiveHead(Fixture):
         settled.wait(10)   # same guard: the prove call went on into its second call (a mutant, under the flock) or ended
         after = writer()   # appended while a second call (if one was made) is still blocked
         release[1].set()
+        release[0].set()
         t.join(10)
+        for w in threads:
+            w.join(10)   # same guard
         self.assertTrue(while_blocked, "the append did not finish while the live-head call was blocked")   # no writer waited for GitHub
         self.assertTrue(after, "the append did not finish while a second live-head call was blocked")
 
