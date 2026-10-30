@@ -4762,6 +4762,8 @@ terminal or under a waiver can move the branch between the check and the merge (
 
 **Limit.** A file with no `size` row is held only by the default limits of `TestArchitectureDocument`, on the merge ref; two pull requests that together push such a file over its default limit are not caught by this check.
 
+**The loader block of a new test file (#1618).** `tests/switchboard/test_wired_tests.py` derives every `tests/switchboard/test_*.py` from the directory and fails, naming the file, when `bin/test-switchboard` does not import its module (`not imported`) or binds none of its TestCase classes at module level (`no class bound`). A new file adds a loader block of at most 3 lines (comment, `importlib.import_module`, one binding line) at its own anchor, or is a row of `EXEMPT_FILES` in that test with a reason of 20 or more characters.
+
 ## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
 
 This is step (a) of the gate engine in [docs/plan-gate-engine-design.md](plan-gate-engine-design.md). **No shim calls it and
