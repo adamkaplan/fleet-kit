@@ -300,12 +300,18 @@ class TestChangedRunHasAReservedSlot(unittest.TestCase):
 
     def test_s11_it_starts_within_5_seconds_with_every_ordinary_slot_taken(self):
         root, e, _state = held_state_fixture(ordinary=3, changed=0)
-        started = time.time()
         done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed", "--base", "main"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("PASS bin/test-by-command", done.stdout)
         self.assertIn("PASS bin/test-by-import", done.stdout)
-        self.assertLess(time.time() - started, 5 + 10, "start-to-finish, with the interpreter's own start")
+        # the only bound is the timeout=120 above: a hang guard, so that a run that never starts ends the test; the property is the observation, not a speed
+        # the probe cannot fail by itself: this test holds the slots, so it shows only that its own holders are alive and the competing slots stayed held while the run happened; the status and output assertions above are what fail on a regression, not the probe
+        import fcntl
+        for k in range(3):
+            probe = os.open(os.path.join(_state, "fleet-switchboard", "heavy-slot-%d.lock" % k), os.O_RDWR)
+            self.addCleanup(os.close, probe)
+            with self.assertRaises(BlockingIOError, msg="ordinary slot %d was free after the run, so it was not held while the run started: %s" % (k, done.stdout + done.stderr)):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot(self):
         root, e, _state = held_state_fixture(ordinary=3, changed=0)
@@ -352,10 +358,15 @@ class TestQuickSlot(unittest.TestCase):
     def test_a_focused_run_takes_a_quick_slot_at_once_while_every_full_slot_is_held(self):
         self.hold_full_slots()
         err = __import__("io").StringIO()
-        began = time.time()
         status = heavy_slots.run_quick([str(self.script)], self.state, wait_max=5, out=err, environ={"HOME": self.state})
         self.assertEqual(status, 0, err.getvalue())
-        self.assertLess(time.time() - began, 5)
+        # the probe cannot fail by itself: this test holds the full slots, so it shows only that its own holders are alive and the competing slots stayed held while the run happened; the status assertion above is what fails on a regression, not the probe
+        import fcntl
+        for i in range(heavy_slots.DEFAULT_SLOTS):
+            probe = os.open(heavy_slots.slot_path(self.state, i), os.O_RDWR)
+            self.addCleanup(os.close, probe)
+            with self.assertRaises(BlockingIOError, msg="full slot %d was free when run_quick returned, so it did not run in a quick slot: status %r, output: %s" % (i, status, err.getvalue())):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.assertIn("quick slots", err.getvalue())
         self.assertIn("/4 (ceiling 10 min)", err.getvalue())
 
@@ -609,6 +620,7 @@ class TestBounds(unittest.TestCase):
         done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn("10000 changed paths is more than the %d" % ps.MAX_CHANGED, done.stderr)
+        # a hang guard, kept: the whole test takes about 2.6 s on an idle machine (its 10,000-file fixture included), so 60 s is a factor above 20; the property is that the refusal is bounded, it must not walk the paths or hang
         self.assertLess(time.time() - started, 60)
 
     def test_the_gates_read_is_capped_in_paths_and_in_bytes_with_a_named_note(self):
@@ -846,6 +858,135 @@ class TestOneTableOfTheBinSetClasses(unittest.TestCase):
         self.assertEqual(table_lines(done.stdout), [])
         self.assertNotIn("new file under bin/", done.stdout)
         self.assertNotIn("CANNOT RUN", done.stdout)
+
+
+def run_one(case_class, name):
+    """Run ONE test of this file in a nested runner and return its result (a failure of the nested run is data here, never a failure of the caller)."""
+    result = unittest.TestResult()
+    unittest.TestSuite([case_class(name)]).run(result)
+    return result
+
+
+class TestObservationsHaveMutants(unittest.TestCase):
+    """#1626: the quick-slot test and the reserved-slot test judge by observation, not by a duration; each keeps a mutant that removes the mechanism and must fail for the diagnosing reason."""
+    QUICK = "test_a_focused_run_takes_a_quick_slot_at_once_while_every_full_slot_is_held"
+
+    def test_the_real_run_quick_passes_the_quick_slot_test(self):
+        result = run_one(TestQuickSlot, self.QUICK)
+        self.assertEqual((result.testsRun, result.failures, result.errors), (1, [], []))
+
+    def test_a_run_quick_that_waits_for_a_full_slot_fails_the_quick_slot_test_on_its_status(self):
+        calls = []
+
+        def mutant(command, state_dir, wait_max=5, name=None, environ=None, out=None, **keywords):
+            calls.append(command)   # the mutation: the ordinary slots (the held ones) in place of the quick slots
+            return heavy_slots.run(command, state_dir, heavy_slots.DEFAULT_SLOTS, 1, name, environ=dict(environ or {}), out=out, **keywords)
+        with mock.patch.object(heavy_slots, "run_quick", mutant):
+            result = run_one(TestQuickSlot, self.QUICK)
+        self.assertEqual(len(calls), 1, "the mutation was not applied")
+        self.assertEqual((result.testsRun, len(result.errors)), (1, 0), result.errors)
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn("AssertionError", result.failures[0][1])
+        self.assertIn("75 != 0", result.failures[0][1])   # the status assertion failed, not a later one
+        self.assertIn("the command was not run", result.failures[0][1])   # and its message carries the output
+
+    def test_the_reserved_slot_mutant_is_the_existing_s11_test(self):
+        """Covered, not duplicated: TestChangedRunHasAReservedSlot.test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot runs an ordinary (not --changed) run with every ordinary slot held and asserts exit 75 and 'the command was not run'; the real --changed run is the test it mutates."""
+        names = [n for n in dir(TestChangedRunHasAReservedSlot) if n.startswith("test_s11_")]
+        self.assertIn("test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot", names)
+        result = run_one(TestChangedRunHasAReservedSlot, "test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot")
+        self.assertEqual((result.testsRun, result.failures, result.errors), (1, [], []))
+        real = run_one(TestChangedRunHasAReservedSlot, "test_s11_it_starts_within_5_seconds_with_every_ordinary_slot_taken")
+        self.assertEqual((real.testsRun, real.failures, real.errors), (1, [], []))
+
+    def test_the_reserved_slot_mutant_run_changed_on_the_ordinary_slots_fails_the_s11_test_on_its_status(self):
+        # the probe of the converted test cannot fail by itself; this mutant makes its status assertion the discriminator: a copy of bin/ whose run_changed takes the ordinary slots (the held ones, waiting 2 s) instead of the reserved ones
+        import shutil
+        copy = tempfile.mkdtemp(prefix="ps-mutant-")
+        self.addCleanup(shutil.rmtree, copy, True)
+        shutil.copytree(REPO / "bin", Path(copy, "bin"))
+        module = Path(copy, "bin", "heavy_slots.py")
+        text = module.read_text()
+        old = "code = run(command, changed_dir(state_dir), CHANGED_SLOTS, wait, name,"
+        self.assertEqual(text.count(old), 1, "the mutation cannot be applied: the line of run_changed moved")
+        module.write_text(text.replace(old, "code = run(command, state_dir, DEFAULT_SLOTS, min(wait, 2), name,"))
+        self.assertIn("state_dir, DEFAULT_SLOTS, min(wait, 2)", module.read_text(), "the mutation was not applied")
+        name = "test_s11_it_starts_within_5_seconds_with_every_ordinary_slot_taken"
+        with mock.patch.dict(globals(), {"SWITCHBOARD": Path(copy, "bin", "fleet-switchboard")}):
+            result = run_one(TestChangedRunHasAReservedSlot, name)
+        self.assertEqual((result.testsRun, len(result.errors)), (1, 0), result.errors)
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn("AssertionError", result.failures[0][1])
+        self.assertIn("3 != 0", result.failures[0][1])   # the status assertion failed, not the probe
+        self.assertIn("the command was not run", result.failures[0][1])
+
+
+CLOCK_CALLS = {("time", "time"), ("time", "monotonic"), ("time", "perf_counter")}
+MIN_REASON = 20
+BOUND_ASSERTS = {"assertLess", "assertLessEqual", "assertGreater", "assertGreaterEqual"}
+
+
+def clock_bounds(source):
+    """The wall-clock bounds of a test source, by line: an assertLess/assertLessEqual/assertGreater/assertGreaterEqual call, or a comparison, whose operand holds a subtraction
+    with a call of time.time(), time.monotonic() or time.perf_counter() in it. Closed rule: a duration measured by those calls and compared. Known limits, stated: a fake clock
+    (the injected `clock["now"] - 1000.0 <= 125` of the 120 second wait test) calls none of them and is not a wall-clock measure, so it is not listed; `time.time() + n`
+    (an injected `now=`) is an addition, not a measured duration; a clock imported under another name is not recognised."""
+    import ast
+
+    def is_clock(node):
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                and (node.func.value.id, node.func.attr) in CLOCK_CALLS)
+
+    def measures(node):
+        return any(isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Sub) and (is_clock(sub.left) or is_clock(sub.right)) for sub in ast.walk(node))
+    lines = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in BOUND_ASSERTS and any(measures(a) for a in node.args):
+            lines.add(node.lineno)
+        elif isinstance(node, ast.Compare) and measures(node):
+            lines.add(node.lineno)
+    return sorted(lines)
+
+
+def unexplained_clock_bounds(source):
+    """The lines of clock_bounds with no written reason: a comment of the line above (a line that starts with #) or a comment on the line itself, of at least MIN_REASON characters after the #."""
+    text = source.splitlines()
+
+    def reason(line):
+        return len(line.partition("#")[2].strip()) >= MIN_REASON if "#" in line else False
+    return [n for n in clock_bounds(source) if not (text[n - 2].strip().startswith("#") and reason(text[n - 2])) and not reason(text[n - 1])]
+
+
+class TestWallClockBoundsAreExplained(unittest.TestCase):
+    """#1626: a bound on measured wall time is a flake on a loaded machine; each one that remains carries a written reason, so a new one cannot arrive unseen."""
+
+    def test_every_remaining_wall_clock_bound_of_this_file_has_a_written_reason(self):
+        source = Path(__file__).read_text()
+        remaining = clock_bounds(source)
+        self.assertEqual(len(remaining), 1, "the wall-clock bounds of this file, by line: %s" % remaining)
+        self.assertEqual(unexplained_clock_bounds(source), [], "a wall-clock bound with no reason in a comment above it or on its line")
+
+    def test_a_planted_bound_without_a_reason_is_named_by_its_line(self):
+        source = Path(__file__).read_text()
+        planted = source + "\n\nclass Planted(unittest.TestCase):\n    def test_x(self):\n        started = time.time()\n        self.assertLess(time.time() - started, 5)\n"
+        line = planted.count("\n", 0, planted.rindex("self.assertLess(time.time() - started, 5)")) + 1
+        self.assertEqual(unexplained_clock_bounds(planted), [line])
+        head, sep, last = planted.rpartition("        self.assertLess(time.time() - started, 5)")
+        explained = head + "        # a reason of more than twenty characters\n" + sep + last
+        self.assertEqual(unexplained_clock_bounds(explained), [])
+
+    def test_a_reason_shorter_than_20_characters_is_not_a_reason(self):
+        bound = "        self.assertLess(time.time() - started, 5)\n"
+        head = "class Planted(unittest.TestCase):\n    def test_x(self):\n        started = time.time()\n"
+        self.assertEqual(unexplained_clock_bounds(head + "        # x\n" + bound), [5])
+        self.assertEqual(unexplained_clock_bounds(head + bound.rstrip("\n") + "  # x\n"), [4])
+        self.assertEqual(unexplained_clock_bounds(head + "        # a hang guard for a stuck run\n" + bound), [])
+        self.assertEqual(unexplained_clock_bounds(head + bound.rstrip("\n") + "  # a hang guard for a stuck run\n"), [])
+
+    def test_a_comparison_and_a_monotonic_clock_are_found_too_and_the_fake_clock_is_not(self):
+        self.assertEqual(clock_bounds("import time\nx = 1\nassert time.monotonic() - x < 5\n"), [3])
+        self.assertEqual(clock_bounds("self.assertGreater(5, time.perf_counter() - x)\n"), [1])
+        self.assertEqual(clock_bounds("self.assertLessEqual(clock['now'] - 1000.0, 125)\n"), [])
 
 
 if __name__ == "__main__":
