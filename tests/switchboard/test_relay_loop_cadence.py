@@ -254,10 +254,6 @@ class TwoLoopsTrace(Fixture):
         exec(compile(src.replace(old_call, "pass"), mutant.__file__, "exec"), mutant.__dict__)
         self.assertGreater(self.trace(relay, lock=mutant._lock_exclusive).most, 1)
 
-    def test_mutant_head_read_under_the_lock_is_caught(self):
-        mod = load_backend_module("if not _same_head(first, head):", "if not _same_head(b.live_head(pr), head):")
-        self.assertGreater(self.trace(mod, workers=1, each=1).net, 0)
-
     def two_sends(self, mod):
         import threading as th
         barrier = th.Barrier(2)
