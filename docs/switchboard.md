@@ -181,6 +181,21 @@ message. A `send` from another agent skips the batch.
   events, reminders and orders keep the rules above, and so does a `send`
   from anyone but the boss. The config key `send_to_working` (`"steer"`, the
   default, or `"queue"` for the old behaviour) is the one switch.
+- **Long turn.** The config key `steer_after_minutes` (default `0`, off) names
+  a number of minutes. When it is on and the recipient's current turn has
+  lasted longer than that, a `send` from a peer and a reminder to it steer into
+  the long turn like a boss's (audited with `"busy": true` and
+  `turn_age_seconds`), instead of waiting for the turn to end. The age is read
+  from a recorded turn start (`turn-start.json` in the state directory, written
+  only with the key on, dropped when the status leaves `working`); an unknown
+  age (no record, a restart) counts as young. Orders, reports and stop or hold
+  orders keep their rules, and an idle recipient is woken as before. With the
+  key on, an old turn steers a boss's `send` too, even when `send_to_working`
+  is `"queue"`. The first pass after a daemon start discards the record.
+
+  | config key | default | meaning |
+  |---|---|---|
+  | `steer_after_minutes` | `0` (off) | a peer send and a reminder steer into a long turn once it has lasted more than this many minutes |
 - **Explicit interrupt.** `fleet-switchboard send --interrupt <agent> "text"`
   is for stop and hold orders only, from a boss to its own worker, and is
   never automatic. It calls `session.interrupt` with `resume=false` (the
@@ -4851,6 +4866,7 @@ unchanged.
 - The parent ask's Done-when is read live, with no hash. A parent edited after approval changes the required Done-when silently.
 - A merged sibling's `PLAN:` link, omitted or forged, makes the gate stricter, never looser: a sibling that does not link the plan is not counted at all.
 - The plan is read from the visible body only: a `PLAN:` line in a code fence or an HTML comment is read by no gate and not by the claim.
+- **A `CLAIMS:` line that is not read is refused (#1617).** A `CLAIMS:` line must stand directly under the `PLAN:` line. Any other line that starts with `CLAIMS:` (any case, after spaces or tabs, in the raw body, so also in a code fence or an HTML comment) makes `pr_claim` return an error, and every reader of the claim (G1, `prove`, `verdict`, `ci-record`, the claim listing, the merge gate and the union) refuses through it. The error names the line number of the body and the place: after a blank line, after another opening line, above the `PLAN:` line, no `PLAN:` line, a second line, inside a code fence, inside an HTML comment. The merge gate counts the refusal as a claim line, so it fails closed (the `CU` waiver applies). To fix a body that quotes the rule, write the example inline, not at the start of a line (for a fence or a comment). A body with no such line behaves as before, and the held-PR opening check skips the claim line, so a well placed `CLAIMS:` line does not hide the `Rationale:` line.
 - **The claims are bound as merged.** The merge gate writes one `claim` ledger line for the pull request (its `CLAIMS:` text, or none) before it judges the union. The union reads, for a MERGED sibling, the NEWEST claim line recorded at or before the sibling's `merged_at` (the claim in force at the merge), never its current body and never a line recorded after the merge. A merged sibling with no such line, a line with no usable timestamp, or no `merged_at` is refused as unknown (`merged pull request #N has no recorded claim at or before its merge: its claim is unknown`). An OPEN sibling is read from its current body.
 - **The list is GitHub's search, bounded.** `plan_peers` reads `GET /search/issues?q=repo:<owner/repo> is:pr "<the plan link>" in:body`, not the whole repository: only the pull requests whose body holds the plan link, at most 3 pages of 100 (300 matching). Beyond that the read is refused with `too many pull requests to judge`. It is never silently truncated. A body that spells the link another way is not found by the search, which only makes the gate stricter. The code sends the link quoted, with the `#` percent-encoded (`%23`); a test pins that shape. A peer the search does not find makes the gate STRICTER (an unfound open sibling is not counted, so the union is judged sooner against what is found; an unfound merged sibling covers nothing). Search-index lag can hide a just-opened sibling, so the "last merge" call can be too early.
 - **Every refusal of a claiming pull request can be waived.** The refusals `claim union could not be read` (a list error, too many pull requests), `merged pull request #N has no recorded claim: unknown`, `the claim could not be recorded` and `claim union could not be judged` each name the waiver (`waive <pr> --gates CU`). The `CU` waiver (chief of staff only, bound to the head, 24 h) is consulted BEFORE the refusal, and a pass is audited as `plan.claim_union.waived` naming what was waived.
@@ -4958,6 +4974,8 @@ refuses when the plan names no scenario for that role). The ledger never uses th
 so the steps and minutes the gates cost can be reported.
 
 **Re-running a head's CI.** A head with no run, or a run that was cancelled, is re-run without a push or a close and reopen: `gh workflow run test.yml --ref <branch>` (the workflow has `workflow_dispatch`, no inputs; its checks are named like a pull request run's and count for the branch's head; its concurrency group is its commit sha, so it never cancels the pull request's own run). Then `gates ci-record <repo#N>`.
+
+**Which test files CI runs.** One list, `bin/ci-test-files.txt`: a `run` row per `bin/test-*` file (and `cloud/tests/test-cloud`) that has a step in `.github/workflows/test.yml`, an `exempt` row with a written reason for a file that has none of its own. `TestCiTestFileList` in `bin/test-switchboard` derives the files from the directory and fails a file in neither section, a `run` row with no step, and an exempt row without a reason; a new `bin/test-*` file needs a row and, if it runs, a step.
 
 **Which runs happen when (the test workflow).** The cause, measured the day it was found: the macOS queue wait had a mean of 18 minutes, a 90th percentile of 64 and a longest of 195, in a sample of 198 macOS jobs; 44 percent of them were cancelled by our own pushes and re-runs, and 39 percent were for pull requests into `integration`, which no ruleset requires. So the macOS leg of `.github/workflows/test.yml` runs where it protects something. A small `plan` job (a few seconds, on Ubuntu) puts the macOS entry in or out of the matrix, so the required names `test (macos-latest)` and `test (ubuntu-latest)` are unchanged and never skipped by accident:
 

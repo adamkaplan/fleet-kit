@@ -69686,12 +69686,16 @@ TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamp
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
-# The #1563 reminder-ttl tests.
-_reminder_ttl = importlib.import_module("test_reminder_ttl")
-TestReminderTtlMore = _reminder_ttl.build(PR4Base)
+# The steer-after-minutes tests of #1540, moved under the line ceiling.
+_steer_long = importlib.import_module("test_steer_long_turn")
+TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
+TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
+# The CI test-file list tests of #1498.
+_ci_test_files = importlib.import_module("test_ci_test_files")
+TestCiTestFileList = _ci_test_files.TestCiTestFileList
 
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
@@ -69703,6 +69707,9 @@ TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly
+# A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
+_claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
+TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
@@ -74737,8 +74744,8 @@ class TestPrClaimLine(LedgerBase):
 
     def test_s4_a_pull_request_without_a_claim_line_behaves_exactly_as_before(self):
         baseline = ["S1", "S2", "S3", "U1"]
-        for body in (None, "", "PLAN: acme/app#7", "PLAN: acme/app#7\ncanon: n/a docs", "PLAN: acme/app#7\n\nCLAIMS: S1", "CLAIMS: S1\nPLAN: acme/app#7",
-                     "Notes\nPLAN: acme/app#7 and CLAIMS: S1", "PLAN: acme/app#7\n    CLAIMS", "no plan here\nCLAIMS: S9"):
+        for body in (None, "", "PLAN: acme/app#7", "PLAN: acme/app#7\ncanon: n/a docs",
+                     "Notes\nPLAN: acme/app#7 and CLAIMS: S1", "PLAN: acme/app#7\n    CLAIMS"):
             with self.subTest(body=body):
                 claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
                 self.assertEqual(([s["id"] for s in claimed], left, error), (baseline, [], None))
@@ -74756,7 +74763,7 @@ class TestPrClaimLine(LedgerBase):
                      "<!--PLAN: x-->\n<!--\nPLAN: y\nCLAIMS: S2\n-->PLAN: real#1", "PLAN: real#1\n```\nCLAIMS: S1\n```"):
             with self.subTest(body=body):
                 claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
-                self.assertEqual(([s["id"] for s in claimed], left, error), (["S1", "S2", "S3", "U1"], [], None))
+                hidden = next(n for n, text in enumerate(body.split("\n"), 1) if text.startswith("CLAIMS:")); self.assertEqual(claimed, []); self.assertIn("line %d" % hidden, error); self.assertIn("must stand directly under the `PLAN:` line", error)
         claimed = sb.plan_ledger.pr_scenarios(self.scenarios, "```\nignored\n```\nPLAN: real#1\nCLAIMS: S1")[0]
         self.assertEqual([s["id"] for s in claimed], ["S1"])
 
