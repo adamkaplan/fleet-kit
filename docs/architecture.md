@@ -127,6 +127,10 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/agents_verify.py` | 5 | `agents verify`: did the service register our agents as written | |
 | `switchboard/secret_spans.py` | 5 | where the first secret-shaped match is: a fixed rule label and numbers, never the text | |
 | `switchboard/answer_delivery.py` | 5 | how an answer reaches the asker, behind the AnswerDelivery port | |
+| `switchboard/caches.py` | 5 | the bounded file cache and the audit tail a report reads | |
+| `switchboard/bootstrap.py` | 5 | the `bootstrap` command | |
+| `switchboard/profile_pieces.py` | 5 | the profile pieces shared by the install, the doctor and the commands that write a profile | |
+| `switchboard/installer.py` | 5 | the installer: the service, its units and the `install` command | |
 | `cloud_relay_daemon.py` | 5 | the daemon half of the cloud hub relay: pulls pod requests from the hub and runs them with the same rules as the local commands | |
 | `fleet-switchboard` | 6 | the entry: today also every section not yet moved to a part (the assembler, the engine, the commands) | |
 
@@ -155,6 +159,14 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/answer_delivery.py` | `fleet-switchboard` | namespace | 33 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/audit.py` | `fleet-switchboard` | entry-import | 12 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/audit.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/bootstrap.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/bootstrap.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/caches.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/caches.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/installer.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/installer.py` | `fleet-switchboard` | namespace | 58 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/profile_pieces.py` | `fleet-switchboard` | entry-import | 8 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/profile_pieces.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decision.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/decision.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decision.py` | `switchboard/handoff.py` | namespace | 1 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
@@ -187,8 +199,8 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 34 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decisions_b.py` | `fleet-switchboard` | namespace | 30 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 17 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/judge.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 26 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/judge.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 24 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 25 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/plan_input.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/review_laws_install.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
@@ -252,15 +264,15 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `external_adapter.py` | `_load_core:sys.modules` | 3 | uses `sys` beyond its plain attributes |
 | `fleet-switchboard` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
-| `fleet-switchboard` | `Installer.reaper_command_problem:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
-| `fleet-switchboard` | `Installer.reaper_command_problem:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
-| `fleet-switchboard` | `Installer.reaper_command_problem:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `installed_guard_module:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `installed_guard_module:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `fleet-switchboard` | `installed_guard_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `_brief_advisory:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `_brief_advisory:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `fleet-switchboard` | `_brief_advisory:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `switchboard/installer.py` | `Installer.reaper_command_problem:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `switchboard/installer.py` | `Installer.reaper_command_problem:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `switchboard/installer.py` | `Installer.reaper_command_problem:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `_declared_module:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `_declared_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `_declared_module:load_module(non-constant)` | 1 | a dynamic load |
