@@ -418,6 +418,7 @@
         "bin/report_fold.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
+        "bin/turn_start.py",
         "bin/work_sync.py",
         "bin/switchboard/plan_input.py",
         "bin/switchboard/v2_transport.py",
@@ -444,6 +445,9 @@
           "*"
         ],
         "bin/record_json.py": [
+          "*"
+        ],
+        "bin/turn_start.py": [
           "*"
         ],
         "bin/awaiting_live.py": [

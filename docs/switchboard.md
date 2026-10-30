@@ -181,6 +181,21 @@ message. A `send` from another agent skips the batch.
   events, reminders and orders keep the rules above, and so does a `send`
   from anyone but the boss. The config key `send_to_working` (`"steer"`, the
   default, or `"queue"` for the old behaviour) is the one switch.
+- **Long turn.** The config key `steer_after_minutes` (default `0`, off) names
+  a number of minutes. When it is on and the recipient's current turn has
+  lasted longer than that, a `send` from a peer and a reminder to it steer into
+  the long turn like a boss's (audited with `"busy": true` and
+  `turn_age_seconds`), instead of waiting for the turn to end. The age is read
+  from a recorded turn start (`turn-start.json` in the state directory, written
+  only with the key on, dropped when the status leaves `working`); an unknown
+  age (no record, a restart) counts as young. Orders, reports and stop or hold
+  orders keep their rules, and an idle recipient is woken as before. With the
+  key on, an old turn steers a boss's `send` too, even when `send_to_working`
+  is `"queue"`. The first pass after a daemon start discards the record.
+
+  | config key | default | meaning |
+  |---|---|---|
+  | `steer_after_minutes` | `0` (off) | a peer send and a reminder steer into a long turn once it has lasted more than this many minutes |
 - **Explicit interrupt.** `fleet-switchboard send --interrupt <agent> "text"`
   is for stop and hold orders only, from a boss to its own worker, and is
   never automatic. It calls `session.interrupt` with `resume=false` (the
