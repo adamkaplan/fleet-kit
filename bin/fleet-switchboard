@@ -6024,6 +6024,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 # resolves the role alias and the boss record). A test scans this file for `reports_to` readers and fails when one is not in this table.
 BOSS_READ_SITES = {
     "bin/fleet-switchboard:headless_target": "a retired worker is not discovered: its STORED metadata (boss record applied), resolved through `resolve_boss`, as `reattach_caller_problem` does",
+    "bin/lost_worker.py:_losses": "a cloud worker is not discovered: the launching lane is the `reports_to` text of its own cloud record, only the address of an alert (the loss is told to the Chief of Staff too)",
     "bin/switchboard/handoff.py:_boss_of": "the literal text; `boss_name` is built on it",
     "bin/fleet-switchboard:notice_boss": "resolves the text through `resolve_boss`, over a discovery that already applies the boss record",
     "bin/fleet-switchboard:reattach_caller_problem": "a dead agent is not discovered: its STORED metadata, overlaid with the boss record",
@@ -9547,6 +9548,26 @@ def cloud_watch_tick(engine, discovery):
     return result
 
 
+def lost_worker_tick(engine, discovery):
+    """#1481: the lost-worker detector (bin/lost_worker.py). Reads the audits and the cloud records the pass already holds; sends one alert per loss."""
+    import importlib.util   # by path, beside this file, as `_brief_advisory` does: the module stays out of the clear's loaded set (no impact-matrix row)
+    spec = importlib.util.spec_from_file_location("lost_worker", os.path.join(os.path.dirname(os.path.realpath(__file__)), "lost_worker.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    registry = load_module("registry")
+
+    def retired(eng, name):
+        return registry.get_retired(eng.state_dir, name) is not None
+
+    alive = {}
+    for name, obs in (discovery.agents.items() if discovery is not None else ()):   # the lane of a local worker comes from the one boss rule
+        boss = boss_name(discovery, obs)
+        if boss and obs.status != "unknown":
+            alive[name] = {"lane": boss, "ask": (obs.fleet or {}).get("issue") or (obs.fleet or {}).get("repo")}
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, retired=retired, parse_bounded=load_module("record_json").parse_bounded)
+    return module.run_pass(ns, engine, engine.now(), alive)
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -9570,6 +9591,10 @@ def finish_pass(engine, discovery, report):
         cloud_watch_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-watch", "cloud-watch", err, report)
+    try:
+        lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
+    except Exception as err:
+        engine._failed("lost-worker", "lost-worker", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:

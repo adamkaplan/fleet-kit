@@ -6294,6 +6294,24 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
 
+## A lost worker is announced to its lane and the Chief of Staff (#1481)
+
+The alert is one line that starts `[lost worker]`. One detector in the daemon's pass (`bin/lost_worker.py`, called from `finish_pass` after the cloud watch) reads the switchboard audit and the cloud launcher's audit (`~/.local/state/cw-cloud/audit.jsonl`, or `CW_CLOUD_AUDIT`) from a stored byte position, and sends once per loss to the launching lane (the cloud record's `reports_to`) and to the Chief of Staff (one message when they are the same agent). It changes no worker, pod, label or record; its own memory is `lost-workers.json` in the state directory, so a restart repeats nothing. A message that cannot be sent is audited once (`lost_worker.alert_not_sent`) and the pass goes on.
+
+The line names the worker, the ask, the kind, the last event time and the evidence line (an audit line, cut short), and says `repeat: N earlier lost worker(s) of this ask` when the same ask lost workers before, else `first loss of this ask`.
+
+The four kinds it sends for:
+
+| Kind | Record that shows it |
+|---|---|
+| `pod_no_stop` | a `cloud.created` line, its hard deadline passed, no stop line in either audit (stops of any reason, `done` included, never alert here) and no final report line |
+| `local_worker` | a local worker seen alive in an earlier pass, now gone from discovery and not retired in the registry |
+| `refused_launch` | a `cloud.create_failed` line |
+| `reaper_missed` | a failed line of the reaper's own login refresh in the launcher audit (runtime id `reaper`) |
+
+A worker the cloud launcher ends (idle, hard limit, pod gone, failed pod) is announced by the launcher's sender (#1480), not here. Tests: `tests/switchboard/test_lost_worker.py`.
+
+**Bounds of the alert (read round, #1481).** At most 10 individual alerts a pass; one more message to the Chief of Staff says how many more there are (`N more lost worker(s)`), and those are alerted on the following passes, 10 at a time, with the count left; none is dropped or repeated (the mark is written before the send). With no usable memory (the first pass ever, or after a corrupt memory) only workers created in the last hour are alerted; with a valid memory every loss since it is alerted, a restart gap included. An unreadable `lost-workers.json` makes that pass alert nothing and write one audit line (`lost_worker.memory_corrupt`); the file is set aside as `lost-workers.json.corrupt` and the next pass writes a fresh memory, so later losses are alerted. A worker name is cleaned (control characters removed) and capped at 80 characters in every message. A local worker is worded `possibly lost` (absent from discovery, not known dead). The memory file is mode 0600 and synced before it replaces the old one.
 ## The installed tree is the default branch, clean (#1380)
 
 The tree the fleet's commands and the daemon run from (the checkout `fleet-switchboard install` was run from) must be the default branch, clean, so no command, verdict or merge gate is computed by code from an unmerged branch.
