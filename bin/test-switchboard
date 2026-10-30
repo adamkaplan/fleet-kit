@@ -69639,6 +69639,9 @@ TestTheCheck, TestSizeMutants, TestTheMergeGate, TestSizeDocumentation = _size_c
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
+# The demands of a new file under bin/ (#1620).
+_new_module_demands = importlib.import_module("test_new_module_demands")
+TestNewModuleDemands = _new_module_demands.TestNewModuleDemands
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable

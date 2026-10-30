@@ -6337,3 +6337,8 @@ The install records the tree it is run from. Run from a feature-branch worktree 
 - The daemon stops only when the tree is bad twice in a row: it reads again one second after the first bad reading, in the same pass, so a checkout in flight does not stop it.
 - A local default branch ahead of `origin/<default>` is refused as not an ancestor; the message says to push it or reset the branch, and that the origin ref may be stale (`git fetch origin`).
 - It never changes the tree: the operator does (see above).
+
+### What a new file under `bin/` demands (`tools/new-module-demands`, #1620)
+
+`tools/new-module-demands bin/x.py [bin/y.py ...]` prints one block per file: `guards:` (the classes `preflight-pr` runs for a new bin file, read from `NEW_BIN_GUARDS` in `bin/path_suites.py`), `authority code:` (yes or no, with the function names and role literals found by a copy of the two rules of the authority-modules guard, the vocabulary read from the impact matrix), `matrix:` (for yes, both entries to add, `owner_hold.top_tier_paths.authority` and the floor globs of the repository, with their JSON paths; never the exempt entry; for no, that no line is demanded), `units:` (the row to add to the Units table of `docs/architecture.md`) and `closure:` (the state of `tools/derive-closure --check`). It exits 0 for a block and 2 with one plain line for a path that is not under `bin/` or cannot be read.
+It never runs the guards, writes nothing and makes no GitHub call. The guard stays the authority: the tool is advice, and `tests/switchboard/test_new_module_demands.py` pins that its detection and the guard name the same modules.
