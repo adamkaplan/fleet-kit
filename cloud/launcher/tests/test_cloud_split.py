@@ -166,6 +166,17 @@ class TestSplitCommands(tcw.VaultBase):
         for stale in (self.checkout / "runs.jsonl", self.checkout / "fixed", self.stub_dir / "az.log"):
             stale.unlink(missing_ok=True)
 
+    def no_id_answers(self):
+        """A patch of the fake pod's answer writer: a prompt answer carries no message id while it is active."""
+        handler = self.remote.server.RequestHandlerClass
+        real = handler._answer
+
+        def answer(this, status, body):
+            if this.path.endswith("/prompt") and isinstance(body, dict) and isinstance(body.get("data"), dict):
+                body = {"data": {k: v for k, v in body["data"].items() if k != "id"}}
+            return real(this, status, body)
+        return mock.patch.object(handler, "_answer", answer)
+
     def script(self):
         out = []
 
@@ -184,6 +195,8 @@ class TestSplitCommands(tcw.VaultBase):
         run("launch --stack", fn=lambda: self.launch_with("--cloud", "--stack", "--shape", "S", name="coder8"))
         run("status", "status")
         run("send", "send", "coder7", "please", "rebase")
+        with self.no_id_answers():
+            run("send without id", "send", "coder7", "second", "note")
         run("read", "read", "coder7")
         run("retire", "retire", "coder7", "--reason", "done")
         run("refused launch", fn=lambda: self.launch_with("--cloud", repo="other-org/other-repo", name="coder9"))
@@ -195,6 +208,48 @@ class TestSplitCommands(tcw.VaultBase):
         kube = [self.normal(json.dumps(c)) for c in self.jsonl("kubectl.log")]
         az = [self.normal(l) for l in ((self.stub_dir / "az.log").read_text().splitlines() if (self.stub_dir / "az.log").exists() else [])]
         return out, calls, kube, az
+
+    def mutant_module(self):
+        tree = Path(tempfile.mkdtemp(prefix="cwsplit-mut-"))
+        self.addCleanup(shutil.rmtree, str(tree), True)
+        (tree / "bin").mkdir()
+        text = (ROOT / "bin" / "cloud_worker.py").read_text()
+        before = text.count('print(message_id or "sent")')
+        text = text.replace('print(message_id or "sent")', 'print(message_id or "sent!")')
+        self.applied = before == 1 and text.count('print(message_id or "sent!")') == 1
+        (tree / "bin" / "cloud_worker.py").write_text(text)
+        for name in ("cloud_cluster.py", "path_walk.py"):
+            shutil.copy(str(ROOT / "bin" / name), str(tree / "bin" / name))
+        os.symlink(str(ROOT / "cloud"), str(tree / "cloud"))
+        loader = importlib.machinery.SourceFileLoader("cw_mutant_1647", str(tree / "bin" / "cloud_worker.py"))
+        spec = importlib.util.spec_from_loader("cw_mutant_1647", loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["cw_mutant_1647"] = module
+        self.addCleanup(sys.modules.pop, "cw_mutant_1647", None)
+        loader.exec_module(module)
+        return module
+
+    def test_s4_mutant_the_changed_fallback_text_is_seen(self):
+        new = self.script()
+        module = self.mutant_module()
+        real = tcw.sb.load_module
+        self.addCleanup(setattr, tcw.sb, "load_module", real)
+        tcw.sb.load_module = lambda name: module if name == "cloud_worker" else real(name)
+        for path in (self.state, self.stub_dir / "calls.log", self.stub_dir / "az.log", self.stub_dir / "kubectl.log"):
+            shutil.rmtree(str(path), True) if path.is_dir() else path.unlink(missing_ok=True)
+        for fresh in (self.remote.requests, self.remote.bodies, self.remote.messages):
+            del fresh[:]
+        module.bind(tcw.sb.__dict__)
+        lib = module._lib()
+        for name in ("PREFLIGHT_ARGV", "VAULT_CHECK_PYTHON"):
+            hook = mock.patch.object(lib, name, getattr(self.lib, name))
+            hook.start()
+            self.addCleanup(hook.stop)
+        mutant = self.script()
+        differing = sum(1 for a, b in zip(mutant[0], new[0]) if a != b) + abs(len(mutant[0]) - len(new[0]))
+        print("S4 mutant: differing lines %d (at least 1), mutation applied %s" % (differing, self.applied))
+        self.assertTrue(self.applied)
+        self.assertGreaterEqual(differing, 1)
 
     def test_s4_the_scripted_commands_give_the_same_outputs_and_call_logs(self):
         new = self.script()
