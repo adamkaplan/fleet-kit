@@ -119,6 +119,7 @@ def get_token(target):
         try:
             token = app_token.mint(target)
             say("token permissions: " + app_token.render_permissions())  # the mint refused anything else
+            say("orchestrator permissions: " + app_token.render_permissions(None, "orchestrator"))  # the set of the other role, from the same table
             return token
         except SystemExit:  # app_token already said why, on stderr; a mint that fails is an unreadable answer
             raise Unreadable("no token could be minted")

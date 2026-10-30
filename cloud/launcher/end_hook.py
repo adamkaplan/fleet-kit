@@ -76,10 +76,21 @@ class Ctx:
         shutil.rmtree(self.home, True)
 
 
+# A refusal because the git token had ended (a one-hour token) says one of these. A rejected ref, a hostile configuration or a network
+# failure says none of them, and so never asks for a refresh.
+ENDED_TOKEN_RE = re.compile(r"Authentication failed|Invalid username or token|Bad credentials|returned error: 401|HTTP 401", re.I)
+
+
+class TokenEnded(RuntimeError):
+    """A git call refused because the token had ended: the one case in which the hook signals a refresh (see main)."""
+
+
 def git(workdir, *args, check=True, ctx=None, opts=True):
     cmd = [GIT_BIN, "-C", workdir] + (ctx.opts if ctx and opts else []) + list(args)
     p = subprocess.run(cmd, capture_output=True, text=True, env=ctx.env if ctx else None)
     if check and p.returncode != 0:
+        if args and args[0] in ("push", "fetch") and ENDED_TOKEN_RE.search(p.stderr or ""):
+            raise TokenEnded("the git token had ended")   # a fixed text: nothing of the remote's answer is carried
         raise RuntimeError((p.stderr.strip().splitlines() or ["git %s failed" % args[0]])[-1])
     return p
 
@@ -277,6 +288,10 @@ def main():
     try:
         print(json.dumps(run(workdir, worker)))
         return 0
+    except TokenEnded as e:
+        # ONE word to the stop side: ask for a fresh token and run me once more. The hook holds no credential for the minter and asks no one itself.
+        print(json.dumps({"pushed": False, "wip_branch": None, "error": str(e), "refresh": "needed"}))
+        return 1
     except (RuntimeError, OSError) as e:
         print(json.dumps({"pushed": False, "wip_branch": None, "error": str(e)}))
         return 1
