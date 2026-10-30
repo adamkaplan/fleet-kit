@@ -802,5 +802,35 @@ class OnceAndLabel(unittest.TestCase):
         self.assertEqual(self.calls_for("cw "), 0)
 
 
+class HistoryExpansion(unittest.TestCase):
+    """Pasted into an interactive zsh, an exclamation mark can start a history event."""
+    def setUp(self):
+        with open(DOCS, encoding="utf-8") as f:
+            self.doc = f.read()
+        self.whole = probe_section(self.doc)
+
+    @staticmethod
+    def triggers(text):
+        blocks = code_blocks(text)
+        hits = 0
+        for b in blocks:
+            for line in b.split("\n"):
+                for i, c in enumerate(line):
+                    if c == "!" and line[i + 1:i + 2] not in ("", " ", "=", "("):
+                        hits += 1
+        return hits, len(blocks)
+
+    def test_every_code_block_of_the_runbook_has_no_history_expansion_trigger(self):
+        hits, n = self.triggers(self.whole)
+        print("S-hist: exclamation marks that could expand %d in %d code blocks" % (hits, n))
+        self.assertEqual(hits, 0)
+
+    def test_a_negated_bracket_with_a_bang_is_caught(self):
+        mutant = self.whole.replace("*[^abcdefghij", "*[!abcdefghij")
+        self.assertNotEqual(mutant, self.whole)   # the mutation is applied
+        self.assertEqual(self.triggers(mutant)[0], 1)
+        print("S-hist mutant hits 1")
+
+
 if __name__ == "__main__":
     unittest.main()
