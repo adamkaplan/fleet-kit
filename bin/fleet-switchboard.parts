@@ -22,3 +22,7 @@ switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
 switchboard/secret_spans.py
+switchboard/caches.py
+switchboard/bootstrap.py
+switchboard/profile_pieces.py
+switchboard/installer.py
