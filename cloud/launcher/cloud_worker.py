@@ -2556,13 +2556,16 @@ class Launcher:
                 out.append(None)   # this pod's place in the result: filled after the stops ran
                 jobs.append((len(out) - 1, worker, reason, ann(pod, "run-id") or None))
         for (slot, worker, reason, _), (res, err, hook) in zip(jobs, self._run_stops(jobs)):
-            if err is None:
-                self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
-                out[slot] = (worker, reason, 0)
-                self.retire_row(worker, reason)   # the pod is ended: its registry row is retired, once (DW-3)
-            else:
+            try:
+                if err is not None:
+                    raise err
+                if res is not None:
+                    self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
+                    out[slot] = (worker, reason, 0)
+                    self.retire_row(worker, reason)   # the pod is ended: its registry row is retired, once (DW-3)
+            except CloudError as e:
                 self.reap_results[worker] = dict(hook or {})
-                out[slot] = (worker, reason, err.code)
+                out[slot] = (worker, reason, e.code)
         out.extend(renewed)
         self.remove_orphan_secrets(pods, now)
         self.send_wip_notes(live, now)
