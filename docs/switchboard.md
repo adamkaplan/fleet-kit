@@ -5489,6 +5489,35 @@ The Chief of Staff's permission list gains: **`fleet-switchboard disk *`** (the 
 
 **The gh shim picks the account of the repo a command NAMES for a caller with no repo of its own** (the Chief of Staff): for `gh issue ...` and `gh pr ...` commands, never `merge`, that carry `-R`/`--repo` (or `--repo=`, `-Rowner/repo`), or an issue or pull request URL as the target right after the verb, `gh_users` is consulted for THAT repo, reads and writes alike. The repo is read only from the real flag or that target: never from a `--body`, `--title` or other flag's value, and two different repos named give none. A caller that has a repo of its own keeps its own account. `whoami --json` now carries `own`: false when the repo it prints is only the config's `intent_repo` default (the Chief of Staff has no repo of its own, and before this the default repo's account was used for everything it ran), and the shim then treats the caller as having none, using the named repo's account when a command names one and the default's otherwise. Nothing else (`repo`, `secret`, `workflow`, `run`, `api`, `merge`) picks an account by what it names. It fails closed like the #270 rule: a write whose token cannot be had is refused with `gh: account lookup failed, retry`; a read still falls through. It is a convenience for a caller that works across accounts, not a boundary.
 
+### Every form the gh shim signs (#1638)
+
+A comment a fleet account writes through `shims/gh` carries `<!-- fleet-switchboard:from=NAME -->` (NAME is the caller's fleet name, or `agent` when `whoami` fails: an unknown sender is signed, never refused). The eleven signed forms:
+
+1. `gh issue comment` (`--body`, `-b`, `--body-file`, `-F`, stdin)
+2. `gh pr comment` (same flags)
+3. `gh pr review` (same flags)
+4. `gh issue create` (same flags)
+5. `gh pr create` (same flags)
+6. `gh issue close` with `--comment`, `--comment=x`, `-c` or `-cx`
+7. `gh pr close` with the same comment flags
+8. `gh api` POST or PATCH to `repos/O/R/issues/N/comments` with a `body` field
+9. `gh api` POST or PATCH to `repos/O/R/issues/comments/ID` with a `body` field
+10. `gh api` POST or PATCH to `repos/O/R/pulls/N/comments` with a `body` field
+11. `gh api` POST or PATCH to `repos/O/R/pulls/N/reviews` with a `body` field
+
+For `gh api` the field is `-f`, `-F`, `--field` or `--raw-field` named `body` (`-F body=@file` and `@-` are read and signed). A body that already carries a marker is not signed again. Every other call, including a `gh api` read, another endpoint, a call with no body field and one with `--input`, runs the real `gh` unchanged. **A signed form whose body cannot be read (an unreadable body file, an error while signing) is refused with one line, a non-zero exit and nothing posted: it is never posted unsigned.** A form with no body flag at all (`--editor`, a close with no comment) is passed through. Not covered: `gh api --input`, `pulls/comments/ID` and reply endpoints, bundled short flags (`-dcx`), and a flag before the verb (`gh -R o/r issue comment`).
+
+| Input or outside call | Test (`tests/switchboard/test_gh_shim_sign.py`) | Run-by-hand mutant |
+|---|---|---|
+| the table `SIGNED_COMMANDS` | `test_the_five_old_forms_are_signed_as_before` | remove a pair from the set |
+| the table `CLOSE_COMMANDS` and `--comment`/`-c` | `test_the_close_forms_are_signed_in_every_spelling` | set it to `set()` |
+| the table `SIGNED_API`, the method and the field flags | `test_the_api_forms_are_signed_in_every_field_spelling`, `test_unrelated_calls_are_passed_byte_for_byte` | change a pattern; make the endpoint test `if False` |
+| a body file, stdin, `@file`, `@-` | `test_a_body_file_and_stdin_are_signed_and_the_temporary_file_is_removed`, `test_an_api_body_file_and_stdin_are_signed` | skip the temporary file's removal |
+| an unreadable body | `test_a_body_that_cannot_be_read_is_refused_and_nothing_is_posted` | return None from `read_text` failures |
+| a marked body | `test_a_marked_body_is_not_signed_twice` | drop the `SIGNED_RE` check in `sign` |
+| `whoami` (outside call) | `test_an_unknown_sender_is_signed_as_agent_and_never_refused` | make a failed lookup raise |
+| the real `gh` | the fake real `gh` of the test file records argv, stdin and files | none |
+
 ### Headless workers: presence from the service, not from a terminal (#433)
 
 A worker is a session in the OpenCode service; a terminal is only a way to watch it. A worker with no terminal is **headless**. herdr knows nothing about it, so what it is doing comes from the service alone, by ONE rule in `bin/agent_presence.py` (measured in a spike on a throwaway profile of the live version, never on the live service):
