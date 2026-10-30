@@ -617,7 +617,7 @@ class TestConfig(Base):
             "github_repos": [], "gh": sb.own_gh_path("gh"), "gh_by_name": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],   # #1216: the RESOLVED gh (a machine with a gh on PATH names it by path); `gh_by_name` is the gh as configured (PATH finds the shim), used by the one merge call of `merge-gate --pass --merge`
             "owner_logins": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
-                              "check_suite", "workflow_run"],
+                              "check_suite", "workflow_run", "push"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
             "awaiting_cos_label": None, "decisions_cos_grace_seconds": 300, "cos_orders_file": None,  # PR 18
             "pr_notice_hold_minutes": 0,  # PR notices
@@ -1455,13 +1455,13 @@ class TestGithubConfig(Base):
         self.assertEqual((config["github_repos"], config["gh"], config["github_lookback_hours"],
                           config["github_port"]), ([], sb.own_gh_path("gh"), 24, None))   # the RESOLVED gh: environment-independent
         self.assertEqual(config["github_events"], ["issues", "issue_comment", "sub_issues", "pull_request",
-                                                   "pull_request_review", "check_suite", "workflow_run"])
+                                                   "pull_request_review", "check_suite", "workflow_run", "push"])
 
     def test_a_config_gets_its_own_lists(self):
         first = self.cfg()
         first["github_repos"].append("a/b")
         first["github_events"].append("push")
-        self.assertEqual((self.cfg()["github_repos"], len(self.cfg()["github_events"])), ([], 7))
+        self.assertEqual((self.cfg()["github_repos"], len(self.cfg()["github_events"])), ([], 8))
         self.assertEqual(sb.DEFAULTS["github_repos"], [])
 
     def test_good_values(self):
