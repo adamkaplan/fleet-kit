@@ -225,6 +225,62 @@ if __name__ == "__main__":
     unittest.main()
 
 
+HOST = None   # set by bin/test-switchboard
+
+
+class BotVerdict(unittest.TestCase):
+    """U7 through the REAL `gates`: the fixtures of bin/test-switchboard (HOST) build the pull request, the ledger and the reviews; run twice, with and without a bot review."""
+    def gates(self, with_bot, json_out=False):
+        host = HOST.TestReviewPostAndDismiss("test_no_command_sends_a_dismissal")
+        host.setUp()
+        try:
+            host.reset()
+            if with_bot:
+                host.reviews.append(review("reviewer-one[bot]", 9100, commit=host.HEAD))
+            argv = ("gates", host.PR) + (("--json",) if json_out else ())
+            code, out, err = host.run_as("coder", *argv)
+            return code, out
+        finally:
+            host.tearDown()
+            host.doCleanups()
+
+    def parts(self, out):
+        lines = out.splitlines()
+        verdict = [l for l in lines if l.startswith("gates for ")]
+        ready = [l for l in lines if "READY" in l]
+        return verdict, ready, [l for l in lines if "bot" in l.lower() and "FIX" in l]
+
+    def check_equal(self):
+        (c1, o1), (c2, o2) = self.gates(False), self.gates(True)
+        v1, r1, b1 = self.parts(o1)
+        v2, r2, b2 = self.parts(o2)
+        self.assertEqual(len(v1), 1, o1)
+        self.assertEqual((c1, v1, r1), (c2, v2, r2))
+        self.assertEqual(b1, [])
+        self.assertEqual(len(b2), 1, o2)
+        self.assertIn("5 FIX", b2[0])
+        import json
+        self.assertNotIn("bot_reviews", json.loads(self.gates(False, True)[1]))
+        self.assertIn("bot_reviews", json.loads(self.gates(True, True)[1]))
+
+    def test_u7_a_bot_finding_changes_no_verdict_ready_text_or_exit_status(self):
+        self.check_equal()
+
+    def test_u7_mutant_a_bot_fix_that_makes_the_pull_request_not_ready_is_caught(self):
+        real_lines, real_render, seen = sb.bot_review_lines, sb.plan_ledger.render_gates, []
+        def lines(*a, **k):
+            got = real_lines(*a, **k)
+            seen.extend(got)
+            return got
+        def render(*a, **k):
+            out = real_render(*a, **k)
+            return [l.replace("READY", "NOT READY") if seen and l.startswith("gates for ") else l for l in out]
+        with mock.patch.object(sb, "bot_review_lines", lines), mock.patch.object(sb.plan_ledger, "render_gates", render):
+            self.assertIsNot(sb.bot_review_lines, real_lines, "the mutant is applied")
+            with self.assertRaises(AssertionError):
+                self.check_equal()
+
+
 class BotSize(unittest.TestCase):
     """U6 and U7 (#1625)."""
     def added(self, path):
