@@ -181,7 +181,7 @@ CLASS_ORIGINAL = "        elif not (test_classes(Path(tests_dir) / name) & " + '
 CLASS_MUTATED = "        elif False and (test_classes(Path(tests_dir) / name) & " + 'bound.get(mod, set())):'
 
 
-def run_tests(module, names):
+def run_named_cases(module, names):
     """Run the named TestWiredCheckPlanted tests of `module` in-process: {name: None if it passed, else its failure message}."""
     import io
     out = {}
@@ -216,7 +216,7 @@ class TestMutantIsCaught(unittest.TestCase):
         return mod
 
     def test_the_mutant_fails_each_s3_and_s5_test(self):
-        got = run_tests(self.load_mutant(ORIGINAL_LINE, MUTATED_LINE), SKIPPED)
+        got = run_named_cases(self.load_mutant(ORIGINAL_LINE, MUTATED_LINE), SKIPPED)
         for name, message in got.items():
             self.assertIsNotNone(message, "the mutant PASSED %s" % name)
             self.assertNotIn("test_planted.py", message)      # the planted file is not named
@@ -224,14 +224,15 @@ class TestMutantIsCaught(unittest.TestCase):
         self.assertNotIn("test_size_ceilings.py", " ".join(got.values()))
 
     def test_the_class_check_mutant_fails_the_no_class_test(self):
-        got = run_tests(self.load_mutant(CLASS_ORIGINAL, CLASS_MUTATED), NO_CLASS)
+        got = run_named_cases(self.load_mutant(CLASS_ORIGINAL, CLASS_MUTATED), NO_CLASS)
         message = got[NO_CLASS[0]]
         self.assertIsNotNone(message, "the mutant PASSED")
         self.assertNotIn("no class bound", message)
 
     def test_the_real_module_passes_the_same_tests(self):
         import sys
-        self.assertEqual(run_tests(sys.modules[__name__], SKIPPED + NO_CLASS), {n: None for n in SKIPPED + NO_CLASS})
+        this = sys.modules[__name__]
+        self.assertEqual(run_named_cases(this, SKIPPED + NO_CLASS), {n: None for n in SKIPPED + NO_CLASS})
 
 
 if __name__ == "__main__":
