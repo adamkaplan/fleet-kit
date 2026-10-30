@@ -69235,7 +69235,7 @@ class TestSupportRebinding(unittest.TestCase):
                         moved |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
                 elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("support."):   # a name another support module holds (the standard library's is not a fake)
                     moved |= {a.asname or a.name for a in node.names}
-        return moved - {"BIN", "REPO"}
+        return moved - {"BIN", "REPO", "unittest"}
 
     @staticmethod
     def rebindings(source, moved, skip=None):
