@@ -18720,7 +18720,7 @@ def _unjudged(who, runner, now, why, ctx=None):
             engine, state, _ = build_engine(runner, now, "cli", writable=False)
             repo, number, _ = _ledger_pr(types.SimpleNamespace(pr=who.pr, plan=None, ask=None))
             body = pr_picture(engine, repo, number, state)[1]
-        has_claim = plan_ledger.claim_text(body) is not None
+        has_claim = plan_ledger.claim_text(body) is not None or plan_ledger.misplaced_claim(body) is not None
     except Exception:
         has_claim = True
     if not has_claim:

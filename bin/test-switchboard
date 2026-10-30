@@ -69650,6 +69650,9 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+# A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
+_claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
+TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
