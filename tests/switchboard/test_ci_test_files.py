@@ -5,7 +5,7 @@ import unittest
 
 from support.paths import BIN, REPO
 
-SWITCHBOARD = REPO / "bin" / "test-switchboard"
+_SWITCHBOARD_FILE = REPO / "bin" / "test-switchboard"
 
 
 def _ci_list_problems(list_text, files, workflow_text):
@@ -89,10 +89,10 @@ class TestCiTestFileList(unittest.TestCase):
         return problems
 
     def test_the_exempt_test_impact_brief_is_really_loaded_here(self):
-        self.assertEqual(self._exempt_claim_problems(SWITCHBOARD.read_text(), self._bound_names(SWITCHBOARD.read_text())), [])
+        self.assertEqual(self._exempt_claim_problems(_SWITCHBOARD_FILE.read_text(), self._bound_names(_SWITCHBOARD_FILE.read_text())), [])
 
     def test_a_switchboard_that_stops_loading_test_impact_brief_fails_naming_the_row(self):
-        original = SWITCHBOARD.read_text()
+        original = _SWITCHBOARD_FILE.read_text()
         source = original.replace('"test-impact-brief", ', '', 1)
         if source == original:
             source = original.replace(', "test-impact-brief")', ')', 1)
