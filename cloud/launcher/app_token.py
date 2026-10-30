@@ -110,12 +110,26 @@ def revoke(token):
         return False
 
 
-def die(msg, code=1):
+LAST_FAILURE = {}  # the last die(): {'transient': bool, 'reason': text, 'retry_after': int or None}; a caller that retries reads it
+
+
+def _wait_seconds(value):
+    """A Retry-After header as whole seconds, or None when it is not a plain number."""
+    if not (isinstance(value, str) and value.isascii() and value.isdigit()):
+        return None   # an HTTP date, a sign, a float, a non-ASCII digit (int() would raise on it): not a number
+    return int(value) if len(value) <= 6 else 999999   # a huge wait is over the cap: the retries end at once
+
+
+def die(msg, code=1, transient=False, retry_after=None):
+    """Print the reason and exit. transient=True marks a PASSING failure (the vault, the network, HTTP 5xx or 429, a 403 with Retry-After);
+    everything else is a refusal. LAST_FAILURE tells the caller which."""
     if MINTED:
         token = MINTED.pop()
         msg += (" The token was revoked." if revoke(token)
                 else " Revocation failed: the token expires within an hour and was never printed.")
         del token
+    LAST_FAILURE.clear()
+    LAST_FAILURE.update({"transient": bool(transient), "reason": msg, "retry_after": retry_after})
     print("app-token: " + msg, file=sys.stderr)
     sys.exit(code)
 
@@ -139,10 +153,10 @@ def vault(env_name, secret):
         if len(p.stdout) > MAX_BYTES:
             die("the vault command for %s printed more than %d bytes" % (secret, MAX_BYTES))
     except (OSError, subprocess.TimeoutExpired):
-        die("could not run the command for %s" % secret)
+        die("could not run the command for %s" % secret, transient=True)
     val = p.stdout.strip() if secret != "cw-app-key" else p.stdout
     if p.returncode != 0 or not val.strip():
-        die("the vault command for %s failed or printed nothing" % secret)
+        die("the vault command for %s failed or printed nothing" % secret, transient=True)
     return val
 
 
@@ -217,13 +231,16 @@ def github_json(method, path, jwt, body=None, not_found=None, role="worker"):
         if e.code == 422 and method == "POST":
             die("the App's installation does not cover this repository: add it to the installation (HTTP 422); "
                 "if the App lacks a requested permission, %s" % owner_step(role))
+        retry = e.headers.get("Retry-After") if e.headers else None
+        passing = e.code == 429 or 500 <= e.code <= 599 or (e.code == 403 and retry is not None)
+        flags = {"transient": passing, "retry_after": _wait_seconds(retry) if passing else None}
         if e.code == 403 and method == "POST":  # the App may not hold, or the installation not yet accept, a requested permission
-            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None), owner_step(role)))
-        die(http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None))
+            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, retry), owner_step(role)), **flags)
+        die(http_error_text(e.code, retry), **flags)
     except TimeoutError:
-        die("the GitHub request timed out: the launch is refused and nothing was minted")
+        die("the GitHub request timed out: the launch is refused and nothing was minted", transient=True)
     except Exception:  # OSError, ValueError, UnicodeDecodeError, RecursionError, MemoryError: any failure is a named refusal, never a crash
-        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted")
+        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted", transient=True)
 
 
 def is_id(x):
