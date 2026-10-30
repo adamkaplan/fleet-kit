@@ -147,6 +147,10 @@ def run_files(names, sel_of, root, basedir, timeout, quick, clock=None, run=None
             td = clock() - t0
             if quick and d == "timeout" and tmo < timeout and path.rsplit("/", 1)[-1] not in TIMEOUT_ALLOW:
                 not_run = list(names[i:])
+                if b not in (0, "timeout", "absent"):  # a failure on the branch comes first
+                    v = "FAIL: branch exit %s; clean copy not run (budget)" % b; failed = True
+                    out("%-52s %-9s %-9s %s  [branch %.1fs, default %.1fs]" % (rel, b, "-", v, tb, clock() - t0))
+                    verdicts.append((rel, b, "-", v))
                 break
         n = os.path.basename(path)
         if "timeout" in (b, d):

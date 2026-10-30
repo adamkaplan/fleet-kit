@@ -118,6 +118,64 @@ class Budget(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.check_failure(lines, res)
 
+    TIGHT = 10
+
+    def tight(self, path):
+        """Run the tight-budget case in a child process: branch fails after 1 s, the clean copy is cut by the clamp.
+        Exit 0 when the failure is recorded and the budget line is possible, 1 otherwise."""
+        code = (
+            "import sys, importlib.machinery as M, importlib.util as U\n"
+            "sys.path.insert(0, %r)\n"
+            "l = M.SourceFileLoader('pm', %r); sp = U.spec_from_loader('pm', l); m = U.module_from_spec(sp); l.exec_module(m)\n"
+            "m.QUICK_TOTAL = %d\n"
+            "t = [0.0]\n"
+            "def run(root, rel, tmo, sel=None):\n"
+            "    import os\n"
+            "    if os.path.basename(root) == 'branch':\n"
+            "        t[0] += 1; return 1\n"
+            "    t[0] += tmo; return 'timeout'\n"
+            "lines = []\n"
+            "v, failed, nr = m.run_files(['t.py'], {}, %r, %r, 100, True, clock=lambda: t[0], run=run, out=lines.append)\n"
+            "print(v, failed, nr)\n"
+            "ok = failed and nr == ['t.py'] and [x for x in v if x[3].startswith('FAIL')] and not any('budget' in x[3] and not x[3].startswith('FAIL') for x in v)\n"
+            "sys.exit(0 if ok else 1)\n"
+        ) % (os.path.join(ROOT, "bin"), path, self.TIGHT, os.path.join(self.tmp, "branch"), os.path.join(self.tmp, "default"))
+        for d in ("branch", "default"):
+            open(os.path.join(self.tmp, d, "t.py"), "w").close()
+        import subprocess
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        print("tight run:", r.returncode, r.stdout.strip())
+        return r.returncode
+
+    def test_failing_file_cut_by_the_budget_on_the_clean_copy_is_a_failure_with_status_1(self):
+        self.assertEqual(self.tight(PRE), 0)
+        m = load(PRE)
+        m.QUICK_TOTAL = self.TIGHT
+        t = [0.0]
+
+        def run(root, rel, tmo, sel=None):
+            if os.path.basename(root) == "branch":
+                t[0] += 1
+                return 1
+            t[0] += tmo
+            return "timeout"
+        lines = []
+        v, failed, nr = m.run_files(["t.py"], {}, os.path.join(self.tmp, "branch"), os.path.join(self.tmp, "default"),
+                                    100, True, clock=lambda: t[0], run=run, out=lines.append)
+        self.assertTrue(failed)
+        self.assertEqual(nr, ["t.py"])
+        self.assertTrue(any(ln.startswith("t.py") and "FAIL" in ln for ln in lines))
+
+    def test_mutant_with_the_old_order_is_caught_in_a_child_process(self):
+        old = '                if b not in (0, "timeout", "absent"):  # a failure on the branch comes first\n'
+        with open(PRE) as fh:
+            src = fh.read()
+        self.assertIn(old, src)  # the mutation is applied
+        p = os.path.join(self.tmp, "mutant_old_order")
+        with open(p, "w") as fh:
+            fh.write(src.replace(old, "                if False:\n"))
+        self.assertEqual(self.tight(p), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
