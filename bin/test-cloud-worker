@@ -284,7 +284,7 @@ def end_children_and_remove(tmp, directory):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(dir=str(BIN.parent))   # under the worktree, never the shared /tmp
+        tmp = tempfile.TemporaryDirectory()   # the platform's temporary directory, never the repository root: an entry that judges the root runs beside the entries that load this fixture
         self.home = Path(tmp.name).resolve()
         self.addCleanup(end_children_and_remove, tmp, self.home)
         self.stub_dir = self.home / "stub"
