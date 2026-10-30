@@ -2510,6 +2510,7 @@ class Switchboard:
     `audit` None makes it read-only: `pending` and `status` use it that way,
     and any write then raises instead of happening unaudited.
     """
+    _note_lock = threading.Lock()   # _note's check-then-set on _last; the relay thread has its own engine, this guards any second caller
 
     # The sweep cache of the worktree in-use checks (`worktree_sweep`) is PER THREAD: the daemon's janitor thread and its main thread (auto-retire reclaim)
     # each hold their own, so one can never read, seed or clear the other's session index (#762).
@@ -2587,10 +2588,11 @@ class Switchboard:
         return self.audit.external(self.actor, event, subject, detail)
 
     def _note(self, event, subject, detail):
-        """Audit a non-write event once per change, not once per pass."""
-        if self.audit is None or self._last.get((event, subject)) == detail:
-            return
-        self._last[(event, subject)] = detail
+        """Audit a non-write event once per change, not once per pass. The check-then-set is under a lock."""
+        with self._note_lock:
+            if self.audit is None or self._last.get((event, subject)) == detail:
+                return
+            self._last[(event, subject)] = detail
         self.audit.append(self.actor, event, subject, detail)
 
     # -- observe
@@ -3866,7 +3868,7 @@ def installed_tree_clear(state_dir, runner=subprocess.run):
 DAEMON_RECORD = "daemon.json"  # what the running daemon says about itself: its pid, and where its key came from
 
 
-def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, watch=None, on_reload=None):
+def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, watch=None, on_reload=None, relay_engine=None):
     """`run`: a pass on every poke, and at least every `poll` seconds, under the
     single-instance lock.
 
@@ -3876,6 +3878,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
     `wait(sock, timeout)` and `passes` are for tests and `--once`. `record` is written to daemon.json
     once the lock is held, with this pid: `status` reads it to say what the DAEMON has, not what the shell
     that runs `status` has.
+    `relay_engine` builds the relay thread's OWN engine (the Engine is not thread-safe: the relay thread must not share the
+    pass thread's); REQUIRED when a hub is configured (the relay then fails to start and is audited); a test that shares says so: relay_engine=lambda: engine.
     """
     wait = wait or wait_for_poke
     with single_instance(state_dir):
@@ -3887,7 +3891,13 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
         except OSError as err:  # no pokes then; the poll interval still passes
             sock = None
             engine._note("poke.unavailable", None, {"error": _one_line(str(err))})
+        relay_loop = None
         try:
+            try:   # the relay is pulled on its own cadence, not after each pass (#1477)
+                relay_loop = load_module("cloud_relay_daemon").start_loop(
+                    engine, sys.modules[__name__], subprocess.run, engine.now, os.environ, engine_factory=relay_engine, guarded=True)
+            except Exception as err:
+                engine._failed(None, "pass", err, {"errors": []})
             done = 0
             while True:
                 drain_pokes(sock)
@@ -3898,10 +3908,11 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                     if bad is not None:   # two reads in a row before it stops and alerts
                         time.sleep(INSTALLED_TREE_RECHECK_SECONDS)
                         bad = installed_tree_problem(state_dir)
+                    if relay_loop is not None:
+                        relay_loop.set_blocked(bad is not None)   # the relay thread obeys this verdict; it never reads the tree itself
                     if bad is None:
                         installed_tree_clear(state_dir)
                         engine.run_pass()
-                        load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
                     else:   # no verdict, merge or message is decided or delivered; only this re-check goes on
                         engine._note("installed_tree.stopped", None, {"problem": bad})
                         installed_tree_alert(state_dir, bad, engine.now, getattr(getattr(engine, "herdr", None), "binary", None))
@@ -3913,6 +3924,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                 timeout = next_poll(engine, poll)
                 wait(sock, min(timeout, CONFIG_STABLE_SECONDS) if watch is not None and watch.pending else timeout)
         finally:
+            if relay_loop is not None:
+                relay_loop.stop()
             if sock is not None:
                 sock.close()
 
@@ -13855,13 +13868,13 @@ def identify_caller(herdr, v2, environ):
     return name
 
 
-def build_engine(runner, now, actor, writable=True, socket_call=None):
+def build_engine(runner, now, actor, writable=True, socket_call=None, owns_link=True):
     """The engine over the configured clients. Refuses an unconfigured v2 or a bad fault name."""
     config = load_runnable_config()
     active_faults()
     state = ensure_state_dir()
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
-    if actor == "daemon":
+    if actor == "daemon" and owns_link:   # the relay thread's engine does not (one writer of v2-link.json)
         v2.state_dir = state   # the daemon's link is what `status` reports
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
@@ -13920,7 +13933,8 @@ def cmd_run(args, runner, now, wait):
     try:
         run_daemon(engine, state, args.poll or config["poll_seconds"], wait,
                    record=dict(daemon_record(config), config_loaded_at=iso(now())), watch=watch,
-                   on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv))
+                   on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv),
+                   relay_engine=lambda: build_engine(runner, now, "daemon", owns_link=False)[0])   # the relay thread's own engine
     except KeyboardInterrupt:
         return EXIT_OK
     finally:
@@ -15110,6 +15124,7 @@ class GhAccounts:
         self.paused = {}                         # account -> epoch until which its reads wait (the limit's reset)
         self.limited_once = set()                # accounts whose pause was audited, so it is said once per episode
         self.lock = threading.Lock()             # the hub's threads and the pass read through one gate
+        self._local = threading.local()          # depth of `read` on this thread: a call inside `read` is checked and counted by `read` itself
         self.audit, self.actor = None, "daemon"
         self.conditional = False                 # ask with `-i` and keep the ETag: the daemon turns it on; a one-shot command or a test reads plainly
 
@@ -15207,7 +15222,11 @@ class GhAccounts:
         env = self.env_for(repo) if repo else None
         if env is not None:
             run_kwargs["env"] = env
-        done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
+        self._local.depth = getattr(self._local, "depth", 0) + 1
+        try:
+            done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
+        finally:
+            self._local.depth -= 1
         status, headers, body = _split_http(done.stdout) if use_head else (None, {}, done.stdout)
         with self.lock:
             self.calls.append((now, account, _endpoint_of(path), status == 304))
@@ -15237,6 +15256,31 @@ class GhAccounts:
             if reset is not None:
                 self._pause(account, reset, status)
         return subprocess.CompletedProcess(argv, done.returncode or 1, body, done.stderr or ("HTTP %d" % status))
+
+    def _inside_read(self):
+        return getattr(self._local, "depth", 0) > 0
+
+    def check_pause(self):
+        """For a caller that runs gh through its own runner (the relay): GhRateLimited when ANY account is paused (fail closed: the relay does not know which
+        account its call would use; the cost is availability only). A call made inside `read` is not checked twice: `read` has checked it."""
+        if self._inside_read():
+            return
+        now = self.now()
+        with self.lock:
+            paused = [(a, u) for a, u in self.paused.items() if now < u]
+        if paused:
+            account, until = max(paused, key=lambda x: x[1])
+            raise GhRateLimited(account, until)
+
+    def record(self, kind):
+        """Counts one gh call of a caller outside `read` (kind: who made it). A call made inside `read` is NOT counted here: `read` counts it once, after it ran."""
+        if self._inside_read():
+            return
+        now = self.now()
+        with self.lock:
+            self.calls.append((now, self.describe(None), kind, False))
+            while self.calls and self.calls[0][0] < now - 600:
+                self.calls.popleft()
 
     def read_usage(self):
         """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
@@ -16070,206 +16114,14 @@ def add_intent_parsers(sub):
     sub.add_parser("intents", help="Your open asks, one line each with its Done-when")
 
 
-# ---------------------------------------------------------------- `plan check` (#135, gate G0a)
-
-PLAN_URL_RE = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([0-9]+)(?:#issuecomment-([0-9]+))?/?$")
-PLAN_COMMENT_PAGES = 10
-
-
-class PlanInputError(Exception):
-    """The plan or the ask cannot be read: exit 2."""
-
-
-def parse_plan_source(text, default_repo=None):
-    """(repo, number, comment id or None) from `owner/repo#N`, an issue URL (a `#issuecomment-ID` picks that comment),
-    or a bare `N` / `#N` with `default_repo`. Raises PlanInputError."""
-    text = (text or "").strip()
-    found = PLAN_URL_RE.match(text)
-    if found:
-        return found.group(1), int(found.group(2)), int(found.group(3)) if found.group(3) else None
-    found = re.match(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$", text) or re.match(r"^()#?([0-9]+)$", text)
-    if not found or int(found.group(2)) < 1:
-        raise PlanInputError("%r is not a plan: write owner/repo#N, an issue URL, or --file PATH" % text)
-    repo = found.group(1) or default_repo
-    if not repo:
-        raise PlanInputError("%r names no repo and no intent_repo is configured: write owner/repo#N" % text)
-    return repo, int(found.group(2)), None
-
-
-def plan_comment_choice(body, comments):
-    """(text, source, defects): the ONE rule every reader of an issue's plan applies: the plan select_plan_text picks, with the comment-level
-    defects (a second plan-looking comment naming both ids, a bad receipt) RETURNED beside it, never kept in a global."""
-    text, source = plan_check.select_plan_text(body, comments)
-    return text, source, plan_check.plan_comment_defects(comments)
-
-
-def second_plan_defects(defects):
-    return [d for d in defects if d.get("code") == "second-plan-comment"]
-
-
-def fetch_plan(reader, repo, number, comment_id=None):
-    """(text, source label, done_when of the issue, comment-level defects) read from GitHub with GETs only. `reader` has `_api(path, repo)`.
-    The defects are computed from every comment of the issue also when `comment_id` names one: naming a comment does not skip the report."""
-    try:
-        issue = reader._api("repos/%s/issues/%d" % (repo, number), repo)
-        comments = []
-        for page in range(1, PLAN_COMMENT_PAGES + 1):
-            got = reader._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
-            if not isinstance(got, list):
-                raise PlanInputError("the comments of %s#%d did not come back as a list" % (repo, number))
-            comments.extend(got)
-            if len(got) < 100:
-                break
-    except IntentError as err:
-        raise PlanInputError("cannot read %s#%d: %s" % (repo, number, err)) from None
-    body = issue.get("body") if isinstance(issue, dict) and isinstance(issue.get("body"), str) else ""
-    defects = plan_check.plan_comment_defects(comments)
-    if comment_id is not None:
-        picked = [c for c in comments if isinstance(c, dict) and c.get("id") == comment_id]
-        if not picked:
-            raise PlanInputError("%s#%d has no comment %d" % (repo, number, comment_id))
-        text, source = picked[0].get("body") or "", "comment %d%s" % (comment_id, plan_check.comment_author(picked[0]))
-    else:
-        text, source, defects = plan_comment_choice(body, comments)
-    return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1], defects
-
-
-def _parent_ask_done_when(reader, repo, number):
-    """The Done-when of the ASK that is the native sub-issue parent of issue `number` of `repo`, or None. Like `IntentReader.ask_of`, a parent counts as the ask only
-    when it has a parent of its own (the charter): the issue under a charter is itself the ask, and a charter's Done-when is never borrowed. Anything that is not
-    "the ask of this repository's work item" is REFUSED (PlanInputError), never read as another issue: a parent in another repository (the parent's repository comes
-    from the API payload, the reader's `parent()` keeps only the number), a pull request, the issue itself, and a cycle."""
-    where = "%s#%d" % (repo, number)
-
-    def parent_payload(of):
-        try:
-            found = reader._api("repos/%s/issues/%d/parent" % (repo, of), repo)
-        except IntentError as err:
-            if err.reason == "not_found":
-                return None
-            raise
-        if not isinstance(found, dict) or not isinstance(found.get("number"), int):
-            raise PlanInputError("the parent of %s#%d did not come back as an issue" % (repo, of))
-        if found.get("pull_request"):
-            raise PlanInputError("the parent of %s#%d is a pull request, not an ask" % (repo, of))
-        url = str(found.get("repository_url") or "").lower().rstrip("/")
-        if not url.endswith("/repos/" + repo.lower()):
-            raise PlanInputError("the parent of %s#%d (#%d) is in another repository (%s): a plan reads the Done-when of an ask of its own repository only"
-                                 % (repo, of, found["number"], url.rsplit("/repos/", 1)[-1] or "unknown"))
-        return found
-    try:
-        parent = parent_payload(number)
-        if parent is None:
-            return None
-        if parent["number"] == number:
-            raise PlanInputError("%s is its own parent" % where)
-        grand = parent_payload(parent["number"])
-        if grand is None:
-            return None
-        if grand["number"] in (number, parent["number"]):
-            raise PlanInputError("the parent chain of %s loops back on itself" % where)
-        return reader.issue(parent["number"], repo).done_when
-    except IntentError as err:
-        raise PlanInputError("cannot read the parent ask of %s: %s" % (where, err)) from None
-
-
-def load_plan(args, runner, now):
-    """(text, source label, result) of the plan `args` names (source, file, ask, done_when), checked. Raises
-    PlanInputError, ValueError (an unreadable block) or the readers' errors."""
-    try:
-        plan_check.MAX_BYTES
-    except Exception as err:  # the module is missing or broken: say so, never a traceback
-        raise PlanInputError("the plan checker (bin/plan_check.py) cannot be loaded: %s" % _one_line(str(err), 150)) from None
-    done_when = args.done_when
-    plan_own = None
-    comment_defects = []
-    if args.file:
-        if args.source:
-            raise PlanInputError("give a plan source or --file, not both")
-        try:
-            with open(args.file, "r", encoding="utf-8") as handle:
-                text = handle.read(plan_check.MAX_BYTES * 4 + 1)
-        except (OSError, UnicodeDecodeError) as err:
-            raise PlanInputError("cannot read %s: %s" % (args.file, getattr(err, "strerror", None) or err)) from None
-        if len(text) > plan_check.MAX_BYTES * 4:
-            raise PlanInputError("%s is larger than %d bytes" % (args.file, plan_check.MAX_BYTES * 4))
-        source = "file %s" % args.file
-        plan_own = parse_intent(text)[1]
-        done_when = done_when or plan_own
-        plan_own = plan_own if done_when != plan_own else None
-    else:
-        if not args.source:
-            raise PlanInputError("give a plan: owner/repo#N, an issue URL, or --file PATH")
-        config = load_config()
-        repo, number, comment_id = parse_plan_source(args.source, config.get("intent_repo"))
-        reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"],
-                              accounts=GhAccounts(config, runner, now))
-        text, source, issue_done, comment_defects = fetch_plan(reader, repo, number, comment_id)
-        if args.ask and not done_when:
-            ask_repo, ask_number, _ = parse_plan_source(args.ask, repo)
-            done_when = reader.issue(ask_number, ask_repo).done_when  # the ask is the authority
-            plan_own = issue_done
-        elif done_when:
-            plan_own = issue_done if issue_done and issue_done != done_when else None
-        else:
-            done_when = issue_done
-            if not done_when:   # a work item states no Done-when of its own: its ask's is the authority (the sub-issue parent, never a "Work item of" line)
-                done_when = _parent_ask_done_when(reader, repo, number)
-    if args.ask and args.file and not args.done_when:
-        raise PlanInputError("--ask needs a plan read from GitHub; for --file give --done-when TEXT")
-    result = plan_check.check(text, done_when, plan_own)
-    if comment_defects:
-        result["defects"] = list(result["defects"]) + list(comment_defects)
-        result["result"] = "fail"
-    return text, source, result
-
-
-def cmd_plan_check(args, runner, now):
-    """`plan check`: read a plan, check it, print PASS or FAIL with one line per defect and the content hash. Exit 0
-    pass, 1 fail, 2 unreadable. Reads only; never writes GitHub."""
-    def finish(code, payload, lines, error=None):
-        if args.json:
-            print(json.dumps(payload, sort_keys=True))
-        elif error:
-            sys.stderr.write("%s: plan check: %s\n" % (PROG, error))
-        else:
-            print("\n".join(lines))
-        return code
-
-    try:
-        text, source, result = load_plan(args, runner, now)
-    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
-        return finish(EXIT_USAGE, {"result": "error", "error": _one_line(str(err), 300)}, [], _one_line(str(err), 300))
-    result["source"] = source
-    return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source, explaining=getattr(args, "explain", False)))
-
-
-def cmd_plan_template(args, runner, now):
-    """`plan template <ask>` (or `--done-when TEXT`): print a prefilled plan for the ask: its Done-when clauses numbered and one scenario stub
-    per clause. Reads only (a GET of the ask); never writes GitHub. Exit 0, or 2 when the ask or its Done-when cannot be read."""
-    try:
-        done_when, source = args.done_when, None
-        if not done_when:
-            if not args.ask:
-                raise PlanInputError("give the ask (owner/repo#N) or --done-when TEXT")
-            config = load_config()
-            repo, number, _ = parse_plan_source(args.ask, config.get("intent_repo"))
-            reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
-            done_when, source = reader.issue(number, repo).done_when, "%s#%d" % (repo, number)
-        clauses = plan_check.clauses_of(done_when)
-        if not (done_when or "").strip() or not clauses:
-            raise PlanInputError("the ask has no Done-when line: nothing to prefill (write the plan by hand, or add the Done-when first)")
-    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
-        sys.stderr.write("%s: plan template: %s\n" % (PROG, _one_line(str(err), 300)))
-        return EXIT_USAGE
-    print("\n".join(plan_check.template(clauses, _plain(source, 120) if source else None)))
-    return EXIT_OK
-
-
 # ---------------------------------------------------------------- `prove`, `verdict`, `gates` (#107): the evidence ledger
 
 PLAN_LINE_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
 LEDGER_PR_PATTERN = r"owner/repo#N or the PR's URL"
+
+
+class PlanInputError(Exception):
+    """The plan or the ask cannot be read: exit 2."""
 
 
 class LedgerCommandError(Exception):
@@ -16530,9 +16382,10 @@ def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now
     return {"facts": facts, "plan": plan, "plan_problem": problem}
 
 
-def _ledger_context(args, runner, now, writable, parts=None, floor=False):
+def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_read=True):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
-    (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
+    (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built. `plan_read=False` skips the read of the plan
+    (the relay's link check needs only the PR and the plan's source: one GitHub read)."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
@@ -16552,7 +16405,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
     plan, plan_problem = None, None
-    if source:
+    if source and plan_read:
         record_step("a GitHub read of the plan %s" % source)
         try:
             plan = checked_plan(config, source, args.ask, runner, now)
@@ -20208,81 +20061,9 @@ def add_ledger_parsers(sub):
     check.add_argument("--json", action="store_true")
 
 
-# ---------------------------------------------------------------- `review-laws install` (#179, slice L1)
-
-REVIEW_LAWS_FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md")
-REVIEW_LAWS_EDIT = {
-    "REVIEW_LAWS.md": "the verdict format, the matrix cells you tighten (never loosen), and the floor paths your repository names",
-    "CODING_STANDARDS.md": "add the rules your repository's own code needs; remove none without saying why",
-    "SECURITY_STANDARDS.md": "add the rules for your repository's own identities, secrets and permissions",
-    "TEST_STANDARDS.md": "add how your repository's tests are run in CI and what they must cover",
-}
-
-
-def review_laws_source():
-    return Path(os.path.realpath(__file__)).parent.parent / "docs" / "review-laws"
-
-
-def cmd_review_laws(args, runner, now):
-    """`review-laws install <repo path>`: copy the generic starter set (REVIEW_LAWS.md, CODING_STANDARDS.md, SECURITY_STANDARDS.md,
-    TEST_STANDARDS.md, each opening with `extends: fleet-kit-review-laws @ review-laws-<n>`) to the root of a repository and say what to edit. It
-    writes only those files, never overwrites one the repository already has (`--force` replaces it), and touches nothing else (not
-    AGENTS.md: the laws must not contradict it, so the pointer line is the repository's own edit)."""
-    source = review_laws_source()
-    try:
-        version = (source / "VERSION").read_text().strip()
-        texts = {name: (source / name).read_text() for name in REVIEW_LAWS_FILES}
-    except OSError as err:
-        sys.stderr.write("%s: review-laws: the starter set is not readable (%s): %s\n" % (PROG, source, getattr(err, "strerror", None) or err))
-        return EXIT_USAGE
-    target = Path(args.repo).expanduser()
-    if not target.is_dir():
-        sys.stderr.write("%s: review-laws: %s is not a directory\n" % (PROG, args.repo))
-        return EXIT_USAGE
-    header = "extends: fleet-kit-review-laws @ %s" % version
-    bad = [n for n, text in texts.items() if text.splitlines()[0] != header]
-    if bad:
-        sys.stderr.write("%s: review-laws: the starter set is inconsistent: %s do not open with %r\n" % (PROG, ", ".join(bad), header))
-        return EXIT_USAGE
-    links = [n for n in REVIEW_LAWS_FILES if os.path.islink(str(target / n))]   # a link (even a dangling one) is never replaced, forced or not
-    if links:
-        sys.stderr.write("%s: review-laws: %s is a symbolic link in %s: nothing was written (a link could send the copy somewhere else; remove it yourself)\n"
-                         % (PROG, ", ".join(links), target))
-        return EXIT_USAGE
-    existing = [n for n in REVIEW_LAWS_FILES if os.path.lexists(str(target / n))]
-    if existing and not args.force:
-        sys.stderr.write("%s: review-laws: %s already has %s: nothing was written (the repository's own copies are its law; --force replaces them)\n"
-                         % (PROG, target, ", ".join(existing)))
-        return EXIT_USAGE
-    written = []
-    for name in REVIEW_LAWS_FILES:
-        temp = target / (".%s.%d.tmp" % (name, os.getpid()))
-        try:
-            temp.write_text(texts[name])
-            os.replace(str(temp), str(target / name))
-        except OSError as err:
-            try:
-                temp.unlink()
-            except OSError:
-                pass
-            sys.stderr.write("%s: review-laws: could not write %s: %s (written so far: %s)\n"
-                             % (PROG, name, getattr(err, "strerror", None) or err, ", ".join(written) or "none"))
-            return EXIT_ERROR
-        written.append(name)
-    lines = ["review laws (%s) installed in %s. What to edit:" % (version, target)] + ["  %s: %s" % (n, REVIEW_LAWS_EDIT[n]) for n in written]
-    lines.append("Next: keep the `extends:` line (it says which version you started from); make sure the laws do not contradict your AGENTS.md "
-                 "(leave a pointer line there for any hygiene rule you moved); reviewers read these files from the base branch of a pull request.")
-    if (target / "AGENTS.md").exists():
-        lines.append("Your repository has an AGENTS.md: it was not touched.")
-    print("\n".join(lines))
-    return EXIT_OK
-
-
-cmd_review_laws.direct = True   # no error mapping, no daemon start
-
-
 # ---------------------------------------------------------------- `review record` and `review laws` (#179, slice L2)
 
+REVIEW_LAWS_FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md")
 REVIEW_LAW_FILES = REVIEW_LAWS_FILES + ("REVIEW_OVERLAY.md",)   # the laws a reviewer loads, and the repository's own overlay
 REVIEW_FILE_MAX = 30000      # bytes of one law file a reviewer is shown
 REVIEW_TOTAL_MAX = 90000     # bytes of all of them together
