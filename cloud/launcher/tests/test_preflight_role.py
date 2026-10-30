@@ -298,5 +298,60 @@ class S7Documents(unittest.TestCase):
         self.assertIn("grants", text.split("the `preflight` role", 1)[1][:3000])
 
 
+HOOK_NAME = "CW_PREFLIGHT_ORG_TOKEN_CMD"
+HOOK_MARKER = "echo planted-marker-hook-7f3a9c"
+STAND_IN = (
+    "import os, sys\n"
+    "dump = repr(sorted(os.environ.items()))\n"
+    "print('names=%%d marker=%%d' %% (dump.count(%r), dump.count(%r)))\n" % (HOOK_NAME, HOOK_MARKER)
+)
+RUNNER = (
+    "import os, sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "sys.path.extend(sys.argv[3:])\n"
+    "import cloud_worker as cw\n"
+    "cw.PREFLIGHT_ARGV = [sys.executable, sys.argv[2]]\n"
+    "line = cw.check_repo_preflight('acme-org/x', dict(os.environ, **{%r: %r}))\n"
+    "print(line)\n"
+    "sys.exit(0 if line == 'names=0 marker=0' else 1)\n" % (HOOK_NAME, HOOK_MARKER)
+)
+
+
+class HookStaysOutOfTheChild(unittest.TestCase):
+    def run_child(self, workdir, mutate=None):
+        launcher = os.path.join(workdir, "launcher")
+        os.makedirs(launcher)
+        shutil.copy(os.path.join(LAUNCHER, "cloud_worker.py"), launcher)   # a scratch copy of the module; its siblings come from the real directory
+        if mutate:
+            path = os.path.join(launcher, "cloud_worker.py")
+            with open(path) as f:
+                src = f.read()
+            with open(path, "w") as f:
+                f.write(mutate(src))
+        stand_in = os.path.join(workdir, "stand_in.py")
+        with open(stand_in, "w") as f:
+            f.write(STAND_IN)
+        return subprocess.run([sys.executable, "-c", RUNNER, launcher, stand_in, LAUNCHER, os.path.join(ROOT, "bin")], capture_output=True, text=True, timeout=60)
+
+    def test_child_does_not_see_the_hook_name_or_its_marker_and_a_mutant_passing_it_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "real"))
+            real = self.run_child(os.path.join(d, "real"))
+            self.assertEqual(real.returncode, 0, real.stdout + real.stderr)
+            self.assertEqual(real.stdout.strip(), "names=0 marker=0")
+            print("real child: %s" % real.stdout.strip())
+            os.makedirs(os.path.join(d, "mut"))
+            old = '    "CW_APP_KEY_CMD",\n)'
+            def apply(src):
+                assert src.count(old) == 1   # the mutation applies exactly once
+                out = src.replace(old, '    "CW_APP_KEY_CMD",\n    "%s",\n)' % HOOK_NAME, 1)
+                assert out != src
+                return out
+            mut = self.run_child(os.path.join(d, "mut"), apply)
+            print("mutant child: %s (exit %d)" % (mut.stdout.strip(), mut.returncode))
+            self.assertEqual(mut.returncode, 1, mut.stdout + mut.stderr)
+            self.assertEqual(mut.stdout.strip(), "names=1 marker=1")
+
+
 if __name__ == "__main__":
     unittest.main()
