@@ -1569,10 +1569,10 @@ class OneWallClock(unittest.TestCase):
         t = threading.Thread(target=lambda: out.append(self.timed(mod, "http://127.0.0.1:9", 1.0)), daemon=True)
         t.start()
         t.join(10)   # hang guard, never a verdict: the real fetch has answered, the mutant one is still blocked on the lookup
-        returned = self.lookup_returned.is_set()
+        returned, answered = self.lookup_returned.is_set(), bool(out)   # both taken BEFORE the release
         self.lookup_release.set()
         t.join(10)   # hang guard: the mutant fetch answers once the lookup returned
-        return out, returned
+        return out, returned, answered
 
     def full_backlog(self, n=4):
         """Deterministic n dead addresses: each attempt sleeps its whole timeout, then times out (no kernel backlog)."""
@@ -1590,14 +1590,14 @@ class OneWallClock(unittest.TestCase):
         return "http://localhost:9"
 
     def test_slow_dns_is_cut_at_the_deadline(self):
-        out, returned = self.slow_dns(relay)
+        out, returned, _ = self.slow_dns(relay)
         self.assertIsInstance(out[0][1], relay.PassCut)
         self.assertFalse(returned, "the fetch was cut only after the name lookup had returned")
 
     def test_mutant_without_the_thread_cut_is_caught_by_dns(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
-        self.slow_dns(mod)   # the mutant joins without the deadline: it answers only after the lookup returned
-        self.assertTrue(self.lookup_returned.is_set(), "the mutant fetch returned before the name lookup had returned")
+        out, _, answered = self.slow_dns(mod)   # the mutant joins without the deadline: silent until the release
+        self.assertFalse(answered, "the mutant fetch answered before the name lookup had returned"); self.assertTrue(out, "it never answered")
 
     def test_four_dead_addresses_share_one_deadline(self):
         _, err = self.timed(relay, self.full_backlog(), 2.0)
