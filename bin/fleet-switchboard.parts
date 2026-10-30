@@ -20,3 +20,5 @@ switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
 switchboard/secret_spans.py
+switchboard/plan_input.py
+switchboard/review_laws_install.py
