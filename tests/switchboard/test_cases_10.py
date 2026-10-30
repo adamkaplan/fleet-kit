@@ -478,13 +478,13 @@ fleet-heartbeat:load_config
 fleet-scenario:read
 fleet-switchboard:__init__
 fleet-switchboard:_api
-fleet-switchboard:_audit_tail
+switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
 fleet-switchboard:_docker_inspect
-fleet-switchboard:_fresh
+switchboard/caches.py:_fresh
 fleet-switchboard:_last
 fleet-switchboard:_load_markers
-fleet-switchboard:_read_json_object
+switchboard/profile_pieces.py:_read_json_object
 fleet-switchboard:_review_api
 fleet-switchboard:_write_gates_config
 fleet-switchboard:anonymous_volumes
@@ -607,6 +607,7 @@ switchboard/judge.py:looks_like_plugin_event
 switchboard/judge.py:parse_plugin_event
 switchboard/judge_request.py:_guess_configured
 switchboard/judge_request.py:parse_policy_request
+switchboard/sent_view.py:sent_deliveries
 switchboard/triage.py:triage_summary
 switchboard/v2_transport.py:_decode
 switchboard/v2_transport.py:_read_file
