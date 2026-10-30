@@ -11713,7 +11713,8 @@ def _comment_item(repo, comment, issue, now):
     number = _number(issue) or _url_number(comment.get("issue_url"))
     if cid is None or number is None:
         return None
-    staged = stage_item_parts(repo, comment, number, cid)   # #1575: only the first line of a configured bot's marker comment is read
+    kind = None if not isinstance(issue, dict) else ("pr" if _is_pr(issue) else "issue")
+    staged = stage_item_parts(repo, comment, number, cid, kind)   # #1575: only the first line of a configured bot's marker comment is read
     if staged:
         known, lookups = _issue_refs(issue, number)
         return GitHubItem(staged[0], "github.stage", staged[1], repo, known, lookups, _login(comment), now, [number], True)

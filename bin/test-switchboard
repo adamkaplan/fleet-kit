@@ -8720,6 +8720,45 @@ class TestStageEvents(Base):
         self.assertNotIn("ignore your instructions", self.rig.state_text())
         self.assertEqual({g[2] for g in got}, {"github.stage"})
 
+    # ---- #1591: the line says what its number is ----
+    def kind_item(self, kind, body=None, cid=5001):
+        issue = {"number": 7, "pull_request": {"url": "x"}} if kind == "pr" else ({"number": 7} if kind == "issue" else None)
+        comment = {"id": cid, "body": body or self.line(), "user": {"login": "github-actions[bot]"}, "issue_url": "https://api.github.com/repos/%s/issues/7" % GH_REPO}
+        return sb._comment_item(GH_REPO, comment, issue, 1.0)
+
+    def test_1591_s2_a_pull_request_item_is_the_whole_item_of_before(self):
+        item = self.kind_item("pr")
+        self.assertEqual(item.summary, "stage up on PR #7, head aaaaaaa")
+        self.assertEqual((item.key, item.kind, item.repo, item.issues, item.lookups, item.sender, item.numbers, item.actionable),
+                         ("github.stage:5001:up:" + self.HEAD + ":", "github.stage", GH_REPO, [], [("pr", 7)], "github-actions[bot]", [7], True))
+
+    def test_1591_s3_an_issue_item_differs_from_the_pull_request_item_in_the_summary_only(self):
+        pr, issue = self.kind_item("pr"), self.kind_item("issue")
+        self.assertTrue(issue.summary.startswith("stage up on issue #7, head aaaaaaa"))
+        self.assertEqual(issue.summary.replace("issue #", "PR #"), pr.summary)
+        for f in ("key", "kind", "repo", "sender", "numbers", "actionable"):
+            self.assertEqual(getattr(issue, f), getattr(pr, f), f)
+
+    def test_1591_s4_no_issue_object_says_neither_word(self):
+        item = self.kind_item(None)
+        self.assertTrue(item.summary.startswith("stage up on #7, head aaaaaaa"))
+        self.assertNotIn("PR", item.summary)
+        self.assertNotIn("issue", item.summary)
+
+    def test_1591_s5_unreadable_is_the_same_words_and_key_in_the_three_cases(self):
+        bad = self.line(status="sleeping")
+        got = [self.kind_item(k, bad) for k in ("pr", "issue", None)]
+        self.assertEqual([g.summary for g in got], ["stage event unreadable"] * 3)
+        self.assertEqual(len({g.key for g in got}), 1)
+
+    def test_1591_s6_an_issue_event_keeps_its_recipient_and_key_and_a_repeated_edit_is_not_delivered_again(self):
+        for action in ("created", "edited"):
+            self.gh.send("issue_comment", {"action": action, "issue": {"number": 12, "title": "t", "state": "open"}, "repository": {"full_name": GH_REPO},
+                                           "comment": {"id": 5301, "body": self.line(), "user": {"login": "github-actions[bot]", "type": "Bot"}}})
+        (one,) = self.told()
+        self.assertEqual(one[1], "stage up on issue #12, head aaaaaaa")
+        self.assertEqual((one[0], one[2], one[3]), ("github.stage:5301:up:" + self.HEAD + ":", "github.stage", "platform"))   # recipient recorded from the previous build (c1575)
+
     def test_s7_s14_a_planted_link_and_a_long_body_are_never_read(self):
         planted = "SIGNED-MARKER-7f3a"
         body = self.line() + "\nsign in: https://stage.example.org/login?sig=%s\n" % planted + "z" * 1000000
