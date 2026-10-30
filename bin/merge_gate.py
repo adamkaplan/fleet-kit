@@ -25,7 +25,10 @@ import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+except NameError:   # a test runs the source with no file: the module is then already importable
+    pass
 import size_ceilings   # the one reading of the size ceilings of docs/architecture.md (#1605)
 
 CONFIG_KEY = "merge_gate"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
