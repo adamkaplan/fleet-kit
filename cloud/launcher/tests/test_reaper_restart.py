@@ -155,29 +155,40 @@ class S15Docs(unittest.TestCase):
         self.assertIn("install command", text)
 
 
+class LoginModel(R.Refresher):
+    """A model of the real refresher: after a failed attempt it answers 'waiting' for 300 s (CLUSTER_TOKEN_RETRY_SECONDS), then tries again."""
+    RETRY_GAP = 300
+
+    def __init__(self, kube, clock, good, failed, attempts):
+        super().__init__(kube)
+        self.clock, self.good, self.failed, self.attempts = clock, good, failed, attempts
+        self.last_failure, self.from_ticker = None, False
+
+    def run(self, force=False):
+        now = self.clock.now
+        if not force and self.last_failure is not None and 0 <= (now - self.last_failure).total_seconds() < self.RETRY_GAP:
+            return R.types_ns(state="waiting", token="", reason="the vault did not answer")
+        if self.from_ticker:
+            self.attempts.append(now)
+        if self.from_ticker and now >= R.T0 + 100 * MIN and len(self.failed) < 2:
+            self.failed.append(now)
+            self.last_failure = now
+            return R.types_ns(state="failed", token="", reason="the vault did not answer")
+        self.last_failure = None
+        self.good.append(now)
+        return super().run(force)
+
+
 class S12LoginGap(unittest.TestCase):
     def test_the_longest_gap_between_successful_refreshes_is_within_30_minutes(self):
         mod = target()
         clock = R.Clock()
-        good, failed = [], []
-
-        class Flaky(R.Refresher):
-            ticker_calls = 0
-
-            def run(self, force=False):
-                r = super().run(force)
-                if getattr(self, "from_ticker", False):
-                    Flaky.ticker_calls += 1
-                    if clock.now >= R.T0 + 100 * MIN and len(failed) < 2:
-                        failed.append(clock.now)
-                        return R.types_ns(state="failed", token="", reason="the vault did not answer")
-                good.append(clock.now)
-                return r
+        good, failed, attempts = [], [], []
         err = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
-            launcher, kube, refresher, ticker, renewed, attempts, env = R.build(mod, clock, tmp, with_ticker=True, wait=lambda: None)
-            flaky = Flaky(kube)
-            ticker.refresher = flaky
+            launcher, kube, refresher, ticker, renewed, attempted, env = R.build(mod, clock, tmp, with_ticker=True, wait=lambda: None)
+            model = LoginModel(kube, clock, good, failed, attempts)
+            ticker.refresher = model
             good.append(clock.now)
             with contextlib.redirect_stderr(err):
                 for step in range(3 * 60 * 4):
@@ -186,17 +197,20 @@ class S12LoginGap(unittest.TestCase):
                     stalled = 40 <= minute < 90
                     raised = minute in (120, 121)   # a pass that raises before the renewal step: no refresh from it either
                     if minute % 5 == 0 and step % 4 == 0 and not stalled and not raised:
-                        flaky.from_ticker = False
-                        flaky.run()
+                        model.from_ticker = False
+                        model.run()
                     if ticker.due():
-                        flaky.from_ticker = True
+                        model.from_ticker = True
                         ticker.tick()
         good.append(clock.now)
         gap = max((b - a).total_seconds() for a, b in zip(good, good[1:])) / 60
         lines = [l for l in err.getvalue().splitlines() if "login refresh failed" in l]
+        delays = [min((t - f).total_seconds() for t in attempts if t > f) / 60 if any(t > f for t in attempts) else 999 for f in failed]
         print("S12: longest gap between successful login refreshes %d minutes (limit 30), failed refreshes reported %d" % (round(gap), len(lines)))
+        print("S12: longest wait from a failed refresh to the next attempt %s minutes (limit 6)" % (round(max(delays), 1) if delays else None))
         self.assertLessEqual(gap, 30)
         self.assertEqual((len(failed), len(lines)), (2, 2))
+        self.assertLessEqual(max(delays), 6)   # the ticker's retry follows the refresher's 300 s gap: not a full cadence later
 
 
 def mutant(directory, name, edits):
@@ -214,13 +228,14 @@ def mutant(directory, name, edits):
 
 
 class Mutants(unittest.TestCase):
-    def child(self, name, edits, test):
+    def child(self, name, edits, test, want=1):
         with tempfile.TemporaryDirectory() as tmp:
             path = mutant(tmp, name, edits)   # outside the repository; the edit asserted applied
             p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reaper_restart." + test], cwd=HERE,
                                    env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             out = p.communicate(timeout=120)[0]
         self.assertEqual(p.returncode, 1, out)
+        return out
 
     def test_a_loop_that_never_compares_fails_the_restart_test(self):
         self.child("mutant-13", [("if code_identity(tree) != identity:", "if False:")], "S13Restart.test_exit_after_a_change_and_none_without_one")
@@ -231,31 +246,57 @@ class Mutants(unittest.TestCase):
     def test_a_refresh_on_the_pass_cadence_only_shows_the_gap(self):
         self.child("mutant-12", [("RENEW_CADENCE_SECONDS = 600 ", "RENEW_CADENCE_SECONDS = 10 ** 9 ")], "S12LoginGap")
 
+    def test_a_ticker_without_the_retry_flag_fails_the_login_test(self):
+        out = self.child("mutant-12b", [("return self.retry or (self.clock()", "return (self.clock()")], "S12LoginGap")
+        import re
+        m = re.search(r"S12: longest gap between successful login refreshes (\d+) minutes", out)
+        w = re.search(r"next attempt (\S+) minutes", out)
+        self.assertTrue(m, out)
+        print("S12: retry-dropped mutant gap %s minutes (limit 30); wait from a failed refresh to the next attempt %s minutes (limit 6)" % (
+            m.group(1), w.group(1) if w else "?"))
+
+
+def kit_files_of(rel):
+    """The kit files (cloud/launcher/X.py, bin/X.py) that the file `rel` names: by import (module level and inside functions) and by a
+    spec_from_file_location / SourceFileLoader call whose arguments carry a 'X.py' string."""
+    import ast
+    with open(os.path.join(ROOT, rel)) as f:
+        tree = ast.parse(f.read())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            called = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if called in ("spec_from_file_location", "SourceFileLoader"):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and sub.value.endswith(".py"):
+                        names.add(sub.value[:-3])
+    return {r for n in names for r in ("cloud/launcher/%s.py" % n, "bin/%s.py" % n) if os.path.isfile(os.path.join(ROOT, r))}
+
 
 class S13ImportsInIdentity(unittest.TestCase):
     def test_every_imported_kit_module_is_in_the_identity_list(self):
-        import ast
-        with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
-            tree = ast.parse(f.read())
-        names = set()
-        for node in ast.walk(tree):   # module level and inside functions
-            if isinstance(node, ast.Import):
-                names.update(a.name.split(".")[0] for a in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                names.add(node.module.split(".")[0])
-        kit = sorted(rel for n in names for rel in ("cloud/launcher/%s.py" % n, "bin/%s.py" % n) if os.path.isfile(os.path.join(ROOT, rel)))
-        listed = target().CODE_IDENTITY_FILES
-        missing = [rel for rel in kit if rel not in listed]
-        print("S13: imported kit modules %d, all in the identity list" % len(kit))
+        listed = list(target().CODE_IDENTITY_FILES)
+        found, todo = set(), list(listed)
+        while todo:   # the transitive closure over the listed modules and what they name
+            for rel in kit_files_of(todo.pop()) - found:
+                found.add(rel)
+                todo.append(rel)
+        found.discard("cloud/launcher/cloud_worker.py")
+        missing = sorted(rel for rel in found if rel not in listed)
+        print("S13: kit modules found transitively %d, all in the identity list" % len(found))
         self.assertEqual(missing, [])
 
 
 class S13ImportsMutant(unittest.TestCase):
-    def test_the_list_without_token_mint_fails_the_test(self):
+    def drop(self, old):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
                 src = f.read()
-            old = ', "cloud/launcher/token_mint.py"'
             assert src.count(old) == 1
             d = os.path.join(tmp, "mutant-13b")
             os.makedirs(d)
@@ -266,6 +307,12 @@ class S13ImportsMutant(unittest.TestCase):
                                    env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             out = p.communicate(timeout=120)[0]
         self.assertEqual(p.returncode, 1, out)
+
+    def test_the_list_without_token_mint_fails_the_test(self):
+        self.drop(', "cloud/launcher/token_mint.py"')
+
+    def test_the_list_without_record_json_fails_the_test(self):
+        self.drop(', "bin/record_json.py"')
 
 
 if __name__ == "__main__":

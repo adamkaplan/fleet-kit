@@ -70,7 +70,7 @@ ORPHAN_SECRET_REASON = "orphan secret: its pod is absent"
 PW_SECRET_NAME = re.compile(r"(.+-[0-9a-f]{4})-pw")   # '<worker>-<4 hex digits>-pw': the password Secret of the pod named by the group
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
-CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py")   # the module and the kit modules it imports
+CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
@@ -3303,6 +3303,9 @@ def code_identity(tree=None):
     return h.hexdigest()
 
 
+START_IDENTITY = code_identity()   # taken once when this module is imported: a file changed after Python read the modules is seen at the first compare
+
+
 class RenewalTicker:
     """The renewal and the reaper's own login refresh on their own cadence: a thread that, at least every RENEW_CADENCE_SECONDS of the clock,
     refreshes the login and renews every due token, whatever the pass is doing (a stop that waits, an activity read that hangs). `wait` is the
@@ -3324,8 +3327,8 @@ class RenewalTicker:
         try:
             with self.L.renew_lock:
                 refresh = self.refresher.run()
-                self.retry = refresh.state == "failed"   # a failed refresh is tried again at the next look (the refresher spaces its own retries)
-                if self.retry:
+                self.retry = refresh.state in ("failed", "waiting")   # tried again at each look until the refresher's own retry gap has passed and it has tried
+                if refresh.state == "failed":   # one line per failure, not one per look
                     print("cloud-worker: the login refresh failed: %s" % scrub(getattr(refresh, "reason", ""), (), 200), file=sys.stderr)
                 if self.L.kube is not None and refresh.token:
                     self.L.kube.add_secrets(refresh.token)
@@ -3369,7 +3372,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
         refresher = refresher or ClusterTokenRefresher(env, clock)
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         ticker = None
-        identity = code_identity(tree)
+        identity = code_identity(tree) if tree else START_IDENTITY
         while True:
             refresh = refresher.run()
             for line in getattr(refresher, "notices", []):
