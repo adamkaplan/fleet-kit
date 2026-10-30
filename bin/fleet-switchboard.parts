@@ -1,4 +1,6 @@
 # The parts of the daemon, in the order they run, relative to this file. The line naming the entry is the entry's own code.
+switchboard/plan_input.py
+switchboard/review_laws_install.py
 fleet-switchboard
 switchboard/v2_transport.py
 switchboard/facts.py
