@@ -26,24 +26,15 @@ def stage_check_config(config, source):
 
 
 def _stage_url(value):
-    if not isinstance(value, str) or len(value) > 200 or not re.fullmatch(r"[\x21-\x7e]+", value):
-        return None
-    parts = urllib.parse.urlsplit(value)
-    if parts.scheme != "https" or not parts.hostname or parts.query or parts.fragment or "?" in value or "#" in value or "@" in parts.netloc:
-        return None
-    return value
-
-
-_stage_url_unwrapped = _stage_url
-
-
-def _stage_url(value):
-    """A url the parser cannot read (urlsplit or port raise) is no url: the line is unreadable, whatever the exception."""
+    """A url the parser cannot read (urlsplit, port or hostname raise) is no url: the line is unreadable, whatever the exception."""
     try:
-        parts = urllib.parse.urlsplit(value) if isinstance(value, str) else None
-        if parts is not None:
-            parts.port, parts.hostname
-        return _stage_url_unwrapped(value)
+        if not isinstance(value, str) or len(value) > 200 or not re.fullmatch(r"[\x21-\x7e]+", value):
+            return None
+        parts = urllib.parse.urlsplit(value)
+        parts.port
+        if parts.scheme != "https" or not parts.hostname or parts.query or parts.fragment or "?" in value or "#" in value or "@" in parts.netloc:
+            return None
+        return value
     except Exception:
         return None
 
