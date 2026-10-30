@@ -742,7 +742,7 @@ class TestGitShim(Base):
         if base is None:
             self.skipTest("no main to diff against (a shallow checkout)")
         diff = subprocess.run(["git", "-C", str(REPO), "diff", base, "-U0", "--no-color"], capture_output=True, text=True, timeout=60).stdout
-        self.assertEqual(self.config_write_hits(self.added_lines(diff)), [])
+        self.assertEqual(self.unallowed_config_write_hits(diff), [])
 
 
 class TestGhShim(Base):
