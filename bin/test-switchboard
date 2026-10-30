@@ -3081,6 +3081,220 @@ class TestDaemon(Base):
 # -------------------------------------------------- the poke socket, ensure, the plugin
 
 
+class TestDaemonRelayLoop(Base):
+    """#1477: the relay is not pulled inline after run_pass; it has its own loop, so a stuck relay does not stall passes."""
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.dict(sys.modules, {sb.__name__: sb})   # run_daemon looks its own module up by name (strictly: a missing host fails the start)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.world = World(self, agents=("platform",))
+
+    def test_a_blocked_relay_does_not_stop_the_engine_passes(self):
+        import os as _os
+        relay = sb.load_module("cloud_relay_daemon")
+        gate, orig = threading.Event(), relay.pass_if_configured
+        entered = threading.Event()
+        relay.pass_if_configured = lambda *a, **k: (entered.set(), gate.wait(20))
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"}
+        saved = {k: _os.environ.get(k) for k in env}
+        _os.environ.update(env)
+        try:
+            self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3, relay_engine=lambda: self.world.engine), 3)   # returns while the relay is still blocked
+            self.assertTrue(entered.wait(30))   # the relay did run, and was still blocked while the passes completed
+        finally:
+            gate.set()
+            relay.pass_if_configured = orig
+            for k, v in saved.items():
+                _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
+
+    def test_twenty_calls_are_answered_inside_the_wait_while_a_45_second_pass_runs(self):
+        """S1/S2 on the real run_daemon with a fake 45 s engine pass (fake clock). Each call is answered by the relay loop while the
+        pass is still running. Mutant: the relay pulled inline after run_pass: the pass waits for an answer that only comes after it,
+        so the first wait times out and fewer than 20 calls are answered."""
+        import os as _os
+        relay = sb.load_module("cloud_relay_daemon")
+        import importlib.machinery, importlib.util, tempfile
+        loader = importlib.machinery.SourceFileLoader("t_relay_daemon_tests", str(Path(sb.__file__).parent / "test-cloud-relay-daemon"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        rt = importlib.util.module_from_spec(spec)
+        loader.exec_module(rt)   # its FakeBackend and FakeHub; the Executor is the REAL one, on a temp ledger
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        backend, hub = rt.FakeBackend(), rt.FakeHub()
+        real_exec = rt.relay.Executor(tmp.name, backend, lambda: 1000)
+        clock, answered = [0.0], {}
+        pending_cid = "r-pending"   # a report claimed and never delivered, as in the S13 proof: its replay is refused 409
+        real_exec.reports.claim(rt.CODER, pending_cid, {"command": "report", "pr": rt.PR, "args": rt.relay.args_digest({"state": "done", "text": "x"}), "state": "pending"})
+
+        got = threading.Event()
+
+        def pull(*a, **k):
+            def post(rid, body):
+                answered[rid] = (clock[0], body)
+                hub.post(rid, body)
+                got.set()
+            return relay.pass_once(real_exec, hub.fetch, post)
+        orig_pull, orig_cadence = relay.pass_if_configured, relay.CADENCE
+        relay.pass_if_configured, relay.CADENCE = pull, 0.01
+        saved = {k: _os.environ.get(k) for k in ("FLEET_RELAY_HUB_URL", "FLEET_RELAY_HUB_TOKEN_FILE")}
+        _os.environ.update({"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"})
+        asked, pass_end = {}, []
+        lock = threading.Lock()
+        engine, real = self.world.engine, self.world.engine.run_pass
+
+        def long_pass():
+            if pass_end:
+                return real()
+            for i in range(20):   # a pod call every 2 s of fake time; the pass lasts 45 s of fake time
+                clock[0] = 2.0 * i
+                kind = i % 4
+                if kind == 0:
+                    rid = hub.submit(rt.CODER, "prove", cid="c%d" % i, **rt.PROVE)
+                elif kind == 1:
+                    rid = hub.submit(rt.TESTER, "verdict", cid="c%d" % i, **rt.VERDICT)
+                elif kind == 2:
+                    rid = hub.submit(rt.CODER, "gates", head=None, cid="c%d" % i)
+                else:
+                    rid = hub.submit(rt.CODER, "report", head=None, cid=pending_cid if i == 3 else "c%d" % i, state="done", text="x")
+                asked[rid] = clock[0]
+                got.wait(60)   # a loose bound (the loop answers by its own cadence): the assertions below count answers, not seconds
+                got.clear()
+            clock[0] = 45.0
+            pass_end.append(clock[0])
+        engine.run_pass = long_pass
+        try:
+            sb.run_daemon(engine, self.world.state, 5, lambda sock, t: None, passes=1, relay_engine=lambda: engine)
+        finally:
+            relay.pass_if_configured, relay.CADENCE = orig_pull, orig_cadence
+            for k, v in saved.items():
+                _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
+        self.assertEqual(len(answered), 20)
+        statuses = [answered[r][1]["status"] for r in sorted(asked)]
+        self.assertEqual(statuses, [409 if i == 3 else 200 for i in range(20)])   # the pending report is refused as the real executor does
+        self.assertEqual(answered["%032x" % 4][1]["reason"], rt.relay.PENDING_REASON)
+        self.assertLess(max(v[0] for v in answered.values()), pass_end[0])   # all answered while the 45 s pass was still running
+
+    def test_without_a_hub_the_audit_is_that_of_the_bare_passes(self):
+        """U3: FLEET_RELAY_HUB_URL unset: run_daemon writes the audit bytes of the same 3 bare engine passes (the loop body before the
+        relay existed). Mutant: a relay loop started with no hub adds a thread and relay lines."""
+        import os as _os
+        saved = _os.environ.pop("FLEET_RELAY_HUB_URL", None)
+        relay, started = sb.load_module("cloud_relay_daemon"), []
+        orig_run = relay.RelayLoop.run
+        relay.RelayLoop.run = lambda loop: started.append(1)
+        try:
+            sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3, relay_engine=lambda: self.world.engine)
+            relay.RelayLoop.run = orig_run
+            self.assertEqual(started, [])   # no relay thread ran
+            via_daemon = self.world.audit()
+            other = World(self, agents=("platform",))
+            for _ in range(3):
+                other.engine.run_pass()
+            bare = other.audit()
+        finally:
+            if saved is not None:
+                _os.environ["FLEET_RELAY_HUB_URL"] = saved
+        def lines(rows):   # the clock stamp is real time (and repeats are rate-limited by it): compare what was said, byte for byte
+            return sorted({json.dumps({k: v for k, v in r.items() if k != "ts"}, sort_keys=True) for r in rows})
+        self.assertEqual(lines(via_daemon), lines(bare))
+        self.assertFalse([r for r in via_daemon if str(r.get("event")).startswith("relay.")])
+
+    def relay_env(self):
+        import os as _os
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent"}
+        saved = {k: _os.environ.get(k) for k in env}
+        _os.environ.update(env)
+
+        def restore():
+            for k, v in saved.items():
+                _os.environ.pop(k, None) if v is None else _os.environ.__setitem__(k, v)
+        self.addCleanup(restore)
+
+    def test_a_start_loop_that_raises_does_not_stop_the_daemon(self):
+        self.relay_env()
+        relay = sb.load_module("cloud_relay_daemon")
+        orig = relay.start_loop
+
+        def boom(*a, **k):
+            raise RuntimeError("no relay today")
+        relay.start_loop = boom
+        self.addCleanup(setattr, relay, "start_loop", orig)
+        self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=3, relay_engine=lambda: self.world.engine), 3)
+        failures = [e for e in self.world.audit() if e["event"] == "error" and e["detail"].get("step") == "pass"]
+        self.assertEqual(len(failures), 1)
+
+    def test_the_relay_loop_is_stopped_when_run_daemon_returns(self):
+        self.relay_env()
+        relay = sb.load_module("cloud_relay_daemon")
+        orig_pull, orig_start, loops = relay.pass_if_configured, relay.start_loop, []
+        relay.pass_if_configured = lambda *a, **k: 0
+        relay.start_loop = lambda *a, **k: (loops.append(orig_start(*a, **k)), loops[-1])[1]
+        self.addCleanup(setattr, relay, "pass_if_configured", orig_pull)
+        self.addCleanup(setattr, relay, "start_loop", orig_start)
+        sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=2, relay_engine=lambda: self.world.engine)
+        self.assertEqual(len(loops), 1)
+        self.assertFalse(loops[0].thread.is_alive())   # stop() ran in the finally and the loop (a 5 s wait) ended at once
+
+    def test_a_hub_without_a_relay_engine_is_audited_and_the_passes_go_on(self):
+        self.relay_env()
+        self.assertEqual(sb.run_daemon(self.world.engine, self.world.state, 5, lambda sock, t: None, passes=2), 2)
+        failures = [e for e in self.world.audit() if e["event"] == "error" and e["detail"].get("step") == "pass"]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("engine factory", json.dumps(failures[0]["detail"]))
+
+    def relayed_report_during_a_pass(self, relay_engine):
+        """The pass thread discovers and holds its result while the relay thread relays a `report` (the real SwitchboardBackend.report on the
+        engine the loop was given). Returns (the pass's discovery is still the engine's, the riders recorded, the errors)."""
+        self.relay_env()
+        world = self.world
+        world.add_agent("coder", fleet={"role": "coder", "reports_to": "platform"})
+        relay = sb.load_module("cloud_relay_daemon")
+        engine, seen, errors = world.engine, {}, []
+        discovered, reported = threading.Event(), threading.Event()
+        orig_pull = relay.pass_if_configured
+        done_once = []
+
+        def pull(loop_engine, host, runner, now, environ, budget=None):
+            if done_once:
+                return 0
+            done_once.append(1)
+            try:
+                if not discovered.wait(60):
+                    errors.append("the pass never discovered")
+                relay.SwitchboardBackend(host, (loop_engine, world.state, world.config), runner, now).report("coder", {"state": "working", "text": "half way"})
+            except Exception as err:
+                errors.append(repr(err))
+            finally:
+                reported.set()
+            return 0
+
+        def fake_pass():
+            mine = engine.discover(world.clock.now())
+            discovered.set()
+            reported.wait(60)
+            seen["intact"] = engine.discovery is mine
+            return {}
+        relay.pass_if_configured = pull
+        self.addCleanup(setattr, relay, "pass_if_configured", orig_pull)
+        engine.run_pass = fake_pass
+        sb.run_daemon(engine, world.state, 5, lambda sock, t: None, passes=1, relay_engine=relay_engine)
+        riders = [r for r in sb.read_report_riders(world.state) if r["from"] == "coder"]
+        return seen.get("intact"), riders, errors
+
+    def test_a_relayed_report_does_not_touch_the_pass_threads_engine(self):
+        intact, riders, errors = self.relayed_report_during_a_pass(lambda: self.world.new_engine())
+        self.assertEqual(errors, [])
+        self.assertTrue(intact)   # the pass's discovery was not replaced under it
+        self.assertEqual(len(riders), 1)   # and the rider was recorded
+
+    def test_mutant_sharing_the_engine_again_is_caught(self):
+        intact, riders, errors = self.relayed_report_during_a_pass(lambda: self.world.engine)   # explicit sharing: the relay thread runs on the pass thread's engine
+        self.assertEqual(errors, [])
+        self.assertFalse(intact)   # the relay's discover replaced the pass's discovery: the guard above fails
+
+
 class TestDaemonWaits(Base):
     def setUp(self):
         super().setUp()
@@ -9312,6 +9526,64 @@ class TestGithubDaemon(Base):
         super().setUp()
         self.world = World(self, agents=("platform",))
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+
+    def racing_calls(self, locked):
+        """Two threads record() into a gate whose counter has ONE stale entry. A deque that makes both threads look at the stale head at the same moment
+        (a barrier) forces the check-then-act interleaving a GIL alone does not: with the lock the second thread waits; without it both trim."""
+        barrier = threading.Barrier(2)
+
+        class Racy(collections.deque):
+            def __getitem__(self, i):
+                value = super().__getitem__(i)
+                if i == 0 and value[0] < 500:   # the stale entry: both threads see it before either removes it
+                    try:
+                        barrier.wait(0.5)
+                    except threading.BrokenBarrierError:
+                        pass
+                return value
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, lambda: 1000.0, environ={})
+        accounts.calls = Racy([(0.0, "default", "old", False)])
+        if not locked:
+            accounts.lock = contextlib.nullcontext()   # the mutant: the same gate with its lock removed
+        errors = []
+
+        def work():
+            try:
+                accounts.record("relay")
+            except BaseException as err:
+                errors.append(err)
+        threads = [threading.Thread(target=work) for _ in range(2)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        return len(accounts.calls), errors
+
+    def test_gh_accounts_counter_is_safe_for_two_threads(self):
+        # PC-6/U10: the pass thread and the relay thread count through ONE GhAccounts: the check-then-trim of its counter is under its lock
+        self.assertEqual(self.racing_calls(True), (2, []))
+        self.assertNotEqual(self.racing_calls(False), (2, []))   # without the lock one thread's entry is trimmed away (or it raises): the test can fail
+
+    def test_gh_accounts_records_once_inside_read_and_checks_any_pause(self):
+        accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5}, lambda *a, **k: None, self.world.clock.now, environ={})
+        done = subprocess.CompletedProcess([], 0, "{}", "")
+
+        def inner(*a, **k):
+            accounts.check_pause()
+            accounts.record("relay")   # a call made by a caller that runs inside `read`: read counts it, not record
+            return done
+        accounts.read(inner, "repos/o/r/pulls/1", "o/r", 5)
+        self.assertEqual(len(accounts.calls), 1)
+        accounts.record("relay")
+        self.assertEqual(len(accounts.calls), 2)
+        accounts.paused["some-account"] = self.world.clock.now() + 600
+        with self.assertRaises(sb.GhRateLimited):
+            accounts.check_pause()
+
+    def test_the_relay_engine_does_not_own_the_v2_link_file(self):
+        daemon = sb.build_engine(self.world.route, self.world.clock.now, "daemon")[0]
+        relay = sb.build_engine(self.world.route, self.world.clock.now, "daemon", owns_link=False)[0]
+        self.assertIsNotNone(daemon.v2.state_dir)   # the daemon's own client writes v2-link.json
+        self.assertIsNone(relay.v2.state_dir)   # the relay thread's does not: one writer, no flapping
+        self.assertEqual(relay.actor, "daemon")   # its audit lines are still the daemon's
 
     def test_no_repo_means_a_hub_with_no_watches_that_opens_and_starts_nothing(self):
         # PR 15: the watched set is derived on every pass, so the hub always exists; with nothing to watch it idles
@@ -68309,7 +68581,7 @@ class TestLoadAlert(Base):
     def test_the_cloud_figure_is_in_the_load_record_and_the_health_status(self):
         """Lane with cloud workers (2 live; finished, stale and unreadable records not counted), lane with none (0), local counts apart; the figure is also in the hourly series."""
         latest = self._cloud_run()
-        self.assertEqual((latest["orch"]["busy"], latest["orch"]["idle"], latest["orch"]["cloud"]), (1, 1, 2))
+        self.assertEqual((latest["orch"]["busy"], latest["orch"]["idle"], latest["orch"]["cloud"]), (3, 1, 2))
         self.assertEqual((latest["orchb"]["busy"], latest["orchb"]["idle"], latest["orchb"]["cloud"]), (0, 0, 0))
         series = json.loads((self.state_dir / "load.json").read_text())["series"]["orch"]["hours"]
         self.assertEqual([h["cloud"] for h in series.values()], [2])
@@ -68318,14 +68590,14 @@ class TestLoadAlert(Base):
         """Real load_tick over fake discovery and fake cloud records; a spliced mutant that adds cloud workers to busy fails the exact figures."""
         def figures(latest):
             return {k: (latest[k]["busy"], latest[k]["idle"], latest[k]["cloud"]) for k in ("orch", "orchb")}
-        self.assertEqual(figures(self._cloud_run()), {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+        self.assertEqual(figures(self._cloud_run()), {"orch": (3, 1, 2), "orchb": (0, 0, 0)})
         source = SWITCHBOARD.read_text()
         import re as _re
         body = _re.search(r"def load_tick\(.*?\n\n\n", source, _re.S).group(0)
-        old = '"busy": sum(1 for c in coders if c.status == "working"),'
+        old = '"busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0),'
         self.assertIn(old, body)
         scope = dict(vars(sb))
-        exec(body.replace(old, '"busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0),'), scope)
+        exec(body.replace(old, '"busy": sum(1 for c in coders if c.status == "working"),'), scope)
         real = sb.load_tick
         def patch():
             sb.load_tick = scope["load_tick"]
@@ -68333,8 +68605,8 @@ class TestLoadAlert(Base):
             mutated = figures(self._cloud_run(patch))
         finally:
             sb.load_tick = real
-        self.assertEqual(mutated["orch"][0], 3)   # the mutant shows busy 3
-        self.assertNotEqual(mutated, {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+        self.assertEqual(mutated["orch"][0], 1)   # the mutant ignores cloud workers: busy 1
+        self.assertNotEqual(mutated, {"orch": (3, 1, 2), "orchb": (0, 0, 0)})
 
     def test_mutant_dropping_the_cloud_count_in_load_tick_is_caught(self):
         original = sb.live_cloud_by_lane
@@ -69354,9 +69626,24 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+# The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
+_relay_tree_guard = importlib.import_module("test_relay_tree_guard")
+RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
+# The relay-loop tests of #1477, moved under the architecture cap.
+_relay_loop = importlib.import_module("test_relay_loop_cadence")
+RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
+
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
+# The load figure counts cloud workers as busy (#1487).
+_load_cloud = importlib.import_module("test_load_alert_cloud")
+TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
+
+# The delivery-lag tests of #1402.
+_delivery_lag = importlib.import_module("test_delivery_lag")
+_delivery_lag.World = World
+PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
