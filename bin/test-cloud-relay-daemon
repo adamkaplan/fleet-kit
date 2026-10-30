@@ -1306,15 +1306,18 @@ class Round2(Fixture):
     def serve(self, handler):
         return HubReadAndTransport._serve(self, handler)
 
-    @staticmethod
-    def header_trickle(h):
+    def header_trickle(self, h):
         import time
-        for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 60:   # one byte per 0.2 s: every socket read succeeds
-            h.wfile.write(bytes([byte]))
-            h.wfile.flush()
-            time.sleep(0.2)
+        try:
+            for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 60:   # one byte per 0.2 s: every socket read succeeds
+                h.wfile.write(bytes([byte]))
+                h.wfile.flush()
+                time.sleep(0.2)
+        finally:
+            self.trickle_finished.set()   # #1521: what the tests observe: had the handler finished when the fetch answered?
 
     def timed_fetch(self, mod):
+        self.trickle_finished = threading.Event()
         old, mod.READ_DEADLINE = mod.READ_DEADLINE, 1.0
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, _ = mod.http_transport(self.serve(self.header_trickle), "tok")
@@ -1326,9 +1329,10 @@ class Round2(Fixture):
         return time.monotonic() - t0, None
 
     def test_trickling_headers_are_cut_at_the_total_deadline(self):
-        took, err = self.timed_fetch(relay)
+        _, err = self.timed_fetch(relay)
+        finished = self.trickle_finished.is_set()   # the trickle (about 17 s of bytes) is still running when the cut comes
         self.assertIsInstance(err, TimeoutError)
-        self.assertLess(took, 2.0)
+        self.assertFalse(finished, "the fetch was cut only after the hub's handler had finished")
 
     def test_mutant_without_the_watchdog_is_caught(self):
         mod = load_backend_module("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)", extra=(("worker.join(READ_DEADLINE)", "worker.join()"),))
