@@ -478,13 +478,13 @@ fleet-heartbeat:load_config
 fleet-scenario:read
 fleet-switchboard:__init__
 fleet-switchboard:_api
-fleet-switchboard:_audit_tail
+switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
 fleet-switchboard:_docker_inspect
-fleet-switchboard:_fresh
+switchboard/caches.py:_fresh
 fleet-switchboard:_last
 fleet-switchboard:_load_markers
-fleet-switchboard:_read_json_object
+switchboard/profile_pieces.py:_read_json_object
 fleet-switchboard:_review_api
 fleet-switchboard:_write_gates_config
 fleet-switchboard:anonymous_volumes
