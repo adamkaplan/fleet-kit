@@ -69650,6 +69650,9 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+# The lost-worker alert tests of #1481.
+_lost_worker = importlib.import_module("test_lost_worker")
+TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
