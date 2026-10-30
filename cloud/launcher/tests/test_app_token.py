@@ -580,7 +580,7 @@ class Mint(unittest.TestCase):
             if answer == "nested":
                 Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
                 p = self.run_copy(text, runner=RAISE_ON_NESTING)
-                return p.returncode == 1 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
+                return p.returncode == 75 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
             if answer == "kelvin":
                 Stub.lookup, Stub.seen = (200, {"id": 5, "account": {"id": 9, "login": "\u212a" + "ite-org"}}), []
                 p = self.run_copy(text, "kite-org/widget-service")
