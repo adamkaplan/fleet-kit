@@ -136,6 +136,16 @@ There is no yaml library and nothing is evaluated. The parser reads a flat list 
 deeper-indented lines, or a `|`/`>` block. Comments (`# ...`) are allowed: a `#` starts an inline comment only when a space (or the end of the value) follows it, so `see #348` and `issue #12` stay whole. Refused, naming the block line: tabs, nested
 lists or maps, flow lists `[a, b]`, anchors and tags, duplicate keys, a second document, over 100 KB or 200 scenarios.
 
+## A plan that adds a file under `bin/`
+
+A new file under `bin/` brings nine guard classes, and some of them demand lines in the impact matrix, the Units table and the closure that the plan must already name. Before the plan is posted run `tools/new-module-demands bin/x.py` (one path per new file) and put its output in the plan as constraints:
+
+- the guard classes it lists (the rows of `NEW_BIN_GUARDS` in `bin/path_suites.py`), each a class that must pass;
+- `authority code:` yes or no. For yes, the two matrix entries it prints, both: the module in `owner_hold.top_tier_paths.authority` AND in the floor globs `owner_hold.floor[<repository>].globs` (never an exempt entry for a file with authority code); for no, that no matrix line is demanded;
+- the row to add to the Units table of `docs/architecture.md`, and the `closure:` state of `derive-closure --check`.
+
+The tool only informs: it runs no guard, and the guard stays the authority, so the build still runs the classes.
+
 ## A good example
 
 See the block above, with a second behaviour scenario and an unchanged one:

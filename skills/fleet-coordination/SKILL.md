@@ -36,6 +36,8 @@ CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 
 A pull request for an ask, or for a work item with a live check, says `Refs #N`, never `Closes`, `Fixes` or `Resolves`; `Closes #N` only where the plan says so.
 
+A brief for a change that adds a file under `bin/` carries the output of `tools/new-module-demands bin/x.py` (the guard classes, the matrix entries, the units row, the closure state): the tool informs, the guards decide.
+
 Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
 
 ## Builder checklist
