@@ -1,6 +1,8 @@
 bin/test-cloud-cost-report
+bin/test-cloud-retired
 cloud/launcher/tests/test_app_token.py
 cloud/launcher/tests/test_chain_list.py
+cloud/launcher/tests/test_chain_time.py
 cloud/launcher/tests/test_cloud_allowlist.py
 cloud/launcher/tests/test_cloud_docs_wording.py
 cloud/launcher/tests/test_cloud_hub_manifest.py
@@ -11,7 +13,6 @@ cloud/launcher/tests/test_cloud_pr_preflight.py
 cloud/launcher/tests/test_cloud_preflight_quick.py
 cloud/launcher/tests/test_cloud_preflight_wired.py
 cloud/launcher/tests/test_cloud_prestop.py
-cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_cloud_quick_bounds.py
 cloud/launcher/tests/test_cloud_quick_guards.py
 cloud/launcher/tests/test_cloud_quick_scans_run.py
@@ -30,10 +31,13 @@ cloud/launcher/tests/test_driver.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_issues_read.py
+cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
 cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
+cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_preflight.py
+cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_reaper_managed.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_row.py
@@ -56,6 +60,7 @@ cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_identity_image.py
 cloud/worker/tests/test_pr_edit.py
 cloud/worker/tests/test_pr_edit_hardening.py
+cloud/worker/tests/test_push_rules.py
 cloud/worker/tests/test_question_denied.py
 cloud/worker/tests/test_root_scanner.py
 cloud/worker/tests/test_scan_allowlist_node.py
