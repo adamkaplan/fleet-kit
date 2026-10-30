@@ -24786,7 +24786,7 @@ class TestSweep(Base):
         untested = self.docs_fact_rows() - {c[0] for c in self.BOARD_ROWS}
         self.assertEqual(sorted(untested), sorted(self.NOT_PROBED))
 
-    NOT_PROBED = ["facts", "now", "pr"]   # always set, or the whole view (the `unreadable` row is probed)
+    NOT_PROBED = ["facts", "now", "pr", "review"]   # always set, or the whole view (the `unreadable` row is probed); `review` only widens the listing of standing change requests (#1404)
 
     def test_986_a_mutant_per_row_class_fails_the_real_board_probe(self):
         for rows, where, old, new in self.BOARD_MUTANTS:
@@ -63566,7 +63566,7 @@ class TestReviewPostAndDismiss(LedgerBase):
     def check_gates_line(self):
         self.reset()
         self.blocking(77, by="rdr1", head=self.OLD)
-        code, out, err = self.run_as("coder", "gates", self.PR)
+        code, out, err = self.run_as("rdr1", "gates", self.PR)
         lines = [l for l in out.splitlines() if l.startswith("blocking review:")]
         self.assertEqual(len(lines), 1, out)
         self.assertIn("rdr1 CHANGES_REQUESTED at %s" % self.OLD[:12], lines[0])
@@ -63739,6 +63739,201 @@ class TestReviewPostAndDismiss(LedgerBase):
                 stack.enter_context(mock.patch.object(sb, name, value))
             with self.assertRaises(AssertionError):
                 check()
+
+    # -- #1404: every standing change request is listed by `gates` from the first call; dismissal is only offered
+
+    def standing(self, decision=""):
+        """A standing request of rdr1 at the CURRENT head, followed only by a comment-form approval; the decision field does not read changes requested."""
+        self.reset()
+        self.blocking(77, by="rdr1")
+        self.reviews[-1]["submitted_at"] = "2020-01-01T00:00:00Z"
+        self.reviews.append({"id": 78, "user": {"login": "shared"}, "state": "COMMENTED", "commit_id": self.HEAD,
+                             "body": "Review of %s: APPROVE\n\nfine\n\n%s" % (self.HEAD, sb.fleet_mark("rdr1"))})
+        self.pr["reviewDecision"] = decision
+
+    def gate_lines(self):
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        return out, [l for l in out.splitlines() if l.startswith("blocking review:")]
+
+    def check_standing_listed(self):
+        self.standing()
+        out, lines = self.gate_lines()
+        self.assertEqual(len(lines), 1, out)
+        self.assertRegex(lines[0], r"rdr1 CHANGES_REQUESTED at %s \(review 77, \d+d old;" % self.HEAD[:12])
+
+    def check_verdict_names_it(self):
+        self.standing()
+        out, lines = self.gate_lines()
+        verdict = [l for l in out.splitlines() if l.startswith("  BLOCKED:")]
+        self.assertEqual(len(verdict), 1, out)
+        self.assertIn("review 77", verdict[0])
+
+    def check_other_pr_not_listed(self):
+        self.reset()
+        out, lines = self.gate_lines()
+        self.assertEqual(lines, [], out)
+
+    def check_no_dismissal(self):
+        self.standing()
+        self.reviews[0]["commit_id"] = self.OLD
+        self.reviews.pop()   # no earlier review of the reader at the head: the approve is posted
+        for argv in (("gates", self.PR), ("review", "post", self.PR, "--head", self.HEAD, "--verdict", "approve", "--body-file", self.body_file()),
+                     ("review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--head", self.HEAD)):
+            self.run_as("rdr1" if argv[0] == "review" and argv[1] == "post" else "coder", *argv)
+        self.assertEqual(self.dismissed, [])
+
+    def test_gates_lists_a_standing_request_whatever_the_decision_field_says(self):
+        self.check_standing_listed()
+
+    def test_the_verdict_list_names_the_pull_request_as_blocked_by_it(self):
+        self.check_verdict_names_it()
+
+    def test_a_pull_request_with_no_request_shows_none_and_another_pull_requests_is_not_listed(self):
+        self.check_other_pr_not_listed()
+
+    def test_an_approve_at_a_later_head_prints_the_exact_dismiss_command_and_says_it_ran_nothing(self):
+        self.standing()
+        self.reviews[0]["commit_id"] = self.OLD
+        self.reviews.pop()
+        code, out, err = self.post()
+        self.assertEqual(code, 0, err)
+        offers = [l for l in out.splitlines() if "fleet-switchboard review dismiss" in l]
+        self.assertEqual(len(offers), 1, out)
+        self.assertIn("review dismiss %s --review 77 --reason TEXT" % self.PR, offers[0])
+        self.assertIn("did not dismiss it", offers[0])
+        self.assertEqual(self.dismissed, [])
+        self.reset()
+        self.blocking(77, by="rdr2", head=self.OLD)   # another reader's request is not offered to this one
+        self.assertNotIn("review dismiss", self.post()[1])
+
+    def test_no_command_sends_a_dismissal(self):
+        self.check_no_dismissal()
+
+    def test_the_dismissal_endpoint_has_one_call_site_and_it_is_review_dismiss(self):
+        source = Path(sb.__file__).read_text() if getattr(sb, "__file__", None) else (REPO / "bin" / "fleet-switchboard").read_text()
+        sites = [m.start() for m in re.finditer(r'"/dismissals"', source)]
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(re.findall(r"\ndef (\w+)\(", source[:sites[0]])[-1], "cmd_review_dismiss")
+
+    def test_an_unreadable_review_list_says_so_and_never_reads_as_none(self):
+        self.standing()
+        self.fail_read = (1, {}, "reviews")
+        out, lines = self.gate_lines()
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("could not be read whole", lines[0])
+        self.assertNotIn("none", lines[0])
+
+    def test_a_pull_request_with_no_request_prints_what_it_printed_before(self):
+        self.reset()
+        self.reviews.append({"id": 5, "user": {"login": "shared"}, "state": "APPROVED", "commit_id": self.HEAD, "body": "x\n\n" + sb.fleet_mark("rdr1")})
+        now_out = self.run_as("coder", "gates", self.PR)[1]
+        with mock.patch.object(sb, "blocking_review_lines", lambda *a, **k: []):
+            before = self.run_as("coder", "gates", self.PR)[1]
+        self.assertEqual(now_out, before)
+
+    def test_the_listing_and_the_merge_shims_rule_agree_on_every_combination(self):
+        rule = sb.load_review_rule()
+        source = (REPO / "shims" / "review_rule.py").read_text()
+        states = sorted(set(re.search(r'state in \(([^)]*)\)', source).group(1).replace('"', "").replace(" ", "").split(","))) + ["COMMENTED"]
+        self.assertEqual(len(states), 4)
+        one = [(s, c) for s in states for c in (self.HEAD, self.OLD)]
+        seqs = [[a] for a in one] + [[a, b] for a in one for b in one]
+        def build(logins):
+            return [{"id": 100 * i + j, "user": {"login": login}, "state": st, "commit_id": c, "body": ""} for i, (login, seq) in enumerate(logins) for j, (st, c) in enumerate(seq)]
+        count = 0
+        for decision in ("", "CHANGES_REQUESTED"):
+            for first in seqs:
+                for second in [None] + seqs:
+                    reviews = build([("a", first)] + ([("b", second)] if second else []))
+                    with mock.patch.object(sb, "_review_pages", lambda *a, **k: (True, reviews, "")):
+                        rows, problem = sb.standing_requests(None, None, lambda: 0, "acme/app", 9, self.HEAD, decision)
+                    views = [{"author": {"login": r["user"]["login"]}, "state": r["state"], "commit": {"oid": r["commit_id"]}} for r in reviews]
+                    self.assertEqual((problem, [r["login"] for r in rows]), ("", [w for w, _ in rule.blocking_reviews(views, self.HEAD, decision)]))
+                    count += 1
+        self.assertEqual(count, 2 * len(seqs) * (1 + len(seqs)))
+
+    def two_requests(self):
+        self.reset()
+        self.blocking(77, by="rdr1")
+        self.blocking(78, by="rdr2")
+        self.reviews[0]["user"] = {"login": "login-one"}   # the rule is per login
+        self.reviews[1]["user"] = {"login": "login-two"}
+
+    def check_dismiss_command_only_for_own(self):
+        self.two_requests()
+        code, out, err = self.run_as("rdr1", "gates", self.PR)
+        lines = {l.split()[2]: l for l in out.splitlines() if l.startswith("blocking review:")}
+        self.assertEqual(sorted(lines), ["rdr1", "rdr2"], out)
+        self.assertIn("review dismiss %s --review 77 --reason TEXT" % self.PR, lines["rdr1"])
+        self.assertNotIn("review dismiss", lines["rdr2"])
+        self.assertIn("ask rdr2 or a person to dismiss it", lines["rdr2"])
+
+    def test_the_dismiss_command_is_named_only_for_the_callers_own_request(self):
+        self.check_dismiss_command_only_for_own()
+
+    def test_the_mutant_that_names_the_command_for_every_author_fails(self):
+        real = sb.blocking_review_lines
+        self.mutant_fails(self.check_dismiss_command_only_for_own, blocking_review_lines=lambda *a, **k: real(*a[:7]))
+
+    def test_a_caller_that_is_not_a_fleet_agent_is_told_to_ask_for_every_request(self):
+        self.two_requests()
+        code, out, err = self.run_as(None, "gates", self.PR)
+        lines = [l for l in out.splitlines() if l.startswith("blocking review:")]
+        self.assertEqual(len(lines), 2, out)
+        for line in lines:
+            self.assertNotIn("review dismiss", line)
+            self.assertRegex(line, r"ask rdr[12] or a person to dismiss it")
+
+    def test_the_blocked_line_says_other_ways_of_requesting_are_not_covered(self):
+        self.standing()
+        out, lines = self.gate_lines()
+        verdict = [l for l in out.splitlines() if l.startswith("  BLOCKED:")][0]
+        self.assertIn("no BLOCKED line is not proof that a merge passes", verdict)
+
+    def check_offer_skips_a_superseded_request(self):
+        self.standing()
+        self.reviews[0]["commit_id"] = self.OLD
+        self.reviews.pop()
+        out = self.post()[1]
+        self.assertIn("your earlier change request 77 (at %s): dismiss it if it is fixed: fleet-switchboard review dismiss" % self.OLD[:12], out)
+        self.assertIn("(this approve did not dismiss it and nothing here does)", out)
+        self.assertNotIn("still stands", out)
+        self.reviews.append({"id": 90, "user": {"login": "shared"}, "state": "APPROVED", "commit_id": self.HEAD, "body": "ok\n\n" + sb.fleet_mark("rdr1")})
+        self.assertNotIn("review dismiss", self.post()[1])   # superseded by the same login's approval: the rule no longer lists it
+
+    def test_the_offer_never_offers_a_request_a_later_approval_superseded(self):
+        self.check_offer_skips_a_superseded_request()
+
+    def test_the_mutant_that_offers_every_own_request_fails(self):
+        def every(engine, runner, now, repo, number, ref, name, head):
+            return ["note: your earlier change request 77 (at %s): dismiss it if it is fixed: fleet-switchboard review dismiss %s --review 77 --reason TEXT" % (self.OLD[:12], ref)]
+        self.mutant_fails(self.check_offer_skips_a_superseded_request, review_dismiss_offer=every)
+
+    def test_the_mutant_that_lists_no_standing_request_fails(self):
+        self.mutant_fails(self.check_standing_listed, standing_requests=lambda *a, **k: ([], ""))
+        self.mutant_fails(self.check_verdict_names_it, standing_requests=lambda *a, **k: ([], ""))
+
+    def test_the_mutant_that_lists_a_request_of_another_pull_request_fails(self):
+        real = sb._review_pages
+        other = {"id": 91, "user": {"login": "shared"}, "state": "CHANGES_REQUESTED", "commit_id": self.HEAD, "body": "x\n\n" + sb.fleet_mark("rdr2")}
+        def every_pull_request(*a, **k):
+            ok, got, why = real(*a, **k)
+            return ok, (got or []) + [other], why
+        self.mutant_fails(self.check_other_pr_not_listed, _review_pages=every_pull_request)
+
+    def test_the_mutant_that_dismisses_in_the_approve_fails(self):
+        real = sb.review_dismiss_offer
+        def dismissing(engine, runner, now, repo, number, ref, name, head):
+            sb._review_api(engine, runner, now, repo, "repos/%s/pulls/%d/reviews/77/dismissals" % (repo, number), "PUT", {"message": "x", "event": "DISMISS"})
+            return real(engine, runner, now, repo, number, ref, name, head)
+        self.mutant_fails(self.check_no_dismissal, review_dismiss_offer=dismissing)
+
+    def test_the_documentation_holds_one_section_with_the_three_statements(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        sections = [s for s in re.split(r"\n(?=#{2,3} )", text) if s.startswith("### Standing change requests are listed by `gates`")]
+        self.assertEqual(len(sections), 1)
+        for statement in ("`gates` lists, in every call, each standing CHANGES_REQUESTED", "this approve did not dismiss it", "Dismissal stays the reader's own act or a person's"):
+            self.assertIn(statement, " ".join(sections[0].split()))
 
     def test_the_mutant_that_skips_the_head_check_fails(self):
         self.mutant_fails(self.check_post_head_refusals, review_head_problem=lambda given, current: None)
@@ -63948,7 +64143,7 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.reset()
         self.reviews = [{"id": 1000 + i, "user": {"login": "u%d" % i}, "state": "COMMENTED", "commit_id": self.HEAD, "body": "c"} for i in range(100)]
         self.blocking(77, by="rdr1")
-        code, out, err = self.run_as("coder", "gates", self.PR)
+        code, out, err = self.run_as("rdr1", "gates", self.PR)
         self.assertIn("--review 77", out)
         self.assertTrue(any(p.endswith("&page=2") for p in self.reads))
         self.assertNotIn("latest[author] = (state", (REPO / "shims" / "gh").read_text())   # the rule is not restated in the shim

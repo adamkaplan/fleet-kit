@@ -2457,6 +2457,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | `facts` | NOT CHECKED when the PR view is unreadable (the whole `facts` is None) | no view, no gate board |
 | `unreadable` | NOT CHECKED (the PR view's own error) | same |
 | `head` | NOT CHECKED when absent | no head: no per-head moment |
+| `review` | a PR view with no decision reads as none: GitHub's `reviewDecision` (`changes requested` or not) only widens which standing change requests `gates` lists (the review list itself is read by `standing_requests`, never by a gate); an unreadable review list is said on a `blocking review:` line | no gate reads it: information only (#1404) |
 | `notice_senders` | absent: fewer known writers; the writers of the proofs still exclude their own verdicts, so the pull request stays as ready as the board says (the row tests only that the baseline stays ready; an exclusion of a proof by a notice sender is not tested here) | it only narrows who is excluded; a failing notice read raises, which is NOT CHECKED |
 | `author` | absent: the proof writers and notice senders still exclude their own verdicts; the board is read as it is (the row tests only that the baseline stays ready; an exclusion of a proof by the author is not tested here) | the author is one more excluded name; it opens no gate on its own |
 | `ci` | NOT READY when None, none or unknown (G4 missing) | the PR view was whole: no green run is not green |
@@ -6156,6 +6157,14 @@ Cause: a review marker (`<!-- fleet-switchboard:from=NAME -->`) was written only
 - `gates` prints `blocking review: <name> CHANGES_REQUESTED at <head> (dismiss with: fleet-switchboard review dismiss ...)` for each LOGIN whose latest decisive review (dismissals count) is CHANGES_REQUESTED while GitHub's reviewDecision says so: the same rule as the merge shim, one function in `shims/review_rule.py`, with a parity test.
 
 The reviewer definitions and the review skill name these commands, not the bare GitHub command. A cloud reader can use them once its token allows it (a separate question for the owner).
+
+### Standing change requests are listed by `gates` from the first call (#1404)
+
+Cause (recorded case, 27 Oct): a reader's change request of 23 Oct, fixed long before and followed by the same reader's approval in comment form, blocked a green, fully proven pull request, and was found only when the merge was refused. Two commands read the standing reviews, both by the rule of `shims/review_rule.py`: the `gh` shim's merge probe and `blocking_review_lines` of `gates`. `gates` printed its `blocking review:` line only when the pull request's decision already read changes requested, and a comment-form approval never clears a change request at the current head, so nothing showed the request before the merge.
+
+- `gates` lists, in every call, each standing CHANGES_REQUESTED review of the pull request by that same rule as a `blocking review:` line (review id, the commit it was posted at, its author's fleet name, its age), whatever the decision field says, and the verdict list adds one `BLOCKED:` line naming the review ids. A pull request with none shows no such line, and no other pull request's request is listed. A review list that cannot be read whole says so on a `blocking review:` line and never reads as none.
+- After an APPROVE, `review post` prints, for that reader's own older standing change requests of the same pull request, the exact `review dismiss` command and says that this approve did not dismiss it.
+- Dismissal stays the reader's own act or a person's (the existing rule of `review dismiss`): `gates`, `review post` and `review record` only read and print, and no command removes a change request on its own authority.
 
 ## Review comments on a lane's pull request
 
