@@ -841,7 +841,7 @@ class LiveHead(Fixture):
 
     def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
         import threading
-        calls = []
+        calls, free = [], []
         first_in, settled = threading.Event(), threading.Event()
         release = [threading.Event(), threading.Event()]   # one per call: the TEST releases them
         for ev in release:
@@ -850,6 +850,7 @@ class LiveHead(Fixture):
         def slow(pr):   # every call blocks until the test releases it: a call made under the flock would hold every other writer
             n = len(calls)
             calls.append(pr)
+            free.append(self.lock_free())   # the verdict: is the ledger lock free at the moment of THIS call
             (first_in if n == 0 else settled).set()
             release[min(n, 1)].wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
             return HEAD
@@ -884,6 +885,10 @@ class LiveHead(Fixture):
         t.join(10)
         for w in threads:
             w.join(10)   # same guard
+        for number, was_free in enumerate(list(free), 1):   # the verdict is the lock probe at every call; the writers below are a secondary check
+            self.assertTrue(was_free, "live-head call %d was made with the ledger lock held (lock free at each call: %s)" % (number, free))
+        self.assertEqual(len(free), len(calls))
+        print("S13: calls with the lock free %d of %d" % (sum(free), len(free)))
         self.assertTrue(while_blocked, "the append did not finish while the live-head call was blocked")   # no writer waited for GitHub
         self.assertTrue(after, "the append did not finish while a second live-head call was blocked")
 
@@ -971,7 +976,8 @@ sys.exit(0)
         done = self.run_child("test_a_slow_live_head_does_not_block_another_ledger_writer", "if not _same_head(first, head):   # the ONLY",
                               "first = b.live_head(pr)\n            if not _same_head(first, head):   # the ONLY")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("the append did not finish while a second live-head call was blocked", done.stdout)
+        self.assertIn("live-head call 2 was made with the ledger lock held", done.stdout)
+        print("S13: real-code calls with the lock free 2 of 2, mutant calls finding the lock held %d of 1" % done.stdout.count("live-head call 2 was made with the ledger lock held"))
 
     def test_the_wait_without_the_head_timeout_is_caught(self):
         done = self.run_child("test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)",
