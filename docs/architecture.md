@@ -56,6 +56,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_channel.py` | 1 | the receiving end of a message between two cloud agents | |
 | `cloud_relay.py` | 2 | the hub half of pod, hub and daemon calls for report, prove, verdict and gates: a bounded in-memory queue and the refusals | |
 | `cloud_client.py` | 1 | the sending end of a message or report through the cloud channel | |
+| `cloud_cluster.py` | 5 | the launcher process, the settings reader, the vault recovery, the cluster client and the tunnel of the cloud launch (#1647); a part of `cloud_worker.py` | |
 | `external_adapter.py` | 1 | a generic client for an outside system that holds decisions and work items | |
 | `agent_calls.py` | 2 | GitHub calls made from agents' shells, counted per account and per hour | |
 | `github_census.py` | 2 | the 5-minute sample line per account and the census of process kinds behind GitHub calls the records do not count (read only) | |
@@ -90,7 +91,6 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_cost_report.py` | 5 | USD per day of the cloud fleet, from the launcher's audit lines (read only) | |
 | `cloud_hub.py` | 5 | the cloud switchboard's front door | |
 | `cloud_retired.py` | 5 | the read of a retired cloud worker from its run record, and the boss kept at its removal (#1546); a part of `cloud_worker.py` | |
-| `cloud_cluster.py` | 5 | the launcher process, the settings reader, the vault recovery, the cluster client and the tunnel of the cloud launch (#1647); a part of `cloud_worker.py` | |
 | `cloud_way_back_check.py` | 5 | a read-only check of the way back from the cloud to local | |
 | `cloud_worker.py` | 5 | remote (cloud) workers for the switchboard | |
 | `delegated_clear.py` | 5 | the Chief of Staff's clear under the owner's standing order | |
