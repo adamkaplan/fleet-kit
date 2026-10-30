@@ -16076,6 +16076,10 @@ PLAN_LINE_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
 LEDGER_PR_PATTERN = r"owner/repo#N or the PR's URL"
 
 
+class PlanInputError(Exception):
+    """The plan or the ask cannot be read: exit 2."""
+
+
 class LedgerCommandError(Exception):
     """A `prove`, `verdict` or `gates` command that cannot go on (exit 2): a usage problem, said in one line."""
 
@@ -20014,6 +20018,7 @@ def add_ledger_parsers(sub):
 
 # ---------------------------------------------------------------- `review record` and `review laws` (#179, slice L2)
 
+REVIEW_LAWS_FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md")
 REVIEW_LAW_FILES = REVIEW_LAWS_FILES + ("REVIEW_OVERLAY.md",)   # the laws a reviewer loads, and the repository's own overlay
 REVIEW_FILE_MAX = 30000      # bytes of one law file a reviewer is shown
 REVIEW_TOTAL_MAX = 90000     # bytes of all of them together

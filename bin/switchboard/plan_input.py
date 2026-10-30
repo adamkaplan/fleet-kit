@@ -1,13 +1,7 @@
-import re
-
 # ---------------------------------------------------------------- `plan check` (#135, gate G0a)
 
 PLAN_URL_RE = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([0-9]+)(?:#issuecomment-([0-9]+))?/?$")
 PLAN_COMMENT_PAGES = 10
-
-
-class PlanInputError(Exception):
-    """The plan or the ask cannot be read: exit 2."""
 
 
 def parse_plan_source(text, default_repo=None):

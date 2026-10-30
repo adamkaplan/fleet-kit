@@ -1,6 +1,5 @@
 # ---------------------------------------------------------------- `review-laws install` (#179, slice L1)
 
-REVIEW_LAWS_FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md")
 REVIEW_LAWS_EDIT = {
     "REVIEW_LAWS.md": "the verdict format, the matrix cells you tighten (never loosen), and the floor paths your repository names",
     "CODING_STANDARDS.md": "add the rules your repository's own code needs; remove none without saying why",
