@@ -43,6 +43,7 @@ cloud/launcher/tests/test_reaper_managed.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_retire_gone_pod.py
 cloud/launcher/tests/test_run_record.py
+cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
