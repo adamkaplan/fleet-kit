@@ -1272,6 +1272,9 @@ def stack_model_secret(env=None):
     return name, ran[1].strip()
 
 
+git_token_sleep = time.sleep   # tests replace it
+
+
 def git_token(repo, cluster, role="worker"):
     """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does.
     The default mint gets `--role ROLE` for any role but the worker's (the same rule as the launcher's git_token_cmd); a custom command runs unchanged."""
@@ -1280,13 +1283,28 @@ def git_token(repo, cluster, role="worker"):
     if not raw and role != "worker":
         argv += ["--role", role]
     env = {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}
-    ran = _capture(argv, env=dict(env, GH_REPO=repo))
+
+    def last(ran):
+        return _one(cluster.clean(ran[2].strip().splitlines()[-1], 200), 200) if ran and ran[2].strip() else "no message"
+
+    # The retry rule (a copy of the launcher's tempfail_tries: this program loads the launcher by path only for other work, and a test
+    # runs this function without it): again ONLY on status 75 (a custom command too), 4 tries, waits of 2, 5 and 10 seconds.
+    tries = 0
+    while True:
+        tries += 1
+        ran = _capture(argv, env=dict(env, GH_REPO=repo))
+        if not ran or ran[0] != 75 or tries >= 4:
+            break
+        wait = (2, 5, 10)[tries - 1]
+        print("git token try %d of 4 failed: %s; trying again in %d seconds" % (tries, last(ran), wait), file=sys.stderr)
+        git_token_sleep(wait)
     token = (ran[1] if ran and ran[0] == 0 else "").strip()
     if not token or len(token) > 4096:
         why = ""
         if ran and ran[2].strip():
-            why = ": " + _one(cluster.clean(ran[2].strip().splitlines()[-1], 200), 200)
-        raise Refusal("the git token command gave no usable token%s; nothing was created" % why)
+            why = ": " + last(ran)
+        after = " after %d tries" % tries if tries > 1 else ""
+        raise Refusal("the git token command gave no usable token%s%s; nothing was created" % (after, why))
     return token
 
 

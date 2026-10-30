@@ -511,22 +511,50 @@ def git_token_cmd(repo, env, role="worker"):
     return cmd + ["--role", role] if role != "worker" else cmd
 
 
+GIT_TOKEN_TRIES = 4
+GIT_TOKEN_WAITS = (2, 5, 10)
+EXIT_TEMPFAIL = 75   # the token command's status for a passing failure; the only status that is tried again
+git_token_sleep = time.sleep   # tests replace it
+
+
+def tempfail_tries(run, last_line, say, sleep):
+    """Run run() -> (status, result) up to GIT_TOKEN_TRIES times, waiting 2, 5, 10 seconds, and again ONLY when status is 75. last_line(result) is
+    the cleaned last stderr line. say(text) hears one line per retry (no token value). Returns (status, result, tries). Shared by the launch."""
+    tries = 0
+    while True:
+        tries += 1
+        status, result = run()
+        if status != EXIT_TEMPFAIL or tries >= GIT_TOKEN_TRIES:
+            return status, result, tries
+        wait = GIT_TOKEN_WAITS[tries - 1]
+        say("git token try %d of %d failed: %s; trying again in %d seconds" % (tries, GIT_TOKEN_TRIES, last_line(result), wait))
+        sleep(wait)
+
+
 def run_git_token_cmd(cmd, repo, env, register=None):
     """THE mint call (the launch and the renewal both come here): run cmd for repo in env, return the token it printed. Never prints, never puts
     the token in an argument or a file. register(text) hears the child's stdout before it is judged, so a caller's scrubber knows it.
     Raises CloudError(EXIT_USAGE) with no value in the text."""
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        p = None
-    if p and register:
-        register(p.stdout.strip())
+    def once():
+        try:
+            q = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            q = None
+        if q and register:
+            register(q.stdout.strip())
+        return (q.returncode if q else None), q
+
+    def line(q):
+        return scrub(q.stderr.strip().splitlines()[-1], (), 200) if q and q.stderr.strip() else "no message"
+
+    _, p, tries = tempfail_tries(once, line, lambda t: print(t, file=sys.stderr), lambda s: git_token_sleep(s))
     token = (p.stdout if p and p.returncode == 0 else "").strip()
     if not token or len(token) > GIT_TOKEN_MAX_CHARS:
         why = ""
         if p and p.stderr.strip():
             why = ": " + scrub(p.stderr.strip().splitlines()[-1], (), 200)
-        raise CloudError("the git token command gave no usable token%s" % why, EXIT_USAGE)
+        after = " after %d tries" % tries if tries > 1 else ""
+        raise CloudError("the git token command gave no usable token%s%s" % (after, why), EXIT_USAGE)
     return token
 
 

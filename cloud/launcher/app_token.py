@@ -118,6 +118,9 @@ def _wait_seconds(value):
     return int(value) if isinstance(value, str) and value.isdigit() and len(value) <= 6 else None
 
 
+EXIT_TEMPFAIL = 75   # sysexits "temporary failure": the process status of a passing failure (a launch retries on this status only)
+
+
 def die(msg, code=1, transient=False, retry_after=None):
     """Print the reason and exit. transient=True marks a PASSING failure (the vault, the network, HTTP 5xx or 429, a 403 with Retry-After);
     everything else is a refusal. LAST_FAILURE tells the caller which."""
@@ -129,7 +132,7 @@ def die(msg, code=1, transient=False, retry_after=None):
     LAST_FAILURE.clear()
     LAST_FAILURE.update({"transient": bool(transient), "reason": msg, "retry_after": retry_after})
     print("app-token: " + msg, file=sys.stderr)
-    sys.exit(code)
+    sys.exit(EXIT_TEMPFAIL if transient and code == 1 else code)
 
 
 def b64(b):
