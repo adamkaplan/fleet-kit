@@ -500,7 +500,7 @@ class Mint(unittest.TestCase):
         for name, status, body in (("404", 404, {}), ("301", 301, {}), ("403", 403, {}), ("500", 500, {})):
             Stub.lookup, Stub.seen = (status, body), []
             p = self.run_mint()
-            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []), name)
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (75, "", []), name)
             self.assertNotIn(Stub.gets[-1][1].split()[1], p.stderr)
             self.assertNotIn(self.keymark, p.stderr)
         Stub.lookup = (301, {})
