@@ -12,7 +12,8 @@ MODEL_LIST = [{"providerID": "acme-provider", "id": "model-a", "variants": [{"id
 OPTIONS = ("--model", "acme-provider/model-a", "--reasoning", "medium")
 
 
-def build(host):
+def build():
+    host = HOST   # set by bin/test-switchboard: the fixtures of that file
     class TestLaunchModel(host.LedgerBase):
         """S2-S7, U1-U3, U7: the choice is checked against the local list before anything exists, then carried on the session and the record."""
 
