@@ -125,7 +125,7 @@ class Hook(Base):
     def test_clean_tree_or_no_repository_does_nothing(self):
         self.fake_git('echo "$@" >> %s/calls\nexec REAL "$@"\n' % self.t)
         p = self.hook()
-        self.assertEqual((p.returncode, p.stdout + p.stderr), (0, ""))
+        self.assertEqual((p.returncode, p.stdout + p.stderr), (0, "cw-prestop: nothing to push\n"))   # #1579: one line (was: no output)
         self.assertFalse([l for l in open(os.path.join(self.t, "calls")) if " push " in " " + l])
         p = self.hook(CW_WORKDIR=os.path.join(self.t, "nothing"))   # no repository: one line now (see EarlyReturns), never a push
         self.assertEqual(p.returncode, 0)
