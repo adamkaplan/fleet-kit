@@ -337,7 +337,7 @@ Cause: the four manifest files `cloud/k8s/cloud-hub.yaml`, `cloud-hub-network.ya
 
 The steps, in order (the namespace `cwp` is the example):
 
-1. Step 1, render: `cloud/k8s/render-namespace cwp > cwp.yaml`. Read the header and the file.
+1. Step 1, render: `CW_HUB_IMAGE=REFERENCE cloud/k8s/render-namespace cwp > cwp.yaml`. Read the header and the file. REFERENCE is the settings' hub image reference, a `name@sha256:<64 hex>` value; the render refuses (exit status 2, nothing printed) without it, and the file to apply must not hold `IMAGE_DIGEST` as the image (the apply block counts the image lines that still hold it and must print 0 before `kc create`; the manifest's own comment line names the placeholder and stays).
 2. Step 2, the server-side dry run FIRST: `kc apply --dry-run=server -f cwp.yaml` (`kc`, defined in the first block below, adds `-n "${NS:?}"`, so kubectl refuses a document that names another namespace). Read the whole output: every object must say `created (server dry run)` and nothing may be an error. The namespace must exist for the dry run to pass, so the owner creates it first (step 3).
 3. Step 3, the apply: the owner's step, done by the holder of the ADMINISTRATOR login. A pod, the launcher's own account and this change can never do it. The manifests do not create the namespace; the administrator creates it and then creates the objects (the hub file asks for `create`, never a second `apply`, because applying it again resets the registry Secret to empty objects). The command list for the administrator apply is below.
 4. Step 4, the secrets in the namespace: the owner's step. The pull secret named by `CW_PULL_SECRET` (the manifests use the name `cw-pull`), the hub's registry Secret `cloud-hub-registry` and its password Secret `cloud-hub-pw`. The apply of step 3 creates the last two as empty objects: check they exist and create them only when they are missing.
@@ -357,7 +357,7 @@ NS=cwp
 kubectl config current-context
 ns_ok && kubectl create namespace "${NS:?}"
 kc apply --dry-run=server -f cwp.yaml
-kc create -f cwp.yaml
+[ "$(grep -c '"image": "IMAGE_DIGEST"' cwp.yaml)" = 0 ] && kc create -f cwp.yaml
 kc get secret cloud-hub-registry cloud-hub-pw
 ( set -C; umask 077; kc create token cw-operator --duration=DURATION > TOKEN_FILE )
 ```

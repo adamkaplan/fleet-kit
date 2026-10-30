@@ -39,6 +39,18 @@ def docs_of(text):
     return re.split(r"^---\s*$", text, flags=re.M)
 
 
+REF = "registry.example/acme/hub@sha256:" + "ab" * 32
+REF2 = "registry.example/acme/hub@sha256:" + "0" * 64
+
+
+def run_env(script, ns, image=None):
+    env = {"PATH": "/nonexistent"}
+    if image is not None:
+        env["CW_HUB_IMAGE"] = image
+    return subprocess.run([sys.executable, "-c", LAUNCH, script, ns], env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=60)
+
+
 def split_header(out, original_body):
     """The render is the header (comment lines) and then the files joined; returns the header."""
     assert out.endswith(original_body), "the body differs"
@@ -51,7 +63,7 @@ JOINED = "---\n".join(read(n) for n in FILES)
 class Render(unittest.TestCase):
     def test_the_probe_render_has_no_cw_namespace_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as empty:
-            done = run(SCRIPT, "cwp", cwd=empty)
+            done = run_env(SCRIPT, "cwp", REF)
             self.assertEqual(os.listdir(empty), [])
         self.assertEqual(done.returncode, 0, done.stderr)
         text = done.stdout.decode()
@@ -75,7 +87,7 @@ class Render(unittest.TestCase):
 
     def test_the_render_for_cwp_changes_just_the_namespace_lines(self):
         base = run(SCRIPT, "cw").stdout.decode().splitlines()
-        probe = run(SCRIPT, "cwp").stdout.decode().splitlines()
+        probe = run_env(SCRIPT, "cwp", REF).stdout.decode().splitlines()
         base, probe = base[5:], probe[5:]   # the five header lines differ by the namespace
         self.assertEqual(len(base), len(probe))
         changed = 0
@@ -83,16 +95,49 @@ class Render(unittest.TestCase):
             if a == b:
                 continue
             changed += 1
+            if '"image":' in a:
+                self.assertEqual(b, a.replace("IMAGE_DIGEST", REF))
+                continue
             self.assertIn("cwp", b)
             self.assertEqual(re.sub(r'(namespace: |"namespace": "|-n |"value": ")cw\b', r"\1cwp", a), b)
-        self.assertEqual(changed, 26)   # 21 namespace lines, the one value, four comment lines that name the namespace
+        self.assertEqual(changed, 27)   # 21 namespace lines, the one value, four comment lines, the one image line
 
     def test_the_header_names_the_cluster_wide_documents(self):
-        header = "".join(run(SCRIPT, "cwp").stdout.decode().splitlines(keepends=True)[:5])
+        header = "".join(run_env(SCRIPT, "cwp", REF).stdout.decode().splitlines(keepends=True)[:5])
         self.assertTrue(header.startswith("# rendered for namespace cwp\n"))
         for word in ("RuntimeClass", "ClusterRole", "ClusterRoleBinding", "runtimeclass.yaml", "containerd-fix.yaml", "once per cluster"):
             self.assertIn(word, header)
         self.assertTrue(all(line.startswith("#") for line in header.splitlines()))
+
+
+class InvalidImageValues(unittest.TestCase):
+    def test_invalid_image_values_are_rejected_before_any_output(self):
+        bad = [None, "registry.example/acme/hub:latest", "IMAGE_DIGEST", "registry.example/acme/hub@sha256:" + "a" * 63]
+        n = 0
+        for value in bad:
+            done = run_env(SCRIPT, "cwp", value)
+            self.assertEqual((done.returncode, done.stdout), (2, b""), value)
+            self.assertEqual(done.stderr.count(b"\n"), 1)
+            self.assertIn(b"CW_HUB_IMAGE", done.stderr)
+            if value:
+                self.assertNotIn(value.encode(), done.stderr)
+            n += 1
+        done = run_env(SCRIPT, "cwp", "")
+        self.assertEqual((done.returncode, done.stdout), (2, b""))
+        ok = run_env(SCRIPT, "cwp", REF)
+        self.assertEqual(ok.returncode, 0)
+        out = ok.stdout.decode()
+        self.assertEqual(out.count('"image": "IMAGE_DIGEST"'), 0)
+        self.assertEqual(out.count('"image": "%s"' % REF), 1)
+        self.assertNotIn("IMAGE_DIGEST", "".join(out.splitlines(True)[:5]))
+        InvalidImageValues.counts = (n, 1)
+
+    def test_the_render_of_the_live_namespace_ignores_the_image_variable(self):
+        plain = run_env(SCRIPT, "cw").stdout
+        self.assertEqual(plain.decode()[len(plain.decode()) - len(JOINED):], JOINED)
+        self.assertIn(b"placeholder", plain.split(b"\n---")[0][:600])
+        self.assertEqual(run_env(SCRIPT, "cw", REF2).stdout, plain)
+        self.assertEqual(run_env(SCRIPT, "cw", "junk").stdout, plain)
 
 
 class Refusals(unittest.TestCase):
@@ -126,15 +171,25 @@ class Mutants(unittest.TestCase):
         return path
 
     def test_a_script_that_leaves_a_namespace_line_fails_the_probe_check(self):
-        path = self.mutant_copy("    sys.stdout.write(render(argv[1]))",
-                                "    sys.stdout.write(render(argv[1]).replace('\"namespace\": \"%s\"' % argv[1], '\"namespace\": \"cw\"', 1))")
-        text = run(path, "cwp").stdout.decode()
+        path = self.mutant_copy("    sys.stdout.write(render(argv[1], image))",
+                                "    sys.stdout.write(render(argv[1], image).replace('\"namespace\": \"%s\"' % argv[1], '\"namespace\": \"cw\"', 1))")
+        text = run_env(path, "cwp", REF).stdout.decode()
         self.assertNotEqual(re.findall(r'(?m)^\s*"?namespace"?: "?cw"?,?\s*$', text), [])
 
     def test_a_script_that_reformats_a_document_fails_the_equality_check(self):
         path = self.mutant_copy("out.append(body + end)", "out.append(body + ('' if body != 'kind: Role' else ' ') + end)")
         out = run(path, "cw").stdout.decode()
         self.assertNotEqual(out[len(out) - len(JOINED):], JOINED)
+
+
+    def test_a_script_without_the_image_check_is_caught(self):
+        path = self.mutant_copy("if image == PLACEHOLDER or not DIGEST_REF.fullmatch(image):", "if False:")
+        done = run_env(path, "cwp")
+        self.assertEqual(done.returncode, 0)   # the mutant renders; the check of the new test must see a refusal, so this fails it
+        self.assertIn('"image": "IMAGE_DIGEST"', done.stdout.decode())
+        self.assertNotEqual((done.returncode, done.stdout), (2, b""))
+        n = getattr(InvalidImageValues, "counts", (4, 1))[0]
+        print("S9: invalid values refused %d of 4, valid reference rendered with 0 placeholders 1 of 1, mutant caught 1 of 1 (mutation applied True)" % n)
 
 
 class Runbook(unittest.TestCase):
@@ -153,6 +208,12 @@ class Runbook(unittest.TestCase):
         for i, mark in enumerate(marks):
             end = at[i + 1] if i < 5 else len(self.section)
             self.assertIn(mark, self.section[at[i]:end], steps[i])
+
+    def test_the_render_step_names_the_image_variable(self):
+        step1 = self.section.split("Step 1", 1)[1].split("Step 2", 1)[0]
+        self.assertIn("CW_HUB_IMAGE=REFERENCE cloud/k8s/render-namespace cwp > cwp.yaml", step1)
+        self.assertIn("name@sha256:<64 hex>", step1)
+        self.assertRegex(self.section, r"""\[ "\$\(grep -c '"image": "IMAGE_DIGEST"' cwp\.yaml\)" = 0 \] && kc create -f cwp\.yaml""")
 
     def test_the_four_setting_names_and_the_marked_steps(self):
         for name in ("CW_CLOUD_NAMESPACE=cwp", "CW_HUB_CHANNEL_URL=http://cloud-hub.cwp.svc:8443/message", "CW_PULL_SECRET", "CW_CLOUD_TOKEN_FILE"):
