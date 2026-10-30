@@ -208,11 +208,16 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
+Not yet measured: `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`
+
+A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
 ### macOS (per entry)
 
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 1 | serial |
+| `bin/test-cloud-retired` | 66 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
@@ -266,6 +271,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
@@ -278,6 +284,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | Entry | Seconds | Lane |
 |---|---|---|
 | `bin/test-cloud-cost-report` | 0 | serial |
+| `bin/test-cloud-retired` | 33 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
@@ -331,6 +338,7 @@ Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py
 | `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
 | `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
 | `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
 | `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
 | `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
 | `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
@@ -360,7 +368,7 @@ the create's own clock, so the floor can trail the stored cap by scheduling time
 exceeding the hard limit and alerting is not decided: it exits 1 from `reap` so a scheduler can alert). The spend cap
 is read from `CW_CLOUD_SPEND_CAP_USD`; unset or empty means the prototype's USD 25, and zero, negative, non-numeric,
 `nan`, `inf` or a cost that cannot be read refuses `create` (exit 5). The check adds this launch's estimate (hard limit times the shape's rate) to what the running pods already cost. A worker name with `_` maps to `-` plus a 4-hex
-hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `S`); `create` refuses a spec with a stored credential.
+hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `O`, the orchestrator row: `O` (250m CPU, 768 MiB, 0.02 USD/hour), requests equal limits, no nested Docker; cost per day of one always-on orchestrator: 24 x 0.02 = 0.48 USD a day, a list-price estimate, not a billed figure, the node's own price not included; `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory); `create` refuses a spec with a stored credential.
 
 **Not in this slice.** Automatic detection of a node drain notice: the end hook runs on `stop`, the idle stop and the hard limit; a drain is handled today by the operator running `stop --reason "node drain"`. The `cw-worker` service account's cloud identity and what it may do belong to the image/cluster setup (slice A and the platform), not here. `bin/test-cloud-launcher` is not yet wired into CI (the suite lists are CI's own).
 
@@ -512,3 +520,9 @@ value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault se
 `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
 
 **Repository allow-list.** `create` (and the driver, `run-task`, through the same function `check_repo_allowed`) launches only for a repository the owner listed. `CW_ALLOWED_REPOS` is a comma-separated list of `OWNER/NAME`, compared exactly and case-insensitively; no wildcard. Unset, empty, or any entry that is not `OWNER/NAME` shaped (a dot segment, a space, a `*`, an extra slash) refuses everything (fail closed). `CW_TOOLING_REPO` (`OWNER/NAME`) names the tooling's own repository, which is refused even when it is listed; unset adds no extra check, malformed refuses. A refused repository exits `2` with `refused: <repo> is not on the cloud allow-list` before any `kubectl` call, so nothing is created. Both settings are read from the environment of whoever runs the launcher or the driver, like the other `CW_` settings: the operator exports them in the shell (or the service unit) that starts it. An agent running as the same user could set them for a command it runs, so the list is a mistake-guard for the operator, not a boundary; the stops are the token's one-repository scope and the repository's own rules. The check compares spellings: a renamed or transferred repository is not matched by its old name, and an entry or tooling value ending in `.git` is malformed and refuses. The guard table is `docs/cloud-guard-parity.md`.
+
+**Token roles.** The mint takes a role (`app_token.py OWNER/REPO --role ROLE`, default `worker`; an unknown role is refused before any network call) from one table of permission sets, `PERMISSIONS_BY_ROLE` in `cloud/launcher/app_token.py`. The worker role asks for, and accepts, exactly `contents: write, pull_requests: write, issues: read, metadata: read`. The orchestrator role asks for, and accepts, exactly `issues: write, pull_requests: read, checks: read, metadata: read` (no `contents` key at all). A launch with `--agent orchestrator` mints under the orchestrator role and records it on the pod as the annotation `cw/role: orchestrator` (a worker pod carries no annotation: its spec is unchanged); the reaper's renewal mints under the role the annotation names, and a pod made before the annotation renews as a worker. A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command. An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set. The orchestrator pod holds no App key, App id, vault setting or mint command.
+
+The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
+
+**What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.

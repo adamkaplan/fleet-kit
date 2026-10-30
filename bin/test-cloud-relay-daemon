@@ -888,6 +888,13 @@ class LiveHead(Fixture):
                 case.tmp.cleanup()
 
 
+def describe_stub_state(error, finished, written, total):
+    """#1417: the failure message of the total-deadline tests: what the call raised, whether the stub had finished writing, the live threads."""
+    raised = "none" if error is None else type(error).__name__ + ": " + str(error)
+    names = sorted(t.name for t in threading.enumerate())[:20]
+    return "call raised: %s; stub finished writing: %s (%d of %d bytes written); live threads: %s" % (raised, finished.is_set(), written[0], total, ", ".join(names))
+
+
 class HubReadAndTransport(unittest.TestCase):
     """MEDIUM 2a, L1 (daemon side), L6 and L7: a hostile hub."""
 
@@ -945,6 +952,10 @@ class HubReadAndTransport(unittest.TestCase):
         mod = load_backend_module("if inflight and inflight[0].is_alive():", "if False:")
         self.assertGreater(self._threads_hanging(mod), 2)
 
+    # Cause of the failure on a loaded runner (ask #1406): the scenario once set the product's wall-clock
+    # deadline READ_DEADLINE to 0.4 seconds for the whole run, so
+    # the plain request ran under the shortened deadline and a slow loopback GET was cut with a timeout.
+    # The product default of 30 seconds is unchanged; now only the post that must be cut runs under 0.4 seconds.
     def _late_post_scenario(self, mod):
         import json
         import threading
@@ -987,7 +998,7 @@ class HubReadAndTransport(unittest.TestCase):
         http.client.HTTPConnection.connect = lambda conn: (gate.wait(20) if slow_for["post"] and slow_for.get("armed") else None, real(conn))[1]
         self.addCleanup(setattr, http.client.HTTPConnection, "connect", real)
         self.addCleanup(gate.set)
-        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.4
+        old = mod.READ_DEADLINE
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, post = mod.http_transport("http://127.0.0.1:%d" % srv.server_port, "tok")
         ex = relay.Executor(tmp.name, FakeBackend(), lambda: 1000)
@@ -996,11 +1007,18 @@ class HubReadAndTransport(unittest.TestCase):
         pending = fetch()
         gate.clear()
         status, reason, record = ex.handle(pending["requests"][0])   # pass 1 executes: one ledger record
-        with self.assertRaises(mod.PassCut):
-            post(req["id"], {"status": status, "reason": reason, "record": record})   # the POST connect hangs: cut
+        before = set(threading.enumerate())
+        mod.READ_DEADLINE = 0.4   # short deadline only for the post that must be cut
+        try:
+            with self.assertRaises(mod.PassCut):
+                post(req["id"], {"status": status, "reason": reason, "record": record})   # the POST connect hangs: cut
+        finally:
+            mod.READ_DEADLINE = old
         gate.set()   # the late thread now completes after the cut
         import time
-        time.sleep(0.5)
+        end = time.monotonic() + 5
+        while time.monotonic() < end and any(t.is_alive() for t in set(threading.enumerate()) - before):
+            threading.Event().wait(0.01)
         slow_for["armed"] = False
         status2, _, record2 = ex.handle(fetch()["requests"][0])   # next pass: the same request is a replay
         post(req["id"], {"status": status2, "reason": "", "record": record2})
@@ -1019,25 +1037,36 @@ class HubReadAndTransport(unittest.TestCase):
         old = relay.READ_DEADLINE
         relay.READ_DEADLINE = 1.0
         self.addCleanup(setattr, relay, "READ_DEADLINE", old)
+        finished = threading.Event()
+        written = [0]
 
         def trickle(h):
             h.send_response(200)
             h.send_header("Content-Length", "100000")
             h.end_headers()
-            for _ in range(200):   # a byte every 0.2 s: every single read succeeds well inside the 20 s socket timeout
+            for _ in range(200):   # a byte every 0.2 s for 40 s: every single read succeeds well inside the 20 s socket timeout
                 h.wfile.write(b" ")
                 h.wfile.flush()
+                written[0] += 1
                 time.sleep(0.2)
+            finished.set()
         fetch, _ = relay.http_transport(self._serve(trickle), "tok")
-        t0 = time.monotonic()
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(TimeoutError) as caught:
             fetch()
-        self.assertLess(time.monotonic() - t0, 2.5)
+        # decided by an observation, not by a measured duration: the real code returns at the 1 s deadline while the 40 s stub is still writing
+        self.assertFalse(finished.is_set(), describe_stub_state(caught.exception, finished, written, 200))
 
+    # Cause of #1417: this test once compared the measured time of the call with 2.5 s (assertGreater, a lower bound on a measured duration);
+    # on a loaded machine the monotonic clock read 2.27 s for a stub that writes a byte every 0.2 s fifteen times, and the test failed
+    # although nothing was wrong. It now decides by whether the stub had finished writing when the call returned.
+    # The cause of the 2.27 s reading is not found: it is known only that a lower bound on a measured duration depends on the machine's speed,
+    # and that the cause is not found, so the test no longer depends on any measured duration.
     def test_mutant_without_the_total_deadline_is_caught(self):
         mod = load_backend_module("if left <= 0:", "if False:", extra=(("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)"), ("worker.join(READ_DEADLINE)", "worker.join()")))
         old, mod.READ_DEADLINE = relay.READ_DEADLINE, 1.0
         import time
+        finished = threading.Event()
+        written = [0]
 
         def trickle(h):
             h.send_response(200)
@@ -1046,12 +1075,71 @@ class HubReadAndTransport(unittest.TestCase):
             for _ in range(15):
                 h.wfile.write(b" ")
                 h.wfile.flush()
+                written[0] += 1
                 time.sleep(0.2)
+            finished.set()
         fetch, _ = mod.http_transport(self._serve(trickle), "tok")
-        t0 = time.monotonic()
-        with self.assertRaises(Exception):
-            fetch()   # it ends only when the stub stops (ValueError from the empty JSON), after 3 s: not at the deadline
-        self.assertGreater(time.monotonic() - t0, 2.5)
+        with self.assertRaises(Exception) as caught:
+            fetch()   # it ends only when the stub stops (ValueError from the empty JSON): not at the deadline
+        self.assertTrue(finished.is_set(), describe_stub_state(caught.exception, finished, written, 15))   # the mutant returned only after the stub finished writing
+
+    def forced_failure_message(self, describe):
+        """The mutant of #1417 returns before the stub finishes (here the real code, cut at the 1 s deadline); run the observation of the
+        mutant test on it and return the message of the AssertionError."""
+        import time
+        old = relay.READ_DEADLINE
+        relay.READ_DEADLINE = 1.0
+        self.addCleanup(setattr, relay, "READ_DEADLINE", old)
+        finished = threading.Event()
+        written = [0]
+
+        def trickle(h):
+            h.send_response(200)
+            h.send_header("Content-Length", "100000")
+            h.end_headers()
+            for _ in range(60):
+                h.wfile.write(b" ")
+                h.wfile.flush()
+                written[0] += 1
+                time.sleep(0.2)
+            finished.set()
+        fetch, _ = relay.http_transport(self._serve(trickle), "tok")
+        with self.assertRaises(TimeoutError) as caught:
+            fetch()
+        self.assertFalse(finished.is_set())   # the mutation is applied: the call returned before the stub finished
+        with self.assertRaises(AssertionError) as failure:
+            self.assertTrue(finished.is_set(), describe(caught.exception, finished, written, 60))
+        return str(failure.exception), written[0], type(caught.exception).__name__ + ": " + str(caught.exception)
+
+    def message_holds_all_items(self, message, written, raised):
+        self.assertIn("call raised: " + raised, message)
+        self.assertIn("stub finished writing: False", message)
+        self.assertIn("%d of 60 bytes" % written, message)
+        self.assertIn("live threads: ", message)
+        self.assertIn("MainThread", message)
+
+    def test_the_failure_message_names_the_error_the_stub_and_the_threads(self):
+        message, written, raised = self.forced_failure_message(describe_stub_state)
+        self.message_holds_all_items(message, written, raised)
+
+    def test_a_message_holding_only_numbers_fails_that_test(self):
+        def numbers_only(error, finished, written, total):
+            return "%d of %d" % (written[0], total)
+        message, written, raised = self.forced_failure_message(numbers_only)
+        with self.assertRaises(AssertionError):
+            self.message_holds_all_items(message, written, raised)
+
+    def test_the_thread_list_is_sorted_and_cut_at_20_names(self):
+        gate = threading.Event()
+        threads = [threading.Thread(target=gate.wait, name="zz%02d" % i, daemon=True) for i in range(25)]
+        for t in threads:
+            t.start()
+        self.addCleanup(gate.set)
+        done = threading.Event()
+        listed = describe_stub_state(None, done, [0], 1).split("live threads: ")[1].split(", ")
+        self.assertEqual(len(listed), 20)
+        self.assertEqual(listed, sorted(listed))
+        self.assertIn("call raised: none", describe_stub_state(None, done, [0], 1))
 
     def test_endless_stream_without_a_length_is_cut(self):
         def endless(h):
@@ -1444,6 +1532,172 @@ class OneWallClock(unittest.TestCase):
                                   extra=(("if declared and declared.isdigit() and len(raw)", "if False and len(raw)"), ("if left <= 0:", "if False:"), ("worker.join(READ_DEADLINE)", "worker.join()")))
         _, err = self.timed(mod, self.serve_padded(), 1.0)
         self.assertIsNone(err)   # the mutant parses the cut body as complete
+
+
+class TestLatePostNoWallClock(unittest.TestCase):
+    def scenario_source(self):
+        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
+        start = text.index("    def _late_post_scenario")
+        return text[start:text.index("    def test_late_post_after_the_cut", start)]
+
+    def test_short_deadline_is_set_only_around_the_cut_post(self):
+        src = self.scenario_source()
+        sets = [l for l in src.splitlines() if "READ_DEADLINE = 0.4" in l]
+        self.assertEqual(len(sets), 1)
+        self.assertLess(src.index("READ_DEADLINE = 0.4"), src.index("post(req"))
+        self.assertLess(src.index("PassCut"), src.index("READ_DEADLINE = old"))
+        self.assertLess(src.index("READ_DEADLINE = old"), src.index("gate.set()   # the late"))
+
+    def test_no_fixed_sleep_remains_in_the_scenario(self):
+        self.assertEqual(self.scenario_source().count("time.sleep" + "("), 0)
+
+    @staticmethod
+    def comment_block_above_scenario(text):
+        lines = text.split("\n")
+        at = [i for i, l in enumerate(lines) if l.lstrip().startswith("def _late_post_scenario")]
+        if not at:
+            return ""
+        block, i = [], at[0] - 1
+        while i >= 0 and lines[i].lstrip().startswith("#"):
+            block.insert(0, lines[i])
+            i -= 1
+        return "\n".join(block)
+
+    def comment_names_the_cause(self, text):
+        block = self.comment_block_above_scenario(text)
+        return ("the plain request ran under the shortened deadline" in block) and ("30 seconds" in block)
+
+    def own_text(self):
+        return open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-cloud-relay-daemon")).read()
+
+    def test_the_comment_names_the_cause(self):
+        self.assertTrue(self.comment_names_the_cause(self.own_text()))
+
+    def test_the_comment_check_is_not_vacuous(self):
+        text = self.own_text()
+        block = self.comment_block_above_scenario(text)
+        self.assertNotEqual(block, "")
+        scratch = text.replace(block + "\n", "")
+        self.assertNotEqual(scratch, text)   # the mutation applied
+        self.assertFalse(self.comment_names_the_cause(scratch))
+
+
+class TotalDeadlineTestsDecideByObservation(unittest.TestCase):
+    """#1417: the two total-deadline tests must not compare a measured duration with a bound below 10 seconds (a lower or an upper
+    bound on a measured duration depends on the machine's speed). The scan reads the source of the tests; its mutant checks run it on
+    the OLD text of the two tests, which it must flag."""
+
+    NAMES = ("test_a_trickling_hub_is_cut_at_the_total_deadline", "test_mutant_without_the_total_deadline_is_caught")
+    CLOCKS = ("monotonic", "time", "perf_counter")
+    OLD = {
+        "test_a_trickling_hub_is_cut_at_the_total_deadline": """
+def test_a_trickling_hub_is_cut_at_the_total_deadline(self):
+    t0 = time.monotonic()
+    with self.assertRaises(TimeoutError):
+        fetch()
+    self.assertLess(time.monotonic() - t0, 2.5)
+""",
+        "test_mutant_without_the_total_deadline_is_caught": """
+def test_mutant_without_the_total_deadline_is_caught(self):
+    t0 = time.monotonic()
+    with self.assertRaises(Exception):
+        fetch()
+    self.assertGreater(time.monotonic() - t0, 2.5)
+""",
+    }
+
+    @classmethod
+    def source_of(cls, text, name):
+        import ast
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.get_source_segment(text, node)
+        raise AssertionError("test not found: " + name)
+
+    @classmethod
+    def small_bound_comparisons(cls, src):
+        """Count the comparisons (operators or assert helpers) of an elapsed time with a number below 10."""
+        import ast
+        tree = ast.parse(__import__("textwrap").dedent(src))
+
+        def reads_clock(n):
+            return any(isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in cls.CLOCKS for x in ast.walk(n)) or \
+                any(isinstance(x, ast.Name) and x.id in ("elapsed", "took") for x in ast.walk(n))
+
+        def small(n):
+            return any(isinstance(x, ast.Constant) and isinstance(x.value, (int, float)) and not isinstance(x.value, bool) and x.value < 10
+                       for x in ast.walk(n))
+        count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                parts = [node.left] + list(node.comparators)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr.startswith("assert") and node.func.attr not in ("assertRaises", "assertIsNone", "assertIsNotNone"):
+                parts = list(node.args)
+            else:
+                continue
+            if any(reads_clock(x) for x in parts) and any(small(x) for x in parts):
+                count += 1
+        return count
+
+    def own_text(self):
+        return Path(__file__).read_text()
+
+    def test_the_two_tests_have_no_small_bound_on_a_measured_duration(self):
+        text = self.own_text()
+        for name in self.NAMES:
+            self.assertEqual(self.small_bound_comparisons(self.source_of(text, name)), 0, name)
+
+    def test_the_two_tests_decide_by_whether_the_stub_was_still_writing(self):
+        text = self.own_text()
+        for name in self.NAMES:
+            src = self.source_of(text, name)
+            self.assertIn("finished", src, name)
+            self.assertIn("is_set()", src, name)
+
+    def test_the_mutant_test_names_its_cause(self):
+        text = self.own_text()
+        head = text[:text.index("def test_mutant_without_the_total_deadline_is_caught")].rsplit("\n\n", 1)[-1]
+        self.assertIn("a lower bound on a measured duration", head)
+        self.assertIn("2.27", head)
+
+    @staticmethod
+    def comment_block_above(text, name):
+        """Only the comment lines directly above 'def <name>' (no blank line, no code between)."""
+        lines = text.split("\n")
+        at = next(i for i, ln in enumerate(lines) if ln.strip().startswith("def " + name))
+        block = []
+        i = at - 1
+        while i >= 0 and lines[i].strip().startswith("#"):
+            block.insert(0, lines[i])
+            i -= 1
+        return "\n".join(block)
+
+    def test_the_comment_block_directly_above_the_mutant_test_says_the_cause_is_not_found(self):
+        block = self.comment_block_above(self.own_text(), "test_mutant_without_the_total_deadline_is_caught")
+        for phrase in ("a lower bound on a measured duration", "2.27", "not found"):
+            self.assertIn(phrase, block)
+
+    def test_the_comment_check_fails_when_the_block_is_removed(self):
+        text = self.own_text()
+        block = self.comment_block_above(text, "test_mutant_without_the_total_deadline_is_caught")
+        self.assertTrue(block)
+        stripped = text.replace(block + "\n", "")
+        self.assertNotEqual(stripped, text)
+        empty = self.comment_block_above(stripped, "test_mutant_without_the_total_deadline_is_caught")
+        for phrase in ("a lower bound on a measured duration", "2.27", "not found"):
+            self.assertNotIn(phrase, empty)
+
+    def test_the_scan_finds_the_old_comparisons(self):
+        for name, old in self.OLD.items():
+            self.assertEqual(self.small_bound_comparisons(old), 1, name)
+
+    def test_a_build_that_only_lowers_the_bound_is_still_found(self):
+        for name, old in self.OLD.items():
+            self.assertEqual(self.small_bound_comparisons(old.replace("2.5", "2.0")), 1, name)
+
+    def test_a_bound_of_ten_seconds_or_more_is_allowed(self):
+        old = self.OLD[self.NAMES[0]].replace("2.5", "10.0")
+        self.assertEqual(self.small_bound_comparisons(old), 0)
 
 
 if __name__ == "__main__":
