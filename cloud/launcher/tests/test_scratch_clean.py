@@ -26,6 +26,7 @@ _loader.exec_module(cwt)
 
 AGENT_TEST = HERE / "test_orchestrator_agent.py"
 STUBBORN = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)  # %s"
+CHILD = "import time; time.sleep(300)  # %s"
 
 
 def root_entries():
@@ -66,6 +67,7 @@ class ScratchCleanup(unittest.TestCase):
                 record["pid"] = p.pid
                 record["home"] = str(self.home)
                 record["p"] = p
+                record["alive_before"] = alive(p.pid)
                 time.sleep(0.5)
         result = run_case(ChildLeft)
         self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
@@ -75,12 +77,51 @@ class ScratchCleanup(unittest.TestCase):
 
     def test_s3_a_running_child_is_ended_and_the_directory_removed(self):
         before = root_entries()
-        gone, entries, rec = self._run(lambda home: ["sleep", "300", str(home)])
+        gone, entries, rec = self._run(lambda home: [sys.executable, "-c", CHILD % home])
         print("S3: children alive %d, directory entries %d" % (int(gone), len(entries)))
         self.assertFalse(gone)
         self.assertEqual(entries, [])
         self.assertFalse(os.path.exists(rec["home"]))
         self.assertEqual(root_entries(), before)
+
+    def test_s3_the_child_is_alive_before_cleanup(self):
+        gone, entries, rec = self._run(lambda home: [sys.executable, "-c", CHILD % home])
+        print("S3: child alive before cleanup %s" % rec["alive_before"])
+        self.assertTrue(rec["alive_before"])
+
+    def test_s3_the_bare_cleanup_leaves_the_child_alive(self):
+        src = (ROOT / "bin" / "test-cloud-worker").read_text()
+        mutant = src.replace("self.addCleanup(end_children_and_remove, tmp, self.home)", "self.addCleanup(tmp.cleanup)", 1)
+        applied = mutant != src
+        copy = ROOT / "bin" / ("zz_s3_mutant_%d.py" % os.getpid())
+        script = (
+            "import importlib.util, os, sys, time, unittest\n"
+            "sys.path.insert(0, %r)\n"
+            "import stub_support\n"
+            "spec = importlib.util.spec_from_file_location('zz_s3_mutant', %r)\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "rec = {}\n"
+            "class Late:\n"
+            "    def addCleanup(self, fn, *a): pass\n"
+            "class Case(m.Base):\n"
+            "    def test_child(self):\n"
+            "        p = stub_support.start(Late(), [sys.executable, '-c', %r %% self.home], cwd=str(self.home))\n"
+            "        rec['p'] = p\n"
+            "        time.sleep(0.5)\n"
+            "r = unittest.TextTestRunner(stream=open(os.devnull, 'w')).run(unittest.defaultTestLoader.loadTestsFromTestCase(Case))\n"
+            "rec['p'].poll()\n"
+            "left = m._alive(rec['p'].pid)\n"
+            "if left: rec['p'].kill(); rec['p'].wait()\n"
+            "sys.exit(1 if (left or not r.wasSuccessful()) else 0)\n"
+        ) % (str(HERE), str(copy), CHILD)
+        try:
+            copy.write_text(mutant)
+            p = subprocess.run([sys.executable, "-c", script], cwd=str(HERE), capture_output=True, text=True)
+        finally:
+            copy.unlink()
+        print("S3 mutant (the old bare cleanup): exit %d, mutation applied %s" % (p.returncode, applied))
+        self.assertTrue(applied)
+        self.assertEqual(p.returncode, 1, p.stderr[-800:])
 
     def test_s4_a_child_that_ignores_the_end_signal_is_killed(self):
         self.assertEqual(cwt.CHILD_END_WAIT_SECONDS, 15)
