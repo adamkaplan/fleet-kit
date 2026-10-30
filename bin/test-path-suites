@@ -898,6 +898,62 @@ class TestObservationsHaveMutants(unittest.TestCase):
         self.assertEqual((real.testsRun, real.failures, real.errors), (1, [], []))
 
 
+CLOCK_CALLS = {("time", "time"), ("time", "monotonic"), ("time", "perf_counter")}
+BOUND_ASSERTS = {"assertLess", "assertLessEqual", "assertGreater", "assertGreaterEqual"}
+
+
+def clock_bounds(source):
+    """The wall-clock bounds of a test source, by line: an assertLess/assertLessEqual/assertGreater/assertGreaterEqual call, or a comparison, whose operand holds a subtraction
+    with a call of time.time(), time.monotonic() or time.perf_counter() in it. Closed rule: a duration measured by those calls and compared. Known limits, stated: a fake clock
+    (the injected `clock["now"] - 1000.0 <= 125` of the 120 second wait test) calls none of them and is not a wall-clock measure, so it is not listed; `time.time() + n`
+    (an injected `now=`) is an addition, not a measured duration; a clock imported under another name is not recognised."""
+    import ast
+
+    def is_clock(node):
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                and (node.func.value.id, node.func.attr) in CLOCK_CALLS)
+
+    def measures(node):
+        return any(isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Sub) and (is_clock(sub.left) or is_clock(sub.right)) for sub in ast.walk(node))
+    lines = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in BOUND_ASSERTS and any(measures(a) for a in node.args):
+            lines.add(node.lineno)
+        elif isinstance(node, ast.Compare) and measures(node):
+            lines.add(node.lineno)
+    return sorted(lines)
+
+
+def unexplained_clock_bounds(source):
+    """The lines of clock_bounds with no written reason: a comment of the line above (a line that starts with #) or a comment on the line itself."""
+    text = source.splitlines()
+    return [n for n in clock_bounds(source) if not text[n - 2].strip().startswith("#") and "#" not in text[n - 1]]
+
+
+class TestWallClockBoundsAreExplained(unittest.TestCase):
+    """#1626: a bound on measured wall time is a flake on a loaded machine; each one that remains carries a written reason, so a new one cannot arrive unseen."""
+
+    def test_every_remaining_wall_clock_bound_of_this_file_has_a_written_reason(self):
+        source = Path(__file__).read_text()
+        remaining = clock_bounds(source)
+        self.assertEqual(len(remaining), 1, "the wall-clock bounds of this file, by line: %s" % remaining)
+        self.assertEqual(unexplained_clock_bounds(source), [], "a wall-clock bound with no reason in a comment above it or on its line")
+
+    def test_a_planted_bound_without_a_reason_is_named_by_its_line(self):
+        source = Path(__file__).read_text()
+        planted = source + "\n\nclass Planted(unittest.TestCase):\n    def test_x(self):\n        started = time.time()\n        self.assertLess(time.time() - started, 5)\n"
+        line = planted.count("\n", 0, planted.rindex("self.assertLess(time.time() - started, 5)")) + 1
+        self.assertEqual(unexplained_clock_bounds(planted), [line])
+        head, sep, last = planted.rpartition("        self.assertLess(time.time() - started, 5)")
+        explained = head + "        # a reason\n" + sep + last
+        self.assertEqual(unexplained_clock_bounds(explained), [])
+
+    def test_a_comparison_and_a_monotonic_clock_are_found_too_and_the_fake_clock_is_not(self):
+        self.assertEqual(clock_bounds("import time\nx = 1\nassert time.monotonic() - x < 5\n"), [3])
+        self.assertEqual(clock_bounds("self.assertGreater(5, time.perf_counter() - x)\n"), [1])
+        self.assertEqual(clock_bounds("self.assertLessEqual(clock['now'] - 1000.0, 125)\n"), [])
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=1).result
     ok = result.wasSuccessful()
