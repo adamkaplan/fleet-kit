@@ -6,7 +6,6 @@ STAGE_LINE_MAX = 400
 STAGE_STATUSES = ("requested", "up", "updated", "building", "rebuilding", "suspended", "resumed", "expiring", "renewed", "expired", "failed")
 STAGE_UNREADABLE = "stage event unreadable"
 STAGE_HEAD_RE = re.compile(r"[0-9a-fA-F]{40}")
-STAGE_WORD_RE = re.compile(r"[a-z][a-z0-9-]{0,19}")
 STAGE_UNTIL_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]{1,6})?)?(?:Z|[+-][0-9]{2}:[0-9]{2})?")
 STAGE_LISTS = {"repos": frozenset(), "bots": frozenset()}   # set from the config by the GitHub source; empty: no comment is a stage event
 
@@ -33,6 +32,20 @@ def _stage_url(value):
     if parts.scheme != "https" or not parts.hostname or parts.query or parts.fragment or "?" in value or "#" in value or "@" in parts.netloc:
         return None
     return value
+
+
+_stage_url_unwrapped = _stage_url
+
+
+def _stage_url(value):
+    """A url the parser cannot read (urlsplit or port raise) is no url: the line is unreadable, whatever the exception."""
+    try:
+        parts = urllib.parse.urlsplit(value) if isinstance(value, str) else None
+        if parts is not None:
+            parts.port, parts.hostname
+        return _stage_url_unwrapped(value)
+    except Exception:
+        return None
 
 
 def stage_parse(first):

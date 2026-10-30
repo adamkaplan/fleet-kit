@@ -8659,6 +8659,14 @@ class TestStageEvents(Base):
         self.gh.send("issue_comment", {"action": action, "issue": issue, "repository": {"full_name": repo},
                                        "comment": {"id": cid, "body": body, "user": {"login": login, "type": "Bot"}}})
 
+    def test_s5b_a_malformed_url_host_is_unreadable_and_never_raises(self):
+        for n, url in enumerate(("https://[::1", "https://[bad", "https://exa mple.com:99999/x", "https://example.com:99999/x")):
+            with self.subTest(url=url):
+                self.assertIsNone(sb.stage_parse(self.line(url=url)))
+                self.comment(self.line(url=url), cid=5100 + n)
+                self.assertEqual(self.told()[-1][1], "stage event unreadable")
+        self.assertEqual(len(self.told()), 4)
+
     def told(self):
         return [(f.key, f.summary, f.kind, f.recipient) for f in self.hub.facts()]
 
