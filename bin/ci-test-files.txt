@@ -30,4 +30,5 @@ run cloud/tests/test-cloud
 exempt bin/test-cloud-cost-report | listed in bin/test-cloud-launcher.chain, so the bin/test-cloud-launcher step runs it
 exempt bin/test-cloud-launcher.chain | the chain list read by bin/test-cloud-launcher, not a test file
 exempt bin/test-cloud-launcher.parallel | a helper of bin/test-cloud-launcher, not a test file
+exempt bin/test-cloud-retired | listed in bin/test-cloud-launcher.chain, so the bin/test-cloud-launcher step runs it
 exempt bin/test-impact-brief | its TestCase classes are loaded and run by bin/test-switchboard (_load_brief_tests), so the bin/test-switchboard step runs it
