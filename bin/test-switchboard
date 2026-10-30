@@ -12315,6 +12315,110 @@ class TestAgentShellCalls(Base):
         self.assertEqual(stat.S_IMODE(os.stat(str(self.state / "agent-calls-hours.json")).st_mode), 0o600)
 
 
+class TestSameNameAccountsAdd(Base):
+    """#879: accounts whose names clean to the same name are ADDED in the hourly fold, the load hours and the usage record, never overwritten."""
+
+    SAME = ("acme a", "acme/a")     # both clean to `acme?a`
+    WORD = "acme?a"
+
+    def _fold(self, mod, delta):
+        d = Path(tempfile.mkdtemp(dir=str(self.home)))
+        mod.fold(str(d), 1000000.0, delta)
+        return mod.load_hours(str(d))[0][str(mod._hour(1000000.0))]
+
+    def _usage(self, mod, readings):
+        d = Path(tempfile.mkdtemp(dir=str(self.home)))
+        mod.record_usage(str(d), 1000000.0, readings)
+        return json.loads((d / "github-usage.json").read_text())["accounts"]
+
+    def _mutant(self, old, new):
+        src = Path(sb.agent_calls.__file__).read_text()
+        self.assertEqual(src.count(old), 1, "the mutant's target line moved")
+        mod = types.ModuleType("agent_calls_mutant")
+        mod.__file__ = sb.agent_calls.__file__
+        exec(compile(src.replace(old, new), "agent_calls_mutant", "exec"), mod.__dict__)
+        return mod
+
+    def _checks(self, mod):
+        """Each record's check, by name; returns the names that fail."""
+        failed = []
+        a, b = self.SAME
+        if self._fold(mod, {a: 3, b: 4})["daemon"].get(self.WORD) != 7:
+            failed.append("fold")
+        d = Path(tempfile.mkdtemp(dir=str(self.home)))
+        (d / "agent-calls-hours.json").write_text(json.dumps({"hours": {"5": {"agent": {a: 3, b: 4}}}}))
+        if mod.load_hours(str(d))[0]["5"]["agent"].get(self.WORD) != 7:
+            failed.append("load")
+        if self._usage(mod, {a: (3, 10, 50, 100), b: (4, 20, 50, 200)}).get(self.WORD, {}).get("used") != 7:
+            failed.append("usage")
+        return failed
+
+    def test_s2_the_fold_adds_two_accounts_that_clean_to_one_word(self):
+        a, b = self.SAME
+        self.assertEqual(self._fold(sb.agent_calls, {a: 3, b: 4})["daemon"], {self.WORD: 7})
+        row = self._fold(sb.agent_calls, {a: {"api issues/#": 1}, b: {"api issues/#": 2, "api graphql": 1}})   # the per-endpoint form adds too
+        self.assertEqual(sum(sum(c.values()) for c in row["lanes"]["daemon"].values()), 4)
+        self.assertEqual(row["daemon"], {self.WORD: 4})
+
+    def test_s3_the_load_hours_add_them(self):
+        self.assertEqual(self._checks(sb.agent_calls), [])
+
+    def test_s4_the_usage_record_adds_them(self):
+        a, b = self.SAME
+        got = self._usage(sb.agent_calls, {a: (3, 10, 50, 100), b: (4, 20, 50, 200)})
+        self.assertEqual(got, {self.WORD: {"used": 7, "remaining": 30, "limit": 100, "reset": 200}})
+
+    def test_s5_a_scan_of_the_code_finds_no_place_that_overwrites(self):
+        tree = ast.parse(Path(sb.agent_calls.__file__).read_text())
+
+        def keyed(node):
+            return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_account" for n in ast.walk(node))
+
+        places, overwriting = [], []
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            gets = {ast.dump(c.func.value) for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                    and c.func.attr == "get" and c.args and keyed(c.args[0])}
+            for n in ast.walk(fn):
+                if isinstance(n, (ast.DictComp, ast.SetComp)) and keyed(n.key if isinstance(n, ast.DictComp) else n.elt):
+                    places.append((fn.name, n.lineno))
+                    overwriting.append((fn.name, n.lineno))        # a comprehension keyed by a cleaned name keeps only the last
+                elif isinstance(n, ast.Assign):
+                    for t in n.targets:
+                        if isinstance(t, ast.Subscript) and keyed(t.slice):
+                            places.append((fn.name, n.lineno))
+                            if ast.dump(t.value) not in gets:       # it must read the earlier count under the same cleaned key
+                                overwriting.append((fn.name, n.lineno))
+        self.assertGreaterEqual(len(places), 3, places)
+        self.assertEqual(overwriting, [], "these places overwrite instead of adding")
+
+    def test_s6_each_overwriting_mutant_fails_a_check(self):
+        mutants = {
+            "load": ("out[_account(a)] = out.get(_account(a), 0) + int(n)", "out[_account(a)] = int(n)"),
+            "fold": ("delta[_account(a)] = delta.get(_account(a), 0) + int(n)", "delta[_account(a)] = int(n)"),
+            "usage": ('"used": old["used"] + u,', '"used": u,'),
+        }
+        for name, (old, new) in mutants.items():
+            with self.subTest(name):
+                self.assertIn(name, self._checks(self._mutant(old, new)), "the mutant must fail its record's check")
+
+    def test_u1_distinct_cleaned_names_are_recorded_as_before(self):
+        self.assertEqual(self._fold(sb.agent_calls, {"acme-a": 3, "acme-b": 4})["daemon"], {"acme-a": 3, "acme-b": 4})
+        d = Path(tempfile.mkdtemp(dir=str(self.home)))
+        (d / "agent-calls-hours.json").write_text(json.dumps({"hours": {"5": {"agent": {"acme-a": 3, "acme-b": 4}}}}))
+        self.assertEqual(sb.agent_calls.load_hours(str(d))[0]["5"]["agent"], {"acme-a": 3, "acme-b": 4})
+        got = self._usage(sb.agent_calls, {"acme-a": (3, 10, 50, 100), "acme-b": (4, 20, 60, 200)})
+        self.assertEqual(got, {"acme-a": {"used": 3, "remaining": 10, "limit": 50, "reset": 100}, "acme-b": {"used": 4, "remaining": 20, "limit": 60, "reset": 200}})
+
+    def test_u2_a_negative_count_and_a_non_number_are_dropped(self):
+        a, b = self.SAME
+        for bad in (-5, "x", None, True):
+            with self.subTest(bad=bad):
+                d = Path(tempfile.mkdtemp(dir=str(self.home)))
+                (d / "agent-calls-hours.json").write_text(json.dumps({"hours": {"5": {"agent": {a: 3, b: bad}}}}))
+                self.assertEqual(sb.agent_calls.load_hours(str(d))[0]["5"]["agent"], {self.WORD: 3})
+                self.assertEqual(self._fold(sb.agent_calls, {a: 3, b: bad})["daemon"].get(self.WORD), 3)
+
+
 class TestShimReadCache(Base):
     """#867 clauses 3 and 4: a repeated identical `gh api <path>` read is answered from a short cache and revalidated with the entity tag; a write by the same agent
     drops it; below 15 percent of the budget the shim says so once and serves a cached read instead of spending."""
