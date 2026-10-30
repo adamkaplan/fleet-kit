@@ -191,6 +191,17 @@ jobs:
           bin/test-app-mint 2>&1 | tee "$RUNNER_TEMP/out-app.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out-app.txt"
 
+      # #1605: the pull request head merged with the CURRENT tip of its base (fetched now, never the stored merge ref): no file with a size row in
+      # docs/architecture.md may end over its ceiling because of this pull request. A plain re-run of the job reads the then-current tip.
+      - name: Size ceilings on the merge result
+        if: ${{ github.event_name == 'pull_request' && github.base_ref == 'integration' && !cancelled() }}
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch origin "$BASE"
+          python3 bin/size_ceilings.py check --tip "origin/$BASE" --head "$HEAD_SHA"
+
       - name: bin/test-cloud-neutral-names
         if: ${{ !cancelled() }}
         run: |

@@ -453,6 +453,7 @@ cloud_channel_server.py:do_POST
 cloud_cli.py:post
 cloud_cost_report.py:read_lines
 cloud_hub.py:_read_json
+cloud_hub.py:_read_json_aged
 cloud_hub.py:kube_http
 cloud_relay.py:loads_strict
 cloud_relay_daemon.py:_read
@@ -460,6 +461,7 @@ cloud_way_back_check.py:main
 cloud_worker.py:run_launcher
 cpu_guard.py:load_episode
 decision_sync.py:_read_json
+decisions_pull.py:held_body
 decisions_pull.py:parse
 delegated_clear.py:score_block
 disk_janitor.py:_without_own_events
@@ -1300,7 +1302,7 @@ class TestCloudLoad(Base):
         fh = sb.load_fleet_health()
         src = (BIN / "fleet_health.py").read_text()
         self.assertIn("\\u2601 cloud", src)
-        self.assertIn('(" +%d\\u2601 cloud" % f["cloud"]) if f.get("cloud")', src)
+        self.assertIn('(" (%d\\u2601 cloud of the busy)" % f["cloud"]) if f.get("cloud")', src)
 
     def test_a_boss_with_control_characters_is_cleaned_at_the_source_and_a_non_string_is_no_boss(self):
         self.rec("e", reports_to="a\x1b[31mb\nc"); self.rec("l", reports_to="x" * 500); self.rec("n", reports_to=["orch"]); self.rec("i", reports_to=7)
