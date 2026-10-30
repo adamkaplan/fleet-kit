@@ -77,7 +77,7 @@ import html
 import unicodedata
 import http.client
 import urllib.parse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from datetime import datetime, timezone
 import collections
 import ast
@@ -96,7 +96,7 @@ import json
 import math
 import os
 from pathlib import Path
-import inspect
+import inspect, io
 import re
 import secrets
 import select
@@ -2510,6 +2510,7 @@ class Switchboard:
     `audit` None makes it read-only: `pending` and `status` use it that way,
     and any write then raises instead of happening unaudited.
     """
+    _note_lock = threading.Lock()   # _note's check-then-set on _last; the relay thread has its own engine, this guards any second caller
 
     # The sweep cache of the worktree in-use checks (`worktree_sweep`) is PER THREAD: the daemon's janitor thread and its main thread (auto-retire reclaim)
     # each hold their own, so one can never read, seed or clear the other's session index (#762).
@@ -2587,10 +2588,11 @@ class Switchboard:
         return self.audit.external(self.actor, event, subject, detail)
 
     def _note(self, event, subject, detail):
-        """Audit a non-write event once per change, not once per pass."""
-        if self.audit is None or self._last.get((event, subject)) == detail:
-            return
-        self._last[(event, subject)] = detail
+        """Audit a non-write event once per change, not once per pass. The check-then-set is under a lock."""
+        with self._note_lock:
+            if self.audit is None or self._last.get((event, subject)) == detail:
+                return
+            self._last[(event, subject)] = detail
         self.audit.append(self.actor, event, subject, detail)
 
     # -- observe
@@ -3866,7 +3868,7 @@ def installed_tree_clear(state_dir, runner=subprocess.run):
 DAEMON_RECORD = "daemon.json"  # what the running daemon says about itself: its pid, and where its key came from
 
 
-def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, watch=None, on_reload=None):
+def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, watch=None, on_reload=None, relay_engine=None):
     """`run`: a pass on every poke, and at least every `poll` seconds, under the
     single-instance lock.
 
@@ -3876,6 +3878,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
     `wait(sock, timeout)` and `passes` are for tests and `--once`. `record` is written to daemon.json
     once the lock is held, with this pid: `status` reads it to say what the DAEMON has, not what the shell
     that runs `status` has.
+    `relay_engine` builds the relay thread's OWN engine (the Engine is not thread-safe: the relay thread must not share the
+    pass thread's); REQUIRED when a hub is configured (the relay then fails to start and is audited); a test that shares says so: relay_engine=lambda: engine.
     """
     wait = wait or wait_for_poke
     with single_instance(state_dir):
@@ -3887,7 +3891,13 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
         except OSError as err:  # no pokes then; the poll interval still passes
             sock = None
             engine._note("poke.unavailable", None, {"error": _one_line(str(err))})
+        relay_loop = None
         try:
+            try:   # the relay is pulled on its own cadence, not after each pass (#1477)
+                relay_loop = load_module("cloud_relay_daemon").start_loop(
+                    engine, sys.modules[__name__], subprocess.run, engine.now, os.environ, engine_factory=relay_engine, guarded=True)
+            except Exception as err:
+                engine._failed(None, "pass", err, {"errors": []})
             done = 0
             while True:
                 drain_pokes(sock)
@@ -3898,10 +3908,11 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                     if bad is not None:   # two reads in a row before it stops and alerts
                         time.sleep(INSTALLED_TREE_RECHECK_SECONDS)
                         bad = installed_tree_problem(state_dir)
+                    if relay_loop is not None:
+                        relay_loop.set_blocked(bad is not None)   # the relay thread obeys this verdict; it never reads the tree itself
                     if bad is None:
                         installed_tree_clear(state_dir)
                         engine.run_pass()
-                        load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
                     else:   # no verdict, merge or message is decided or delivered; only this re-check goes on
                         engine._note("installed_tree.stopped", None, {"problem": bad})
                         installed_tree_alert(state_dir, bad, engine.now, getattr(getattr(engine, "herdr", None), "binary", None))
@@ -3913,6 +3924,8 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                 timeout = next_poll(engine, poll)
                 wait(sock, min(timeout, CONFIG_STABLE_SECONDS) if watch is not None and watch.pending else timeout)
         finally:
+            if relay_loop is not None:
+                relay_loop.stop()
             if sock is not None:
                 sock.close()
 
@@ -13855,13 +13868,13 @@ def identify_caller(herdr, v2, environ):
     return name
 
 
-def build_engine(runner, now, actor, writable=True, socket_call=None):
+def build_engine(runner, now, actor, writable=True, socket_call=None, owns_link=True):
     """The engine over the configured clients. Refuses an unconfigured v2 or a bad fault name."""
     config = load_runnable_config()
     active_faults()
     state = ensure_state_dir()
     v2 = V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
-    if actor == "daemon":
+    if actor == "daemon" and owns_link:   # the relay thread's engine does not (one writer of v2-link.json)
         v2.state_dir = state   # the daemon's link is what `status` reports
     herdr = HerdrClient(config["herdr"], runner, socket_call=socket_call)
     audit = AuditLog(state / "audit.jsonl") if writable else None
@@ -13920,7 +13933,8 @@ def cmd_run(args, runner, now, wait):
     try:
         run_daemon(engine, state, args.poll or config["poll_seconds"], wait,
                    record=dict(daemon_record(config), config_loaded_at=iso(now())), watch=watch,
-                   on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv))
+                   on_reload=lambda changed: reload_in_place(engine, hub, judge_server, changed, argv),
+                   relay_engine=lambda: build_engine(runner, now, "daemon", owns_link=False)[0])   # the relay thread's own engine
     except KeyboardInterrupt:
         return EXIT_OK
     finally:
@@ -14089,7 +14103,7 @@ def launch_memory_check(args, engine, state, runner, now):
     return None
 
 
-def cmd_launch(args, runner, now, socket_call=None):
+def _cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "read_repo", None) is not None and (getattr(args, "cloud", False) or args.resume):
         raise LaunchError("--read-repo needs a terminal launch of a new worker (not --headless, --cloud or --resume)")
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
@@ -14247,6 +14261,71 @@ def cmd_launch(args, runner, now, socket_call=None):
     if note and (brief or args.checkpoint or args.overdue):
         sys.stderr.write("%s: %s\n" % (PROG, note))
     return EXIT_OK
+
+
+LAUNCH_REFUSED_REASON_MAX = 300   # #1464: the reason in the caller's message, in characters
+
+
+class _StderrTee:
+    """Passes everything to the real stream and keeps the lines written (the reason of a refusal that is a printed line and an exit code)."""
+
+    def __init__(self, stream):
+        self.stream, self.lines = stream, []
+
+    def write(self, text):
+        self.lines.extend(part for part in str(text).splitlines() if part.strip())
+        return self.stream.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+LAUNCH_AFTER_CREATED = re.compile(r"the worker (?:\S+ )?was created|the pane is open without the brief")   # #1464: the text the code writes when a failure comes AFTER the worker (pod or pane) exists
+
+
+def launch_refusal_reason(text):
+    """#1464: one line, scrubbed of credential-shaped parts, at most LAUNCH_REFUSED_REASON_MAX characters."""
+    text = re.sub(r"\s+", " ", redact_command_text(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(text)))).strip()
+    return text if len(text) <= LAUNCH_REFUSED_REASON_MAX else text[:LAUNCH_REFUSED_REASON_MAX - 3] + "..."
+
+
+def tell_launch_refused(runner, now, name, reason):
+    """#1464: ONE `[switchboard]` message to the caller: `launch of NAME refused: <reason>`. A caller who cannot be identified (a plain shell, no
+    pane) is told nothing and nothing more is printed; nothing here raises: the refusal's own exit is what the launch returns."""
+    verb = "FAILED after the worker was created" if LAUNCH_AFTER_CREATED.search(str(reason)) else "refused"   # the worker exists: not a refusal
+    text = "launch of %s %s: %s" % (_one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(name)), 80), verb, launch_refusal_reason(reason))
+    engine = None
+    try:
+        engine, _, _ = build_engine(runner, now, "cli")
+        caller = identify_caller(engine.herdr, engine.v2, os.environ)
+        discovery = engine.discover(engine.now())
+        fact = Fact("launch.refused:%s:%s" % (caller, uuid.uuid4().hex[:16]), caller, "launch.failed" if verb[0] == "F" else "launch.refused", text, engine.now(), batch=False, sender="switchboard")
+        engine.send_fact(fact, discovery, engine.now())
+    except Exception as err:   # nothing more is printed (what a refused launch prints stays as it is): the audit line, when there is a log, is the record
+        try:
+            if engine is not None and engine.audit is not None:
+                engine.audit.append(engine.actor, "launch.refusal_unsent", str(name)[:80], {"why": _one_line(str(err), 160)})
+        except Exception:
+            pass
+
+
+def cmd_launch(args, runner, now, socket_call=None):
+    """`_cmd_launch`, and a refusal of it (a LaunchError, or any exit but OK) tells the caller once (#1464); what it prints and returns is unchanged."""
+    tee, real = _StderrTee(sys.stderr), sys.stderr
+    sys.stderr = tee
+    try:
+        code = _cmd_launch(args, runner, now, socket_call)
+    except LaunchError as err:
+        sys.stderr = real
+        tell_launch_refused(runner, now, getattr(args, "name", "?"), str(err))
+        raise
+    finally:
+        sys.stderr = real
+    if code != EXIT_OK:
+        line = tee.lines[-1] if tee.lines else "exit code %s" % code
+        line = re.sub(r"^%s: " % re.escape(PROG), "", line)
+        tell_launch_refused(runner, now, getattr(args, "name", "?"), line)
+    return code
 
 
 cmd_launch.ensure_on_use = True   # the daemon is alive when it runs
@@ -14534,7 +14613,7 @@ def _cmd_send(args, runner, now):
     if lane_problem:
         sys.stderr.write("%s: not sent, %s\n" % (PROG, lane_problem))
         return EXIT_USAGE
-    verdict = check_approval(config, runner, now, text, repo, number)   # #951: only a message that starts `Approved at sha256:`; GETs only; never raises
+    verdict = check_approval(config, runner, now, text, repo, number, sender)   # #951, #1463: every approval hash in the message; only the Chief of Staff's; GETs only; never raises
     try:
         outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt)
     except InterruptRefused as err:
@@ -14552,49 +14631,122 @@ def _cmd_send(args, runner, now):
     return EXIT_OK
 
 
-def check_approval(config, runner, now, text, repo, number):
-    """#951: None for a message that carries no approval (nothing is read). Otherwise the verdict of `plan_approval.evaluate`, from GET reads of the
-    issue, its comments and (when it has no Done-when of its own) its ask. FAIL MODE: any failure to read is a refusal line, never an error:
-    the message is delivered either way."""
+def _read_for_approval(reader, repo, number):
+    """The GET reads of one issue for an approval (#951): (comments, done_when). Raises on any failure to read."""
+    issue = reader.issue(number, repo)
+    done_when = issue.done_when
+    if not done_when:
+        ask, _ = reader.ask_of(number, repo)
+        done_when = reader.issue(ask, repo).done_when if ask != number else None
+    comments = []
+    for page in range(1, PLAN_COMMENT_PAGES + 1):
+        got = reader._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
+        if not isinstance(got, list):
+            raise IntentError("gh", "the comments did not come back as a list")
+        comments.extend(got)
+        if len(got) < 100:
+            break
+    return comments, done_when
+
+
+def check_approval(config, runner, now, text, repo, number, sender="cos"):
+    """#951, #1463: None for a message that carries no approval (nothing is read). Otherwise a list with one verdict per hash found
+    (`plan_approval.find_approvals`): `plan_approval.evaluate` per candidate issue (the one sent on and the ones the text names, at most
+    10), from GET reads. Only the Chief of Staff's approval is read at all: another sender gets one audit line naming it. FAIL MODE: any
+    failure to read is a refusal line, never an error: the message is delivered either way."""
     module = load_module("plan_approval")
-    value = module.approval_value(text)
-    if value is None:
-        return None
-    if number is None:
-        return {"ok": False, "line": "approval not recorded: the message names no issue (use --issue); the message was delivered"}
     try:
+        sights = module._sightings(text)               # once per message: the three readers share it
+        found = module.find_approvals(text, sights)
+    except Exception:
+        return None
+    try:
+        refused = module.refused_forms(text, sights)
+    except Exception:
+        refused = []
+    if not found and not refused:
+        return None
+    if sender != COS_NAME:
+        return [{"ok": False, "audit": "plan.approval_refused", "sender": sender, "hashes": [f["value"] for f in found] + refused,
+                 "line": "approval not recorded: only the Chief of Staff's approval is recorded, and this message is from %s; the message was delivered" % sender}]
+    lead = [{"ok": False, "audit": "plan.approval_negated_or_quoted", "hashes": refused, "line": "approval not recorded: negated or quoted"}] if refused else []
+    if not found:
+        return lead                                   # a refused form reads no issue
+    if number is None:
+        return lead + [{"ok": False, "line": "approval not recorded: the message names no issue (use --issue); the message was delivered"}]
+    try:
+        plan_check = load_plan_check()
         reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
-        issue = reader.issue(number, repo)
-        done_when = issue.done_when
-        if not done_when:
-            ask, _ = reader.ask_of(number, repo)
-            done_when = reader.issue(ask, repo).done_when if ask != number else None
-        comments = []
-        for page in range(1, PLAN_COMMENT_PAGES + 1):
-            got = reader._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
-            if not isinstance(got, list):
-                raise IntentError("gh", "the comments did not come back as a list")
-            comments.extend(got)
-            if len(got) < 100:
-                break
-        return module.evaluate(value, comments, done_when, load_plan_check())
+        reads, failed = {}, {}
+        for cand in module.candidates(text, repo, number, sights=sights):
+            try:
+                reads[cand] = _read_for_approval(reader, cand[0], cand[1])
+            except Exception as err:
+                failed[cand] = err
+        verdicts = []
+        for item in found:
+            value, matched, first = item["value"], None, None
+            for cand in reads:
+                comments, done_when = reads[cand]
+                verdict = module.evaluate(value, comments, done_when, plan_check)
+                if verdict["ok"] and matched is None:
+                    matched = dict(verdict, repo=cand[0], number=cand[1])
+                elif not verdict["ok"] and verdict.get("plan_hash") and "sha256:" + value.lower() == verdict["plan_hash"] and first is None:
+                    first = verdict                       # the plan is this hash, but the clauses differ (or no Done-when): refused with its reason
+            if matched is not None:
+                verdicts.append(matched)
+            elif first is not None:
+                verdicts.append(first)
+            elif not reads:
+                err = failed.get((repo, number)) or next(iter(failed.values()), "")
+                verdicts.append({"ok": False, "line": "approval not recorded: the issue could not be read (%s); the message was delivered"
+                                 % _one_line(str(err), 120)})
+            else:
+                own = module.evaluate(value, *reads[(repo, number)], plan_check) if (repo, number) in reads else None
+                if not module.HEX64_RE.match(value) and own is not None:
+                    verdicts.append(own)                  # not a full hash: refused as before
+                    continue
+                why = own["line"].split(": ", 1)[1].rsplit("; the message", 1)[0] if own is not None else "the issue could not be read"
+                verdicts.append({"ok": False, "audit": "plan.approval_unmatched", "hashes": [value],
+                                 "line": "approval not recorded: approval for no current plan sha256:%s (%s); the message was delivered" % (value, why)})
+        return lead + verdicts
     except Exception as err:
-        return {"ok": False, "line": "approval not recorded: the issue could not be read (%s); the message was delivered" % _one_line(str(err), 120)}
+        return lead + [{"ok": False, "line": "approval not recorded: the issue could not be read (%s); the message was delivered" % _one_line(str(err), 120)}]
 
 
 def record_approval(engine, verdict, sender, recipient, repo, number):
-    """Audit a passing approval with both hashes, or print the one refusal line. A no-approval message (None) is untouched."""
+    """Audit each passing approval once per hash and issue with both hashes, or print the one refusal line (audited when it names a sender
+    or a hash no plan has). A no-approval message (None) is untouched."""
     if verdict is None:
         return
-    if not verdict["ok"]:
-        sys.stderr.write("%s: %s\n" % (PROG, verdict["line"]))
-        return
-    if engine.audit is not None:
-        try:
-            engine.audit.append(engine.actor, "plan.approved", "%s#%d" % (repo, number),
-                                {"from": sender, "to": recipient, "plan_hash": verdict["plan_hash"], "done_when_hash": verdict["done_when_hash"]})
-        except OSError:
-            pass
+    done = set()
+    if engine.audit is not None:                  # once per hash and issue across sends too: the audit already holds it
+        for entry in _audit_tail(engine.state_dir):
+            detail = entry.get("detail") if entry.get("event") == "plan.approved" else None
+            if isinstance(detail, dict) and detail.get("issue"):
+                done.add((detail.get("plan_hash"), detail["issue"]))
+    for one in ([verdict] if isinstance(verdict, dict) else verdict):
+        if not one["ok"]:
+            sys.stderr.write("%s: %s\n" % (PROG, one["line"]))
+            if one.get("audit") and engine.audit is not None:
+                try:
+                    engine.audit.append(engine.actor, one["audit"], "%s#%s" % (repo, number),
+                                        {"from": sender, "to": recipient, "hashes": one.get("hashes", []), "reason": one["line"][:200]})
+                except OSError:
+                    pass
+            continue
+        target_repo, target = one.get("repo", repo), one.get("number", number)
+        key = (one["plan_hash"], "%s#%d" % (target_repo, target))
+        if key in done:
+            continue
+        done.add(key)
+        if engine.audit is not None:
+            try:
+                engine.audit.append(engine.actor, "plan.approved", "%s#%d" % (target_repo, target),
+                                    {"from": sender, "to": recipient, "plan_hash": one["plan_hash"], "done_when_hash": one["done_when_hash"],
+                                     "issue": "%s#%d" % (target_repo, target)})
+            except OSError:
+                pass
 
 
 def cmd_report(args, runner, now):
@@ -14972,6 +15124,7 @@ class GhAccounts:
         self.paused = {}                         # account -> epoch until which its reads wait (the limit's reset)
         self.limited_once = set()                # accounts whose pause was audited, so it is said once per episode
         self.lock = threading.Lock()             # the hub's threads and the pass read through one gate
+        self._local = threading.local()          # depth of `read` on this thread: a call inside `read` is checked and counted by `read` itself
         self.audit, self.actor = None, "daemon"
         self.conditional = False                 # ask with `-i` and keep the ETag: the daemon turns it on; a one-shot command or a test reads plainly
 
@@ -15069,7 +15222,11 @@ class GhAccounts:
         env = self.env_for(repo) if repo else None
         if env is not None:
             run_kwargs["env"] = env
-        done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
+        self._local.depth = getattr(self._local, "depth", 0) + 1
+        try:
+            done = runner(argv, capture_output=True, text=run_kwargs.pop("text", True), timeout=timeout, **run_kwargs)
+        finally:
+            self._local.depth -= 1
         status, headers, body = _split_http(done.stdout) if use_head else (None, {}, done.stdout)
         with self.lock:
             self.calls.append((now, account, _endpoint_of(path), status == 304))
@@ -15099,6 +15256,31 @@ class GhAccounts:
             if reset is not None:
                 self._pause(account, reset, status)
         return subprocess.CompletedProcess(argv, done.returncode or 1, body, done.stderr or ("HTTP %d" % status))
+
+    def _inside_read(self):
+        return getattr(self._local, "depth", 0) > 0
+
+    def check_pause(self):
+        """For a caller that runs gh through its own runner (the relay): GhRateLimited when ANY account is paused (fail closed: the relay does not know which
+        account its call would use; the cost is availability only). A call made inside `read` is not checked twice: `read` has checked it."""
+        if self._inside_read():
+            return
+        now = self.now()
+        with self.lock:
+            paused = [(a, u) for a, u in self.paused.items() if now < u]
+        if paused:
+            account, until = max(paused, key=lambda x: x[1])
+            raise GhRateLimited(account, until)
+
+    def record(self, kind):
+        """Counts one gh call of a caller outside `read` (kind: who made it). A call made inside `read` is NOT counted here: `read` counts it once, after it ran."""
+        if self._inside_read():
+            return
+        now = self.now()
+        with self.lock:
+            self.calls.append((now, self.describe(None), kind, False))
+            while self.calls and self.calls[0][0] < now - 600:
+                self.calls.popleft()
 
     def read_usage(self):
         """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
@@ -15932,206 +16114,14 @@ def add_intent_parsers(sub):
     sub.add_parser("intents", help="Your open asks, one line each with its Done-when")
 
 
-# ---------------------------------------------------------------- `plan check` (#135, gate G0a)
-
-PLAN_URL_RE = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([0-9]+)(?:#issuecomment-([0-9]+))?/?$")
-PLAN_COMMENT_PAGES = 10
-
-
-class PlanInputError(Exception):
-    """The plan or the ask cannot be read: exit 2."""
-
-
-def parse_plan_source(text, default_repo=None):
-    """(repo, number, comment id or None) from `owner/repo#N`, an issue URL (a `#issuecomment-ID` picks that comment),
-    or a bare `N` / `#N` with `default_repo`. Raises PlanInputError."""
-    text = (text or "").strip()
-    found = PLAN_URL_RE.match(text)
-    if found:
-        return found.group(1), int(found.group(2)), int(found.group(3)) if found.group(3) else None
-    found = re.match(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$", text) or re.match(r"^()#?([0-9]+)$", text)
-    if not found or int(found.group(2)) < 1:
-        raise PlanInputError("%r is not a plan: write owner/repo#N, an issue URL, or --file PATH" % text)
-    repo = found.group(1) or default_repo
-    if not repo:
-        raise PlanInputError("%r names no repo and no intent_repo is configured: write owner/repo#N" % text)
-    return repo, int(found.group(2)), None
-
-
-def plan_comment_choice(body, comments):
-    """(text, source, defects): the ONE rule every reader of an issue's plan applies: the plan select_plan_text picks, with the comment-level
-    defects (a second plan-looking comment naming both ids, a bad receipt) RETURNED beside it, never kept in a global."""
-    text, source = plan_check.select_plan_text(body, comments)
-    return text, source, plan_check.plan_comment_defects(comments)
-
-
-def second_plan_defects(defects):
-    return [d for d in defects if d.get("code") == "second-plan-comment"]
-
-
-def fetch_plan(reader, repo, number, comment_id=None):
-    """(text, source label, done_when of the issue, comment-level defects) read from GitHub with GETs only. `reader` has `_api(path, repo)`.
-    The defects are computed from every comment of the issue also when `comment_id` names one: naming a comment does not skip the report."""
-    try:
-        issue = reader._api("repos/%s/issues/%d" % (repo, number), repo)
-        comments = []
-        for page in range(1, PLAN_COMMENT_PAGES + 1):
-            got = reader._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
-            if not isinstance(got, list):
-                raise PlanInputError("the comments of %s#%d did not come back as a list" % (repo, number))
-            comments.extend(got)
-            if len(got) < 100:
-                break
-    except IntentError as err:
-        raise PlanInputError("cannot read %s#%d: %s" % (repo, number, err)) from None
-    body = issue.get("body") if isinstance(issue, dict) and isinstance(issue.get("body"), str) else ""
-    defects = plan_check.plan_comment_defects(comments)
-    if comment_id is not None:
-        picked = [c for c in comments if isinstance(c, dict) and c.get("id") == comment_id]
-        if not picked:
-            raise PlanInputError("%s#%d has no comment %d" % (repo, number, comment_id))
-        text, source = picked[0].get("body") or "", "comment %d%s" % (comment_id, plan_check.comment_author(picked[0]))
-    else:
-        text, source, defects = plan_comment_choice(body, comments)
-    return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1], defects
-
-
-def _parent_ask_done_when(reader, repo, number):
-    """The Done-when of the ASK that is the native sub-issue parent of issue `number` of `repo`, or None. Like `IntentReader.ask_of`, a parent counts as the ask only
-    when it has a parent of its own (the charter): the issue under a charter is itself the ask, and a charter's Done-when is never borrowed. Anything that is not
-    "the ask of this repository's work item" is REFUSED (PlanInputError), never read as another issue: a parent in another repository (the parent's repository comes
-    from the API payload, the reader's `parent()` keeps only the number), a pull request, the issue itself, and a cycle."""
-    where = "%s#%d" % (repo, number)
-
-    def parent_payload(of):
-        try:
-            found = reader._api("repos/%s/issues/%d/parent" % (repo, of), repo)
-        except IntentError as err:
-            if err.reason == "not_found":
-                return None
-            raise
-        if not isinstance(found, dict) or not isinstance(found.get("number"), int):
-            raise PlanInputError("the parent of %s#%d did not come back as an issue" % (repo, of))
-        if found.get("pull_request"):
-            raise PlanInputError("the parent of %s#%d is a pull request, not an ask" % (repo, of))
-        url = str(found.get("repository_url") or "").lower().rstrip("/")
-        if not url.endswith("/repos/" + repo.lower()):
-            raise PlanInputError("the parent of %s#%d (#%d) is in another repository (%s): a plan reads the Done-when of an ask of its own repository only"
-                                 % (repo, of, found["number"], url.rsplit("/repos/", 1)[-1] or "unknown"))
-        return found
-    try:
-        parent = parent_payload(number)
-        if parent is None:
-            return None
-        if parent["number"] == number:
-            raise PlanInputError("%s is its own parent" % where)
-        grand = parent_payload(parent["number"])
-        if grand is None:
-            return None
-        if grand["number"] in (number, parent["number"]):
-            raise PlanInputError("the parent chain of %s loops back on itself" % where)
-        return reader.issue(parent["number"], repo).done_when
-    except IntentError as err:
-        raise PlanInputError("cannot read the parent ask of %s: %s" % (where, err)) from None
-
-
-def load_plan(args, runner, now):
-    """(text, source label, result) of the plan `args` names (source, file, ask, done_when), checked. Raises
-    PlanInputError, ValueError (an unreadable block) or the readers' errors."""
-    try:
-        plan_check.MAX_BYTES
-    except Exception as err:  # the module is missing or broken: say so, never a traceback
-        raise PlanInputError("the plan checker (bin/plan_check.py) cannot be loaded: %s" % _one_line(str(err), 150)) from None
-    done_when = args.done_when
-    plan_own = None
-    comment_defects = []
-    if args.file:
-        if args.source:
-            raise PlanInputError("give a plan source or --file, not both")
-        try:
-            with open(args.file, "r", encoding="utf-8") as handle:
-                text = handle.read(plan_check.MAX_BYTES * 4 + 1)
-        except (OSError, UnicodeDecodeError) as err:
-            raise PlanInputError("cannot read %s: %s" % (args.file, getattr(err, "strerror", None) or err)) from None
-        if len(text) > plan_check.MAX_BYTES * 4:
-            raise PlanInputError("%s is larger than %d bytes" % (args.file, plan_check.MAX_BYTES * 4))
-        source = "file %s" % args.file
-        plan_own = parse_intent(text)[1]
-        done_when = done_when or plan_own
-        plan_own = plan_own if done_when != plan_own else None
-    else:
-        if not args.source:
-            raise PlanInputError("give a plan: owner/repo#N, an issue URL, or --file PATH")
-        config = load_config()
-        repo, number, comment_id = parse_plan_source(args.source, config.get("intent_repo"))
-        reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"],
-                              accounts=GhAccounts(config, runner, now))
-        text, source, issue_done, comment_defects = fetch_plan(reader, repo, number, comment_id)
-        if args.ask and not done_when:
-            ask_repo, ask_number, _ = parse_plan_source(args.ask, repo)
-            done_when = reader.issue(ask_number, ask_repo).done_when  # the ask is the authority
-            plan_own = issue_done
-        elif done_when:
-            plan_own = issue_done if issue_done and issue_done != done_when else None
-        else:
-            done_when = issue_done
-            if not done_when:   # a work item states no Done-when of its own: its ask's is the authority (the sub-issue parent, never a "Work item of" line)
-                done_when = _parent_ask_done_when(reader, repo, number)
-    if args.ask and args.file and not args.done_when:
-        raise PlanInputError("--ask needs a plan read from GitHub; for --file give --done-when TEXT")
-    result = plan_check.check(text, done_when, plan_own)
-    if comment_defects:
-        result["defects"] = list(result["defects"]) + list(comment_defects)
-        result["result"] = "fail"
-    return text, source, result
-
-
-def cmd_plan_check(args, runner, now):
-    """`plan check`: read a plan, check it, print PASS or FAIL with one line per defect and the content hash. Exit 0
-    pass, 1 fail, 2 unreadable. Reads only; never writes GitHub."""
-    def finish(code, payload, lines, error=None):
-        if args.json:
-            print(json.dumps(payload, sort_keys=True))
-        elif error:
-            sys.stderr.write("%s: plan check: %s\n" % (PROG, error))
-        else:
-            print("\n".join(lines))
-        return code
-
-    try:
-        text, source, result = load_plan(args, runner, now)
-    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
-        return finish(EXIT_USAGE, {"result": "error", "error": _one_line(str(err), 300)}, [], _one_line(str(err), 300))
-    result["source"] = source
-    return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source, explaining=getattr(args, "explain", False)))
-
-
-def cmd_plan_template(args, runner, now):
-    """`plan template <ask>` (or `--done-when TEXT`): print a prefilled plan for the ask: its Done-when clauses numbered and one scenario stub
-    per clause. Reads only (a GET of the ask); never writes GitHub. Exit 0, or 2 when the ask or its Done-when cannot be read."""
-    try:
-        done_when, source = args.done_when, None
-        if not done_when:
-            if not args.ask:
-                raise PlanInputError("give the ask (owner/repo#N) or --done-when TEXT")
-            config = load_config()
-            repo, number, _ = parse_plan_source(args.ask, config.get("intent_repo"))
-            reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
-            done_when, source = reader.issue(number, repo).done_when, "%s#%d" % (repo, number)
-        clauses = plan_check.clauses_of(done_when)
-        if not (done_when or "").strip() or not clauses:
-            raise PlanInputError("the ask has no Done-when line: nothing to prefill (write the plan by hand, or add the Done-when first)")
-    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
-        sys.stderr.write("%s: plan template: %s\n" % (PROG, _one_line(str(err), 300)))
-        return EXIT_USAGE
-    print("\n".join(plan_check.template(clauses, _plain(source, 120) if source else None)))
-    return EXIT_OK
-
-
 # ---------------------------------------------------------------- `prove`, `verdict`, `gates` (#107): the evidence ledger
 
 PLAN_LINE_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
 LEDGER_PR_PATTERN = r"owner/repo#N or the PR's URL"
+
+
+class PlanInputError(Exception):
+    """The plan or the ask cannot be read: exit 2."""
 
 
 class LedgerCommandError(Exception):
@@ -16392,9 +16382,10 @@ def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now
     return {"facts": facts, "plan": plan, "plan_problem": problem}
 
 
-def _ledger_context(args, runner, now, writable, parts=None, floor=False):
+def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_read=True):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
-    (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
+    (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built. `plan_read=False` skips the read of the plan
+    (the relay's link check needs only the PR and the plan's source: one GitHub read)."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
@@ -16414,7 +16405,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
     plan, plan_problem = None, None
-    if source:
+    if source and plan_read:
         record_step("a GitHub read of the plan %s" % source)
         try:
             plan = checked_plan(config, source, args.ask, runner, now)
@@ -16523,6 +16514,24 @@ def _record(ctx, args, now, entry):
     return stored, already
 
 
+def tree_file_exists(runner=None):
+    """(#1405) `exists(path)` for `plan_ledger.proof_files`: True for a regular file of the working tree the command runs in (not the pull request head's tree), found under the git top level (else the current directory),
+    never outside it. Any trouble reading is "no such file"."""
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+        root = Path(top.stdout.strip() if top.returncode == 0 and top.stdout.strip() else os.getcwd()).resolve()
+    except (OSError, subprocess.SubprocessError):
+        root = Path(os.getcwd()).resolve()
+
+    def exists(path):
+        try:
+            found = (root / path).resolve()
+            return root in found.parents and found.is_file()
+        except (OSError, ValueError):
+            return False
+    return exists
+
+
 def _evidence(args):
     text = plan_ledger.clip(redact_command_text(args.evidence), plan_ledger.EVIDENCE_LIMIT)
     if not text:
@@ -16561,10 +16570,13 @@ def cmd_prove(args, runner, now):
             head = _head_of(ctx, args)
             common = (head, _evidence(args))
         head, evidence = common
+        files = sorted(set(args.file)) if getattr(args, "file", None) else None
+        if files is None:   # #1405: no --file: name the existing files of the tree the command or the evidence names
+            files = plan_ledger.proof_files(args.command, evidence, tree_file_exists(runner))
         entry = {"kind": "proof", "pr": ctx.pr, "scenario": sid, "plan_ref": ctx.source,
                  "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                  "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
-                 **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {}),
+                 **({"files": files} if files else {}),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
         try:
             stored, already = _record(ctx, args, now, entry)
@@ -16575,6 +16587,8 @@ def cmd_prove(args, runner, now):
         outcomes.append((stored, already))
         print("%s proof #%d: %s %s at %s (%s), bound to plan %s" % ("already recorded" if already else "recorded", stored["seq"], sid, args.result,
                                                                     head[:8], ctx.pr, entry["plan_hash"][:19]))
+        if files and not getattr(args, "file", None):   # a note on stderr, only when a file was found: the existing output of a proof that names none is pinned by TestPlanLedger
+            print("%s names %d file(s): %s" % (sid, len(files), ", ".join(files)), file=sys.stderr)
     if outcomes:
         print(recorded_line("proof", ctx.pr, common[0], outcomes))
     if refused:
@@ -16719,11 +16733,24 @@ def cmd_waive(args, runner, now):
         _gates_audit(engine, "gate.waiver.refused", pr, {"by": who, "why": "the ledger is not trustworthy"})
         raise LedgerCommandError("refused: the ledger is not trustworthy, nothing was recorded: %s" % problem)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
-    why = item_entry_refusal(engine, repo, number, entries, unreadable)   # #770: a work item's gates are not waived through the pull request command
+    why = item_entry_refusal(engine, repo, number, entries, unreadable, True)   # #770: a work item's gates are not waived through the pull request command
+    ask = ask_subject(engine, repo, number, entries, unreadable, None, runner, now, True) if unreadable and not why else None   # #1347: an ASK issue: the plan hash is its head
+    if unreadable and not why and ask is None:
+        why = item_entry_refusal(engine, repo, number, entries, unreadable)
     if why:
         _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "waive"})
         raise LedgerCommandError("refused: %s" % why)
-    ctx = types.SimpleNamespace(facts=dict(facts or {}, body=body, notice_senders=senders), unreadable=unreadable)
+    if ask is not None:
+        if gates != ["CU"]:
+            raise LedgerCommandError("refused: only CU can be waived for an ask issue (%s), nothing was recorded" % pr)
+        facts, senders = ask["facts"], ()
+        probe = types.SimpleNamespace(pr=args.pr, plan=None, ask=None)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            closable = cmd_gates_ask_close(probe, runner, now) == EXIT_OK   # the ONE closing rule: an ask it passes needs no waiver
+        if closable:
+            print("nothing recorded: `gates ask-close` does not refuse %s, so there is nothing to waive" % pr)
+            return EXIT_OK
+    ctx = types.SimpleNamespace(facts=dict(facts or {}, body=body, notice_senders=senders), unreadable=None if ask else unreadable)
     head = _head_of(ctx, args)
     writers = plan_ledger.authors_of(entries, pr, senders, (facts or {}).get("author"))
     if who in writers:
@@ -16879,12 +16906,19 @@ def cmd_gates(args, runner, now):
     carry_refused = (ctx.facts.get("carries") or {}).get("refusal")
     report["impact_rating"] = gate_impact_rating(ctx.state, ctx.pr, ctx.facts.get("head"))   # #892: output text only; no gate reads it
     gates_carried_note(report, ctx)
+    head_lines = gates_head_lines(ctx, report)
+    if head_lines:
+        report["head_lines"] = head_lines
     claim_union_note(report, ctx, runner, now)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
+    standing_lines = []   # #1404: every call lists each standing change request by the shim's rule, whatever the decision field says (the decision only widens the rule, as at the shim)
+    if isinstance(ctx.facts, dict) and not ctx.unreadable and not getattr(ctx, "ask_issue", False):   # an issue subject has no pull request: no reviews to list
+        standing_lines = blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head"),
+                                               "CHANGES_REQUESTED" if ctx.facts.get("review") == "changes requested" else "", gates_caller_name(runner, now))
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
     if args.json:
@@ -16894,6 +16928,8 @@ def cmd_gates(args, runner, now):
             report["rating_block"] = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head"))
         if shares:
             report["shares"] = shares
+        if standing_lines:
+            report["blocking_reviews"] = standing_lines
         print(json.dumps(report, sort_keys=True))
     else:
         lines = plan_ledger.render_gates(report, ctx.pr)
@@ -16905,8 +16941,11 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
-        if isinstance(ctx.facts, dict) and ctx.facts.get("review") == "changes requested" and not ctx.unreadable:
-            lines.extend(blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head")))   # #1123: GitHub's decision blocks the merge; say who and how to clear it
+        if standing_lines:
+            lines.extend(standing_lines)
+            verdict = standing_verdict_line(ctx.pr, standing_lines)
+            if verdict:
+                lines.append(verdict)
         note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
         if note:
             lines.append("rating: %s" % note)
@@ -16929,6 +16968,14 @@ def cmd_gates_ask_close(args, runner, now):
     if ctx.plan is None or ctx.plan["result"] != "pass":
         raise LedgerCommandError("cannot close %s: %s" % (ctx.pr, ctx.plan_problem or "its plan fails `plan check`"))
     head = ctx.facts.get("head")
+    found = unclaimed_verdict(args, ctx, runner, now)   # #1347: the ONE rule of the merge gate; a read that fails is said, never raised
+    if found and found[2]:
+        print("refused: %s stays open: %s unclaimed by any merged pull request; closed without a merge: %s" % (ctx.pr, ", ".join(found[2]), ", ".join("#%s" % n for n in found[3])), file=sys.stderr)
+        return EXIT_ERROR
+    if found:
+        print("note: closed pull requests of %s not judged: %s" % (ctx.pr, found[1]), file=sys.stderr)
+        print("refused: %s stays open: %s failed (%s); the chief of staff can log a waiver: `waive %s --gates CU --reason \"...\"`" % (ctx.pr, found[0], PEERS_TOO_MANY if found[0] == "too many pull requests" else found[1], ctx.pr), file=sys.stderr)
+        return EXIT_ERROR
     authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
     rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"]]
     open_rows = [r for r in rows if r["status"] != "ok"]
@@ -18668,19 +18715,39 @@ def claim_union_refusal(args, runner, now):
         if not found:
             return refuse("unknown sibling", "this merged pull request has no claim recorded at or before its merge: its claim is unknown; the gate fails closed for a pull request with a claim line") if claiming else None
         body = plan_ledger.claim_body(text)
+    found = unclaimed_verdict(args, ctx, runner, now, body)
+    if found is None:
+        return None
+    return plan_ledger.union_refusal(ctx.pr, found[2], found[3]) if found[2] else "merge of %s refused: %s" % (ctx.pr, found[1]) + CU_HINT % ctx.pr
+
+
+def unclaimed_verdict(args, ctx, runner, now, body=None):
+    """#1347: THE ONE rule of 'unclaimed because of closed pull requests / too many / waived', called by the merge gate (`body` = this pull request's body) and by `gates ask-close`
+    (`body` None: the ask has no subject pull request). (what, detail, uncovered, closed numbers) when refused (`uncovered` is [] for a read that failed: `detail` says why, naming the bound
+    `too many pull requests to judge`), None when nothing is unclaimed, when this pull request has no claim line and a read failed, or when a head-bound `CU` waiver is logged."""
+    scenarios, closed = ctx.plan["scenarios_parsed"], []
     try:
-        peers = plan_peers(ctx, runner, now)
+        peers = plan_peers(ctx, runner, now, closed if body is None else None)   # the merge gate's union read stays the plain one
     except Exception as err:
-        if plan_ledger.pr_claim(body, scenarios)[0] is None:
+        if body is not None and plan_ledger.pr_claim(body, scenarios)[0] is None:
             return None   # a pull request with no claim line claims every per-PR scenario: the union is covered whatever the peers say (docs/switchboard.md)
         what = "unknown sibling" if isinstance(err, ClaimUnknown) else "too many pull requests" if PEERS_TOO_MANY in str(err) else "list error"
-        return refuse(what, "the claim union could not be read (%s); the gate fails closed for a pull request with a claim line" % _one_line(str(err), 100))
-    applies, uncovered, last = plan_ledger.claim_union(scenarios, body, peers)
-    if not (applies and last and uncovered):
-        return None
-    if _cu_waived(args, runner, now, "uncovered scenarios: " + ", ".join(uncovered), ctx):
-        return None
-    return plan_ledger.union_refusal(ctx.pr, uncovered)
+        found = (what, "the claim union could not be read (%s); the gate fails closed for a pull request with a claim line" % _one_line(str(err), 100), [], [])
+    else:
+        lost, gone = plan_ledger.closed_unclaimed(scenarios, peers, closed) if body is None else (None, None)
+        if body is not None:
+            applies, lost, last = plan_ledger.claim_union(scenarios, body, peers)
+            lost, gone = (lost, []) if applies and last else ([], [])
+            if lost:   # one more bounded read, only on the refusal path, to name the closed pull requests
+                try:
+                    plan_peers(ctx, runner, now, closed)
+                    gone = [n for n, _ in closed]
+                except Exception:
+                    gone = None   # said by union_refusal: the closed pull requests could not be read
+        if not lost:
+            return None
+        found = ("uncovered scenarios: " + ", ".join(lost), None, lost, gone)
+    return None if _cu_waived(args, runner, now, found[0], ctx) else found
 
 
 def claim_union_note(report, ctx, runner, now):
@@ -18730,7 +18797,7 @@ class _CarryDone(Exception):
     pass
 
 
-def carry_head_facts(get, repo, old_head, new_head):
+def carry_head_facts(get, repo, old_head, new_head, base=None):
     """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
     "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
@@ -18746,6 +18813,9 @@ def carry_head_facts(get, repo, old_head, new_head):
         default = get("repos/%s" % repo).get("default_branch")
         inside = get("repos/%s/compare/%s...%s" % (repo, default, parents[1]))
         merge = isinstance(inside, dict) and inside.get("status") in ("behind", "identical")
+        if not merge and base and base != default:   # #1405: a merge of the pull request's own base (an integration branch) counts as the default branch does
+            inside = get("repos/%s/compare/%s...%s" % (repo, base, parents[1]))
+            merge = isinstance(inside, dict) and inside.get("status") in ("behind", "identical")
     runs = (get("repos/%s/commits/%s/check-runs" % (repo, new_head)) or {}).get("check_runs") or []
     green = bool(runs) and all(r.get("status") == "completed" and r.get("conclusion") in ("success", "neutral", "skipped") for r in runs)
     return {"files": files, "merge_of_default": merge, "ci_green": green}
@@ -18784,6 +18854,34 @@ def carry_proofs(state, pr, plan, old_head, new_head, facts, now):
                 continue
         out.append({"proof": row["seq"], "scenario": sid, "verdict": verdict, "reason": reason})
     return out
+
+
+def gates_head_lines(ctx, report, get=None):
+    """(#1405) One line per scenario of the plan that has a proof: proven at this head, carried, or void naming the first named file that changed (see `plan_ledger.head_view`).
+    Reads GitHub with GETs only, one compare per old head, through the same `carry_head_facts` the carry uses (so a compare of 300 files or more, or a head that is not a
+    descendant, is `unknown`). Any read that fails is `unknown`, never a change or no change."""
+    head = (ctx.facts or {}).get("head")
+    if not head or ctx.plan is None or ctx.plan.get("result") != "pass" or ctx.unreadable:
+        return []
+    reader, cache = get, {}
+
+    def files_between(old):
+        if old not in cache:
+            try:
+                nonlocal reader
+                reader = reader or carry_get(ctx.engine, ctx.repo)
+                cache[old] = carry_head_facts(reader, ctx.repo, old, head)["files"]
+            except Exception:
+                cache[old] = None
+        return cache[old]
+    lines = []
+    for scenario in ctx.plan["scenarios_parsed"]:
+        if plan_ledger.claim_of(scenario) != "pr":
+            continue
+        line = plan_ledger.head_view(scenario["id"], plan_ledger.evaluator_of(scenario), ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, files_between)
+        if line:
+            lines.append(line)
+    return lines
 
 
 def gates_carried_note(report, ctx):
@@ -19174,6 +19272,15 @@ def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, dep
     return "the process chain is deeper than %d: it cannot be established" % depth
 
 
+def gates_caller_name(runner, now):
+    """The caller's fleet name, or "" when the caller is not a fleet agent (it owns no review)."""
+    try:
+        kind = gates_caller_kind(runner, now)
+        return kind[1] if kind[0] == "agent" else ""
+    except Exception:
+        return ""
+
+
 def gates_caller_kind(runner, now):
     """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
     decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on`, `move` (its operator path) and `waive` (its chief-of-staff caller is an agent
@@ -19409,7 +19516,13 @@ def carry_at_green(ctx, now, get=None, green=True):
     if not old:
         return []
     try:
-        facts = carry_head_facts(get or carry_get(ctx.engine, ctx.repo), ctx.repo, old, head)
+        reader = get or carry_get(ctx.engine, ctx.repo)
+        base = None
+        try:   # #1405: the pull request's base branch (an integration branch): a merge of it carries like a merge of the default branch; a failed read is the default branch alone
+            base = ((reader("repos/%s/pulls/%d" % (ctx.repo, ctx.number)) or {}).get("base") or {}).get("ref")
+        except Exception:
+            base = None
+        facts = carry_head_facts(reader, ctx.repo, old, head, base) if isinstance(base, str) and base else carry_head_facts(reader, ctx.repo, old, head)
         facts["ci_green"] = green and (ctx.facts or {}).get("ci") == "green"
         ci_ids = {x["id"] for x in ctx.plan["scenarios_parsed"] if plan_ledger.evaluator_of(x) == "ci"}   # re-recorded at each green head, never carried: not a refusal to print
         return [d for d in carry_proofs(ctx.state, ctx.pr, ctx.plan, old, head, facts, now()) if d["scenario"] not in ci_ids]
@@ -19948,81 +20061,9 @@ def add_ledger_parsers(sub):
     check.add_argument("--json", action="store_true")
 
 
-# ---------------------------------------------------------------- `review-laws install` (#179, slice L1)
-
-REVIEW_LAWS_FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md")
-REVIEW_LAWS_EDIT = {
-    "REVIEW_LAWS.md": "the verdict format, the matrix cells you tighten (never loosen), and the floor paths your repository names",
-    "CODING_STANDARDS.md": "add the rules your repository's own code needs; remove none without saying why",
-    "SECURITY_STANDARDS.md": "add the rules for your repository's own identities, secrets and permissions",
-    "TEST_STANDARDS.md": "add how your repository's tests are run in CI and what they must cover",
-}
-
-
-def review_laws_source():
-    return Path(os.path.realpath(__file__)).parent.parent / "docs" / "review-laws"
-
-
-def cmd_review_laws(args, runner, now):
-    """`review-laws install <repo path>`: copy the generic starter set (REVIEW_LAWS.md, CODING_STANDARDS.md, SECURITY_STANDARDS.md,
-    TEST_STANDARDS.md, each opening with `extends: fleet-kit-review-laws @ review-laws-<n>`) to the root of a repository and say what to edit. It
-    writes only those files, never overwrites one the repository already has (`--force` replaces it), and touches nothing else (not
-    AGENTS.md: the laws must not contradict it, so the pointer line is the repository's own edit)."""
-    source = review_laws_source()
-    try:
-        version = (source / "VERSION").read_text().strip()
-        texts = {name: (source / name).read_text() for name in REVIEW_LAWS_FILES}
-    except OSError as err:
-        sys.stderr.write("%s: review-laws: the starter set is not readable (%s): %s\n" % (PROG, source, getattr(err, "strerror", None) or err))
-        return EXIT_USAGE
-    target = Path(args.repo).expanduser()
-    if not target.is_dir():
-        sys.stderr.write("%s: review-laws: %s is not a directory\n" % (PROG, args.repo))
-        return EXIT_USAGE
-    header = "extends: fleet-kit-review-laws @ %s" % version
-    bad = [n for n, text in texts.items() if text.splitlines()[0] != header]
-    if bad:
-        sys.stderr.write("%s: review-laws: the starter set is inconsistent: %s do not open with %r\n" % (PROG, ", ".join(bad), header))
-        return EXIT_USAGE
-    links = [n for n in REVIEW_LAWS_FILES if os.path.islink(str(target / n))]   # a link (even a dangling one) is never replaced, forced or not
-    if links:
-        sys.stderr.write("%s: review-laws: %s is a symbolic link in %s: nothing was written (a link could send the copy somewhere else; remove it yourself)\n"
-                         % (PROG, ", ".join(links), target))
-        return EXIT_USAGE
-    existing = [n for n in REVIEW_LAWS_FILES if os.path.lexists(str(target / n))]
-    if existing and not args.force:
-        sys.stderr.write("%s: review-laws: %s already has %s: nothing was written (the repository's own copies are its law; --force replaces them)\n"
-                         % (PROG, target, ", ".join(existing)))
-        return EXIT_USAGE
-    written = []
-    for name in REVIEW_LAWS_FILES:
-        temp = target / (".%s.%d.tmp" % (name, os.getpid()))
-        try:
-            temp.write_text(texts[name])
-            os.replace(str(temp), str(target / name))
-        except OSError as err:
-            try:
-                temp.unlink()
-            except OSError:
-                pass
-            sys.stderr.write("%s: review-laws: could not write %s: %s (written so far: %s)\n"
-                             % (PROG, name, getattr(err, "strerror", None) or err, ", ".join(written) or "none"))
-            return EXIT_ERROR
-        written.append(name)
-    lines = ["review laws (%s) installed in %s. What to edit:" % (version, target)] + ["  %s: %s" % (n, REVIEW_LAWS_EDIT[n]) for n in written]
-    lines.append("Next: keep the `extends:` line (it says which version you started from); make sure the laws do not contradict your AGENTS.md "
-                 "(leave a pointer line there for any hygiene rule you moved); reviewers read these files from the base branch of a pull request.")
-    if (target / "AGENTS.md").exists():
-        lines.append("Your repository has an AGENTS.md: it was not touched.")
-    print("\n".join(lines))
-    return EXIT_OK
-
-
-cmd_review_laws.direct = True   # no error mapping, no daemon start
-
-
 # ---------------------------------------------------------------- `review record` and `review laws` (#179, slice L2)
 
+REVIEW_LAWS_FILES = ("REVIEW_LAWS.md", "CODING_STANDARDS.md", "SECURITY_STANDARDS.md", "TEST_STANDARDS.md")
 REVIEW_LAW_FILES = REVIEW_LAWS_FILES + ("REVIEW_OVERLAY.md",)   # the laws a reviewer loads, and the repository's own overlay
 REVIEW_FILE_MAX = 30000      # bytes of one law file a reviewer is shown
 REVIEW_TOTAL_MAX = 90000     # bytes of all of them together
@@ -20210,7 +20251,7 @@ def whole_read_problem(files_read, listed, bounds=None):
         if total < bound or read < bound:
             return "%s: the row says %d lines read of %d in its diff, but GitHub counts %d added and deleted lines, so its diff has at least %d (the bound): read it again to its last line and count them" % (_printable_path(path), read, total, bound, bound)
         if read < total:
-            return "%s was read to line %d of %d: the first unread line is line %d (chunks of %d lines; read every file to its last line)" % (_printable_path(path), read, total, read + 1, RATER_CHUNK_LINES)
+            return "%s was read to line %d of %d: the first unread line is line %d (chunks of %d lines; read every file to its last line; a row is `- <path> | <lines read> | <lines in its diff>`, and the third field is the line count of that file's diff, not the changed file's length)" % (_printable_path(path), read, total, read + 1, RATER_CHUNK_LINES)
     return None
 
 
@@ -20463,6 +20504,9 @@ def cmd_review_post(args, runner, now):
         if notice:
             print("note: " + notice)
         print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name) + (" (posted as a comment)" if notice else ""))
+        if args.verdict == "approve":
+            for line in review_dismiss_offer(engine, runner, now, repo, number, ref, name, head):
+                print(line)
         return EXIT_OK
     except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
         review_refusal_audit(seen.get("engine"), "review.post.refused", seen.get("ref"), seen.get("name"), seen.get("head"), str(err), verdict=args.verdict) if seen.get("name") and seen.get("ref") else None
@@ -20570,23 +20614,62 @@ def rest_review_as_view(review):
     """A Reviews-API review in the shape `gh pr view --json reviews` gives the shim's rule (author.login, commit.oid)."""
     user = review.get("user") if isinstance(review.get("user"), dict) else {}
     return {"author": {"login": user.get("login")} if user.get("login") else None, "state": review.get("state"),
-            "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id")}
+            "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id"), "submitted_at": review.get("submitted_at")}
 
 
-def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED"):
-    """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks."""
-    ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number))
+def standing_requests(engine, runner, now, repo, number, head="", decision="", fresh=False):
+    """(rows, problem): the standing CHANGES_REQUESTED reviews of ONE pull request, by the SAME rule as the merge shim (`shims/review_rule.py`, never a copy), each
+    row {login, name, id, commit, age}; `problem` is a one-line cause when the list could not be read whole or the rule file is unreadable (never an empty `rows`)."""
+    try:
+        ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number), fresh=fresh)
+    except Exception as err:   # a read that cannot even be made is unreadable, never "none", and never raises out of `gates`
+        ok, reviews, why = False, None, type(err).__name__
     if not ok:
-        return ["blocking review: the reviews could not be read whole (%s): not listed" % why]
+        return [], "the reviews could not be read whole (%s): not listed" % why
     try:
         rule = load_review_rule()
     except Exception:
-        return ["blocking review: the rule file shims/review_rule.py is unreadable: blocking reviews not listed"]
+        return [], "the rule file shims/review_rule.py is unreadable: blocking reviews not listed"
     rows = []
     for login, review in rule.blocking_reviews([rest_review_as_view(r) for r in reviews if isinstance(r, dict)], head or "", decision):
-        rows.append("blocking review: %s CHANGES_REQUESTED at %s (dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
-            signed_by_fleet(review.get("body")) or login, str(review["commit"]["oid"] or "unknown")[:12], pr, review.get("id")))
-    return rows
+        stamp = parse_iso(review.get("submitted_at")) if isinstance(review.get("submitted_at"), str) else None
+        rows.append({"login": login, "name": signed_by_fleet(review.get("body")) or login, "id": review.get("id"),
+                     "commit": str(review["commit"]["oid"] or "unknown")[:12], "age": None if stamp is None else max(0, int(now() - stamp))})
+    return rows, ""
+
+
+def review_age_text(seconds):
+    """`3d`, `5h`, `12m` or `unknown age` for the age of a review."""
+    return "unknown age" if seconds is None else "%dd" % (seconds // 86400) if seconds >= 172800 else _age_text(seconds)
+
+
+def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED", caller=None):
+    """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks.
+    Each names the review id, the commit, the author's fleet name and its age (#1404)."""
+    rows, problem = standing_requests(engine, runner, now, repo, number, head, decision)
+    if problem:
+        return ["blocking review: " + problem]
+    def how(row):   # the command is named only for the caller's OWN review (`caller` None: no identity given, the command is named for each)
+        if caller is None or row["name"] == caller:
+            return "dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT" % (pr, row["id"])
+        return "ask %s or a person to dismiss it" % row["name"]
+    return ["blocking review: %s CHANGES_REQUESTED at %s (review %s, %s old; %s)" % (
+        row["name"], row["commit"], row["id"], review_age_text(row["age"]), how(row)) for row in rows]
+
+
+def standing_verdict_line(pr, lines):
+    """The verdict-list line (#1404) naming the pull request as blocked by its standing requests, or None; read off the `blocking review:` lines (`review NN`), so it can never disagree with them."""
+    ids = [m.group(1) for m in (re.search(r"\(review (\S+),", l) for l in lines if l.startswith("blocking review:")) if m]
+    return "  BLOCKED: %s has %d standing change request(s) (review %s): a merge is refused until each is dismissed or approved over (a request tagged or recorded in another way is not covered: no BLOCKED line is not proof that a merge passes)" % (pr, len(ids), ", ".join(ids)) if ids else None
+
+
+def review_dismiss_offer(engine, runner, now, repo, number, ref, name, head):
+    """Lines of the offer after an APPROVE (#1404): the exact `review dismiss` command for the reader's OWN older standing change requests of this pull request. It only READS and prints: nothing is dismissed here."""
+    rows, problem = standing_requests(engine, runner, now, repo, number, "", "", fresh=True)   # the shared rule (head unknown: an older-head request is not dropped by the head test, only by a later review): a request a later approval superseded is not listed, so never offered
+    if problem:
+        return ["note: older change requests of yours could not be listed (%s): check `fleet-switchboard gates %s`" % (_one_line(problem, 120), ref)]
+    return ["note: your earlier change request %s (at %s): dismiss it if it is fixed: fleet-switchboard review dismiss %s --review %s --reason TEXT (this approve did not dismiss it and nothing here does)"
+            % (r["id"], r["commit"], ref, r["id"]) for r in rows if r["name"] == name and r["commit"].lower() != head[:12].lower()]   # the offer is for requests of an OLDER commit
 
 
 @recording("review_record", applies=is_review_record)
