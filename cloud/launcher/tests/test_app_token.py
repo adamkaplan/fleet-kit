@@ -374,7 +374,7 @@ class Mint(unittest.TestCase):
                 app_token.github_json("GET", "/x", "jwt")
         finally:
             app_token.open_url = orig
-        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(cm.exception.code, 75)
 
     def test_a_rate_limit_says_so_and_when_to_retry(self):
         for hdr, want in (("30", "Retry after 30 seconds"), ("Wed, 21 Oct 2026 07:28:00 GMT", "Retry later"), (None, "Retry later")):
