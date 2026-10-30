@@ -1,0 +1,249 @@
+"""#1665: the end hook keeps git's refusal lines, bounded and scrubbed.
+
+The error of a failed git call carries the last EIGHT lines of git's standard error, at most 600 characters, joined on one line with ' | ',
+each line scrubbed (key-shaped runs, an address with a credential and control characters become a fixed word), the last line always last.
+A FAKE git (a small script, written here) prints the lines the case needs; the hook runs as a program with its git path pointed at the fake.
+Mutants (scratch copies of the hook OUTSIDE the repository) run this file as a child through stub_support.start.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LAUNCHER = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "..", "worker", "tests"))
+import stub_support  # noqa: E402
+import test_token_at_limit as tl  # noqa: E402  (its harness: a running worker, the fake cluster, a scripted end hook)
+
+HOOK_ENV = "CW_TEST_END_HOOK"
+INNER_ENV = "CW_TEST_INNER_RUN"
+SUMMARY = "error: failed to push some refs to 'https://github.com/acme-org/widget-service.git'"
+REJECTED = " ! [rejected]        HEAD -> coder7/wip (non-fast-forward)"
+KEY = "ghp_" + "Zk9Wp3Qx7Lm2" * 3
+HEXRUN = "0123456789abcdef" * 3
+CRED = "https://deploy:hunter2pass@example.invalid/acme.git"
+ESC = "\x1b[31m"
+
+# The fake git: every call succeeds and prints nothing, except `log` (one unpushed commit unless FAKE_MODE is nothing) and the push, whose
+# standard error is the file FAKE_LINES (FAKE_MODE refuse), or which succeeds (FAKE_MODE ok / nothing).
+FAKE_GIT = (
+    "#!/usr/bin/env python3\n"
+    "import os, sys\n"
+    "args = sys.argv[1:]\n"
+    "verb = next((a for a in args if a in ('push', 'log')), '')\n"
+    "mode = os.environ.get('FAKE_MODE', '')\n"
+    "if verb == 'log' and mode != 'nothing':\n"
+    "    print('0123456789abcdef0123456789abcdef01234567')\n"
+    "if verb == 'push' and mode == 'refuse':\n"
+    "    sys.stderr.write(open(os.environ['FAKE_LINES']).read())\n"
+    "    sys.exit(1)\n")
+DRIVER = (
+    "import importlib.util, sys\n"
+    "sp = importlib.util.spec_from_file_location('h', sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)\n"
+    "m.GIT_BIN = sys.argv[2]\n"
+    "sys.exit(m.main())\n")
+
+
+def read_hook():
+    with open(os.path.join(LAUNCHER, "end_hook.py")) as f:
+        return f.read()
+
+
+def write_copy(directory, old, new):
+    src = read_hook()
+    assert src.count(old) == 1, "the mutation did not apply"
+    path = os.path.join(directory, "end_hook.py")
+    with open(path, "w") as f:
+        f.write(src.replace(old, new))
+    return path
+
+
+def last_line_copy(directory):
+    """A build that keeps only the last line (the base)."""
+    return write_copy(directory, "raise GitFailed(refusal_text(lines), lines[-1])", "raise GitFailed(lines[-1], lines[-1])")
+
+
+def no_bound_copy(directory):
+    """A build with no bound."""
+    return write_copy(directory, 'REFUSAL_LINES, REFUSAL_CHARS, REMOVED = 8, 600, "<removed>"', 'REFUSAL_LINES, REFUSAL_CHARS, REMOVED = 1000, 10 ** 6, "<removed>"')
+
+
+def no_scrub_copy(directory):
+    """A build that does not scrub."""
+    return write_copy(directory, "take = [scrub_line(l) for l in lines[-REFUSAL_LINES:]]", "take = list(lines[-REFUSAL_LINES:])")
+
+
+class Scratch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.t = self.tmp.name
+        self.fake = os.path.join(self.t, "git")
+        with open(self.fake, "w") as f:
+            f.write(FAKE_GIT)
+        os.chmod(self.fake, 0o755)
+        self.work = os.path.join(self.t, "work")
+        os.makedirs(os.path.join(self.work, ".git"))
+        self.driver = os.path.join(self.t, "driver.py")
+        with open(self.driver, "w") as f:
+            f.write(DRIVER)
+
+    def hook(self, lines=None, mode="refuse", path=None, **env):
+        listing = os.path.join(self.t, "lines")
+        with open(listing, "w") as f:
+            f.write("".join(l + "\n" for l in (lines or [])))
+        e = dict(os.environ, CW_WORKDIR=self.work, CW_WORKER="coder7", FAKE_MODE=mode, FAKE_LINES=listing)
+        e.update(env)
+        path = path or os.environ.get(HOOK_ENV) or os.path.join(LAUNCHER, "end_hook.py")
+        e.pop(HOOK_ENV, None)
+        p = subprocess.run([sys.executable, self.driver, path, self.fake], env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        return p.returncode, json.loads(p.stdout.strip().splitlines()[-1])
+
+    @staticmethod
+    def refusal(n_noise=2, width=0):
+        noise = ["remote: noise line %02d %s" % (i, "word " * (width // 5)) for i in range(n_noise)]
+        return ["To https://github.com/acme-org/widget-service.git", REJECTED] + noise + [SUMMARY]
+
+
+def segments(error):
+    return error.count(" | ") + 1
+
+
+class S2Refused(Scratch):
+    def test_the_error_holds_the_rejected_line_and_ends_in_the_summary(self):
+        code, ans = self.hook(self.refusal(0))
+        err = ans["error"]
+        self.assertEqual(code, 1)
+        self.assertTrue("rejected" in err and "non-fast-forward" in err)
+        self.assertTrue(err.endswith(SUMMARY))
+        self.assertEqual(err.count("\n"), 0)
+        print("S2: error holds rejected and non-fast-forward 1 of 1, ends in the summary 1 of 1, newlines %d" % err.count("\n"))
+
+    def test_a_refusal_with_the_remotes_own_message_keeps_it(self):
+        code, ans = self.hook(["remote: Permission to acme-org/widget-service.git denied", "fatal: unable to access the repository", SUMMARY])
+        self.assertIn("remote: Permission to acme-org/widget-service.git denied", ans["error"])
+        self.assertTrue(ans["error"].endswith(SUMMARY))
+
+
+class S3Bound(Scratch):
+    def test_thirty_lines_are_cut_to_eight_lines(self):
+        code, ans = self.hook(["remote: line %02d of the answer with some words in it" % i for i in range(29)] + [SUMMARY])
+        err = ans["error"]
+        self.assertTrue(segments(err) <= 8 and len(err) <= 600 and err.endswith(SUMMARY))
+        self.assertEqual(segments(err), 8)
+        print("S3: lines %d (at most 8), characters %d (at most 600)" % (segments(err), len(err)))
+
+    def test_long_lines_are_cut_to_the_character_bound(self):
+        code, ans = self.hook(["remote: " + ("word " * 40) + str(i) for i in range(29)] + [SUMMARY])
+        self.assertTrue(len(ans["error"]) <= 600 and ans["error"].endswith(SUMMARY))
+
+
+class S4Scrubbed(Scratch):
+    def test_no_key_no_credential_address_no_control_character_is_kept(self):
+        lines = ["remote: %s here %s %s %s%s" % (KEY, HEXRUN, CRED, ESC, "text") for _ in range(7)] + [SUMMARY + " " + KEY]
+        code, ans = self.hook(lines)
+        err = ans["error"]
+        keys = err.count(KEY) + err.count(HEXRUN) + err.count("Zk9Wp3Qx7Lm2")
+        creds = err.count("hunter2pass") + err.count("deploy:")
+        escapes = err.count("\x1b")
+        self.assertEqual((keys, creds, escapes), (0, 0, 0))
+        self.assertEqual(code, 1)
+        print("S4: key-shaped runs %d, credential addresses %d, escape characters %d" % (keys, creds, escapes))
+
+
+class S5Unchanged(Scratch):
+    def test_refresh_needed_and_the_other_answers(self):
+        code, ans = self.hook(["fatal: Authentication failed for 'https://github.com/acme-org/widget-service.git/'"])
+        self.assertEqual((code, ans.get("refresh"), ans["error"]), (1, "needed", "the git token had ended"))
+        base = last_line_copy(self.t)
+        same = 0
+        for mode in ("ok", "nothing"):
+            a, b = self.hook(mode=mode), self.hook(mode=mode, path=base)
+            self.assertEqual(a[0], 0)
+            same += a == b
+        self.assertEqual(same, 2)
+        print("S5: refresh needed answers 1, other answers equal the base %d of 2" % same)
+
+
+class S6Launcher(tl.Stop):
+    def test_the_audit_line_and_the_run_record_show_the_longer_error_scrubbed_again(self):
+        s = Scratch("setUp")
+        s.t = self.tmp.name
+        s.work = os.path.join(s.t, "w")
+        os.makedirs(os.path.join(s.work, ".git"))
+        s.fake, s.driver = os.path.join(s.t, "git"), os.path.join(s.t, "driver.py")
+        for p, text in ((s.fake, FAKE_GIT), (s.driver, DRIVER)):
+            with open(p, "w") as f:
+                f.write(text)
+        os.chmod(s.fake, 0o755)
+        code, ans = s.hook(["To https://github.com/acme-org/widget-service.git", REJECTED, SUMMARY])
+        planted = "ghp_" + "Qx7Lm2Zk9Wp3" * 3
+        ans = dict(ans, error=ans["error"] + " | later " + planted)   # a key-shaped run the hook missed: the launcher scrubs again
+        res, error = self.run_stop([ans])
+        self.assertIsNotNone(error)
+        reason = self.stop_audit()["reason"]
+        record = json.loads(self.record_text())["end_hook"]["error"]
+        shown = int("non-fast-forward" in reason and "rejected" in reason) , int("non-fast-forward" in record and "rejected" in record)
+        planted_count = self.everywhere().count(planted) + self.everywhere().count("Qx7Lm2Zk9Wp3Qx7Lm2Zk9Wp3")
+        self.assertEqual((shown, planted_count), ((1, 1), 0))
+        print("S6: audit lines with the longer error 1, run records 1, planted text occurrences %d" % planted_count)
+
+
+class U2Equal(Scratch):
+    def test_success_nothing_to_push_and_a_non_git_error_answer_as_the_base(self):
+        base = last_line_copy(self.t)
+        same = 0
+        for mode, env in (("ok", {}), ("nothing", {}), ("ok", {"CW_WORKER": ""})):
+            same += self.hook(mode=mode, **env) == self.hook(mode=mode, path=base, **env)
+        self.assertEqual(same, 3)
+        print("U2: answers equal the base %d of 3" % same)
+
+
+class U3Bound(Scratch):
+    def test_eight_lines_of_eighty_characters_and_the_scrubbed_answer(self):
+        eighty = ["remote: " + "word " * 14 + "ab" for _ in range(7)] + ["error: " + "word " * 14 + "abc"]
+        self.assertTrue(all(len(l) == 80 for l in eighty))
+        answers = [self.hook(eighty)[1]["error"], self.hook(["a %s b%s c" % (KEY, ESC)] * 8)[1]["error"]]
+        controls = sum(len(re.findall(r"[\x00-\x1f\x7f]", a)) for a in answers)
+        self.assertEqual(controls, 0)
+        self.assertTrue(all(segments(a) <= 8 and len(a) <= 600 for a in answers))
+        print("U3: control characters %d, lines %d, characters %d" % (controls, max(segments(a) for a in answers), max(len(a) for a in answers)))
+
+
+class S7Mutants(Scratch):
+    TARGETS = ((last_line_copy, "S2Refused"), (no_bound_copy, "S3Bound"), (no_scrub_copy, "S4Scrubbed"))
+
+    @unittest.skipIf(os.environ.get(INNER_ENV), "inside a mutant's child run")
+    def test_each_mutant_fails_its_test(self):
+        caught = applied = 0
+        for copy, cls in self.TARGETS:
+            scratch = tempfile.mkdtemp(prefix="cw-mutant-")   # outside the repository
+            self.addCleanup(shutil.rmtree, scratch, True)
+            path = copy(scratch)
+            applied += os.path.isfile(path)
+            p = stub_support.start(self, [sys.executable, "-m", "unittest", "-q", "test_end_hook_refusal_lines." + cls], cwd=HERE,
+                                   env=dict(os.environ, **{HOOK_ENV: path, INNER_ENV: "1"}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out, _ = p.communicate(timeout=90)
+            self.assertEqual(p.returncode, 1, out)
+            caught += 1
+        self.assertEqual((caught, applied), (3, 3))
+        print("S7: mutants caught %d of 3, mutations applied %d of 3" % (caught, applied))
+
+
+class S8Docs(Scratch):
+    def test_the_documentation_states_the_bound(self):
+        with open(os.path.join(LAUNCHER, "README.md")) as f:
+            text = f.read().lower()
+        found = sum(p in text for p in ("eight lines", "600 characters", "a new image"))
+        self.assertEqual(found, 3)
+        print("S8: phrases found %d of 3" % found)
+
+
+if __name__ == "__main__":
+    unittest.main()
