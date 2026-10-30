@@ -195,9 +195,26 @@ class OrphanSecrets(unittest.TestCase):
         print("S7: marker occurrences %d, whole-object list requests %d" % (seen.count(MARKER), len(whole)))
 
 
+    def test_template_has_escapes_not_control_characters(self):
+        calls = []
+
+        class Rec(self.mod.Kube):
+            def run(self, args, **kw):
+                calls.append(list(args))
+                return ""
+
+        Rec({"CW_KUBE_CONTEXT": "x"}).list_secrets("cw/pod")
+        arg = calls[0][calls[0].index("-o") + 1]
+        self.assertEqual((arg.count("\n"), arg.count("\t")), (0, 0))
+        self.assertIn('{"\\t"}', arg)
+        self.assertIn('{"\\n"}', arg)
+        print("S7: template control characters 0, escapes 2 kinds")
+
+
 class Mutants(unittest.TestCase):
     EDITS = {
         "age": ("            if age <= ORPHAN_SECRET_AFTER_SECONDS:\n", "            if False:\n", "OrphanSecrets.test_age_boundary"),
+        "template": ("        tmpl = (r'{range", "        tmpl = ('{range", "OrphanSecrets.test_template_has_escapes_not_control_characters"),
         "pod": ('            if pod in names or pod + "-0" in names:\n', "            if False:\n", "OrphanSecrets.test_secret_of_a_listed_pod_kept"),
     }
 
@@ -216,15 +233,17 @@ class Mutants(unittest.TestCase):
                                    env=dict(os.environ, **{MODULE_ENV: path}), capture_output=True, text=True)
             self.assertEqual(p.returncode, 1, key + p.stderr[-300:])
             failed += 1
-        print("%d of 2 mutants fail, %d of 2 mutations applied" % (failed, applied))
+        print("%d of 3 mutants fail, %d of 3 mutations applied" % (failed, applied))
 
 
 class Documentation(unittest.TestCase):
     PHRASES = {
         "README.md": ["per-run Secret whose pod is absent", "more than 3600 seconds old", "one audit line", "removed: a Secret whose pod is listed",
-                      "persistent orchestrator's Secret", "must keep the pod"],
+                      "persistent orchestrator's Secret", "must keep the pod",
+                      "pass's own clock", "launched again a moment later", "NAME-0"],
         "../../docs/cloud-worker-interface.md": ["per-run Secret whose pod is absent", "more than 3600 seconds old", "one audit line", "removed: a Secret whose pod is listed",
-                                                 "persistent orchestrator's Secret", "must keep the pod"],
+                                                 "persistent orchestrator's Secret", "must keep the pod",
+                                                 "pass's own clock", "launched again a moment later", "NAME-0"],
     }
 
     def test_four_sentences_found(self):

@@ -1457,8 +1457,8 @@ class Kube:
     def list_secrets(self, selector):
         """The Secrets that match a label selector, WITHOUT any value: an output form that names only the name, the labels cw/pod and app and
         the creation time (never the whole object). Returns [(name, cw/pod, app, creationTimestamp)]; an answer that cannot be read raises."""
-        tmpl = ('{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.cw/pod}{"\t"}{.metadata.labels.app}{"\t"}'
-                '{.metadata.creationTimestamp}{"\n"}{end}')
+        tmpl = (r'{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.cw/pod}{"\t"}{.metadata.labels.app}{"\t"}'
+                r'{.metadata.creationTimestamp}{"\n"}{end}')
         out = self.run(["get", "secrets", "-l", selector, "-o", "jsonpath=" + tmpl])
         rows = []
         for line in out.splitlines():
