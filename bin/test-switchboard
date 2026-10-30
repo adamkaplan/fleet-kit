@@ -80267,7 +80267,7 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         rollup = self.first() + [self.chk("ci", 101, "build", "", "QUEUED")]
         got = why({"statusCheckRollup": rollup})
         self.assertEqual(got["status"], "not-green")
-        self.assertEqual(got["why"], 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" run 101 is queued]')
+        self.assertEqual(got["why"], 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" job "build" run 101 is queued]')
         got = why({})
         self.assertEqual(got["why"], "CI is none at aaaaaaaa (only a complete, green run is recorded)")
 
