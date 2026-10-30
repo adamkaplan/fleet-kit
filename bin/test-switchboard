@@ -76659,6 +76659,7 @@ OLD_SOURCE_ALLOWED = {
     ("bin/fleet-switchboard", "pane_health_pass", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass reads the pane states it wrote (derived)",
     ("bin/fleet-switchboard", "janitor_agent_roots", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (the temp janitor, #936, owns it): it reads the live agents' working directories from the derived pane record",
     ("bin/fleet-switchboard", "janitor_agent_roots", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the temp janitor, #936, owns it): only the name in its unreadable-record message, the read itself is read_retired_strict (the registry's)",
+    ("tests/switchboard/support/herdr_world.py", "set_retired", "retired.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the test helper that writes the old retired file next to the registry; moved from bin/test-switchboard with World (T1e of #1092)",
 }
 # Live observers: the call sites that ask herdr which panes exist right now (`"agent", "list"`), keyed by (file, function), each a NAMED entry with its reason,
 # never a silent skip. The heartbeat's dated entry (2026-11-03) ended with #973: its bell opt-in is the registry's `bell` field. The two left are the live source the registry is fed from.
