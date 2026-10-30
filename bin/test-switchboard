@@ -36893,6 +36893,36 @@ class TestWholeRead(LedgerBase):
         self.assertEqual(why.count("\n"), 0)
         self.assertIsNone(sb.whole_read_problem([("a", 5, 5)], ["a"]))
 
+    def test_1522_s1_the_definition_says_lines_in_its_diff_is_the_line_count_of_that_files_diff(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        self.assertEqual(self.diff_count_sentences(text), 1)
+        self.assertEqual(self.diff_count_sentences(text.replace("never the length of the changed file", "")), 0)   # mutant: the sentence removed
+
+    @staticmethod
+    def diff_count_sentences(text):
+        return len([s for s in re.split(r"(?<=\.) ", text.replace("\n", " ")) if "lines in its diff" in s and "line count of that file's own diff" in s and "never the length of the changed file" in s])
+
+    def test_1522_s2_a_block_built_by_the_instructions_method_for_a_14000_line_diff_is_recorded_unedited(self):
+        diff = self.world.state / "big.diff"
+        diff.write_text("".join("+line %d\n" % i for i in range(13990)) + "\n" * 10)
+        counted = int(subprocess.run(["wc", "-l", str(diff)], capture_output=True, text=True).stdout.split()[0])
+        self.assertEqual(counted, 14000)
+        self.set_counts({"src/a.py": 13990})
+        before = len(self.records())
+        code, out, err = self.record((("src/a.py", counted, counted),) + self.WHOLE[1:])
+        self.assertEqual((code, len(self.records()) - before), (0, 1), err)
+
+    def test_1522_s3_the_refusal_for_678_of_14000_names_the_row_form_and_what_the_third_field_counts(self):
+        why = sb.whole_read_problem([("src/a.py", 678, 14000)], ["src/a.py"])
+        for part in ("- <path> | <lines read> | <lines in its diff>", "line count of that file's diff", "read to line 678 of 14000"):
+            self.assertIn(part, why)
+        self.set_counts({"src/a.py": 1})
+        code, out, err = self.record((("src/a.py", 678, 14000),) + self.WHOLE[1:])
+        self.assertIn("line count of that file's diff", err)
+        self.assertEqual(code, 2)
+        old = "src/a.py was read to line 678 of 14000: the first unread line is line 679 (chunks of 200 lines; read every file to its last line)"
+        self.assertNotIn("line count of that file's diff", old)   # mutant: the old message lacks the words
+
     def test_1047_an_uncited_mark_is_replaced_by_a_later_record_and_shown_in_the_state_line(self):
         uncited = "- no rule here | block | src/a.py:4 | vague | fix it\n"
         self.assertEqual(self.record(self.WHOLE, verdict="request-changes", findings=uncited, reviewer="code")[0], 0)
