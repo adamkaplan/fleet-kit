@@ -5,6 +5,9 @@ import io
 import json
 import os
 from pathlib import Path
+import inspect
+import tempfile
+import unittest
 import re
 import sys
 from unittest import mock
@@ -214,12 +217,39 @@ def build():
             self.assertEqual(len(self.bodies), 1)   # test_s5 expects 0 sessions: it fails
             self.assertEqual(self.reads, [])
 
+        def test_cloud_skips_when_the_fixtures_are_not_in_the_tree(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                cls = build_cloud(root=tmp)
+            self.assertTrue(cls.__unittest_skip__)
+            self.assertEqual(cls.__unittest_skip_why__, "cloud/worker/tests is not in this tree")
+            real = build_cloud()
+            self.assertEqual(len(unittest.defaultTestLoader.getTestCaseNames(real)), 5)
+
+        def test_cloud_skip_mutant_the_skip_removed_is_caught(self):
+            source = inspect.getsource(build_cloud)
+            start = source.index("    if not (root")
+            end = source.index("    path = root")
+            mutated = source[:start] + source[end:]
+            self.assertNotEqual(mutated, source)   # applied
+            scope = dict(globals())
+            exec(mutated, scope)
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(Exception):
+                    scope["build_cloud"](root=tmp)
+
     return TestLaunchModel
 
 
-def build_cloud():
+def build_cloud(root=None):
     """S8, U8: the cloud route, on the fixtures of bin/test-cloud-worker (a fake pod service and a stub launcher); only the class below is exposed."""
-    path = Path(__file__).resolve().parents[2] / "bin" / "test-cloud-worker"
+    root = Path(root) if root is not None else Path(__file__).resolve().parents[2]
+    if not (root / "cloud" / "worker" / "tests" / "stub_support.py").exists():
+        @unittest.skip("cloud/worker/tests is not in this tree")
+        class TestLaunchModelCloud(unittest.TestCase):
+            def test_skipped(self):
+                pass
+        return TestLaunchModelCloud
+    path = root / "bin" / "test-cloud-worker"
     loader = importlib.machinery.SourceFileLoader("cw_for_launch_model", str(path))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader("cw_for_launch_model", loader))
     sys.modules["cw_for_launch_model"] = module
