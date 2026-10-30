@@ -116,7 +116,7 @@ class TestScenarios(Cap):
         self.assertEqual(count, 3)
         self.assertEqual(code, 0, err)
 
-    def test_s6_the_record_holds_the_shape_and_the_count_reads_no_cluster(self):
+    def test_s6_the_record_has_the_shape_and_the_count_reads_no_cluster(self):
         c1 = self.ask("coder1", shape="M")
         c2 = self.ask("coder2", lane="lane-b", shape="S")
         shapes = self.shapes()
