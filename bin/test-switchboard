@@ -12043,6 +12043,110 @@ class TestAgentShellCalls(Base):
         self.assertEqual(stat.S_IMODE(os.stat(str(self.state / "agent-calls-hours.json")).st_mode), 0o600)
 
 
+class TestSameNameAccountsAdd(Base):
+    """#879: accounts whose names clean to the same name are ADDED in the hourly fold, the load hours and the usage record, never overwritten."""
+
+    SAME = ("acme a", "acme/a")     # both clean to `acme?a`
+    WORD = "acme?a"
+
+    def _fold(self, mod, delta):
+        d = Path(tempfile.mkdtemp(dir=str(self.home)))
+        mod.fold(str(d), 1000000.0, delta)
+        return mod.load_hours(str(d))[0][str(mod._hour(1000000.0))]
+
+    def _usage(self, mod, readings):
+        d = Path(tempfile.mkdtemp(dir=str(self.home)))
+        mod.record_usage(str(d), 1000000.0, readings)
+        return json.loads((d / "github-usage.json").read_text())["accounts"]
+
+    def _mutant(self, old, new):
+        src = Path(sb.agent_calls.__file__).read_text()
+        self.assertEqual(src.count(old), 1, "the mutant's target line moved")
+        mod = types.ModuleType("agent_calls_mutant")
+        mod.__file__ = sb.agent_calls.__file__
+        exec(compile(src.replace(old, new), "agent_calls_mutant", "exec"), mod.__dict__)
+        return mod
+
+    def _checks(self, mod):
+        """Each record's check, by name; returns the names that fail."""
+        failed = []
+        a, b = self.SAME
+        if self._fold(mod, {a: 3, b: 4})["daemon"].get(self.WORD) != 7:
+            failed.append("fold")
+        d = Path(tempfile.mkdtemp(dir=str(self.home)))
+        (d / "agent-calls-hours.json").write_text(json.dumps({"hours": {"5": {"agent": {a: 3, b: 4}}}}))
+        if mod.load_hours(str(d))[0]["5"]["agent"].get(self.WORD) != 7:
+            failed.append("load")
+        if self._usage(mod, {a: (3, 10, 50, 100), b: (4, 20, 50, 200)}).get(self.WORD, {}).get("used") != 7:
+            failed.append("usage")
+        return failed
+
+    def test_s2_the_fold_adds_two_accounts_that_clean_to_one_word(self):
+        a, b = self.SAME
+        self.assertEqual(self._fold(sb.agent_calls, {a: 3, b: 4})["daemon"], {self.WORD: 7})
+        row = self._fold(sb.agent_calls, {a: {"api issues/#": 1}, b: {"api issues/#": 2, "api graphql": 1}})   # the per-endpoint form adds too
+        self.assertEqual(sum(sum(c.values()) for c in row["lanes"]["daemon"].values()), 4)
+        self.assertEqual(row["daemon"], {self.WORD: 4})
+
+    def test_s3_the_load_hours_add_them(self):
+        self.assertEqual(self._checks(sb.agent_calls), [])
+
+    def test_s4_the_usage_record_adds_them(self):
+        a, b = self.SAME
+        got = self._usage(sb.agent_calls, {a: (3, 10, 50, 100), b: (4, 20, 50, 200)})
+        self.assertEqual(got, {self.WORD: {"used": 7, "remaining": 30, "limit": 100, "reset": 200}})
+
+    def test_s5_a_scan_of_the_code_finds_no_place_that_overwrites(self):
+        tree = ast.parse(Path(sb.agent_calls.__file__).read_text())
+
+        def keyed(node):
+            return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_account" for n in ast.walk(node))
+
+        places, overwriting = [], []
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            gets = {ast.dump(c.func.value) for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                    and c.func.attr == "get" and c.args and keyed(c.args[0])}
+            for n in ast.walk(fn):
+                if isinstance(n, (ast.DictComp, ast.SetComp)) and keyed(n.key if isinstance(n, ast.DictComp) else n.elt):
+                    places.append((fn.name, n.lineno))
+                    overwriting.append((fn.name, n.lineno))        # a comprehension keyed by a cleaned name keeps only the last
+                elif isinstance(n, ast.Assign):
+                    for t in n.targets:
+                        if isinstance(t, ast.Subscript) and keyed(t.slice):
+                            places.append((fn.name, n.lineno))
+                            if ast.dump(t.value) not in gets:       # it must read the earlier count under the same cleaned key
+                                overwriting.append((fn.name, n.lineno))
+        self.assertGreaterEqual(len(places), 3, places)
+        self.assertEqual(overwriting, [], "these places overwrite instead of adding")
+
+    def test_s6_each_overwriting_mutant_fails_a_check(self):
+        mutants = {
+            "load": ("out[_account(a)] = out.get(_account(a), 0) + int(n)", "out[_account(a)] = int(n)"),
+            "fold": ("delta[_account(a)] = delta.get(_account(a), 0) + int(n)", "delta[_account(a)] = int(n)"),
+            "usage": ('"used": old["used"] + u,', '"used": u,'),
+        }
+        for name, (old, new) in mutants.items():
+            with self.subTest(name):
+                self.assertIn(name, self._checks(self._mutant(old, new)), "the mutant must fail its record's check")
+
+    def test_u1_distinct_cleaned_names_are_recorded_as_before(self):
+        self.assertEqual(self._fold(sb.agent_calls, {"acme-a": 3, "acme-b": 4})["daemon"], {"acme-a": 3, "acme-b": 4})
+        d = Path(tempfile.mkdtemp(dir=str(self.home)))
+        (d / "agent-calls-hours.json").write_text(json.dumps({"hours": {"5": {"agent": {"acme-a": 3, "acme-b": 4}}}}))
+        self.assertEqual(sb.agent_calls.load_hours(str(d))[0]["5"]["agent"], {"acme-a": 3, "acme-b": 4})
+        got = self._usage(sb.agent_calls, {"acme-a": (3, 10, 50, 100), "acme-b": (4, 20, 60, 200)})
+        self.assertEqual(got, {"acme-a": {"used": 3, "remaining": 10, "limit": 50, "reset": 100}, "acme-b": {"used": 4, "remaining": 20, "limit": 60, "reset": 200}})
+
+    def test_u2_a_negative_count_and_a_non_number_are_dropped(self):
+        a, b = self.SAME
+        for bad in (-5, "x", None, True):
+            with self.subTest(bad=bad):
+                d = Path(tempfile.mkdtemp(dir=str(self.home)))
+                (d / "agent-calls-hours.json").write_text(json.dumps({"hours": {"5": {"agent": {a: 3, b: bad}}}}))
+                self.assertEqual(sb.agent_calls.load_hours(str(d))[0]["5"]["agent"], {self.WORD: 3})
+                self.assertEqual(self._fold(sb.agent_calls, {a: 3, b: bad})["daemon"].get(self.WORD), 3)
+
+
 class TestShimReadCache(Base):
     """#867 clauses 3 and 4: a repeated identical `gh api <path>` read is answered from a short cache and revalidated with the entity tag; a write by the same agent
     drops it; below 15 percent of the budget the shim says so once and serves a cached read instead of spending."""
@@ -30891,6 +30995,112 @@ class LedgerBase(Base):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
 
 
+class TestGatesMissingWording(LedgerBase):
+    """#1545: each `missing` line of G1 names the record (the proof or the verdict) and who may record it; the two records stay two records, and which PR reads ready does not change."""
+
+    EVALUATORS = ("ci", "tester", "reviewer", "owner")
+
+    def scen(self, sid, evaluator):
+        return {"id": sid, "evaluator": evaluator, "proof": "test", "claim": "pr"}
+
+    def state(self, evaluator, entries=(), authors=()):
+        return sb.plan_ledger.scenario_state(self.scen("S1", evaluator), list(entries), "acme/app#9", "sha256:p", "h1", set(authors))
+
+    def entry(self, kind, evaluator="tester", result="pass", plan="sha256:p", head="h1", by="coder", seq=1):
+        return {"kind": kind, "pr": "acme/app#9", "scenario": "S1", "plan_hash": plan, "head": head, "result": result, "by": by, "seq": seq,
+                **({"evaluator": evaluator} if kind == "verdict" else {})}
+
+    def test_S2_each_missing_line_names_its_record_and_its_own_evaluator(self):
+        for ev in self.EVALUATORS:
+            proof_line, verdict_line = self.state(ev)["missing"]
+            self.assertTrue(proof_line.startswith("proof (`prove S1`"), proof_line)
+            self.assertIn("the %s judges it, a prover records it" % ev, proof_line)
+            self.assertTrue(verdict_line.startswith("%s verdict (`verdict S1 --as %s`" % (ev, ev)), verdict_line)
+            self.assertIn("only the %s may record it" % ev, verdict_line)
+            for other in set(self.EVALUATORS) - {ev}:
+                self.assertNotIn(other, proof_line + verdict_line)
+
+    def test_S3_the_other_cases_still_name_their_record_and_evaluator(self):
+        ev = "reviewer"
+        lines = [
+            self.state(ev, [self.entry("proof", result="fail"), self.entry("verdict", ev)])["missing"][0],
+            self.state(ev, [self.entry("proof", seq=1), self.entry("verdict", ev, result="fail", seq=2)])["missing"][0],
+            self.state(ev, [self.entry("proof", seq=1), self.entry("verdict", ev, by="coder", seq=2)], authors=("coder",))["missing"][0]]
+        self.assertEqual([(("proof" in l) or ("verdict" in l), "reviewer" in l) for l in lines], [(True, True), (True, True), (True, True)], lines)
+        self.assertIn("verdict says fail", lines[1])
+        self.assertIn("by an author", lines[2])
+        plan_voided = self.state(ev, [self.entry("proof", plan="sha256:old", seq=1), self.entry("verdict", ev, plan="sha256:old", seq=2)])
+        head_voided = self.state(ev, [self.entry("proof", head="h0", seq=1), self.entry("verdict", ev, head="h0", seq=2)])
+        self.assertEqual(plan_voided["void"], ["proof #1 void: plan changed", "reviewer verdict #2 void: plan changed"])
+        self.assertEqual(head_voided["void"], ["proof #1 void: head moved", "reviewer verdict #2 void: head moved"])
+
+    def test_S7_U2_twelve_ledgers_give_the_same_entries_and_status_as_before(self):
+        # the count of missing entries, the status and the ready result (status ok) before this change, computed on its base as data: (proof, verdict) -> (entries, status)
+        # the corpus is a hard-coded table (count and status per ledger), not computed from the old function, and the check does not depend on its order
+        before = {("absent", "absent"): (2, "missing"), ("absent", "pass"): (1, "missing"), ("absent", "fail"): (2, "missing"), ("absent", "author"): (2, "missing"),
+                  ("pass", "absent"): (1, "missing"), ("pass", "pass"): (0, "ok"), ("pass", "fail"): (1, "missing"), ("pass", "author"): (1, "missing"),
+                  ("fail", "absent"): (2, "missing"), ("fail", "pass"): (1, "missing"), ("fail", "fail"): (2, "missing"), ("fail", "author"): (2, "missing")}
+        got = {}
+        for pr_kind, v_kind in before:
+            entries = []
+            if pr_kind != "absent":
+                entries.append(self.entry("proof", result=pr_kind, seq=1))
+            if v_kind != "absent":
+                entries.append(self.entry("verdict", "tester", result="fail" if v_kind == "fail" else "pass", by="coder" if v_kind == "author" else "tst", seq=2))
+            state = self.state("tester", entries, authors=("coder",))
+            got[(pr_kind, v_kind)] = (len(state["missing"]), state["status"])
+        self.assertEqual(got, before)
+        self.assertEqual(len(got), 12)
+
+    def kinds(self, argv_who, *argv):
+        code, out, err = self.run_as(argv_who, *argv)
+        self.assertEqual(code, 0, (out, err))
+        return [e["kind"] for e in self.ledger() if e["kind"] in ("proof", "verdict")]
+
+    def test_S4_a_proof_writes_no_verdict_and_a_verdict_writes_no_proof(self):
+        self.assertEqual(self.kinds("coder", "prove", "S2", "--pr", self.PR, "--evidence", "ran it", "--result", "pass"), ["proof"])
+        self.assertEqual(self.kinds("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged"), ["proof", "verdict"])
+        self.assertEqual(self.kinds("rev", "verdict", "--all", "--head", LEDGER_HEAD, "--pr", self.PR, "--as", "reviewer", "--result", "pass", "--evidence", "judged"), ["proof", "verdict", "verdict"])
+
+    def test_S4_the_item_and_ci_writers_each_write_one_kind_derived_from_the_code(self):
+        writers = {"cmd_prove": {"proof"}, "cmd_verdict": {"verdict"}, "cmd_item_prove": {"proof"}, "cmd_item_verdict": {"verdict"},
+                   "cmd_item_ci_record": {"verdict"}, "ci_record_core": {"verdict"}}
+        for name, want in writers.items():
+            found = set()
+            for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(getattr(sb, name))))):
+                if isinstance(node, ast.Dict):
+                    for k, v in zip(node.keys, node.values):
+                        if isinstance(k, ast.Constant) and k.value == "kind" and isinstance(v, ast.Constant) and v.value in ("proof", "verdict"):
+                            found.add(v.value)
+            self.assertEqual(found, want, name)
+        relay = ast.parse((Path(sb.__file__).resolve().parent / "cloud_relay_daemon.py").read_text())   # the relay's `_write` names its kind as a keyword: dict(base, kind="proof")
+        relay_kinds = {kw.value.value for fn in ast.walk(relay) if isinstance(fn, ast.FunctionDef) and fn.name == "_write" for call in ast.walk(fn)
+                       if isinstance(call, ast.Call) for kw in call.keywords if kw.arg == "kind" and isinstance(kw.value, ast.Constant)}
+        self.assertEqual(relay_kinds, {"proof", "verdict"}, "cloud_relay_daemon._write writes a proof for prove and a verdict for verdict, one each")
+
+    def test_S5_S6_a_verdict_that_also_writes_a_proof_is_caught(self):
+        real = sb.plan_ledger.append_once
+
+        def both(state, entries, now):
+            return real(state, list(entries) + [dict(e, kind="proof") for e in entries if e.get("kind") == "verdict"], now)
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        with mock.patch.object(sb.plan_ledger, "append_once", both):
+            code, out, err = self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged")
+        self.assertEqual(code, 0, (out, err))
+        self.assertEqual([e["kind"] for e in self.ledger()], ["proof", "verdict", "proof"], "the S4 check sees the proof the mutant writes")
+
+    def test_S6_a_build_naming_the_tester_on_every_verdict_line_is_caught(self):
+        real = sb.plan_ledger.scenario_state
+
+        def always_tester(scenario, *rest):
+            out = real(scenario, *rest)
+            out["missing"] = [m.replace("%s verdict" % out["evaluator"], "tester verdict") for m in out["missing"]]
+            return out
+        with mock.patch.object(sb.plan_ledger, "scenario_state", always_tester):
+            wrong = [self.state(ev)["missing"][1] for ev in self.EVALUATORS]
+        self.assertEqual(sum(1 for ev, line in zip(self.EVALUATORS, wrong) if not line.startswith("%s verdict" % ev)), 3)
+
+
 # (plan hash, scenario hash) of five plan texts with a tester measure scenario, computed BEFORE the change to how G1 reads an unwritten claim (the checker is not touched by it): an unwritten claim and a
 # written `claim: pr` share one scenario hash because the canonical text has always filled `pr` in.
 PINNED_G1_HASHES = [
@@ -36682,6 +36892,36 @@ class TestWholeRead(LedgerBase):
             self.assertIn(part, why)
         self.assertEqual(why.count("\n"), 0)
         self.assertIsNone(sb.whole_read_problem([("a", 5, 5)], ["a"]))
+
+    def test_1522_s1_the_definition_says_lines_in_its_diff_is_the_line_count_of_that_files_diff(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        self.assertEqual(self.diff_count_sentences(text), 1)
+        self.assertEqual(self.diff_count_sentences(text.replace("never the length of the changed file", "")), 0)   # mutant: the sentence removed
+
+    @staticmethod
+    def diff_count_sentences(text):
+        return len([s for s in re.split(r"(?<=\.) ", text.replace("\n", " ")) if "lines in its diff" in s and "line count of that file's own diff" in s and "never the length of the changed file" in s])
+
+    def test_1522_s2_a_block_built_by_the_instructions_method_for_a_14000_line_diff_is_recorded_unedited(self):
+        diff = self.world.state / "big.diff"
+        diff.write_text("".join("+line %d\n" % i for i in range(13990)) + "\n" * 10)
+        counted = int(subprocess.run(["wc", "-l", str(diff)], capture_output=True, text=True).stdout.split()[0])
+        self.assertEqual(counted, 14000)
+        self.set_counts({"src/a.py": 13990})
+        before = len(self.records())
+        code, out, err = self.record((("src/a.py", counted, counted),) + self.WHOLE[1:])
+        self.assertEqual((code, len(self.records()) - before), (0, 1), err)
+
+    def test_1522_s3_the_refusal_for_678_of_14000_names_the_row_form_and_what_the_third_field_counts(self):
+        why = sb.whole_read_problem([("src/a.py", 678, 14000)], ["src/a.py"])
+        for part in ("- <path> | <lines read> | <lines in its diff>", "line count of that file's diff", "read to line 678 of 14000"):
+            self.assertIn(part, why)
+        self.set_counts({"src/a.py": 1})
+        code, out, err = self.record((("src/a.py", 678, 14000),) + self.WHOLE[1:])
+        self.assertIn("line count of that file's diff", err)
+        self.assertEqual(code, 2)
+        old = "src/a.py was read to line 678 of 14000: the first unread line is line 679 (chunks of 200 lines; read every file to its last line)"
+        self.assertNotIn("line count of that file's diff", old)   # mutant: the old message lacks the words
 
     def test_1047_an_uncited_mark_is_replaced_by_a_later_record_and_shown_in_the_state_line(self):
         uncited = "- no rule here | block | src/a.py:4 | vague | fix it\n"
@@ -63733,6 +63973,130 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.assertRegex(section, r"cloud reader.*token allows")
 
 
+class TestReviewRefusalNamesRule(TestReviewPostAndDismiss):
+    """#1544: a refusal of `review post` / `review dismiss` names a fixed rule label and the line and columns of the first match, and shows no matched character."""
+
+    @staticmethod
+    def key(chars="QJXZ", n=24):   # built at run time: no key-shaped literal in the file
+        return "gh" + "p_" + (chars * n)[:n]
+
+    def where(self, text):
+        return sb.find_secret_span(text)
+
+    def check_names(self, text, want):
+        """`want` = (rule, line, first column, last column); both commands refuse and say it, nothing posted or dismissed."""
+        self.reset()
+        self.blocking(77, by="rdr1")
+        said = "rule %s, line %d, columns %d to %d" % want
+        code, out, err = self.post(text=text)
+        self.assertNotEqual(code, 0)
+        self.assertIn(said, err)
+        self.assertEqual(self.posted, [])
+        code, out, err = self.dismiss(77, text)
+        self.assertNotEqual(code, 0)
+        self.assertIn(said, err)
+        self.assertEqual(self.dismissed, [])
+
+    def test_the_refusal_names_the_rule_the_line_and_the_columns(self):   # S2, S3
+        text = "one\ntwo\nsee value: %s and more\nfour\nfive\n" % self.key()
+        self.assertEqual(self.where(text), ("known-key-prefix", 3, 12, 39))
+        self.check_names(text, ("known-key-prefix", 3, 12, 39))
+
+    def test_the_match_first_in_the_file_wins_whichever_rule_it_is(self):   # S4
+        text = "see value: %s\nlater: Bearer %s\n" % (self.key(), "Q" * 12)
+        self.assertEqual(self.where(text)[:2], ("known-key-prefix", 1))
+        text = "Bearer %s\nlater: %s\n" % ("Q" * 12, self.key())
+        self.assertEqual(self.where(text), ("bearer-or-basic-token", 1, 1, 19))
+
+    def test_positions_count_characters_from_one_and_a_carriage_return_is_no_column(self):   # U2
+        key = self.key()
+        for text, want in (("a\tb %s\n" % key, (1, 5, 32)), ("caf\u00e9 \u00fc %s" % key, (1, 8, 35)), ("x\r\ny\r\n\tz %s\r\n" % key, (3, 4, 31))):
+            with self.subTest(text=text):
+                self.assertEqual(self.where(text), ("known-key-prefix",) + want)
+        crlf = "token: Q\r\nnext"
+        self.assertEqual(self.where(crlf), ("credential-word-value", 1, 1, 8))
+
+    def corpus(self):
+        key, jwt = self.key(), "ey" + "J" + "Q" * 8 + "." + "Z" * 8 + "." + "X" * 4
+        return [("Bearer " + "Q" * 8, "bearer-or-basic-token"), ("Bearer Q", None), ("[redacted]", None),
+                ("password: " + "Q" * 5, "credential-word-value"), ("one token", None), ("token: [redacted]", None),
+                (key, "known-key-prefix"), ("gh" + "p_short", None),
+                ("https://acme:" + "Q" * 6 + "@host/x", "url-password"), ("https://acme@host/x", None),
+                (jwt, "jwt-shape"), ("ey" + "J" + "Q", None)]
+
+    def test_the_finder_agrees_with_the_old_test_on_a_fixed_corpus_and_always_answers(self):   # S6, S7, U1
+        refused = 0
+        for text, rule in self.corpus():
+            with self.subTest(text=text):
+                old = sb.redact_command_text(text) != text
+                found = self.where(text)
+                self.assertEqual(found is not None, old)
+                if old:
+                    refused += 1
+                    self.assertIn(found[0], sb.SECRET_RULE_NAMES + (sb.SECRET_RULE_SEQUENCE,))
+                    self.assertEqual(found[0], rule)
+        self.assertGreater(refused, 4)
+        self.assertEqual(sb.redact_command_text("Bearer " + "Q" * 8), "Bearer [redacted]")   # the redaction itself is unchanged
+
+    def test_a_body_changed_only_by_the_sequence_still_gets_a_rule_and_a_position(self):   # S7
+        for text in ("auth Bearer " + "Q" * 8, "x\ntoken " + "Bearer " + "Z" * 9):
+            found = self.where(text)
+            self.assertIsNotNone(found, text)
+            self.assertTrue(1 <= found[1] <= 2 and 1 <= found[2] <= found[3], found)
+
+    def check_no_matched_character(self):
+        self.reset()
+        self.blocking(77, by="rdr1")
+        text = "intro\n\nsee value: %s\n" % self.key()
+        shown = []
+        for code, out, err in (self.post(text=text), self.dismiss(77, text)):
+            self.assertNotEqual(code, 0)
+            shown += [out, err]
+        shown.append(self.audit_path.read_text())
+        body = self.world.state / "review-body.txt"
+        for path in self.world.state.rglob("*"):
+            if path.is_file() and path != body:
+                shown.append(path.read_bytes().decode("utf-8", "replace"))
+        blob = "\n".join(shown)
+        for window in ("QJX", "JXZ", "XZQ", "ZQJ"):
+            self.assertNotIn(window, blob)
+        for char in "QJXZ":
+            self.assertNotIn(char, blob)
+        self.assertIn("line 3, columns 12 to 39", shown[1])
+        return blob
+
+    def test_no_character_of_the_matched_value_reaches_any_output_audit_or_state(self):   # S5
+        self.check_no_matched_character()
+
+    def test_mutants_each_fail_a_test(self):   # S8
+        real = sb.find_secret_span
+        def leak(text):
+            found = real(text)
+            return (found[0] + " QJX",) + tuple(found[1:]) if found else found
+        def off(index):
+            def mutant(text):
+                found = real(text)
+                return tuple(v + 1 if i == index and found else v for i, v in enumerate(found)) if found else found
+            return mutant
+        for name, mutant, checks in (("text printed", leak, (self.check_no_matched_character,)),
+                                     ("line off by one", off(1), (self.test_the_refusal_names_the_rule_the_line_and_the_columns,)),
+                                     ("columns off by one", off(3), (self.test_the_refusal_names_the_rule_the_line_and_the_columns,))):
+            with self.subTest(mutant=name), mock.patch.object(sb, "find_secret_span", mutant):
+                failed = 0
+                for check in checks:
+                    try:
+                        check()
+                    except AssertionError:
+                        failed += 1
+                self.assertEqual(failed, 1, name)
+
+
+for _name in dir(TestReviewPostAndDismiss):   # the parent's tests run in their own class
+    if _name.startswith("test_") and _name not in TestReviewRefusalNamesRule.__dict__:
+        setattr(TestReviewRefusalNamesRule, _name, None)
+
+
+
 class TestReviewerSubagents(LedgerBase):
     """#179 slice L2: the four reviewer agents, `review laws` (from the base commit) and `review record` with its shadow line in `gates`."""
 
@@ -65173,6 +65537,261 @@ class TestReviewCheckout(LedgerBase):
         skill = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
         self.assertIn("review checkout --sparse", skill)
         self.assertIn("over the 5,000-file limit", skill)
+
+    # ---- #1551: the checkout names each changed file whose diff it does not hold whole, and holds the base commit's law files in base/
+
+    def serve_laws(self, present):
+        """Answer the contents API for the base commit with `present` ({name: text}); every other law file is not found."""
+        plain = self.route
+
+        def route(argv, **kwargs):
+            found = re.search(r"/contents/([^?]+)\?ref=([0-9a-f]+)", argv[2]) if argv[0] == FAKE_GH and argv[1] == "api" and "/contents/" in argv[2] else None
+            if found:
+                text = present.get(found.group(1))
+                if text is None:
+                    return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"encoding": "base64", "content": base64.b64encode(text.encode()).decode()}), "")
+            return plain(argv, **kwargs)
+        self.route = route
+
+    def big_trees(self):
+        self.base_tree = {"big.py": "x\n" * 3, "small.py": "one\n" * 20}
+        self.head_tree = {"big.py": "".join("line %d\n" % i for i in range(6000)), "small.py": "two\n" * 20}
+
+    def test_1551_a_6000_line_file_is_named_not_whole_in_the_output_pr_diff_and_its_own_diff_and_a_20_line_file_is_not(self):
+        self.big_trees()
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual(len(out.strip().splitlines()), 1, "the printed path is the one stdout line")
+        named = [l for l in err.splitlines() if "not whole" in l and "big.py" in l]
+        self.assertEqual(len(named), 1, err)
+        self.assertIn("6000 lines", named[0])
+        self.assertIn("line bound 4000", named[0])
+        self.assertEqual([l for l in err.splitlines() if "small.py" in l and "not whole" in l], [])
+        for name in ("pr.diff", "diffs/big.py.diff"):
+            with self.subTest(name=name):
+                text = (root / name).read_text()
+                head = text.splitlines()[:4]
+                self.assertTrue(any("big.py" in l and "6000 lines" in l and "line bound 4000" in l and "not whole" in l for l in head), head)
+                self.assertIn("diff skipped: too large to compare here (6000 lines) for big.py", text)
+        self.assertNotIn("not whole", (root / "diffs" / "small.py.diff").read_text())
+        self.assertEqual(json.loads((root / ".fleet-review-checkout").read_text())["not_whole"], 1)
+
+    def test_1551_a_checkout_within_the_bounds_has_a_pr_diff_with_no_notice_and_a_marker_count_of_0(self):
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        text = (root / "pr.diff").read_text()
+        self.assertTrue(text.startswith("--- a/a.txt\n"), text[:80])
+        self.assertNotIn("not whole", text + err)
+        self.assertEqual(json.loads((root / ".fleet-review-checkout").read_text())["not_whole"], 0)
+
+    def test_1551_the_files_after_the_time_bound_are_named_with_the_reason_and_the_files_before_are_not(self):
+        names = ["f%02d.txt" % i for i in range(40)]
+        self.base_tree = {n: "old\n" for n in names}
+        self.head_tree = {n: "new\n" for n in names}
+        real, calls = self.rc._diff_text, [0]
+
+        def spend(*a, **k):
+            result = real(*a, **k)
+            calls[0] += 1
+            if calls[0] == 10:
+                self.rc.DIFF_SECONDS = -1
+            return result
+        with mock.patch.object(self.rc, "DIFF_SECONDS", self.rc.DIFF_SECONDS), mock.patch.object(self.rc, "_diff_text", spend):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        text = (Path(out.strip()) / "pr.diff").read_text()
+        for index, name in enumerate(names):
+            with self.subTest(name=name):
+                line = [l for l in err.splitlines() if "'%s'" % name in l and "not whole" in l]
+                self.assertEqual(len(line), 1 if index >= 10 else 0)
+                if index >= 10:
+                    self.assertIn("time bound -1 seconds", line[0])
+                self.assertEqual(any("'%s'" % name in l and "not whole" in l for l in text.splitlines()[:45]), index >= 10)
+
+    def test_1551_a_binary_file_is_named_and_a_3999_line_file_is_not_and_its_diff_is_whole(self):
+        self.base_tree = {"pic.bin": "a\x00b", "long.txt": "".join("old %d\n" % i for i in range(3999))}
+        self.head_tree = {"pic.bin": "c\x00d", "long.txt": "".join("new %d\n" % i for i in range(3999))}
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual([l for l in err.splitlines() if "not whole" in l and "pic.bin" in l and "binary" in l].__len__(), 1, err)
+        self.assertEqual([l for l in err.splitlines() if "long.txt" in l and "not whole" in l], [])
+        text = (root / "diffs" / "long.txt.diff").read_text()
+        self.assertEqual(sum(1 for l in text.splitlines() if l.startswith("+new ")), 3999)
+        self.assertNotIn("not whole", text)
+
+    def test_1551_the_notice_names_the_first_200_files_says_how_many_were_cut_and_the_marker_holds_the_full_count(self):
+        names = ["g%03d.txt" % i for i in range(205)]
+        self.base_tree = {n: "a\nb\n" for n in names}
+        self.head_tree = {n: "c\nd\n" for n in names}
+        with mock.patch.object(self.rc, "MAX_DIFF_LINES", 1):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual(len([l for l in err.splitlines() if "the diff is not whole" in l]), 200)
+        self.assertEqual(len([l for l in err.splitlines() if "5 more" in l]), 1)
+        top = (root / "pr.diff").read_text().splitlines()[:203]
+        self.assertEqual(len([l for l in top if l.startswith("  '")]), 200)
+        self.assertEqual(len([l for l in top if "and 5 more not whole" in l]), 1)
+        self.assertEqual(json.loads((root / ".fleet-review-checkout").read_text())["not_whole"], 205)
+
+    def test_1551_base_holds_each_law_file_the_base_commit_has_and_the_missing_one_is_named_in_three_places(self):
+        present = {name: "law of %s\n" % name for name in sb.REVIEW_LAW_FILES if name != "REVIEW_OVERLAY.md"}
+        self.serve_laws(present)
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        for name, text in present.items():
+            self.assertEqual((root / "base" / name).read_text(), text)
+        self.assertEqual((root / "base" / "a.txt").read_text(), "one\n")
+        self.assertEqual((root / "laws-missing.txt").read_text(), "REVIEW_OVERLAY.md\n")
+        self.assertEqual(len([l for l in err.splitlines() if "REVIEW_OVERLAY.md" in l and "law files not provided" in l]), 1)
+        self.assertEqual(json.loads((root / ".fleet-review-checkout").read_text())["laws_missing"], ["REVIEW_OVERLAY.md"])
+
+    def test_1551_a_base_with_no_law_file_lists_them_all_and_a_changed_law_file_keeps_the_merge_base_copy(self):
+        self.serve_laws({})
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual((root / "laws-missing.txt").read_text().split(), list(sb.REVIEW_LAW_FILES))
+        self.assertEqual(self.files(root / "base"), ["a.txt"])
+        self.run_as("coder", "review", "checkout", "--remove", str(root))
+        changed = sb.REVIEW_LAW_FILES[0]
+        self.base_tree = {"a.txt": "one\n", changed: "the merge base copy\n"}
+        self.head_tree = {"a.txt": "one\n", changed: "the pull request rewrote it\n"}
+        self.serve_laws({changed: "the base commit copy\n"})
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((Path(out.strip()) / "base" / changed).read_text(), "the merge base copy\n")
+
+    def test_1551_a_hostile_law_file_path_is_refused_named_missing_and_writes_nothing_outside(self):
+        data = {"../outside.md": b"x", "/etc/law.md": b"x", "back\\slash.md": b"x", ".git/config": b"x", "ok/law.md": b"fine"}
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(self.rc.remove_tree, str(work), True)
+        (work / "base").mkdir()
+        missing = self.rc._write_laws(str(work), (data, ["gone.md"]), set(), 0, {"file": 100, "files": 10, "total": 1000}, 0)
+        self.assertEqual((work / "base" / "ok" / "law.md").read_bytes(), b"fine")
+        self.assertEqual(sorted(p.name for p in work.rglob("*") if p.is_file()), ["law.md"])
+        self.assertFalse((work / "outside.md").exists() or (self.work / "outside.md").exists())
+        self.assertEqual(len(missing), 5, missing)
+        self.assertEqual(missing[0], "gone.md")
+        self.assertEqual(len([m for m in missing if "refused" in m]), 4)
+        over = self.rc._write_laws(str(work), ({"big.md": b"x" * 11}, []), set(), 0, {"file": 10, "files": 10, "total": 1000}, 0)
+        self.assertEqual(len(over), 1)
+
+    def test_1551_a_changed_law_file_the_merge_base_lacks_is_named_missing_and_one_it_holds_is_not(self):
+        added, edited = sb.REVIEW_LAW_FILES[0], sb.REVIEW_LAW_FILES[1]
+        self.base_tree = {"a.txt": "one\n", edited: "the merge base copy\n"}
+        self.head_tree = {"a.txt": "one\n", added: "new by the pull request\n", edited: "rewritten\n"}
+        self.serve_laws({added: "the base commit copy\n", edited: "the base commit copy\n"})
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        reason = "changed by this pull request; base/ holds no merge-base copy"
+        self.assertFalse((root / "base" / added).exists())
+        self.assertIn("%r (%s)" % (added, reason), (root / "laws-missing.txt").read_text().splitlines())
+        self.assertEqual(len([l for l in err.splitlines() if reason in l and added in l and "law files not provided" in l]), 1)
+        self.assertTrue(any(reason in m and added in m for m in json.loads((root / ".fleet-review-checkout").read_text())["laws_missing"]))
+        self.assertEqual((root / "base" / edited).read_text(), "the merge base copy\n")
+        self.assertFalse(any(edited in m for m in (root / "laws-missing.txt").read_text().splitlines()))
+
+    def test_1551_the_old_continue_for_a_changed_law_file_is_caught(self):
+        source = Path(self.rc.__file__).read_text()
+        old = "            if not os.path.isfile(os.path.join(root, \"base\", name)):\n                missing.append("
+        self.assertIn(old, source, "the mutant applies")
+        mutated = source.replace(old, "            if False:\n                missing.append(")
+        self.assertNotEqual(mutated, source)
+        space = {"__name__": "mutant_review_checkout"}
+        exec(compile(mutated, "mutant", "exec"), space)
+        applied = []
+        with mock.patch.object(self.rc, "_write_laws", lambda *a, **k: (applied.append(1), space["_write_laws"](*a, **k))[1]):
+            with self.assertRaises(AssertionError):
+                self.test_1551_a_changed_law_file_the_merge_base_lacks_is_named_missing_and_one_it_holds_is_not()
+        self.assertTrue(applied, "the mutant ran")
+
+    def test_1551_a_hostile_path_is_cut_and_escaped_in_the_notice_the_output_and_laws_missing(self):
+        hostile = "line\nbreak\x1b[31m" + "x" * 200 + ".txt"
+        self.base_tree = {hostile: "a\nb\n"}
+        self.head_tree = {hostile: "c\nd\n"}
+        with mock.patch.object(self.rc, "MAX_DIFF_LINES", 1):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        shown = self.rc._shown(hostile)
+        self.assertLessEqual(len(shown), 120)
+        notice = (root / "pr.diff").read_text().splitlines()[:3]
+        for text in (err, "\n".join(notice)):   # the notice, not the diff body: its "diff skipped ... for <path>" line is older wording that shows the raw path
+            self.assertNotIn("\x1b", text)
+            self.assertNotIn("line\nbreak", text)
+            self.assertNotIn("x" * 150, text)
+        self.assertTrue(any(l.startswith("  ") and "\\n" in l for l in notice), notice)
+        self.assertTrue(all("break" not in l or "\\n" in l for l in notice))
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(self.rc.remove_tree, str(work), True)
+        (work / "base").mkdir()
+        missing = self.rc._write_laws(str(work), ({hostile + "/..": b"x"}, []), {hostile}, 0, {"file": 100, "files": 10, "total": 1000}, 0)
+        missing += self.rc._write_laws(str(work), ({hostile: b"x"}, []), {hostile}, 0, {"file": 100, "files": 10, "total": 1000}, 0)
+        for line in missing:
+            self.assertNotIn("\n", line)
+            self.assertNotIn("\x1b", line)
+            self.assertLessEqual(len(line), 400)
+        self.assertEqual(len(missing), 2)
+
+    def test_1551_four_mutants_each_fail_a_check(self):
+        real_diff = self.rc._diff_text
+
+        def not_named(*a, **k):
+            return None
+
+        def words_dropped(path, lines, why):
+            return "%s: %d lines, %s\n" % (path, lines, why)
+
+        def old_wording_removed(*a, **k):
+            out = real_diff(*a, **k)
+            return "" if out.startswith("diff skipped") else out
+        mutants = {
+            "a skipped file not named": ("_not_whole", not_named),
+            "the words not whole dropped": ("_not_whole_line", words_dropped),
+            "a missing law file not named": ("_write_laws", lambda *a, **k: []),
+            "the old wording removed": ("_diff_text", old_wording_removed),
+        }
+        self.assertEqual(self.run_scenario_checks(), None, "the real checkout passes the checks")
+        for label, (attr, fake) in mutants.items():
+            with self.subTest(label):
+                applied = []
+                with mock.patch.object(self.rc, attr, lambda *a, _f=fake, **k: (applied.append(1), _f(*a, **k))[1]):
+                    with self.assertRaises(AssertionError):
+                        self.run_scenario_checks()
+                self.assertTrue(applied, "the mutant ran")
+
+    def run_scenario_checks(self):
+        self.big_trees()
+        self.serve_laws({name: "law\n" for name in sb.REVIEW_LAW_FILES if name != "REVIEW_OVERLAY.md"})
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        try:
+            self.assertEqual(len([l for l in err.splitlines() if "big.py" in l and "not whole" in l]), 1)
+            for name in ("pr.diff", "diffs/big.py.diff"):
+                text = (root / name).read_text()
+                self.assertIn("not whole", text)
+                self.assertIn("diff skipped: too large to compare here (6000 lines)", text)
+            self.assertEqual(len([l for l in err.splitlines() if "REVIEW_OVERLAY.md" in l]), 1)
+            self.assertEqual((root / "laws-missing.txt").read_text(), "REVIEW_OVERLAY.md\n")
+        finally:
+            self.run_as("coder", "review", "checkout", "--remove", str(root))
+
+    def test_1551_the_documentation_states_the_three_kinds_the_notice_the_law_files_and_the_unchanged_bounds(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        at = text.index("**`review checkout` names a diff it does not hold whole (#1551).**")
+        section = text[at:text.index("\n", at)]
+        for statement in ("a line bound (", "a time bound (", "a binary file (", "the notice is in the output (stderr", "in the first lines of `pr.diff` and in each per-file diff",
+                          "`laws-missing.txt`", "The bounds are unchanged"):
+            self.assertIn(statement, section)
+        self.assertEqual(text.count("(#1551).**"), 1)
 
 
 class TestPlanReviewCore(unittest.TestCase):
@@ -67763,6 +68382,9 @@ TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivation
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+# The census of process kinds (#1501).
+_census = importlib.import_module("test_github_census")
+TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
 
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):

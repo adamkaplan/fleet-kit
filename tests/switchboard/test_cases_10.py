@@ -453,6 +453,7 @@ cloud_channel_server.py:do_POST
 cloud_cli.py:post
 cloud_cost_report.py:read_lines
 cloud_hub.py:_read_json
+cloud_hub.py:_read_json_aged
 cloud_hub.py:kube_http
 cloud_relay.py:loads_strict
 cloud_relay_daemon.py:_read
@@ -460,6 +461,7 @@ cloud_way_back_check.py:main
 cloud_worker.py:run_launcher
 cpu_guard.py:load_episode
 decision_sync.py:_read_json
+decisions_pull.py:held_body
 decisions_pull.py:parse
 delegated_clear.py:score_block
 disk_janitor.py:_without_own_events
