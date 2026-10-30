@@ -72,19 +72,26 @@ def kube_review(bearer):
     return (st.get("user") or {}).get("username") if st.get("authenticated") else None
 
 
-def run_server(env=None, port=8080):
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-    import app_token
-    env = dict(os.environ if env is None else env)
+SOCKET_TIMEOUT = 10   # seconds: a client that sends nothing is cut, so a slow client cannot stall the service
 
-    def log(line):
-        print("token-service: " + line, file=sys.stderr, flush=True)
+
+def make_server(env=None, port=8080, review=None, mint=None, log=None):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    env = dict(os.environ if env is None else env)
+    if mint is None:
+        import app_token
+        mint = app_token.mint
+    review = review or kube_review
+    log = log or (lambda line: print("token-service: " + line, file=sys.stderr, flush=True))
+    seconds = SOCKET_TIMEOUT
 
     class H(BaseHTTPRequestHandler):
+        timeout = seconds   # applied to the connection's socket by the handler's setup
+
         def do_POST(self):
             n = min(int(self.headers.get("Content-Length") or 0), 4096)
             auth = self.headers.get("Authorization") or ""
-            status, answer = serve(self.rfile.read(n), auth[7:] if auth.startswith("Bearer ") else "", env, kube_review, app_token.mint, log, log)
+            status, answer = serve(self.rfile.read(n), auth[7:] if auth.startswith("Bearer ") else "", env, review, mint, log, log)
             out = json.dumps(answer).encode()
             self.send_response(status)
             self.send_header("Content-Length", str(len(out)))
@@ -93,7 +100,11 @@ def run_server(env=None, port=8080):
 
         def log_message(self, *a):
             pass
-    HTTPServer(("", port), H).serve_forever()
+    return HTTPServer(("", port), H)
+
+
+def run_server(env=None, port=8080):
+    make_server(env, port).serve_forever()
 
 
 if __name__ == "__main__":

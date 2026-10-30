@@ -57,5 +57,34 @@ class TestServe(unittest.TestCase):
             self.assertNotIn(PLANTED, "\n".join(log + audit))
 
 
+class TestSocketTimeout(unittest.TestCase):
+    def test_a_silent_client_is_cut_and_the_next_request_is_served(self):
+        import http.client
+        import socket
+        import threading
+        import time
+        self.assertEqual(token_service.SOCKET_TIMEOUT, 10)
+        old = token_service.SOCKET_TIMEOUT
+        token_service.SOCKET_TIMEOUT = 1   # the same code path, a shorter wait for the test
+        try:
+            srv = token_service.make_server(ENV, 0, review=lambda b: CALLER, mint=lambda r: "ghs_fake", log=lambda l: None)
+        finally:
+            token_service.SOCKET_TIMEOUT = old
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        silent = socket.create_connection(("127.0.0.1", port))   # sends nothing
+        try:
+            began = time.time()
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+            c.request("POST", "/", body=json.dumps({"repository": "acme/widgets", "role": "worker"}), headers={"Authorization": "Bearer x"})
+            r = c.getresponse()
+            self.assertEqual(r.status, 200)
+            self.assertLess(time.time() - began, 8)
+        finally:
+            silent.close()
+            srv.shutdown()
+            srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

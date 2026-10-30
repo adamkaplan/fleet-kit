@@ -1,10 +1,19 @@
 # The token service (option (i), ask #1582). APPLIED BY THE ADMINISTRATOR, NEVER BY THIS CHANGE, and only if the owner chooses to put the
 # App key in the cluster. It is the ONLY workload that mounts the key Secret; the network policy admits only the reaper.
+# Everything here lives in the namespace cw-tokens (created by the first document, by the administrator), apart from the reaper's namespace
+# cw: the reaper's Role holds get on Secrets and create on pods/exec in cw, so a key Secret in cw would be within its reach. The key Secret
+# cw-app-key is NOT defined here: the owner creates it in cw-tokens. The image is a PLACEHOLDER digest of zeros that cannot run: the
+# administrator replaces it with the launcher image's digest (an owner step; the real digest is private).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cw-tokens
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: cw-token-service
-  namespace: cw
+  namespace: cw-tokens
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -22,7 +31,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: cw-token-service
-    namespace: cw
+    namespace: cw-tokens
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -32,7 +41,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: cw-token-service
-  namespace: cw
+  namespace: cw-tokens
   labels:
     app: cw-token-service
 spec:
@@ -46,20 +55,62 @@ spec:
         app: cw-token-service
     spec:
       serviceAccountName: cw-token-service
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: service
-          image: cw-launcher:latest
+          image: registry.example.internal/cw/launcher@sha256:0000000000000000000000000000000000000000000000000000000000000000
           command: ["python3", "/opt/cw/token_service.py", "serve"]
           env:
             - name: CW_APP_KEY_CMD
               value: cat /etc/cw-app/key
             - name: CW_APP_ID_CMD
               value: cat /etc/cw-app/id
+            - name: CW_TOKEN_SERVICE_CALLER
+              value: system:serviceaccount:cw:cw-cloud-reaper
+            - name: HOME
+              value: /tmp
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 10
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: app-key
               mountPath: /etc/cw-app
               readOnly: true
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: app-key
           secret:
             secretName: cw-app-key
@@ -68,7 +119,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: cw-token-service
-  namespace: cw
+  namespace: cw-tokens
 spec:
   podSelector:
     matchLabels:
@@ -76,8 +127,23 @@ spec:
   policyTypes: ["Ingress"]
   ingress:
     - from:
-        - podSelector:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cw
+          podSelector:
             matchLabels:
               app: cw-cloud-reaper
       ports:
         - port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cw-token-service
+  namespace: cw-tokens
+spec:
+  selector:
+    app: cw-token-service
+  ports:
+    - port: 8080
+      targetPort: 8080
