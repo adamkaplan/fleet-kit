@@ -84693,6 +84693,13 @@ class TestAssembler(unittest.TestCase):
     """The entry builds its one namespace from the manifest bin/fleet-switchboard.parts (docs/switchboard.md, "The assembler")."""
 
     def _copy(self, lines):
+        snapshot = dict(sys.modules)
+
+        def restore_modules():
+            for name in [n for n in sys.modules if n not in snapshot]:
+                del sys.modules[name]
+            sys.modules.update(snapshot)
+        self.addCleanup(restore_modules)
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(root), True)
         for sibling in BIN.glob("*.py"):   # the entry loads its sibling modules from its own directory
