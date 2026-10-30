@@ -1,4 +1,4 @@
-"""The launch row of a cloud agent holds its endpoint; a registry failure is said on standard error and goes on (ask #1510).
+"""The launch row of a cloud agent holds its kind and no endpoint; a registry failure is said on standard error and goes on (ask #1510).
 
 These tests RUN the launch, the stop and the clear (bin/test-cloud-worker's fake cluster and stub launcher, a scratch state directory) and read
 the registry's own file. The mutants copy the source tree to a scratch directory, assert the change was applied, and run the behaviour tests there:
@@ -77,7 +77,7 @@ class Behaviour(TCW.Base):
         record["hard_deadline"] = "2020-01-01T00:00:00Z"
         path.write_text(json.dumps(record))
 
-    def test_matches_two_launches_write_one_row_each_with_their_own_endpoint(self):
+    def test_matches_two_launches_write_one_row_each_with_kind_cloud_and_no_endpoint(self):
         urls = {"coder7": self.address("worker-aaa"), "coder8": self.address("worker-bbb")}
         for name, url in urls.items():
             code, out, err = self.launch_at(name, url)
@@ -87,10 +87,10 @@ class Behaviour(TCW.Base):
         self.assertEqual(sorted(rows), ["coder7", "coder8"])
         for name, url in urls.items():
             self.assertEqual(rows[name]["kind"], "cloud")
-            self.assertEqual(rows[name]["endpoint"], url)
+            self.assertNotIn("endpoint", rows[name])
             self.assertEqual(json.loads((self.state / "cloud" / (name + ".json")).read_text())["url"], url)
             self.assertFalse(rows[name].get("pane"))
-        self.assertEqual(len({r["endpoint"] for r in rows.values()}), 2)
+        self.assertFalse(any("endpoint" in r for r in rows.values()))
 
     def test_matches_a_launch_whose_registry_is_unavailable_writes_no_row_and_goes_on(self):
         self.blocked_registry()
@@ -123,10 +123,10 @@ class Behaviour(TCW.Base):
             code, out, err = self.main("retire", "coder7")
         self.assertEqual(code, 1)
         self.assertEqual(calls, [])
-        self.assertEqual(self.rows()["coder7"]["endpoint"], self.address("worker-aaa"))
+        self.assertEqual(self.rows()["coder7"]["kind"], "cloud")
         self.assertNotIn("coder7", REG.read(str(self.state))["retired"])
 
-    def test_matches_the_clear_retires_the_row_once_and_a_second_run_retires_nothing(self):
+    def test_matches_the_cloud_sweep_retires_the_row_once_and_a_second_run_retires_nothing(self):
         stub = self.stub.read_text().replace('elif command == "status":', 'elif command == "snapshot":\n    print(json.dumps({"pods": []}))\nelif command == "status":', 1)
         self.stub.write_text(stub)
         self.launch_at("coder7", self.address("worker-aaa"))
@@ -168,7 +168,7 @@ class Behaviour(TCW.Base):
             engine = types.SimpleNamespace(actor="op", audit=types.SimpleNamespace(append=lambda a, ev, n, d: audit.append((ev, n, d))))
             err = io.StringIO()
             with mock.patch.dict(sbcw.H, {"load_module": lambda name: fake, "_one_line": lambda t, n: " ".join(str(t).split())[:n]}), contextlib.redirect_stderr(err):
-                sbcw._registry_note(engine, what, str(self.state), "w1", *args)
+                sbcw._registry_note(engine, what, str(self.state), "w1", *args, address=url)
             text = err.getvalue()
             self.assertEqual(len(text.strip().splitlines()), 1, text)
             self.assertIn("w1", text)
@@ -182,7 +182,7 @@ class Behaviour(TCW.Base):
 class Mutants(unittest.TestCase):
     """A scratch copy of the tree with ONE change asserted applied; the behaviour tests run in it and must exit 1."""
     CASES = (
-        ("the endpoint dropped", "bin/cloud_worker.py", ', "endpoint": record["url"]', ""),
+        ("the endpoint written again", "bin/cloud_worker.py", '"state": "working"}, address=record["url"])', '"state": "working", "endpoint": record["url"]}, address=record["url"])'),
         ("a row written though the registry is unavailable", "bin/cloud_worker.py",
          "    except Exception as err:\n        say(str(err))",
          "    except Exception as err:\n        say(str(err))\n        H[\"load_module\"](\"registry\").upsert(__import__(\"tempfile\").gettempdir(), name, dict(args[0])) if what == \"upsert\" else None"),
@@ -223,16 +223,17 @@ class Mutants(unittest.TestCase):
 
 
 class Docs(unittest.TestCase):
-    def test_matches_both_documents_say_who_when_retire_reaper_failure_and_the_limit(self):
+    def test_matches_both_documents_say_no_endpoint_why_and_the_stderr_line(self):
         for rel in ("docs/cloud-worker-interface.md", "cloud/launcher/README.md"):
             text = " ".join((ROOT / rel).read_text().split())
             found = [bool(re.search(p, text)) for p in (
                 r"switchboard-side launch writes the agent's registry row",
-                r"worker's own address as (the )?`endpoint`",
+                r"no pane and no endpoint",
+                r"`send` by the registry has no fallback and no address a Mac lane can reach exists yet",
+                r"ask #1587",
                 r"retire[s]? it once|retire it once",
-                r"reaper's own stop of a pod writes nothing",
                 r"never refuses a launch or keeps a pod",
-                r"does not refuse a fragment or a (non-http scheme|scheme other than http)")]
+                r"one line on standard error")]
             self.assertTrue(all(found), (rel, found))
 
 
