@@ -85,13 +85,47 @@ class TokenEnded(RuntimeError):
     """A git call refused because the token had ended: the one case in which the hook signals a refresh (see main)."""
 
 
+class GitFailed(RuntimeError):
+    """A failed git call: the text is the bounded, scrubbed refusal (see refusal_text); `summary` is git's own last line, as it always was."""
+    def __init__(self, text, summary):
+        super().__init__(text)
+        self.summary = summary
+
+
+REFUSAL_LINES, REFUSAL_CHARS, REMOVED = 8, 600, "<removed>"
+# A key-shaped run: a token prefix, a long hex run, or a long token-like run; an address with a credential (user:pass@); any control character.
+_KEYLIKE_RE = re.compile(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{6,}|[0-9A-Fa-f]{32,}|[A-Za-z0-9+_=-]{32,}")
+_CREDURL_RE = re.compile(r"(?<=://)[^/\s@]*@")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+
+
+def scrub_line(line):
+    """Free text from git made safe to keep: key-shaped runs, a credential in an address and control characters become a fixed word."""
+    line = _CONTROL_RE.sub(" " + REMOVED + " ", line)
+    line = _CREDURL_RE.sub(REMOVED + "@", line)
+    return _KEYLIKE_RE.sub(REMOVED, line)
+
+
+def refusal_text(lines):
+    """The last REFUSAL_LINES lines of git's standard error, each scrubbed, joined on one line with ' | ', at most REFUSAL_CHARS characters;
+    the last (summary) line is always last, and the earlier lines that do not fit whole are dropped, oldest first."""
+    take = [scrub_line(l) for l in lines[-REFUSAL_LINES:]]
+    out = take[-1][:REFUSAL_CHARS]
+    for l in reversed(take[:-1]):
+        if len(l) + 3 + len(out) > REFUSAL_CHARS:
+            break
+        out = l + " | " + out
+    return out
+
+
 def git(workdir, *args, check=True, ctx=None, opts=True):
     cmd = [GIT_BIN, "-C", workdir] + (ctx.opts if ctx and opts else []) + list(args)
     p = subprocess.run(cmd, capture_output=True, text=True, env=ctx.env if ctx else None)
     if check and p.returncode != 0:
         if args and args[0] in ("push", "fetch") and ENDED_TOKEN_RE.search(p.stderr or ""):
             raise TokenEnded("the git token had ended")   # a fixed text: nothing of the remote's answer is carried
-        raise RuntimeError((p.stderr.strip().splitlines() or ["git %s failed" % args[0]])[-1])
+        lines = [l.strip() for l in (p.stderr or "").strip().splitlines() if l.strip()] or ["git %s failed" % args[0]]
+        raise GitFailed(refusal_text(lines), lines[-1])
     return p
 
 
@@ -320,7 +354,7 @@ def prestop_main():
     except ConfigRefused as e:
         return report(workdir, "the repository configuration is not a plain one: %s" % e, ctx)
     except (RuntimeError, OSError) as e:
-        msg = " ".join(str(e).split())
+        msg = " ".join(str(getattr(e, "summary", e)).split())
         msg = re.sub(r"https?://\S+", "<url>", msg)[:80]
         return report(workdir, msg, ctx, trusted)
     finally:
