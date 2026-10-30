@@ -68523,6 +68523,9 @@ TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine =
 # The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
 _relay_tree_guard = importlib.import_module("test_relay_tree_guard")
 RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
+# The relay-loop tests of #1477, moved under the architecture cap.
+_relay_loop = importlib.import_module("test_relay_loop_cadence")
+RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
 
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
