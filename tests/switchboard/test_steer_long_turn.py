@@ -33,6 +33,8 @@ def build(Base, TestSteerToWorking):
             return self.send(sender="coder")
 
         def remind(self):
+            item = sb.add_reminder(self.world.state, "platform", EPOCH, EPOCH, "check the build")   # in the file: the delivery recheck (#1401) keeps only a reminder that is still there
+            sb.write_reminders(self.world.state, [dict(item, id="long1")])
             fact = sb.Fact("reminder:long1", "platform", "reminder", "check the build", EPOCH, batch=False)
             return fact
 
