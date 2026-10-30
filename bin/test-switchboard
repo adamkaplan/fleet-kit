@@ -10952,8 +10952,6 @@ class TestReminders(PR4Base):
 
 
 class TestReminderTtl(PR4Base):
-    """#1563: `remind --ttl` drops a reminder too old to matter, audited."""
-
     def setUp(self):
         super().setUp()
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
