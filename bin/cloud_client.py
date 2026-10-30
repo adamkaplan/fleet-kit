@@ -10,7 +10,8 @@ Rules:
     - The token is read from the projected token file at each try, capped at MAX_TOKEN_BYTES and limited to token
       characters. It is not kept after the call returns, never printed, never in an error line (a server reason that
       echoes it is redacted).
-    - Retries are min(retries, MAX_RETRIES), only on transport failure (status 0) and 5xx, with an injected sleep.
+    - Retries are min(retries, MAX_RETRIES): six tries by default with waits of 0.5, 1, 2, 4 and 8 seconds, a
+      window of RETRY_WINDOW_SECONDS (15.5), so a restart of the hub's pod shorter than that is bridged. Only on transport failure (status 0) and 5xx, with an injected sleep.
       Any other status is returned at once as a one-line error. A duplicate (200 with duplicate true) is delivered.
     - A key is made once per message (or given) and reused on every retry, so the channel delivers it once.
     - 401 and 403 are one-line errors that name the status and the channel's reason, with no token.
@@ -21,10 +22,12 @@ import time
 import uuid
 
 TOKEN_PATH = "/var/run/secrets/tokens/fleet-switchboard"
-RETRIES = 3
-MAX_RETRIES = 5
+RETRIES = 6
+MAX_RETRIES = 6
 MAX_TOKEN_BYTES = 4096
 BACKOFF_SECONDS = 0.5
+# Six tries, five waits of 0.5, 1, 2, 4 and 8 seconds: the stated retry window, in seconds (one place).
+RETRY_WINDOW_SECONDS = sum(BACKOFF_SECONDS * (2 ** n) for n in range(MAX_RETRIES - 1))
 _TOKEN_CHARS = re.compile(r"[A-Za-z0-9._~+/=-]+")
 
 

@@ -189,6 +189,10 @@ The command makes up to 3 tries with one key. It retries only on a transport fai
 - The remembered keys are held in memory only, at most 10000 pairs, the least recently seen key is forgotten first (a repeat refreshes a key). A hub restart forgets all of them, so
   a duplicate is possible after a restart (and after a key ages out of the 10000).
 
+### A restart of the hub's pod
+
+A restart of the hub's pod loses the remembered dedupe keys, the relay queue, a report claimed and not yet delivered, and the decisions file on the pod's volume. The lane's send retries for a window of 15 seconds (six tries, waits of 0.5, 1, 2, 4 and 8 seconds) with the same key, so a restart of the hub's pod shorter than that is bridged. When the hub stays down longer, the send ends with one line that says the channel is unavailable and nothing is queued on disk: the lane sends again. The documented limit stays: a message whose first delivery reached the agent and whose retry reaches the new hub after a restart is delivered twice, because the keys are held in memory only. A second replica is REJECTED for now: its cost is one more pod requesting 100m CPU and 128Mi memory, it needs the remembered keys and the relay queue shared (a new component) and one owner step, a patch of replicas plus a pod disruption budget; a pod disruption budget on one replica would block every voluntary node drain and does not stop a node loss, so none is added, and the owner can overrule. The window is measured by a tester after the merge in the probe namespace. The pod's relay command keeps one attempt and prints its call id.
+
 ## Hardening guards
 
 Each guard has a test that fails when it is removed (in `bin/test-cloud-hub` and `bin/test-cloud-cli`):
