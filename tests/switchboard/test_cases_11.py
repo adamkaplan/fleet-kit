@@ -231,7 +231,7 @@ class TestAgentRegistryInventory(unittest.TestCase):
     interface spec has its sections and its freeze line."""
     DOC = REPO / "docs" / "agent-registry.md"
     RECORDS = {
-        "pane-health.json": r"pane-health\.json|PANE_HEALTH_FILE|PANE_FILE|read_pane_health|write_pane_health|pane_health_pass|pane_health_status",
+        "pane-health.json": r"pane-health\.json|pane-health registry|PANE_HEALTH_FILE|PANE_FILE|read_pane_health|write_pane_health|pane_health_pass|pane_health_status",
         "retired.json": r"retired\.json|RETIRED_FILE|read_retired|known_agent",
         "last-reports.json": r"last-reports\.json|LAST_REPORT_FILE|record_last_report",
         "boss-overrides.json": r"boss-overrides\.json|\.overlay\(",
@@ -907,7 +907,7 @@ class TestAssembler(unittest.TestCase):
         self.assertEqual(lines[0], "fleet-switchboard")
 
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py", "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard", *[str(f.relative_to(BIN)) for f in SWITCHBOARD_SOURCE_FILES if f != SWITCHBOARD], "part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -956,7 +956,7 @@ class TestAssembler(unittest.TestCase):
         self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py"])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", *[str(f.relative_to(BIN)) for f in SWITCHBOARD_SOURCE_FILES if f != SWITCHBOARD]])
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
 

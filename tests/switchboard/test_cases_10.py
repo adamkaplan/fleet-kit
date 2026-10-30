@@ -501,7 +501,6 @@ fleet-switchboard:github_status
 fleet-switchboard:handle
 fleet-switchboard:health_watched_repos
 fleet-switchboard:janitor_agent_roots
-fleet-switchboard:job_read
 fleet-switchboard:json
 fleet-switchboard:lab_facts
 fleet-switchboard:launch_memory_check
@@ -602,6 +601,7 @@ switchboard/handoff.py:post_ask_comment
 switchboard/import_v1.py:read_v1_export
 switchboard/jev.py:_load
 switchboard/jev.py:_post
+switchboard/job_runs.py:job_read
 switchboard/judge.py:ask_judge_daemon
 switchboard/judge.py:looks_like_plugin_event
 switchboard/judge.py:parse_plugin_event
