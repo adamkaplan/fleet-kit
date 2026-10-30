@@ -841,33 +841,78 @@ class LiveHead(Fixture):
 
     def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
         import threading
-        import time
+        calls = []
+        first_in, settled = threading.Event(), threading.Event()
+        release = [threading.Event(), threading.Event()]   # one per call: the TEST releases them
+        for ev in release:
+            self.addCleanup(ev.set)   # no thread of this test outlives it
 
-        def slow(pr):   # every call is slow: a call made under the flock would hold every other writer for this long
-            time.sleep(0.7)
+        def slow(pr):   # every call blocks until the test releases it: a call made under the flock would hold every other writer
+            n = len(calls)
+            calls.append(pr)
+            (first_in if n == 0 else settled).set()
+            release[min(n, 1)].wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
             return HEAD
         self.backend.live_head = slow
-        t = threading.Thread(target=lambda: self.run_one(CODER, "prove", **PROVE))
+
+        def prove():
+            try:
+                self.run_one(CODER, "prove", **PROVE)
+            finally:
+                settled.set()
+        t = threading.Thread(target=prove, daemon=True)
         t.start()
-        worst, end = 0.0, time.monotonic() + 1.6
-        while time.monotonic() < end:
-            t0 = time.monotonic()
-            plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
-                kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e"))
-            worst = max(worst, time.monotonic() - t0)
-            time.sleep(0.05)
+        self.assertTrue(first_in.wait(10))   # same guard: the first call (made before the flock) is blocked now
+
+        threads = []   # every writer thread is joined at the end, so none writes into a directory that is already removed
+
+        def writer():
+            done = []
+            w = threading.Thread(target=lambda: (plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
+                kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e")),
+                done.append(True)), daemon=True)
+            threads.append(w)
+            w.start()
+            w.join(10)   # same guard
+            return bool(done)
+        while_blocked = writer()   # appended while the first call is blocked
+        release[0].set()
+        settled.wait(10)   # same guard: the prove call went on into its second call (a mutant, under the flock) or ended
+        after = writer()   # appended while a second call (if one was made) is still blocked
+        release[1].set()
+        release[0].set()
         t.join(10)
-        self.assertLess(worst, 0.3)   # no writer waited for GitHub
+        for w in threads:
+            w.join(10)   # same guard
+        self.assertTrue(while_blocked, "the append did not finish while the live-head call was blocked")   # no writer waited for GitHub
+        self.assertTrue(after, "the append did not finish while a second live-head call was blocked")
 
     def test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing(self):
-        import time
+        import threading
         old = relay.HEAD_TIMEOUT
         relay.HEAD_TIMEOUT = 0.2
         self.addCleanup(setattr, relay, "HEAD_TIMEOUT", old)
-        self.backend.live_head = lambda pr: (time.sleep(2), HEAD)[1]
-        t0 = time.monotonic()
-        self.refused(504, "could not be read in time", CODER, "prove", **PROVE)
-        self.assertLess(time.monotonic() - t0, 1.5)
+        release = threading.Event()
+        self.addCleanup(release.set)   # no thread of this test outlives it
+
+        def blocked(pr):
+            release.wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
+            return HEAD
+        self.backend.live_head = blocked
+        answer, audits = [], len(self.backend.audits)
+        t = threading.Thread(target=lambda: answer.append(self.run_one(CODER, "prove", **PROVE)), daemon=True)
+        t.start()
+        t.join(10)   # same guard
+        answered, still_blocked = bool(answer), not release.is_set()
+        release.set()
+        t.join(10)
+        self.assertTrue(answered, "the prove call was not answered while the live-head call was blocked")
+        self.assertTrue(still_blocked)
+        got = answer[0]
+        self.assertEqual(got["status"], 504, got)
+        self.assertIn("could not be read in time", got["reason"])
+        self.assertIsNone(got["record"])
+        self.assertEqual(len(self.backend.audits), audits + 1)
         self.assertEqual(self.raw(), b"")
 
     def test_a_different_live_head_is_refused(self):
@@ -887,6 +932,52 @@ class LiveHead(Fixture):
             finally:
                 case.doCleanups()
                 case.tmp.cleanup()
+
+
+class LiveHeadMutantsInAChildProcess(unittest.TestCase):
+    """#1521: the mutant of each live-head test is applied to a scratch copy of the product module and the guard test is run on it in a CHILD
+    process: it must fail (exit 1) for its diagnosing reason, with the mutation asserted applied (load_backend_module asserts the anchor
+    occurs once). The guards are 10 s waits inside the tests (a blocked mechanism fails instead of hanging)."""
+    CHILD = """
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("daemon_tests_under_mutation", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+guard, old, new = sys.argv[2:5]
+case = mod.LiveHead(guard)
+case.setUp()
+mod.make_mutant_executor(case, old, new)
+print("MUTATION APPLIED")
+sys.stdout.flush()
+try:
+    getattr(case, guard)()
+except AssertionError as err:
+    print("DIAGNOSIS: " + str(err))
+    sys.exit(1)
+finally:
+    case.doCleanups()
+sys.exit(0)
+"""
+
+    def run_child(self, guard, old, new):
+        import subprocess
+        done = subprocess.run([sys.executable, "-c", self.CHILD, str(Path(__file__).resolve()), guard, old, new],
+                              capture_output=True, text=True, timeout=120)
+        self.assertIn("MUTATION APPLIED", done.stdout, done.stderr)
+        return done
+
+    def test_the_call_made_under_the_ledger_lock_is_caught(self):
+        done = self.run_child("test_a_slow_live_head_does_not_block_another_ledger_writer", "if not _same_head(first, head):   # the ONLY",
+                              "first = b.live_head(pr)\n            if not _same_head(first, head):   # the ONLY")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("the append did not finish while a second live-head call was blocked", done.stdout)
+
+    def test_the_wait_without_the_head_timeout_is_caught(self):
+        done = self.run_child("test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing", "_bounded(lambda: b.live_head(pr), HEAD_TIMEOUT)",
+                              "b.live_head(pr)")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("the prove call was not answered while the live-head call was blocked", done.stdout)
 
 
 def describe_stub_state(error, finished, written, total):
@@ -1267,15 +1358,18 @@ class Round2(Fixture):
     def serve(self, handler):
         return HubReadAndTransport._serve(self, handler)
 
-    @staticmethod
-    def header_trickle(h):
+    def header_trickle(self, h):
         import time
-        for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 60:   # one byte per 0.2 s: every socket read succeeds
-            h.wfile.write(bytes([byte]))
-            h.wfile.flush()
-            time.sleep(0.2)
+        try:
+            for byte in b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 60:   # one byte per 0.2 s: every socket read succeeds
+                h.wfile.write(bytes([byte]))
+                h.wfile.flush()
+                time.sleep(0.2)
+        finally:
+            self.trickle_finished.set()   # #1521: what the tests observe: had the handler finished when the fetch answered?
 
     def timed_fetch(self, mod):
+        self.trickle_finished = threading.Event()
         old, mod.READ_DEADLINE = mod.READ_DEADLINE, 1.0
         self.addCleanup(setattr, mod, "READ_DEADLINE", old)
         fetch, _ = mod.http_transport(self.serve(self.header_trickle), "tok")
@@ -1287,14 +1381,16 @@ class Round2(Fixture):
         return time.monotonic() - t0, None
 
     def test_trickling_headers_are_cut_at_the_total_deadline(self):
-        took, err = self.timed_fetch(relay)
+        _, err = self.timed_fetch(relay)
+        finished = self.trickle_finished.is_set()   # the trickle (about 17 s of bytes) is still running when the cut comes
         self.assertIsInstance(err, TimeoutError)
-        self.assertLess(took, 2.0)
+        self.assertFalse(finished, "the fetch was cut only after the hub's handler had finished")
 
     def test_mutant_without_the_watchdog_is_caught(self):
         mod = load_backend_module("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)", extra=(("worker.join(READ_DEADLINE)", "worker.join()"),))
-        took, _ = self.timed_fetch(mod)
-        self.assertGreater(took, 2.0)
+        self.timed_fetch(mod)
+        # the fetch of the mutant returns only when the trickle has ended (about 17 s: it waits for it, the 1 s deadline does not cut it)
+        self.assertTrue(self.trickle_finished.is_set(), "the mutant fetch returned before the hub's handler had finished")
 
     def test_pass_budget_leaves_later_requests_pending(self):
         t = [0.0]
@@ -1435,6 +1531,7 @@ class OneWallClock(unittest.TestCase):
     def setUp(self):
         import socket
         self.socket = socket
+        self.lookup_release = threading.Event()
         self.real_gai = socket.getaddrinfo
         self.addCleanup(setattr, socket, "getaddrinfo", self.real_gai)
 
@@ -1450,8 +1547,12 @@ class OneWallClock(unittest.TestCase):
         return time.monotonic() - t0, None
 
     def slow_dns(self):
+        self.lookup_returned = threading.Event()   # #1521: what the tests observe: had the lookup returned when the fetch answered?
+        self.addCleanup(self.lookup_release.set)
+
         def gai(*a, **k):
-            time.sleep(10)
+            self.lookup_release.wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; the test releases it at its end
+            self.lookup_returned.set()
             return self.real_gai(*a, **k)
         self.socket.getaddrinfo = gai
         return "http://127.0.0.1:9"
@@ -1461,32 +1562,39 @@ class OneWallClock(unittest.TestCase):
         socket = self.socket
         self.addCleanup(setattr, socket, "create_connection", socket.create_connection)
 
+        self.finished_attempts = []   # #1521: what the tests observe: how many attempts had finished when the fetch answered?
+
         def dead(address, timeout=None, *a, **k):
             for _ in range(n):
                 time.sleep(timeout if timeout is not None else 2.0)
+                self.finished_attempts.append(True)
             raise TimeoutError("timed out")
         socket.create_connection = dead
         return "http://localhost:9"
 
     def test_slow_dns_is_cut_at_the_deadline(self):
-        took, err = self.timed(relay, self.slow_dns(), 1.0)
+        _, err = self.timed(relay, self.slow_dns(), 1.0)
+        returned = self.lookup_returned.is_set()   # the lookup is blocked on an Event the test controls
         self.assertIsInstance(err, relay.PassCut)
-        self.assertLess(took, 2.0)
+        self.assertFalse(returned, "the fetch was cut only after the name lookup had returned")
 
     def test_mutant_without_the_thread_cut_is_caught_by_dns(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
-        took, _ = self.timed(mod, self.slow_dns(), 1.0)
-        self.assertGreater(took, 5.0)
+        self.timed(mod, self.slow_dns(), 1.0)
+        # the mutant joins without the deadline: it waits for the lookup (the 10 s guard of slow_dns), so the lookup has returned
+        self.assertTrue(self.lookup_returned.is_set(), "the mutant fetch returned before the name lookup had returned")
 
     def test_four_dead_addresses_share_one_deadline(self):
-        took, err = self.timed(relay, self.full_backlog(), 2.0)
+        _, err = self.timed(relay, self.full_backlog(), 2.0)
+        finished = len(self.finished_attempts)   # the four attempts need about 8 s together: the cut comes before they have all ended
         self.assertIsInstance(err, TimeoutError)
-        self.assertLess(took, 3.5)
+        self.assertLess(finished, 4, "the fetch was cut only after all four attempts had finished")
 
     def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
-        took, _ = self.timed(mod, self.full_backlog(), 2.0)
-        self.assertGreater(took, 5.0)
+        self.timed(mod, self.full_backlog(), 2.0)
+        # the mutant joins without the deadline: it waits for the whole loop, so all four attempts have finished
+        self.assertEqual(len(self.finished_attempts), 4, "the mutant fetch returned before all four attempts had finished")
 
     def test_pass_records_the_cut(self):
         notes = []
@@ -2132,6 +2240,240 @@ def test_mutant_without_the_total_deadline_is_caught(self):
     def test_a_bound_of_ten_seconds_or_more_is_allowed(self):
         old = self.OLD[self.NAMES[0]].replace("2.5", "10.0")
         self.assertEqual(self.small_bound_comparisons(old), 0)
+
+    # ---- #1521: the scan reads EVERY function of the file, not two tests ----
+    # The OLD text of each of the eight tests converted by #1521 (kept as constants, like OLD above: inputs of the mutant checks, never run).
+    OLD_1521 = {
+        "test_a_slow_live_head_does_not_block_another_ledger_writer": """
+def test_a_slow_live_head_does_not_block_another_ledger_writer(self):
+    import threading
+    import time
+
+    def slow(pr):   # every call is slow: a call made under the flock would hold every other writer for this long
+        time.sleep(0.7)
+        return HEAD
+    self.backend.live_head = slow
+    t = threading.Thread(target=lambda: self.run_one(CODER, "prove", **PROVE))
+    t.start()
+    worst, end = 0.0, time.monotonic() + 1.6
+    while time.monotonic() < end:
+        t0 = time.monotonic()
+        plan_ledger.append_checked(self.state, 1, lambda entries, seq: dict(
+            kind="proof", pr=PR, scenario="S1", plan_ref="r", plan_hash="h", head=HEAD, result="pass", by="other", evidence="e", command="c", env="e"))
+        worst = max(worst, time.monotonic() - t0)
+        time.sleep(0.05)
+    t.join(10)
+    self.assertLess(worst, 0.3)
+""",
+        "test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing": """
+def test_a_late_live_head_is_refused_with_a_named_reason_and_writes_nothing(self):
+    import time
+    old = relay.HEAD_TIMEOUT
+    relay.HEAD_TIMEOUT = 0.2
+    self.addCleanup(setattr, relay, "HEAD_TIMEOUT", old)
+    self.backend.live_head = lambda pr: (time.sleep(2), HEAD)[1]
+    t0 = time.monotonic()
+    self.refused(504, "could not be read in time", CODER, "prove", **PROVE)
+    self.assertLess(time.monotonic() - t0, 1.5)
+    self.assertEqual(self.raw(), b"")
+""",
+        "test_trickling_headers_are_cut_at_the_total_deadline": """
+def test_trickling_headers_are_cut_at_the_total_deadline(self):
+    took, err = self.timed_fetch(relay)
+    self.assertIsInstance(err, TimeoutError)
+    self.assertLess(took, 2.0)
+""",
+        "test_mutant_without_the_watchdog_is_caught": """
+def test_mutant_without_the_watchdog_is_caught(self):
+    mod = load_backend_module("threading.Timer(READ_DEADLINE, cut)", "threading.Timer(1000, cut)", extra=(("worker.join(READ_DEADLINE)", "worker.join()"),))
+    took, _ = self.timed_fetch(mod)
+    self.assertGreater(took, 2.0)
+""",
+        "test_slow_dns_is_cut_at_the_deadline": """
+def test_slow_dns_is_cut_at_the_deadline(self):
+    took, err = self.timed(relay, self.slow_dns(), 1.0)
+    self.assertIsInstance(err, relay.PassCut)
+    self.assertLess(took, 2.0)
+""",
+        "test_mutant_without_the_thread_cut_is_caught_by_dns": """
+def test_mutant_without_the_thread_cut_is_caught_by_dns(self):
+    mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
+    took, _ = self.timed(mod, self.slow_dns(), 1.0)
+    self.assertGreater(took, 5.0)
+""",
+        "test_four_dead_addresses_share_one_deadline": """
+def test_four_dead_addresses_share_one_deadline(self):
+    took, err = self.timed(relay, self.full_backlog(), 2.0)
+    self.assertIsInstance(err, TimeoutError)
+    self.assertLess(took, 3.5)
+""",
+        "test_mutant_without_the_thread_cut_is_caught_by_addresses": """
+def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
+    mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
+    took, _ = self.timed(mod, self.full_backlog(), 2.0)
+    self.assertGreater(took, 5.0)
+""",
+    }
+    NEW_UNLISTED = """
+def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
+    t0 = time.monotonic()
+    self.work()
+    took = time.monotonic() - t0
+    self.assertLess(took, 3.0)
+"""
+    # KEPT with a reason (three places): a function of the file or an OLD text above. Any other flagged comparison fails the scan.
+    KEPT = {
+        "_late_post_scenario": "the poll that waits at most 5 seconds for the threads of a pass to end: a generous hang guard (the slowest honest case is "
+                               "about 0.1 s, the guard 50 times that) that exits at the first observation; a broken mechanism fails instead of hanging, "
+                               "and the poll is never what the test judges",
+        "OLD[test_a_trickling_hub_is_cut_at_the_total_deadline]": "the literal OLD text of a test converted by #1417: the input of that scan's mutant "
+                                                                  "check, never run as a test",
+        "OLD[test_mutant_without_the_total_deadline_is_caught]": "the literal OLD text of a test converted by #1417: the input of that scan's mutant "
+                                                                 "check, never run as a test",
+    }
+
+    @classmethod
+    def clock_call(cls, x):
+        import ast
+        return isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in cls.CLOCKS and \
+            isinstance(x.func.value, ast.Name) and x.func.value.id == "time"
+
+    @classmethod
+    def helpers_returning_a_difference(cls, tree):
+        """The functions of the file whose body returns a clock difference (timed_fetch, timed): their value is a measured duration."""
+        import ast
+        found = set()
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef):
+                for ret in ast.walk(fn):
+                    if isinstance(ret, ast.Return) and ret.value is not None and any(
+                            isinstance(b, ast.BinOp) and isinstance(b.op, ast.Sub) and any(cls.clock_call(c) for c in ast.walk(b)) for b in ast.walk(ret.value)):
+                        found.add(fn.name)
+        return found
+
+    @classmethod
+    def measured_comparison_lines(cls, fn, helpers, follow_derived=True):
+        """The line numbers, inside the function node fn, of a comparison of a measured duration with a number under 10 seconds. A value is
+        measured when it is a clock call, a name assigned from an expression holding a measured value, or the value of a helper that returns a
+        clock difference. follow_derived=False is the scan variant that skips everything derived from a clock difference (differences, the
+        names assigned from them, the helpers' values) and the tests of loops: it must flag nothing in the old forms (not vacuous)."""
+        import ast
+
+        def is_difference(x, names):
+            return isinstance(x, ast.BinOp) and isinstance(x.op, ast.Sub) and any(cls.clock_call(c) or (isinstance(c, ast.Name) and c.id in names) for c in ast.walk(x))
+
+        def is_helper_call(x):
+            return isinstance(x, ast.Call) and ((isinstance(x.func, ast.Attribute) and x.func.attr in helpers) or (isinstance(x.func, ast.Name) and x.func.id in helpers))
+
+        def measured(x, names):
+            if not follow_derived and (is_difference(x, names) or is_helper_call(x)):
+                return False
+            if cls.clock_call(x) or (isinstance(x, ast.Name) and x.id in names) or (follow_derived and is_helper_call(x)):
+                return True
+            return any(measured(c, names) for c in ast.iter_child_nodes(x))
+
+        def has_small(x):
+            return any(isinstance(c, ast.Constant) and isinstance(c.value, (int, float)) and not isinstance(c.value, bool) and c.value < 10 for c in ast.walk(x))
+        names, bounds = set(), set()   # measured names; names holding a clock plus a small number (a deadline of a loop)
+        pairs = []   # (targets, value): a tuple assigned from a tuple of the same length is taken element by element
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                if isinstance(node.targets[0], ast.Tuple) and isinstance(node.value, ast.Tuple) and len(node.targets[0].elts) == len(node.value.elts):
+                    pairs.extend(([t], v) for t, v in zip(node.targets[0].elts, node.value.elts))
+                else:
+                    pairs.append((node.targets, node.value))
+        for _ in range(6):   # fixpoint over the assignments of the function
+            for targets, value in pairs:
+                if measured(value, names):
+                    if is_helper_call(value) and isinstance(targets[0], ast.Tuple):
+                        targets = [targets[0].elts[0]]   # the first value of a helper's pair is the measured time
+                    for tgt in targets:
+                        for n in ast.walk(tgt):
+                            if isinstance(n, ast.Name):
+                                names.add(n.id)
+                                if has_small(value):
+                                    bounds.add(n.id)
+        skipped = set()
+        if not follow_derived:
+            for node in ast.walk(fn):
+                if isinstance(node, ast.While):
+                    skipped.update(id(c) for c in ast.walk(node.test))
+        lines = []
+        for node in ast.walk(fn):
+            if id(node) in skipped:
+                continue
+            if isinstance(node, ast.Compare):
+                parts = [node.left] + list(node.comparators)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in (
+                    "assertLess", "assertGreater", "assertLessEqual", "assertGreaterEqual"):
+                parts = list(node.args[:2])
+            else:
+                continue
+            if any(i != j and measured(a, names) and (has_small(b) or any(isinstance(c, ast.Name) and c.id in bounds for c in ast.walk(b)))
+                   for i, a in enumerate(parts) for j, b in enumerate(parts)):
+                lines.append(node.lineno)
+        return lines
+
+    @classmethod
+    def flagged_in_text(cls, src, helpers, follow_derived=True):
+        import ast
+        import textwrap
+        return cls.measured_comparison_lines(ast.parse(textwrap.dedent(src)), helpers, follow_derived)
+
+    @classmethod
+    def flagged_in_file(cls, text, follow_derived=True):
+        """{outermost function name: [lines]} for every function of the file (a test, a helper of a test)."""
+        import ast
+        tree = ast.parse(text)
+        helpers = cls.helpers_returning_a_difference(tree)
+        found = {}
+        for outer in ast.walk(tree):
+            if isinstance(outer, (ast.ClassDef, ast.Module)):
+                for fn in outer.body:
+                    if isinstance(fn, ast.FunctionDef):
+                        lines = cls.measured_comparison_lines(fn, helpers, follow_derived)
+                        if lines:
+                            found[fn.name] = lines
+        return found
+
+    def unlisted(self, found):
+        return {k: v for k, v in found.items() if k not in self.KEPT}
+
+    def test_no_function_of_the_file_compares_a_measured_duration_with_a_small_bound_except_the_kept(self):
+        found = self.flagged_in_file(self.own_text())
+        self.assertEqual(self.unlisted(found), {}, "a comparison of a measured duration under 10 seconds (test name: lines)")
+
+    def test_the_kept_places_are_flagged_and_each_has_a_reason(self):
+        self.assertEqual(len(self.KEPT), 3)
+        for key, reason in self.KEPT.items():
+            self.assertGreater(len(reason), 40, key)
+        found = self.flagged_in_file(self.own_text())
+        self.assertIn("_late_post_scenario", found)   # the kept poll is really found: the entry is not stale
+        helpers = self.helpers_returning_a_difference(__import__("ast").parse(self.own_text()))
+        for name in self.NAMES:
+            self.assertTrue(self.flagged_in_text(self.OLD[name], helpers), name)
+            self.assertIn("OLD[%s]" % name, self.KEPT)
+
+    def test_the_helpers_that_return_a_measured_time_are_followed(self):
+        helpers = self.helpers_returning_a_difference(__import__("ast").parse(self.own_text()))
+        self.assertLessEqual({"timed_fetch", "timed"}, helpers)
+
+    def test_the_scan_flags_the_old_forms_and_a_new_unlisted_comparison_and_is_not_vacuous(self):
+        import ast
+        helpers = self.helpers_returning_a_difference(ast.parse(self.own_text()))
+        old = sum(1 for src in self.OLD_1521.values() if self.flagged_in_text(src, helpers))
+        new = sum(1 for src in (self.NEW_UNLISTED,) if self.flagged_in_text(src, helpers))
+        variant = sum(1 for src in self.OLD_1521.values() if self.flagged_in_text(src, helpers, follow_derived=False))
+        print("S8: old forms flagged %d of %d, new unlisted flagged %d of 1, kept %d" % (old, len(self.OLD_1521), new, len(self.KEPT)))
+        self.assertEqual((len(self.OLD_1521), old, new), (8, 8, 1))
+        self.assertEqual(variant, 0)   # the variant that skips names derived from a clock difference sees none of the 8: the full scan is not vacuous
+        self.assertEqual(self.unlisted({"test_a_new_comparison_of_a_measured_duration_without_a_reason": [1]}),
+                         {"test_a_new_comparison_of_a_measured_duration_without_a_reason": [1]})
+
+    def test_a_bound_of_ten_seconds_or_more_on_a_measured_duration_is_not_flagged_by_the_file_scan(self):
+        import ast
+        helpers = self.helpers_returning_a_difference(ast.parse(self.own_text()))
+        self.assertEqual(self.flagged_in_text(self.NEW_UNLISTED.replace("3.0", "10.0"), helpers), [])
 
 
 if __name__ == "__main__":

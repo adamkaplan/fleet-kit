@@ -38,6 +38,7 @@ cloud/launcher/tests/test_model_credential.py
 cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
+cloud/launcher/tests/test_orphan_secrets.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_reaper_managed.py

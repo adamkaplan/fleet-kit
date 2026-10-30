@@ -68581,7 +68581,7 @@ class TestLoadAlert(Base):
     def test_the_cloud_figure_is_in_the_load_record_and_the_health_status(self):
         """Lane with cloud workers (2 live; finished, stale and unreadable records not counted), lane with none (0), local counts apart; the figure is also in the hourly series."""
         latest = self._cloud_run()
-        self.assertEqual((latest["orch"]["busy"], latest["orch"]["idle"], latest["orch"]["cloud"]), (1, 1, 2))
+        self.assertEqual((latest["orch"]["busy"], latest["orch"]["idle"], latest["orch"]["cloud"]), (3, 1, 2))
         self.assertEqual((latest["orchb"]["busy"], latest["orchb"]["idle"], latest["orchb"]["cloud"]), (0, 0, 0))
         series = json.loads((self.state_dir / "load.json").read_text())["series"]["orch"]["hours"]
         self.assertEqual([h["cloud"] for h in series.values()], [2])
@@ -68590,14 +68590,14 @@ class TestLoadAlert(Base):
         """Real load_tick over fake discovery and fake cloud records; a spliced mutant that adds cloud workers to busy fails the exact figures."""
         def figures(latest):
             return {k: (latest[k]["busy"], latest[k]["idle"], latest[k]["cloud"]) for k in ("orch", "orchb")}
-        self.assertEqual(figures(self._cloud_run()), {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+        self.assertEqual(figures(self._cloud_run()), {"orch": (3, 1, 2), "orchb": (0, 0, 0)})
         source = SWITCHBOARD.read_text()
         import re as _re
         body = _re.search(r"def load_tick\(.*?\n\n\n", source, _re.S).group(0)
-        old = '"busy": sum(1 for c in coders if c.status == "working"),'
+        old = '"busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0),'
         self.assertIn(old, body)
         scope = dict(vars(sb))
-        exec(body.replace(old, '"busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0),'), scope)
+        exec(body.replace(old, '"busy": sum(1 for c in coders if c.status == "working"),'), scope)
         real = sb.load_tick
         def patch():
             sb.load_tick = scope["load_tick"]
@@ -68605,8 +68605,8 @@ class TestLoadAlert(Base):
             mutated = figures(self._cloud_run(patch))
         finally:
             sb.load_tick = real
-        self.assertEqual(mutated["orch"][0], 3)   # the mutant shows busy 3
-        self.assertNotEqual(mutated, {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+        self.assertEqual(mutated["orch"][0], 1)   # the mutant ignores cloud workers: busy 1
+        self.assertNotEqual(mutated, {"orch": (3, 1, 2), "orchb": (0, 0, 0)})
 
     def test_mutant_dropping_the_cloud_count_in_load_tick_is_caught(self):
         original = sb.live_cloud_by_lane
@@ -69636,6 +69636,9 @@ RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCanc
 # The census of process kinds (#1501).
 _census = importlib.import_module("test_github_census")
 TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamples, _census.TestCensus, _census.TestMutants, _census.TestDocumentation
+# The load figure counts cloud workers as busy (#1487).
+_load_cloud = importlib.import_module("test_load_alert_cloud")
+TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
