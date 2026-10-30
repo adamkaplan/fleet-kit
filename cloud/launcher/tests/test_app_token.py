@@ -340,7 +340,7 @@ class Mint(unittest.TestCase):
         for cls in ("RecursionError", "ValueError", "UnicodeDecodeError", "MemoryError"):
             Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10 + b"]" * 10, []
             p = self.run_mint(runner=RAISE_ON_NESTING, RAISE_CLASS=cls)
-            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []), cls)
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (75, "", []), cls)
             self.assertIn("nothing was minted", p.stderr, cls)
             self.assertIn("not usable JSON", p.stderr, cls)
             self.assertNotIn("Traceback", p.stderr, cls)
