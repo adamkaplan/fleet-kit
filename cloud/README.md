@@ -284,6 +284,15 @@ Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-
 - `CLOUD_PREPUSH_PREFLIGHT=full` asks `bin/cloud-prepush` for the full mode; `quick` (the default) is printed as `preflight mode: quick`; any other value is refused with exit 2. Continuous integration stays the full check.
 <!-- preflight-modes:end -->
 
+### The background run (ask #1616)
+
+Cause: the foreground command bounds each test file at 120 seconds and the whole run at 1500 seconds, and nothing of it survives the end of its starting command; on a pod the slow files of the full check run longer than that and are reported as "could not run", so no pod reported a full-suite result.
+
+- Start: `CLOUD_PREPUSH_PREFLIGHT=full bin/cloud-prepush --background <base>` starts the same run (same selection, same preflight, same base comparison) detached (its own session, no stdin, output in `run.log`), prints the result file's path and the log's path, and exits 0 at once. The run has its own default bounds, 300 seconds per file and 7200 seconds in all; `CLOUD_PREPUSH_TIMEOUT` and `CLOUD_PREPUSH_TOTAL` override them. `CLOUD_PREPUSH_RESULT` names the result directory (default a fresh private directory under the temporary directory); `result.json` and `run.log` survive the end of the run.
+- Result file: one JSON document, replaced atomically at the start and after every file: `version`, `started`, `finished` (null while running), `status` (`running` or `finished`), `selection`, and per file the `branch` and `base` result (`pass`, `fail`, `could not run`, `running`, `not started`) with seconds.
+- Read: `bin/cloud-prepush --read FILE` (the result file or its directory) prints the lines the foreground run prints, plus a `RUNNING <file> (branch|base)` line for a file in progress and `cloud-prepush: still running: N of M files done`. Exit 0: finished, no difference; 1: finished with a difference or a file that could not run; 4: still running (never 0: a file not yet run is `not started`, never passed); 2: the file is missing or unreadable.
+- Polling: a background process does not count as activity for the idle limit (only a busy session does), so a builder that starts the run and ends its turn is stopped as idle. A builder keeps polling with short foreground calls, one command at a time: `sleep 60; bin/cloud-prepush --read DIR`, until the exit status is not 4. A launch of a builder that will run the full check asks for an idle limit above the longest poll.
+
 It needs git and python3 only, makes no network call and writes nothing outside its temporary directory. It is advice, never the gate: continuous integration stays the gate and its result is the only evidence. Tests: `cloud/worker/tests/test_cloud_prepush.py` and `cloud/worker/tests/test_cloud_prepush_preflight.py`.
 
 ## Saving unpushed work when the pod ends
