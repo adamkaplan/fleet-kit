@@ -1301,13 +1301,16 @@ def cmd_launch(args, runner, now):
         return _launch(args, runner, now, lambda state: stack.enter_context(reservation(state, args.name)))
 
 
+LANE_KEY = "reports_to"   # a worker's lane is its record's boss as written (a record of this directory, not a discovered agent: read by key, not through boss_name)
+
+
 def lane_m_workers(state, lane):
     """The sorted names of the lane's live shape-M workers, from the record directory alone (no token, no cluster call)."""
     found = []
     for record in list_records(state):
         if not isinstance(record, dict) or "problem" in record or record.get("shape") != "M" or _ended(record):
             continue
-        if (record.get("reports_to") or "(no boss)") == lane:
+        if (record.get(LANE_KEY) or "(no boss)") == lane:
             found.append(str(record.get("worker")))
     return sorted(found)
 
