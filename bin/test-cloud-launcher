@@ -89,7 +89,8 @@ for l in 0 1 2; do lane "$l" "$@" & pids="$pids $!"; done
 ran=0
 failed=""   # every failing entry runs to the end of the chain and is named here (#1547); a hung entry is ended by the workflow step's time limit
 killtree() { for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; kill "$1" 2>/dev/null; }
-trap 'for p in $pids; do killtree "$p"; done; killtree $$; exit 143' TERM INT
+# the handler first ignores further signals, then kills only the trees of the pids this script started (never its own shell), then exits 143
+trap 'trap "" TERM INT; for p in $pids; do killtree "$p"; done; exit 143' TERM INT
 while IFS= read -r e; do
   [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
   is_parallel "$e" && continue
