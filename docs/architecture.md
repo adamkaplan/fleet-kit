@@ -63,6 +63,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `health_records.py` | 2 | health recorders: what the daemon has already read, turned into records | |
 | `pr_events.py` | 2 | `pr-state` read from the forwarder's webhook events | |
 | `pr_reading.py` | 2 | the one reading of a pull request that `merge-gate` and the clear packet share | |
+| `pod_state_line.py` | 2 | the state line of a cloud worker: the closed vocabulary of the error line, its redaction and the state reading | |
 | `registry.py` | 2 | the one agent registry (interface frozen in `docs/agent-registry.md`) | |
 | `installed_guard.py` | 2 | is the installed tree the default branch, clean: the one reading of its git state, the entry check and the install of its hooks (#1380) | |
 | `guard_alert.py` | 2 | the standalone alert of a bad installed tree, run from the state directory with nothing of the kit (#1380) | |

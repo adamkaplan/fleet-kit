@@ -31,9 +31,11 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from pathlib import Path
 
+_ME = None   # this module, set by bind()
 H = {}   # the switchboard's own namespace, set by bind()
 
 _OWN_BIN = Path(__file__).resolve().parent   # fixed at import
@@ -71,12 +73,18 @@ class CloudError(Exception):
     """A cloud-worker step that did not finish; the message says why in one line."""
 
 
+class ServiceSilent(CloudError):
+    """The agent service of a pod did not answer at all (no connection, a timeout): worth trying again; an ANSWER that is an error is not."""
+
+
 def bind(namespace):
     """Receive the switchboard's globals (its classes and helpers). Called by the hook that loads this module."""
     H.clear()
     H.update(namespace)
     _classes.cache = None
-    return sys.modules[__name__]
+    global _ME
+    _ME = sys.modules[__name__]
+    return _ME
 
 
 def _one(text, limit=300):
@@ -1413,6 +1421,7 @@ def _launch(args, runner, now, reserve):
                 remove_record(state, name)
             raise LaunchError("%s: %s (the worker %s was created; %s)" % (
                 name, problem, name, "it was stopped and its record dropped" if stopped else "the stop failed: the pod and its record are kept; stop it with `%s retire %s`" % (H["PROG"], name)))
+        accepted = None   # set once the brief is accepted
         fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo)
         try:
             with tunnel(cluster, record) as live:
@@ -1426,6 +1435,7 @@ def _launch(args, runner, now, reserve):
                     if hcode != 0:
                         raise CloudError("the hub entry could not be given the session: %s" % _reason(hcode, hnote))
                 if brief:
+                    accepted = int(time.time() * 1000)   # the time the first message is sent: it is accepted when the call returns
                     v2.prompt(session, SETUP_PREAMBLE % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
         except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
             stopped = _stop_after_failure(engine, runner, name, run_id, "launch failed: %s" % _one(cluster.clean(str(err), 80), 80), cluster)
@@ -1437,8 +1447,19 @@ def _launch(args, runner, now, reserve):
             if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
+        stated = None
+        try:   # the one state line, once: read only, bounded, never a failure of the launch (an interrupt waits until the launch has finished its record)
+            with tunnel(cluster, record) as live:
+                stated = launch_state_line(runner, state, cluster, record, name, remote_v2(state, live, STATE_WAIT_SECONDS), accepted)
+        except KeyboardInterrupt as err:
+            stated = err
+        except Exception:
+            stated = "cloud %s: no state read within %d s" % (name, STATE_WAIT_SECONDS)
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
+    if isinstance(stated, BaseException):
+        raise stated
+    print(stated, file=sys.stderr)   # stderr: stdout stays the one JSON line
     return H["EXIT_OK"]
 
 
@@ -1799,6 +1820,64 @@ def status_extra(runner):
         return status_lines(runner, state)
     except Exception as err:
         return ["      cloud workers: unreadable (%s)" % _one(str(err), 100)], []
+
+
+# ---------------------------------------------------------------- the state line (`status NAME`, and the launch)
+
+STATE_WAIT_SECONDS = 60   # `launch --cloud` waits at most this long for the first session message, then says so and ends normally
+READ_FAIL = "state not read"
+_clock = time.monotonic   # the wait's clock and pause: a test swaps them for a fake clock, so no test waits for real
+_sleep = time.sleep
+_MOVED = frozenset(("ERROR_VOCABULARY", "ERROR_LINE_MAX", "PLACEHOLDER", "redact_error", "state_line"))   # the names of the module bin/pod_state_line.py that this module re-exports
+
+
+def _state_module():
+    """bin/pod_state_line.py, loaded only when a command that needs it runs (never at import: it is not in the switchboard's closure)."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.append(here)
+    return __import__("pod_state_line")
+
+
+def __getattr__(name):
+    if name in _MOVED:
+        return getattr(_state_module(), name)
+    raise AttributeError(name)
+
+
+def _known_secrets(state, record, cluster):
+    return _state_module().known_secrets(_ME, state, record, cluster)
+
+
+def read_state(runner, state, cluster, record, timeout, snapshot=None, v2_for=None, messages=20):
+    return _state_module().pod_read_state(_ME, runner, state, cluster, record, timeout, snapshot, v2_for, messages)
+
+
+@refusals
+def cmd_state(args, runner, now):
+    """`status NAME` for a cloud worker: ONE line. Only the caller's own worker (the operator, the Chief of Staff or the worker's own boss, the rule of
+    `retire`); another lane's is refused. Read only: no message sent, no file written, no cluster change."""
+    LaunchError = H["LaunchError"]
+    record = route(args.name)
+    if record is None:
+        raise LaunchError("%s is not a cloud worker" % _one(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(args.name)), 60))
+    kind = H["gates_caller_kind"](runner, now)
+    if not _may_retire(kind, record):
+        raise Refusal("refused: only the operator, the Chief of Staff or %s's own boss may read its state" % args.name)
+    _, state, config = H["build_engine"](runner, now, "cli", writable=False)
+    with Cluster() as cluster:
+        try:
+            row = read_state(runner, state, cluster, record, STATUS_SECONDS)
+            line = _state_module().state_line(args.name, state, row)
+        except CloudError as err:
+            row, line = {"state": READ_FAIL}, "cloud %s: %s (%s)" % (args.name, READ_FAIL, _one(cluster.clean(str(err), 100), 100))
+    print(line)
+    return H["EXIT_OK"] if row["state"] != READ_FAIL else H["EXIT_ERROR"]
+
+
+
+def launch_state_line(runner, state, cluster, record, name, v2, accepted_ms=None, seconds=STATE_WAIT_SECONDS):
+    return _state_module().pod_launch_state_line(_ME, runner, state, cluster, record, name, v2, accepted_ms, seconds)
 
 
 # ---------------------------------------------------------------- retire
