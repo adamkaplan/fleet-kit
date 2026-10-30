@@ -1,0 +1,388 @@
+"""Tests of the lost-worker detector (ask #1481, bin/lost_worker.py): one case per loss kind, a clean end, a repeat, a duplicate, an unsendable message,
+and two mutants (alerts on every worker, alerts on none) that the same cases must catch. Fake records only; nothing is read from a real state directory."""
+import datetime
+import importlib.util
+import json
+import os
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+NOW = 1_800_000_000.0
+
+
+def load():
+    spec = importlib.util.spec_from_file_location("lost_worker_under_test", str(REPO / "bin" / "lost_worker.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def stamp(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def parse(text):
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+class Audit:
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def append(self, actor, event, subject=None, detail=None, **extra):
+        with open(self.path, "a") as handle:
+            handle.write(json.dumps({"ts": stamp(NOW), "actor": actor, "event": event, "subject": subject, "detail": detail}) + "\n")
+
+
+class Engine:
+    actor = "switchboard"
+
+    def __init__(self, directory, fail=False):
+        self.audit = Audit(Path(directory) / "audit.jsonl")
+        self.audit.path.touch()
+        self.sent, self.fail, self.cloud_watch = [], fail, {"records": []}
+
+    def send(self, sender, recipient, text, **kw):
+        if self.fail:
+            raise OSError("no channel")
+        self.sent.append((recipient, text))
+        return {"sent": True}
+
+
+def line(path, **item):
+    with open(path, "a") as handle:
+        handle.write(json.dumps(item) + "\n")
+
+
+class Rig:
+    def __init__(self, mod, fail=False):
+        self.mod, self.dir = mod, tempfile.mkdtemp()
+        self.engine = Engine(self.dir, fail)
+        self.launcher = os.path.join(self.dir, "launcher.jsonl")
+        open(self.launcher, "a").close()
+        self.sb = types.SimpleNamespace(parse_iso=parse, parse_bounded=json.loads, _one_line=lambda t, n=200: str(t)[:n], retired=lambda e, n: False)
+        self.alive = {}
+        self.remember()
+
+    def remember(self):   # a valid memory with no offsets: the cases below are not first passes
+        with open(os.path.join(self.dir, "lost-workers.json"), "w") as handle:
+            json.dump({"offsets": {}, "alerted": {}}, handle)
+
+    def created(self, name, deadline=NOW - 60, lane="lane-a", branch="ask-7"):
+        line(self.engine.audit.path, ts=stamp(NOW - 7200), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(deadline)})
+        self.engine.cloud_watch["records"].append({"worker": name, "reports_to": lane, "branch": branch})
+
+    def stopped(self, name, reason="idle"):
+        line(self.launcher, ts=stamp(NOW - 30), worker=name, runtime_id="pod/" + name, action="stop", ok=True, reason=reason)
+
+    def passes(self, n=1, at=NOW):
+        out = []
+        for _ in range(n):
+            out += self.mod.run_pass(self.sb, self.engine, at, self.alive, self.launcher)
+        return out
+
+
+def scenarios(mod):
+    """Every case against `mod`; the names of the cases that failed (a mutant must fail at least one)."""
+    failed = []
+
+    def check(name, ok):
+        if not ok:
+            failed.append(name)
+
+    r = Rig(mod)   # S2: silent pod: two messages (lane and chief of staff), five fields
+    r.created("w1")
+    got = r.passes()
+    check("S2 count", len(got) == 1 and sorted(x[0] for x in r.engine.sent) == ["chief-of-staff", "lane-a"])
+    text = r.engine.sent[0][1] if r.engine.sent else ""
+    check("S2 fields", all(f in text for f in ("w1", "ask-7", "pod_no_stop", stamp(NOW - 7200)[:19], "Evidence")))
+
+    r = Rig(mod)   # a pod still before its deadline is not lost
+    r.created("w1", deadline=NOW + 600)
+    check("before deadline", r.passes() == [])
+
+    r = Rig(mod)   # S3: the other kinds
+    r.engine.audit.append("x", "cloud.create_failed", "w2", {"reason": "quota"})
+    line(r.launcher, ts=stamp(NOW - 5), worker="", runtime_id="reaper", action="refresh-cluster-token", ok=False, reason="login failed")
+    r.alive["loc"] = {"lane": "boss", "ask": "ask-9"}
+    first = r.passes()
+    r.alive.clear()
+    got = first + r.passes(at=NOW + 10)
+    check("S3 kinds", sorted(x["kind"] for x in got) == ["local_worker", "reaper_missed", "refused_launch"])
+    check("S3 named", all(("kind=" + x["kind"]) in x["text"] for x in got))
+
+    r = Rig(mod)   # S4: six passes, one alert for the loss
+    r.created("w1")
+    r.passes(6)
+    check("S4 duplicate", len([m for m in r.engine.sent if m[0] == "lane-a"]) == 1)
+    r.engine.sent.clear()
+    r.passes()
+    check("S4 again", r.engine.sent == [])
+
+    r = Rig(mod)   # S5: a stop of reason done and a final report: no alert
+    r.created("w1")
+    r.stopped("w1", "done")
+    r.created("w2")
+    line(r.launcher, ts=stamp(NOW - 40), worker="w2", runtime_id="pod/w2", action="report", ok=True, reason="")
+    check("S5 clean", r.passes() == [] and r.engine.sent == [])
+
+    r = Rig(mod)   # S5b: work already done (final text says so), pod ends at the hard limit with pushed false: a clean end, not a loss
+    r.created("w3")
+    line(r.launcher, ts=stamp(NOW - 40), worker="w3", runtime_id="pod/w3", action="report", ok=True, reason="work done: PRs already open, nothing new to push")
+    line(r.launcher, ts=stamp(NOW - 30), worker="w3", runtime_id="pod/w3", action="stop", ok=True, reason="hard limit", pushed=False)
+    check("S5b done then hard limit", r.passes() == [] and r.engine.sent == [])
+    r = Rig(mod)   # pushed false alone proves nothing: a pod with that and neither a stop nor a report is still lost
+    r.created("w4")
+    line(r.launcher, ts=stamp(NOW - 30), worker="w4", runtime_id="pod/w4", action="send", ok=True, reason="pushed=false")
+    check("S5c pushed false alone is not a clean end", len(r.passes()) == 1)
+
+    r = Rig(mod)   # S6: the third launch of an ask
+    for n in ("a1", "a2", "a3"):
+        r.created(n)
+    texts = {x["name"]: x["text"] for x in r.passes()}
+    check("S6 repeat", "repeat" not in texts.get("a1", "repeat") and texts.get("a3", "").count("repeat") == 1 and "repeat: 2 earlier" in texts.get("a3", ""))
+
+    r = Rig(mod, fail=True)   # U1: a send that fails is audited, the pass finishes
+    r.created("w1")
+    try:
+        r.passes(3)
+        ok = True
+    except Exception:
+        ok = False
+    with open(r.engine.audit.path) as handle:
+        said = [x for x in handle if "lost_worker.alert_not_sent" in x]
+    check("U1 pass", ok and len(said) == 2)   # once per recipient, never again on later passes
+    return failed
+
+
+class TestLostWorker(unittest.TestCase):
+    def test_every_case_passes_on_the_real_detector(self):
+        self.assertEqual(scenarios(load()), [])
+
+    def test_the_four_kinds_are_named(self):
+        self.assertEqual(load().KINDS, ("pod_no_stop", "local_worker", "refused_launch", "reaper_missed"))
+
+    def test_mutant_that_alerts_on_every_worker_is_caught(self):
+        mod = load()
+        real = mod._losses
+
+        def every(state, sb, engine, discovery, now, records):
+            out = real(state, sb, engine, discovery, now, records)
+            for name, c in state.get("created", {}).items():
+                out.append({"key": "x:%s" % name, "kind": "pod_no_stop", "name": name, "ask": "a", "at": c["at"], "lane": None, "line": "all"})
+            return out
+        mod._losses = every
+        self.assertTrue(scenarios(mod))
+
+    def test_mutant_that_alerts_on_none_is_caught(self):
+        mod = load()
+        mod._losses = lambda *a, **k: []
+        self.assertTrue(scenarios(mod))
+
+    def test_the_documentation_names_the_alert_and_the_kinds(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("## A lost worker is announced"):].split("\n## ", 1)[0]
+        self.assertIn("[lost worker]", section)
+        for kind in load().KINDS:
+            self.assertIn("`%s`" % kind, section)
+
+
+class TestLostWorkerReadRound(unittest.TestCase):
+    def rig(self, memory=True):
+        r = Rig(load())
+        if not memory:
+            os.unlink(os.path.join(r.dir, "lost-workers.json"))
+        return r
+
+    def alerts(self, r):
+        return [m for m in r.engine.sent if m[0] == "lane-a"]
+
+    def test_s9_cap_and_backlog(self):
+        r = self.rig()
+        for n in range(25):
+            r.created("w%02d" % n)
+        counts = []
+        for _ in range(3):
+            r.engine.sent.clear()
+            got = r.passes()
+            rolls = [m[1] for m in r.engine.sent if "more lost worker" in m[1]]
+            counts.append((len(got), [x.split(" more")[0].split()[-1] for x in rolls]))
+        self.assertEqual(counts, [(10, ["15"]), (10, ["5"]), (5, [])])
+        r.engine.sent.clear()
+        self.assertEqual(r.passes(), [])
+        self.assertEqual(r.engine.sent, [])
+
+    def test_s10_first_pass_alerts_only_recent(self):
+        r = self.rig(memory=False)
+        for n in range(40):
+            r.created("old%d" % n)
+        for n in range(2):
+            line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="new%d" % n, detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual(sorted(x["name"] for x in r.passes()), ["new0", "new1"])
+        self.assertEqual(r.passes(), [])
+
+    def test_s10b_valid_memory_alerts_across_a_restart_gap(self):
+        r = self.rig()
+        r.passes()
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual([x["name"] for x in r.passes()], ["gap"])
+
+    def test_mutant_that_applies_the_one_hour_rule_with_a_valid_memory_is_caught(self):
+        mod = load()
+        real = mod._load
+        mod._load = lambda sb, path: (real(sb, path)[0], "none")
+        r = Rig(mod)
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="gap", detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual(r.passes(), [])   # the mutant alerts nothing: the s10b case above fails on it
+
+    def test_s11_name_cleaned_and_corrupt_memory(self):
+        r = self.rig()
+        name = "bad\x00\x07" + "n" * 100000
+        r.created(name)
+        r.passes()
+        text = r.engine.sent[0][1]
+        self.assertFalse(any(ord(c) < 32 for c in text))
+        self.assertLessEqual(text.split(" (ask")[0].count("n"), 80)
+        r = self.rig()
+        with open(os.path.join(r.dir, "lost-workers.json"), "w") as handle:
+            handle.write("{not json")
+        r.created("w1")
+        self.assertEqual(r.passes(), [])
+        self.assertEqual(r.engine.sent, [])
+        with open(r.engine.audit.path) as handle:
+            self.assertEqual(len([x for x in handle if "lost_worker.memory_corrupt" in x]), 1)
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="w2", detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual([x["name"] for x in r.passes()], ["w2"])
+        self.assertTrue(json.load(open(os.path.join(r.dir, "lost-workers.json")))["offsets"])
+
+    def test_memory_file_is_private(self):
+        r = self.rig()
+        r.created("w1")
+        r.passes()
+        self.assertEqual(os.stat(os.path.join(r.dir, "lost-workers.json")).st_mode & 0o777, 0o600)
+
+    def test_local_worker_is_possibly_lost(self):
+        r = self.rig()
+        r.alive["loc"] = {"lane": "boss", "ask": "ask-9"}
+        r.passes()
+        r.alive.clear()
+        self.assertIn("possibly lost", r.passes(at=NOW + 10)[0]["text"])
+
+
+class TestLostWorkerMemoryOnly(unittest.TestCase):
+    def setUp(self):
+        self.mod = load()
+        self.r = Rig(self.mod)
+        os.unlink(os.path.join(self.r.dir, "lost-workers.json"))
+        os.mkdir(os.path.join(self.r.dir, "lost-workers.json"))   # a directory at the memory path: neither written nor set aside
+        for name, age in (("recent", 300), ("old", 3 * 3600)):
+            line(self.r.engine.audit.path, ts=stamp(NOW - age), actor="x", event="cloud.created", subject=name, detail={"hard_deadline": stamp(NOW - 60)})
+
+    def corrupt_lines(self):
+        with open(self.r.engine.audit.path) as handle:
+            return len([x for x in handle if "lost_worker.memory_corrupt" in x])
+
+    def check(self, r):
+        self.assertEqual([x["name"] for x in r.passes()], ["recent"])
+        self.assertEqual(self.corrupt_lines(), 1)
+        self.assertEqual(r.passes(), [])
+        self.assertEqual(self.corrupt_lines(), 1)
+        self.assertEqual(len([m for m in r.engine.sent if m[0] == "chief-of-staff"]), 1)
+
+    def test_s11b_memory_only_alerts_once_and_audits_once(self):
+        self.check(self.r)
+
+    def test_mutant_that_audits_every_pass_and_alerts_nothing_is_caught(self):
+        real = self.mod.run_pass
+
+        def mutant(sb, engine, now, alive=None, launcher_audit=None):
+            engine.audit.append(engine.actor, "lost_worker.memory_corrupt", None, {})
+            return []
+        self.mod.run_pass = mutant
+        with self.assertRaises(AssertionError):
+            self.check(self.r)
+        self.mod.run_pass = real
+
+    def test_failed_save_does_not_repeat_the_first_run_rule(self):
+        r = Rig(self.mod)
+        os.unlink(os.path.join(r.dir, "lost-workers.json"))
+        line(r.engine.audit.path, ts=stamp(NOW - 300), actor="x", event="cloud.created", subject="recent", detail={"hard_deadline": stamp(NOW - 60)})
+        line(r.engine.audit.path, ts=stamp(NOW - 3 * 3600), actor="x", event="cloud.created", subject="old", detail={"hard_deadline": stamp(NOW - 60)})
+        real = self.mod._save
+        self.mod._save = lambda path, state: (_ for _ in ()).throw(OSError("disk full"))
+        self.assertEqual([x["name"] for x in r.passes()], ["recent"])
+        self.assertEqual(r.passes(), [])   # not re-alerted
+        self.mod._save = real
+        line(r.engine.audit.path, ts=stamp(NOW - 100), actor="x", event="cloud.created", subject="newer", detail={"hard_deadline": stamp(NOW - 60)})
+        self.assertEqual([x["name"] for x in r.passes()], ["newer"])
+
+    def load_mutant(self, *pairs):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        for old, new in zip(pairs[::2], pairs[1::2]):
+            self.assertIn(old, src)
+            src = src.replace(old, new)
+        module = types.ModuleType("lost_worker_mutant")
+        exec(compile(src, "lost_worker_mutant", "exec"), module.__dict__)
+        return module
+
+    def check_proc_cap(self):
+        r = Rig(self.mod)
+        path = os.path.join(r.dir, "lost-workers.json")
+        os.unlink(path)
+        os.mkdir(path)
+        self.mod.ALERTED_MAX, self.mod.PASS_CAP = 30, 10 ** 6
+        for i in range(100):
+            line(r.engine.audit.path, ts=stamp(NOW - 300 - i), actor="x", event="cloud.created", subject="k%03d" % i, detail={"hard_deadline": stamp(NOW - 60)})
+        r.passes()
+        mem = self.mod._PROC_ALERTED[path]
+        self.assertEqual(len(mem), 30)
+        self.assertTrue(any("k000" in k for k in mem))   # the newest is kept
+
+    def test_in_process_memory_is_capped_and_keeps_the_newest(self):
+        self.check_proc_cap()
+
+    def test_mutant_that_never_prunes_the_in_process_memory_is_caught(self):
+        self.mod = self.load_mutant("    _PROC_ALERTED[path] = dict(alerted)", "    pass", "    while len(alerted) > ALERTED_MAX:", "    _PROC_ALERTED.setdefault(path, {}).update(alerted)\n    while len(alerted) > ALERTED_MAX:")
+        with self.assertRaises(AssertionError):
+            self.check_proc_cap()
+
+    def check_audit_per_path(self):
+        a, b = Rig(self.mod), Rig(self.mod)
+        for r in (a, b):
+            os.unlink(os.path.join(r.dir, "lost-workers.json"))
+            with open(os.path.join(r.dir, "lost-workers.json"), "w") as h:
+                h.write("{not json")
+            os.chmod(r.dir, 0o500) if False else None
+        # a corrupt file that cannot be set aside: replace by a directory-free trick: make the file undeletable via patched os
+        real_replace, real_unlink = os.replace, os.unlink
+        os.replace = lambda *x, **k: (_ for _ in ()).throw(OSError("no"))
+        os.unlink = lambda *x, **k: (_ for _ in ()).throw(OSError("no"))
+        try:
+            for r in (a, b, a, b):
+                r.passes()
+        finally:
+            os.replace, os.unlink = real_replace, real_unlink
+        for r in (a, b):
+            with open(r.engine.audit.path) as h:
+                self.assertEqual(len([x for x in h if "lost_worker.memory_corrupt" in x]), 1)
+
+    def test_audit_line_is_once_per_path(self):
+        self.check_audit_per_path()
+
+    def test_mutant_with_one_process_wide_audit_flag_is_caught(self):
+        class OnePath(set):
+            def __contains__(self, item):
+                return len(self) > 0
+        self.mod._PROC_AUDITED = OnePath()
+        with self.assertRaises(AssertionError):
+            self.check_audit_per_path()
+
+
+if __name__ == "__main__":
+    unittest.main()

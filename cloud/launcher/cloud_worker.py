@@ -64,7 +64,13 @@ REAPER_RUNTIME_ID = "reaper"           # the reaper's own runtime id in the audi
 REFRESH_ACTION = "refresh-cluster-token"   # the audit action of the reaper's own login refresh
 SLOW_PASS_SECONDS = 600                 # a reaper pass that takes longer than this is named on the reaper's log and in the audit (a pass is normally seconds)
 SLOW_PASS_ACTION = "slow-reap-pass"     # the audit action of that note (its reason holds the seconds)
+ORPHAN_SECRET_AFTER_SECONDS = 3600      # a per-run Secret whose pod is absent is removed by the pass once it is older than this (set once; not a CW_ setting)
+ORPHAN_SECRET_ACTION = "orphan-secret-removed"   # the audit action of that removal (one line per Secret; its reason holds the name and the age)
+ORPHAN_SECRET_REASON = "orphan secret: its pod is absent"
+PW_SECRET_NAME = re.compile(r"(.+-[0-9a-f]{4})-pw")   # '<worker>-<4 hex digits>-pw': the password Secret of the pod named by the group
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
+RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
+CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
 RENEW_POLL_SECONDS = 15                 # how often that thread looks at the clock
 IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
 IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
@@ -507,22 +513,50 @@ def git_token_cmd(repo, env, role="worker"):
     return cmd + ["--role", role] if role != "worker" else cmd
 
 
+GIT_TOKEN_TRIES = 4
+GIT_TOKEN_WAITS = (2, 5, 10)
+EXIT_TEMPFAIL = 75   # the token command's status for a passing failure; the only status that is tried again
+git_token_sleep = time.sleep   # tests replace it
+
+
+def tempfail_tries(run, last_line, say, sleep):
+    """Run run() -> (status, result) up to GIT_TOKEN_TRIES times, waiting 2, 5, 10 seconds, and again ONLY when status is 75. last_line(result) is
+    the cleaned last stderr line. say(text) hears one line per retry (no token value). Returns (status, result, tries). Shared by the launch."""
+    tries = 0
+    while True:
+        tries += 1
+        status, result = run()
+        if status != EXIT_TEMPFAIL or tries >= GIT_TOKEN_TRIES:
+            return status, result, tries
+        wait = GIT_TOKEN_WAITS[tries - 1]
+        say("git token try %d of %d failed: %s; trying again in %d seconds" % (tries, GIT_TOKEN_TRIES, last_line(result), wait))
+        sleep(wait)
+
+
 def run_git_token_cmd(cmd, repo, env, register=None):
     """THE mint call (the launch and the renewal both come here): run cmd for repo in env, return the token it printed. Never prints, never puts
     the token in an argument or a file. register(text) hears the child's stdout before it is judged, so a caller's scrubber knows it.
     Raises CloudError(EXIT_USAGE) with no value in the text."""
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        p = None
-    if p and register:
-        register(p.stdout.strip())
+    def once():
+        try:
+            q = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            q = None
+        if q and register:
+            register(q.stdout.strip())
+        return (q.returncode if q else None), q
+
+    def line(q):
+        return scrub(q.stderr.strip().splitlines()[-1], (), 200) if q and q.stderr.strip() else "no message"
+
+    _, p, tries = tempfail_tries(once, line, lambda t: print(t, file=sys.stderr), lambda s: git_token_sleep(s))
     token = (p.stdout if p and p.returncode == 0 else "").strip()
     if not token or len(token) > GIT_TOKEN_MAX_CHARS:
         why = ""
         if p and p.stderr.strip():
             why = ": " + scrub(p.stderr.strip().splitlines()[-1], (), 200)
-        raise CloudError("the git token command gave no usable token%s" % why, EXIT_USAGE)
+        after = " after %d tries" % tries if tries > 1 else ""
+        raise CloudError("the git token command gave no usable token%s%s" % (after, why), EXIT_USAGE)
     return token
 
 
@@ -594,6 +628,9 @@ def check_repo_preflight(repo, env):
             p = subprocess.run(argv, capture_output=True, text=True, timeout=PREFLIGHT_SECONDS, stdin=subprocess.DEVNULL, env=_preflight_env(env, home), cwd=home)
     except (OSError, subprocess.TimeoutExpired, ValueError):
         raise CloudError("refused: the repository preflight for %s could not be run; nothing was created" % scrub(repo, (), 120), EXIT_USAGE) from None
+    for x in (p.stderr or "").splitlines():   # only the child's own retry lines (already scrubbed texts), once each, in order
+        if x.startswith("mint try "):
+            print(scrub(x.strip(), (), 300), file=sys.stderr)
     lines = [x.strip() for x in p.stdout.splitlines() if x.strip()]
     if p.returncode != 0:
         said = " | ".join(lines[-4:]) or "no message (exit %d)" % p.returncode
@@ -1449,6 +1486,22 @@ class Kube:
     def pod_events(self, name):
         out = self.run(["get", "events", "--field-selector", "involvedObject.kind=Pod,involvedObject.name=" + name, "-o", "json"])
         return json.loads(out)["items"]
+
+    def list_secrets(self, selector):
+        """The Secrets that match a label selector, WITHOUT any value: an output form that names only the name, the labels cw/pod and app and
+        the creation time (never the whole object). Returns [(name, cw/pod, app, creationTimestamp)]; an answer that cannot be read raises."""
+        tmpl = (r'{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.cw/pod}{"\t"}{.metadata.labels.app}{"\t"}'
+                r'{.metadata.creationTimestamp}{"\n"}{end}')
+        out = self.run(["get", "secrets", "-l", selector, "-o", "jsonpath=" + tmpl])
+        rows = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            f = line.split("\t")
+            if len(f) != 4 or not f[0]:
+                raise CloudError("kubectl get: the Secret list could not be read")
+            rows.append(tuple(f))
+        return rows
 
     def delete_secret(self, name):
         self.run(["delete", "secret", name + "-pw", "--ignore-not-found"])
@@ -2446,12 +2499,70 @@ class Launcher:
                     res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
+                    self.retire_row(worker, reason)   # the pod is ended: its registry row is retired, once (DW-3)
                 except CloudError as e:
                     self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
         out.extend(renewed)
+        self.remove_orphan_secrets(pods, now)
         self.send_wip_notes(live, now)
         return out
+
+    def remove_orphan_secrets(self, pods, now):
+        """Remove each per-run Secret (`<pod>-run`, label cw/pod; `<pod>-pw`, label app=cw-worker) whose pod is absent from THIS pass's pod list and
+        that is more than ORPHAN_SECRET_AFTER_SECONDS old by its creation time (an upper bound of how long the pod has been gone). Each goes by its
+        exact name through the launcher's own delete, with ONE audit line. A kept Secret: its pod is listed (or that name plus `-0`, a persistent
+        orchestrator's pod; this branch has no workload list, so that rule alone stands in for the workload), a Secret younger than the time, any
+        Secret without the launcher's label (the hub's). An unreadable list deletes nothing and is said once. No value is ever read."""
+        if not hasattr(self.kube, "list_secrets"):
+            return []   # a cluster object that cannot list Secrets (an earlier test's fake): the step does not run; the real Kube always can
+        try:
+            run_rows = self.kube.list_secrets("cw/pod")
+            pw_rows = self.kube.list_secrets("app=" + LABEL)
+        except (CloudError, ValueError, OSError) as e:
+            print("cloud-worker: orphan secrets: the Secret list could not be read: %s" % scrub(str(e), (), 120).replace("\n", " "), file=sys.stderr)
+            return []
+        names = {(p.get("metadata") or {}).get("name") for p in pods}
+        found = []
+        for name, pod, app, created in run_rows:
+            if pod and name == pod + "-run":
+                found.append((name, pod, created, self.kube.delete_run_secret))
+        for name, pod, app, created in pw_rows:
+            m = PW_SECRET_NAME.fullmatch(name)
+            if m and app == LABEL:
+                found.append((name, m.group(1), created, self.kube.delete_secret))
+        done = []
+        for name, pod, created, delete in found:
+            if pod in names or pod + "-0" in names:
+                continue
+            try:
+                age = int((now - parse_iso(created)).total_seconds())
+            except (ValueError, TypeError):
+                continue
+            if age <= ORPHAN_SECRET_AFTER_SECONDS:
+                continue
+            try:
+                delete(pod)
+            except CloudError as e:
+                print("cloud-worker: orphan secrets: %s was not removed: %s" % (name, scrub(str(e), (), 120).replace("\n", " ")), file=sys.stderr)
+                continue
+            self.audit(pod, REAPER_RUNTIME_ID, ORPHAN_SECRET_ACTION, 0.0, True, "%s age %d seconds: %s" % (name, age, ORPHAN_SECRET_REASON))
+            done.append(name)
+        return done
+
+    def retire_row(self, worker, reason):
+        """The reaper retires the registry row of a worker it ended, through the registry's own `retire` (the state directory is the switchboard's
+        own). A registry that cannot be written is ONE line on standard error and never a reason to keep the pod (the pod is already ended)."""
+        try:
+            import registry
+            base = self.env.get("XDG_STATE_HOME")
+            base = base if base and os.path.isabs(base) else os.path.join(os.path.expanduser("~"), ".local", "state")
+            got = registry.retire(os.path.join(base, "fl" + "eet-switchboard"), worker, "cloud-worker", "reaped: %s" % reason)
+            why = got.get("problem") if isinstance(got, dict) else None
+        except Exception as e:  # noqa: BLE001  (any registry failure is said, never raised)
+            why = str(e) or e.__class__.__name__
+        if why:
+            print("registry: %s: %s" % (worker, scrub(why, (), 120).replace("\n", " ")), file=sys.stderr)
 
     def note_slow_pass(self, took):
         """A pass that took longer than SLOW_PASS_SECONDS: ONE line on the reaper's own log and ONE audit line with the seconds. A short pass: none."""
@@ -3208,6 +3319,24 @@ def reaper_lock(identity, root=None):
     return fd
 
 
+def code_identity(tree=None):
+    """A sha256 over the bytes of the reaper's code on DISK (CODE_IDENTITY_FILES under `tree`, the kit root by default). A missing file is part of
+    the identity (its name and a marker), not an error."""
+    tree = tree or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    h = hashlib.sha256()
+    for rel in CODE_IDENTITY_FILES:
+        try:
+            with open(os.path.join(tree, rel), "rb") as f:
+                data = b"present:" + f.read()
+        except OSError:
+            data = b"missing"
+        h.update(rel.encode() + b"\0" + hashlib.sha256(data).digest())
+    return h.hexdigest()
+
+
+START_IDENTITY = code_identity()   # taken once when this module is imported: a file changed after Python read the modules is seen at the first compare
+
+
 class RenewalTicker:
     """The renewal and the reaper's own login refresh on their own cadence: a thread that, at least every RENEW_CADENCE_SECONDS of the clock,
     refreshes the login and renews every due token, whatever the pass is doing (a stop that waits, an activity read that hangs). `wait` is the
@@ -3217,10 +3346,10 @@ class RenewalTicker:
         self.L, self.refresher, self.clock = launcher, refresher, clock
         self.wait = wait or (lambda: self._stop.wait(RENEW_POLL_SECONDS))
         self._stop, self.thread, self.last = threading.Event(), None, clock()
-        self.ticks = 0
+        self.ticks, self.retry = 0, False
 
     def due(self):
-        return (self.clock() - self.last).total_seconds() >= RENEW_CADENCE_SECONDS
+        return self.retry or (self.clock() - self.last).total_seconds() >= RENEW_CADENCE_SECONDS
 
     def tick(self):
         now = self.clock()
@@ -3229,6 +3358,9 @@ class RenewalTicker:
         try:
             with self.L.renew_lock:
                 refresh = self.refresher.run()
+                self.retry = refresh.state in ("failed", "waiting")   # tried again at each look until the refresher's own retry gap has passed and it has tried
+                if refresh.state == "failed":   # one line per failure, not one per look
+                    print("cloud-worker: the login refresh failed: %s" % scrub(getattr(refresh, "reason", ""), (), 200), file=sys.stderr)
                 if self.L.kube is not None and refresh.token:
                     self.L.kube.add_secrets(refresh.token)
                 self.L.renew_git_tokens(self.L._before_hard_limit(self.L.kube.list_pods(), now), now)
@@ -3253,7 +3385,7 @@ class RenewalTicker:
             self.thread.join(5)   # a tick in flight ends first
 
 
-def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None):
+def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, tree=None):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop).
 
     The reaper's own login is the token file: it is made fresh at the start of every pass (before the cluster is reached), so an installed
@@ -3271,6 +3403,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
         refresher = refresher or ClusterTokenRefresher(env, clock)
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         ticker = None
+        identity = code_identity(tree) if tree else START_IDENTITY
         while True:
             refresh = refresher.run()
             for line in getattr(refresher, "notices", []):
@@ -3306,6 +3439,12 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
             if not a.loop:
                 why = "end of its pass"
                 return EXIT_HOOK if any(c for _, _, c in work) else 0
+            if code_identity(tree) != identity:   # between two passes only: a stop and its end hook have finished
+                why = "end of its pass"   # the pass ended; the line above says why the loop does not go on
+                print("cloud-worker: the installed code changed: the reaper exits to be started again", file=sys.stderr)
+                if L is not None:
+                    L.audit("", REAPER_RUNTIME_ID, RESTART_ACTION, 0.0, True, "the installed code changed")
+                return 0
             sleep(min(a.loop, REAP_FLOOR_SECONDS))
     except (Interrupted, KeyboardInterrupt) as e:
         why = "stopped by %s" % (e if isinstance(e, Interrupted) else "interrupt")
