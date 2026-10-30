@@ -59619,7 +59619,7 @@ class TestMadeUpPids(unittest.TestCase):
         self.assertEqual([n for n in numbers if proofs.get(n) is not False or n in (os.getpid(), os.getppid(), child.pid)], [])
 
     def test_s3_the_helper_skips_every_number_the_proof_says_is_alive_even_the_one_it_would_start_at(self):
-        with mock.patch.object(sys.modules["support.herdr_world"], "_MADE_UP_NEXT", [5000]), mock.patch.object(sys.modules[__name__], "_MADE_UP_GIVEN", set()), \
+        with mock.patch.object(sys.modules["support.herdr_world"], "_MADE_UP_NEXT", [5000]), mock.patch.object(sys.modules["support.herdr_world"], "_MADE_UP_GIVEN", set()), \
                 mock.patch.object(sys.modules["support.herdr_world"], "_pid_alive", lambda pid: pid in (5000, 5001, 5003)):
             got = [made_up_pid() for _ in range(3)]
         self.assertEqual(got, [5002, 5004, 5005])
@@ -59750,16 +59750,16 @@ class TestMadeUpPids(unittest.TestCase):
         return [n for n in dir(cls) if n.startswith("test") and callable(getattr(cls, n)) and (mentions("setUp", set()) or mentions(n, {"setUp"}))]
 
     def stand_in_groups(self):
-        module = sys.modules[__name__]
+        this_file = sys.modules[__name__]
         real_parent = ("test_odd_file_names_in_the_state_directory_are_left_alone_and_never_stop_the_wrapper",)   # it uses the REAL parent as its live process
         return {cls.__name__: [n for n in self.stand_in_tests_of(cls) if n not in real_parent] for cls in self.all_subclasses(StandInPids)
-                if cls is not TestMadeUpPids and cls.__module__ == module.__name__}
+                if cls is not TestMadeUpPids and cls.__module__ == this_file.__name__}
 
     def run_groups(self, groups, bases):
         """Each group with 4243 and 4242 as the real parent and grandparent, once per base. [(group, base, tests run, failures, numbers handed out, wrapped)]."""
-        module, runs = sys.modules[__name__], []
+        this_file, runs = sys.modules[__name__], []
         for group, names in groups.items():
-            cls = getattr(module, group)
+            cls = getattr(this_file, group)
             for base in bases:
                 suite, result = unittest.TestSuite(cls(n) for n in names), unittest.TestResult()   # a suite empties itself when it runs: one per base
                 given = set(_MADE_UP_GIVEN)
