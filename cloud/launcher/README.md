@@ -191,7 +191,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 
 ## Where the test fixtures make their scratch directory
 
-The fixtures of `bin/test-cloud-worker` make their scratch directory under the repository root. The launcher tests make theirs in the platform's temporary directory. At cleanup the fixture ends every child process that names its directory (end signal, wait at most 15 seconds, kill) and then removes the directory.
+The fixtures of `bin/test-cloud-worker` make their scratch directory in the platform's temporary directory and never in the repository root, because an entry that judges the root runs beside the entries that load the fixture. At cleanup the fixture ends every child process that names its directory (end signal, wait at most 15 seconds, kill) and then removes the directory.
 
 ## How a member adds a test to the chain
 
@@ -215,7 +215,7 @@ Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.
 
 Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
 
-Not yet measured: `cloud/launcher/tests/test_cloud_quick_budget.py`, `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_orphan_secrets.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_reaper_restart.py`, `cloud/launcher/tests/test_reaper_row.py`, `cloud/launcher/tests/test_scratch_clean.py`, `cloud/launcher/tests/test_token_at_limit.py`
+Not yet measured: `cloud/launcher/tests/test_cloud_quick_budget.py`, `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_fixture_root.py`, `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_orphan_secrets.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_reaper_restart.py`, `cloud/launcher/tests/test_reaper_row.py`, `cloud/launcher/tests/test_scratch_clean.py`, `cloud/launcher/tests/test_token_at_limit.py`
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
 

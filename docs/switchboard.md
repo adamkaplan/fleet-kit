@@ -4748,6 +4748,20 @@ branch protection, not by this gate. Known limits: a merge is bound to the head 
 terminal or under a waiver can move the branch between the check and the merge (the next check refuses the now stale pass); a pass costs a full CI run and up to
 `wait_minutes` on a busy branch; and closing the pull request for the re-run fires its `closed` and `reopened` events, which other automation may react to.
 
+## The size ceilings on the merge result (#1605)
+
+**The case.** On 30 Oct five pull requests (+60, +73, +65, +63 and +41 lines) each stayed under the ceiling of `bin/fleet-switchboard` (27,500) when checked alone, and were merged into `integration` one after the other, taking the file from 27,267 to 27,569 lines. `TestArchitectureDocument` checks the ceilings, but on the merge ref GitHub built when the run started, which is an older tip; nothing re-checked the combined result when the tip moved.
+
+**What is checked.** The `size` rows of the Known violations table of `docs/architecture.md` (today: `bin/test-switchboard`, `bin/cloud_worker.py`, `bin/impact_hold.py`, `bin/delegated_clear.py` and `bin/fleet-switchboard`), read from the document at the merge result, never typed into the check. The test workflow's step `Size ceilings on the merge result` runs on every pull request whose base is `integration`: it fetches the base, merges the pull request head with the current tip inside the job (`git merge-tree --write-tree`: it writes no branch, no tag, no comment and does not touch the working tree) and runs `python3 bin/size_ceilings.py check --tip origin/integration --head <head sha>`. The check merges the pull request head with the current tip, never the stored `refs/pull/N/merge`.
+
+**What fails.** A file with a `size` row that is over its ceiling after the merge and that the pull request makes longer, for example `bin/fleet-switchboard is 27,563 lines after merging with origin/integration, over its ceiling of 27,500; this pull request adds 63`. A pull request that adds nothing to a file already over its ceiling passes (it does not make it worse). It fails closed: a merge that conflicts cannot be sized (one line names the conflict and the files), and a `size` row that cannot be read (a ceiling that is not a number, a missing cell) is a line naming the row. A pull request that RAISES its own ceiling in the same diff passes this check: the raise is an owner-visible diff of `docs/architecture.md`.
+
+**Re-run without a push.** The step fetches the tip when it runs, so GitHub's plain re-run of the job reads the then-current tip; closing and reopening the pull request does the same.
+
+**The merge script.** `merge_gate.check_merge` calls the same function (`size_ceilings.check_merge`) on the merge it is about to make, in the repository it runs from, and refuses it with the same lines: the stdout lines of `python3 bin/size_ceilings.py check` are the message the merge script shows. It checks only when both the tip and the head are commits of that repository; otherwise it decides as before (the workflow step is the check there). When the size module is not available, the merge gate's call is skipped (fail-open) and CI is the guard in that case.
+
+**Limit.** A file with no `size` row is held only by the default limits of `TestArchitectureDocument`, on the merge ref; two pull requests that together push such a file over its default limit are not caught by this check.
+
 ## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
 
 This is step (a) of the gate engine in [docs/plan-gate-engine-design.md](plan-gate-engine-design.md). **No shim calls it and
