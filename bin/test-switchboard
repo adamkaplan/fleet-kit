@@ -59608,7 +59608,7 @@ class TestMadeUpPids(unittest.TestCase):
         child = subprocess.Popen(["sleep", "30"])
         self.addCleanup(child.kill)
         self.addCleanup(child.wait)
-        module, proofs, real = sys.modules[__name__], {}, _pid_alive
+        module, proofs, real = sys.modules["support.herdr_world"], {}, _pid_alive
         spy = lambda pid: proofs.__setitem__(pid, real(pid)) or proofs[pid]           # the proof the helper made for each number it looked at
         with mock.patch.object(module, "_MADE_UP_NEXT", [child.pid]), mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", spy), \
                 mock.patch.object(module, "_MADE_UP_BLOCK", [0]):
@@ -59619,15 +59619,15 @@ class TestMadeUpPids(unittest.TestCase):
         self.assertEqual([n for n in numbers if proofs.get(n) is not False or n in (os.getpid(), os.getppid(), child.pid)], [])
 
     def test_s3_the_helper_skips_every_number_the_proof_says_is_alive_even_the_one_it_would_start_at(self):
-        with mock.patch.object(sys.modules[__name__], "_MADE_UP_NEXT", [5000]), mock.patch.object(sys.modules[__name__], "_MADE_UP_GIVEN", set()), \
-                mock.patch.object(sys.modules[__name__], "_pid_alive", lambda pid: pid in (5000, 5001, 5003)):
+        with mock.patch.object(sys.modules["support.herdr_world"], "_MADE_UP_NEXT", [5000]), mock.patch.object(sys.modules[__name__], "_MADE_UP_GIVEN", set()), \
+                mock.patch.object(sys.modules["support.herdr_world"], "_pid_alive", lambda pid: pid in (5000, 5001, 5003)):
             got = [made_up_pid() for _ in range(3)]
         self.assertEqual(got, [5002, 5004, 5005])
 
     def test_s6_no_number_is_given_twice_in_a_hundred_and_a_restarted_base_does_not_repeat(self):
         numbers = [made_up_pid() for _ in range(100)]
         self.assertEqual(len(set(numbers)), 100)
-        with mock.patch.object(sys.modules[__name__], "_MADE_UP_NEXT", [numbers[0]]):
+        with mock.patch.object(sys.modules["support.herdr_world"], "_MADE_UP_NEXT", [numbers[0]]):
             self.assertNotIn(made_up_pid(), numbers)    # the base went back to the first number: it is not handed out again
 
     def test_the_table_gives_one_number_per_key_inside_a_test_and_other_numbers_to_other_tests(self):
@@ -59644,7 +59644,7 @@ class TestMadeUpPids(unittest.TestCase):
         self.assertIsNone(sb.daemon_pid_refusal(made_up_pid()))
 
     def test_the_liveness_proof_pins_every_answer_of_the_system(self):
-        module = sys.modules[__name__]
+        module = sys.modules["support.herdr_world"]
         for error, alive in ((ProcessLookupError(), False), (PermissionError(), True), (OSError(errno.EIO, "x"), True)):
             with self.subTest(error=type(error).__name__), mock.patch.object(os, "kill", side_effect=error):
                 self.assertIs(module._pid_alive(5), alive)
@@ -59652,7 +59652,7 @@ class TestMadeUpPids(unittest.TestCase):
             self.assertTrue(module._pid_alive(5))
 
     def test_the_helper_never_returns_this_process_its_parent_or_its_grandparent(self):
-        module = sys.modules[__name__]
+        module = sys.modules["support.herdr_world"]
         first = [None]
         with mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", lambda pid: False), mock.patch.object(module, "_MADE_UP_NEXT", [6000]):
             with mock.patch.object(module, "_ancestors", lambda: {6000, 6001, 6002}), mock.patch.object(os, "getppid", lambda: 6003), mock.patch.object(os, "getpid", lambda: 6004):
@@ -59763,8 +59763,8 @@ class TestMadeUpPids(unittest.TestCase):
             for base in bases:
                 suite, result = unittest.TestSuite(cls(n) for n in names), unittest.TestResult()   # a suite empties itself when it runs: one per base
                 given = set(_MADE_UP_GIVEN)
-                with mock.patch.object(os, "getppid", lambda: 4243), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), 4243, 4242}), \
-                        mock.patch.object(module, "_MADE_UP_NEXT", [base]):
+                with mock.patch.object(os, "getppid", lambda: 4243), mock.patch.object(sys.modules["support.herdr_world"], "_ancestors", lambda: {os.getpid(), 4243, 4242}), \
+                        mock.patch.object(sys.modules["support.herdr_world"], "_MADE_UP_NEXT", [base]):
                     suite.run(result)
                 handed = sorted(_MADE_UP_GIVEN - given)
                 runs.append((group, base, result.testsRun, [str(e[0]) for e in result.failures + result.errors], len(handed), bool(handed) and handed[0] < base))
@@ -59799,7 +59799,7 @@ class TestMadeUpPids(unittest.TestCase):
         self.assert_wrapped(self.run_groups(groups, (4240, _pid_limit() - 2)), groups)           # the real thing passes
 
     def test_the_fake_herdrs_pane_shell_number_is_made_up_from_either_end_of_the_range(self):
-        module = sys.modules[__name__]
+        module = sys.modules["support.herdr_world"]
         for base in (4240, _pid_limit() - 2):
             with mock.patch.object(module, "_MADE_UP_NEXT", [base]), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), 4243, 4242}), \
                     mock.patch.object(os, "getppid", lambda: 4243):
@@ -59809,7 +59809,7 @@ class TestMadeUpPids(unittest.TestCase):
                 self.assertFalse(_pid_alive(herdr.shell_pid))
 
     def test_a_wrap_never_happens_inside_one_test_and_a_test_that_needs_more_numbers_than_fit_raises(self):
-        module = sys.modules[__name__]
+        module = sys.modules["support.herdr_world"]
         top = _pid_limit()
         with mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", lambda pid: False), mock.patch.object(module, "_ancestors", lambda: set()), \
                 mock.patch.object(module, "_MADE_UP_FRESH", [False]), mock.patch.object(module, "_MADE_UP_NEXT", [top - 1]):
@@ -59818,7 +59818,7 @@ class TestMadeUpPids(unittest.TestCase):
                 made_up_pid()                                  # the next number would have to wrap: inside a test that is refused, never done
 
     def test_a_wrap_happens_between_tests_and_inside_each_test_the_numbers_ascend_from_any_base(self):
-        module = sys.modules[__name__]
+        module = sys.modules["support.herdr_world"]
 
         class Asks(unittest.TestCase):
             numbers = []
@@ -59845,7 +59845,7 @@ class TestMadeUpPids(unittest.TestCase):
     def test_no_test_asks_for_more_numbers_than_the_reserve_and_the_hungriest_one_passes_from_any_base(self):
         """The reserve is at least what any test asks (checked over every request recorded so far, by any caller), and the test that asks for the most, run from
         bases inside and outside the last stretch of the range, passes: a test cannot run out of numbers because of where the machine's pids stand."""
-        module = sys.modules[__name__]
+        module = sys.modules["support.herdr_world"]
         for _ in range(100):
             made_up_pid()                                  # its own ask, so it never depends on which tests ran before it (alone, the registry holds just this)
         hungriest = max(_MADE_UP_BY_TEST, key=lambda test: len(_MADE_UP_BY_TEST[test]))
@@ -59867,7 +59867,7 @@ class TestMadeUpPids(unittest.TestCase):
         self.assertEqual([test for test, got in _MADE_UP_BY_TEST.items() if got != sorted(got) or len(set(got)) != len(got)], [])
 
     def test_the_old_numbers_are_never_handed_out_when_they_are_the_parent_and_grandparent(self):
-        module = sys.modules[__name__]
+        module = sys.modules["support.herdr_world"]
         with mock.patch.object(os, "getppid", lambda: 4243), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), 4243, 4242}), \
                 mock.patch.object(module, "_MADE_UP_NEXT", [4240]), mock.patch.object(module, "_pid_alive", lambda pid: False):
             got = [made_up_pid() for _ in range(5)]
