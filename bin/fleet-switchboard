@@ -20191,7 +20191,7 @@ def whole_read_problem(files_read, listed, bounds=None):
         if total < bound or read < bound:
             return "%s: the row says %d lines read of %d in its diff, but GitHub counts %d added and deleted lines, so its diff has at least %d (the bound): read it again to its last line and count them" % (_printable_path(path), read, total, bound, bound)
         if read < total:
-            return "%s was read to line %d of %d: the first unread line is line %d (chunks of %d lines; read every file to its last line)" % (_printable_path(path), read, total, read + 1, RATER_CHUNK_LINES)
+            return "%s was read to line %d of %d: the first unread line is line %d (chunks of %d lines; read every file to its last line; a row is `- <path> | <lines read> | <lines in its diff>`, and the third field is the line count of that file's diff, not the changed file's length)" % (_printable_path(path), read, total, read + 1, RATER_CHUNK_LINES)
     return None
 
 
