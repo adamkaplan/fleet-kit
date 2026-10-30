@@ -166,6 +166,8 @@ TestGithubConfig, TestPlanningSkill, TestCompose, TestOwnMeasurementTester = (_s
 _support_test_cases_12 = importlib.import_module("test_cases_12")   # support import
 WorkflowPlanPins, TestAgentShellCalls, TestShimReadCache, TestSameNameAccountsAdd = (_support_test_cases_12.WorkflowPlanPins, _support_test_cases_12.TestAgentShellCalls, _support_test_cases_12.TestShimReadCache, _support_test_cases_12.TestSameNameAccountsAdd)   # support import
 TestSelfRegisteringCli, TestGhShimGateProbe, TestClosedUnmergedLastPr, StubIssueHub = (_support_test_cases_12.TestSelfRegisteringCli, _support_test_cases_12.TestGhShimGateProbe, _support_test_cases_12.TestClosedUnmergedLastPr, _support_test_cases_12.StubIssueHub)   # support import
+_support_test_cases_13 = importlib.import_module("test_cases_13")   # support import
+TestClosedUnmergedDocs, TestUnionCheckLimitsDocs = (_support_test_cases_13.TestClosedUnmergedDocs, _support_test_cases_13.TestUnionCheckLimitsDocs)   # support import
 
 
 def daemon_text(path):
@@ -79803,29 +79805,6 @@ class TestAskWaive(unittest.TestCase):
             with patch:
                 with self.assertRaises(AssertionError, msg=case):
                     getattr(self, case)()
-
-
-class TestClosedUnmergedDocs(unittest.TestCase):
-    """#1347 S9: the documentation says plainly that a closed-unmerged last pull request is a defect and what clears it."""
-
-    def test_the_union_check_section_names_the_defect_the_refusals_and_the_waiver(self):
-        text = (REPO / "docs/switchboard.md").read_text()
-        item = [l for l in text.split("\n") if l.startswith("- **A closed-unmerged last pull request is a defect")]
-        self.assertEqual(len(item), 1)
-        for needle in ("`gates ask-close` refuses the ask and names the unclaimed scenarios and the closed pull requests", "the next pull request's merge is refused too",
-                       "a pull request claims the scenario", "head-bound `CU` waiver"):
-            self.assertIn(needle, item[0])
-
-
-class TestUnionCheckLimitsDocs(unittest.TestCase):
-    """#1347 S12: the union-check section states its three limits plainly."""
-
-    def test_the_section_states_the_three_limits(self):
-        text = (REPO / "docs/switchboard.md").read_text()
-        for needle in ("An ask whose only pull request closed unmerged with no claim line and no narrowing claim anywhere passes.",
-                       "A last merge made before the union gate existed is not caught at `gates ask-close`.",
-                       "A failed read refuses the close, and only the head-bound `CU` waiver clears it."):
-            self.assertEqual(text.count(needle), 1, needle)
 
 
 class TestNoPaneToJudge(StandInPids, Base):
