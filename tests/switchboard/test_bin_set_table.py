@@ -31,6 +31,7 @@ class TestTheBinSetClassesAreAllInTheTable(unittest.TestCase):
         "TestOwnMarkerNotHonoured": "reads every module's text for the marker, and passed with a planted unlisted module",
         "TestLatestRunOfWorkflow": "copies the bin/ files into a fixture tree, and passed with a planted unlisted module",
         "TestArchTools": "copies the sibling modules into a fixture tree for the architecture tools, and passed with a planted unlisted module",
+        "HubFilesUnchanged": "lists cloud/worker/bin (the derivation matches its spelling), not bin/: it compares each worker copy with the file of the same name in bin/, so a new file under bin/ with no copy is never read",
         "TestGitShim": "lists bin/test-* for the suites that must route git through the shim; a new bin file that is not a test-* file is not read",
         "TestConflictCarry": "lists the modules of bin/ whose names contain clear, hold or floor to compare them with its carried table; a name outside that pattern is not read (the classes could not run in the pod: the git wrapper refuses their setUp; named so)",
     }
