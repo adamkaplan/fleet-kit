@@ -472,7 +472,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "red_ci_required", "default_branches", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base", "relay_holders"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -725,6 +725,7 @@ def validate_config(raw, source="config"):
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
     validate_red_ci_required(config, source)  # #1141
     validate_default_branches(config, source)
+    validate_relay_holders(config, source)  # #1479
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
     validate_hold_labels_config(config, source)  # #376
@@ -836,6 +837,24 @@ def validate_default_branches(config, source):
         return
     if not isinstance(raw, dict) or len(raw) > 20 or not all(isinstance(r, str) and r and isinstance(b, str) and b for r, b in raw.items()):
         raise ConfigError("%s: 'default_branches' must be an object of at most 20 repository -> non-empty branch name" % source)
+
+
+RELAY_HOLDER_KEY = re.compile(r"[^/#]+/[^/#]+#[0-9]+")   # the only key shape holder_of builds: '<owner/repo>#<issue number>'
+
+
+def validate_relay_holders(config, source):
+    """`relay_holders`: read by the relay daemon, not here. Absent is fine; present it is an object of "<owner/repo>#<issue number>" -> a non-empty pod name
+    ({} is valid). The config file is trusted: there is no cap on the number of entries."""
+    if "relay_holders" not in config:
+        return
+    raw = config["relay_holders"]
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'relay_holders' must be an object of repo#issue -> pod name, got %r" % (source, type(raw).__name__))
+    for key, pod in raw.items():
+        if not isinstance(key, str) or not RELAY_HOLDER_KEY.fullmatch(key):
+            raise ConfigError("%s: 'relay_holders' key %r must look like owner/repo#<issue number>: fix or remove the entry in config.json" % (source, key))
+        if not isinstance(pod, str) or not pod.strip():
+            raise ConfigError("%s: 'relay_holders' entry %r must be a non-empty pod name: fix or remove the entry in config.json" % (source, key))
 
 
 def validate_plan_evaluators(config, source):
@@ -5959,6 +5978,7 @@ BOSS_READ_SITES = {
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
     "bin/fleet-switchboard:cloud_sender": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record): its reports_to is read from the record and validated by `_cloud_boss`, to name the pane-less sender of its report",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
+    "bin/cloud_retired.py:keep_boss": "keeps the boss of a removed cloud worker from the worker's own endpoint record (not a discovered agent) so `read` can answer for it after the record is gone",
 }
 
 
@@ -8920,7 +8940,11 @@ def record_github_calls(engine):
         last_usage = getattr(engine, "usage_read_at", None)
         if last_usage is None or engine.now() - last_usage >= agent_calls.USAGE_EVERY:
             engine.usage_read_at = engine.now()   # once a minute, tried again next minute whatever happens
-            agent_calls.record_usage(str(engine.state_dir), engine.now(), accounts.read_usage())
+            readings = accounts.read_usage()
+            agent_calls.record_usage(str(engine.state_dir), engine.now(), readings)
+            if readings:   # #1501: the 5-minute sample line, and the census of process kinds when the outside count jumps (read only; own failure handling)
+                census_module = "github_census"   # a name, not a literal: this read-only look stays out of the clear's closure (the loader is by path all the same)
+                load_module(census_module).run(engine, readings, agent_calls.recorded_by_account(str(engine.state_dir), readings, engine.now()), engine.now())
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -20053,6 +20077,22 @@ def review_laws_text(engine, config, runner, now, repo, base_sha):
     return "\n\n".join(parts), missing
 
 
+def review_law_files(config, runner, now, repo, base_sha):
+    """The review law files of `repo` at `base_sha`, one by one, for `review checkout`: ({name: bytes}, missing names). `review_laws_text` is not changed."""
+    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    files, missing = {}, []
+    for name in REVIEW_LAW_FILES:
+        try:
+            got = reader._api("repos/%s/contents/%s?ref=%s" % (repo, name, base_sha), repo)
+            files[name] = base64.b64decode(got["content"]) if got.get("encoding") == "base64" else None
+        except (IntentError, AttributeError, KeyError, TypeError, ValueError):
+            files[name] = None
+        if files[name] is None:
+            del files[name]
+            missing.append(name)
+    return files, missing
+
+
 def local_review_overlay(repo):
     """The operator's own overlay for `repo`, if one exists: $XDG_CONFIG_HOME/fleet-switchboard/review-overlay/<owner>__<repo>.md (capped)."""
     path = config_path().parent / "review-overlay" / (repo.replace("/", "__").lower() + ".md")
@@ -20163,7 +20203,7 @@ def whole_read_problem(files_read, listed, bounds=None):
         rows[path] = (max(read, rows[path][0]) if path in rows else read, max(total, rows[path][1]) if path in rows else total)
     missing = [p for p in listed if p not in rows]
     if missing:
-        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each)" % ", ".join(_printable_path(p) for p in missing[:10])
+        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each) (each row's path is a repo path as in files.txt, e.g. bin/widget-api/app.py)" % ", ".join(_printable_path(p) for p in missing[:10])
     for path in listed:
         read, total = rows[path]
         bound = (bounds or {}).get(path, 0)
@@ -20387,7 +20427,7 @@ def cmd_review_post(args, runner, now):
         if not text:
             raise ReviewError("the body file is empty: a review says something (nothing was posted)")
         if redact_command_text(text) != text:
-            raise ReviewError("the body holds a secret-shaped value (it is not shown): remove it and post again (nothing was posted)")
+            raise ReviewError("the body holds a secret-shaped value (it is not shown): %s: remove it and post again (nothing was posted)" % secret_where(text))
         name = _review_caller(runner, now)
         seen["name"], seen["head"] = name, args.head
         repo, number, ref, raw = _review_pr(args, engine)
@@ -20468,7 +20508,7 @@ def cmd_review_dismiss(args, runner, now):
         if not reason:
             raise ReviewError("--reason must say why (nothing was dismissed)")
         if redact_command_text(reason) != reason:
-            raise ReviewError("the reason holds a secret-shaped value (it is not shown) (nothing was dismissed)")
+            raise ReviewError("the reason holds a secret-shaped value (it is not shown): %s (nothing was dismissed)" % secret_where(reason))
         name = _review_caller(runner, now)
         seen["name"] = name
         repo, number, ref, raw = _review_pr(args, engine)
@@ -20790,7 +20830,7 @@ def cmd_review_checkout(args, runner, now):
                 matrix_text = None
                 sys.stderr.write("%s: review checkout: the impact matrix cannot be read, so impact-matrix.txt is not written to the checkout: %s\n" % (PROG, _one_line(str(err), 160)))
             sparse_result = {}
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, sparse=args.sparse, result=sparse_result, law_files=review_law_files(config, runner, now, repo, base), notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
@@ -22958,7 +22998,7 @@ def build_parser():
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
-    launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack) or M (4 CPU, 8 GiB)")
+    launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack), M (4 CPU, 8 GiB) or O (250m CPU, 768 MiB; the default of --agent orchestrator)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
