@@ -1540,8 +1540,9 @@ class OneWallClock(unittest.TestCase):
 
     def test_mutant_without_the_thread_cut_is_caught_by_addresses(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
-        took, _ = self.timed(mod, self.full_backlog(), 2.0)
-        self.assertGreater(took, 5.0)
+        self.timed(mod, self.full_backlog(), 2.0)
+        # the mutant joins without the deadline: it waits for the whole loop, so all four attempts have finished
+        self.assertEqual(len(self.finished_attempts), 4, "the mutant fetch returned before all four attempts had finished")
 
     def test_pass_records_the_cut(self):
         notes = []
