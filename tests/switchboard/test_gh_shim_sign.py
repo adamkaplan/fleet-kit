@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parents[2]
 SHIM_DIR = REPO / "shims"
 MARK = "<!-- fleet-switchboard:from=%s -->"
 
-FAKE_GH = """#!/usr/bin/env python3
+RECORDING_GH = """#!/usr/bin/env python3
 import json, os, sys
 files = {}
 for a in sys.argv[1:]:
@@ -77,7 +77,7 @@ class Rig:
             (self.shims / "gh").write_text(shim_source)
         self.bin = self.home / "realbin"
         self.bin.mkdir()
-        (self.bin / "gh").write_text(FAKE_GH)
+        (self.bin / "gh").write_text(RECORDING_GH)
         (self.bin / "gh").chmod(0o755)
         self.sb = self.home / "fakesb"
         self.sb.write_text(FAKE_SB)
