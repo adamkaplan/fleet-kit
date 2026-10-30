@@ -1513,7 +1513,8 @@ def _finish_starting(args, runner, engine, state, record, repo, branch):
     never sends it twice; the failure is said and the brief can be sent with `send`)."""
     LaunchError = H["LaunchError"]
     name = args.name
-    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip() or args.agent == "orchestrator")
+    configured = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip())
+    hub = configured or args.agent == "orchestrator"   # the same rule as the launch's own
     recovery = VaultRecovery(cloud_dir(state) / VAULT_LOCK_NAME, lambda detail: _audit(engine, "cloud.vault_check", name, detail))
     try:
         with Cluster(recovery) as cluster:
