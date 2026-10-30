@@ -2470,7 +2470,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | `floor` | NOT CHECKED when None-decision (with or without a hold-all or re-hold), unreadable, re-hold unreadable or not a dict; absent with the label set: the label alone holds, the reading goes on; absent with no label: G6 not open, NOT READY | an unreadable floor would say G6 waiting, a false ready |
 | `held_check` | a raising check is NOT CHECKED (exception); a missing one on a held PR is G6b missing: NOT READY | the one `held_defects` check, local |
 
-S5 fact audit: 20 fact keys and arguments (computed from the source by the test, which fails when this number is stale) read by `evaluate_gates`, its helpers, `_ledger_context`, `pr_picture` and `sweep_gate_reading`, 4 external calls (PR view, plan fetch, floor view, `clear_who`): each has a row above and a test (`test_986_every_fact_the_gates_read_has_a_row_in_the_table`).
+S5 fact audit: 21 fact keys and arguments (computed from the source by the test, which fails when this number is stale) read by `evaluate_gates`, its helpers, `_ledger_context`, `pr_picture` and `sweep_gate_reading`, 4 external calls (PR view, plan fetch, floor view, `clear_who`): each has a row above and a test (`test_986_every_fact_the_gates_read_has_a_row_in_the_table`).
 
 Tests behind the S5 claims: wait from ready, new head, gate opens again, once per head, unreadable is not checked, mutants: the `test_986_*` tests and `EDGES`/`READING_CASES`; early/late/never: `edge_unread_drops`, `edge_roundtrip`, `edge_prune`, `edge_partial_list`, the clock test; bounds: `edge_cap`, `edge_real_calls`, the call counter; per-fact table: the two tests above.
 
