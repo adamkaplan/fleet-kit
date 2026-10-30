@@ -438,6 +438,7 @@ class FakeV2:
         self.wake_lasts = 0
         self.before_synthetic = None   # a hook run as a synthetic arrives (the end-of-turn race)
         self.interrupts = []           # every session.interrupt: {"session", "resume", "was_busy", "at"}
+        self.measured = None           # #1345: {(state, form): turn started?} from the measured table (tests/switchboard/fixtures/delivery_measure.json); None keeps the older rule (resume true starts a turn on an idle session)
         self._ids = 0
 
     def _id(self, prefix):
@@ -683,6 +684,25 @@ class FakeV2:
                 self._start(s, at, self.wake_lasts, 1, items=[i for i in s["inbox"] if i["delivery"] == "steer"])
         return {"interrupted": busy}
 
+    @staticmethod
+    def form_of(delivery, resume):
+        """The name of a delivery form in the measured table: `<delivery>_resume` with resume true, `<delivery>` with resume false, `prompt` for a plain prompt (delivery None)."""
+        if delivery is None:
+            return "prompt"
+        return delivery + "_resume" if resume else delivery
+
+    def state_of(self, s):
+        """The measured case a session is in: working, idle after a provider error (outcome `failed`), or idle after a normal turn."""
+        if s["turn"] is not None:
+            return "working"
+        return "idle_after_provider_error" if s["outcome"] == "failed" else "idle_after_normal_turn"
+
+    def starts_turn(self, s, delivery, resume):
+        """Does this form start a turn on this idle session? With the measured table: what was measured; without it: resume true does."""
+        if self.measured is None:
+            return bool(resume)
+        return bool(self.measured[(self.state_of(s), self.form_of(delivery, resume))])
+
     def op_session_synthetic(self, params, body):
         if self.before_synthetic is not None:
             hook, self.before_synthetic = self.before_synthetic, None
@@ -701,13 +721,23 @@ class FakeV2:
                               "from": fleet.get("from"), "text": body["text"], "record": record,
                               "description": body.get("description")}
         self._write("session.synthetic", s["id"], mid)
+        if s["turn"] is not None and self.measured is not None and not self.measured[("working", self.form_of(body["delivery"], body["resume"]))]:
+            return copy.deepcopy(record)   # measured: this form never reaches the model of a working session (admitted, never delivered)
         s["inbox"].append(item)
-        if s["turn"] is None and body["resume"]:
+        if s["turn"] is None and self.starts_turn(s, body["delivery"], body["resume"]):
             self._start(s, at, self.wake_lasts, 1, items=[item])
         return copy.deepcopy(record)
 
     def op_session_prompt(self, params, body):
         s = self._session(params)
+        if self.measured is not None and (s["turn"] is not None or not self.starts_turn(s, None, None)):
+            # measured: a plain prompt to a working session reaches the model at its next step (a steer), and one the idle session ignores waits in the inbox; a working session
+            # whose measured answer is "never reaches the model" drops it
+            mid = self._id("msg")
+            if s["turn"] is None or self.measured[("working", "prompt")]:
+                s["inbox"].append({"id": mid, "sessionID": s["id"], "type": "user", "text": body["text"], "metadata": copy.deepcopy(body.get("metadata")),
+                                   "resume": False, "delivery": "steer", "time": {"created": self.clock.ms(self.clock.now())}})
+            return {"id": mid}
         self.start_turn(s["id"], body["text"], fleet=bool((body.get("metadata") or {}).get("fleet")),
                         metadata=body.get("metadata"))
         return {"id": s["messages"][-1]["id"]}

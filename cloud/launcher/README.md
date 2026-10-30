@@ -196,6 +196,156 @@ The script runs each entry once, stops at the first red with `RESULT: FAIL`, and
 
 Residual risk: two members adding names that sort next to each other (the same place in the list) still conflict in git (adjacent inserts), and the first member to add in an empty gap next to the fixed last line conflicts with it. Only entries far apart merge cleanly. A test documents this limit.
 
+## Chain times (ask #1390)
+
+Cause: the whole chain of `bin/test-cloud-launcher` ran one entry after another. On the macOS `test-cloud` leg that took 24 to 30 minutes (24 on the default branch at batch 6, 25.7 on one pull request and 30.2 on another, whose step limit of 30 minutes then cut the leg with no test failing); on Ubuntu it took 15.6 minutes. The cost was the entries themselves, mostly real subprocess starts of the fake cluster client, not fixed sleeps, and the macOS runner is about twice as slow.
+
+The fix is parallel lanes, not removing or moving a test: the entries named in `bin/test-cloud-launcher.parallel` (a subset of the chain, slowest first, each using its own temporary directory and no fixed port) run in three lanes beside the serial loop, each with its own output file replayed whole afterwards. Every chain entry still runs on BOTH systems: there is no macOS-only exception and no Ubuntu-only list, because the 22 entries that start no subprocess total about 150 seconds and moving them would lower macOS coverage for almost no time. A parallel entry that is not in the chain is refused, and `cloud/launcher/tests/test_chain_time.py` checks both lists. Each entry prints `RUN <entry>` and `TIME <entry> <seconds>`.
+
+Chain time after the change: macOS 11.6 minutes, Ubuntu 5.1 minutes (one run of the pull request's head; the step timeout is 20 minutes). The per-entry seconds below are from that run, so they include the slowdown of running beside other entries.
+
+Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_app_token.py` (122 s), `test_driver.py` (120 s).
+
+Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
+
+Not yet measured: `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_token_at_limit.py`
+
+A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
+### macOS (per entry)
+
+| Entry | Seconds | Lane |
+|---|---|---|
+| `bin/test-cloud-cost-report` | 1 | serial |
+| `bin/test-cloud-retired` | 66 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
+| `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_docs_wording.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_network.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_pod_replaced.py` | 3 | serial |
+| `cloud/launcher/tests/test_cloud_pr_preflight.py` | 25 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_quick.py` | 14 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_wired.py` | 42 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 7 | serial |
+| `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 15 | serial |
+| `cloud/launcher/tests/test_cloud_shapes.py` | 27 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 22 | serial |
+| `cloud/launcher/tests/test_cluster_token_refresh.py` | 37 | serial |
+| `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cw_names.py` | 5 | serial |
+| `cloud/launcher/tests/test_docs_preflight_modes.py` | 0 | serial |
+| `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
+| `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
+| `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
+| `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
+| `cloud/launcher/tests/test_stack_registry_check.py` | 2 | serial |
+| `cloud/launcher/tests/test_stack_registry_pod.py` | 1 | serial |
+| `cloud/launcher/tests/test_token_read_at_call.py` | 1 | serial |
+| `cloud/launcher/tests/test_vault_check_pins.py` | 1 | serial |
+| `cloud/worker/tests/test_cloud_prepush.py` | 30 | serial |
+| `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
+| `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
+| `cloud/worker/tests/test_identity_image.py` | 4 | serial |
+| `cloud/worker/tests/test_question_denied.py` | 0 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 6 | serial |
+| `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
+| `cloud/worker/tests/test_stack_up.py` | 1 | serial |
+| `cloud/worker/tests/test_cloud_prepush_preflight.py` | 21 | serial |
+| `cloud/launcher/tests/test_cloud_prestop.py` | 314 | parallel |
+| `cloud/launcher/tests/test_git_token_renewal.py` | 310 | parallel |
+| `cloud/launcher/tests/test_run_record.py` | 239 | parallel |
+| `cloud/launcher/tests/test_driver.py` | 120 | parallel |
+| `cloud/launcher/tests/test_cloud_stack_wait.py` | 117 | parallel |
+| `cloud/launcher/tests/test_app_token.py` | 122 | parallel |
+| `cloud/launcher/tests/test_orchestrator_hub_session.py` | 74 | parallel |
+| `cloud/launcher/tests/test_cloud_worker.py` | 75 | parallel |
+| `cloud/launcher/tests/test_cloud_k1.py` | 65 | parallel |
+| `cloud/launcher/tests/test_preflight.py` | 65 | parallel |
+| `cloud/launcher/tests/test_cloud_stack.py` | 54 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_bounds.py` | 46 | parallel |
+| `cloud/launcher/tests/test_issues_read.py` | 45 | parallel |
+| `cloud/launcher/tests/test_stub_cleanup.py` | 41 | parallel |
+| `cloud/worker/tests/test_pr_edit_hardening.py` | 45 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
+| `cloud/worker/tests/test_pr_edit.py` | 41 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 34 | parallel |
+| `cloud/worker/tests/test_guard_table.py` | 44 | parallel |
+| `cloud/worker/tests/test_cw_gh_comments.py` | 37 | parallel |
+| `cloud/worker/tests/test_cloud_prepush_hardening.py` | 34 | parallel |
+| `cloud/worker/tests/test_stack_pull.py` | 35 | parallel |
+
+### Ubuntu (per entry)
+
+| Entry | Seconds | Lane |
+|---|---|---|
+| `bin/test-cloud-cost-report` | 0 | serial |
+| `bin/test-cloud-retired` | 33 | serial |
+| `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
+| `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_docs_wording.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_hub_network.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_pod_replaced.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_pr_preflight.py` | 10 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_quick.py` | 6 | serial |
+| `cloud/launcher/tests/test_cloud_preflight_wired.py` | 5 | serial |
+| `cloud/launcher/tests/test_cloud_quick_guards.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_quick_selector.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_settings.py` | 10 | serial |
+| `cloud/launcher/tests/test_cloud_shapes.py` | 11 | serial |
+| `cloud/launcher/tests/test_cloud_status_summary.py` | 16 | serial |
+| `cloud/launcher/tests/test_cluster_token_refresh.py` | 7 | serial |
+| `cloud/launcher/tests/test_cw_minter_manifest.py` | 0 | serial |
+| `cloud/launcher/tests/test_cw_names.py` | 2 | serial |
+| `cloud/launcher/tests/test_docs_preflight_modes.py` | 0 | serial |
+| `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
+| `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
+| `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
+| `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
+| `cloud/launcher/tests/test_stack_registry_check.py` | 1 | serial |
+| `cloud/launcher/tests/test_stack_registry_pod.py` | 1 | serial |
+| `cloud/launcher/tests/test_token_read_at_call.py` | 0 | serial |
+| `cloud/launcher/tests/test_vault_check_pins.py` | 0 | serial |
+| `cloud/worker/tests/test_cloud_prepush.py` | 15 | serial |
+| `cloud/worker/tests/test_dockerfile_agent.py` | 0 | serial |
+| `cloud/worker/tests/test_dockerfile_node.py` | 0 | serial |
+| `cloud/worker/tests/test_entrypoint_question.py` | 0 | serial |
+| `cloud/worker/tests/test_identity_image.py` | 1 | serial |
+| `cloud/worker/tests/test_question_denied.py` | 0 | serial |
+| `cloud/worker/tests/test_root_scanner.py` | 1 | serial |
+| `cloud/worker/tests/test_scan_allowlist_node.py` | 1 | serial |
+| `cloud/worker/tests/test_stack_up.py` | 0 | serial |
+| `cloud/worker/tests/test_cloud_prepush_preflight.py` | 15 | serial |
+| `cloud/launcher/tests/test_cloud_prestop.py` | 29 | parallel |
+| `cloud/launcher/tests/test_git_token_renewal.py` | 106 | parallel |
+| `cloud/launcher/tests/test_run_record.py` | 153 | parallel |
+| `cloud/launcher/tests/test_driver.py` | 93 | parallel |
+| `cloud/launcher/tests/test_cloud_stack_wait.py` | 58 | parallel |
+| `cloud/launcher/tests/test_app_token.py` | 31 | parallel |
+| `cloud/launcher/tests/test_orchestrator_hub_session.py` | 4 | parallel |
+| `cloud/launcher/tests/test_cloud_worker.py` | 23 | parallel |
+| `cloud/launcher/tests/test_cloud_k1.py` | 32 | parallel |
+| `cloud/launcher/tests/test_preflight.py` | 28 | parallel |
+| `cloud/launcher/tests/test_cloud_stack.py` | 29 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_bounds.py` | 45 | parallel |
+| `cloud/launcher/tests/test_issues_read.py` | 10 | parallel |
+| `cloud/launcher/tests/test_stub_cleanup.py` | 36 | parallel |
+| `cloud/worker/tests/test_pr_edit_hardening.py` | 5 | parallel |
+| `cloud/worker/tests/test_push_rules.py` | 1 | serial |
+| `cloud/worker/tests/test_pr_edit.py` | 5 | parallel |
+| `cloud/launcher/tests/test_cloud_quick_scans_run.py` | 30 | parallel |
+| `cloud/worker/tests/test_guard_table.py` | 4 | parallel |
+| `cloud/worker/tests/test_cw_gh_comments.py` | 1 | parallel |
+| `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
+| `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
+
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
 a cluster Secret scoped to the pod and mounted at `/run/cw/server-password` (0600); Basic auth, as the local v2
@@ -218,7 +368,7 @@ the create's own clock, so the floor can trail the stored cap by scheduling time
 exceeding the hard limit and alerting is not decided: it exits 1 from `reap` so a scheduler can alert). The spend cap
 is read from `CW_CLOUD_SPEND_CAP_USD`; unset or empty means the prototype's USD 25, and zero, negative, non-numeric,
 `nan`, `inf` or a cost that cannot be read refuses `create` (exit 5). The check adds this launch's estimate (hard limit times the shape's rate) to what the running pods already cost. A worker name with `_` maps to `-` plus a 4-hex
-hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `S`); `create` refuses a spec with a stored credential.
+hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `O`, the orchestrator row: `O` (250m CPU, 768 MiB, 0.02 USD/hour), requests equal limits, no nested Docker; cost per day of one always-on orchestrator: 24 x 0.02 = 0.48 USD a day, a list-price estimate, not a billed figure, the node's own price not included; `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory); `create` refuses a spec with a stored credential.
 
 **Not in this slice.** Automatic detection of a node drain notice: the end hook runs on `stop`, the idle stop and the hard limit; a drain is handled today by the operator running `stop --reason "node drain"`. The `cw-worker` service account's cloud identity and what it may do belong to the image/cluster setup (slice A and the platform), not here. `bin/test-cloud-launcher` is not yet wired into CI (the suite lists are CI's own).
 
@@ -247,6 +397,16 @@ The managed reaper's loop (`reap --loop`) does it, as one more step of each pass
 - **When it fails** (the vault, the lookup, the mint or the patch): the old token stays, one audit line (`action: renew-git-token`, `ok: false`, the reason, never a value) is written, and the next pass tries again. The worker is
   named in the pass's report as `git token not renewed: ...` with exit 1, so its lane can retire it before the token ends. A failure that persists is audited once per CHANGE of reason, not every pass (the report still names the worker every pass); a renewal writes one `ok: true` line, which also marks a failure as cleared, and a `git token renewed` entry.
 - **Clock skew.** The age is judged by the reaper's clock against the stamp the reaper itself wrote (or the cluster's creation time): a skew of a few minutes between them shifts the renewal by that much, and a stamp from the future is not trusted (it is renewed at once). The 30-minute margin absorbs a skew of several minutes; a larger one is a clock to fix.
+
+**The token at its limit (#1354).** **Cause.** Workers ended with unpushed work because the one-hour git token had ended before the push: the reaper's renewal (30 minutes left) can miss, when the reaper sleeps, the vault refuses or the kubelet projects late, and the end hook's push is then refused. Two changes, both on the launcher side; the pod gets no new credential (it holds none for the minter and never will).
+
+- **The note at minute 40.** The reaper's pass sends each worker ONE note when its pod is 40 minutes old (the `cw/wip-note` pod annotation is set before the send, so a second pass sends none): it names the branch `<worker>/wip` and the exact command `git push origin HEAD:refs/heads/<worker>/wip` (plain, never forced). It reaches the worker's own session through `kubectl exec` of a short program that reads the same server password file the activity probe reads; no image change is needed.
+- **One refresh and one retry.** The rule is exactly one refresh and one retry. When the end hook's `fetch` or `push` is refused because the token had ended, the hook answers `refresh: needed` (a fixed word; nothing of the remote's text) and the STOP side, not the pod, mints through the renewal's route (`run_git_token_cmd`), replaces ONLY the `git-token` key of the per-run Secret, waits (at most 120 seconds) until the pod's file shows the new token (a digest comes back, never the token), and runs the hook once more. A refused refresh means no second attempt and no loop; a refusal for any other reason (a rejected ref, a hostile configuration, the network) asks for no refresh. A second token end during the retry loses the work: the pod is kept as for any hook failure.
+- **Scope.** The new token is for the same repository and the same permissions, with the same one-hour life (the minter's own checks and its 61-minute refusal are unchanged) and is checked once more with GitHub before the Secret is patched: exactly the pod's one repository, push and pull, never admin or maintain; anything unreadable is a refusal and the old file is kept. The token is never printed or written to a log, record or audit line. The pod's token file is replaced by a temporary file and a rename: that is the kubelet's own projection of the Secret; nothing added here writes the file.
+- **The word.** The stop's audit line carries one word, refresh: used, refused or none (a word, never a value), and so does the `end_hook` part of the run record.
+- **The word, in full.** The audit word `used` is returned even when the wait for the new value to appear in the pod timed out: the Secret then holds the new token, and `used` does not prove that the pod's file shows it.
+
+Not run in a cluster: the live check (a real pod with an ended token, and the note reaching a real session) is the operator's, after merge.
 
 #### Acting on an object later, by name
 
@@ -370,3 +530,9 @@ value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault se
 `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
 
 **Repository allow-list.** `create` (and the driver, `run-task`, through the same function `check_repo_allowed`) launches only for a repository the owner listed. `CW_ALLOWED_REPOS` is a comma-separated list of `OWNER/NAME`, compared exactly and case-insensitively; no wildcard. Unset, empty, or any entry that is not `OWNER/NAME` shaped (a dot segment, a space, a `*`, an extra slash) refuses everything (fail closed). `CW_TOOLING_REPO` (`OWNER/NAME`) names the tooling's own repository, which is refused even when it is listed; unset adds no extra check, malformed refuses. A refused repository exits `2` with `refused: <repo> is not on the cloud allow-list` before any `kubectl` call, so nothing is created. Both settings are read from the environment of whoever runs the launcher or the driver, like the other `CW_` settings: the operator exports them in the shell (or the service unit) that starts it. An agent running as the same user could set them for a command it runs, so the list is a mistake-guard for the operator, not a boundary; the stops are the token's one-repository scope and the repository's own rules. The check compares spellings: a renamed or transferred repository is not matched by its old name, and an entry or tooling value ending in `.git` is malformed and refuses. The guard table is `docs/cloud-guard-parity.md`.
+
+**Token roles.** The mint takes a role (`app_token.py OWNER/REPO --role ROLE`, default `worker`; an unknown role is refused before any network call) from one table of permission sets, `PERMISSIONS_BY_ROLE` in `cloud/launcher/app_token.py`. The worker role asks for, and accepts, exactly `contents: write, pull_requests: write, issues: read, metadata: read`. The orchestrator role asks for, and accepts, exactly `issues: write, pull_requests: read, checks: read, metadata: read` (no `contents` key at all). A launch with `--agent orchestrator` mints under the orchestrator role and records it on the pod as the annotation `cw/role: orchestrator` (a worker pod carries no annotation: its spec is unchanged); the reaper's renewal mints under the role the annotation names, and a pod made before the annotation renews as a worker. A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command. An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set. The orchestrator pod holds no App key, App id, vault setting or mint command.
+
+The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
+
+**What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
