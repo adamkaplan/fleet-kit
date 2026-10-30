@@ -289,5 +289,81 @@ class TestDocs(unittest.TestCase):
         print("S8: %d of 3 sentences found" % (found // 2))
 
 
+LAUNCHER_SRC = os.environ.get("GIT_TOKEN_RETRY_LAUNCHER") or os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")   # a mutant's scratch copy, in a child
+
+
+def load_launcher_from(path):
+    sys.path.insert(0, os.path.join(ROOT, "cloud", "launcher"))
+    try:
+        spec = importlib.util.spec_from_file_location("git_token_retry_launcher_copy", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.pop(0)
+    return mod
+
+
+class TestLauncherCopyRetry(Fakes):
+    def launcher_copy(self, cmd):
+        lib = load_launcher_from(LAUNCHER_SRC)
+        waits, err, token, refusal = [], io.StringIO(), None, ""
+        with mock.patch.object(lib, "git_token_sleep", waits.append), contextlib.redirect_stderr(err):
+            try:
+                token = lib.run_git_token_cmd(cmd.split(" "), REPO, dict(os.environ))
+            except lib.CloudError as e:
+                refusal = str(e)
+        return token, refusal, waits, err.getvalue()
+
+    def test_s9_launcher_copy_retries_once_and_a_status_1_runs_once(self):
+        token, refusal, waits, err = self.launcher_copy(self.command([75, 0]))
+        runs, lines = self.runs(), len(err.strip().splitlines())
+        self.assertEqual((token, runs, lines, waits), (TOKEN, 2, 1, [2]))
+        self.assertNotIn(TOKEN, err + refusal)
+        token1, refusal1, waits1, err1 = self.launcher_copy(self.command([1]))
+        runs1 = self.runs()
+        self.assertEqual((token1, runs1, waits1, err1), (None, 1, [], ""))
+        self.assertIn("gave no usable token", refusal1)
+        print("S9: launcher runs %d, retry lines %d; status 1 runs %d" % (runs, lines, runs1))
+
+
+class TestBinRetryCounted(Fakes):
+    def test_s4b_bin_copy_runs_exactly_twice_with_one_retry_line(self):
+        token, refusal, waits, err = self.launch(load_bin(), self.command([75, 0]))
+        runs, lines = self.runs(), len(err.strip().splitlines())
+        self.assertEqual((token, runs, lines, waits), (TOKEN, 2, 1, [2]))
+        self.assertNotIn(TOKEN, err + refusal)
+        token1, refusal1, waits1, err1 = self.launch(load_bin(), self.command([1]))
+        runs1 = self.runs()
+        self.assertEqual((token1, runs1, waits1), (None, 1, []))
+        print("S4: bin runs %d, retry lines %d; launcher runs 2, retry lines 1; status 1 runs %d and 1 in each copy" % (runs, lines, runs1))
+
+
+COPY_MUTANTS = (("bin never retries", "bin", "if not ran or ran[0] != 75 or tries >= 4:", "if True:", "GIT_TOKEN_RETRY_BIN", "TestBinRetryCounted"),
+                ("launcher never retries", "launcher", "if status != EXIT_TEMPFAIL or tries >= GIT_TOKEN_TRIES:", "if True:",
+                 "GIT_TOKEN_RETRY_LAUNCHER", "TestLauncherCopyRetry"))
+
+
+class TestCopyMutants(unittest.TestCase):
+    def test_s7b_one_mutant_per_copy_fails_its_new_test(self):
+        failing = applied = 0
+        for name, copy, old, new, var, cls in COPY_MUTANTS:
+            scratch = tempfile.mkdtemp(prefix="git-token-copy-mutant-")
+            self.addCleanup(shutil.rmtree, scratch, True)
+            real = os.path.join(ROOT, "bin", "cloud_worker.py") if copy == "bin" else os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
+            src = open(real).read()
+            self.assertEqual(src.count(old), 1, name)
+            path = os.path.join(scratch, "cloud_worker.py")
+            open(path, "w").write(src.replace(old, new))
+            self.assertIn(new, open(path).read())
+            applied += 1
+            p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_git_token_retry." + cls], cwd=HERE,
+                                   env=dict(os.environ, **{var: path}), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            p.communicate(timeout=120)
+            self.assertEqual(p.returncode, 1, name)
+            failing += 1
+        self.assertEqual((failing, applied), (2, 2))
+        print("S7b: mutants caught %d of 2 (one per copy), mutations applied %d of 2" % (failing, applied))
+
+
 if __name__ == "__main__":
     unittest.main()
