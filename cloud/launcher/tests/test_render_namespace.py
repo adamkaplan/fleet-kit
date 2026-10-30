@@ -145,7 +145,7 @@ class Runbook(unittest.TestCase):
         self.section = text.split("\n## A probe namespace\n", 1)[1].split("\n## ", 1)[0]
 
     def test_the_six_steps_come_in_order(self):
-        marks = ["cloud/k8s/render-namespace cwp > cwp.yaml", 'kubectl apply --dry-run=server -n "$NS" -f cwp.yaml', "ADMINISTRATOR login",
+        marks = ["cloud/k8s/render-namespace cwp > cwp.yaml", 'kc apply --dry-run=server -f cwp.yaml', "ADMINISTRATOR login",
                  "CW_PULL_SECRET`", "private settings", "smoke launch"]
         steps = ["Step %d" % n for n in range(1, 7)]
         at = [self.section.index(s) for s in steps]
@@ -168,13 +168,13 @@ class Runbook(unittest.TestCase):
         self.assertIn("adds one more hub pod and its Services", self.section)
         self.assertIn("while the namespace exists", self.section)
         self.assertIn("Deleting the namespace removes everything inside it", self.section)
-        for command in ('kubectl delete namespace "${NS:?}"', 'kubectl -n "${NS:?}" delete rolebinding cw-minter',
-                        'kubectl -n "${NS:?}" delete secret cw-minter-token', 'rm -rf "${PROBE_CONFIG_DIR:?}"', "rm -f TOKEN_FILE"):
+        for command in ('kubectl delete namespace "${NS:?}"', 'kc delete rolebinding cw-minter',
+                        'kc delete secret cw-minter-token', 'rm -rf "${PROBE_CONFIG_DIR:?}"', "rm -f TOKEN_FILE"):
             self.assertIn(command, self.section)
 
 
 DAEMON_ENV = "FL" + "EET_CLOUD_HUB_DAEMON"   # assembled: the neutral-names scan of this folder reads the old prefix
-R1_COMMAND = 'kubectl -n "${NS:?}" set env deployment/cloud-hub %s=relay-probe' % DAEMON_ENV
+R1_COMMAND = 'kc set env deployment/cloud-hub %s=relay-probe' % DAEMON_ENV
 
 
 def hub_reserved_names():
@@ -207,7 +207,7 @@ class RelayAppendix(unittest.TestCase):
 
     def test_the_daemon_name_command_is_found_once_and_the_reserved_names_match_the_hub(self):
         self.assertEqual(self.text.count(R1_COMMAND), 1)
-        self.assertIn('kubectl -n "$NS" rollout status deployment/cloud-hub', self.text)
+        self.assertIn('`kc rollout status deployment/cloud-hub`', self.text)
         line = [l for l in self.text.split("\n") if l.startswith("Reserved names:")]
         self.assertEqual(len(line), 1)
         listed = set(re.findall(r"`([^`]+)`", line[0]))
@@ -220,7 +220,7 @@ class RelayAppendix(unittest.TestCase):
         self.assertIn("mode 0600", self.text)
         self.assertIn("hands ONLY THE DIGEST to the administrator", self.text)
         self.assertIn('{"relay-probe": "DIGEST_VALUE"}', self.text)
-        self.assertIn('kubectl -n "${NS:?}" get secret cloud-hub-registry', self.text)
+        self.assertIn('kc get secret cloud-hub-registry', self.text)
 
     def test_the_session_verb_and_the_entry_change_are_named(self):
         self.assertIn("cloud/launcher/cloud-worker hub-session WORKER_NAME --session SESSION_ID", self.text)
@@ -288,7 +288,7 @@ def subshells(block):
     return found
 
 
-TOKEN_BARE = 'kubectl -n "${NS:?}" create token cw-operator --duration=DURATION'
+TOKEN_BARE = 'kc create token cw-operator --duration=DURATION'
 
 
 class CredentialFileCare(unittest.TestCase):
@@ -367,7 +367,7 @@ class CredentialFileCare(unittest.TestCase):
         self.assertNotIn("docker-" + "password", self.doc)
         copies = [l for l in self.doc.split("\n") if "get secret PULL_SECRET_NAME -o json" in l and "create -f -" in l]
         self.assertEqual(len(copies), 1)
-        self.assertIn('kubectl -n "${NS:?}" create -f -', copies[0])
+        self.assertIn('| kc create -f -', copies[0])
         self.assertIn("managedFields", copies[0])
         self.assertIn('kubectl -n "${SRC:?}" get secret', copies[0])
         self.assertIn("--from-file=.dockerconfigjson=DOCKER_CONFIG_FILE", self.whole)
@@ -445,8 +445,8 @@ class CredentialShapeSweep(unittest.TestCase):
         self.assertEqual(self.doc.count(sentence), 1)
 
     def test_a_runbook_with_the_old_patch_restored_fails_the_scan(self):
-        new = 'kubectl -n "${NS:?}" patch secret cloud-hub-registry --type merge --patch-file registry-patch.json'
-        old = 'kubectl -n "${NS:?}" patch secret cloud-hub-registry --type merge -p "$(cat secrets.json)"'
+        new = 'kc patch secret cloud-hub-registry --type merge --patch-file registry-patch.json'
+        old = 'kc patch secret cloud-hub-registry --type merge -p "$(cat secrets.json)"'
         mutant = self.whole.replace(new, old)
         self.assertNotEqual(mutant, self.whole)   # the mutation is applied
         self.assertEqual(len(credential_shapes(mutant)), 1)
@@ -460,7 +460,6 @@ class CredentialShapeSweep(unittest.TestCase):
 
 
 LIVE = r"(?<![\w-])cw(?![\w-])"
-REPORT = "ns_ok || false"
 GUARD = 'ns_ok() {'
 
 
@@ -469,8 +468,6 @@ def runbook_shapes(text):
     found = []
     for block in code_blocks(text):
         lines = block.split("\n")
-        if any("kubectl" in l for l in lines) and not any(l == REPORT for l in lines):
-            found.append("block without the namespace guard: " + lines[0])
         for line in lines:
             if re.search(r"(?:-n|--namespace|namespace)[ =]+\"?" + LIVE, line):
                 found.append("the live namespace on a line: " + line)
@@ -484,8 +481,9 @@ def runbook_shapes(text):
                 found.append("from-env-file: " + line)
             if re.search(r"get secret\b.*(-o|--output)[ =]*(yaml|json)\b", line) and not re.search(r"(-o|--output)[ =]*(yaml|json)\b.*[|>]", line):
                 found.append("secret in full to a terminal: " + line)
-            if re.search(r"\bkubectl\b.*\b(apply|create)\b.* -f\b", line) and "namespace" not in line.split(" -f")[0].split("kubectl", 1)[1].split()[:2] and ' -n "${NS:?}"' not in line:
-                found.append("apply or create -f without the namespace: " + line)
+            for seg in line.split("|"):   # one pipeline side at a time: a kc call on the other side does not count
+                if re.search(r"\bkubectl\b.*\b(apply|create)\b.* -f\b", seg) and "namespace" not in seg.split(" -f")[0].split("kubectl", 1)[1].split()[:2] and ' -n "${NS:?}"' not in seg:
+                    found.append("apply or create -f without the namespace: " + line)
             if "rm -rf" in line and not re.search(r'rm -rf "\$\{\w+:\?\}"', line):
                 found.append("rm -rf without a guarded path: " + line)
     return found
@@ -502,14 +500,14 @@ class RunbookSweep(unittest.TestCase):
         self.assertGreaterEqual(len(code_blocks(self.whole)), 6)
 
     def test_every_block_with_kubectl_starts_with_the_guard(self):
-        for block in code_blocks(self.whole):
-            if "kubectl" in block:
-                self.assertIn(REPORT, block.split("\n")[:3])
-        self.assertIn(GUARD, code_blocks(self.whole)[0].split("\n")[0])
-        self.assertLess(code_blocks(self.whole)[0].index("kubectl config current-context"), code_blocks(self.whole)[0].index("kubectl create -n"))
+        first = code_blocks(self.whole)[0]
+        self.assertIn(GUARD, first.split("\n")[0])
+        self.assertEqual(first.split("\n")[1], WRAPPER)
+        self.assertEqual(unchained_calls(self.whole), [])
+        self.assertLess(first.index("kubectl config current-context"), first.index("kc create -f cwp.yaml"))
 
     def test_the_scan_sees_each_new_shape(self):
-        guard = REPORT + "\n"
+        guard = "true\n"
         samples = {
             "dash n cw": guard + "kubectl -n cw get pods",
             "namespace cw": guard + "kubectl get namespace cw",
@@ -523,21 +521,21 @@ class RunbookSweep(unittest.TestCase):
             "create without namespace": guard + "kubectl create -f cwp.yaml",
             "apply without namespace": guard + "kubectl apply --dry-run=server -f cwp.yaml",
             "unguarded rm": guard + "kubectl get nodes\nrm -rf PROBE_CONFIG_DIR",
-            "no guard": 'kubectl -n "${NS:?}" get nodes',
         }
         for name, text in samples.items():
             self.assertEqual(len(runbook_shapes("```text\n" + text + "\n```")), 1, name)
         good = guard + 'kubectl -n "${NS:?}" get secret x -o json | python3 -c pass\nkubectl delete namespace "${NS:?}"\nrm -rf "${DIR:?}"\nkubectl create -n "${NS:?}" -f cwp.yaml'
+        self.assertEqual(len(unchained_calls("```text\nkubectl -n \"${NS:?}\" get nodes\n```")), 1)
         self.assertEqual(runbook_shapes("```text\n" + good + "\n```"), [])
 
     def test_a_runbook_with_a_planted_shape_fails_the_sweep(self):
         plants = {
-            "-n cw": ('kubectl -n "${NS:?}" get secret cloud-hub-registry cloud-hub-pw', "kubectl -n cw get secret cloud-hub-registry cloud-hub-pw"),
+            "-n cw": ('kc get secret cloud-hub-registry cloud-hub-pw', "kubectl -n cw get secret cloud-hub-registry cloud-hub-pw"),
             "delete literal": ('kubectl delete namespace "${NS:?}"', "kubectl delete namespace cw"),
             "cat token": ("rm -f TOKEN_FILE\n", "cat TOKEN_FILE\nrm -f TOKEN_FILE\n"),
             "from-env-file": ('create secret generic cloud-hub-pw', "create secret generic cloud-hub-pw --from-env-file=F"),
             "terminal secret": (" -o json | python3", " -o json\npython3"),
-            "create without namespace": ('kubectl create -n "${NS:?}" -f cwp.yaml', "kubectl create -f cwp.yaml"),
+            "create without namespace": ('kc create -f cwp.yaml', "kubectl create -f cwp.yaml"),
             "unguarded rm": ('rm -rf "${PROBE_CONFIG_DIR:?}"', "rm -rf PROBE_CONFIG_DIR"),
         }
         for name, (old, new) in plants.items():
@@ -547,7 +545,8 @@ class RunbookSweep(unittest.TestCase):
         self.assertEqual(len(plants), 7)
 
 
-NS_FORMS = ('-n "$NS"', '-n "${NS:?}"', '-n "${SRC:?}"')
+WRAPPER = 'kc() { ns_ok && kubectl -n "${NS:?}" "$@"; }'
+CLUSTER_LINE = re.compile(r'kubectl (create|delete) namespace "\$\{NS:\?\}"')
 
 
 def probe_section(text):
@@ -555,26 +554,28 @@ def probe_section(text):
 
 
 def kubectl_calls(text):
-    """Every kubectl call of the code blocks of a probe section, one per call, continuation lines joined."""
+    """Every kubectl word of the code blocks of a probe section, as (text before it, text from it) on its line."""
     calls = []
     for block in code_blocks(text):
         for line in block.replace("\\\n", " ").split("\n"):
-            for part in line.split("kubectl")[1:]:
-                calls.append("kubectl" + part)
+            for m in re.finditer(r"\bkubectl\b", line):
+                calls.append((line[:m.start()], line[m.start():]))
     return calls
 
 
-def calls_without_the_namespace(text):
-    """The calls that carry no -n on the call itself (apart from config and the namespace create and delete)."""
+def unchained_calls(text):
+    """The kubectl words that are not the wrapper's definition, a chained cluster-scoped line, the SRC read or the context read."""
     bad = []
-    for call in kubectl_calls(text):
-        body = call[len("kubectl"):].strip()
-        if body.startswith("config "):
+    for before, rest in kubectl_calls(text):
+        if before == "kc() { ns_ok && " and rest == 'kubectl -n "${NS:?}" "$@"; }':
             continue
-        if re.match(r'(create|delete) namespace "\$\{NS:\?\}"', body):
+        if rest.startswith("kubectl config current-context"):
             continue
-        if not any(form in call for form in NS_FORMS):
-            bad.append(call)
+        if before.endswith("ns_ok && ") and CLUSTER_LINE.match(rest):
+            continue
+        if rest.startswith('kubectl -n "${SRC:?}" get '):
+            continue
+        bad.append(before + rest)
     return bad
 
 
@@ -588,39 +589,42 @@ class PastedBlockGuard(unittest.TestCase):
             self.doc = f.read()
         self.whole = probe_section(self.doc)
 
-    def test_every_kubectl_call_of_the_probe_section_matches_the_namespace_form(self):
+    def test_every_kubectl_word_of_the_probe_section_matches_the_chained_form(self):
         calls = kubectl_calls(self.whole)
-        self.assertGreaterEqual(len(calls), 12)
-        self.assertEqual(calls_without_the_namespace(self.whole), [])
+        self.assertGreaterEqual(len(calls), 6)
+        self.assertEqual(unchained_calls(self.whole), [])
         for block in code_blocks(self.whole):
             for line in block.split("\n"):
-                if "kubectl" in line:
-                    self.assertNotIn('-n "$NS"', line)   # the bare form does not fail an empty NS
-        pull = [c for c in calls if "get secret PULL_SECRET_NAME" in c]
+                self.assertNotIn("|| false", line)   # a report that does not stop the next pasted line
+                self.assertNotIn('-n "$NS"', line)
+        pull = [c for b, c in calls if c.startswith('kubectl -n "${SRC:?}" get secret PULL_SECRET_NAME')]
         self.assertEqual(len(pull), 1)
-        self.assertIn('-n "${SRC:?}"', pull[0])
-        deletes = [c for c in calls if "delete namespace" in c]
-        self.assertEqual(len(deletes), 1)
-        self.assertIn('"${NS:?}"', deletes[0])
+        self.assertEqual(len([c for b, c in calls if "delete namespace" in c]), 1)
+        self.assertEqual(self.whole.count(WRAPPER), 1)
+        self.assertIn("runs NOTHING", self.whole)
+        self.assertIn('so the write receives empty input and creates nothing', self.whole)
 
-    def test_a_scratch_text_with_one_kubectl_call_lacking_n_is_caught(self):
+    def test_a_scratch_text_with_one_bare_kubectl_call_is_caught(self):
         mutations = [
-            ('kubectl -n "${NS:?}" delete secret cw-minter-token', "kubectl delete secret cw-minter-token"),
-            ('kubectl -n "${NS:?}" patch secret cloud-hub-registry', "kubectl patch secret cloud-hub-registry"),
-            ('kubectl -n "${NS:?}" set env', "kubectl set env"),
-            ('| kubectl -n "${NS:?}" create -f -', "| kubectl create -f -"),
+            ('kc delete secret cw-minter-token', "kubectl delete secret cw-minter-token"),
+            ('kc patch secret cloud-hub-registry', "kubectl patch secret cloud-hub-registry"),
+            ('kc set env', 'kubectl -n "${NS:?}" set env'),
+            ('| kc create -f -', "| kubectl create -f -"),
             ('kubectl -n "${SRC:?}" get secret', "kubectl get secret"),
-            ('kubectl -n "${NS:?}" create secret generic cloud-hub-pw', 'kubectl -n "" create secret generic cloud-hub-pw'),
+            ('kc create secret generic cloud-hub-pw', 'kubectl -n "" create secret generic cloud-hub-pw'),
+            ('ns_ok && kubectl delete namespace', "kubectl delete namespace"),
+            ('ns_ok && kubectl create namespace', "kubectl create namespace"),
+            (WRAPPER, WRAPPER.replace("ns_ok && ", "")),
         ]
         for old, new in mutations:
             mutant = self.whole.replace(old, new, 1)
             self.assertNotEqual(mutant, self.whole, old)   # the mutation is applied
-            self.assertEqual(len(calls_without_the_namespace(mutant)), 1, old)
-        self.assertEqual(len(mutations), 6)
+            self.assertEqual(len(unchained_calls(mutant)), 1, old)
+        self.assertEqual(len(mutations), 9)
 
     def test_no_pasted_block_has_the_word_exit_as_a_command(self):
         self.assertEqual(exit_commands(self.whole), [])
-        for old, new in (('ns_ok || false', "ns_ok || exit 1"), ("rm -f cwp.yaml", "exit")):
+        for old, new in (('kc get secret cloud-hub-registry cloud-hub-pw', "exit 1"), ("rm -f cwp.yaml", "exit")):
             mutant = self.whole.replace(old, new, 1)
             self.assertNotEqual(mutant, self.whole)   # the mutation is applied
             self.assertNotEqual(exit_commands(mutant), [], new)
@@ -639,6 +643,93 @@ class PastedBlockGuard(unittest.TestCase):
             self.assertIn("rc=%d still-open" % want, r.stdout, name)
             self.assertEqual(r.returncode, 0, name)
             self.assertEqual(bool(r.stderr), want == 1, name)
+
+
+BAD_VALUES = (("cw", "cw"), ("default", "default"), ("kube-system", "kube-system"), ("unset", None), ("empty", ""))
+SHELL_BLOCK = re.compile(r"\bkc\b|\bkubectl\b")
+
+
+def administrator_script(section, value):
+    """The probe section's shell blocks in the document's order, as ONE script: the definitions, then NS as given, then the rest.
+    The NS= lines of the blocks are dropped (the case sets NS); the other lines are the document's own."""
+    blocks = [b for b in code_blocks(section) if SHELL_BLOCK.search(b)]
+    first = blocks[0].split("\n")
+    assert first[0].startswith("ns_ok() {") and first[1].startswith("kc() {")
+    lines = first[2:]
+    for block in blocks[1:]:
+        lines += block.split("\n")
+    lines = [l for l in lines if not l.startswith("NS=")]
+    return "\n".join(first[:2] + ([] if value is None else ["NS=" + value]) + lines)
+
+
+def stub_calls(section, value):
+    """Runs the script in sh -c with a stub kubectl first on PATH; returns the number of lines the stub wrote (its calls)."""
+    with tempfile.TemporaryDirectory() as scratch:
+        stubs = os.path.join(scratch, "stubs")
+        work = os.path.join(scratch, "work")
+        os.mkdir(stubs)
+        os.mkdir(work)
+        log = os.path.join(scratch, "calls.log")
+        stub = os.path.join(stubs, "kubectl")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\necho "$*" >> "%s"\nexit 0\n' % log)
+        os.chmod(stub, 0o755)
+        env = {"PATH": stubs + ":/usr/bin:/bin", "HOME": work}
+        subprocess.run(["sh", "-c", administrator_script(section, value)], cwd=work, env=env,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        if not os.path.exists(log):
+            return 0
+        with open(log) as f:
+            return len(f.read().splitlines())
+
+
+def check_stub_guard(section):
+    for name, value in BAD_VALUES:
+        got = stub_calls(section, value)
+        if got != 0:
+            raise AssertionError("%s: the stub was called %d times" % (name, got))
+    if stub_calls(section, "cwp") == 0:
+        raise AssertionError("cwp: the stub was never called")
+
+
+class StubGuard(unittest.TestCase):
+    def setUp(self):
+        with open(DOCS, encoding="utf-8") as f:
+            self.whole = probe_section(f.read())
+
+    def test_a_blocked_namespace_never_reaches_the_stub_and_cwp_does(self):
+        for name, value in BAD_VALUES:
+            with self.subTest(name=name):
+                self.assertEqual(stub_calls(self.whole, value), 0)
+        self.assertGreaterEqual(stub_calls(self.whole, "cwp"), 10)
+        check_stub_guard(self.whole)
+
+    def test_the_blocks_run_in_the_documents_order_with_the_definitions_first(self):
+        script = administrator_script(self.whole, "cwp")
+        lines = script.split("\n")
+        self.assertTrue(lines[0].startswith("ns_ok() {"))
+        self.assertEqual(lines[1], WRAPPER)
+        self.assertEqual(lines[2], "NS=cwp")
+        self.assertEqual(sum(1 for l in lines if l.startswith("NS=")), 1)
+        for earlier, later in (("kc create -f cwp.yaml", "kc create secret generic cloud-hub-pw"),
+                               ("kc create secret generic cloud-hub-pw", "SRC=SOURCE_NAMESPACE"),
+                               ("SRC=SOURCE_NAMESPACE", "kc delete rolebinding cw-minter"),
+                               ("kc delete rolebinding cw-minter", "kc set env"), ("kc set env", "kc patch secret")):
+            self.assertLess(script.index(earlier), script.index(later))
+        self.assertEqual(sum(1 for l in administrator_script(self.whole, None).split("\n") if l.startswith("NS=")), 0)
+
+    def test_a_wrapper_without_the_check_is_caught_by_the_stub_guard(self):
+        mutant = self.whole.replace(WRAPPER, WRAPPER.replace("ns_ok && ", ""), 1)
+        self.assertNotEqual(mutant, self.whole)   # the mutation is applied
+        self.assertGreater(stub_calls(mutant, "cw"), 0)
+        with self.assertRaises(AssertionError):
+            check_stub_guard(mutant)
+
+    def test_one_bare_call_in_a_block_is_caught_by_the_stub_guard(self):
+        mutant = self.whole.replace("kc delete secret cw-minter-token", 'kubectl -n "${NS:-x}" delete secret cw-minter-token', 1)
+        self.assertNotEqual(mutant, self.whole)   # the mutation is applied
+        with self.assertRaises(AssertionError):
+            check_stub_guard(mutant)
 
 
 class Chained(unittest.TestCase):
