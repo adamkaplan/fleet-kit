@@ -1,0 +1,99 @@
+diff a/cloud/launcher/app_token.py b/cloud/launcher/app_token.py	(rejected hunks)
+@@ -171,22 +195,22 @@ def api_base():
+         return API
+     u = urllib.parse.urlparse(base)
+     if u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost", "::1"):
+-        die("CW_GITHUB_API_BASE is only allowed for a loopback http address")
++        die("CW_GITHUB_API_BASE is only allowed for a loopback http address", "other")
+     return base.rstrip("/")
+ 
+ 
+ def check_permissions(perms):
+     """Refuse unless perms is exactly EXPECTED_PERMISSIONS. Names a key, never a value."""
+     if not isinstance(perms, dict):
+-        die("refusing: the answer carries no permissions object")
++        die("refusing: the answer carries no permissions object", "permissions")
+     for k in sorted(perms):
+         if k not in EXPECTED_PERMISSIONS:
+-            die("refusing: the token carries an extra permission: %s" % str(k)[:40])
++            die("refusing: the token carries an extra permission: %s" % str(k)[:40], "permissions")
+     for k, want in EXPECTED_PERMISSIONS.items():
+         if k not in perms:
+-            die("refusing: the token lacks the permission: %s (%s)" % (k, owner_step()))
++            die("refusing: the token lacks the permission: %s (%s)" % (k, owner_step()), "permissions")
+         if perms[k] != want:
+-            die("refusing: the token has a different level for the permission: %s" % k)
++            die("refusing: the token has a different level for the permission: %s" % k, "permissions")
+ 
+ 
+ def github_json(method, path, jwt, body=None, not_found=None):
+@@ -202,21 +226,21 @@ def github_json(method, path, jwt, body=None, not_found=None):
+         with open_url(req) as r:
+             raw = r.read(MAX_BYTES + 1)
+         if len(raw) > MAX_BYTES:
+-            die("the GitHub answer is larger than %d bytes" % MAX_BYTES)
++            die("the GitHub answer is larger than %d bytes" % MAX_BYTES, "GitHub error")
+         return json.loads(raw)
+     except urllib.error.HTTPError as e:
+         if e.code == 404 and not_found:
+-            die(not_found)
++            die(not_found, "installation")
+         if e.code == 422 and method == "POST":
+             die("the App's installation does not cover this repository: add it to the installation (HTTP 422); "
+-                "if the App lacks a requested permission, %s" % owner_step())
++                "if the App lacks a requested permission, %s" % owner_step(), "installation")
+         if e.code == 403 and method == "POST":  # the App may not hold, or the installation not yet accept, a requested permission
+-            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None), owner_step()))
+-        die(http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None))
++            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None), owner_step()), "permissions")
++        die(http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None), "GitHub error")
+     except TimeoutError:
+-        die("the GitHub request timed out: the launch is refused and nothing was minted")
++        die("the GitHub request timed out: the launch is refused and nothing was minted", "GitHub error")
+     except Exception:  # OSError, ValueError, UnicodeDecodeError, RecursionError, MemoryError: any failure is a named refusal, never a crash
+-        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted")
++        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted", "GitHub error")
+ 
+ 
+ def is_id(x):
+@@ -265,24 +289,24 @@ def mint(target):
+     token = ans.get("token") if isinstance(ans, dict) else None
+     repos = ans.get("repositories") if isinstance(ans, dict) else None
+     if not isinstance(token, str) or not token:
+-        die("the answer has no token")
++        die("the answer has no token", "GitHub error")
+     MINTED.append(token)
+     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
+-        die("refusing: the token does not cover exactly the one target repository")
++        die("refusing: the token does not cover exactly the one target repository", "installation")
+     full = repos[0].get("full_name")
+     if not (isinstance(full, str) and valid_target(full) and full.lower() == target.lower()):
+-        die("refusing: the token does not cover exactly the one target repository")
++        die("refusing: the token does not cover exactly the one target repository", "installation")
+     owner = repos[0].get("owner")  # the account id is stable where the login is not: both answers must carry it, and it must agree
+     if not isinstance(owner, dict) or not is_id(owner.get("id")):
+-        die("refusing: the token's repository carries no usable owner id")
++        die("refusing: the token's repository carries no usable owner id", "installation")
+     if owner.get("id") != owner_id:
+-        die("refusing: the token's repository is not owned by the installation's account")
++        die("refusing: the token's repository is not owned by the installation's account", "installation")
+     try:
+         exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
+     except (KeyError, ValueError, TypeError):
+-        die("the answer has no readable expiry")
++        die("the answer has no readable expiry", "GitHub error")
+     if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
+-        die("refusing: the token lives longer than 61 minutes")
++        die("refusing: the token lives longer than 61 minutes", "GitHub error")
+     check_permissions(ans.get("permissions"))
+     MINTED.clear()
+     return token
+@@ -290,7 +314,7 @@ def mint(target):
+ 
+ def main(argv):
+     if len(argv) != 1 or not valid_target(argv[0]):
+-        die("usage: app_token.py OWNER/REPO", 2)
++        die("usage: app_token.py OWNER/REPO", "other", 2)
+     sys.stdout.write(mint(argv[0]))
+     sys.stdout.flush()
+ 
