@@ -413,6 +413,8 @@ DEFAULTS = {
     "cos_orders_file": None,        # PR 18: the Chief of Staff's own standing orders, an absolute path; None means standing-orders.md beside config.json
     # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
     "gh_users": {},
+    "github_stage_repos": [],  # #1575: "owner/repo" names whose pull-request comment may carry a stage event (empty: none does)
+    "github_stage_bots": [],   # #1575: the logins (for example github-actions[bot]) whose comment may carry a stage event (empty: none does)
     "github_bot_logins": [],  # the cloud readers' bot account(s), each a fleet identity besides the `gh_users` accounts (at most 10); none by default
     "intent_live_silence_minutes": 10,  # #367: a live forwarder whose last event (or start) is older than this does not get the long intent trust (0 = always trusted, as before)
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
@@ -11442,6 +11444,7 @@ def _validate_github(config, source):
     if not isinstance(bots, list) or len(bots) > 10 or not all(isinstance(a, str) and GITHUB_LOGIN_RE.match(a) for a in bots):
         raise ConfigError("%s: 'github_bot_logins' must be a list of at most 10 GitHub logins, got %r" % (source, bots))
     config["github_bot_logins"] = list(bots)
+    stage_check_config(config, source)
     poll = config["github_poll_seconds"]
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
         raise ConfigError("%s: 'github_poll_seconds' must be a number of at least %d (each read of a repo costs "
@@ -11710,6 +11713,10 @@ def _comment_item(repo, comment, issue, now):
     number = _number(issue) or _url_number(comment.get("issue_url"))
     if cid is None or number is None:
         return None
+    staged = stage_item_parts(repo, comment, number, cid)   # #1575: only the first line of a configured bot's marker comment is read
+    if staged:
+        known, lookups = _issue_refs(issue, number)
+        return GitHubItem(staged[0], "github.stage", staged[1], repo, known, lookups, _login(comment), now, [number], True)
     body = comment.get("body") if isinstance(comment, dict) else None
     if isinstance(body, str) and REVIEW_COMMENT_RE.match(body.split("\n", 1)[0][:300]):
         return _review_comment_item(repo, comment, issue, number, cid, now)
@@ -11799,8 +11806,9 @@ def _wh_issues(repo, payload, now):
 
 
 def _wh_issue_comment(repo, payload, now):
-    if payload.get("action") != "created":
-        return []
+    comment = payload.get("comment")
+    if payload.get("action") != "created" and not (payload.get("action") == "edited" and isinstance(comment, dict) and stage_item_parts(repo, comment, 0, 0) is not None):
+        return []   # #1575: `edited` only for a stage comment
     item = _comment_item(repo, payload.get("comment") or {}, payload.get("issue"), now)
     return [item] if item else []
 
@@ -12051,6 +12059,7 @@ class GitHubHub:
                  now=time.time, actor="daemon"):
         self.config, self.state_dir, self.audit = config, Path(state_dir), audit
         self.runner, self.spawn, self.now, self.actor = runner, spawn, now, actor
+        stage_lists_set(config)
         self.lock = threading.RLock()
         self.queue = {}        # key -> GitHubItem, until delivered
         self.watches = {repo: Watch(repo) for repo in watched_repos(config, {})}   # the baseline less the excluded repositories
@@ -12699,6 +12708,15 @@ class GitHubHub:
                 owner = self._resolve(item.repo, candidates[:], [("issue", candidates[0])], agents, now, seen)
                 if owner:
                     return owner, "reference"
+        if item.key.startswith("github.stage:"):   # #1575: a pull request of a cloud worker's branch goes to the lane that launched it (#1407's table, by name)
+            for number in item.numbers:
+                pr = seen.get(number)
+                if pr is None:
+                    pr = self._read_one(item.repo, "pulls/%d" % number, now)
+                ref = ((pr or {}).get("head") or {}).get("ref") if isinstance(pr, dict) else None
+                for worker, lane, launch_head in (self._push_workers_load(now).get((item.repo, ref)) or []) if isinstance(ref, str) else []:
+                    if lane in agents:
+                        return lane, "cloud"
         return None, None
 
     def _resolve(self, repo, known, pending, agents, now, seen):
