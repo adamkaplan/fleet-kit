@@ -400,6 +400,19 @@ def remove_reminders(state_dir, ids):
     return gone
 
 
+def cancel_chain(state_dir, sender, key):
+    """#1401: drop every WAITING copy (pending or fired, still in the file) of the chain of this sender and key, in one locked step.
+    Returns the ids dropped. Another sender's or another key's reminder, and a sender-less one, are never matched; a delivered copy is not in the file."""
+    if not key or not isinstance(sender, str) or not sender.strip():
+        return []
+    with reminders_lock(state_dir):
+        items = read_reminders(state_dir)
+        gone = [i["id"] for i in items if i.get("key") == key and i.get("from") == sender]
+        if gone:
+            write_reminders(state_dir, [i for i in items if i["id"] not in gone])
+    return gone
+
+
 DROP_HOOK = None  # test hook: called between the snapshot read and the locked drop
 
 
@@ -540,6 +553,23 @@ class ReminderFacts:
         newer = [i for i in items if i["id"] != item["id"] and i.get("key") == item["key"] and i.get("from") == item.get("from")
                  and i["at"] <= now and (i.get("created", 0), i["at"]) > (item.get("created", 0), item["at"])]
         return max(newer, key=lambda i: (i.get("created", 0), i["at"])) if newer else None
+
+    def recheck_delivery(self, fact):
+        """#1401: the delivery step asks once more, under the lock, whether a reminder fact is still wanted. Returns None (deliver it) or the
+        id of the newer copy that replaces it, or "cancelled" when it is no longer in the file; a dropped superseded copy is removed here."""
+        if not str(getattr(fact, "key", "")).startswith("reminder:"):
+            return None
+        item_id = fact.key[len("reminder:"):]
+        with reminders_lock(self.state_dir):
+            items = read_reminders(self.state_dir)
+            item = next((i for i in items if i["id"] == item_id), None)
+            if item is None:
+                return "cancelled"
+            kept = self.superseded(item, items)
+            if kept is None or kept.get("condition"):   # a gated newer copy may not be delivered: the older one is not dropped for it
+                return None
+            write_reminders(self.state_dir, [i for i in items if i["id"] != item_id])
+        return kept["id"]
 
     def __call__(self):
         facts = []
@@ -734,12 +764,31 @@ REMIND_LIST_MAX = 50   # reminders `remind --list` prints
 def remind_manage(args, engine, state, sender, moment):
     """`remind --list` (the caller's own pending reminders: set by it or for it) and `remind --cancel <id>` (one of those, by id). Nothing else is
     shown or touched: another agent's reminder is not listed and is refused with the same words as an unknown id."""
+    chain_key = getattr(args, "cancel_key", None)
     if args.list_mine and args.cancel:
         sys.stderr.write("%s: remind: give --list or --cancel, not both\n" % PROG)
+        return EXIT_USAGE
+    if chain_key and (args.list_mine or args.cancel):
+        sys.stderr.write("%s: remind: give --cancel-key on its own\n" % PROG)
         return EXIT_USAGE
     if args.name or args.when or args.text:
         sys.stderr.write("%s: remind: --list and --cancel take no recipient, time or text\n" % PROG)
         return EXIT_USAGE
+    if chain_key:
+        if not (isinstance(sender, str) and sender.strip()):
+            sys.stderr.write("%s: remind: --cancel-key needs a known sender\n" % PROG)
+            return EXIT_USAGE
+        try:
+            gone = cancel_chain(state, sender, _one_line(chain_key, 80))
+        except ReminderError as err:
+            sys.stderr.write("%s: remind: %s\n" % (PROG, _one_line(str(err), 200)))
+            return EXIT_ERROR
+        if not gone:
+            sys.stderr.write("%s: remind: no waiting reminder of yours with key %s\n" % (PROG, _one_line(chain_key, 80)))
+            return EXIT_USAGE
+        engine.audit.append("cli", "reminder.cancelled", sender, {"key": _one_line(chain_key, 80), "owner": sender, "count": len(gone)})
+        print("cancelled %d reminder(s) with key %s" % (len(gone), _one_line(chain_key, 80)))
+        return EXIT_OK
     try:
         mine = [item for item in read_reminders(state) if sender in (item.get("to"), item.get("from"))]
     except ReminderError as err:
@@ -777,7 +826,7 @@ def cmd_remind(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     moment = now()
-    if args.list_mine or args.cancel:
+    if args.list_mine or args.cancel or getattr(args, "cancel_key", None):
         return remind_manage(args, engine, state, sender, moment)
     if not args.name or not args.when or not args.text:
         sys.stderr.write("%s: remind needs <name> <when> <text> (or --list, or --cancel <id>)\n" % PROG)

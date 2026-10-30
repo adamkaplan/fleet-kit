@@ -10797,6 +10797,30 @@ class TestReminders(PR4Base):
             self.assertTrue(fact.summary.endswith("\u2026 (late by %d min)" % (7 + (n - 4000) * 0)) or "\u2026 (late by" in fact.summary)
             sb.write_reminders(self.world.state, [])
 
+    # ---- #1401: cancel a chain by owner and key; a copy on its way is re-checked at the delivery step
+
+    def audit_events(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), self.world.route, self.world.clock.now, lambda s: None)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_delivered_copy_is_not_recalled_and_a_second_cancel_writes_no_second_line(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        sent = self.keyed(delay=10)
+        self.world.tick(10)
+        self.assertEqual(len(self.world.engine.run_pass()["sent"]), 1)   # delivered and pruned
+        self.keyed(delay=600)
+        code, _, err = self.run_cli("remind", "--cancel-key", "k", "--from", "a")
+        self.assertEqual(code, 0, err)
+        code, _, _ = self.run_cli("remind", "--cancel-key", "k", "--from", "a")
+        self.assertEqual(code, 2)
+        self.assertEqual(len(self.audit_events("reminder.cancelled")), 1)
+        self.assertEqual(len(self.world.admissions("platform")), 1, "no retraction is sent")
+        self.assertEqual(self.world.admissions("platform")[0]["keys"], ["reminder:" + sent["id"]])
+
     def test_every_path_that_removes_or_skips_a_reminder_is_in_the_docs_table(self):
         here = os.path.dirname(os.path.abspath(__file__))
         src = open(os.path.join(here, "switchboard", "reminders.py")).read()
@@ -69646,6 +69670,9 @@ TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine =
 # The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
 _relay_tree_guard = importlib.import_module("test_relay_tree_guard")
 RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
+_sent_view = importlib.import_module("test_sent_view")
+_sent_view.World = World
+TestSentView = _sent_view.TestSentView
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
 RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel
@@ -69670,6 +69697,9 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+# The reminder-cancel tests of #1401.
+_reminder_cancel = importlib.import_module("test_reminder_cancel")
+TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly
@@ -82345,6 +82375,7 @@ class ReviewCommentEndToEndTests(Base):
             self.assertIn("def " + name, src)
             self.assertIn(name if name != "_unowned_seen" else "review-unowned.json", table)
         self.assertTrue(paths)
+
 
 
 if __name__ == "__main__":

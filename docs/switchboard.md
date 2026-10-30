@@ -544,6 +544,7 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard orders remove --charter <n or owner/repo#n> <number>` | Chief of Staff only (PR 17) | Removes the order with that number in `orders list`; the last one takes the section with it. The legacy `Standing authority:` line is numbered but lies outside the section, so it is refused (edit it on GitHub) |
 | `fleet-switchboard orders copy --source <charter> --charter <charter>` | Chief of Staff only (#347); anyone else is refused, audited | Copies every order bullet of the source charter's `## Standing orders` section to the target, word for word with its original `(ordered by ..., date)` (nothing re-dated), one order at a time through the same writer, with the same read-back. Orders the target already holds are skipped, so a second run copies only what is missing. It ALWAYS prints a result: one line per order, one line per failure and one summary line; a failed order is named, the rest are still copied, and any failure exits 1. The 20-order limit applies (the overflow is reported as failures). The legacy `Standing authority:` line is not a bullet and is not copied (the output says so). Each copied order gets the owner's heads-up as an added one does, and one comment on the target charter. The source is never changed. Code: `bin/orders_copy.py` |
 | `fleet-switchboard pending <name>` | Anyone | What is pending for an agent, and why anything is held |
+| `fleet-switchboard sent [--limit N]` | The sender, for its own messages only | Your own last messages (at most 20, newest first): to whom, when each was sent, delivered and picked up, or `not yet` (#1550). No GitHub call, no write |
 | `fleet-switchboard cloud-clear [--dry-run]` | The operator, the Chief of Staff, or the worker's own boss (the same rule as `retire`); anyone else is refused and the refusal audited | Removes every cloud worker record whose pod is gone AND whose hard deadline has passed, and names each one it removes (`cleared <name> (pod gone, deadline <time>)`). It never touches a record whose pod still stands, nor one that is not past its deadline, and it refuses (exit 1) when the cluster could not be read: it never removes a record it cannot prove is gone. `--dry-run` lists what it would clear (`would clear <name>`) and removes nothing. It makes no `stop` call: there is no pod. Code: `bin/cloud_worker.py` |
 
 Each agent definition gains one paragraph: what a `[switchboard]` message is,
@@ -2800,6 +2801,14 @@ issue stays open, behaves as before.
 another agent's reminder is not shown and is refused as unknown. Reminders live in `reminders.json` in the state directory, are
 read by the daemon on every pass and are only removed once delivered, dropped or cancelled, so a daemon restart loses none
 (a test arms one, starts a new engine over the same state and sees it fire).
+
+**Cancel a chain, and a copy on its way (#1401).** `remind --cancel-key <key>` cancels every waiting reminder (pending or fired) of yours with
+that key in one locked step and writes ONE audit line, `reminder.cancelled` (key, owner, count); another owner's or another key's
+reminder is never matched, and a copy already delivered is not recalled. At the delivery step each reminder fact is checked once more
+against `reminders.json`: a copy that fired and became a fact, and was then cancelled or superseded by a newer due copy of the same
+owner and key while it was on its way, is not delivered, and `reminder.drop_in_flight` names the dropped id and the replacing id (or `cancelled`).
+When some facts of a plan are dropped this way the plan is decided again from the facts left (a wake planned for a dropped fact does not
+carry the rest); a changed action is audited as `recheck`. A reminders file that cannot be read at this step defers the delivery to the next pass: nothing is sent or lost. The audit line `source.error` for it names the file and the error class only, never reminder text.
 
 **Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
 ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
@@ -6301,6 +6310,17 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
+
+## `sent`: what became of the messages you sent (#1550)
+
+Cause: a peer sent a time-boxed message to another lane and could not tell whether, or when, it was read: the sender saw only that its `send` was accepted. The facts existed in three places and were shown to nobody: the moment a send was admitted is in `sent-keys.json` (the sent-keys ledger: session id, then `send:<sender>:<16 hex>`, then an epoch); the moment it was delivered is the `ts` of the `v2.synthetic` audit line with `phase` `result` whose `call` matches the `intent` line that carries the key in `detail.keys` (its `subject` is the recipient); whether the recipient has taken it up is in the recipient's own transcript, which the daemon reads through `message_list`. #583 shows the RECEIVER the sent and delivered times in the message header, and #1540 lets a peer send steer into a long turn, which shortens the delay but shows the sender nothing. What was left is a sender-side listing.
+
+`fleet-switchboard sent [--limit N]` lists the caller's own last messages (N from 1 to 20, default 20), newest first, one line each: the recipient, `sent HH:MMZ`, `delivered HH:MMZ` and `picked up HH:MMZ` (UTC). The caller is resolved as `send` resolves its sender (the pane; `--from` only in the Lab), and only keys that start `send:<caller>:` are listed: a message of another sender is never shown. It makes no GitHub call, writes nothing and prints no message text.
+
+- **delivered** is the `ts` of the matching audit result line. `not yet` when the intent line has no result line; `unknown` when the line is older than the last 4 MB of `audit.jsonl` or the result records a failed call (a send of unknown fate).
+- **picked up** is the start of the recipient's first turn after the delivery: the earliest assistant message of the recipient's session whose `time.created` is not earlier than the delivery, in the newest page (`READ_LIMIT` messages) of ONE `message_list` per distinct recipient session. It goes through the daemon's bounded read path (`v2_reads_per_pass`, `v2_reads_per_minute`), never a loop of raw reads. `not yet` when the page was read and holds no such turn; `unknown` when the session cannot be read, the read budget is spent, or the page starts after the delivery (the turn may be older than the page). It is never estimated from the delivery time.
+- **Caps.** `v2_reads_per_pass` is 8, so the reads of one run stop there: rows for sessions past the 8th recipient show `unknown` for picked up, though up to 20 lines are listed. A delivery whose audit result is `ok=false` (a 409) shows `delivered unknown`, and so `picked up unknown`. An empty ledger prints `no messages` and the note.
+- picked up is a turn start, **not proof that the text was understood**: the first turn after a delivery may be about something else, and a message steered into a running turn is taken up inside it.
 
 ## A lost worker is announced to its lane and the Chief of Staff (#1481)
 
