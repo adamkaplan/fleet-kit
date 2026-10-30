@@ -15,7 +15,7 @@ A **unit** is a file: the entry `bin/fleet-switchboard`, a part under `bin/switc
 
 ## Where a new test goes
 
-A new file `tests/switchboard/test_<unit>.py` is preferred, named for the unit it is about, and it is picked up by `bin/test-switchboard` like `test_architecture.py`. Appending to `bin/test-switchboard` is allowed until the test split empties it, within the size row's headroom; when a change would go past the ceiling, the test names where the new tests go (a file under `tests/switchboard/`) or which row to lower.
+A new file `tests/switchboard/test_<unit>.py` is preferred, named for the unit it is about, and it is picked up by `bin/test-switchboard` like `test_architecture.py`. Every `tests/switchboard/test_*.py` must be imported and have a class bound at module level by `bin/test-switchboard`, or be listed with a reason of 20 or more characters in `tests/switchboard/test_wired_tests.py`. Appending to `bin/test-switchboard` is allowed until the test split empties it, within the size row's headroom; when a change would go past the ceiling, the test names where the new tests go (a file under `tests/switchboard/`) or which row to lower.
 
 ## Layers
 
