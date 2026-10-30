@@ -69669,6 +69669,9 @@ TestSamples, TestCensus, TestMutants, TestCensusDocumentation = _census.TestSamp
 # The bin-set table test (#1457).
 _bin_set_table = importlib.import_module("test_bin_set_table")
 TestTheBinSetClassesAreAllInTheTable = _bin_set_table.TestTheBinSetClassesAreAllInTheTable
+# The steer-after-minutes tests of #1540, moved under the line ceiling.
+_steer_long = importlib.import_module("test_steer_long_turn")
+TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy

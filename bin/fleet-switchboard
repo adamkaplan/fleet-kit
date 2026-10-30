@@ -365,6 +365,7 @@ DEFAULTS = {
     "batch_seconds": 90,
     "launch_default": "headless",   # #433: what a plain `launch` starts: "headless" (no terminal) or "terminal" (a herdr tab)
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
+    "steer_after_minutes": 0,       # #1540: 0 = off; else a turn longer than this many minutes takes a peer `send` and a reminder as `steer` too
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
     "call_timeout_seconds": 20,
@@ -2573,6 +2574,7 @@ class Switchboard:
         self.light = bool(config.get("v2_light"))   # v2_light: no optional read of session history
         self.sent = SentLedger(self.state_dir) if self.light else None
         self._delivered = {}   # session id -> (newest synthetic id, since, keys): what delivered_keys last found; memory only
+        self.turn_start_fresh = True   # #1540: set once per process; the first turn-start pass after a daemon start discards the file
         self._last = {}  # (event, subject) -> detail last audited, so a steady hold is audited once
         self.discovery = None  # the newest discover(), for sources that read the fleet (PR 4)
         self.judge_warm, self._warm_due = None, 0.0  # the daemon's policy-context warmer, if the judge is on
@@ -3115,13 +3117,24 @@ class Switchboard:
         message_id = derive_message_id(observation.session_id, keys)
         resume = plan.action == "wake" or interrupt
         delivery = "queue" if resume and not fault("steer-not-queue") else "steer"
-        busy = resume and not interrupt and steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None))
+        age = None
+        busy = False
+        if resume and not interrupt:
+            try:
+                if self.config.get("steer_after_minutes") and self.state_dir is not None:
+                    age = load_module("turn_start").age(self.state_dir, observation.session_id, self.now(), load_module("record_json").parse_bounded)   # #1540: from the recorded start; None = unknown = young
+            except Exception as err:   # an unreadable record or module is an unknown age = young = queue
+                age = None
+                self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age)
         if busy:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
                   "keys": keys, "resume": resume, "delivery": delivery, "left": len(plan.pending) - len(keys)}
         if busy:
             detail["busy"] = True
+            if age is not None:
+                detail["turn_age_seconds"] = int(age)
         description = None if fault("no-description") else describe_items(plan.recipient, carried, repos)
         detail["description"] = description
         if interrupt:
@@ -3281,6 +3294,13 @@ class Switchboard:
         self._early_facts = {}   # #467: facts the early decisions step reads for this pass only; never carried over from an earlier one
         self.reads.begin_pass()
         discovery = self.discover(now)
+        if self.config.get("steer_after_minutes") and self.state_dir is not None:   # #1540: only with the key on is the turn-start file touched
+            try:
+                load_module("turn_start").note(self.state_dir, [(o.session_id, o.status) for o in discovery.agents.values()], now,
+                                                  load_module("record_json").parse_bounded, fresh=self.turn_start_fresh)
+                self.turn_start_fresh = False
+            except Exception as err:   # an unrecorded start is unknown, which counts as young: never stops a pass
+                self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
         early_decisions(self, discovery)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
@@ -8272,6 +8292,10 @@ def validate_decisions_config(config, source):
     if not _is_number(grace) or grace < 0:
         raise ConfigError("%s: 'decisions_cos_grace_seconds' must be a number of seconds, 0 or more, got %r"
                           % (source, grace))
+    steer_after = config["steer_after_minutes"]
+    if not _is_number(steer_after) or isinstance(steer_after, bool) or steer_after < 0:
+        raise ConfigError("%s: 'steer_after_minutes' must be a number of minutes, 0 (off, the default) or more, got %r"
+                          % (source, steer_after))
     hold = config["pr_notice_hold_minutes"]
     if not _is_number(hold) or hold < 0:
         raise ConfigError("%s: 'pr_notice_hold_minutes' must be a number of minutes, 0 (no hold, the default) or "
