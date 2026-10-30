@@ -12293,8 +12293,11 @@ class GitHubHub:
                 with os.fdopen(fd, "w") as handle:
                     handle.write(json.dumps(record))
                 os.replace(str(tmp), str(path))
+                self._told_write_failed = False
             except OSError:
-                pass
+                if not getattr(self, "_told_write_failed", False):   # once per failure episode, no message text
+                    self._told_write_failed = True
+                    self._audit("github.rejected", "-", {"reason": "%s could not be written: a restart repeats the edit once" % INTENT_TOLD_FILE})
 
     def _told_has(self, recipient, payload):
         return "%s|%s" % (recipient, intent_edit_id(payload)) in self._told_load()

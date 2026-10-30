@@ -265,7 +265,7 @@ depends on it.
 | `fleet-switchboard <command>` | Short-lived CLI, run by you and by agents | `launch`, `send`, `remind`, `intent`, `pending`, `status`, `audit`, `poke`. `send` applies the delivery rule and delivers itself; it does not need the daemon |
 | Harness adapter | A class shared by the daemon and the CLI, one per harness kind | Everything harness-specific: launch, observe, note, wake |
 | herdr plugin manifest | `herdr-plugin.toml` | Starts the daemon; turns herdr events into pokes |
-| Files | `$XDG_STATE_HOME/fleet-switchboard/` (mode 0700): `audit.jsonl`, `reminders.json`, `github-read.json` (a read marker per repo: a disposable cursor, below), the lock. Config in `$XDG_CONFIG_HOME/fleet-switchboard/config.json`, because the kit supports Python 3.9, which has no `tomllib` | See [Data](#data) |
+| Files | `$XDG_STATE_HOME/fleet-switchboard/` (mode 0700): `audit.jsonl`, `reminders.json`, `intent-told.json` (who was told which Intent edit, #1437), `github-read.json` (a read marker per repo: a disposable cursor, below), the lock. Config in `$XDG_CONFIG_HOME/fleet-switchboard/config.json`, because the kit supports Python 3.9, which has no `tomllib` | See [Data](#data) |
 | Decision model client (PR 7) | A class in `bin/fleet-switchboard`, stdlib `urllib`. The OpenRouter key comes from the switchboard's config and never enters an agent's environment | Jev calls for the classifier and the shadow judges |
 | `fleet-hooks` plugin (PR 8–9) | A v2 plugin of a few lines, loaded from the Lab's config | Forwards v2's `permission` hook, and `prompt` if needed, to `fleet-switchboard`; holds no logic |
 | GitHub forwarders (PR 5) | One `gh webhook forward` child process per watched repo, supervised by the daemon, which receives on a listener bound to 127.0.0.1 | Relays GitHub webhooks to the daemon |
@@ -6240,7 +6240,9 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 
 ## An Intent edit is told once (#1437)
 
-An Intent edit is delivered once per recipient, however many wakes follow. The edit is named by the issue (with its repo), the edit time (`updated_at`) and a body hash (a hash of the changed Intent and Done-when text), so a second real edit of the same issue is a new edit and is delivered once too. The record of who was told is kept in `intent-told.json` in the state directory (bounded in size and age), so it survives a restart; a missing or corrupt file reads as empty and is audited, never an error.
+An Intent edit is delivered once per recipient, however many wakes follow. The edit is named by the issue (with its repo), the edit time (`updated_at`) and a body hash (a hash of the changed Intent and Done-when text), so a second real edit of the same issue is a new edit and is delivered once too. The record of who was told is kept in `intent-told.json` in the state directory (bounded in size and age), so it survives a restart; a missing or corrupt file reads as empty and is audited, never an error. A failed write of the record is audited once per failure episode (no message text); a restart after a failed write repeats the edit once.
+
+The cause: the `intent.edit` fact is made again on every pass, and the held item drops only when the engine finds its key in the transcript, so an edit that was delivered but never matched came back at every wake; the record is what stops that.
 
 ## The installed tree is the default branch, clean (#1380)
 

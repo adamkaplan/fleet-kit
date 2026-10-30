@@ -8223,6 +8223,24 @@ class TestIntentEditToldOnce(TestIntentEditWiring):
             self.deliver(self.hub)
         self.assertEqual(total, 1)
 
+    def test_ten_wakes_with_no_acknowledge_offer_a_told_edit_once(self):
+        """The recorded case: the edit is never acknowledged, so only the told-record filter stops the repeats."""
+        self.edit()
+        (fact,) = self.intent_facts()
+        self.hub.told([fact.key], "cos")
+        offered = [self.count(self.hub) for _ in range(10)]
+        self.assertEqual(offered, [0] * 10)
+
+    def test_a_failed_record_write_is_audited_once_per_episode(self):
+        self.edit()
+        (fact,) = self.intent_facts()
+        with mock.patch.object(sb.os, "replace", side_effect=OSError("disk")):
+            self.hub.told([fact.key], "cos")
+            self.hub.told([fact.key], "cos")
+        lines = [l for l in self.rig.world.audit_path.read_text().splitlines() if "%s could not be written" % sb.INTENT_TOLD_FILE in l]
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("disk", lines[0])
+
     def test_two_recipients_are_each_told_once(self):
         rig = GithubRig(self, agents={"platform": {"role": "orchestrator", "charter": 1},
                                       "cos": {"role": "chief-of-staff"}, "cos2": {"role": "chief-of-staff"}})
