@@ -150,6 +150,7 @@
       ],
       "authority": [
         "bin/plan_ledger.py",
+        "bin/epic_record.py",
         "bin/impact_floor.py",
         "bin/chat_clear.py",
         "bin/merge_gate.py",
@@ -203,6 +204,7 @@
           "templates/**",
           "tools/cos-permissions-proof/**",
           "bin/plan_ledger.py",
+          "bin/epic_record.py",
           "bin/impact_floor.py",
           "bin/chat_clear.py",
           "bin/merge_gate.py",
