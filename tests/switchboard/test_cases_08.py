@@ -2158,6 +2158,31 @@ class TestArchTools(unittest.TestCase):
     """The two move tools (S0 of #1092): `arch-split-check` reads the surface of the daemon as its own entry assembles it, and `arch-part-cut` never overwrites a part."""
 
     def tool(self, name, *args):
+    # The warnings machinery adds __warningregistry__ to a module's globals when a warning is raised from code of that module, so dir(module) can hold a name the tool never reads.
+    INTERPRETER_ADDED = frozenset({"__warningregistry__"})
+
+    def daemon_names(self, module):
+        return sorted(set(dir(module)) - self.INTERPRETER_ADDED)
+
+    def scratch_module(self, *extra):
+        mod = types.ModuleType("daemon_scratch")
+        for n in ("alpha", "beta") + extra:
+            setattr(mod, n, 1)
+        return mod
+
+    def test_the_names_the_interpreter_adds_are_left_out_of_the_daemon_names_and_a_planted_name_is_not(self):
+        expected = sorted(dir(self.scratch_module()))
+        self.assertEqual(self.daemon_names(self.scratch_module()), expected)
+        self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
+        planted = self.daemon_names(self.scratch_module("daemon_planted_name"))
+        self.assertIn("daemon_planted_name", planted)
+        self.assertEqual(planted, sorted(dir(self.scratch_module("daemon_planted_name"))))
+
+    def test_without_the_rule_the_comparison_with_the_warning_registry_present_fails(self):
+        expected = sorted(dir(self.scratch_module()))
+        with mock.patch.object(type(self), "INTERPRETER_ADDED", frozenset()):
+            self.assertNotEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
+
         return subprocess.run([sys.executable, "-B", str(REPO / "tools" / name)] + [str(a) for a in args], capture_output=True, text=True)
 
     def test_the_surface_of_the_daemon_is_read_as_its_entry_assembles_it_not_as_a_text_join(self):
