@@ -17,8 +17,8 @@ the tests and the change and judges them; it never runs them.
 - **R-TEST-8 No debt.** Duplicate tests and tests that cannot fail are removed; the proportion of test to change is reasonable for the risk. _check: note only: a judgement about proportion._
 - **R-TEST-9 Fixtures are synthetic.** A fixture uses neutral names and invented data with the same shape as the real case; nothing private is committed. _check: search: a fixture holding a private name or real data._
 - **R-TEST-10 The unchanged still holds.** A change states what must stay the same and has a test that shows it does (a golden output, a regression case). _check: test: a golden or regression case for what must stay the same._
-- **R-TEST-11 No standing test of one change.** A measure of one pull request's own diff (its added lines, the files it touches) is a proof recorded on that pull request, never a test that runs for every later pull request. _check: search: a test that diffs against an integration ref._
 
 ## This repository
 
 - **How the tests run.** `bin/test-switchboard` (stdlib only, no network); CI runs it on macOS and Ubuntu. A change to `bin/` carries a test in it that fails on the previous code.
+- **A measure of one pull request is not a test.** A measure of one pull request's own diff is a proof recorded on that pull request, never a test that runs for every later one.
