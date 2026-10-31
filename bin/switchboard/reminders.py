@@ -613,8 +613,14 @@ class ReminderFacts:
                     self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", item["to"],
                                              {"dropped": item["id"], "kept": kept["id"], "key": _one_line(item["key"], 60)})
                 continue
+            unreadable = False
             if item.get("condition"):
                 found = self.verdict(item)
+                unreadable = found is None and self.engine is not None and self.engine.now() - item["at"] > reminder_bound(self.engine.config, item)   # #1728 ceiling: a condition that cannot be read does not hold a due reminder past its bound
+                if unreadable:
+                    found = "deliver"
+                    if self.engine.audit is not None:
+                        self.engine.audit.append(self.engine.actor, "reminder.ceiling", item["to"], {"id": item["id"], "why": "condition unreadable"})
                 if found is None:
                     self.waiting(item["id"], item["to"], item["at"], "condition unreadable")
                     continue
@@ -627,6 +633,7 @@ class ReminderFacts:
                         self.notify_drop(item, found)
                     continue
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
+            text = text + " (condition unreadable)" if unreadable else text
             late = (self.engine.now() if self.engine else time.time()) - item["at"]
             if late >= LATE_NOTE_SECONDS:
                 note = " (late by %d min)" % int(late // 60)

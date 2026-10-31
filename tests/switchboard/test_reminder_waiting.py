@@ -181,4 +181,50 @@ def build(PR4Base):
             self.assertEqual(counts["lane-a"], 3)
             self.assertEqual(counts["lane-b"], 1)
             self.assertEqual(len(lines), 2)
+        def unreadable_world(self):
+            self.world.add_agent("u-free", fleet={"role": "coder", "reports_to": "platform", "issue": 40})
+            self.world.v2.start_turn(self.world.sessions["u-free"], "task", fleet=True, lasts=86400, steps=3)
+            self.world.engine.run_pass()
+            now = self.world.clock.now()
+            item = sb.add_reminder(self.world.state, "u-free", now + 60, now - 3600, "check the widget", condition={"while_running": "u-free"})["id"]
+            self.world.engine.config["steer_after_minutes"] = 0
+            self.world.engine.__dict__.pop("deliver", None)      # the real delivery
+            patch = mock.patch.object(sb.ReminderFacts, "verdict", lambda self, item: None)   # the condition cannot be read
+            patch.start()
+            self.addCleanup(patch.stop)
+            return item
+
+        def carrying(self, item):
+            return len([e for e in self.sent_to("u-free") if "reminder:" + item in e["detail"]["keys"]])
+
+        def test_s11_an_unreadable_condition_past_its_bound_is_delivered_with_a_note_and_one_ceiling_line(self):
+            item = self.unreadable_world()
+            self.world.tick(2 * 60)                              # due, inside the bound (5 minutes)
+            self.world.engine.run_pass()
+            self.assertEqual(self.carrying(item), 0)
+            self.world.tick(5 * 60)                              # past the bound
+            self.world.engine.run_pass()
+            self.assertEqual(self.carrying(item), 1)
+            mine = [e for e in self.ceilings() if e["detail"]["id"] == item and e["detail"].get("why") == "condition unreadable"]
+            self.assertEqual(len(mine), 1)
+            self.assertEqual(mine[0]["detail"]["why"], "condition unreadable")
+            facts = [e for e in self.world.audit() if e["event"] == "v2.synthetic" and e.get("subject") == "u-free"]
+            self.assertIn("condition unreadable", str(facts))
+
+        def test_s12_a_mutant_that_leaves_it_waiting_is_caught(self):
+            item = self.unreadable_world()
+            self.world.tick(8 * 60)
+            self.world.engine.run_pass()
+            self.assertEqual(self.carrying(item), 1)             # control: the unmutated code
+            item = self.unreadable_world_again()
+            with mock.patch.object(sb, "reminder_bound", lambda config, item: 10 ** 9):   # the mutant: the flag is never set
+                self.world.tick(8 * 60)
+                self.world.engine.run_pass()
+                with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
+                    self.assertEqual(self.carrying(item), 1)
+
+        def unreadable_world_again(self):
+            now = self.world.clock.now()
+            item = sb.add_reminder(self.world.state, "u-free", now + 60, now - 3600, "check the widget again", condition={"while_running": "u-free"})["id"]
+            return item
     return TestReminderWaiting
