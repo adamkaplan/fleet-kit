@@ -14,6 +14,7 @@ cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/worker/tests/test_activity.py
+cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_cw_gh.py
 cloud/worker/tests/test_entrypoint.py
