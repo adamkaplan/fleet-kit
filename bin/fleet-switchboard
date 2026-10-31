@@ -23929,13 +23929,8 @@ def private_parser():
 
 
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
-<<<<<<< HEAD
          socket_call=None, _window=_WINDOW):
-    os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
-=======
-         socket_call=None):
     os.environ.pop(OWN_GH_ENV, None)   # #1216: an inherited marker means nothing; own gh calls reach the real gh by path (own_gh_path)
->>>>>>> origin/integration
     raw = tuple(argv if argv is not None else sys.argv[1:])   # #835: the command line as typed, captured BEFORE any registrar runs: `review record` reads its rating inputs from this, never from the shared parser
     snapshot, replaced_by = code_snapshot, code_replaced   # local references: a registrar that rebinds these names changes nothing here
     direct = direct_command(raw)
@@ -23943,7 +23938,6 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
     if direct:   # #924: `review record` and `impact clear` dispatch BEFORE any registrar runs: the parser is built from their own registrars only
         parser = private_parser()
     try:
-<<<<<<< HEAD
         if not direct:
             calls = _window(True)   # the window opens before the registrars run; `calls` is main's own local copy of the count of effect calls
             try:
@@ -23955,7 +23949,7 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
         try:
             args, extra = parser.parse_known_args(list(raw))
             args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
-            if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
+            if extra and args.action == "remind" and not (args.list_mine or args.cancel or getattr(args, "cancel_key", None)) and not any(word.startswith("-") for word in extra):
                 args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
             elif extra:
                 parser.error("unrecognized arguments: %s" % " ".join(extra))
@@ -23979,36 +23973,19 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             if args.action in DIRECT_COMMANDS and vars(args).get(DIRECT_COMMANDS[args.action][0]) == DIRECT_COMMANDS[args.action][1]:   # a spelling the pre-dispatch did not take: it must not run after a registrar
                 sys.stderr.write("%s: %s %s: refused: a command registrar ran in this process; run it as `%s %s %s ...`\n" % (PROG, args.action, DIRECT_COMMANDS[args.action][1], PROG, args.action, DIRECT_COMMANDS[args.action][1]))
                 return EXIT_ERROR
+        action = getattr(args, "action", None)
+        refused, noted = installed_tree_check(action, daemon=action == "run" and not getattr(args, "once", False), records=command_records(action, parser.commands))   # #1380: before anything else runs, and for every command but the ones that move the tree
+        if refused:
+            sys.stderr.write(refused + "\n")
+            return EXIT_ERROR
+        if noted:
+            sys.stderr.write(noted + "\n")
         return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
     finally:
         _window(False)   # whatever happened, the window is closed: what dispatch runs (the daemon's own chat clear among it) is not a registrar's call
 
 
 del _WINDOW
-=======
-        args, extra = parser.parse_known_args(list(raw))
-        args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
-        if extra and args.action == "remind" and not (args.list_mine or args.cancel or getattr(args, "cancel_key", None)) and not any(word.startswith("-") for word in extra):
-            args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
-        elif extra:
-            parser.error("unrecognized arguments: %s" % " ".join(extra))
-        conflict = reaper_only_conflict(args)   # in the parser, before anything is written or loaded
-        if conflict:
-            parser.error(conflict)
-    except SystemExit as exit_:
-        return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
-    if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
-        sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
-        return EXIT_ERROR
-    action = getattr(args, "action", None)
-    refused, noted = installed_tree_check(action, daemon=action == "run" and not getattr(args, "once", False), records=command_records(action, parser.commands))   # #1380: before anything else runs, and for every command but the ones that move the tree
-    if refused:
-        sys.stderr.write(refused + "\n")
-        return EXIT_ERROR
-    if noted:
-        sys.stderr.write(noted + "\n")
-    return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
->>>>>>> origin/integration
 
 
 # ============================================================================
