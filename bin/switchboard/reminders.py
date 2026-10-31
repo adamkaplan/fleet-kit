@@ -636,6 +636,8 @@ class ReminderFacts:
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
             if isinstance(item.get("wake_class"), str):
                 facts[-1].wake_class = item["wake_class"]
+            if self.engine is not None:
+                facts[-1].bound = reminder_bound(self.engine.config, item)   # #1728: the steer rule reads it
         return facts
 
 
@@ -655,7 +657,7 @@ def waiting_reason(engine, plan, now):
             age = load_module("turn_start").age(engine.state_dir, observation.session_id, now, load_module("record_json").parse_bounded)
     except Exception:
         age = None
-    if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age):
+    if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age, now):
         return None
     return "lane in a turn of %d minutes, queued" % (age // 60) if age is not None else "lane in a turn of unknown length, queued"
 
@@ -668,6 +670,44 @@ def reminder_bound(config, item):
     key, default = ("checkpoint_bound_minutes", 5) if checkpoint else ("reminder_bound_minutes", 10)
     minutes = config.get(key, default)
     return (minutes if _is_number(minutes) and minutes >= 0 else default) * 60
+
+
+def late_reminder_counts(entries, now, config, window=86400):
+    """#1728: {lane: reminders delivered LATER than their bound in the last `window` seconds}, from audit entries. A `reminder.add` id is paired with
+    the first `v2.synthetic` line whose keys hold `reminder:<id>`; the delivery time minus the due `at` is compared with the bound."""
+    due, counts = {}, {}
+    for row in entries:
+        detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+        if row.get("event") == "reminder.add" and isinstance(detail.get("id"), str):
+            due.setdefault(detail["id"], (row.get("subject"), parse_iso(detail.get("at")), bool(detail.get("for"))))
+        elif row.get("event") == "v2.synthetic" and isinstance(detail.get("keys"), list):
+            sent = parse_iso(row.get("ts"))
+            for key in detail["keys"]:
+                found = due.pop(key[len("reminder:"):], None) if str(key).startswith("reminder:") else None
+                if found is None or sent is None or found[1] is None or now - sent > window:
+                    continue
+                lane = found[0] or "?"
+                counts.setdefault(lane, 0)
+                if sent - found[1] > reminder_bound(config, {"deadline": found[2]}):
+                    counts[lane] += 1
+    return counts
+
+
+def late_reminder_lines(state_dir, now, config):
+    """#1728: one `status` line per lane that had a reminder delivered in the last 24 hours (a display only; nothing decides from it)."""
+    try:
+        text = Path(state_dir, "audit.jsonl").read_text(errors="replace")
+        rows = []
+        for line in text.splitlines():
+            if "reminder.add" in line or "reminder:" in line:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+        counts = late_reminder_counts(rows, now, config)
+    except OSError:
+        return []
+    return ["      late reminders  %s: %d in the last 24 h" % (lane, n) for lane, n in sorted(counts.items())]
 
 
 def ceiling_wake(engine, source, plan, now):

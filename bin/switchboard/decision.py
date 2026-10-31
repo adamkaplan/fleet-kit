@@ -77,7 +77,7 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
 
 
-def steers_into_turn(config, observation, carried, discovery=None, age=None):
+def steers_into_turn(config, observation, carried, discovery=None, age=None, now=None):
     """A wake to an agent that is working goes in as `steer` (with `resume`, so one that outlives its turn starts
     the next at once): the running turn takes it at its next safe point instead of after the turn. Only a
     message that carries a `send` from the agent's own boss; `send_to_working` "queue" turns it off. Measured in
@@ -86,6 +86,9 @@ def steers_into_turn(config, observation, carried, discovery=None, age=None):
     recorded turn start; None = unknown = young), a message made only of peer sends and reminders steers too."""
     if observation.status != "working":
         return False
+    if now is not None and carried and all(fact.kind in ("send", "reminder") for fact in carried) and any(
+            fact.kind == "reminder" and getattr(fact, "bound", None) is not None and now - fact.created > fact.bound for fact in carried):
+        return True   # #1728: a reminder older than its bound steers, whatever the age of the turn and `steer_after_minutes`
     limit = config.get("steer_after_minutes", 0)
     if limit and age is not None and age > limit * 60 and carried \
             and all(fact.kind in ("send", "reminder") for fact in carried):

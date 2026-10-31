@@ -3128,7 +3128,7 @@ class Switchboard:
             except Exception as err:   # an unreadable record or module is an unknown age = young = queue
                 age = None
                 self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
-            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age)
+            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age, self.now())
         if busy:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,
@@ -13707,6 +13707,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         if config_ok:
             report["friction"] = friction_status_line(config, state)
             report["load"] = load_fleet_health().status_lines(state, now())
+            report["late_reminders"] = late_reminder_lines(state, now(), config)   # #1728
         report["stopped_news"] = stopped_news_summary(state, now())
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
@@ -13913,6 +13914,7 @@ def format_status(report):
     lines.extend("      " + report["v2_link"] for _ in [0] if report.get("v2_link"))
     lines.extend("      " + report["friction"] for _ in [0] if report.get("friction"))
     lines.extend("      " + line for line in report.get("load") or [])   # #348
+    lines.extend(report.get("late_reminders") or [])   # #1728
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
         lines.append("      stopped    %d note(s) judged for news in the last hour: %d dropped, %d would be dropped (shadow)"
