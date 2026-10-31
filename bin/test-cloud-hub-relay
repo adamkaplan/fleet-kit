@@ -327,7 +327,7 @@ class TestBoundsAndCaps(unittest.TestCase):
         import socket
         saved = dict(SECRETS)
         self.addCleanup(lambda: (SECRETS.clear(), SECRETS.update(saved)))   # the module-level dict is restored whatever happens
-        with Hub(wait=8.0, max_per_pod=50) as hub:   # default max_handlers=32 -> relay cap 16
+        with Hub(wait=None, max_per_pod=50) as hub:   # default max_handlers=32 -> relay cap 16
             self.assertEqual(hub.server.max_handlers, 32)
             self.assertEqual(hub.relay.max_inflight, 16)
             self.assertEqual((cloud_relay.MAX_WAIT_PER_POD, cloud_relay.MAX_WAIT_TOTAL), (4, 16))
@@ -338,6 +338,17 @@ class TestBoundsAndCaps(unittest.TestCase):
             Path(hub.tmp.name, "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
             Path(hub.tmp.name, "agents.json").write_text(json.dumps(agents))
             threads = []
+            def release_all():   # no time bound on the held waits: every one is answered here, so a failure never hangs the run (the hub's server is already closed here: the answer goes to the relay itself)
+                end = time.monotonic() + 10
+                while hub.relay.pending and time.monotonic() < end:
+                    for req in hub.relay.list_pending():
+                        hub.relay.result(req["id"], {"status": 200, "reason": "ok"})
+                    time.sleep(0.01)
+                for t in threads:
+                    t.join(10)
+                stuck = [t for t in threads if t.is_alive()]
+                self.assertFalse(stuck, "%d held relay call threads did not end within 10 seconds" % len(stuck))
+            self.addCleanup(release_all)
             for i in range(4):          # 4 pods x 4 held waits = 16 held
                 for j in range(4):
                     t = threading.Thread(target=hub.relay_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
