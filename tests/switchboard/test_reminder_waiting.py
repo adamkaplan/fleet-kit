@@ -227,4 +227,43 @@ def build(PR4Base):
             now = self.world.clock.now()
             item = sb.add_reminder(self.world.state, "u-free", now + 60, now - 3600, "check the widget again", condition={"while_running": "u-free"})["id"]
             return item
+
+        def unreadable_texts(self, size, letter):
+            self.unreadable_world()
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, "u-free", now + 60, now - 3600, letter * size, condition={"while_running": "u-free"})
+            self.world.tick(8 * 60)
+            source = next(s for s in self.world.engine.sources if isinstance(s, sb.ReminderFacts))
+            return [f.summary for f in source() if f.summary.startswith(letter) and f.summary.endswith("(condition unreadable)")]
+
+        def test_s13_the_unreadable_note_is_kept_and_the_text_stays_within_the_cap(self):
+            for size, letter in zip((sb.TEXT_CAP - 23, sb.TEXT_CAP - 22, sb.TEXT_CAP, 5, 3990), "xyzwv"):
+                with self.subTest(size=size):
+                    texts = self.unreadable_texts(size, letter)
+                    self.assertEqual(len(texts), 1)
+                    self.assertLessEqual(len(texts[0]), sb.TEXT_CAP)
+
+        def held_passes(self, passes=3):
+            item = self.unreadable_world()
+            self.world.tick(8 * 60)
+            self.world.engine.deliver = lambda *a, **k: None   # the lane is held: the delivery is deferred
+            for _ in range(passes):
+                self.world.engine.run_pass()
+            return [e for e in self.ceilings() if e["detail"]["id"] == item and e["detail"].get("why") == "condition unreadable"]
+
+        def test_s14_the_unreadable_ceiling_line_is_written_once_per_id(self):
+            self.assertEqual(len(self.held_passes()), 1)         # control: the unmutated code
+
+        def test_s15_a_mutant_without_the_once_per_id_guard_is_caught(self):
+            class Forgetful(set):
+                def __contains__(self, item):
+                    return False
+            real = sb.ReminderFacts.__call__
+            def mutant(self, *a, **k):
+                self.__dict__["_ceiled_unreadable"] = Forgetful(self.__dict__.get("_ceiled_unreadable", ()))
+                return real(self, *a, **k)
+            with mock.patch.object(sb.ReminderFacts, "__call__", mutant):
+                lines = self.held_passes()
+                with self.assertRaisesRegex(AssertionError, r"^3 != 1"):
+                    self.assertEqual(len(lines), 1)
     return TestReminderWaiting

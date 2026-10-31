@@ -619,7 +619,11 @@ class ReminderFacts:
                 unreadable = found is None and self.engine is not None and self.engine.now() - item["at"] > reminder_bound(self.engine.config, item)   # #1728 ceiling: a condition that cannot be read does not hold a due reminder past its bound
                 if unreadable:
                     found = "deliver"
-                    if self.engine.audit is not None:
+                    done = self.__dict__.setdefault("_ceiled_unreadable", set())   # once per id, on the ReminderFacts instance like ceiling_wake's _ceiled (never on the shared engine)
+                    if len(done) > 1000:
+                        done.clear()
+                    if self.engine.audit is not None and item["id"] not in done:
+                        done.add(item["id"])
                         self.engine.audit.append(self.engine.actor, "reminder.ceiling", item["to"], {"id": item["id"], "why": "condition unreadable"})
                 if found is None:
                     self.waiting(item["id"], item["to"], item["at"], "condition unreadable")
@@ -633,12 +637,13 @@ class ReminderFacts:
                         self.notify_drop(item, found)
                     continue
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
-            text = text + " (condition unreadable)" if unreadable else text
             late = (self.engine.now() if self.engine else time.time()) - item["at"]
             if late >= LATE_NOTE_SECONDS:
                 note = " (late by %d min)" % int(late // 60)
                 cut = len(text) + len(note) > TEXT_CAP
                 text = text[:max(0, TEXT_CAP - len(note) - (1 if cut else 0))] + ("\u2026" if cut else "") + note   # the note is applied before the cap and kept: the body is cut, not the note
+            if unreadable:   # the note is the last thing added and is kept: the body is cut, not the note
+                text = text[:max(0, TEXT_CAP - 23)] + " (condition unreadable)" if len(text) > TEXT_CAP - 23 else text + " (condition unreadable)"
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
             facts[-1].bound = reminder_bound(self.engine.config if self.engine else {}, item)   # #1728: read by steers_into_turn
