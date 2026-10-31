@@ -77,12 +77,20 @@ def decide(recipient, pending, observation, now, batch_seconds, engaged_seconds,
     return Plan(recipient, "wake", "no prompt from you in the engagement window", pending, observation)
 
 
-def steers_into_turn(config, observation, carried, discovery=None):
+def steers_into_turn(config, observation, carried, discovery=None, age=None):
     """A wake to an agent that is working goes in as `steer` (with `resume`, so one that outlives its turn starts
     the next at once): the running turn takes it at its next safe point instead of after the turn. Only a
     message that carries a `send` from the agent's own boss; `send_to_working` "queue" turns it off. Measured in
-    a throwaway v2 2.0.24: a steer lands after the in-flight tool call, before the next model request."""
-    return (config.get("send_to_working", "steer") == "steer" and observation.status == "working"
+    a throwaway v2 2.0.24: a steer lands after the in-flight tool call, before the next model request.
+    #1540: with `steer_after_minutes` on (not 0) and a turn that has lasted MORE than that (`age`, seconds, from the
+    recorded turn start; None = unknown = young), a message made only of peer sends and reminders steers too."""
+    if observation.status != "working":
+        return False
+    limit = config.get("steer_after_minutes", 0)
+    if limit and age is not None and age > limit * 60 and carried \
+            and all(fact.kind in ("send", "reminder") for fact in carried):
+        return True
+    return (config.get("send_to_working", "steer") == "steer"
             and any(fact.kind == "send" and fact.sender and fact.sender == boss_name(discovery, observation) for fact in carried))
 
 
