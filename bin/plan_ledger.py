@@ -586,6 +586,16 @@ def claim_union(scenarios, this_body, others):
     return narrowed, [i for i in per if i not in covered], last
 
 
+def omitted_claims(scenarios, this_body, others):
+    """The per-pull-request scenario ids this body's claim line leaves out (#1716) that no OTHER open or merged pull request of the plan covers: the ids `claim_union_note` lists
+    for one pull request. `others` is [(state, body)] as for `claim_union`. A body with no claim line claims every one and a refused line covers nothing (`covered_ids` gives the empty
+    set): both leave out nothing here, they have their own gates. Pure."""
+    mine = covered_ids(scenarios, [this_body])
+    if not mine:
+        return []
+    covered = mine | covered_ids(scenarios, [body for _, body in others])
+    return [s.get("id") for s in scenarios if claim_of(s) == "pr" and s.get("id") not in covered]
+
 def claim_line(pr, head, body):
     """The ONE ledger line that binds a pull request's claim as it stood when its merge was gated (#976). `claim_text` None: no claim line."""
     text = claim_text(body)
