@@ -1,0 +1,4 @@
+{
+ "command": "branch-ff",
+ "help": "usage: fleet-switchboard branch-ff [-h] pr SCRATCH_BRANCH positional arguments: pr The pull request: OWNER/REPO#N or its URL SCRATCH_BRANCH The branch whose head the pull request's branch moves to options: -h, --help show this help message and exit"
+}
