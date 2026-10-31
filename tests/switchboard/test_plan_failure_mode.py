@@ -87,6 +87,7 @@ class TestNoFailureMode(unittest.TestCase):
     def test_s1_s5_the_documents_carry_the_lines(self):
         for path in ("docs/plan-template.md", "skills/fleet-planning/SKILL.md"):
             self.assertIn("missing, corrupt or unreadable", (REPO / path).read_text(), path)
+            self.assertIn("the input is missing, corrupt or unreadable: the output says so and the last good output is kept", (REPO / path).read_text(), path)
         text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
         self.assertIn("quoted heredoc", text)
         self.assertIn("backtick", text)

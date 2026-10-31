@@ -90,7 +90,7 @@ scenarios:
     evaluator: ci
 ```
 
-Input missing, corrupt or unreadable: say so, keep last good output.
+the input is missing, corrupt or unreadable: the output says so and the last good output is kept
 
 Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `commission()` method" (how).
 
