@@ -65,7 +65,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         path = unquote(urlparse(self.path).path)
-        if path.startswith("/orgs/") and Stub.org_code:
+        if (path.startswith("/orgs/") or path == "/repos/%s/rulesets/9" % REPO) and Stub.org_code:   # #1573: the organization ruleset is read at repository level
             if Stub.org_code == "drop":
                 self.close_connection = True
                 self.connection.close()
