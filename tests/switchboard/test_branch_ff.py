@@ -115,6 +115,37 @@ class TestBranchFf(Base):
         self.assertIn("branch.ff", out)
         self.assertIn(NEW, out)
 
+    def allowed_case(self):
+        self.assertEqual(self.clear()[0], 0)
+        code, out, err = self.main("orch", "branch-ff", PR, "scratch")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.gh.writes()), 1, err)
+
+    def test_the_runner_reaches_the_fake_gh_when_gh_resolves_to_an_absolute_path(self):
+        import tempfile
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, True)
+        script = home / "gh"
+        marker = home / "ran"
+        script.write_text("#!/bin/sh\ntouch %s\nexit 97\n" % marker)
+        script.chmod(0o755)
+        self.allowed_case()   # control: no FLEET_REAL_GH
+        self.assertEqual(len(self.gh.writes()), 1)
+        self.gh = FakeGitHub()
+        (self.world.state / sb.CLEAR_HEADS_FILE).unlink()
+        with mock.patch.dict(os.environ, {"FLEET_REAL_GH": str(script)}):
+            self.allowed_case()
+            self.assertEqual(len(self.gh.writes()), 1, "branch moves")
+        self.assertFalse(marker.exists(), "the real gh was run")
+        self.gh = FakeGitHub()
+        (self.world.state / sb.CLEAR_HEADS_FILE).unlink()
+
+        def old(argv, **kwargs):
+            return self.gh(argv, **kwargs) if argv[0] == "gh" or os.path.basename(argv[0]) == "git" else self.world.route(argv, **kwargs)
+        with mock.patch.dict(os.environ, {"FLEET_REAL_GH": str(script)}), mock.patch.object(type(self), "runner", staticmethod(old)):
+            with self.assertRaisesRegex(AssertionError, r"^2 != 0"):
+                self.allowed_case()
+
     def installed_tree(self):
         """A real git clone as the installed tree, recorded in this world's state dir; KIT_ROOT points at it."""
         import tempfile
@@ -155,12 +186,12 @@ class TestBranchFf(Base):
         self.assertEqual((len(self.ledger()), len(self.gh.writes()), len(self.world.audit())), (ledger, writes, audit), "writes of a refused command")
         return refused
 
-    def test_s9_both_commands_are_refused_on_an_unreadable_installed_tree(self):
+    def test_s7_both_commands_are_refused_on_an_unreadable_installed_tree(self):
         self.assertEqual(self.refused_when_unreadable(), 2)
         self.assertTrue(sb.command_records("clear-head", sb.build_parser().commands))
         self.assertTrue(sb.command_records("branch-ff", sb.build_parser().commands))
 
-    def test_s9_a_command_without_its_mark_is_not_refused(self):
+    def test_s8_a_command_without_its_mark_is_not_refused(self):
         for name in ("cmd_clear_head", "cmd_branch_ff"):
             with self.subTest(name):
                 self.setUp()
