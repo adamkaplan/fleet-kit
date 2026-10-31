@@ -179,7 +179,7 @@ class SwitchboardSide(unittest.TestCase):
         def run_launcher(runner, command, worker, options=(), *a, **kw):
             seen["created"].append([command, worker, list(options)])
             raise Sentinel()
-        lib = types.SimpleNamespace(check_repo_preflight=lambda repo, env: "ok")
+        lib = types.SimpleNamespace(check_repo_preflight=lambda repo, env: "ok", AGENTS=("worker", "orchestrator"))
         names = ("launcher_argv", "use_settings", "check_allowed", "_lib", "load_record", "H", "run_launcher", "Cluster", "model_entry", "git_token", "stack_model_secret", "_audit")
         saved = {k: getattr(b, k) for k in names}
         h = dict(b.H, LaunchError=type("LaunchError", (Exception,), {}), NAME_RE=re.compile("[a-z0-9]+"), RESERVED_AGENT_NAMES=(), LANE_NAME_PREFIX="lane-", PROG="sb",
