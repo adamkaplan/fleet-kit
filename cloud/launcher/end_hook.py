@@ -282,7 +282,7 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     # last fetch is seen. Only if that fetch itself fails (refused, network, timeout) is the answer taken from the local references.
     refreshed = refresh_refs(workdir, url if prestop else "origin", ctx)
     if git(workdir, "log", "--max-count=1", "--format=%H", "HEAD", "--not", "--remotes", check=False, ctx=ctx).stdout.strip() == "":
-        return NothingToPush({"pushed": False, "wip_branch": None, "skipped": skipped, "local_only": not refreshed})
+        return NothingToPush({"pushed": False, "wip_branch": None, "skipped": skipped, "local_only": not refreshed, **extra})
     # refs must be current: a stale one could call unpushed work safe. prestop fetches from the explicit URL, never the configured origin
     if not refreshed:
         if prestop:

@@ -86,6 +86,29 @@ def _calls(scope, taint, hits):
             hits.add(n.lineno)
 
 
+# The ONE exemption (a named entry, not a pattern): path relative to the repository root -> (guard, reason).
+ALLOWED = {
+    "cloud/worker/tests/test_push_rules.py": (
+        "only when WRITE_PUSH_RULES=1 regenerates a fixture",
+        "the write is guarded by the environment switch WRITE_PUSH_RULES=1; a normal run only reads the fixture, so no file lands in the tree"),
+}
+GUARD_TEXT = 'os.environ.get("WRITE_PUSH_RULES") == "1"'
+
+
+def scan(files, allowed):
+    """`path:line` of every write under the root, minus the lines of an allowed path whose source holds its guard (at most one line)."""
+    found = []
+    for p in files:
+        rel = os.path.relpath(p, KIT)
+        with open(p) as fh:
+            src = fh.read()
+        lines = writes_under_root(src)
+        if rel in allowed and GUARD_TEXT in src and len(lines) <= 1:
+            continue
+        found += ["%s:%d" % (rel, ln) for ln in lines]
+    return found
+
+
 def writes_under_root(source):
     """Sorted line numbers of the calls in `source` that write to a path built from the repository root. Taint is followed through
     plain assignments, per function (a name such as `path` is a temporary path in one test and a root path in another)."""
@@ -109,16 +132,25 @@ class Scan(unittest.TestCase):
     def test_no_cloud_test_writes_under_the_repository_root(self):
         files = sorted(glob.glob(os.path.join(KIT, "cloud", "*", "tests", "*.py")))
         self.assertTrue(files)
-        found = []
-        for p in files:
-            with open(p) as fh:
-                found += ["%s:%d" % (os.path.relpath(p, KIT), ln) for ln in writes_under_root(fh.read())]
-        self.assertEqual(found, [])
+        self.assertEqual(scan(files, ALLOWED), [])
 
     def test_each_planted_write_is_refused_and_clean_code_passes(self):
         for name, src in (("open", MUTANT_OPEN), ("write_text", MUTANT_WRITE_TEXT), ("through a name", MUTANT_ALIASED)):
             self.assertEqual(len(writes_under_root(src)), 1, name)
         self.assertEqual(writes_under_root(CLEAN), [])
+
+    def test_a_widened_exemption_is_refused(self):
+        files = sorted(glob.glob(os.path.join(KIT, "cloud", "*", "tests", "*.py")))
+        self.assertEqual(list(ALLOWED), ["cloud/worker/tests/test_push_rules.py"])
+        self.assertEqual(scan(files, {}), ["cloud/worker/tests/test_push_rules.py:314"])   # the exemption is what makes the real scan pass
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            planted = os.path.join(d, "test_planted.py")
+            with open(planted, "w") as fh:
+                fh.write(MUTANT_OPEN + "# " + GUARD_TEXT + "\n")
+            self.assertEqual(len(scan(files + [planted], ALLOWED)), 1)   # a second path is not exempt: the scan fails
+            widened = dict(ALLOWED); widened[os.path.relpath(planted, KIT)] = ("x", "x")
+            self.assertEqual(scan(files + [planted], widened), [])        # mutation applied True: only a widened table lets it pass
 
 
 if __name__ == "__main__":

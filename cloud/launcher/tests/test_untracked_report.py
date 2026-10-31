@@ -144,7 +144,7 @@ class Cases:
         clean = self.tree()
         res = self.run(clean)
         if not self.prestop:
-            self.tc.assertEqual(res, {"pushed": False, "wip_branch": None, "skipped": [], "untracked": [], "untracked_more": 0})
+            self.tc.assertEqual(res, {"pushed": False, "wip_branch": None, "skipped": [], "local_only": False, "untracked": [], "untracked_more": 0})
 
     def spaces_and_a_newline(self):
         t = self.tree(); t.put("with space.txt"); t.put("line\nbreak.txt")
@@ -238,6 +238,15 @@ class Mutants(unittest.TestCase):
             for prestop in (False, True):
                 with self.subTest(label, prestop=prestop):
                     self.assertTrue(Cases(self, mod, prestop).failures(), "survived: %s" % label)
+
+    def test_the_clean_tree_skip_a_push_line_carries_the_keys(self):
+        """The clean-tree skip-a-push line carries untracked [] and untracked_more 0; the mutant that leaves the keys off must fail."""
+        for prestop in (False,):   # the pre-stop path prints "nothing to push" and no line on a clean tree
+            t = Cases(self, end_hook, prestop).tree()
+            res = Cases(self, end_hook, prestop).run(t)
+            self.assertEqual((res["untracked"], res["untracked_more"]), ([], 0))
+            mod = mutant('"local_only": not refreshed, **extra})', '"local_only": not refreshed})')   # mutation applied True (mutant() raises if not)
+            self.assertTrue(Cases(self, mod, prestop).failures(), "survived: keys missing on the skip-a-push line")
 
     def test_the_real_hook_fails_no_case(self):
         for prestop in (False, True):
