@@ -65,6 +65,7 @@ cloud/launcher/tests/test_stub_cleanup.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_token_read_at_call.py
 cloud/launcher/tests/test_vault_check_pins.py
+cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush.py
 cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_cloud_prepush_hardening.py
