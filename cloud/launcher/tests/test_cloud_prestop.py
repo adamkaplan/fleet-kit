@@ -56,7 +56,8 @@ class Base(unittest.TestCase):
         open(os.path.join(self.work, "a.txt"), "w").write("a")
         sh("git", "-C", self.work, "add", "-A")
         sh("git", "-C", self.work, "commit", "-qm", "base")
-        sh("git", "-C", self.work, "push", "-q", "origin", "HEAD:main")
+        sh("git", "-C", self.origin, "fetch", "-q", self.work, "HEAD:refs/heads/main")   # seeds the bare origin without a push to the default branch, which a pod's git wrapper refuses
+        sh("git", "-C", self.work, "fetch", "-q", "origin")   # the work tree keeps the remote-tracking branch the push used to create (the tests below reset to origin/main)
         # the hook is installed under the names the image gives it
         # origin is named like the pod's repository; the hook never uses it (it pushes to the explicit address, which the seam points at the bare repo)
         sh("git", "-C", self.work, "remote", "set-url", "origin", URL)
