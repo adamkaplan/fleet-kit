@@ -67258,6 +67258,7 @@ RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
 _sent_view = importlib.import_module("test_sent_view")
 _sent_view.World = World
 TestSentView = _sent_view.TestSentView
+_branch_ff = importlib.import_module("test_branch_ff"); TestBranchFf = _branch_ff.TestBranchFf
 # The relay-loop tests of #1477, moved under the architecture cap.
 _relay_loop = importlib.import_module("test_relay_loop_cadence")
 RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCancel = _relay_loop.RelayLoopCadence, _relay_loop.TwoLoopsTrace, _relay_loop.TrickleHub, _relay_loop.HubFilesUnchanged, _relay_loop.OneWorkerAndCancel

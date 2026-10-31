@@ -62,13 +62,21 @@ def cmd_clear_head(args, runner, now):
     return EXIT_OK
 
 
-def branch_ff_first_refusal(engine, state, repo, number, scratch):
+def branch_ff_read(engine, runner, repo, path):
+    """One GET through the engine's gh runner (the repo's account, counted): the answer as a dict. Raises when the read fails or is not an object."""
+    done = engine.accounts.read(runner, path, repo, engine.config["call_timeout_seconds"])
+    if done.returncode != 0:
+        raise ValueError("%s failed" % path.split("?")[0])
+    got = load_module("record_json").parse_bounded(done.stdout or "")
+    if not isinstance(got, dict):
+        raise ValueError("%s answered no object" % path.split("?")[0])
+    return got
+
+
+def branch_ff_first_refusal(engine, runner, state, repo, number, scratch):
     """(refusal text, None) for the FIRST failed condition, or (None, facts) when all hold. Every GitHub read that fails is a refusal."""
     def read(path):
-        got = [v for v in engine.gh_api(path, paginate=False) if isinstance(v, dict)]
-        if not got:
-            raise ValueError("empty answer")
-        return got[0]
+        return branch_ff_read(engine, runner, repo, path)
     pr = "%s#%d" % (repo, number)
     try:
         pull = read("repos/%s/pulls/%d" % (repo, number))
@@ -115,7 +123,7 @@ def cmd_branch_ff(args, runner, now):
         return branch_ff_refuse("the scratch branch name is not a plain branch name")
     kind = gates_caller_kind(runner, now)
     engine, state, _ = build_engine(runner, now, "cli")
-    why, facts = branch_ff_first_refusal(engine, state, repo, number, scratch)
+    why, facts = branch_ff_first_refusal(engine, runner, state, repo, number, scratch)
     if why:
         return branch_ff_refuse("branch-ff refused: " + why)
     pr = "%s#%d" % (repo, number)
