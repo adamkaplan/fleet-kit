@@ -42310,6 +42310,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         '%s is being launched by anothe': 'refused before any pod exists: it says nothing was created',
         'the vault check lock %s was no': 'refused before any pod exists: it says nothing was created',
         'the vault access check stopped': 'refused before any pod exists: it says nothing was created',
+        '--issue %r is not a whole numb': 'refused before any pod exists: it says nothing was created',
         'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
     }
 
