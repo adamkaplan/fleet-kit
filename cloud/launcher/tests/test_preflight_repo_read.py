@@ -90,15 +90,20 @@ def run(prog, base, detail):
     return p, list(Fake.paths), Fake.orgs
 
 
+ID_LINE = "preflight: organization ruleset 9: read at repository level, counted"
+
+
 def s2(prog, base):
     p, paths, orgs = run(prog, base, "ok")
-    named = sum(1 for x in paths if x == "/repos/%s/rulesets/9" % REPO)   # a pass line carries no ruleset id: the read of ruleset 9 is the naming
+    named = sum(1 for x in p.stdout.splitlines() if x.strip() == ID_LINE)   # the ruleset is named by its identifier on one line
+    reqs = sum(1 for x in paths if x == "/repos/%s/rulesets/9" % REPO)
     nv = sum(1 for x in p.stdout.splitlines() if "NOT VERIFIED" in x)
     passing = 1 if p.returncode == 0 and "preflight ok" in p.stdout else 0
-    return "S2: repositories passing %d of 1, ruleset 9 named %d line, NOT VERIFIED lines %d, requests under /orgs/ %d" % (passing, named, nv, orgs)
+    return ("S2: repositories passing %d of 1, ruleset 9 named %d line, NOT VERIFIED lines %d, requests to the repository-level path %d, requests under /orgs/ %d"
+            % (passing, named, nv, reqs, orgs))
 
 
-S2_LINE = "S2: repositories passing 1 of 1, ruleset 9 named 1 line, NOT VERIFIED lines 0, requests under /orgs/ 0"
+S2_LINE = ("S2: repositories passing 1 of 1, ruleset 9 named 1 line, NOT VERIFIED lines 0, requests to the repository-level path 1, requests under /orgs/ 0")
 
 
 def s5(prog, base, root):
@@ -142,6 +147,8 @@ class S2Reads(Base):
         print(line)
         self.assertEqual(line, S2_LINE)
         self.assertIn("/repos/%s/rulesets/9" % REPO, Fake.paths)
+        p, _, _ = run(self.prog, self.base, "ok")
+        self.assertEqual([x for x in p.stdout.splitlines() if x.strip() == ID_LINE], [ID_LINE])
 
 
 class S5FailsClosed(Base):
@@ -160,12 +167,17 @@ class S10Absent(Base):
         errors = sum(1 for x in text.splitlines() if re.search(r"cannot read|error|Traceback", x, re.I))
         warns = text.count("bypass_actor") + text.count("WARN open: bypass")
         mentions = text.lower().count("bypass")
-        same = 1 if (p.returncode, p.stdout, p.stderr) == (q.returncode, q.stdout, q.stderr) and q.returncode == 0 else 0
-        line = ("S10: detail without bypass_actors: exit %d, errors %d, bypass_actor warnings %d, mentions of bypass %d, output equal to the same run on a "
-                "repository ruleset with the field absent %d of 1" % (p.returncode, errors, warns, mentions, same))
+        a, b = (p.stdout + p.stderr).splitlines(), (q.stdout + q.stderr).splitlines()
+        self.assertEqual(a.count(ID_LINE), 1)
+        a.remove(ID_LINE)
+        differing = sum(1 for x, y in zip(a, b) if x != y) + abs(len(a) - len(b))
+        differing += 1   # the removed identifier line is the one line that differs
+        self.assertEqual(q.returncode, 0)
+        line = ("S10: detail without bypass_actors: exit %d, errors %d, bypass_actor warnings %d, mentions of bypass %d, differing lines from the "
+                "repository-ruleset run %d (the identifier line)" % (p.returncode, errors, warns, mentions, differing))
         print(line)
-        self.assertEqual(line, "S10: detail without bypass_actors: exit 0, errors 0, bypass_actor warnings 0, mentions of bypass 0, output equal to the same run on a "
-                               "repository ruleset with the field absent 1 of 1")
+        self.assertEqual(line, "S10: detail without bypass_actors: exit 0, errors 0, bypass_actor warnings 0, mentions of bypass 0, differing lines from the "
+                               "repository-ruleset run 1 (the identifier line)")
 
 
 class S4Marker(Base):
@@ -271,6 +283,20 @@ class S7Mutants(Base):
         self.assertEqual(line, "S7: mutants failing their test 2 of 2")
         # and the real program passes both scenario tests (they discriminate)
         self.assertEqual(s2(os.path.join(self.tmp.name, "launcher", "preflight.py"), self.base), S2_LINE)
+
+    def test_S14_a_mutant_without_the_identifier_line_fails_the_S2_test(self):
+        text = open(os.path.join(LAUNCHER, "preflight.py")).read()
+        old = '            if verdict[key] and st == "Organization": say("organization ruleset %d: read at repository level, counted" % rid)\n'
+        self.assertEqual(text.count(old), 1)
+        applied = text.count(old) == 1
+        m = program_copy(self.tmp.name, "mutant14", text.replace(old, ""))
+        failing = 1 if s2(m, self.base) != S2_LINE else 0
+        real_ids = sum(1 for x in run(self.prog, self.base, "repo")[0].stdout.splitlines() if x.strip() == ID_LINE)
+        copy_ids = sum(1 for x in run(m, self.base, "repo")[0].stdout.splitlines() if x.strip() == ID_LINE)
+        line = ("S14: mutants failing the S2 test %d of 1, identifier lines for a repository ruleset %d, mutation applied %s"
+                % (failing, real_ids + copy_ids, applied))
+        print(line)
+        self.assertEqual(line, "S14: mutants failing the S2 test 1 of 1, identifier lines for a repository ruleset 0, mutation applied True")
 
     def test_S7_docs_the_readme_says_repository_level_and_not_seen_and_not_the_old_sentence(self):
         with open(os.path.join(LAUNCHER, "README.md")) as f:
