@@ -128,6 +128,72 @@ class TestMutants(World):
         self.assertEqual(self.sent, [])
 
 
+def load_entry(path):
+    import importlib.machinery, importlib.util
+    loader = importlib.machinery.SourceFileLoader("fp1_entry", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("fp1_entry", loader))
+    sys.modules.setdefault("fp1_entry", module)
+    loader.exec_module(module)
+    return module
+
+
+class FinishPass(unittest.TestCase):
+    """FP1: finish_pass runs each tick in its own try; the entry under test is $FP1_ENTRY (the mutant's scratch copy) or the real one."""
+
+    def run_pass(self, turn_raises):
+        from unittest import mock
+        sb = load_entry(os.environ.get("FP1_ENTRY") or os.path.join(ROOT, "bin", "fleet-switchboard"))
+        calls = {"end": 0, "turn": 0, "lost": 0}
+        failed = []
+
+        def turn(engine, discovery):
+            calls["turn"] += 1
+            if turn_raises:
+                raise RuntimeError("boom")
+        def bump(key):
+            def f(*a, **k):
+                calls[key] += 1
+            return f
+        quiet = lambda *a, **k: None
+        engine = types.SimpleNamespace(audit=None, actor="daemon", now=lambda: 0)
+        engine._failed = lambda subject, step, err, report: failed.append(step)
+        with mock.patch.multiple(sb, cloud_end_tick=bump("end"), cloud_turn_tick=turn, lost_worker_tick=bump("lost"), cloud_watch_tick=quiet,
+                                 health_write=quiet, prune_delivered_reminders=quiet, friction_tick=quiet, load_tick=quiet, prune_report_riders=quiet,
+                                 publish_decisions=quiet, write_catching_up=quiet, schedule_judge_warm=quiet):
+            sb.finish_pass(engine, None, {"errors": []})
+        return calls, failed
+
+    def test_fp1_each_tick_has_its_own_try(self):
+        calls, failed = self.run_pass(False)
+        self.assertEqual((calls, failed), ({"end": 1, "turn": 1, "lost": 1}, []))
+        calls2, failed2 = self.run_pass(True)
+        self.assertEqual(calls2["lost"], 1)
+        self.assertEqual(failed2.count("cloud-turn-end"), 1)
+        print("FP1: normal pass calls end 1, turn 1, lost 1; turn raising: lost still called 1, failure recorded 1")
+
+
+class FinishPassMutant(unittest.TestCase):
+    def test_fp1_mutant_fails(self):
+        import subprocess
+        sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
+        import stub_support
+        src = open(os.path.join(ROOT, "bin", "fleet-switchboard")).read()
+        good = ('        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)\n    try:\n        lost_worker_tick(engine, discovery)')
+        bad = ('        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)\n        lost_worker_tick(engine, discovery)')
+        applied = src.count(good) == 1
+        self.assertTrue(applied)
+        scratch = tempfile.mkdtemp(prefix="fp1-mutant-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        path = os.path.join(scratch, "fleet-switchboard")
+        open(path, "w").write(src.replace(good, bad))
+        p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_cloud_turn_end.FinishPass"], cwd=HERE,
+                               env=dict(os.environ, FP1_ENTRY=path), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p.communicate(timeout=90)
+        failed = 1 if p.returncode != 0 else 0
+        self.assertEqual(failed, 1)
+        print("FP1 mutant: failed %d of 1, mutation applied %s" % (failed, applied))
+
+
 class TestDocs(unittest.TestCase):
     def test_s6_the_document_says_what_is_sent_to_whom_and_when(self):
         with open(DOC) as f:

@@ -9705,6 +9705,7 @@ def finish_pass(engine, discovery, report):
         cloud_turn_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-turn-end", "cloud-turn-end", err, report)
+    try:
         lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
     except Exception as err:
         engine._failed("lost-worker", "lost-worker", err, report)
