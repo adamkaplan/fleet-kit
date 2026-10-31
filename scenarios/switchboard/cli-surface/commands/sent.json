@@ -1,0 +1,4 @@
+{
+ "command": "sent",
+ "help": "usage: fleet-switchboard sent [-h] [--limit LIMIT] [--from SENDER] options: -h, --help show this help message and exit --limit LIMIT How many of your newest messages to list (1 to 20, default 20) --from SENDER Lab only: the sender's fleet name"
+}
