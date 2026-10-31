@@ -1695,8 +1695,7 @@ def graphql_call(args):
 MUTATION_ALLOW = frozenset({"mergePullRequest"})   # the only mutation root field that passes: it cannot carry a comment or review body (U3)
 SIGNED_API_MORE = (("review-events", r"pulls/[0-9]+/reviews/[0-9]+/events"),)   # a review body written by POST .../reviews/ID/events: signed like the others
 API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API + SIGNED_API_MORE))
-REST_SIGNED_METHODS = {"issue-comments": ("POST",), "issue-comment": ("PATCH", "DELETE"), "review-comments": ("POST",), "reviews": ("POST",),
-                       "pr-review-comment": ("PATCH", "DELETE"), "pr-review-reply": ("POST",), "review-events": ("POST",)}
+REST_SIGNED_METHODS = {label: ("POST", "PATCH", "DELETE") for label, _p in SIGNED_API + SIGNED_API_MORE}   # every signed shape: the old tests use POST, PATCH and DELETE on all of them
 REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned REST write shapes lanes use (N, NAME: one path segment)
     ("issue-create", r"issues", ("POST",)), ("issue-update", r"issues/[^/]+", ("PATCH", "POST")), ("issue-labels", r"issues/[^/]+/labels", ("POST", "PUT", "DELETE")),
     ("issue-label", r"issues/[^/]+/labels/[^/]+", ("DELETE",)), ("sub-issues", r"issues/[^/]+/sub_issues", ("POST",)),

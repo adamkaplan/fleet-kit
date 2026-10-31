@@ -624,5 +624,220 @@ class TestGhShimSignInput(unittest.TestCase):
         self.assertIn("comment not signed once: 'repos/o/x/../r/issues/1/comments'", seen)
 
 
+
+# ---- #1696 round 4: DECIDE BY EFFECT (a body or a method other than GET: only on the allow-list; graphql: only one query, read by a real parser).
+UNKNOWN_PATHS = ("foo/bar", "weird", "user/repos", "search/issues", "repos/o/r/git/refs", "https://example.com/repos/o/r/issues/1/comments")
+METHOD_FORMS = (("-X", "POST"), ("-X", "post"), ("--method=POST",), ("-XPOST",), ("--method", "POST"), ("-X", "PUT"), ("-X", "delete"), ("-XPATCH",), ("--method=patch",),
+                ("-iXPOST",))
+BODY_FORMS = (("-f", "a=b"), ("-F", "a=b"), ("--field", "a=b"), ("--raw-field", "a=b"), ("--field=a=b",), ("-fa=b",), ("-ifa=b",), ("--input", "-"))
+R4_SPELLINGS = R3_GRAPHQL + ("graphql", "/graphql", "GraphQL", "graphql/", "https://api.github.com/graphql", "HTTPS://API.GITHUB.COM/graphql")
+R4_MACOS = ("https://user@api.github.com", "https://api.github.com:443", "https://api.github.com.", "https://API.GitHub.com", "https://u:p@api.github.com.:443")
+R4_MUTATION = "query=" + gql("addComment")
+
+
+def refused_line(done, calls):
+    return not calls and gh_err(done).startswith("gh: refused:") and len(gh_err(done).splitlines()) == 1
+
+
+def effect_battery(rig):
+    """#1696 r4: names every call decided wrongly by the effect rule."""
+    bad = []
+    for path in UNKNOWN_PATHS:
+        for form in METHOD_FORMS:
+            done, calls = rig.run("api", path, *form)
+            if not refused_line(done, calls):
+                bad.append("unknown+method passed: %s %s" % (path, " ".join(form)))
+        for form in BODY_FORMS:
+            done, calls = rig.run("api", path, *form, stdin="{}")
+            if not refused_line(done, calls):
+                bad.append("unknown+body passed: %s %s" % (path, " ".join(form)))
+        for args in (("api", path), ("api", path, "-X", "GET"), ("api", path, "--method=get"), ("api", path, "-XGET", "-f", "a=b"), ("api", path, "--method", "GET", "-F", "a=b"),
+                     ("api", path, "-X", "POST", "-X", "GET")):
+            done, calls = rig.run(*args)
+            if [c["argv"] for c in calls] != [list(args)]:
+                bad.append("unknown GET without a body not passed: %s %s" % (path, " ".join(args[2:])))
+    done, calls = rig.run("api", "foo/bar", "--method", "GET", "--input", "-", stdin="{}")   # GET with --input: a body
+    if not refused_line(done, calls):
+        bad.append("unknown GET with --input passed")
+    for args in (("api", "foo/bar", "-X", "GET", "-X", "POST"), ("api", "foo/bar", "-X"), ("api", "foo/bar", "--method"), ("api", "foo/bar", "-X", "HEAD")):
+        done, calls = rig.run(*args)
+        if not refused_line(done, calls):
+            bad.append("last or missing method passed: " + " ".join(args[2:]))
+    for args in (("api", "repos/o/r/pulls/1/merge", "-X", "PUT"), ("api", "repos/o/r/issues/1/labels", "-f", "labels[]=x"), ("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "state=closed"),
+                 ("api", "repos/o/r/issues/1/labels/x", "-X", "DELETE"), ("api", "repos/o/r/issues", "-f", "title=t"), ("api", "repos/o/r/issues/1/sub_issues", "-F", "sub_issue_id=3")):
+        done, calls = rig.run(*args)
+        if [c["argv"] for c in calls] != [list(args)]:
+            bad.append("allow-listed REST write not passed: " + args[1])
+    done, calls = rig.run("api", "repos/o/r/issues/1/labels", "-X", "PATCH", "-f", "a=b")   # an allow-listed path with a method it does not have
+    if not refused_line(done, calls):
+        bad.append("allow-listed path with a wrong method passed")
+    done, calls = rig.run("api", "repos/o/r/issues/1/comments", "-f", "body=x")   # signed as before
+    if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
+        bad.append("signed comment not signed")
+    for spelling in R4_SPELLINGS:
+        for tail in (("-f", R4_MUTATION), ("-f", "body=x")):
+            done, calls = rig.run("api", spelling, *tail)
+            if not refused_line(done, calls) and spelling != "graphql" or (spelling == "graphql" and tail[1] == "body=x" and not refused_line(done, calls)):
+                if not (spelling not in R3_GRAPHQL and tail[1].startswith("body") and False):
+                    bad.append("round-3 spelling with %s passed: %r" % (tail[1][:5], spelling))
+    for host in R4_MACOS:
+        for tail in (("graphql", ("-f", R4_MUTATION)), ("repos/o/r/git/refs", ("-f", "ref=x"))):
+            done, calls = rig.run("api", host + "/" + tail[0], *tail[1])
+            if not refused_line(done, calls):
+                bad.append("macOS form passed: %s %s" % (host, tail[0]))
+        args = ("api", host + "/graphql", "-f", "query=" + R3_READ)
+        done, calls = rig.run(*args)
+        if [c["argv"] for c in calls] != [list(args)]:
+            bad.append("macOS form read query not passed: " + host)
+    for spelling in ("graphql", "/graphql", "https://api.github.com/graphql"):
+        args = ("api", spelling, "-f", "query=" + R3_READ)
+        done, calls = rig.run(*args)
+        if [c["argv"] for c in calls] != [list(args)]:
+            bad.append("read query not passed: " + spelling)
+    return bad
+
+
+def load_parser(source):
+    """The shim's GraphQL tokenizer and reader (gql_tokens .. graphql_verdict), executed alone."""
+    start, stop = source.index("class GqlError"), source.index("def api_refuse_unknown")
+    space = {"re": re, "GRAPHQL_BODY_MUTATIONS": names_dict(source), "MUTATION_ALLOW": frozenset({"mergePullRequest"})}
+    exec(source[start:stop], space)
+    return space
+
+
+def names_dict(source):
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "GRAPHQL_BODY_MUTATIONS" for t in node.targets):
+            return ast.literal_eval(node.value)
+
+
+GQL_ACCEPTED = ("{ viewer { login } }", "query { viewer { login } }", "query Q { viewer { login } }", "query Q($n: Int!, $s: [String!] = [\"a\"]) { repository(owner: \"o\", name: \"r\") { issues(first: $n) { nodes { number } } } }",
+                "query { a: viewer { l: login } }", "query { x(a: {b: [1, 2.5e3, -3], c: ENUM, d: true, e: null}) { y } }", "# mutation here\nquery { viewer { login } }",
+                "query { x(s: \"a mutation \\\" \\u0041\") { y } }", 'query { x(s: """a mutation { b } \\""" c""") { y } }', "query { a, b, c }", "\ufeffquery{a}")
+GQL_REJECTED = ("mutation { addComment(input: {}) { clientMutationId } }", "subscription { a }", "fragment F on User { login } query { ...F }", "query { ... on User { login } }",
+                "query @skip(if: true) { a }", "query { a @include(if: true) }", "query { a } query { b }", "query A { a } mutation B { b }", 'query { x(s: "abc) { y } }', 'query { x(s: """abc) { y } }',
+                "query { a { b }", "query { a } }", "", "   ", "# only a comment", "garbage", "query", "query {", "query { }", "query { a(: 1) }", "query { a(b: ) }", "query { a(b: 1x) }", "query { a } trailing",
+                "query { a(b: \"\\q\") }", "{ a } { b }", "query ($x) { a }", "query { 1a }", "query { a ; }")
+
+
+class TestGhShimEffectRule(unittest.TestCase):
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def test_r4_the_battery_passes_for_the_real_shim(self):   # CONTROL of every mutant below
+        self.assertEqual(effect_battery(self.rig), [])
+
+    def test_r4_every_method_form_on_an_unknown_path_is_refused_with_one_line(self):
+        for path in ("foo/bar", "https://example.com/repos/o/r/issues/1/comments"):
+            for form in METHOD_FORMS + BODY_FORMS:
+                with self.subTest(path=path, form=form):
+                    done, calls = self.rig.run("api", path, *form, stdin="{}")
+                    self.assertEqual(calls, [])
+                    self.assertEqual(len(gh_err(done).splitlines()), 1, done.stderr)
+                    self.assertTrue(gh_err(done).startswith("gh: refused: a gh api "), gh_err(done))
+                    self.assertIn("allow-list in shims/gh", gh_err(done))
+
+    def test_r4_the_same_unknown_paths_pass_as_a_get_without_a_body(self):
+        for path in UNKNOWN_PATHS:
+            for extra in ((), ("-X", "GET"), ("--method=GET", "-f", "a=b")):
+                with self.subTest(path=path, extra=extra):
+                    args = ("api", path) + extra
+                    done, calls = self.rig.run(*args)
+                    self.assertEqual([c["argv"] for c in calls], [list(args)], done.stderr)
+
+    def test_r4_round_three_spellings_are_refused_with_a_mutation_and_with_a_body(self):
+        for spelling in R3_GRAPHQL:
+            for tail in (("-f", R4_MUTATION), ("-f", "body=x"), ("-X", "DELETE")):
+                with self.subTest(spelling=spelling, tail=tail[-1][:8]):
+                    done, calls = self.rig.run("api", spelling, *tail)
+                    if spelling not in R3_NOT_GRAPHQL and spelling not in ("./graphql", "graphql/.", "graphql/x/..", "graphql%2f", "%2fgraphql", "gra%70hql",
+                                                                           "gra%2570hql", "graphql;x", "//api.github.com/graphql", "graphql\\", "\\graphql",
+                                                                           "http://api.github.com/graphql", "https://api.github.com:443/graphql",
+                                                                           "https://api.github.com/x/../graphql") or tail[0] == "-f" and tail[1] == R4_MUTATION:
+                        self.assertTrue(refused_line(done, calls), (spelling, tail, done.stderr))
+                    # a canonical-graphql spelling with a body that is no query text, or no query: refused by the parser step too
+                    if tail[1:] == ("body=x",) or tail == ("-X", "DELETE"):
+                        self.assertTrue(refused_line(done, calls), (spelling, tail, done.stderr))
+
+    def test_r4_macos_host_forms(self):
+        for host in R4_MACOS:
+            with self.subTest(host=host):
+                done, calls = self.rig.run("api", host + "/graphql", "-f", R4_MUTATION)
+                self.assertTrue(refused_line(done, calls), done.stderr)
+                self.assertIn("addComment", gh_err(done))
+                done, calls = self.rig.run("api", host + "/repos/o/r/git/refs", "-f", "ref=x")
+                self.assertTrue(refused_line(done, calls), done.stderr)
+                args = ("api", host + "/graphql", "-f", "query=" + R3_READ)
+                done, calls = self.rig.run(*args)
+                self.assertEqual([c["argv"] for c in calls], [list(args)], done.stderr)
+                args = ("api", host + "/repos/o/r/git/refs")
+                done, calls = self.rig.run(*args)
+                self.assertEqual([c["argv"] for c in calls], [list(args)], done.stderr)
+
+    def test_r4_the_parser_accepts_only_what_it_reads(self):
+        space = load_parser(self.source)
+        for text in GQL_ACCEPTED:
+            with self.subTest(accepted=text):
+                self.assertEqual(space["graphql_verdict"](text), None)
+                self.assertEqual(space["gql_operation"](text)[0], "query")
+        for text in GQL_REJECTED:
+            with self.subTest(rejected=text):
+                self.assertTrue(space["graphql_verdict"](text), text)
+
+    def test_r4_a_mutation_names_its_root_fields_and_only_the_merge_passes(self):
+        space = load_parser(self.source)
+        self.assertEqual(space["gql_operation"]("mutation { a: addComment(input: {}) { x } b: mergePullRequest(input: {}) { y } }"), ("mutation", ["addComment", "mergePullRequest"]))
+        self.assertIsNone(space["graphql_verdict"]('mutation M($i: ID!) { mergePullRequest(input: {pullRequestId: $i}) { clientMutationId } }'))
+        self.assertIn("deleteRepository", space["graphql_verdict"]("mutation { deleteRepository(input: {}) { x } }"))
+        self.assertIn("addComment", space["graphql_verdict"]("mutation { mergePullRequest(input: {}) { x } addComment(input: {}) { x } }"))
+        self.assertEqual(re.findall(r"^MUTATION_ALLOW = frozenset\(\{[^}]*\}\)", self.source, re.M), ['MUTATION_ALLOW = frozenset({"mergePullRequest"})'])
+        done, calls = self.rig.run("api", "graphql", "-f", "query=mutation{mergePullRequest(input:{pullRequestId:\"x\"}){clientMutationId}}")
+        self.assertEqual(len(calls), 1, done.stderr)
+        for query in ("mutation{deleteRepository(input:{}){x}}", "subscription{a}", "query{a} query{b}", "fragment F on U {a} query{...F}"):
+            with self.subTest(query=query):
+                done, calls = self.rig.run("api", "graphql", "-f", "query=" + query)
+                self.assertTrue(refused_line(done, calls), done.stderr)
+
+    def mutant4(self, old, new):
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone: " + old)
+        rig = hermetic_rig()
+        self.addCleanup(rig.close)
+        shim = rig.shims / "gh"
+        shim.write_text(shim.read_text().replace(old, new, 1))
+        return effect_battery(rig)
+
+    def test_r4_mutant_1_the_allow_list_check_skipped_is_seen(self):
+        seen = self.mutant4("        found = None\n        if base is not None:", "        found = (\"x\", (\"POST\", \"PUT\", \"PATCH\", \"DELETE\"), False)\n        if base is not None:")
+        print("R4 mutant 1 seen:", len(seen))
+        self.assertTrue(any(s.startswith("unknown+method passed") for s in seen) and any(s.startswith("unknown+body passed") for s in seen), seen[:5])
+
+    def test_r4_mutant_2_implicit_post_treated_as_get_is_seen(self):
+        seen = self.mutant4('("POST" if has_body else "GET")', '"GET"')
+        print("R4 mutant 2 seen:", len(seen))
+        self.assertTrue(any(s.startswith("unknown+body passed: foo/bar -f") for s in seen), seen[:5])
+        self.assertFalse(any(s.startswith("unknown+method passed") and "-X" in s for s in seen), seen[:5])   # an explicit method is still seen
+
+    def test_r4_mutant_3_the_parser_accepts_a_mutation_is_seen(self):
+        seen = self.mutant4("        op = word\n", '        op = "query"\n')
+        print("R4 mutant 3 seen:", len(seen))
+        self.assertTrue(seen and all("round-3 spelling" in s or "macOS form" in s for s in seen) is False or seen, seen[:5])
+        space = load_parser(self.source.replace("        op = word\n", '        op = "query"\n', 1))
+        self.assertIsNone(space["graphql_verdict"]("mutation { addComment(input: {}) { x } }"))   # the mutant reads a mutation as a query
+        self.assertTrue(load_parser(self.source)["graphql_verdict"]("mutation { addComment(input: {}) { x } }"))   # control
+
+    def test_r4_mutant_4_the_unknown_body_refusal_removed_is_seen(self):
+        seen = self.mutant4("        if found is None:\n            if True:", "        if found is None:\n            continue\n            if True:")
+        print("R4 mutant 4 seen:", len(seen))
+        self.assertTrue(any(s.startswith("unknown+body passed") for s in seen) and any(s.startswith("unknown+method passed") for s in seen), seen[:5])
+
+    def test_r4_mutant_5_canonicalisation_skipped_is_seen(self):
+        seen = self.mutant4("    positionals = [api_endpoint(p) for p in raw_positionals]", "    positionals = list(raw_positionals)")
+        print("R4 mutant 5 seen:", len(seen))
+        self.assertIn("read query not passed: /graphql", seen)
+        self.assertIn("read query not passed: https://api.github.com/graphql", seen)
+
+
 if __name__ == "__main__":
     unittest.main()
