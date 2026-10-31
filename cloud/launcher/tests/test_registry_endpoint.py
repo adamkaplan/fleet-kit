@@ -195,9 +195,9 @@ class Mutants(unittest.TestCase):
     )
 
     def run_mutant(self, rel, old, new):
-        with tempfile.TemporaryDirectory(dir=str(ROOT)) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             copy = Path(tmp) / "tree"
-            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__", tmp and Path(tmp).name))
+            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
             target = copy / rel
             text = target.read_text()
             self.assertEqual(text.count(old), 1, "the mutation does not apply once")
@@ -209,9 +209,9 @@ class Mutants(unittest.TestCase):
             return done.returncode
 
     def test_matches_the_unchanged_copy_passes(self):
-        with tempfile.TemporaryDirectory(dir=str(ROOT)) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             copy = Path(tmp) / "tree"
-            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__", Path(tmp).name))
+            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
             done = subprocess.run([sys.executable, "-m", "unittest", "test_registry_endpoint.Behaviour"], cwd=str(copy / "cloud/launcher/tests"),
                                   env=dict(os.environ, CW1510_IN_MUTANT="1"), capture_output=True, text=True, timeout=900)
             self.assertEqual(done.returncode, 0, done.stderr[-1500:])
