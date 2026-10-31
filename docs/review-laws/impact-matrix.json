@@ -569,6 +569,7 @@
           "merge_wake_facts",
           "read_record_file",
           "read_reminders",
+          "reminder_bound",
           "reminders_lock",
           "remove_reminders",
           "wake_class_of",
