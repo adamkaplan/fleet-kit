@@ -129,6 +129,12 @@ class AlertWakeFacts:
         return [Fact(key, name, "alert", text, created, issue=number, sender="switchboard", repo=repo)
                 for key, (text, created, name, repo, number) in sorted(wake.facts.items())]
 
+    def drop_stale(self, keys):   # #1402: a fact dropped at delivery does not come back
+        state = getattr(self.engine, "alert_wake", None) if self.engine else None
+        for key in keys:
+            if state is not None:
+                state.facts.pop(key, None)
+
 
 # ---- #1141: a required check that failed at an open head of a worker-owned pull request, and a default branch that turned red or green again, reach the
 # people who must act. Reads nothing new: the runs the catch-up already reads. The messages are ordinary facts (the delivery rule holds them while blocked).
@@ -325,6 +331,12 @@ class RedCiFacts:
         return [Fact(key, name, "alert", text, created, sender="switchboard", repo=repo)
                 for key, (text, created, name, repo) in sorted(state.facts.items())]
 
+    def drop_stale(self, keys):   # #1402: a fact dropped at delivery does not come back
+        state = getattr(self.engine, "red_ci", None) if self.engine else None
+        for key in keys:
+            if state is not None:
+                state.facts.pop(key, None)
+
 
 def testers_status(config, agents, fleets, state):
     """The `status` lines of the resolved testers per repo with their source (#372); [] when there are none or the picture is unreadable."""
@@ -409,3 +421,9 @@ class TriageFacts:
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
         return [Fact(key, name, "triage", summary, created, sender="switchboard")
                 for key, (summary, created) in sorted(state.facts.items()) for name in chiefs]
+
+    def drop_stale(self, keys):   # #1402: a fact dropped at delivery does not come back
+        state = getattr(self.engine, "triage", None) if self.engine else None
+        for key in keys:
+            if state is not None:
+                state.facts.pop(key, None)
