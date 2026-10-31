@@ -173,7 +173,7 @@ class WorkflowPlanPins(unittest.TestCase):
         check(re.findall(r"uses: (\S+)", text) == ["actions/checkout@v5"] * 3, "the only action is actions/checkout@v5 (no third-party action)")
         check("permissions:\n  contents: read\n\n" in top and top.count("permissions:") == 1, "contents: read only")
         check("secrets." not in text.replace("secrets.PRIVATE_NAMES", ""), "no new secret")
-        check("cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in top, "the concurrency rule is unchanged")
+        check("cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}" in top, "the concurrency rule: cancel a push run, never a reopened one (#1235)")
         check(re.findall(r"^  ([a-z][a-z-]*):$", jobs, re.M) == ["plan", "test", "test-cloud"], "the jobs")
         check("\n  test:\n    needs: plan\n    name: ${{ matrix.name }}\n" in text, "test is named by the plan's name")
         check("\n  test-cloud:\n    needs: plan\n    name: ${{ matrix.cloud }}\n" in text, "test-cloud is named by the plan's cloud name")
@@ -188,10 +188,10 @@ class WorkflowPlanPins(unittest.TestCase):
             return self.plan(text, k.pop("listtext", listtext), *a, **k)
         key = lambda rows: self.names(rows)
         both = list(self.REQUIRED)
-        check(key(run("pull_request", "main")) == both, "a pull request into main ends with both required results")
-        check(key(run("pull_request", "main", files=("docs/other.md",))) == both, "a docs-only pull request into main still runs macOS")
-        check(key(run("pull_request", "main", draft=True)) == ["test (ubuntu-latest)"], "a draft into main skips macOS")
-        check(key(run("pull_request", "main", draft=False)) == both, "marked ready, macOS runs")
+        check(key(run("pull_request", "main", files=("shims/x",))) == both, "a platform path in a pull request into main runs macOS (#1235)")
+        check(key(run("pull_request", "main", files=("docs/other.md",))) == ["test (ubuntu-latest)"], "a docs-only pull request into main runs ubuntu only (#1235)")
+        check(key(run("pull_request", "main", files=("shims/x",), draft=True)) == ["test (ubuntu-latest)"], "a draft into main skips macOS")
+        check(key(run("pull_request", "main", files=("shims/x",), draft=False)) == both, "marked ready with a platform path, macOS runs")
         for event in ("push", "workflow_dispatch"):
             check(key(run(event)) == both, event + " runs both")
         check(key(run("pull_request", "integration")) == ["test (ubuntu-latest)"], "a docs-only pull request into integration skips macOS")
@@ -266,8 +266,8 @@ class WorkflowPlanPins(unittest.TestCase):
             ("the nightly legs dropped", swap('if event == "schedule":', 'if event == "never":'), listtext),
             ("the nightly without integration", swap('["main"] + (["integration"]', '["main"] + ([]'), listtext),
             ("a nightly leg named like a required one", swap('name="nightly %s (%s)" % (r, o)', 'name="test (%s)" % o'), listtext),
-            ("macOS skipped for a pull request into main", swap("macos = not draft", "macos = False"), listtext),
-            ("the draft rule dropped", swap("macos = not draft", "macos = True"), listtext),
+            ("macOS skipped for every pull request into main", swap('elif base == "main" and draft:', 'elif base == "main":'), listtext),
+            ("the draft rule dropped", swap('elif base == "main" and draft:', 'elif base == "main" and False:'), listtext),
             ("ready_for_review dropped", swap("types: [opened, synchronize, reopened, ready_for_review]", "types: [opened, synchronize, reopened]"), listtext),
             ("the path list not read", swap('LIST = ".github/macos-platform-paths.txt"', 'LIST = ".github/missing.txt"'), listtext),
             ("the list read from the head, no self-touch rule", swap('shown = git("show", "origin/" + base + ":" + LIST)', 'shown = git("show", "HEAD:" + LIST)').replace("or LIST in files ", ""), listtext),
@@ -286,7 +286,7 @@ class WorkflowPlanPins(unittest.TestCase):
             ("the job renamed", swap("name: ${{ matrix.name }}", "name: macos-${{ matrix.os }}"), listtext),
             ("a third-party action", swap("      - name: Decide the runners\n", "      - uses: dorny/paths-filter@v3\n      - name: Decide the runners\n"), listtext),
             ("a wider permission", swap("permissions:\n  contents: read\n", "permissions:\n  contents: read\n  issues: write\n"), listtext),
-            ("an unconditional cancel", swap("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", "cancel-in-progress: true"), listtext),
+            ("an unconditional cancel", swap("cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}", "cancel-in-progress: true"), listtext),
         ]
         for group, members in self.groups(listtext).items():
             out.append(("the group %s emptied from the list" % group, text, re.sub(r"(?m)^(?!#)(?:%s)\n" % "|".join(re.escape(m) for m in members), "", listtext)))

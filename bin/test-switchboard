@@ -9742,7 +9742,7 @@ class TestHygiene(unittest.TestCase):
         top, jobs = workflow.split("\njobs:\n", 1)
         self.assertIn("\nconcurrency:\n", top, "the concurrency block is top-level (before jobs)")
         self.assertIn("group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}", top)
-        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", top)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}", top)
         self.assertNotIn("cancel-in-progress: true", workflow, "an unconditional cancel would cancel a push to main")
         self.assertNotIn("github.ref }}", top, "a push to main must not share a group: GitHub drops a PENDING run of a shared group even without cancel-in-progress")
         # ask #990: the matrix is no longer a literal os list: the `plan` job decides it (one macOS entry per job of the run, in or out), pinned by WorkflowPlanPins below
@@ -23525,6 +23525,7 @@ class TestSweep(Base):
         ("ci", "ci is None", {"ci": None}, {}, "not ready"),
         ("ci", "ci is absent", {"ci": KeyError}, {}, "not ready"),
         ("ci", "ci says none", {"ci": "none"}, {}, "not ready"),
+        ("legs", "a macOS leg is not green (failed, absent, skipped, cancelled or in progress)", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test (macos-latest)": "failure"}, False)}, {}, "not ready"),
         ("draft", "a draft", {"draft": True}, {}, "not ready"),
         ("body", "the body is empty", {"body": ""}, {}, "not ready"),
         ("body", "the body is None", {"body": None}, {}, "not ready"),
@@ -67823,6 +67824,7 @@ _changed_file_pages.HOST = sys.modules[__name__]
 TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
     """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a
