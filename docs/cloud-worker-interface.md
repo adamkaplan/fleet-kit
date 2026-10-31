@@ -12,7 +12,7 @@ One program, `cloud-worker <command>`; every command takes `--json` (one JSON ob
 
 | Command | Inputs | Output (stdout JSON) | Effect |
 |---|---|---|---|
-| `create <worker>` | `--repo OWNER/NAME`, `--branch B`, `--idle 30m` (default), `--hard 2h` (default), `--shape XS\|O\|S\|M` (default `XS`; `S` with `--stack`; `O` with `--agent orchestrator`, the orchestrator row: 250m CPU, 768 MiB; `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory; `XS` and `O` are refused with `--stack`), `--stack` | the endpoint record (section 3) plus `runtime_id` | starts one pod from the image with the environment of section 2; returns only once the worker answers |
+| `create <worker>` | `--repo OWNER/NAME`, `--branch B`, `--idle 30m` (default), `--hard 2h` (default), `--shape XS\|O\|S\|M` (default `XS`; `S` with `--stack`; `O` with `--agent orchestrator`, the orchestrator row: 250m CPU, 768 MiB; `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory; `XS` and `O` are refused with `--stack`), `--stack` | the endpoint record (section 3) plus `runtime_id`, `idle_seconds` and `hard_seconds` | starts one pod from the image with the environment of section 2; returns only once the worker answers |
 | `stop <worker>` | `--reason TEXT`; `--run-id NONCE`; `--record-dir DIR`; `--no-record` | `{worker, runtime_id, pushed, wip_branch, skipped, record}` | first writes the run record (below), then runs the end hook (section 5), then rewrites the record's `run.json` once with the hook's result (`end_hook`: `ran`, `pushed`, `wip_branch`, `skipped`, `note`, `error`), then deletes the pod and its scratch volume. `record` is the record directory, `""` when none could be made |
 | `extend <worker>` | `--hard +1h` or an ISO time; `--idle 30m` | the new deadlines | moves the deadlines; never past `--max-hard` (default 8h, **OPEN**: value); the pod itself carries a cluster-side floor at that cap (section 6) |
 | `delete <worker>` | `--force` | `{worker, runtime_id, deleted}` | removes the pod and its leftovers without the end hook; refused unless the hook ran or `--force` is given; used by the reaper after a kept pod is resolved |
@@ -75,7 +75,7 @@ Owned by the switchboard (slice C), in its state directory, mode 0600 (a JSON fi
 
 ```json
 {"worker": "coder7", "url": "https://worker-coder7.example.internal:4096", "auth_ref": "file:<state>/cloud/coder7.password",
- "runtime_id": "pod/coder7-7f9c", "idle_deadline": "2026-10-14T12:10:00Z", "hard_deadline": "2026-10-14T14:00:00Z"}
+ "runtime_id": "pod/coder7-7f9c", "idle_deadline": "2026-10-14T12:10:00Z", "hard_deadline": "2026-10-14T14:00:00Z", "idle_seconds": 1800, "hard_seconds": 7200}
 ```
 
 `auth_ref` names where the switchboard host keeps its own copy of the password (a file path the switchboard chooses itself under its state directory; whatever the launcher prints for it is ignored; it is never taken from caller input, mode 0600: it protects only against other local users); the record never holds it. The pod's copy (`/run/cw/server-password`) is a separate file on the pod side. `create` returns the password once, on a file descriptor named in its output, for C to store. C creates the record from `create`'s output and removes it after `stop` or `delete`.

@@ -846,9 +846,13 @@ def _launch(args, runner, now, reserve):
 def _limits_note(args, record):
     """One line for stderr: the idle and hard limits of the launch (each says `(default)` only when its flag was absent) and the stop time, the
     earlier of the launcher's own two deadlines (read from its answer; `not reported` when neither parses). No address, token or brief."""
-    def limit(label, value, default):
-        text = str(value or "")[:20] if value else default
-        return "%s limit %s%s" % (label, text, "" if value else " (default)")
+    def applied(seconds):
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+            return "not reported"
+        return "%dh" % (seconds // 3600) if seconds % 3600 == 0 else "%dm" % (seconds // 60) if seconds % 60 == 0 else "%ds" % seconds
+    def limit(label, value, key):
+        text = str(value)[:20] if value else applied(record.get(key))
+        return "%s limit %s%s" % (label, text, "" if value else " (default)" if text != "not reported" else "")
     stops = []
     for key in ("idle_deadline", "hard_deadline"):
         try:
@@ -857,7 +861,7 @@ def _limits_note(args, record):
             continue
         stops.append(when)
     stop = min(stops).strftime("%Y-%m-%dT%H:%M:%SZ") if stops else "not reported"
-    return "launch --cloud: %s, %s, stops at %s" % (limit("idle", args.idle, "30m"), limit("hard", args.hard, "2h"), stop)
+    return "launch --cloud: %s, %s, stops at %s" % (limit("idle", args.idle, "idle_seconds"), limit("hard", args.hard, "hard_seconds"), stop)
 
 
 def _registry_note(engine, what, state, name, *args):
@@ -878,6 +882,8 @@ def _record_from_create(name, body):
     if body.get("worker") != name:
         raise CloudError("the launcher answered for another worker")
     record = {key: body.get(key) for key in RECORD_FIELDS}
+    record["idle_seconds"] = body.get("idle_seconds")   # the limits the launcher applied (ask #1474)
+    record["hard_seconds"] = body.get("hard_seconds")
     if any(not isinstance(record[key], str) or not record[key] for key in ("url", "runtime_id")):
         raise CloudError("the launcher's record has no url or runtime_id")
     problem = endpoint_problem(record["url"])

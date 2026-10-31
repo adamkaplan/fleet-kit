@@ -1926,6 +1926,7 @@ class Launcher:
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
+                    "idle_seconds": parse_duration(a.idle), "hard_seconds": parse_duration(a.hard),
                     "password_fd": a.password_fd}
         old = self._catch_signals()
         try:
