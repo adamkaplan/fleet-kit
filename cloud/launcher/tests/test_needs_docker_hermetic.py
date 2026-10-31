@@ -2,6 +2,8 @@
 
 It runs the one pinned test in copies of the tree outside the repository: LINUX-LIKE (no probe) and MACOS-LIKE (fake probes), then a MUTANT
 (the pinned line put back) in both: the mutant fails only where the probe reads, with the stored line, and passes as the control where it does not."""
+import importlib.machinery
+import importlib.util
 import os
 import re
 import shutil
@@ -84,12 +86,15 @@ class NeedsDockerHermetic(unittest.TestCase):
             mut_linux = make_copy(base, "mut-linux", False)
             mut_mac = make_copy(base, "mut-mac", True)
             applied = mutate(mut_linux) and mutate(mut_mac)
-            probe = subprocess.run([sys.executable, "-c", (
-                "import importlib.machinery as m, importlib.util as u;"
-                "l=m.SourceFileLoader('sb', %r);s=u.spec_from_loader('sb', l);mod=u.module_from_spec(s);l.exec_module(mod);"
-                "import subprocess;print(mod.memory_read(subprocess.run))") % str(mac / SW)],
-                capture_output=True, text=True, timeout=60)
-            self.assertRegex(probe.stdout.strip(), r"^\(80, 5\)$", probe.stdout + probe.stderr)
+            loader = importlib.machinery.SourceFileLoader("sb_copy", str(mac / SW))
+            spec = importlib.util.spec_from_loader("sb_copy", loader)
+            mod = importlib.util.module_from_spec(spec)
+            try:
+                loader.exec_module(mod)
+                reading = str(mod.memory_read(subprocess.run))
+            finally:
+                sys.modules.pop("sb_copy", None)
+            self.assertRegex(reading, r"^\(80, 5\)$", reading)
             results = [run(linux), run(mac)]
             s2 = sum(1 for r in results if r.returncode == 0)
             print("S2: docker baseline test passes in %d of 2 conditions" % s2)
