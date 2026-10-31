@@ -884,7 +884,9 @@ def failure_mode_warning(scenarios, text):
     speaks of a missing, corrupt, unreadable or absent input. Only for a plan that has scenarios."""
     if not scenarios:
         return None
-    if not re.search(r"\b(?:%s)\b" % "|".join(FAILURE_TRIGGER_WORDS), text or "", re.IGNORECASE):
+    # "the text it read" is the reviewer's quoting phrase of a review proof, not an input of the plan
+    body = re.sub(r"\btext it read\b", "", text or "", flags=re.IGNORECASE)
+    if not re.search(r"\b(?:%s)\b" % "|".join(FAILURE_TRIGGER_WORDS), body, re.IGNORECASE):
         return None
     if any(FAILURE_SCENARIO_RE.search(" ".join(str(v) for v in s.values())) for s in scenarios):
         return None
