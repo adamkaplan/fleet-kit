@@ -14123,7 +14123,7 @@ class TestClearNotice(Base):
             began = time.monotonic()
             lines = self.clear()
             elapsed = time.monotonic() - began
-        self.assertLess(elapsed, 1.0, "the clear did not wait for the blocked send")
+        self.assertFalse(finished.is_set(), "the clear did not wait for the blocked send")
         self.assertTrue(self.body.startswith("MERGE: automatic"), "the marker edit is done")
         self.assertTrue(lines[0].startswith("cleared the impact hold") and any("MERGE: automatic" in l for l in lines))
         sends = [i for i, step in enumerate(self.order) if step.startswith("SEND")]
