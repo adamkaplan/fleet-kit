@@ -52,6 +52,21 @@ def count_forms(source):
             + len(names_in(source, "GRAPHQL_BODY_MUTATIONS")))
 
 
+def hermetic_rig(gated=None):
+    """#1696: a Rig whose shim reads the merge gate config from the rig's own private directory (MG_HOME), never the account's real home: a machine's own
+    config cannot change the result. No `gated` repo: no config at all (nothing gated). With one: a config.json that lists it under merge_gate.repos."""
+    rig = Rig()
+    shim = rig.shims / "gh"
+    text = shim.read_text()
+    assert text.count("\nMG_HOME = None") == 1
+    shim.write_text(text.replace("\nMG_HOME = None", "\nMG_HOME = %r" % str(rig.home), 1))
+    if gated:
+        config = rig.home / ".config" / "fleet-switchboard" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"merge_gate": {"repos": {gated: {}}}}))
+    return rig
+
+
 def gql(name):
     return "mutation{%s(input:{subjectId:\"X\",body:\"hello\"}){clientMutationId}}" % name
 
@@ -170,13 +185,29 @@ class TestGhShimSignInput(unittest.TestCase):
             self.refused(*self.rig.run("api", "graphql", "-F", "query=@" + str(self.rig.home / "none.graphql")))
 
     def test_u2_reads_and_other_calls_are_untouched(self):
+        rig = hermetic_rig()   # no merge gate config in this rig's home: the merge mutation below is not gated
+        self.addCleanup(rig.close)
         for args in (("api", "repos/o/r/issues/1/comments"), ("api", "graphql", "-f", "query=query { viewer { login } }"),
                      ("api", "repos/o/r/issues/1/labels", "-f", "body=x"), ("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "body=x"),
                      ("api", "graphql", "-f", "query=mutation{mergePullRequest(input:{pullRequestId:\"X\"}){clientMutationId}}")):
             with self.subTest(args=args):
-                done, calls = self.rig.run(*args)
+                done, calls = rig.run(*args)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0]["argv"], list(args))
+
+    def test_u3_a_graphql_merge_mutation_with_and_without_a_gate(self):
+        merge = ("api", "graphql", "-f", "query=mutation{mergePullRequest(input:{pullRequestId:\"X\"}){clientMutationId}}")
+        free = hermetic_rig()
+        self.addCleanup(free.close)
+        done, calls = free.run(*merge)
+        self.assertEqual(len(calls), 1, done.stderr)   # no gate: the call goes through untouched
+        self.assertEqual(calls[0]["argv"], list(merge))
+        gated = hermetic_rig("o/r")
+        self.addCleanup(gated.close)
+        done, calls = gated.run(*merge)
+        self.assertEqual(calls, [])                    # a gated repository: refused with one line, nothing reaches the real gh
+        self.assertEqual(done.returncode, 10)
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
 
     def test_u6_input_on_a_get_or_another_endpoint_is_untouched(self):
         path = self.file('{"body":"x"}')
