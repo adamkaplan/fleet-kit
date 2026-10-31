@@ -1118,7 +1118,7 @@ class HubReadAndTransport(unittest.TestCase):
                 post(req["id"], {"status": status, "reason": reason, "record": record})   # the POST connect hangs: cut
         finally:
             mod.READ_DEADLINE = old
-        gate.set()   # the late thread now completes after the cut
+        [t.join(10) for t in threading.enumerate() if isinstance(t, threading.Timer) and t.interval == 0.4]; gate.set()   # the late thread now completes after the cut (the watchdog of the cut post has finished first; 10 s is a hang guard, never a verdict)
         late = ran_connect[-1]; late.join(10)   # the thread that held the POST connect   # a guard so a broken mechanism fails instead of hanging: the slowest honest case is about 0.1 s, the guard 100 times that; never what the test judges
         self.assertFalse(late.is_alive(), "the late thread did not end")
         slow_for["armed"] = False
@@ -2485,7 +2485,7 @@ def test_a_new_comparison_of_a_measured_duration_without_a_reason(self):
 
     def test_the_late_post_helper_no_longer_polls(self):
         src = TestLatePostNoWallClock.scenario_source(self)
-        self.assertEqual((src.count("enumerate" + "("), src.count("monotonic")), (0, 0))
+        self.assertEqual((src.count("enumerate" + "("), src.count("monotonic")), (1, 0))   # #1673: the one enumeration joins the watchdog timers, it does not poll
         print("S11: real (1, 1), mutant (1, 2), enumerations of the thread set in the helper %d" % src.count("enumerate" + "("))
 
     def test_a_bound_of_ten_seconds_or_more_on_a_measured_duration_is_not_flagged_by_the_file_scan(self):
