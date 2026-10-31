@@ -323,6 +323,8 @@ def read_result(arg):
         print("cloud-prepush: run %d, identical: %d (of which failing on both sides: %d), could not run %d"
               % (run, same, kinds.count("both_fail"), kinds.count("noRun")))
         print("cloud-prepush: advice only; continuous integration stays the gate and its result is the only evidence")
+    if doc.get("left_to_ci"):
+        print(doc["left_to_ci"])
     rc = doc.get("exit")
     return rc if isinstance(rc, int) and rc else 0
 
@@ -479,10 +481,18 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
     if rec:
         rec.select(picked)
     run = same = noRun = 0
+    left_ci = cloud_quick.left_to_ci(*cloud_quick.split_readers(READ_LIST)) if cloud_quick is not None and MODE == "quick" else []
+    left_notes = []
     both_fail = []
     diffs = []
     try:
         for i, rel in enumerate(picked, 1):
+            if rel in left_ci and rel in READ_LIST:  # one reader can run: this one is left to CI (not a difference)
+                noRun += 1
+                left_notes.append("NOT RUN: %s cannot run in quick" % rel)
+                if rec:
+                    rec.set(rel, branch="could not run", base="could not run", kind="noRun", text=left_notes[-1])
+                continue
             if MODE == "quick" and cloud_quick is not None and cloud_quick.cannot_run_quick(rel) and rel in READ_LIST:
                 noRun += 1
                 diffs.append("NOT RUN: %s cannot run in quick" % rel)
@@ -561,11 +571,17 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
         git(["worktree", "prune"], root)
     for d in diffs:
         print(d)
+    for d in left_notes:
+        print(d)
     for rel in both_fail:
         print("FAILS ON BOTH SIDES with the same tail (a new failure inside it would hide): " + rel)
     print("cloud-prepush: run %d, identical: %d (of which failing on both sides: %d), could not run %d"
           % (run, same, len(both_fail), noRun))
     print("cloud-prepush: advice only; continuous integration stays the gate and its result is the only evidence")
+    if left_notes:
+        if rec:
+            rec.doc["left_to_ci"] = cloud_quick.left_line(left_ci)
+        print(cloud_quick.left_line(left_ci))
     return 1 if diffs else 0
 
 
