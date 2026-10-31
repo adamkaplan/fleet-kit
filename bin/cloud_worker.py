@@ -816,6 +816,8 @@ def _launch(args, runner, now, reserve):
         try:
             with tunnel(cluster, record) as live:
                 v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
+                if choice:   # #1655: the pod's own model list, read once, before the session and the brief
+                    _model_served(engine, name, choice["model"], v2)
                 session = v2.session_create(args.agent if args.agent == "orchestrator" else CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
                                             {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}},
                                             **(H["launch_model_kwargs"](choice) if choice else {}))["id"]
@@ -840,6 +842,24 @@ def _launch(args, runner, now, reserve):
     _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
+
+
+def _model_served(engine, name, model, v2):
+    """#1655: ONE read of the pod's model list; a model its provider does not serve (providerID AND id) is refused with one line that lists at most
+    twelve served ids of the provider that match the model-id pattern (never other pod text); the failure path of _launch stops the pod."""
+    provider, _, mid = model.partition("/")
+    try:
+        listed = v2.model_list()
+    except (H["V2Error"], H["V2Unreachable"], OSError):
+        listed = None
+    if not isinstance(listed, list):
+        raise CloudError("--model %s could not be verified: the pod's model list could not be read" % model)
+    rows = [m for m in listed[:2000] if isinstance(m, dict) and m.get("providerID") == provider and isinstance(m.get("id"), str)]
+    if any(m["id"] == mid for m in rows):
+        return
+    ids = sorted({m["id"] for m in rows if H["LAUNCH_MODEL_RE"].fullmatch(m["id"])})[:12]
+    _audit(engine, "cloud.model_not_served", name, {"model": model})
+    raise CloudError("--model %s is not served by the pod's provider: it serves at most 12 of: %s" % (model, ", ".join(ids) or "none"))
 
 
 def _registry_note(engine, what, state, name, *args):
