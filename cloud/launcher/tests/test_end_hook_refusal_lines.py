@@ -245,5 +245,72 @@ class S8Docs(Scratch):
         print("S8: phrases found %d of 3" % found)
 
 
+class S9Prestop(Scratch):
+    """The pre-stop line keeps git's own LAST line (cut to 80 characters, a URL replaced), none of the earlier refusal lines."""
+    PRESTOP_DRIVER = (
+        "import importlib.util, sys\n"
+        "sp = importlib.util.spec_from_file_location('h', sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)\n"
+        "m.GIT_BIN = sys.argv[2]\n"
+        "m.HELPER_DIR = sys.argv[3]\n"
+        "sys.argv = [sys.argv[0], '--prestop']\n"
+        "sys.exit(m.main())\n")
+    OLD = 'msg = " ".join(str(getattr(e, "summary", e)).split())'
+    NEW = 'msg = " ".join(str(e).split())'
+
+    def prestop_line(self, lines, path=None):
+        listing = os.path.join(self.t, "lines")
+        with open(listing, "w") as f:
+            f.write("".join(l + "\n" for l in lines))
+        # the pre-stop hook scrubs the environment: this fake reads its lines from a file beside it, not from FAKE_LINES
+        fake = os.path.join(self.t, "git-prestop")
+        with open(fake, "w") as f:
+            f.write(FAKE_GIT.replace("os.environ.get('FAKE_MODE', '')", "'refuse'").replace("os.environ['FAKE_LINES']", "%r" % listing))
+        os.chmod(fake, 0o755)
+        helpers = os.path.join(self.t, "helpers")
+        os.makedirs(helpers, exist_ok=True)
+        helper = os.path.join(helpers, "git-credential-cw")
+        with open(helper, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(helper, 0o755)
+        driver = os.path.join(self.t, "prestop_driver.py")
+        with open(driver, "w") as f:
+            f.write(self.PRESTOP_DRIVER)
+        e = dict(os.environ, CW_WORKDIR=self.work, CW_WORKER="coder7", CW_REPO="acme-org/widget-service", FAKE_MODE="refuse", FAKE_LINES=listing)
+        path = path or os.environ.get(HOOK_ENV) or os.path.join(LAUNCHER, "end_hook.py")
+        e.pop(HOOK_ENV, None)
+        p = subprocess.run([sys.executable, driver, path, fake, helpers], env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        out = [l for l in p.stdout.splitlines() if l.startswith("cw-prestop: ")]
+        return p.returncode, out
+
+    def test_the_prestop_line_keeps_the_last_line_only(self):
+        lines = self.refusal()
+        rc, out = self.prestop_line(lines)
+        self.assertEqual((rc, len(out)), (0, 1), out)
+        last = " ".join(SUMMARY.split())
+        last = re.sub(r"https?://\S+", "<url>", last)[:80]
+        self.assertIn("not pushed (%s)" % last, out[0])
+        earlier = sum(l.strip() in out[0] for l in lines[:-1])
+        self.assertEqual(earlier, 0)
+        self.assertNotIn("non-fast-forward", out[0])
+        # the same refusal through the end hook answers the bounded lines
+        error = self.hook(lines)[1]["error"]
+        self.assertIn("non-fast-forward", error)
+        self.assertTrue(error.endswith(SUMMARY))
+        print("S9 part 1: prestop line equals git last line 1 of 1, earlier refusal lines in it %d" % earlier)
+
+    @unittest.skipIf(os.environ.get(INNER_ENV), "inside a mutant's child run")
+    def test_a_prestop_that_reads_the_whole_text_fails_it(self):
+        scratch = tempfile.mkdtemp(prefix="cw-mutant-")   # outside the repository
+        self.addCleanup(shutil.rmtree, scratch, True)
+        path = write_copy(scratch, self.OLD, self.NEW)
+        applied = os.path.isfile(path)
+        p = stub_support.start(self, [sys.executable, "-m", "unittest", "-q", "test_end_hook_refusal_lines.S9Prestop.test_the_prestop_line_keeps_the_last_line_only"],
+                               cwd=HERE, env=dict(os.environ, **{HOOK_ENV: path, INNER_ENV: "1"}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out, _ = p.communicate(timeout=90)
+        self.assertEqual(p.returncode, 1, out)
+        self.assertTrue(applied)
+        print("S9: prestop line equals git last line 1 of 1, earlier refusal lines in it 0, mutant fails 1 of 1, mutation applied %s" % applied)
+
+
 if __name__ == "__main__":
     unittest.main()
