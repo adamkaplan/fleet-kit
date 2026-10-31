@@ -53,7 +53,7 @@ class TestScansRun(unittest.TestCase):
         r = subprocess.run([sys.executable, os.path.join(self.wt, "bin", "cloud-pr-preflight"), "--quick"], cwd=self.wt,
                            env=env, capture_output=True, text=True, timeout=140)
         self.assertEqual(r.returncode, 1, r.stderr[-500:])
-        self.assertIn("NOT RUN: quick run exceeded 1 s", r.stdout)
+        self.assertIn("NOT RUN (budget): quick run exceeded 1 s", r.stdout)
         self.assertNotIn("RESULT: PASS", r.stdout)
 
     def test_missing_helper_is_loud_in_prepush(self):
