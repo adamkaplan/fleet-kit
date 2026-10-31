@@ -153,6 +153,7 @@
         "bin/impact_floor.py",
         "bin/chat_clear.py",
         "bin/merge_gate.py",
+        "bin/size_ceilings.py",
         "bin/clear_carry.py",
         "bin/reassign.py",
         "bin/item_verdicts.py",
@@ -170,6 +171,7 @@
         "bin/cloud_relay.py",
         "cloud/worker/bin/cloud_relay.py",
         "bin/cloud_cli.py",
+        "bin/cloud_cluster.py",
         "bin/external_adapter.py",
         "bin/delegated_clear.py",
         "bin/impact_hold.py",
@@ -204,6 +206,7 @@
           "bin/impact_floor.py",
           "bin/chat_clear.py",
           "bin/merge_gate.py",
+          "bin/size_ceilings.py",
           "bin/clear_carry.py",
           "bin/reassign.py",
           "bin/item_verdicts.py",
@@ -221,6 +224,7 @@
           "bin/cloud_relay.py",
           "cloud/worker/bin/cloud_relay.py",
           "bin/cloud_cli.py",
+          "bin/cloud_cluster.py",
           "bin/external_adapter.py",
           "bin/delegated_clear.py",
           "bin/impact_hold.py",
@@ -396,12 +400,14 @@
         "bin/agent_presence.py",
         "bin/awaiting_live.py",
         "bin/ci_runs.py",
+        "bin/cloud_worker.py",
         "bin/cpu_guard.py",
         "bin/dead_hint.py",
         "bin/decision_core.py",
         "bin/decision_sync.py",
         "bin/disk_janitor.py",
         "bin/fleet_health.py",
+        "bin/header_cache.py",
         "bin/heavy_slots.py",
         "bin/item_verdicts.py",
         "bin/plan_review.py",
@@ -415,7 +421,9 @@
         "bin/report_fold.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
+        "bin/turn_start.py",
         "bin/work_sync.py",
+        "bin/switchboard/plan_input.py",
         "bin/switchboard/v2_transport.py",
         "bin/switchboard/facts.py",
         "bin/switchboard/import_v1.py",
@@ -424,11 +432,16 @@
         "bin/switchboard/plan_review.py",
         "bin/switchboard/triage.py",
         "bin/switchboard/alert_labels.py",
+        "bin/switchboard/link_scrub.py",
         "bin/switchboard/handoff.py",
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
-        "bin/switchboard/jev.py"
+        "bin/switchboard/jev.py",
+        "bin/switchboard/secret_spans.py",
+        "bin/switchboard/caches.py",
+        "bin/switchboard/profile_pieces.py",
+        "bin/switchboard/installer.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -436,6 +449,9 @@
           "*"
         ],
         "bin/record_json.py": [
+          "*"
+        ],
+        "bin/turn_start.py": [
           "*"
         ],
         "bin/awaiting_live.py": [
@@ -455,6 +471,9 @@
           "newest",
           "own_repo"
         ],
+        "bin/cloud_worker.py": [
+          "read_record_file"
+        ],
         "bin/red_ci.py": [
           "*"
         ],
@@ -465,6 +484,7 @@
         "bin/decision_core.py": [
           "one_line"
         ],
+        "bin/header_cache.py": ["_dir", "_h", "drop", "usable"],
         "bin/disk_janitor.py": [
           "settings",
           "validate"
@@ -497,6 +517,13 @@
         "bin/spotlight_guard.py": [
           "settings",
           "validate"
+        ],
+        "bin/switchboard/plan_input.py": [
+          "_parent_ask_done_when",
+          "fetch_plan",
+          "load_plan",
+          "parse_plan_source",
+          "plan_comment_choice"
         ],
         "bin/switchboard/v2_transport.py": [
           "V2Breaker",
@@ -531,8 +558,13 @@
           "ReminderFacts",
           "_clean_line",
           "add_reminder",
+          "alert_stale",
+          "alert_subject",
+          "digest_replaced",
           "drop_superseded_item",
           "found_reason",
+          "is_digest",
+          "judge_delivery",
           "merge_wake",
           "merge_wake_facts",
           "read_record_file",
@@ -554,9 +586,12 @@
           "_alert_not_a_map",
           "_alert_repo_not_read",
           "_check_sla",
+          "_standing_day",
           "parked_until",
           "read_mark",
+          "standing_line",
           "triage_awaiting_labels",
+          "triage_body_standing",
           "triage_says_reviewed",
           "validate_triage_config",
           "whole",
@@ -566,6 +601,8 @@
           "AlertWakeFacts",
           "RedCiFacts",
           "TriageFacts"
+        ],
+        "bin/switchboard/link_scrub.py": [
         ],
         "bin/switchboard/handoff.py": [
           "WorkerFacts",
@@ -609,10 +646,13 @@
           "compose",
           "compose_order",
           "decide",
+          "delayed_since",
           "describe_items",
           "hold_reason",
+          "in_late_scope",
           "is_withdrawal",
           "orders_note",
+          "sent_at",
           "steers_into_turn",
           "superseded_by"
         ],
@@ -637,6 +677,22 @@
           "jev_key_file",
           "locate_jev_key",
           "validate_jev_config"
+        ],
+        "bin/switchboard/secret_spans.py": [
+          "_secret_position",
+          "find_secret_span",
+          "secret_where"
+        ],
+        "bin/switchboard/caches.py": [
+          "BoundedFileCache",
+          "_audit_tail",
+          "_valid_context"
+        ],
+        "bin/switchboard/profile_pieces.py": [
+          "InstallError"
+        ],
+        "bin/switchboard/installer.py": [
+          "reaper_only_conflict"
         ]
       },
       "registrar_allow": {
@@ -757,12 +813,13 @@
         "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
-        "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
+        "bin/cloud_end_alert.py": "loaded only by `cloud_end_tick` and `cloud_turn_tick` (via `load_module`), both called only by `finish_pass` (after `cloud_watch_tick`), not by the clear",
         "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
         "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
         "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
+        "bin/launch_brief_check.py": "loaded only by `launch_brief_mismatch`, the launch-time reader of the brief (#1350), which the clear cannot reach",
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",

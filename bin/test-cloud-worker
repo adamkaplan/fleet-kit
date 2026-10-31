@@ -113,7 +113,7 @@ if command == "create":
         sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
         sys.exit(2)
     shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "XS"
-    if shape not in ("XS", "S", "M"):
+    if shape not in ("XS", "O", "S", "M"):
         sys.stderr.write("error: shape must be XS, S or M\\n")
         sys.exit(2)
 if command == "create":
@@ -221,11 +221,72 @@ GIT_TOKEN = "ghs_GitInstallationTokenAbCdEf0123456789"
 
 PREFLIGHT_PASS = ["sh", "-c", 'echo "preflight: preflight ok: deletion, non_fast_forward, pull_request"']
 
+CHILD_END_WAIT_SECONDS = 15   # bounded wait for a child to end after the end signal
+
+
+def _children_of(directory):
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    found = []
+    for line in out.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) != os.getpid() and str(directory) in command:
+            found.append(int(pid))
+    return found
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:   # our own child: reaping it tells whether it ended (a zombie is gone)
+        return os.waitpid(pid, os.WNOHANG)[0] == 0
+    except ChildProcessError:
+        pass
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def _wait_gone(pids, seconds):
+    end = time.time() + seconds
+    while time.time() < end and any(_alive(p) for p in pids):
+        time.sleep(0.1)
+    return [p for p in pids if _alive(p)]
+
+
+def end_children_and_remove(tmp, directory):
+    """Cleanup of Base.setUp: end every child naming the scratch directory (SIGTERM, wait, SIGKILL), then remove it."""
+    import signal
+    pids = _children_of(directory)
+    for sig, wait in ((signal.SIGTERM, CHILD_END_WAIT_SECONDS), (signal.SIGKILL, 5)):
+        for p in pids:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass
+        pids = _wait_gone(pids, wait)
+        if not pids:
+            break
+    error = None
+    for _ in range(5):
+        try:
+            tmp.cleanup()
+            error = None
+            break
+        except OSError as e:
+            error = e
+            time.sleep(0.2)
+    if pids or error:
+        raise RuntimeError("scratch cleanup failed: children not ended %s, removal error %s" % (pids, error))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(dir=str(BIN.parent))   # under the worktree, never the shared /tmp
-        self.addCleanup(tmp.cleanup)
+        tmp = tempfile.TemporaryDirectory()   # the platform's temporary directory, never the repository root: an entry that judges the root runs beside the entries that load this fixture
         self.home = Path(tmp.name).resolve()
+        self.addCleanup(end_children_and_remove, tmp, self.home)
         self.stub_dir = self.home / "stub"
         self.stub_dir.mkdir()
         self.stub = self.stub_dir / "cloud-worker"
@@ -1700,7 +1761,7 @@ class TestLauncherLookup(Base):
         self.stub.rename(moved)
         self.stub = moved
         os.environ["PATH"] = "%s:%s" % (self.bare, os.environ["PATH"])
-        patch = mock.patch.object(self.mod, "checkout_launcher_path", lambda: self.entry)
+        patch = mock.patch.object(self.mod.cloud_cluster, "checkout_launcher_path", lambda: self.entry)
         patch.start()
         self.addCleanup(patch.stop)
         os.environ.pop("FLEET_CLOUD_WORKER_BIN", None)
@@ -1931,7 +1992,7 @@ class TestLauncherLookupInputs(Base):
 
         for label, patch in (("path before checkout", mock.patch.object(self.mod, "launcher_argv", mutant_path_first)),
                              ("checkout before variable", mock.patch.object(self.mod, "launcher_argv", mutant_variable_last)),
-                             ("working directory as the checkout", mock.patch.object(self.mod, "checkout_launcher_path", mutant_cwd)),
+                             ("working directory as the checkout", mock.patch.object(self.mod.cloud_cluster, "checkout_launcher_path", mutant_cwd)),
                              ("no checkout lookup", mock.patch.object(self.mod, "launcher_argv", mutant_path_only))):
             with self.subTest(label), patch:
                 self.assertNotEqual(self.ordering_failures(), [], label)
@@ -2325,7 +2386,7 @@ class TestVaultCheckProcess(VaultBase):
         self.addCleanup(holder.kill)
         self.assertEqual(holder.stdout.readline().strip(), "held")
         recovery = self.cw.VaultRecovery(lock, None, sleep=lambda s: time.sleep(0.02))
-        with mock.patch.object(self.cw, "VAULT_LOCK_GRACE", 0), mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+        with mock.patch.object(self.cw.cloud_cluster, "VAULT_LOCK_GRACE", 0), mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
             with self.assertRaises(self.cw.Refusal):   # held: refused after its bounded wait
                 recovery(lambda: None, dict(os.environ))
         holder.kill()   # SIGKILL: the kernel frees the lock with the process
@@ -2384,11 +2445,53 @@ class TestVaultCheckProcess(VaultBase):
         holder.start()
         self.wait_started()
         recovery = self.cw.VaultRecovery(self.home / "vault.lock", None, sleep=lambda s: time.sleep(0.05), clock=time.monotonic)
-        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0), mock.patch.object(self.cw, "VAULT_LOCK_GRACE", 0.3):
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0), mock.patch.object(self.cw.cloud_cluster, "VAULT_LOCK_GRACE", 0.3):
             with self.assertRaises(self.cw.Refusal) as caught:
                 recovery(lambda: self.cw._capture(["az", "x"], env=env), env)
         self.assertIn("vault-check.lock", str(caught.exception))
         holder.join(30)
+
+
+class TestNeedsDocker(Base):   # #1488
+    LINE = "NEEDS: docker"
+    BASELINE = BIN.parent / "tests" / "golden" / "needs-docker-launch-baseline.json"   # captured from the launch on origin/integration, before the check existed
+    GUARD = "if needs is not None and not getattr(args, \"stack\", False):"
+
+    def run_launch(self, text, *extra, cloud=True):
+        (self.home / "brief.txt").write_text(text)
+        argv = ["launch", "coder7", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "coder", "--reports-to", "orch", "--brief-file", str(self.home / "brief.txt"), *extra]
+        with mock.patch.object(sb, "launch_agent", return_value={"name": "coder7", "session": "ses_l", "pane": "p1", "tab": "t1"}):   # a local launch: the terminal is not under test, what the command prints is
+            return self.main(*argv, *(["--cloud"] if cloud else ["--terminal", "--workspace", "w1", "--dir", str(self.home)]))
+
+    def seen(self, res):
+        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": "".join(l + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
+
+    def test_s2_a_docker_brief_without_stack_is_refused_before_any_pod(self):
+        code, out, err = self.run_launch("Build.\n" + self.LINE + "\n")
+        refusal = [l for l in err.splitlines() if "needs docker" in l]
+        self.assertEqual((code, len(refusal), self.stub_calls(), self.LINE in "".join(refusal), "--stack" in "".join(refusal)), (1, 1, [], True, True))   # exit 1, one line naming the brief line and the flag, no pod (no call at all)
+
+    def test_s3_a_docker_brief_with_stack_is_accepted(self):
+        code, out, err = self.run_launch("Build.\n" + self.LINE + "\n", "--stack")
+        self.assertEqual((code, [c[0] for c in self.stub_calls()].count("create"), len(self.stub_calls())), (0, 1, 1), err)   # exit 0, exactly one pod
+
+    def test_s4_u1_unmarked_cloud_and_local_launches_are_the_stored_baseline(self):
+        want = json.loads(self.BASELINE.read_text())
+        for text in ("Build.\n", "Build.\n" + self.LINE + "\n"):   # a local launch is unchanged with or without the line (before the cloud launch: it makes the name taken)
+            self.assertEqual(self.seen(self.run_launch(text, cloud=False)), want["local_launch"])
+        self.assertEqual(self.seen(self.run_launch("Build.\n")), want["cloud_unmarked_brief"])
+
+    def test_s5_a_check_that_ignores_the_line_is_caught(self):
+        src = (BIN / "cloud_worker.py").read_text()
+        self.assertEqual(src.count(self.GUARD), 1)
+        scratch = Path(tempfile.mkdtemp(prefix="needs-mutant-", dir=str(self.home)))   # a copy outside the repository; the real file is never edited
+        shutil.copytree(str(BIN), str(scratch / "bin"), ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(str(BIN.parent / "cloud"), str(scratch / "cloud"), ignore=shutil.ignore_patterns("__pycache__"))
+        (scratch / "bin" / "cloud_worker.py").write_text(src.replace(self.GUARD, "if False:"))
+        done = subprocess.run([sys.executable, str(scratch / "bin" / "test-cloud-worker"), "TestNeedsDocker.test_s2_a_docker_brief_without_stack_is_refused_before_any_pod"], capture_output=True, text=True, timeout=600)
+        failing = int(done.returncode != 0 and "AssertionError" in done.stderr + done.stdout)   # the refusal case sees exit 0: the pod was launched
+        print("%d of 1 mutants failing" % failing)
+        self.assertEqual(failing, 1, done.stdout + done.stderr)
 
 
 if __name__ == "__main__":

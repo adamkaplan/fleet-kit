@@ -10,8 +10,11 @@ plain `gh issue comment ...` and the signature is added without its help.
 
 It signs the body of `gh issue comment`, `gh pr comment`, `gh pr review`,
 `gh issue create` and `gh pr create` when the body comes from --body/-b,
---body-file/-F (a file, or - for stdin). Everything else, and anything it does
-not understand, runs the real gh unchanged: this must never block a command.
+--body-file/-F (a file, or - for stdin); the --comment/-c text of `gh issue close`
+and `gh pr close`; and the `body` field of a POST or PATCH made with `gh api` to
+a comment or review endpoint (SIGNED_API below). Everything else runs the real gh
+unchanged. A signed form whose text cannot be read is refused with one line and
+nothing is posted: it is never posted unsigned.
 """
 import importlib.util
 import json
@@ -30,6 +33,9 @@ MARK = "<!-- fleet-switchboard:from=%s -->"
 SIGNED_RE = re.compile(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]{1,64}\s*-->")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SIGNED_COMMANDS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"), ("issue", "create"), ("pr", "create")}
+CLOSE_COMMANDS = {("issue", "close"), ("pr", "close")}   # signed through their --comment/-c text
+SIGNED_API = (("issue-comments", r"issues/[0-9]+/comments"), ("issue-comment", r"issues/comments/[0-9]+"),
+              ("review-comments", r"pulls/[0-9]+/comments"), ("reviews", r"pulls/[0-9]+/reviews"))   # `gh api` endpoints (under repos/OWNER/REPO/) whose POST or PATCH body is signed
 LOOKUP_SECONDS = 3.0
 WRITE_LOOKUP_SECONDS = 10.0   # a WRITE waits longer for the account lookup: a slow answer must not make it run as the wrong account
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -118,8 +124,6 @@ def count_call(args):
     """Best effort, never fails or delays the command: one line (time, account name, endpoint class) for the daemon's hourly count. The switchboard's
     own calls are counted by the daemon, not here. Nothing else is recorded: no token, no argument, no body, no repo."""
     try:
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return
         words = command_words(args)
         if not words or words[0] in NO_NETWORK_GROUPS:
             return
@@ -358,11 +362,15 @@ def warn_low(account, low):
 # There is NO per-agent cap, count or quota here or in any configuration: the top spender is a RANKING of the last hour, recomputed from the daemon's record at every
 # call, never a limit and never remembered. The wait is bounded and ends the moment no account the caller tops is low; nothing is refused.
 #
-# WHAT A CALLER CAN SET. This block reads NO environment variable of its own: the state directory is the account's home from the password database (never HOME,
-# XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE), the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN), the marker FLEET_SWITCHBOARD_OWN_GH
-# is not honoured here, the timeouts are constants, and it looks at EVERY low account (never the one a configuration variable maps this call to). The one thing it
-# cannot defend is the identity itself: "who is this caller" is the switchboard's answer from the caller's own session and pane. A caller can only make ITSELF wait
-# less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch the wait off.
+# WHAT A CALLER CAN SET. This block reads NO environment variable of its own:
+#   - the state directory is the account's home from the password database (never HOME, XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE);
+#   - the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN);
+#   - the retired FLEET_SWITCHBOARD_OWN_GH is read nowhere in this file (the switchboard's own calls run the real gh by path);
+#   - the timeouts are constants;
+#   - it looks at EVERY low account (never the one a configuration variable maps this call to).
+# The one thing it cannot defend is the identity itself: "who is this caller" is the switchboard's answer from the caller's own session and pane. A caller can only
+# make ITSELF wait less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch
+# the wait off.
 SLOW_SECONDS = 2.0            # the longest any one uncached read of the top spender waits
 NOTICE_EVERY = 3600           # at most one message per account in this many seconds
 TRY_EVERY = 300               # at most one ATTEMPT to send per account in this many seconds, whether or not it made a message (a failing or slow switchboard costs one call in this many, not every call)
@@ -458,7 +466,7 @@ def tell_top_spender(state, account):
             pass
         if not fresh_stamp(os.path.join(state, "gh-low-tried", _digest(account)[:16]), TRY_EVERY):
             return   # an attempt was made a few minutes ago (it may have failed): not again per call
-        subprocess.run([binary, "budget-notice", "--account", str(account)], capture_output=True, timeout=8, env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
+        subprocess.run([binary, "budget-notice", "--account", str(account)], capture_output=True, timeout=8)
     except Exception:
         pass
 
@@ -925,8 +933,6 @@ def read_scope(args, lookup, write):
     repository's account when it only reads, and is refused when it writes. A record that cannot be read (`read_repo` false) refuses every command that
     reaches GitHub. Fails closed on its own trouble. A worker without the key is never touched; a lookup that failed says nothing about the record."""
     try:
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return None
         ident = lookup.identity()
         if "read_repo" not in ident:
             return None
@@ -966,8 +972,6 @@ def read_scope(args, lookup, write):
 def read_account_env(gh, lookup, extra):
     """The environment for a READ of the extra repository: GH_TOKEN of the account `gh_users` maps it to, nothing else. A missing map, mapping or token refuses
     (NoAccountMapped / AccountLookupFailed): a read of the extra repository never runs as the inherited or the worker's own account."""
-    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-        return None
     users = config_users()
     matcher = load_matcher()
     account = matcher.account_for(users, extra) if matcher is not None and users else None
@@ -1080,8 +1084,6 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None, read
     try:
         if read_repo:
             return read_account_env(gh, lookup, read_repo)
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return None   # the switchboard's own call (the daemon's, or a command's): it named its account; never re-identified
         users = config_users()
         words = command_words(args or [])
         app = app_config() if (credential or not words or words[0] not in APP_SKIP_GROUPS) and not (args and not words) else None   # `gh --version` makes no call
@@ -1171,7 +1173,11 @@ def sign(body, name):
     return body if SIGNED_RE.search(body) else body.rstrip("\n") + "\n\n" + MARK % name + "\n"
 
 
-def body_flag(args):
+BODY_FLAGS = ((("--body", "-b"), "body"), (("--body-file", "-F"), "file"))
+COMMENT_FLAGS = ((("--comment", "-c"), "body"),)
+
+
+def body_flag(args, specs=BODY_FLAGS):
     """(index, kind, inline) of the LAST body flag among args[2:]: kind "body" or "file"; inline is the
     value when it is part of the same argument (`--body=x`, `-bx`), else None (the value is args[index+1])."""
     found = None
@@ -1180,7 +1186,7 @@ def body_flag(args):
         arg = args[i]
         if arg == "--":
             break
-        for names, kind in ((("--body", "-b"), "body"), (("--body-file", "-F"), "file")):
+        for names, kind in specs:
             for name in names:
                 if arg == name:
                     found = (i, kind, None)
@@ -1191,11 +1197,31 @@ def body_flag(args):
     return found
 
 
-def signed_call(args, name):
-    """(new argv, stdin text or None, temp file to remove or None), or None when there is nothing to sign."""
-    if len(args) < 3 or (args[0], args[1]) not in SIGNED_COMMANDS:
+class Unsignable(Exception):
+    """A signed form whose text cannot be signed: the call is refused, never posted unsigned."""
+
+
+def read_text(path):
+    try:
+        with open(path, "r") as handle:
+            return handle.read()
+    except (OSError, UnicodeError) as err:
+        raise Unsignable("the text of %s cannot be read (%s)" % (path, type(err).__name__))
+
+
+def temp_signed(text, name):
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".md")
+    with os.fdopen(handle, "w") as out:
+        out.write(sign(text, name))
+    return temp
+
+
+def signed_call(args, name, specs=BODY_FLAGS, commands=SIGNED_COMMANDS):
+    """(new argv, stdin text or None, temp file(s) to remove or None), or None when there is nothing to sign.
+    Raises Unsignable for a --body-file that cannot be read."""
+    if len(args) < 3 or (args[0], args[1]) not in commands:
         return None
-    flag = body_flag(args)
+    flag = body_flag(args, specs)
     if flag is None:
         return None
     index, kind, inline = flag
@@ -1213,19 +1239,139 @@ def signed_call(args, name):
         return new, None, None
     if value == "-":
         return new, sign(sys.stdin.read(), name), None
-    try:
-        with open(value, "r") as handle:
-            text = handle.read()
-    except OSError:
-        return None
-    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".md")
-    with os.fdopen(handle, "w") as out:
-        out.write(sign(text, name))
+    temp = temp_signed(read_text(value), name)
     if inline is not None:
         new[index] = args[index][:len(args[index]) - len(value)] + temp
     else:
         new[value_at] = temp
     return new, None, temp
+
+
+def close_call(args, namer):
+    """`gh issue close` and `gh pr close`: the --comment/-c text is signed; no comment (or an empty one) passes through."""
+    flag = body_flag(args, COMMENT_FLAGS) if len(args) >= 3 and (args[0], args[1]) in CLOSE_COMMANDS else None
+    if flag is None:
+        return None
+    index, _kind, inline = flag
+    value = inline if inline is not None else (args[index + 1] if index + 1 < len(args) else None)
+    if not value:
+        return None
+    return signed_call(args, namer(), COMMENT_FLAGS, CLOSE_COMMANDS)
+
+
+API_VALUE_FLAGS = ("-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header", "--input", "-q", "--jq", "-t", "--template",
+                   "--hostname", "--cache", "-p", "--preview")
+API_FIELD_FLAGS = ("-f", "--raw-field", "-F", "--field")
+API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API))
+
+
+def api_parse(args):
+    """(positionals, method or None, fields) of a `gh api` call; fields are (index, flag, inline, text) of every field flag, in order."""
+    positionals, method, fields, i = [], None, [], 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            positionals.extend(args[i + 1:])
+            break
+        long_inline = arg.startswith("--") and "=" in arg
+        base = arg.split("=", 1)[0] if long_inline else arg
+        if base in API_VALUE_FLAGS and not long_inline:
+            value = args[i + 1] if i + 1 < len(args) else None
+            if base in ("-X", "--method") and value is not None:
+                method = value.upper()
+            if base in API_FIELD_FLAGS and value is not None:
+                fields.append((i, base, None, value))
+            i += 2
+            continue
+        if long_inline and base in API_VALUE_FLAGS:
+            value = arg.split("=", 1)[1]
+            if base == "--method":
+                method = value.upper()
+            if base in API_FIELD_FLAGS:
+                fields.append((i, base, value, value))
+        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 2 and arg[:2] in API_VALUE_FLAGS:
+            value = arg[2:]
+            if arg[:2] == "-X":
+                method = value.upper()
+            if arg[:2] in API_FIELD_FLAGS:
+                fields.append((i, arg[:2], value, value))
+        elif not arg.startswith("-"):
+            positionals.append(arg)
+        i += 1
+    return positionals, method, fields
+
+
+def api_call(args, namer):
+    """`gh api` POST or PATCH to a comment or review endpoint (SIGNED_API): every `body` field is signed (`-f`, `-F`, `--field`, `--raw-field`; `-F body=@file`
+    and `@-` are read, signed and passed as a temporary file or stdin). A read, another endpoint, a call with no body field and `--input` are not touched."""
+    if not args or args[0] != "api":
+        return None
+    positionals, method, fields = api_parse(args)
+    if not any(API_ENDPOINT_RE.match(p) for p in positionals):
+        return None
+    if any(a == "--input" or a.startswith("--input=") for a in args[1:]):
+        return None
+    if (method or ("POST" if fields else "GET")) not in ("POST", "PATCH"):
+        return None
+    bodies = [f for f in fields if f[3].split("=", 1)[0] == "body" and "=" in f[3]]
+    if not bodies:
+        return None
+    name = namer()
+    new, stdin_text, temps = list(args), None, []
+    for index, flag, inline, text in bodies:
+        value = text.split("=", 1)[1]
+        if flag in ("-F", "--field") and value.startswith("@"):
+            if value == "@-":
+                stdin_text = sign(sys.stdin.read() if stdin_text is None else stdin_text, name)
+                continue
+            temps.append(temp_signed(read_text(value[1:]), name))
+            replaced = "body=@" + temps[-1]
+        else:
+            replaced = "body=" + sign(value, name)
+        if inline is None:
+            new[index + 1] = replaced
+        else:
+            new[index] = args[index][:len(args[index]) - len(inline)] + replaced
+    return new, stdin_text, temps or None
+
+
+def leading_repo_flags(args):
+    """How many leading arguments are `-R`/`--repo` flags with their values (`-R o/r`, `--repo o/r`, `--repo=o/r`, `-Ro/r`): a value that looks like a verb is a value."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-R", "--repo"):
+            if i + 1 >= len(args):
+                break
+            i += 2
+        elif arg.startswith("--repo=") or (arg.startswith("-R") and len(arg) > 2 and not arg.startswith("--")):
+            i += 1
+        else:
+            break
+    return i
+
+
+def sign_plan(args, lookup):
+    """The plan for a call, or None when it is not a signed form. Raises Unsignable when a signed form's text cannot be signed. The name is looked up
+    only when a body is about to be signed, so an unrelated call costs no lookup. A `-R`/`--repo` flag before the command words is skipped to find the
+    form and kept in the new argv."""
+    lead = leading_repo_flags(args)
+    core = args[lead:]
+    if len(core) >= 3 and (core[0], core[1]) in SIGNED_COMMANDS:
+        handler = lambda namer: signed_call(core, namer())
+    elif len(core) >= 3 and (core[0], core[1]) in CLOSE_COMMANDS:
+        handler = lambda namer: close_call(core, namer)
+    elif core and core[0] == "api":
+        handler = lambda namer: api_call(core, namer)
+    else:
+        return None
+    try:
+        plan = handler(lambda: my_name(lookup))
+    except Unsignable:
+        raise
+    except Exception as err:
+        raise Unsignable("signing failed (%s)" % type(err).__name__)
+    return plan if plan is None or not lead else (args[:lead] + plan[0], plan[1], plan[2])
 
 
 # ---- the gate probe (plan-driven development: enforcing in a repo whose mode is enforce). docs/plan-gate-engine-design.md, E1 and E3.
@@ -1515,7 +1661,7 @@ def review_probe(args, found, reason, lookup, gh):
     the boundary is GitHub's branch protection / required reviews. The check reads the PR's head and the merge then runs unbound, so a push in
     between can land an unchecked head (a short, documented window; the enforcing gates bind `--match-head-commit` themselves). Returns the refusal text, or None."""
     try:
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1" or len(args) < 2 or args[0] != "pr" or args[1] != "merge":
+        if len(args) < 2 or args[0] != "pr" or args[1] != "merge":
             return None
         review_rule_load()   # FIRST, before any skip path: an unloadable rule refuses a merge whatever else happens
         parsed = gate_parse(args)
@@ -1583,8 +1729,6 @@ def gate_probe(args, lookup, gh=None):
     fail-open, recorded in the spool when the shim could not tell which PR it was. `gates-check` exits 10 only for a refusal that
     applies in the repo's mode, and the shim also requires the reply to say `enforce`, so a shadow repo never refuses here."""
     try:
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return None
         if len(args) < 2 or args[0] != "pr" or args[1] not in ("ready", "merge"):
             return None
         listed = gate_repos()
@@ -1617,7 +1761,7 @@ def gate_probe(args, lookup, gh=None):
         try:
             done = subprocess.run(sb_argv(binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"),
                                   capture_output=True, text=True, timeout=gate_seconds(), stdin=subprocess.DEVNULL,
-                                  env=sb_env(own=True))
+                                  env=sb_env())
         except subprocess.TimeoutExpired:
             gate_spool("fail_open", repo, number, check, "no answer within %gs" % gate_seconds())
             return None
@@ -1717,11 +1861,11 @@ ENV_ALLOW = ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "HERDR_SOCKET_PATH"
 ENV_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"   # a fixed PATH: the caller's cannot choose the `python3` a switchboard script starts with
 
 
-def sb_env(own=False):
+def sb_env():
     """The FIXED environment every switchboard the shim starts runs in, built from an ALLOW LIST and never by filtering the caller's: a fixed PATH, HOME as the
     account's real home, the locale and temp names, and the identity names the switchboard verifies against the session. Everything else the caller set
     (`PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `FLEET_SWITCHBOARD_*`, a made-up name) never reaches it, so a worker cannot hand the switchboard a library, a state
-    directory or a configuration of its own. `own` adds the switchboard's own-call marker."""
+    directory or a configuration of its own. No marker is ever added (#1216)."""
     env = {"PATH": ENV_PATH}
     for name in ENV_ALLOW:
         if name in os.environ:
@@ -1729,8 +1873,6 @@ def sb_env(own=False):
     home = mg_home()
     if home:
         env["HOME"] = home
-    if own:
-        env["FLEET_SWITCHBOARD_OWN_GH"] = "1"
     return env
 
 
@@ -1892,8 +2034,8 @@ def mg_refuse(why):
 
 def merge_gate_probe(args, lookup, gh):
     """None (run as given), ("refuse", one line) or ("go", args, release_ref): the merge may run with these args; `release_ref` is the pull request whose lock is
-    released when the merge returns (None when no lock was used). The marker FLEET_SWITCHBOARD_OWN_GH is NOT honoured here (a worker can set it): the
-    switchboard's own gh calls never merge through this shim. Routes covered: `pr merge` in any shape (one the shim cannot parse is refused), `gh api` writes to
+    released when the merge returns (None when no lock was used). No environment variable lifts this check (the retired FLEET_SWITCHBOARD_OWN_GH is read nowhere
+    in this file): the switchboard's own gh calls run the real gh by path and never reach this shim. Routes covered: `pr merge` in any shape (one the shim cannot parse is refused), `gh api` writes to
     `pulls/N/merge`, GraphQL merge mutations. Not covered, and said in the docs: an alias the shim cannot see, the web UI, a push to the branch."""
     try:
         args = canonical_pr_merge(args)
@@ -1940,7 +2082,7 @@ def merge_gate_probe(args, lookup, gh):
             return mg_refuse("merge of %s refused: the merge gate cannot be asked (no switchboard)" % ref)
         try:
             done = subprocess.run(sb_argv(binary, "merge-gate", ref, "--check", "--json"), capture_output=True, text=True, timeout=merge_gate_seconds(),
-                                  stdin=subprocess.DEVNULL, env=sb_env(own=True))
+                                  stdin=subprocess.DEVNULL, env=sb_env())
         except (subprocess.SubprocessError, OSError):
             return mg_refuse("merge of %s refused: the merge gate did not answer in time; retry, or ask the chief of staff for a logged waiver" % ref)
         try:
@@ -1977,7 +2119,7 @@ def merge_gate_release(ref):
         binary = mg_binary()
         if binary:
             subprocess.run(sb_argv(binary, "merge-gate", ref, "--release"), capture_output=True, text=True, timeout=merge_gate_seconds(),
-                           stdin=subprocess.DEVNULL, env=sb_env(own=True))
+                           stdin=subprocess.DEVNULL, env=sb_env())
     except Exception:
         pass
 
@@ -2037,7 +2179,7 @@ def hold_probe(args, lookup, gh, write):
 def audit_write(args, lookup, outcome, write, repo=None, number=None):
     """One audit line for a gh write (never a command line); best effort, never changes the command."""
     try:
-        if not write or os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1" or is_git_credential(args):
+        if not write or is_git_credential(args):
             return
         module = load_hold()
         if module is not None:
@@ -2130,9 +2272,11 @@ def run(args):
         audit_write(args, lookup, "refused", write, hold_repo, hold_number)
         return 1
     try:
-        plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
-    except Exception:
-        plan = None  # never let signing stop the command
+        plan = sign_plan(args, lookup)
+    except Unsignable as err:
+        sys.stderr.write("gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(err)))
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
     refusal = review_probe(args, over_found, over_reason, lookup, gh)
     if refusal is not None:
         sys.stderr.write(refusal + "\n")
@@ -2185,9 +2329,8 @@ def run(args):
     served = None
     agent = None
     try:
-        own = os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1"
         words = command_words(args)
-        if not own and words and words[0] not in NO_NETWORK_GROUPS:
+        if words and words[0] not in NO_NETWORK_GROUPS:
             ident = lookup.identity() if (write or cacheable_read(args)) else {}
             agent = ident.get("name")
             if write:
@@ -2225,9 +2368,9 @@ def run(args):
             cache_mark(lookup.identity().get("name"))   # the write has ended (an exec'd write cannot say so: the grace window covers it)
         return done.returncode
     finally:
-        if temp:
+        for path in ([temp] if isinstance(temp, str) else temp or []):
             try:
-                os.unlink(temp)
+                os.unlink(path)
             except OSError:
                 pass
 
