@@ -9676,6 +9676,16 @@ def lost_worker_tick(engine, discovery):
     return module.run_pass(ns, engine, engine.now(), alive)
 
 
+def push_watch_tick(engine, discovery):
+    """#1740: the lane that launched a cloud worker is told of its pushes and of its quiet after a push (bin/push_watch.py, by path like lost_worker_tick)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("push_watch", os.path.join(os.path.dirname(os.path.realpath(__file__)), "push_watch.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line)
+    return module.run_pass(ns, engine, engine.now(), lambda path: engine.gh_api(path, paginate=False), engine.config.get("push_watch"))
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -9711,6 +9721,10 @@ def finish_pass(engine, discovery, report):
         lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
     except Exception as err:
         engine._failed("lost-worker", "lost-worker", err, report)
+    try:
+        push_watch_tick(engine, discovery)   # #1740: a worker's push is told to the lane that launched it
+    except Exception as err:
+        engine._failed("push-watch", "push-watch", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:
