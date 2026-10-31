@@ -67264,6 +67264,8 @@ RelayLoopCadence, TwoLoopsTrace, TrickleHub, HubFilesUnchanged, OneWorkerAndCanc
 # The size ceilings on the merge result (#1605).
 _size_ceilings = importlib.import_module("test_size_ceilings")
 TestTheCheck, TestSizeMutants, TestTheMergeGate, TestSizeDocumentation = _size_ceilings.TestTheCheck, _size_ceilings.TestMutants, _size_ceilings.TestTheMergeGate, _size_ceilings.TestDocumentation
+# The failure-mode scenario warning of plan_check (#1455).
+TestNoFailureMode = importlib.import_module("test_plan_failure_mode").TestNoFailureMode
 TestEveryTestFileIsWired, TestWiredCheckPlanted, TestMutantIsCaught = (_wm := importlib.import_module("test_wired_tests")).TestEveryTestFileIsWired, _wm.TestWiredCheckPlanted, _wm.TestMutantIsCaught
 
 # The census of process kinds (#1501).
