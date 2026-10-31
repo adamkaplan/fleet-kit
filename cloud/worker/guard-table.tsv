@@ -32,3 +32,5 @@ pr-edit-url-other-repo	denied	gh	PATCH	pr edit URL or --repo	editing a pull requ
 pr-edit-api	denied	gh	PATCH	repos/OWNER/NAME/pulls/N	writing a pull request through the raw API	api -X PATCH repos/acme-org/widget-service/pulls/7
 pr-edit-no-hold-line	denied	gh	PATCH	client only: the new body drops or changes the line MERGE: captain	a body without the hold line	pr edit 7 --body-file /tmp/nohold
 pr-edit-read-failed	denied	gh	PATCH	client only: the read of the pull request failed	the pull request could not be read	pr edit 10 --body-file /tmp/f
+shell-record-var	denied	gh	ANY	any shell command naming CW_PR_RECORD	a command that names the pod record of its own pull requests	api CW_PR_RECORD
+shell-record-dir	denied	gh	ANY	any shell command naming pr-record	a command that names the pod record of its own pull requests	api pr-record

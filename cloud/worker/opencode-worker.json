@@ -1,6 +1,10 @@
 {
   "permission": {
     "question": "deny",
+    "edit": {
+      "*": "allow",
+      "*pr-record*": "deny"
+    },
     "bash": {
       "*": "allow",
       "gh pr merge*": "deny",
@@ -142,6 +146,8 @@
       "gh api*PATCH*": "deny",
       "gh api*PUT*": "deny",
       "gh api*DELETE*": "deny",
+      "*CW_PR_RECORD*": "deny",
+      "*pr-record*": "deny",
       "*git*push*!main": "deny",
       "*git*push*!main!*": "deny",
       "*git*push*!main\"*": "deny",
@@ -2070,6 +2076,10 @@
     "worker": {
       "permission": {
         "question": "deny",
+        "edit": {
+          "*": "allow",
+          "*pr-record*": "deny"
+        },
         "bash": {
           "*": "allow",
           "gh pr merge*": "deny",
@@ -2211,6 +2221,8 @@
           "gh api*PATCH*": "deny",
           "gh api*PUT*": "deny",
           "gh api*DELETE*": "deny",
+          "*CW_PR_RECORD*": "deny",
+          "*pr-record*": "deny",
           "*git*push*!main": "deny",
           "*git*push*!main!*": "deny",
           "*git*push*!main\"*": "deny",
