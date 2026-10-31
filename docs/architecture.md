@@ -312,6 +312,9 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `fleet-switchboard` | `lost_worker_tick:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `lost_worker_tick:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `fleet-switchboard` | `lost_worker_tick:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `push_watch_tick:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `fleet-switchboard` | `push_watch_tick:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `fleet-switchboard` | `push_watch_tick:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_app_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `validate_app_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_hold_labels_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
