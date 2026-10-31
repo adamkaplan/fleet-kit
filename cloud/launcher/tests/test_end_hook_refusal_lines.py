@@ -76,7 +76,7 @@ def no_bound_copy(directory):
 
 def no_scrub_copy(directory):
     """A build that does not scrub."""
-    return write_copy(directory, "take = [scrub_line(l) for l in lines[-REFUSAL_LINES:]]", "take = list(lines[-REFUSAL_LINES:])")
+    return write_copy(directory, "take = scrub_lines(lines)[-REFUSAL_LINES:]", "take = list(lines[-REFUSAL_LINES:])")
 
 
 class Scratch(unittest.TestCase):
@@ -310,6 +310,95 @@ class S9Prestop(Scratch):
         self.assertEqual(p.returncode, 1, out)
         self.assertTrue(applied)
         print("S9: prestop line equals git last line 1 of 1, earlier refusal lines in it 0, mutant fails 1 of 1, mutation applied %s" % applied)
+
+
+# (value planted, the part that must not survive): one class per line (#1665, constraint PC-3)
+PLANTED = (
+    ("key broken by a slash", "Qm8xT2vLp4Zr/Wn6Yb3Kd9Hc5Fa", "Wn6Yb3Kd9Hc5Fa"),
+    ("key broken by a dot", "Hb7yR4nKs2Vc.Xt9Lw3Pq6Jd8Mz", "Xt9Lw3Pq6Jd8Mz"),
+    ("20-character AKIA key", "AKIA" + "IOSFODNN7EXAMPLE", "IOSFODNN7EXAMPLE"),
+    ("sk- key", "sk-a1b2c3d4", "a1b2c3d4"),
+    ("xox- key", "xoxb-12345-abcde", "12345-abcde"),
+    ("gh prefix with one character", "ghp_Z", "ghp_Z"),
+    ("JWT", "eyJhbGci.0123456789ab", "0123456789ab"),
+    ("fullwidth gh token", "\uff47\uff48\uff50\uff3fAb3dE5", "Ab3dE5"),
+)
+LOWER_PATH = "/work/repo/cloud/launcher/tests/test_x.py"
+MIXED_PATH = "src/module_one/handler_v2/a.py"
+MIXED_REF = "refs/heads/Feature/login-page-x"
+SHORT_WORD = "Qm8xT2vLp4Zr6Wn3Yb9K"
+SEP = "! [hint] see the remote"   # a line that starts outside the run class, so that the next line is not joined into a planted run
+HALF_A, HALF_B = "ghp_Ab3dE5fG7hJ9", "Kk2Lm4Np6Qr8St0Uv1Wx9"
+
+
+class S10Classes(Scratch):
+    def test_no_planted_value_of_any_class_is_kept(self):
+        kept = planted = 0
+        for name, value, marker in PLANTED:
+            code, ans = self.hook(["remote: " + value, SEP, SUMMARY])
+            planted += 1
+            self.assertEqual(code, 1)
+            self.assertTrue(ans["error"].endswith(SUMMARY) and "remote: " in ans["error"], name)
+            kept += (marker in ans["error"]) + (value in ans["error"] and marker not in value)
+        self.assertEqual((kept, planted), (0, 8))
+        print("S10: planted values in the error %d of 8, classes planted %d of 8" % (kept, planted))
+
+
+class S11Split(Scratch):
+    def test_a_token_split_over_two_lines_replaces_both_lines(self):
+        code, ans = self.hook(["remote: " + HALF_A, HALF_B + " more", SUMMARY])
+        err = ans["error"]
+        halves = (HALF_A[4:] in err) + (HALF_B in err)
+        self.assertEqual(halves, 0)
+        self.assertTrue(err and err.endswith(SUMMARY))
+        print("S11: halves in the error %d of 2, errors not empty %d of 1" % (halves, bool(err)))
+
+
+class S12Limits(Scratch):
+    def test_long_names_and_short_words_and_the_readme(self):
+        self.assertEqual((len(LOWER_PATH), len(MIXED_PATH), len(MIXED_REF), len(SHORT_WORD)), (41, 30, 31, 20))
+        kept = replaced = short = 0
+        kept += LOWER_PATH in self.hook(["remote: " + LOWER_PATH, SEP, SUMMARY])[1]["error"]
+        for name in (MIXED_PATH, MIXED_REF):
+            replaced += name not in self.hook(["remote: " + name, SEP, SUMMARY])[1]["error"]
+        short += SHORT_WORD in self.hook(["remote: " + SHORT_WORD, SEP, SUMMARY])[1]["error"]
+        with open(os.path.join(LAUNCHER, "README.md")) as f:
+            text = f.read().lower()
+        phrases = sum(x in text for x in ("a prefixed token", "24 or more characters", "an address with a credential", "a control character",
+                                          "a key of 23 characters or fewer", "made only of lower-case letters"))
+        self.assertEqual((kept, replaced, short, phrases), (1, 2, 1, 6))
+        print("S12: lower-case paths kept %d of 1, mixed long names replaced %d of 2, short words kept %d of 1, README phrases %d of 6" % (kept, replaced, short, phrases))
+
+
+def _mut(old, new):
+    return lambda directory: write_copy(directory, old, new)
+
+
+class S13ClassMutants(Scratch):
+    TARGETS = (
+        (_mut("import unicodedata\n", "class unicodedata:\n    normalize = staticmethod(lambda form, text: text)\n"), "S10Classes"),
+        (_mut("[A-Za-z0-9+/_=.-]{24,}", "[A-Za-z0-9+_=-]{24,}"), "S10Classes"),
+        (_mut("if _MIXED_RE.search(m.group())]", "if True]"), "S12Limits"),
+        (_mut(r"|(?<![A-Za-z0-9])(?:sk-|xox[a-z]-)[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}", ""), "S10Classes"),
+        (_mut("if len(touched) > 1:", "if False:"), "S11Split"),
+    )
+
+    @unittest.skipIf(os.environ.get(INNER_ENV), "inside a mutant's child run")
+    def test_each_mutant_fails_the_test_of_its_class(self):
+        caught = applied = 0
+        for copy, cls in self.TARGETS:
+            scratch = tempfile.mkdtemp(prefix="cw-mutant-")   # outside the repository
+            self.addCleanup(shutil.rmtree, scratch, True)
+            path = copy(scratch)
+            applied += os.path.isfile(path)
+            p = stub_support.start(self, [sys.executable, "-m", "unittest", "-q", "test_end_hook_refusal_lines." + cls], cwd=HERE,
+                                   env=dict(os.environ, **{HOOK_ENV: path, INNER_ENV: "1"}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out, _ = p.communicate(timeout=90)
+            self.assertEqual(p.returncode, 1, out)
+            self.assertIn("FAILED (failures=1)", out)
+            caught += 1
+        self.assertEqual((caught, applied), (5, 5))
+        print("S13: mutants failing their test %d of 5, mutations applied %d of 5" % (caught, applied))
 
 
 if __name__ == "__main__":
