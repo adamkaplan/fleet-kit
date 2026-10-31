@@ -46,6 +46,7 @@ cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
 cloud/launcher/tests/test_preflight.py
+cloud/launcher/tests/test_preflight_signal_events.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_read_retired_last_message.py
 cloud/launcher/tests/test_reaper_managed.py
