@@ -148,7 +148,7 @@ def make_repo(base, name, dirty):
         f.write("one\n")
     g("add", "-A", cwd=work)
     g("commit", "-m", "init", cwd=work)
-    g("push", "origin", "HEAD:main", cwd=work)
+    g("fetch", work, "HEAD:refs/heads/main", cwd=origin)   # seeds the bare origin without a push to the default branch, which a pod's git wrapper refuses
     g("fetch", "origin", cwd=work)
     if dirty:
         with open(os.path.join(work, "a.txt"), "a") as f:
