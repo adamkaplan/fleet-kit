@@ -407,13 +407,13 @@ class TestWholeRun(Base):
         self.record("coder7")
         real = self.cloud()._capture
         mutant = lambda argv, env=None, feed=None, timeout=None, **kw: real(argv, env=env, feed=feed, timeout=6)   # the constant, not the argument
-        with mock.patch.object(self.cloud(), "_capture", mutant), self.assertRaises(AssertionError):
+        with mock.patch.object(self.cloud().cloud_cluster, "_capture", mutant), self.assertRaises(AssertionError):
             self.bounded_slow_token()
 
     def test_a_launcher_output_over_the_limit_is_a_bad_read(self):
         self.put_pods(*[self.pod("cw-w%d" % i, "w%d" % i) for i in range(20)])
         self.record("coder7")
-        with mock.patch.object(self.cloud(), "LAUNCHER_OUTPUT_LIMIT", 100):
+        with mock.patch.object(self.cloud().cloud_cluster, "LAUNCHER_OUTPUT_LIMIT", 100):
             lines, _ = self.status()
         self.assertTrue(any("cluster not read" in l and "over 100 bytes" in l for l in lines), lines)
 
