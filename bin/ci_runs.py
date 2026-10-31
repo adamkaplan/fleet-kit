@@ -39,6 +39,8 @@ def _time(text):
 
 def _unfinished(entry):
     """True for a run that has not completed: its status says so, or it is a status context still pending or expected."""
+    if str(entry.get("conclusion") or "").upper() == "SUCCESS":
+        return False   # #1625: a conclusion of success is complete, whatever a stuck status says
     if entry.get("status") not in (None, "COMPLETED"):
         return True
     return str(entry.get("conclusion") or entry.get("state") or "").upper() in ("PENDING", "EXPECTED") and not entry.get("conclusion")
@@ -266,6 +268,19 @@ def not_green_runs(rollup):
         if _unfinished(e) or word not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
             name = e.get("workflowName")
             bad.append((_clean(name) if isinstance(name, str) and name else "", _run_id(e), (word or str(e.get("status") or "pending")).lower()))
+    return bad
+
+
+def not_green_jobs(rollup):
+    """[(workflow, job name, run id, state)] of the latest checks that are not complete and green, for the ci-record refusal (#1625). The names are
+    author-controlled text: sanitised, quoted and bounded as `_clean` does. A check whose conclusion is success is never listed."""
+    bad = []
+    for e in newest(rollup):
+        word = str(e.get("conclusion") or e.get("state") or "").upper()
+        if _unfinished(e) or word not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            name, job = e.get("workflowName"), e.get("name") or e.get("context")
+            bad.append((_clean(name) if isinstance(name, str) and name else "", _clean(job) if isinstance(job, str) and job else "", _run_id(e),
+                        (word or str(e.get("status") or "pending")).lower()))
     return bad
 
 
