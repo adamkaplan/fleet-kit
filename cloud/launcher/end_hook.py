@@ -101,7 +101,7 @@ REFUSAL_LINES, REFUSAL_CHARS, REMOVED = 8, 600, "<removed>"
 _PREFIXED_RE = re.compile(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|(?:sk-|xox[a-z]-)[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}")
 _RUN_RE = re.compile(r"[A-Za-z0-9+/_=.-]{24,}")
 _MIXED_RE = re.compile(r"[0-9A-Z]")
-_CREDURL_RE = re.compile(r"(?<=://)[^/\s@]*@")
+_CREDURL_RE = re.compile(r"(?<=://)[^/\s]*@")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
 
 
@@ -112,9 +112,14 @@ def _secret_spans(text):
     return spans
 
 
+def _normal(text):
+    """NFKC-normalised text without its format characters (a zero-width space or a soft hyphen cannot split a key)."""
+    return "".join(c for c in unicodedata.normalize("NFKC", text) if unicodedata.category(c) != "Cf")
+
+
 def scrub_line(line):
     """Free text from git made safe to keep: a prefixed token, a long mixed run, a credential in an address and control characters become a fixed word."""
-    line = _CONTROL_RE.sub(" " + REMOVED + " ", unicodedata.normalize("NFKC", line))
+    line = _CONTROL_RE.sub(" " + REMOVED + " ", _normal(line))
     line = _CREDURL_RE.sub(REMOVED + "@", line)
     out, pos = [], 0
     for a, b in sorted(_secret_spans(line)):
@@ -129,7 +134,7 @@ def scrub_line(line):
 
 def scrub_lines(lines):
     """Every line scrubbed, and a run of class (i) or (ii) that spans the boundary of two lines replaces both lines."""
-    norm = [_CONTROL_RE.sub(" " + REMOVED + " ", unicodedata.normalize("NFKC", l)) for l in lines]
+    norm = [_CONTROL_RE.sub(" " + REMOVED + " ", _normal(l)) for l in lines]
     joined, bounds, n = "".join(norm), [], 0
     for l in norm:
         bounds.append((n, n + len(l)))

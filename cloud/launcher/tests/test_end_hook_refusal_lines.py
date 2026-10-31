@@ -440,5 +440,67 @@ class S13ClassMutants(Scratch):
         print("S13b: boundary mutant fails 1 of 1, mutation applied %s" % applied)
 
 
+class S10c(Scratch):
+    def test_password_with_an_at_and_format_characters_in_a_key(self):
+        pw = "https://user:pa@ss@host/x"
+        code, ans = self.hook(["remote: " + pw, SEP, SUMMARY])
+        err = ans["error"]
+        self.assertTrue(err.endswith(SUMMARY))
+        pw_removed = int("ss@host" not in err and "pa@" not in err and "https://<removed>@host/x" in err)
+        tail = "Zk9Wp3Qx7Lm2Yt4Rv"[:16]
+        keys = ("gh" + chr(0x200b) + "p_" + tail, "AKIA" + chr(0x200b) + "ABCD1234EFGH5678", "gh" + chr(0xad) + "p_" + tail)
+        removed = 0
+        for k in keys:
+            code, ans = self.hook(["remote: " + k, SEP, SUMMARY])
+            bare = k.replace(chr(0x200b), "").replace(chr(0xad), "")
+            self.assertTrue(ans["error"].endswith(SUMMARY))
+            removed += k not in ans["error"] and bare not in ans["error"] and bare[4:] not in ans["error"]
+        kept = 0
+        for a in ("https://github.com/acme/widget.git", "https://host/path@ref"):
+            kept += a in self.hook(["remote: " + a, SEP, SUMMARY])[1]["error"]
+        self.assertEqual((pw_removed, removed, kept), (1, 3, 2))
+        print("S10c: password address removed %d of 1, format-character keys removed %d of 3, ordinary addresses kept %d of 2" % (pw_removed, removed, kept))
+
+
+def _unmutated(directory):
+    path = os.path.join(directory, "end_hook.py")
+    shutil.copy(os.path.join(LAUNCHER, "end_hook.py"), path)
+    return path
+
+
+class S13cMutants(Scratch):
+    TARGETS = (
+        (_mut(r"(?<=://)[^/\s]*@", r"(?<=://)[^/\s@]*@"), "S10c"),
+        (_mut("if unicodedata.category(c) != \"Cf\")", "if True)"), "S10c"),
+    )
+
+    def _child(self, path):
+        p = stub_support.start(self, [sys.executable, "-m", "unittest", "-q", "test_end_hook_refusal_lines.S10c"], cwd=HERE,
+                               env=dict(os.environ, **{HOOK_ENV: path, INNER_ENV: "1"}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out, _ = p.communicate(timeout=90)
+        return p.returncode, out
+
+    @unittest.skipIf(os.environ.get(INNER_ENV), "inside a mutant's child run")
+    def test_mutants_fail_and_controls_pass(self):
+        caught = applied = passed = 0
+        for copy, cls in self.TARGETS:
+            scratch = tempfile.mkdtemp(prefix="cw-mutant-")   # outside the repository
+            self.addCleanup(shutil.rmtree, scratch, True)
+            path = copy(scratch)
+            applied += os.path.isfile(path)
+            rc, out = self._child(path)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("FAILED (failures=1)", out)
+            caught += 1
+            control = _unmutated(tempfile.mkdtemp(prefix="cw-control-"))
+            self.addCleanup(shutil.rmtree, os.path.dirname(control), True)
+            rc, out = self._child(control)
+            self.assertEqual(rc, 0, out)
+            passed += 1
+        self.assertEqual((caught, applied, passed), (2, 2, 2))
+        print("S13c: mutants failing their test %d of 2, mutations applied %d of 2" % (caught, applied))
+        print("S13c control: unmutated copies pass %d of 2" % passed)
+
+
 if __name__ == "__main__":
     unittest.main()
