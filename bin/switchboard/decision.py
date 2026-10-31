@@ -34,6 +34,8 @@ def hold_reason(observation, missing=None):
     if observation.problem:
         return observation.problem
     if observation.status == "blocked":
+        if getattr(observation, "errored", False):
+            return None   # #1697: idle after a provider error, nothing open: a send is delivered and wakes it
         return "%s is blocked on a permission request or a question" % observation.name
     if observation.status not in ("idle", "working"):
         return "%s has status %s in herdr" % (observation.name, observation.status)

@@ -2025,6 +2025,7 @@ class Observation:
         self.wrong_program = False  # the pane runs something other than the configured v2
         self.headless = False  # #433: a worker with no terminal: what it does is read from the OpenCode service, never from herdr
         self.conflict = []  # other sessions that claim the same name
+        self.errored = False  # #1697: herdr says blocked, but nothing is open and the last turn ended on a provider error: idle, not blocked
 
     def engaged(self, now, window):
         """You prompted this agent within `window` seconds. Off under `no-engagement-gate`."""
@@ -2037,6 +2038,8 @@ class Observation:
                "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
                "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
                "wrong_program": self.wrong_program, "conflict": self.conflict}
+        if self.errored:   # present only for an errored agent: every other agent's output is what it always was
+            out["errored"] = True
         if self.headless:   # present only for a headless worker: a terminal-only fleet's output is what it always was
             out["headless"] = True
         return out
@@ -2647,6 +2650,7 @@ class Switchboard:
         self.check_program(observation)
         if observation.problem:
             return observation
+        read_errored_turn(self, observation, now)
         try:
             observation.last_human_prompt = self.last_human_prompt(
                 session_id, now, inbox=fleet.get("role") == "chief-of-staff", info=info, fresh=fresh)
@@ -11071,6 +11075,26 @@ def resume_first_recovery(engine, discovery, seen, reported):
         return False
 
 
+def read_errored_turn(engine, observation, now):
+    """#1697: herdr says `blocked`, but after a provider error nothing is open. Sets `observation.errored` ONLY when the open permission list AND
+    the open question list were both read and are both empty, and the newest message's error matches PROVIDER_ERROR. Everything else stays
+    blocked: an open request, an unreadable list, an ended turn with no provider error, a spent read budget (fail closed). Never reads for an
+    agent herdr does not call blocked; at most three reads (two lists, the newest message). Returns the observation's `errored`."""
+    if observation.status != "blocked" or getattr(engine, "light", False):
+        return False
+    reads = engine.reads
+    if not reads.may_fill(now):
+        return False
+    try:
+        reads.filled(now)   # one fill of the shared budget for the three reads
+        if engine.v2.permission_list(observation.session_id) or engine.v2.form_list(observation.session_id):
+            return False
+    except Exception:
+        return False
+    observation.errored = bool(PROVIDER_ERROR.search(last_turn_error(engine, observation.session_id)))
+    return observation.errored
+
+
 def ended_turn_text(name, resumed):
     """What the blocked report says of an ended turn with nothing open: the real command, or that it was just resumed."""
     if resumed:
@@ -13812,7 +13836,7 @@ def _agent_line(entry):
     if seen is None:
         return "%-14s (not found)  %s" % (entry["name"], _plan_line(entry))
     return "%-14s %-8s %s  pane %s  your last prompt %s  %s" % (
-        seen["name"], seen["status"], seen["session"], seen["pane"] or ("(headless)" if seen.get("headless") else "-"),
+        seen["name"], "idle after a provider error" if seen.get("errored") else seen["status"], seen["session"], seen["pane"] or ("(headless)" if seen.get("headless") else "-"),
         seen["last_human_prompt"] or "not in the window", _plan_line(entry)) + launch_model_note(seen.get("fleet"))
 
 
