@@ -12,8 +12,13 @@ It signs the body of `gh issue comment`, `gh pr comment`, `gh pr review`,
 `gh issue create` and `gh pr create` when the body comes from --body/-b,
 --body-file/-F (a file, or - for stdin); the --comment/-c text of `gh issue close`
 and `gh pr close`; and the `body` field of a POST or PATCH made with `gh api` to
-a comment or review endpoint (SIGNED_API below). Everything else runs the real gh
-unchanged. A signed form whose text cannot be read is refused with one line and
+a comment or review endpoint (SIGNED_API below), whether the body comes from a field
+or from a JSON object read with --input (a file, or - for stdin; an object with no body
+passes unchanged; JSON that cannot be read, a body that is not a string or a missing
+file is refused). A `gh api graphql` call whose query names a body-writing mutation
+(GRAPHQL_BODY_MUTATIONS below: addComment, addPullRequestReview and the like) is refused
+with one line that names the REST or `gh pr comment` form to use: GraphQL text is not
+signed. Everything else runs the real gh unchanged. A signed form whose text cannot be read is refused with one line and
 nothing is posted: it is never posted unsigned.
 """
 import importlib.util
@@ -35,7 +40,18 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SIGNED_COMMANDS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"), ("issue", "create"), ("pr", "create")}
 CLOSE_COMMANDS = {("issue", "close"), ("pr", "close")}   # signed through their --comment/-c text
 SIGNED_API = (("issue-comments", r"issues/[0-9]+/comments"), ("issue-comment", r"issues/comments/[0-9]+"),
-              ("review-comments", r"pulls/[0-9]+/comments"), ("reviews", r"pulls/[0-9]+/reviews"))   # `gh api` endpoints (under repos/OWNER/REPO/) whose POST or PATCH body is signed
+              ("review-comments", r"pulls/[0-9]+/comments"), ("reviews", r"pulls/[0-9]+/reviews"),
+              ("pr-review-comment", r"pulls/comments/[0-9]+"), ("pr-review-reply", r"pulls/[0-9]+/comments/[0-9]+/replies"))   # `gh api` endpoints (under repos/OWNER/REPO/) whose POST or PATCH body is signed
+GRAPHQL_BODY_MUTATIONS = {   # GraphQL mutations that write a comment or review body: refused (not signed), with the form to use instead
+    "addComment": "gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments",
+    "addPullRequestReview": "gh pr review or POST repos/OWNER/REPO/pulls/N/reviews",
+    "addPullRequestReviewComment": "POST repos/OWNER/REPO/pulls/N/comments",
+    "addPullRequestReviewThread": "POST repos/OWNER/REPO/pulls/N/comments",
+    "addPullRequestReviewThreadReply": "POST repos/OWNER/REPO/pulls/N/comments/ID/replies",
+    "updateIssueComment": "PATCH repos/OWNER/REPO/issues/comments/ID",
+    "updatePullRequestReview": "PUT repos/OWNER/REPO/pulls/N/reviews/ID",
+    "updatePullRequestReviewComment": "PATCH repos/OWNER/REPO/pulls/comments/ID",
+}
 LOOKUP_SECONDS = 3.0
 WRITE_LOOKUP_SECONDS = 10.0   # a WRITE waits longer for the account lookup: a slow answer must not make it run as the wrong account
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -1157,8 +1173,8 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None, read
         return None
 
 
-def _clean_reason(text):
-    return "".join(c if 32 <= ord(c) < 127 else " " for c in text)[:120]
+def _clean_reason(text, limit=120):
+    return "".join(c if 32 <= ord(c) < 127 else " " for c in text)[:limit]
 
 
 def my_name(lookup=None):
@@ -1199,6 +1215,10 @@ def body_flag(args, specs=BODY_FLAGS):
 
 class Unsignable(Exception):
     """A signed form whose text cannot be signed: the call is refused, never posted unsigned."""
+
+
+class Refused(Unsignable):
+    """A call refused with its own one line (shown after "gh: refused: ")."""
 
 
 def read_text(path):
@@ -1301,16 +1321,105 @@ def api_parse(args):
     return positionals, method, fields
 
 
+def input_value(args):
+    """(index, inline, value) of the LAST --input of a `gh api` call, or None."""
+    found = None
+    for i in range(1, len(args)):
+        if args[i] == "--":
+            break
+        if args[i] == "--input":
+            found = (i, None, args[i + 1] if i + 1 < len(args) else "")
+        elif args[i].startswith("--input="):
+            found = (i, args[i][8:], args[i][8:])
+    return found
+
+
+def read_input_json(value):
+    """(text, parsed object) of an --input value (a file, or - for stdin); Unsignable when it cannot be read or is not JSON."""
+    if value == "-":
+        try:
+            text = sys.stdin.read()
+        except (OSError, UnicodeError):
+            raise Unsignable("the --input text cannot be read")
+    else:
+        text = read_text(value)
+    try:
+        return text, json.loads(text)
+    except ValueError:
+        raise Unsignable("the --input JSON cannot be parsed")
+
+
+def input_call(args, name, found):
+    index, inline, value = found
+    text, data = read_input_json(value)
+    if not isinstance(data, dict) or "body" not in data:
+        return list(args), (text if value == "-" else None), None
+    if not isinstance(data["body"], str):
+        raise Unsignable("the --input body is not a string")
+    data["body"] = sign(data["body"], name)
+    out = json.dumps(data)
+    new = list(args)
+    if value == "-":
+        return new, out, None
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".json")
+    with os.fdopen(handle, "w") as fh:
+        fh.write(out)
+    if inline is None:
+        new[index + 1] = temp
+    else:
+        new[index] = "--input=" + temp
+    return new, None, temp
+
+
+def graphql_call(args):
+    """A `gh api graphql` call whose query names a body-writing mutation is refused (Refused); a query that cannot be read is refused. Else None
+    (when stdin was read for the query it is passed on)."""
+    positionals, _method, fields = api_parse(args)
+    if "graphql" not in positionals:
+        return None
+    texts, stdin_text = [], None
+    for _i, flag, _inline, text in fields:
+        key, eq, value = text.partition("=")
+        if key != "query" or not eq:
+            continue
+        if flag in ("-F", "--field") and value.startswith("@"):
+            if value == "@-":
+                stdin_text = sys.stdin.read() if stdin_text is None else stdin_text
+                texts.append(stdin_text)
+            else:
+                texts.append(read_text(value[1:]))
+        else:
+            texts.append(value)
+    found = input_value(args)
+    if found is not None:
+        text, data = read_input_json(found[2])
+        if found[2] == "-":
+            stdin_text = text
+        if isinstance(data, dict) and isinstance(data.get("query"), str):
+            texts.append(data["query"])
+    for mutation in GRAPHQL_BODY_MUTATIONS:
+        if any(re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % mutation, t, re.I) for t in texts):
+            raise Refused("the GraphQL mutation %s writes a body that cannot be signed and nothing was posted; use %s"
+                          % (mutation, GRAPHQL_BODY_MUTATIONS[mutation]))
+    return list(args), stdin_text, None
+
+
 def api_call(args, namer):
     """`gh api` POST or PATCH to a comment or review endpoint (SIGNED_API): every `body` field is signed (`-f`, `-F`, `--field`, `--raw-field`; `-F body=@file`
-    and `@-` are read, signed and passed as a temporary file or stdin). A read, another endpoint, a call with no body field and `--input` are not touched."""
+    and `@-` are read, signed and passed as a temporary file or stdin). `--input FILE` or `--input -` is read as JSON: a string `body` is signed, an object
+    with no body passes, anything else is refused. A `gh api graphql` call naming a body mutation is refused. A read and another endpoint are not touched."""
     if not args or args[0] != "api":
         return None
     positionals, method, fields = api_parse(args)
+    if "graphql" in positionals:
+        return graphql_call(args)
     if not any(API_ENDPOINT_RE.match(p) for p in positionals):
         return None
-    if any(a == "--input" or a.startswith("--input=") for a in args[1:]):
-        return None
+    found = input_value(args)
+    if found is not None:
+        if (method or "POST") not in ("POST", "PATCH"):
+            return None
+        return input_call(args, namer(), found)
     if (method or ("POST" if fields else "GET")) not in ("POST", "PATCH"):
         return None
     bodies = [f for f in fields if f[3].split("=", 1)[0] == "body" and "=" in f[3]]
@@ -2274,7 +2383,8 @@ def run(args):
     try:
         plan = sign_plan(args, lookup)
     except Unsignable as err:
-        sys.stderr.write("gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(err)))
+        sys.stderr.write("gh: refused: %s\n" % _clean_reason(str(err), 400) if isinstance(err, Refused) else
+                         "gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(err)))
         audit_write(args, lookup, "refused", write, hold_repo, hold_number)
         return 1
     refusal = review_probe(args, over_found, over_reason, lookup, gh)
