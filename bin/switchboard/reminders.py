@@ -671,6 +671,47 @@ def reminder_bound(config, item):
     return (minutes if _is_number(minutes) and minutes >= 0 else default) * 60
 
 
+def late_reminder_counts(state_dir, config, now):
+    """#1728: {lane: reminders delivered LATER than their bound in the last 24 hours}, from the audit lines. Each `reminder.add` (id, `at`, recipient)
+    is paired with the FIRST `v2.synthetic` line whose keys hold `reminder:<id>`; delivery minus `at` is compared with `reminder_bound`."""
+    import json
+    from datetime import datetime
+    def epoch(text):
+        try:
+            return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    added, delivered, counts = {}, {}, {}
+    try:
+        with open(str(state_dir) + "/audit.jsonl", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return counts
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        detail = entry.get("detail") if isinstance(entry, dict) and isinstance(entry.get("detail"), dict) else {}
+        if entry.get("event") == "reminder.add" and detail.get("id") is not None:
+            added[str(detail["id"])] = (entry.get("subject"), epoch(detail.get("at")), {"deadline": bool(detail.get("deadline")), "condition": {"unless_report_from": 1} if detail.get("for") else {}})
+        elif entry.get("event") == "v2.synthetic":
+            for key in detail.get("keys") or []:
+                if isinstance(key, str) and key.startswith("reminder:"):
+                    delivered.setdefault(key[len("reminder:"):], epoch(entry.get("ts")))
+    for item_id, (lane, due, item) in added.items():
+        counts.setdefault(lane, 0)
+        sent = delivered.get(item_id)
+        if due is not None and sent is not None and sent >= now - 86400 and sent - due > reminder_bound(config, item):
+            counts[lane] += 1
+    return counts
+
+
+def late_reminder_lines(state_dir, config, now):
+    """One `status` line per lane: how many reminders came later than their bound in the last 24 hours."""
+    return ["      reminders  %s: %d later than the bound in 24h" % (lane, n) for lane, n in sorted(late_reminder_counts(state_dir, config, now).items())]
+
+
 def ceiling_wake(engine, source, plan, now):
     """#1728 ceiling: a due reminder of this lane past its bound that this pass would not admit (a batch window) turns the plan into a queued wake,
     carrying every pending fact of the lane, with one `reminder.ceiling` audit line per reminder. A wake already planned (queued behind a turn) is

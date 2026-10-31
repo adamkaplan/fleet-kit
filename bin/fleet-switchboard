@@ -13940,6 +13940,12 @@ def cmd_status(args, runner=subprocess.run, now=time.time):
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(format_status(report))
+        try:
+            lane_lines = late_reminder_lines(state_dir_path(), load_config(config_path()), now())
+        except Exception:   # a missing log or config must not take `status` down
+            lane_lines = []
+        if lane_lines:
+            print("\n".join(lane_lines))
         if cloud_lines:
             print("\n".join(cloud_lines))
     return EXIT_OK if report["ok"] else EXIT_ERROR

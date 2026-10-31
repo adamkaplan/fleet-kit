@@ -159,4 +159,26 @@ def build(PR4Base):
             self.assertEqual(len(self.sent_to("s-long")), 0)
             holds = [e for e in self.lines() if e["detail"]["reason"].startswith("hold:") and "s-long" in e["detail"]["reason"]]
             self.assertEqual(len(holds), 1)
+
+        def test_s7_status_counts_per_lane_the_reminders_delivered_later_than_their_bound(self):
+            import json, tempfile
+            base = 1_800_000_000
+            stamp = lambda e: sb.iso(e)
+            rows, number = [], 0
+            for lane, late, ontime in (("lane-a", 3, 4), ("lane-b", 1, 3)):
+                for minutes in [25] * late + [2] * ontime:
+                    number += 1
+                    due = base + number * 60
+                    rows.append({"ts": stamp(due - 60), "event": "reminder.add", "subject": lane, "detail": {"id": "r%d" % number, "at": stamp(due)}})
+                    for extra in (0, 60):   # only the FIRST delivery line counts
+                        rows.append({"ts": stamp(due + minutes * 60 + extra), "event": "v2.synthetic", "subject": lane, "detail": {"keys": ["reminder:r%d" % number]}})
+            with tempfile.TemporaryDirectory() as tmp:
+                with open(tmp + "/audit.jsonl", "w") as handle:
+                    handle.write("\n".join(json.dumps(r) for r in rows) + "\n")
+                now = base + 3600
+                counts = sb.late_reminder_counts(tmp, {}, now)
+                lines = sb.late_reminder_lines(tmp, {}, now)
+            self.assertEqual(counts["lane-a"], 3)
+            self.assertEqual(counts["lane-b"], 1)
+            self.assertEqual(len(lines), 2)
     return TestReminderWaiting
