@@ -123,6 +123,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/review_laws_install.py` | 5 | `review-laws install`: the review laws copied into a repository | |
 | `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
 | `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
+| `switchboard/branch_ff.py` | 5 | `clear-head` and `branch-ff`: a cleared head recorded by the Chief of Staff, and a pull request's branch moved to it, fast-forward only | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
 | `switchboard/audit.py` | 2 | the audit log | |
