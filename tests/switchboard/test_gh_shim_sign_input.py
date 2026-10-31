@@ -309,6 +309,37 @@ class TestGhShimSignInput(unittest.TestCase):
                 done, calls = self.rig.run(*args)
                 self.assertEqual(calls[0]["argv"], list(args))
 
+    def test_h4_the_older_hold_and_merge_gate_refusals_come_first(self):
+        merge = ("api", "graphql", "-f", "query=mutation{mergePullRequest(input:{pullRequestId:\"X\"}){clientMutationId}}")
+        unreadable = (("api", "graphql", "--input", "query.json"), ("api", "graphql", "-F", "query=@query.graphql"))
+        comment = ("api", "graphql", "-f", "query=" + gql("addComment"))
+        free = hermetic_rig()   # control: with no gate and no hold, the comment mutation and the unreadable queries are refused by the NEW line, exit 1
+        self.addCleanup(free.close)
+        done, calls = free.run(*comment)
+        self.assertEqual((done.returncode, calls), (1, []))
+        self.assertIn("writes a body that cannot be signed", done.stderr)
+        for args in unreadable:
+            done, calls = free.run(*args)
+            self.assertEqual((done.returncode, calls), (1, []))
+            self.assertIn("cannot be signed and nothing was posted", done.stderr)
+        gated = hermetic_rig("o/r")
+        self.addCleanup(gated.close)
+        for args in (merge,) + unreadable:
+            with self.subTest(args=args):
+                done, calls = gated.run(*args)
+                self.assertEqual((done.returncode, calls), (10, []))
+                self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
+                self.assertTrue(done.stderr.startswith("gh: "), done.stderr)
+                self.assertNotIn("cannot be signed", done.stderr)
+        held = hermetic_rig()
+        self.addCleanup(held.close)
+        config = held.home / ".config" / "fleet-switchboard" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"hold_labels": {"o/r": {"label": "hold", "message": "m"}}}))
+        done, calls = held.run(*comment)
+        self.assertEqual((done.returncode, calls), (1, []))
+        self.assertEqual(done.stderr.strip(), "gh: graphql mutation cannot be tied to a pull request, so it is refused while a hold label is configured: use the gh pr verbs")
+
     def test_s10_completeness_and_count(self):
         self.assertEqual(forms_missing(self.source), [])
         self.assertEqual(count_forms(self.source), 21)
@@ -356,6 +387,17 @@ class TestGhShimSignInput(unittest.TestCase):
         seen = self.mutant('    short = API_HOST_RE.sub("", text, count=1)', "    short = text")
         self.assertEqual(sorted(seen), sorted(["URL form not signed: -f", "URL form not signed: -F", "URL form --input not signed"]
                                               + ["graphql spelling let through: https://api.github.com/graphql"]))
+
+    def test_h4_mutant_the_new_refusal_before_the_gates_is_seen(self):
+        source = self.source.replace("        return late\n", "        raise\n", 1)
+        self.assertNotEqual(source, self.source)
+        rig = hermetic_rig("o/r")
+        self.addCleanup(rig.close)
+        shim = rig.shims / "gh"
+        shim.write_text(shim.read_text().replace("        return late\n", "        raise\n", 1))
+        done, calls = rig.run("api", "graphql", "--input", "query.json")
+        self.assertEqual(done.returncode, 1)   # the mutant refuses first (exit 1), the real shim exit 10 (test_h4_the_older...)
+        self.assertIn("cannot be signed", done.stderr)
 
 
 if __name__ == "__main__":

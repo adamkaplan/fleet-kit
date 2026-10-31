@@ -1544,6 +1544,27 @@ def sign_plan(args, lookup):
     return plan if plan is None or not lead else (args[:lead] + plan[0], plan[1], plan[2])
 
 
+class DeferredRefusal(tuple):
+    """What sign_plan returns for a graphql call it refused: the refusal is kept (.err) and written by run() AFTER the existing hold, plan-gate and merge-gate
+    decisions, so those refusals (exit 10) keep their text and exit code."""
+    err = None
+
+
+_sign_plan_now = sign_plan
+
+
+def sign_plan(args, lookup):
+    try:
+        return _sign_plan_now(args, lookup)
+    except Unsignable as err:
+        core = args[leading_repo_flags(args):]
+        if not core or core[0] != "api" or "graphql" not in api_parse(core)[0]:
+            raise
+        late = DeferredRefusal((list(args), None, None))
+        late.err = err
+        return late
+
+
 # ---- the gate probe (plan-driven development: enforcing in a repo whose mode is enforce). docs/plan-gate-engine-design.md, E1 and E3.
 #
 # Before `gh pr ready` or `gh pr merge` of a PR the shim asks `fleet-switchboard gates-check <repo#N> --for ready|merge`, with
@@ -2468,6 +2489,11 @@ def run(args):
         return 10
     if merged is not None:
         args, release_ref = merged[1], merged[2]
+    if isinstance(plan, DeferredRefusal):   # the graphql refusal comes after every older refusal above
+        sys.stderr.write("gh: refused: %s\n" % _clean_reason(str(plan.err), 400) if isinstance(plan.err, Refused) else
+                         "gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(plan.err)))
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
     credential = is_git_credential(args)
     extra = {"credential": True} if credential else {}   # only the git credential route passes the keyword: every other call is exactly as it was
     if scope is not None:
