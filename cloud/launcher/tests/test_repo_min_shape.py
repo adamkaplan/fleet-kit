@@ -46,6 +46,18 @@ class Validator(unittest.TestCase):
         self.assertIsNone(cw.repo_min_shapes("acme-org/a=S\x07"))
         self.assertFalse(cw.VALIDATORS[self.KEY][1]("acme-org/a=S\n"))
 
+    def test_s2_the_orchestrator_row_is_not_a_floor_and_a_good_list_is_accepted(self):
+        good = refused = 0
+        self.assertEqual(self.parse("acme-org/a=XS, acme-org/b=S, acme-org/c=M")[self.KEY], "acme-org/a=XS, acme-org/b=S, acme-org/c=M")
+        good += 1
+        with self.assertRaises(cw.CloudError) as ctx:
+            self.parse("acme-org/a=O")
+        self.assertIn(self.KEY, str(ctx.exception))
+        self.assertNotIn("acme-org/a=O", str(ctx.exception))
+        self.assertIsNone(cw.repo_min_shapes("acme-org/a=O"))
+        refused += 1
+        print("S2: good lists accepted %d of 1, bad lists refused %d of 1 (the orchestrator row O; with the 9 earlier bad lists 10 of 10)" % (good, refused))
+
     def test_the_row_is_optional_and_has_a_kind_and_a_rule(self):
         self.assertIn((self.KEY, False, "name"), cw.SETTINGS)
         self.assertIn(self.KEY, cw.VALIDATORS)
@@ -103,6 +115,69 @@ class Floor(base.Base):
             a = argparse.Namespace(**kw)
             cw.check_shape(a, {"CW_REPO_MIN_SHAPE": self.SETTING})
             self.assertEqual(a.shape, want)
+
+    def test_s3_the_orchestrator_row_is_refused_under_any_floor_and_xs_is_accepted_at_floor_xs(self):
+        code, err, shape = self.made("--shape", "O", setting="acme-org/widget-service=XS")
+        self.assertEqual((code, shape), (2, None), err)
+        self.assertEqual(self.objects(), [], "0 objects created")
+        lines = [x for x in err.splitlines() if x.strip()]
+        self.assertEqual(len(lines), 1, err)
+        self.assertIn("CW_REPO_MIN_SHAPE", lines[0])
+        code, err, shape = self.made("--shape", "XS", setting="acme-org/widget-service=XS")
+        self.assertEqual((code, shape), (0, "XS"), err)
+        print("S3: the O case refused 1 of 1 with 0 objects created, floor XS with --shape XS accepted 1 of 1")
+
+    def test_s8_a_malformed_setting_in_the_process_environment_refuses_and_creates_nothing(self):
+        bad = "acme-org/widget-service=L"
+        def launch():
+            code, err, shape = self.made(setting=bad)
+            return code, err, shape, len(self.objects())
+        code, err, shape, n = launch()
+        self.assertEqual((code, shape, n), (2, None, 0), err)
+        lines = [x for x in err.splitlines() if x.strip()]
+        self.assertEqual(len(lines), 1, err)
+        self.assertIn("CW_REPO_MIN_SHAPE", lines[0])
+        self.assertNotIn(bad, err)
+        real = cw.check_shape
+        cw.check_shape = lambda a, env=None: real(a, None)
+        try:
+            applied = cw.check_shape is not real
+            mcode, _, _, mn = launch()
+        finally:
+            cw.check_shape = real
+        caught = (mcode, mn) != (2, 0)
+        self.assertTrue(applied)
+        self.assertTrue(caught)
+        print("S8: 1 of 1 launches exit with status 2 with 0 objects created, and %d of 1 mutants fail the test, mutation applied %s" % (caught, applied))
+
+    def test_s9_a_mixed_case_repository_gets_the_floor_and_a_case_sensitive_key_does_not(self):
+        code, err, shape = self.made(repo="Acme-Org/Widget-Service")
+        self.assertEqual((code, shape), (0, "S"), err)
+        real = cw._repo_key
+        cw._repo_key = lambda text: (text or "").strip() if real(text) else None
+        try:
+            applied = cw._repo_key is not real
+            mcode, _, mshape = self.made(repo="Acme-Org/Widget-Service")
+        finally:
+            cw._repo_key = real
+        caught = (mcode, mshape) != (0, "S")
+        self.assertTrue(applied)
+        self.assertTrue(caught)
+        print("S9: 1 of 1 mixed-case launches get the floor shape and %d of 1 mutants fail, mutation applied %s" % (caught, applied))
+
+    def test_s10_the_floor_order_and_the_rank_of_the_orchestrator_row(self):
+        self.assertEqual(cw.FLOOR_ORDER, ("XS", "S", "M"))
+        self.assertLess(cw.shape_rank("O"), cw.shape_rank("XS"))
+        a = argparse.Namespace(repo=REPO, agent="orchestrator")
+        cw.check_shape(a, {"CW_REPO_MIN_SHAPE": "acme-org/widget-service=XS"})
+        self.assertEqual(a.shape, "XS")
+        a = argparse.Namespace(repo=REPO, agent="orchestrator")
+        cw.check_shape(a, {"CW_REPO_MIN_SHAPE": self.SETTING})
+        self.assertEqual(a.shape, "S")
+        a = argparse.Namespace(repo="a/b", agent="orchestrator")
+        cw.check_shape(a, {"CW_REPO_MIN_SHAPE": self.SETTING})
+        self.assertEqual(a.shape, cw.DEFAULT_ORCHESTRATOR_SHAPE)
+        print("S10: 1 of 1 floor orders equal XS, S, M, 1 of 1 ranks of O below XS and 1 of 1 orchestrator launches raised to the floor")
 
     # S5: a mutant that ignores the setting
     @contextlib.contextmanager
