@@ -191,13 +191,21 @@ class TestBranchFf(Base):
         self.assertTrue(sb.command_records("clear-head", sb.build_parser().commands))
         self.assertTrue(sb.command_records("branch-ff", sb.build_parser().commands))
 
-    def test_s8_a_command_without_its_mark_is_not_refused(self):
-        for name in ("cmd_clear_head", "cmd_branch_ff"):
-            with self.subTest(name):
-                self.setUp()
-                with mock.patch.object(getattr(sb, name), "guard_records", False):
-                    with self.assertRaisesRegex(AssertionError, r"^1 != 2"):
-                        self.refused_when_unreadable()
+    def mutant_without_mark(self, name):
+        self.assertEqual(self.refused_when_unreadable(), 2, "control: both marked")
+        self.gh = FakeGitHub()
+        for leftover in (self.world.state / sb.CLEAR_HEADS_FILE,):
+            if leftover.exists():
+                leftover.unlink()
+        with mock.patch.object(getattr(sb, name), "guard_records", False):
+            with self.assertRaisesRegex(AssertionError, r"^1 != 2"):
+                self.refused_when_unreadable()
+
+    def test_s8_clear_head_without_its_mark_is_not_refused(self):
+        self.mutant_without_mark("cmd_clear_head")
+
+    def test_s8_branch_ff_without_its_mark_is_not_refused(self):
+        self.mutant_without_mark("cmd_branch_ff")
 
     def refusal_cases(self):
         """Each: (name, a function that arranges the world, the argv after `branch-ff`)."""
