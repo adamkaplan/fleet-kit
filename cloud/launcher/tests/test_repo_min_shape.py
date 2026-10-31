@@ -56,7 +56,20 @@ class Validator(unittest.TestCase):
         self.assertNotIn("acme-org/a=O", str(ctx.exception))
         self.assertIsNone(cw.repo_min_shapes("acme-org/a=O"))
         refused += 1
-        print("S2: good lists accepted %d of 1, bad lists refused %d of 1 (the orchestrator row O; with the 9 earlier bad lists 10 of 10)" % (good, refused))
+        kinds = {"an entry without a shape": ["acme-org/widget-service", "acme-org/widget-service=", "acme-org/a=S,,acme-org/b=M", "acme-org/a=S,acme-org/b"],
+                 "an unknown shape": ["acme-org/widget-service=L", "acme-org/widget-service=s"],
+                 "a repository that is not OWNER/NAME": ["widget-service=S", "acme-org/*=S"],
+                 "a duplicate repository": ["acme-org/a=S,ACME-ORG/A=M"],
+                 "a value with a newline": ["acme-org/a=S\nacme-org/b=M"],
+                 "the orchestrator row O": ["acme-org/a=O"]}
+        forms = refused_forms = refused_kinds = 0
+        for kind, values in kinds.items():
+            results = [cw.repo_min_shapes(v) is None for v in values]
+            forms += len(values)
+            refused_forms += sum(results)
+            refused_kinds += all(results)
+        self.assertEqual((refused_kinds, refused_forms), (len(kinds), forms))
+        print("S2: good lists accepted %d of 1, bad list kinds refused %d of %d (%d of %d forms)" % (good, refused_kinds, len(kinds), refused_forms, forms))
 
     def test_the_row_is_optional_and_has_a_kind_and_a_rule(self):
         self.assertIn((self.KEY, False, "name"), cw.SETTINGS)
@@ -123,8 +136,22 @@ class Floor(base.Base):
         lines = [x for x in err.splitlines() if x.strip()]
         self.assertEqual(len(lines), 1, err)
         self.assertIn("CW_REPO_MIN_SHAPE", lines[0])
+        refused_objects = len(self.objects())
         code, err, shape = self.made("--shape", "XS", setting="acme-org/widget-service=XS")
         self.assertEqual((code, shape), (0, "XS"), err)
+        cases = (("c1", "test_s3_a_listed_repository_gets_its_floor_and_a_smaller_shape_is_refused"), ("c2", "test_s3_a_listed_repository_gets_its_floor_and_a_smaller_shape_is_refused"),
+                 ("c3", "test_s3_a_listed_repository_gets_its_floor_and_a_smaller_shape_is_refused"),
+                 ("c4", "test_s3_the_orchestrator_row_is_refused_under_any_floor_and_xs_is_accepted_at_floor_xs"), ("c5", "test_s3_a_stack_launch_takes_the_larger_shape"))
+        passed = 0
+        for case, name in cases:
+            self.assertTrue(hasattr(type(self), name), name)
+            if name != self._testMethodName:
+                result = unittest.TestResult()
+                type(self)(name).run(result)
+                passed += result.wasSuccessful()
+            else:
+                passed += 1
+        print("S3: cases %d of %d (%s), objects created for refused ones %d" % (passed, len(cases), ", ".join("%s: %s" % c for c in cases), refused_objects))
         print("S3: the O case refused 1 of 1 with 0 objects created, floor XS with --shape XS accepted 1 of 1")
 
     def test_s8_a_malformed_setting_in_the_process_environment_refuses_and_creates_nothing(self):
@@ -177,6 +204,22 @@ class Floor(base.Base):
         a = argparse.Namespace(repo="a/b", agent="orchestrator")
         cw.check_shape(a, {"CW_REPO_MIN_SHAPE": self.SETTING})
         self.assertEqual(a.shape, cw.DEFAULT_ORCHESTRATOR_SHAPE)
+        key = "CW_REPO_MIN_SHAPE"
+        text = cw.VALIDATORS[key][0]
+        self.assertIn("XS, S, M", text)
+        self.assertNotIn(", O", text)
+        real = cw.VALIDATORS[key]
+        old_list = ", ".join(cw.FLOOR_ORDER)
+        applied = text.count("(SHAPE one of %s)" % old_list) == 1
+        cw.VALIDATORS[key] = (text.replace(old_list, ", ".join(cw.SHAPES)), real[1])
+        try:
+            mutated = cw.VALIDATORS[key][0]
+            caught = not ("XS, S, M" in mutated and ", O" not in mutated)
+        finally:
+            cw.VALIDATORS[key] = real
+        self.assertTrue(applied)
+        self.assertTrue(caught)
+        print("S10: help text lists XS, S, M 1 of 1, mutant (SHAPES back) fails %d of 1, mutation applied %s" % (caught, applied))
         print("S10: 1 of 1 floor orders equal XS, S, M, 1 of 1 ranks of O below XS and 1 of 1 orchestrator launches raised to the floor")
 
     # S5: a mutant that ignores the setting

@@ -3101,7 +3101,7 @@ VALIDATORS = {
     "CW_STACK_REGISTRY": ("a lower-case registry host name ending in .azurecr.io: no scheme, path, port, user or IP address", _registry_host_ok),
     "CW_STACK_PULL_CLIENT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
     "CW_STACK_PULL_TENANT_ID": ("a GUID", lambda v: bool(_GUID.fullmatch(v))),
-    "CW_REPO_MIN_SHAPE": ("a comma-separated list of OWNER/NAME=SHAPE entries (SHAPE one of %s), no repository twice" % ", ".join(SHAPES), lambda v: repo_min_shapes(v) is not None),
+    "CW_REPO_MIN_SHAPE": ("a comma-separated list of OWNER/NAME=SHAPE entries (SHAPE one of %s), no repository twice" % ", ".join(FLOOR_ORDER), lambda v: repo_min_shapes(v) is not None),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
