@@ -50,7 +50,7 @@ GRAPHQL_BODY_MUTATIONS = {   # GraphQL mutations that write a comment or review 
     "addPullRequestReviewThread": "POST repos/OWNER/REPO/pulls/N/comments",
     "addPullRequestReviewThreadReply": "POST repos/OWNER/REPO/pulls/N/comments/ID/replies",
     "updateIssueComment": "PATCH repos/OWNER/REPO/issues/comments/ID",
-    "updatePullRequestReview": "PUT repos/OWNER/REPO/pulls/N/reviews/ID",
+    "updatePullRequestReview": "gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments",
     "updatePullRequestReviewComment": "PATCH repos/OWNER/REPO/pulls/comments/ID",
 }
 LOOKUP_SECONDS = 3.0
@@ -1447,7 +1447,9 @@ def graphql_call(args):
         text, data = read_input_json(found[2])
         if found[2] == "-":
             stdin_text = text
-        if isinstance(data, dict) and isinstance(data.get("query"), str):
+        if not isinstance(data, dict):
+            raise Refused("the GraphQL --input is not a JSON object, so it is refused; only one query object passes")
+        if isinstance(data.get("query"), str):
             texts.append(data["query"])
     if not texts:
         raise Refused("the GraphQL request has no readable query text, so it is refused; only one query passes")
@@ -1702,7 +1704,7 @@ REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned
     ("pull-update", r"pulls/[^/]+", ("PATCH", "POST")), ("pull-merge", r"pulls/[^/]+/merge", ("PUT",)), ("label-create", r"labels", ("POST",)))
 
 
-def api_scan(args):
+def api_scan(args, headers=None):
     """(method, has_input, field texts, positionals) of a `gh api` call read the way gh (cobra) reads flags: -X/--method any case and joined, bundled short
     flags (-iXPUT, -ifa=b), `--flag=value`, repeated flags (the last method wins), `--` ends the flags. method is None when none is given, "" when its value is missing."""
     method, has_input, fields, positionals, i = None, False, [], [], 1
@@ -1721,6 +1723,8 @@ def api_scan(args):
             if not eq:
                 value = args[i] if i < len(args) else None
                 i += 1
+            if kind == "x" and name == "--header" and headers is not None and value is not None:
+                headers.append(value)
             if kind == "m":
                 method = "" if value is None else value.upper()
             elif kind == "f" and value is not None:
@@ -1734,6 +1738,8 @@ def api_scan(args):
                     if value is None:
                         value = args[i] if i < len(args) else None
                         i += 1
+                    if ch == "H" and headers is not None and value is not None:
+                        headers.append(value)
                     if ch == "X":
                         method = "" if value is None else value.upper()
                     elif ch in "fF" and value is not None:
@@ -1950,41 +1956,83 @@ def api_refuse_unknown(method, shown):
                   "add its path and method there to allow it" % (method, shown))
 
 
+RAW_PREFIXES = ("https://api.github.com", "http://api.github.com", "//api.github.com")
+RAW_RULE = ("the endpoint would change if cleaned: the shim matches the raw path only; write it plainly as repos/OWNER/REPO/... "
+            "(one optional leading slash, no backslash, %-escape, dot segment, semicolon, space, #, double or trailing slash)")
+
+
+def api_raw_path(text):
+    """The RAW path of an endpoint positional for a write: None when cleaning would change its text (or it is another host's), else the path as written
+    (one leading slash and the exact api.github.com prefix dropped, the ?query cut off, nothing decoded or resolved). Never normalises."""
+    rest = text
+    for prefix in RAW_PREFIXES:
+        if rest.startswith(prefix + "/"):
+            rest = rest[len(prefix):]
+            break
+    if rest.startswith("/"):
+        rest = rest[1:]
+    path = rest.split("?", 1)[0]
+    if "#" in rest or "://" in path or any(ord(c) <= 0x20 or ord(c) == 0x7f for c in path) or any(c in path for c in "\\%;"):
+        return None
+    if "//" in path or path.endswith("/") or not path or any(seg in (".", "..") for seg in path.split("/")):
+        return None
+    return path
+
+
+def api_other_host(text):
+    """True for a scheme://host or //host positional whose host is not api.github.com in any spelling (it is not GitHub's: off the allow-list)."""
+    if not (re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", text) or text.startswith("//")):
+        return False
+    try:
+        parts = urlsplit(text)
+        host = parts.hostname
+    except ValueError:
+        return False
+    return not (host and host.rstrip(".") == "api.github.com" and parts.scheme.lower() in ("", "https", "http"))
+
+
 def api_decide(args, namer, previous):
-    """The one decision, by effect. See the round 4 comment above."""
-    method, has_input, fields, raw_positionals = api_scan(args)
+    """The one decision, by effect, on the RAW path for a write. See the round 4 comment above."""
+    headers = []
+    method, has_input, fields, raw_positionals = api_scan(args, headers)
+    for header in headers:
+        if header.partition(":")[0].strip().lower() == "x-http-method-override":
+            raise Refused("the X-HTTP-Method-Override header is refused: GitHub honours it as a method, so the shim cannot tell the real method")
     has_body = has_input or bool(fields)
     effective = method if method is not None else ("POST" if has_body else "GET")
-    if effective == "GET" and not has_input:
-        return None
+    if effective == "GET":
+        if has_body and any(api_endpoint(p) == "graphql" for p in raw_positionals):
+            raise Refused("a GET to graphql that carries a field or --input is refused: send the query as a plain POST with a query field, or drop the fields")
+        if not has_input:
+            return None
     if not raw_positionals:
         return None
-    positionals = [api_endpoint(p) for p in raw_positionals]
-    for raw, canon in zip(raw_positionals, positionals):
-        if canon == "graphql":
+    for raw in raw_positionals:
+        path = api_raw_path(raw)
+        if path is None and api_other_host(raw):
+            api_refuse_unknown(effective or "(no method)", "the endpoint (%s)" % raw[:60])
+        if path is None:
+            raise Refused("a gh api %s with a body or a method other than GET is refused on (%s): %s" % (effective or "(no method)", raw[:60], RAW_RULE))
+        if path == "graphql":
             continue
-        shown = "an endpoint it cannot read" if canon == UNKNOWN_ENDPOINT else "the endpoint"
-        base = canon if canon != UNKNOWN_ENDPOINT else None
         found = None
-        if base is not None:
-            for label, pattern in SIGNED_API + SIGNED_API_MORE:
-                if re.fullmatch(r"repos/[^/]+/[^/]+/" + pattern, base):
-                    found = (label, REST_SIGNED_METHODS.get(label, ()), True)
-            for label, pattern, methods in REST_WRITES:
-                if re.fullmatch(r"repos/[^/]+/[^/]+/" + pattern, base):
-                    found = (label, methods, False)
+        for label, pattern in SIGNED_API + SIGNED_API_MORE:
+            if re.fullmatch(r"repos/[^/]+/[^/]+/" + pattern, path):
+                found = (label, REST_SIGNED_METHODS.get(label, ()), True)
+        for label, pattern, methods in REST_WRITES:
+            if re.fullmatch(r"repos/[^/]+/[^/]+/" + pattern, path):
+                found = (label, methods, False)
         if found is None:
-            if True:   # an endpoint off the allow-list that carries a mutation in an inline query field: the refusal names the mutation (the same text as graphql)
-                for text in (f.partition("=")[2] for f in fields if f.partition("=")[0] == "query" and "=" in f):
-                    verdict = graphql_verdict(text)
-                    if verdict and "mutation" in verdict:
-                        raise Refused(verdict)
-            api_refuse_unknown(effective or "(no method)", "%s %s" % (shown, "(" + raw[:60] + ")"))
+            for text in (f.partition("=")[2] for f in fields if f.partition("=")[0] == "query" and "=" in f):
+                verdict = graphql_verdict(text)
+                if verdict and "mutation" in verdict:
+                    raise Refused(verdict)
+            api_refuse_unknown(effective or "(no method)", "the endpoint (%s)" % raw[:60])
         if effective not in found[1]:
             api_refuse_unknown(effective or "(no method)", "the endpoint %s (%s allows %s)" % (raw[:60], found[0], "/".join(found[1])))
         if found[2] and len(api_parse(args)[2]) != len(fields):
             raise Refused("the flags of this gh api call to a comment or review endpoint cannot be read, so its body cannot be signed and nothing was posted")
-    if any(p == "graphql" for p in positionals):
+    if any(api_raw_path(p) == "graphql" for p in raw_positionals):
         return graphql_call(args)
     return previous(args, namer)
 

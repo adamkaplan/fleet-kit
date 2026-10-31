@@ -160,10 +160,10 @@ def battery2(rig):
         bad.append("FIFO refusal text differs")
     for host in M1_HOSTS:
         done, calls = rig.run("api", host + "/graphql", "-f", "query=" + gql("addComment"))
-        if calls or not gh_err(done).startswith("gh: refused: the GraphQL mutation addComment"):
+        if calls or RAW_LINE not in gh_err(done):   # r5 (OLD: refused with the mutation name): a userinfo, port, dot or upper-case host is not accepted for a write
             bad.append("graphql mutation let through: " + host)
         done, calls = rig.run("api", host + "/repos/o/r/issues/1/comments", "-f", "body=x")
-        if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
+        if calls or RAW_LINE not in gh_err(done):   # r5 (OLD: signed once)
             bad.append("REST comment not signed: " + host)
     for host in ("https://api.github.com.evil", "https://api.github.com:8443", "http://api.github.com:8080"):   # #1696 r3: plain http to api.github.com is GitHub's (refused/signed like https): see TestRoot
         args = ("api", host + "/graphql", "-f", "query=" + gql("addComment"))
@@ -188,6 +188,11 @@ R3_COMMENTS = ("./repos/o/r/issues/1/comments", "repos/o/x/../r/issues/1/comment
 R3_UNKNOWN = ("foo/bar", "%zz/graphql", "repos%", "x%e9", "weird")
 R3_TEXT = "gh: refused: the GraphQL mutation addComment writes a body that cannot be signed and nothing was posted; use gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments"
 R3_READ = "query { viewer { login } }"
+RAW_LINE = ("the endpoint would change if cleaned: the shim matches the raw path only; write it plainly as repos/OWNER/REPO/... "
+            "(one optional leading slash, no backslash, %-escape, dot segment, semicolon, space, #, double or trailing slash)")
+R5_RAW_OK_GRAPHQL = ("//api.github.com/graphql", "http://api.github.com/graphql")   # r5 (OLD: all 21 spellings reached the graphql parser): only these two are raw-valid
+R5_RAW_OK_COMMENTS = ("/repos/o/r/issues/1/comments", "repos/o/r/issues/1/comments?a=b%20c", "http://api.github.com/repos/o/r/issues/1/comments", "//api.github.com/repos/o/r/issues/1/comments")
+R5_RAW_OK_UNKNOWN = ("foo/bar", "weird")
 R3_NOT_GRAPHQL = ("repos/x/../graphql", "/repos/x/../graphql", "graphql\t", "graphql\n", "\tgraphql", "graphql ", "https://api.github.com:443./graphql")   # r4: their meaning is not the graphql endpoint (or cannot be read): a body is refused
 
 
@@ -197,11 +202,12 @@ def battery3(rig):
     mutation = "query=" + gql("addComment")
     for spelling in R3_GRAPHQL:
         done, calls = rig.run("api", spelling, "-f", mutation)
-        if calls or done.returncode != 1 or gh_err(done) != R3_TEXT:
+        want_text = spelling in R5_RAW_OK_GRAPHQL   # r5 (OLD: every spelling got the mutation line): an unclean spelling is refused by the raw rule
+        if calls or done.returncode != 1 or (gh_err(done) != R3_TEXT if want_text else RAW_LINE not in gh_err(done)):
             bad.append("mutation not refused: %r" % spelling)
         args = ("api", spelling, "-f", "query=" + R3_READ)
         done, calls = rig.run(*args)
-        if spelling in R3_NOT_GRAPHQL:
+        if spelling not in R5_RAW_OK_GRAPHQL:   # r5 (OLD: read query passed for the graphql meanings)
             if calls or not gh_err(done).startswith("gh: refused:"):
                 bad.append("read query with a body to a non-graphql meaning not refused: %r" % spelling)
         elif len(calls) != 1 or calls[0]["argv"] != list(args):
@@ -212,11 +218,14 @@ def battery3(rig):
             bad.append("body-less GET touched: %r" % spelling)
     for spelling in R3_COMMENTS:
         done, calls = rig.run("api", spelling, "-f", "body=x")
-        if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1 or calls[0]["argv"][1] != spelling:
+        if spelling in R5_RAW_OK_COMMENTS:   # r5 (OLD: every spelling signed once): only the raw-valid ones are signed; the rest are refused by the raw rule
+            if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1 or calls[0]["argv"][1] != spelling:
+                bad.append("comment not signed once: %r" % spelling)
+        elif calls or not gh_err(done).startswith("gh: refused:"):
             bad.append("comment not signed once: %r" % spelling)
     for spelling in R3_UNKNOWN:   # class (iii): refused only when the request text names a body mutation
         done, calls = rig.run("api", spelling, "-f", mutation)
-        if calls or gh_err(done) != R3_TEXT:
+        if calls or (gh_err(done) != R3_TEXT if spelling in R5_RAW_OK_UNKNOWN else RAW_LINE not in gh_err(done)):
             bad.append("unknown shape with a mutation not refused: %r" % spelling)
         args = ("api", spelling, "-f", "query=" + R3_READ)
         done, calls = rig.run(*args)
@@ -416,7 +425,10 @@ class TestGhShimSignInput(unittest.TestCase):
             with self.subTest(spelling=spelling):
                 done, calls = self.rig.run("api", spelling, "-f", "query=" + gql("addComment"))
                 self.refused(done, calls)
-                self.assertEqual([l for l in done.stderr.splitlines() if l.startswith("gh:")], bare.stderr.splitlines())
+                if spelling in R5_RAW_OK_GRAPHQL + ("/graphql", "https://api.github.com/graphql", "graphql?x=1", "GraphQL"):
+                    self.assertEqual([l for l in done.stderr.splitlines() if l.startswith("gh:")], bare.stderr.splitlines())
+                else:   # r5 (OLD: the same line as the bare word): graphql/ and the #x form change if cleaned
+                    self.assertIn(RAW_LINE, gh_err(done))
 
     def test_h2_a_read_query_in_every_spelling_passes_untouched(self):
         rig = hermetic_rig()
@@ -425,6 +437,9 @@ class TestGhShimSignInput(unittest.TestCase):
             with self.subTest(spelling=spelling):
                 args = ("api", spelling, "-f", "query=query { viewer { login } }")
                 done, calls = rig.run(*args)
+                if spelling in ("GraphQL", "graphql/"):   # r5 (OLD: passed): a write on a spelling that would change if cleaned
+                    self.refused(done, calls)
+                    continue
                 self.assertEqual(len(calls), 1, done.stderr)
                 self.assertEqual(calls[0]["argv"], list(args))
 
@@ -439,7 +454,8 @@ class TestGhShimSignInput(unittest.TestCase):
         temp = calls[0]["argv"][-1]
         self.assertEqual(json.loads(calls[0]["files"][temp])["body"].count(SIGNED), 1)
         done, calls = self.rig.run("api", "https://API.github.com/repos/o/r/pulls/1/reviews", "--input", "-", stdin='{"body":"x"}')
-        self.assertEqual(json.loads(calls[0]["stdin"])["body"].count(SIGNED), 1)
+        self.refused(done, calls)   # r5 (OLD: signed once): the host is compared exactly, lower-case
+        self.assertIn(RAW_LINE, gh_err(done))
 
     def test_h3_another_host_is_not_touched(self):
         for url in ("https://example.com/repos/o/r/issues/1/comments", "https://api.github.com.evil.test/repos/o/r/issues/1/comments"):
@@ -517,11 +533,11 @@ class TestGhShimSignInput(unittest.TestCase):
 
     def test_h2_h3_mutants_are_seen(self):
         seen = self.mutant("    return [api_endpoint(p) for p in positionals], method, fields", "    return positionals, method, fields")
-        self.assertEqual(sorted(seen), sorted(["graphql spelling let through: " + p for p in SPELLINGS if p != "graphql"] + ["URL form not signed: -f", "URL form not signed: -F", "URL form --input not signed"]))   # r4 (OLD: the same list, plus the bare word)
+        self.assertEqual(sorted(seen), sorted(["graphql spelling let through: " + p for p in ("/graphql", "graphql?x=1", "https://api.github.com/graphql")] + ["URL form not signed: -f", "URL form not signed: -F", "URL form --input not signed"]))   # r5 (OLD: 5 spellings, now the 3 raw-valid ones: GraphQL and graphql/ are refused by the raw rule or the unknown rule first)
         seen = self.mutant('    if first == "graphql":\n        return "graphql"', '    if first == "graphql":\n        return text')
-        self.assertEqual(seen, [])   # r4 (OLD: 5 spellings let through): equivalent now, the allow-list decision refuses the unknown path with the named mutation
+        self.assertEqual(sorted(seen), sorted(["graphql spelling let through: " + p for p in ("/graphql", "graphql?x=1", "https://api.github.com/graphql")]))   # r5 (OLD: []): the 3 raw-valid spellings now reach the canonical form
         seen = self.mutant('host.rstrip(".") != "api.github.com"', "True")
-        self.assertEqual(sorted(seen), sorted(["URL form not signed: -f", "URL form not signed: -F", "URL form --input not signed"]))   # r4 (OLD: + one graphql spelling)
+        self.assertEqual(sorted(seen), sorted(["graphql spelling let through: https://api.github.com/graphql", "URL form not signed: -f", "URL form not signed: -F", "URL form --input not signed"]))   # r4 (OLD: + one graphql spelling)
 
     def test_h4_mutant_the_new_refusal_before_the_gates_is_seen(self):
         source = self.source.replace("        return late\n", "        raise\n", 1)
@@ -559,8 +575,7 @@ class TestGhShimSignInput(unittest.TestCase):
 
     def test_m1_mutant_host_not_normalised_is_seen(self):   # 8 failures: the case-only host still matches the old rule
         seen = self.mutant2('host.rstrip(".") != "api.github.com"', "True")
-        self.assertTrue(all(s.startswith(("graphql mutation let through", "REST comment not signed")) for s in seen), seen)
-        self.assertEqual(len(seen), len(M1_HOSTS), seen)   # r4 (OLD: 2 per host)   # r3: the one canonical function has no old rule behind it: every host form is seen
+        self.assertEqual(seen, [], seen)   # r5 (OLD: 2 per host): equivalent now, every such host form is refused by the raw rule before the host test   # r3: the one canonical function has no old rule behind it: every host form is seen
 
     def test_r3_each_spelling_is_decided_by_its_meaning(self):   # CONTROL of the r3 mutants
         rig = hermetic_rig()
@@ -573,14 +588,17 @@ class TestGhShimSignInput(unittest.TestCase):
                 with self.subTest(spelling=spelling, mutation=name):
                     done, calls = self.rig.run("api", spelling, "-f", "query=" + gql(name))
                     self.refused(done, calls)
-                    self.assertTrue(gh_err(done).startswith("gh: refused: the GraphQL mutation %s writes a body" % name), gh_err(done))
+                    if spelling in R5_RAW_OK_GRAPHQL:
+                        self.assertTrue(gh_err(done).startswith("gh: refused: the GraphQL mutation %s writes a body" % name), gh_err(done))
+                    else:   # r5 (OLD: the mutation line for every spelling): refused by the raw rule
+                        self.assertIn(RAW_LINE, gh_err(done))
 
     def test_r3_read_queries_and_signed_comments_in_every_spelling(self):
         for spelling in R3_GRAPHQL:
             with self.subTest(read=spelling):
                 args = ("api", spelling, "-f", "query=" + R3_READ)
                 done, calls = self.rig.run(*args)
-                if spelling in R3_NOT_GRAPHQL:   # r4 (OLD: passed): the meaning is not graphql, a body is refused
+                if spelling not in R5_RAW_OK_GRAPHQL:   # r5 (OLD: passed unless in R3_NOT_GRAPHQL): an unclean spelling with a body is refused
                     self.refused(done, calls)
                 else:
                     self.assertEqual([c["argv"] for c in calls], [list(args)], done.stderr)
@@ -590,8 +608,11 @@ class TestGhShimSignInput(unittest.TestCase):
         for spelling in R3_COMMENTS:
             with self.subTest(signed=spelling):
                 done, calls = self.rig.run("api", spelling, "-f", "body=x")
-                self.assertEqual(len(calls), 1, done.stderr)
-                self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
+                if spelling in R5_RAW_OK_COMMENTS:   # r5 (OLD: all signed once): only raw-valid spellings
+                    self.assertEqual(len(calls), 1, done.stderr)
+                    self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
+                else:
+                    self.refused(done, calls)
 
     def test_r3_the_three_classes(self):
         bad = battery3(self.rig)
@@ -609,19 +630,17 @@ class TestGhShimSignInput(unittest.TestCase):
 
     def test_r3_mutant_canonicalisation_skipped_is_seen(self):
         seen = self.mutant3("    return [api_endpoint(p) for p in positionals], method, fields", "    return positionals, method, fields")
-        self.assertTrue(seen)
-        print("R3 mutant 1 seen:", len(seen))
-        self.assertIn("mutation not refused: './graphql'", seen)
+        print("R3 mutant 1 seen:", len(seen))   # r5 (OLD: 48 seen, './graphql' among them): only the two raw-valid scheme-relative / http spellings reach the canonicaliser now
+        self.assertEqual(len(seen), 4, seen)
+        self.assertIn("mutation not refused: '//api.github.com/graphql'", seen)
 
     def test_r3_mutant_percent_decode_skipped_is_seen(self):
         seen = self.mutant3('decoded = unquote(text, errors="strict")', "decoded = text")
-        self.assertEqual(len([s for s in seen if s.startswith("comment not signed once")]), 3, seen)   # the refusals are still made by the unknown-shape backstop
-        self.assertIn("comment not signed once: 'repos%2fo%2fr%2fissues%2f1%2fcomments'", seen)
+        self.assertEqual(seen, [])   # r5 (OLD: 3 failures): equivalent now, the decision no longer decodes; the raw rule refuses a %-escape before any decoder is reached
 
     def test_r3_mutant_dot_segments_not_resolved_is_seen(self):
         seen = self.mutant3('posixpath.normpath("/" + path).lstrip("/")', '("/" + path).lstrip("/")')
-        self.assertEqual(len([s for s in seen if s.startswith("comment not signed once")]), 4, seen)   # a refusal is still made by the backstop (a REST-shaped path with a mutation)
-        self.assertIn("comment not signed once: 'repos/o/x/../r/issues/1/comments'", seen)
+        self.assertEqual(seen, [])   # r5 (OLD: 4 failures): equivalent now, the raw rule refuses a dot segment itself
 
 
 
@@ -687,8 +706,8 @@ def effect_battery(rig):
                 bad.append("macOS form passed: %s %s" % (host, tail[0]))
         args = ("api", host + "/graphql", "-f", "query=" + R3_READ)
         done, calls = rig.run(*args)
-        if [c["argv"] for c in calls] != [list(args)]:
-            bad.append("macOS form read query not passed: " + host)
+        if not refused_line(done, calls):   # r5 (OLD: passed): not accepted for a write
+            bad.append("macOS form read query not refused: " + host)
     for spelling in ("graphql", "/graphql", "https://api.github.com/graphql"):
         args = ("api", spelling, "-f", "query=" + R3_READ)
         done, calls = rig.run(*args)
@@ -766,11 +785,15 @@ class TestGhShimEffectRule(unittest.TestCase):
             with self.subTest(host=host):
                 done, calls = self.rig.run("api", host + "/graphql", "-f", R4_MUTATION)
                 self.assertTrue(refused_line(done, calls), done.stderr)
-                self.assertIn("addComment", gh_err(done))
+                self.assertIn(RAW_LINE, gh_err(done))   # r5 (OLD: the mutation name): the host form is not accepted for a write
                 done, calls = self.rig.run("api", host + "/repos/o/r/git/refs", "-f", "ref=x")
                 self.assertTrue(refused_line(done, calls), done.stderr)
                 args = ("api", host + "/graphql", "-f", "query=" + R3_READ)
                 done, calls = self.rig.run(*args)
+                self.assertTrue(refused_line(done, calls), done.stderr)   # r5 (OLD: passed untouched): a read query WITH a field is a POST write on that host form
+                self.assertIn(RAW_LINE, gh_err(done))
+                args = ("api", host + "/graphql")
+                done, calls = self.rig.run(*args)   # a GET with no body passes
                 self.assertEqual([c["argv"] for c in calls], [list(args)], done.stderr)
                 args = ("api", host + "/repos/o/r/git/refs")
                 done, calls = self.rig.run(*args)
@@ -809,7 +832,7 @@ class TestGhShimEffectRule(unittest.TestCase):
         return effect_battery(rig)
 
     def test_r4_mutant_1_the_allow_list_check_skipped_is_seen(self):
-        seen = self.mutant4("        found = None\n        if base is not None:", "        found = (\"x\", (\"POST\", \"PUT\", \"PATCH\", \"DELETE\"), False)\n        if base is not None:")
+        seen = self.mutant4("        found = None\n        for label, pattern in SIGNED_API + SIGNED_API_MORE:", "        found = (\"x\", (\"POST\", \"PUT\", \"PATCH\", \"DELETE\"), False)\n        for label, pattern in SIGNED_API + SIGNED_API_MORE:")
         print("R4 mutant 1 seen:", len(seen))
         self.assertTrue(any(s.startswith("unknown+method passed") for s in seen) and any(s.startswith("unknown+body passed") for s in seen), seen[:5])
 
@@ -822,8 +845,8 @@ class TestGhShimEffectRule(unittest.TestCase):
     def test_r4_mutant_3_the_parser_accepts_a_mutation_is_seen(self):
         seen = self.mutant4("        op = word\n", '        op = "query"\n')
         print("R4 mutant 3 seen:", len(seen))
-        self.assertEqual(len(seen), 24, seen[:5])   # the 19 round-3 spellings and the 5 macOS forms, each read as a query by the mutant and passed
-        self.assertTrue(all(s.startswith(("round-3 spelling with query passed", "macOS form passed")) for s in seen), seen[:5])
+        self.assertEqual(len(seen), 4, seen[:5])   # r5 (OLD: 24, the 19 round-3 spellings and the 5 macOS forms): the raw rule now refuses the unclean ones first; only the 4 raw-valid graphql spellings reach the parser
+        self.assertTrue(all(s.startswith("round-3 spelling with query passed") for s in seen), seen[:5])
         # S9 per-name bar: under the mutant EVERY refused mutation name reaches the real gh (exactly 1 failure per name), on the real shim 0
         mrig = hermetic_rig()
         self.addCleanup(mrig.close)
@@ -845,12 +868,12 @@ class TestGhShimEffectRule(unittest.TestCase):
         self.assertTrue(load_parser(self.source)["graphql_verdict"]("mutation { addComment(input: {}) { x } }"))   # control
 
     def test_r4_mutant_4_the_unknown_body_refusal_removed_is_seen(self):
-        seen = self.mutant4("        if found is None:\n            if True:", "        if found is None:\n            continue\n            if True:")
+        seen = self.mutant4("        if found is None:\n            for text in (f.partition", "        if found is None:\n            continue\n            for text in (f.partition")
         print("R4 mutant 4 seen:", len(seen))
         self.assertTrue(any(s.startswith("unknown+body passed") for s in seen) and any(s.startswith("unknown+method passed") for s in seen), seen[:5])
 
     def test_r4_mutant_5_canonicalisation_skipped_is_seen(self):
-        seen = self.mutant4("    positionals = [api_endpoint(p) for p in raw_positionals]", "    positionals = list(raw_positionals)")
+        seen = self.mutant4('    if rest.startswith("/"):\n        rest = rest[1:]', '    if False:\n        rest = rest[1:]')   # r5 (OLD: canonicalisation skipped): the one leading slash is no longer accepted
         print("R4 mutant 5 seen:", len(seen))
         self.assertIn("read query not passed: /graphql", seen)
         self.assertIn("read query not passed: https://api.github.com/graphql", seen)
