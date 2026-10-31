@@ -11,7 +11,7 @@ class ClaimsNoteState:
     def __init__(self, state_dir):
         self.announced, self.said, self.problem = {}, set(), None
         try:
-            raw = json.loads((Path(state_dir) / CLAIMS_NOTE_FILE).read_text())
+            raw = load_module("record_json").parse_bounded((Path(state_dir) / CLAIMS_NOTE_FILE).read_text())
             if isinstance(raw, dict) and isinstance(raw.get("announced"), dict):
                 self.announced = {k: v for k, v in raw["announced"].items() if isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)}
         except FileNotFoundError:
