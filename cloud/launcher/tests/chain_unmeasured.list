@@ -1,4 +1,5 @@
 cloud/launcher/tests/test_cloud_quick_budget.py
+cloud/launcher/tests/test_cloud_tests_write_tmp.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_mint_retry.py
@@ -14,5 +15,6 @@ cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
+cloud/launcher/tests/test_untracked_report.py
 cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush_background.py
