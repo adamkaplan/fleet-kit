@@ -79,6 +79,22 @@ def no_scrub_copy(directory):
     return write_copy(directory, "take = scrub_lines(lines)[-REFUSAL_LINES:]", "take = list(lines[-REFUSAL_LINES:])")
 
 
+def _child_run(case, cls, path):
+    p = stub_support.start(case, [sys.executable, "-m", "unittest", "-q", "test_end_hook_refusal_lines." + cls], cwd=HERE,
+                           env=dict(os.environ, **{HOOK_ENV: path, INNER_ENV: "1"}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    out, _ = p.communicate(timeout=90)
+    return p.returncode, out
+
+
+def _control_passes(case, cls):
+    """The SAME child command on an UNMUTATED copy must exit 0."""
+    control = _unmutated(tempfile.mkdtemp(prefix="cw-control-"))
+    case.addCleanup(shutil.rmtree, os.path.dirname(control), True)
+    rc, out = _child_run(case, cls, control)
+    case.assertEqual(rc, 0, out)
+    return 1
+
+
 class Scratch(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -221,18 +237,20 @@ class S7Mutants(Scratch):
 
     @unittest.skipIf(os.environ.get(INNER_ENV), "inside a mutant's child run")
     def test_each_mutant_fails_its_test(self):
-        caught = applied = 0
+        caught = applied = passed = 0
         for copy, cls in self.TARGETS:
+            passed += _control_passes(self, cls)
             scratch = tempfile.mkdtemp(prefix="cw-mutant-")   # outside the repository
             self.addCleanup(shutil.rmtree, scratch, True)
             path = copy(scratch)
             applied += os.path.isfile(path)
-            p = stub_support.start(self, [sys.executable, "-m", "unittest", "-q", "test_end_hook_refusal_lines." + cls], cwd=HERE,
-                                   env=dict(os.environ, **{HOOK_ENV: path, INNER_ENV: "1"}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            out, _ = p.communicate(timeout=90)
-            self.assertEqual(p.returncode, 1, out)
+            rc, out = _child_run(self, cls, path)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("FAILED (failures=1)", out)
+            self.assertIn(cls, out)
             caught += 1
-        self.assertEqual((caught, applied), (3, 3))
+        self.assertEqual((caught, applied, passed), (3, 3, len(self.TARGETS)))
+        print("S7 control: unmutated copies pass %d of %d" % (passed, len(self.TARGETS)))
         print("S7: mutants caught %d of 3, mutations applied %d of 3" % (caught, applied))
 
 
@@ -410,33 +428,35 @@ class S13ClassMutants(Scratch):
 
     @unittest.skipIf(os.environ.get(INNER_ENV), "inside a mutant's child run")
     def test_each_mutant_fails_the_test_of_its_class(self):
-        caught = applied = 0
+        caught = applied = passed = 0
         for copy, cls in self.TARGETS:
+            passed += _control_passes(self, cls)
             scratch = tempfile.mkdtemp(prefix="cw-mutant-")   # outside the repository
             self.addCleanup(shutil.rmtree, scratch, True)
             path = copy(scratch)
             applied += os.path.isfile(path)
-            p = stub_support.start(self, [sys.executable, "-m", "unittest", "-q", "test_end_hook_refusal_lines." + cls], cwd=HERE,
-                                   env=dict(os.environ, **{HOOK_ENV: path, INNER_ENV: "1"}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            out, _ = p.communicate(timeout=90)
-            self.assertEqual(p.returncode, 1, out)
+            rc, out = _child_run(self, cls, path)
+            self.assertEqual(rc, 1, out)
             self.assertIn("FAILED (failures=1)", out)
+            self.assertIn(cls, out)
             caught += 1
-        self.assertEqual((caught, applied), (5, 5))
+        self.assertEqual((caught, applied, passed), (5, 5, 5))
+        print("S13 control: unmutated copies pass %d of 5" % passed)
         print("S13: mutants failing their test %d of 5, mutations applied %d of 5" % (caught, applied))
 
     @unittest.skipIf(os.environ.get(INNER_ENV), "inside a mutant's child run")
     def test_the_boundary_mutant_fails_the_glued_key_test(self):
+        passed = _control_passes(self, "S10bGlued")
         scratch = tempfile.mkdtemp(prefix="cw-mutant-")   # outside the repository
         self.addCleanup(shutil.rmtree, scratch, True)
         path = _mut("|(?:sk-|xox[a-z]-)", "|(?<![A-Za-z0-9])(?:sk-|xox[a-z]-)")(scratch)
         applied = os.path.isfile(path)
-        p = stub_support.start(self, [sys.executable, "-m", "unittest", "-q", "test_end_hook_refusal_lines.S10bGlued"], cwd=HERE,
-                               env=dict(os.environ, **{HOOK_ENV: path, INNER_ENV: "1"}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        out, _ = p.communicate(timeout=90)
-        self.assertEqual(p.returncode, 1, out)
+        rc, out = _child_run(self, "S10bGlued", path)
+        self.assertEqual(rc, 1, out)
         self.assertIn("FAILED (failures=1)", out)
+        self.assertIn("test_a_key_glued_to_letters_is_removed", out)
         self.assertTrue(applied)
+        print("S13b control: unmutated copy passes %d of 1" % passed)
         print("S13b: boundary mutant fails 1 of 1, mutation applied %s" % applied)
 
 
