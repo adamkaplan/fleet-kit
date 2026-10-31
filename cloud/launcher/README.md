@@ -188,6 +188,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   a cloud record has it, so `send`, `read` and `retire` by name cannot be routed to the wrong one. A failed or cut `launch --cloud` stops
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
+- **The registry row (#1510).** The switchboard-side launch writes the agent's registry row at launch through the registry's own write function (`kind` cloud, no pane and no endpoint: the endpoint is not recorded because `send` by the registry has no fallback and no address a Mac lane can reach exists yet, ask #1587); `retire` and `cloud-clear` retire it once; the reaper's own stop of a pod writes nothing, the clear retires the row later. A registry failure never refuses a launch or keeps a pod: it is one line on standard error and one audit line.
 
 **The cap on shape M per lane (ask #1640).** A lane may hold at most 4 shape-M cloud workers at once (`MAX_M_PER_LANE` in `bin/cloud_worker.py`), because a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable. The refusal reads: `refused: lane LANE already holds 4 shape-M cloud workers (A, B, C, D): retire one (retire NAME) or launch a smaller shape (--shape S)`; it exits 2 before any token, launcher or cluster call. The count reads the record directory alone: a record counts while it exists, holds the shape M and its hard deadline has not passed (the lane is its `reports-to` boss, or `(no boss)`); a retire or a clear ends it. A launch of another shape, of a name that already has a record, or of a lane below the cap is unchanged. Limits: a launch still in flight has no record yet; two launches of one lane at the same moment can pass together; records written before this change hold no shape and are not counted.
 
@@ -256,6 +257,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_model_credential.py` | 2 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 43 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 66 | serial |
+| `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 10 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 8 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 2 | serial |
@@ -330,6 +332,7 @@ Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, n
 | `cloud/launcher/tests/test_model_credential.py` | 1 | serial |
 | `cloud/launcher/tests/test_orchestrator_agent.py` | 17 | serial |
 | `cloud/launcher/tests/test_reaper_managed.py` | 23 | serial |
+| `cloud/launcher/tests/test_registry_endpoint.py` | 1 | serial |
 | `cloud/launcher/tests/test_retire_gone_pod.py` | 5 | serial |
 | `cloud/launcher/tests/test_stack_model_key.py` | 3 | serial |
 | `cloud/launcher/tests/test_stack_registry_check.py` | 1 | serial |
