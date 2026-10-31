@@ -1093,7 +1093,7 @@ class HubReadAndTransport(unittest.TestCase):
         gate = threading.Event()
         real = http.client.HTTPConnection.connect
         slow_for = {"post": True}
-        ran_connect = []   # the threads that ran a held connect: the post's connection is made by the late thread itself
+        ran_connect, entered = [], threading.Event()   # the threads that ran a held connect: the post's connection is made by the late thread itself
         def connect_hook(conn):
             if slow_for["post"] and slow_for.get("armed"):
                 if not gate.is_set(): ran_connect.append(threading.current_thread())
