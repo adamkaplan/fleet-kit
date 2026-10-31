@@ -368,6 +368,17 @@ class S11Split(Scratch):
         print("S11: halves in the error %d of 2, errors not empty %d of 1" % (halves, bool(err)))
 
 
+class S12bKeyBeforeSummary(Scratch):
+    def test_a_key_that_ends_the_line_before_the_summary_keeps_the_earlier_reason(self):
+        code, ans = self.hook(["remote: rejected: protected branch", "remote: token " + KEY, SUMMARY])
+        err = ans["error"]
+        halves = (KEY[:8] in err) + (KEY[-8:] in err)
+        ends = err.endswith("<removed>")
+        self.assertEqual((code, ends, halves), (1, True, 0))
+        self.assertIn("rejected", err)
+        print("S12b: key before the summary: ends in the fixed word %d of 1, halves in the error %d of 2, earlier reason line kept %d of 1" % (ends, halves, "rejected" in err))
+
+
 class S12Limits(Scratch):
     def test_long_names_and_short_words_and_the_readme(self):
         self.assertEqual((len(LOWER_PATH), len(MIXED_PATH), len(MIXED_REF), len(SHORT_WORD)), (41, 30, 31, 20))
