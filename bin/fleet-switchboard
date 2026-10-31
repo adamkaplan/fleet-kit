@@ -16782,6 +16782,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_r
             plan = checked_plan(config, source, args.ask, runner, now)
         except (PlanInputError, ValueError, ConfigError, IntentError) as err:
             plan_problem = _one_line(str(err), 200)
+    facts = approval_facts(facts, config, state, pr, source, plan) if floor else facts   # #1735: G0c is tracked where the repo enforces it
     carries = carries_context(engine, config, repo, number, facts, body, entries, runner, now) if not writable else None
     if carries:
         facts["carries"] = carries
@@ -19560,6 +19561,11 @@ def cmd_merge_gate(args, runner, now):
             print(json.dumps({"allowed": False, "reason": union, "head": None, "locked": False}, sort_keys=True))
         else:
             sys.stderr.write("%s\n" % union)
+        return plan_ledger.EXIT_REFUSE
+    union = approval_refusal(args, runner, now)   # #1735: the approval gate G0c, where the repo enforces it; after the union, before the CI check
+    if union:
+        _gates_audit(engine, "merge_gate.refused", ref, {"by": who, "why": _one_line(union, 300)})
+        print(json.dumps({"allowed": False, "reason": union, "head": None, "locked": False}, sort_keys=True)) if args.json else sys.stderr.write("%s\n" % union)
         return plan_ledger.EXIT_REFUSE
     allowed, why, head = gate.check_merge(reading, gh, conf, state, repo, number, who, kind[0] == "person", waived, now)
     _gates_audit(engine, "merge_gate.allowed" if allowed else "merge_gate.refused", ref, {"by": who, "why": _one_line(why, 300)})
