@@ -191,3 +191,24 @@ The family of other substring rules over text a person chooses stays as it is, e
 A passing failure of the preflight's mint (the vault command, a network error or timeout, an HTTP 5xx or 429 answer, or a 403 with a Retry-After) is retried inside the preflight: 4 tries, with waits of 2, 5 and 10 seconds between them, one line on standard error per retry (`mint try N of 4 failed: <reason>; trying again in S seconds`, never a value); a Retry-After over 10 seconds ends the retries at once. A refusal (a 404, a 422, a 403 without Retry-After, any `refusing:` check, the expiry or permission checks) is never retried: it ends after one try. A launch that still cannot mint says its tries and the last reason (`no token could be minted after 4 tries: <reason>`) and writes one audit line (action `create.failed`, reason `preflight: ...`) through the launcher's own audit file.
 
 The launch's own mint of the pod's git token runs a command (`app_token.py`, or `CW_GIT_TOKEN_CMD`): `app_token.py` exits with status 75 for a passing failure (the vault command, a network error or timeout, an HTTP 5xx or 429 answer, or a 403 with a Retry-After) and keeps its old status for every refusal. The launch retries the command only on status 75: up to 4 tries with waits of 2, 5 and 10 seconds, one line on standard error per retry (`git token try N of 4 failed: <last line>; trying again in S seconds`, never a value), and a final refusal that says `after 4 tries`; a Retry-After over 10 seconds cannot be read from an exit status, so it does not end the retries early. A custom token command is retried only when it exits with 75; a command that exits with any other status is never retried.
+
+## A pod that ends Failed (ask #1442)
+
+Cause. A cloud pod that ended in the Failed phase (for example a container killed for memory, exit 137, or a pod evicted by its node) showed only
+"does not answer" in `status`, because every read of a worker goes through the agent inside the pod. The reaper asked the dead pod for its activity,
+found it unreadable, reported `activity unreadable` every minute and kept the pod for two hours, until its hard limit. No run record was written,
+because the stop path that writes it is never reached for a pod nobody can enter, so nobody could see why the pod had failed. The missing read was
+the pod's own status and events (`get_pod` and `pod_events`), which the launcher already could make and did not make for a Failed pod.
+
+What the record holds. The first reaper pass or `status` that sees the pod Failed reads, once, the pod's reason, each container's terminated reason
+and exit code, and the last 10 events (each cut to 300 characters), every text through the launcher's own scrub, and writes a run record
+(`run.json`, exit reason `pod failed`) with the reason, the exit code and the events. A later pass finds that record by the run id of the pod and
+does nothing for it: no activity read, no second record, no second report. A Failed pod without the `kept` annotation is deleted ten minutes
+after its record; one that holds unpushed work (`kept`) stays.
+
+How a lane reads it. `status` prints `pod failed: <reason>` (the reason cut to 160 characters, for example `OOMKilled (exit 137)`) for such a pod,
+instead of `does not answer`; the full reason, exit code and events are in the record's `run.json` under the run record directory.
+
+Two limits of what `status` and the reaper do. The switchboard prints the launcher's reason on one line: every control character removed, scrubbed once more by its own scrub, and a `pod_failed` value that is not text is treated like an answer it cannot read (the line for an unavailable launcher status), never an error. The reaper reads, records and deletes only a pod that carries a worker annotation: a pod with the launcher's label and none is left alone; a record that cannot be written leaves the pod in place, is reported once as `record not written`, and is written on the first pass that can.
+
+Three more limits of the record of a Failed pod. A record written when the pod could not be read has, as its reason, the text of the read error (not the pod's own reason) and is not refreshed: the pod is read once. The worker annotation of a pod is checked against the worker-name rule (the switchboard's agent name rule) before it becomes a part of a path: a pod whose annotation does not match is treated as a pod with no annotation, never read, recorded or deleted. The reaper's told-once set (the reports of an unwritable record, of an unreadable deadline and of a record time that cannot be read) clears the entry of an unwritable record when that record is written; a pod deleted by someone else leaves a few bytes in the set until the process ends. The event text stored in the record is not stripped of control characters (the JSON escapes them); only the status line prints, and it is stripped.

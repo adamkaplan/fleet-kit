@@ -33,6 +33,7 @@ cloud/launcher/tests/test_cw_names.py
 cloud/launcher/tests/test_docs_preflight_modes.py
 cloud/launcher/tests/test_driver.py
 cloud/launcher/tests/test_end_hook_nothing_to_push.py
+cloud/launcher/tests/test_failed_pod_record.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_git_token_retry.py

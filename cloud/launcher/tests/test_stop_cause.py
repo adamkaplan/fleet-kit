@@ -144,7 +144,10 @@ class Cause(tcw.Base):
         self.assertEqual(self.make_stop(True, gone=True), ["pod_gone"])
 
     def test_s11_a_reaper_idle_stop_of_a_failed_pod_carries_pod_failed(self):
-        self.assertEqual(self.make_stop(False, phase="Failed"), ["pod_failed"])
+        self.assertEqual(self.make_stop(False, phase="Failed"), [])   # the first sight of a Failed pod records it and writes no stop (ask #1442)
+        self.clock.advance(minutes=11)   # past the ten minutes after the record
+        self.reap()
+        self.assertEqual([l["cause"] for l in self.stops()], ["pod_failed"])
 
     def test_s11_a_reaper_hard_stop_of_a_failed_pod_carries_pod_failed(self):
         self.assertEqual(self.make_stop(True, phase="Failed"), ["pod_failed"])
