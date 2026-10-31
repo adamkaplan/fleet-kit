@@ -344,6 +344,20 @@ class S10Classes(Scratch):
         print("S10: planted values in the error %d of 8, classes planted %d of 8" % (kept, planted))
 
 
+GLUED = (("xsk- key glued to a letter", "x", "sk-a1b2c3d4"), ("KEYsk- key glued to upper-case letters", "KEY", "sk-a1b2c3d4"))
+
+
+class S10bGlued(Scratch):
+    def test_a_key_glued_to_letters_is_removed(self):
+        removed = 0
+        for name, glue, key in GLUED:
+            code, ans = self.hook(["remote: " + glue + key, SEP, SUMMARY])
+            self.assertTrue(ans["error"].endswith(SUMMARY) and "remote: " in ans["error"], name)
+            removed += key not in ans["error"] and key[3:] not in ans["error"]
+        self.assertEqual(removed, 2)
+        print("S10b: glued keys removed %d of 2" % removed)
+
+
 class S11Split(Scratch):
     def test_a_token_split_over_two_lines_replaces_both_lines(self):
         code, ans = self.hook(["remote: " + HALF_A, HALF_B + " more", SUMMARY])
@@ -379,7 +393,7 @@ class S13ClassMutants(Scratch):
         (_mut("import unicodedata\n", "class unicodedata:\n    normalize = staticmethod(lambda form, text: text)\n"), "S10Classes"),
         (_mut("[A-Za-z0-9+/_=.-]{24,}", "[A-Za-z0-9+_=-]{24,}"), "S10Classes"),
         (_mut("if _MIXED_RE.search(m.group())]", "if True]"), "S12Limits"),
-        (_mut(r"|(?<![A-Za-z0-9])(?:sk-|xox[a-z]-)[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}", ""), "S10Classes"),
+        (_mut(r"|(?:sk-|xox[a-z]-)[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}", ""), "S10Classes"),
         (_mut("if len(touched) > 1:", "if False:"), "S11Split"),
     )
 
@@ -399,6 +413,20 @@ class S13ClassMutants(Scratch):
             caught += 1
         self.assertEqual((caught, applied), (5, 5))
         print("S13: mutants failing their test %d of 5, mutations applied %d of 5" % (caught, applied))
+
+    @unittest.skipIf(os.environ.get(INNER_ENV), "inside a mutant's child run")
+    def test_the_boundary_mutant_fails_the_glued_key_test(self):
+        scratch = tempfile.mkdtemp(prefix="cw-mutant-")   # outside the repository
+        self.addCleanup(shutil.rmtree, scratch, True)
+        path = _mut("|(?:sk-|xox[a-z]-)", "|(?<![A-Za-z0-9])(?:sk-|xox[a-z]-)")(scratch)
+        applied = os.path.isfile(path)
+        p = stub_support.start(self, [sys.executable, "-m", "unittest", "-q", "test_end_hook_refusal_lines.S10bGlued"], cwd=HERE,
+                               env=dict(os.environ, **{HOOK_ENV: path, INNER_ENV: "1"}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out, _ = p.communicate(timeout=90)
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("FAILED (failures=1)", out)
+        self.assertTrue(applied)
+        print("S13b: boundary mutant fails 1 of 1, mutation applied %s" % applied)
 
 
 if __name__ == "__main__":

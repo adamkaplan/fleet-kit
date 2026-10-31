@@ -98,7 +98,7 @@ REFUSAL_LINES, REFUSAL_CHARS, REMOVED = 8, 600, "<removed>"
 # Classes of the scrub (each replaced by a fixed word): (i) a prefixed token (gh[pousr]_ or github_pat_; sk- or xox?-; AKIA + 16; a JWT),
 # (ii) a run of 24 or more of letters, digits and + / _ = . - that holds a digit or an upper-case letter, (iii) an address with a credential,
 # (iv) a control character. Every line is NFKC-normalised first; a second pass over the lines joined with no separator catches a run split over two lines.
-_PREFIXED_RE = re.compile(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|(?<![A-Za-z0-9])(?:sk-|xox[a-z]-)[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}")
+_PREFIXED_RE = re.compile(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|(?:sk-|xox[a-z]-)[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}")
 _RUN_RE = re.compile(r"[A-Za-z0-9+/_=.-]{24,}")
 _MIXED_RE = re.compile(r"[0-9A-Z]")
 _CREDURL_RE = re.compile(r"(?<=://)[^/\s@]*@")
