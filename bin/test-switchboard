@@ -39625,6 +39625,7 @@ class TestImpactHold(LedgerBase):
         import ast
         found = self.registrar_findings(ast.parse(self.real_source()))
         known = {"add_ledger_parsers": {"attribute _actions", "an assignment or delete of an attribute (action.default)", "an assignment or delete of an attribute (action.nargs)"},   # reads the actions of ITS OWN `verdict` parser and sets the two fields of its `scenario` positional
+                 "add_sent_parsers": {"the name SENT_LIMIT_MAX is outside the registrar vocabulary"},   # #924: reads the module constant SENT_LIMIT_MAX (a merged ask); the finding stays reported, the lint is unchanged
                  "add_plan_parsers": {'the string "review"'}}   # its own `plan review` subcommand and a positional named review
         self.assertEqual(found, known, "a registrar uses the shared parser beyond its own commands: a NEW finding is a decision (the rating is immune to it, but the reviewer must look)")
 
