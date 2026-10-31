@@ -171,6 +171,7 @@
         "bin/cloud_relay.py",
         "cloud/worker/bin/cloud_relay.py",
         "bin/cloud_cli.py",
+        "bin/cloud_cluster.py",
         "bin/external_adapter.py",
         "bin/delegated_clear.py",
         "bin/impact_hold.py",
@@ -223,6 +224,7 @@
           "bin/cloud_relay.py",
           "cloud/worker/bin/cloud_relay.py",
           "bin/cloud_cli.py",
+          "bin/cloud_cluster.py",
           "bin/external_adapter.py",
           "bin/delegated_clear.py",
           "bin/impact_hold.py",
@@ -429,12 +431,16 @@
         "bin/switchboard/plan_review.py",
         "bin/switchboard/triage.py",
         "bin/switchboard/alert_labels.py",
+        "bin/switchboard/link_scrub.py",
         "bin/switchboard/handoff.py",
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
         "bin/switchboard/engine.py",
         "bin/switchboard/jev.py",
-        "bin/switchboard/secret_spans.py"
+        "bin/switchboard/secret_spans.py",
+        "bin/switchboard/caches.py",
+        "bin/switchboard/profile_pieces.py",
+        "bin/switchboard/installer.py"
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
@@ -594,6 +600,8 @@
           "RedCiFacts",
           "TriageFacts"
         ],
+        "bin/switchboard/link_scrub.py": [
+        ],
         "bin/switchboard/handoff.py": [
           "WorkerFacts",
           "_Unread",
@@ -672,6 +680,17 @@
           "_secret_position",
           "find_secret_span",
           "secret_where"
+        ],
+        "bin/switchboard/caches.py": [
+          "BoundedFileCache",
+          "_audit_tail",
+          "_valid_context"
+        ],
+        "bin/switchboard/profile_pieces.py": [
+          "InstallError"
+        ],
+        "bin/switchboard/installer.py": [
+          "reaper_only_conflict"
         ]
       },
       "registrar_allow": {

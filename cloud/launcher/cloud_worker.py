@@ -231,6 +231,7 @@ POD_TERMINATION_GRACE_SECONDS = 60
 PRESTOP_BUDGET_SECONDS = 45
 PRESTOP_LIFECYCLE = {"preStop": {"exec": {"command": ["/usr/local/bin/cw-prestop", str(PRESTOP_BUDGET_SECONDS)]}}}
 # The one read-only recovery route for work a hook could not push (a constant string).
+NO_REPOSITORY_NOTE = "no repository in the pod; nothing to push"   # the end hook's answer when /work/repo holds no checkout (end_hook.py says the same)
 RECOVERY_ROUTE = ("recover read-only: the work is still in /work/repo of the kept pod; see the pod's own output line "
                   "(cw-prestop: not pushed) and the run record")
 
@@ -513,22 +514,50 @@ def git_token_cmd(repo, env, role="worker"):
     return cmd + ["--role", role] if role != "worker" else cmd
 
 
+GIT_TOKEN_TRIES = 4
+GIT_TOKEN_WAITS = (2, 5, 10)
+EXIT_TEMPFAIL = 75   # the token command's status for a passing failure; the only status that is tried again
+git_token_sleep = time.sleep   # tests replace it
+
+
+def tempfail_tries(run, last_line, say, sleep):
+    """Run run() -> (status, result) up to GIT_TOKEN_TRIES times, waiting 2, 5, 10 seconds, and again ONLY when status is 75. last_line(result) is
+    the cleaned last stderr line. say(text) hears one line per retry (no token value). Returns (status, result, tries). Shared by the launch."""
+    tries = 0
+    while True:
+        tries += 1
+        status, result = run()
+        if status != EXIT_TEMPFAIL or tries >= GIT_TOKEN_TRIES:
+            return status, result, tries
+        wait = GIT_TOKEN_WAITS[tries - 1]
+        say("git token try %d of %d failed: %s; trying again in %d seconds" % (tries, GIT_TOKEN_TRIES, last_line(result), wait))
+        sleep(wait)
+
+
 def run_git_token_cmd(cmd, repo, env, register=None):
     """THE mint call (the launch and the renewal both come here): run cmd for repo in env, return the token it printed. Never prints, never puts
     the token in an argument or a file. register(text) hears the child's stdout before it is judged, so a caller's scrubber knows it.
     Raises CloudError(EXIT_USAGE) with no value in the text."""
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        p = None
-    if p and register:
-        register(p.stdout.strip())
+    def once():
+        try:
+            q = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            q = None
+        if q and register:
+            register(q.stdout.strip())
+        return (q.returncode if q else None), q
+
+    def line(q):
+        return scrub(q.stderr.strip().splitlines()[-1], (), 200) if q and q.stderr.strip() else "no message"
+
+    _, p, tries = tempfail_tries(once, line, lambda t: print(t, file=sys.stderr), lambda s: git_token_sleep(s))
     token = (p.stdout if p and p.returncode == 0 else "").strip()
     if not token or len(token) > GIT_TOKEN_MAX_CHARS:
         why = ""
         if p and p.stderr.strip():
             why = ": " + scrub(p.stderr.strip().splitlines()[-1], (), 200)
-        raise CloudError("the git token command gave no usable token%s" % why, EXIT_USAGE)
+        after = " after %d tries" % tries if tries > 1 else ""
+        raise CloudError("the git token command gave no usable token%s%s" % (after, why), EXIT_USAGE)
     return token
 
 
@@ -1776,7 +1805,8 @@ class Launcher:
         info = {"rid": runtime_id, "cost": 0.0}
 
         def why():   # a stop that wrote a run record names its directory once, here
-            return "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
+            text = "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
+            return "%s; %s" % (text, info["hook_note"]) if text and info.get("hook_note") else (text or info.get("hook_note", ""))
         try:
             result = fn(info)
         except CloudError as e:
@@ -2203,6 +2233,10 @@ class Launcher:
                     except CloudError as e:
                         res = {"pushed": False, "wip_branch": None, "error": str(e)}
             view = self._hook_view(res)   # every field text from the pod: a string, scrubbed, short
+            no_repo = res.get("no_repository") is True and not view["error"]   # no checkout in the pod: the launcher's own words, not the pod's
+            if no_repo:
+                view["note"] = NO_REPOSITORY_NOTE
+                info["hook_note"] = NO_REPOSITORY_NOTE
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
             self._hook_record(info, dict(view, ran=True, refresh=info["refresh"]))
             if view["error"]:
@@ -2219,10 +2253,12 @@ class Launcher:
             try:
                 raw = res.get("skipped")
                 skipped = [self.kube.scrub(x, 200) for x in raw][:50] if isinstance(raw, list) else []
-                note = self.kube.scrub(res.get("note") or "")
+                note = NO_REPOSITORY_NOTE if no_repo else self.kube.scrub(res.get("note") or "")
             except Exception:  # output handling never undoes the stop
                 pass
-            if note:
+            if no_repo:
+                print("cloud-worker: end hook: %s" % note, file=sys.stderr)
+            elif note:
                 print("cloud-worker: end hook: %s; nothing to push" % note, file=sys.stderr)
             if skipped:  # these files were not pushed and went with the pod: say so, loudly
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)

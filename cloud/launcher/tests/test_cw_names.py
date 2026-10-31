@@ -30,12 +30,13 @@ NAMES = {
 NEW = set(NAMES.values())
 STANDARD_TOOLS = {"cat", "git", "head", "ls", "sh"}   # the image's own tools, run by the record and the report read (not names this project coined)
 OLD = re.compile(P, re.I)
-# The channel's interface names, set by the switchboard, and byte-identical copies of its own files: the ONLY places the old prefix may stay.
+# The channel's interface names, set by the switchboard, and byte-identical copies of its own files (and the recorded copy of the orchestrator definition, pinned equal to it by test_s3_image_definition_equals_recorded_copy): the ONLY places the old prefix may stay.
 # The names are stripped before the scan; the copies (exact paths) are skipped whole. The word planted in any other file still fails.
 CHANNEL_NAMES = tuple(P.upper() + x for x in ("_AGENT_NAME", "_BOSS", "_CLOUD_CHANNEL_URL", "_CLOUD_TOKEN_FILE"))
 CHANNEL_NAMES += tuple(P.upper() + x for x in ("_CLOUD_CHANNEL_LISTEN", "_CLOUD_HUB_AGENTS", "_CLOUD_HUB_SECRETS", "_CLOUD_HUB_DECISIONS", "_CLOUD_AGENT_NAMESPACE"))   # the hub manifest's own names
 CHANNEL_COPIES = ("cloud/worker/bin/cloud_cli.py", "cloud/worker/bin/cloud_client.py", "cloud/worker/bin/cloud_hub.py",
-                  "cloud/worker/bin/cloud_channel.py", "cloud/worker/bin/cloud_channel_server.py", "cloud/worker/bin/cloud_relay.py", "cloud/worker/agents/orchestrator.md")
+                  "cloud/worker/bin/cloud_channel.py", "cloud/worker/bin/cloud_channel_server.py", "cloud/worker/bin/cloud_relay.py", "cloud/worker/agents/orchestrator.md",
+                  "cloud/worker/tests/golden/orchestrator.md")
 
 
 def old_name_in(rel, text):

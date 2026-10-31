@@ -14,6 +14,7 @@ switchboard/plan_review.py
 switchboard/pr_explain.py
 switchboard/triage.py
 switchboard/alert_labels.py
+switchboard/link_scrub.py
 switchboard/handoff.py
 switchboard/agents_verify.py
 switchboard/answer_delivery.py
@@ -21,5 +22,11 @@ switchboard/audit.py
 switchboard/decision.py
 switchboard/engine.py
 switchboard/jev.py
+switchboard/launch_model.py
 switchboard/secret_spans.py
+switchboard/caches.py
+switchboard/bootstrap.py
+switchboard/profile_pieces.py
+switchboard/installer.py
 switchboard/sent_view.py
+switchboard/bot_reviews.py

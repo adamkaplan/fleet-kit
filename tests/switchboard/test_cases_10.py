@@ -451,6 +451,7 @@ chat_clear.py:read_seen
 ci_runs.py:_read_run
 cloud_channel_server.py:do_POST
 cloud_cli.py:post
+cloud_cluster.py:run_launcher
 cloud_cost_report.py:read_lines
 cloud_hub.py:_read_json
 cloud_hub.py:_read_json_aged
@@ -458,7 +459,6 @@ cloud_hub.py:kube_http
 cloud_relay.py:loads_strict
 cloud_relay_daemon.py:_read
 cloud_way_back_check.py:main
-cloud_worker.py:run_launcher
 cpu_guard.py:load_episode
 decision_sync.py:_read_json
 decisions_pull.py:held_body
@@ -478,13 +478,13 @@ fleet-heartbeat:load_config
 fleet-scenario:read
 fleet-switchboard:__init__
 fleet-switchboard:_api
-fleet-switchboard:_audit_tail
+switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
 fleet-switchboard:_docker_inspect
-fleet-switchboard:_fresh
+switchboard/caches.py:_fresh
 fleet-switchboard:_last
 fleet-switchboard:_load_markers
-fleet-switchboard:_read_json_object
+switchboard/profile_pieces.py:_read_json_object
 fleet-switchboard:_review_api
 fleet-switchboard:_write_gates_config
 fleet-switchboard:anonymous_volumes
