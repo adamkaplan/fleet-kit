@@ -3,6 +3,7 @@
 The fixtures are those of bin/test-switchboard (HOST is that module, set by its loader block): the plan wake world, with a routing hub whose
 `route_of` is the real one. Neutral names (acme/api). The mutants patch one function and must fail the very checks the real code passes.
 """
+import json
 import re
 import sys
 import types
@@ -249,6 +250,51 @@ class TestClaimsNoteSkips(NoGithubReadChecks, ClaimsNoteBase):
                 lines = self.skipped(fx)
                 self.assertEqual(len(lines), 1, lines)
                 self.assertIn(why, lines[0])
+
+    def unavailable_checks(self, fx):
+        for number in (7, 8, 9):
+            self.pull(fx, number, LINK + "CLAIMS: S1")
+        self.hold(fx)
+        real = fx.hub.route_of
+        def route(item, agents, now):
+            if item.numbers == [8]:
+                raise self.sb.GitHubUnavailable("read of issues/3 failed recently\nretry later")
+            return real(item, agents, now)
+        fx.hub.route_of = route
+        self.run_pass(fx)
+        self.assertEqual(sorted(t.split(":")[0] for t in self.notices(fx)), ["PR acme/api#7", "PR acme/api#9"], "the first and third announced")
+        saved = json.loads((Path(fx.engine.state_dir) / self.sb.CLAIMS_NOTE_FILE).read_text())["announced"]
+        self.assertEqual(sorted(k.split(":")[0] for k in saved), ["acme/api#7", "acme/api#9"], "the state file holds both keys")
+        self.run_pass(fx)
+        lines = self.skipped(fx)
+        self.assertEqual(len(lines), 1, "one audit line names the second")
+        self.assertTrue(lines[0].startswith("GitHub unavailable: read of issues/3"), lines)
+
+    def test_one_failed_read_skips_that_pull_request_and_not_the_state_write(self):
+        self.unavailable_checks(self.world())
+
+    def test_a_mutant_that_lets_the_exception_escape_fails_and_the_control_passes(self):
+        src = (REPO / "bin" / "switchboard" / "claims_note.py").read_text()
+        self.assertIn("except GitHubUnavailable as err:", src)
+        start = src.index("def claims_note_pass(")
+        body = src[start:src.index("\n\n\ndef ", start)]
+        mutated = body.replace("except GitHubUnavailable as err:", "except KeyboardInterrupt as err:")
+        self.assertNotEqual(mutated, body)   # applied
+        original = self.sb.claims_note_pass
+        namespace = original.__globals__
+        exec(mutated, namespace)   # the pass again, with the per-pull-request catch gone; rebinds the name in the part's namespace
+        mutant = namespace["claims_note_pass"]
+        applied = []
+        try:
+            with mock.patch.object(self.sb, "claims_note_pass", mutant):
+                applied.append(1)
+                with self.assertRaisesRegex(AssertionError, r"the first and third announced"):
+                    self.unavailable_checks(self.world())
+        finally:
+            namespace["claims_note_pass"] = original
+            self.sb.claims_note_pass = original
+        self.assertTrue(applied)
+        self.unavailable_checks(self.world())   # the control
 
     def test_u2_a_pass_that_meets_an_error_is_noted_and_does_not_raise(self):
         fx = self.world()

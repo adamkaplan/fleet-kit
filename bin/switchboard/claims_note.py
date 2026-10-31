@@ -90,7 +90,14 @@ def claims_note_pass(engine, state, repos, now):
                         engine._note("claims_note.skipped", "%s#%d" % (repo, number), {"why": why})
                     continue
                 item = GitHubItem("github.pr:%s" % key, "github.pr", "PR #%d" % number, repo, _pr_refs(record, number)[0], [], _login(record), now, [number], True)
-                owner, _ = hub.route_of(item, discovery.agents, now)
+                try:
+                    owner, _ = hub.route_of(item, discovery.agents, now)
+                except GitHubUnavailable as err:   # one failed read skips this pull request only: the state write below still happens
+                    why = "GitHub unavailable: %s" % _one_line(str(err), 120)
+                    if (key, why) not in note.said:
+                        note.said.add((key, why))
+                        engine._note("claims_note.skipped", "%s#%d" % (repo, number), {"why": why})
+                    continue
                 if not owner:
                     if (key, "no recipient") not in note.said:
                         note.said.add((key, "no recipient"))
