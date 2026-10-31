@@ -950,8 +950,11 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                     row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s" % ", ".join(epic)
         elif gid == "G4":
             ci = (facts or {}).get("ci")
-            if ci in ("green", "passing"):
-                row.update(status="ok", detail="CI %s at %s" % (ci, (head or "?")[:8]))
+            applies, legs_ok, legs_said = (facts or {}).get("legs") or (False, True, "")   # #1235: the macOS legs, read from the rollup
+            if ci in ("green", "passing") and applies and not legs_ok:
+                row.update(status="missing", missing=["CI is green at %s but %s" % ((head or "?")[:8], legs_said)])
+            elif ci in ("green", "passing"):
+                row.update(status="ok", detail="CI %s at %s%s" % (ci, (head or "?")[:8], "; ubuntu legs green at the head, " + legs_said if applies else ""))
             elif (facts or {}).get("draft") is True and ci == "none":   # #770: a draft whose workflow skips drafts has no run at all, and "CI is failing" sends the author the wrong way; a draft WITH runs keeps the failing line
                 row.update(status="missing", missing=["draft: no CI run seen; this repo's workflow may skip drafts; mark ready, then wait"])
             else:
