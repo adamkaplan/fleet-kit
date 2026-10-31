@@ -39,6 +39,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `brief_advisory.py` | 0 | the pure rules that read an impact brief for the advisory case, the Decisions row and the held-body rationale line (#1215) | |
 | `charter_check.py` | 0 | the one check of the endpoints of a command that moves or copies between charters | |
 | `ci_runs.py` | 0 | the newest run of each check decides the CI verdict | |
+| `cloud_end_alert.py` | 0 | the pass that reads the launcher's audit file and tells a cloud worker's boss and the Chief of Staff, once per run and reason, that the launcher ended it (ask #1480; the send function and the bounded parse are handed in) | |
 | `cloud_quick.py` | 0 | the shared selection helper of the cloud pre-push quick mode: picks the tests that read the changed files, holds the scan list and the heavy-test list, resolves a scan selector (standard library only) | |
 | `closed_labels.py` | 0 | a closed issue never keeps asking for an answer | |
 | `dead_hint.py` | 0 | what is known about a dead agent and what to do about it (pure text) | |
@@ -52,6 +53,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `path_walk.py` | 0 | one walk up from a trusted path, shared by the cloud launcher and the installer | |
 | `repo_exclusion.py` | 0 | repositories the owner keeps out of the fleet's view are never watched or read | |
 | `report_fold.py` | 0 | folding a report into an earlier send | |
+| `launch_brief_check.py` | 0 | `launch --issue N` refuses a brief that names another issue or a stale PR head, before anything starts (#1350) | |
 | `resume_brief.py` | 0 | a brief given to `launch --resume` is delivered or the command says it was not | |
 | `cloud_channel.py` | 1 | the receiving end of a message between two cloud agents | |
 | `cloud_relay.py` | 2 | the hub half of pod, hub and daemon calls for report, prove, verdict and gates: a bounded in-memory queue and the refusals | |
