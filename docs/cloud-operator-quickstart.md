@@ -555,3 +555,33 @@ Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-
 The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
 
 **What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
+
+## A worker lost with its node
+
+**Cause: inferred until these reads are made.** On 29 October four pods that sat on one node were killed in the same second (the event `Killing: Stopping container worker`, no other event) while pods on other nodes were untouched, and the launcher's audit has no stop line for them. The cause is INFERRED to be the removal or disturbance of that node. The launcher's own login cannot read nodes (it may not list them), so the holder of the ADMINISTRATOR login confirms the cause with these read-only commands (placeholders in capitals):
+
+```
+kubectl get events --all-namespaces --field-selector involvedObject.kind=Node
+kubectl describe node NODE_NAME
+kubectl get pods --all-namespaces -o wide
+kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml
+az aks nodepool show --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME --name NODEPOOL_NAME
+az aks nodepool list --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME
+az monitor activity-log list --resource-group RESOURCE_GROUP_NAME --start-time START_TIME --end-time END_TIME
+```
+
+Also read the API server's audit log of pod deletes in the window through the cloud's log query (a query such as `AUDIT_LOG_QUERY` over the diagnostic logs, which names who deleted each pod). Read the Events, Conditions and Taints parts of `kubectl describe node`.
+
+The alternative causes and the read that rules each in or out:
+
+- A person's delete or another operator's cleanup: the audit log of pod deletes names the requester.
+- An eviction for node pressure: the event says `Evicted`, not `Killing`, and the pod is Failed.
+- The autoscaler's scale-down: the node would be gone; the status record and the node events confirm or rule it out.
+- A reboot, a drain or an image upgrade: the node survives; the node pool's recent operations, the node's events and conditions confirm it.
+- A taint eviction after the node was NotReady: the node events say not ready and the taints show it.
+
+**What the annotation does.** Every pod the launcher renders (a worker, a stack worker, and an orchestrator) carries `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`. It protects ONLY against the autoscaler's scale-down. It does not protect against a node upgrade or maintenance eviction (only a pod disruption budget limits those, a separate cluster-wide object this change does not add), a reboot, a drain for an upgrade, a node failure, a taint eviction or a spot eviction.
+
+**What it costs.** A node that holds a worker is not scaled down until the worker ends: an idle worker ends at its idle limit (`--idle`), a worker at its hard limit, at most the maximum hard limit (8 hours by default), and a pod the reaper cannot end at the cluster-side deadline floor (the maximum hard limit plus five minutes). A persistent orchestrator has no deadline: once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives.
+
+**What is saved.** The pre-stop hook (`cw-prestop`) pushes unpushed work to the worker's `wip` branch when the pod is deleted, but no stop line and no run record is written. A worker lost with its node is told apart from one the launcher stopped by the cloud end alert of ask 1480 (pull request 1486), which reports a created worker whose pod is gone with no stop line as a gone pod after that ask's own waiting rule.

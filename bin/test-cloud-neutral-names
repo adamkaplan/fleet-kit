@@ -43,6 +43,14 @@ CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/gcm.sh" >"$t/o" 2>&1; 
 printf 'export GCM_OTHER\nexport GCM_INTERACTIVE_X\nexport XGCM_INTERACTIVE\nexport MADE_UP\n' > "$t/gcm2.sh"
 CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/gcm2.sh" >"$t/o" 2>&1; rc=$?
 [ $rc = 1 ] && [ "$(grep -c '^name without the cw prefix' "$t/o")" = 4 ] && ok "other cw-less names, near-misses included, still fail" || bad "near-miss names rc=$rc"
+# #1519: the exact platform key passes; another key of its family is still refused; a family-admitting mutant is caught
+fam='cluster-autoscaler.kubernetes.io/scale-down-disabled'
+fampy='import sys,importlib.machinery as m,importlib.util as u;l=m.SourceFileLoader("c",sys.argv[1]);s=u.spec_from_loader("c",l);c=u.module_from_spec(s);l.exec_module(c);sys.exit(0 if c.STD.match(sys.argv[2]) else 1)'
+python3 -c "$fampy" $chk cluster-autoscaler.kubernetes.io/safe-to-evict && ok "the exact autoscaler key is standard" || bad "exact autoscaler key refused"
+python3 -c "$fampy" $chk "$fam" && bad "another autoscaler key was admitted" || ok "another autoscaler key is still refused"
+sed 's#cluster-autoscaler\\.kubernetes\\.io/safe-to-evict#cluster-autoscaler\\.kubernetes\\.io/.*#' $chk > "$t/fam"
+grep -q 'io/\.\*)\$' "$t/fam" && ok "family mutant applied" || bad "family mutant not applied"
+python3 -c "$fampy" "$t/fam" "$fam" && ok "the family mutant admits the other key (caught)" || bad "family mutant not caught"
 # mutant: a check that exempts every name must fail the rows above
 sed 's/and name not in GIT_STANDARD_ENV:/and False:/' $chk > "$t/mut"; chmod +x "$t/mut"; sed -i.bak 's#^ROOT = .*#ROOT = "'"$PWD"'"#' "$t/mut"
 CLOUD_BANNED_WORDS_FILE="$t/list" "$t/mut" --extra-source "$t/gcm2.sh" >"$t/o" 2>&1; [ $? = 1 ] && bad "the exempt-everything mutant was not caught" || ok "the exempt-everything mutant is caught"

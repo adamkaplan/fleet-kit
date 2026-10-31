@@ -569,3 +569,33 @@ The App already holds checks: read (the owner confirmed it on 29 October), so th
 A passing failure of the preflight's mint (the vault command, a network error or timeout, an HTTP 5xx or 429 answer, or a 403 with a Retry-After) is retried inside the preflight: 4 tries, with waits of 2, 5 and 10 seconds between them, one line on standard error per retry (`mint try N of 4 failed: <reason>; trying again in S seconds`, never a value); a Retry-After over 10 seconds ends the retries at once. A refusal (a 404, a 422, a 403 without Retry-After, any `refusing:` check, the expiry or permission checks) is never retried: it ends after one try. A launch that still cannot mint says its tries and the last reason (`no token could be minted after 4 tries: <reason>`) and writes one audit line (action `create.failed`, reason `preflight: ...`) through the launcher's own audit file.
 
 The launch's own mint of the pod's git token runs a command (`app_token.py`, or `CW_GIT_TOKEN_CMD`): `app_token.py` exits with status 75 for a passing failure (the vault command, a network error or timeout, an HTTP 5xx or 429 answer, or a 403 with a Retry-After) and keeps its old status for every refusal. The launch retries the command only on status 75: up to 4 tries with waits of 2, 5 and 10 seconds, one line on standard error per retry (`git token try N of 4 failed: <last line>; trying again in S seconds`, never a value), and a final refusal that says `after 4 tries`; a Retry-After over 10 seconds cannot be read from an exit status, so it does not end the retries early. A custom token command is retried only when it exits with 75; a command that exits with any other status is never retried.
+
+## A worker lost with its node
+
+**Cause: inferred until these reads are made.** On 29 October four pods that sat on one node were killed in the same second (the event `Killing: Stopping container worker`, no other event) while pods on other nodes were untouched, and the launcher's audit has no stop line for them. The cause is INFERRED to be the removal or disturbance of that node. The launcher's own login cannot read nodes (it may not list them), so the holder of the ADMINISTRATOR login confirms the cause with these read-only commands (placeholders in capitals):
+
+```
+kubectl get events --all-namespaces --field-selector involvedObject.kind=Node
+kubectl describe node NODE_NAME
+kubectl get pods --all-namespaces -o wide
+kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml
+az aks nodepool show --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME --name NODEPOOL_NAME
+az aks nodepool list --resource-group RESOURCE_GROUP_NAME --cluster-name CLUSTER_NAME
+az monitor activity-log list --resource-group RESOURCE_GROUP_NAME --start-time START_TIME --end-time END_TIME
+```
+
+Also read the API server's audit log of pod deletes in the window through the cloud's log query (a query such as `AUDIT_LOG_QUERY` over the diagnostic logs, which names who deleted each pod). Read the Events, Conditions and Taints parts of `kubectl describe node`.
+
+The alternative causes and the read that rules each in or out:
+
+- A person's delete or another operator's cleanup: the audit log of pod deletes names the requester.
+- An eviction for node pressure: the event says `Evicted`, not `Killing`, and the pod is Failed.
+- The autoscaler's scale-down: the node would be gone; the status record and the node events confirm or rule it out.
+- A reboot, a drain or an image upgrade: the node survives; the node pool's recent operations, the node's events and conditions confirm it.
+- A taint eviction after the node was NotReady: the node events say not ready and the taints show it.
+
+**What the annotation does.** Every pod the launcher renders (a worker, a stack worker, and an orchestrator) carries `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`. It protects ONLY against the autoscaler's scale-down. It does not protect against a node upgrade or maintenance eviction (only a pod disruption budget limits those, a separate cluster-wide object this change does not add), a reboot, a drain for an upgrade, a node failure, a taint eviction or a spot eviction.
+
+**What it costs.** A node that holds a worker is not scaled down until the worker ends: an idle worker ends at its idle limit (`--idle`), a worker at its hard limit, at most the maximum hard limit (8 hours by default), and a pod the reaper cannot end at the cluster-side deadline floor (the maximum hard limit plus five minutes). A persistent orchestrator has no deadline: once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives.
+
+**What is saved.** The pre-stop hook (`cw-prestop`) pushes unpushed work to the worker's `wip` branch when the pod is deleted, but no stop line and no run record is written. A worker lost with its node is told apart from one the launcher stopped by the cloud end alert of ask 1480 (pull request 1486), which reports a created worker whose pod is gone with no stop line as a gone pod after that ask's own waiting rule.

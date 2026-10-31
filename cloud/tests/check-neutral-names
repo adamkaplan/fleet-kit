@@ -102,7 +102,7 @@ def build_surfaces(out, build_log):
     return pod
 
 
-STD = re.compile(r"^(app|azure\.workload\.identity/.*|kubernetes\.io/.*|app\.kubernetes\.io/.*)$")
+STD = re.compile(r"^(app|azure\.workload\.identity/.*|kubernetes\.io/.*|app\.kubernetes\.io/.*|cluster-autoscaler\.kubernetes\.io/safe-to-evict)$")
 
 
 def prefix_misses(pod):

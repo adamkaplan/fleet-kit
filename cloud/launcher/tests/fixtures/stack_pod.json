@@ -4,6 +4,7 @@
     "kind": "Pod",
     "metadata": {
       "annotations": {
+        "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
         "cw/hard-deadline": "2026-10-14T14:00:00Z",
         "cw/idle-seconds": "600",
         "cw/max-hard": "2026-10-14T20:00:00Z",
@@ -151,6 +152,7 @@
     "kind": "Pod",
     "metadata": {
       "annotations": {
+        "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
         "cw/hard-deadline": "2026-10-14T14:00:00Z",
         "cw/idle-seconds": "600",
         "cw/max-hard": "2026-10-14T20:00:00Z",
