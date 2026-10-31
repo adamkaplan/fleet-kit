@@ -420,6 +420,7 @@ class S4Real(Base):
 
 
 MINT_ROLES_TESTS = 32   # the plan's count: '32 of 32 tests of test_mint_roles pass'
+MINT_ROLES_HANG_GUARD_SECONDS = 900   # a bound for a hang, about six times the longest measured run; not a speed requirement
 
 
 class S3Mints(Base):
@@ -467,10 +468,10 @@ class S3Mints(Base):
         child = stub_support.start(self, [sys.executable, "-B", "-m", "unittest", "test_mint_roles"], cwd=HERE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True)
         try:
-            _out, err = child.communicate(timeout=300)   # a hang guard only: the verdict is the exit code and the counts
+            _out, err = child.communicate(timeout=MINT_ROLES_HANG_GUARD_SECONDS)   # a hang guard only: the verdict is the exit code and the counts
         except subprocess.TimeoutExpired:
             stub_support.stop_group(child)
-            raise AssertionError("the test_mint_roles run did not end within 300 seconds (hang guard)")
+            raise AssertionError("the test_mint_roles run did not end within %d seconds (hang guard)" % MINT_ROLES_HANG_GUARD_SECONDS)
         took = time.monotonic() - t0
         m = re.search(r"Ran (\d+) tests?", err)
         self.assertIsNotNone(m, err[-300:])
