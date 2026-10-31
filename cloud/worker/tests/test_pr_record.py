@@ -53,6 +53,7 @@ class T(unittest.TestCase):
             shutil.copy(os.path.join(WORKER, src), os.path.join(self.share, name))
         subprocess.run(["git", "init", "-q", self.work], check=True)
         subprocess.run(["git", "-C", self.work, "remote", "add", "origin", "https://github.com/%s.git" % P.REPO], check=True)
+        self.cw = P.bound_client(self.d, "cw-gh-bound", P.BRANCH)
         P.PRS.clear()
         P.PRS[CREATED] = P.pr()
         P.PRS[8] = P.pr(head="other-branch")
@@ -74,7 +75,7 @@ class T(unittest.TestCase):
         return r.stdout
 
     def create(self, entry=ENTRYPOINT, **extra):
-        return self.start("python3", CW_GH, "pr", "create", "--title", "t", "--body", "b", "--head", P.BRANCH, "--base", "main", entry=entry, **extra)
+        return self.start("python3", self.cw, "pr", "create", "--title", "t", "--body", "b", "--head", P.BRANCH, "--base", "main", entry=entry, **extra)
 
     def guard(self, record, line):
         env = {"PATH": "/usr/bin:/bin"}
@@ -112,7 +113,7 @@ class T(unittest.TestCase):
         path = self.record_path()
         self.assertEqual(self.create().returncode, 0)
         P.H.seen = []
-        r = self.start("python3", CW_GH, "pr", "edit", str(CREATED), "--body-file", self.body)
+        r = self.start("python3", self.cw, "pr", "edit", str(CREATED), "--body-file", self.body)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(P.patches()), 1)
         self.assertTrue(os.path.isfile(path))
@@ -152,7 +153,7 @@ class T(unittest.TestCase):
         open(rec, "w").write(numbers)
         P.H.seen = []
         env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "CW_GH_API_BASE": self.base, "GH_TOKEN": P.TOKEN, "CW_BRANCH": P.BRANCH, "CW_PR_RECORD": rec}
-        r = subprocess.run([sys.executable, CW_GH, "pr", "edit", str(n), "--body-file", self.body], env=env, capture_output=True, text=True,
+        r = subprocess.run([sys.executable, self.cw, "pr", "edit", str(n), "--body-file", self.body], env=env, capture_output=True, text=True,
                            cwd=self.work, timeout=60, stdin=subprocess.DEVNULL)
         self.assertNotIn(P.TOKEN, r.stdout + r.stderr)
         return r
@@ -167,7 +168,7 @@ class T(unittest.TestCase):
         self.assertEqual(len(P.patches()), 1)
 
     def test_s15_a_mutant_restoring_the_record_alone_edits_the_forged_number(self):
-        src = open(CW_GH).read()
+        src = open(self.cw).read()
         old = "or not (mine and head == mine):"
         self.assertEqual(src.count(old), 1)
         mut = os.path.join(self.d, "cw-gh-mutant")
@@ -248,7 +249,7 @@ class T(unittest.TestCase):
             self.assertEqual(r["kind"], "denied")
             self.assertTrue(G.guard_denies(r["example"]), r["id"])
             P.H.seen = []
-            c = subprocess.run([sys.executable, CW_GH] + r["example"].split(), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+            c = subprocess.run([sys.executable, self.cw] + r["example"].split(), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
                                env={"PATH": "/usr/bin:/bin", "CW_GH_API_BASE": self.base, "GH_TOKEN": P.TOKEN, "HOME": "/nonexistent"})
             self.assertEqual(c.returncode, 2, (r["id"], c.stderr))
             self.assertEqual(P.patches(), [])
