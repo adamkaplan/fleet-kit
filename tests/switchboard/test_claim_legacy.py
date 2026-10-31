@@ -43,6 +43,10 @@ class TestClaimLegacy(unittest.TestCase):
         self.fx.merged_iso = lambda after=0: iso(self.fx.world.clock.now() + after)
         self.assertIn("S3", self.fx.refusal([("merged", "S2 U1")]))   # a recorded claim narrows: S3 stays uncovered
 
+    def test_the_shape_of_1675_a_sibling_merged_on_25_october_with_no_recorded_claim_passes_with_no_waiver(self):
+        self.assertIsNone(self.judge("2026-10-25T17:57:00Z"))
+        self.assertIn("no recorded claim", self.judge("2026-10-30T00:00:00Z"))   # the same shape after the cutoff is still refused
+
     def test_s3_after_the_cutoff_or_unreadable_the_sibling_is_still_unknown(self):
         for when in (iso(CUTOFF + 86400 * 30), "not a time", "2026-10-29"):
             why = self.judge(when)
