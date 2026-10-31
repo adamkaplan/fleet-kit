@@ -1,0 +1,21 @@
+== TestMadeUpPids TestSupportRebinding TestEveryViewDerivesFromTheRegistry TestHygiene
+Ran 45 tests in 67.974s
+OK
+== TestPR8Source TestPR10Source TestOneCharter TestRecordJsonReaders TestEachThingOnce TestAgentRegistryInventory TestTheBinSetClassesAreAllInTheTable
+Ran 94 tests in 78.182s
+OK
+== TestAssembler TestArchitectureDocument TestGitShim TestDeliveryLag TestSentView TestLaunch TestHeavyWatchdog
+Ran 401 tests in 54.933s
+OK (skipped=1)
+== files
+Ran 27 tests in 17.041s
+
+OK
+from closure_roots alone: definitions 245 over the entry, 415 over the entry and the parts; bindings 223 over the entry, 360 over the entry and the parts
+closure definitions: 502 over the entry and 28 parts (entry alone: 340); 18 parts hold a definition or a binding of it
+from closure_roots alone: definitions 245 over the entry, 415 over the entry and the parts; bindings 223 over the entry, 360 over the entry and the parts
+derive rc=0
+Ran 4 tests in 40.840s
+
+OK
+DONE
