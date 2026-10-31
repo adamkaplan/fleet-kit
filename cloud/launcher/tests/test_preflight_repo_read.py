@@ -282,5 +282,113 @@ class S7Mutants(Base):
         self.assertEqual(line, "S7 docs: 2 of 2 sentences found, old sentence 0 of 1")
 
 
+
+WRAPPER = '''import os, runpy, sys
+os.environ["CW_GITHUB_API_BASE"] = %r
+os.environ["CW_PREFLIGHT_TOKEN_CMD"] = %r
+sys.path.insert(0, %r)
+sys.argv = [%r] + sys.argv[1:]
+runpy.run_path(%r, run_name="__main__")
+'''
+LAUNCH_DRIVER = '''import os, sys
+sys.path.insert(0, %r)
+sys.path.append(%r)
+import run_task
+run_task.cw.PREFLIGHT_ARGV = [sys.executable, %r]
+sys.exit(run_task.main())
+'''
+
+
+class S4Real(Base):
+    """S4 made real: ONE launch (the operator driver, run_task.main) runs the REAL preflight.py through the launcher's PREFLIGHT_ARGV hook (the child's own
+    environment is scrubbed, so a small wrapper sets the fake's API base and the marker token command, then runs the real program); the launch then really
+    creates and stops a worker on the fake cluster; the five places of THAT launch and the preflight's output are scanned."""
+
+    def launch(self, program_dir, planted_in_audit=False):
+        sys.path.insert(0, HERE)
+        import test_driver as td
+        drv = td.Driver("test_s5_a_normal_end_runs_the_task_stops_the_worker_and_cleans_up")
+        drv.setUp()
+        self.addCleanup(drv.tmp.cleanup)
+        d = drv.tmp.name
+        prog = os.path.join(program_dir, "preflight.py")
+        wrapper, driver = os.path.join(d, "wrap_preflight.py"), os.path.join(d, "drive.py")
+        with open(wrapper, "w") as f:
+            f.write(WRAPPER % (self.base, "echo " + MARKER, program_dir, prog, prog))
+        with open(driver, "w") as f:
+            f.write(LAUNCH_DRIVER % (program_dir, os.path.join(REPO_ROOT, "bin"), wrapper))
+        rec = os.path.join(d, "records")
+        os.makedirs(rec)
+        Fake.detail, Fake.paths, Fake.orgs = "ok", [], 0
+        args = [sys.executable, driver] + drv.args()[2:]
+        p = subprocess.run(args, env=dict(drv.denv, CW_RUN_RECORD_DIR=rec), capture_output=True, text=True, timeout=90)
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        st = drv.st()
+        applied = st["applied"]
+        pods = [o for o in applied if o["kind"] == "Pod"]
+        self.assertEqual(len(pods), 1)
+        places = {"pod spec": json.dumps(pods[0]),
+                  "per-run Secrets": json.dumps([o for o in applied if o["kind"] == "Secret"] + [st.get("run_secrets", {})]),
+                  "pod environment": json.dumps(pods[0]["spec"]["containers"][0]["env"]),
+                  "audit file": drv.read(drv.env["CW_CLOUD_AUDIT"])}
+        recs = []
+        for root, _, names in os.walk(rec):
+            for n in names:
+                with open(os.path.join(root, n), errors="replace") as f:
+                    recs.append(f.read())
+        self.assertTrue(recs, "no run record was written offline")
+        places["run record"] = "\n".join(recs)
+        places["preflight output"] = out   # the driver prints the preflight's result line and its refusal text; the launch's whole output
+        ran = sum(1 for x in Fake.paths if x == "/repos/%s/rulesets/9" % REPO)
+        self.assertIn("preflight: preflight ok", out)
+        return places, ran
+
+    FIVE = ("pod spec", "per-run Secrets", "pod environment", "audit file", "run record")
+
+    def test_S4_real_the_preflight_runs_in_one_launch_and_nothing_is_in_five_places(self):
+        places, ran = self.launch(LAUNCHER)
+        marker = sum(places[k].count(MARKER) for k in self.FIVE)
+        answer = sum(places[k].count(ANSWER) for k in places)
+        pfout = places["preflight output"].count(MARKER) + places["preflight output"].count(ANSWER)
+        line = ("S4 real: preflight ran in the launch %d of 1 (requests to the repository-level path %d), marker occurrences in 5 places %d, "
+                "answer text occurrences %d, preflight output occurrences %d" % (1 if ran else 0, ran, marker, answer, pfout))
+        print(line)
+        self.assertEqual(line, "S4 real: preflight ran in the launch 1 of 1 (requests to the repository-level path 1), marker occurrences in 5 places 0, "
+                               "answer text occurrences 0, preflight output occurrences 0")
+
+    def test_S4_real_mutant_a_launcher_that_writes_the_preflight_result_into_the_audit_is_found(self):
+        d = os.path.join(self.tmp.name, "mut", "cloud", "launcher")
+        os.makedirs(d)
+        os.makedirs(os.path.join(self.tmp.name, "mut", "bin"))
+        shutil.copy(os.path.join(REPO_ROOT, "bin", "path_walk.py"), os.path.join(self.tmp.name, "mut", "bin"))   # the launcher finds it by its own place
+        for n in os.listdir(LAUNCHER):
+            if n.endswith(".py") or n == "repo-approvals.json":
+                shutil.copy(os.path.join(LAUNCHER, n), d)
+        # the result line of the preflight carries the token command (the planted text) and the launcher writes that line into the audit file
+        old_pf = '        say("preflight ok: " + ", ".join(sorted(t for t in types if isinstance(t, str))) + warn_tail)\n'
+        new_pf = '        say("preflight ok: " + ", ".join(sorted(t for t in types if isinstance(t, str))) + warn_tail + " " + os.environ.get("CW_PREFLIGHT_TOKEN_CMD", ""))\n'
+        old_cw = "    return scrub(lines[-1], (), 300)\n\n\n# ----------------------------------------------------------------"
+        new_cw = ("    write_audit(audit_path(env), {\"action\": \"preflight\", \"reason\": lines[-1]})\n"
+                  "    return scrub(lines[-1], (), 300)\n\n\n# ----------------------------------------------------------------")
+        applied = 0
+        for name, old, new in (("preflight.py", old_pf, new_pf), ("cloud_worker.py", old_cw, new_cw)):
+            path = os.path.join(d, name)
+            with open(path) as f:
+                text = f.read()
+            self.assertEqual(text.count(old), 1, name)
+            applied += 1
+            with open(path, "w") as f:
+                f.write(text.replace(old, new))
+        places, ran = self.launch(d)
+        in_audit = places["audit file"].count(MARKER) + places["audit file"].count(ANSWER)
+        found = sum(places[k].count(MARKER) for k in self.FIVE)
+        fails = 1 if found != 0 else 0   # the S4 real assertion (zero in 5 places) fails on the mutant
+        line = "S4 real mutant: marker/answer occurrences in audit %d, test fails %d of 1, mutation applied %s" % (in_audit, fails, applied == 2)
+        print(line)
+        self.assertEqual(line, "S4 real mutant: marker/answer occurrences in audit 1, test fails 1 of 1, mutation applied True")
+
+
+
 if __name__ == "__main__":
     unittest.main()
