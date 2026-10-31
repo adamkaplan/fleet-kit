@@ -80,6 +80,8 @@ class TestMutant(unittest.TestCase):
             shutil.copytree(ROOT / "cloud" / "worker" / "tests", os.path.join(d, "cloud", "worker", "tests"), ignore=shutil.ignore_patterns("__pycache__"))
             os.makedirs(os.path.join(d, "cloud", "launcher", "tests"))
             shutil.copy(__file__, os.path.join(d, "cloud", "launcher", "tests"))
+            shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_lookup.py", os.path.join(d, "cloud", "launcher", "tests"))
+            shutil.copy(ROOT / "cloud" / "launcher" / "tests" / "cw_cases_vault.py", os.path.join(d, "cloud", "launcher", "tests"))
             Path(d, "bin", "cloud_worker.py").write_text(mutant)
             res = subprocess.run([sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name),
                                   "TestHubSession.test_s2_s3_orchestrator_without_the_setting_gives_the_entry_the_session_once"],
