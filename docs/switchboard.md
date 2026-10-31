@@ -6401,6 +6401,15 @@ The ask header a message carries (an issue's Intent, Done-when, state, `updated_
 - Restart: the command-line processes use the cache at once, with no restart. The daemon needs a restart only for its own invalidation call (the events above); until then entries age out as stated. The daemon's own reads do not use the file cache.
 - Writers that bypass `_gh_write` (`write_issue_body`, a runner call near line 20343, `handoff.py`, the `switchboard-trial` label edit) leave a stale entry; the age bounds it (10 minutes open, 24 hours closed); a follow-up will give them one drop helper.
 
+## `pins`: the existing tests your diff may contradict (#1543)
+
+A cloud pod has no `heavy` and cannot run the whole suite, so an existing test that pins the old behaviour first fails in the full CI run, and each case then costs a plan amendment, a new approval and a new pod.
+
+- **What it lists.** `fleet-switchboard pins [--base REF]` (default `origin/integration`) reads the `git diff` of the checkout against the base. For each existing test under `tests/`, the `bin/test-*` files, `cloud/launcher/tests/`, `cloud/worker/tests/` and `cloud/tests/` that names a function, class or constant the diff changes or removes, or a quoted message of 12 characters or more of a removed or changed line, it prints one line: `file:line  Class::test  matched <term>`, then a count line. It never lists a test the diff itself adds, prints at most 200 lines and says when it cut. A diff with no match prints `no existing test names a changed definition or message`.
+- **It only reads.** It runs `git diff` and `git grep` over the checkout: no network, no write. It exits 0 whatever it finds, and non-zero only when the diff cannot be read. It does not run the tests and does not decide that a listed test is contradicted.
+- **What it also says.** A test in a file the diff changes lists itself when its own hunk's def is named (the hunk's function is a term). A deleted file is read from its old side, so its removed definitions count. More than 300 names or messages are not all searched, and it prints `cut: N names / M messages not searched`. A quoted message needs a non-space character. It reads from the repository's toplevel, so a run from a subdirectory lists the same tests.
+- **What to run besides.** A test in a file you changed can list itself (its hunk's own def is a term): run what you edited too. The terms are searched 50 at a time within about 100 seconds; on a timeout it prints `cut: search timed out: N of M terms not searched` and still exits 0 with what it found. A diff whose headers it cannot read (a quoted path) is non-zero, never a clean answer.
+- **What a builder does.** Run the listed classes before you push (`fleet-switchboard heavy --short -- ...`), and say in the pull request which listed tests the change legitimately contradicts.
 
 ## `sent`: what became of the messages you sent (#1550)
 

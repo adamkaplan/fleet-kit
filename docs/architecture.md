@@ -122,6 +122,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/plan_input.py` | 5 | `plan check` and `plan template`: where a plan is read from, and the plan loaded | |
 | `switchboard/review_laws_install.py` | 5 | `review-laws install`: the review laws copied into a repository | |
 | `switchboard/pr_explain.py` | 5 | `pr-explain` and the checks of a held pull request body | |
+| `switchboard/pins.py` | 5 | `pins`: the existing tests that name what the diff changes or removes (read-only) | |
 | `switchboard/sent_view.py` | 5 | `sent`: a sender's own recent messages with their sent, delivered and picked-up times | |
 | `switchboard/v2_transport.py` | 1 | the OpenCode v2 client and its HTTP transport | |
 | `switchboard/jev.py` | 1 | the Jev client: the decision model, the classifier and the policy judge's questions | |
@@ -209,6 +210,7 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/plan_input.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/review_laws_install.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/pr_explain.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/pins.py` | `fleet-switchboard` | entry-import | 1 | the part's module-level patterns use the entry's `re`; its other standard-library imports are inside its functions, so the clear's closure does not reach the part |
 | `switchboard/sent_view.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/reminders.py` | `fleet-switchboard` | entry-import | 12 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 34 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
