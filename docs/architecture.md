@@ -43,6 +43,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_quick.py` | 0 | the shared selection helper of the cloud pre-push quick mode: picks the tests that read the changed files, holds the scan list and the heavy-test list, resolves a scan selector (standard library only) | |
 | `closed_labels.py` | 0 | a closed issue never keeps asking for an answer | |
 | `dead_hint.py` | 0 | what is known about a dead agent and what to do about it (pure text) | |
+| `header_cache.py` | 0 | the shared file cache of the ask header (Intent, Done-when, state, updated_at, parent): one file per issue, ages, bounds (#1520) | |
 | `impact_brief.py` | 0 | the impact brief: what a held change can do, built from the diff and the records only (pure, no clock, no network) (#1215) | |
 | `lost_worker.py` | 0 | a lost worker is told once to its lane and the Chief of Staff, with its cause (#1481) | |
 | `merged_labels.py` | 0 | a merged pull request does not keep its hold | |
@@ -53,6 +54,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `path_walk.py` | 0 | one walk up from a trusted path, shared by the cloud launcher and the installer | |
 | `repo_exclusion.py` | 0 | repositories the owner keeps out of the fleet's view are never watched or read | |
 | `report_fold.py` | 0 | folding a report into an earlier send | |
+| `launch_brief_check.py` | 0 | `launch --issue N` refuses a brief that names another issue or a stale PR head, before anything starts (#1350) | |
 | `resume_brief.py` | 0 | a brief given to `launch --resume` is delivered or the command says it was not | |
 | `cloud_channel.py` | 1 | the receiving end of a message between two cloud agents | |
 | `cloud_relay.py` | 2 | the hub half of pod, hub and daemon calls for report, prove, verdict and gates: a bounded in-memory queue and the refusals | |
@@ -323,3 +325,6 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `registry.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `registry.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `registry.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `header_cache.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `header_cache.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `header_cache.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
