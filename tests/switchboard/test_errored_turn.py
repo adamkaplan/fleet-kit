@@ -106,16 +106,18 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             self.assertNotIn("idle after a provider error", real[0])
 
         def test_s5_m1_every_error_case_read_blocked_fails_the_table(self):
+            self.check_table()
             with mock.patch.object(sb, "PROVIDER_ERROR", sb.re.compile(r"(?!x)x")):
-                with self.assertRaises(AssertionError):
+                with self.assertRaisesRegex(AssertionError, r"^0 != 3"):
                     self.check_table()
 
         def test_s5_m2_a_real_prompt_read_idle_with_error_fails_the_table(self):
             def always(engine, observation, now):
                 observation.errored = observation.status == "blocked"
                 return observation.errored
+            self.check_table()
             with mock.patch.object(sb, "read_errored_turn", always):
-                with self.assertRaises(AssertionError):
+                with self.assertRaisesRegex(AssertionError, r"^0 != 4"):
                     self.check_table()
 
         def counted(self):
