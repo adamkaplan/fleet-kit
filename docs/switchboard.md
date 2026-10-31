@@ -6413,6 +6413,15 @@ The install records the tree it is run from. Run from a feature-branch worktree 
 - A local default branch ahead of `origin/<default>` is refused as not an ancestor; the message says to push it or reset the branch, and that the origin ref may be stale (`git fetch origin`).
 - It never changes the tree: the operator does (see above).
 
+## Review bots at the head (#1625)
+
+A review bot is an account of type Bot (or a login ending `[bot]`); no list and no name is kept. Four statements:
+
+1. `gates` prints one `bot review:` line per bot: the login, its latest review state, the FIX and BLOCK counts and the head it was made at. A bot whose latest review is at an older head prints `older than the head ..., does not count`. The counts come from the `- [FIX]` and `- [BLOCK]` lines, checked against the first line (`<Name>: N findings (B BLOCK, F FIX, K NOTE)`); if they differ both are printed and the line says so; a body with neither prints `findings not read`, never zero. The lines come from the one reviews read `gates` already makes, and are information: the verdict, the READY text and the exit status do not change.
+2. A bot review with FIX or BLOCK findings at the pull request's current head wakes the orchestrator once per bot and head (the item is keyed by the bot and the head, not the review id; the summary is fixed words, never review text).
+3. The `gates ci-record` refusal names the pending job (workflow, job name, run id, state), through `ci_runs.not_green_jobs`.
+4. A check whose conclusion is success is never pending, whatever its status says; a check with no conclusion that is unfinished stays pending.
+
 ### What a new file under `bin/` demands (`tools/new-module-demands`, #1620)
 
 `tools/new-module-demands bin/x.py [bin/y.py ...]` prints one block per file: `guards:` (the classes `preflight-pr` runs for a new bin file, read from `NEW_BIN_GUARDS` in `bin/path_suites.py`), `authority code:` (yes or no, with the function names and role literals found by a copy of the two rules of the authority-modules guard, the vocabulary read from the impact matrix), `matrix:` (for yes, both entries to add, `owner_hold.top_tier_paths.authority` and the floor globs of the repository, with their JSON paths; never the exempt entry; for no, that no line is demanded), `units:` (the row to add to the Units table of `docs/architecture.md`) and `closure:` (the state of `tools/derive-closure --check`). It exits 0 for a block and 2 with one plain line for a path that is not under `bin/` or cannot be read.
