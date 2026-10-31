@@ -2,6 +2,7 @@
 Offline: the matcher is the repository's own (the one of test_guard_table.py: re.fullmatch of the pattern with '*' as '.*', re.S), not
 opencode's; the live check is a tester's job in a real pod. Mutants run on a scratch copy of the file."""
 import functools
+import hashlib
 import json
 import os
 import re
@@ -301,8 +302,8 @@ class Slices(unittest.TestCase):
         self.assertGreater(len(order_problems(blocks(conf)[1])), 0)
 
     def test_s6_the_wrapper_is_unchanged_and_the_documentation_says_it(self):
-        r = subprocess.run(["git", "diff", "origin/integration", "--", "cloud/worker/guard.sh"], cwd=ROOT, capture_output=True, text=True)
-        self.assertEqual(r.stdout, "")
+        digest = hashlib.sha256(open(os.path.join(WORKER, "guard.sh"), "rb").read()).hexdigest()   # the wrapper's content, not a diff against a branch (ask #1677)
+        self.assertEqual(digest, open(os.path.join(HERE, "guard.sha256")).read().strip())
         doc = open(os.path.join(ROOT, "docs", "cloud-worker-interface.md")).read()
         self.assertIn("only as a whole ref name or as the last part of a ref", doc)
         self.assertIn("The git wrapper `cloud/worker/guard.sh` reads refs exactly", doc)
