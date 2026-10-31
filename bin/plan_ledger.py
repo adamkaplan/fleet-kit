@@ -879,6 +879,21 @@ def review_records_at(entries, pr, head, expected=REVIEWERS_NOW):
     return {"expected": list(expected), "recorded": recorded, "uncited": uncited, "blocking": blocking, "missing": [r for r in expected if r not in recorded]}
 
 
+def approval_state(events, issue, current_hash):
+    """#1735, G0c: (status, detail) from the plan.approved events of `issue`, newest first, each {"plan_hash": ...}; None = they could not be read. Pure: it reads no file.
+    ok when an event holds the current hash; missing when none does (the detail names the current hash and the newest approved one) or the events were unreadable; n/a with no plan link."""
+    if not issue:
+        return "n/a", "the pull request has no plan link (G0a is the gate for that)"
+    if events is None:
+        return "missing", "the plan.approved events of %s could not be read in time: refused (fails closed)" % issue
+    seen = [e["plan_hash"] for e in events if isinstance(e, dict) and isinstance(e.get("plan_hash"), str)]
+    if current_hash and current_hash in seen:
+        return "ok", "approved at plan hash %s" % current_hash
+    if seen:
+        return "missing", "no approval of %s at its current plan hash %s; the newest approved hash is %s" % (issue, current_hash, seen[0])
+    return "missing", "no plan.approved event for %s (current plan hash %s)" % (issue, current_hash)
+
+
 def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     """The gate table for one PR. `plan` is {"result", "defects", "scenarios_parsed", "plan_hash"} from the plan checker
     (None when no plan could be found), `facts` is what `gh pr view` said (head, ci, captain, body, notice_senders).
@@ -896,8 +911,11 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
         if scope != "P":
             row["status"] = "n/a"
             row["detail"] = UNTRACKED_WHY.get(gid, "")
-        elif not tracked:
+        elif not tracked and not (gid == "G0c" and isinstance((facts or {}).get("approval"), dict)):   # #1735: G0c is tracked only where the repo enforces it (facts["approval"] is then set)
             row["detail"] = UNTRACKED_WHY.get(gid, "not recorded yet")
+        elif gid == "G0c":
+            status, said = approval_state(facts["approval"].get("events"), facts["approval"].get("issue"), (plan or {}).get("plan_hash"))
+            row.update(tracked=True, status=status, detail=said, missing=[said] if status == "missing" else [])
         elif gid == "G0a":
             if plan is None:
                 row.update(status="missing", missing=["no plan found: pass --plan, or put `PLAN: <link>` in the PR body"])
@@ -1115,9 +1133,9 @@ CHECK_FOR = ("ready", "merge")
 DEFAULT_BUDGET_MS = 3000
 BUDGET_RANGE = (500, 30000)
 # the gates each check requires, among those the engine tracks (G0b, G0c and G2/G3 are untracked and cannot refuse)
-REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G1", "G4", "G6", "G6b")}
+REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G0c", "G1", "G4", "G6", "G6b")}
 DEFAULT_ENFORCED = ("G0a", "G1")   # the gates a repo in `enforce` refuses on unless its `enforce_gates` says otherwise
-ENFORCEABLE = ("G0a", "G1", "G4", "G6", "G6b")
+ENFORCEABLE = ("G0a", "G0c", "G1", "G4", "G6", "G6b")
 EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
 
 
