@@ -3,14 +3,19 @@
 The fixtures and the base classes are those of bin/test-switchboard (HOST, set by its loader block). The moved methods of TestPR8Source and TestImpactHold are
 bound on two classes of their own that inherit the rest; the inherited tests are switched off there (None), so each test runs once, on its own class."""
 
+import types
+
 HOST = None   # set by bin/test-switchboard
 
 
 def load():
-    g = globals()
-    for key, value in vars(HOST).items():   # the code below reads the names of the entry file as its globals
-        if not key.startswith("__"):
-            g.setdefault(key, value)
+    """Run the body with the names of the entry file as ITS globals, in a namespace of its own: this module's globals are never written."""
+    namespace = {key: value for key, value in vars(HOST).items() if not key.startswith("__")}
+    namespace["HOST"] = HOST
+    return types.FunctionType(_body.__code__, namespace)()
+
+
+def _body():
     TestPR8Source, TestImpactHold = HOST.TestPR8Source, HOST.TestImpactHold
 
     def hostile_parser_cases():
