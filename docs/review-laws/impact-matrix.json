@@ -150,6 +150,7 @@
       ],
       "authority": [
         "bin/plan_ledger.py",
+        "bin/epic_record.py",
         "bin/impact_floor.py",
         "bin/chat_clear.py",
         "bin/merge_gate.py",
@@ -203,6 +204,7 @@
           "templates/**",
           "tools/cos-permissions-proof/**",
           "bin/plan_ledger.py",
+          "bin/epic_record.py",
           "bin/impact_floor.py",
           "bin/chat_clear.py",
           "bin/merge_gate.py",
@@ -816,6 +818,7 @@
         "bin/cloud_end_alert.py": "loaded only by `cloud_end_tick` and `cloud_turn_tick` (via `load_module`), both called only by `finish_pass` (after `cloud_watch_tick`), not by the clear",
         "bin/cloud_relay_daemon.py": "loaded only by `run_daemon`'s pass loop (`pass_if_configured`), not by the clear; it is still a top tier authority path (it writes ledger entries), so this lists only that the clear cannot reach it",
         "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
+        "bin/epic_record.py": "loaded only by the gates commands (gates, gates ask-close, item-gates) and the epic prove and verdict commands, never by the clear: no function the clear reaches calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
         "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
