@@ -81,6 +81,9 @@ def approval_refusal(args, runner, now):
         config = load_runnable_config()
         if not approval_on(config, repo):
             return None
+    except Exception:   # the gate is decided from the setting alone: whatever stops that read leaves the gate OFF, as before the change
+        return None
+    try:
         reading, gh = load_module("pr_reading"), merge_gate_gh(config, runner, repo)
         base = reading.read_pr(gh, repo, number)["base"]
         if base not in APPROVAL_BASES and base != reading.read_default_branch(gh, repo):

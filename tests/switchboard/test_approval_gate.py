@@ -345,3 +345,23 @@ class TestApprovalGateCommands(unittest.TestCase):
         row = self.row()
         self.assertEqual((row["status"], "could not be read" in row["detail"]), ("missing", True))
         self.assertRegex(self.refusal() or "", r"^merge of acme/app#9 refused: ")
+
+    def test_an_unreadable_config_leaves_the_gate_off_and_a_gate_on_repo_fails_closed(self):
+        before = self.h.run_as("coder", "merge-gate", self.h.PR, "--check", "--json")
+        with mock.patch.object(HOST.sb, "load_runnable_config", side_effect=ValueError("config broken")):
+            self.assertIsNone(self.refusal())
+        with mock.patch.object(HOST.sb, "approval_on", side_effect=RuntimeError("setting broken")):
+            self.assertIsNone(self.refusal())
+        self.assertEqual(self.h.run_as("coder", "merge-gate", self.h.PR, "--check", "--json"), before, "the merge-gate output is unchanged")
+        self.enforce()
+        with mock.patch.object(HOST.sb, "_ledger_context", side_effect=RuntimeError("ledger broken")):
+            self.assertRegex(self.refusal() or "", r"^merge of acme/app#9 refused: the plan approval could not be judged \(ledger broken\)")
+
+    def test_mutant_the_config_load_inside_the_fail_closed_try_is_caught(self):
+        old = "    except Exception:   # the gate is decided from the setting alone: whatever stops that read leaves the gate OFF, as before the change\n        return None\n    try:\n"
+        self.assertIsNone(self.refusal(), "control: the unmutated refusal, gate off")
+        with mock.patch.object(HOST.sb, "load_runnable_config", side_effect=ValueError("config broken")):
+            self.assertIsNone(self.refusal(), "control: the unmutated refusal, config unreadable")
+            mutant = mutated_refusal(old, "")   # the config load back inside the fail-closed try
+            with self.assertRaisesRegex(AssertionError, r"^'merge of acme/app#9 refused: the plan approval could not be judged \(config broken\); the gate fails closed' is not None$"):
+                self.assertIsNone(self.refusal_by(mutant))
