@@ -928,3 +928,153 @@ class TestGhShimMutationRoots(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- #1696 round 5: the shim matches the RAW path for a write (it never normalises toward a path the server will not use).
+READER_FORMS = ("repos/o/r/contents/x\\..\\..\\pulls/1/merge", "repos/o/r/contents/x%5c..%5c..%5cpulls/1/merge", "repos/o/r/contents/x%252f..%252f..%252fpulls/1/merge")
+CLEANING_CLASSES = {"backslash": "repos/o/r/pulls/1/merge\\", "percent": "repos/o/r/pulls/1/%6derge", "dot": "repos/o/r/pulls/./1/merge", "dotdot": "repos/o/r/x/../pulls/1/merge",
+                    "semicolon": "repos/o/r/pulls/1/merge;x", "tab": "repos/o/r/pulls/1/merge\t", "newline": "repos/o/r/pulls/1/merge\n", "space": "repos/o/r/pulls/1/merge ",
+                    "hash": "repos/o/r/pulls/1/merge#x", "double slash": "repos/o/r//pulls/1/merge", "trailing slash": "repos/o/r/pulls/1/merge/",
+                    "userinfo host": "https://u@api.github.com/repos/o/r/pulls/1/merge", "port host": "https://api.github.com:443/repos/o/r/pulls/1/merge",
+                    "dot host": "https://api.github.com./repos/o/r/pulls/1/merge", "upper host": "https://API.github.com/repos/o/r/pulls/1/merge"}
+PLAIN_WRITES = ("repos/o/r/pulls/1/merge", "/repos/o/r/pulls/1/merge", "https://api.github.com/repos/o/r/pulls/1/merge", "http://api.github.com/repos/o/r/pulls/1/merge",
+                "//api.github.com/repos/o/r/pulls/1/merge", "repos/o/r/pulls/1/merge?x=1%20y")
+
+
+def raw_line(done, calls, method="PUT"):
+    """The one raw-rule refusal: exactly one gh: line, anchored, and no call made."""
+    text = gh_err(done)
+    return not calls and len(text.splitlines()) == 1 and text.startswith("gh: refused: a gh api %s with a body" % method) and text.endswith("): " + RAW_LINE)
+
+
+class TestGhShimRawPath(unittest.TestCase):
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def reader_failures(self, rig):
+        return [form for form in READER_FORMS if not raw_line(*rig.run("api", "-X", "PUT", form, "-f", "message=m"))]
+
+    def mutant_rig(self, *pairs):
+        rig = hermetic_rig()
+        self.addCleanup(rig.close)
+        shim = rig.shims / "gh"
+        text = shim.read_text()
+        for old, new in pairs:
+            self.assertEqual(text.count(old), 1, "the mutant's anchor is gone: " + old)
+            text = text.replace(old, new, 1)
+        shim.write_text(text)
+        return rig
+
+    def test_the_three_reader_forms_are_refused_with_no_call(self):
+        for form in READER_FORMS:
+            with self.subTest(form=form):
+                done, calls = self.rig.run("api", "-X", "PUT", form, "-f", "message=m")
+                self.assertTrue(raw_line(done, calls), (gh_err(done), calls))
+        self.assertEqual(self.reader_failures(self.rig), [])   # control: 0
+
+    def test_every_cleaning_class_is_refused_for_a_write(self):
+        for name, path in CLEANING_CLASSES.items():
+            with self.subTest(cls=name):
+                done, calls = self.rig.run("api", "-X", "PUT", path, "-f", "merge_method=squash")
+                self.assertTrue(raw_line(done, calls), (gh_err(done), calls))
+
+    def test_the_plain_raw_paths_still_pass(self):
+        for path in PLAIN_WRITES:
+            with self.subTest(path=path):
+                args = ("api", "-X", "PUT", path, "-f", "merge_method=squash")
+                done, calls = self.rig.run(*args)
+                self.assertEqual([c["argv"] for c in calls], [list(args)], gh_err(done))
+        for path in ("repos/o/r/issues/1/comments", "/repos/o/r/issues/1/comments", "https://api.github.com/repos/o/r/issues/1/comments"):
+            with self.subTest(signed=path):
+                done, calls = self.rig.run("api", path, "-f", "body=x")
+                self.assertEqual(len(calls), 1, gh_err(done))
+                self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
+
+    def test_a_get_without_a_body_passes_on_any_path(self):
+        for path in list(CLEANING_CLASSES.values()) + list(READER_FORMS):
+            for extra in ((), ("-X", "GET"), ("--method=get",)):
+                with self.subTest(path=path, extra=extra):
+                    args = ("api", path) + extra
+                    done, calls = self.rig.run(*args)
+                    self.assertEqual([c["argv"] for c in calls], [list(args)], gh_err(done))
+
+    def test_get_graphql_with_a_field_is_refused_and_without_passes(self):
+        query = "query=query { viewer { login } }"
+        forms = (("-X", "GET", "-f", query), ("--method=get", "-f", query), ("--method", "get", "-F", query), ("-XGET", "--field=" + query), ("-X", "GET", "--raw-field", query),
+                 ("-X", "GET", "--input", self.input_file('{"query":"query{a}"}')))
+        for form in forms:
+            with self.subTest(form=form):
+                done, calls = self.rig.run("api", "graphql", *form)
+                self.assertEqual(calls, [])
+                self.assertEqual(len(gh_err(done).splitlines()), 1, done.stderr)
+                self.assertTrue(gh_err(done).startswith("gh: refused: a GET to graphql that carries a field or --input is refused"), gh_err(done))
+        for form in ((), ("-X", "GET"), ("--method=get",), ("-X", "get")):
+            with self.subTest(plain=form):
+                args = ("api", "graphql") + form
+                done, calls = self.rig.run(*args)
+                self.assertEqual([c["argv"] for c in calls], [list(args)], gh_err(done))
+
+    def input_file(self, text):
+        path = self.rig.home / ("in%d.json" % len(list(self.rig.home.glob("in*.json"))))
+        path.write_text(text)
+        return str(path)
+
+    def test_a_non_object_input_on_graphql_is_refused(self):
+        for text in ('[{"query":"mutation{a}"}]', "[]", '"x"', "3", "null"):
+            with self.subTest(text=text):
+                done, calls = self.rig.run("api", "graphql", "--input", self.input_file(text))
+                self.assertEqual(calls, [])
+                self.assertEqual(gh_err(done), "gh: refused: the GraphQL --input is not a JSON object, so it is refused; only one query object passes")
+        done, calls = self.rig.run("api", "graphql", "--input", self.input_file('{"query":"query{a}"}'))   # control: an object passes
+        self.assertEqual(len(calls), 1, gh_err(done))
+
+    def test_the_method_override_header_is_refused(self):
+        forms = (("-H", "X-HTTP-Method-Override: DELETE"), ("--header", "x-http-method-override:PUT"), ("--header=X-Http-Method-Override: x"), ("-HX-HTTP-METHOD-OVERRIDE: PATCH"))
+        for form in forms:
+            form = (form,) if isinstance(form, str) else form
+            for extra in ((), ("-f", "a=b"), ("-X", "POST", "-f", "a=b")):   # a GET and a POST
+                with self.subTest(form=form, extra=extra):
+                    done, calls = self.rig.run("api", "repos/o/r/issues", *form, *extra)
+                    self.assertEqual(calls, [])
+                    self.assertTrue(gh_err(done).startswith("gh: refused: the X-HTTP-Method-Override header is refused"), gh_err(done))
+                    self.assertEqual(len(gh_err(done).splitlines()), 1)
+        args = ("api", "repos/o/r/issues", "-H", "Accept: application/json")   # control
+        done, calls = self.rig.run(*args)
+        self.assertEqual([c["argv"] for c in calls], [list(args)], gh_err(done))
+
+    def test_the_graphql_hint_names_a_form_the_shim_accepts(self):
+        done, calls = self.rig.run("api", "graphql", "-f", "query=" + gql("updatePullRequestReview"))
+        self.assertEqual(calls, [])
+        self.assertEqual(gh_err(done), "gh: refused: the GraphQL mutation updatePullRequestReview writes a body that cannot be signed and nothing was posted; use "
+                                       "gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments")
+        self.assertNotIn("PUT repos/OWNER/REPO/pulls", gh_err(done))
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments", "-X", "POST", "-f", "body=x")   # the hint's own form is accepted (and signed)
+        self.assertEqual(len(calls), 1)
+
+    def test_mutant_canonicaliser_in_the_decision_fails_the_three_reader_forms(self):
+        rig = self.mutant_rig(("        path = api_raw_path(raw)\n", "        path = api_endpoint(raw)\n"))
+        failing = self.reader_failures(rig)
+        print("RAW mutant canonicaliser: %d of %d reader forms fail under the mutant; control %d" % (len(failing), len(READER_FORMS), len(self.reader_failures(self.rig))))
+        self.assertEqual(failing, list(READER_FORMS))   # 3 of 3, each named
+        for form in READER_FORMS:
+            done, calls = rig.run("api", "-X", "PUT", form, "-f", "message=m")
+            self.assertEqual(len(calls), 1, form)   # the mutant lets the call through
+        self.assertEqual(self.reader_failures(self.rig), [])   # control 0
+
+    def test_mutant_raw_rule_skipped_for_writes_is_seen(self):
+        rig = self.mutant_rig(('if "#" in rest or', 'if False or'), ('if "//" in path or', 'if False or'), ('path.endswith("/")', 'False'),
+                              ('or not path or any(seg in (".", "..") for seg in path.split("/"))', 'or not path'), ('for c in "\\\\%;"', 'for c in ""'),
+                              ('any(ord(c) <= 0x20 or ord(c) == 0x7f for c in path)', 'False'))
+        seen = [name for name, path in CLEANING_CLASSES.items() if not raw_line(*rig.run("api", "-X", "PUT", path, "-f", "merge_method=squash"))]
+        print("RAW mutant rule skipped: %d of %d classes seen" % (len(seen), len(CLEANING_CLASSES)))
+        for name in ("backslash", "percent", "dot", "dotdot", "semicolon", "tab", "newline", "space", "hash", "double slash", "trailing slash"):
+            self.assertIn(name, seen)
+
+    def test_mutant_get_graphql_with_a_field_passes_is_seen(self):
+        rig = self.mutant_rig(('        if has_body and any(api_endpoint(p) == "graphql" for p in raw_positionals):', '        if False and any(api_endpoint(p) == "graphql" for p in raw_positionals):'))
+        done, calls = rig.run("api", "graphql", "-X", "GET", "-f", "query=query{a}")
+        self.assertEqual(len(calls), 1)   # the mutant lets it through; the real shim (test above) refuses
+        done, calls = self.rig.run("api", "graphql", "-X", "GET", "-f", "query=query{a}")
+        self.assertEqual(calls, [])
