@@ -62,6 +62,9 @@ def cmd_clear_head(args, runner, now):
     return EXIT_OK
 
 
+cmd_clear_head.guard_records = True   # a clearance is a record (#1712): the installed-tree guard refuses it when the tree cannot be read
+
+
 def branch_ff_read(engine, runner, repo, path):
     """One GET through the engine's gh runner (the repo's account, counted): the answer as a dict. Raises when the read fails or is not an object."""
     done = engine.accounts.read(runner, path, repo, engine.config["call_timeout_seconds"])
@@ -134,6 +137,9 @@ def cmd_branch_ff(args, runner, now):
     engine.audit.append(engine.actor, "branch.ff", pr, {"by": kind[1], "pr": pr, "from": facts["from"], "to": facts["to"], "clear_head": facts["line"]})
     print("branch.ff by %s: %s %s -> %s (clear-head #%d)" % (kind[1], pr, facts["from"], facts["to"], facts["line"]))
     return EXIT_OK
+
+
+cmd_branch_ff.guard_records = True   # a branch move is a push (#1712): the installed-tree guard refuses it when the tree cannot be read
 
 
 def add_branch_ff_parsers(sub):

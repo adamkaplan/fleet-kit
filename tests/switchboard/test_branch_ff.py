@@ -1,7 +1,9 @@
 """The `clear-head` and `branch-ff` tests of #1712: a pull request's branch moves to a head that was already read and cleared. Everything is faked: no real GitHub call."""
 import json
 import os
+import shutil
 import subprocess
+from pathlib import Path
 from unittest import mock
 from support.core import Base
 from support.loader import captured, sb
@@ -112,6 +114,59 @@ class TestBranchFf(Base):
         self.assertEqual((detail["by"], detail["from"], detail["to"], detail["clear_head"], lines[0]["subject"]), ("orch", OLD, NEW, 1, PR))
         self.assertIn("branch.ff", out)
         self.assertIn(NEW, out)
+
+    def installed_tree(self):
+        """A real git clone as the installed tree, recorded in this world's state dir; KIT_ROOT points at it."""
+        import tempfile
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, True)
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com", "GIT_TERMINAL_PROMPT": "0"}
+        patched = mock.patch.dict(os.environ, env)
+        patched.start()
+        self.addCleanup(patched.stop)
+        origin, tree = home / "origin", home / "installed"
+        for argv in (["init", "-q", "-b", "main", str(origin)],):
+            subprocess.run(["git"] + argv, check=True, capture_output=True)
+        (origin / "one.txt").write_text("one\n")
+        for argv in (["add", "one.txt"], ["commit", "-q", "-m", "one"]):
+            subprocess.run(["git", "-C", str(origin)] + argv, check=True, capture_output=True)
+        subprocess.run(["git", "clone", "-q", str(origin), str(tree)], check=True, capture_output=True)
+        (self.world.state / "installed-tree").write_text("%s\nmain\n" % tree)
+        patch = mock.patch.object(sb, "KIT_ROOT", tree)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return tree
+
+    def refused_when_unreadable(self):
+        """On a trusted tree both commands run; on an unreadable one the count of those refused with nothing written (2 when both are marked)."""
+        tree = self.installed_tree()
+        self.assertEqual(self.clear()[0], 0, "control: clear-head on a trusted tree")
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertEqual(self.main("orch", "branch-ff", PR, "scratch")[0], 0, "control: branch-ff on a trusted tree")
+        self.assertEqual(len(self.gh.writes()), 1)
+        (tree / ".git" / "HEAD").write_text("garbage\n")
+        ledger, writes, audit = len(self.ledger()), len(self.gh.writes()), len(self.world.audit())
+        refused = 0
+        for who, argv in (("cos", ("clear-head", "acme/widgets#8", "--sha", NEW)), ("orch", ("branch-ff", PR, "scratch"))):
+            code, out, err = self.main(who, *argv)
+            if code != 0 and "could not be read" in err and len(err.strip().splitlines()) == 1:
+                refused += 1
+        self.assertEqual(refused, 2, "commands refused")
+        self.assertEqual((len(self.ledger()), len(self.gh.writes()), len(self.world.audit())), (ledger, writes, audit), "writes of a refused command")
+        return refused
+
+    def test_s9_both_commands_are_refused_on_an_unreadable_installed_tree(self):
+        self.assertEqual(self.refused_when_unreadable(), 2)
+        self.assertTrue(sb.command_records("clear-head", sb.build_parser().commands))
+        self.assertTrue(sb.command_records("branch-ff", sb.build_parser().commands))
+
+    def test_s9_a_command_without_its_mark_is_not_refused(self):
+        for name in ("cmd_clear_head", "cmd_branch_ff"):
+            with self.subTest(name):
+                self.setUp()
+                with mock.patch.object(getattr(sb, name), "guard_records", False):
+                    with self.assertRaisesRegex(AssertionError, r"^1 != 2"):
+                        self.refused_when_unreadable()
 
     def refusal_cases(self):
         """Each: (name, a function that arranges the world, the argv after `branch-ff`)."""
