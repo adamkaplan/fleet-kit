@@ -85,6 +85,15 @@ class TestRefusal(Launch):
         self.assertEqual(self.records(), [])
         self.assertEqual([b for m, p, b in self.remote.bodies if p == "/api/session"], [], "a session was created")
 
+    def test_s11_an_empty_model_list_refuses(self):
+        code, err, lines = self.refused([])
+        print("S11: refused launches %d of 1, line holds the words not served by the pod's provider %d of 1, stop calls %d, records left %d" % (
+            code == 1, len(lines), len(self.stops()), len(self.records())))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(lines), 1, err)
+        self.assertEqual(len(self.stops()), 1)
+        self.assertEqual(self.records(), [])
+
     def test_other_provider_with_the_same_id_is_not_served(self):
         code, err, lines = self.refused([{"providerID": "other", "id": "model-unserved"}, {"providerID": P, "id": "model-01"}])
         self.assertNotEqual(code, 0)
