@@ -16,7 +16,7 @@ SHA_A, SHA_B, SHA_C = "a" * 40, "b" * 40, "c" * 40
 def load(mutant=False):
     text = (REPO / "bin" / "push_watch.py").read_text()
     if mutant:   # sends every item to every lane
-        text = text.replace("tell(lane, text, name)", "[tell(l, text, name) for l in ('lane-a', 'lane-b')]", 1)
+        text = text.replace("tell(lane, text + (", "[tell(l, text, name) for l in ('lane-a', 'lane-b')]; tell(lane, text + (", 1)
         assert "lane-b" in text
     module = types.ModuleType("push_watch_under_test")
     exec(compile(text, "push_watch.py", "exec"), module.__dict__)
@@ -60,7 +60,7 @@ def record(worker, lane, repo="o/r"):
 class World:
     """A fake gh: refs per worker prefix, commits per sha, and a request log."""
     def __init__(self):
-        self.refs, self.commits, self.requests, self.fail = {}, {}, [], False
+        self.refs, self.commits, self.requests, self.fail, self.chain = {}, {}, [], False, [SHA_A, SHA_B, SHA_C]
 
     def __call__(self, path):
         self.requests.append(path)
@@ -69,6 +69,11 @@ class World:
         match = re.search(r"matching-refs/heads/(.+)$", path)
         if match:
             return [{"ref": "refs/heads/" + b, "object": {"sha": s}} for b, s in self.refs.items() if b.startswith(match.group(1))]
+        if "/compare/" in path:
+            prev, tip = path.rsplit("/", 1)[1].split("...")
+            chain = self.chain[self.chain.index(prev) + 1:self.chain.index(tip) + 1]
+            return {"commits": [{"sha": c, "commit": self.commits[c]["commit"]} for c in chain],
+                    "files": [{"filename": "n%d.py" % i, "additions": 1, "deletions": 1} for i in range(3)]}
         return self.commits[path.rsplit("/", 1)[1]]
 
 
@@ -147,6 +152,27 @@ class TestPushWatch(Case):
         self.assertEqual([("second" in t) for t in self.to("lane-a")], [False, True])
         self.assertEqual(len(self.run_pass(NOW + 1300)), 1)   # the quiet item of the second sha only
         self.assertIn(SHA_B[:8], self.to("lane-a")[-1])
+
+    def test_s2_two_commits_in_one_pass_are_two_items_for_the_launching_lane_and_none_for_the_other(self):
+        self.world.refs = {"w-a/wip": SHA_A, "w-b/wip": SHA_A}
+        self.run_pass(NOW)
+        self.world.refs = {"w-a/wip": SHA_C}
+        self.run_pass(NOW + 60)
+        got = self.to("lane-a")
+        self.assertEqual(len(got), 3)   # the first sight, then the two new commits
+        self.assertIn("second", got[1])
+        self.assertIn("third", got[2])
+        self.assertEqual(len(self.to("lane-b")), 1)   # its own first sight only
+        self.run_pass(NOW + 120)
+        self.assertEqual(len(self.to("lane-a")), 3)
+
+    def test_the_task_branch_of_the_record_is_read_by_its_exact_name(self):
+        self.engine.cloud_watch = {"records": [dict(record("w-a", "lane-a"), branch="upkeep/1-x")]}
+        self.world.refs = {"upkeep/1-x": SHA_A, "upkeep/1-xy": SHA_B}
+        self.run_pass(NOW)
+        self.assertEqual(len(self.to("lane-a")), 1)
+        self.assertIn("upkeep/1-x:", self.to("lane-a")[0])
+        self.assertEqual(len([p for p in self.world.requests if "matching-refs" in p]), 2)
 
     def test_s5_the_mutant_that_tells_every_lane_fails_with_the_named_check_and_the_control_passes(self):
         self.world.refs = {"w-a/wip": SHA_A}
