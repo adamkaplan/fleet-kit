@@ -822,7 +822,8 @@ class TestGhShimEffectRule(unittest.TestCase):
     def test_r4_mutant_3_the_parser_accepts_a_mutation_is_seen(self):
         seen = self.mutant4("        op = word\n", '        op = "query"\n')
         print("R4 mutant 3 seen:", len(seen))
-        self.assertTrue(seen and all("round-3 spelling" in s or "macOS form" in s for s in seen) is False or seen, seen[:5])
+        self.assertEqual(len(seen), 24, seen[:5])   # the 19 round-3 spellings and the 5 macOS forms, each read as a query by the mutant and passed
+        self.assertTrue(all(s.startswith(("round-3 spelling with query passed", "macOS form passed")) for s in seen), seen[:5])
         space = load_parser(self.source.replace("        op = word\n", '        op = "query"\n', 1))
         self.assertIsNone(space["graphql_verdict"]("mutation { addComment(input: {}) { x } }"))   # the mutant reads a mutation as a query
         self.assertTrue(load_parser(self.source)["graphql_verdict"]("mutation { addComment(input: {}) { x } }"))   # control
