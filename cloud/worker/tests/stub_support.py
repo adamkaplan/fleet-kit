@@ -48,6 +48,23 @@ def spawn(argv, **kw):
     return p
 
 
+def _group_has_live_member(pgid):
+    """True when some process of the group is not a zombie; True too when /proc cannot be read (the old behaviour)."""
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return True
+    for p in pids:
+        try:
+            with open("/proc/%s/stat" % p) as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if fields[0] != "Z" and int(fields[2]) == pgid:
+            return True
+    return False
+
+
 def group_alive(pgid):
     """True while some process still has this process group id. PermissionError (macOS, a group of only exited processes) counts as alive."""
     try:
@@ -56,7 +73,7 @@ def group_alive(pgid):
         return False
     except PermissionError:
         return True
-    return True
+    return _group_has_live_member(pgid)
 
 
 def stop_group(p, port=None):
