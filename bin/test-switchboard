@@ -67587,6 +67587,22 @@ class TestSupportRebinding(unittest.TestCase):
             with self.subTest(form=name):
                 self.assertEqual(self.rebindings(source, moved), [])
 
+    def test_the_scan_still_flags_a_real_moved_helper_in_a_scratch_file_outside_the_repo(self):
+        moved = self.moved_names()
+        self.assertIn("made_up_pid", moved)
+        self.assertNotIn("unittest", moved)
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp) / "scratch_test.py"
+            scratch.write_text("def f():\n    with mock.patch.object(sys.modules[__name__], 'made_up_pid', None):\n        pass\n")
+            self.assertFalse(str(scratch).startswith(str(REPO)))
+            self.assertTrue(self.rebindings(scratch.read_text(), moved), "a patched moved helper must be reported with unittest excluded")
+
+    def test_unittest_alone_is_not_reported_and_only_the_exclusion_is_why(self):
+        source = "def f():\n    with mock.patch.object(sys.modules[__name__], 'unittest', None):\n        pass\n"
+        moved = self.moved_names()
+        self.assertEqual(self.rebindings(source, moved), [])
+        self.assertTrue(self.rebindings(source, moved | {"unittest"}), "without the exclusion the name would be reported")
+
     def test_every_rebinding_of_a_moved_name_in_this_file_also_rebinds_it_in_the_support_modules(self):
         source = Path(__file__).read_text()
         own = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "TestSupportRebinding")   # it names the forms on purpose
