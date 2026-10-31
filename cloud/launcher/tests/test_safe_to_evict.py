@@ -159,8 +159,13 @@ class AllowListAndAuditSentence(unittest.TestCase):
     ALLOW = ("kubectl get events ", "kubectl describe node ", "kubectl get pods ", "kubectl -n kube-system get configmap cluster-autoscaler-status",
              "az aks nodepool show ", "az aks nodepool list ", "az monitor activity-log list ")
 
-    # one string of single characters, so that the stub-cleanup scan does not read a lone ampersand as a backgrounding shell string; the same seven characters as before
+    # spelled so the scan does not mistake the data for a backgrounding string; the seven members and their order are asserted by test_shell_chain_is_the_seven_metacharacters
     SHELL_CHAIN = tuple(";&|`") + ("$(", ">", "<")
+
+    def test_shell_chain_is_the_seven_metacharacters(self):
+        self.assertEqual(len(self.SHELL_CHAIN), 7)
+        self.assertEqual("".join(self.SHELL_CHAIN), ";&|`$(><")
+        self.assertTrue(all(isinstance(c, str) for c in self.SHELL_CHAIN))
 
     def allowed_line(self, ln):
         return ln.startswith(self.ALLOW) and not any(c in ln for c in self.SHELL_CHAIN)
