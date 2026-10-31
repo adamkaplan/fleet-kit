@@ -23523,6 +23523,7 @@ class TestSweep(Base):
         ("ci", "ci is None", {"ci": None}, {}, "not ready"),
         ("ci", "ci is absent", {"ci": KeyError}, {}, "not ready"),
         ("ci", "ci says none", {"ci": "none"}, {}, "not ready"),
+        ("legs", "a macOS leg is not green (failed, absent, skipped, cancelled or in progress)", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test (macos-latest)": "failure"}, False)}, {}, "not ready"),
         ("draft", "a draft", {"draft": True}, {}, "not ready"),
         ("body", "the body is empty", {"body": ""}, {}, "not ready"),
         ("body", "the body is None", {"body": None}, {}, "not ready"),
