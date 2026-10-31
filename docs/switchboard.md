@@ -6429,7 +6429,9 @@ Cause: a pull request's head had been read and cleared in a scratch branch, and 
 4. the pull request's head branch is neither the repository's default branch nor `integration`;
 5. every GitHub read answered (a read that fails is a refusal), and the pull request comes from the same repository.
 
-A request that carries `--force`, or that fails any of the above, makes no GitHub write and no `branch.ff` audit line: nine kinds of refusal in all (not a fast-forward, no line, a line for another pull request, a line for another sha, a merged pull request, a closed one, the default branch, the integration branch, a `--force` flag). The one success writes ONE audit line, `branch.ff` (who, pull request, from sha, to sha, the clear-head line id), and prints it. The command never forces.
+A request that carries `--force`, or that fails any of the above, makes no GitHub write and no `branch.ff` audit line: ten kinds of refusal in all (not a fast-forward, no line, a line for another pull request, a line for another sha, a merged pull request, a closed one, the default branch, the integration branch, a `--force` flag, a pull request whose head repository is another repository (a fork)). The one success writes ONE audit line, `branch.ff` (who, pull request, from sha, to sha, the clear-head line id), and prints it. The command never forces.
+
+**Trust model.** A `clear-head` line is a record in the state directory: a process running as the same user can write one, and `by` is recorded, not verified. The command is a convenience against mistakes, not a barrier against a lane that holds the state directory (the same trust as every other state file of the daemon). Two concurrent `clear-head` runs can lose one line (a read, then a write of the whole file); the later `branch-ff` simply finds no line and refuses.
 
 ## A lost worker is announced to its lane and the Chief of Staff (#1481)
 
