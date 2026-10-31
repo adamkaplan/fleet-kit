@@ -70,6 +70,11 @@ def hermetic_rig(gated=None):
     return rig
 
 
+def gh_err(done):
+    """#1696: the shim's own gh: lines of a call's stderr (an interpreter warning on another platform is not the shim's output)."""
+    return "\n".join(l for l in done.stderr.splitlines() if l.startswith("gh:"))
+
+
 def gql(name):
     return "mutation{%s(input:{subjectId:\"X\",body:\"hello\"}){clientMutationId}}" % name
 
@@ -148,14 +153,14 @@ def battery2(rig):
     os.mkfifo(str(fifo))
     for form in (("-F", "query=@%s" % fifo), ("--input", str(fifo)), ("--input=" + str(fifo),)):
         done, calls = rig.run("api", "graphql", *form)
-        if calls or not done.stderr.startswith("gh: refused:") or "is not a regular file" not in done.stderr:
+        if calls or not gh_err(done).startswith("gh: refused:") or "is not a regular file" not in done.stderr:
             bad.append("FIFO query not refused: " + form[0])
     done, calls = rig.run("api", "graphql", "-F", "query=@%s" % fifo)
-    if done.stderr.strip() != H4_REFUSAL % fifo:
+    if gh_err(done) != H4_REFUSAL % fifo:
         bad.append("FIFO refusal text differs")
     for host in M1_HOSTS:
         done, calls = rig.run("api", host + "/graphql", "-f", "query=" + gql("addComment"))
-        if calls or not done.stderr.startswith("gh: refused: the GraphQL mutation addComment"):
+        if calls or not gh_err(done).startswith("gh: refused: the GraphQL mutation addComment"):
             bad.append("graphql mutation let through: " + host)
         done, calls = rig.run("api", host + "/repos/o/r/issues/1/comments", "-f", "body=x")
         if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
@@ -174,7 +179,7 @@ def battery2(rig):
 
 class TestGhShimSignInput(unittest.TestCase):
     def setUp(self):
-        self.rig = Rig()
+        self.rig = hermetic_rig()   # #1696: the shim's merge-gate home is the rig's own: a machine's gate config cannot change a result
         self.addCleanup(self.rig.close)
         self.source = (SHIM_DIR / "gh").read_text()
 
@@ -303,7 +308,7 @@ class TestGhShimSignInput(unittest.TestCase):
             with self.subTest(spelling=spelling):
                 done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", *spelling)
                 self.refused(done, calls)
-                self.assertEqual(done.stderr.strip(), "gh: refused: the --input file %s is not a regular file, so it cannot be signed and nothing was posted" % fifo)
+                self.assertEqual(gh_err(done), "gh: refused: the --input file %s is not a regular file, so it cannot be signed and nothing was posted" % fifo)
         done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", str(self.rig.home))   # a directory
         self.refused(done, calls)
         self.assertIn("is not a regular file", done.stderr)
@@ -330,7 +335,7 @@ class TestGhShimSignInput(unittest.TestCase):
 
     def test_h2_every_spelling_of_graphql_is_refused_like_the_bare_word(self):
         bare, _calls = self.rig.run("api", "graphql", "-f", "query=" + gql("addComment"))
-        self.assertEqual(bare.stderr.strip(), "gh: refused: the GraphQL mutation addComment writes a body that cannot be signed and nothing was posted; use gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments")   # control
+        self.assertEqual(gh_err(bare), "gh: refused: the GraphQL mutation addComment writes a body that cannot be signed and nothing was posted; use gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments")   # control
         for spelling in SPELLINGS + ("HTTPS://API.GITHUB.COM/graphql/#x",):
             with self.subTest(spelling=spelling):
                 done, calls = self.rig.run("api", spelling, "-f", "query=" + gql("addComment"))
@@ -387,7 +392,7 @@ class TestGhShimSignInput(unittest.TestCase):
                 done, calls = gated.run(*args)
                 self.assertEqual((done.returncode, calls), (10, []))
                 self.assertEqual(len([l for l in done.stderr.splitlines() if l.startswith("gh:")]), 1, done.stderr)
-                self.assertTrue(done.stderr.startswith("gh: "), done.stderr)
+                self.assertTrue(gh_err(done).startswith("gh: "), done.stderr)
                 self.assertNotIn("cannot be signed", done.stderr)
         held = hermetic_rig()
         self.addCleanup(held.close)
@@ -396,7 +401,7 @@ class TestGhShimSignInput(unittest.TestCase):
         config.write_text(json.dumps({"hold_labels": {"o/r": {"label": "hold", "message": "m"}}}))
         done, calls = held.run(*comment)
         self.assertEqual((done.returncode, calls), (1, []))
-        self.assertEqual(done.stderr.strip(), "gh: graphql mutation cannot be tied to a pull request, so it is refused while a hold label is configured: use the gh pr verbs")
+        self.assertEqual(gh_err(done), "gh: graphql mutation cannot be tied to a pull request, so it is refused while a hold label is configured: use the gh pr verbs")
 
     def test_s10_completeness_and_count(self):
         self.assertEqual(forms_missing(self.source), [])
