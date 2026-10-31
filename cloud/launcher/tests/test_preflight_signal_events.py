@@ -93,8 +93,15 @@ class Events(unittest.TestCase):
     def test_s13_sigint_condition(self):
         src = read(TESTFILE)
         name = "test_sigint_cleans_up"
+        tmp = tempfile.gettempdir()
+        before_c = set(os.listdir(tmp))
         rc_c, out_c = run_real(self.tree(), name, sigint_ignored=True)
-        control = int(rc_c == 0)
+        left_c = sorted(x for x in set(os.listdir(tmp)) - before_c if x.startswith("cloud-preflight-"))
+        for x in left_c:
+            shutil.rmtree(os.path.join(tmp, x), ignore_errors=True)
+        control_named = left_c[0] if left_c else ""
+        self.assertEqual(control_named, "", left_c)
+        control = int(rc_c == 0 and control_named == "")
         self.assertEqual(control, 1, out_c)
         m = once(src, RESTORE, "")
         before = set(os.listdir(tempfile.gettempdir()))
@@ -106,7 +113,12 @@ class Events(unittest.TestCase):
         # the pinned hang guard raises its own text (the script ignores SIGINT and does not end); the temporary copy it leaves is named by the listing
         self.assertIn("AssertionError: the preflight script did not end within 20 seconds after the signal (hung)", out_m)
         self.assertEqual(len(left), 1, left)
-        mutant = int(rc_m != 0 and len(left) == 1 and left[0].startswith("cloud-preflight-"))
+        named = left[0] if left else ""
+        failure = out_m + "\nLEFTOVER temporary directory: " + named
+        self.assertIn("cloud-preflight-", failure)
+        self.assertIn(named, failure)
+        self.assertTrue(named)
+        mutant = int(rc_m != 0 and bool(named) and named in failure)
         s = read(SCRIPT)
         s2 = once(s, RMTREE, "pass")
         rc_s, out_s = run_real(self.tree(scripttext=s2), name)
@@ -114,8 +126,8 @@ class Events(unittest.TestCase):
         self.assertEqual(nocleanup, 1, out_s)
         applied = RESTORE not in m and RMTREE not in s2
         self.assertTrue(applied)
-        RESULTS["S13"] = ("S13: control passes %d of 1 with SIGINT ignored, mutant without the restoration fails %d of 1 with the leftover directory named, "
-                          "script without its cleanup fails the real test %d of 1, mutations applied %s" % (control, mutant, nocleanup, applied))
+        RESULTS["S13"] = ("S13: control passes %d of 1 with SIGINT ignored and leaves no directory, mutant without the restoration fails %d of 1 with the leftover directory named: %s, "
+                          "script without its cleanup fails the real test %d of 1, mutations applied %s" % (control, mutant, named, nocleanup, applied))
         print(RESULTS["S13"])
 
 
