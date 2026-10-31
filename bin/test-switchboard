@@ -79820,8 +79820,6 @@ class TestAskWaive(unittest.TestCase):
             with patch:
                 with self.assertRaises(AssertionError, msg=case):
                     getattr(self, case)()
-
-
 class TestEpicRecord(unittest.TestCase):
     """#1383: an epic-claimed scenario is recorded on its owning ask issue or work item at the default branch's head, and read there. Fakes only; the search, the compares and the head are one fake GitHub."""
 
