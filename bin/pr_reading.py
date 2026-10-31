@@ -75,14 +75,15 @@ def _runs(gh, repo, query, what):
 
 
 def _newest_per_workflow(runs):
-    """The newest run of each workflow (by creation time, then id): the one that decides for that workflow."""
-    best = {}
+    """The newest run of each workflow (by creation time, then id): the one that decides for that workflow. It carries `attempts`: how many runs of that workflow there are."""
+    best, count = {}, {}
     for run in runs:
+        count[run.get("workflow_id", run.get("name"))] = count.get(run.get("workflow_id", run.get("name")), 0) + 1
         key = run.get("workflow_id", run.get("name"))
         rank = (epoch(run.get("created_at")) or 0, run.get("id") if isinstance(run.get("id"), int) else 0)
         if key not in best or rank > best[key][0]:
             best[key] = (rank, run)
-    return [item[1] for item in best.values()]
+    return [dict(item[1], attempts=count[k]) for k, item in best.items()]
 
 
 def read_pr_runs(gh, repo, number, head):
@@ -98,7 +99,8 @@ def read_pr_runs(gh, repo, number, head):
                 sha = (item.get("base") or {}).get("sha") if isinstance(item.get("base"), dict) else None
                 base = sha if isinstance(sha, str) and len(sha) == 40 else None
         out.append({"id": run.get("id"), "workflow": str(run.get("name") or "workflow"), "workflow_id": run.get("workflow_id"),
-                    "status": run.get("status"), "conclusion": run.get("conclusion"), "created": epoch(run.get("created_at")), "base": base})
+                    "status": run.get("status"), "conclusion": run.get("conclusion"), "created": epoch(run.get("created_at")), "base": base,
+                    "attempts": run.get("attempts", 1)})
     return out
 
 
@@ -118,6 +120,15 @@ def read_failing_jobs(gh, repo, run_id):
     jobs = data.get("jobs") if isinstance(data, dict) else None
     names = [str(j.get("name")) for j in jobs or [] if isinstance(j, dict) and j.get("conclusion") in ("failure", "timed_out", "cancelled", "startup_failure")]
     return names[:5] or ["(no failing job named)"]
+
+
+def read_jobs(gh, repo, run_id):
+    """[{"name", "conclusion"}] of the jobs of a run (the latest attempt, at most 100): the legs of a matrix are jobs. An unreadable list raises ReadError."""
+    data = _json(gh, ["api", "repos/%s/actions/runs/%s/jobs?filter=latest&per_page=100" % (repo, run_id)], "the jobs of run %s" % run_id)
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, list):
+        raise ReadError("the jobs of run %s answered no list" % run_id)
+    return [{"name": str(j.get("name")), "conclusion": str(j.get("conclusion") or j.get("status") or "")} for j in jobs if isinstance(j, dict)]
 
 
 def read_branch_runs(gh, repo, branch, workflow_ids=None):
