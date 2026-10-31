@@ -191,7 +191,7 @@ class SwitchboardSide(unittest.TestCase):
             b.launcher_argv, b.use_settings, b.check_allowed = (lambda: ["x"]), (lambda: "test"), (lambda repo: None)
             b._lib, b.load_record, b.H, b.run_launcher, b.Cluster = (lambda: lib), (lambda st, n: None), h, run_launcher, FakeCluster
             b._audit = lambda *a, **k: None
-            b.model_entry, b.git_token, b.stack_model_secret = (lambda: "m"), (lambda repo, cluster: "t"), (lambda: None)
+            b.model_entry, b.git_token, b.stack_model_secret = (lambda: "m"), (lambda repo, cluster, role="worker": "t"), (lambda: None)
             err = None
             try:
                 with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
