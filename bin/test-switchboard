@@ -79908,13 +79908,13 @@ class TestEpicBatch(TestEpicRecord):
 
     def test_l3_a_renamed_named_file_reads_as_changed_in_the_compare_and_so_stale(self):
         self.check_rename_stale()
-        got = sb.compare_files(lambda p: {"status": "ahead", "files": [{"filename": "src/b.py", "previous_filename": "src/a.py"}]}, "o/r", "a", "b")
+        got = sb.epic_changed(lambda p: {"status": "ahead", "files": [{"filename": "src/b.py", "previous_filename": "src/a.py"}]}, "o/r")("a", "b")
         self.assertEqual(sorted(got), ["src/a.py", "src/b.py"])
 
     def test_l3_m1_a_compare_that_drops_the_previous_name_reads_the_renamed_file_as_untouched_and_is_caught(self):
-        real = sb.compare_files
+        real = sb.compare_rows
         strip = lambda get: (lambda p: dict(get(p), files=[{"filename": f["filename"]} for f in get(p).get("files", [])]))
-        self.mutant(sb, "compare_files", lambda get, repo, a, b: real(strip(get), repo, a, b), self.check_rename_stale)
+        self.mutant(sb, "compare_rows", lambda get, repo, a, b: real(strip(get), repo, a, b), self.check_rename_stale)
 
     def test_l5_a_verdict_refusal_is_structured_and_names_the_epic_claim_first(self):
         self.prove("E1")
