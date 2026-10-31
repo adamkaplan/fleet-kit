@@ -113,7 +113,7 @@ def verdict(**k):
 
 YES = lambda head: (True, None)
 NO = lambda head: (False, "no merge of acme/app#4")
-CASES = {   # name -> (entries, default_head, authors, contains, changed)
+EPIC_CASES = {   # name -> (entries, default_head, authors, contains, changed)
     "unrecorded": ([], H1, set(), YES, lambda a, b: []),
     "recorded and current": ([proof(), verdict()], H1, set(), YES, lambda a, b: []),
     "recorded and not current": ([proof(), verdict()], H2, set(), YES, lambda a, b: ["b.py"]),
@@ -166,11 +166,11 @@ class TestEpicRecordMove(unittest.TestCase):
 
     def test_u7_the_fixture_table_has_0_differing_cells(self):
         differ = []
-        for name, (entries, default, authors, contains, changed) in CASES.items():
+        for name, (entries, default, authors, contains, changed) in EPIC_CASES.items():
             args = (SC, entries, REF, PH, default, authors, contains, changed)
             if self.oracle["epic_state"](*args) != epic().epic_state(*args):
                 differ.append(name)
-        rows = [self.oracle["epic_state"](SC, e, REF, PH, d, a, c, ch) for e, d, a, c, ch in CASES.values()]
+        rows = [self.oracle["epic_state"](SC, e, REF, PH, d, a, c, ch) for e, d, a, c, ch in EPIC_CASES.values()]
         self.assertEqual(self.oracle["epic_lines"](rows, H2), epic().epic_lines(rows, H2))
         self.assertEqual(len({r["state"] for r in rows}), 3)
         plan = {"scenarios_parsed": [SC, {"id": "S1", "evaluator": "ci", "proof": "test", "claim": "pr"}, {"id": "M1", "evaluator": "tester", "proof": "measure"}]}
