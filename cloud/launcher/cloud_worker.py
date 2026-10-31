@@ -2511,15 +2511,15 @@ class Launcher:
         whole and un-annotated, and ONE audit line says so; the next pass tries again."""
         done, running, nxt, got = {}, {}, 0, []
 
-        def work(i, ctx):
+        def work(i, ctx):   # a late (abandoned) thread never replaces the limit result: dict.setdefault of one key is atomic in CPython
             _, worker, reason, nonce = jobs[i]
             try:
-                done[i] = (ctx.stop(argparse.Namespace(worker=worker, reason=reason, run_id=nonce,
-                                                      cause="hard" if reason == "hard limit" else "idle"), reason), None, ctx.last_hook)
+                done.setdefault(i, (ctx.stop(argparse.Namespace(worker=worker, reason=reason, run_id=nonce,
+                                                      cause="hard" if reason == "hard limit" else "idle"), reason), None, ctx.last_hook))
             except CloudError as e:
-                done[i] = (None, e, ctx.last_hook)
+                done.setdefault(i, (None, e, ctx.last_hook))
             except BaseException as e:   # as before: not ours to swallow, re-raised by the pass
-                done[i] = (None, e, None)
+                done.setdefault(i, (None, e, None))
         while nxt < len(jobs) or running:
             for i, (dead, t0, ctx) in list(running.items()):
                 took = int((self.clock() - t0).total_seconds())
@@ -2578,6 +2578,7 @@ class Launcher:
                 if pod in live:
                     live.remove(pod)
                 out.append(None)   # this pod's place in the result: filled after the stops ran
+                # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
                 jobs.append((len(out) - 1, worker, reason, ann(pod, "run-id") or None))
         for (slot, worker, reason, _), (res, err, hook) in zip(jobs, self._run_stops(jobs)):
             try:

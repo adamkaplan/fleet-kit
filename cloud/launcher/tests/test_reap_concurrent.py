@@ -294,6 +294,55 @@ class Concurrent(unittest.TestCase):
         time.sleep(0.2)
         self.assertEqual((len(cluster.deletes), len(cluster.annotations), cluster.hooks), (0, 0, 2))
 
+    def test_S4b_a_stop_that_ends_after_its_limit_does_not_replace_the_limit_result(self):
+        mod = target_module()
+
+        class Late(BaseException):
+            pass
+        kept = raised = lines_n = 0
+        for late_error in (False, True):
+            L, cluster, clock, env, events = build(mod, tempfile.mkdtemp(), 1)
+            real_exec, first = cluster.exec, [late_error]
+
+            def exec_(name, *cmd, **k):
+                out = real_exec(name, *cmd, **k)
+                if first and cmd[0] == "cw-end-hook":
+                    first.clear()
+                    raise Late("late")
+                return out
+            cluster.exec = exec_
+            real_audit = L.audit
+
+            def audit(*a, **k):   # the limit line is written right after the pass wrote the limit result: let the abandoned thread end now
+                real_audit(*a, **k)
+                cluster.release_all()
+                wait_for(lambda: cluster.finished >= 1, "the abandoned hook to end")
+                time.sleep(0.2)
+            L.audit = audit
+            box = {}
+
+            def one_pass():
+                try:
+                    box["out"] = L.reap()
+                except BaseException as e:
+                    box["err"] = e
+            t = threading.Thread(target=one_pass, daemon=True)
+            t.start()
+            wait_for(lambda: cluster.hooks >= 1, "the hook to start")
+            clock.now += dt.timedelta(seconds=mod.REAP_STOP_SECONDS)
+            t.join(5)
+            self.assertFalse(t.is_alive(), "the pass was held by the stop")
+            raised += "err" in box
+            kept += box.get("out") == [("coder0", "hard limit", 1)] and L.reap_results.get("coder0") == {}
+            L.audit, cluster.hold = real_audit, False
+            try:
+                L.reap()   # a later pass must not re-raise what the late thread raised
+            except BaseException:
+                raised += 1
+            lines_n += len([l for l in audit_lines(env) if l["action"] == "stop" and "hit its limit" in l["reason"]]) == 1
+        print("S4b: limit result kept %d of 1, late exceptions raised in the pass %d, stop audit lines %d" % (kept // 2, raised, lines_n // 2))
+        self.assertEqual((kept, raised, lines_n), (2, 0, 2))
+
     def test_U2_one_pod_and_no_pod_passes(self):
         mod = target_module()
         L, cluster, clock, env, _ = build(mod, tempfile.mkdtemp(), 1)
@@ -431,6 +480,25 @@ class Mutants(unittest.TestCase):
         ]
         print("S7: mutants caught %d of 4, mutations applied 4 of 4" % sum(n))
         self.assertEqual(sum(n), 4)
+
+    def test_S4b_the_mutant_with_a_plain_write_in_work_fails(self):
+        edits = [("done.setdefault(i, (ctx.stop(", "done[i] = (ctx.stop("), ("ctx.last_hook))\n            except CloudError as e:", "ctx.last_hook)\n            except CloudError as e:"),
+                 ("done.setdefault(i, (None, e, ctx.last_hook))", "done[i] = (None, e, ctx.last_hook)"),
+                 ("done.setdefault(i, (None, e, None))", "done[i] = (None, e, None)")]
+        test, results = "test_S4b_a_stop_that_ends_after_its_limit_does_not_replace_the_limit_result", []
+        for name, mutated in (("control", False), ("m4b", True)):
+            with tempfile.TemporaryDirectory() as tmp:
+                env = dict(os.environ)
+                if mutated:
+                    env[MODULE_ENV] = mutant(tmp, name, edits)   # outside the repository
+                p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent.Concurrent." + test], cwd=HERE,
+                                       env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                results.append((p.communicate(timeout=90)[0], p.returncode))
+        control_ok, mutant_fails = results[0][1] == 0, results[1][1] == 1 and "FAIL: test_S4b" in results[1][0]
+        print("S4b mutant: control passes %d of 1, mutant fails %d of 1, mutation applied True" % (control_ok, mutant_fails))
+        self.assertEqual(results[0][1], 0, results[0][0])
+        self.assertEqual(results[1][1], 1, results[1][0])
+        self.assertRegex(results[1][0], r"(?m)^FAIL: test_S4b")
 
     def test_S9_the_mutant_that_iterates_the_live_set_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
