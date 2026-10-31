@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import unittest
+import urllib.parse
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +44,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
     other_seen = []
     body_override = None
     big_zip = False        # the download is a zip of 2001 entries
+    many_files = False     # pulls/9/files answers 100 files on page 1, 5 on page 2
     nonjson = False        # answer 201 with a body that is not JSON
     redirect = None        # (code, location) answered for every API call
     logs_location = None   # a Location for the logs redirect, instead of the download path
@@ -90,6 +92,9 @@ class Stub(http.server.BaseHTTPRequestHandler):
             return self.answer(200, {"number": 9, "title": "t", "state": "open", "html_url": "https://x/pull/9", "body": "b", "node_id": "PR_abc123",
                                      "head": {"ref": "feat", "sha": SHA}, "base": {"ref": "main"}, "user": {"login": "bot"}})
         if p == "/repos/%s/pulls/9/files" % REPO:
+            if Stub.many_files:
+                pg = int(urllib.parse.parse_qs(self.path.partition("?")[2]).get("page", ["1"])[0])
+                return self.answer(200, [{"filename": "f%d_%d.py" % (pg, i)} for i in range(100 if pg == 1 else 5 if pg == 2 else 0)])
             return self.answer(200, [{"filename": "a.py"}])
         if p == "/repos/%s/issues/9/comments" % REPO:
             return self.answer(201, {"html_url": "https://x/pull/9#c1"})
@@ -126,7 +131,7 @@ CALLS = {
     ("pr", "list"): (["pr", "list", "-R", REPO], ("GET", "/repos/%s/pulls?state=open&per_page=30" % REPO), "9\tt\tfeat\topen"),
     ("pr", "comment"): (["pr", "comment", "9", "-R", REPO, "--body", "hello"], ("POST", "/repos/%s/issues/9/comments" % REPO), "https://x/pull/9#c1"),
     ("pr", "checks"): (["pr", "checks", "9", "-R", REPO], ("GET", "/repos/%s/pulls/9" % REPO), "ci\tsuccess"),
-    ("pr", "diff"): (["pr", "diff", "9", "-R", REPO, "--name-only"], ("GET", "/repos/%s/pulls/9/files?per_page=100" % REPO), "a.py"),
+    ("pr", "diff"): (["pr", "diff", "9", "-R", REPO, "--name-only"], ("GET", "/repos/%s/pulls/9/files?per_page=100&page=1" % REPO), "a.py"),
     ("pr", "ready"): (["pr", "ready", "9", "-R", REPO], ("GET", "/repos/%s/pulls/9" % REPO), "ready for review"),
     ("repo", "view"): (["repo", "view", REPO], ("GET", "/repos/%s" % REPO), "default branch:\tmain"),
     ("issue", "view"): (["issue", "view", "3", "-R", REPO], ("GET", "/repos/%s/issues/3" % REPO), "title:\ti"),
@@ -197,6 +202,15 @@ class Client(unittest.TestCase):
                 self.assertIn(first, [(m, pth) for m, pth, _, _ in Stub.seen][:3], Stub.seen)
                 self.assertNotIn(TOKEN, p.stdout + p.stderr)
                 self.assertTrue(all(a == "Bearer " + TOKEN for _, _, _, a in Stub.seen))
+
+    def test_pr_diff_follows_the_pages(self):
+        Stub.many_files = True
+        try:
+            p = self.run_gh("pr", "diff", "9", "-R", REPO, "--name-only")
+        finally:
+            Stub.many_files = False
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(p.stdout.split()), 105)
 
     def test_pr_create_sends_the_given_fields_and_is_never_interactive(self):
         self.run_gh("pr", "create", "-R", REPO, "--title", "T", "--body", "B", "--head", "feat", "--base", "main", "--draft")
