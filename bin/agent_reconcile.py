@@ -65,6 +65,7 @@ def reconcile_on_read(state_dir, read, live_check, registry=None, endpoint_check
             except Exception:
                 continue
             evidence = {"endpoint_verdict": verdict, "checked_at": int(time.time())}
+            # a row the view calls pane-less but shows_dead does not: the evidence fails the pane rule, nothing is removed (as the old pair).
             if not _load_registry().shows_dead(agent, evidence):
                 continue
             try:

@@ -569,13 +569,18 @@ def migrate_bell(state_dir, belled_panes, whole, now=None):
     return {"changed": count[0], "problem": got["problem"], "ran": True}
 
 
+def no_pane_by_both_rules(row):
+    """A row BOTH old rules call pane-less: `no_pane_to_judge(row)` and the registry's old test (no pane, an endpoint). The one copy, used by shows_dead and reconcile_remove."""
+    return no_pane_to_judge(row) and row.get("pane") is None and row.get("endpoint") is not None
+
+
 def shows_dead(row, evidence):
     """THE registry-side dead verdict: does the evidence show this row dead? A row with no pane to judge (`no_pane_to_judge`): only the bounded
     endpoint check answering "dead". Any other row: its recorded state is `dead` and the pane and the process were both checked absent (an unchecked
     part, None, is not absence). Evidence that is not a dict shows nothing."""
     if not isinstance(evidence, dict):
         return False
-    if no_pane_to_judge(row):
+    if no_pane_by_both_rules(row):
         return evidence.get("endpoint_verdict") == "dead"
     return row.get("state") == "dead" and evidence.get("pane_listed") is False and evidence.get("process_found") is False
 
@@ -587,7 +592,7 @@ def reconcile_remove(state_dir, name, evidence, whole):
         row = doc["agents"].get(name)
         if row is None:
             return False, [], None
-        if no_pane_to_judge(row):   # a no-pane row: removed only on a bounded check's evidence of death (shows_dead, one verdict)
+        if no_pane_by_both_rules(row):   # a no-pane row: removed only on a bounded check's evidence of death (shows_dead, one verdict)
             if not shows_dead(row, evidence):
                 why = "%s has no pane and no evidence of death for its endpoint: nothing removed" % name
                 return False, [{"event": "reconcile_refused", "name": name, "evidence": evidence if isinstance(evidence, dict) else None, "why": why}], why

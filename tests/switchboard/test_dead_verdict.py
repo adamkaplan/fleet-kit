@@ -1,4 +1,5 @@
-"""#1668: the registry decides death from evidence in ONE function, `registry.shows_dead(row, evidence)`. Neutral names (acme)."""
+"""#1668: the registry decides death from evidence in ONE function, `registry.shows_dead(row, evidence)`. Neutral names (acme).
+The scan sees literal evidence keys only."""
 import ast
 import importlib.util
 import tempfile
@@ -84,7 +85,50 @@ ROWS = [
     ("orchestrator, no endpoint, no pane (differing kind 2)", {"kind": "orchestrator", "state": "dead"}, GONE),
     ("endpoint with empty-string pane (differing kind 3)", {"state": "dead", "pane": "", "endpoint": "http://acme.example"}, GONE),
 ]
-DIFFERING = ("differing kind",)
+
+GRID_KINDS = 4 * 3 * 2 * 2
+
+
+def grid(reg):
+    """Every row the registry can write (kind x pane x endpoint x state) x every evidence the view builds. Returns (rows written, cells, mismatching cells)."""
+    written, cells, bad = 0, 0, []
+    for kind in ("local", "cloud", "orchestrator", None):
+        for pane in ("p_1", None, ""):
+            for endpoint in ("http://acme.example", None):
+                for state in ("dead", "alive"):
+                    row = {"state": state, "pane": pane}
+                    if kind:
+                        row["kind"] = kind
+                    if endpoint:
+                        row["endpoint"] = endpoint
+                    with tempfile.TemporaryDirectory() as d:
+                        def put(doc, row=row):
+                            doc["agents"]["acme"] = dict(row)
+                            return True, [], None
+                        reg._mutate(d, put)
+                        stored = reg.read(d)["agents"].get("acme")
+                        if stored is not None:
+                            written += 1
+                        if stored is None:
+                            continue
+                        if old_view_pane_less(stored):
+                            shapes = [{"endpoint_verdict": v} for v in ("dead", "alive", "unknown", None)]
+                        else:
+                            shapes = [{"state": state, **{k: v for k, v in (("pane_listed", p), ("process_found", q)) if v != "missing"}}
+                                      for p in (True, False, None, "missing") for q in (True, False, None, "missing")]
+                        for ev in shapes:
+                            cells += 1
+                            old = bool(old_removes(stored, ev))
+                            new = bool(reg.shows_dead(stored, ev))
+                            reg._mutate(d, put)
+                            actual = bool(reg.reconcile_remove(d, "acme", ev, True)["changed"])
+                            if not (old == new == actual):
+                                bad.append((kind, pane, endpoint, state, ev, old, new, actual))
+    return written, cells, bad
+
+
+def old_view_pane_less(row):
+    return REG.no_pane_to_judge(row)
 
 
 class TestSharesDeadVerdict(unittest.TestCase):
@@ -129,31 +173,12 @@ class TestSharesDeadVerdict(unittest.TestCase):
         self.assertEqual(len(fake.calls), 1)
         self.assertEqual(fake.calls[0][1]["pane_listed"], False)
 
-    def test_s4_old_against_new_table(self):
-        print("\n%-56s %-5s %-5s" % ("row", "old", "new"))
-        added = 0
-        kept = 0
-        for label, row, ev in ROWS:
-            old, new = bool(old_removes(row, ev)), REG.shows_dead(row, ev)
-            print("%-56s %-5s %-5s" % (label, "rm" if old else "keep", "rm" if new else "keep"))
-            if new and not old:
-                added += 1
-        self.assertEqual(added, 0)
-        for label, row, ev in ROWS:
-            if "differing kind" in label:
-                self.assertTrue(old_registry_rule(row, ev), label)    # the registry's old inline test removed it
-                self.assertFalse(REG.shows_dead(row, ev), label)      # the new function keeps it
-                kept += 1
-        self.assertEqual(kept, 3)
-
-    def test_s4_reconcile_remove_keeps_the_differing_rows(self):
-        for label, row, ev in ROWS:
-            with tempfile.TemporaryDirectory() as d:
-                REG.upsert(d, "acme", dict(row))
-                if "acme" not in REG.read(d)["agents"]:
-                    continue   # the registry's own writer refused this shape: nothing to remove
-                changed = bool(REG.reconcile_remove(d, "acme", ev, True)["changed"])
-                self.assertEqual(changed, bool(REG.shows_dead(row, ev)), label)
+    def test_s4_the_grid_old_pair_against_new(self):
+        written, cells, bad = grid(REG)
+        self.assertEqual(written, GRID_KINDS)
+        self.assertGreater(cells, 300)
+        self.assertEqual(bad, [])
+        print("\ngrid: %d rows written, %d cells" % (written, cells))
 
     def test_s5_s6_scan_and_three_mutants(self):
         reg_src = (BIN / "registry.py").read_text()
@@ -165,12 +190,17 @@ class TestSharesDeadVerdict(unittest.TestCase):
                 "        evidence = evidence_of(agent, live)\n",
                 "        evidence = evidence_of(agent, live)\n        if evidence.get(\"pane_listed\") is not False:\n            continue\n", 1)),
             "the view not calling it": (reg_src, view_src.replace("_load_registry().shows_dead(", "(lambda a, e: True)(")),
+            "THE LOOSE RULE (no-pane branch keyed on no_pane_to_judge only)": (reg_src.replace(
+                "    if no_pane_by_both_rules(row):\n        return evidence", "    if no_pane_to_judge(row):\n        return evidence", 1), view_src),
             "the registry not calling it": (reg_src.replace("not shows_dead(row, evidence)", "not (evidence or {}).get(\"x\")"), view_src),
         }
         for label, (r, v) in mutants.items():
             with self.subTest(mutant=label):
                 self.assertNotEqual((r, v), (reg_src, view_src), "mutant not applied")
-                self.assertTrue(problems(r, v), "mutant not caught")
+                if label.startswith("THE LOOSE"):
+                    self.assertNotEqual(grid(load("registry", r))[2], [], "the loose rule passed the grid")
+                else:
+                    self.assertTrue(problems(r, v), "mutant not caught")
 
     def test_s7_docs_hold_one_section_with_the_four_statements(self):
         text = (BIN.parent / "docs" / "agent-registry.md").read_text()
