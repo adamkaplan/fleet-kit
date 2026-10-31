@@ -179,6 +179,7 @@ def cmd_comment(args, runner, now):
 
 
 cmd_comment.ensure_on_use = True   # the daemon is alive when it runs
+cmd_comment.header_cache = True    # #1520
 
 
 def cmd_whoami(args, runner, now):
