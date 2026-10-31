@@ -47,6 +47,7 @@ CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agen
 CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss", "stack_model_secret": "--stack-model-secret"}
 LAUNCHER_SHAPES = ("XS", "S", "M", "O")   # the launcher's SHAPES keys (O: the orchestrator row, 250m and 768 MiB, meant for --agent orchestrator; a worker on it is likely to be killed for memory); the launcher's own default (XS; S with --stack; O with --agent orchestrator) applies when --shape is not given
 LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
+MAX_M_PER_LANE = 4   # the most live shape-M (4 CPU) cloud workers one lane may hold: a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
@@ -654,6 +655,17 @@ def cmd_launch(args, runner, now):
         return _launch(args, runner, now, lambda state: stack.enter_context(reservation(state, args.name)))
 
 
+def lane_m_workers(state, lane):
+    """The sorted names of the lane's live shape-M workers, from the record directory alone (no token, no cluster call)."""
+    found = []
+    for record in list_records(state):
+        if not isinstance(record, dict) or "problem" in record or record.get("shape") != "M" or _ended(record):
+            continue
+        if (record.get("reports_to") or "(no boss)") == lane:
+            found.append(str(record.get("worker")))
+    return sorted(found)
+
+
 def _launch(args, runner, now, reserve):
     """`launch NAME --cloud --repo OWNER/REPO --branch B --agent A`: the allow-list first, then (with a cluster token minted for this command) the
     model entry and a one-hour git token go to the launcher as per-run secrets, the pod is created, and the session and the brief are sent through
@@ -689,6 +701,14 @@ def _launch(args, runner, now, reserve):
     check_allowed(repo)   # before anything is read, minted or created
     if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_STACK_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
         raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_STACK_SHAPES)))
+    if args.shape == "M":   # the per-lane cap on shape M: a directory read, only for a new name, before the preflight mints a token
+        cap_state = H["ensure_state_dir"]()
+        if load_record(cap_state, name) is None:
+            lane = args.reports_to or "(no boss)"
+            held = lane_m_workers(cap_state, lane)
+            if len(held) >= MAX_M_PER_LANE:
+                raise Refusal("lane %s already holds %d shape-M cloud workers (%s): retire one (retire NAME) or launch a smaller shape (--shape S)"
+                              % (lane, MAX_M_PER_LANE, ", ".join(held[:10])))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
@@ -769,6 +789,8 @@ def _launch(args, runner, now, reserve):
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
             if args.reports_to:
                 record["reports_to"] = args.reports_to
+            if isinstance(args.shape, str) and args.shape:
+                record["shape"] = args.shape
             save_record(state, record)
         except (CloudError, OSError) as err:
             remove_record(state, name)
