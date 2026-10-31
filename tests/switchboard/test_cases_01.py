@@ -651,6 +651,54 @@ class TestGitShim(Base):
     def added_lines(diff):
         return "\n".join(l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
 
+    # Built from pieces: the row's text would otherwise be flagged by the very scan this table configures.
+    CONFIG_WRITE_ALLOWED = (   # (file, exact added line, purpose)
+        ("tests/switchboard/test_cases_12.py", " " * 23 + "GIT_CONFIG_" + _G.upper() + '="/dev/null", GIT_CONFIG_' + _S.upper() + '="/dev/null")',
+         "points git at /dev/null: writes no git configuration"),
+    )
+
+    @classmethod
+    def config_write_allowed(cls, path, line):
+        return any(path == f and line == text for f, text, _ in cls.CONFIG_WRITE_ALLOWED)
+
+    @classmethod
+    def unallowed_config_write_hits(cls, diff):
+        path, hits = None, []
+        for l in diff.splitlines():
+            if l.startswith("+++ b/"):
+                path = l[6:]
+            elif l.startswith("+++"):
+                path = None
+            elif l.startswith("+"):
+                hits += [h for h in cls.config_write_hits(l[1:]) if not cls.config_write_allowed(path, l[1:])]
+        return hits
+
+    @staticmethod
+    def diff_adding(path, line):
+        return "diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1 +1 @@\n+%s\n" % (path, path, path, path, line)
+
+    def test_s7_u1_allow_table_drops_only_the_exact_row_in_its_file(self):
+        f, text, _ = self.CONFIG_WRITE_ALLOWED[0]
+        self.assertEqual(self.unallowed_config_write_hits(self.diff_adding(f, text)), [])
+        self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding("tests/switchboard/test_other.py", text))), 1)
+        self.assertEqual(len(self.unallowed_config_write_hits(self.diff_adding(f, text + " "))), 1)
+
+    def test_s7_u1_allow_table_widening_mutants_are_caught(self):
+        f, text, _ = self.CONFIG_WRITE_ALLOWED[0]
+        other, longer = self.diff_adding("tests/switchboard/test_other.py", text), self.diff_adding(f, text + " ")
+        mutants = {
+            "prefix": (lambda path, line: any(path == r and line.startswith(t) for r, t, _ in self.CONFIG_WRITE_ALLOWED), longer),
+            "substring": (lambda path, line: any(path == r and t in line for r, t, _ in self.CONFIG_WRITE_ALLOWED), longer),
+            "any-file": (lambda path, line: any(line == t for _, t, _ in self.CONFIG_WRITE_ALLOWED), other),
+        }
+        caught = 0
+        for name, (widened, diff) in mutants.items():
+            with self.subTest(name):
+                with mock.patch.object(type(self), "config_write_allowed", staticmethod(widened)):
+                    self.assertEqual(self.unallowed_config_write_hits(diff), [], "the mutant must widen the table")
+                    caught += len(self.unallowed_config_write_hits(diff)) == 0   # the (b)/(c) expectation of one hit now fails
+        self.assertEqual(caught, 3)
+
     def test_s7_u1_every_row_of_the_scan_finds_its_sample_and_only_that_row_does(self):
         for name, rx, hostile in self.CONFIG_WRITE_SPELLINGS:
             with self.subTest(name):   # the mutant: skip this row; the sample must then go unfound by every other row, so the row cannot be dropped unseen
@@ -694,7 +742,7 @@ class TestGitShim(Base):
         if base is None:
             self.skipTest("no main to diff against (a shallow checkout)")
         diff = subprocess.run(["git", "-C", str(REPO), "diff", base, "-U0", "--no-color"], capture_output=True, text=True, timeout=60).stdout
-        self.assertEqual(self.config_write_hits(self.added_lines(diff)), [])
+        self.assertEqual(self.unallowed_config_write_hits(diff), [])
 
 
 class TestGhShim(Base):
