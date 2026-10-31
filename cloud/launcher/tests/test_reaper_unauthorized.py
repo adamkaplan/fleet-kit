@@ -194,9 +194,14 @@ class S9Relogin(unittest.TestCase):
         w.reads = 0
         relogin()
         r3 = w.reads
-        print("S9: vault reads first call %d, second call inside the gap %d, call after the gap %d, inside-gap calls answering not written %d of 1"
-              % (r1, r2, r3, 1 if second is False else 0))
+        w.clock.now += 60 * dt.timedelta(seconds=1)
+        w.reads = 0
+        extra_answer = relogin()
+        extra_reads = w.reads
+        print("S9: vault reads first call %d, second call inside the gap %d, call after the gap %d, inside-gap calls answering not written %d of 2"
+              % (r1, r2, r3, sum(1 for x in (second, extra_answer) if x is False)))
         self.assertEqual((r1, r2, r3, first, second), (1, 0, 1, False, False))
+        self.assertEqual((extra_reads, extra_answer), (0, False))
 
 
 def mutate(directory, edits):
