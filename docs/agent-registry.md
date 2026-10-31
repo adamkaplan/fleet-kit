@@ -33,7 +33,7 @@ rebuilt from another record.
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
 | `bin/switchboard/judge.py:53` | `discovery.agents` | the judge's own sessions: the session ids of the discovered agents | nobody | the policy judge's socket | derived (reader) |
 | `bin/switchboard/decisions_a.py:209` | `discovery.agents` | the decisions list reads the discovered agents to find each worker's boss | nobody | the Decisions list | derived (reader) |
-| `bin/switchboard/claims_note.py:93` | `discovery.agents` | the claims notice pass hands the discovered agents to `route_of` to find the recipients of a pull request's own events | nobody | the claims notice (ask #1716) | derived (reader) |
+| `bin/switchboard/claims_note.py:95` | `discovery.agents` | the claims notice pass hands the discovered agents to `route_of` to find the recipients of a pull request's own events | nobody | the claims notice (ask #1716) | derived (reader) |
 | `bin/switchboard/decisions_b.py:457` | `discovery.agents` | the external-decision host reads the newest discovery | nobody | external decision sync | derived (reader) |
 | `bin/impact_hold.py:401` | `discovery.agents` | looks up the orchestrator of a block | nobody | impact hold | derived (reader) |
 | `bin/lanes.py:55` | `discovery.agents` | looks up lanes by agent | nobody | lane resolution | derived (reader) |
