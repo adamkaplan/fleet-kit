@@ -1674,6 +1674,14 @@ def pod_deadline_floor(max_hard):
     return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
 
 
+FLOOR_ORDER = ("XS", "S", "M")   # the shapes a repository floor may name, smallest first; the orchestrator row O is not one of them and ranks below XS
+
+
+def shape_rank(shape):
+    """The rank of a shape for the floor comparisons: its place in FLOOR_ORDER, or -1 (below XS) for any other row, the orchestrator row O included."""
+    return FLOOR_ORDER.index(shape) if shape in FLOOR_ORDER else -1
+
+
 def repo_min_shapes(raw):
     """THE parse of CW_REPO_MIN_SHAPE: {repository key: shape} from comma-separated OWNER/NAME=SHAPE pairs, or None when any entry is malformed (no
     '=', an unknown shape, a repository that is not OWNER/NAME, a repeated repository, a control character). The repository part is parsed by `_repo_key`,
@@ -1685,7 +1693,7 @@ def repo_min_shapes(raw):
         repo, sep, shape = entry.partition("=")
         key = _repo_key(repo.strip())
         shape = shape.strip()
-        if not sep or key is None or shape not in SHAPES or key in floors:
+        if not sep or key is None or shape not in FLOOR_ORDER or key in floors:
             return None
         floors[key] = shape
     return floors
@@ -1705,11 +1713,11 @@ def check_shape(a, env=None):
     named = getattr(a, "shape", None)
     if named is not None and named not in SHAPES:
         raise CloudError("shape must be one of %s" % ", ".join(SHAPES), EXIT_USAGE)
-    if named is not None and floor is not None and list(SHAPES).index(named) < list(SHAPES).index(floor):
+    if named is not None and floor is not None and shape_rank(named) < shape_rank(floor):
         raise CloudError("refused: %s needs at least shape %s (CW_REPO_MIN_SHAPE), not %s; name a larger shape or change the setting; nothing was created" % (scrub(a.repo, (), 120), floor, named), EXIT_USAGE)
     if named is None:
         a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
-        if floor is not None and list(SHAPES).index(floor) > list(SHAPES).index(a.shape):
+        if floor is not None and shape_rank(floor) > shape_rank(a.shape):
             a.shape = floor
     if getattr(a, "stack", False) and not SHAPES[a.shape]["stack"]:
         raise CloudError("--stack needs a shape that can run a nested Docker stack (%s), not %s" % (", ".join(k for k, v in SHAPES.items() if v["stack"]), a.shape), EXIT_USAGE)
