@@ -67296,6 +67296,7 @@ TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Ba
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
+TestKeyedReminderSupersede = importlib.import_module("test_keyed_reminder_supersede").build(PR4Base)
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly
