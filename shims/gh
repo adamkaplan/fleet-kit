@@ -1565,6 +1565,86 @@ def sign_plan(args, lookup):
         return late
 
 
+# ---- #1696 round 2 (H4, M1): wrappers over the defs above; new lines only.
+from urllib.parse import urlsplit
+
+_api_endpoint_old = api_endpoint
+
+
+def api_endpoint(text):
+    """M1: an https URL whose parsed host is exactly api.github.com (any case; userinfo, port 443 and a trailing dot allowed) is reduced to its path, query
+    and fragment, then treated like the old spelling rules. Any other host, scheme or port is left untouched (not GitHub)."""
+    try:
+        parts = urlsplit(text)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return _api_endpoint_old(text)
+    if parts.scheme.lower() == "https" and host and host.rstrip(".") == "api.github.com" and port in (None, 443):
+        rest = parts.path + ("?" + parts.query if parts.query else "") + ("#" + parts.fragment if parts.fragment else "")
+        return _api_endpoint_old("https://api.github.com" + rest)
+    return _api_endpoint_old(text)
+
+
+_graphql_call_old = graphql_call
+
+
+def graphql_temp_copy(path, temps):
+    """H4: a named query file is opened without blocking, must be a regular file (refused BEFORE any read), and the exact bytes read from that one
+    descriptor go to a temp copy. The temp mode is the library default (mkstemp: 0600); the name is fleet-gh-*.gql, in the default temp dir."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as err:
+        raise Unsignable("the query text cannot be read (%s)" % type(err).__name__)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise Unsignable("the query file %s is not a regular file" % path)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read()
+    except OSError as err:
+        raise Unsignable("the query text cannot be read (%s)" % type(err).__name__)
+    finally:
+        os.close(fd)
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".gql")
+    temps.append(temp)
+    with os.fdopen(handle, "wb") as out:
+        out.write(raw)
+    return temp
+
+
+def graphql_call(args):
+    """H4: the query files (-F query=@file, --input FILE) are read once, as regular files, and the real gh gets temp copies of those bytes."""
+    positionals, _method, fields = api_parse(args)
+    if "graphql" not in positionals:
+        return None
+    new, temps = list(args), []
+    try:
+        for index, flag, inline, text in fields:
+            key, eq, value = text.partition("=")
+            if key == "query" and eq and flag in ("-F", "--field") and value.startswith("@") and value != "@-":
+                replaced = "query=@" + graphql_temp_copy(value[1:], temps)
+                if inline is None:
+                    new[index + 1] = replaced
+                else:
+                    new[index] = args[index][:len(args[index]) - len(inline)] + replaced
+        found = input_value(args)
+        if found is not None and found[2] != "-":
+            copy = graphql_temp_copy(found[2], temps)
+            if found[1] is None:
+                new[found[0] + 1] = copy
+            else:
+                new[found[0]] = "--input=" + copy
+        plan = _graphql_call_old(new)
+    except BaseException:
+        for path in temps:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+    return plan[0], plan[1], temps or None
+
+
 # ---- the gate probe (plan-driven development: enforcing in a repo whose mode is enforce). docs/plan-gate-engine-design.md, E1 and E3.
 #
 # Before `gh pr ready` or `gh pr merge` of a PR the shim asks `fleet-switchboard gates-check <repo#N> --for ready|merge`, with

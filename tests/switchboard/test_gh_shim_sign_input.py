@@ -116,6 +116,62 @@ def battery(rig):
     return bad
 
 
+H4_REFUSAL = "gh: refused: the query file %s is not a regular file, so it cannot be signed and nothing was posted"
+M1_HOSTS = ("https://user@api.github.com", "https://api.github.com:443", "https://api.github.com.", "https://API.GitHub.com", "https://u:p@api.github.com.:443")
+READ_QUERY = "query { viewer { login } }"
+
+
+def battery2(rig):
+    """#1696 round 2: H4 (graphql query files: refused when not regular, passed as temp copies) and M1 (host normalisation). Names the failures."""
+    bad = []
+    home = rig.home
+    query = home / "q.graphql"
+    query.write_text(READ_QUERY)
+    for form in (("-F", "query=@%s" % query), ("--field=query=@%s" % query,)):
+        done, calls = rig.run("api", "graphql", *form)
+        last = calls[0]["argv"][-1] if calls else ""
+        temp = last.split("=@", 1)[-1]
+        if len(calls) != 1 or temp == str(query) or calls[0]["files"].get(temp) != READ_QUERY or os.path.exists(temp):
+            bad.append("clean query not passed as a temp copy: " + form[0])
+    path = home / "in.json"
+    path.write_text(json.dumps({"query": READ_QUERY}))
+    done, calls = rig.run("api", "graphql", "--input", str(path))
+    if len(calls) != 1 or calls[0]["argv"][-1] == str(path) or calls[0]["files"].get(calls[0]["argv"][-1]) != path.read_text():
+        bad.append("clean --input not passed as a temp copy")
+    done, calls = rig.run("api", "graphql", "-F", "query=@-", stdin=READ_QUERY)
+    if len(calls) != 1 or calls[0]["stdin"] != READ_QUERY:
+        bad.append("stdin query not passed")
+    done, calls = rig.run("api", "graphql", "--input", "-", stdin=json.dumps({"query": READ_QUERY}))
+    if len(calls) != 1 or json.loads(calls[0]["stdin"])["query"] != READ_QUERY:
+        bad.append("stdin --input not passed")
+    fifo = home / "q.fifo"
+    os.mkfifo(str(fifo))
+    for form in (("-F", "query=@%s" % fifo), ("--input", str(fifo)), ("--input=" + str(fifo),)):
+        done, calls = rig.run("api", "graphql", *form)
+        if calls or not done.stderr.startswith("gh: refused:") or "is not a regular file" not in done.stderr:
+            bad.append("FIFO query not refused: " + form[0])
+    done, calls = rig.run("api", "graphql", "-F", "query=@%s" % fifo)
+    if done.stderr.strip() != H4_REFUSAL % fifo:
+        bad.append("FIFO refusal text differs")
+    for host in M1_HOSTS:
+        done, calls = rig.run("api", host + "/graphql", "-f", "query=" + gql("addComment"))
+        if calls or not done.stderr.startswith("gh: refused: the GraphQL mutation addComment"):
+            bad.append("graphql mutation let through: " + host)
+        done, calls = rig.run("api", host + "/repos/o/r/issues/1/comments", "-f", "body=x")
+        if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
+            bad.append("REST comment not signed: " + host)
+    for host in ("https://api.github.com.evil", "https://api.github.com:8443", "http://api.github.com"):
+        args = ("api", host + "/graphql", "-f", "query=" + gql("addComment"))
+        done, calls = rig.run(*args)
+        if len(calls) != 1 or calls[0]["argv"] != list(args):
+            bad.append("not-GitHub host touched (graphql): " + host)
+        args = ("api", host + "/repos/o/r/issues/1/comments", "-f", "body=x")
+        done, calls = rig.run(*args)
+        if len(calls) != 1 or calls[0]["argv"] != list(args):
+            bad.append("not-GitHub host touched (REST): " + host)
+    return bad
+
+
 class TestGhShimSignInput(unittest.TestCase):
     def setUp(self):
         self.rig = Rig()
@@ -399,6 +455,34 @@ class TestGhShimSignInput(unittest.TestCase):
         done, calls = rig.run("api", "graphql", "--input", "query.json")
         self.assertEqual(done.returncode, 1)   # the mutant refuses first (exit 1), the real shim exit 10 (test_h4_the_older...)
         self.assertIn("cannot be signed", done.stderr)
+
+    def test_h4_m1_round_two_battery_passes_for_the_real_shim(self):   # the CONTROL of every mutant below
+        rig = hermetic_rig()
+        self.addCleanup(rig.close)
+        self.assertEqual(battery2(rig), [])
+
+    def mutant2(self, old, new):
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone: " + old)
+        rig = hermetic_rig()
+        self.addCleanup(rig.close)
+        shim = rig.shims / "gh"
+        shim.write_text(shim.read_text().replace(old, new, 1))
+        return battery2(rig)
+
+    def test_h4_mutant_original_path_passed_is_seen(self):
+        seen = self.mutant2("    return plan[0], plan[1], temps or None", "    return list(args), plan[1], None")
+        self.assertEqual(len(seen), 3, seen)
+        self.assertTrue(all(x.startswith("clean ") for x in seen), seen)
+
+    def test_h4_mutant_fifo_not_refused_is_seen(self):
+        seen = self.mutant2('        if not stat.S_ISREG(mode):\n            raise Unsignable("the query file', '        if False:\n            raise Unsignable("the query file')
+        self.assertEqual(len(seen), 4, seen)
+        self.assertTrue(all("FIFO" in x for x in seen), seen)
+
+    def test_m1_mutant_host_not_normalised_is_seen(self):   # 8 failures: the case-only host still matches the old rule
+        seen = self.mutant2('if parts.scheme.lower() == "https" and host and', 'if False and host and')
+        self.assertTrue(all(s.startswith(("graphql mutation let through", "REST comment not signed")) for s in seen), seen)
+        self.assertEqual(len(seen), 2 * len(M1_HOSTS) - 2, seen)   # the plain-case host still matches the old rule
 
 
 if __name__ == "__main__":
