@@ -38,6 +38,8 @@ SCENARIO_TESTS = {
     "S12": "test_s6_and_s12_only_the_rated_pull_request_costs_a_read_and_none_without_a_rating",
     "U2": "test_u2_a_top_tier_path_in_a_no_paths_repository_is_not_judged_without_a_hold_rating",
     "U3": "test_u3_labels_a_person_added_are_never_removed_in_a_no_paths_repository",
+    "S13": "test_a_cleared_pull_request_pushed_to_an_unrated_head_is_held_again_in_a_no_paths_repository",
+    "S13b": "test_a_cleared_pull_request_pushed_to_an_unrated_head_is_held_again_in_a_no_paths_repository",
 }
 NO_MUTANT = {"U1": "the existing floor tests pass unchanged", "S9": "these mutants"}
 PASS_SKIP = 'if not globs and (not ours or ((records.get((pr, head)) or ("",))[0] == "hold" and not records_problem)):'
@@ -69,6 +71,8 @@ MUTANTS = {
                                                      ("release_impact_hold", 'if not isinstance(state["applied"].get(pr), dict):', "if False:"),
                                                      ("release_impact_hold", "remove = [l for l in ours if l in have]", "remove = [l for l in have if l in set(names.values())]"),
                                                      ("release_impact_hold", 'del state["applied"][pr]', 'state["applied"].pop(pr, None)')]),
+    "S13": ("ignores an earlier clear on an unrated head", [("_impact_rehold_now", "if not why:", "if True:")]),
+    "S13b": ("skips the no-globs repository", [("impact_would_hold_pass", PASS_SKIP, "if not globs:"), ("impact_would_hold_pass", JUDGE_CALL, "spent, skipped = 0, 0")]),
 }
 
 
@@ -312,6 +316,22 @@ def build(TestImpactHold, FAKE_GH, LEDGER_HEAD, LEDGER_NEW_HEAD):
                     with mutated(edits):
                         survived = self.run_named(name)
                     self.assertFalse(survived, "the mutant survives: %s fails to fail (%s)" % (name, what))
+
+        def test_s13_both_wrong_builds_are_killed_and_fail_anchored_on_the_hold_reapplied_count(self):
+            name = SCENARIO_TESTS["S13"]
+            self.assertEqual(SCENARIO_TESTS["S13b"], name)
+            self.assertTrue(self.run_named(name), "control: the real daemon passes the S13 test")
+            killed = 0
+            for scenario in ("S13", "S13b"):
+                what, edits = MUTANTS[scenario]
+                with mutated(edits):
+                    result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(TestIndependentImpactNoPaths(name))
+                text = "".join(trace for _, trace in result.failures + result.errors)
+                self.assertFalse(result.wasSuccessful(), "the mutant survives: %s" % what)
+                self.assertTrue("hold_reapplied" in text or "label" in text or "not enough values" in text or "0 != 1" in text, "%s: unanchored failure: %s" % (scenario, text[-300:]))
+                killed += 1
+            print("S13 mutants killed: %d of 2" % killed)
+            self.assertEqual(killed, 2)
 
     for _name in [n for n in dir(TestImpactHold) if n.startswith("test_")]:
         setattr(TestIndependentImpactNoPaths, _name, None)   # the inherited tests run once, in their own class
