@@ -354,7 +354,7 @@ class TestClaimsNoteMutants(ClaimsNoteBase):
             applied.append(1)
             return [s["id"] for s in scenarios if ledger.claim_of(s) == "pr"]
         with mock.patch.object(ledger, "omitted_claims", every):
-            with self.assertRaises(AssertionError):
+            with self.assertRaisesRegex(AssertionError, r"\ALists differ: \[\['S1', 'S2', 'S3', 'U1'\]\] != \[\['S3', 'U1'\]\]"):
                 self.checks(self.world())
         self.assertTrue(applied)
 
@@ -370,7 +370,7 @@ class TestClaimsNoteMutants(ClaimsNoteBase):
                 state.announced = Forgetful(state.announced)
             return state
         with mock.patch.object(self.sb, "claims_note_state", mutant):
-            with self.assertRaises(AssertionError):
+            with self.assertRaisesRegex(AssertionError, r"\ALists differ: \[\d+\.\d+\] != \[\d+\.\d+\]"):
                 self.checks(self.world())
         self.assertTrue(applied)
 
