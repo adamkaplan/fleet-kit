@@ -14127,7 +14127,7 @@ class TestClearNotice(Base):
         self.assertTrue(self.body.startswith("MERGE: automatic"), "the marker edit is done")
         self.assertTrue(lines[0].startswith("cleared the impact hold") and any("MERGE: automatic" in l for l in lines))
         sends = [i for i, step in enumerate(self.order) if step.startswith("SEND")]
-        self.assertTrue(sends and all(any(step.startswith("PATCH") for step in self.order[:i]) for i in sends), "the marker edit happened BEFORE the send was attempted: %s" % self.order)
+        self.assertTrue(sends and all(any(step.startswith("PATCH") for step in self.order[:i]) for i in sends), "the marker edit (PATCH) must come before every send attempt, and at least one send must have been attempted: %s" % self.order)
         (event,) = self.events("gate.clear_notify_failed")
         self.assertIn("notice not sent: timed out", event["detail"]["error"])
         release.set()
