@@ -2053,7 +2053,7 @@ class TestCloudWatchBounds(unittest.TestCase):
 
     def test_every_untrusted_record_parse_is_bounded_and_listed_in_the_docs(self):
         """Completeness: every json.loads in cloud_worker.py of a record file goes through parse_bounded, and the docs table names each reader."""
-        text = self.SRC.read_text()
+        text = self.SRC.read_text() + (REPO / "bin" / "cloud_cluster.py").read_text()   # the text moved out of it (ask #1647)
         loads = [l.strip() for l in text.splitlines() if "json.loads(" in l and not l.lstrip().startswith("#")]
         self.assertEqual(loads, ["return json.loads(text)", "body = json.loads(out) if (out or \"\").strip() else None"])
         import re

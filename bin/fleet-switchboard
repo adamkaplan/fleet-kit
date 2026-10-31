@@ -6089,8 +6089,11 @@ BOSS_READ_SITES = {
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
     "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
     "bin/fleet-switchboard:cloud_sender": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record): its reports_to is read from the record and validated by `_cloud_boss`, to name the pane-less sender of its report",
+    "bin/fleet-switchboard:cloud_turn_tick": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the watch's record and handed to scan_turns, which sends to that lane or, with no valid name, to the Chief of Staff alone (#1484)",
+    "bin/cloud_end_alert.py:scan_audit": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record; the message goes to the lane name `send` resolves (the same lookup), with the Chief of Staff as the second recipient",
     "bin/cloud_worker.py:_may_retire": "the one caller rule of `retire` and `cloud-clear`: a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
     "bin/cloud_retired.py:keep_boss": "keeps the boss of a removed cloud worker from the worker's own endpoint record (not a discovered agent) so `read` can answer for it after the record is gone",
+    "bin/cloud_worker.py:lane_m_workers": "the lane of a record, for the M cap: a cloud worker's own endpoint record (not a discovered agent), read as written",
 }
 
 
@@ -8615,7 +8618,7 @@ def pr_ci_of(rollup):
         verdict = str(check.get("conclusion") or check.get("state") or "").upper()
         if verdict in failing:
             return "failing"
-        if check.get("status") not in (None, "COMPLETED") or verdict in ("PENDING", "EXPECTED", ""):
+        if (check.get("status") not in (None, "COMPLETED") and verdict != "SUCCESS") or verdict in ("PENDING", "EXPECTED", ""):
             pending = True
     return "pending" if pending else "green"
 
@@ -8910,6 +8913,7 @@ def pr_facts_from(data):
             "head_at": pr_head_time(data.get("commits")),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
             "ci": pr_ci_of(data.get("statusCheckRollup")), "ci_rollup": data.get("statusCheckRollup"), "review": review,
+            "legs": load_module("merge_gate").rollup_legs(load_module("ci_runs").newest(data.get("statusCheckRollup")), data.get("statusCheckRollup")),   # #1235: G4 reads the macOS legs too
             # PR 52: a conflict is `mergeable` CONFLICTING, found in the read a notice already costs; the head
             # commit is what makes it one event per push
             "mergeable": str(data.get("mergeable") or "").upper() or None,
@@ -9604,6 +9608,54 @@ def cloud_watch_tick(engine, discovery):
     return result
 
 
+CLOUD_END_ALERT_FILE = "cloud-end-alert.json"   # #1480: the private cursor and the sent keys of the pass that reads the launcher's audit file
+
+
+def cloud_audit_path():
+    """Where the cloud launcher's audit file is (the launcher's own rule: $CW_CLOUD_AUDIT, else cw-cloud/audit.jsonl in its state directory)."""
+    return os.environ.get("CW_CLOUD_AUDIT") or os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")
+
+
+def cloud_end_tick(engine, discovery):
+    """#1480: a cloud worker the launcher ended (idle, hard limit, pod gone, failed pod) tells its boss and the Chief of Staff in the same pass, once per run
+    and reason. Reads the launcher's audit file from a stored cursor; sends through the daemon's own `send`. Returns what was handed to it."""
+    state_dir = getattr(engine, "state_dir", None)
+    if state_dir is None:
+        return []
+    return load_module("cloud_end_alert").scan_audit(cloud_audit_path(), Path(state_dir) / CLOUD_END_ALERT_FILE, Path(state_dir) / "cloud",
+                                                     _read_small(state_dir, LAST_REPORT_FILE), lambda to, text: engine.send("switchboard", to, text),
+                                                     load_module("record_json").parse_bounded,
+                                                     lambda worker, detail: engine.audit is not None and engine.audit.append(engine.actor, "cloud_end_alert.send_failed", worker, detail))
+
+
+def cloud_turn_activity(worker):
+    """#1484: (busy, last update in epoch seconds) of a cloud worker, from the launcher's own `status` (which reads the worker's activity script in the pod); None when unreadable."""
+    import datetime as _dt
+    cloud = load_module("cloud_worker").bind(globals())
+    code, data, _err = cloud.run_launcher(None, "status", worker, timeout=60)
+    rec = data[0] if code == 0 and isinstance(data, list) and data and isinstance(data[0], dict) else None
+    if rec is None:
+        return None
+    since = rec.get("idle_since")
+    if not since:
+        return True, 0
+    return False, _dt.datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc).timestamp()
+
+
+def cloud_turn_tick(engine, discovery, activity=None):
+    """#1484: a cloud worker whose turn ended and who waits tells its recorded boss, once per turn end (the sender, state file and keys of #1480)."""
+    state_dir = getattr(engine, "state_dir", None)
+    watch = getattr(engine, "cloud_watch", None)
+    if state_dir is None or not watch:
+        return []
+    workers = [(r.get("worker"), r.get("reports_to")) for r in watch.get("records", []) if isinstance(r, dict)]
+    if not hasattr(engine, "_cloud_turn_memory"):
+        engine._cloud_turn_memory = {}
+    return load_module("cloud_end_alert").scan_turns(workers, activity or cloud_turn_activity, Path(state_dir) / CLOUD_END_ALERT_FILE, cloud_audit_path(),
+                                                     lambda to, text: engine.send("switchboard", to, text), load_module("record_json").parse_bounded,
+                                                     time.time(), engine._cloud_turn_memory)
+
+
 def lost_worker_tick(engine, discovery):
     """#1481: the lost-worker detector (bin/lost_worker.py). Reads the audits and the cloud records the pass already holds; sends one alert per loss."""
     import importlib.util   # by path, beside this file, as `_brief_advisory` does: the module stays out of the clear's loaded set (no impact-matrix row)
@@ -9647,6 +9699,14 @@ def finish_pass(engine, discovery, report):
         cloud_watch_tick(engine, discovery)
     except Exception as err:
         engine._failed("cloud-watch", "cloud-watch", err, report)
+    try:
+        cloud_end_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("cloud-end-alert", "cloud-end-alert", err, report)
+    try:
+        cloud_turn_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)
     try:
         lost_worker_tick(engine, discovery)   # #1481: a lost worker is told once to its lane and the Chief of Staff
     except Exception as err:
@@ -11797,7 +11857,7 @@ def _review_comment_item(repo, comment, issue, number, cid, now):
         return None
     signer = signed_by_fleet(body)
     known, lookups = _issue_refs(issue, number)
-    clean = lambda text: _one_line(re.sub(r"[\x00-\x1f\x7f]", "", text), REVIEW_NAME_CAP)   # no control character reaches the line
+    clean = lambda text: _one_line(scrub_signed_links(re.sub(r"[\x00-\x1f\x7f]", "", text)), REVIEW_NAME_CAP)   # no control character reaches the line
     who = clean(login)
     if signer:
         who += " (signed %s)" % clean(signer)
@@ -11820,7 +11880,7 @@ def _comment_item(repo, comment, issue, now):
     if signed_by_fleet(body):
         return None
     known, lookups = _issue_refs(issue, number)
-    summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(comment.get("body") or "", 400))
+    summary = "@%s commented on #%d: %s" % (_login(comment) or "someone", number, _one_line(scrub_signed_links(comment.get("body") or ""), 400))
     return GitHubItem("github.comment:%d" % cid, "github.comment", summary, repo, known, lookups, _login(comment), now,
                       [number], not _is_bot(comment))
 
@@ -11874,8 +11934,11 @@ def _review_item(repo, review, pr, now):
         return None
     known, lookups = _pr_refs(pr, number)
     state = str(review.get("state") or "reviewed").lower()
+    bot = bot_wake_item(repo, review, pr, now, known, lookups, number)   # a review bot's finding at the current head: one item per bot and head (#1625)
+    if bot:
+        return bot
     summary = "@%s reviewed PR #%d (%s): %s" % (_login(review) or "someone", number, state,
-                                                _one_line(review.get("body") or "", 300))
+                                                _one_line(scrub_signed_links(review.get("body") or ""), 300))
     return GitHubItem("github.review:%d" % rid, "github.review", summary, repo, known, lookups, _login(review), now,
                       [number], state == "changes_requested")
 
@@ -17047,10 +17110,11 @@ def cmd_gates(args, runner, now):
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
-    standing_lines = []   # #1404: every call lists each standing change request by the shim's rule, whatever the decision field says (the decision only widens the rule, as at the shim)
+    standing_lines, seen = [], []   # #1404: every call lists each standing change request by the shim's rule, whatever the decision field says (the decision only widens the rule, as at the shim)
     if isinstance(ctx.facts, dict) and not ctx.unreadable and not getattr(ctx, "ask_issue", False):   # an issue subject has no pull request: no reviews to list
         standing_lines = blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head"),
-                                               "CHANGES_REQUESTED" if ctx.facts.get("review") == "changes requested" else "", gates_caller_name(runner, now))
+                                               "CHANGES_REQUESTED" if ctx.facts.get("review") == "changes requested" else "", gates_caller_name(runner, now), seen)
+    bots = bot_review_lines(seen, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else []   # #1625: information only
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
     if args.json:
@@ -17062,11 +17126,13 @@ def cmd_gates(args, runner, now):
             report["shares"] = shares
         if standing_lines:
             report["blocking_reviews"] = standing_lines
+        report.update(bot_reviews=bots) if bots else None   # a pull request with no bot review keeps its keys
         print(json.dumps(report, sort_keys=True))
     else:
         lines = plan_ledger.render_gates(report, ctx.pr)
         if shares:
             lines.append(shares)
+        lines.extend(bots)
         if suites_finding:
             lines.append(suites_finding)
         if ctx.unreadable:
@@ -19569,7 +19635,7 @@ def ci_record_core(ctx, now, quiet=False):
     if ci != "green":
         if not quiet:
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
-        named = "; ".join("%s run %s is %s" % (w or "status", r, st) for w, r, st in load_module("ci_runs").not_green_runs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
+        named = "; ".join("%s%s run %s is %s" % (w or "status", " job " + j if j else "", r, st) for w, j, r, st in load_module("ci_runs").not_green_jobs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
         return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)%s" % (ci, head[:8], " [%s]" % named if named else ""))
     out["carry"] = carry_at_green(ctx, now)   # the carry does not depend on whether any ci verdict is wanted
     for d in out["carry"]:
@@ -20749,7 +20815,7 @@ def rest_review_as_view(review):
             "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id"), "submitted_at": review.get("submitted_at")}
 
 
-def standing_requests(engine, runner, now, repo, number, head="", decision="", fresh=False):
+def standing_requests(engine, runner, now, repo, number, head="", decision="", fresh=False, seen=None):
     """(rows, problem): the standing CHANGES_REQUESTED reviews of ONE pull request, by the SAME rule as the merge shim (`shims/review_rule.py`, never a copy), each
     row {login, name, id, commit, age}; `problem` is a one-line cause when the list could not be read whole or the rule file is unreadable (never an empty `rows`)."""
     try:
@@ -20758,6 +20824,8 @@ def standing_requests(engine, runner, now, repo, number, head="", decision="", f
         ok, reviews, why = False, None, type(err).__name__
     if not ok:
         return [], "the reviews could not be read whole (%s): not listed" % why
+    if seen is not None:
+        seen.extend(reviews)   # #1625: the bot lines share this one read
     try:
         rule = load_review_rule()
     except Exception:
@@ -20775,10 +20843,10 @@ def review_age_text(seconds):
     return "unknown age" if seconds is None else "%dd" % (seconds // 86400) if seconds >= 172800 else _age_text(seconds)
 
 
-def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED", caller=None):
+def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED", caller=None, seen=None):
     """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks.
     Each names the review id, the commit, the author's fleet name and its age (#1404)."""
-    rows, problem = standing_requests(engine, runner, now, repo, number, head, decision)
+    rows, problem = standing_requests(engine, runner, now, repo, number, head, decision, seen=seen)
     if problem:
         return ["blocking review: " + problem]
     def how(row):   # the command is named only for the caller's OWN review (`caller` None: no identity given, the command is named for each)
@@ -20935,6 +21003,14 @@ def cmd_review(args, runner, now):
             if block_problem and verdict != "incomplete":
                 raise ReviewError("refused: %s (nothing was recorded)" % block_problem)
             listed, listed_problem = pr_changed_paths(raw)
+            if listed is None and verdict != "incomplete" and isinstance(raw.get("files"), list):   # #1098: `gh pr view` lists 100 files at most: the whole list is read through the ONE paged reader (every page up to GitHub's 3000), never judged from the first page
+                module = load_module("delegated_clear")
+                try:
+                    pages = module.read_pr_files(impact_carry_get(engine, runner, repo), repo, number)[0]
+                    raw = dict(raw, files=[{"path": f["filename"], "additions": f.get("additions"), "deletions": f.get("deletions")} for f in pages], changedFiles=len(pages), truncated=False)
+                    listed, listed_problem = pr_changed_paths(raw)
+                except module.FileListError as err:
+                    listed_problem = "%s; the paged list could not be read: %s" % (listed_problem, err)
             if verdict != "incomplete":   # fails toward refusal: a list GitHub did not give whole is never replaced by the block's own
                 if listed is None:
                     raise ReviewError("refused: %s, so the read cannot be checked (nothing was recorded)" % listed_problem)
