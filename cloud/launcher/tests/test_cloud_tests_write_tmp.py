@@ -142,7 +142,11 @@ class Scan(unittest.TestCase):
     def test_a_widened_exemption_is_refused(self):
         files = sorted(glob.glob(os.path.join(KIT, "cloud", "*", "tests", "*.py")))
         self.assertEqual(list(ALLOWED), ["cloud/worker/tests/test_push_rules.py"])
-        self.assertEqual(scan(files, {}), ["cloud/worker/tests/test_push_rules.py:314"])   # the exemption is what makes the real scan pass
+        rel = "cloud/worker/tests/test_push_rules.py"
+        with open(os.path.join(KIT, rel)) as fh:
+            found_at = [i for i, text in enumerate(fh.read().splitlines(), 1) if 'open(CONF, "w")' in text]
+        self.assertEqual(len(found_at), 1)   # exactly one line is the guarded write; found by its text, not by a number
+        self.assertEqual(scan(files, {}), ["%s:%d" % (rel, found_at[0])])   # the exemption is what makes the real scan pass
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             planted = os.path.join(d, "test_planted.py")
@@ -151,6 +155,9 @@ class Scan(unittest.TestCase):
             self.assertEqual(len(scan(files + [planted], ALLOWED)), 1)   # a second path is not exempt: the scan fails
             widened = dict(ALLOWED); widened[os.path.relpath(planted, KIT)] = ("x", "x")
             self.assertEqual(scan(files + [planted], widened), [])        # mutation applied True: only a widened table lets it pass
+            print("S15: guarded write found by text at line %d, scan without the table names it %d of 1, second paths refused %d of 1, "
+                  "widened tables let it pass %d of 1, mutation applied True" % (found_at[0], len(scan(files, {})),
+                  len(scan(files + [planted], ALLOWED)), int(scan(files + [planted], widened) == [])))
 
 
 if __name__ == "__main__":
