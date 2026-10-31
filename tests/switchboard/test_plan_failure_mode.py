@@ -128,5 +128,52 @@ class TestNoFailureMode(unittest.TestCase):
         self.assertEqual(got["code"], "no-failure-mode")
 
 
+    def _warn_count(self, module, text):
+        return len([w for w in module.check(text, DONE)["warnings"] if w["code"] == "no-failure-mode"])
+
+    def _only_in_other_field(self, field, word="missing"):
+        base = plan()
+        old = {"pass": "the summary has exactly 3 lines and the first line starts with", "discriminates": "a stub that prints an empty summary returns 0 lines"}[field]
+        self.assertIn(old, base)
+        return base.replace(old, old + " (" + word + " nothing)", 1)
+
+    def test_a_failure_word_only_in_a_pass_or_discriminates_line_still_warns_and_its_control_does_not(self):
+        for field in ("pass", "discriminates"):
+            with self.subTest(field=field):
+                got = run(self._only_in_other_field(field)).stdout.count("no-failure-mode")
+                self.assertEqual(got, 1)   # anchored: the failure word is only in a verdict line
+                for word in ("missing", "unreadable"):
+                    control = plan().replace("then the summary has exactly 3 lines", "then the summary has exactly 3 lines even when a file is " + word, 1)
+                    self.assertEqual(run(control).stdout.count("no-failure-mode"), 0, word)   # control: in a scenario text
+                print("warn %d / control 0 (%s)" % (got, field))
+
+    def _mutant(self):
+        src = (REPO / "bin" / "plan_check.py").read_text()
+        real = 'FAILURE_SCENARIO_RE.search(str(s.get("text", "")))'
+        self.assertEqual(src.count(real), 1)
+        mutated = src.replace(real, 'FAILURE_SCENARIO_RE.search(" ".join(str(v) for v in s.values()))')
+        import importlib.util
+        tmp = tempfile.mkdtemp()
+        path = Path(tmp) / "plan_check_mutant.py"
+        path.write_text(mutated)
+        spec = importlib.util.spec_from_file_location("plan_check_mutant", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_a_mutant_that_searches_all_fields_is_caught_and_the_real_module_passes(self):
+        mutant = self._mutant()
+        caught = passes = 0
+        for field in ("pass", "discriminates"):
+            text = self._only_in_other_field(field)
+            expected = 1
+            self.assertEqual(self._warn_count(plan_check, text), expected)   # control: the real module warns once
+            passes += 1
+            got = self._warn_count(mutant, text)
+            self.assertEqual((expected, got), (1, 0))   # the mutant has 0 occurrences where 1 is expected
+            caught += 1
+        print("mutant caught %d of %d, control passes %d of %d" % (caught, 2, passes, 2))
+
+
 if __name__ == "__main__":
     unittest.main()
