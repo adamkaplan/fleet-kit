@@ -98,7 +98,7 @@ def cloud_dir(state):
 
 
 def valid_name(name):
-    return isinstance(name, str) and bool(H["NAME_RE"].match(name))
+    return isinstance(name, str) and bool(H["NAME_RE"].fullmatch(name))
 
 
 def record_path(state, name):
@@ -801,6 +801,7 @@ def _launch(args, runner, now, reserve):
             raise LaunchError("the worker was created but its record could not be stored (%s); stop was requested" % _one(cluster.clean(str(err), 100), 100)) from None
         _audit(engine, "cloud.created", name, {"runtime_id": record["runtime_id"], "host": urllib.parse.urlsplit(record["url"]).hostname,
                                                "idle_deadline": record.get("idle_deadline"), "hard_deadline": record.get("hard_deadline")})
+        _show_identity_note(body, cluster)
         try:   # a local agent may have taken the name while the pod was being made; discovery that cannot answer counts as a failure (cannot tell)
             taken = engine.discover(engine.now()).agents.get(name) is not None
             problem = "a local fleet agent named %s appeared while the pod was being made" % name if taken else None
@@ -854,6 +855,16 @@ def _registry_note(engine, what, state, name, *args):
         _audit(engine, "cloud.registry_error", name, {"why": _one(str(err), 120)})
 
 
+POD_UID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")   # the form of a pod uid (the launcher's cloud_worker.py holds the equal text: a test compares them)
+
+
+def _show_identity_note(body, cluster):
+    """The launcher's one-line note that a pod's uid could not be read (the record holds none): shown once on stderr, never on stdout."""
+    note = body.get("identity_note")
+    if isinstance(note, str) and note:
+        print("%s: WARNING: %s" % (H["PROG"], _one(cluster.clean(note, 300), 300)), file=sys.stderr)
+
+
 def _record_from_create(name, body):
     if body is None:
         raise CloudError("the launcher printed no record")
@@ -865,6 +876,8 @@ def _record_from_create(name, body):
     problem = endpoint_problem(record["url"])
     if problem:
         raise CloudError("the launcher named an endpoint that is refused: %s" % problem)
+    if isinstance(body.get("pod_uid"), str) and POD_UID_RE.fullmatch(body["pod_uid"]):
+        record["pod_uid"] = body["pod_uid"]   # the pod's identity at create time: a retire acts only on the pod that has it
     return record
 
 
@@ -1222,9 +1235,15 @@ def cmd_retire(args, runner, now, record):
     if args.undo:
         raise LaunchError("a cloud worker's pod is gone once retired: there is nothing to undo")
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200] or "finished"
+    extra = ["--reason", reason]
+    uid = record.get("pod_uid")
+    if isinstance(uid, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", uid):
+        extra += ["--pod-uid", uid]
+    if record.get("agent") == "orchestrator":   # a hub orchestrator: its hub entry goes with it, also when its pod is already gone
+        extra += ["--hub-entry"]
     try:
         with Cluster() as cluster:
-            code, body, note = run_launcher(runner, "stop", args.name, ["--reason", reason], STOP_SECONDS, cluster=cluster)
+            code, body, note = run_launcher(runner, "stop", args.name, extra, STOP_SECONDS, cluster=cluster)
     except Refusal:
         raise
     except CloudError as err:

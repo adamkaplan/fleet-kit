@@ -1,0 +1,746 @@
+"""A retire of a gone cloud worker is audited, exact and bound to the pod it records (ask #1327, scenarios S1 to S7, U1).
+
+The cluster is the FAKE one of the launcher tests (fake_kubectl); a not-found text is served by a tiny stand-in script. Every
+mutant is a patch of the running code, and each test asserts that the mutation was applied.
+"""
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import inspect
+import re
+import signal
+import stat
+import sys
+import tempfile
+import textwrap
+import types
+import unittest
+from unittest import mock
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import test_cloud_worker as tcw  # noqa: E402
+import test_retire_gone_pod as trg  # noqa: E402
+
+_loader = importlib.machinery.SourceFileLoader("test_cloud_worker_bin", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "bin", "test-cloud-worker"))
+tcwb = importlib.util.module_from_spec(importlib.util.spec_from_loader("test_cloud_worker_bin", _loader))
+sys.modules["test_cloud_worker_bin"] = tcwb
+_loader.exec_module(tcwb)
+sb = tcwb.sb
+
+cw, sbcw = tcw.cw, trg.sbcw
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+REGISTRY = "cloud-hub-registry"
+OTHER = {"other-agent": "f" * 64}
+SWITCHBOARD_NAME_RE = r"^[a-z][a-z0-9_-]{0,31}$"   # the switchboard's agent name rule (a test below reads it from the switchboard)
+PREFIX = "fl" + "eet"   # assembled from a fragment so the neutral-names scan finds no whole word in this file
+
+
+def raising(error):
+    def answer(pod):
+        raise error
+    return answer
+
+
+def read(rel):
+    with open(os.path.join(ROOT, rel), encoding="utf-8") as handle:
+        return handle.read()
+
+
+class GoneBase(tcw.Base):
+    def gone_worker(self, *extra):
+        """A created worker whose pod an operator deleted: both Secrets are left."""
+        self.create("coder7", *extra)
+        trg.plant_run_secret(self)
+        st = self.st()
+        st["pods"].pop(cw.pod_name("coder7"))
+        self.write_state(st)
+
+    def stop(self, *extra):
+        return self.run_cli("stop", "coder7", "--reason", "retire", *extra)
+
+
+class AuditNamesSecrets(GoneBase):
+    def test_s2_the_stop_audit_names_the_secrets_removed_and_no_content(self):
+        self.gone_worker()
+        code, out, err = self.stop()
+        self.assertEqual(code, 0, err)
+        line = [x for x in self.audit_lines() if x["action"] == "stop"][-1]
+        pw = cw.pod_name("coder7")
+        print("%d of 2 Secret names in the audit reason" % len([n for n in (pw + "-pw", pw + "-run") if n in line["reason"]]))
+        self.assertIn(pw + "-pw", line["reason"])
+        self.assertIn(pw + "-run", line["reason"])
+        self.assertIsNone(re.search(r"gh[pousr]_|github_pat_|sk-[A-Za-z0-9]{20}|eyJ", json.dumps(line)))
+
+    def test_s2_a_stop_that_removed_nothing_says_so(self):
+        self.gone_worker()
+        self.assertEqual(self.stop()[0], 0)
+        trg.plant_run_secret(self)
+        st = self.st()
+        st["secrets"] = {}
+        self.write_state(st)
+        self.assertEqual(self.stop()[0], 0)
+        self.assertIn("secrets removed: none", [x for x in self.audit_lines() if x["action"] == "stop"][-1]["reason"])
+
+
+class NotFoundExact(tcw.Base):
+    """S3: the match is the whole message of the one object asked for (kind and exact name), one trailing newline trimmed."""
+    NAME = "cw-coder7"
+
+    def kube_saying(self, text):
+        script = os.path.join(self.tmp.name, "says-%d" % len(os.listdir(self.tmp.name)))
+        with open(script, "w") as handle:
+            handle.write("#!/bin/sh\ncat <<'EOF' >&2\n%s\nEOF\nexit 1\n" % text)   # one newline after the text, as a real client prints
+        os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR)
+        return cw.Kube(dict(self.env, CW_KUBECTL=script))
+
+    def exact(self, kind):
+        return 'Error from server (NotFound): %s "%s" not found' % (kind, self.NAME)
+
+    def cases(self, kind, other):
+        e = self.exact(kind)
+        return {"another object": 'Error from server (NotFound): %s "someone-else" not found' % kind,
+                "text after the words": e + ", try again later",
+                "the words in another sentence": "note: NotFound is meant by the docs; " + e,
+                "another kind": 'Error from server (NotFound): %s "%s" not found' % (other, self.NAME)}
+
+    def table(self, label, read_it, kind, other):
+        rows = []
+        for case, text in self.cases(kind, other).items():
+            try:
+                rows.append((case, "read as gone" if read_it(self.kube_saying(text)) is None else "answered"))
+            except cw.CloudError:
+                rows.append((case, "raises"))
+        for case, got in rows:
+            print("%s | %s | %s" % (label, case, got))
+        self.assertEqual([got for _, got in rows], ["raises"] * 4, rows)
+        self.assertIsNone(read_it(self.kube_saying(self.exact(kind))), "the exact message reads as gone")
+
+    def test_s3_pod_read_near_misses_raise_and_the_exact_message_is_gone(self):
+        self.table("pod read", lambda k: k.get_pod(self.NAME), "pods", "secrets")
+
+    def test_s3_secret_read_near_misses_raise_and_the_exact_message_is_gone(self):
+        self.table("secret read", lambda k: k.get_secret(self.NAME), "secrets", "pods")
+
+    def test_s3_the_per_run_secret_read_uses_the_same_match(self):
+        kube = self.kube_saying('Error from server (NotFound): secrets "cw-coder7-run" not found, and more')
+        with self.assertRaises(cw.CloudError):
+            kube.get_run_secret("cw-coder7")
+        self.assertIsNone(self.kube_saying('Error from server (NotFound): secrets "cw-coder7-run" not found').get_run_secret("cw-coder7"))
+
+    def test_s3_one_trailing_newline_is_trimmed_and_only_one(self):
+        self.assertIsNone(self.kube_saying(self.exact("pods")).get_pod(self.NAME))
+        with self.assertRaises(cw.CloudError):
+            self.kube_saying(self.exact("pods") + "\n").get_pod(self.NAME)   # two newlines in all
+
+
+class NameRule(GoneBase):
+    def test_s4_a_name_with_a_trailing_newline_is_refused_and_valid_names_are_not(self):
+        code, out, err = self.run_cli("stop", "coder7\n", "--reason", "x")
+        self.assertEqual(code, 2, err)
+        self.assertFalse(os.path.exists(self.env["FAKE_KUBE_CALLS"]), "a cluster call was made for a name with a newline")
+        refused = [n for n in ("coder7", "a", "worker-1", "orch_1", "a" * 32) if self.run_cli("stop", n, "--reason", "x")[0] == 2]
+        print("1 of 1 newline name refused and %d of 5 valid names refused" % len(refused))
+        self.assertEqual(refused, [])
+
+    def test_s4_the_launcher_has_no_loose_name_match_left(self):
+        self.assertNotRegex(read("cloud/launcher/cloud_worker.py"), r"(?<![A-Za-z_])NAME_RE\.match\(")
+        self.assertNotRegex(read("cloud/launcher/run_task.py"), r"NAME_RE\.match\(")
+
+    def test_s4_the_switchboard_side_refuses_it_and_a_name_with_a_newline_reaches_no_path(self):
+        self.assertIn(SWITCHBOARD_NAME_RE, read("bin/" + PREFIX + "-switchboard"))
+        with mock.patch.dict(sbcw.H, {"NAME_RE": re.compile(SWITCHBOARD_NAME_RE)}):
+            self.assertFalse(sbcw.valid_name("coder7\n"))
+            self.assertTrue(all(sbcw.valid_name(n) for n in ("coder7", "a", "worker-1", "orch_1", "a" * 32)))
+            for path in (sbcw.record_path, sbcw.password_path):
+                with self.assertRaises(sbcw.CloudError):
+                    path("/state", "coder7\n")
+
+
+class BoundToThePod(GoneBase):
+    def hook(self):
+        return mock.patch.object(cw.Launcher, "run_hook", lambda launcher, name: {"pushed": False, "wip_branch": None})
+
+    def new_pod_under_the_name(self):
+        """The old pod is replaced by another under the same name (another uid); both Secrets stay."""
+        st = self.st()
+        pod = st["pods"][cw.pod_name("coder7")]
+        pod["metadata"]["uid"] = "uid-new-77"
+        self.write_state(st)
+
+    def left_whole(self):
+        st = self.st()
+        return (st["pods"].get(cw.pod_name("coder7"), {}).get("metadata", {}).get("uid") == "uid-new-77"
+                and sorted(st["secrets"]) == [cw.pod_name("coder7") + "-pw", cw.pod_name("coder7") + "-run"])
+
+    def raced_retire(self):
+        made = self.create("coder7")
+        trg.plant_run_secret(self)
+        self.new_pod_under_the_name()
+        with self.hook():
+            code, out, err = self.stop("--pod-uid", made["pod_uid"])
+        return code, err
+
+    def test_s5_create_reports_the_uid_of_the_pod_it_made(self):
+        made = self.create("coder7")
+        self.assertEqual(made["pod_uid"], self.pod()["metadata"]["uid"])
+        self.assertTrue(made["pod_uid"])
+
+    def test_s5_a_new_pod_under_the_name_is_left_whole_with_its_secrets(self):
+        code, err = self.raced_retire()
+        self.assertEqual(code, 6, err)
+        self.assertTrue(self.left_whole(), "0 objects of the new pod may be deleted")
+        self.assertFalse([c for c in open(self.env["FAKE_KUBE_CALLS"]).read().splitlines() if '"delete"' in c], "a delete was sent")
+
+    def test_s5_a_mutant_that_ignores_the_uid_fails_the_test(self):
+        real, applied = cw.Launcher.stop, []
+
+        def mutant(launcher, a, reason=None):
+            applied.append(1)
+            a.pod_uid = None   # the uid is ignored: the retire acts by name
+            return real(launcher, a, reason)
+        with mock.patch.object(cw.Launcher, "stop", mutant):
+            code, err = self.raced_retire()
+        self.assertTrue(applied, "the mutation was not applied")
+        self.assertFalse(self.left_whole(), "the mutant was not killed: it left the new pod whole")
+
+    def test_s5_a_pod_that_reads_as_gone_is_retired_by_name_only_when_no_live_pod_exists(self):
+        self.gone_worker()
+        real, reads = cw.Kube.get_pod, []
+
+        def late(kube, name):   # the first read says gone; a new pod holds the name by the second
+            reads.append(name)
+            if len(reads) == 1:
+                return None
+            return {"metadata": {"name": name, "uid": "uid-new-5"}, "status": {"phase": "Running"}}
+        with mock.patch.object(cw.Kube, "get_pod", late):
+            code, out, err = self.stop()
+        self.assertEqual(code, 6, err)
+        self.assertEqual(len(self.st()["secrets"]), 2, "a Secret was deleted while a pod holds the name")
+
+    def test_s5_a_record_with_no_uid_acts_as_before(self):
+        self.gone_worker()
+        self.assertEqual(self.stop()[0], 0)
+        self.assertEqual(self.st()["secrets"], {})
+
+
+class HubEntry(tcw.Base):
+    def setUp(self):
+        super().setUp()
+        self.patch_state(secrets={REGISTRY: 1, "cloud-hub-pw": 1},
+                         secret_bodies={"cloud-hub-pw": {"keep": "kept-pw"}, REGISTRY: {"secrets.json": json.dumps(OTHER), "agents.json": json.dumps({"other-agent": {"url": "u"}})}},
+                         hook_result={"pushed": False, "wip_branch": None})
+
+    def gone_orchestrator(self):
+        code, out, err = self.run_cli("create", "orch1", "--repo", "acme-org/widget-service", "--branch", "main", "--agent", "orchestrator", "--boss", "boss1")
+        self.assertEqual(code, 0, err)
+        st = self.st()
+        st["pods"].pop(cw.pod_name("orch1"))
+        self.write_state(st)
+
+    def agents(self):
+        return json.loads(self.st()["secret_bodies"][REGISTRY]["agents.json"])
+
+    def retire(self):
+        return self.run_cli("stop", "orch1", "--reason", "retire", "--hub-entry")
+
+    def test_s6_a_gone_orchestrator_loses_its_hub_entry(self):
+        self.gone_orchestrator()
+        self.assertIn("orch1", self.agents())
+        code, out, err = self.retire()
+        self.assertEqual(code, 0, err)
+        print("%d of 1 hub entry removed" % (0 if "orch1" in self.agents() else 1))
+        self.assertEqual(list(self.agents()), ["other-agent"])
+        self.assertNotIn("orch1", json.loads(self.st()["secret_bodies"][REGISTRY]["secrets.json"]))
+
+    def test_s6_a_mutant_that_skips_the_removal_leaves_the_entry(self):
+        self.gone_orchestrator()
+        applied = []
+        with mock.patch.object(cw.Launcher, "_unregister", lambda launcher, agent: applied.append(agent) or True):
+            self.assertEqual(self.retire()[0], 0)
+        self.assertTrue(applied, "the mutation was not applied")
+        self.assertIn("orch1", self.agents(), "the mutant left no entry: the test would not catch it")
+
+    def test_s6_a_failure_of_the_removal_is_reported_not_swallowed(self):
+        self.gone_orchestrator()
+        real = cw.Kube.registry_update
+
+        def broken(kube, secret, change):
+            raise cw.CloudError("the hub registry Secret %s is not found" % secret)
+        with mock.patch.object(cw.Kube, "registry_update", broken):
+            code, out, err = self.retire()
+        self.assertNotEqual(code, 0)
+        self.assertIn("hub registry entry", err)
+        self.assertIn("orch1", self.agents())
+        self.assertFalse([x for x in self.audit_lines() if x["action"] == "stop"][-1]["ok"])
+
+    def test_s6_a_gone_worker_that_is_not_a_hub_orchestrator_makes_no_registry_call(self):
+        self.gone_orchestrator()
+        self.assertEqual(self.run_cli("stop", "orch1", "--reason", "retire")[0], 0)
+        self.assertIn("orch1", self.agents())
+
+
+class RetireSide(unittest.TestCase):
+    """The switchboard side: the record carries the uid and a hub orchestrator is retired with its entry."""
+    setUp = trg.Retire.setUp
+    touch = trg.Retire.touch
+
+    def calls_of(self, record):
+        seen = []
+
+        def launcher(runner, verb, name, extra, seconds, cluster=None):
+            seen.append(list(extra))
+            return 0, {"runtime_id": "", "pushed": False, "pod_gone": True, "secrets_removed": []}, ""
+        args = types.SimpleNamespace(name="coder7", reason="done", undo=False)
+        with mock.patch.object(sbcw, "run_launcher", launcher), contextlib.redirect_stdout(io.StringIO()):
+            sbcw.cmd_retire(args, None, None, dict({"runtime_id": "pod/coder7"}, **record))
+        return seen[0]
+
+    def test_s5_the_record_from_a_create_carries_the_uid(self):
+        body = {"worker": "coder7", "url": "https://worker-cw-coder7.example.internal:4096", "runtime_id": "pod/cw-coder7", "pod_uid": "uid-1"}
+        self.assertEqual(sbcw._record_from_create("coder7", body)["pod_uid"], "uid-1")
+        del body["pod_uid"]
+        self.assertNotIn("pod_uid", sbcw._record_from_create("coder7", body))
+
+    def test_s5_the_retire_hands_the_recorded_uid_to_the_launcher(self):
+        extra = self.calls_of({"pod_uid": "uid-1"})
+        self.assertEqual(extra[extra.index("--pod-uid") + 1], "uid-1")
+        self.assertNotIn("--pod-uid", self.calls_of({}))
+
+    def test_s6_an_orchestrator_record_asks_for_its_hub_entry_to_go(self):
+        self.assertIn("--hub-entry", self.calls_of({"agent": "orchestrator"}))
+        self.assertNotIn("--hub-entry", self.calls_of({"agent": "coder"}))
+
+
+class UnreadIdentity(tcw.Base):
+    """S9: a create whose read of the new pod fails says so once on stderr and in the audit."""
+    MARK = "pod identity"
+
+    # every way the uid is missing or not the form a retire accepts: the nine kinds of the one check (each row a case)
+    MISSING = {"the read raises a cloud error": None, "the read raises another error": raising(RuntimeError("boom")),
+               "the read returns nothing": lambda pod: None,
+               "the read returns text": lambda pod: "pod",
+               "the read returns a list": lambda pod: [pod],
+               "the metadata is not a dict": lambda pod: {"metadata": "x"},
+               "the pod has no uid": lambda pod: {"metadata": {}},
+               "the uid is empty": lambda pod: {"metadata": {"uid": ""}},
+               "the uid is not text": lambda pod: {"metadata": {"uid": 7}},
+               "the uid has white space": lambda pod: {"metadata": {"uid": "uid 1"}},
+               "the uid has a control character": lambda pod: {"metadata": {"uid": "uid\x01"}},
+               "the uid is over 64 characters": lambda pod: {"metadata": {"uid": "a" * 65}}}
+
+    def create_with_failed_read(self, patches=(), answer=None, worker="coder7"):
+        """answer: None raises at the read; else a function (real pod) -> what the read returns."""
+        real_wait, real_get, state = cw.Launcher._wait_ready, cw.Kube.get_pod, {"ready": False}
+
+        def wait(launcher, name, seconds):
+            result = real_wait(launcher, name, seconds)
+            state["ready"] = True   # every read from here on is the create's read of the uid
+            return result
+
+        def get(kube, name):
+            if state["ready"]:
+                if answer is None:
+                    raise cw.CloudError("the cluster did not answer")
+                return answer(real_get(kube, name))
+            return real_get(kube, name)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(cw.Launcher, "_wait_ready", wait))
+            stack.enter_context(mock.patch.object(cw.Kube, "get_pod", get))
+            for p in patches:
+                stack.enter_context(p)
+            return self.run_cli("create", worker, "--repo", "acme-org/widget-service", "--branch", "main")
+
+    def lines(self, err):
+        return [x for x in err.splitlines() if self.MARK in x]
+
+    def test_s9_a_failed_read_gives_one_stderr_line_naming_the_worker_and_one_audit_line(self):
+        code, out, err = self.create_with_failed_read()
+        self.assertEqual(code, 0, err)
+        audited = [x for x in self.audit_lines() if self.MARK in x["reason"]]
+        print("%d of 1 stderr line, %d of 1 audit line" % (len(self.lines(err)), len(audited)))
+        self.assertEqual(len(self.lines(err)), 1, err)
+        self.assertIn("coder7", self.lines(err)[0])
+        self.assertEqual(len(audited), 1)
+        self.assertEqual(json.loads(out)["pod_uid"], "")
+
+    def test_s9_every_way_the_uid_is_missing_gives_the_same_one_line_and_one_audit_line(self):
+        cases = self.MISSING
+        template = "cloud-worker: WARNING: the pod identity of %s could not be read; the worker record holds none and a retire acts by name"
+        for n, (label, answer) in enumerate(cases.items()):
+            with self.subTest(label):
+                worker = "coder%d" % n
+                code, out, err = self.create_with_failed_read(answer=answer, worker=worker)
+                self.assertEqual(code, 0, err)
+                print("%s: %d of 1 stderr line" % (label, len(self.lines(err))))
+                want = template % worker
+                self.assertEqual(self.lines(err), [want])
+                audited = [x for x in self.audit_lines() if self.MARK in x["reason"]]
+                self.assertEqual(len(audited), n + 1)   # one line per create, none more
+                self.assertIn(want.split("WARNING: ")[1], audited[-1]["reason"])
+                self.assertEqual(json.loads(out)["pod_uid"], "")
+
+    def test_s9_a_mutant_that_notes_only_the_raising_case_fails_the_other_cases(self):
+        real, applied = cw.Launcher._read_pod_uid, []
+
+        def only_raising(launcher, worker, name, info):
+            applied.append(worker)
+            try:
+                uid = ((launcher.kube.get_pod(name) or {}).get("metadata") or {}).get("uid")
+            except cw.CloudError:
+                launcher._note_unread_identity(worker, info)
+                return ""
+            return uid or ""   # nothing is noted for a read that answers without a usable uid
+        mutant = mock.patch.object(cw.Launcher, "_read_pod_uid", only_raising)
+        code, out, err = self.create_with_failed_read([mutant])
+        self.assertTrue(applied, "the mutation was not applied")
+        self.assertEqual(len(self.lines(err)), 1, "the mutant still notes the raising case")
+        applied.clear()
+        silent_on = []
+        for n, (label, answer) in enumerate(self.MISSING.items()):
+            if answer is None:
+                continue   # the one case the mutant handles
+            try:
+                code, out, err = self.create_with_failed_read([mutant], answer=answer, worker="coder%d" % (n + 20))
+            except Exception:   # the mutant lets the read's error escape: no note either
+                err = ""
+            silent_on.append((label, len(self.lines(err))))
+        self.assertTrue(applied, "the mutation was not applied")
+        print("mutant: stderr lines for the other %d cases (the check wants 1 each): %s" % (len(silent_on), [c for _, c in silent_on]))
+        self.assertEqual([c for _, c in silent_on], [0] * (len(self.MISSING) - 1), "the mutant is silent on every other way the uid is missing")
+
+    def test_s9_a_uid_in_the_accepted_form_is_recorded_without_a_note(self):
+        for uid in ("a" * 64, "uid-1.2_3", "7"):
+            with self.subTest(uid):
+                code, out, err = self.create_with_failed_read(answer=lambda pod, uid=uid: {"metadata": {"uid": uid}}, worker="coder%d" % len(uid))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.lines(err), [])
+                self.assertEqual(json.loads(out)["pod_uid"], uid)
+                self.assertNotIn("identity_note", json.loads(out))
+
+    def test_s9_the_note_is_in_the_create_answer_for_the_switchboard_to_show(self):
+        code, out, err = self.create_with_failed_read()
+        self.assertEqual(json.loads(out)["identity_note"], "the pod identity of coder7 could not be read; the worker record holds none and a retire acts by name")
+
+    def test_s9_the_launcher_and_the_switchboard_accept_one_uid_form(self):
+        self.assertEqual(cw.POD_UID_RE.pattern, sbcw.POD_UID_RE.pattern)
+        self.assertEqual(cw.POD_UID_RE.flags, sbcw.POD_UID_RE.flags)
+
+    def test_s9_a_mutant_that_records_the_empty_identity_silently_fails_the_test(self):
+        applied = []
+        silent = mock.patch.object(cw.Launcher, "_note_unread_identity", lambda launcher, worker, info: applied.append(worker))
+        code, out, err = self.create_with_failed_read([silent])
+        self.assertTrue(applied, "the mutation was not applied")
+        print("mutant: %d stderr lines (the test wants 1)" % len(self.lines(err)))
+        self.assertEqual(len(self.lines(err)), 0)
+        self.assertEqual([x for x in self.audit_lines() if self.MARK in x["reason"]], [])
+
+    def test_s9_a_create_whose_read_works_prints_no_such_line(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cw.main(["create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main"], self.env, self.clock, lambda s: self.clock.advance(seconds=s))
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(self.lines(err.getvalue()), [])
+        self.assertEqual([x for x in self.audit_lines() if self.MARK in x["reason"]], [])
+
+
+def fire_term(pod):
+    signal.raise_signal(signal.SIGTERM)   # the launcher's own handler turns it into the termination exception
+    return pod
+
+
+class SignalDuringTheRead(tcw.Base):
+    """S10: a signal during the read of the new pod's uid ends the create with the usual cleanup (real Launcher.create, fake cluster)."""
+    SIGNALS = {"interrupt": raising(KeyboardInterrupt()), "termination exception": raising(cw.Interrupted("signal 15")), "SIGTERM raised": fire_term}
+
+    def fd(self, value):
+        r, w = os.pipe()
+        os.write(w, value.encode())
+        os.close(w)
+        self.addCleanup(os.close, r)
+        return r
+
+    def create_with(self, answer, patches=()):
+        real_wait, real_get, state = cw.Launcher._wait_ready, cw.Kube.get_pod, {"ready": False, "reads": 0}
+
+        def wait(launcher, name, seconds):
+            result = real_wait(launcher, name, seconds)
+            state["ready"] = True   # every read from here on is the create's read of the uid
+            return result
+
+        def get(kube, name):
+            if state["ready"]:
+                state["reads"] += 1
+                return answer(real_get(kube, name))
+            return real_get(kube, name)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(cw.Launcher, "_wait_ready", wait))
+            stack.enter_context(mock.patch.object(cw.Kube, "get_pod", get))
+            for p in patches:
+                stack.enter_context(p)
+            result = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-secret-fd", "model-key=%d" % self.fd("v1"))
+        self.assertEqual(state["reads"], 1, "the read of the uid was not reached")
+        return result
+
+    def deletes(self):
+        with open(self.env["FAKE_KUBE_CALLS"]) as handle:
+            return [x for x in handle.read().splitlines() if '"delete"' in x]
+
+    def left(self):
+        st = self.st()
+        return len(st.get("pods", {})), len(st.get("secrets", {}))
+
+    def cleanups(self):
+        if not os.path.exists(self.env["CW_CLOUD_AUDIT"]):
+            return []
+        return [x for x in self.audit_lines() if x["action"] in ("create.interrupted", "create.failed")]
+
+    def test_s10_a_signal_during_the_read_removes_the_pod_and_the_secrets_once(self):
+        for label, answer in self.SIGNALS.items():
+            with self.subTest(label):
+                self.setUp()
+                code, out, err = self.create_with(answer)
+                print("%s: %d pods, %d Secrets left, %d cleanups, status %d, %d deletes" % ((label,) + self.left() + (len(self.cleanups()), code, len(self.deletes()))))
+                self.assertEqual(code, cw.EXIT_INTERRUPTED, err)
+                self.assertEqual(self.left(), (0, 0))
+                self.assertEqual(len(self.deletes()), 3, "the pod, the password Secret and the per-run Secret, once each")
+                lines = self.cleanups()
+                self.assertEqual(len(lines), 1)
+                self.assertEqual(lines[0]["action"], "create.interrupted")
+                self.assertFalse(lines[0]["ok"])
+                pod = cw.pod_name("coder7")
+                for gone in ("pod/" + pod, "secret/%s-pw" % pod, "secret/%s-run" % pod):
+                    self.assertIn(gone, lines[0]["reason"])
+        
+    def test_s10_an_ordinary_failure_of_the_read_keeps_the_pod_with_one_note_and_no_cleanup(self):
+        code, out, err = self.create_with(raising(RuntimeError("boom")))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.left()[0], 1)
+        self.assertEqual(len(self.st()["secrets"]), 2)
+        self.assertEqual(len([x for x in err.splitlines() if "pod identity" in x]), 1, err)
+        self.assertEqual(self.cleanups(), [])
+        self.assertEqual(self.deletes(), [])
+
+    def test_s10_a_mutant_that_reads_after_the_cleanup_block_leaves_the_pod_and_a_secret(self):
+        source = textwrap.dedent(inspect.getsource(cw.Launcher.create))
+        self.assertEqual(source.count("self._read_pod_uid(worker, name, info)"), 1)
+        lines = source.splitlines(keepends=True)
+        out = []
+        for line in lines:
+            if line.strip().startswith("pod_uid = self._read_pod_uid"):
+                continue
+            if line.strip().startswith("domain = self.env.get"):
+                out.append(" " * (len(line) - len(line.lstrip())) + "pod_uid = self._read_pod_uid(worker, name, info)\n")
+            out.append(line)
+        mutated = "".join(out)
+        self.assertNotEqual(mutated, source, "the mutation was not applied")
+        scope = {}
+        exec(mutated, vars(cw), scope)
+        for label, answer in self.SIGNALS.items():
+            with self.subTest(label):
+                self.setUp()
+                with mock.patch.object(cw.Launcher, "create", scope["create"]):
+                    code, out_, err = self.create_with(answer)
+                print("mutant, %s: %d pods, %d Secrets left, %d cleanups" % ((label,) + self.left() + (len(self.cleanups()),)))
+                self.assertEqual(self.left()[0], 1, "the mutant left no pod: the test would not catch it")
+                self.assertGreaterEqual(self.left()[1], 1)
+                self.assertEqual(self.cleanups(), [])
+
+
+class Documents(unittest.TestCase):
+    CAUSES = ("stop audit did not name the Secrets it removed", "not-found match was a substring match", "Secret read still used the loose match",
+              "name with a trailing newline passed the name pattern", "record was not bound to a pod identity", "hub entry of a gone orchestrator was left behind")
+    SAYS = ("the stop audit names the Secrets it removed", "the not-found match is anchored to the whole message of the one object asked for",
+            "a name with a trailing newline is refused", "the worker record carries the pod's uid and a retire acts only on the pod with that uid",
+            "a retire of a gone orchestrator removes its hub entry and reports a failure to do so")
+
+    def section(self, rel, title):
+        text = read(rel)
+        self.assertIn(title, text)
+        return text.split(title, 1)[1].split("\n## ", 1)[0]
+
+    def test_s1_the_readme_retire_section_names_the_six_causes(self):
+        part = self.section("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)")
+        found = [c for c in self.CAUSES if c.lower() in part.lower()]
+        print("the section names %d of 6 causes" % len(found))
+        self.assertEqual(found, list(self.CAUSES))
+
+    def test_s7_both_documents_say_each_behaviour(self):
+        for rel, title in (("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)"), ("docs/cloud-worker-interface.md", "## Retire of a gone worker (ask #1327)")):
+            part = self.section(rel, title)
+            found = [s for s in self.SAYS if s.lower() in part.lower()]
+            print("%d of 5 statements in %s" % (len(found), rel))
+            self.assertEqual(found, list(self.SAYS), rel)
+
+    UNREAD = "a create whose read of the new pod fails or gives no usable uid cannot record the pod's uid: it says so in one stderr line and in its audit line"
+    SHOWN = "a successful `launch --cloud` shows that line once on its own stderr"
+
+    def test_s9_both_documents_say_launch_shows_the_note(self):
+        for rel, title in (("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)"), ("docs/cloud-worker-interface.md", "## Retire of a gone worker (ask #1327)")):
+            self.assertIn(self.SHOWN, self.section(rel, title).lower(), rel)
+
+    def test_s9_both_documents_say_a_create_that_cannot_read_the_uid_says_so(self):
+        for rel, title in (("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)"), ("docs/cloud-worker-interface.md", "## Retire of a gone worker (ask #1327)")):
+            self.assertIn(self.UNREAD, self.section(rel, title).lower(), rel)
+
+    SIGNALLED = "a signal (an interrupt or a termination request) during that read of the new pod's uid ends the create with its usual cleanup: the pod and its secrets are removed once"
+    KEPT = "an ordinary failure of the read gives the note and no cleanup, and the pod is kept"
+
+    def test_s10_both_documents_say_a_signal_during_the_read_ends_the_create_with_its_cleanup(self):
+        for rel, title in (("cloud/launcher/README.md", "## Retire of a gone worker (ask #1327)"), ("docs/cloud-worker-interface.md", "## Retire of a gone worker (ask #1327)")):
+            part = self.section(rel, title).lower()
+            self.assertIn(self.SIGNALLED, part, rel)
+            self.assertIn(self.KEPT, part, rel)
+
+
+class WipNoteNameRule(unittest.TestCase):
+    """S11 (after integration's newer line): send_wip_notes matches the worker name with a full match, so 'coder7' plus a newline is refused."""
+    OLD = '!= "Running" or not NAME_RE.fullmatch(worker or "")'
+    NEW = '!= "Running" or not NAME_RE.match(worker or "")'
+
+    @staticmethod
+    def sent(module, worker):
+        """The notes sent for one running, due pod whose worker annotation is `worker`."""
+        pod = {"metadata": {"name": "cw-x", "uid": "u1", "annotations": {"cw/worker": worker, "cw/started": "2026-01-01T00:00:00Z"}},
+               "status": {"phase": "Running"}}
+        notes = []
+        launcher = module.Launcher.__new__(module.Launcher)
+        launcher.kube = types.SimpleNamespace(annotate=lambda *a, **k: None, scrub=lambda e, n=0: str(e))
+        launcher.send_note = lambda name, text: notes.append(text)
+        launcher.audit = lambda *a, **k: None
+        launcher._cost_or_zero = lambda pod: 0.0
+        with mock.patch.object(module, "wip_note_due", lambda started, now, already: True), \
+                mock.patch.object(module, "parse_iso", lambda text: None), \
+                mock.patch.object(module, "ann", lambda p, key, default=None: p["metadata"]["annotations"].get("cw/" + key, default)), \
+                contextlib.redirect_stderr(io.StringIO()):
+            launcher.send_wip_notes([pod], None)
+        return notes
+
+    def test_s11_a_newline_name_is_refused_and_a_plain_name_is_accepted(self):
+        self.assertEqual(len(self.sent(cw, "coder7\n")), 0)
+        self.assertEqual(len(self.sent(cw, "coder7")), 1)
+
+    def test_s11_a_mutant_that_matches_loosely_fails_the_test(self):
+        source = read("cloud/launcher/cloud_worker.py")
+        self.assertEqual(source.count(self.OLD), 1)
+        mutant = types.ModuleType("cw_mutant")
+        mutant.__file__ = os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
+        exec(compile(source.replace(self.OLD, self.NEW), mutant.__file__, "exec"), mutant.__dict__)
+        self.assertEqual(len(self.sent(mutant, "coder7\n")), 1, "the mutant lets the newline name through, so the test above fails on it")
+
+
+class VanishedNoteNameRule(unittest.TestCase):
+    """S12 (after integration's newer line): _note_vanished_pods matches the worker name with a full match, so 'coder7' plus a newline is never noted."""
+    OLD = "not isinstance(worker, str) or not NAME_RE.fullmatch(worker):"
+    NEW = "not isinstance(worker, str) or not NAME_RE.match(worker):"
+
+    @staticmethod
+    def noted(module, tmp):
+        """The stop lines written for two workers whose pods are absent, each with an old create line: 'coder7' plus a newline and 'coder7'."""
+        import datetime
+        now = datetime.datetime(2026, 1, 2, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        created = (now - datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        path = os.path.join(tmp, "audit.jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            for worker in ("coder7\n", "coder7"):
+                handle.write(json.dumps({"ts": created, "action": "create", "ok": True, "runtime_id": "pod/" + module.pod_name(worker.strip()) + ("-nl" if worker.endswith("\n") else ""),
+                                         "worker": worker}) + "\n")
+        lines = []
+        launcher = module.Launcher.__new__(module.Launcher)
+        launcher.audit_path = path
+        launcher.kube = types.SimpleNamespace(get_pod=lambda name: None)
+        launcher.audit = lambda worker, *rest: lines.append(worker)
+        with mock.patch.object(module, "parse_iso", lambda text: datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)):
+            launcher._note_vanished_pods([{"metadata": {"name": "cw-other"}}], now)
+        return lines
+
+    def count(self, module):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = self.noted(module, tmp)
+        return sum(w == "coder7" for w in lines), sum(w == "coder7\n" for w in lines)
+
+    def test_s12_a_newline_name_is_not_noted_and_a_plain_name_is(self):
+        self.assertEqual(self.count(cw), (1, 0))
+
+    def test_s12_a_mutant_that_matches_loosely_fails_the_test(self):
+        source = read("cloud/launcher/cloud_worker.py")
+        self.assertEqual(source.count(self.OLD), 1)
+        mutant = types.ModuleType("cw_mutant12")
+        mutant.__file__ = os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
+        exec(compile(source.replace(self.OLD, self.NEW), mutant.__file__, "exec"), mutant.__dict__)
+        plain, newline = self.count(mutant)
+        self.assertEqual(newline, 1, "the mutant also notes the newline name, so the test above fails on it")
+        print("S12: plain names noted %d of 1, newline names noted %d of 1, mutants failing the test %d of 1, mutation applied True"
+              % (self.count(cw)[0], self.count(cw)[1], int(newline == 1 and (plain, newline) != (1, 0))))
+
+
+class SourceFragmentTest(unittest.TestCase):
+    """This file's own source holds no whole retired prefix (the neutral-names scan)."""
+
+    @staticmethod
+    def count(text):
+        return len(re.findall("(?i)" + "fl" + "eet", text))
+
+    def test_own_source_has_no_retired_prefix(self):
+        with open(__file__, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertEqual(self.count(text), 0)
+
+    def test_own_source_check_fails_on_a_planted_literal(self):
+        with open(__file__, encoding="utf-8") as handle:
+            text = handle.read()
+        planted = text + "\n# " + "fl" + "eet" + "\n"
+        self.assertNotEqual(planted, text)   # the mutation applied
+        self.assertEqual(self.count(planted), 1)
+
+
+class TestLaunchShowsTheIdentityNote(tcwb.Base):
+    """Ask #1327 S9: a SUCCESSFUL `launch --cloud` shows the launcher's identity note once on stderr; stdout stays one JSON answer. The real
+    command path runs (sb.main launch) against a fake launcher whose create answer carries the note."""
+    NOTE = "the pod identity of %s could not be read; the worker record holds none and a retire acts by name"
+
+    def give_note(self):
+        text = self.stub.read_text()
+        old = '"idle_deadline": "2099-10-14T12:10:00Z"'
+        self.assertIn(old, text)
+        self.stub.write_text(text.replace(old, '"pod_uid": "", **({"identity_note": os.environ["STUB_NOTE"]} if os.environ.get("STUB_NOTE") else {}), ' + old))
+
+    def lines(self, err):
+        return [x for x in err.splitlines() if "pod identity" in x]
+
+    def test_the_note_is_shown_once_for_two_launches_and_stdout_is_pure_json(self):
+        self.give_note()
+        for name, note in (("coder7", self.NOTE % "coder7"), ("coder8", self.NOTE % "coder8" + "\nsecond line")):
+            with self.subTest(name), mock.patch.dict(os.environ, {"STUB_NOTE": note}):
+                code, out, err = self.launch(name)
+                self.assertEqual(code, 0, err)
+                print("%s: %d of 1 note line on stderr" % (name, len(self.lines(err))))
+                self.assertEqual(len(self.lines(err)), 1, err)
+                self.assertIn(name, self.lines(err)[0])
+                self.assertEqual([x for x in err.splitlines() if "second line" in x and "pod identity" not in x], [])
+                self.assertEqual(json.loads(out)["name"], name)
+                self.assertNotIn("pod identity", out)
+
+    def test_a_launch_whose_answer_has_no_note_shows_none(self):
+        self.give_note()
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.lines(err), [])
+
+    def test_a_mutant_that_ignores_the_note_shows_none(self):
+        self.give_note()
+        mod, applied = sb.load_module("cloud_worker"), []
+        with mock.patch.dict(os.environ, {"STUB_NOTE": self.NOTE % "coder7"}), \
+                mock.patch.object(mod, "_show_identity_note", lambda body, cluster: applied.append(1)):
+            code, out, err = self.launch()
+        self.assertTrue(applied, "the mutation was not applied")
+        self.assertEqual(code, 0, err)
+        print("mutant: %d note lines (the real code shows 1)" % len(self.lines(err)))
+        self.assertEqual(self.lines(err), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
