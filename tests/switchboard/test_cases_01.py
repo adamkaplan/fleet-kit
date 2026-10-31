@@ -655,6 +655,8 @@ class TestGitShim(Base):
     CONFIG_WRITE_ALLOWED = (   # (file, exact added line, purpose)
         ("tests/switchboard/test_cases_12.py", " " * 23 + "GIT_CONFIG_" + _G.upper() + '="/dev/null", GIT_CONFIG_' + _S.upper() + '="/dev/null")',
          "points git at /dev/null: writes no git configuration"),
+        ("cloud/launcher/tests/test_self_registering_isolation.py", " " * 8 + '(home / ".git' + 'config").write_text("[core]\\n\\thooksPath = %s\\n" % hooks)',
+         "writes a hostile file into a temporary home the test makes and asserts (never the real home)"),
     )
 
     @classmethod
