@@ -67796,6 +67796,7 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 # The CI test-file list tests of #1498.
 _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
+_hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite
 
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
