@@ -69,7 +69,8 @@ def claims_note_pass(engine, state, repos, now):
             return
         sent, cache = False, {}
         default_repo = engine.config.get("intent_repo")
-        hub._notices = hub._load_notices()   # route_of reads them; the hub's own pass loads the same file before it routes
+        if not hub._notices:   # route_of reads them and the hub's own pass may not have run yet; never replace the ones it holds
+            hub._notices = hub._load_notices()
         for repo in repos:
             issues_unit, merged_unit = state.units.get((repo, "issues")), state.units.get((repo, "merged"))
             if issues_unit is None or merged_unit is None:

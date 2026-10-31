@@ -296,6 +296,16 @@ class TestClaimsNoteSkips(NoGithubReadChecks, ClaimsNoteBase):
         self.assertTrue(applied)
         self.unavailable_checks(self.world())   # the control
 
+    def test_the_notices_the_hub_holds_are_kept_and_a_hub_with_none_gets_the_files(self):
+        held, filed = {("acme/api", 5): {"from": "coder"}}, {("acme/api", 6): {"from": "coder"}}
+        for start, expect in ((held, held), ({}, filed)):
+            fx = self.world()
+            self.pull(fx, 7, LINK + "CLAIMS: S1")
+            self.hold(fx)
+            fx.hub._notices, fx.hub._load_notices = dict(start), lambda: dict(filed)
+            self.run_pass(fx)
+            self.assertEqual(fx.hub._notices, expect)
+
     def test_u2_a_pass_that_meets_an_error_is_noted_and_does_not_raise(self):
         fx = self.world()
         self.pull(fx, 7, LINK + "CLAIMS: S1")
