@@ -119,4 +119,15 @@ def build(CharterRig, Base):
                 self.run_set(lanes[-1], "7", sb.IntentError("not_found", text))
             self.assertEqual(self.recorded(*lanes), 3)
 
+        def test_extra_value_edge_cases(self):
+            for k, value in enumerate(("#", WIDGET + "#0", WIDGET + "#7#8", "1234567890", "x/y#0")):
+                lane = self.lane("orch-edge%d" % k)
+                with self.subTest(value):
+                    code, err, _ = self.run_set(lane, value, LIVE)
+                    self.assertNotEqual(code, 0, "refused: %r" % value)
+                    self.assertEqual(self.recorded(lane), 0, "no charter recorded for %r" % value)
+            upper = self.lane("orch-edgeup")
+            code, err, _ = self.run_set(upper, "ACME-ORG/Widget-Service#7", LIVE)
+            self.assertEqual((code, self.recorded(upper)), (0, 1), err)
+
     return TestCharterOtherRepo
