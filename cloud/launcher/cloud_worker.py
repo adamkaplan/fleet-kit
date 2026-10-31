@@ -2437,7 +2437,7 @@ class Launcher:
     def record(self, pod):
         name = pod["metadata"]["name"]
         act = self.activity(name)
-        idle_for = int(ann(pod, "idle-seconds", "600"))   # 600: a pod made before the create's default became 30m carries no annotation and keeps its 10m
+        idle_for = int(ann(pod, "idle-seconds", "600"))
         since = act[1] if act and not act[0] else None
         return {"worker": ann(pod, "worker"), "runtime_id": "pod/" + name, "phase": pod.get("status", {}).get("phase"),
                 "idle_since": iso(since) if since else None,
@@ -2511,7 +2511,7 @@ class Launcher:
                     # its hard limit; it is reported so it is not silent.
                     out.append((worker, "activity unreadable", 1))
                     continue
-                if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):   # 600: a pod without the annotation was made before the default became 30m
+                if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
                     reason = "idle"
             if reason:
                 self.last_hook = None
