@@ -33,6 +33,7 @@ def copy_tree(dest):
 def make_home(base, hostile):
     home = base / ("home-hostile" if hostile else "home-empty")
     home.mkdir(mode=0o700)
+    assert home.resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()), "the hostile file is written only into a temporary home"
     if hostile:
         hooks = home / "hooks"
         hooks.mkdir()
