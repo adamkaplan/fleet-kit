@@ -569,6 +569,17 @@ def migrate_bell(state_dir, belled_panes, whole, now=None):
     return {"changed": count[0], "problem": got["problem"], "ran": True}
 
 
+def shows_dead(row, evidence):
+    """THE registry-side dead verdict: does the evidence show this row dead? A row with no pane to judge (`no_pane_to_judge`): only the bounded
+    endpoint check answering "dead". Any other row: its recorded state is `dead` and the pane and the process were both checked absent (an unchecked
+    part, None, is not absence). Evidence that is not a dict shows nothing."""
+    if not isinstance(evidence, dict):
+        return False
+    if no_pane_to_judge(row):
+        return evidence.get("endpoint_verdict") == "dead"
+    return row.get("state") == "dead" and evidence.get("pane_listed") is False and evidence.get("process_found") is False
+
+
 def reconcile_remove(state_dir, name, evidence, whole):
     """Remove a DEAD agent. Refuses unless `whole` is True AND the registry's own check of the evidence shows it dead: the agent's recorded state is
     `dead`, and the live read lacked its pane (`evidence["pane_listed"]` false) and its process (`evidence["process_found"]` false)."""
@@ -576,14 +587,13 @@ def reconcile_remove(state_dir, name, evidence, whole):
         row = doc["agents"].get(name)
         if row is None:
             return False, [], None
-        if row.get("pane") is None and row.get("endpoint") is not None:   # a no-pane row: removed only on a bounded check's evidence of death (the same function, one verdict)
-            if not isinstance(evidence, dict) or evidence.get("endpoint_verdict") != "dead":
+        if no_pane_to_judge(row):   # a no-pane row: removed only on a bounded check's evidence of death (shows_dead, one verdict)
+            if not shows_dead(row, evidence):
                 why = "%s has no pane and no evidence of death for its endpoint: nothing removed" % name
                 return False, [{"event": "reconcile_refused", "name": name, "evidence": evidence if isinstance(evidence, dict) else None, "why": why}], why
             doc["agents"].pop(name)
             return True, [{"event": "reconcile_remove", "name": name, "evidence": evidence, "session": row.get("session")}], None
-        if row.get("state") != "dead" or not isinstance(evidence, dict) or evidence.get("pane_listed") is not False \
-                or evidence.get("process_found") is not False:
+        if not shows_dead(row, evidence):
             why = "%s is not shown dead by the evidence: nothing removed" % name
             return False, [{"event": "reconcile_refused", "name": name, "evidence": evidence if isinstance(evidence, dict) else None, "why": why}], why
         doc["agents"].pop(name)
