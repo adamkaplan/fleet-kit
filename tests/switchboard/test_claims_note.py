@@ -268,6 +268,15 @@ class TestClaimsNoteMutants(ClaimsNoteBase):
         self.assertTrue(applied)
 
 
+class TestClaimsNoteDocumentation(unittest.TestCase):
+    def test_s6_the_claim_section_says_the_notice_exists_informs_once_per_body_and_skips_no_line_or_no_link(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        sections = re.findall(r"(?m)^- \*\*A notice lists the scenarios a `CLAIMS:` line leaves out[^\n]*", text)
+        self.assertEqual(len(sections), 1)
+        statements = ("opened or its body is edited", "only informs and is sent once per body", "no `CLAIMS:` line or no plan link gets none")
+        self.assertEqual([s for s in statements if s in sections[0]], list(statements))
+
+
 class TestClaimsNoteScan(unittest.TestCase):
     def test_u6_no_test_of_this_file_measures_the_size_of_a_pull_request(self):
         text = Path(__file__).read_text()
