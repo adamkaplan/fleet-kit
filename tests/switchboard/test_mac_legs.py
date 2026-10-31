@@ -345,6 +345,31 @@ class TestPlatformPaths(unittest.TestCase):
         self.assertEqual(consts["WORKFLOWS"], ".github/workflows/")
         self.assertTrue(LIST.exists())
 
+    def test_cloud_launcher_chain_files_are_on_the_list_permanently(self):
+        sentence = "do not remove: these files decide the macOS leg's time"
+        paths = ("bin/test-cloud-launcher", "bin/test-cloud-launcher.chain", "bin/test-cloud-launcher.parallel")
+
+        def problems(text):
+            lines, found = text.splitlines(), []
+            for path in paths:
+                at = [i for i, l in enumerate(lines) if l.strip() == path]
+                if not at:
+                    found.append("not listed: " + path)
+                elif not lines[at[0] - 1].rstrip().endswith(sentence):
+                    found.append("no reason: " + path)
+            return found
+        text = LIST.read_text()
+        self.assertEqual(problems(text), [])
+        listed = patterns_of(text)
+        print("control: listed %d of 3, reasons %d of 3" % (sum(p in listed for p in paths), 3 - len([x for x in problems(text) if x.startswith("no reason")])))
+        named = 0
+        for path in paths:
+            mutant = "\n".join(l for l in text.splitlines() if l.strip() != path)
+            found = problems(mutant)
+            self.assertEqual(found, ["not listed: " + path], path)
+            named += 1
+        print("mutants naming exactly one path: %d of 3" % named)
+
 
     # PC-5 of #1671. Known limits: a command whose first element is built at run time, and a tool called only through a variable, are not seen.
     OS_TOOLS = frozenset("launchctl osascript mdfind sysctl plutil notify-send pmset caffeinate diskutil scutil sw_vers vm_stat mdutil pgrep pkill defaults open ps lsof".split())
