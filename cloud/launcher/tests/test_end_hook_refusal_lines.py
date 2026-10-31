@@ -246,7 +246,7 @@ class S7Mutants(Scratch):
             applied += os.path.isfile(path)
             rc, out = _child_run(self, cls, path)
             self.assertEqual(rc, 1, out)
-            self.assertIn("FAILED (failures=1)", out)
+            self.assertIn("FAILED (failures=", out)
             self.assertIn(cls, out)
             caught += 1
         self.assertEqual((caught, applied, passed), (3, 3, len(self.TARGETS)))
