@@ -61407,6 +61407,7 @@ class TestV2LightGuards(Base):
         ("triage_stop", 1): (3, "stop", ()),
         ("synthetic_lines", 1): (5, "lines", (("transcript_lines", 1),)),
         ("transcript_lines", 1): (5, "transcript", ()),
+        ("read_errored_turn", 1): ("covered", "its own test: test_under_light_a_blocked_agent_is_read_blocked_and_nothing_is_read in TestErroredTurn (tests/switchboard/test_errored_turn.py)", ()),
         ("undelivered_wake_tick", 1): ("list", "wedged", (("V2Reads.inbox", 1),)),
         ("chat_clear_live_now", 1): ("chat", "the live decision: shadow under light; pinned by TestChatClearHook test_light_live_route_* and test_light_live_every_route_*", ()),
         ("chat_clear_prompts", 1): ("chat", "the ONE allowed read: pinned by TestChatClearHook (S1 to S4)", ()),

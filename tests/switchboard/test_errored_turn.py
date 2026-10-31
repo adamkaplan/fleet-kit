@@ -152,4 +152,19 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             found = self.world.engine.discover(self.world.clock.now()).agents
             self.assertFalse(found["c5-econnreset"].errored)
             self.assertEqual(calls, [])
+        def test_under_light_a_blocked_agent_is_read_blocked_and_nothing_is_read(self):
+            engine = self.world.engine
+            engine.light = True   # the engine's flag for the config key v2_light: True
+            calls = []
+            for method in ("permission_list", "form_list", "message_list"):
+                real = getattr(engine.v2, method)
+
+                def spy(session_id, *a, __real=real, __method=method, **k):
+                    calls.append((__method, session_id))
+                    return __real(session_id, *a, **k)
+                setattr(engine.v2, method, spy)
+            found = engine.discover(self.world.clock.now()).agents
+            self.assertFalse(found["c5-econnreset"].errored)
+            self.assertEqual(found["c5-econnreset"].status, "blocked")
+            self.assertEqual(len(calls), 0)
     return TestErroredTurn
