@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -81,10 +82,21 @@ class Ctx:
         shutil.rmtree(self.home, True)
 
 
+# A refusal because the git token had ended (a one-hour token) says one of these. A rejected ref, a hostile configuration or a network
+# failure says none of them, and so never asks for a refresh.
+ENDED_TOKEN_RE = re.compile(r"Authentication failed|Invalid username or token|Bad credentials|returned error: 401|HTTP 401", re.I)
+
+
+class TokenEnded(RuntimeError):
+    """A git call refused because the token had ended: the one case in which the hook signals a refresh (see main)."""
+
+
 def git(workdir, *args, check=True, ctx=None, opts=True):
     cmd = [GIT_BIN, "-C", workdir] + (ctx.opts if ctx and opts else []) + list(args)
     p = subprocess.run(cmd, capture_output=True, text=True, env=ctx.env if ctx else None)
     if check and p.returncode != 0:
+        if args and args[0] in ("push", "fetch") and ENDED_TOKEN_RE.search(p.stderr or ""):
+            raise TokenEnded("the git token had ended")   # a fixed text: nothing of the remote's answer is carried
         raise RuntimeError((p.stderr.strip().splitlines() or ["git %s failed" % args[0]])[-1])
     return p
 
@@ -153,6 +165,90 @@ def config_refusal(workdir, repo, ctx):
             raise ConfigRefused(shown)
 
 
+class NothingToPush(dict):
+    """The result of a run that decided from local references that there was nothing to push (a dict like any other result)."""
+
+
+FETCH_TIMEOUT_SECONDS = 20
+
+
+def refresh_refs(workdir, remote, ctx):
+    """One bounded `git fetch --prune` (no loop, no retry). True if it worked; False on any failure or on the timeout. Its output is
+    discarded and never printed or logged."""
+    if ctx:
+        cmd = [GIT_BIN, "-C", workdir] + ctx.opts + ["fetch", "--prune", remote, "+refs/heads/*:refs/remotes/origin/*"]
+    else:
+        cmd = [GIT_BIN, "-C", workdir, "fetch", "--prune", remote]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ctx.env if ctx else None,
+                           timeout=FETCH_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return p.returncode == 0
+
+NO_REPOSITORY_NOTE = "no repository in the pod; nothing to push"
+
+
+def probe_path(path):
+    """'absent' only when lstat of the path, or of a parent on the way, says FileNotFoundError or NotADirectoryError; 'dir' for a real
+    directory. Any other OSError (permission, loop, name too long) propagates; a link at the path, a dangling link on the way, or a
+    non-directory at the path raises RuntimeError. Never the os.path helpers: they turn an error into "not found"."""
+    path = os.path.abspath(path)
+    parts = [p for p in path.split(os.sep) if p]
+    cur = os.sep
+    for i, part in enumerate(parts):
+        cur = os.path.join(cur, part)
+        try:
+            st = os.lstat(cur)
+        except (FileNotFoundError, NotADirectoryError):
+            return "absent"
+        if stat.S_ISLNK(st.st_mode):
+            if i == len(parts) - 1:
+                raise RuntimeError("%s is a link, not a directory" % path)
+            try:
+                os.stat(cur)
+            except (FileNotFoundError, NotADirectoryError):
+                raise RuntimeError("%s is a dangling link" % cur)
+        elif i == len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError("%s is not a directory" % path)
+    return "dir"
+
+
+def has_marker(directory):
+    """True when directory holds a .git entry (file or directory); False only when lstat says it is absent; other errors propagate."""
+    try:
+        os.lstat(os.path.join(directory, ".git"))
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
+def first_entry(directory):
+    """True when the directory holds any entry at all (a listing error propagates)."""
+    with os.scandir(directory) as it:
+        for _ in it:
+            return True
+    return False
+
+
+def no_checkout(workdir):
+    """True only when the repository directory is absent or empty AND the workspace is absent or empty. Any entry in the
+    workspace, or a directory the hook cannot read, raises (the hook exits 1, the pod is kept)."""
+    state = probe_path(workdir)
+    if state == "dir":
+        if has_marker(workdir):
+            return False
+        if first_entry(workdir):
+            raise RuntimeError("%s holds files but no .git: not deleting the pod" % workdir)
+        return True
+    workspace = os.path.dirname(os.path.abspath(workdir))
+    if probe_path(workspace) == "absent":
+        return True
+    if first_entry(workspace):
+        raise RuntimeError("no repository at %s but the workspace %s is not empty: not deleting the pod" % (workdir, workspace))
+    return True
+
+
 MAX_UNTRACKED = 10
 
 
@@ -164,6 +260,11 @@ def untracked_report(status_entries):
 
 
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
+    # Three answers: no checkout at all (see no_checkout: nothing was cloned, nothing can be lost; this answer carries
+    # no_repository), a checkout whose push fails (RuntimeError from git: the caller prints `error`, exit 1), and
+    # nothing unpushed or pushed (as before). A state the hook cannot read is an error, never "no repository".
+    if no_checkout(workdir):
+        return {"pushed": False, "wip_branch": None, "skipped": [], "no_repository": True, "note": NO_REPOSITORY_NOTE}
     url = HOST_URL + "%s.git" % repo if prestop else None
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout
     entries = [e for e in status.split("\0") if len(e) > 3]
@@ -177,11 +278,17 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
             if git(workdir, "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", check=False, ctx=ctx).returncode != 0:
                 git(workdir, "-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid",
                     "commit", *(["--no-verify"] if prestop else []), "-m", "WIP: work in progress saved by %s at the end of the worker" % worker, ctx=ctx)
+    # Nothing to push: first a bounded fetch with prune refreshes the remote-tracking refs, so a remote branch deleted or moved since the
+    # last fetch is seen. Only if that fetch itself fails (refused, network, timeout) is the answer taken from the local references.
+    refreshed = refresh_refs(workdir, url if prestop else "origin", ctx)
+    if git(workdir, "log", "--max-count=1", "--format=%H", "HEAD", "--not", "--remotes", check=False, ctx=ctx).stdout.strip() == "":
+        return NothingToPush({"pushed": False, "wip_branch": None, "skipped": skipped, "local_only": not refreshed})
     # refs must be current: a stale one could call unpushed work safe. prestop fetches from the explicit URL, never the configured origin
-    if prestop:
-        git(workdir, "fetch", "--prune", url, "+refs/heads/*:refs/remotes/origin/*", ctx=ctx)
-    else:
-        git(workdir, "fetch", "--prune", "origin")
+    if not refreshed:
+        if prestop:
+            git(workdir, "fetch", "--prune", url, "+refs/heads/*:refs/remotes/origin/*", ctx=ctx)
+        else:
+            git(workdir, "fetch", "--prune", "origin")
     contained = git(workdir, "branch", "-r", "--contains", "HEAD", ctx=ctx).stdout.strip()
     if contained:
         return {"pushed": False, "wip_branch": None, "skipped": skipped, **extra}
@@ -253,9 +360,13 @@ def prestop_main():
     workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
     if not valid_worker(worker):
         return report(workdir, "the worker name is not valid", names=False)
-    if not os.path.exists(os.path.join(workdir, ".git")):
+    try:
+        gst = os.lstat(os.path.join(workdir, ".git"))
+    except (FileNotFoundError, NotADirectoryError):
         return report(workdir, "there is no git repository here", names=False)
-    if not os.path.isdir(os.path.join(workdir, ".git")):
+    except OSError as e:
+        return report(workdir, "cannot read %s/.git: %s" % (workdir, type(e).__name__), names=False)
+    if not stat.S_ISDIR(gst.st_mode):
         return report(workdir, ".git is a file: a linked worktree or a separate git directory is not supported", names=False)
     repo = os.environ.get("CW_REPO", "")
     if not REPO_RE.match(repo) or ".." in repo:
@@ -272,6 +383,9 @@ def prestop_main():
         if res["pushed"]:
             print("cw-prestop: saved work to %s; %s" % (res["wip_branch"], json.dumps(
                 {"untracked": res["untracked"], "untracked_more": res["untracked_more"]})))
+        elif isinstance(res, NothingToPush):
+            print("cw-prestop: nothing to push (the answer is from local references: the fetch failed)" if res.get("local_only")
+                  else "cw-prestop: nothing to push")
         return 0
     except OriginElsewhere:
         return report(workdir, "origin points elsewhere", ctx)
@@ -295,6 +409,10 @@ def main():
     try:
         print(json.dumps(run(workdir, worker)))
         return 0
+    except TokenEnded as e:
+        # ONE word to the stop side: ask for a fresh token and run me once more. The hook holds no credential for the minter and asks no one itself.
+        print(json.dumps({"pushed": False, "wip_branch": None, "error": str(e), "refresh": "needed"}))
+        return 1
     except (RuntimeError, OSError) as e:
         print(json.dumps({"pushed": False, "wip_branch": None, "error": str(e)}))
         return 1
