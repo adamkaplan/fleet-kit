@@ -47,19 +47,19 @@ class S6(unittest.TestCase):
         mutant = text.replace(new_lines[0], old)
         applied = mutant != text and mutant.count(old) == 1
         self.assertTrue(applied)
-        return text, mutant, mutant.splitlines().index(old) + 1
+        return text, mutant, mutant.splitlines().index(old) + 1, applied
 
     def test_mutants(self):
         n1 = "cloud/launcher/tests/test_cloud_worker.py"
         old1 = '    g("' + _PUSH + '", "origin", "HEAD' + ':main", cwd=work)'
-        t1, m1, l1 = self._mutate(n1, 'g("fetch", work, "HEAD:refs/heads/main", cwd=origin)', old1)
+        t1, m1, l1, a1 = self._mutate(n1, 'g("fetch", work, "HEAD:refs/heads/main", cwd=origin)', old1)
         n2 = "cloud/launcher/tests/test_cloud_prestop.py"
         old2 = '        sh("git", "-C", self.work, "' + _PUSH + '", "-q", "origin", "HEAD' + ':main")'
-        t2, m2, l2 = self._mutate(n2, 'sh("git", "-C", self.origin, "fetch", "-q", self.work, "HEAD:refs/heads/main")', old2)
+        t2, m2, l2, a2 = self._mutate(n2, 'sh("git", "-C", self.origin, "fetch", "-q", self.work, "HEAD:refs/heads/main")', old2)
         control = scan(n1, t1) + scan(n2, t2)
         f1, f2 = scan(n1, m1), scan(n2, m2)
         print("S6 mutants: control finds %d, mutant 1 finds %d, mutant 2 finds %d, each with the file and line named, mutations applied %s"
-              % (len(control), len(f1), len(f2), True))
+              % (len(control), len(f1), len(f2), all([a1, a2])))
         self.assertEqual(len(control), 0)
         self.assertEqual(len(f1), 1)
         self.assertEqual(len(f2), 1)
