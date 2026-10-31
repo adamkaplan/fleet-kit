@@ -8910,6 +8910,7 @@ def pr_facts_from(data):
             "head_at": pr_head_time(data.get("commits")),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
             "ci": pr_ci_of(data.get("statusCheckRollup")), "ci_rollup": data.get("statusCheckRollup"), "review": review,
+            "legs": load_module("merge_gate").rollup_legs(load_module("ci_runs").newest(data.get("statusCheckRollup")), data.get("statusCheckRollup")),   # #1235: G4 reads the macOS legs too
             # PR 52: a conflict is `mergeable` CONFLICTING, found in the read a notice already costs; the head
             # commit is what makes it one event per push
             "mergeable": str(data.get("mergeable") or "").upper() or None,

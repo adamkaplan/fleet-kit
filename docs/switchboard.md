@@ -4981,7 +4981,17 @@ so the steps and minutes the gates cost can be reported.
 
 **Which runs happen when (the test workflow).** The cause, measured the day it was found: the macOS queue wait had a mean of 18 minutes, a 90th percentile of 64 and a longest of 195, in a sample of 198 macOS jobs; 44 percent of them were cancelled by our own pushes and re-runs, and 39 percent were for pull requests into `integration`, which no ruleset requires. So the macOS leg of `.github/workflows/test.yml` runs where it protects something. A small `plan` job (a few seconds, on Ubuntu) puts the macOS entry in or out of the matrix, so the required names `test (macos-latest)` and `test (ubuntu-latest)` are unchanged and never skipped by accident:
 
-- a pull request into `main`: both legs, macOS unconditional; a **draft** into `main` runs only the Ubuntu leg until it is marked ready (`ready_for_review` is a trigger type, and marking it ready starts the macOS leg);
+*The cause, re-measured on 30 Oct 2026 for ask #1235* (the 80 newest of the 200 `test.yml` runs of that day, each run's jobs read with `gh api repos/<repo>/actions/runs/<id>/jobs`; counts only):
+
+1. Runner types: two labels, `ubuntu-latest` (233 jobs) and `macos-latest` (24 jobs), both GitHub-hosted; no self-hosted runner.
+2. How many macOS jobs run at once: at most 4 at the same time in that sample (the plan's own limit was not read).
+3. Minutes of the two macOS legs: `test (macos-latest)` 58 on average (6 green jobs), `test-cloud (macos-latest)` 34 (5 green jobs).
+4. The queue: the 24 macOS jobs waited a mean of 0.7 minutes from creation to start (90th percentile and longest 5.0); when measured, 6 runs were in progress and none was queued.
+5. Cancelled by a later push: 53 of 196 pull-request runs (27 percent) of the day, and 8 of the 24 macOS jobs.
+6. Cost of one pull request: the 2 pull requests with macOS jobs in the sample used 253 macOS minutes each on average (every push that ran macOS, plus the gate pass's re-run).
+
+- a pull request into `main` (#1235): the Ubuntu legs on every push; the macOS legs only when the diff touches a path of the same list (the rule of the next bullet) or the pull request carries the label `needs-mac`; a **draft** runs only the Ubuntu legs until it is marked ready (`ready_for_review`); a `reopened` run (the gate pass's close and reopen, on the merge ref) runs every leg. **A lane gets a macOS run early** by putting the label `needs-mac` on the pull request before it pushes (a label added later takes effect at the next push; `labeled` is not a trigger type). The concurrency group of a `reopened` run has its own suffix and `cancel-in-progress` is off for it: a later push never cancels it, and it cancels no push run;
+- **what G4 and the gate pass require:** the Ubuntu legs green at the head, and both macOS legs (`test (macos-latest)`, `test-cloud (macos-latest)`) green at the head or on the gate pass's merge-ref run of that head; G4 and `merge-gate --pass` say which they found. A leg that is absent, skipped, cancelled or not green is never read as green. When the head had no macOS run, `merge-gate --pass` closes and reopens the pull request (held pull requests: `--rerun-held`, as for a moved branch) and waits for the `reopened` run, then reads the legs; the required check names are unchanged. The rule applies only where the workflow has the Ubuntu legs by these names (`merge_gate.UBUNTU_LEGS`, `MAC_LEGS`);
 - a pull request into `integration`: the Ubuntu leg always; macOS only when the diff (a plain `git diff --no-renames --name-only`, so a file moved out of a listed path counts; a list that cannot be read or holds no pattern, or a diff that fails, runs macOS and says so on the plan step and in its step summary) touches a path of the one list, `.github/macos-platform-paths.txt`, read from the BASE branch so the pull request cannot rewrite the list that gates it (a pull request that edits that file, or changes any file under `.github/workflows/`, runs macOS by a path fixed in the plan script, independent of the list) (the shims, the plugins, the install and service code, the heavy-slot code, the workflow files; `bin/fleet-switchboard` is left out on purpose);
 - a push to `main` and a manual dispatch: both legs;
 - the nightly (05:00 UTC, the default branch's workflow file): both legs for `main` and for `integration`, named `nightly <ref> (<os>)` so they cannot be mistaken for a required name; a missing `integration` branch drops that leg.
@@ -4991,7 +5001,7 @@ Every path or condition the plan script decides from, and where it comes from:
 | Decision | Source |
 |---|---|
 | the event (pull request, push, dispatch, nightly) and the base branch (`main` or not) | hard-coded in the script |
-| a draft into `main` skips macOS | hard-coded in the script |
+| a draft into `main` skips macOS; a `reopened` run of a pull request into `main` runs every leg; the label `needs-mac` runs macOS | hard-coded in the script (the labels and the action come from the event) |
 | the list file's own path, `.github/macos-platform-paths.txt` (an edit of it runs macOS) | hard-coded in the script |
 | the workflow directory, `.github/workflows/` (a change under it runs macOS) | hard-coded in the script |
 | the nightly's refs (`main`, and `integration` when that branch exists) | hard-coded in the script |
@@ -5000,7 +5010,7 @@ Every path or condition the plan script decides from, and where it comes from:
 
 Each row is pinned through the real script, and each has a mutant that fails the pins.
 
-A pull request retargeted from `integration` to `main` is not re-planned by the retarget itself (`edited` is not a trigger type, so that a title or body edit never starts a run): push to it or re-run it, and the plan then sees base `main`. Only the macOS result of a draft into `main`, or of an `integration` pull request that touches no listed path, is absent. Telling the daemon of a failed nightly is a later slice of ask #990. In short, a pull request is re-run with a re-run, never by closing and reopening it (a close and reopen cancels its run and queues a new macOS job): `gh run rerun <id>`, or `gh workflow run test.yml --ref <branch>`.
+A pull request retargeted from `integration` to `main` is not re-planned by the retarget itself (`edited` is not a trigger type, so that a title or body edit never starts a run): push to it or re-run it, and the plan then sees base `main`. Only the macOS result of a draft into `main`, or of an `integration` pull request that touches no listed path, is absent. Telling the daemon of a failed nightly is a later slice of ask #990. In short, a pull request is re-run with a re-run, never by closing and reopening it (a close and reopen cancels its run and queues a new macOS job; only the gate pass does it, on purpose, once, to get the merge-ref macOS run): `gh run rerun <id>`, or `gh workflow run test.yml --ref <branch>`.
 
 **The built-in `ci` recorder.** `fleet-switchboard gates ci-record <repo#N>` makes the switchboard itself record the `ci` verdict. It reads the PR's
 check runs at its **current head** through `gh` (the repo's account) and only when they are all complete and green records a passing `ci`
