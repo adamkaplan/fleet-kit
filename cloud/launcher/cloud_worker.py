@@ -1139,6 +1139,12 @@ def refresh_reason(err):
     return REFRESH_REASONS.get(getattr(err, "kind", ""), "the cluster token could not be obtained")
 
 
+VANISHED_READ_BYTES = 2 * 1024 * 1024   # the most audit bytes the vanished-pod check reads
+VANISHED_WINDOW_SECONDS = 24 * 3600      # and the oldest line it looks at
+VANISHED_MIN_AGE_SECONDS = 600           # a create line must be older than this before its pod is read by name
+VANISHED_MAX_READS = 20                  # the most by-name pod reads of one pass
+
+
 def audit_path(env):
     """Where the audit file is: the setting, else the state directory."""
     return env.get("CW_CLOUD_AUDIT") or os.path.join(env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")
@@ -1828,12 +1834,14 @@ class Launcher:
         self.renew_lock = threading.RLock()   # the pass and the renewal thread never renew at the same moment
 
     # -- audit: one line per action, no secret, written before the action returns --
-    def audit(self, worker, runtime_id, action, cost, ok, reason="", refresh=None):
+    def audit(self, worker, runtime_id, action, cost, ok, reason="", refresh=None, cause=None):
         line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
                 "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name,
                 "reason": self.kube.scrub(reason, limit=1000)}
         if refresh in (REFRESH_USED, REFRESH_REFUSED, REFRESH_NONE):   # a stop that ran the hook: ONE word, never a value
             line["refresh"] = refresh
+        if cause:   # a stop the launcher made of its own accord names why: idle, hard, pod_gone or pod_failed (a person's stop has none)
+            line["cause"] = cause
         write_audit(self.audit_path, line)
 
     def cost(self, pod):
@@ -1851,12 +1859,12 @@ class Launcher:
         except CloudError as e:
             if not e.audited:
                 # the failure is never dropped: a caller's own reason (a stop reason, the run-secret names) comes first
-                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("refresh"))
+                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e), info.get("refresh"), info.get("cause"))
             raise
         except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
-            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("refresh"))
+            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300], info.get("refresh"), info.get("cause"))
             raise CloudError("unexpected cloud data: %s" % self.kube.scrub(e, 200))
-        self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("refresh"))
+        self.audit(worker, info["rid"], action, info["cost"], True, why(), info.get("refresh"), info.get("cause"))
         return result
 
     def _need(self, worker):
@@ -2223,6 +2231,8 @@ class Launcher:
         audit_reason = ("%s; " % reason if reason else "") + "run-id=" + nonce if nonce else reason   # the record keeps the plain reason
 
         def go(info):
+            if getattr(a, "cause", None):
+                info["cause"] = a.cause
             pod = self._need(worker)
             uid = ((pod or {}).get("metadata") or {}).get("uid")
             self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "FLEET_CLOUD_TOKEN_FILE") else None   # a hub pod, orchestrator or worker
@@ -2231,6 +2241,8 @@ class Launcher:
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
                     raise CloudError("worker %s does not match run id %s; nothing was stopped or deleted" % (worker, nonce), EXIT_REFUSED)
             if not pod:
+                if getattr(a, "cause", None):   # only the reaper's own stop names a cause; a by-name stop carries none
+                    info["cause"] = "pod_gone"
                 if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
                     self._remove(name, nonce)
                 # The pod read said NotFound (an operator deleted it); any other read error raised in _need above and never reaches here.
@@ -2249,6 +2261,8 @@ class Launcher:
                     info["record"] = where
                     print("cloud-worker: run record: %s" % where, file=sys.stderr)
             phase = (pod.get("status") or {}).get("phase")
+            if phase == "Failed" and getattr(a, "cause", None):
+                info["cause"] = "pod_failed"
             if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
                 # Secrets, and say so.
@@ -2517,6 +2531,7 @@ class Launcher:
         pods = self.kube.list_pods()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
+        self._note_vanished_pods(pods, now)
         for pod in pods:
             worker = ann(pod, "worker")
             reason = None
@@ -2543,7 +2558,8 @@ class Launcher:
                     live.remove(pod)
                 try:
                     # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
-                    res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None), reason)
+                    res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None,
+                                                       cause="hard" if reason == "hard limit" else "idle"), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
                     self.retire_row(worker, reason)   # the pod is ended: its registry row is retired, once (DW-3)
@@ -2554,6 +2570,51 @@ class Launcher:
         self.remove_orphan_secrets(pods, now)
         self.send_wip_notes(live, now)
         return out
+
+    def _note_vanished_pods(self, pods, now):
+        """A worker this launcher created (a `create` line in the audit's last 24 hours, read from its last 2 MB) with no later stop or delete line,
+        whose pod is absent from this pass's snapshot: ONE stop line, cause pod_gone. The next pass sees that line and writes nothing."""
+        try:
+            with open(self.audit_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - VANISHED_READ_BYTES))
+                lines = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return
+        present = {"pod/" + p["metadata"]["name"] for p in pods}
+        open_runs = {}
+        for raw in lines:
+            try:
+                rec = json.loads(raw)
+                when = parse_iso(rec["ts"])
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+            if not isinstance(rec, dict) or (now - when).total_seconds() > VANISHED_WINDOW_SECONDS:
+                continue
+            rid = rec.get("runtime_id")
+            if rec.get("action") == "create" and rec.get("ok") is True and isinstance(rid, str) and rid:
+                if rec.get("persistent") is True:
+                    continue   # a persistent orchestrator's pod is briefly absent while its StatefulSet recreates it: never stamped
+                open_runs[rid] = (rec.get("worker"), when)
+            elif rec.get("action") in ("stop", "delete") and rec.get("ok") is True and rid in open_runs:
+                del open_runs[rid]   # only a stop that happened closes the run; a failed stop (the pod was kept) leaves it open
+        if not pods:
+            return   # an empty snapshot is no evidence of anything
+        reads = 0
+        for rid, (worker, created) in open_runs.items():
+            if rid in present or not isinstance(worker, str) or not NAME_RE.match(worker):
+                continue
+            if (now - created).total_seconds() <= VANISHED_MIN_AGE_SECONDS:
+                continue   # too young: a later pass notices it
+            if reads >= VANISHED_MAX_READS:
+                break
+            reads += 1
+            try:
+                gone = self.kube.get_pod(pod_name(worker)) is None   # None only on the exact not-found of this one pod
+            except (CloudError, ValueError, TypeError, OSError):
+                continue   # any other answer: nothing is written for it
+            if gone:
+                self.audit(worker, rid, "stop", 0.0, True, "pod gone; no stop was recorded", None, "pod_gone")
 
     def remove_orphan_secrets(self, pods, now):
         """Remove each per-run Secret (`<pod>-run`, label cw/pod; `<pod>-pw`, label app=cw-worker) whose pod is absent from THIS pass's pod list and
