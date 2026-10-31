@@ -18048,6 +18048,7 @@ class TestGitStashGuard(Base):
                 self.assertRegex(text, re.compile(r"never `git stash`.{0,600}scratch branch", re.I))
 
 
+TestGhShimSign = importlib.import_module("test_gh_shim_sign").TestGhShimSign
 class TestSignedComments(HandoffCase):
     """The trial's agents share the user's GitHub account, so an agent's comment came back to it as a wake.
     A comment the switchboard posts is signed, and a signed comment is never an event."""

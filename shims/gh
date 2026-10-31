@@ -10,8 +10,11 @@ plain `gh issue comment ...` and the signature is added without its help.
 
 It signs the body of `gh issue comment`, `gh pr comment`, `gh pr review`,
 `gh issue create` and `gh pr create` when the body comes from --body/-b,
---body-file/-F (a file, or - for stdin). Everything else, and anything it does
-not understand, runs the real gh unchanged: this must never block a command.
+--body-file/-F (a file, or - for stdin); the --comment/-c text of `gh issue close`
+and `gh pr close`; and the `body` field of a POST or PATCH made with `gh api` to
+a comment or review endpoint (SIGNED_API below). Everything else runs the real gh
+unchanged. A signed form whose text cannot be read is refused with one line and
+nothing is posted: it is never posted unsigned.
 """
 import importlib.util
 import json
@@ -30,6 +33,9 @@ MARK = "<!-- fleet-switchboard:from=%s -->"
 SIGNED_RE = re.compile(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]{1,64}\s*-->")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SIGNED_COMMANDS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"), ("issue", "create"), ("pr", "create")}
+CLOSE_COMMANDS = {("issue", "close"), ("pr", "close")}   # signed through their --comment/-c text
+SIGNED_API = (("issue-comments", r"issues/[0-9]+/comments"), ("issue-comment", r"issues/comments/[0-9]+"),
+              ("review-comments", r"pulls/[0-9]+/comments"), ("reviews", r"pulls/[0-9]+/reviews"))   # `gh api` endpoints (under repos/OWNER/REPO/) whose POST or PATCH body is signed
 LOOKUP_SECONDS = 3.0
 WRITE_LOOKUP_SECONDS = 10.0   # a WRITE waits longer for the account lookup: a slow answer must not make it run as the wrong account
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -1167,7 +1173,11 @@ def sign(body, name):
     return body if SIGNED_RE.search(body) else body.rstrip("\n") + "\n\n" + MARK % name + "\n"
 
 
-def body_flag(args):
+BODY_FLAGS = ((("--body", "-b"), "body"), (("--body-file", "-F"), "file"))
+COMMENT_FLAGS = ((("--comment", "-c"), "body"),)
+
+
+def body_flag(args, specs=BODY_FLAGS):
     """(index, kind, inline) of the LAST body flag among args[2:]: kind "body" or "file"; inline is the
     value when it is part of the same argument (`--body=x`, `-bx`), else None (the value is args[index+1])."""
     found = None
@@ -1176,7 +1186,7 @@ def body_flag(args):
         arg = args[i]
         if arg == "--":
             break
-        for names, kind in ((("--body", "-b"), "body"), (("--body-file", "-F"), "file")):
+        for names, kind in specs:
             for name in names:
                 if arg == name:
                     found = (i, kind, None)
@@ -1187,11 +1197,31 @@ def body_flag(args):
     return found
 
 
-def signed_call(args, name):
-    """(new argv, stdin text or None, temp file to remove or None), or None when there is nothing to sign."""
-    if len(args) < 3 or (args[0], args[1]) not in SIGNED_COMMANDS:
+class Unsignable(Exception):
+    """A signed form whose text cannot be signed: the call is refused, never posted unsigned."""
+
+
+def read_text(path):
+    try:
+        with open(path, "r") as handle:
+            return handle.read()
+    except (OSError, UnicodeError) as err:
+        raise Unsignable("the text of %s cannot be read (%s)" % (path, type(err).__name__))
+
+
+def temp_signed(text, name):
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".md")
+    with os.fdopen(handle, "w") as out:
+        out.write(sign(text, name))
+    return temp
+
+
+def signed_call(args, name, specs=BODY_FLAGS, commands=SIGNED_COMMANDS):
+    """(new argv, stdin text or None, temp file(s) to remove or None), or None when there is nothing to sign.
+    Raises Unsignable for a --body-file that cannot be read."""
+    if len(args) < 3 or (args[0], args[1]) not in commands:
         return None
-    flag = body_flag(args)
+    flag = body_flag(args, specs)
     if flag is None:
         return None
     index, kind, inline = flag
@@ -1209,19 +1239,119 @@ def signed_call(args, name):
         return new, None, None
     if value == "-":
         return new, sign(sys.stdin.read(), name), None
-    try:
-        with open(value, "r") as handle:
-            text = handle.read()
-    except OSError:
-        return None
-    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".md")
-    with os.fdopen(handle, "w") as out:
-        out.write(sign(text, name))
+    temp = temp_signed(read_text(value), name)
     if inline is not None:
         new[index] = args[index][:len(args[index]) - len(value)] + temp
     else:
         new[value_at] = temp
     return new, None, temp
+
+
+def close_call(args, namer):
+    """`gh issue close` and `gh pr close`: the --comment/-c text is signed; no comment (or an empty one) passes through."""
+    flag = body_flag(args, COMMENT_FLAGS) if len(args) >= 3 and (args[0], args[1]) in CLOSE_COMMANDS else None
+    if flag is None:
+        return None
+    index, _kind, inline = flag
+    value = inline if inline is not None else (args[index + 1] if index + 1 < len(args) else None)
+    if not value:
+        return None
+    return signed_call(args, namer(), COMMENT_FLAGS, CLOSE_COMMANDS)
+
+
+API_VALUE_FLAGS = ("-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header", "--input", "-q", "--jq", "-t", "--template",
+                   "--hostname", "--cache", "-p", "--preview")
+API_FIELD_FLAGS = ("-f", "--raw-field", "-F", "--field")
+API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API))
+
+
+def api_parse(args):
+    """(positionals, method or None, fields) of a `gh api` call; fields are (index, flag, inline, text) of every field flag, in order."""
+    positionals, method, fields, i = [], None, [], 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            positionals.extend(args[i + 1:])
+            break
+        long_inline = arg.startswith("--") and "=" in arg
+        base = arg.split("=", 1)[0] if long_inline else arg
+        if base in API_VALUE_FLAGS and not long_inline:
+            value = args[i + 1] if i + 1 < len(args) else None
+            if base in ("-X", "--method") and value is not None:
+                method = value.upper()
+            if base in API_FIELD_FLAGS and value is not None:
+                fields.append((i, base, None, value))
+            i += 2
+            continue
+        if long_inline and base in API_VALUE_FLAGS:
+            value = arg.split("=", 1)[1]
+            if base == "--method":
+                method = value.upper()
+            if base in API_FIELD_FLAGS:
+                fields.append((i, base, value, value))
+        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 2 and arg[:2] in API_VALUE_FLAGS:
+            value = arg[2:]
+            if arg[:2] == "-X":
+                method = value.upper()
+            if arg[:2] in API_FIELD_FLAGS:
+                fields.append((i, arg[:2], value, value))
+        elif not arg.startswith("-"):
+            positionals.append(arg)
+        i += 1
+    return positionals, method, fields
+
+
+def api_call(args, namer):
+    """`gh api` POST or PATCH to a comment or review endpoint (SIGNED_API): every `body` field is signed (`-f`, `-F`, `--field`, `--raw-field`; `-F body=@file`
+    and `@-` are read, signed and passed as a temporary file or stdin). A read, another endpoint, a call with no body field and `--input` are not touched."""
+    if not args or args[0] != "api":
+        return None
+    positionals, method, fields = api_parse(args)
+    if not any(API_ENDPOINT_RE.match(p) for p in positionals):
+        return None
+    if any(a == "--input" or a.startswith("--input=") for a in args[1:]):
+        return None
+    if (method or ("POST" if fields else "GET")) not in ("POST", "PATCH"):
+        return None
+    bodies = [f for f in fields if f[3].split("=", 1)[0] == "body" and "=" in f[3]]
+    if not bodies:
+        return None
+    name = namer()
+    new, stdin_text, temps = list(args), None, []
+    for index, flag, inline, text in bodies:
+        value = text.split("=", 1)[1]
+        if flag in ("-F", "--field") and value.startswith("@"):
+            if value == "@-":
+                stdin_text = sign(sys.stdin.read() if stdin_text is None else stdin_text, name)
+                continue
+            temps.append(temp_signed(read_text(value[1:]), name))
+            replaced = "body=@" + temps[-1]
+        else:
+            replaced = "body=" + sign(value, name)
+        if inline is None:
+            new[index + 1] = replaced
+        else:
+            new[index] = args[index][:len(args[index]) - len(inline)] + replaced
+    return new, stdin_text, temps or None
+
+
+def sign_plan(args, lookup):
+    """The plan for a call, or None when it is not a signed form. Raises Unsignable when a signed form's text cannot be signed. The name is looked up
+    only when a body is about to be signed, so an unrelated call costs no lookup."""
+    if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS:
+        handler = lambda namer: signed_call(args, namer())
+    elif len(args) >= 3 and (args[0], args[1]) in CLOSE_COMMANDS:
+        handler = lambda namer: close_call(args, namer)
+    elif args and args[0] == "api":
+        handler = lambda namer: api_call(args, namer)
+    else:
+        return None
+    try:
+        return handler(lambda: my_name(lookup))
+    except Unsignable:
+        raise
+    except Exception as err:
+        raise Unsignable("signing failed (%s)" % type(err).__name__)
 
 
 # ---- the gate probe (plan-driven development: enforcing in a repo whose mode is enforce). docs/plan-gate-engine-design.md, E1 and E3.
@@ -2122,9 +2252,11 @@ def run(args):
         audit_write(args, lookup, "refused", write, hold_repo, hold_number)
         return 1
     try:
-        plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
-    except Exception:
-        plan = None  # never let signing stop the command
+        plan = sign_plan(args, lookup)
+    except Unsignable as err:
+        sys.stderr.write("gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(err)))
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
     refusal = review_probe(args, over_found, over_reason, lookup, gh)
     if refusal is not None:
         sys.stderr.write(refusal + "\n")
@@ -2216,9 +2348,9 @@ def run(args):
             cache_mark(lookup.identity().get("name"))   # the write has ended (an exec'd write cannot say so: the grace window covers it)
         return done.returncode
     finally:
-        if temp:
+        for path in ([temp] if isinstance(temp, str) else temp or []):
             try:
-                os.unlink(temp)
+                os.unlink(path)
             except OSError:
                 pass
 
