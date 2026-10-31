@@ -94,6 +94,21 @@ class TestMutant(unittest.TestCase):
         self.assertNotIn("No such file", res.stdout + res.stderr)
         self.assertNotIn("FileNotFoundError", res.stdout + res.stderr)
 
+    def test_s4_the_unmutated_copy_runs_the_same_child_and_passes(self):
+        with tempfile.TemporaryDirectory() as d:   # the same scratch copy, the line not reverted
+            shutil.copytree(ROOT / "bin", os.path.join(d, "bin"), ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(ROOT / "cloud" / "worker" / "tests", os.path.join(d, "cloud", "worker", "tests"), ignore=shutil.ignore_patterns("__pycache__"))
+            os.makedirs(os.path.join(d, "cloud", "launcher", "tests"))
+            shutil.copy(__file__, os.path.join(d, "cloud", "launcher", "tests"))
+            for name in ("cw_cases_lookup.py", "cw_cases_vault.py", "fake_opencode_export.sh"):
+                shutil.copy(ROOT / "cloud" / "launcher" / "tests" / name, os.path.join(d, "cloud", "launcher", "tests"))
+            shutil.copytree(ROOT / "cloud" / "launcher", os.path.join(d, "cloud", "launcher"), dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "tests"))
+            res = subprocess.run([sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name),
+                                  "TestHubSession.test_s2_s3_orchestrator_without_the_setting_gives_the_entry_the_session_once"],
+                                 env=dict(os.environ, TMPDIR=d), capture_output=True, text=True, cwd=d)
+        print("control: unmutated child exit %d" % res.returncode)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
 
 class TestDocs(unittest.TestCase):
     def test_docs_orchestrator_hub_session(self):
