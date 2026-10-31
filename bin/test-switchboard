@@ -67802,6 +67802,7 @@ TestCiTestFileList = _ci_test_files.TestCiTestFileList
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)

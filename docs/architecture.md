@@ -128,6 +128,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/engine.py` | 3 | the engine: the single-instance lock and the pass | |
 | `switchboard/triage.py` | 4 | the triage pass (rule family T), shadow by default, written nothing to GitHub | |
 | `switchboard/alert_labels.py` | 4 | an alert label on an open issue wakes that repository's orchestrator | |
+| `switchboard/link_scrub.py` | 4 | the signed-link scrub of a GitHub comment summary | |
 | `switchboard/handoff.py` | 5 | the handoff: a brief, not a fork | |
 | `switchboard/agents_verify.py` | 5 | `agents verify`: did the service register our agents as written | |
 | `switchboard/launch_model.py` | 5 | `launch --model` and `--reasoning`: the choice checked against the local service's model list before a session exists | |
