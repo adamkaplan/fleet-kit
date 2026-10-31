@@ -1,6 +1,7 @@
 """Ask #1480: a cloud worker the launcher ended alerts its boss and the Chief of Staff, once per run and reason. Offline: a scratch state
 directory, a fixture audit file, a recording send function. Mutants are copies of the module's text in memory, never a file."""
 import json, os, shutil, sys, tempfile, types, unittest
+import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
@@ -364,6 +365,42 @@ class TestS9ThreeHostileRecords(World):
             pass
         print("S9 mutant M3: the hostile test fails on the leaking build %d of 1, control passes %d of 1, mutation applied True" % (failed, control))
         self.assertEqual((failed, control), (1, 1))
+
+    def child_copy(self, mutate):
+        """A faithful scratch copy of the whole tree outside the repository; with mutate, bin/cloud_end_alert.py carries the M3 edit."""
+        scratch = os.path.join(tempfile.mkdtemp(prefix="end-alert-copy-"), "tree")
+        self.addCleanup(shutil.rmtree, os.path.dirname(scratch), True)
+        shutil.copytree(ROOT, scratch, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc", "node_modules"))
+        if mutate:
+            target = os.path.join(scratch, "bin", "cloud_end_alert.py")
+            old = 'return "yes" if hook["pushed"] else "no"'
+            with open(target) as f:
+                text = f.read()
+            self.assertEqual(text.count(old), 1)
+            with open(target, "w") as f:
+                f.write(text.replace(old, 'return "yes %s" % hook.get("wip_branch") if hook["pushed"] else "no"'))
+        return scratch
+
+    def run_child(self, scratch):
+        env = dict(os.environ, END_ALERT_INNER="1")
+        return subprocess.run([sys.executable, "-m", "unittest", "-q",
+                               "test_cloud_end_alert.TestS9ThreeHostileRecords.test_s9_three_hostile_records_leave_five_facts_and_nothing_else"],
+                              cwd=os.path.join(scratch, "cloud", "launcher", "tests"), env=env, capture_output=True, text=True, timeout=90)
+
+    @unittest.skipIf(os.environ.get("END_ALERT_INNER"), "the child run does not start a child")
+    def test_s9_m3_in_a_child_on_a_scratch_copy_with_a_control(self):
+        control = self.run_child(self.child_copy(False))
+        mutated = self.child_copy(True)
+        with open(os.path.join(mutated, "bin", "cloud_end_alert.py")) as f:
+            applied = 'hook.get("wip_branch")' in f.read()
+        broken = self.run_child(mutated)
+        out = broken.stdout + broken.stderr
+        failed = 1 if broken.returncode == 1 and "FAILED (failures=1)" in out else 0
+        named = 1 if "https://x.example/a?token=abc123&u=1" in out else 0
+        ctl = 1 if control.returncode == 0 else 0
+        print("S9 mutant M3 in a child: the hostile test fails on the leaking copy %d of 1, control passes %d of 1, "
+              "the failure names the leaked branch %d of 1, mutation applied %s" % (failed, ctl, named, applied))
+        self.assertEqual((ctl, failed, named, applied), (1, 1, 1, True), control.stderr[-500:] + out[-800:])
 
     def test_s9_a_mutant_that_copies_the_directory_name_is_caught_on_the_records(self):
         broken = mutant('return dirname if re.fullmatch(re.escape(worker) + "-" + RECORD_STAMP, dirname or "") else None', "return dirname or None")
