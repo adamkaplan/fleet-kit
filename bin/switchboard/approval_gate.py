@@ -92,7 +92,7 @@ def approval_refusal(args, runner, now):
     head = (ctx.facts or {}).get("head")
     if not ctx.problem and head and "G0c" in plan_ledger.valid_waivers(ctx.entries, ctx.pr, head, now()):
         try:
-            AuditLog(ctx.state / "audit.jsonl").append("cli", "plan.approval.waived", ctx.pr, {"pr": ctx.pr, "head": head, "waived": said})
+            AuditLog(ctx.state / "audit.jsonl").append("cli", "plan.approval.waived", ctx.pr, {"pr": ctx.pr, "head": head, "waived": "G0c: " + said})
         except OSError:
             pass
         return None
