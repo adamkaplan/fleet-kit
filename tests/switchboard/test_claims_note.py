@@ -159,7 +159,58 @@ class TestClaimsNotePass(ClaimsNoteBase):
         self.assertEqual(self.sb.plan_ledger.omitted_claims(self.sb.plan_check.parse_scenarios(self.sb.plan_check.scenario_block(HOST.LEDGER_PLAN)), body, others), ["S3", "U1"])
 
 
-class TestClaimsNoteSkips(ClaimsNoteBase):
+class NoGithubReadChecks:
+    """(mixed into TestClaimsNoteSkips, whose loader line is the one registered) PC-2 on the REAL path: a real GitHubHub routes the notice and its GitHub reads fail the test on any call."""
+
+    def real_hub(self, fx, calls):
+        sb = self.sb
+        hub = sb.GitHubHub(fx.engine.config, fx.world.state, sb.AuditLog(fx.world.audit_path), lambda *a, **k: None, None, fx.world.clock.now)
+        def refuse(name):
+            def call(*a, **k):
+                calls.append((name, a, sorted(k)))
+                raise AssertionError("GitHub read %s%r" % (name, a))
+            return call
+        hub._read_one, hub.gh_api = refuse("_read_one"), refuse("gh_api")
+        hub.config, hub.watches, hub.state_dir, hub._notices = fx.engine.config, {}, fx.engine.state_dir, {}
+        hub._load_notices = lambda: {}
+        return hub
+
+    def checks(self, fx):
+        with mock.patch.object(self.sb, "claims_note_pass", lambda *a: None):
+            fx.go()
+        calls = self.calls = []
+        fx.engine.hub = self.real_hub(fx, calls)
+        self.sb.claims_note_pass(fx.engine, fx.engine.triage, ["acme/api"], fx.world.clock.now())
+        self.assertIsInstance(fx.engine.hub, self.sb.GitHubHub)
+        self.assertEqual([t.split(":")[0] for t in self.notices(fx)], ["PR acme/api#7"], "the notice routed and sent")   # the pull request naming a closing issue
+        self.assertEqual(len([w for w in self.skipped(fx) if w.startswith("no recipient")]), 1, "the one naming none has no lane to reach (the audit says so)")
+        self.assertEqual(calls, [], "GitHub calls on the routing path")
+
+    def fixture(self):
+        fx = self.world()
+        self.pull(fx, 7, LINK + "CLAIMS: S1")             # names a closing issue
+        self.pull(fx, 8, "PLAN: acme/api#3\nCLAIMS: S2")   # names none
+        return fx
+
+    def test_the_real_route_of_reads_no_github_for_the_pull_requests_the_pass_builds(self):
+        self.checks(self.fixture())
+
+    def test_a_mutant_that_adds_a_lookup_the_hub_must_resolve_is_caught_and_the_control_passes(self):
+        real, applied = self.sb.GitHubItem, []
+        def mutant(*args):
+            item = real(*args)
+            item.lookups = [("pr", args[8][0])]   # the hub must now read the pull request
+            applied.append(1)
+            return item
+        with mock.patch.object(self.sb, "GitHubItem", mutant):
+            with self.assertRaisesRegex(AssertionError, r"the notice routed and sent"):
+                self.checks(self.fixture())
+        self.assertTrue(applied)
+        self.assertEqual(self.calls[0][0], "_read_one")   # the mutant made the hub read GitHub
+        self.checks(self.fixture())   # the control
+
+
+class TestClaimsNoteSkips(NoGithubReadChecks, ClaimsNoteBase):
     def hold(self, fx, drop=None):
         """The units held by a triage pass that has no notice pass, so the pass under test is the only one that runs."""
         with mock.patch.object(self.sb, "claims_note_pass", lambda *a: None):
