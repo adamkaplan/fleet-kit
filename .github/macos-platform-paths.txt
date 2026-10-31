@@ -31,12 +31,8 @@ bin/guard_alert.py
 bin/spotlight_guard.py
 
 # group: cloud-launcher-chain
-# the launcher test entry point: do not remove: these files decide the macOS leg's time
-bin/test-cloud-launcher
-# the chain driver: do not remove: these files decide the macOS leg's time
-bin/test-cloud-launcher.chain
-# the parallel runner: do not remove: these files decide the macOS leg's time
-bin/test-cloud-launcher.parallel
+# the launcher test driver, its chain list and its parallel list: do not remove: these files decide the macOS leg's time
+bin/test-cloud-launcher*
 
 # group: workflow
 .github/workflows/**
