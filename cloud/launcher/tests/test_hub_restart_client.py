@@ -209,5 +209,36 @@ class S6Docs(unittest.TestCase):
             self.assertIn(word, text)
 
 
+class S10Tries(unittest.TestCase):
+    NEW = "The command makes up to 6 tries with one key (five waits of 0.5, 1, 2, 4 and 8 seconds, a window of about 15 seconds)."
+    HANG = "A hub that hangs instead of refusing holds a send for up to 10 seconds per try, so a lane can wait about 75 seconds in the worst case before the command returns exit status 1."
+
+    def _text(self):
+        with open(os.path.join(ROOT, "docs", "cloud-channel.md")) as f:
+            return " ".join(f.read().split())
+
+    def has_six_tries(self, text):
+        return (self.NEW in text, self.HANG in text, "up to 3 tries" not in text)
+
+    def test_real_text(self):
+        got = self.has_six_tries(self._text())
+        text = self._text()
+        print("S10: six tries and the window %d of 1, the sentence on a hub that hangs %d of 1, occurrences of up to 3 tries %d"
+              % (text.count(self.NEW), text.count(self.HANG), text.count("up to 3 tries")))
+        self.assertEqual(got, (True, True, True))
+
+    def test_mutant(self):
+        text = self._text()
+        control = self.has_six_tries(text)
+        applied = text.count(self.NEW) == 1
+        mutant = text.replace(self.NEW, "The command makes up to 3 tries with one key.")
+        got = self.has_six_tries(mutant)
+        print("S10: control passes %d of 1, mutant (the old sentence back) fails %d of 1, mutation applied %s"
+              % (control == (True, True, True), got != (True, True, True), applied))
+        self.assertTrue(applied)
+        self.assertEqual(control, (True, True, True))
+        self.assertEqual(got, (False, True, False))
+
+
 if __name__ == "__main__":
     unittest.main()
