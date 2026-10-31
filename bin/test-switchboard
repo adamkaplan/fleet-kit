@@ -42315,6 +42315,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         'the vault check lock %s was no': 'refused before any pod exists: it says nothing was created',
         'the vault access check stopped': 'refused before any pod exists: it says nothing was created',
         'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
+        'the brief line %r needs docker': 'refused before any pod exists: it says nothing was created',
     }
 
     def other_created_words(self, source):
