@@ -34,7 +34,7 @@ Receipt format: `docs/plan-template.md`.
    **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
    **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
-   An uncovered Done-when clause gets a new `S` scenario; never edit, reword or delete the clause.
+   An uncovered Done-when clause gets a new `S` scenario.
 3. **Constraints** (`PC-n`): what must hold and why (a shared contract, a security rule, a held path). Nothing else is a
    constraint.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
@@ -50,7 +50,7 @@ issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; forma
 
 ## The form
 
-Put it in the repo the work concerns. **an issue body** (outcome, Done-when, link to the
+**An issue body** (outcome, Done-when, link to the
 detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
 `scenarios:` yaml block. The latest such comment counts. One plan per ask; sections for work items.
 
