@@ -2192,7 +2192,7 @@ class TestArchTools(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(out.parent), True)
         done = self.tool("arch-split-check", "--write-surface", out, "--after", *files)
         self.assertEqual(done.returncode, 0, done.stderr[-600:])
-        self.assertEqual(out.read_text().split(), sorted(dir(sb)), "the names the tool reads are the names of the daemon as it loads")
+        self.assertEqual(out.read_text().split(), self.daemon_names(sb), "the names the tool reads are the names of the daemon as it loads, without the names the interpreter adds")
 
     def test_a_cut_refuses_a_part_name_already_listed_and_a_name_given_twice_and_writes_nothing(self):
         root = Path(tempfile.mkdtemp())
