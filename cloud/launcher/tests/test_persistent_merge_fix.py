@@ -254,5 +254,74 @@ class S21Exempt(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def refusal_checks(module):
+    """The two exempt refusals run through the persistent tests' fake cluster against MODULE: each is exit 2, its flag text once on stderr, 0 creates."""
+    class Checks(po.PBase):
+        mod = module
+
+        def check(self, flag, **kw):
+            code, err = self.refuse(**kw)
+            creates = [v for v in self.verbs() if v[0] in ("create", "apply", "patch")]
+            st = self.st()
+            leftovers = len(st.get("sts", {})) + int("applied" in st) + len(set(st["secrets"]) - {po.REGISTRY, "cloud-hub-pw"})
+            if len(creates) > 0 or leftovers > 0 or code != 2:
+                raise AssertionError("something was created before the refusal (creates = %d, exit %d)" % (len(creates), code))
+            self.assertEqual(err.count(flag), 1, err)
+            self.assertEqual(len(creates), 0)
+
+        def refuse(self, agent=True, stack=False):
+            argv = ["create", po.WORKER, "--repo", "acme-org/widget-service", "--branch", "main", "--run-id", "0123456789abcdef"]
+            if agent:
+                argv += ["--agent", "orchestrator", "--boss", "boss1"]
+            fd = po.fd_with(po.GIT_VALUE)
+            self.fds.append(fd)
+            argv += ["--run-secret-fd", "git-token=%d" % fd, "--persistent"]
+            if stack:
+                argv += ["--stack", "--shape", "S"]
+            code, _, err = self.run_cli(*argv)
+            return code, err
+
+        def test_a_worker_with_persistent(self):
+            self.check("--persistent is only for --agent orchestrator", agent=False)
+
+        def test_an_orchestrator_with_persistent_and_stack(self):
+            self.check("--persistent does not combine with --stack", stack=True)
+    return Checks
+
+
+def run_suite(cls):
+    with open(os.devnull, "w") as null:
+        result = unittest.TextTestRunner(stream=null, verbosity=0).run(unittest.defaultTestLoader.loadTestsFromTestCase(cls))
+    bad = result.failures + result.errors
+    return result.testsRun - len(bad), bad
+
+
+class S21bCreatesNothing(unittest.TestCase):
+    CALL = "                self._persistent_refusals(a, agent, run_values)\n"
+    ANCHOR = '"type": "Opaque", "stringData": {"password": password}})\n'
+
+    def test_s21b_the_refusals_create_nothing_and_a_launcher_that_creates_first_fails(self):
+        src = read(SOURCE)
+        self.assertEqual(src.count(self.CALL), 1)
+        self.assertEqual(src.count(self.ANCHOR), 1)
+        text = src.replace(self.CALL, "").replace(self.ANCHOR, self.ANCHOR + self.CALL)   # moved behind the first create (the password Secret)
+        mask = "                hits = scan_workload(spec)\n"   # the stack launch is otherwise stopped by this scan before any create, which would hide the late refusal
+        self.assertEqual(text.count(mask), 1)
+        text = text.replace(mask, "                hits = []\n")
+        guard = "    bad = workload_problems(workload)\n"   # and so is the render's own field check of a stack workload
+        self.assertEqual(text.count(guard), 1)
+        text = text.replace(guard, "    bad = []\n")
+        self.assertNotEqual(text, src)
+        self.assertEqual(text.count("self._persistent_refusals(a, agent, run_values)"), 1)
+        copy = module_from(text)
+        ok, bad = run_suite(refusal_checks(cw))
+        mok, mbad = run_suite(refusal_checks(copy))
+        self.assertEqual((ok, len(bad)), (2, 0), bad)
+        failed = sum(1 for _, tb in mbad if "something was created before the refusal" in tb)
+        self.assertEqual((mok, failed), (0, 2), mbad)
+        print("S21b: refusals showing 0 creates and one refusal line with exit status 2 %d of 2, copy of the launcher with the refusal behind the create fails %d of 2 with the anchored text, control passes %d of 2, mutation applied %s"
+              % (ok, failed, ok, True))
+
+
 if __name__ == "__main__":
     unittest.main()
