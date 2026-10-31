@@ -159,9 +159,25 @@ class AllowListAndAuditSentence(unittest.TestCase):
     ALLOW = ("kubectl get events ", "kubectl describe node ", "kubectl get pods ", "kubectl -n kube-system get configmap cluster-autoscaler-status",
              "az aks nodepool show ", "az aks nodepool list ", "az monitor activity-log list ")
 
+    SHELL_CHAIN = (";", "&", "|", "`", "$(", ">", "<")
+
+    def allowed_line(self, ln):
+        return ln.startswith(self.ALLOW) and not any(c in ln for c in self.SHELL_CHAIN)
+
     def allowed(self, block):
         lines = [ln for ln in block.splitlines() if ln.strip()]
-        return sum(1 for ln in lines if ln.startswith(self.ALLOW)), len(lines)
+        return sum(1 for ln in lines if self.allowed_line(ln)), len(lines)
+
+    def failed_lines(self, block):
+        return [ln for ln in block.splitlines() if ln.strip() and not self.allowed_line(ln)]
+
+    def plant(self, block, extra):
+        self.assertEqual(block.splitlines().count(extra), 0)
+        mutated = block + extra + "\n"
+        self.assertEqual(mutated.splitlines().count(extra), 1)
+        applied = len(mutated.splitlines()) == len(block.splitlines()) + 1
+        self.assertTrue(applied, extra)
+        return mutated, applied
 
     def test_s6_every_line_of_each_block_is_on_the_allow_list(self):
         for rel in DOCS:
@@ -174,18 +190,28 @@ class AllowListAndAuditSentence(unittest.TestCase):
         control = self.allowed(block)
         print("S6: control: the real block matches %d of %d" % control)
         self.assertEqual(control, (7, 7))
-        failing = 0
-        applied_all = True
-        for extra in ("kubectl exec NODE_NAME -- id", "az aks nodepool update --name NODEPOOL_NAME", "kubectl get secrets --all-namespaces"):
-            mutated = block + extra + "\n"
-            applied_all = applied_all and mutated != block
-            self.assertTrue(mutated != block)
-            self.assertTrue(block_clean(mutated), extra)
-            ok, total = self.allowed(mutated)
-            if ok != total:
-                failing += 1
-        print("S6: mutants failing the allow-list %d of 3, none holding a forbidden word, mutation applied %s" % (failing, applied_all))
-        self.assertEqual(failing, 3)
+        self.assertEqual(self.failed_lines(block), [])
+        results = {}
+        groups = {
+            "plan": ("kubectl exec NODE_NAME -- id", "az aks nodepool update --name NODEPOOL_NAME", "kubectl get secrets --all-namespaces"),
+            "chained": ("kubectl get pods --all-namespaces -o wide; rm x", "kubectl get pods -o wide && rm x"),
+        }
+        for name, extras in groups.items():
+            failing = 0
+            applied_all = True
+            for extra in extras:
+                mutated, applied = self.plant(block, extra)
+                applied_all = applied_all and applied
+                self.assertTrue(block_clean(mutated), extra)
+                self.assertIn(extra, self.failed_lines(mutated))
+                ok, total = self.allowed(mutated)
+                if ok != total:
+                    failing += 1
+            results[name] = (failing, applied_all)
+        print("S6: mutants failing the allow-list %d of 3, none holding a forbidden word, mutation applied %s" % results["plan"])
+        print("S6: chained-line mutants failing the allow-list %d of 2, mutation applied %s" % results["chained"])
+        self.assertEqual(results["plan"][0], 3)
+        self.assertEqual(results["chained"][0], 2)
 
     @staticmethod
     def has_audit_sentence(sec):
