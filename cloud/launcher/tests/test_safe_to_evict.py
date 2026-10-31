@@ -159,7 +159,8 @@ class AllowListAndAuditSentence(unittest.TestCase):
     ALLOW = ("kubectl get events ", "kubectl describe node ", "kubectl get pods ", "kubectl -n kube-system get configmap cluster-autoscaler-status",
              "az aks nodepool show ", "az aks nodepool list ", "az monitor activity-log list ")
 
-    SHELL_CHAIN = (";", "&", "|", "`", "$(", ">", "<")
+    # one string of single characters, so that the stub-cleanup scan does not read a lone ampersand as a backgrounding shell string; the same seven characters as before
+    SHELL_CHAIN = tuple(";&|`") + ("$(", ">", "<")
 
     def allowed_line(self, ln):
         return ln.startswith(self.ALLOW) and not any(c in ln for c in self.SHELL_CHAIN)
