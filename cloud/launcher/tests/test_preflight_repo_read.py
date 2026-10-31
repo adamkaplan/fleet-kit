@@ -416,5 +416,76 @@ class S4Real(Base):
 
 
 
+class S3Mints(Base):
+    """S3: the preflight mints no token of another role. Mechanism: the file runs the preflight as a subprocess, so a mock patch is not possible;
+    the scratch program copy gets an app_token.py whose mint() appends the role of every call to a file and returns the planted marker."""
+    OLD_MINT = "            return app_token.mint(target)\n"
+
+    def recording_copy(self, name, preflight_text=None):
+        prog = program_copy(self.tmp.name, name, preflight_text)
+        at = os.path.join(os.path.dirname(prog), "app_token.py")
+        with open(at, "a") as f:
+            f.write("\n\ndef mint(target, role=\"worker\"):\n    with open(os.environ[\"CW_MINT_RECORD\"], \"a\") as r:\n"
+                    "        r.write(role + \"\\n\")\n    return \"" + MARKER + "\"\n")
+        return prog
+
+    def mints(self, prog):
+        rec = os.path.join(self.tmp.name, "record-" + os.path.basename(os.path.dirname(prog)))
+        Fake.detail, Fake.paths, Fake.orgs = "ok", [], 0
+        env = {k: v for k, v in os.environ.items() if k != "CW_PREFLIGHT_TOKEN_CMD"}
+        env.update(CW_GITHUB_API_BASE=self.base, CW_MINT_RECORD=rec)
+        p = subprocess.run([sys.executable, prog, REPO], env=env, capture_output=True, text=True, timeout=60)
+        roles = []
+        if os.path.exists(rec):
+            with open(rec) as f:
+                roles = f.read().split()
+        return p, roles
+
+    def check(self, prog):
+        """The S3 check: raises AssertionError naming every other role; returns the recorded roles."""
+        p, roles = self.mints(prog)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(roles, "no mint was recorded")
+        other = [r for r in roles if r not in ("worker", "orchestrator")]
+        if other:
+            raise AssertionError("mint for another role: " + ", ".join(sorted(set(other))))
+        self.assertTrue(set(roles) <= {"worker", "orchestrator"})
+        return roles
+
+    def test_S3_the_preflight_mints_only_worker_and_orchestrator_and_the_mutant_is_found(self):
+        prog = self.recording_copy("recorded")
+        roles = self.check(prog)
+        other = sum(1 for r in roles if r not in ("worker", "orchestrator"))
+        self.assertEqual(other, 0)
+        p = subprocess.run([sys.executable, "-m", "unittest", "test_mint_roles"], cwd=HERE, capture_output=True, text=True, timeout=90)
+        m = re.search(r"Ran (\d+) tests?", p.stderr)
+        self.assertIsNotNone(m, p.stderr[-300:])
+        self.assertEqual(p.returncode, 0, p.stderr[-300:])
+        self.assertTrue(re.search(r"^OK\s*$", p.stderr, re.M), p.stderr[-300:])
+        n = int(m.group(1))
+        line = "S3: mints for other roles %d, test_mint_roles %d of %d" % (other, n, n)
+        print(line)
+        # the mutant: the preflight mints once more for another role
+        text = open(os.path.join(LAUNCHER, "preflight.py")).read()
+        self.assertEqual(text.count(self.OLD_MINT), 1)
+        applied = text.count(self.OLD_MINT) == 1
+        mut = self.recording_copy("mutant3", text.replace(self.OLD_MINT, '            app_token.mint(target, "reviewer")\n' + self.OLD_MINT))
+        control = 1
+        try:
+            self.check(self.recording_copy("control3"))
+        except AssertionError:
+            control = 0
+        failed = named = 0
+        try:
+            self.check(mut)
+        except AssertionError as e:
+            failed = 1
+            named = 1 if re.search(r"another role: .*\breviewer\b", str(e)) else 0
+        line = ("S3 mutant: control passes %d of 1, mutant fails %d of 1, failure names the role %d of 1, mutation applied %s"
+                % (control, failed, named, applied))
+        print(line)
+        self.assertEqual(line, "S3 mutant: control passes 1 of 1, mutant fails 1 of 1, failure names the role 1 of 1, mutation applied True")
+
+
 if __name__ == "__main__":
     unittest.main()
