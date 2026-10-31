@@ -9742,7 +9742,7 @@ class TestHygiene(unittest.TestCase):
         top, jobs = workflow.split("\njobs:\n", 1)
         self.assertIn("\nconcurrency:\n", top, "the concurrency block is top-level (before jobs)")
         self.assertIn("group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}", top)
-        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", top)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}", top)
         self.assertNotIn("cancel-in-progress: true", workflow, "an unconditional cancel would cancel a push to main")
         self.assertNotIn("github.ref }}", top, "a push to main must not share a group: GitHub drops a PENDING run of a shared group even without cancel-in-progress")
         # ask #990: the matrix is no longer a literal os list: the `plan` job decides it (one macOS entry per job of the run, in or out), pinned by WorkflowPlanPins below
@@ -18048,6 +18048,8 @@ class TestGitStashGuard(Base):
                 self.assertRegex(text, re.compile(r"never `git stash`.{0,600}scratch branch", re.I))
 
 
+TestGhShimSign = importlib.import_module("test_gh_shim_sign").TestGhShimSign
+TestGhShimSignRepoFlag = importlib.import_module("test_gh_shim_sign_repo_flag").TestGhShimSignRepoFlag
 class TestSignedComments(HandoffCase):
     """The trial's agents share the user's GitHub account, so an agent's comment came back to it as a wake.
     A comment the switchboard posts is signed, and a signed comment is never an event."""
@@ -23523,6 +23525,7 @@ class TestSweep(Base):
         ("ci", "ci is None", {"ci": None}, {}, "not ready"),
         ("ci", "ci is absent", {"ci": KeyError}, {}, "not ready"),
         ("ci", "ci says none", {"ci": "none"}, {}, "not ready"),
+        ("legs", "a macOS leg is not green (failed, absent, skipped, cancelled or in progress)", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test (macos-latest)": "failure"}, False)}, {}, "not ready"),
         ("draft", "a draft", {"draft": True}, {}, "not ready"),
         ("body", "the body is empty", {"body": ""}, {}, "not ready"),
         ("body", "the body is None", {"body": None}, {}, "not ready"),
@@ -67759,12 +67762,14 @@ def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2
 sys.path.insert(0, str(REPO / "tests" / "switchboard"))
 _architecture = importlib.import_module("test_architecture")
 TestArchitectureDocument, TestArchitectureDocumentFailurePaths = _architecture.TestArchitectureDocument, _architecture.TestArchitectureDocumentFailurePaths
+TestSharesDeadVerdict = importlib.import_module("test_dead_verdict").TestSharesDeadVerdict   # #1668
 # The closure test (ask #1092, slice S13) is run the same way: the clear's closure follows the parts (tools/derive-closure).
 _closure = importlib.import_module("test_closure")
 TestDerivedClosure, TestRefusalInAPart, TestMovingADefinition, TestTheDerivationIsHeld = _closure.TestDerivedClosure, _closure.TestRefusalInAPart, _closure.TestMovingADefinition, _closure.TestTheDerivationIsHeld
 # The shadow test (#1339): an added definition under a closure name in another file is refused by the clear.
 _shadow = importlib.import_module("test_shadow")
 TestShadowRule, TestShadowGlue, TestShadowStatuses, TestReasonsAreOneCleanLine = _shadow.TestShadowRule, _shadow.TestShadowGlue, _shadow.TestShadowStatuses, _shadow.TestReasonsAreOneCleanLine
+_bot_reviews = importlib.import_module("test_bot_reviews"); _bot_reviews.HOST = sys.modules[__name__]; BotLines, BotWake, PendingJobs, BotDocumentation, BotMutants, BotSize, BotVerdict = _bot_reviews.BotLines, _bot_reviews.BotWake, _bot_reviews.PendingJobs, _bot_reviews.BotDocumentation, _bot_reviews.BotMutants, _bot_reviews.BotSize, _bot_reviews.BotVerdict
 # The relay tree-guard test (#1380, #1429): the relay thread obeys the installed-tree guard.
 _relay_tree_guard = importlib.import_module("test_relay_tree_guard")
 RelayObeysTheTreeGuard = _relay_tree_guard.RelayObeysTheTreeGuard
@@ -67796,11 +67801,14 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 # The CI test-file list tests of #1498.
 _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
+TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
 
 # The delivery-lag tests of #1402.
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
+TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
@@ -67810,8 +67818,13 @@ TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
 TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
+# The whole-read check of a pull request of more than 100 files (#1098); the host module gives the class its fixtures.
+_changed_file_pages = importlib.import_module("test_changed_file_pages")
+_changed_file_pages.HOST = sys.modules[__name__]
+TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
+TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
     """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a
@@ -78331,7 +78344,7 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         rollup = self.first() + [self.chk("ci", 101, "build", "", "QUEUED")]
         got = why({"statusCheckRollup": rollup})
         self.assertEqual(got["status"], "not-green")
-        self.assertEqual(got["why"], 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" run 101 is queued]')
+        self.assertEqual(got["why"], 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" job "build" run 101 is queued]')
         got = why({})
         self.assertEqual(got["why"], "CI is none at aaaaaaaa (only a complete, green run is recorded)")
 
@@ -80188,6 +80201,12 @@ Brief_impact_brief_BriefTests, Brief_impact_brief_MutantTests = _brief_modules["
 Brief_installed_guard_TreeCase, Brief_installed_guard_TestTheEntryGuard, Brief_installed_guard_TestTheDaemon, Brief_installed_guard_TestTheHooks, Brief_installed_guard_TestTheDocument, Brief_installed_guard_TestAdviceNamesAWorktree = (
     _brief_modules["test_installed_guard"].TreeCase, _brief_modules["test_installed_guard"].TestTheEntryGuard, _brief_modules["test_installed_guard"].TestTheDaemon, _brief_modules["test_installed_guard"].TestTheHooks,
     _brief_modules["test_installed_guard"].TestTheDocument, _brief_modules["test_installed_guard"].TestAdviceNamesAWorktree)
+# #1552: tests/test_plan_check_words.py is run by THIS runner too (loaded by path like the brief tests above; bound by name so CI collects it)
+_plan_check_words_spec = importlib.util.spec_from_file_location("plan_check_words_tests", REPO / "tests" / "test_plan_check_words.py")
+_plan_check_words_module = importlib.util.module_from_spec(_plan_check_words_spec)
+sys.path.insert(0, str(REPO))
+_plan_check_words_spec.loader.exec_module(_plan_check_words_module)
+PlanCheckWords_Words, PlanCheckWords_Corpus = _plan_check_words_module.Words, _plan_check_words_module.Corpus
 for _name, _module in _brief_modules.items():   # a TestCase added to one of these files and not bound above would silently drop out of CI
     _held = {v for k, v in globals().items() if k.startswith("Brief_")}
     _defined = {v for v in vars(_module).values() if isinstance(v, type) and issubclass(v, unittest.TestCase) and v.__module__ == _module.__name__}

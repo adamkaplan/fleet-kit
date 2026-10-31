@@ -121,6 +121,8 @@ A clean tree whose HEAD is already pushed pushes nothing and reports `pushed: fa
 
 Not run in a cluster: the live check (a real pod with an ended token, and the note reaching a real session) is the operator's, after merge.
 
+A pod with no checkout: nothing was cloned and nothing can be lost, on this condition: the pod is deleted without a push only when the repository directory is absent or empty AND the workspace (the parent of the repository directory) is absent or empty (the launcher's fresh scratch volume). ANY entry in the workspace, a repository directory that holds files but no `.git`, or a directory the hook cannot read (a permission error, a link, a dangling link) makes the hook exit 1 and keeps the pod. Stated limits: a worker that deletes its own marker, or moves the work out of the workspace (to a directory of its own choosing outside /work), loses it as before, because the hook pushes from the workspace only; a pod kept this way is retried by the reaper until a person reads the files by the recover route and deletes it by name; a hostile pod that writes the flag on purpose can only delete its own pod. The hook answers `no_repository: true`, the stop goes on and deletes the pod, the run record's `end_hook.note` is `no repository in the pod; nothing to push`, and the stop's audit reason carries the same words. A failed push in a real checkout (a refused push, an expired token, a conflict) is never treated this way: it keeps the pod, as in item 3.
+
 ## 6. Idle and hard limit
 
 - **Idle** = no tool call and no model activity (a running session or step) for `CW_IDLE_SECONDS`. Inbound
