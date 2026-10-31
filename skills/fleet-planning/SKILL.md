@@ -90,6 +90,8 @@ scenarios:
     evaluator: ci
 ```
 
+Input missing, corrupt or unreadable: say so, keep last good output.
+
 Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `commission()` method" (how).
 
 ## Wordings `plan check` accepts
