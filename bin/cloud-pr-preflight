@@ -288,7 +288,7 @@ def main():
             for line in cloud_quick.cannot_lines(every):
                 print(line)
             left = cloud_quick.left_to_ci(reads, cannot)
-            failed |= bool(cannot)
+            failed |= bool(cannot) and not left
             if changed_files and not reads:
                 print("\nRESULT: FAIL")
                 return 1  # decided from the reader picks alone: no scan is started
