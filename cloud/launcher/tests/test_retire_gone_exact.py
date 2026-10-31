@@ -588,6 +588,42 @@ class Documents(unittest.TestCase):
             self.assertIn(self.KEPT, part, rel)
 
 
+class WipNoteNameRule(unittest.TestCase):
+    """S11 (after integration's newer line): send_wip_notes matches the worker name with a full match, so 'coder7' plus a newline is refused."""
+    OLD = '!= "Running" or not NAME_RE.fullmatch(worker or "")'
+    NEW = '!= "Running" or not NAME_RE.match(worker or "")'
+
+    @staticmethod
+    def sent(module, worker):
+        """The notes sent for one running, due pod whose worker annotation is `worker`."""
+        pod = {"metadata": {"name": "cw-x", "uid": "u1", "annotations": {"cw/worker": worker, "cw/started": "2026-01-01T00:00:00Z"}},
+               "status": {"phase": "Running"}}
+        notes = []
+        launcher = module.Launcher.__new__(module.Launcher)
+        launcher.kube = types.SimpleNamespace(annotate=lambda *a, **k: None, scrub=lambda e, n=0: str(e))
+        launcher.send_note = lambda name, text: notes.append(text)
+        launcher.audit = lambda *a, **k: None
+        launcher._cost_or_zero = lambda pod: 0.0
+        with mock.patch.object(module, "wip_note_due", lambda started, now, already: True), \
+                mock.patch.object(module, "parse_iso", lambda text: None), \
+                mock.patch.object(module, "ann", lambda p, key, default=None: p["metadata"]["annotations"].get("cw/" + key, default)), \
+                contextlib.redirect_stderr(io.StringIO()):
+            launcher.send_wip_notes([pod], None)
+        return notes
+
+    def test_s11_a_newline_name_is_refused_and_a_plain_name_is_accepted(self):
+        self.assertEqual(len(self.sent(cw, "coder7\n")), 0)
+        self.assertEqual(len(self.sent(cw, "coder7")), 1)
+
+    def test_s11_a_mutant_that_matches_loosely_fails_the_test(self):
+        source = read("cloud/launcher/cloud_worker.py")
+        self.assertEqual(source.count(self.OLD), 1)
+        mutant = types.ModuleType("cw_mutant")
+        mutant.__file__ = os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
+        exec(compile(source.replace(self.OLD, self.NEW), mutant.__file__, "exec"), mutant.__dict__)
+        self.assertEqual(len(self.sent(mutant, "coder7\n")), 1, "the mutant lets the newline name through, so the test above fails on it")
+
+
 class SourceFragmentTest(unittest.TestCase):
     """This file's own source holds no whole retired prefix (the neutral-names scan)."""
 
