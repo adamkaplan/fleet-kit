@@ -108,6 +108,25 @@ class TestNoFailureMode(unittest.TestCase):
     def test_a_plan_with_trigger_words_and_no_scenarios_has_no_warning(self):
         self.assertIsNone(plan_check.failure_mode_warning([], "the verb reads three files"))
 
+    def _no_trigger_plan(self):
+        return plan().replace("The verb reads three files and writes a feed.", "The verb prints a summary.").replace("feed", "list")
+
+    def test_a_trigger_word_only_in_a_pass_line_does_not_warn_and_its_control_does(self):
+        quiet = self._no_trigger_plan()
+        self.assertEqual(run(quiet).stdout.count("no-failure-mode"), 0)   # nothing at all speaks of reading
+        in_pass = quiet.replace("the first line starts with", "the verdict quotes what it read: the first line starts with")
+        self.assertEqual(run(in_pass).stdout.count("no-failure-mode"), 0)   # anchored: the word is only in a pass line
+        in_text = quiet.replace("then the summary has exactly 3 lines", "then the summary has exactly 3 lines it read")
+        self.assertEqual(run(in_text).stdout.count("no-failure-mode"), 1)   # control: the same word in a scenario text
+        for key in ("discriminates", "proof", "evaluator", "covers", "claim"):
+            with self.subTest(field=key):
+                got = plan_check.failure_mode_warning([{"id": "S1", "text": "the summary has 3 lines", key: "the verb reads files"}], "The verb prints a summary.")
+                self.assertIsNone(got)
+
+    def test_a_scenario_text_that_reads_an_input_warns_without_a_failure_scenario(self):
+        got = plan_check.failure_mode_warning([{"id": "S1", "text": "the verb reads three files"}], "The verb prints a summary.")
+        self.assertEqual(got["code"], "no-failure-mode")
+
 
 if __name__ == "__main__":
     unittest.main()
