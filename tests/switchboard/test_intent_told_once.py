@@ -10,7 +10,7 @@ def edited_body(intent, done):
 
 
 def build(Wiring):
-    class TestIntentEditToldOnce(TestIntentEditWiring):
+    class TestIntentEditToldOnce(Wiring):
         """#1437: an Intent edit is told once per recipient, keyed by issue, edit time and body hash, and the record outlives a restart."""
 
         def deliver(self, hub, name="cos"):
