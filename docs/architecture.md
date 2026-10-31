@@ -130,6 +130,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/decision.py` | 3 | the delivery decision: what is sent, to whom, and refused when too long | |
 | `switchboard/engine.py` | 3 | the engine: the single-instance lock and the pass | |
 | `switchboard/triage.py` | 4 | the triage pass (rule family T), shadow by default, written nothing to GitHub | |
+| `switchboard/claims_note.py` | 4 | the notice of the scenarios a pull request's `CLAIMS:` line leaves out, once per body, from the held units | |
 | `switchboard/alert_labels.py` | 4 | an alert label on an open issue wakes that repository's orchestrator | |
 | `switchboard/link_scrub.py` | 4 | the signed-link scrub of a GitHub comment summary | |
 | `switchboard/handoff.py` | 5 | the handoff: a brief, not a fork | |
@@ -197,6 +198,10 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/triage.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/triage.py` | `fleet-switchboard` | namespace | 34 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/triage.py` | `switchboard/decisions_a.py` | namespace | 3 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/claims_note.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/claims_note.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part reads the entry's names (the pull request records, the plan link and the plan facts) |
+| `switchboard/claims_note.py` | `plan_check.py` | import | 1 | a name the part reads from another unit without a declared edge |
+| `switchboard/claims_note.py` | `switchboard/plan_input.py` | namespace | 1 | one namespace: the part reads `parse_plan_source` |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | entry-import | 15 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/v2_transport.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `fleet-switchboard` | `-` | size | 27,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |

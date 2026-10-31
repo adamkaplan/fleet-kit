@@ -1054,6 +1054,7 @@ def triage_pass(engine, decisions, now, errors=()):
         plan_wake_pass(engine, state, repos, now, budget)   # #765: the plans posted or edited, from the units just held
     except Exception as err:
         engine._note("plan_wake.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    claims_note_pass(engine, state, repos, now)   # #1716: the claims a pull request's body leaves out, from the held units (never raises)
     triage_mark_reads(engine, state, repos, errors, now)
     try:
         alert_wake_pass(engine, state, cfg, now)   # #851: an alert issue wakes its repository's orchestrator once, from the lists just held
