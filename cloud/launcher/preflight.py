@@ -250,6 +250,7 @@ def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None, ta
                 problems.append("ruleset %d does not cover the branch%s" % (
                     rid, " (a pattern was not understood: %s)" % ", ".join(odd) if odd else ""))
             verdict[key] = enf == "active" and cov
+            if verdict[key] and st == "Organization": say("organization ruleset %d: read at repository level, counted" % rid)
             if verdict[key] and bypass is not None and isinstance(rs.get("bypass_actors"), list):
                 bypass.extend((rid, a) for a in rs["bypass_actors"] if isinstance(a, dict))
         if verdict[key] is None:
