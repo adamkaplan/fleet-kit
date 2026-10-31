@@ -74,7 +74,28 @@ LATE_NOTE_SECONDS = 300
 TEXT_CAP = 4000  # mirrors MESSAGE_CAP in bin/fleet-switchboard
 
 
-def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, key=None, wake_class=None):
+REMINDER_TTL_MAX = 86400   # #1563: the longest ttl `remind --ttl` takes
+
+
+def parse_ttl(text):
+    """`--ttl 30m` (seconds, minutes, hours, days) as whole seconds, 1 to 24 hours; ReminderError otherwise (one line)."""
+    match = re.fullmatch(r"([0-9]{1,9})([smhd])", str(text).strip())
+    seconds = int(match.group(1)) * REMINDER_UNITS[match.group(2)] if match else 0
+    if not match or seconds < 1 or seconds > REMINDER_TTL_MAX:
+        raise ReminderError("--ttl must be a duration such as 30m or 2h, from 1s to 24h, got %r" % str(text)[:40])
+    return seconds
+
+
+def ttl_text(seconds):
+    """1800 as `30m`: the largest unit that divides it exactly."""
+    seconds = int(seconds)
+    for unit, size in (("h", 3600), ("m", 60)):
+        if seconds % size == 0:
+            return "%d%s" % (seconds // size, unit)
+    return "%ds" % seconds
+
+
+def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None, key=None, wake_class=None, ttl=None):
     if not isinstance(to, str) or not to.strip():
         raise ReminderError("a reminder needs the name of the agent it is for")
     if not text.strip():
@@ -89,6 +110,8 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
         item["condition"] = dict(condition)  # checked when it is due: {"unless_report_from", "since"} or {"while_running"}
     if key:
         item["key"] = key
+    if ttl:
+        item["ttl"] = int(ttl)   # #1563: seconds after `at` past which the copy is dropped, audited
     with reminders_lock(state_dir):
         items = read_reminders(state_dir)
         if key and isinstance(sender, str) and sender.strip():   # one pending per owner and key; another owner or key, a fired one and a sender-less one are never touched
@@ -262,8 +285,109 @@ def merge_wake_facts(recipient, facts, budget=None):
                   merge_wake([(wake_class_of(f), f.summary) for f in group]), max(f.created for f in group),
                   batch=all(f.batch for f in group), sender="switchboard")
     merged.members = keys
+    merged.sent_min = min(f.created for f in group)   # #1402: the oldest member, so an old digest does not look new
     merged.member_lines = {f.key: "- %s: %s" % (_clean_line(wake_class_of(f)), _clean_line(f.summary)) for f in group}
     return [f for f in facts if not wake_class_of(f)] + rest + [merged]
+
+
+# ---- #1402: what is dropped at delivery
+DIGEST_REPLACE_AFTER = 6 * 3600      # seconds: a digest older than this is replaced by the current one
+MAX_PRESENT_READS = 10               # present-state reads per delivery (one per subject); the rest are delivered unverified
+DIGEST_KEY_RE = re.compile(r"^triage:[0-9a-f]{10}:[0-9]+$")
+PULL_ALERT_RE = re.compile(r"^red-ci:pr(?:-unowned)?:([^#:\s]+/[^#:\s]+)#([0-9]+):([^:]*):")
+ISSUE_ALERT_RE = re.compile(r"^alert:([^#:\s]+/[^#:\s]+)#([0-9]+) (.+):[^:]+$")
+STANDING_ALERT_RE = re.compile(r"^alert-standing:([^#:\s]+/[^#:\s]+)#([0-9]+):")
+UNVERIFIED_MARK = "[unverified: its present state could not be read] "
+
+
+def is_digest(fact):
+    return fact.kind == "triage" and bool(DIGEST_KEY_RE.match(fact.key))
+
+
+def alert_subject(fact):
+    """(kind, repo, number, expected) of what an alert says is true, or None when it names no subject:
+    ("pull", repo, n, head) a red check on that head of an open pull request; ("issue", repo, n, label) an open issue carrying that label;
+    ("standing", repo, n, None) an issue with no standing line yet. One table: every member has a reader in `alert_stale`."""
+    if fact.kind != "alert":
+        return None
+    found = PULL_ALERT_RE.match(fact.key)
+    if found:
+        return ("pull", found.group(1), int(found.group(2)), found.group(3))
+    found = STANDING_ALERT_RE.match(fact.key)
+    if found:
+        return ("standing", found.group(1), int(found.group(2)), None)
+    found = ISSUE_ALERT_RE.match(fact.key)
+    if found and fact.issue == int(found.group(2)):
+        label = found.group(3).split(" ", 1)[1] if " " in found.group(3) else None
+        return ("issue", found.group(1), int(found.group(2)), label)
+    return None
+
+
+SUBJECT_ENDPOINT = {"pull": "pulls", "issue": "issues", "standing": "issues"}   # the present record each subject kind is read from
+
+
+def alert_stale(subject, record, fact, standing):
+    """Why the alert is no longer true against its present record, or "" when it still is. Pure."""
+    kind, _repo, _number, expected = subject
+    if kind == "pull":
+        sha = ((record.get("head") or {}).get("sha")) if isinstance(record.get("head"), dict) else None
+        if record.get("merged") or record.get("merged_at"):
+            return "the pull request is merged"
+        if record.get("state") != "open":
+            return "the pull request is closed"
+        if isinstance(sha, str) and expected and sha.lower() != expected.lower():
+            return "the head moved on to %s" % sha[:12]
+        return ""
+    if record.get("state") == "closed":
+        return "the issue is closed"
+    if kind == "issue":
+        names = [l.get("name") if isinstance(l, dict) else l for l in record.get("labels") or []]
+        if expected and "labels" in record and expected not in names:
+            return "the label %s is gone" % expected
+    if kind == "standing" and standing(record.get("body"), fact.created) is not None:
+        return "a standing line is already posted"
+    return ""
+
+
+def digest_replaced(facts, delivered):
+    """{key: the current digest} for each digest older than DIGEST_REPLACE_AFTER that a newer digest for the same recipient replaces."""
+    newest = {}
+    for fact in facts:
+        if is_digest(fact):
+            top = newest.get(fact.recipient)
+            if top is None or (fact.created, fact.key) > (top.created, top.key):
+                newest[fact.recipient] = fact
+    return {f.key: newest[f.recipient] for f in facts
+            if is_digest(f) and newest[f.recipient] is not f and delivered - f.created > DIGEST_REPLACE_AFTER}
+
+
+def judge_delivery(facts, delivered, read, standing):
+    """(kept, dropped [(fact, kind, why)]) for the facts about to be delivered. `read(subject)` is the present record of an alert's subject, None when
+    unreadable (it is called at most once per subject by the caller's cache). A read that fails keeps the alert, marked unverified: never a silent drop."""
+    kept, dropped, reads = [], [], 0
+    replaced = {} if fault("keep-old-digest") else digest_replaced(facts, delivered)
+    for fact in facts:
+        if fact.key in replaced:
+            dropped.append((fact, "digest", "replaced by the current digest %s" % replaced[fact.key].key))
+            continue
+        subject = alert_subject(fact) if read is not None else None
+        if subject is None:
+            kept.append(fact)
+            continue
+        try:
+            record = read(subject)
+        except Exception:
+            record = None
+        if not isinstance(record, dict):
+            kept.append(Fact(fact.key, fact.recipient, fact.kind, UNVERIFIED_MARK + fact.summary, fact.created, issue=fact.issue, batch=fact.batch,
+                             sender=fact.sender, rider=fact.rider, repo=fact.repo))
+            continue
+        why = alert_stale(subject, record, fact, standing)
+        if why and not fault("deliver-stale-alert"):
+            dropped.append((fact, "alert", why))
+        else:
+            kept.append(fact)
+    return kept, dropped
 
 
 def remove_reminders(state_dir, ids):
@@ -273,6 +397,19 @@ def remove_reminders(state_dir, ids):
         gone = [item["id"] for item in items if item["id"] in ids]
         if gone:
             write_reminders(state_dir, [item for item in items if item["id"] not in ids])
+    return gone
+
+
+def cancel_chain(state_dir, sender, key):
+    """#1401: drop every WAITING copy (pending or fired, still in the file) of the chain of this sender and key, in one locked step.
+    Returns the ids dropped. Another sender's or another key's reminder, and a sender-less one, are never matched; a delivered copy is not in the file."""
+    if not key or not isinstance(sender, str) or not sender.strip():
+        return []
+    with reminders_lock(state_dir):
+        items = read_reminders(state_dir)
+        gone = [i["id"] for i in items if i.get("key") == key and i.get("from") == sender]
+        if gone:
+            write_reminders(state_dir, [i for i in items if i["id"] not in gone])
     return gone
 
 
@@ -417,10 +554,33 @@ class ReminderFacts:
                  and i["at"] <= now and (i.get("created", 0), i["at"]) > (item.get("created", 0), item["at"])]
         return max(newer, key=lambda i: (i.get("created", 0), i["at"])) if newer else None
 
+    def recheck_delivery(self, fact):
+        """#1401: the delivery step asks once more, under the lock, whether a reminder fact is still wanted. Returns None (deliver it) or the
+        id of the newer copy that replaces it, or "cancelled" when it is no longer in the file; a dropped superseded copy is removed here."""
+        if not str(getattr(fact, "key", "")).startswith("reminder:"):
+            return None
+        item_id = fact.key[len("reminder:"):]
+        with reminders_lock(self.state_dir):
+            items = read_reminders(self.state_dir)
+            item = next((i for i in items if i["id"] == item_id), None)
+            if item is None:
+                return "cancelled"
+            kept = self.superseded(item, items)
+            if kept is None or kept.get("condition"):   # a gated newer copy may not be delivered: the older one is not dropped for it
+                return None
+            write_reminders(self.state_dir, [i for i in items if i["id"] != item_id])
+        return kept["id"]
+
     def __call__(self):
         facts = []
         everything = read_reminders(self.state_dir)
         for item in self.due():
+            ttl = item.get("ttl")
+            if _is_number(ttl) and ttl > 0 and (self.engine.now() if self.engine else time.time()) - item["at"] > ttl:
+                if remove_reminders(self.state_dir, {item["id"]}) and self.engine is not None and self.engine.audit is not None:
+                    self.engine.audit.append(self.engine.actor, "reminder.drop_ttl", item["to"],
+                                             {"id": item["id"], "due": iso(item["at"]), "ttl": int(ttl)})
+                continue
             kept = self.superseded(item, everything)
             if kept is not None and kept.get("condition") and self.verdict(kept) != "deliver":
                 kept = None   # the newer one is gated or unresolved: it may not be delivered, so deliver the older
@@ -604,12 +764,31 @@ REMIND_LIST_MAX = 50   # reminders `remind --list` prints
 def remind_manage(args, engine, state, sender, moment):
     """`remind --list` (the caller's own pending reminders: set by it or for it) and `remind --cancel <id>` (one of those, by id). Nothing else is
     shown or touched: another agent's reminder is not listed and is refused with the same words as an unknown id."""
+    chain_key = getattr(args, "cancel_key", None)
     if args.list_mine and args.cancel:
         sys.stderr.write("%s: remind: give --list or --cancel, not both\n" % PROG)
+        return EXIT_USAGE
+    if chain_key and (args.list_mine or args.cancel):
+        sys.stderr.write("%s: remind: give --cancel-key on its own\n" % PROG)
         return EXIT_USAGE
     if args.name or args.when or args.text:
         sys.stderr.write("%s: remind: --list and --cancel take no recipient, time or text\n" % PROG)
         return EXIT_USAGE
+    if chain_key:
+        if not (isinstance(sender, str) and sender.strip()):
+            sys.stderr.write("%s: remind: --cancel-key needs a known sender\n" % PROG)
+            return EXIT_USAGE
+        try:
+            gone = cancel_chain(state, sender, _one_line(chain_key, 80))
+        except ReminderError as err:
+            sys.stderr.write("%s: remind: %s\n" % (PROG, _one_line(str(err), 200)))
+            return EXIT_ERROR
+        if not gone:
+            sys.stderr.write("%s: remind: no waiting reminder of yours with key %s\n" % (PROG, _one_line(chain_key, 80)))
+            return EXIT_USAGE
+        engine.audit.append("cli", "reminder.cancelled", sender, {"key": _one_line(chain_key, 80), "owner": sender, "count": len(gone)})
+        print("cancelled %d reminder(s) with key %s" % (len(gone), _one_line(chain_key, 80)))
+        return EXIT_OK
     try:
         mine = [item for item in read_reminders(state) if sender in (item.get("to"), item.get("from"))]
     except ReminderError as err:
@@ -618,7 +797,8 @@ def remind_manage(args, engine, state, sender, moment):
     if args.list_mine:
         mine.sort(key=lambda item: item["at"])
         for item in mine[:REMIND_LIST_MAX]:
-            print("%s  %s  to=%s  issue=%s  key=%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item.get("key") or "-", 80), _one_line(item["text"], 120)))
+            ttl = " ttl %s" % ttl_text(item["ttl"]) if _is_number(item.get("ttl")) and item["ttl"] > 0 else ""
+            print("%s  %s  to=%s  issue=%s  key=%s%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item.get("key") or "-", 80), ttl, _one_line(item["text"], 120)))
         if len(mine) > REMIND_LIST_MAX:
             print("(%d more not shown)" % (len(mine) - REMIND_LIST_MAX))
         if not mine:
@@ -646,7 +826,7 @@ def cmd_remind(args, runner, now):
     else:
         sender = identify_caller(engine.herdr, engine.v2, os.environ)
     moment = now()
-    if args.list_mine or args.cancel:
+    if args.list_mine or args.cancel or getattr(args, "cancel_key", None):
         return remind_manage(args, engine, state, sender, moment)
     if not args.name or not args.when or not args.text:
         sys.stderr.write("%s: remind needs <name> <when> <text> (or --list, or --cancel <id>)\n" % PROG)
@@ -659,6 +839,13 @@ def cmd_remind(args, runner, now):
     if args.key and not (isinstance(sender, str) and sender.strip()):
         sys.stderr.write("%s: --key needs a known sender (an unidentified caller would replace other callers' reminders); nothing armed\n" % PROG)
         return EXIT_USAGE
+    ttl = None
+    if getattr(args, "ttl", None) is not None:
+        try:
+            ttl = parse_ttl(args.ttl)
+        except ReminderError as err:
+            sys.stderr.write("%s: remind: %s\n" % (PROG, err))
+            return EXIT_USAGE
     condition = {}
     for flag, key in ((args.until_closed, "until_closed"), (args.until_merged, "until_merged")):
         if flag:
@@ -682,7 +869,7 @@ def cmd_remind(args, runner, now):
                    "use --keep-if-closed to keep it\n" % (PROG, repo, number))
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
                         " ".join(args.text).strip(), number, sender, repo, condition=condition or None,
-                        key=_one_line(args.key, 80) if args.key else None)
+                        key=_one_line(args.key, 80) if args.key else None, ttl=ttl)
     if len(item["text"]) > TEXT_CAP:
         sys.stderr.write("%s: warning: text is cut at %d characters: %d characters over\n" % (PROG, TEXT_CAP, len(item["text"]) - TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
@@ -695,3 +882,4 @@ def cmd_remind(args, runner, now):
 
 
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
+cmd_remind.header_cache = True    # #1520
