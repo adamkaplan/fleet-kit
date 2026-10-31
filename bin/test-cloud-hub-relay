@@ -299,6 +299,25 @@ class TestClient(unittest.TestCase):
             cloud_cli.make_post = orig
         self.assertEqual(urls, ["http://hub.svc:8080/relay"])
 
+class _WaitingObserver(dict):
+    """The relay's held-waits dict that sets an event once the sum of its values reaches the target."""
+    def __init__(self, event, target):
+        super().__init__()
+        self.event, self.target = event, target
+
+    def _check(self):
+        if sum(self.values()) >= self.target:
+            self.event.set()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._check()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self._check()
+
+
 class TestBoundsAndCaps(unittest.TestCase):
     def test_caps_derive_from_max_handlers(self):
         for mh, total in ((4, 2), (16, 8), (None, 16)):
@@ -337,6 +356,8 @@ class TestBoundsAndCaps(unittest.TestCase):
             for name in agents: SECRETS[name] = "secret-" + name
             Path(hub.tmp.name, "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
             Path(hub.tmp.name, "agents.json").write_text(json.dumps(agents))
+            registered = threading.Event()
+            hub.relay.waiting = _WaitingObserver(registered, 16)   # set when all 16 held waits are registered
             threads = []
             def release_all():   # no time bound on the held waits: every one is answered here, so a failure never hangs the run (the hub's server is already closed here: the answer goes to the relay itself)
                 end = time.monotonic() + 10
@@ -352,7 +373,13 @@ class TestBoundsAndCaps(unittest.TestCase):
             for i in range(4):          # 4 pods x 4 held waits = 16 held
                 for j in range(4):
                     t = threading.Thread(target=hub.relay_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
-            self.wait_for(lambda: sum(hub.relay.waiting.values()) == 16)
+            def all_registered():
+                if registered.wait(0.02):
+                    return True
+                if not registered.is_set() and not all(t.is_alive() for t in threads):
+                    raise AssertionError("a held relay call ended before all 16 were registered")
+                return False
+            self.wait_for(all_registered)
             self.assertEqual(sum(hub.relay.waiting.values()), 16)
             socks = []
             for _ in range(hub.server.max_handlers):   # as many slow bodies as the hub has handlers: without the in-flight cap they would take every one
