@@ -894,6 +894,13 @@ class TestAssembler(unittest.TestCase):
     """The entry builds its one namespace from the manifest bin/fleet-switchboard.parts (docs/switchboard.md, "The assembler")."""
 
     def _copy(self, lines):
+        snapshot = dict(sys.modules)
+
+        def restore_modules():
+            for name in [n for n in sys.modules if n not in snapshot]:
+                del sys.modules[name]
+            sys.modules.update(snapshot)
+        self.addCleanup(restore_modules)
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(root), True)
         for sibling in BIN.glob("*.py"):   # the entry loads its sibling modules from its own directory
@@ -901,6 +908,17 @@ class TestAssembler(unittest.TestCase):
         copy_entry(root)   # the shipped parts the copied entry needs
         (root / "fleet-switchboard.parts").write_text("\n".join(lines) + "\n")
         return root
+
+    def test_a_load_of_the_copied_entry_leaves_sys_modules_as_it_was(self):
+        before = dict(sys.modules)
+        root = self._copy(["fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py"])
+        _load("t_assembled", root / "fleet-switchboard")
+        self.doCleanups()   # what unittest runs after the test
+        self.assertEqual(set(sys.modules), set(before))
+        for name, module in before.items():
+            self.assertIs(sys.modules[name], module, name)
+        if "impact_hold" in before:
+            self.assertIs(sys.modules["impact_hold"], before["impact_hold"])
 
     def test_the_shipped_manifest_names_the_entry_itself(self):
         lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]

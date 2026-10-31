@@ -17872,15 +17872,27 @@ class TestPR8Source(unittest.TestCase):
     def test_the_engine_still_never_types(self):
         self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
+    @staticmethod
+    def names_defined_twice(text):
+        """[(name, first line, second line)] for each top-level name a def, a class or an assignment defines a second time. A `del name` is not a definition (the daemon deletes its builder once built)."""
+        seen, twice = {}, []
+        for node in ast.parse(text).body:
+            names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
+                t.id for t in (node.targets if isinstance(node, ast.Assign) else []) if isinstance(t, ast.Name)]
+            for each in names:
+                if each in seen:
+                    twice.append((each, seen[each], node.lineno))
+                seen[each] = node.lineno
+        return twice
+
     def test_no_top_level_name_is_defined_twice_in_the_big_files(self):
         for name in ("fleet-switchboard", "test-switchboard", "fleet-scenario", "proof-switchboard"):
-            seen = {}
-            for node in ast.parse(daemon_text(BIN / name)).body:
-                names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
-                    t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
-                for each in names:
-                    self.assertNotIn(each, seen, "%s defines %s twice (lines %s and %s)" % (name, each, seen.get(each), node.lineno))
-                    seen[each] = node.lineno
+            self.assertEqual(self.names_defined_twice(daemon_text(BIN / name)), [], name)
+
+
+
+
+
 
 
 class TestNoticeRace(ActingCase):
@@ -20268,7 +20280,7 @@ class TestPR10Source(unittest.TestCase):
     def test_the_import_command_runs_only_the_clients_it_is_given(self):
         source = switchboard_source()
         start = source.index(self.SECTION)
-        section = source[start:source.index("\ndef build_parser")] + (BIN / "switchboard" / "import_v1.py").read_text()   # the part holds the rest of the section
+        section = source[start:source.index("\ndef build_parser")] + (BIN / "switchboard" / "import_v1.py").read_text()   # this test pins the import section, which ends at `build_parser`; `add_core_parsers` (the moved commands, #924) is defined AFTER `build_parser`, so its help text is outside it and is held by the surface walk instead
         self.assertNotIn("subprocess.run", section, "the runner is injected")
         self.assertNotIn("herdr", section.replace("herdr's", "").lower().replace("herdr_", ""))
 
@@ -31298,6 +31310,11 @@ class TestCarriesLine(LedgerBase):
         exec(compile(src.replace(old, new, 1), mod.__file__, "exec"), ns)
         if module_name == "impact_hold":   # its functions run in the daemon's globals (bind): the mutant too, and it replaces the daemon's name
             original = ns[function]
+            guards = getattr(original, "guard", None)
+            if guards:   # a guarded effect: the mutant is the effect itself, guarded by the daemon's own latch like `bind` builds it (the module's copy refuses always)
+                inner = types.FunctionType(original.__wrapped__.__code__, vars(sb), original.__name__, original.__wrapped__.__defaults__, original.__wrapped__.__closure__)
+                inner.__kwdefaults__ = original.__wrapped__.__kwdefaults__
+                return sb, sb.effect_guard(guards[0], vars(sb)[guards[1].__name__])(inner)
             return sb, types.FunctionType(original.__code__, vars(sb), original.__name__, original.__defaults__, original.__closure__)
         return mod, ns[function]
 
@@ -36055,6 +36072,17 @@ def _adoption_cells():
 _adoption_cells()
 
 
+HOSTILE_RATING_DEFAULTS = {"impact_severity": "Negligible", "impact_probability": "Improbable", "impact_reason": "floor-authority", "impact_action": "none", "impact_class": "data", "block": "/nonexistent/block.txt"}
+
+
+
+
+
+
+
+
+
+
 CHANGE_KINDS = ("base", "record", "matrix", "rating", "head", "none")   # (#999) what can change under a hold the daemon put on, with the head unchanged: the ONE table every row below derives from
 
 
@@ -37456,7 +37484,9 @@ class TestImpactHold(LedgerBase):
             return found
         clear_functions = [n for n in hold.body if isinstance(n, ast.FunctionDef)]
         wanted_roots = sorted({x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[0]) | {x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[1]))
-        self.assertEqual(sorted(rule["closure_roots"]), sorted(set(wanted_roots) | {"HELPER_MODULES", "_make_loader"}), "closure_roots is every daemon name the moved clear code reads (bin/impact_hold.py), and the table that generates the daemon's loaders")
+        bind_reads = {x.slice.value for f in ast.walk(hold) if isinstance(f, ast.FunctionDef) and f.name == "bind" for x in ast.walk(f) if isinstance(x, ast.Subscript) and isinstance(x.slice, ast.Constant) and isinstance(x.slice.value, str) and x.slice.value.isupper()}   # #924 round 4: `bind` reads NO daemon name from the namespace by key
+        self.assertEqual(bind_reads, set())
+        self.assertEqual(sorted(rule["closure_roots"]), sorted(set(wanted_roots) | {"HELPER_MODULES", "_make_loader", "RepoIssue", "issue_arg", "parse_issue_ref"} | bind_reads), "closure_roots is every daemon name the moved clear code reads (bin/impact_hold.py), and the table that generates the daemon's loaders")
         reach = sb.load_module("delegated_clear").closure(daemon, rule["closure_roots"])[0]
         reached = set()
         for name in reach:
@@ -38639,7 +38669,7 @@ class TestImpactHold(LedgerBase):
                     if called in ("globals", "vars", "locals", "__import__", "import_module", "eval", "exec", "setattr") or (called == "getattr" and not (len(x.args) > 1 and isinstance(x.args[1], ast.Constant))):
                         found.setdefault(name, set()).add(called)
         followed = {"resolve_command": {"globals"}, "command_registrars": {"globals"}}   # the walker follows these: the literal "cmd_" and REGISTRAR_NAME_RE are edges for the named actions
-        inside_a_root = {"main": {"globals"}, "rating_inputs": {"vars"}}   # `main`'s own tripwire reads (a root itself) and the private parser's own namespace (reached from cmd_review, a root): nothing leaves them
+        inside_a_root = {"main": {"vars"}, "rating_inputs": {"vars"}}   # `main`'s own read of the subcommand of the direct commands from the namespace (a root itself) and the private parser's own namespace (reached from cmd_review, a root): nothing leaves them
         self.assertEqual(found, {k: v for k, v in dict(followed, **inside_a_root).items() if k in found}, "a NEW dynamic edge on the path to the rating code is a decision: follow it in the walker or list it here with its reason")
         # the two string edges are really followed: without the dynamic actions the resolver does not reach cmd_review
         plain = module.closure(daemon, ["resolve_command"], ())[0]
@@ -38663,6 +38693,18 @@ class TestImpactHold(LedgerBase):
                 diff = "\n".join(list(difflib.unified_diff(source.split("\n"), head.split("\n"), lineterm="", n=3))[2:])
                 self.assertTrue(self.closure_check(head, diff), "refused: %s" % label)
                 self.assertEqual(module.closure_refusals(source, head, diff, sorted(rule["closure_roots"]), set(rule["clear_entry_points"])), [], "the mutant (the roots of round 2, no dynamic edge) lets %s through" % label)
+
+    # ---- #924: a flag of another command is not clear machinery; the roots are derived and classified in one table
+
+
+
+
+
+
+
+
+
+
 
     def test_one_definition_of_rated_at_this_head_the_clear_and_every_other_reader_use_it(self):
         import ast
@@ -38797,15 +38839,25 @@ class TestImpactHold(LedgerBase):
     RATING_FLAGS = ("--reviewer", "impact", "--verdict", "approve")
     HOSTILE_DEFAULTS = {"impact_severity": "Negligible", "impact_probability": "Improbable", "impact_reason": "floor-authority", "impact_action": "none", "impact_class": "data", "block": "/nonexistent/block.txt", "confirms_carry": True}
 
-    def record_run(self, flags=(), registrars=(), argv=None):
+    def record_run(self, flags=(), registrars=(), argv=None, build=None, namespace=False):
         """Run the REAL `review record` as the reviewer role with hostile registrars injected into the module's globals before the real `build_parser()` runs. (code, stderr, the entry written without its chain fields or None)."""
         self.world.add_agent("rev", fleet={"role": "reviewer"}) if "rev" not in self.world.sessions else None
         self.ledger_reset()
         patchers = [mock.patch.object(sb, name, fn, create=True) for name, fn in registrars]
+        if build is not None:   # #924: a hostile `build_parser` itself, not only a hostile registrar it collects
+            patchers.append(mock.patch.object(sb, "build_parser", build))
         for patcher in patchers:
             patcher.start()
         try:
-            if argv is None:
+            if namespace:   # #924: the hostile parser REALLY runs (the direct route of `main` never builds it): build it, parse the line, and hand the shared namespace to the real `cmd_review`
+                line = ["review", "record", self.PR, *self.RATING_FLAGS, *flags]
+                os.environ["HERDR_PANE_ID"] = self.world.panes["rev"]
+                with captured() as (o, e), mock.patch.object(sys, "argv", ["fleet-switchboard"] + line), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
+                    args = sb.build_parser().parse_known_args(line)[0]
+                    args.raw_argv = tuple(line)
+                    code = sb.cmd_review(args, self.route, self.world.clock.now)
+                err = e.getvalue()
+            elif argv is None:
                 code, out, err = self.run_as("rev", "review", "record", self.PR, *self.RATING_FLAGS, *flags)
             else:
                 os.environ["HERDR_PANE_ID"] = self.world.panes["rev"]
@@ -38886,28 +38938,22 @@ class TestImpactHold(LedgerBase):
                 self.assertEqual((clean["impact_severity"], clean["impact_probability"], clean["impact_reason"], clean["impact_action"], clean["impact_class"]), ("Critical", "Improbable", "applied floor-authority", "second-review", "data"))
             for label, registrars in cases:
                 with self.subTest(flags=flags_label, registrar=label):
-                    code, err, entry = self.record_run(flags, registrars)
+                    code, err, entry = self.record_run(flags, registrars, namespace=True)   # the hostile registrar really runs, in the real build_parser, and the namespace it shaped reaches the real cmd_review
                     self.assertEqual((code, entry), (0, clean), err)
         with self.subTest("a registrar that rewrites sys.argv"):   # the raw tuple was captured before the registrars ran
-            code, err, entry = self.record_run(argv=["review", "record", self.PR, *self.RATING_FLAGS, *self.EXPLICIT], registrars=[("add_zzz_parsers", rewrites_argv)])
+            code, err, entry = self.record_run(self.EXPLICIT, registrars=[("add_zzz_parsers", rewrites_argv)], namespace=True)
             self.assertEqual(code, 0, err)
             clean_code, clean_err, clean = self.record_run(self.EXPLICIT)
             self.assertEqual(entry, clean)
 
-    def test_a_registrar_that_reassigns_a_function_of_the_rating_path_stops_the_record(self):
-        self.record_pr_setup()
-        for name in sb.RATING_PATH_FUNCTIONS:
-            with self.subTest(function=name):
-                def registrar(sub, name=name):
-                    setattr(sb, name, lambda *a, **k: 0)
-                original = getattr(sb, name)
-                self.addCleanup(setattr, sb, name, original)   # the hostile registrar replaced it for real: put it back whatever happens
-                try:
-                    code, err, entry = self.record_run(self.EXPLICIT, [("add_zzz_parsers", registrar)])
-                finally:
-                    setattr(sb, name, original)
-                self.assertEqual((code, entry), (1, None), err)
-                self.assertIn("a command registrar replaced code on the rating path", err)
+
+
+
+
+
+
+
+
 
     def test_a_direct_call_with_no_raw_argv_records_no_rating_whatever_the_namespace_carries(self):
         self.record_pr_setup()
@@ -39004,25 +39050,140 @@ class TestImpactHold(LedgerBase):
                            | {"setattr(args, ...)" for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "setattr"})
             self.assertEqual(reads, [], "%s reads no rating input from the shared namespace" % name)
 
+    # The vocabulary of a registrar (ONE table, #924): everything else is a finding. A registrar sets up ITS OWN parsers: it reads its own parameter (`sub`), the names it binds itself, literals, and the names below.
+    REGISTRAR_VALUES = frozenset({"AGENTS_VERIFY_TIMEOUT", "BATCH_ROWS_MAX", "BLOCK_TABLE_TEXT", "CHARTER_HELP", "COS_WORKSPACE_LABEL", "DAEMON_HEALTH_WAIT", "DECISIONS_STALE_SECONDS", "IMPACT_RATING_FIELDS", "MEASURE_SCAN_MAX", "ORDERS_HEADING",
+                                  "ORDER_MAX_CHARS", "PROG", "REPORT_MAX", "REPORT_STATES", "RESUME_COMMAND", "RESUME_REASON", "RESUME_SECONDS", "add_decision_list_flags", "float", "int", "issue_arg"})   # constants and converters the registrars read
+    REGISTRAR_MODULES = frozenset({"argparse", "plan_ledger", "scenario"})   # modules: only `Name.UPPER_CASE_CONSTANT` is read from them (`argparse.SUPPRESS`), never anything else, never the name alone
+    REGISTRAR_ATTRIBUTES = frozenset({"add_argument", "add_parser", "add_subparsers", "add_mutually_exclusive_group", "add_argument_group", "set_defaults", "replace", "split", "join", "format", "default", "dest", "nargs"})   # what a registrar calls or reads on its own objects
+
+    @classmethod
+    def registrar_findings(cls, tree):
+        """What each `add_<name>_parsers` function of `tree` does beyond setting up its own parsers: {name: {finding}}. An ALLOW-LIST derived by walking the registrar, not a ban list: a name it reads must be its own (a parameter, or a name it binds: an assignment, a loop, a `with`, a comprehension,
+        a nested function's parameter) or in the vocabulary table above; a module name only as the base of an UPPER_CASE constant; an attribute only from the table (and never a dunder or a private name); and no attribute or subscript is ever the target of an assignment, a loop, a `with`,
+        a comprehension or a `del`. Every shape that reaches another module (sys, globals, __dict__, __setattr__, type, object, an alias of a module) is outside the vocabulary."""
+        import ast
+        found = {}
+        for node in tree.body:
+            if not (isinstance(node, ast.FunctionDef) and re.fullmatch(r"add_[a-z0-9_]+_parsers", node.name)):
+                continue
+            own = set()
+            for x in ast.walk(node):
+                if isinstance(x, ast.arg):
+                    own.add(x.arg)
+                elif isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                    own.add(x.id)
+                elif isinstance(x, ast.FunctionDef) and x is not node:
+                    own.add(x.name)
+            def note(what):
+                found.setdefault(node.name, set()).add(what)
+            parents = {child: parent for parent in ast.walk(node) for child in ast.iter_child_nodes(parent)}
+            for x in ast.walk(node):
+                if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in own:
+                    if x.id in cls.REGISTRAR_MODULES:
+                        parent = parents.get(x)
+                        if not (isinstance(parent, ast.Attribute) and parent.value is x and parent.attr.isupper()):
+                            note("the module %s used for more than one of its constants" % x.id)
+                    elif x.id not in cls.REGISTRAR_VALUES:
+                        note("the name %s is outside the registrar vocabulary" % x.id)
+                if isinstance(x, ast.Attribute):
+                    if isinstance(x.ctx, (ast.Store, ast.Del)):
+                        note("an assignment or delete of an attribute (%s)" % ast.unparse(x)[:40])
+                    elif x.attr.startswith("_"):
+                        note("attribute " + x.attr)
+                    elif not (x.attr in cls.REGISTRAR_ATTRIBUTES or (x.attr.isupper() and isinstance(x.value, ast.Name) and x.value.id in cls.REGISTRAR_MODULES)):
+                        note("the attribute %s is outside the registrar vocabulary" % x.attr)
+                if isinstance(x, ast.Subscript) and isinstance(x.ctx, (ast.Store, ast.Del)):
+                    note("an assignment or delete of a subscript")
+                if isinstance(x, (ast.Global, ast.Nonlocal)):
+                    note("a global statement")
+                if isinstance(x, ast.Constant) and x.value == "review" and node.name != "add_review_parsers":
+                    note('the string "review"')
+        return found
+
     def test_no_command_registrar_reaches_into_the_shared_parser_beyond_its_own_commands(self):
         """Defence in depth (not the closure): the vocabulary a registrar may use is its own `sub.add_parser`, `add_argument`, `add_subparsers` and `set_defaults` on a parser it made. A NEW use of the rest fails here."""
         import ast
-        found = {}
-        for node in ast.parse(self.real_source()).body:
-            if not (isinstance(node, ast.FunctionDef) and re.fullmatch(r"add_[a-z0-9_]+_parsers", node.name)):
-                continue
-            for x in ast.walk(node):
-                if isinstance(x, ast.Attribute) and x.attr in ("choices", "_name_parser_map", "_actions", "_subparsers"):
-                    found.setdefault(node.name, set()).add("attribute " + x.attr)
-                if isinstance(x, ast.Call) and getattr(x.func, "id", getattr(x.func, "attr", None)) in ("globals", "setattr", "exec", "eval", "__import__", "import_module", "getattr", "vars"):
-                    found.setdefault(node.name, set()).add("call " + getattr(x.func, "id", getattr(x.func, "attr", None)))
-                if isinstance(x, ast.Constant) and x.value == "review" and node.name != "add_review_parsers":
-                    found.setdefault(node.name, set()).add('the string "review"')
-                if isinstance(x, (ast.Assign, ast.AugAssign)) and any(ast.unparse(t).startswith(("sys.argv", "os.environ", "argparse.")) for t in (x.targets if isinstance(x, ast.Assign) else [x.target])):
-                    found.setdefault(node.name, set()).add("an assignment to argv, the environment or argparse")
-        known = {"add_ledger_parsers": {"attribute _actions"},   # reads the actions of ITS OWN `verdict` parser to find its flags
+        found = self.registrar_findings(ast.parse(self.real_source()))
+        known = {"add_ledger_parsers": {"attribute _actions", "an assignment or delete of an attribute (action.default)", "an assignment or delete of an attribute (action.nargs)"},   # reads the actions of ITS OWN `verdict` parser and sets the two fields of its `scenario` positional
+                 "add_sent_parsers": {"the name SENT_LIMIT_MAX is outside the registrar vocabulary"},   # #924: reads the module constant SENT_LIMIT_MAX (a merged ask); the finding stays reported, the lint is unchanged
                  "add_plan_parsers": {'the string "review"'}}   # its own `plan review` subcommand and a positional named review
         self.assertEqual(found, known, "a registrar uses the shared parser beyond its own commands: a NEW finding is a decision (the rating is immune to it, but the reviewer must look)")
+
+
+
+
+
+
+
+
+        # The limit, stated (#924): this pin traces ONE delegated clear and ONE record with explicit flags (no refusal, dismiss, revoke, owner-clear, --block or error branch). The superset claim covers the traced paths; the static derivation
+        # (the names the clear's code reads, by walking it) covers every other branch.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # ---- #924 round 4: the check is a closure cell of each effect, never a parameter and never read from the namespace at bind time
+
+
+    def hostile(self, body):
+        """Run `body(seen)` as a registrar of the real `main`; (seen, the DELETE writes, main's code, its stderr)"""
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        seen = {}
+        def registrar(sub):
+            with captured():
+                body(seen)
+        patcher = mock.patch.object(sb, "add_zzz_parsers", registrar, create=True)
+        patcher.start()
+        try:
+            with captured() as (o, e):
+                code = sb.main(["version"], runner=self.route, now=self.world.clock.now)
+        finally:
+            patcher.stop()
+        return seen, [w for w in self.writes if w[0] == "DELETE"], code, e.getvalue()
+
+    @staticmethod
+    def outcome(call):
+        """'ran' when the call returned success or nothing; 'refused' for the refusal (a return of 1, the RuntimeError); 'error: X' for any other failure (it also did nothing)"""
+        try:
+            result = call()
+        except RuntimeError as err:
+            return "refused" if "registrar ran" in str(err) or "already bound" in str(err) or "not bound" in str(err) else "error: RuntimeError"
+        except Exception as err:
+            return "error: %s" % type(err).__name__
+        return "refused" if result == 1 else "ran"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def test_s20_s23_no_agent_command_writes_the_threshold_and_no_committed_file_sets_one(self):
         daemon = switchboard_source()
@@ -39047,6 +39208,15 @@ class TestImpactHold(LedgerBase):
         code, out, err = self.run_as("rev", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-severity", "Huge", "--impact-probability", p)
         self.assertEqual(code, 2)
         self.assertEqual(self.run_as("rev", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--impact-severity", s)[0], 2)
+
+
+
+
+
+
+
+
+
 
 
 class TestCiRecordPass(LedgerBase):
@@ -67296,6 +67466,10 @@ TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Ba
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")
 TestCancelKeyRecheck = _reminder_cancel.build(PR4Base)
+# The tests #924 added (moved out of this file, its line ceiling); the host module gives the classes their fixtures.
+_t924 = importlib.import_module("test_924")
+_t924.HOST = sys.modules[__name__]
+TestPR8Source924, TestImpactHold924 = _t924.load()
 # The lost-worker alert tests of #1481.
 _lost_worker = importlib.import_module("test_lost_worker")
 TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker.TestLostWorker, _lost_worker.TestLostWorkerReadRound, _lost_worker.TestLostWorkerMemoryOnly
@@ -71738,13 +71912,12 @@ class TestPullFileListRead(LedgerBase):
         self.assertEqual(source.count(old), 1, "the mutation point is there: %r" % old)
         module = types.ModuleType("impact_hold_mutant")
         exec(compile(source.replace(old, new), "impact_hold_mutant", "exec"), module.__dict__)
-        bound = {}
-        for name in module.MOVED:
-            original = getattr(module, name)
-            function = types.FunctionType(original.__code__, sb.__dict__, name, original.__defaults__, original.__closure__)
-            function.__kwdefaults__ = original.__kwdefaults__
-            function.__dict__.update(original.__dict__)
-            bound[name] = function
+        saved = {name: sb.__dict__[name] for name in module.MOVED}
+        try:
+            module.bind(sb.__dict__, sb.EFFECT_CHECK)   # the mutant copy is bound once, with the daemon's own check
+            bound = {name: sb.__dict__[name] for name in module.MOVED}
+        finally:
+            sb.__dict__.update(saved)
         return mock.patch.dict(sb.__dict__, bound)
 
     def producers(self):

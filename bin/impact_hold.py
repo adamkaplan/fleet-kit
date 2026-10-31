@@ -10,9 +10,43 @@ test patch resolves exactly as it did, and puts the functions back in that names
 it once; a module that is missing or fails to load stops the daemon loudly (never a daemon without the rule). The functions below are therefore written against the
 daemon's globals and are not meant to be called from this module's own namespace. Python 3.9 standard library only.
 """
+from functools import wraps
+from inspect import signature as _signature
 import types
 
+def _make_guard(check):
+    """#924: the refusal of an effect at its FIRST statement. `check` (the latch's) is the closure cell of the wrapper: never a parameter of an effect, never read from a namespace."""
+    def guard(when, refuse):
+        def decorate(effect):
+            signature = _signature(effect)
+
+            @wraps(effect)
+            def guarded_effect(*args, **kwargs):
+                arguments = signature.bind(*args, **kwargs).arguments   # an unknown keyword (`_effect_check=` too) is a TypeError before anything runs
+                if when(arguments) and check():
+                    return refuse(arguments)
+                return effect(*args, **kwargs)
+            guarded_effect.guard = (when, refuse)
+            return guarded_effect
+        return decorate
+    return guard
+
+
+def _refuse_clear_core(arguments):
+    raise RuntimeError("a command registrar ran in this process, or impact_hold is not bound: an impact clear is refused")
+
+
+def _refuse_clear_command(arguments):
+    sys.stderr.write("%s: impact clear: refused: a command registrar ran in this process, or impact_hold is not bound\n" % PROG)
+    return EXIT_ERROR
+
+
+_unbound = _make_guard(lambda: True)   # the module's own copies of the two effects: a check that always refuses
+
+
 MOVED = ('rating_at',
+         '_refuse_clear_core',
+         '_refuse_clear_command',
          'applied_for_repo',
          '_plan_hold',
          'rehold_reason',
@@ -959,6 +993,7 @@ def authors_hold_labels(names, raw, already):
     return [label for label in ours if label in have and label not in already]
 
 
+@_unbound(lambda arguments: True, _refuse_clear_core)   # `bind` rebuilds it around the daemon's check; until then the module's own copy refuses
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None, brief=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, plus (#742) every other
     hold label of the fleet's prefix the PR carries at that head (`merge-captain` and each `hold-<reason>`, whoever added it). A DELEGATED clear (`under_order`)
@@ -1241,6 +1276,7 @@ def clear_who(engine, runner, repo, number, report=None):
     return module.who_can_clear(got["rule"], got["report"], got["files"], impact_floor.matches, got["closure"], block, delegation, pr=pr)
 
 
+@_unbound(lambda arguments: True, _refuse_clear_command)
 def cmd_impact_clear(args, runner, now):
     """`impact clear <repo#N> --reason TEXT`: the owner's own terminal only (the Chief of Staff cannot: G6 is never waivable by it)."""
     kind = gates_caller_kind(runner, now)
@@ -1498,15 +1534,35 @@ def release_impact_hold(engine, repo, number, report, record):
 
 
 
-def bind(namespace):
-    """Rebind every moved function to `namespace` (the daemon's globals), install it there under its own name, and return the names bound."""
-    here = globals()
-    for name in MOVED:
-        original = here[name]
-        bound = types.FunctionType(original.__code__, namespace, original.__name__, original.__defaults__, original.__closure__)
-        bound.__kwdefaults__ = original.__kwdefaults__
-        bound.__dict__.update(original.__dict__)   # the attributes a command declares (`ledger`, `ensure_on_use`, ...)
-        bound.__doc__ = original.__doc__
-        bound.__module__ = namespace.get("__name__", bound.__module__)
-        namespace[name] = bound
-    return MOVED
+def _make_bind(make_guard):
+    """#924: the latch check reaches the two effects ONCE, as the guard's closure cell (never a parameter, never read from the namespace). `make_guard` is deleted from the module below; `bind` refuses a second call into a namespace. Limits: docs/switchboard.md."""
+    bound = []
+
+    def rebuilt(function, namespace):   # the same code, run in `namespace` (the daemon's globals) like every moved function
+        made = types.FunctionType(function.__code__, namespace, function.__name__, function.__defaults__, function.__closure__)
+        made.__kwdefaults__ = dict(function.__kwdefaults__) if function.__kwdefaults__ else None
+        made.__dict__.update(function.__dict__)   # the attributes a command declares (`ledger`, `ensure_on_use`, ...)
+        made.__doc__, made.__module__ = function.__doc__, namespace.get("__name__", function.__module__)
+        return made
+
+    def bind(namespace, check):
+        """Rebind every moved function to `namespace`, install it there under its own name, and return the names bound; the effects are built around `check`."""
+        if any(done is namespace for done in bound):
+            raise RuntimeError("impact_hold is already bound to this namespace: a second bind is refused")
+        bound.append(namespace)
+        if not callable(check):
+            raise TypeError("impact_hold.bind needs the latch's check")
+        guard, here = make_guard(check), globals()
+        for name in MOVED:
+            original = here[name]
+            guards = getattr(original, "guard", None)
+            function = rebuilt(original.__wrapped__ if guards else original, namespace)
+            if guards:   # the refusal is the namespace's own copy (it names PROG and sys there)
+                function = rebuilt(guard(guards[0], namespace[guards[1].__name__])(function), namespace)
+            namespace[name] = function
+        return MOVED
+    return bind
+
+
+bind = _make_bind(_make_guard)
+del _make_bind, _make_guard
