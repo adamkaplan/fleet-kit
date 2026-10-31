@@ -5,6 +5,7 @@ cloud/launcher/tests/test_chain_list.py
 cloud/launcher/tests/test_chain_time.py
 cloud/launcher/tests/test_cloud_allowlist.py
 cloud/launcher/tests/test_cloud_docs_wording.py
+cloud/launcher/tests/test_cloud_end_alert.py
 cloud/launcher/tests/test_cloud_hub_manifest.py
 cloud/launcher/tests/test_cloud_hub_network.py
 cloud/launcher/tests/test_cloud_k1.py
@@ -24,6 +25,7 @@ cloud/launcher/tests/test_cloud_split.py
 cloud/launcher/tests/test_cloud_stack.py
 cloud/launcher/tests/test_cloud_stack_wait.py
 cloud/launcher/tests/test_cloud_status_summary.py
+cloud/launcher/tests/test_cloud_turn_end.py
 cloud/launcher/tests/test_cloud_worker.py
 cloud/launcher/tests/test_cluster_token_refresh.py
 cloud/launcher/tests/test_cw_minter_manifest.py
@@ -35,6 +37,7 @@ cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_git_token_renewal.py
 cloud/launcher/tests/test_git_token_retry.py
 cloud/launcher/tests/test_issues_read.py
+cloud/launcher/tests/test_m_cap.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
@@ -56,6 +59,7 @@ cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_stack_model_key.py
 cloud/launcher/tests/test_stack_registry_check.py
 cloud/launcher/tests/test_stack_registry_pod.py
+cloud/launcher/tests/test_stop_cause.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_stub_cleanup.py
 cloud/launcher/tests/test_token_at_limit.py

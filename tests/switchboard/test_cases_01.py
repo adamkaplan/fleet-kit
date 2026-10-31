@@ -691,13 +691,13 @@ class TestGitShim(Base):
             "substring": (lambda path, line: any(path == r and t in line for r, t, _ in self.CONFIG_WRITE_ALLOWED), longer),
             "any-file": (lambda path, line: any(line == t for _, t, _ in self.CONFIG_WRITE_ALLOWED), other),
         }
-        caught = 0
+        def expectation_holds(diff):   # the real exact-match expectation: the other-file and longer diffs each hit once
+            return len(self.unallowed_config_write_hits(diff)) == 1
+        self.assertTrue(expectation_holds(other) and expectation_holds(longer))   # unpatched: holds
         for name, (widened, diff) in mutants.items():
             with self.subTest(name):
                 with mock.patch.object(type(self), "config_write_allowed", staticmethod(widened)):
-                    self.assertEqual(self.unallowed_config_write_hits(diff), [], "the mutant must widen the table")
-                    caught += len(self.unallowed_config_write_hits(diff)) == 0   # the (b)/(c) expectation of one hit now fails
-        self.assertEqual(caught, 3)
+                    self.assertFalse(expectation_holds(diff), "the widened table must break the one-hit expectation")
 
     def test_s7_u1_every_row_of_the_scan_finds_its_sample_and_only_that_row_does(self):
         for name, rx, hostile in self.CONFIG_WRITE_SPELLINGS:
