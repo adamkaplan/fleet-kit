@@ -37,6 +37,13 @@ def make_copy(base, name, macos):
     for top in ROOT.glob("*.md"):
         shutil.copy2(top, dest / top.name)
     os.chmod(dest, 0o700)
+    if not macos:   # LINUX-LIKE: the probes are absent whatever machine runs this (a Mac has the real ones at their absolute paths)
+        target = dest / SW
+        text = target.read_text()
+        absent = 'MEMORY_PROBES = {"memory_pressure": "%s", "vm_stat": "%s"}' % (Path(base) / "absent-memory_pressure", Path(base) / "absent-vm_stat")
+        text, n0 = PROBES_LINE.subn(lambda m: absent, text, count=1)
+        assert n0 == 1
+        target.write_text(text)
     if macos:
         probes = Path(base) / (name + "-probes")
         probes.mkdir()
