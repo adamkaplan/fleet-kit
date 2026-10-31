@@ -378,9 +378,12 @@ class TestBoundsAndCaps(unittest.TestCase):
             case.doCleanups()
 
     @staticmethod
+    # the limit is a HANG GUARD only: it never decides a verdict, it fails a broken mechanism with its own text
     def wait_for(cond, limit=10.0):
         end = time.monotonic() + limit
-        while time.monotonic() < end and not cond():
+        while not cond():
+            if time.monotonic() >= end:
+                raise AssertionError("wait_for: the state was not reached within %s seconds" % limit)
             time.sleep(0.01)
 
     def test_slow_body_trickle_cut_at_deadline(self):
