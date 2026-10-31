@@ -210,7 +210,7 @@ export function buildBlocks(inputs, now) {
     const context = isNum(ctx.percent) ? { percent: ctx.percent } : isNum(ctx[CONTEXT_USED]) ? { used: ctx[CONTEXT_USED] } : null
     blocks.push({
       key: ws, name: lead.name, state, alert, spark: series, sparkKind: seriesKind, bars: movedBars(load, lead.name, now), open, stalled,
-      decisions: isCos ? ownerWaiting : isNum(fig.decisions) ? fig.decisions : waiting, busy, cloud: isNum(fig.cloud) && fig.cloud > 0 ? fig.cloud : 0, total: busy !== null && idle !== null ? busy + idle + (isNum(fig.cloud) && fig.cloud > 0 ? fig.cloud : 0) : null, pushes, context, cos: isCos, toolWhy: series ? null : toolWhy(inputs.records, (figBusy ?? 0) > 0), ctxOff: usageOff(inputs.records), ctxWhy: context || usageRow.hours ? null : ctxWhy(inputs.records),
+      decisions: isCos ? ownerWaiting : isNum(fig.decisions) ? fig.decisions : waiting, busy, cloud: isNum(fig.cloud) && fig.cloud > 0 ? fig.cloud : 0, total: busy !== null && idle !== null ? busy + idle : null, pushes, context, cos: isCos, toolWhy: series ? null : toolWhy(inputs.records, (figBusy ?? 0) > 0), ctxOff: usageOff(inputs.records), ctxWhy: context || usageRow.hours ? null : ctxWhy(inputs.records),
       heat: (alert ? 1000 : 0) + (stalled ?? 0) * 10 + (open ?? 0) + (series ? series.reduce((a, b) => a + b, 0) / 10 : 0),
     })
   }
