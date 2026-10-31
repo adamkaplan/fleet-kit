@@ -22,15 +22,19 @@ import ast
 import builtins
 import collections
 import glob
+import importlib
 import os
 import re
 import shutil
 import symtable
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "bin"))   # #1605: the one reading of the size rows and of a line count
+size_ceilings = importlib.import_module("size_ceilings")
 ENTRY = "fleet-switchboard"
 SOURCE_LIMIT = 1500
 TEST_LIMIT = 2500
@@ -60,7 +64,7 @@ def parse_document(text):
     for line in _section(text, "Known violations").splitlines():
         if line.startswith("| `"):
             source, target, kind, ceiling, why = (_cells(line) + [""] * 5)[:5]
-            violations[(source.strip("`"), target.strip("`"), kind)] = (int(ceiling.replace(",", "")), why)
+            violations[(source.strip("`"), target.strip("`"), kind)] = (size_ceilings.parse_count(ceiling), why)
     return units, violations
 
 
@@ -94,8 +98,7 @@ def test_files(root):
 
 
 def line_count(path):
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        return sum(1 for _ in handle)
+    return size_ceilings.line_count(path)
 
 
 def _tables(path):
