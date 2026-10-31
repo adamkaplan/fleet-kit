@@ -81,6 +81,7 @@ class TestRefusal(Launch):
         self.assertNotEqual(code, 0)
         self.assertEqual(len(lines), 1, err)
         self.assertIn("/model-unserved", lines[0])   # the provider part may be shown as [redacted] by the launch's own scrub
+        self.assertIn("not served by the pod's provider", lines[0])
         self.assertEqual(len(self.stops()), 1)
         self.assertEqual(self.records(), [])
         self.assertEqual([b for m, p, b in self.remote.bodies if p == "/api/session"], [], "a session was created")
@@ -91,6 +92,7 @@ class TestRefusal(Launch):
             code == 1, len(lines), len(self.stops()), len(self.records())))
         self.assertEqual(code, 1)
         self.assertEqual(len(lines), 1, err)
+        self.assertIn("not served by the pod's provider", lines[0])
         self.assertEqual(len(self.stops()), 1)
         self.assertEqual(self.records(), [])
 
@@ -124,6 +126,7 @@ class TestRefusal(Launch):
         self.assertEqual(err.count("not served by the pod's provider"), 1)
         self.assertEqual(records, 1)
         self.assertIn("coder7", text)
+        self.assertIn("model-unserved", text)
         self.assertEqual(text.count("PlantedTokenRun"), 0)
 
     def test_a_list_that_is_not_a_list_cannot_be_verified(self):
@@ -183,6 +186,25 @@ class TestMutants(unittest.TestCase):
                 caught += child.wait(timeout=90) == 1
         print("S6: mutants caught %d of 2, mutations applied %d of 2" % (caught, applied))
         self.assertEqual((caught, applied), (2, 2))
+
+
+class TestWordsMutant(unittest.TestCase):
+    def test_s6c_a_mutant_that_changes_the_refusal_words_fails_s2(self):
+        old, new = "is not served by the pod's provider", "cannot be used by the pod's provider"
+        src = (ROOT / "bin" / "cloud_worker.py").read_text()
+        self.assertEqual(src.count(old), 1, "the mutated line is not as expected")
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copytree(ROOT / "bin", os.path.join(d, "bin"), ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(ROOT / "cloud" / "worker" / "tests", os.path.join(d, "cloud", "worker", "tests"), ignore=shutil.ignore_patterns("__pycache__"))
+            os.makedirs(os.path.join(d, "cloud", "launcher", "tests"))
+            shutil.copy(__file__, os.path.join(d, "cloud", "launcher", "tests"))
+            Path(d, "bin", "cloud_worker.py").write_text(src.replace(old, new, 1))
+            child = stub_support.start(self, [sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name),
+                                              "TestRefusal.test_s2_unserved_model_stops_the_pod"],
+                                       env=dict(os.environ, TMPDIR=d), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=d)
+            caught = child.wait(timeout=90) == 1
+        print("S6c: mutant that changes the refusal words fails S2 %d of 1, mutation applied %s" % (caught, src.count(old) == 1))
+        self.assertTrue(caught)
 
 
 class TestDocs(unittest.TestCase):
