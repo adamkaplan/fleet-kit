@@ -2603,7 +2603,7 @@ class Launcher:
             return   # an empty snapshot is no evidence of anything
         reads = 0
         for rid, (worker, created) in open_runs.items():
-            if rid in present or not isinstance(worker, str) or not NAME_RE.match(worker):
+            if rid in present or not isinstance(worker, str) or not NAME_RE.fullmatch(worker):
                 continue
             if (now - created).total_seconds() <= VANISHED_MIN_AGE_SECONDS:
                 continue   # too young: a later pass notices it
