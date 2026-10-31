@@ -42055,6 +42055,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
             ' > getattr(args, "headless", Fals|raise LaunchError("--headless opens no t': (B + ["--headless"], []),
             ' > (args.name or "").startswith(L|raise LaunchError("names starting %r are': (["launch", sb.LANE_NAME_PREFIX + "x"] + B[2:], []),
             ' > problem|raise LaunchError(problem)': (B, [P("launch_agent_problem", return_value="the agent is not known")]),
+            ' > mismatch|return EXIT_USAGE': (B, [P("launch_brief_mismatch", return_value="the brief names another issue")]),
             ' > args.new_workspace > args.workspace|raise LaunchError("--new-workspace makes': (B + ["--new-workspace", "lab"], []),
             ' > args.new_workspace > problems|raise LaunchError("; ".join(problems))': (newws, [P("launch_problems", return_value=["p1", "p2"])]),
             ' > args.new_workspace > problem|raise LaunchError(problem)': (newws, [P("launch_account_problem", return_value="no account")]),
@@ -67283,6 +67284,7 @@ TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJ
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 # The reminder-cancel tests of #1401.
