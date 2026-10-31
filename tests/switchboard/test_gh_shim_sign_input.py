@@ -824,6 +824,22 @@ class TestGhShimEffectRule(unittest.TestCase):
         print("R4 mutant 3 seen:", len(seen))
         self.assertEqual(len(seen), 24, seen[:5])   # the 19 round-3 spellings and the 5 macOS forms, each read as a query by the mutant and passed
         self.assertTrue(all(s.startswith(("round-3 spelling with query passed", "macOS form passed")) for s in seen), seen[:5])
+        # S9 per-name bar: under the mutant EVERY refused mutation name reaches the real gh (exactly 1 failure per name), on the real shim 0
+        mrig = hermetic_rig()
+        self.addCleanup(mrig.close)
+        mshim = mrig.shims / "gh"
+        mshim.write_text(mshim.read_text().replace("        op = word\n", '        op = "query"\n', 1))
+        let_through = []
+        for name in MUTATIONS:
+            done, calls = mrig.run("api", "graphql", "-f", "query=" + gql(name))
+            if calls:
+                let_through.append(name)
+        self.assertEqual(let_through, list(MUTATIONS), "each mutation name let through exactly once under the mutant: %s" % let_through)
+        self.assertEqual(len(let_through), 8)
+        for name in MUTATIONS:   # the control: the real shim refuses every name, 0 failures, the line names it
+            done, calls = self.rig.run("api", "graphql", "-f", "query=" + gql(name))
+            self.assertEqual(calls, [], name)
+            self.assertIn(name, gh_err(done), name)
         space = load_parser(self.source.replace("        op = word\n", '        op = "query"\n', 1))
         self.assertIsNone(space["graphql_verdict"]("mutation { addComment(input: {}) { x } }"))   # the mutant reads a mutation as a query
         self.assertTrue(load_parser(self.source)["graphql_verdict"]("mutation { addComment(input: {}) { x } }"))   # control
