@@ -839,5 +839,52 @@ class TestGhShimEffectRule(unittest.TestCase):
         self.assertIn("read query not passed: https://api.github.com/graphql", seen)
 
 
+class TestGhShimMutationRoots(unittest.TestCase):
+    """#1696 r4 addendum: the root fields of the single mutation are judged by the FIELD name (never an alias), each one."""
+    MERGE = 'mergePullRequest(input:{pullRequestId:"x"}){clientMutationId}'
+
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def verdicts(self, source):
+        space = load_parser(source)
+        return [space["graphql_verdict"]("mutation{%s}" % body) for body in (
+            "a: " + self.MERGE, "a: %s b: %s" % (self.MERGE, self.MERGE), "m: addComment(input:{}){x}", "mergePullRequest: addComment(input:{}){x}",
+            "%s addComment(input:{}){x}" % self.MERGE, "addComment(input:{}){x} %s" % self.MERGE, "x: %s y: deleteRepository(input:{}){z}" % self.MERGE)]
+
+    def test_alias_and_several_roots_are_judged_by_each_field(self):
+        got = self.verdicts(self.source)
+        self.assertIsNone(got[0])
+        self.assertIsNone(got[1])
+        for i in (2, 3, 4, 5):
+            self.assertIn("addComment", got[i] or "", i)
+        self.assertIn("deleteRepository", got[6] or "")
+        self.assertNotIn("mergePullRequest is refused", got[6] or "")
+
+    def test_the_same_through_the_shim(self):
+        for body, passes in (("a: " + self.MERGE, True), ("m: addComment(input:{}){x}", False), ("mergePullRequest: addComment(input:{}){x}", False),
+                             ("a: %s b: deleteRepository(input:{}){x}" % self.MERGE, False), ("deleteRepository(input:{}){x} %s" % self.MERGE, False)):
+            with self.subTest(body=body):
+                done, calls = self.rig.run("api", "graphql", "-f", "query=mutation{%s}" % body)
+                if passes:
+                    self.assertEqual(len(calls), 1, done.stderr)
+                else:
+                    self.assertTrue(refused_line(done, calls), done.stderr)
+
+    def mutated(self, old, new):
+        self.assertEqual(self.source.count(old), 1, old)
+        return self.verdicts(self.source.replace(old, new, 1))
+
+    def test_mutant_alias_judged_by_the_alias_is_seen(self):
+        got = self.mutated('                take()\n                name = take("name")[1]\n            roots.append(name)', '                take()\n                take("name")\n            roots.append(name)')
+        self.assertEqual([i for i, v in enumerate(got) if v != self.verdicts(self.source)[i]], [0, 1, 2, 3, 6])   # the alias is judged: a: merge refused, m: addComment passes, mergePullRequest: addComment passes
+
+    def test_mutant_only_the_first_root_judged_is_seen(self):
+        got = self.mutated("    return op, roots\n", "    return op, roots[:1]\n")
+        self.assertEqual([i for i, v in enumerate(got) if v != self.verdicts(self.source)[i]], [4, 6])
+
+
 if __name__ == "__main__":
     unittest.main()
