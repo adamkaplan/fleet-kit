@@ -3128,7 +3128,7 @@ class Switchboard:
             except Exception as err:   # an unreadable record or module is an unknown age = young = queue
                 age = None
                 self._note("turn_start.error", None, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
-            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age)
+            busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age, self.now())
         if busy:
             delivery = "steer"
         detail = {"mode": plan.action, "session": observation.session_id, "message_id": message_id,

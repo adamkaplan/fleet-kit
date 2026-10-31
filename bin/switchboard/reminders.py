@@ -634,6 +634,7 @@ class ReminderFacts:
                 text = text[:max(0, TEXT_CAP - len(note) - (1 if cut else 0))] + ("\u2026" if cut else "") + note   # the note is applied before the cap and kept: the body is cut, not the note
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
+            facts[-1].bound = reminder_bound(self.engine.config if self.engine else {}, item)   # #1728: read by steers_into_turn
             if isinstance(item.get("wake_class"), str):
                 facts[-1].wake_class = item["wake_class"]
         return facts
@@ -655,7 +656,7 @@ def waiting_reason(engine, plan, now):
             age = load_module("turn_start").age(engine.state_dir, observation.session_id, now, load_module("record_json").parse_bounded)
     except Exception:
         age = None
-    if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age):
+    if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age, now):
         return None
     return "lane in a turn of %d minutes, queued" % (age // 60) if age is not None else "lane in a turn of unknown length, queued"
 

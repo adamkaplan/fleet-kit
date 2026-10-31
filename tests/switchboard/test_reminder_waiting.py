@@ -116,4 +116,47 @@ def build(PR4Base):
                 self.world.engine.run_pass()
                 with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
                     self.assertEqual(len(self.ceilings()), 1)
+
+        def long_lane(self, name, issue):
+            self.world.add_agent(name, fleet={"role": "coder", "reports_to": "platform", "issue": issue})
+            self.world.v2.start_turn(self.world.sessions[name], "task", fleet=True, lasts=86400, steps=3)
+            self.world.engine.run_pass()
+            self.world.tick(30 * 60)                             # a turn of 3x the bound (10 minutes)
+
+        def sent_to(self, name):
+            return [e for e in self.world.audit() if e["event"] == "v2.synthetic" and e.get("subject") == name and e["detail"].get("keys")]
+
+        def steered(self, name):
+            return len([e for e in self.sent_to(name) if e["detail"]["delivery"] == "steer"])
+
+        def steer_world(self, name="s-long", issue=30):
+            self.long_lane(name, issue)
+            self.world.engine.config["steer_after_minutes"] = 0
+            now = self.world.clock.now()
+            sb.add_reminder(self.world.state, name, now - 11 * 60, now - 3600, "look at the build")
+            self.world.engine.__dict__.pop("deliver", None)      # the real delivery
+
+        def test_s4_a_due_reminder_in_a_turn_of_three_bounds_is_steered_not_queued(self):
+            self.steer_world()
+            self.world.engine.run_pass()
+            self.assertEqual((self.steered("s-long"), len(self.sent_to("s-long"))), (1, 1))   # 1 of 1: queue count 0
+
+        def test_s4_a_mutant_that_waits_for_the_turn_to_end_is_caught(self):
+            self.steer_world()
+            self.world.engine.run_pass()
+            self.assertEqual(self.steered("s-long"), 1)          # control: the unmutated code
+            self.steer_world("s-long2", 31)
+            with mock.patch.object(sb, "reminder_bound", lambda config, item: 10 ** 9):   # the mutant: no bound, so the reminder waits for the turn
+                self.world.engine.run_pass()
+                with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
+                    self.assertEqual(self.steered("s-long2"), 1)
+
+        def test_s6_a_real_open_permission_request_holds_the_due_reminder(self):
+            self.steer_world()
+            self.world.herdr.panes[self.world.panes["s-long"]]["status"] = "blocked"
+            self.world.v2.ask_permission(self.world.sessions["s-long"])
+            self.world.engine.run_pass()
+            self.assertEqual(len(self.sent_to("s-long")), 0)
+            holds = [e for e in self.lines() if e["detail"]["reason"].startswith("hold:") and "s-long" in e["detail"]["reason"]]
+            self.assertEqual(len(holds), 1)
     return TestReminderWaiting

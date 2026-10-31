@@ -1,0 +1,16 @@
+#1728 part 3: existing lines changed (verbatim)
+
+bin/switchboard/decision.py
+OLD: def steers_into_turn(config, observation, carried, discovery=None, age=None):
+NEW: def steers_into_turn(config, observation, carried, discovery=None, age=None, now=None):
+
+bin/fleet-switchboard (Engine.deliver)
+OLD:             busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age)
+NEW:             busy = steers_into_turn(self.config, observation, carried, getattr(self, "discovery", None), age, self.now())
+
+bin/switchboard/reminders.py (waiting_reason, a part-1/2 line)
+OLD:     if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age):
+NEW:     if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age, now):
+
+(Added lines, not changes: the `now is not None and any(... reminder ... bound)` case in steers_into_turn; `facts[-1].bound = reminder_bound(...)` in reminders.py.)
+Existing tests pinning the old rule: none found (TestSteerLongTurn, TestReminderTtlMore, TestCancelKeyRecheck, TestReminderWaiting pass).
