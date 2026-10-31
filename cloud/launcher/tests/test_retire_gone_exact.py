@@ -4,6 +4,8 @@ The cluster is the FAKE one of the launcher tests (fake_kubectl); a not-found te
 mutant is a patch of the running code, and each test asserts that the mutation was applied.
 """
 import contextlib
+import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -22,6 +24,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import test_cloud_worker as tcw  # noqa: E402
 import test_retire_gone_pod as trg  # noqa: E402
+
+_loader = importlib.machinery.SourceFileLoader("test_cloud_worker_bin", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "bin", "test-cloud-worker"))
+tcwb = importlib.util.module_from_spec(importlib.util.spec_from_loader("test_cloud_worker_bin", _loader))
+sys.modules["test_cloud_worker_bin"] = tcwb
+_loader.exec_module(tcwb)
+sb = tcwb.sb
 
 cw, sbcw = tcw.cw, trg.sbcw
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
@@ -642,6 +650,51 @@ class SourceFragmentTest(unittest.TestCase):
         planted = text + "\n# " + "fl" + "eet" + "\n"
         self.assertNotEqual(planted, text)   # the mutation applied
         self.assertEqual(self.count(planted), 1)
+
+
+class TestLaunchShowsTheIdentityNote(tcwb.Base):
+    """Ask #1327 S9: a SUCCESSFUL `launch --cloud` shows the launcher's identity note once on stderr; stdout stays one JSON answer. The real
+    command path runs (sb.main launch) against a fake launcher whose create answer carries the note."""
+    NOTE = "the pod identity of %s could not be read; the worker record holds none and a retire acts by name"
+
+    def give_note(self):
+        text = self.stub.read_text()
+        old = '"idle_deadline": "2099-10-14T12:10:00Z"'
+        self.assertIn(old, text)
+        self.stub.write_text(text.replace(old, '"pod_uid": "", **({"identity_note": os.environ["STUB_NOTE"]} if os.environ.get("STUB_NOTE") else {}), ' + old))
+
+    def lines(self, err):
+        return [x for x in err.splitlines() if "pod identity" in x]
+
+    def test_the_note_is_shown_once_for_two_launches_and_stdout_is_pure_json(self):
+        self.give_note()
+        for name, note in (("coder7", self.NOTE % "coder7"), ("coder8", self.NOTE % "coder8" + "\nsecond line")):
+            with self.subTest(name), mock.patch.dict(os.environ, {"STUB_NOTE": note}):
+                code, out, err = self.launch(name)
+                self.assertEqual(code, 0, err)
+                print("%s: %d of 1 note line on stderr" % (name, len(self.lines(err))))
+                self.assertEqual(len(self.lines(err)), 1, err)
+                self.assertIn(name, self.lines(err)[0])
+                self.assertEqual([x for x in err.splitlines() if "second line" in x and "pod identity" not in x], [])
+                self.assertEqual(json.loads(out)["name"], name)
+                self.assertNotIn("pod identity", out)
+
+    def test_a_launch_whose_answer_has_no_note_shows_none(self):
+        self.give_note()
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.lines(err), [])
+
+    def test_a_mutant_that_ignores_the_note_shows_none(self):
+        self.give_note()
+        mod, applied = sb.load_module("cloud_worker"), []
+        with mock.patch.dict(os.environ, {"STUB_NOTE": self.NOTE % "coder7"}), \
+                mock.patch.object(mod, "_show_identity_note", lambda body, cluster: applied.append(1)):
+            code, out, err = self.launch()
+        self.assertTrue(applied, "the mutation was not applied")
+        self.assertEqual(code, 0, err)
+        print("mutant: %d note lines (the real code shows 1)" % len(self.lines(err)))
+        self.assertEqual(self.lines(err), [])
 
 
 if __name__ == "__main__":
