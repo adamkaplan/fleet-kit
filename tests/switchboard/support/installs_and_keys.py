@@ -197,6 +197,10 @@ class InstallFakes:
             shown = self.integration_reports_at or target
             state = "current (v13)" if os.path.exists(target) else "not installed"
             return ok("claude: current (v10) (/elsewhere/hooks/herdr-agent-state.sh)\nopencode: %s (%s)\n" % (state, shown))
+        if argv[0] == "git":   # #1380: the install step that records the installed tree reads its git directory; the fake one is under the test's HOME, never the real tree's
+            if "--git-common-dir" in argv:
+                return ok(str(self.binary and Path(self.binary).parent.parent / "fake-git") + "\n")
+            return subprocess.CompletedProcess(argv, 1, "", "")
         reaper = "cloud-reaper" in " ".join(argv)   # the reaper's service is loaded and unloaded on its own
         if argv[0] == "launchctl":
             if argv[1] == "print":
