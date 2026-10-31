@@ -900,7 +900,9 @@ def failure_mode_warning(scenarios, text):
     searched = [prose_of(text)] + [str(s.get("text", "")) for s in scenarios]
     if not re.search(r"\b(?:%s)\b" % "|".join(FAILURE_TRIGGER_WORDS), "\n".join(searched), re.IGNORECASE):
         return None
-    if any(FAILURE_SCENARIO_RE.search(" ".join(str(v) for v in s.values())) for s in scenarios):
+    # the same by-field-key method as the trigger side: only a scenario's `text` says what it covers; a failure word in a `pass`,
+    # `discriminates`, `proof`, `evaluator`, `covers` or `claim` line is a verdict's wording and never clears the warning
+    if any(FAILURE_SCENARIO_RE.search(str(s.get("text", ""))) for s in scenarios):
         return None
     return {"id": "-", "code": "no-failure-mode", "message": "no-failure-mode: the plan reads or produces something but no scenario "
             "covers an input that is missing, corrupt or unreadable: add one (the output says so and the last good output is kept)"}
