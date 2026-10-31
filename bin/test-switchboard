@@ -67296,6 +67296,7 @@ TestLostWorker, TestLostWorkerReadRound, TestLostWorkerMemoryOnly = _lost_worker
 # A CLAIMS: line present but not read is refused (#1617); HOST gives the test the fixtures of this file.
 _claim_placement = importlib.import_module("test_claim_placement"); _claim_placement.HOST = sys.modules[__name__]
 TestClaimPlacement, TestClaimMutants, TestClaimReaders = _claim_placement.TestClaimPlacement, _claim_placement.TestClaimMutants, _claim_placement.TestClaimReaders
+_claim_legacy = importlib.import_module("test_claim_legacy"); _claim_legacy.HOST = sys.modules[__name__]; TestClaimLegacy = _claim_legacy.TestClaimLegacy
 # The whole-read check of a pull request of more than 100 files (#1098); the host module gives the class its fixtures.
 _changed_file_pages = importlib.import_module("test_changed_file_pages")
 _changed_file_pages.HOST = sys.modules[__name__]
