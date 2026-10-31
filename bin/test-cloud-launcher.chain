@@ -45,6 +45,7 @@ cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
+cloud/launcher/tests/test_persistent_merge_fix.py
 cloud/launcher/tests/test_persistent_orchestrator.py
 cloud/launcher/tests/test_preflight.py
 cloud/launcher/tests/test_probe_redirect.py
