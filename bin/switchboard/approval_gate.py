@@ -13,8 +13,7 @@ def approval_events(state_dir, issue, current_hash, clock=None, seconds=None, fi
     limit = clock() + (APPROVAL_SECONDS if seconds is None else seconds)
     base = Path(state_dir)
     paths = [base / "audit.jsonl"] + sorted(base.glob("audit-*.jsonl.gz"), key=lambda p: p.name, reverse=True)
-    if len(paths) > (APPROVAL_FILES if files is None else files):
-        return None
+    bound, read = (APPROVAL_FILES if files is None else files), 0
     want, found, parse = str(issue).lower(), [], load_module("record_json").parse_bounded
     try:
         for path in paths:
@@ -23,6 +22,10 @@ def approval_events(state_dir, issue, current_hash, clock=None, seconds=None, fi
                 handle = gzip.open(str(path), "rb") if path.name.endswith(".gz") else open(str(path), "rb")
             except FileNotFoundError:
                 continue
+            if read >= bound:
+                handle.close()
+                return None
+            read += 1
             with handle:
                 for count, raw in enumerate(handle):
                     if count % 500 == 0 and clock() > limit:

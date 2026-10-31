@@ -98,6 +98,26 @@ def mutated_events(old, new):
     return space["approval_events"]
 
 
+def many_files(total, at):
+    """A state directory of `total` audit files (the live one, then rotated ones) read newest first; the ISSUE event at H_NEW sits only in the `at`th file read (1 = the live audit)."""
+    folder = Path(tempfile.mkdtemp(prefix="approval-"))
+    line = lambda e: (json.dumps(e) + "\n").encode()
+    for position in range(1, total + 1):
+        body = line(event(ISSUE if position == at else OTHER, H_NEW if position == at else H_OLD))
+        if position == 1:
+            (folder / "audit.jsonl").write_bytes(body)
+        else:
+            with gzip.open(str(folder / ("audit-2026-%03d.jsonl.gz" % (1000 - position))), "wb") as handle:
+                handle.write(body)
+    return folder
+
+
+def seventy_files_found(events_fn):
+    got = events_fn(many_files(70, 1), ISSUE, H_NEW)
+    if got != [{"plan_hash": H_NEW}]:
+        raise AssertionError("approval gate: 70 files present: got %s, want the event found" % (got,))
+
+
 class TestApprovalGateReader(unittest.TestCase):
     """S2, S4, S7, U2, U3 on a fixture audit."""
 
@@ -131,6 +151,23 @@ class TestApprovalGateReader(unittest.TestCase):
         ticks = iter(range(0, 1000, 5))
         self.assertIsNone(read(folder, ISSUE, H_NEW, clock=lambda: next(ticks), seconds=2), "a read past its time bound")
         self.assertEqual(read(folder, ISSUE, H_NEW), [{"plan_hash": H_OLD}, {"plan_hash": H_OLD}])
+
+    def test_seventy_files_present_are_not_an_error_when_the_event_is_in_the_live_audit(self):
+        seventy_files_found(HOST.sb.approval_events)
+
+    def test_the_bound_counts_files_read_the_61st_file_read_is_not_read(self):
+        read = HOST.sb.approval_events
+        self.assertEqual(read(many_files(61, 60), ISSUE, H_NEW), [{"plan_hash": H_NEW}], "the 60th file read is read")
+        folder = many_files(62, 61)
+        self.assertIsNone(read(folder, ISSUE, H_NEW), "the 61st file read is past the bound")
+        row = plan_ledger.approval_state(read(folder, ISSUE, H_NEW), ISSUE, H_NEW)
+        self.assertEqual(row[0], "missing")
+        self.assertRegex(row[1], r"could not be read in time")
+
+    def test_mutant_the_up_front_count_of_files_present_is_caught_by_the_seventy_file_check(self):
+        mutant = mutated_events("    bound, read = (APPROVAL_FILES if files is None else files), 0\n", "    bound, read = (APPROVAL_FILES if files is None else files), 0\n    if len(paths) > bound:\n        return None\n")
+        with self.assertRaisesRegex(AssertionError, r"^approval gate: 70 files present: got None, want the event found$"):
+            seventy_files_found(mutant)
 
     def test_the_decision_is_one_short_pure_function_and_the_reader_reads_no_github_and_writes_nothing(self):
         body = source_of(plan_ledger.approval_state)
