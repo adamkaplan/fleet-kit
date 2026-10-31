@@ -3,6 +3,7 @@ cloud/launcher/tests/test_end_hook_nothing_to_push.py
 cloud/launcher/tests/test_fixture_root.py
 cloud/launcher/tests/test_idle_default_note.py
 cloud/launcher/tests/test_mint_retry.py
+cloud/launcher/tests/test_needs_docker_hermetic.py
 cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
 cloud/launcher/tests/test_probe_redirect.py
@@ -14,4 +15,5 @@ cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_scratch_clean.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
+cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush_background.py
