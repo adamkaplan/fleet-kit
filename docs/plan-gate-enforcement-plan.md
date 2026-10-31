@@ -96,7 +96,7 @@ argument shapes pass through, a broken ledger refuses G1 only in enforce, a hand
 - **A daemon pass that runs `gates ci-record`** on open PRs (today it is a command; someone or something must run it, and run it again within 7 days so the preflight stays satisfied). The recorder itself, the owner-terminal verdict and the preflight that refuses an unproven recorder are built (the owner/ci PR).
 - **The plan review engine** and its **consensus record** (G0b): nothing writes a `consensus` entry, so the launch check always records `would_refuse` and cannot
   enforce.
-- **Plan approval records** (G0c) and the **alignment review record** (G2/G3): untracked, so they cannot block.
+- **Plan approval records** (G0c): tracked and enforced where a repo's `enforce_gates` names G0c (#1735); untracked for any other repo. The **alignment review record** (G2/G3): untracked, so it cannot block.
 - **Enforcement in the shim**: built in the shim enforcement PR (refuse on exit 10, `--match-head-commit`, `--auto` refused). Still open: post-creation checks for `gh pr create`. It had to add
   `--match-head-commit` to the real merge, refuse `--auto` in enforce, and post-creation checks for `gh pr create`.
 - **`plan check`**: an epic claim must name its integration branch (`epic-claim-without-branch`).

@@ -4919,6 +4919,13 @@ missing>. Way out: ask the chief of staff for a logged waiver (`fleet-switchboar
 G8), or the chief of staff can switch the repo to shadow (`fleet-switchboard gates mode <repo> shadow`).` Gates that are only reported are
 not named as the reason. (`waive` is not built yet: the line names the path the design defines.)
 
+### The approval gate G0c (#1735)
+
+1. **Enforced where a repo enforces it.** `G0c` is tracked only for a repo whose `enforce_gates` names it (mode `enforce`); for any other repo it stays untracked ("not tracked yet (not counted)") and `gates`, `gates-check` and `merge-gate` print what they printed before. Where it is on, `merge` requires it, and `merge-gate --check` refuses a pull request whose base is the integration branch or the default branch, after the claim union and before the CI check, with a line naming the plan issue, the plan's current hash, the newest approved hash (if any) and the approver ("the plan's approver (work item: its orchestrator; ask: the Chief of Staff; epic: the Chief of Staff, then the owner)"). A pull request with no plan link is `n/a` (G0a is its gate).
+2. **What it reads.** The `plan.approved` audit events (the ones `record_approval` writes), in the live audit and then the rotated `audit-*.jsonl.gz` files newest first, found by the event's `subject` or its `detail.issue` (the events before 30 Oct 2026 carry the issue in the subject alone), and it is `ok` only when an event holds the plan's current hash (`plan_check.plan_hash`). Events of another hash, none at all, or events that could not be read within 2 seconds and 60 files make it `missing` (fails closed). It reads no GitHub for the events and writes nothing.
+3. **What it does not read.** An approval given as a comment, or as a message that `plan_approval.evaluate` did not pass (no event is recorded for it), and who the sender was: it does not look back at pull requests merged before the first event.
+4. **The waiver.** A logged `waive <pr> --gates G0c` at the pull request's head passes it, is audited (`plan.approval.waived`) and appears in the same waiver list; a new head voids it.
+
 ## The owner's verdict and the built-in `ci` recorder (#107)
 
 **The `owner` verdict** (a scenario whose evaluator is `owner`, or the old personal spelling, which is an alias) is recorded only from
