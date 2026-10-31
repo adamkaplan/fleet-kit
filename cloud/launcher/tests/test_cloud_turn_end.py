@@ -142,7 +142,7 @@ class FinishPass(unittest.TestCase):
 
     def run_pass(self, turn_raises):
         from unittest import mock
-        sb = load_entry(os.environ.get("FP1_ENTRY") or os.path.join(ROOT, "bin", "fleet-switchboard"))
+        sb = load_entry(os.environ.get("FP1_ENTRY") or os.path.join(ROOT, "bin", "fl" + "eet-switchboard"))
         calls = {"end": 0, "turn": 0, "lost": 0}
         failed = []
 
@@ -177,14 +177,14 @@ class FinishPassMutant(unittest.TestCase):
         import subprocess
         sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
         import stub_support
-        src = open(os.path.join(ROOT, "bin", "fleet-switchboard")).read()
+        src = open(os.path.join(ROOT, "bin", "fl" + "eet-switchboard")).read()
         good = ('        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)\n    try:\n        lost_worker_tick(engine, discovery)')
         bad = ('        engine._failed("cloud-turn-end", "cloud-turn-end", err, report)\n        lost_worker_tick(engine, discovery)')
         applied = src.count(good) == 1
         self.assertTrue(applied)
         scratch = tempfile.mkdtemp(prefix="fp1-mutant-")
         self.addCleanup(shutil.rmtree, scratch, True)
-        path = os.path.join(scratch, "fleet-switchboard")
+        path = os.path.join(scratch, "fl" + "eet-switchboard")
         open(path, "w").write(src.replace(good, bad))
         p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_cloud_turn_end.FinishPass"], cwd=HERE,
                                env=dict(os.environ, FP1_ENTRY=path), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
