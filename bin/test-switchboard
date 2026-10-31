@@ -79965,7 +79965,15 @@ class TestEpicRecord(unittest.TestCase):
         code, out, err = self.cmd("cmd_gates", pr="item", rest=[self.ITEM]) if item else self.cmd("cmd_gates")
         return out
 
+    def claim_merged(self):
+        """#1347: `gates ask-close` reads a merged pull request's RECORDED claim; a real one was recorded at its merge gate, so the fake merged pull requests of the plan record theirs (before 2026-01-01)."""
+        for number, _ in self.merged:
+            pr = "%s#%d" % (self.REPO, number)
+            if not sb.plan_ledger.recorded_claim(self.rows(), pr)[0]:
+                sb.plan_ledger.append_checked(self.state, 1767139200, lambda have, seq, pr=pr: {"kind": "claim", "pr": pr, "head": "a" * 40, "claim_text": "S1"})
+
     def close(self):
+        self.claim_merged()
         return self.cmd("cmd_gates_ask_close")
 
     def refused(self, result, needle):
@@ -80088,7 +80096,7 @@ class TestEpicRecord(unittest.TestCase):
         report = sb.plan_ledger.evaluate_gates(self.plan(), [], None, {"head": self.HEAD, "body": "PLAN: %s" % self.ASK, "ci": "green"}, self.PR)
         self.assertEqual([s["id"] for s in report["scenarios"]], ["S1"])
         g1 = next(g for g in report["gates"] if g["gate"] == "G1")
-        self.assertEqual(g1["missing"], ["S1: proof (`prove S1`); reviewer verdict (`verdict S1 --as reviewer`)"])
+        self.assertEqual(g1["missing"], ["S1: proof (`prove S1`; the reviewer judges it, a prover records it); reviewer verdict (`verdict S1 --as reviewer`; only the reviewer may record it)"])
         self.assertEqual(sum("E1" in m for m in g1["missing"]), 0)
         r = self.prove("E1", pr=self.PR)
         self.refused(r, "record it on the ask issue or work item that owns the plan")
@@ -80113,8 +80121,9 @@ class TestEpicRecord(unittest.TestCase):
         self.assertEqual((code, out.strip()), (sb.EXIT_OK, "%s may close: 1 of 1 scenarios proven and judged at plan %s: S1" % (self.ASK, self.hash[:19])))
         gates = self.gates()
         self.assertEqual([l for l in gates.splitlines() if l.startswith("  epic ")], [])
-        self.assertEqual([r for r in self.reads[before:] if "compare" in r or "pulls" in r or "search" in r], [])
-        self.assertEqual(self.reads[before:], [])
+        self.assertEqual([r for r in self.reads[before:] if "compare" in r or "pulls" in r], [])
+        self.assertEqual(len(self.reads[before:]), 1, "#1347: the one plan listing of the claim-union gate, and no epic read")   # the one search of every ask-close; the epic code adds none
+        self.assertTrue(self.reads[before].startswith("search/issues?"), self.reads[before:])
 
     # ---- U1..U3
     def test_u2_a_record_at_a_head_that_lacks_a_merge_is_ignored_by_the_gate_and_one_that_holds_every_merge_counts(self):
