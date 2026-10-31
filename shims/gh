@@ -1956,6 +1956,7 @@ def api_refuse_unknown(method, shown):
                   "add its path and method there to allow it" % (method, shown))
 
 
+OVERRIDE_HEADERS = ("x-http-method-override", "x-http-method", "x-method-override")
 RAW_PREFIXES = ("https://api.github.com", "http://api.github.com", "//api.github.com")
 RAW_RULE = ("the endpoint would change if cleaned: the shim matches the raw path only; write it plainly as repos/OWNER/REPO/... "
             "(one optional leading slash, no backslash, %-escape, dot segment, semicolon, space, #, double or trailing slash)")
@@ -1996,8 +1997,8 @@ def api_decide(args, namer, previous):
     headers = []
     method, has_input, fields, raw_positionals = api_scan(args, headers)
     for header in headers:
-        if header.partition(":")[0].strip().lower() == "x-http-method-override":
-            raise Refused("the X-HTTP-Method-Override header is refused: GitHub honours it as a method, so the shim cannot tell the real method")
+        if header.partition(":")[0].strip().lower() in OVERRIDE_HEADERS:
+            raise Refused("a method-override header (X-HTTP-Method-Override, X-HTTP-Method, X-Method-Override) is refused: it can turn a read into a write, so the shim cannot tell the real method")
     has_body = has_input or bool(fields)
     effective = method if method is not None else ("POST" if has_body else "GET")
     if effective == "GET":

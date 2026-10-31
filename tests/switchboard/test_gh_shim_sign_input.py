@@ -1030,19 +1030,35 @@ class TestGhShimRawPath(unittest.TestCase):
         done, calls = self.rig.run("api", "graphql", "--input", self.input_file('{"query":"query{a}"}'))   # control: an object passes
         self.assertEqual(len(calls), 1, gh_err(done))
 
-    def test_the_method_override_header_is_refused(self):
-        forms = (("-H", "X-HTTP-Method-Override: DELETE"), ("--header", "x-http-method-override:PUT"), ("--header=X-Http-Method-Override: x"), ("-HX-HTTP-METHOD-OVERRIDE: PATCH"))
-        for form in forms:
-            form = (form,) if isinstance(form, str) else form
+    def override_forms(self):
+        for name in ("X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"):
+            for shown in (name, name.lower(), name.upper(), name.swapcase()):
+                yield name, ("-H", shown + ": DELETE")
+                yield name, ("-H" + shown + ":PUT",)
+                yield name, ("--header", shown + ":PATCH")
+                yield name, ("--header=" + shown + ": x",)
+
+    def override_failures(self, rig):
+        text = "gh: refused: a method-override header (X-HTTP-Method-Override, X-HTTP-Method, X-Method-Override) is refused: it can turn a read into a write, so the shim cannot tell the real method"
+        bad = []
+        for name, form in self.override_forms():
             for extra in ((), ("-f", "a=b"), ("-X", "POST", "-f", "a=b")):   # a GET and a POST
-                with self.subTest(form=form, extra=extra):
-                    done, calls = self.rig.run("api", "repos/o/r/issues", *form, *extra)
-                    self.assertEqual(calls, [])
-                    self.assertTrue(gh_err(done).startswith("gh: refused: the X-HTTP-Method-Override header is refused"), gh_err(done))
-                    self.assertEqual(len(gh_err(done).splitlines()), 1)
+                done, calls = rig.run("api", "repos/o/r/issues", *form, *extra)
+                if calls or gh_err(done) != text:
+                    bad.append((form, extra))
+        return bad
+
+    def test_the_method_override_headers_are_refused(self):
+        self.assertEqual(self.override_failures(self.rig), [])
         args = ("api", "repos/o/r/issues", "-H", "Accept: application/json")   # control
         done, calls = self.rig.run(*args)
         self.assertEqual([c["argv"] for c in calls], [list(args)], gh_err(done))
+
+    def test_mutant_override_check_skipped_is_seen(self):
+        rig = self.mutant_rig(("in OVERRIDE_HEADERS:", "in ():"))
+        seen = self.override_failures(rig)
+        print("RAW mutant override check skipped: %d seen" % len(seen))
+        self.assertEqual(len(seen), len(list(self.override_forms())) * 3)
 
     def test_the_graphql_hint_names_a_form_the_shim_accepts(self):
         done, calls = self.rig.run("api", "graphql", "-f", "query=" + gql("updatePullRequestReview"))
