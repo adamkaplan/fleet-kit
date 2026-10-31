@@ -391,12 +391,31 @@ class TestBoundsAndCaps(unittest.TestCase):
                 return False
             self.wait_for(all_registered)
             self.assertEqual(sum(hub.relay.waiting.values()), 16)
+            gate, seen, over, refused = threading.Lock(), {"live": 16}, threading.Event(), threading.Event()   # the relay's admission, watched: an event decides, never a socket timeout
+            real_admit, real_release = hub.relay.admit, hub.relay.release
+            def watched_admit():
+                ok = real_admit()
+                with gate:
+                    if not ok:
+                        refused.set()
+                    else:
+                        seen["live"] += 1
+                        if seen["live"] > hub.relay.max_inflight:
+                            over.set()
+                return ok
+            def watched_release():
+                real_release()
+                with gate:
+                    seen["live"] -= 1
+            hub.relay.admit, hub.relay.release = watched_admit, watched_release
             socks = []
             for _ in range(hub.server.max_handlers):   # as many slow bodies as the hub has handlers: without the in-flight cap they would take every one
                 s = socket.create_connection(("127.0.0.1", hub.port))
                 s.settimeout(5)
                 s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-pod-0\r\nContent-Length: 100\r\n\r\n{")
                 socks.append(s)
+            TestBoundsAndCaps.wait_for(lambda: over.is_set() or refused.is_set(), 30.0)   # an event; the limit is a hang guard that raises its own text
+            self.assertFalse(over.is_set(), "over-admitted: a pod relay handler was admitted beyond the cap of %d" % hub.relay.max_inflight)
             for s in socks:             # every excess one is refused 503 straight away, its body unread
                 first = s.recv(4096).split(b"\r\n")[0]
                 self.assertIn(b" 503 ", first)
