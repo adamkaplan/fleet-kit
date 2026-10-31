@@ -135,6 +135,9 @@ class TestBranchFf(Base):
                 line()
                 self.gh.pull["head"]["ref"] = branch
             return arrange
+        def fork():
+            line()
+            self.gh.pull["head"]["repo"] = {"full_name": "forker/widgets"}
         return [("not a fast-forward", diverged, [PR, "scratch"]),
                 ("no clear-head line", lambda: None, [PR, "scratch"]),
                 ("a line for another pull request", lambda: line(pr="%s#8" % REPO), [PR, "scratch"]),
@@ -143,7 +146,8 @@ class TestBranchFf(Base):
                 ("a closed pull request", closed, [PR, "scratch"]),
                 ("the default branch", on("main"), [PR, "scratch"]),
                 ("the integration branch", on("integration"), [PR, "scratch"]),
-                ("a --force flag", lambda: line(), [PR, "scratch", "--force"])]
+                ("a --force flag", lambda: line(), [PR, "scratch", "--force"]),
+                ("a head from another repository", fork, [PR, "scratch"])]
 
     def run_case(self, index):
         name, arrange, argv = self.refusal_cases()[index]
@@ -152,6 +156,8 @@ class TestBranchFf(Base):
         before = len(self.world.audit())
         code, out, err = self.main("orch", "branch-ff", *argv)
         self.assertNotEqual(code, 0, name)
+        if name == "a head from another repository":
+            self.assertIn("another repository", err)
         if name != "a --force flag":   # the parser's own refusal is usage text over several lines
             self.assertEqual(len(err.strip().splitlines()), 1, "%s: %r" % (name, err))
         self.assertEqual(len(self.gh.writes()), 0, "ref updates after a refused request")
@@ -159,9 +165,9 @@ class TestBranchFf(Base):
         self.assertEqual(len(self.world.audit()), before, "audit lines written by a refusal")
         return name
 
-    def test_s4_nine_requests_are_each_refused_writing_nothing(self):
-        names = [self.run_case(i) for i in range(9)]
-        self.assertEqual(len(set(names)), 9)
+    def test_s4_ten_requests_are_each_refused_writing_nothing(self):
+        names = [self.run_case(i) for i in range(10)]
+        self.assertEqual(len(set(names)), 10)
 
     def test_s4_a_failed_read_is_a_refusal(self):
         self.assertEqual(self.clear()[0], 0)
