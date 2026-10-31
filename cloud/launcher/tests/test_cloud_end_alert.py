@@ -350,20 +350,25 @@ class TestS9ThreeHostileRecords(World):
         self.assertEqual((present, branch, shapes, n), (5, 0, 0, 3))
 
     def test_s9_m3_the_branch_copying_mutant_fails_the_hostile_test_and_the_control_passes(self):
-        broken = mutant('return "yes" if hook["pushed"] else "no"', 'return "yes %s" % hook.get("wip_branch") if hook["pushed"] else "no"')
-        failed = 0
-        try:
-            self.three(broken, valid_name=True)
-        except AssertionError as e:
-            failed = 1 if "leaked branch" in str(e) else 0
+        old = 'return "yes" if hook["pushed"] else "no"'
+        with open(SOURCE) as f:
+            applied = f.read().count(old) == 1   # computed before the replace
+        broken = mutant(old, 'return "yes %s" % hook.get("wip_branch") if hook["pushed"] else "no"')
+        planted = HOSTILE_RECORDS[0][1]   # the branch of the first valid-name record, where the copy leaks first
         control = 0
         try:
             self.three(real, valid_name=True)
             control = 1
         except AssertionError:
             pass
-        print("S9 mutant M3: the hostile test fails on the leaking build %d of 1, control passes %d of 1, mutation applied True" % (failed, control))
-        self.assertEqual((failed, control), (1, 1))
+        with self.assertRaises(AssertionError) as caught:
+            self.three(broken, valid_name=True)
+        failed = 1 if isinstance(caught.exception, AssertionError) else 0
+        named = 1 if planted in str(caught.exception) else 0
+        print("S9 mutant M3: control passes %d of 1" % control)
+        print("S9 mutant M3: the hostile test fails on the leaking build %d of 1, mutation applied %s" % (failed, applied))
+        print("S9 mutant M3: the failure names the leaked branch %d of 1" % named)
+        self.assertEqual((control, failed, named, applied), (1, 1, 1, True))
 
     def test_s9_a_mutant_that_copies_the_directory_name_is_caught_on_the_records(self):
         broken = mutant('return dirname if re.fullmatch(re.escape(worker) + "-" + RECORD_STAMP, dirname or "") else None', "return dirname or None")
