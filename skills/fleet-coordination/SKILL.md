@@ -58,6 +58,8 @@ The mistakes that cost the most review rounds and the most lost work. Meet them 
 
 **A cloud builder never runs the whole bin/test-switchboard** or any suite over about 10 minutes in its pod: CI runs it on the merged head (45 to 55 minutes on a runner), and a pod is slower; in the briefs the fleet writes, the pod's hard limit is 50 minutes (the launcher's own default is longer). It runs the named classes singly, each under about 100 seconds, and keeps itself active with short foreground commands, because a long background run is not activity and an idle pod is stopped. It pushes its work branch after every commit, and sends its final message the minute the class list is done and stops. Item (j) and the paragraph on focused local runs are for a local worker and are not changed.
 
+A mutant counts as caught only with a passing control (the same command on the unmutated copy exits 0) and an anchored failure text (the mutated check is named in the failure); a harness that counts any non-zero exit as a catch proves nothing. Builders RUN the control and print its result next to the mutant count.
+
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
 
 A coder brief says: durable helper scripts go in the agent's own scratch directory (once #948 provides it), until then in a named directory under the switchboard's state area that no janitor lists (e.g. `~/.local/state/fleet-switchboard/scratch/<agent>`); the shared temporary directory is for one session's scratch only (the OS clears it at boot and files unread for 3 days).
