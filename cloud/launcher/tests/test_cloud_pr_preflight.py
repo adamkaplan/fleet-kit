@@ -175,7 +175,7 @@ def leftovers(before):
     return [x for x in set(os.listdir(tempfile.gettempdir())) - before if x.startswith("cloud-preflight-")]
 
 
-SLEEP = "import time\ntime.sleep(60)\n"
+SLEEP = "import os, time\nos.environ.get(\"CLOUD_PREFLIGHT_STARTED\") and open(os.environ[\"CLOUD_PREFLIGHT_STARTED\"], \"w\").close()\ntime.sleep(60)\n"
 
 
 class Signals(unittest.TestCase):
@@ -186,19 +186,21 @@ class Signals(unittest.TestCase):
 
     def go(self, sig, script=SCRIPT):
         before = set(os.listdir(tempfile.gettempdir()))
-        e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="30", CLOUD_PREFLIGHT_BASE="main")
-        p = stub_support.start(self, [sys.executable, script], cwd=self.r.d, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(100):
-            if leftovers(before):
-                break
-            time.sleep(0.1)
-        time.sleep(0.5)
+        marker_dir = tempfile.mkdtemp(prefix="preflight-marker-"); self.addCleanup(shutil.rmtree, marker_dir, ignore_errors=True)
+        marker = os.path.join(marker_dir, "started")
+        e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="30", CLOUD_PREFLIGHT_BASE="main", CLOUD_PREFLIGHT_STARTED=marker)
+        p = stub_support.start(self, [sys.executable, script], cwd=self.r.d, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+        while not os.path.exists(marker):   # the sleeping test file writes the marker when it has STARTED: an event, not a guess
+            if p.poll() is not None:
+                raise AssertionError("the preflight script ended before its test file started (exit %s)" % p.returncode)
+            time.sleep(0.02)
         self.assertTrue(leftovers(before), "no temp copy appeared")
         p.send_signal(sig)
         try:
-            rc = p.wait(timeout=20)
+            rc = p.wait(timeout=20)   # a hang guard only: it never decides the verdict
         except subprocess.TimeoutExpired:
-            p.kill(); p.wait(); rc = "hung"
+            p.kill(); p.wait()
+            raise AssertionError("the preflight script did not end within 20 seconds after the signal (hung)")
         left = leftovers(before)
         for x in left:
             shutil.rmtree(os.path.join(tempfile.gettempdir(), x), ignore_errors=True)
