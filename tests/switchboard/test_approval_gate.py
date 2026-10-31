@@ -98,6 +98,16 @@ def mutated_events(old, new):
     return space["approval_events"]
 
 
+def corrupt_gz_dir():
+    """A state directory whose rotated audit has a valid gzip header and a corrupt deflate body (zlib.error, not an OSError)."""
+    folder = audit_dir([])
+    data = bytearray(gzip.compress("".join(json.dumps(event(ISSUE, H_NEW)) + "\n" for _ in range(50)).encode()))   # no file name in the header: the deflate stream starts at byte 10
+    for i in range(10, len(data) - 8):
+        data[i] = 0xFF   # block type 3 is invalid: zlib.error
+    (folder / "audit-2026-10-20.jsonl.gz").write_bytes(bytes(data))
+    return folder
+
+
 def mutated_refusal(old, new):
     """approval_refusal from the real part with `old` replaced by `new` (asserted applied)."""
     text = PART.read_text()
@@ -151,6 +161,17 @@ class TestApprovalGateReader(unittest.TestCase):
         state = mutated_state("if current_hash and current_hash in seen:", "if seen:")
         with self.assertRaisesRegex(AssertionError, r"^approval gate: events only at an older hash: got ok, want missing$"):
             scenario_rows(HOST.sb.approval_events, state)
+
+    def test_a_corrupt_gzip_reads_as_none_and_the_row_says_could_not_be_read(self):
+        folder = corrupt_gz_dir()
+        self.assertIsNone(HOST.sb.approval_events(folder, ISSUE, H_NEW))
+        row = judge(HOST.sb.approval_events, plan_ledger.approval_state, folder, ISSUE, H_NEW)
+        self.assertEqual((row[0], "could not be read" in row[1]), ("missing", True))
+
+    def test_mutant_the_narrow_except_lets_a_corrupt_gzip_propagate_and_is_caught(self):
+        narrow = mutated_events("    except Exception:", "    except (OSError, EOFError, ValueError, UnicodeError, RecursionError):")
+        with self.assertRaisesRegex(Exception, r"^Error -3"):
+            narrow(corrupt_gz_dir(), ISSUE, H_NEW)
 
     def test_the_reader_stops_at_the_first_file_with_the_current_hash_and_at_its_bounds(self):
         read = HOST.sb.approval_events
@@ -312,3 +333,15 @@ class TestApprovalGateCommands(unittest.TestCase):
         self.assertIsNone(self.refusal_by(mutant), "the mutant honours an unaudited waiver")
         with self.assertRaisesRegex(AssertionError, r"^None is not true : the waiver must be refused$"):
             self.assertTrue(self.refusal_by(mutant), "the waiver must be refused")
+
+    def test_a_corrupt_gzip_in_the_state_dir_fails_the_gates_row_and_the_merge_gate_closed(self):
+        self.enforce()
+        self.approve(self.current())
+        self.assertEqual(self.row()["status"], "ok")
+        self.assertIsNone(self.refusal(), "control: readable audit passes")
+        (self.h.world.state / "audit.jsonl").unlink()
+        corrupt = corrupt_gz_dir() / "audit-2026-10-20.jsonl.gz"
+        (self.h.world.state / corrupt.name).write_bytes(corrupt.read_bytes())
+        row = self.row()
+        self.assertEqual((row["status"], "could not be read" in row["detail"]), ("missing", True))
+        self.assertRegex(self.refusal() or "", r"^merge of acme/app#9 refused: ")

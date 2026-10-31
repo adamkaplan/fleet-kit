@@ -45,7 +45,7 @@ def approval_events(state_dir, issue, current_hash, clock=None, seconds=None, fi
             if any(e["plan_hash"] == current_hash for e in mine) or clock() > limit:
                 break
         return found if clock() <= limit else None
-    except (OSError, EOFError, ValueError, UnicodeError, RecursionError):
+    except Exception:   # a corrupt gzip raises zlib.error, which is no OSError: every read failure is missing
         return None
 
 
