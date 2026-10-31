@@ -330,6 +330,17 @@ class Concurrent(unittest.TestCase):
         print("S10: stops with the right cause %d of 2" % (2 if ok else 0))
         self.assertEqual((len(seen), causes), (2, ["idle", "hard"]))
 
+    def test_S10_a_failed_pod_stops_through_the_pool_with_cause_pod_failed(self):
+        mod = target_module()
+        L, cluster, clock, env, events = build(mod, tempfile.mkdtemp(), 1, hold=False)
+        cluster.pods[0]["status"] = {"phase": "Failed"}
+        for name in ("delete_secret", "delete_run_secret", "get_secret"):
+            setattr(cluster, name, lambda *a, **k: None)
+        out = L.reap()
+        causes = [l.get("cause") for l in audit_lines(env) if l["action"] == "stop"]
+        print("S10: a Failed pod through the pool ends with cause %s, reaped %d of 1, hook runs %d" % (causes, len(out), cluster.hooks))
+        self.assertEqual((causes, out, cluster.hooks), (["pod_failed"], [("coder0", "hard limit", 0)], 0))
+
 
 class ScrubSnapshot(unittest.TestCase):
     def test_S9_scrub_survives_a_set_that_grows_under_it(self):
