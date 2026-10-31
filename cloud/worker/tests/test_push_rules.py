@@ -308,6 +308,11 @@ class Slices(unittest.TestCase):
         self.assertIn("only as a whole ref name or as the last part of a ref", doc)
         self.assertIn("The git wrapper `cloud/worker/guard.sh` reads refs exactly", doc)
 
+    def test_s8_the_documentation_says_a_wrapper_change_updates_the_digest(self):
+        doc = open(os.path.join(ROOT, "docs", "cloud-worker-interface.md")).read()
+        self.assertIn("updates `cloud/worker/tests/guard.sha256` in the same commit", doc)
+        self.assertIn("do not compare it with any branch", doc)
+
 
 if __name__ == "__main__":
     if os.environ.get("WRITE_PUSH_RULES") == "1":
