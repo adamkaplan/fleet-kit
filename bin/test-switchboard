@@ -23002,6 +23002,10 @@ class TestSweep(Base):
         ("ci", "ci is absent", {"ci": KeyError}, {}, "not ready"),
         ("ci", "ci says none", {"ci": "none"}, {}, "not ready"),
         ("legs", "a macOS leg is not green (failed, absent, skipped, cancelled or in progress)", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test (macos-latest)": "failure"}, False)}, {}, "not ready"),
+        ("legs", "a macOS leg is skipped", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success", "test (macos-latest)": "success", "test-cloud (macos-latest)": "skipped"}, False)}, {}, "not ready"),
+        ("legs", "the macOS legs are absent", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success"}, False)}, {}, "not ready"),
+        ("legs", "a macOS leg is cancelled", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success", "test (macos-latest)": "cancelled", "test-cloud (macos-latest)": "success"}, False)}, {}, "not ready"),
+        ("legs", "a macOS leg is in progress", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success", "test (macos-latest)": "success", "test-cloud (macos-latest)": "in_progress"}, False)}, {}, "not ready"),
         ("draft", "a draft", {"draft": True}, {}, "not ready"),
         ("body", "the body is empty", {"body": ""}, {}, "not ready"),
         ("body", "the body is None", {"body": None}, {}, "not ready"),
@@ -42311,6 +42315,7 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
         'the vault check lock %s was no': 'refused before any pod exists: it says nothing was created',
         'the vault access check stopped': 'refused before any pod exists: it says nothing was created',
         'the cloud worker was not creat': 'the pod creation failed: no worker exists, so refused is right',
+        'the brief line %r needs docker': 'refused before any pod exists: it says nothing was created',
     }
 
     def other_created_words(self, source):
