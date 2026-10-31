@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from urllib.parse import urlparse
 
@@ -457,13 +458,21 @@ class S3Mints(Base):
         roles = self.check(prog)
         other = sum(1 for r in roles if r not in ("worker", "orchestrator"))
         self.assertEqual(other, 0)
-        p = subprocess.run([sys.executable, "-m", "unittest", "test_mint_roles"], cwd=HERE, capture_output=True, text=True, timeout=90)
+        classes = ("RequestBodies", "Answers", "Mutants")
+        names = ["test_mint_roles." + c for c in classes]
+        t0 = time.monotonic()
+        try:
+            p = subprocess.run([sys.executable, "-B", "-m", "unittest"] + names, cwd=HERE, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("the role-table selection did not end within 300 seconds (hang guard)")
+        print("S3 selection took %.1f s" % (time.monotonic() - t0))
         m = re.search(r"Ran (\d+) tests?", p.stderr)
         self.assertIsNotNone(m, p.stderr[-300:])
         self.assertEqual(p.returncode, 0, p.stderr[-300:])
         self.assertTrue(re.search(r"^OK\s*$", p.stderr, re.M), p.stderr[-300:])
         n = int(m.group(1))
-        line = "S3: mints for other roles %d, test_mint_roles %d of %d" % (other, n, n)
+        self.assertGreaterEqual(n, 1)
+        line = "S3: mints for other roles %d, role-table tests %d of %d (classes: %s)" % (other, n, n, ", ".join(classes))
         print(line)
         # the mutant: the preflight mints once more for another role
         text = open(os.path.join(LAUNCHER, "preflight.py")).read()
