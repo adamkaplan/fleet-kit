@@ -308,6 +308,28 @@ class Concurrent(unittest.TestCase):
         print("U2: one-pod and no-pod passes equal the base %d of 2" % same)
         self.assertEqual((got1, got0), (want1, want0))
 
+    def test_S10_the_concurrent_stops_carry_the_stop_cause(self):
+        mod = target_module()
+        L, cluster, clock, env, events = build(mod, tempfile.mkdtemp(), 2, hold=False)
+        L.hard_deadline = lambda pod: T0 - dt.timedelta(minutes=1) if real.ann(pod, "worker") == "coder1" else T0 + dt.timedelta(hours=5)
+        L.activity = lambda name: (False, T0 - dt.timedelta(seconds=700))   # idle past the default 600 seconds
+        seen, lock, cls = {}, threading.Lock(), type(L)
+        old = cls.stop
+
+        def recording(self, ns, reason, *a, **k):
+            with lock:
+                seen[ns.worker] = ns
+            return old(self, ns, reason, *a, **k)
+        cls.stop = recording
+        try:
+            L.reap()
+        finally:
+            cls.stop = old
+        causes = [getattr(seen[w], "cause", None) for w in ("coder0", "coder1")]
+        ok = (len(seen), causes) == (2, ["idle", "hard"])
+        print("S10: stops with the right cause %d of 2" % (2 if ok else 0))
+        self.assertEqual((len(seen), causes), (2, ["idle", "hard"]))
+
 
 class ScrubSnapshot(unittest.TestCase):
     def test_S9_scrub_survives_a_set_that_grows_under_it(self):
@@ -381,6 +403,16 @@ class Mutants(unittest.TestCase):
         print("S9 mutant: failed with the set-changed-size error %d of 1, mutation applied True" % (p.returncode == 1 and seen))
         self.assertEqual(p.returncode, 1, out)
         self.assertIn("Set changed size during iteration", out)
+
+    def test_S10_the_mutant_without_the_cause_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = 'run_id=nonce,\n                                                      cause="hard" if reason == "hard limit" else "idle"), reason)'
+            path = mutant(tmp, "m10", [(old, "run_id=nonce), reason)")])
+            p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent.Concurrent.test_S10_the_concurrent_stops_carry_the_stop_cause"],
+                                   cwd=HERE, env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out = p.communicate(timeout=90)[0]
+        print("S10 mutant: failed %d of 1, mutation applied True" % (p.returncode == 1))
+        self.assertEqual(p.returncode, 1, out)
 
 
 class Docs(unittest.TestCase):
