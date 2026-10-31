@@ -461,13 +461,19 @@ def mutant(directory, name, edits):
 
 
 class Mutants(unittest.TestCase):
-    def child(self, name, edits, test):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = mutant(tmp, name, edits)   # outside the repository
-            p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent.Concurrent." + test], cwd=HERE,
-                                   env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            out = p.communicate(timeout=90)[0]
-        self.assertEqual(p.returncode, 1, out)
+    def child(self, name, edits, test, target="Concurrent"):
+        """Runs the test on an UNMUTATED scratch copy first (the control: exit 0), then on the mutant (exit 1 and the test's own FAIL line)."""
+        res = []
+        for label, ed in (("control", []), (name, edits)):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = mutant(tmp, label + "-" + name, ed)   # outside the repository
+                p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent." + target + "." + test], cwd=HERE,
+                                       env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                res.append((p.communicate(timeout=90)[0], p.returncode))
+        self.assertEqual(res[0][1], 0, res[0][0])
+        self.assertEqual(res[1][1], 1, res[1][0])
+        self.assertIn("FAIL: " + test, res[1][0])
+        self.controls = getattr(self, "controls", 0) + 1
         return 1
 
     def test_the_four_mutants_are_caught(self):
@@ -479,6 +485,7 @@ class Mutants(unittest.TestCase):
                        "test_S4_a_stop_past_its_limit_is_abandoned_and_tried_again"),
         ]
         print("S7: mutants caught %d of 4, mutations applied 4 of 4" % sum(n))
+        print("S7 control: unmutated copies pass %d of 4" % self.controls)
         self.assertEqual(sum(n), 4)
 
     def test_S4b_the_mutant_with_a_plain_write_in_work_fails(self):
@@ -502,6 +509,11 @@ class Mutants(unittest.TestCase):
 
     def test_S9_the_mutant_that_iterates_the_live_set_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
+            cpath = mutant(tmp, "c9", [])   # the control: the unmutated copy passes
+            c = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent.ScrubSnapshot"], cwd=HERE,
+                                   env=dict(os.environ, **{MODULE_ENV: cpath}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            cout = c.communicate(timeout=90)[0]
+            self.assertEqual(c.returncode, 0, cout)
             path = mutant(tmp, "m9", [("for v in tuple(secrets_known) if v", "for v in secrets_known if v")])
             p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent.ScrubSnapshot"], cwd=HERE,
                                    env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -510,16 +522,24 @@ class Mutants(unittest.TestCase):
         print("S9 mutant: failed with Set changed size during iteration %d of 1, mutation applied True" % (p.returncode == 1 and seen))
         self.assertEqual(p.returncode, 1, out)
         self.assertIn("Set changed size during iteration", out)
+        self.assertIn("FAIL: test_S9_scrub_survives_a_set_that_grows_under_it", out)
 
     def test_S10_the_mutant_without_the_cause_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             old = 'run_id=nonce,\n                                                      cause="hard" if reason == "hard limit" else "idle"), reason)'
+            cpath = mutant(tmp, "c10", [])   # the control: the unmutated copy passes
+            test10 = "test_reap_concurrent.Concurrent.test_S10_the_concurrent_stops_carry_the_stop_cause"
+            c = stub_support.start(self, [sys.executable, "-m", "unittest", test10], cwd=HERE,
+                                   env=dict(os.environ, **{MODULE_ENV: cpath}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            cout = c.communicate(timeout=90)[0]
+            self.assertEqual(c.returncode, 0, cout)
             path = mutant(tmp, "m10", [(old, "run_id=nonce), reason)")])
             p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent.Concurrent.test_S10_the_concurrent_stops_carry_the_stop_cause"],
                                    cwd=HERE, env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             out = p.communicate(timeout=90)[0]
         print("S10 mutant: failed %d of 1, mutation applied True" % (p.returncode == 1))
         self.assertEqual(p.returncode, 1, out)
+        self.assertIn("FAIL: test_S10_the_concurrent_stops_carry_the_stop_cause", out)
 
 
 class Docs(unittest.TestCase):
