@@ -41,6 +41,7 @@ cloud/launcher/tests/test_m_cap.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
+cloud/launcher/tests/test_needs_docker_hermetic.py
 cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
 cloud/launcher/tests/test_orchestrator_row.py
@@ -65,6 +66,7 @@ cloud/launcher/tests/test_stub_cleanup.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/launcher/tests/test_token_read_at_call.py
 cloud/launcher/tests/test_vault_check_pins.py
+cloud/worker/tests/test_base_merge_base.py
 cloud/worker/tests/test_cloud_prepush.py
 cloud/worker/tests/test_cloud_prepush_background.py
 cloud/worker/tests/test_cloud_prepush_hardening.py
