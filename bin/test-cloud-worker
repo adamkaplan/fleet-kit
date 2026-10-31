@@ -2454,13 +2454,26 @@ class TestVaultCheckProcess(VaultBase):
 
 class TestNeedsDocker(Base):   # #1488
     LINE = "NEEDS: docker"
+    BASELINE = BIN.parent / "tests" / "golden" / "needs-docker-launch-baseline.json"   # captured from the launch on origin/integration, before the check existed
+    GUARD = "if needs is not None and not getattr(args, \"stack\", False):"
 
     def run_launch(self, text, *extra, cloud=True):
         brief = self.home / "brief.txt"
         brief.write_text(text)
         argv = ["launch", "coder7", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "coder",
                 "--reports-to", "orch", "--brief-file", str(brief), *extra]
-        return self.main(*argv, *(["--cloud"] if cloud else []))
+        if cloud:
+            return self.main(*argv, "--cloud")
+        local = {"return_value": {"name": "coder7", "session": "ses_l", "pane": "p1", "tab": "t1"}}   # the terminal itself is not under test: what the command prints is
+        with mock.patch.object(sb, "launch_agent", **local):
+            return self.main(*argv, "--terminal", "--workspace", "w1", "--dir", str(self.home))
+
+    def creates(self):
+        return [c for c in self.stub_calls() if c[0] == "create"]
+
+    def seen(self, code, out, err):
+        return {"exit": code, "stdout": re.sub(r"(http://127\.0\.0\.1:)\d+", r"\1PORT", out),
+                "stderr": "".join(l + "\n" for l in err.splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
 
     def test_s2_a_docker_brief_without_stack_is_refused_before_any_pod(self):
         code, out, err = self.run_launch("Build.\n" + self.LINE + "\n")
@@ -2469,27 +2482,45 @@ class TestNeedsDocker(Base):   # #1488
         self.assertEqual(len(refusal), 1)
         self.assertIn(self.LINE, refusal[0])
         self.assertIn("--stack", refusal[0])
+        self.assertEqual(len(self.creates()), 0)
         self.assertEqual(self.stub_calls(), [])
         self.assertFalse((self.state / "cloud" / "coder7.json").exists())
 
     def test_s3_a_docker_brief_with_stack_is_accepted(self):
         code, out, err = self.run_launch("Build.\n" + self.LINE + "\n", "--stack")
-        self.assertNotIn("needs docker", err)
-        self.assertTrue([c for c in self.stub_calls()])
-
-    def test_s4_an_unmarked_brief_and_a_non_cloud_launch_are_unchanged(self):
-        code, out, err = self.run_launch("Build.\n")
         self.assertEqual(code, 0, err)
         self.assertNotIn("needs docker", err)
-        code, out, err = self.run_launch(self.LINE + "\n", cloud=False)
-        self.assertNotIn("needs docker", err)
+        self.assertEqual(len(self.creates()), 1)   # exactly one pod
+        self.assertEqual(len(self.stub_calls()), 1)
+
+    def test_s4_an_unmarked_cloud_brief_launches_exactly_as_the_baseline(self):
+        want = json.loads(self.BASELINE.read_text())["cloud_unmarked_brief"]
+        code, out, err = self.run_launch("Build.\n")
+        self.assertEqual(self.seen(code, out, err), want)
+        self.assertEqual(code, 0)
+
+    def test_u1_a_local_launch_with_and_without_a_needs_line_is_the_baseline(self):
+        want = json.loads(self.BASELINE.read_text())["local_launch"]
+        for text in ("Build.\n", "Build.\n" + self.LINE + "\n"):   # the line is for the cloud shapes only: a local launch is unchanged either way
+            code, out, err = self.run_launch(text, cloud=False)
+            self.assertEqual(self.seen(code, out, err), want)
+            self.assertEqual(code, 0)
 
     def test_s5_a_check_that_ignores_the_line_is_caught(self):
         src = (BIN / "cloud_worker.py").read_text()
-        self.assertEqual(src.count("if needs is not None and not getattr(args, \"stack\", False):"), 1)
-        mutant = src.replace("if needs is not None and not getattr(args, \"stack\", False):", "if False:")
+        self.assertEqual(src.count(self.GUARD), 1)
+        scratch = Path(tempfile.mkdtemp(prefix="needs-mutant-", dir=str(self.home)))   # a copy outside the repository; the real file is never edited
+        shutil.copytree(str(BIN), str(scratch / "bin"), ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(str(BIN.parent / "cloud"), str(scratch / "cloud"), ignore=shutil.ignore_patterns("__pycache__"))
+        mutant = src.replace(self.GUARD, "if False:")
         self.assertNotEqual(mutant, src)
-        self.assertNotIn("needs is not None", mutant)   # the refusal test above fails on this source: it has no other way to refuse
+        (scratch / "bin" / "cloud_worker.py").write_text(mutant)
+        env = dict(os.environ)
+        done = subprocess.run([sys.executable, str(scratch / "bin" / "test-cloud-worker"), "TestNeedsDocker.test_s2_a_docker_brief_without_stack_is_refused_before_any_pod"],
+                              capture_output=True, text=True, env=env, timeout=600)
+        failing = 1 if (done.returncode != 0 and "AssertionError: 0 != 1" in done.stderr + done.stdout) else 0   # the refusal case sees exit 0: the pod was launched
+        print("%d of 1 mutants failing" % failing)
+        self.assertEqual(failing, 1, done.stdout + done.stderr)
 
 
 if __name__ == "__main__":
