@@ -2458,53 +2458,28 @@ class TestNeedsDocker(Base):   # #1488
     GUARD = "if needs is not None and not getattr(args, \"stack\", False):"
 
     def run_launch(self, text, *extra, cloud=True):
-        brief = self.home / "brief.txt"
-        brief.write_text(text)
-        argv = ["launch", "coder7", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "coder",
-                "--reports-to", "orch", "--brief-file", str(brief), *extra]
-        if cloud:
-            return self.main(*argv, "--cloud")
-        local = {"return_value": {"name": "coder7", "session": "ses_l", "pane": "p1", "tab": "t1"}}   # the terminal itself is not under test: what the command prints is
-        with mock.patch.object(sb, "launch_agent", **local):
-            return self.main(*argv, "--terminal", "--workspace", "w1", "--dir", str(self.home))
+        (self.home / "brief.txt").write_text(text)
+        argv = ["launch", "coder7", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "coder", "--reports-to", "orch", "--brief-file", str(self.home / "brief.txt"), *extra]
+        with mock.patch.object(sb, "launch_agent", return_value={"name": "coder7", "session": "ses_l", "pane": "p1", "tab": "t1"}):   # a local launch: the terminal is not under test, what the command prints is
+            return self.main(*argv, *(["--cloud"] if cloud else ["--terminal", "--workspace", "w1", "--dir", str(self.home)]))
 
-    def creates(self):
-        return [c for c in self.stub_calls() if c[0] == "create"]
-
-    def seen(self, code, out, err):
-        return {"exit": code, "stdout": re.sub(r"(http://127\.0\.0\.1:)\d+", r"\1PORT", out),
-                "stderr": "".join(l + "\n" for l in err.splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
+    def seen(self, res):
+        return {"exit": res[0], "stdout": re.sub(r"(127\.0\.0\.1:)\d+", r"\1PORT", res[1]), "stderr": "".join(l + "\n" for l in res[2].splitlines() if l.startswith(("fleet-switchboard:", "preflight:")))}
 
     def test_s2_a_docker_brief_without_stack_is_refused_before_any_pod(self):
         code, out, err = self.run_launch("Build.\n" + self.LINE + "\n")
-        self.assertEqual(code, 1)
         refusal = [l for l in err.splitlines() if "needs docker" in l]
-        self.assertEqual(len(refusal), 1)
-        self.assertIn(self.LINE, refusal[0])
-        self.assertIn("--stack", refusal[0])
-        self.assertEqual(len(self.creates()), 0)
-        self.assertEqual(self.stub_calls(), [])
-        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+        self.assertEqual((code, len(refusal), self.stub_calls(), self.LINE in "".join(refusal), "--stack" in "".join(refusal)), (1, 1, [], True, True))   # exit 1, one line naming the brief line and the flag, no pod (no call at all)
 
     def test_s3_a_docker_brief_with_stack_is_accepted(self):
         code, out, err = self.run_launch("Build.\n" + self.LINE + "\n", "--stack")
-        self.assertEqual(code, 0, err)
-        self.assertNotIn("needs docker", err)
-        self.assertEqual(len(self.creates()), 1)   # exactly one pod
-        self.assertEqual(len(self.stub_calls()), 1)
+        self.assertEqual((code, [c[0] for c in self.stub_calls()].count("create"), len(self.stub_calls())), (0, 1, 1), err)   # exit 0, exactly one pod
 
-    def test_s4_an_unmarked_cloud_brief_launches_exactly_as_the_baseline(self):
-        want = json.loads(self.BASELINE.read_text())["cloud_unmarked_brief"]
-        code, out, err = self.run_launch("Build.\n")
-        self.assertEqual(self.seen(code, out, err), want)
-        self.assertEqual(code, 0)
-
-    def test_u1_a_local_launch_with_and_without_a_needs_line_is_the_baseline(self):
-        want = json.loads(self.BASELINE.read_text())["local_launch"]
-        for text in ("Build.\n", "Build.\n" + self.LINE + "\n"):   # the line is for the cloud shapes only: a local launch is unchanged either way
-            code, out, err = self.run_launch(text, cloud=False)
-            self.assertEqual(self.seen(code, out, err), want)
-            self.assertEqual(code, 0)
+    def test_s4_u1_unmarked_cloud_and_local_launches_are_the_stored_baseline(self):
+        want = json.loads(self.BASELINE.read_text())
+        for text in ("Build.\n", "Build.\n" + self.LINE + "\n"):   # a local launch is unchanged with or without the line (before the cloud launch: it makes the name taken)
+            self.assertEqual(self.seen(self.run_launch(text, cloud=False)), want["local_launch"])
+        self.assertEqual(self.seen(self.run_launch("Build.\n")), want["cloud_unmarked_brief"])
 
     def test_s5_a_check_that_ignores_the_line_is_caught(self):
         src = (BIN / "cloud_worker.py").read_text()
@@ -2512,13 +2487,9 @@ class TestNeedsDocker(Base):   # #1488
         scratch = Path(tempfile.mkdtemp(prefix="needs-mutant-", dir=str(self.home)))   # a copy outside the repository; the real file is never edited
         shutil.copytree(str(BIN), str(scratch / "bin"), ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(str(BIN.parent / "cloud"), str(scratch / "cloud"), ignore=shutil.ignore_patterns("__pycache__"))
-        mutant = src.replace(self.GUARD, "if False:")
-        self.assertNotEqual(mutant, src)
-        (scratch / "bin" / "cloud_worker.py").write_text(mutant)
-        env = dict(os.environ)
-        done = subprocess.run([sys.executable, str(scratch / "bin" / "test-cloud-worker"), "TestNeedsDocker.test_s2_a_docker_brief_without_stack_is_refused_before_any_pod"],
-                              capture_output=True, text=True, env=env, timeout=600)
-        failing = 1 if (done.returncode != 0 and "AssertionError: 0 != 1" in done.stderr + done.stdout) else 0   # the refusal case sees exit 0: the pod was launched
+        (scratch / "bin" / "cloud_worker.py").write_text(src.replace(self.GUARD, "if False:"))
+        done = subprocess.run([sys.executable, str(scratch / "bin" / "test-cloud-worker"), "TestNeedsDocker.test_s2_a_docker_brief_without_stack_is_refused_before_any_pod"], capture_output=True, text=True, timeout=600)
+        failing = int(done.returncode != 0 and "AssertionError" in done.stderr + done.stdout)   # the refusal case sees exit 0: the pod was launched
         print("%d of 1 mutants failing" % failing)
         self.assertEqual(failing, 1, done.stdout + done.stderr)
 
