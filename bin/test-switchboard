@@ -18048,6 +18048,7 @@ class TestGitStashGuard(Base):
                 self.assertRegex(text, re.compile(r"never `git stash`.{0,600}scratch branch", re.I))
 
 
+TestGhShimSign = importlib.import_module("test_gh_shim_sign").TestGhShimSign
 class TestSignedComments(HandoffCase):
     """The trial's agents share the user's GitHub account, so an agent's comment came back to it as a wake.
     A comment the switchboard posts is signed, and a signed comment is never an event."""
@@ -67804,6 +67805,7 @@ TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJ
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 # The reminder-cancel tests of #1401.
 _reminder_cancel = importlib.import_module("test_reminder_cancel")

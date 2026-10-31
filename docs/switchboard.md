@@ -5501,6 +5501,35 @@ The Chief of Staff's permission list gains: **`fleet-switchboard disk *`** (the 
 
 **The gh shim picks the account of the repo a command NAMES for a caller with no repo of its own** (the Chief of Staff): for `gh issue ...` and `gh pr ...` commands, never `merge`, that carry `-R`/`--repo` (or `--repo=`, `-Rowner/repo`), or an issue or pull request URL as the target right after the verb, `gh_users` is consulted for THAT repo, reads and writes alike. The repo is read only from the real flag or that target: never from a `--body`, `--title` or other flag's value, and two different repos named give none. A caller that has a repo of its own keeps its own account. `whoami --json` now carries `own`: false when the repo it prints is only the config's `intent_repo` default (the Chief of Staff has no repo of its own, and before this the default repo's account was used for everything it ran), and the shim then treats the caller as having none, using the named repo's account when a command names one and the default's otherwise. Nothing else (`repo`, `secret`, `workflow`, `run`, `api`, `merge`) picks an account by what it names. It fails closed like the #270 rule: a write whose token cannot be had is refused with `gh: account lookup failed, retry`; a read still falls through. It is a convenience for a caller that works across accounts, not a boundary.
 
+### Every form the gh shim signs (#1638)
+
+A comment a fleet account writes through `shims/gh` carries `<!-- fleet-switchboard:from=NAME -->` (NAME is the caller's fleet name, or `agent` when `whoami` fails: an unknown sender is signed, never refused). The eleven signed forms:
+
+1. `gh issue comment` (`--body`, `-b`, `--body-file`, `-F`, stdin)
+2. `gh pr comment` (same flags)
+3. `gh pr review` (same flags)
+4. `gh issue create` (same flags)
+5. `gh pr create` (same flags)
+6. `gh issue close` with `--comment`, `--comment=x`, `-c` or `-cx`
+7. `gh pr close` with the same comment flags
+8. `gh api` POST or PATCH to `repos/O/R/issues/N/comments` with a `body` field
+9. `gh api` POST or PATCH to `repos/O/R/issues/comments/ID` with a `body` field
+10. `gh api` POST or PATCH to `repos/O/R/pulls/N/comments` with a `body` field
+11. `gh api` POST or PATCH to `repos/O/R/pulls/N/reviews` with a `body` field
+
+For `gh api` the field is `-f`, `-F`, `--field` or `--raw-field` named `body` (`-F body=@file` and `@-` are read and signed). A body that already carries a marker is not signed again. Every other call, including a `gh api` read, another endpoint, a call with no body field and one with `--input`, runs the real `gh` unchanged. **A signed form whose body cannot be read (an unreadable body file, an error while signing) is refused with one line, a non-zero exit and nothing posted: it is never posted unsigned.** A form with no body flag at all (`--editor`, a close with no comment) is passed through. Not covered: `gh api --input`, `pulls/comments/ID` and reply endpoints, bundled short flags (`-dcx`), and a flag before the verb (`gh -R o/r issue comment`).
+
+| Input or outside call | Test (`tests/switchboard/test_gh_shim_sign.py`) | Run-by-hand mutant |
+|---|---|---|
+| the table `SIGNED_COMMANDS` | `test_the_five_old_forms_are_signed_as_before` | remove a pair from the set |
+| the table `CLOSE_COMMANDS` and `--comment`/`-c` | `test_the_close_forms_are_signed_in_every_spelling` | set it to `set()` |
+| the table `SIGNED_API`, the method and the field flags | `test_the_api_forms_are_signed_in_every_field_spelling`, `test_unrelated_calls_are_passed_byte_for_byte` | change a pattern; make the endpoint test `if False` |
+| a body file, stdin, `@file`, `@-` | `test_a_body_file_and_stdin_are_signed_and_the_temporary_file_is_removed`, `test_an_api_body_file_and_stdin_are_signed` | skip the temporary file's removal |
+| an unreadable body | `test_a_body_that_cannot_be_read_is_refused_and_nothing_is_posted` | return None from `read_text` failures |
+| a marked body | `test_a_marked_body_is_not_signed_twice` | drop the `SIGNED_RE` check in `sign` |
+| `whoami` (outside call) | `test_an_unknown_sender_is_signed_as_agent_and_never_refused` | make a failed lookup raise |
+| the real `gh` | the fake real `gh` of the test file records argv, stdin and files | none |
+
 ### Headless workers: presence from the service, not from a terminal (#433)
 
 A worker is a session in the OpenCode service; a terminal is only a way to watch it. A worker with no terminal is **headless**. herdr knows nothing about it, so what it is doing comes from the service alone, by ONE rule in `bin/agent_presence.py` (measured in a spike on a throwaway profile of the live version, never on the live service):
@@ -6168,6 +6197,7 @@ At delivery, and only there, each alert or digest is judged once:
 
 - **Sent time first.** The first line of every delivered message gives when its facts were sent before when it was delivered: `(sent 12:00Z, delivered 12:10Z)`. A merged wake fact keeps the sent time of its oldest member.
 - **Delayed.** An alert or digest older than 30 minutes at delivery marks the first line `delayed: sent HH:MMZ` (the oldest late one), for example `(delayed: sent 17:16Z, delivered 08:00Z)`. The lag is made visible, not removed: the hold, batch and retry rules are unchanged.
+- **Every kind, once (#1564).** Every delivered message older than 30 minutes at delivery carries the same `delayed: sent HH:MMZ` mark in its first line, whatever its kind: a peer `send`, a `report`, a `notice`, a standing order, an alert, a digest. The rule is the one above (`DELAYED_AFTER`, `delayed_since`, `in_late_scope`); the time shown is when the sender sent it, so a retry never moves it. A kind that carries its own mark keeps only that: a reminder says `(late by N min)` from 5 minutes and gets no second mark. A message delivered within 30 minutes is unchanged.
 - **Stale alerts are dropped.** The alert's subject is read once at delivery through the one present-state read #1378 uses (`present_record`, a pull request or an issue; one read per subject, at most 10 per delivery, never a write). It is dropped when it is no longer true: a red check on a head that is no longer the head, or on a pull request now closed or merged; an issue alert whose issue is now closed or lacks the label; a standing-line alert whose issue now has a standing line in its body. A dropped fact is audited (`stale.dropped`: the fact, why, when it was sent), acknowledged (its source forgets it) and never delivered. A message made only of dropped facts is not sent.
 - **A read that fails delivers, never drops.** The alert is delivered marked `[unverified: its present state could not be read]`. A process with no GitHub hub reads nothing and delivers as made.
 - **A digest older than 6 hours is replaced.** When a newer digest is pending for the same recipient, a digest older than 6 hours is dropped with a `stale.dropped` audit line (kind `digest`, the old digest's key). With no newer digest it is delivered marked delayed: nothing is lost.
@@ -6376,7 +6406,31 @@ The four kinds it sends for:
 
 A worker the cloud launcher ends (idle, hard limit, pod gone, failed pod) is announced by the launcher's sender (#1480), not here. Tests: `tests/switchboard/test_lost_worker.py`.
 
-**Bounds of the alert (read round, #1481).** At most 10 individual alerts a pass; one more message to the Chief of Staff says how many more there are (`N more lost worker(s)`), and those are alerted on the following passes, 10 at a time, with the count left; none is dropped or repeated (the mark is written before the send). With no usable memory (the first pass ever, or after a corrupt memory) only workers created in the last hour are alerted; with a valid memory every loss since it is alerted, a restart gap included. An unreadable `lost-workers.json` makes that pass alert nothing and write one audit line (`lost_worker.memory_corrupt`); the file is set aside as `lost-workers.json.corrupt` and the next pass writes a fresh memory, so later losses are alerted. A worker name is cleaned (control characters removed) and capped at 80 characters in every message. A local worker is worded `possibly lost` (absent from discovery, not known dead). The memory file is mode 0600 and synced before it replaces the old one.
+**Bounds of the alert (read round, #1481).** At most 10 individual alerts a pass; one more message to the Chief of Staff says how many more there are (`N more lost worker(s)`), and those are alerted on the following passes, 10 at a time, with the count left; none is dropped or repeated (the mark is written before the send). With no usable memory (the first pass ever, or after a corrupt memory) only workers created in the last hour are alerted; with a valid memory every loss since it is alerted, a restart gap included. An unreadable `lost-workers.json` makes that pass alert nothing and write one audit line (`lost_worker.memory_corrupt`); the file is set aside as `lost-workers.json.corrupt` and the next pass writes a fresh memory, so later losses are alerted. A worker name is cleaned (control characters removed) and capped at 80 characters in every message. A local worker is worded `possibly lost` (absent from discovery, not known dead). The memory file is mode 0600 and synced before it replaces the old one. Bad entries of every memory key (`alerted` and `reaper_ok` included) are dropped in the one place the memory is loaded, and the test is complete by construction: it derives the keys the code reads with `ast` and fails for a key with no row in its bad-value table, and a mutant that skips the check of any one key is caught.
+**Recency on every pass, one outage one message (#1658).** Cause, from the case of 30 Oct: the detector reads each audit at most `READ_BYTES` (1 MiB) a pass, so a 3 MiB launcher audit is caught up over three passes, and the recency window `RECENT_SECONDS` (one hour) applied only on the one pass that found no memory file; the failed reaper lines of the second and third chunks were each alerted as a new `reaper_missed` message. Closed rule, known limits first: a failed reaper line is a new alert only when its own time is younger than `RECENT_SECONDS`, on every pass; a malformed reaper record gives no alert (fails closed); a line that is only late by more than an hour is summed, not alerted.
+
+- One outage, one message: failed lines read in a pass, and those of later passes before the reaper passes again, are one outage (`reaper_outage` in the memory: first, latest, count, reason, sent, closed_by). The first pass with a recent failure sends ONE message with the count, the first and latest time and the latest reason; later failures of the outage update the stored count and send nothing; an `ok` reaper line later than the latest failure closes it, and the next failure opens a new one with a new message.
+- Gap summary: older failed lines are summed in `reaper_gap` (count, first, latest, reason) and ONE message `[lost worker] reaper: N failed reaper line(s) while the detector was down or before this pass, first T, latest T, latest reason R` is sent when a pass has read both audits to their end; the record is then cleared. A daemon down for more than an hour still says, once, how many failures it missed.
+- The other kinds: during a catch-up the same window applies (to the time the memory holds for the loss: the pod's creation line, the refused line, the last time a local worker was seen alive). A catch-up is a pass with no usable memory and every later pass until both files are read to their end: the `catchup` flag of the memory is set ONLY on a pass with no usable memory (a valid memory restarted behind on a large audit never sets it) and cleared only by a pass that reads both files to their end; a file that exists but cannot be read counts as not at its end, a missing file as at its end. Outside a catch-up a valid memory alerts every loss since, a restart gap included.
+- A memory written by earlier code (a `reaper` table, `reaper_missed:` keys) loads and is never alerted from.
+- Malformed records are dropped, never raised on: `reaper_outage` and `reaper_gap` must be objects with numeric `first` and `latest` (finite, 0 to 4102444800, not a boolean), an integer `count` of 1 to 1000000, a string `reason` (and for the outage a boolean `sent`); one that fails is dropped and the pass goes on; `reaper_new` that is not a list becomes empty.
+
+| Before | After |
+|---|---|
+| a restart on an old audit replays each old failed reaper line as a new alert | old lines are one gap summary message; none alerted of its own |
+| 5 failed lines read in one pass: 5 messages | one message naming 5, first, latest, reason |
+| failure, then later failures of the same outage: a message each | nothing until an `ok` line and a new failure |
+
+| Input or outside call | Test | Run-by-hand mutant |
+|---|---|---|
+| launcher audit reaper lines (`runtime_id` `reaper`, ok or failed), read in chunks of `READ_BYTES` | `test_s2_old_failed_reaper_lines_are_never_alerted_on_any_pass`, `test_s3_one_outage_one_message_until_the_reaper_passes_again` | the window applied only on the first pass; one message per line |
+| switchboard audit lines (created, create_failed) in a catch-up | `test_s4_catch_up_applies_the_recency_rule_to_every_kind` | never clearing `catchup` |
+| `lost-workers.json` (`reaper_outage`, `reaper_gap`, `catchup`, old `reaper` table) | `test_s6_a_detector_down_for_hours_says_once_how_many_it_missed`, `test_u1_a_memory_written_by_the_old_code_is_never_re_alerted_from` | old lines dropped with no summary; one message per old line |
+| `lost-workers.json` with wrong types (every key; `alerted` and `reaper_ok` included) | `test_malformed_memory_is_dropped_and_alerting_goes_on`, `test_every_memory_key_is_cleaned_in_one_place_and_the_table_is_complete_by_construction`, `test_skipping_the_check_of_any_one_memory_key_is_caught` | validation removed |
+| a valid memory with an audit more than `READ_BYTES` behind (`catchup`) | `test_the_catch_up_flag_is_set_only_with_no_usable_memory` | flag set on every pass |
+| a launcher file that exists but cannot be read, or is missing | `test_a_launcher_file_that_exists_but_cannot_be_read_is_not_the_end` | unreadable file counted as the end |
+| the sends to the lane and the Chief of Staff | the same tests, through the fake engine | `test_the_new_tests_pass_on_the_real_module_and_each_mutant_is_caught` plants the four mutants on a copy |
+
 ## The installed tree is the default branch, clean (#1380)
 
 The tree the fleet's commands and the daemon run from (the checkout `fleet-switchboard install` was run from) must be the default branch, clean, so no command, verdict or merge gate is computed by code from an unmerged branch.
