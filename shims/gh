@@ -1323,15 +1323,6 @@ def api_parse(args):
 
 
 _api_parse_raw = api_parse
-API_HOST_RE = re.compile(r"^https://api\.github\.com(?=[/?#]|$)", re.I)
-
-
-def api_endpoint(text):
-    """An endpoint positional in one spelling: the https://api.github.com host (any case) is dropped, and any spelling of graphql (slashes, ?query,
-    #fragment, case) becomes the bare word graphql. Other hosts and other paths are left as they are."""
-    short = API_HOST_RE.sub("", text, count=1)
-    bare = short.split("#", 1)[0].split("?", 1)[0].strip("/").lower()
-    return "graphql" if bare == "graphql" else short
 
 
 def api_parse(args):
@@ -1436,7 +1427,7 @@ def graphql_call(args):
     """A `gh api graphql` call whose query names a body-writing mutation is refused (Refused); a query that cannot be read is refused. Else None
     (when stdin was read for the query it is passed on)."""
     positionals, _method, fields = api_parse(args)
-    if "graphql" not in positionals:
+    if "graphql" not in positionals and UNKNOWN_ENDPOINT not in positionals:
         return None
     texts, stdin_text = [], None
     for _i, flag, _inline, text in fields:
@@ -1558,7 +1549,7 @@ def sign_plan(args, lookup):
         return _sign_plan_now(args, lookup)
     except Unsignable as err:
         core = args[leading_repo_flags(args):]
-        if not core or core[0] != "api" or "graphql" not in api_parse(core)[0]:
+        if not core or core[0] != "api" or not (api_gated(core) or isinstance(err, Refused)):
             raise
         late = DeferredRefusal((list(args), None, None))
         late.err = err
@@ -1566,23 +1557,95 @@ def sign_plan(args, lookup):
 
 
 # ---- #1696 round 2 (H4, M1): wrappers over the defs above; new lines only.
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
-_api_endpoint_old = api_endpoint
+UNKNOWN_ENDPOINT = "\x00unknown"
+REST_ROOTS = (API_TOP - {"graphql"}) | {"repos"}
+
+
+def api_clean(text):
+    """The endpoint positional with backslashes made slashes and percent escapes decoded repeatedly until stable (at most 5 rounds); None when the path part
+    holds a control character or whitespace, an undecodable or endless percent sequence."""
+    for _round in range(6):
+        text = text.replace("\\", "/")
+        head = re.split(r"[?#]", text, maxsplit=1)[0]
+        if any(ord(c) <= 0x20 or ord(c) == 0x7f for c in head):
+            return None
+        try:
+            decoded = unquote(text, errors="strict")
+        except UnicodeDecodeError:
+            return None
+        if decoded == text:
+            return None if "%" in head else text
+        text = decoded
+    return None
 
 
 def api_endpoint(text):
-    """M1: an https URL whose parsed host is exactly api.github.com (any case; userinfo, port 443 and a trailing dot allowed) is reduced to its path, query
-    and fragment, then treated like the old spelling rules. Any other host, scheme or port is left untouched (not GitHub)."""
-    try:
-        parts = urlsplit(text)
-        host, port = parts.hostname, parts.port
-    except ValueError:
-        return _api_endpoint_old(text)
-    if parts.scheme.lower() == "https" and host and host.rstrip(".") == "api.github.com" and port in (None, 443):
-        rest = parts.path + ("?" + parts.query if parts.query else "") + ("#" + parts.fragment if parts.fragment else "")
-        return _api_endpoint_old("https://api.github.com" + rest)
-    return _api_endpoint_old(text)
+    """DECIDE BY MEANING: one canonical form of an endpoint positional. An https or http URL (or //host) whose parsed host is exactly api.github.com (any case,
+    userinfo, port 443 and a trailing dot allowed) is reduced to its path. A positional of ANY other host is not GitHub's and is returned untouched (the call goes
+    to the user's own gh with that host: kept as it was, whatever the path says). Else the path (; params, ?query, #fragment dropped, dot segments resolved,
+    leading slashes stripped, lower case) is classified: graphql -> the bare word graphql; a known REST root -> that canonical path (the signed comment shapes
+    match it once); anything else, or text that cannot be cleaned -> UNKNOWN_ENDPOINT."""
+    clean = api_clean(text)
+    if clean is None:
+        return UNKNOWN_ENDPOINT
+    path = clean
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", clean) or clean.startswith("//"):
+        try:
+            parts = urlsplit(clean)
+            host, port = parts.hostname, parts.port
+        except ValueError:
+            return UNKNOWN_ENDPOINT
+        if parts.scheme.lower() not in ("", "https", "http") or not host or host.rstrip(".") != "api.github.com" or port not in (None, 443):
+            return text
+        path = parts.path
+    path = re.split(r"[?#]", path, maxsplit=1)[0]
+    path = "/".join(seg.split(";", 1)[0] for seg in path.split("/"))
+    path = posixpath.normpath("/" + path).lstrip("/").lower()
+    first = path.split("/", 1)[0]
+    if first == "graphql":
+        return "graphql"
+    return path if first in REST_ROOTS else UNKNOWN_ENDPOINT
+
+
+def query_texts_inline(fields):
+    return [text.partition("=")[2] for _i, _flag, _inline, text in fields if text.partition("=")[0] == "query" and "=" in text]
+
+
+def api_gated(args):
+    """True when the endpoint is graphql or not classifiable (graphql_call decides by the request text)."""
+    positionals = api_parse(args)[0]
+    return "graphql" in positionals or UNKNOWN_ENDPOINT in positionals
+
+
+def rest_query_refusal(args):
+    """Endpoint-agnostic backstop for a REST-shaped endpoint: an inline query field naming a body mutation is refused. A REST write that is no comment form
+    and no such text is never refused."""
+    positionals, _method, fields = api_parse(args)
+    if not any(p.split("/", 1)[0] in REST_ROOTS for p in positionals):
+        return
+    mutation_refusal(query_texts_inline(fields))
+
+
+def mutation_refusal(texts):
+    for mutation in GRAPHQL_BODY_MUTATIONS:
+        if any(re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % mutation, t, re.I) for t in texts):
+            raise Refused("the GraphQL mutation %s writes a body that cannot be signed and nothing was posted; use %s"
+                          % (mutation, GRAPHQL_BODY_MUTATIONS[mutation]))
+
+
+_api_call_now = api_call
+
+
+def api_call(args, namer):
+    """The classes of the endpoint: graphql and UNKNOWN go to graphql_call (the request text decides); a REST shape is checked for a mutation in an inline
+    query field, then handled as before (the signed comment shapes are signed). An endpoint of another host is left alone (the user's own gh)."""
+    if args and args[0] == "api":
+        if api_gated(args):
+            return graphql_call(args)
+        rest_query_refusal(args)
+    return _api_call_now(args, namer)
 
 
 _graphql_call_old = graphql_call
@@ -1615,7 +1678,7 @@ def graphql_temp_copy(path, temps):
 def graphql_call(args):
     """H4: the query files (-F query=@file, --input FILE) are read once, as regular files, and the real gh gets temp copies of those bytes."""
     positionals, _method, fields = api_parse(args)
-    if "graphql" not in positionals:
+    if "graphql" not in positionals and UNKNOWN_ENDPOINT not in positionals:
         return None
     new, temps = list(args), []
     try:
