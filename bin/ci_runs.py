@@ -39,6 +39,8 @@ def _time(text):
 
 def _unfinished(entry):
     """True for a run that has not completed: its status says so, or it is a status context still pending or expected."""
+    if str(entry.get("conclusion") or "").upper() == "SUCCESS":
+        return False   # #1625: a conclusion of success is complete, whatever a stuck status says
     if entry.get("status") not in (None, "COMPLETED"):
         return True
     return str(entry.get("conclusion") or entry.get("state") or "").upper() in ("PENDING", "EXPECTED") and not entry.get("conclusion")
@@ -79,6 +81,7 @@ UNREADABLE = "IDENTITY_UNREADABLE"   # status given to a run whose workflow iden
 _CACHE = {}   # (owner/repo, run id) -> (workflow id, event); a run's workflow never changes, so one bounded read per distinct run
 _PATH = {}   # (owner/repo, run id) -> workflow file path, read with the identity
 _FAILED = {}   # (owner/repo, run id) -> monotonic time of a failed read: not retried before FAIL_WINDOW passes
+GH = None   # the real gh by path (config["gh"]), set by the daemon's config load (#1216); None: no read is made (fails closed), never a bare "gh" that would reach the shim as an agent call
 READER = None   # tests (or a caller with its own gh runner) set a function (repo, run id) -> (workflow id, event) or None
 READ_CAP = 10   # at most this many gh reads per call; the other distinct runs are marked unreadable (fail closed)
 CACHE_MAX = 512   # entries of _CACHE (and of _FAILED); the oldest is dropped first
@@ -117,8 +120,10 @@ def _read_run(repo, run):
     """ONE bounded read of a run: (workflow id, event) from `gh api repos/<repo>/actions/runs/<id>`, or None when it cannot be read."""
     import json
     import subprocess
+    if not GH:
+        return None
     try:
-        done = subprocess.run(["gh", "api", "repos/%s/actions/runs/%d" % (repo, run), "--jq", "{w: .workflow_id, e: .event, p: .path}"],
+        done = subprocess.run([GH, "api", "repos/%s/actions/runs/%d" % (repo, run), "--jq", "{w: .workflow_id, e: .event, p: .path}"],
                               capture_output=True, text=True, timeout=READ_TIMEOUT)
         data = json.loads(done.stdout) if done.returncode == 0 else None
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -263,6 +268,19 @@ def not_green_runs(rollup):
         if _unfinished(e) or word not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
             name = e.get("workflowName")
             bad.append((_clean(name) if isinstance(name, str) and name else "", _run_id(e), (word or str(e.get("status") or "pending")).lower()))
+    return bad
+
+
+def not_green_jobs(rollup):
+    """[(workflow, job name, run id, state)] of the latest checks that are not complete and green, for the ci-record refusal (#1625). The names are
+    author-controlled text: sanitised, quoted and bounded as `_clean` does. A check whose conclusion is success is never listed."""
+    bad = []
+    for e in newest(rollup):
+        word = str(e.get("conclusion") or e.get("state") or "").upper()
+        if _unfinished(e) or word not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            name, job = e.get("workflowName"), e.get("name") or e.get("context")
+            bad.append((_clean(name) if isinstance(name, str) and name else "", _clean(job) if isinstance(job, str) and job else "", _run_id(e),
+                        (word or str(e.get("status") or "pending")).lower()))
     return bad
 
 
