@@ -2179,8 +2179,11 @@ class TestArchTools(unittest.TestCase):
 
     def test_without_the_rule_the_comparison_with_the_warning_registry_present_fails(self):
         expected = sorted(dir(self.scratch_module()))
+        self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected, "the control: the unmutated rule gives the expected names")
         with mock.patch.object(type(self), "INTERPRETER_ADDED", frozenset()):
-            self.assertNotEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
+            with self.assertRaises(AssertionError) as caught:
+                self.assertEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
+        self.assertIn("__warningregistry__", str(caught.exception), "the mutant's failure names the planted name")
 
     def tool(self, name, *args):
         return subprocess.run([sys.executable, "-B", str(REPO / "tools" / name)] + [str(a) for a in args], capture_output=True, text=True)
