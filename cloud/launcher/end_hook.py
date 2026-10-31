@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 
 SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "*credentials*",
                 "*secret*", "*.kubeconfig", "kubeconfig", ".netrc", ".npmrc"]
@@ -94,23 +95,57 @@ class GitFailed(RuntimeError):
 
 
 REFUSAL_LINES, REFUSAL_CHARS, REMOVED = 8, 600, "<removed>"
-# A key-shaped run: a token prefix, a long hex run, or a long token-like run; an address with a credential (user:pass@); any control character.
-_KEYLIKE_RE = re.compile(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{6,}|[0-9A-Fa-f]{32,}|[A-Za-z0-9+_=-]{32,}")
+# Classes of the scrub (each replaced by a fixed word): (i) a prefixed token (gh[pousr]_ or github_pat_; sk- or xox?-; AKIA + 16; a JWT),
+# (ii) a run of 24 or more of letters, digits and + / _ = . - that holds a digit or an upper-case letter, (iii) an address with a credential,
+# (iv) a control character. Every line is NFKC-normalised first; a second pass over the lines joined with no separator catches a run split over two lines.
+_PREFIXED_RE = re.compile(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|(?<![A-Za-z0-9])(?:sk-|xox[a-z]-)[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}")
+_RUN_RE = re.compile(r"[A-Za-z0-9+/_=.-]{24,}")
+_MIXED_RE = re.compile(r"[0-9A-Z]")
 _CREDURL_RE = re.compile(r"(?<=://)[^/\s@]*@")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
 
 
+def _secret_spans(text):
+    """The (start, end) of every class (i) and class (ii) run in the text."""
+    spans = [m.span() for m in _PREFIXED_RE.finditer(text)]
+    spans += [m.span() for m in _RUN_RE.finditer(text) if _MIXED_RE.search(m.group())]
+    return spans
+
+
 def scrub_line(line):
-    """Free text from git made safe to keep: key-shaped runs, a credential in an address and control characters become a fixed word."""
-    line = _CONTROL_RE.sub(" " + REMOVED + " ", line)
+    """Free text from git made safe to keep: a prefixed token, a long mixed run, a credential in an address and control characters become a fixed word."""
+    line = _CONTROL_RE.sub(" " + REMOVED + " ", unicodedata.normalize("NFKC", line))
     line = _CREDURL_RE.sub(REMOVED + "@", line)
-    return _KEYLIKE_RE.sub(REMOVED, line)
+    out, pos = [], 0
+    for a, b in sorted(_secret_spans(line)):
+        if b <= pos:
+            continue
+        if a >= pos:
+            out.append(line[pos:a])
+            out.append(REMOVED)
+        pos = b
+    return "".join(out) + line[pos:]
+
+
+def scrub_lines(lines):
+    """Every line scrubbed, and a run of class (i) or (ii) that spans the boundary of two lines replaces both lines."""
+    norm = [_CONTROL_RE.sub(" " + REMOVED + " ", unicodedata.normalize("NFKC", l)) for l in lines]
+    joined, bounds, n = "".join(norm), [], 0
+    for l in norm:
+        bounds.append((n, n + len(l)))
+        n += len(l)
+    hit = set()
+    for a, b in _secret_spans(joined):
+        touched = [i for i, (s, e) in enumerate(bounds) if s < b and e > a]
+        if len(touched) > 1:
+            hit.update(touched)
+    return [REMOVED if i in hit else scrub_line(l) for i, l in enumerate(norm)]
 
 
 def refusal_text(lines):
-    """The last REFUSAL_LINES lines of git's standard error, each scrubbed, joined on one line with ' | ', at most REFUSAL_CHARS characters;
-    the last (summary) line is always last, and the earlier lines that do not fit whole are dropped, oldest first."""
-    take = [scrub_line(l) for l in lines[-REFUSAL_LINES:]]
+    """The last REFUSAL_LINES lines of git's standard error, scrubbed first (the whole answer, then bounded), joined on one line with ' | ', at most
+    REFUSAL_CHARS characters; the last (summary) line is always last, and the earlier lines that do not fit whole are dropped, oldest first."""
+    take = scrub_lines(lines)[-REFUSAL_LINES:]
     out = take[-1][:REFUSAL_CHARS]
     for l in reversed(take[:-1]):
         if len(l) + 3 + len(out) > REFUSAL_CHARS:
