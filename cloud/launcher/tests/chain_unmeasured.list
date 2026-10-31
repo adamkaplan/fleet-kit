@@ -12,6 +12,7 @@ cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
 cloud/launcher/tests/test_render_namespace.py
 cloud/launcher/tests/test_scratch_clean.py
+cloud/launcher/tests/test_self_registering_isolation.py
 cloud/launcher/tests/test_stop_no_checkout.py
 cloud/launcher/tests/test_token_at_limit.py
 cloud/worker/tests/test_cloud_prepush_background.py
