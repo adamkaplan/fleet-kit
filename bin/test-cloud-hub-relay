@@ -739,6 +739,41 @@ class TestEventWait(unittest.TestCase):
         self.assertTrue(control_ok)
         self.assertIn("a held relay call ended before all 16 were registered", mutant_text or "")
 
+    def test_s7_over_admission_is_seen_as_an_event_and_a_dead_observation_falls_to_the_guard(self):
+        import inspect, textwrap
+        name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+
+        def run(case, meth, remove_admit):
+            old = cloud_relay.Relay.admit
+            if remove_admit:
+                cloud_relay.Relay.admit = lambda self: True
+            try:
+                meth()
+                return None
+            except BaseException as e:   # the kind and text of the failure
+                return e
+            finally:
+                cloud_relay.Relay.admit = old
+                case.doCleanups()
+        case = TestBoundsAndCaps(name)
+        e1 = run(case, getattr(case, name), True)
+        m_over = int(isinstance(e1, AssertionError) and "over-admitted" in str(e1))
+        m_timeout = int(isinstance(e1, TimeoutError) or (e1 is not None and "timed out" in str(e1)))
+        case = TestBoundsAndCaps(name)
+        control = int(run(case, getattr(case, name), False) is None)
+        src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__[name]))
+        self.assertEqual(src.count("over.set()"), 1)
+        self.assertEqual(src.count("30.0"), 1)
+        dead_src = src.replace("over.set()", "pass").replace("30.0", "2.0")
+        ns = dict(globals())
+        exec(compile(dead_src, "<dead-observation>", "exec"), ns)
+        case = TestBoundsAndCaps(name)
+        e3 = run(case, lambda: ns[name](case), True)
+        dead = int(isinstance(e3, AssertionError) and "wait_for: the state was not reached" in str(e3))
+        applied = dead_src != src
+        print("S7: mutant fails %d of 1 with over-admitted and %d of 1 with a TimeoutError, control passes %d of 1, dead observation fails %d of 1 with the guard text, mutations applied %s" % (m_over, m_timeout, control, dead, applied))
+        self.assertEqual((m_over, m_timeout, control, dead, applied), (1, 0, 1, 1, True))
+
     def test_s5_control_passes_and_existing_cap_mutant_is_caught(self):
         name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
         res = unittest.TestResult(); TestBoundsAndCaps(name).run(res)
