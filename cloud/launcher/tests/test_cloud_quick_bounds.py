@@ -81,15 +81,15 @@ class TestClamp(Mini):
     def test_total_never_exceeds_bound_plus_grace(self):
         p, secs = self.run_pre(self.r, PRE, 4)
         self.assertLess(secs, 4 + 8, p.stdout)
-        self.assertIn("NOT RUN", p.stdout)
-        self.assertEqual(p.returncode, 1)
+        self.assertIn("NOT RUN (budget)", p.stdout)
+        self.assertEqual(p.returncode, 3)
         self.assertNotIn("RESULT: PASS", p.stdout)
 
     def test_mutant_without_clamp_fails(self):
         m = self.mutated("tmo = min(timeout, max(1, int(remaining))) if quick else timeout", "tmo = timeout")
         with open(m) as f:
             m1 = f.read()
-        m2 = m1.replace("tmo = min(timeout, max(1, int(QUICK_TOTAL - (time.monotonic() - t_start))))", "tmo = timeout")
+        m2 = m1.replace("tmo = min(timeout, max(1, int(QUICK_TOTAL - (clock() - t_start))))", "tmo = timeout")
         self.assertNotEqual(m2, m1)  # the second clamp is removed too
         write(m, m2)
         p, secs = self.run_pre(self.r, m, 4)
