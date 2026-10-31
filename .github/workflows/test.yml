@@ -222,6 +222,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: node --test plugins/fleet-decisions-tui/health.test.mjs
 
+      - name: node --test the other plugin tests
+        if: ${{ !cancelled() }}
+        run: node --test plugins/fleet-decisions-tui/click.test.mjs plugins/fleet-decisions-tui/kind.test.mjs plugins/fleet-hooks/index.test.mjs
+
       - name: bin/fleet-scenario validate
         if: ${{ !cancelled() }}
         run: bin/fleet-scenario validate
