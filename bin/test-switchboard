@@ -42301,6 +42301,8 @@ class TestLaunchRefusedMessage(TestLaunchMemoryGate):
 
     # A raise that says "created" about something else than the worker (checked before any pod exists); first 30 characters -> reason.
     CREATED_EXEMPT = {
+        '--persistent is only for --age': 'refused before any pod exists: it says nothing was created',
+        '--persistent does not combine ': 'refused before any pod exists: it says nothing was created',
         'the launch reservation of %s i': 'refused before any pod exists: it says nothing was created',
         '%s is not on the cloud allow-l': 'refused before any pod exists: it says nothing was created',
         'CW_ALLOWED_REPOS has an entry ': 'refused before any pod exists: it says nothing was created',
