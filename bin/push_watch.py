@@ -15,6 +15,7 @@ STATE_FILE = "push-watch.json"
 READ_BYTES = 1 << 20
 FIRST_BYTES = 4 << 20
 TOLD_MAX = 50
+COMMITS_MAX = 5
 SUBJECT_MAX = 100
 PATH_MAX = 120
 DEFAULTS = {"enabled": True, "interval": 60, "quiet_minutes": 10}
@@ -104,6 +105,10 @@ def item_text(worker, branch, sha, commit, kind="push", quiet=None, pushed_at=No
     files = commit.get("files") if isinstance(commit.get("files"), list) else []
     stats = commit.get("stats") if isinstance(commit.get("stats"), dict) else {}
     lines = sum(v for v in (stats.get("additions"), stats.get("deletions")) if isinstance(v, int) and not isinstance(v, bool))
+    if not stats:   # a compare read has per-file counts and no total
+        stats = {"additions": sum(f.get("additions", 0) for f in files if isinstance(f, dict) and isinstance(f.get("additions"), int)),
+                 "deletions": sum(f.get("deletions", 0) for f in files if isinstance(f, dict) and isinstance(f.get("deletions"), int))}
+        lines = sum(stats.values())
     paths = [_clean(f.get("filename", ""), PATH_MAX) for f in files[:3] if isinstance(f, dict)]
     message = ((commit.get("commit") or {}).get("message") or "") if isinstance(commit.get("commit"), dict) else ""
     subject = _clean(str(message).split("\n", 1)[0], SUBJECT_MAX)
@@ -147,31 +152,53 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 mem["noboss"] = True
                 engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": "no reports_to: tells no lane"})
             continue
-        try:
-            refs = gh("repos/%s/git/matching-refs/heads/%s" % (repo, name))
-        except Exception as err:
-            if not mem.get("failed"):
-                mem["failed"] = True
-                engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160)})
-            continue
-        mem.pop("failed", None)
-        for ref in _dicts(refs):
-            sha, branch = (ref.get("object") or {}).get("sha"), str(ref.get("ref", "")).replace("refs/heads/", "", 1)
+        wanted = [("repos/%s/git/matching-refs/heads/%s" % (repo, name), None)]
+        task = record.get("branch")
+        if isinstance(task, str) and task and not task.startswith(name):   # the TASK branch the pod pushes to (the launcher's --branch): its own exact read
+            wanted.append(("repos/%s/git/matching-refs/heads/%s" % (repo, task), task))
+        tips = {}
+        failed = False
+        for path_, exact in wanted:
+            try:
+                for ref in _dicts(gh(path_)):
+                    branch = str(ref.get("ref", "")).replace("refs/heads/", "", 1)
+                    if exact is None or branch == exact:
+                        tips[branch] = (ref.get("object") or {}).get("sha")
+            except Exception as err:
+                failed = True
+                if not mem.get("failed"):
+                    mem["failed"] = True
+                    engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160)})
+        if not failed:
+            mem.pop("failed", None)
+        for branch, sha in sorted(tips.items()):
             if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
                 continue
             b = mem.setdefault("branches", {}).setdefault(branch, {"told": []})
             if sha in b["told"]:
                 continue
+            prev = b.get("sha")
             try:
-                commit = gh("repos/%s/commits/%s" % (repo, sha))
+                if prev:   # every new commit since the last sha: ONE compare read, the newest COMMITS_MAX
+                    data = (_dicts(gh("repos/%s/compare/%s...%s" % (repo, prev, sha))) or [{}])[0]
+                    found = [c for c in data.get("commits", []) if isinstance(c, dict) and isinstance(c.get("sha"), str)][-COMMITS_MAX:]
+                    stats = data if data.get("files") is not None else {}
+                    batch = [(c["sha"], c) for c in found] or [(sha, data)]
+                else:
+                    commit = (_dicts(gh("repos/%s/commits/%s" % (repo, sha))) or [{}])[0]
+                    batch, stats = [(sha, commit)], commit
             except Exception as err:
                 engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160)})
                 continue
+            for csha, c in batch:
+                if csha in b["told"]:
+                    continue
+                b["told"] = (b["told"] + [csha])[-TOLD_MAX:]
+                text = item_text(name, branch, csha, dict(c, files=stats.get("files", c.get("files")), stats=stats.get("stats", c.get("stats"))) if len(batch) > 1 or prev else c)
+                tell(lane, text + (" (counts are those of the whole push)" if len(batch) > 1 else ""), name)
+                engine.audit.append(engine.actor, "push_watch.sent", name, {"to": lane, "sha": csha[:8]})
             b["told"] = (b["told"] + [sha])[-TOLD_MAX:]
             b["sha"], b["at"], b["quiet"] = sha, now, False
-            text = item_text(name, branch, sha, (_dicts(commit) or [{}])[0])
-            tell(lane, text, name)
-            engine.audit.append(engine.actor, "push_watch.sent", name, {"to": lane, "sha": sha[:8]})
         for branch, b in mem.get("branches", {}).items():
             minutes = (now - b.get("at", now)) / 60.0
             if b.get("sha") and not b.get("quiet") and state["reported"].get(name, 0) <= b.get("at", 0) and minutes >= cfg["quiet_minutes"]:
