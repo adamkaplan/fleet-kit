@@ -683,6 +683,92 @@ class M2L4DDocs(unittest.TestCase):
                 self.assertIn(phrase, t, path)
 
 
+class S10OneReader(Fixture):
+    """S10 (PC-2): one reader of a Failed pod's termination reason; the record and the status line carry what it returns."""
+    HOSTILE = {"phase": "Failed", "containerStatuses": [{"name": "worker", "state": {"terminated": {
+        "reason": "line1\nline2 " + chr(27) + "[31m " + PLANT + " " + "x" * 5000, "exitCode": 9}}}]}
+    COMPLET = {"phase": "Failed", "containerStatuses": [
+        {"name": "first", "state": {"terminated": {"reason": "Completed", "exitCode": 0}}},
+        {"name": "worker", "state": {"terminated": {"reason": "Error", "exitCode": 2}}}]}
+    SOURCES = (os.path.join(REPO_ROOT, "cloud", "launcher", "cloud_worker.py"), os.path.join(REPO_ROOT, "bin", "cloud_worker.py"))
+
+    @staticmethod
+    def readers(text):
+        """The number of functions (blocks from a 'def ' line to the next) whose body holds the key "terminated" or "exitCode"."""
+        blocks, cur = [], None
+        for line in text.splitlines():
+            if line.lstrip().startswith("def "):
+                cur = []
+                blocks.append(cur)
+            elif cur is not None:
+                cur.append(line)
+        return sum(1 for b in blocks if any('"terminated"' in l or '"exitCode"' in l for l in b))
+
+    def hostile_places(self, pods):
+        texts = []
+        for n in sorted(os.listdir(self.runs)):
+            with open(os.path.join(self.runs, n, "run.json")) as f:
+                texts.append(f.read())
+        for w in pods:
+            texts.append(self.run_cli("status", w)[1])
+        marks = ("line1\n", chr(27), PLANT, "x" * 10)
+        return sum(1 for t in texts for m in marks if m in t)
+
+    def run_pods(self):
+        pods = {w: CASES[w][0] for w in ("oomer", "evictd", "exiter")}
+        pods["hostile"] = self.HOSTILE
+        pods["complet"] = self.COMPLET
+        for w, st in pods.items():
+            self.fail(w, st)
+        self.reap()
+        recs = {r["worker"]: r for r in self.records()}
+        launcher = cw.Launcher(cw.Kube(self.env), self.env, self.clock)
+        good = 0
+        for w in pods:
+            reason, code = launcher._failed_facts(cw.pod_name(w))[:2]
+            line = json.loads(self.run_cli("status", w)[1])[0]["status_line"]
+            ok = (recs[w]["pod_failed_reason"] == reason and recs[w]["exit_code"] == code
+                  and line in ("pod failed: " + reason, "pod failed: " + reason[:160]))
+            if not ok:
+                self.fail_test = (w, reason, code, recs[w], line)
+            good += ok
+        return pods, good
+
+    def test_one_reader_five_pods_a_scan_and_two_mutants(self):
+        pods, good = self.run_pods()
+        self.assertEqual(good, 5, getattr(self, "fail_test", None))
+        hostile = self.hostile_places(pods)
+        self.assertEqual(hostile, 0)
+        found = 0
+        for path in self.SOURCES:
+            with open(path) as f:
+                found += self.readers(f.read())
+        self.assertEqual(found, 1, "readers found: %d" % found)
+        print("S10: pods giving the reader's reason and code in the record and the status line %d of 5, readers found %d (second readers %d), "
+              "hostile text in %d places" % (good, found, found - 1, hostile))
+        # (a) the scan mutant: a second small function appended to the source text, in memory
+        with open(self.SOURCES[0]) as f:
+            real = f.read()
+        mutant = real + "\n\ndef second_reader(t):\n    return t.get(\"exitCode\")\n"
+        self.assertEqual(self.readers(real), 1)
+        count = self.readers(mutant)
+        self.assertEqual(count, 2)
+        with self.assertRaises(AssertionError) as cm:
+            self.assertEqual(count, 1, "readers found: %d" % count)
+        self.assertIn("2", str(cm.exception))
+        caught_scan = 1
+        # (b) the hostile mutant: the raw reason, unscrubbed
+        old, new = "return self.kube.scrub(text, 300), code", "return text, code"
+        raw = mutated(cw.Launcher, "_failed_facts", old, new)
+        self.tearDown()
+        self.setUp()
+        with mock.patch.object(cw.Launcher, "_failed_facts", raw):
+            pods2, _ = self.run_pods()
+            places = self.hostile_places(pods2)
+        self.assertGreaterEqual(places, 1)
+        print("S10 mutants: control passes 1 of 1, scan mutant fails %d of 1 (second readers %d), hostile mutant caught %d of 1 "
+              "(hostile places %d), mutation applied %s" % (caught_scan, count - 1, int(places >= 1), places, old in inspect.getsource(cw.Launcher._failed_facts)))
+
 
 if __name__ == "__main__":
     unittest.main()
