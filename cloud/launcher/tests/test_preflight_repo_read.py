@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -417,6 +418,9 @@ class S4Real(Base):
 
 
 
+MINT_ROLES_TESTS = 32   # the plan's count: '32 of 32 tests of test_mint_roles pass'
+
+
 class S3Mints(Base):
     """S3: the preflight mints no token of another role. Mechanism: the file runs the preflight as a subprocess, so a mock patch is not possible;
     the scratch program copy gets an app_token.py whose mint() appends the role of every call to a file and returns the planted marker."""
@@ -458,21 +462,31 @@ class S3Mints(Base):
         roles = self.check(prog)
         other = sum(1 for r in roles if r not in ("worker", "orchestrator"))
         self.assertEqual(other, 0)
-        classes = ("RequestBodies", "Answers", "Mutants")
-        names = ["test_mint_roles." + c for c in classes]
         t0 = time.monotonic()
+        child = subprocess.Popen([sys.executable, "-B", "-m", "unittest", "test_mint_roles"], cwd=HERE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
-            p = subprocess.run([sys.executable, "-B", "-m", "unittest"] + names, cwd=HERE, capture_output=True, text=True, timeout=300)
+            _out, err = child.communicate(timeout=300)   # a hang guard only: the verdict is the exit code and the counts
         except subprocess.TimeoutExpired:
-            raise AssertionError("the role-table selection did not end within 300 seconds (hang guard)")
-        print("S3 selection took %.1f s" % (time.monotonic() - t0))
-        m = re.search(r"Ran (\d+) tests?", p.stderr)
-        self.assertIsNotNone(m, p.stderr[-300:])
-        self.assertEqual(p.returncode, 0, p.stderr[-300:])
-        self.assertTrue(re.search(r"^OK\s*$", p.stderr, re.M), p.stderr[-300:])
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            child.communicate()
+            raise AssertionError("the test_mint_roles run did not end within 300 seconds (hang guard)")
+        finally:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        took = time.monotonic() - t0
+        m = re.search(r"Ran (\d+) tests?", err)
+        self.assertIsNotNone(m, err[-300:])
+        self.assertEqual(child.returncode, 0, err[-300:])
+        self.assertTrue(re.search(r"^OK\s*$", err, re.M), err[-300:])
         n = int(m.group(1))
-        self.assertGreaterEqual(n, 1)
-        line = "S3: mints for other roles %d, role-table tests %d of %d (classes: %s)" % (other, n, n, ", ".join(classes))
+        self.assertEqual(n, MINT_ROLES_TESTS)
+        line = "S3: mints for other roles %d, test_mint_roles %d of %d (whole file, %d expected), took %.1f s" % (other, n, n, MINT_ROLES_TESTS, took)
         print(line)
         # the mutant: the preflight mints once more for another role
         text = open(os.path.join(LAUNCHER, "preflight.py")).read()
