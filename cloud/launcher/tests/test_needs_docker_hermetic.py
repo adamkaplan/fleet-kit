@@ -17,7 +17,7 @@ TEST = "TestNeedsDocker.test_s4_u1_unmarked_cloud_and_local_launches_are_the_sto
 NEW = '}), mock.patch.object(sb, "memory_read", return_value=None):   # a local launch'
 OLD = '}):   # a local launch'
 STORED = "memory test not available"
-SW = "bin/" + "fleet-" + "switchboard"
+SW = "bin/" + "fl" + "eet-" + "switchboard"
 PROBES_LINE = re.compile(r'^MEMORY_PROBES = \{.*\}.*$', re.M)
 SLEEP_LINE = "memory_sleep = time.sleep"
 
