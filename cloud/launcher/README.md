@@ -213,13 +213,15 @@ The fix is parallel lanes, not removing or moving a test: the entries named in `
 
 Chain time after the change: macOS 11.6 minutes, Ubuntu 5.1 minutes (one run of the pull request's head; the step timeout is 20 minutes). The per-entry seconds below are from that run, so they include the slowdown of running beside other entries.
 
-Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_app_token.py` (122 s), `test_driver.py` (120 s).
+Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_mint_roles.py` (177 s), `test_m_cap.py` (157 s).
 
-Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
+Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_mint_roles.py` (80 s), `test_cloud_stack_wait.py` (58 s).
 
-Not yet measured: `cloud/launcher/tests/test_cloud_quick_budget.py`, `cloud/launcher/tests/test_cloud_split.py`, `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_fixture_root.py`, `cloud/launcher/tests/test_git_token_retry.py`, `cloud/launcher/tests/test_m_cap.py`, `cloud/launcher/tests/test_mint_retry.py`, `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_orphan_secrets.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_read_retired_last_message.py`, `cloud/launcher/tests/test_reap_concurrent.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_reaper_restart.py`, `cloud/launcher/tests/test_reaper_row.py`, `cloud/launcher/tests/test_render_namespace.py`, `cloud/launcher/tests/test_scratch_clean.py`, `cloud/launcher/tests/test_stop_no_checkout.py`, `cloud/launcher/tests/test_token_at_limit.py`, `cloud/worker/tests/test_cloud_prepush_background.py`
+Not yet measured: `cloud/launcher/tests/test_cloud_quick_budget.py`, `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_fixture_root.py`, `cloud/launcher/tests/test_mint_retry.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_orphan_secrets.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_read_retired_last_message.py`, `cloud/launcher/tests/test_reap_concurrent.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_reaper_restart.py`, `cloud/launcher/tests/test_reaper_row.py`, `cloud/launcher/tests/test_render_namespace.py`, `cloud/launcher/tests/test_scratch_clean.py`, `cloud/launcher/tests/test_stop_no_checkout.py`, `cloud/launcher/tests/test_token_at_limit.py`, `cloud/worker/tests/test_cloud_prepush_background.py`
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
+Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, not yet measured on CI): lane 0 785 s, lane 1 822 s, lane 2 773 s (from 696, 665, 596), after `test_cloud_split.py`, `test_m_cap.py`, `test_mint_roles.py` and `test_git_token_retry.py` moved from serial to the end of the parallel list (positions 22, 23, 24, 25 = lanes 0, 1, 2, 0); the Ubuntu seconds of those four are one run on an idle pod, not CI.
 
 ### macOS (per entry)
 
@@ -290,6 +292,10 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/worker/tests/test_cw_gh_comments.py` | 37 | parallel |
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 34 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 35 | parallel |
+| `cloud/launcher/tests/test_cloud_split.py` | 49 | parallel |
+| `cloud/launcher/tests/test_m_cap.py` | 157 | parallel |
+| `cloud/launcher/tests/test_mint_roles.py` | 177 | parallel |
+| `cloud/launcher/tests/test_git_token_retry.py` | 40 | parallel |
 
 ### Ubuntu (per entry)
 
@@ -360,6 +366,10 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/worker/tests/test_cw_gh_comments.py` | 1 | parallel |
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
+| `cloud/launcher/tests/test_cloud_split.py` | 8 | parallel |
+| `cloud/launcher/tests/test_m_cap.py` | 11 | parallel |
+| `cloud/launcher/tests/test_mint_roles.py` | 80 | parallel |
+| `cloud/launcher/tests/test_git_token_retry.py` | 2 | parallel |
 
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
