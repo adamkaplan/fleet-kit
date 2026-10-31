@@ -1322,6 +1322,23 @@ def api_parse(args):
     return positionals, method, fields
 
 
+_api_parse_raw = api_parse
+API_HOST_RE = re.compile(r"^https://api\.github\.com(?=[/?#]|$)", re.I)
+
+
+def api_endpoint(text):
+    """An endpoint positional in one spelling: the https://api.github.com host (any case) is dropped, and any spelling of graphql (slashes, ?query,
+    #fragment, case) becomes the bare word graphql. Other hosts and other paths are left as they are."""
+    short = API_HOST_RE.sub("", text, count=1)
+    bare = short.split("#", 1)[0].split("?", 1)[0].strip("/").lower()
+    return "graphql" if bare == "graphql" else short
+
+
+def api_parse(args):
+    positionals, method, fields = _api_parse_raw(args)
+    return [api_endpoint(p) for p in positionals], method, fields
+
+
 def input_value(args):
     """(index, inline, value) of the LAST --input of a `gh api` call, or None."""
     found = None

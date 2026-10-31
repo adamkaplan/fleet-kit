@@ -16,6 +16,8 @@ MUTATIONS = ("addComment", "addPullRequestReview", "addPullRequestReviewComment"
 NEW_API_EXAMPLES = {"pr-review-comment": "repos/o/r/pulls/comments/5", "pr-review-reply": "repos/o/r/pulls/1/comments/5/replies"}
 ALL_API = dict(API_EXAMPLES, **NEW_API_EXAMPLES)
 SIGNED = MARK % "alice-bot"
+SPELLINGS = ("/graphql", "graphql/", "graphql?x=1", "https://api.github.com/graphql", "GraphQL")
+URL_COMMENTS = "https://api.github.com/repos/o/r/issues/1/comments"
 
 
 def names_in(source, name):
@@ -95,6 +97,18 @@ def battery(rig):
         done, calls = rig.run("api", endpoint, "-X", "PATCH", "-f", "body=x")
         if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
             bad.append("endpoint not signed: " + label)
+    for spelling in SPELLINGS:
+        done, calls = rig.run("api", spelling, "-f", "query=" + gql("addComment"))
+        if calls or done.returncode != 1:
+            bad.append("graphql spelling let through: " + spelling)
+    for flag in ("-f", "-F"):
+        done, calls = rig.run("api", URL_COMMENTS, flag, "body=x")
+        if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
+            bad.append("URL form not signed: " + flag)
+    path.write_text('{"body":"x"}')
+    done, calls = rig.run("api", URL_COMMENTS, "--input", str(path))
+    if len(calls) != 1 or SIGNED not in "".join(calls[0]["files"].values()):
+        bad.append("URL form --input not signed")
     for name in MUTATIONS:
         done, calls = rig.run("api", "graphql", "-f", "query=" + gql(name))
         if calls or done.returncode != 1:
@@ -256,6 +270,45 @@ class TestGhShimSignInput(unittest.TestCase):
         done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", "-", stdin='{"event":"COMMENT"}')   # stdin: read once, passed as that text
         self.assertEqual(calls[0]["stdin"], '{"event":"COMMENT"}')
 
+    def test_h2_every_spelling_of_graphql_is_refused_like_the_bare_word(self):
+        bare, _calls = self.rig.run("api", "graphql", "-f", "query=" + gql("addComment"))
+        self.assertEqual(bare.stderr.strip(), "gh: refused: the GraphQL mutation addComment writes a body that cannot be signed and nothing was posted; use gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments")   # control
+        for spelling in SPELLINGS + ("HTTPS://API.GITHUB.COM/graphql/#x",):
+            with self.subTest(spelling=spelling):
+                done, calls = self.rig.run("api", spelling, "-f", "query=" + gql("addComment"))
+                self.refused(done, calls)
+                self.assertEqual(done.stderr, bare.stderr)
+
+    def test_h2_a_read_query_in_every_spelling_passes_untouched(self):
+        rig = hermetic_rig()
+        self.addCleanup(rig.close)
+        for spelling in ("graphql",) + SPELLINGS:
+            with self.subTest(spelling=spelling):
+                args = ("api", spelling, "-f", "query=query { viewer { login } }")
+                done, calls = rig.run(*args)
+                self.assertEqual(len(calls), 1, done.stderr)
+                self.assertEqual(calls[0]["argv"], list(args))
+
+    def test_h3_a_full_api_github_com_url_is_signed(self):
+        for flag in ("-f", "-F"):
+            with self.subTest(flag=flag):
+                done, calls = self.rig.run("api", URL_COMMENTS, flag, "body=x")
+                self.assertEqual(len(calls), 1, done.stderr)
+                self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
+                self.assertEqual(calls[0]["argv"][1], URL_COMMENTS)   # the URL itself is passed on as written
+        done, calls = self.rig.run("api", URL_COMMENTS, "--input", self.file('{"body":"x"}'))
+        temp = calls[0]["argv"][-1]
+        self.assertEqual(json.loads(calls[0]["files"][temp])["body"].count(SIGNED), 1)
+        done, calls = self.rig.run("api", "https://API.github.com/repos/o/r/pulls/1/reviews", "--input", "-", stdin='{"body":"x"}')
+        self.assertEqual(json.loads(calls[0]["stdin"])["body"].count(SIGNED), 1)
+
+    def test_h3_another_host_is_not_touched(self):
+        for url in ("https://example.com/repos/o/r/issues/1/comments", "https://api.github.com.evil.test/repos/o/r/issues/1/comments"):
+            with self.subTest(url=url):
+                args = ("api", url, "-f", "body=x")
+                done, calls = self.rig.run(*args)
+                self.assertEqual(calls[0]["argv"], list(args))
+
     def test_s10_completeness_and_count(self):
         self.assertEqual(forms_missing(self.source), [])
         self.assertEqual(count_forms(self.source), 21)
@@ -294,6 +347,15 @@ class TestGhShimSignInput(unittest.TestCase):
         self.assertEqual(seen, ["no-body --input passed by path, not by temp copy"])
         seen = self.mutant("        if not stat.S_ISREG(os.fstat(fd).st_mode):", "        if False:")
         self.assertEqual(seen, ["a FIFO --input was not refused"])
+
+    def test_h2_h3_mutants_are_seen(self):
+        seen = self.mutant("    return [api_endpoint(p) for p in positionals], method, fields", "    return positionals, method, fields")
+        self.assertEqual(sorted(seen), sorted(["graphql spelling let through: " + p for p in SPELLINGS] + ["URL form not signed: -f", "URL form not signed: -F", "URL form --input not signed"]))
+        seen = self.mutant('    return "graphql" if bare == "graphql" else short', '    return text if bare == "graphql" else short')
+        self.assertEqual(sorted(seen), sorted("graphql spelling let through: " + p for p in SPELLINGS if p != "graphql"))
+        seen = self.mutant('    short = API_HOST_RE.sub("", text, count=1)', "    short = text")
+        self.assertEqual(sorted(seen), sorted(["URL form not signed: -f", "URL form not signed: -F", "URL form --input not signed"]
+                                              + ["graphql spelling let through: https://api.github.com/graphql"]))
 
 
 if __name__ == "__main__":
