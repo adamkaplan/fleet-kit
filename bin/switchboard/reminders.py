@@ -444,6 +444,7 @@ class ReminderFacts:
 
     def __init__(self, state_dir):
         self.state_dir, self.engine = Path(state_dir), None
+        self.swept = set()   # #1711: ids dropped at a delivery for a newer copy of the same key and recipient
 
     def bind(self, engine):
         self.engine = engine
@@ -554,6 +555,34 @@ class ReminderFacts:
                  and i["at"] <= now and (i.get("created", 0), i["at"]) > (item.get("created", 0), item["at"])]
         return max(newer, key=lambda i: (i.get("created", 0), i["at"])) if newer else None
 
+    def newest_first(self, facts):
+        """The reminder facts in the order of their copies' (created, at), newest first, so a delivery sweeps the older copies before it asks about them."""
+        try:
+            marks = {"reminder:" + i["id"]: (i.get("created", 0), i["at"]) for i in read_reminders(self.state_dir)}
+        except ReminderError:
+            return list(facts)   # the recheck itself reads the file again and defers the delivery
+        return sorted(facts, key=lambda f: marks.get(str(f.key), (0, 0)), reverse=True)
+
+    def drop_older_copies(self, item, items):
+        """#1711: at the delivery of a keyed, unconditional copy, every OTHER older copy of the same key and recipient still in the file
+        (whatever its sender, also none) is dropped, one audit line each. Called under the lock with `items` just read. An unkeyed copy,
+        another key, another recipient and a copy already delivered (not in the file) are never touched."""
+        if not item.get("key") or item.get("condition"):
+            return []
+        mark = (item.get("created", 0), item["at"])
+        older = [i for i in items if i["id"] != item["id"] and i.get("key") == item["key"] and i["to"] == item["to"]
+                 and (i.get("created", 0), i["at"]) < mark]
+        if not older:
+            return []
+        gone = {i["id"] for i in older}
+        self.swept |= gone
+        write_reminders(self.state_dir, [i for i in items if i["id"] not in gone])
+        if self.engine is not None and self.engine.audit is not None:
+            for i in older:
+                self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", i["to"],
+                                         {"dropped": i["id"], "kept": item["id"], "key": _one_line(item["key"], 60), "by": "delivered"})
+        return sorted(gone)
+
     def recheck_delivery(self, fact):
         """#1401: the delivery step asks once more, under the lock, whether a reminder fact is still wanted. Returns None (deliver it) or the
         id of the newer copy that replaces it, or "cancelled" when it is no longer in the file; a dropped superseded copy is removed here."""
@@ -564,9 +593,10 @@ class ReminderFacts:
             items = read_reminders(self.state_dir)
             item = next((i for i in items if i["id"] == item_id), None)
             if item is None:
-                return "cancelled"
+                return "swept" if item_id in self.swept else "cancelled"
             kept = self.superseded(item, items)
             if kept is None or kept.get("condition"):   # a gated newer copy may not be delivered: the older one is not dropped for it
+                self.drop_older_copies(item, items)
                 return None
             write_reminders(self.state_dir, [i for i in items if i["id"] != item_id])
         return kept["id"]
@@ -873,7 +903,8 @@ def cmd_remind(args, runner, now):
     if len(item["text"]) > TEXT_CAP:
         sys.stderr.write("%s: warning: text is cut at %d characters: %d characters over\n" % (PROG, TEXT_CAP, len(item["text"]) - TEXT_CAP))
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
-                                                          "from": sender, "issue": number, "repo": repo})
+                                                          "from": sender, "issue": number, "repo": repo,
+                                                          **({"key": _one_line(item["key"], 60)} if item.get("key") else {})})
     print(item["id"])
     sys.stderr.write("%s: reminder for %s %s (now %s)\n" % (PROG, args.name, _print_when(item["at"], moment), _print_when_now(moment)))
     if warning:

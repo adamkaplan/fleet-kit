@@ -2827,6 +2827,8 @@ owner and key while it was on its way, is not delivered, and `reminder.drop_in_f
 When some facts of a plan are dropped this way the plan is decided again from the facts left (a wake planned for a dropped fact does not
 carry the rest); a changed action is audited as `recheck`. A reminders file that cannot be read at this step defers the delivery to the next pass: nothing is sent or lost. The audit line `source.error` for it names the file and the error class only, never reminder text.
 
+**A delivered keyed reminder replaces the older copies (#1711).** When a keyed reminder is delivered, every other older copy of the same key and the same recipient that is still in the reminders file (pending or fired) is superseded and dropped, whatever their sender (also none), with one `reminder.drop_superseded` audit line each (`by` is `delivered`; it names the dropped and the delivered id). A copy already delivered, a reminder with another key, a reminder for another recipient and an unkeyed reminder are never touched. `reminder.add` also carries the key (cut at 60 characters). Tests: `TestKeyedReminderSupersede`.
+
 **Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
 ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
 still carried. A worker that failed, errored or was aborted is never folded: its line is shown in full. A stop after a
