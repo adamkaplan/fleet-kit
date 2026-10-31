@@ -6,6 +6,7 @@ The four mutants run in child processes on scratch copies of the source outside 
 import datetime as dt
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -314,6 +315,10 @@ class Concurrent(unittest.TestCase):
     def test_S10_the_concurrent_stops_carry_the_stop_cause(self):
         mod = target_module()
         L, cluster, clock, env, events = build(mod, tempfile.mkdtemp(), 2, hold=False)
+        for pod, rid in zip(cluster.pods, ("run-a0", "run-b1")):
+            pod["metadata"]["annotations"]["cw/run-id"] = rid
+        for name in ("delete_pod", "delete_secret", "delete_run_secret", "get_secret"):   # a pod with a run id also removes its Secrets
+            setattr(cluster, name, lambda *a, **k: None)
         L.hard_deadline = lambda pod: T0 - dt.timedelta(minutes=1) if real.ann(pod, "worker") == "coder1" else T0 + dt.timedelta(hours=5)
         L.activity = lambda name: (False, T0 - dt.timedelta(seconds=700))   # idle past the default 600 seconds
         seen, lock, cls = {}, threading.Lock(), type(L)
@@ -333,6 +338,7 @@ class Concurrent(unittest.TestCase):
         lines = {l["worker"]: l.get("cause") for l in audit_lines(env) if l["action"] == "stop"}
         audited = sum(lines.get(w) == c for w, c in (("coder0", "idle"), ("coder1", "hard")))
         scratch = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, scratch, True)
         audit, cursor, sent = os.path.join(scratch, "audit.jsonl"), os.path.join(scratch, "cursor.json"), []
         open(audit, "w").close()
         for w in ("coder0", "coder1"):
@@ -346,7 +352,7 @@ class Concurrent(unittest.TestCase):
         alerted = sum(len([t for to, t in sent if w in t and word in t]) == 2 for w, word in (("coder0", "idle limit"), ("coder1", "hard limit")))
         runs = [getattr(seen[w], "run_id", None) for w in ("coder0", "coder1")]
         pods = {real.ann(p, "worker"): real.ann(p, "run-id") for p in cluster.pods}
-        same_run = sum(runs[i] == pods.get(w) or runs[i] is None for i, w in enumerate(("coder0", "coder1")))
+        same_run = sum(runs[i] == pods.get(w) and runs[i] is not None for i, w in enumerate(("coder0", "coder1")))
         print("S10: stops with the right cause %d of 2, audit lines naming it %d of 2, end alerts naming it %d of 2" % (2 if ok else 0, audited, alerted))
         print("S10: run id equals the pod annotation %d of 2" % same_run)
         self.assertEqual((len(seen), causes), (2, ["idle", "hard"]))
