@@ -879,14 +879,26 @@ FAILURE_TRIGGER_WORDS = ("read", "reads", "reader", "feed", "producer", "guard",
 FAILURE_SCENARIO_RE = re.compile(r"\b(?:missing|corrupt|corrupted|unreadable|absent)\b", re.IGNORECASE)
 
 
+def prose_of(text):
+    """The plan text without the lines inside its scenarios block (the whole text when it has none)."""
+    text = text or ""
+    for start, inner in fenced_blocks(text):
+        first = next((l for l in inner if l.strip() and not l.lstrip().startswith("#")), None)
+        if first is not None and first.strip() == "scenarios:":
+            lines = text.splitlines()
+            return "\n".join(lines[:start] + lines[start + len(inner):])
+    return text
+
+
 def failure_mode_warning(scenarios, text):
     """A warning (never a defect, never in the hash) when the plan's text speaks of reading or producing something and no scenario
     speaks of a missing, corrupt, unreadable or absent input. Only for a plan that has scenarios."""
     if not scenarios:
         return None
-    # "the text it read" is the reviewer's quoting phrase of a review proof, not an input of the plan
-    body = re.sub(r"\btext it read\b", "", text or "", flags=re.IGNORECASE)
-    if not re.search(r"\b(?:%s)\b" % "|".join(FAILURE_TRIGGER_WORDS), body, re.IGNORECASE):
+    # the trigger words are searched in the plan's prose (the text outside the scenarios block) and in each scenario's `text`
+    # field; a `pass`, `discriminates`, `proof`, `evaluator`, `covers` or `claim` line says what a verdict quotes, not what the plan reads
+    searched = [prose_of(text)] + [str(s.get("text", "")) for s in scenarios]
+    if not re.search(r"\b(?:%s)\b" % "|".join(FAILURE_TRIGGER_WORDS), "\n".join(searched), re.IGNORECASE):
         return None
     if any(FAILURE_SCENARIO_RE.search(" ".join(str(v) for v in s.values())) for s in scenarios):
         return None
