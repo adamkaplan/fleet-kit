@@ -2569,6 +2569,7 @@ class Switchboard:
         self.engaged_seconds = config["engaged_minutes"] * 60
         self.executable = config["opencode_executable"] or config["opencode"]
         self.toasted = {}  # agent -> the reason last toasted for it, so a steady reason toasts once
+        self.toasted_intent = {}  # agent -> the Intent-edit reasons shown while still pending: once per edit stamp
         self.pass_toasts = {}  # agent -> (reason, title, body) the pass itself found worth a toast (PR 4)
         self.reads = V2Reads(self)
         self.light = bool(config.get("v2_light"))   # v2_light: no optional read of session history
@@ -3416,10 +3417,11 @@ class Switchboard:
             elif observation.status == "blocked":
                 wanted[name] = ("blocked", "%s is blocked" % name,
                                 "%s is waiting on a permission request or a question" % name)
+        wanted = {name: [found] for name, found in wanted.items()}
         for name, found in self.source_toasts().items():  # says what is asked, so it wins over the generic one
-            if wanted.get(name, ("",))[0] != "different opencode":
+            if wanted.get(name, [("",)])[0][0] != "different opencode":
                 wanted[name] = found
-        return [(name,) + wanted[name] for name in sorted(wanted)]
+        return [(name,) + found for name in sorted(wanted) for found in wanted[name]]
 
     def render_toast(self, discovery, held, now, report):
         """At most one toast per pass (herdr allows one a second, and queues none),
@@ -3428,16 +3430,23 @@ class Switchboard:
         if (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # a toast is a multiplexer call and goes to no pane here: none is tried, none fails
             return
         candidates = self.toast_candidates(discovery, held, now)
+        pending = {(c[0], c[1]) for c in candidates}
         self.toasted = {name: reason for name, reason in self.toasted.items()
-                        if any(c[0] == name and c[1] == reason for c in candidates)}
+                        if (name, reason) in pending and not reason.startswith(INTENT_EDIT_REASON)}
+        self.toasted_intent = {name: {r for r in reasons if (name, r) in pending}
+                               for name, reasons in self.toasted_intent.items()}
         for name, reason, title, body in candidates:
-            if self.toasted.get(name) == reason:
+            intent = reason.startswith(INTENT_EDIT_REASON)
+            if (reason in self.toasted_intent.get(name, ())) if intent else self.toasted.get(name) == reason:
                 continue
             with self._external("herdr.notification", name, {"reason": reason, "title": title}) as result:
                 reply = self.herdr.notification_show(title, body)
                 result["reply"] = reply
             if reply["shown"] or reply["reason"] == "disabled":
-                self.toasted[name] = reason  # shown, or herdr has toasts off for good
+                if intent:
+                    self.toasted_intent.setdefault(name, set()).add(reason)
+                else:
+                    self.toasted[name] = reason  # shown, or herdr has toasts off for good
             report["toasts"].append({"agent": name, "reason": reason, "shown": reply["shown"],
                                      "why": reply["reason"]})
             return  # rate_limited, busy, no_foreground_client: owed, tried again next pass
@@ -9504,6 +9513,9 @@ def format_decisions_status(summary):
 
 # ---- toasts
 
+INTENT_EDIT_REASON = "intent edit #"   # an Intent edit's toast reason: the issue and its edit stamp follow
+
+
 def note_unreachable(engine, recipient, fresh, why):
     """The re-check could not read the recipient at all (pane closed, session gone):
     the pass's render step toasts it, once, like every other toast."""
@@ -9518,8 +9530,11 @@ def collect_source_toasts(engine):
     for source in engine.sources:
         toasts = getattr(source, "toasts", None)
         for agent, reason, title, body in toasts() if toasts else []:
-            found[agent] = (reason, title, body)
-    found.update(engine.pass_toasts)
+            if reason.startswith(INTENT_EDIT_REASON):
+                found.setdefault(agent, []).append((reason, title, body))   # every pending Intent edit, in the order of the edits
+            else:
+                found[agent] = [(reason, title, body)]
+    found.update({agent: [toast] for agent, toast in engine.pass_toasts.items()})
     return found
 
 
