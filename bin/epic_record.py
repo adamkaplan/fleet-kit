@@ -1,9 +1,28 @@
 """epic_record: an epic-claimed scenario, recorded on its owning issue (#1383). Moved unchanged from bin/plan_ledger.py.
 
-Loaded by path from plan_ledger, which sets HOST to its own globals() (claim_of and evaluator_of are read from it at call time: no circular import).
+Reaches claim_of and evaluator_of through `_plan_ledger()`: the module the entry already loaded, else plan_ledger.py loaded by path once (no circular import).
 """
 
-HOST = {}   # plan_ledger's globals(), set by plan_ledger after loading this module
+import importlib.util
+import os
+import sys
+
+_PLAN_LEDGER = None
+
+
+def _plan_ledger():
+    """The module the entry loaded (sys.modules["plan_ledger"]: the SAME functions the entry uses), else bin/plan_ledger.py loaded by path once and kept."""
+    global _PLAN_LEDGER
+    loaded = sys.modules.get("plan_ledger")
+    if loaded is not None:
+        return loaded
+    if _PLAN_LEDGER is None:
+        spec = importlib.util.spec_from_file_location("plan_ledger", os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_ledger.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PLAN_LEDGER = module
+    return _PLAN_LEDGER
+
 #
 # `claim_of` reads a scenario as `epic` when nobody per pull request can prove it: it is proven after the merges. Its record (a proof and a verdict, `via: "epic"`) names the OWNING ISSUE (the ask issue or the
 # work item), the plan hash and a commit of the default branch that holds the merge commit of every merged pull request of the plan. A pull request never carries one.
@@ -14,14 +33,14 @@ EPIC_STATES = ("unrecorded", "recorded", "stale")
 
 def epic_scenarios(plan):
     """The scenarios of a checked plan that are claimed at the epic, in order."""
-    return [s for s in (plan or {}).get("scenarios_parsed") or [] if HOST["claim_of"](s) == "epic"]
+    return [s for s in (plan or {}).get("scenarios_parsed") or [] if _plan_ledger().claim_of(s) == "epic"]
 
 
 def epic_state(scenario, entries, ref, plan_hash, default_head, authors, contains, changed):
     """One epic-claimed scenario's picture on its owning issue `ref`: {id, evaluator, claim, state, status, head, missing[], void[], why}. `state` is `unrecorded` (no proof and verdict of one commit, a fail, a verdict by a writer, or a record whose commit lacks a
     claimant's merge), `recorded` (at `head`; `current` when it is the default branch's head) or `stale` (a file the proof names changed since, or the change cannot be judged). `contains(head)` -> (True, None) or (False, reason);
     `changed(old, new)` -> the files changed, or None when the compare cannot be judged (it counts as stale); `default_head` None (unreadable) makes every record stale. The newest proof decides the commit; the verdict must be at the same commit."""
-    sid, evaluator = scenario["id"], HOST["evaluator_of"](scenario)
+    sid, evaluator = scenario["id"], _plan_ledger().evaluator_of(scenario)
     out = {"id": sid, "evaluator": evaluator, "claim": "epic", "state": "unrecorded", "status": "missing", "head": None, "current": False, "missing": [], "void": [], "why": None}
     mine = [e for e in entries if e.get("pr") == ref and e.get("scenario") == sid and e.get("via") == EPIC_VIA and e.get("kind") in ("proof", "verdict")]
     here = [e for e in mine if e.get("plan_hash") == plan_hash]

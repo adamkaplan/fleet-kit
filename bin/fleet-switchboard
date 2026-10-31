@@ -16824,9 +16824,9 @@ def epic_authors(ctx):
 
 
 def epic_view(ctx, runner, now):
-    """The picture of every epic-claimed scenario of the plan on its owning issue: ([plan_ledger.epic_state rows], default head or None, why or None). Reads GitHub with GETs only. Unreadable reads make a recorded
+    """The picture of every epic-claimed scenario of the plan on its owning issue: ([load_module("epic_record").epic_state rows], default head or None, why or None). Reads GitHub with GETs only. Unreadable reads make a recorded
     scenario stale (the default branch's head) or unrecorded (the claimants), never recorded."""
-    scenarios = plan_ledger.epic_scenarios(ctx.plan)
+    scenarios = load_module("epic_record").epic_scenarios(ctx.plan)
     if not scenarios:
         return [], None, None
     get = epic_get(ctx, runner)
@@ -16852,9 +16852,9 @@ def epic_view(ctx, runner, now):
     rows = []
     for scenario in scenarios:
         if authors is None:   # the writers cannot be excluded: nothing is read as recorded
-            rows.append(dict(plan_ledger.epic_state(scenario, [], ctx.pr, ctx.plan["plan_hash"], default_head, set(), contains, lambda a, b: None), missing=[why]))
+            rows.append(dict(load_module("epic_record").epic_state(scenario, [], ctx.pr, ctx.plan["plan_hash"], default_head, set(), contains, lambda a, b: None), missing=[why]))
             continue
-        rows.append(plan_ledger.epic_state(scenario, ctx.entries, ctx.pr, ctx.plan["plan_hash"], default_head, authors, contains, epic_changed(get, ctx.repo)))
+        rows.append(load_module("epic_record").epic_state(scenario, ctx.entries, ctx.pr, ctx.plan["plan_hash"], default_head, authors, contains, epic_changed(get, ctx.repo)))
     return rows, default_head, why
 
 
@@ -16867,7 +16867,7 @@ def epic_prove(ctx, args, runner, now, caller, scenarios):
     outcomes = []
     for scenario in scenarios:
         entry = {"kind": "proof", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
-                 "evidence": evidence, "command": plan_ledger.clip(redact_command_text(getattr(args, "command", None) or "")), "via": plan_ledger.EPIC_VIA,
+                 "evidence": evidence, "command": plan_ledger.clip(redact_command_text(getattr(args, "command", None) or "")), "via": load_module("epic_record").EPIC_VIA,
                  **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {}),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
         stored, already = _record(ctx, args, now, entry)
@@ -16930,7 +16930,7 @@ def _epic_verdict(ctx, args, runner, now, scenario):
     if problem:
         raise LedgerCommandError("refused: %s: %s; nothing was recorded" % (scenario["id"], problem))
     entry = {"kind": "verdict", "pr": ctx.pr, "scenario": scenario["id"], "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
-             "evaluator": named, "evidence": evidence, "via": plan_ledger.EPIC_VIA, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {})}
+             "evaluator": named, "evidence": evidence, "via": load_module("epic_record").EPIC_VIA, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {})}
     (stored, already), = plan_ledger.append_once(ctx.state, [entry], now())
     if not already and ctx.engine.audit is not None:
         ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, {"scenario": scenario["id"], "result": args.result, "seq": stored["seq"], "by": caller, "chain": stored["hash"], "epic": head})
@@ -17423,7 +17423,7 @@ def cmd_gates(args, runner, now):
     else:
         lines = plan_ledger.render_gates(report, ctx.pr)
         if epic_rows:
-            lines.extend(plan_ledger.epic_lines(epic_rows, report["epic_default_head"]))
+            lines.extend(load_module("epic_record").epic_lines(epic_rows, report["epic_default_head"]))
         if shares:
             lines.append(shares)
         lines.extend(bots)
@@ -17469,7 +17469,7 @@ def cmd_gates_ask_close(args, runner, now):
         print("refused: %s stays open: %s failed (%s); the chief of staff can log a waiver: `waive %s --gates CU --reason \"...\"`" % (ctx.pr, found[0], PEERS_TOO_MANY if found[0] == "too many pull requests" else found[1], ctx.pr), file=sys.stderr)
         return EXIT_ERROR
     authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
-    epic_ids = {x["id"] for x in plan_ledger.epic_scenarios(ctx.plan)}   # #1383: an epic-claimed scenario is recorded at the default branch's head, and read there below
+    epic_ids = {x["id"] for x in load_module("epic_record").epic_scenarios(ctx.plan)}   # #1383: an epic-claimed scenario is recorded at the default branch's head, and read there below
     rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"] if x["id"] not in epic_ids]
     epic_rows, default_head, epic_why = epic_view(ctx, runner, now)
     if epic_ids:   # #1383: an open pull request of the plan holds the ask open (read now, not only at record time); an unreadable list refuses
@@ -17791,7 +17791,7 @@ def cmd_item_gates(args, runner, now):
         print("plan hash: %s" % (report["plan_hash"] or "none"))
         for row in report["rows"]:
             print("%-4s %-8s %s" % (row["gate"], row["status"], "; ".join(row["missing"]) or row.get("detail", "")))
-        for line in plan_ledger.epic_lines(epic_rows, report.get("epic_default_head")):
+        for line in load_module("epic_record").epic_lines(epic_rows, report.get("epic_default_head")):
             print(line)
     return EXIT_OK if report["ready"] else EXIT_ERROR
 

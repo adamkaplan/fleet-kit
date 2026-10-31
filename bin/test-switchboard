@@ -80166,16 +80166,16 @@ class TestEpicRecord(unittest.TestCase):
         self.mutant(sb, "epic_view", lambda ctx, runner, now: ([], self.tip, None), self.check_unrecorded_blocks_close)
 
     def test_s11_m3_a_close_that_lets_a_stale_claim_through_is_caught(self):
-        real = sb.plan_ledger.epic_state
-        self.mutant(sb.plan_ledger, "epic_state", lambda *a: dict(real(*a), state="recorded", status="ok") if real(*a)["state"] == "stale" else real(*a), self.check_stale_blocks_close)
+        real = sb.load_module("epic_record").epic_state
+        self.mutant(sb.load_module("epic_record"), "epic_state", lambda *a: dict(real(*a), state="recorded", status="ok") if real(*a)["state"] == "stale" else real(*a), self.check_stale_blocks_close)
 
     def test_s11_m4_a_build_that_lets_a_writer_judge_is_caught(self):
         self.mutant(sb.plan_ledger, "may_record_verdict", lambda *a: (True, None), self.check_writer_verdict_refused)
 
     def test_s11_m5_a_build_that_reads_an_epic_claim_as_satisfied_is_caught(self):
-        self.mutant(sb.plan_ledger, "epic_state", lambda scenario, *a: {"id": scenario["id"], "evaluator": "tester", "state": "recorded", "status": "ok", "head": self.tip, "current": True,
+        self.mutant(sb.load_module("epic_record"), "epic_state", lambda scenario, *a: {"id": scenario["id"], "evaluator": "tester", "state": "recorded", "status": "ok", "head": self.tip, "current": True,
                                                                         "missing": [], "void": [], "why": None, "claim": "epic"}, self.check_unrecorded_blocks_close)
-        with mock.patch.object(sb.plan_ledger, "epic_state", lambda scenario, *a: {"id": scenario["id"], "evaluator": "tester", "state": "recorded", "status": "ok", "head": self.tip, "current": True,
+        with mock.patch.object(sb.load_module("epic_record"), "epic_state", lambda scenario, *a: {"id": scenario["id"], "evaluator": "tester", "state": "recorded", "status": "ok", "head": self.tip, "current": True,
                                                                                    "missing": [], "void": [], "why": None, "claim": "epic"}):
             with self.assertRaises(AssertionError):
                 self.check_epic_not_satisfied_unrecorded()

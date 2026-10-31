@@ -676,15 +676,6 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     return out
 
 
-import importlib.util as _ilu
-_epic_spec = _ilu.spec_from_file_location("epic_record", str(Path(__file__).resolve().parent / "epic_record.py"))
-epic_record = _ilu.module_from_spec(_epic_spec)
-_epic_spec.loader.exec_module(epic_record)
-epic_record.HOST = globals()   # claim_of and evaluator_of are read from here at call time
-EPIC_VIA, epic_scenarios, epic_state, epic_lines = epic_record.EPIC_VIA, epic_record.epic_scenarios, epic_record.epic_state, epic_record.epic_lines   # #1383: bin/epic_record.py
-
-
-
 # ----------------------------------------------------------------------------------- the carry of a proof (#1129)
 
 CARRY_EVALUATORS = ("tester", "live", "reviewer")   # the types of proof that may carry; `ci` ids are re-recorded by the daemon, never carried
