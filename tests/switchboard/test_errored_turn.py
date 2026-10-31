@@ -114,7 +114,7 @@ def build(Base, World, FAKE_OPENCODE, FAKE_HERDR):
             def always(engine, observation, now):
                 observation.errored = observation.status == "blocked"
                 return observation.errored
-            with mock.patch.object(sb, "classify_blocked", always):
+            with mock.patch.object(sb, "read_errored_turn", always):
                 with self.assertRaises(AssertionError):
                     self.check_table()
 

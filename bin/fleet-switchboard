@@ -2650,7 +2650,7 @@ class Switchboard:
         self.check_program(observation)
         if observation.problem:
             return observation
-        classify_blocked(self, observation, now)
+        read_errored_turn(self, observation, now)
         try:
             observation.last_human_prompt = self.last_human_prompt(
                 session_id, now, inbox=fleet.get("role") == "chief-of-staff", info=info, fresh=fresh)
@@ -11075,6 +11075,26 @@ def resume_first_recovery(engine, discovery, seen, reported):
         return False
 
 
+def read_errored_turn(engine, observation, now):
+    """#1697: herdr says `blocked`, but after a provider error nothing is open. Sets `observation.errored` ONLY when the open permission list AND
+    the open question list were both read and are both empty, and the newest message's error matches PROVIDER_ERROR. Everything else stays
+    blocked: an open request, an unreadable list, an ended turn with no provider error, a spent read budget (fail closed). Never reads for an
+    agent herdr does not call blocked; at most three reads (two lists, the newest message). Returns the observation's `errored`."""
+    if observation.status != "blocked" or getattr(engine, "light", False):
+        return False
+    reads = engine.reads
+    if not reads.may_fill(now):
+        return False
+    try:
+        reads.filled(now)   # one fill of the shared budget for the three reads
+        if engine.v2.permission_list(observation.session_id) or engine.v2.form_list(observation.session_id):
+            return False
+    except Exception:
+        return False
+    observation.errored = bool(PROVIDER_ERROR.search(last_turn_error(engine, observation.session_id)))
+    return observation.errored
+
+
 def ended_turn_text(name, resumed):
     """What the blocked report says of an ended turn with nothing open: the real command, or that it was just resumed."""
     if resumed:
@@ -11258,26 +11278,6 @@ def blocked_alert_section(config):
     if raw is False:
         return None
     return dict(BLOCKED_ALERT_DEFAULTS, **(raw or {}))
-
-
-def classify_blocked(engine, observation, now):
-    """#1697: herdr says `blocked`, but after a provider error nothing is open. Sets `observation.errored` ONLY when the open permission list AND
-    the open question list were both read and are both empty, and the newest message's error matches PROVIDER_ERROR. Everything else stays
-    blocked: an open request, an unreadable list, an ended turn with no provider error, a spent read budget (fail closed). Never reads for an
-    agent herdr does not call blocked; at most three reads (two lists, the newest message). Returns the observation's `errored`."""
-    if observation.status != "blocked" or getattr(engine, "light", False):
-        return False
-    reads = engine.reads
-    if not reads.may_fill(now):
-        return False
-    try:
-        reads.filled(now)   # one fill of the shared budget for the three reads
-        if engine.v2.permission_list(observation.session_id) or engine.v2.form_list(observation.session_id):
-            return False
-    except Exception:
-        return False
-    observation.errored = bool(PROVIDER_ERROR.search(last_turn_error(engine, observation.session_id)))
-    return observation.errored
 
 
 def blocked_kind(engine, observation, resumed=False):
