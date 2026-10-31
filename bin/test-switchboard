@@ -67278,6 +67278,7 @@ _steer_long = importlib.import_module("test_steer_long_turn")
 TestSteerLongTurn = _steer_long.build(Base, TestSteerToWorking)
 _hc = importlib.import_module("test_header_cache"); TestAges, TestSets, TestEvents, TestSafety, TestReplay, TestIsolation, TestDropNeverBlocksAWrite, TestApprovalReadsFresh, TestDocs = _hc.TestAges, _hc.TestSets, _hc.TestEvents, _hc.TestSafety, _hc.TestReplay, _hc.TestIsolation, _hc.TestDropNeverBlocksAWrite, _hc.TestApprovalReadsFresh, _hc.TestDocs
 TestReminderTtlMore = importlib.import_module("test_reminder_ttl").build(PR4Base)
+TestReminderWaiting = importlib.import_module("test_reminder_waiting").build(PR4Base)
 # The load figure counts cloud workers as busy (#1487).
 _load_cloud = importlib.import_module("test_load_alert_cloud")
 TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy

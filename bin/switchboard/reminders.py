@@ -529,6 +529,30 @@ class ReminderFacts:
             return "%s reported to %s since the launch" % (worker, item["to"])
         return "deliver"
 
+    def says_again(self, item_id, reason, now):
+        """#1728: True when `reminder.waiting` is to be written for this reminder now: the first time, a changed reason, or every WAITING_REPEAT seconds."""
+        said = self.__dict__.setdefault("_said", {})
+        before = said.get(item_id)
+        if before is not None and before[0] == reason and 0 <= now - before[1] < WAITING_REPEAT:
+            return False
+        if len(said) > 1000:
+            said.clear()
+        said[item_id] = (reason, now)
+        return True
+
+    def waiting(self, item_id, recipient, due, reason):
+        """#1728: one `reminder.waiting` audit line (id, recipient, minutes past due, a one-line reason) for a due reminder not delivered in this pass."""
+        if self.engine is None or self.engine.audit is None:
+            return
+        now, reason = self.engine.now(), _one_line(reason, 160)
+        if self.says_again(item_id, reason, now):
+            self.engine.audit.append(self.engine.actor, "reminder.waiting", recipient,
+                                     {"id": item_id, "late_min": max(0, int((now - due) // 60)), "reason": reason})
+
+    def ceiling(self, plan, now):
+        """#1728: the ceiling step of one plan (see `ceiling_wake`)."""
+        return ceiling_wake(self.engine, self, plan, now)
+
     def notify_drop(self, item, why):
         """#1132: a reminder dropped because its issue closed or its pull request merged tells its setter ONCE. Called only by the caller
         that removed the reminder from the file (`gone` was non-empty), so a second sweep finds nothing to drop and sends nothing."""
@@ -589,9 +613,16 @@ class ReminderFacts:
                     self.engine.audit.append(self.engine.actor, "reminder.drop_superseded", item["to"],
                                              {"dropped": item["id"], "kept": kept["id"], "key": _one_line(item["key"], 60)})
                 continue
+            unreadable = False
             if item.get("condition"):
                 found = self.verdict(item)
+                unreadable = found is None and self.engine is not None and self.engine.now() - item["at"] > reminder_bound(self.engine.config, item)   # #1728 ceiling: a condition that cannot be read does not hold a due reminder past its bound
+                if unreadable:
+                    found = "deliver"
+                    if self.engine.audit is not None:
+                        self.engine.audit.append(self.engine.actor, "reminder.ceiling", item["to"], {"id": item["id"], "why": "condition unreadable"})
                 if found is None:
+                    self.waiting(item["id"], item["to"], item["at"], "condition unreadable")
                     continue
                 if found != "deliver":
                     gone = remove_reminders(self.state_dir, {item["id"]})
@@ -602,6 +633,7 @@ class ReminderFacts:
                         self.notify_drop(item, found)
                     continue
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
+            text = text + " (condition unreadable)" if unreadable else text
             late = (self.engine.now() if self.engine else time.time()) - item["at"]
             if late >= LATE_NOTE_SECONDS:
                 note = " (late by %d min)" % int(late // 60)
@@ -609,9 +641,134 @@ class ReminderFacts:
                 text = text[:max(0, TEXT_CAP - len(note) - (1 if cut else 0))] + ("\u2026" if cut else "") + note   # the note is applied before the cap and kept: the body is cut, not the note
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
+            facts[-1].bound = reminder_bound(self.engine.config if self.engine else {}, item)   # #1728: read by steers_into_turn
             if isinstance(item.get("wake_class"), str):
                 facts[-1].wake_class = item["wake_class"]
         return facts
+
+
+WAITING_REPEAT = 1800   # #1728: seconds between two `reminder.waiting` lines for the same reminder and reason
+
+
+def waiting_reason(engine, plan, now):
+    """#1728: why the reminders of this plan do not reach the lane now, or None (a wake that goes in at once, or a steer)."""
+    if plan.action != "wake":
+        return "%s: %s" % (plan.action, plan.reason)
+    observation = plan.observation
+    if observation is None or observation.status != "working":
+        return None
+    age = None
+    try:
+        if engine.config.get("steer_after_minutes") and engine.state_dir is not None:
+            age = load_module("turn_start").age(engine.state_dir, observation.session_id, now, load_module("record_json").parse_bounded)
+    except Exception:
+        age = None
+    if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age, now):
+        return None
+    return "lane in a turn of %d minutes, queued" % (age // 60) if age is not None else "lane in a turn of unknown length, queued"
+
+
+def reminder_bound(config, item):
+    """#1728: the bound in SECONDS of a due reminder: `checkpoint_bound_minutes` (default 5) for one a launch checkpoint set (its condition names
+    the worker) or one marked `deadline`, else `reminder_bound_minutes` (default 10)."""
+    condition = item.get("condition") if isinstance(item.get("condition"), dict) else {}
+    checkpoint = bool(item.get("deadline")) or "while_running" in condition or "unless_report_from" in condition
+    key, default = ("checkpoint_bound_minutes", 5) if checkpoint else ("reminder_bound_minutes", 10)
+    minutes = config.get(key, default)
+    return (minutes if _is_number(minutes) and minutes >= 0 else default) * 60
+
+
+def late_reminder_counts(state_dir, config, now):
+    """#1728: {lane: reminders delivered LATER than their bound in the last 24 hours}, from the audit lines. Each `reminder.add` (id, `at`, recipient)
+    is paired with the FIRST `v2.synthetic` line whose keys hold `reminder:<id>`; delivery minus `at` is compared with `reminder_bound`."""
+    import json
+    from datetime import datetime
+    def epoch(text):
+        try:
+            return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    added, delivered, counts = {}, {}, {}
+    try:
+        with open(str(state_dir) + "/audit.jsonl", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return counts
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        detail = entry.get("detail") if isinstance(entry, dict) and isinstance(entry.get("detail"), dict) else {}
+        if entry.get("event") == "reminder.add" and detail.get("id") is not None:
+            added[str(detail["id"])] = (entry.get("subject"), epoch(detail.get("at")), {"deadline": bool(detail.get("deadline")), "condition": {"unless_report_from": 1} if detail.get("for") else {}})
+        elif entry.get("event") == "v2.synthetic":
+            for key in detail.get("keys") or []:
+                if isinstance(key, str) and key.startswith("reminder:"):
+                    delivered.setdefault(key[len("reminder:"):], epoch(entry.get("ts")))
+    for item_id, (lane, due, item) in added.items():
+        counts.setdefault(lane, 0)
+        sent = delivered.get(item_id)
+        if due is not None and sent is not None and sent >= now - 86400 and sent - due > reminder_bound(config, item):
+            counts[lane] += 1
+    return counts
+
+
+def late_reminder_lines(state_dir, config, now):
+    """One `status` line per lane: how many reminders came later than their bound in the last 24 hours."""
+    return ["      reminders  %s: %d later than the bound in 24h" % (lane, n) for lane, n in sorted(late_reminder_counts(state_dir, config, now).items())]
+
+
+def ceiling_wake(engine, source, plan, now):
+    """#1728 ceiling: a due reminder of this lane past its bound that this pass would not admit (a batch window) turns the plan into a queued wake,
+    carrying every pending fact of the lane, with one `reminder.ceiling` audit line per reminder. A wake already planned (queued behind a turn) is
+    delivered by this very pass: only the line is written. A held lane is left alone. Returns the ids written."""
+    if plan.action not in ("wait", "wake"):
+        return []
+    items = {i["id"]: i for i in read_reminders(source.state_dir)}
+    late = [(f, items[f.key[len("reminder:"):]]) for f in plan.pending
+            if str(f.key).startswith("reminder:") and f.key[len("reminder:"):] in items]
+    over = [(f, i) for f, i in late if now - i["at"] > reminder_bound(engine.config, i)]
+    done = source.__dict__.setdefault("_ceiled", set())
+    over = [(f, i) for f, i in over if i["id"] not in done]
+    if not over:
+        return []
+    if plan.action == "wait":
+        for fact in plan.pending:
+            fact.batch = False
+        plan.action, plan.reason = "wake", "ceiling: a due reminder is past its bound"
+    for _, item in over:
+        if len(done) > 1000:
+            done.clear()
+        done.add(item["id"])
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "reminder.ceiling", plan.recipient,
+                                {"id": item["id"], "late_min": max(0, int((now - item["at"]) // 60)),
+                                 "bound_min": int(reminder_bound(engine.config, item) // 60), "delivery": "queued wake"})
+    return [i["id"] for _, i in over]
+
+
+def invariant_break(source, plan, now):
+    """#1728 invariant: the unconditional, unexpired due reminders of this lane that are not in its pending facts (an empty list: it holds)."""
+    have = {f.key for f in plan.pending}
+    return [i for i in source.due() if i["to"] == plan.recipient and not i.get("condition") and not i.get("key") and not i.get("ttl")
+            and "reminder:" + i["id"] not in have]
+
+
+def reminder_waiting(engine, plan, now):
+    """#1728: the audit line for each due reminder in `plan` that is not delivered in this pass. Never raises: it must not stop a delivery."""
+    try:
+        source = next((s for s in engine.sources if isinstance(s, ReminderFacts)), None)
+        mine = [f for f in plan.pending if str(f.key).startswith("reminder:")]
+        reason = waiting_reason(engine, plan, now) if source is not None and mine else None
+        for fact in mine if reason else ():
+            source.waiting(fact.key[len("reminder:"):], plan.recipient, fact.created, reason)
+        if source is not None and plan.action != "hold":
+            for item in invariant_break(source, plan, now):
+                source.waiting(item["id"], plan.recipient, item["at"], "invariant broken: a due reminder of a lane neither held nor cancelled is not a pending fact")
+            source.ceiling(plan, now)
+    except Exception:
+        pass
 
 
 def prune_delivered_reminders(engine, discovery):
