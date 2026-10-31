@@ -16055,7 +16055,7 @@ class IntentReader:
         repo = repo or self.repo
         return self._cached(("orders", repo, number), lambda: fetch_orders(self, number, repo))
 
-    NO_PARENT_SHAPE = re.compile(r"(not_found: )?(gh: )?(not found|http 404 no parent)( \(http 404\))?", re.I)
+    NO_PARENT_SHAPE = re.compile(r"(not_found: )?(gh: )?(not found|no parent issue found|http 404 no parent)( \(http 404\))?", re.I)
 
     def parent(self, number, repo=None, strict=False):
         """The parent issue's number, or None when the issue has no parent. `strict` (#1249, charter set): a 404 whose body is not the exact "no parent" shape raises."""
@@ -23865,11 +23865,11 @@ def cmd_charter(args, runner, now):
         audit("charter.refused", why="lane", given=safe(args.name))
         sys.stderr.write("%s: charter: the lane %r is not a valid agent name; nothing was changed\n" % (PROG, safe(args.name)))
         return EXIT_USAGE
-    raw = (args.charter or "").strip().lower().lstrip("#")
+    raw = (args.charter or "").strip().lower(); named, raw = raw.rpartition("#")[::2] if "/" in raw else ("", raw.lstrip("#"))   # `owner/repo#N` names the repo
     value = None if raw == "none" else (int(raw) if re.fullmatch(r"[0-9]{1,9}", raw) and int(raw) > 0 else False)
     if value is False:
         audit("charter.refused", why="value", given=safe(args.charter or ""))
-        sys.stderr.write("%s: charter: give a positive issue number or `none`, not %r; nothing was changed\n" % (PROG, safe(args.charter or "")))
+        sys.stderr.write("%s: charter: give a positive issue number (N, #N or owner/repo#N) or `none`, not %r; nothing was changed\n" % (PROG, safe(args.charter or "")))
         return EXIT_USAGE
     registry = load_module("registry")
     replace = bool(getattr(args, "replace", False))
@@ -23877,6 +23877,12 @@ def cmd_charter(args, runner, now):
     decided = {}
     pre = {}
     row0 = registry.read(engine.state_dir)["agents"].get(args.name)
+    row_repo = (row0.get("repo") if isinstance(row0, dict) else None) or (engine.config.get("intent_repo") if engine.config else None)
+    if named and named != str(row_repo).lower():
+        audit("charter.refused", why="repo", given=safe(named))
+        rs = lambda t: re.sub(r"[^A-Za-z0-9_./-]", "?", str(t)[:60])
+        sys.stderr.write("%s: charter: %s is not the repo of %s's registry row (%s); nothing was changed\n" % (PROG, rs(named), safe(args.name), rs(row_repo)))
+        return EXIT_USAGE
     if value is not None and isinstance(row0, dict):   # #1143: the GitHub reads happen BEFORE the registry lock, bound to the issue number and the repo; the lock only re-checks registry facts
         repo0 = row0.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
         try:
@@ -23938,7 +23944,7 @@ def add_charter_parsers(sub):
                                     description="The registry row's `charter` is the one record of which charter an orchestrator owns; the lane lookup reads it. The live session's metadata is written once at launch and "
                                                 "cannot be corrected, so it is never read as a second owner. Run by the Chief of Staff or the operator; one audit line with the old and the new value.")
     setter.add_argument("name", help="The orchestrator's fleet name")
-    setter.add_argument("charter", help="An issue number, or `none`")
+    setter.add_argument("charter", help="An issue number (N, #N or owner/repo#N), or `none`")
     setter.add_argument("--replace", action="store_true", help="Required to change a charter that is already set (a flag: it takes no value)")
     setter.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
 

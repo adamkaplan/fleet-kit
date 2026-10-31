@@ -1,0 +1,10 @@
+bin/fleet-switchboard
+OLD: NO_PARENT_SHAPE = re.compile(r"(not_found: )?(gh: )?(not found|http 404 no parent)( \(http 404\))?", re.I)
+NEW: NO_PARENT_SHAPE = re.compile(r"(not_found: )?(gh: )?(not found|no parent issue found|http 404 no parent)( \(http 404\))?", re.I)
+OLD:     raw = (args.charter or "").strip().lower().lstrip("#")
+NEW:     raw = (args.charter or "").strip().lower(); named, raw = raw.rpartition("#")[::2] if "/" in raw else ("", raw.lstrip("#"))   # `owner/repo#N` names the repo
+OLD:         sys.stderr.write("%s: charter: give a positive issue number or `none`, not %r; nothing was changed\n" % (PROG, safe(args.charter or "")))
+NEW:         sys.stderr.write("%s: charter: give a positive issue number (N, #N or owner/repo#N) or `none`, not %r; nothing was changed\n" % (PROG, safe(args.charter or "")))
+OLD:     setter.add_argument("charter", help="An issue number, or `none`")
+NEW:     setter.add_argument("charter", help="An issue number (N, #N or owner/repo#N), or `none`")
+(the `value = ...` line is unchanged)
