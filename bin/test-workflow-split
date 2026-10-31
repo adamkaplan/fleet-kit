@@ -128,8 +128,8 @@ LAUNCHER_TIMEOUT = "20"   # the cloud launcher step's timeout-minutes; the one p
 NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", LAUNCHER_TIMEOUT)] + [suite(n, "", t) for n, t in ADDED + RELAY]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
-CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
-               "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"}
+CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}${{ github.event.action == 'reopened' && '-reopened' || '' }}",
+               "cancel-in-progress": "${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}"}
 TRIGGERS = ["pull_request", "push", "schedule", "workflow_dispatch"]
 MATRIX = ["ubuntu-latest", "macos-latest"]
 
@@ -400,10 +400,10 @@ class Mutants(unittest.TestCase):
             self.assertTrue(result.failures or result.errors, t)
 
     def test_s6_concurrency_group_changed(self):
-        self.fails("github.event.pull_request.number || github.sha }}", "github.sha }}", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+        self.fails("github.event.pull_request.number || github.sha }}${{", "github.sha }}${{", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
 
     def test_s6_cancel_in_progress_always_true(self):
-        self.fails("${{ github.event_name == 'pull_request' }}", "true", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+        self.fails("${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}", "true", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
 
     def test_s6_a_job_level_concurrency_block(self):
         self.fails("  test-cloud:\n", "  test-cloud:\n    concurrency:\n      group: x\n", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
