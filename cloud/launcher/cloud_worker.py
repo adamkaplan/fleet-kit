@@ -68,6 +68,8 @@ ORPHAN_SECRET_AFTER_SECONDS = 3600      # a per-run Secret whose pod is absent i
 ORPHAN_SECRET_ACTION = "orphan-secret-removed"   # the audit action of that removal (one line per Secret; its reason holds the name and the age)
 ORPHAN_SECRET_REASON = "orphan secret: its pod is absent"
 PW_SECRET_NAME = re.compile(r"(.+-[0-9a-f]{4})-pw")   # '<worker>-<4 hex digits>-pw': the password Secret of the pod named by the group
+REAP_PARALLEL = 4                       # the stops of one pass run at most this many at a time
+REAP_STOP_SECONDS = 420                 # one stop's own limit: past it the wait is abandoned for this pass and the pod is left whole
 RENEW_CADENCE_SECONDS = 600             # the renewal and the login refresh run at least this often, on their own thread, whatever a pass is doing
 RESTART_ACTION = "reaper-restart"       # the audit action of the reaper's exit after the installed code changed (the service manager starts it again)
 CODE_IDENTITY_FILES = ("cloud/launcher/cloud_worker.py", "cloud/launcher/run_record.py", "bin/path_walk.py", "cloud/launcher/token_mint.py", "bin/registry.py", "bin/record_json.py")   # the module and the kit modules it imports
@@ -396,7 +398,7 @@ def scrub(text, secrets_known=(), limit=300):
     of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
     then the text is cut to `limit`. Control characters become '?'."""
     text = str(text)[:SCRUB_INPUT_MAX]
-    for sec in sorted({v for v in secrets_known if v and len(v.strip()) >= MIN_FRAGMENT}, key=len, reverse=True):
+    for sec in sorted({v for v in tuple(secrets_known) if v and len(v.strip()) >= MIN_FRAGMENT}, key=len, reverse=True):
         for v in {sec, sec.strip()}:
             text = text.replace(v, "[redacted]")
         out, i = [], 0
@@ -1784,6 +1786,23 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     return pod
 
 
+class _StopKube:
+    """One stop's view of the cluster door: the same calls, but once the stop is abandoned every call raises, so a late thread changes nothing."""
+    def __init__(self, kube, dead):
+        self._kube, self._dead = kube, dead
+
+    def __getattr__(self, name):
+        attr = getattr(self._kube, name)
+        if not callable(attr) or name == "scrub":
+            return attr
+
+        def call(*a, **k):
+            if self._dead.is_set():
+                raise CloudError("stop abandoned")
+            return attr(*a, **k)
+        return call
+
+
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
         self.kube, self.env, self.sleep = kube, env, sleep
@@ -2485,9 +2504,51 @@ class Launcher:
                 print("cloud-worker: WARNING: no usable record for %s; using the pod's own deadline" % ann(pod, "worker"), file=sys.stderr)
         return min(hard, parse_iso(ann(pod, "max-hard", iso(hard))))  # a record never lengthens a life past the cap
 
+    def _run_stops(self, jobs):
+        """Stop the pods of one pass, at most REAP_PARALLEL at a time, each on its own per-stop copy of the launcher (own last_hook, run id, hub
+        mark, record deadline and cluster view). Returns [(result, error, last_hook)] in the order of `jobs`. A stop past REAP_STOP_SECONDS is
+        abandoned: its thread is left to end by itself (our kubectl client is not reachable), every later call of it raises, the pod is left
+        whole and un-annotated, and ONE audit line says so; the next pass tries again."""
+        done, running, nxt, got = {}, {}, 0, []
+
+        def work(i, ctx):   # a late (abandoned) thread never replaces the limit result: dict.setdefault of one key is atomic in CPython
+            _, worker, reason, nonce = jobs[i]
+            try:
+                done.setdefault(i, (ctx.stop(argparse.Namespace(worker=worker, reason=reason, run_id=nonce,
+                                                      cause="hard" if reason == "hard limit" else "idle"), reason), None, ctx.last_hook))
+            except CloudError as e:
+                done.setdefault(i, (None, e, ctx.last_hook))
+            except BaseException as e:   # as before: not ours to swallow, re-raised by the pass
+                done.setdefault(i, (None, e, None))
+        while nxt < len(jobs) or running:
+            for i, (dead, t0, ctx) in list(running.items()):
+                took = int((self.clock() - t0).total_seconds())
+                if i in done:
+                    del running[i]
+                elif took >= REAP_STOP_SECONDS:
+                    dead.set()
+                    del running[i]
+                    done[i] = (None, CloudError("stop hit its limit: %d seconds (limit %d)" % (took, REAP_STOP_SECONDS), 1), None)
+                    self.audit(jobs[i][1], "pod/" + pod_name(jobs[i][1]), "stop", 0.0, False, str(done[i][1]))
+            while nxt < len(jobs) and len(running) < REAP_PARALLEL:
+                dead = threading.Event()
+                ctx = copy.copy(self)
+                ctx.kube, ctx.last_hook, ctx._orchestrator, ctx.foreign = _StopKube(self.kube, dead), None, None, []
+                ctx.recorder = copy.copy(self.recorder)
+                ctx.audit = lambda *a, _d=dead, **k: None if _d.is_set() else self.audit(*a, **k)
+                running[nxt] = (dead, self.clock(), ctx)
+                threading.Thread(target=work, args=(nxt, ctx), daemon=True).start()
+                nxt += 1
+            if running:
+                time.sleep(0.005)
+        for i in range(len(jobs)):
+            if isinstance(done[i][1], BaseException) and not isinstance(done[i][1], CloudError):
+                raise done[i][1]
+        return [done[i] for i in range(len(jobs))]
+
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
-        out, now, live = [], self.clock(), []
+        out, now, live, jobs = [], self.clock(), [], []
         self.reap_results, self.last_hook = {}, None
         pods = self.kube.list_pods()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
@@ -2514,19 +2575,22 @@ class Launcher:
                 if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
                     reason = "idle"
             if reason:
-                self.last_hook = None
                 if pod in live:
                     live.remove(pod)
-                try:
-                    # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
-                    res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None,
-                                                       cause="hard" if reason == "hard limit" else "idle"), reason)
+                out.append(None)   # this pod's place in the result: filled after the stops ran
+                # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
+                jobs.append((len(out) - 1, worker, reason, ann(pod, "run-id") or None))
+        for (slot, worker, reason, _), (res, err, hook) in zip(jobs, self._run_stops(jobs)):
+            try:
+                if err is not None:
+                    raise err
+                if res is not None:
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
-                    out.append((worker, reason, 0))
+                    out[slot] = (worker, reason, 0)
                     self.retire_row(worker, reason)   # the pod is ended: its registry row is retired, once (DW-3)
-                except CloudError as e:
-                    self.reap_results[worker] = dict(self.last_hook or {})
-                    out.append((worker, reason, e.code))
+            except CloudError as e:
+                self.reap_results[worker] = dict(hook or {})
+                out[slot] = (worker, reason, e.code)
         out.extend(renewed)
         self.remove_orphan_secrets(pods, now)
         self.send_wip_notes(live, now)
