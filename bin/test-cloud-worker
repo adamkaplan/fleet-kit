@@ -2460,7 +2460,7 @@ class TestNeedsDocker(Base):   # #1488
     def run_launch(self, text, *extra, cloud=True):
         (self.home / "brief.txt").write_text(text)
         argv = ["launch", "coder7", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main", "--role", "coder", "--reports-to", "orch", "--brief-file", str(self.home / "brief.txt"), *extra]
-        with mock.patch.object(sb, "launch_agent", return_value={"name": "coder7", "session": "ses_l", "pane": "p1", "tab": "t1"}):   # a local launch: the terminal is not under test, what the command prints is
+        with mock.patch.object(sb, "launch_agent", return_value={"name": "coder7", "session": "ses_l", "pane": "p1", "tab": "t1"}), mock.patch.object(sb, "memory_read", return_value=None):   # a local launch: the terminal is not under test, what the command prints is
             return self.main(*argv, *(["--cloud"] if cloud else ["--terminal", "--workspace", "w1", "--dir", str(self.home)]))
 
     def seen(self, res):
