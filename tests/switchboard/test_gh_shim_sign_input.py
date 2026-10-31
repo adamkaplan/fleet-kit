@@ -169,7 +169,8 @@ class TestGhShimSignInput(unittest.TestCase):
         self.assertEqual(calls[0]["stdin"], '{"event":"APPROVE"}')
         path = self.file('{"event":"APPROVE"}')
         done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", path)
-        self.assertEqual(calls[0]["argv"][-1], path)
+        self.assertNotEqual(calls[0]["argv"][-1], path)
+        self.assertEqual(calls[0]["files"][calls[0]["argv"][-1]], '{"event":"APPROVE"}')
 
     def test_s19_review_comment_endpoints_are_signed(self):
         for endpoint, extra in (("repos/o/r/pulls/comments/5", ("-X", "PATCH")), ("repos/o/r/pulls/1/comments/5/replies", ())):
