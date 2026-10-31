@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+from unicodedata import category as _category
 
 SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "*credentials*",
                 "*secret*", "*.kubeconfig", "kubeconfig", ".netrc", ".npmrc"]
@@ -114,7 +115,7 @@ def _secret_spans(text):
 
 def _normal(text):
     """NFKC-normalised text without its format characters (a zero-width space or a soft hyphen cannot split a key)."""
-    return "".join(c for c in unicodedata.normalize("NFKC", text) if unicodedata.category(c) != "Cf")
+    return "".join(c for c in unicodedata.normalize("NFKC", text) if _category(c) != "Cf")
 
 
 def scrub_line(line):

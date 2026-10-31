@@ -471,7 +471,7 @@ def _unmutated(directory):
 class S13cMutants(Scratch):
     TARGETS = (
         (_mut(r"(?<=://)[^/\s]*@", r"(?<=://)[^/\s@]*@"), "S10c"),
-        (_mut("if unicodedata.category(c) != \"Cf\")", "if True)"), "S10c"),
+        (_mut("if _category(c) != \"Cf\")", "if True)"), "S10c"),
     )
 
     def _child(self, path):
