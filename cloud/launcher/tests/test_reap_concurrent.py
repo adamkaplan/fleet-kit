@@ -24,6 +24,8 @@ import stub_support  # noqa: E402
 T0 = dt.datetime(2026, 10, 30, 9, 0, 0, tzinfo=dt.timezone.utc)
 HOOK_SECONDS = 100   # eight in a row: 800 seconds; two waves of four: 200
 MODULE_ENV = "CW_TEST_REAP_CONCURRENT_MODULE"
+SCRUB_SET = 1000
+SCRUB_RUNS = 2000
 PHRASES = ("four at a time", "its own limit", "tried again at the next pass")
 
 
@@ -307,6 +309,33 @@ class Concurrent(unittest.TestCase):
         self.assertEqual((got1, got0), (want1, want0))
 
 
+class ScrubSnapshot(unittest.TestCase):
+    def test_S9_scrub_survives_a_set_that_grows_under_it(self):
+        mod = target_module()
+        planted = "PLANTED-known-secret-value-0001"
+        known = {planted} | {"early-known-%07d-xx" % i for i in range(SCRUB_SET)}
+        text = "log line with " + planted + " inside"
+        errors, removed, done = [], 0, threading.Event()
+
+        def adder():
+            for i in range(5000):
+                known.add("late-added-%07d-yy" % i)
+                time.sleep(0)   # let the scrubbing thread run between two adds
+            done.set()
+        t = threading.Thread(target=adder, daemon=True)
+        t.start()
+        for _ in range(SCRUB_RUNS):
+            try:
+                removed += planted not in mod.scrub(text, known)
+            except RuntimeError as e:
+                errors.append(str(e))
+        t.join()
+        print("S9: scrubs %d of %d, RuntimeError %d, planted value removed %d of %d"
+              % (SCRUB_RUNS, SCRUB_RUNS, len(errors), removed, SCRUB_RUNS))
+        self.assertEqual(errors, [])
+        self.assertEqual(removed, SCRUB_RUNS)
+
+
 def mutant(directory, name, edits):
     with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
         src = f.read()
@@ -341,6 +370,17 @@ class Mutants(unittest.TestCase):
         ]
         print("S7: mutants caught %d of 4, mutations applied 4 of 4" % sum(n))
         self.assertEqual(sum(n), 4)
+
+    def test_S9_the_mutant_that_iterates_the_live_set_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = mutant(tmp, "m9", [("for v in tuple(secrets_known) if v", "for v in secrets_known if v")])
+            p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reap_concurrent.ScrubSnapshot"], cwd=HERE,
+                                   env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out = p.communicate(timeout=90)[0]
+        seen = "Set changed size during iteration" in out
+        print("S9 mutant: failed with the set-changed-size error %d of 1, mutation applied True" % (p.returncode == 1 and seen))
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("Set changed size during iteration", out)
 
 
 class Docs(unittest.TestCase):

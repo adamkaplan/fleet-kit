@@ -398,7 +398,7 @@ def scrub(text, secrets_known=(), limit=300):
     of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
     then the text is cut to `limit`. Control characters become '?'."""
     text = str(text)[:SCRUB_INPUT_MAX]
-    for sec in sorted({v for v in secrets_known if v and len(v.strip()) >= MIN_FRAGMENT}, key=len, reverse=True):
+    for sec in sorted({v for v in tuple(secrets_known) if v and len(v.strip()) >= MIN_FRAGMENT}, key=len, reverse=True):
         for v in {sec, sec.strip()}:
             text = text.replace(v, "[redacted]")
         out, i = [], 0
