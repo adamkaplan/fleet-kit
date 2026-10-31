@@ -171,41 +171,50 @@ class AllowListAndAuditSentence(unittest.TestCase):
 
     def test_s6_mutants_fail_the_allow_list(self):
         block = commands_block(read(DOCS[0]))
+        control = self.allowed(block)
+        print("S6: control: the real block matches %d of %d" % control)
+        self.assertEqual(control, (7, 7))
         failing = 0
+        applied_all = True
         for extra in ("kubectl exec NODE_NAME -- id", "az aks nodepool update --name NODEPOOL_NAME", "kubectl get secrets --all-namespaces"):
             mutated = block + extra + "\n"
-            applied = mutated != block
-            self.assertTrue(applied)
+            applied_all = applied_all and mutated != block
+            self.assertTrue(mutated != block)
             self.assertTrue(block_clean(mutated), extra)
             ok, total = self.allowed(mutated)
             if ok != total:
                 failing += 1
-        print("S6: mutants failing the allow-list %d of 3, none holding a forbidden word, mutation applied %s" % (failing, applied))
+        print("S6: mutants failing the allow-list %d of 3, none holding a forbidden word, mutation applied %s" % (failing, applied_all))
         self.assertEqual(failing, 3)
+
+    @staticmethod
+    def has_audit_sentence(sec):
+        return ("AUDIT_LOG_QUERY" in sec, "names who deleted each pod" in sec)
 
     def test_s2_the_audit_log_sentence(self):
         names = phrases = 0
         for rel in DOCS:
             sec = read(rel).split("## A worker lost with its node", 1)[1]
-            self.assertIn("AUDIT_LOG_QUERY", sec, rel)
-            self.assertIn("names who deleted each pod", sec, rel)
-            names += 1
-            phrases += 1
+            found = self.has_audit_sentence(sec)
+            self.assertEqual(found, (True, True), rel)
+            names += found[0]
+            phrases += found[1]
         print("S2: audit-log name %d of 2 documents and phrase %d of 2 documents" % (names, phrases))
 
     def test_s2_mutant_without_the_audit_log_sentence_fails(self):
         sec = read(DOCS[0]).split("## A worker lost with its node", 1)[1]
-        lines = sec.split("\n")
-        cut = "\n".join(ln for ln in lines if "names who deleted each pod" not in ln)
+        control = self.has_audit_sentence(sec)
+        cut = "\n".join(ln for ln in sec.split("\n") if "names who deleted each pod" not in ln)
         applied = cut != sec
-        with self.assertRaises(AssertionError):
-            self.assertIn("names who deleted each pod", cut)
-        print("S2: mutant that removes the audit-log sentence fails 1 of 1, mutation applied %s" % applied)
+        mutant = self.has_audit_sentence(cut)
+        print("S2: audit-log sentence: control found %d of 1, mutant missing %d of 1, mutation applied %s" % (control == (True, True), mutant[1] is False, applied))
         self.assertTrue(applied)
+        self.assertEqual(control, (True, True))
+        self.assertFalse(mutant[1])
 
     def test_s2_s5_counts(self):
         cmds = ("kubectl get events --all-namespaces --field-selector involvedObject.kind=Node", "kubectl describe node NODE_NAME",
-                "kubectl get pods --all-namespaces -o wide", "kubectl -n kube-system get configmap cluster-annotation".replace("annotation", "autoscaler-status -o yaml"),
+                "kubectl get pods --all-namespaces -o wide", "kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml",
                 "az aks nodepool show", "az aks nodepool list", "az monitor activity-log list", "RESOURCE_GROUP_NAME", "CLUSTER_NAME")
         p8 = ("Evicted", "scale-down", "image upgrade", "NotReady", "node upgrade or maintenance eviction", "node failure", "spot eviction", "ONLY against")
         p10 = ("is not scaled down until the worker ends", "at its idle limit (`--idle`)", "8 hours by default", "plus five minutes", "has no deadline",
@@ -213,9 +222,11 @@ class AllowListAndAuditSentence(unittest.TestCase):
                "ask 1480 (pull request 1486)", "`cw-prestop`", "`wip` branch", "no stop line")
         for rel in DOCS:
             sec = read(rel).split("## A worker lost with its node", 1)[1]
-            print("S2: command strings %d of 9 in each of 2 documents" % sum(c in sec for c in cmds))
             idle = sec.count("30 minutes") + sec.count("30m") + sec.count("minutes by default")
-            print("S5: phrases %d of 8 and %d of 10, idle number occurrences %d" % (sum(p in sec for p in p8), sum(p in sec for p in p10), idle))
+            got = (sum(c in sec for c in cmds), sum(p in sec for p in p8), sum(p in sec for p in p10), idle)
+            print("S2: command strings %d of 9 in each of 2 documents" % got[0])
+            print("S5: phrases %d of 8 and %d of 10, idle number occurrences %d" % got[1:])
+            self.assertEqual(got, (9, 8, 10, 0), rel)
 
 
 if __name__ == "__main__":
