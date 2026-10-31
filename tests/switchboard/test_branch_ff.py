@@ -58,7 +58,7 @@ class TestBranchFf(Base):
         self.gh = FakeGitHub()
 
     def runner(self, argv, **kwargs):
-        return self.gh(argv, **kwargs) if argv[0] == "gh" or os.path.basename(argv[0]) == "git" else self.world.route(argv, **kwargs)
+        return self.gh(argv, **kwargs) if os.path.basename(argv[0]) in ("gh", "git") else self.world.route(argv, **kwargs)
 
     def main(self, who, *argv):
         with mock.patch.dict(os.environ, {sb.SESSION_ENV: self.world.sessions[who]}):
