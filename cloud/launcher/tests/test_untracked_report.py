@@ -253,6 +253,46 @@ class Mutants(unittest.TestCase):
             self.assertEqual(Cases(self, end_hook, prestop).failures(), [])
 
 
+class PrintedCounts(unittest.TestCase):
+    def test_s9_cases_holding(self):
+        held = {}
+        for prestop in (False, True):
+            held[prestop] = len(Cases.ALL) - len(Cases(self, end_hook, prestop).failures())
+            self.assertEqual(held[prestop], len(Cases.ALL))
+        self.assertEqual(len(Cases.ALL), 7)
+        print("S9: cases holding %d of %d on the end path, %d of %d on the pre-stop path"
+              % (held[False], len(Cases.ALL), held[True], len(Cases.ALL)))
+
+    def test_s10_named_mutants_refused(self):
+        named = ("names nothing", "names a secret path as saved")
+        refused = {False: 0, True: 0}
+        control = 0
+        for prestop in (False, True):
+            ok = Cases(self, end_hook, prestop).failures() == []
+            self.assertTrue(ok)
+            control += int(ok)
+            for label in named:
+                old, new = MUTANTS[label]
+                r = bool(Cases(self, mutant(old, new), prestop).failures())
+                self.assertTrue(r, "survived: %s" % label)
+                refused[prestop] += int(r)
+        print("S10: named mutants refused %d of 2 on the end path and %d of 2 on the pre-stop path, control passes %d of 2"
+              % (refused[False], refused[True], control))
+
+    def test_s14_skip_a_push_line_keys(self):
+        old, new = '"local_only": not refreshed, **extra})', '"local_only": not refreshed})'
+        t = Cases(self, end_hook, False).tree()
+        res = Cases(self, end_hook, False).run(t)
+        lines = 1 if (res.get("untracked") == [] and res.get("untracked_more") == 0) else 0
+        with open(os.path.join(LAUNCHER, "end_hook.py")) as f:
+            applied = f.read().count(old) == 1
+        failing = 1 if Cases(self, mutant(old, new), False).failures() else 0
+        self.assertEqual(lines, 1)
+        self.assertIs(applied, True)
+        self.assertEqual(failing, 1)
+        print("S14: lines carrying both keys %d of 1, mutants failing %d of 1, mutation applied %s" % (lines, failing, applied))
+
+
 class Docs(unittest.TestCase):
     def read(self, *p):
         with open(os.path.join(KIT, *p)) as f:
