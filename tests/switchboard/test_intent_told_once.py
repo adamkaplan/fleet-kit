@@ -1,4 +1,4 @@
-"""The #1437 tests (an Intent edit is told once), moved out of bin/test-switchboard. build() is called by bin/test-switchboard, which holds TestIntentEditWiring."""
+"""The #1437 tests (an Intent edit is told once), moved out of bin/test-switchboard. build() is called by bin/test-switchboard, which holds TestIntentEditWiring and GithubRig."""
 from pathlib import Path
 from unittest import mock
 from support.loader import sb
@@ -9,7 +9,7 @@ def edited_body(intent, done):
     return "## Intent\n%s\nDone when: %s\n" % (intent, done)
 
 
-def build(Wiring):
+def build(Wiring, GithubRig):
     class TestIntentEditToldOnce(Wiring):
         """#1437: an Intent edit is told once per recipient, keyed by issue, edit time and body hash, and the record outlives a restart."""
 
