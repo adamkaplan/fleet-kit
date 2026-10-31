@@ -109,9 +109,9 @@ def build(Base, GithubRig, GH_REPO):
             def one_slot(engine, discovery, held, now, report):
                 real(engine, discovery, held, now, report)
                 last = {t["agent"]: t["reason"] for t in report["toasts"] if t["shown"]}
-                engine.toasted_intent = {name: ({last[name]} if name in last else set()) for name in set(engine.toasted_intent) | set(last)}
+                engine.toasted_intent.update({name: {reason} for name, reason in last.items()})
             with mock.patch.object(sb.Switchboard, "render_toast", one_slot):
-                with self.assertRaisesRegex(AssertionError, r"^8 != 2"):
+                with self.assertRaisesRegex(AssertionError, r"^6 != 2"):
                     self.test_s2_two_pending_edits_are_toasted_once_each_over_ten_passes()
 
         def fresh_rig(self):
