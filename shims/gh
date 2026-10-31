@@ -1335,23 +1335,43 @@ def api_call(args, namer):
     return new, stdin_text, temps or None
 
 
+def leading_repo_flags(args):
+    """How many leading arguments are `-R`/`--repo` flags with their values (`-R o/r`, `--repo o/r`, `--repo=o/r`, `-Ro/r`): a value that looks like a verb is a value."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-R", "--repo"):
+            if i + 1 >= len(args):
+                break
+            i += 2
+        elif arg.startswith("--repo=") or (arg.startswith("-R") and len(arg) > 2 and not arg.startswith("--")):
+            i += 1
+        else:
+            break
+    return i
+
+
 def sign_plan(args, lookup):
     """The plan for a call, or None when it is not a signed form. Raises Unsignable when a signed form's text cannot be signed. The name is looked up
-    only when a body is about to be signed, so an unrelated call costs no lookup."""
-    if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS:
-        handler = lambda namer: signed_call(args, namer())
-    elif len(args) >= 3 and (args[0], args[1]) in CLOSE_COMMANDS:
-        handler = lambda namer: close_call(args, namer)
-    elif args and args[0] == "api":
-        handler = lambda namer: api_call(args, namer)
+    only when a body is about to be signed, so an unrelated call costs no lookup. A `-R`/`--repo` flag before the command words is skipped to find the
+    form and kept in the new argv."""
+    lead = leading_repo_flags(args)
+    core = args[lead:]
+    if len(core) >= 3 and (core[0], core[1]) in SIGNED_COMMANDS:
+        handler = lambda namer: signed_call(core, namer())
+    elif len(core) >= 3 and (core[0], core[1]) in CLOSE_COMMANDS:
+        handler = lambda namer: close_call(core, namer)
+    elif core and core[0] == "api":
+        handler = lambda namer: api_call(core, namer)
     else:
         return None
     try:
-        return handler(lambda: my_name(lookup))
+        plan = handler(lambda: my_name(lookup))
     except Unsignable:
         raise
     except Exception as err:
         raise Unsignable("signing failed (%s)" % type(err).__name__)
+    return plan if plan is None or not lead else (args[:lead] + plan[0], plan[1], plan[2])
 
 
 # ---- the gate probe (plan-driven development: enforcing in a repo whose mode is enforce). docs/plan-gate-engine-design.md, E1 and E3.
