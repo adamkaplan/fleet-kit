@@ -90,6 +90,9 @@ class TestMutant(unittest.TestCase):
                                  env=dict(os.environ, TMPDIR=d), capture_output=True, text=True, cwd=d)
         print("%d of 1 mutants refused" % (res.returncode != 0))
         self.assertNotEqual(res.returncode, 0, "the mutant passed the orchestrator test")
+        self.assertIn("the session step ran 0 times, not once", res.stdout + res.stderr, "the mutant failed for another reason")
+        self.assertNotIn("No such file", res.stdout + res.stderr)
+        self.assertNotIn("FileNotFoundError", res.stdout + res.stderr)
 
 
 class TestDocs(unittest.TestCase):
