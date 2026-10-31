@@ -168,22 +168,36 @@ MUTANTS = {
 }
 
 
+def run_in_copy(case, mutation, test):
+    """Run the child test in a faithful scratch copy of the tree outside the repository; the control runs first on the unmutated copy."""
+    with tempfile.TemporaryDirectory() as d:
+        shutil.copytree(ROOT, d, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))
+        os.chmod(d, 0o700)   # copytree gives the copy the repository root's mode (setgid here), which the launch's private-directory check refuses
+        cmd = [sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name), test]
+
+        def child():
+            c = stub_support.start(case, cmd, env=dict(os.environ, TMPDIR=d), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=d, text=True)
+            out = c.communicate(timeout=90)[0]
+            return c.returncode, out
+        control, cout = child()
+        print("control: unmutated copy passes %d of 1" % (control == 0))
+        case.assertEqual(control, 0, "the control copy fails: " + cout[-1500:])
+        target = Path(d, "bin", "cloud_worker.py")
+        src = target.read_text()
+        old, new = mutation
+        case.assertEqual(src.count(old), 1, "the mutated line is not as expected")
+        target.write_text(src.replace(old, new, 1))
+        return child()
+
+
 class TestMutants(unittest.TestCase):
     def test_s6_mutants_are_caught(self):
         src = (ROOT / "bin" / "cloud_worker.py").read_text()
         caught = applied = 0
         for old, new, test in MUTANTS.values():
             applied += src.count(old) == 1
-            self.assertEqual(src.count(old), 1, "the mutated line is not as expected")
-            with tempfile.TemporaryDirectory() as d:
-                shutil.copytree(ROOT / "bin", os.path.join(d, "bin"), ignore=shutil.ignore_patterns("__pycache__"))
-                shutil.copytree(ROOT / "cloud" / "worker" / "tests", os.path.join(d, "cloud", "worker", "tests"), ignore=shutil.ignore_patterns("__pycache__"))
-                os.makedirs(os.path.join(d, "cloud", "launcher", "tests"))
-                shutil.copy(__file__, os.path.join(d, "cloud", "launcher", "tests"))
-                Path(d, "bin", "cloud_worker.py").write_text(src.replace(old, new, 1))
-                child = stub_support.start(self, [sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name), test],
-                                           env=dict(os.environ, TMPDIR=d), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=d)
-                caught += child.wait(timeout=90) == 1
+            code, out = run_in_copy(self, (old, new), test)
+            caught += code == 1 and test.split(".")[1] in out and "AssertionError" in out
         print("S6: mutants caught %d of 2, mutations applied %d of 2" % (caught, applied))
         self.assertEqual((caught, applied), (2, 2))
 
@@ -192,17 +206,9 @@ class TestWordsMutant(unittest.TestCase):
     def test_s6c_a_mutant_that_changes_the_refusal_words_fails_s2(self):
         old, new = "is not served by the pod's provider", "cannot be used by the pod's provider"
         src = (ROOT / "bin" / "cloud_worker.py").read_text()
-        self.assertEqual(src.count(old), 1, "the mutated line is not as expected")
-        with tempfile.TemporaryDirectory() as d:
-            shutil.copytree(ROOT / "bin", os.path.join(d, "bin"), ignore=shutil.ignore_patterns("__pycache__"))
-            shutil.copytree(ROOT / "cloud" / "worker" / "tests", os.path.join(d, "cloud", "worker", "tests"), ignore=shutil.ignore_patterns("__pycache__"))
-            os.makedirs(os.path.join(d, "cloud", "launcher", "tests"))
-            shutil.copy(__file__, os.path.join(d, "cloud", "launcher", "tests"))
-            Path(d, "bin", "cloud_worker.py").write_text(src.replace(old, new, 1))
-            child = stub_support.start(self, [sys.executable, os.path.join(d, "cloud", "launcher", "tests", Path(__file__).name),
-                                              "TestRefusal.test_s2_unserved_model_stops_the_pod"],
-                                       env=dict(os.environ, TMPDIR=d), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=d)
-            caught = child.wait(timeout=90) == 1
+        code, out = run_in_copy(self, (old, new), "TestRefusal.test_s2_unserved_model_stops_the_pod")
+        caught = code == 1 and "test_s2_unserved_model_stops_the_pod" in out and "not served by the pod's provider" in out
+        print("S6c control: unmutated copy passes 1 of 1")
         print("S6c: mutant that changes the refusal words fails S2 %d of 1, mutation applied %s" % (caught, src.count(old) == 1))
         self.assertTrue(caught)
 
