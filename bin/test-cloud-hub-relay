@@ -299,6 +299,25 @@ class TestClient(unittest.TestCase):
             cloud_cli.make_post = orig
         self.assertEqual(urls, ["http://hub.svc:8080/relay"])
 
+class _WaitingObserver(dict):
+    """The relay's held-waits dict that sets an event once the sum of its values reaches the target."""
+    def __init__(self, event, target):
+        super().__init__()
+        self.event, self.target = event, target
+
+    def _check(self):
+        if sum(self.values()) >= self.target:
+            self.event.set()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._check()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self._check()
+
+
 class TestBoundsAndCaps(unittest.TestCase):
     def test_caps_derive_from_max_handlers(self):
         for mh, total in ((4, 2), (16, 8), (None, 16)):
@@ -327,7 +346,7 @@ class TestBoundsAndCaps(unittest.TestCase):
         import socket
         saved = dict(SECRETS)
         self.addCleanup(lambda: (SECRETS.clear(), SECRETS.update(saved)))   # the module-level dict is restored whatever happens
-        with Hub(wait=8.0, max_per_pod=50) as hub:   # default max_handlers=32 -> relay cap 16
+        with Hub(wait=None, max_per_pod=50) as hub:   # default max_handlers=32 -> relay cap 16
             self.assertEqual(hub.server.max_handlers, 32)
             self.assertEqual(hub.relay.max_inflight, 16)
             self.assertEqual((cloud_relay.MAX_WAIT_PER_POD, cloud_relay.MAX_WAIT_TOTAL), (4, 16))
@@ -337,18 +356,66 @@ class TestBoundsAndCaps(unittest.TestCase):
             for name in agents: SECRETS[name] = "secret-" + name
             Path(hub.tmp.name, "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
             Path(hub.tmp.name, "agents.json").write_text(json.dumps(agents))
+            registered = threading.Event()
+            hub.relay.waiting = _WaitingObserver(registered, 16)   # set when all 16 held waits are registered
             threads = []
+            handlers = []   # the handler threads the hub's server starts (its daemon threads are not listed by the server itself)
+            orig_handler = hub.server.process_request_thread
+            def tracked_handler(*a, **kw):
+                handlers.append(threading.current_thread())
+                return orig_handler(*a, **kw)
+            hub.server.process_request_thread = tracked_handler
+            def release_all():   # no time bound on the held waits: every one is answered here, so a failure never hangs the run (the hub's server is already closed here: the answer goes to the relay itself)
+                end = time.monotonic() + 10
+                while hub.relay.pending and time.monotonic() < end:
+                    for req in hub.relay.list_pending():
+                        hub.relay.result(req["id"], {"status": 200, "reason": "ok"})
+                    time.sleep(0.01)
+                for t in threads:
+                    t.join(10)
+                stuck = [t for t in threads if t.is_alive()]
+                self.assertFalse(stuck, "%d held relay call threads did not end within 10 seconds" % len(stuck))
+                for h in list(handlers):   # the answers are delivered: the server's handler threads must end before the test ends
+                    h.join(10)
+                live = [h.name for h in handlers if h.is_alive()]
+                self.assertFalse(live, "hub handler threads did not end within 10 seconds: %s" % live)
+            self.addCleanup(release_all)
             for i in range(4):          # 4 pods x 4 held waits = 16 held
                 for j in range(4):
                     t = threading.Thread(target=hub.relay_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
-            self.wait_for(lambda: sum(hub.relay.waiting.values()) == 16)
+            def all_registered():
+                if registered.wait(0.02):
+                    return True
+                if not registered.is_set() and not all(t.is_alive() for t in threads):
+                    raise AssertionError("a held relay call ended before all 16 were registered")
+                return False
+            self.wait_for(all_registered)
             self.assertEqual(sum(hub.relay.waiting.values()), 16)
+            gate, seen, over, refused = threading.Lock(), {"live": 16}, threading.Event(), threading.Event()   # the relay's admission, watched: an event decides, never a socket timeout
+            real_admit, real_release = hub.relay.admit, hub.relay.release
+            def watched_admit():
+                ok = real_admit()
+                with gate:
+                    if not ok:
+                        refused.set()
+                    else:
+                        seen["live"] += 1
+                        if seen["live"] > hub.relay.max_inflight:
+                            over.set()
+                return ok
+            def watched_release():
+                real_release()
+                with gate:
+                    seen["live"] -= 1
+            hub.relay.admit, hub.relay.release = watched_admit, watched_release
             socks = []
             for _ in range(hub.server.max_handlers):   # as many slow bodies as the hub has handlers: without the in-flight cap they would take every one
                 s = socket.create_connection(("127.0.0.1", hub.port))
                 s.settimeout(5)
                 s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-pod-0\r\nContent-Length: 100\r\n\r\n{")
                 socks.append(s)
+            TestBoundsAndCaps.wait_for(lambda: over.is_set() or refused.is_set(), 30.0)   # an event; the limit is a hang guard that raises its own text
+            self.assertFalse(over.is_set(), "over-admitted: a pod relay handler was admitted beyond the cap of %d" % hub.relay.max_inflight)
             for s in socks:             # every excess one is refused 503 straight away, its body unread
                 first = s.recv(4096).split(b"\r\n")[0]
                 self.assertIn(b" 503 ", first)
@@ -378,9 +445,12 @@ class TestBoundsAndCaps(unittest.TestCase):
             case.doCleanups()
 
     @staticmethod
+    # the limit is a HANG GUARD only: it never decides a verdict, it fails a broken mechanism with its own text
     def wait_for(cond, limit=10.0):
         end = time.monotonic() + limit
-        while time.monotonic() < end and not cond():
+        while not cond():
+            if time.monotonic() >= end:
+                raise AssertionError("wait_for: the state was not reached within %s seconds" % limit)
             time.sleep(0.01)
 
     def test_slow_body_trickle_cut_at_deadline(self):
@@ -545,6 +615,171 @@ def mutant(module, old, new, rename=None):
     if hasattr(module, "Refusal"):
         mod.Refusal = module.Refusal
     return mod
+
+
+class TestEventWait(unittest.TestCase):
+    """The event wait of the saturation test: it raises, survives a delayed registration, and has mutants with controls."""
+    @staticmethod
+    def silent_wait_for(cond, limit=10.0):   # the old body: returns without raising when the state is not reached
+        end = time.monotonic() + limit
+        while time.monotonic() < end and not cond():
+            time.sleep(0.01)
+
+    @staticmethod
+    def s2_counts(wait_for):
+        try:
+            wait_for(lambda: False, 0.3)
+            raised = 0
+        except AssertionError as e:
+            raised = int("wait_for: the state was not reached within 0.3 seconds" in str(e))
+        try:
+            t0 = time.monotonic()
+            wait_for(lambda: True, 5.0)
+            returned = int(time.monotonic() - t0 < 1.0)
+        except AssertionError:
+            returned = 0
+        return raised, returned
+
+    def test_s2_wait_for_raises_with_its_text_and_returns_at_once(self):
+        raised, returned = self.s2_counts(TestBoundsAndCaps.wait_for)
+        print("S2: never-true condition raises %d of 1 with the text, true condition returns %d of 1" % (raised, returned))
+        self.assertEqual((raised, returned), (1, 1))
+
+    def test_s2_mutant_silent_wait_for_is_caught(self):
+        control = self.s2_counts(TestBoundsAndCaps.wait_for) == (1, 1)
+        mutant = self.s2_counts(self.silent_wait_for)
+        applied = self.silent_wait_for is not TestBoundsAndCaps.wait_for
+        print("S2 mutant: control passes %d of 1, mutant fails %d of 1, mutation applied %s" % (int(control), int(mutant != (1, 1)), applied))
+        self.assertTrue(control and applied)
+        self.assertNotEqual(mutant, (1, 1))
+
+    def saturation(self, delay, hub_wait):
+        """The saturation scenario of the pinned test with the LAST of the 16 relay calls delayed by `delay` seconds."""
+        import socket
+        saved = dict(SECRETS)
+        self.addCleanup(lambda: (SECRETS.clear(), SECRETS.update(saved)))
+        with Hub(wait=hub_wait, max_per_pod=50) as hub:
+            agents = {"pod-%d" % i: {"url": "http://127.0.0.1:1", "session": "s", "password_file": "x", "repo": "acme-org/r%d" % i, "issue": i} for i in range(4)}
+            for name in agents: SECRETS[name] = "secret-" + name
+            Path(hub.tmp.name, "secrets.json").write_text(json.dumps({k: sha(v) for k, v in SECRETS.items()}))
+            Path(hub.tmp.name, "agents.json").write_text(json.dumps(agents))
+            registered = threading.Event()
+            hub.relay.waiting = _WaitingObserver(registered, 16)
+            threads = []
+            handlers = []   # the handler threads the hub's server starts (its daemon threads are not listed by the server itself)
+            orig_handler = hub.server.process_request_thread
+            def tracked_handler(*a, **kw):
+                handlers.append(threading.current_thread())
+                return orig_handler(*a, **kw)
+            hub.server.process_request_thread = tracked_handler
+            def release_all():
+                end = time.monotonic() + 10
+                while hub.relay.pending and time.monotonic() < end:
+                    for req in hub.relay.list_pending():
+                        hub.relay.result(req["id"], {"status": 200, "reason": "ok"})
+                    time.sleep(0.01)
+                for t in threads:
+                    t.join(10)
+                stuck = [t for t in threads if t.is_alive()]
+                self.assertFalse(stuck, "%d held relay call threads did not end within 10 seconds" % len(stuck))
+                for h in list(handlers):   # the answers are delivered: the server's handler threads must end before the test ends
+                    h.join(10)
+                live = [h.name for h in handlers if h.is_alive()]
+                self.assertFalse(live, "hub handler threads did not end within 10 seconds: %s" % live)
+            self.addCleanup(release_all)
+            def call(i, j, wait):
+                time.sleep(wait)
+                hub.relay_call(who="pod-%d" % i, call_id="c%d" % j, pr="acme-org/r%d#1" % i)
+            for n in range(16):
+                t = threading.Thread(target=call, args=(n // 4, n % 4, delay if n == 15 else 0)); t.start(); threads.append(t)
+            def all_registered():
+                if registered.wait(0.02):
+                    return True
+                if not all(t.is_alive() for t in threads):
+                    raise AssertionError("a held relay call ended before all 16 were registered")
+                return False
+            TestBoundsAndCaps.wait_for(all_registered, 30.0)
+            self.assertEqual(sum(hub.relay.waiting.values()), 16)
+            socks = []
+            for _ in range(hub.server.max_handlers):
+                s = socket.create_connection(("127.0.0.1", hub.port)); s.settimeout(5)
+                s.sendall(b"POST /relay HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-pod-0\r\nContent-Length: 100\r\n\r\n{")
+                socks.append(s)
+            for s in socks:
+                self.assertIn(b" 503 ", s.recv(4096).split(b"\r\n")[0])
+            self.assertEqual(hub.relay.inflight, 16)
+            status, got = hub.call("GET", "/relay/pending", who="daemon")
+            self.assertEqual((status, len(got["requests"])), (200, 10))
+            for s in socks: s.close()
+            while hub.relay.pending:
+                for req in hub.relay.list_pending():
+                    hub.call("POST", "/relay/result/" + req["id"], {"status": 200, "reason": "ok"}, who="daemon")
+            for t in threads: t.join()
+            return sum(1 for _ in threads)
+
+    def test_s3_last_call_delayed_three_seconds_still_registers_16(self):
+        n = self.saturation(3.0, None)
+        print("S3: count reached 16 with the last call delayed 3 s: %d of 1" % int(n == 16))
+        self.assertEqual(n, 16)
+
+    def test_s3_mutant_bound_held_wait_fails_with_the_early_end_text(self):
+        control = TestEventWait("test_s3_last_call_delayed_three_seconds_still_registers_16")
+        res = unittest.TestResult(); control.run(res)
+        control_ok = res.wasSuccessful()
+        mutant_case = TestEventWait("test_s3_last_call_delayed_three_seconds_still_registers_16")
+        mutant_text = None
+        try:
+            mutant_case.saturation(3.0, 2.0)
+        except AssertionError as e:
+            mutant_text = str(e)
+        finally:
+            mutant_case.doCleanups()
+        caught = mutant_text is not None and "a held relay call ended before all 16 were registered" in mutant_text
+        print("S3 mutant: control passes %d of 1, mutant fails %d of 1 with the early-end text, mutation applied %s" % (int(control_ok), int(caught), True))
+        self.assertTrue(control_ok)
+        self.assertIn("a held relay call ended before all 16 were registered", mutant_text or "")
+
+    def test_s7_over_admission_is_seen_as_an_event_and_a_dead_observation_falls_to_the_guard(self):
+        import inspect, textwrap
+        name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+
+        def run(case, meth, remove_admit):
+            old = cloud_relay.Relay.admit
+            if remove_admit:
+                cloud_relay.Relay.admit = lambda self: True
+            try:
+                meth()
+                return None
+            except BaseException as e:   # the kind and text of the failure
+                return e
+            finally:
+                cloud_relay.Relay.admit = old
+                case.doCleanups()
+        case = TestBoundsAndCaps(name)
+        e1 = run(case, getattr(case, name), True)
+        m_over = int(isinstance(e1, AssertionError) and "over-admitted" in str(e1))
+        m_timeout = int(isinstance(e1, TimeoutError) or (e1 is not None and "timed out" in str(e1)))
+        case = TestBoundsAndCaps(name)
+        control = int(run(case, getattr(case, name), False) is None)
+        src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__[name]))
+        self.assertEqual(src.count("over.set()"), 1)
+        self.assertEqual(src.count("30.0"), 1)
+        dead_src = src.replace("over.set()", "pass").replace("30.0", "2.0")
+        ns = dict(globals())
+        exec(compile(dead_src, "<dead-observation>", "exec"), ns)
+        case = TestBoundsAndCaps(name)
+        e3 = run(case, lambda: ns[name](case), True)
+        dead = int(isinstance(e3, AssertionError) and "wait_for: the state was not reached" in str(e3))
+        applied = dead_src != src
+        print("S7: mutant fails %d of 1 with over-admitted and %d of 1 with a TimeoutError, control passes %d of 1, dead observation fails %d of 1 with the guard text, mutations applied %s" % (m_over, m_timeout, control, dead, applied))
+        self.assertEqual((m_over, m_timeout, control, dead, applied), (1, 0, 1, 1, True))
+
+    def test_s5_control_passes_and_existing_cap_mutant_is_caught(self):
+        name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+        res = unittest.TestResult(); TestBoundsAndCaps(name).run(res)
+        res2 = unittest.TestResult(); TestBoundsAndCaps("test_mutant_admit_removed_the_saturation_test_fails").run(res2)
+        print("S5: control passes %d of 1, existing cap mutant caught %d of 1" % (int(res.wasSuccessful()), int(res2.wasSuccessful())))
+        self.assertTrue(res.wasSuccessful() and res2.wasSuccessful())
 
 
 class TestHostileBodies(unittest.TestCase):
