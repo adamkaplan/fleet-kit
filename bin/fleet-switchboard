@@ -19340,7 +19340,7 @@ class ClaimUnknown(Exception):
 def plan_listing(ctx, runner, now, same=None):
     """[item] of the pull requests OTHER than this one whose body holds the plan link, each GitHub's search item with `merged_at` added: the ONE bounded search of #976 (`GET /search/issues?q=repo:R is:pr "<plan>" in:body`,
     at most PEER_PAGES pages of 100; more raises `too many pull requests to judge`, never a silent truncation). `same(link, source)` decides whether a body's PLAN: line is this plan (default `_same_plan`).
-    Raises when the list cannot be read. Shared by `plan_peers` (the claim union) and `epic_claimants` (the epic record, #1383)."""
+    Raises when the list cannot be read. The epic record's own search (#1383), used by `epic_claimants`; the claim union and the carry keep their own."""
     repo = ctx.pr.rsplit("#", 1)[0]
     reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
     query = urllib.parse.quote_plus('repo:%s is:pr "%s" in:body' % (repo, ctx.source))
@@ -19370,11 +19370,30 @@ def plan_listing(ctx, runner, now, same=None):
 def plan_peers(ctx, runner, now, closed=None):
     """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing; `closed`, a list, is given
     (number, body) of those). A MERGED sibling's body is the claim RECORDED in the ledger when it was gated (the NEWEST claim line recorded at or before its `merged_at`, the claim in force at the merge: never its current body, which an author can edit, and never a line recorded after the merge):
-    a merged sibling with no recorded claim raises ClaimUnknown. An open one reads its current body. GETs only. The list is `plan_listing`: bounded, and with more the read raises
+    a merged sibling with no recorded claim raises ClaimUnknown. An open one reads its current body. GETs only. The list is GitHub's search for the pull requests whose body holds
+    the plan link (`GET /search/issues?q=repo:R is:pr "<plan>" in:body`), not the whole repository: at most PEER_PAGES pages of 100, with more the read raises
     `too many pull requests to judge` (fail closed, never a silent truncation). Raises when the list cannot be read."""
     repo = ctx.pr.rsplit("#", 1)[0]
+    reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
+    query = urllib.parse.quote_plus('repo:%s is:pr "%s" in:body' % (repo, ctx.source))
+    listed = []
+    for page in range(1, PEER_PAGES + 1):
+        got = reader._api("search/issues?q=%s&per_page=100&page=%d" % (query, page), repo)
+        items = got.get("items") if isinstance(got, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("the pull request search did not come back as a list")
+        listed.extend(dict(i, merged_at=(i.get("pull_request") or {}).get("merged_at")) for i in items if isinstance(i, dict))
+        if len(items) < 100:
+            break
+    else:
+        raise ValueError(PEERS_TOO_MANY)
     peers = []
-    for other in plan_listing(ctx, runner, now):
+    for other in listed:
+        if not isinstance(other, dict) or other.get("number") == ctx.number:
+            continue
+        link = plan_ledger.PLAN_LINK_RE.search(plan_ledger.visible_body(other.get("body")))
+        if not link or not _same_plan(link.group(1).strip("<>.,"), ctx.source, ctx.config.get("intent_repo")):
+            continue
         if other.get("state") != "open" and not other.get("merged_at"):
             if closed is not None:
                 closed.append((other.get("number"), other.get("body")))
@@ -19576,7 +19595,7 @@ class _CarryDone(Exception):
 
 
 def compare_files(get, repo, old_head, new_head):
-    """The names of the files changed from `old_head` to `new_head` (GitHub's compare through `get`), the ONE reading of a compare that the carry (#1129) and the epic's stale rule (#1383) share.
+    """The names of the files changed from `old_head` to `new_head` (GitHub's compare through `get`), the epic record's own compare (#1383), used by `epic_changed`; the claim union and the carry keep their own.
     A compare of 300 files or more, a truncated one and one whose new head is not a descendant raise CarryRefused: the diff cannot be judged. A failed read raises."""
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
     if not isinstance(compared, dict):
@@ -19593,7 +19612,12 @@ def compare_files(get, repo, old_head, new_head):
 def carry_head_facts(get, repo, old_head, new_head, base=None):
     """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
     "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
-    files = compare_files(get, repo, old_head, new_head)
+    compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
+    files = [f["filename"] for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+    if len(files) >= CARRY_COMPARE_FILE_CAP or compared.get("truncated") or (compared.get("total_files") or 0) >= CARRY_COMPARE_FILE_CAP:
+        raise CarryRefused(CARRY_TOO_LARGE)
+    if compared.get("status") not in ("ahead", "identical"):
+        raise CarryRefused(CARRY_NOT_DESCENDANT % compared.get("status"))
     commit = get("repos/%s/commits/%s" % (repo, new_head))
     parents = [p.get("sha") for p in (commit.get("parents") or []) if isinstance(p, dict)]
     merge = False
