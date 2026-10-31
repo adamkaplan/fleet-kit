@@ -189,6 +189,8 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
 - **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
 
+**The cap on shape M per lane (ask #1640).** A lane may hold at most 4 shape-M cloud workers at once (`MAX_M_PER_LANE` in `bin/cloud_worker.py`), because a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable. The refusal reads: `refused: lane LANE already holds 4 shape-M cloud workers (A, B, C, D): retire one (retire NAME) or launch a smaller shape (--shape S)`; it exits 2 before any token, launcher or cluster call. The count reads the record directory alone: a record counts while it exists, holds the shape M and its hard deadline has not passed (the lane is its `reports-to` boss, or `(no boss)`); a retire or a clear ends it. A launch of another shape, of a name that already has a record, or of a lane below the cap is unchanged. Limits: a launch still in flight has no record yet; two launches of one lane at the same moment can pass together; records written before this change hold no shape and are not counted.
+
 ## Where the test fixtures make their scratch directory
 
 The fixtures of `bin/test-cloud-worker` make their scratch directory in the platform's temporary directory and never in the repository root, because an entry that judges the root runs beside the entries that load the fixture. At cleanup the fixture ends every child process that names its directory (end signal, wait at most 15 seconds, kill) and then removes the directory.
@@ -203,6 +205,8 @@ The script runs each entry once, stops at the first red with `RESULT: FAIL`, and
 
 Residual risk: two members adding names that sort next to each other (the same place in the list) still conflict in git (adjacent inserts), and the first member to add in an empty gap next to the fixed last line conflicts with it. Only entries far apart merge cleanly. A test documents this limit.
 
+A test that is not yet measured is named by one line in cloud/launcher/tests/chain_unmeasured.list (sorted, at its alphabetical place), never on the `Not yet measured:` README line; the residual risk is the same as above: two names at the same sorted place still conflict, and only names far apart merge cleanly.
+
 ## Chain times (ask #1390)
 
 Cause: the whole chain of `bin/test-cloud-launcher` ran one entry after another. On the macOS `test-cloud` leg that took 24 to 30 minutes (24 on the default branch at batch 6, 25.7 on one pull request and 30.2 on another, whose step limit of 30 minutes then cut the leg with no test failing); on Ubuntu it took 15.6 minutes. The cost was the entries themselves, mostly real subprocess starts of the fake cluster client, not fixed sleeps, and the macOS runner is about twice as slow.
@@ -211,13 +215,15 @@ The fix is parallel lanes, not removing or moving a test: the entries named in `
 
 Chain time after the change: macOS 11.6 minutes, Ubuntu 5.1 minutes (one run of the pull request's head; the step timeout is 20 minutes). The per-entry seconds below are from that run, so they include the slowdown of running beside other entries.
 
-Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_app_token.py` (122 s), `test_driver.py` (120 s).
+Slowest five on macOS: `test_cloud_prestop.py` (314 s), `test_git_token_renewal.py` (310 s), `test_run_record.py` (239 s), `test_mint_roles.py` (177 s), `test_m_cap.py` (157 s).
 
-Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_cloud_stack_wait.py` (58 s), `test_cloud_quick_bounds.py` (45 s).
+Slowest five on Ubuntu: `test_run_record.py` (153 s), `test_git_token_renewal.py` (106 s), `test_driver.py` (93 s), `test_mint_roles.py` (80 s), `test_cloud_stack_wait.py` (58 s).
 
-Not yet measured: `cloud/launcher/tests/test_cloud_quick_budget.py`, `cloud/launcher/tests/test_end_hook_nothing_to_push.py`, `cloud/launcher/tests/test_fixture_root.py`, `cloud/launcher/tests/test_git_token_retry.py`, `cloud/launcher/tests/test_mint_retry.py`, `cloud/launcher/tests/test_mint_roles.py`, `cloud/launcher/tests/test_orchestrator_row.py`, `cloud/launcher/tests/test_orphan_secrets.py`, `cloud/launcher/tests/test_probe_redirect.py`, `cloud/launcher/tests/test_read_retired_last_message.py`, `cloud/launcher/tests/test_reaper_renewal.py`, `cloud/launcher/tests/test_reaper_restart.py`, `cloud/launcher/tests/test_reaper_row.py`, `cloud/launcher/tests/test_scratch_clean.py`, `cloud/launcher/tests/test_token_at_limit.py`, `cloud/worker/tests/test_cloud_prepush_background.py`
+Not yet measured: the names are in cloud/launcher/tests/chain_unmeasured.list, one per line (a member adds a new chain test there).
 
 A change that adds a chain entry adds its name to this line; the next measurement moves it into the tables.
+
+Lane sums after ask #1695 (31 Oct 2026, computed from the macOS seconds above, not yet measured on CI): lane 0 785 s, lane 1 822 s, lane 2 773 s (from 696, 665, 596), after `test_cloud_split.py`, `test_m_cap.py`, `test_mint_roles.py` and `test_git_token_retry.py` moved from serial to the end of the parallel list (positions 22, 23, 24, 25 = lanes 0, 1, 2, 0); the Ubuntu seconds of those four are one run on an idle pod, not CI.
 
 ### macOS (per entry)
 
@@ -227,6 +233,9 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `bin/test-cloud-retired` | 66 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 5 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 2 | serial |
+| `cloud/launcher/tests/test_cloud_end_alert.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_turn_end.py` | 0 | serial |
+| `cloud/launcher/tests/test_stop_cause.py` | 0 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_docs_wording.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
@@ -285,6 +294,10 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/worker/tests/test_cw_gh_comments.py` | 37 | parallel |
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 34 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 35 | parallel |
+| `cloud/launcher/tests/test_cloud_split.py` | 49 | parallel |
+| `cloud/launcher/tests/test_m_cap.py` | 157 | parallel |
+| `cloud/launcher/tests/test_mint_roles.py` | 177 | parallel |
+| `cloud/launcher/tests/test_git_token_retry.py` | 40 | parallel |
 
 ### Ubuntu (per entry)
 
@@ -294,6 +307,9 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `bin/test-cloud-retired` | 33 | serial |
 | `cloud/launcher/tests/test_chain_list.py` | 1 | serial |
 | `cloud/launcher/tests/test_chain_time.py` | 1 | serial |
+| `cloud/launcher/tests/test_cloud_end_alert.py` | 0 | serial |
+| `cloud/launcher/tests/test_cloud_turn_end.py` | 0 | serial |
+| `cloud/launcher/tests/test_stop_cause.py` | 0 | serial |
 | `cloud/launcher/tests/test_cloud_allowlist.py` | 1 | serial |
 | `cloud/launcher/tests/test_cloud_docs_wording.py` | 0 | serial |
 | `cloud/launcher/tests/test_cloud_hub_manifest.py` | 0 | serial |
@@ -352,6 +368,10 @@ A change that adds a chain entry adds its name to this line; the next measuremen
 | `cloud/worker/tests/test_cw_gh_comments.py` | 1 | parallel |
 | `cloud/worker/tests/test_cloud_prepush_hardening.py` | 24 | parallel |
 | `cloud/worker/tests/test_stack_pull.py` | 0 | parallel |
+| `cloud/launcher/tests/test_cloud_split.py` | 8 | parallel |
+| `cloud/launcher/tests/test_m_cap.py` | 11 | parallel |
+| `cloud/launcher/tests/test_mint_roles.py` | 80 | parallel |
+| `cloud/launcher/tests/test_git_token_retry.py` | 2 | parallel |
 
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
