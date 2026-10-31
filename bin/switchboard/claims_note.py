@@ -84,13 +84,14 @@ def claims_note_pass(engine, state, repos, now):
                 key = "%s#%d:%s" % (repo, number, hashlib.sha256(record["body"].encode("utf-8", "replace")).hexdigest()[:16])
                 if key in note.announced:
                     continue
-                ids, why, plan_ref = claims_note_ids(engine, state, repos, repo, number, record, opened, merged, default_repo, cache)
+                ids, why, plan_ref, plan_number, other_repo = claims_note_ids(engine, state, repos, repo, number, record, opened, merged, default_repo, cache)
                 if not ids:
                     if why and (key, why) not in note.said:
                         note.said.add((key, why))
                         engine._note("claims_note.skipped", "%s#%d" % (repo, number), {"why": why})
                     continue
-                item = GitHubItem("github.pr:%s" % key, "github.pr", "PR #%d" % number, repo, _pr_refs(record, number)[0], [], _login(record), now, [number], True)
+                closing = _pr_refs(record, number)[0]   # the closing keywords first, then the plan issue of this repository
+                item = GitHubItem("github.pr:%s" % key, "github.pr", "PR #%d" % number, repo, closing + [n for n in [plan_number] if n is not None and n not in closing], [], _login(record), now, [number], True)
                 try:
                     owner, _ = hub.route_of(item, discovery.agents, now)
                 except GitHubUnavailable as err:   # one failed read skips this pull request only: the state write below still happens
@@ -102,7 +103,7 @@ def claims_note_pass(engine, state, repos, now):
                 if not owner:
                     if (key, "no recipient") not in note.said:
                         note.said.add((key, "no recipient"))
-                        engine._note("claims_note.skipped", "%s#%d" % (repo, number), {"why": "no recipient: the daemon resolves no lane for the pull request's own events (not sent)"})
+                        engine._note("claims_note.skipped", "%s#%d" % (repo, number), {"why": "no recipient: the daemon resolves no lane for the pull request's own events (not sent)" + ("; plan issue in another repository: not used for routing" if other_repo else "")})
                     continue
                 text = claims_note_text(repo, number, plan_ref, ids)
                 plan_wake_state(engine).facts["claims:%s:%s" % (key, owner)] = (text, now, owner, repo, number)   # delivered as an ordinary plan fact
@@ -118,23 +119,23 @@ def claims_note_pass(engine, state, repos, now):
 
 
 def claims_note_ids(engine, state, repos, repo, number, record, opened, merged, default_repo, cache):
-    """(ids left out, why none, plan ref): the one rule is `plan_ledger.omitted_claims` over the other open and merged pull requests of the same plan."""
+    """(ids left out, why none, plan ref, plan issue number when in this repository, plan in another repository): the one rule is `plan_ledger.omitted_claims` over the other open and merged pull requests of the same plan."""
     body = record["body"]
     link = PLAN_LINE_RE.search(plan_ledger.visible_body(body))
     if not link:
-        return [], "the pull request has no plan link", None
+        return [], "the pull request has no plan link", None, None, False
     try:
         ref = link.group(1).strip("<>.,")
         prepo, pnumber, _ = parse_plan_source(ref, default_repo or repo)
     except Exception:
-        return [], "the plan link cannot be read", None
+        return [], "the plan link cannot be read", None, None, False
     scenarios, why = claims_note_plan(engine, state, repos, prepo, pnumber, cache)
     if scenarios is None:
-        return [], why, None
+        return [], why, None, None, False
     if plan_ledger.claim_text(body) is None:
-        return [], "the pull request has no CLAIMS line", None
+        return [], "the pull request has no CLAIMS line", None, None, False
     if not plan_ledger.covered_ids(scenarios, [body]):
-        return [], "the CLAIMS line is refused (it covers nothing)", None
+        return [], "the CLAIMS line is refused (it covers nothing)", None, None, False
     others = []
     for state_name, group in (("open", opened), ("merged", merged)):
         for other in group:
@@ -143,4 +144,4 @@ def claims_note_ids(engine, state, repos, repo, number, record, opened, merged, 
             found = PLAN_LINE_RE.search(plan_ledger.visible_body(other["body"]))
             if found and _same_plan(found.group(1).strip("<>.,"), ref, default_repo or repo):
                 others.append((state_name, other["body"]))
-    return plan_ledger.omitted_claims(scenarios, body, others), "", ref
+    return plan_ledger.omitted_claims(scenarios, body, others), "", ref, (pnumber if prepo == repo else None), prepo != repo

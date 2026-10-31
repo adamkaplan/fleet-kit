@@ -181,16 +181,25 @@ class NoGithubReadChecks:
             fx.go()
         calls = self.calls = []
         fx.engine.hub = self.real_hub(fx, calls)
-        self.sb.claims_note_pass(fx.engine, fx.engine.triage, ["acme/api"], fx.world.clock.now())
+        real_plan = self.sb.claims_note_plan
+        def plan(engine, state, repos, prepo, pnumber, cache):   # the plan of the other repository is held and reads as pass
+            return real_plan(engine, state, repos, "acme/api" if prepo == "acme/other" else prepo, pnumber, cache)
+        with mock.patch.object(self.sb, "claims_note_plan", plan):
+            self.sb.claims_note_pass(fx.engine, fx.engine.triage, ["acme/api"], fx.world.clock.now())
         self.assertIsInstance(fx.engine.hub, self.sb.GitHubHub)
-        self.assertEqual([t.split(":")[0] for t in self.notices(fx)], ["PR acme/api#7"], "the notice routed and sent")   # the pull request naming a closing issue
-        self.assertEqual(len([w for w in self.skipped(fx) if w.startswith("no recipient")]), 1, "the one naming none has no lane to reach (the audit says so)")
+        self.assertEqual([t.split(":")[0] for t in self.notices(fx)], ["PR acme/api#%d" % n for n in (10, 11, 7, 9)], "the notice routed and sent")   # closing keyword, Refs, Part of, the PLAN link alone
+        lines = [w for w in self.skipped(fx) if w.startswith("no recipient")]
+        self.assertEqual(len(lines), 1, "the one whose plan issue is in another repository has no lane to reach (the audit says so)")
+        self.assertIn("plan issue in another repository: not used for routing", lines[0])
         self.assertEqual(calls, [], "GitHub calls on the routing path")
 
     def fixture(self):
         fx = self.world()
         self.pull(fx, 7, LINK + "CLAIMS: S1")             # names a closing issue
-        self.pull(fx, 8, "PLAN: acme/api#3\nCLAIMS: S2")   # names none
+        self.pull(fx, 8, "PLAN: acme/other#3\nCLAIMS: S1")   # its plan issue is in another repository
+        self.pull(fx, 9, "Refs #3\nPLAN: acme/api#3\nCLAIMS: S1")      # no closing keyword
+        self.pull(fx, 10, "Part of #3\nPLAN: acme/api#3\nCLAIMS: S1")
+        self.pull(fx, 11, "PLAN: acme/api#3\nCLAIMS: S1")            # only the plan link
         return fx
 
     def test_the_real_route_of_reads_no_github_for_the_pull_requests_the_pass_builds(self):
