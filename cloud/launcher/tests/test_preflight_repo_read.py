@@ -6,7 +6,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -17,6 +16,8 @@ from urllib.parse import urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(os.path.dirname(LAUNCHER), "worker", "tests"))
+import stub_support  # noqa: E402
 REPO_ROOT = os.path.dirname(os.path.dirname(LAUNCHER))
 REPO = "acme-org/widget-service"
 MARKER = "synthetic" + "Marker" + "Zq7" * 4          # planted as the token of every read (assembled: no literal in the source)
@@ -463,22 +464,13 @@ class S3Mints(Base):
         other = sum(1 for r in roles if r not in ("worker", "orchestrator"))
         self.assertEqual(other, 0)
         t0 = time.monotonic()
-        child = subprocess.Popen([sys.executable, "-B", "-m", "unittest", "test_mint_roles"], cwd=HERE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
+        child = stub_support.start(self, [sys.executable, "-B", "-m", "unittest", "test_mint_roles"], cwd=HERE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
         try:
             _out, err = child.communicate(timeout=300)   # a hang guard only: the verdict is the exit code and the counts
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            child.communicate()
+            stub_support.stop_group(child)
             raise AssertionError("the test_mint_roles run did not end within 300 seconds (hang guard)")
-        finally:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except OSError:
-                pass
         took = time.monotonic() - t0
         m = re.search(r"Ran (\d+) tests?", err)
         self.assertIsNotNone(m, err[-300:])
