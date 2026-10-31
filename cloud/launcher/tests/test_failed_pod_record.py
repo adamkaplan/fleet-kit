@@ -508,9 +508,117 @@ class M1Safety(Tree):
                 return self_.kube.list_pods()
             except Exception:
                 return self_.kube.list_pods_all()   # the mutation: a failed list is replaced by another read and the pass acts
-        mutant = mutated(cw.Launcher, "reap", "for pod in self.kube.list_pods():", "for pod in self._lister():")
+        mutant = mutated(cw.Launcher, "reap", "pods = self.kube.list_pods()", "pods = self._lister()")
         with mock.patch.object(cw.Launcher, "_lister", lister, create=True), mock.patch.object(cw.Launcher, "reap", mutant):
             self.assertLess(self.touched_after_failed_lists(), 3)
+
+
+AUDIT_LINE = 'self.audit(worker, "pod/" + pod["metadata"]["name"], "stop", self.cost(pod), True, "failed pod: record kept ten minutes", None, "pod_failed")'
+REMOVE_CALL = 'self._remove(pod["metadata"]["name"], ann(pod, "run-id") or None, (pod.get("metadata") or {}).get("uid"))'
+
+
+class S11StopLine(Tree):
+    """The ten-minute deletion of a Failed pod writes the stop line with the cause pod_failed, only after the delete returned (PC-3)."""
+
+    def stops(self, worker=None):
+        path = self.env["CW_CLOUD_AUDIT"]
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            lines = [json.loads(x) for x in f]
+        return [x for x in lines if x["action"] == "stop" and (worker is None or x["worker"] == worker)]
+
+    def two_pods(self):
+        self.fail("plain", CASES["oomer"][0])
+        self.fail("kepto", CASES["oomer"][0], kept=True)
+
+    def case_deleted_once(self):
+        self.two_pods()
+        uid = self.pod("plain")["metadata"]["uid"]
+        self.reap()
+        first = (len(self.stops()), len(self.records()))
+        self.clock.advance(minutes=11)
+        seen = []
+        real = cw.Kube.delete_pod
+
+        def spy(kube, name, u=None):
+            seen.append((name, u))
+            return real(kube, name, u)
+        with mock.patch.object(cw.Kube, "delete_pod", spy):
+            self.reap()
+        self.assertEqual(first, (0, 2))
+        self.assertEqual(seen, [(cw.pod_name("plain"), uid)])
+        stops = self.stops("plain")
+        self.assertEqual([(x["cause"], x["reason"], x["ok"]) for x in stops], [("pod_failed", "failed pod: record kept ten minutes", True)])
+        self.assertEqual(len(self.records()), 2)
+        self.assertIsNone(self.pod("plain"))
+        self.assertIsNotNone(self.pod("kepto"))
+        self.assertEqual(self.stops("kepto"), [])
+        return len(stops), len(self.records()), len(seen), len(self.stops("kepto"))
+
+    def case_recreated(self):
+        out = M1Safety.recreated(self)
+        self.assertIsNotNone(self.pod("swap"))
+        self.assertTrue(out and out[0][1].startswith("failed pod not deleted"), out)
+        self.assertEqual(self.stops(), [])
+        return (0 if self.pod("swap") is not None else 1), len(self.stops())
+
+    def case_refused(self):
+        self.fail("plain", CASES["oomer"][0])
+        self.reap()
+        self.clock.advance(minutes=11)
+
+        def refuse(kube, name, u=None):
+            raise cw.CloudError("refused")
+        with mock.patch.object(cw.Kube, "delete_pod", refuse):
+            out = self.reap()
+        self.assertTrue(out and out[0][1].startswith("failed pod not deleted"), out)
+        self.assertIsNotNone(self.pod("plain"))
+        self.assertEqual(self.stops(), [], "a stop line was written although the delete was refused")
+        return len(self.stops())
+
+    def test_the_first_case(self):
+        self.case_deleted_once()
+
+    def test_a_recreated_pod_is_left_whole_with_no_stop_line(self):
+        self.case_recreated()
+
+    def test_a_refused_delete_writes_no_stop_line(self):
+        self.case_refused()
+
+    def failing(self, old, new, names):
+        applied = []
+        mutant = mutated(cw.Launcher, "reap", old, new)
+        applied.append(1)
+        failed = set()
+        for n in names:
+            with mock.patch.object(cw.Launcher, "reap", mutant):
+                res = unittest.TestResult()
+                type(self)(n).run(res)
+            if res.failures or res.errors:
+                failed.add(n)
+        return failed, applied
+
+    def test_two_mutants_fail_the_test_and_the_numbers_are_printed(self):
+        names = ["test_the_first_case", "test_a_refused_delete_writes_no_stop_line"]
+        cause = ', None, "pod_failed")'
+        self.assertIn(cause, AUDIT_LINE)
+        no_cause, a1 = self.failing(cause, ", None)", names)
+        before, a2 = self.failing(REMOVE_CALL, "(" + AUDIT_LINE.replace("self.audit(", "self.audit(", 1) + ", " + REMOVE_CALL + ")", names)
+        self.assertIn("test_the_first_case", no_cause)
+        self.assertIn("test_a_refused_delete_writes_no_stop_line", before)
+        stops, records, deletes, kept = self.case_deleted_once()
+        self.tearDown()
+        self.setUp()
+        swapped = self.case_recreated()
+        self.tearDown()
+        self.setUp()
+        refused = self.case_refused()
+        mutants = int("test_the_first_case" in no_cause) + int("test_a_refused_delete_writes_no_stop_line" in before)
+        print("S11: stop lines with the cause pod_failed %d, records in all %d, delete calls with the listed uid %d, stop lines for the kept pod %d, "
+              "deleted pods for the recreated pod %d, stop lines for the recreated pod %d, stop lines for the refused delete %d, "
+              "mutants failing the test %d of 2, mutation applied %s" % (stops, records, deletes, kept, swapped[0], swapped[1], refused, mutants,
+                                                                         bool(a1 and a2)))
 
 
 class L2L3BDC(Tree):

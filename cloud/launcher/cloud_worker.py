@@ -2652,6 +2652,7 @@ class Launcher:
                 elif ann(pod, "kept") != "true" and note.get("recorded_at") and self._failed_aged(worker, pod, note, now):
                     try:
                         self._remove(pod["metadata"]["name"], ann(pod, "run-id") or None, (pod.get("metadata") or {}).get("uid"))
+                        self.audit(worker, "pod/" + pod["metadata"]["name"], "stop", self.cost(pod), True, "failed pod: record kept ten minutes", None, "pod_failed")
                     except CloudError as e:
                         out.append((worker, "failed pod not deleted: " + self.kube.scrub(e, 120), e.code))
                 continue
