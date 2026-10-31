@@ -14113,6 +14113,7 @@ class TestClearNotice(Base):
 
         def slow(sender, recipient, text, **kw):
             self.order.append("SEND " + recipient)
+            entered.set()
             release.wait(1.5)
             result = real(sender, recipient, text, **kw)
             finished.set()
@@ -14124,6 +14125,8 @@ class TestClearNotice(Base):
             lines = self.clear()
             elapsed = time.monotonic() - began
         self.assertFalse(finished.is_set(), "the clear did not wait for the blocked send")
+        if not entered.wait(10):   # a CEILING, not the decision
+            self.fail("the notice thread never reached the send: order=%s" % self.order)
         self.assertTrue(self.body.startswith("MERGE: automatic"), "the marker edit is done")
         self.assertTrue(lines[0].startswith("cleared the impact hold") and any("MERGE: automatic" in l for l in lines))
         sends = [i for i, step in enumerate(self.order) if step.startswith("SEND")]
