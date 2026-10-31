@@ -155,5 +155,68 @@ class Docs(unittest.TestCase):
         self.assertFalse(block_clean(block + "az aks nodepool scale\n"))
 
 
+class AllowListAndAuditSentence(unittest.TestCase):
+    ALLOW = ("kubectl get events ", "kubectl describe node ", "kubectl get pods ", "kubectl -n kube-system get configmap cluster-autoscaler-status",
+             "az aks nodepool show ", "az aks nodepool list ", "az monitor activity-log list ")
+
+    def allowed(self, block):
+        lines = [ln for ln in block.splitlines() if ln.strip()]
+        return sum(1 for ln in lines if ln.startswith(self.ALLOW)), len(lines)
+
+    def test_s6_every_line_of_each_block_is_on_the_allow_list(self):
+        for rel in DOCS:
+            ok, total = self.allowed(commands_block(read(rel)))
+            print("S6: lines matching the allow-list %d of %d in each of %d documents" % (ok, total, len(DOCS)))
+            self.assertEqual((ok, total), (7, 7), rel)
+
+    def test_s6_mutants_fail_the_allow_list(self):
+        block = commands_block(read(DOCS[0]))
+        failing = 0
+        for extra in ("kubectl exec NODE_NAME -- id", "az aks nodepool update --name NODEPOOL_NAME", "kubectl get secrets --all-namespaces"):
+            mutated = block + extra + "\n"
+            applied = mutated != block
+            self.assertTrue(applied)
+            self.assertTrue(block_clean(mutated), extra)
+            ok, total = self.allowed(mutated)
+            if ok != total:
+                failing += 1
+        print("S6: mutants failing the allow-list %d of 3, none holding a forbidden word, mutation applied %s" % (failing, applied))
+        self.assertEqual(failing, 3)
+
+    def test_s2_the_audit_log_sentence(self):
+        names = phrases = 0
+        for rel in DOCS:
+            sec = read(rel).split("## A worker lost with its node", 1)[1]
+            self.assertIn("AUDIT_LOG_QUERY", sec, rel)
+            self.assertIn("names who deleted each pod", sec, rel)
+            names += 1
+            phrases += 1
+        print("S2: audit-log name %d of 2 documents and phrase %d of 2 documents" % (names, phrases))
+
+    def test_s2_mutant_without_the_audit_log_sentence_fails(self):
+        sec = read(DOCS[0]).split("## A worker lost with its node", 1)[1]
+        lines = sec.split("\n")
+        cut = "\n".join(ln for ln in lines if "names who deleted each pod" not in ln)
+        applied = cut != sec
+        with self.assertRaises(AssertionError):
+            self.assertIn("names who deleted each pod", cut)
+        print("S2: mutant that removes the audit-log sentence fails 1 of 1, mutation applied %s" % applied)
+        self.assertTrue(applied)
+
+    def test_s2_s5_counts(self):
+        cmds = ("kubectl get events --all-namespaces --field-selector involvedObject.kind=Node", "kubectl describe node NODE_NAME",
+                "kubectl get pods --all-namespaces -o wide", "kubectl -n kube-system get configmap cluster-annotation".replace("annotation", "autoscaler-status -o yaml"),
+                "az aks nodepool show", "az aks nodepool list", "az monitor activity-log list", "RESOURCE_GROUP_NAME", "CLUSTER_NAME")
+        p8 = ("Evicted", "scale-down", "image upgrade", "NotReady", "node upgrade or maintenance eviction", "node failure", "spot eviction", "ONLY against")
+        p10 = ("is not scaled down until the worker ends", "at its idle limit (`--idle`)", "8 hours by default", "plus five minutes", "has no deadline",
+               "once ask 1509 (the persistent orchestrator) lands, its pod template is rendered by the same function and carries the mark, and its node is then not scaled down while it lives",
+               "ask 1480 (pull request 1486)", "`cw-prestop`", "`wip` branch", "no stop line")
+        for rel in DOCS:
+            sec = read(rel).split("## A worker lost with its node", 1)[1]
+            print("S2: command strings %d of 9 in each of 2 documents" % sum(c in sec for c in cmds))
+            idle = sec.count("30 minutes") + sec.count("30m") + sec.count("minutes by default")
+            print("S5: phrases %d of 8 and %d of 10, idle number occurrences %d" % (sum(p in sec for p in p8), sum(p in sec for p in p10), idle))
+
+
 if __name__ == "__main__":
     unittest.main()
