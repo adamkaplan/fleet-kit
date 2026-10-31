@@ -1,5 +1,6 @@
 """#1625: `gates` shows each review bot's findings at the head, a bot finding wakes the orchestrator once per bot and head, and a pending job is named.
 Scenarios S2-S6, S8-S10, U3, U5-U7. Neutral names only. Mutants at the end: each is applied, asserted applied, and must fail a check here."""
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -281,8 +282,33 @@ class BotVerdict(unittest.TestCase):
                 self.check_equal()
 
 
+_Q = "[" + chr(34) + chr(39) + "]"
+_DIFF_WORD = "di" + "ff"
+_BASE_USE = r"[^\n]{0,240}?\bintegration\b"
+DIFF_AGAINST_REF = re.compile(_Q + _DIFF_WORD + _Q + _BASE_USE + "|" + "git\\s+" + _DIFF_WORD + _BASE_USE)
+
+
+def calls_that_compare_against_a_ref(text):
+    """The calls in a source text that run a comparison against an integration ref (a text scan: no command is run)."""
+    return [m.group(0) for m in DIFF_AGAINST_REF.finditer(text)]
+
+
 class BotSize(unittest.TestCase):
     """U6 and U7 (#1625)."""
+    def test_no_test_of_this_lane_diffs_against_an_integration_ref(self):
+        names = ["test_bot_reviews.py", "test_claim_placement.py", "test_changed_file_pages.py", "test_launch_model.py", "test_dead_verdict.py"]
+        here = Path(__file__).resolve().parent
+        self.assertTrue((here / names[0]).is_file(), "the file of this class is present")
+        found, skipped = [], []
+        for name in names:
+            if not (here / name).is_file():
+                skipped.append(name)
+                continue
+            found += [(name, c) for c in calls_that_compare_against_a_ref((here / name).read_text())]
+        self.assertEqual(found, [], "skipped: %s" % skipped)
+        planted = "subprocess.run([" + chr(34) + "git" + chr(34) + ", " + chr(34) + "-C" + chr(34) + ", str(REPO), " + chr(34) + _DIFF_WORD + chr(34) + ", " + chr(34) + "origin/integration...HEAD" + chr(34) + ", " + chr(34) + "-U0" + chr(34) + "])"
+        self.assertEqual(len(calls_that_compare_against_a_ref(planted)), 1)
+
     def test_u7_a_bot_finding_does_not_reach_the_verdict_or_the_exit_status(self):
         import re
         source = (REPO / "bin" / "fleet-switchboard").read_text()
