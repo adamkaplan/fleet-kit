@@ -14107,12 +14107,16 @@ class TestClearNotice(Base):
     def test_the_notice_is_last_and_a_send_that_blocks_neither_delays_nor_alters_the_clear(self):
         self.body = "MERGE: captain\n\nPLAN: https://github.com/acme-org/widget-api/issues/3\n"
         release = threading.Event()
+        entered = threading.Event()
+        finished = threading.Event()
         real = self.engine.send
 
         def slow(sender, recipient, text, **kw):
             self.order.append("SEND " + recipient)
             release.wait(1.5)
-            return real(sender, recipient, text, **kw)
+            result = real(sender, recipient, text, **kw)
+            finished.set()
+            return result
         self.engine.send = slow
         self.addCleanup(release.set)
         with mock.patch.object(sb, "NOTIFY_CLEAR_DEADLINE_SECONDS", 0.2):
