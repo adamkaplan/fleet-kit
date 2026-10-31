@@ -632,6 +632,51 @@ class WipNoteNameRule(unittest.TestCase):
         self.assertEqual(len(self.sent(mutant, "coder7\n")), 1, "the mutant lets the newline name through, so the test above fails on it")
 
 
+class VanishedNoteNameRule(unittest.TestCase):
+    """S12 (after integration's newer line): _note_vanished_pods matches the worker name with a full match, so 'coder7' plus a newline is never noted."""
+    OLD = "not isinstance(worker, str) or not NAME_RE.fullmatch(worker):"
+    NEW = "not isinstance(worker, str) or not NAME_RE.match(worker):"
+
+    @staticmethod
+    def noted(module, tmp):
+        """The stop lines written for two workers whose pods are absent, each with an old create line: 'coder7' plus a newline and 'coder7'."""
+        import datetime
+        now = datetime.datetime(2026, 1, 2, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        created = (now - datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        path = os.path.join(tmp, "audit.jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            for worker in ("coder7\n", "coder7"):
+                handle.write(json.dumps({"ts": created, "action": "create", "ok": True, "runtime_id": "pod/" + module.pod_name(worker.strip()) + ("-nl" if worker.endswith("\n") else ""),
+                                         "worker": worker}) + "\n")
+        lines = []
+        launcher = module.Launcher.__new__(module.Launcher)
+        launcher.audit_path = path
+        launcher.kube = types.SimpleNamespace(get_pod=lambda name: None)
+        launcher.audit = lambda worker, *rest: lines.append(worker)
+        with mock.patch.object(module, "parse_iso", lambda text: datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)):
+            launcher._note_vanished_pods([{"metadata": {"name": "cw-other"}}], now)
+        return lines
+
+    def count(self, module):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = self.noted(module, tmp)
+        return sum(w == "coder7" for w in lines), sum(w == "coder7\n" for w in lines)
+
+    def test_s12_a_newline_name_is_not_noted_and_a_plain_name_is(self):
+        self.assertEqual(self.count(cw), (1, 0))
+
+    def test_s12_a_mutant_that_matches_loosely_fails_the_test(self):
+        source = read("cloud/launcher/cloud_worker.py")
+        self.assertEqual(source.count(self.OLD), 1)
+        mutant = types.ModuleType("cw_mutant12")
+        mutant.__file__ = os.path.join(ROOT, "cloud", "launcher", "cloud_worker.py")
+        exec(compile(source.replace(self.OLD, self.NEW), mutant.__file__, "exec"), mutant.__dict__)
+        plain, newline = self.count(mutant)
+        self.assertEqual(newline, 1, "the mutant also notes the newline name, so the test above fails on it")
+        print("S12: plain names noted %d of 1, newline names noted %d of 1, mutants failing the test %d of 1, mutation applied True"
+              % (self.count(cw)[0], self.count(cw)[1], int(newline == 1 and (plain, newline) != (1, 0))))
+
+
 class SourceFragmentTest(unittest.TestCase):
     """This file's own source holds no whole retired prefix (the neutral-names scan)."""
 
