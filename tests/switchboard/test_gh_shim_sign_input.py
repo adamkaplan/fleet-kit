@@ -1,0 +1,221 @@
+"""#1696: `gh api --input` bodies are signed or refused, graphql body mutations are refused, two review-comment endpoints are signed.
+
+Reuses the Rig of test_gh_shim_sign.py. The completeness check here counts 21 forms: 5 SIGNED_COMMANDS + 2 CLOSE_COMMANDS + 6 SIGNED_API + 8 graphql names.
+"""
+import ast
+import json
+import os
+import re
+import unittest
+
+from test_gh_shim_sign import (API_EXAMPLES, MARK, OLD_EXAMPLE, REPO, SHIM_DIR, Rig, forms_without_an_example as old_forms_without_an_example, pairs)
+
+MUTATIONS = ("addComment", "addPullRequestReview", "addPullRequestReviewComment", "addPullRequestReviewThread", "addPullRequestReviewThreadReply",
+             "updateIssueComment", "updatePullRequestReview", "updatePullRequestReviewComment")
+NEW_API_EXAMPLES = {"pr-review-comment": "repos/o/r/pulls/comments/5", "pr-review-reply": "repos/o/r/pulls/1/comments/5/replies"}
+ALL_API = dict(API_EXAMPLES, **NEW_API_EXAMPLES)
+SIGNED = MARK % "alice-bot"
+
+
+def names_in(source, name):
+    """Every string key of the dict (or element of the set) assigned to `name` at module level."""
+    found = []
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            for sub in ast.walk(node.value):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and re.fullmatch(r"[a-z]+[A-Za-z]+", sub.value) and sub.value[0].islower():
+                    found.append(sub.value)
+            if isinstance(node.value, ast.Dict):
+                found = [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
+    return found
+
+
+def forms_missing(source):
+    missing = []
+    for label, _pattern in pairs(source, "SIGNED_API"):
+        if label not in ALL_API:
+            missing.append(("api", label))
+    for group, verb in pairs(source, "SIGNED_COMMANDS"):
+        if group not in OLD_EXAMPLE:
+            missing.append((group, verb))
+    for group, verb in pairs(source, "CLOSE_COMMANDS"):
+        if group not in OLD_EXAMPLE or verb != "close":
+            missing.append((group, verb))
+    for name in names_in(source, "GRAPHQL_BODY_MUTATIONS"):
+        if name not in MUTATIONS:
+            missing.append(("graphql", name))
+    return missing
+
+
+def count_forms(source):
+    return (len(pairs(source, "SIGNED_COMMANDS")) + len(pairs(source, "CLOSE_COMMANDS")) + len(pairs(source, "SIGNED_API"))
+            + len(names_in(source, "GRAPHQL_BODY_MUTATIONS")))
+
+
+def gql(name):
+    return "mutation{%s(input:{subjectId:\"X\",body:\"hello\"}){clientMutationId}}" % name
+
+
+def battery(rig):
+    bad = []
+    path = rig.home / "in.json"
+    path.write_text('{"body":"x"}')
+    done, calls = rig.run("api", ALL_API["issue-comments"], "--input", str(path))
+    if len(calls) != 1 or SIGNED not in "".join(calls[0]["files"].values()):
+        bad.append("--input file not signed")
+    done, calls = rig.run("api", ALL_API["reviews"], "--input", "-", stdin='{"body":"x"}')
+    if len(calls) != 1 or calls[0]["stdin"].count(SIGNED) != 1:
+        bad.append("--input stdin not signed")
+    for label, endpoint in NEW_API_EXAMPLES.items():
+        done, calls = rig.run("api", endpoint, "-X", "PATCH", "-f", "body=x")
+        if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
+            bad.append("endpoint not signed: " + label)
+    for name in MUTATIONS:
+        done, calls = rig.run("api", "graphql", "-f", "query=" + gql(name))
+        if calls or done.returncode != 1:
+            bad.append("graphql let through: " + name)
+    return bad
+
+
+class TestGhShimSignInput(unittest.TestCase):
+    def setUp(self):
+        self.rig = Rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def file(self, text, name="in.json"):
+        path = self.rig.home / name
+        path.write_text(text)
+        return str(path)
+
+    def refused(self, done, calls):
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
+        self.assertTrue(done.stderr.startswith("gh: refused:"), done.stderr)
+        self.assertEqual(calls, [])
+
+    def test_s3_input_file_is_signed_once_and_the_temp_file_removed(self):
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments", "--input", self.file('{"body":"x"}'))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(calls), 1)
+        temp = calls[0]["argv"][-1]
+        data = json.loads(calls[0]["files"][temp])
+        self.assertEqual(data["body"].count(SIGNED), 1)
+        self.assertNotEqual(temp, str(self.rig.home / "in.json"))
+        self.assertFalse(os.path.exists(temp))
+
+    def test_s3b_input_equals_spelling(self):
+        original = self.file('{"body":"x"}')
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/comments", "--input=" + original)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["argv"][-1].startswith("--input="))
+        self.assertNotEqual(calls[0]["argv"][-1], "--input=" + original)   # the recorder cannot read an =path value: the swap to a temp file is what is checked
+
+    def test_s4_input_stdin_is_signed_and_event_kept(self):
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", "-", stdin='{"body":"x","event":"COMMENT"}')
+        data = json.loads(calls[0]["stdin"])
+        self.assertEqual(data["body"].count(SIGNED), 1)
+        self.assertEqual(data["event"], "COMMENT")
+
+    def test_s5_a_broken_input_is_refused(self):
+        cases = [(self.file("{nope"), None), (self.file('{"body":5}'), None), (str(self.rig.home / "missing.json"), None)]
+        for value, stdin in cases:
+            with self.subTest(value=value):
+                self.refused(*self.rig.run("api", "repos/o/r/issues/1/comments", "--input", value))
+        with self.subTest(value="stdin"):
+            self.refused(*self.rig.run("api", "repos/o/r/issues/1/comments", "--input", "-", stdin="{nope"))
+
+    def test_an_input_without_a_body_passes_unchanged(self):
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", "-", stdin='{"event":"APPROVE"}')
+        self.assertEqual(calls[0]["stdin"], '{"event":"APPROVE"}')
+        path = self.file('{"event":"APPROVE"}')
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", path)
+        self.assertEqual(calls[0]["argv"][-1], path)
+
+    def test_s19_review_comment_endpoints_are_signed(self):
+        for endpoint, extra in (("repos/o/r/pulls/comments/5", ("-X", "PATCH")), ("repos/o/r/pulls/1/comments/5/replies", ())):
+            with self.subTest(endpoint=endpoint):
+                done, calls = self.rig.run("api", endpoint, *extra, "-f", "body=x")
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
+
+    def test_s20_review_comment_endpoints_with_input(self):
+        done, calls = self.rig.run("api", "repos/o/r/pulls/comments/5", "-X", "PATCH", "--input", self.file('{"body":"x"}'))
+        temp = calls[0]["argv"][-1]
+        self.assertEqual(json.loads(calls[0]["files"][temp])["body"].count(SIGNED), 1)
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/comments/5/replies", "--input", "-", stdin='{"body":"x"}')
+        self.assertEqual(json.loads(calls[0]["stdin"])["body"].count(SIGNED), 1)
+        self.refused(*self.rig.run("api", "repos/o/r/pulls/1/comments/5/replies", "--input", "-", stdin="[["))
+
+    def test_s7_each_graphql_body_mutation_is_refused(self):
+        for name in MUTATIONS:
+            with self.subTest(name=name):
+                done, calls = self.rig.run("api", "graphql", "-f", "query=" + gql(name))
+                self.refused(done, calls)
+                self.assertIn(name, done.stderr)
+
+    def test_s8_other_ways_to_name_a_mutation(self):
+        q = gql("addComment")
+        forms = {
+            "file": ("-F", "query=@" + self.file(q, "q.graphql"), None),
+            "upper": ("-f", "query=" + q.upper(), None),
+            "alias": ("-f", "query=mutation{a: addComment(input:{body:\"x\"}){clientMutationId}}", None),
+            "json": ("--input", self.file(json.dumps({"query": q}), "q.json"), None),
+            "stdin": ("--input", "-", json.dumps({"query": q})),
+        }
+        for label, (flag, value, stdin) in forms.items():
+            with self.subTest(form=label):
+                self.refused(*self.rig.run("api", "graphql", flag, value, stdin=stdin))
+        with self.subTest(form="unreadable"):
+            self.refused(*self.rig.run("api", "graphql", "-F", "query=@" + str(self.rig.home / "none.graphql")))
+
+    def test_u2_reads_and_other_calls_are_untouched(self):
+        for args in (("api", "repos/o/r/issues/1/comments"), ("api", "graphql", "-f", "query=query { viewer { login } }"),
+                     ("api", "repos/o/r/issues/1/labels", "-f", "body=x"), ("api", "repos/o/r/issues/1", "-X", "PATCH", "-f", "body=x"),
+                     ("api", "graphql", "-f", "query=mutation{mergePullRequest(input:{pullRequestId:\"X\"}){clientMutationId}}")):
+            with self.subTest(args=args):
+                done, calls = self.rig.run(*args)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["argv"], list(args))
+
+    def test_u6_input_on_a_get_or_another_endpoint_is_untouched(self):
+        path = self.file('{"body":"x"}')
+        done, calls = self.rig.run("api", "repos/o/r/issues/1/labels", "--input", path)
+        self.assertEqual(calls[0]["argv"][-1], path)
+
+    def test_s10_completeness_and_count(self):
+        self.assertEqual(forms_missing(self.source), [])
+        self.assertEqual(count_forms(self.source), 21)
+        self.assertEqual(old_forms_without_an_example(self.source), [("api", "pr-review-comment"), ("api", "pr-review-reply")])
+
+    def test_s11_a_planted_name_is_reported(self):
+        planted = self.source + "\nGRAPHQL_BODY_MUTATIONS = {**GRAPHQL_BODY_MUTATIONS, 'addPlanted': 'x'}\n"
+        self.assertEqual(forms_missing(planted), [("graphql", "addPlanted")])
+
+    def test_the_battery_passes_for_the_real_shim(self):
+        self.assertEqual(battery(self.rig), [])
+
+    def mutant(self, old, new):
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone: " + old)
+        rig = Rig(self.source.replace(old, new, 1))
+        self.addCleanup(rig.close)
+        return battery(rig)
+
+    def test_s6_mutant_input_left_unsigned_is_seen(self):
+        seen = self.mutant("        return input_call(args, namer(), found)", "        return None")
+        self.assertIn("--input file not signed", seen)
+        self.assertIn("--input stdin not signed", seen)
+
+    def test_s9_mutant_graphql_let_through_is_seen(self):
+        seen = self.mutant('        return graphql_call(args)', "        return None")
+        self.assertEqual(len([s for s in seen if s.startswith("graphql let through")]), len(MUTATIONS))
+
+    def test_mutant_a_left_out_signed_api_entry_is_seen(self):
+        seen = self.mutant('("pr-review-reply", r"pulls/[0-9]+/comments/[0-9]+/replies")', '("pr-review-reply", r"pulls/[0-9]+/comments/[0-9]+/repliesX")')
+        self.assertIn("endpoint not signed: pr-review-reply", seen)
+        seen = self.mutant('("pr-review-comment", r"pulls/comments/[0-9]+")', '("pr-review-comment", r"pulls/comments/[0-9]+X")')
+        self.assertIn("endpoint not signed: pr-review-comment", seen)
+
+
+if __name__ == "__main__":
+    unittest.main()
