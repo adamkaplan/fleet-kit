@@ -171,6 +171,7 @@
         "bin/cloud_relay.py",
         "cloud/worker/bin/cloud_relay.py",
         "bin/cloud_cli.py",
+        "bin/cloud_cluster.py",
         "bin/external_adapter.py",
         "bin/delegated_clear.py",
         "bin/impact_hold.py",
@@ -223,6 +224,7 @@
           "bin/cloud_relay.py",
           "cloud/worker/bin/cloud_relay.py",
           "bin/cloud_cli.py",
+          "bin/cloud_cluster.py",
           "bin/external_adapter.py",
           "bin/delegated_clear.py",
           "bin/impact_hold.py",
@@ -429,6 +431,7 @@
         "bin/switchboard/plan_review.py",
         "bin/switchboard/triage.py",
         "bin/switchboard/alert_labels.py",
+        "bin/switchboard/link_scrub.py",
         "bin/switchboard/handoff.py",
         "bin/switchboard/audit.py",
         "bin/switchboard/decision.py",
@@ -596,6 +599,8 @@
           "AlertWakeFacts",
           "RedCiFacts",
           "TriageFacts"
+        ],
+        "bin/switchboard/link_scrub.py": [
         ],
         "bin/switchboard/handoff.py": [
           "WorkerFacts",

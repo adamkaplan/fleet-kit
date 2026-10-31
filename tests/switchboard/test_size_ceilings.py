@@ -159,7 +159,7 @@ class TestTheCheck(Cases):
         ceilings, problems = size_ceilings.size_rows(text)
         _units, violations = test_architecture.parse_document(text)
         by_arch = {("bin/" + k[0] if not k[0].startswith(("bin/", "tests/")) else k[0]): v[0] for k, v in violations.items() if k[2] == "size"}
-        self.assertEqual((problems, len(ceilings), ceilings), ([], 5, by_arch))
+        self.assertEqual((problems, len(ceilings), ceilings), ([], 4, by_arch))
         self.assertIs(test_architecture.size_ceilings, size_ceilings)
         self.assertEqual(test_architecture.line_count(REPO / "bin" / "size_ceilings.py"), size_ceilings.line_count(REPO / "bin" / "size_ceilings.py"))
 

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -214,8 +215,75 @@ def refresh_refs(workdir, remote, ctx):
         return False
     return p.returncode == 0
 
+NO_REPOSITORY_NOTE = "no repository in the pod; nothing to push"
+
+
+def probe_path(path):
+    """'absent' only when lstat of the path, or of a parent on the way, says FileNotFoundError or NotADirectoryError; 'dir' for a real
+    directory. Any other OSError (permission, loop, name too long) propagates; a link at the path, a dangling link on the way, or a
+    non-directory at the path raises RuntimeError. Never the os.path helpers: they turn an error into "not found"."""
+    path = os.path.abspath(path)
+    parts = [p for p in path.split(os.sep) if p]
+    cur = os.sep
+    for i, part in enumerate(parts):
+        cur = os.path.join(cur, part)
+        try:
+            st = os.lstat(cur)
+        except (FileNotFoundError, NotADirectoryError):
+            return "absent"
+        if stat.S_ISLNK(st.st_mode):
+            if i == len(parts) - 1:
+                raise RuntimeError("%s is a link, not a directory" % path)
+            try:
+                os.stat(cur)
+            except (FileNotFoundError, NotADirectoryError):
+                raise RuntimeError("%s is a dangling link" % cur)
+        elif i == len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError("%s is not a directory" % path)
+    return "dir"
+
+
+def has_marker(directory):
+    """True when directory holds a .git entry (file or directory); False only when lstat says it is absent; other errors propagate."""
+    try:
+        os.lstat(os.path.join(directory, ".git"))
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
+def first_entry(directory):
+    """True when the directory holds any entry at all (a listing error propagates)."""
+    with os.scandir(directory) as it:
+        for _ in it:
+            return True
+    return False
+
+
+def no_checkout(workdir):
+    """True only when the repository directory is absent or empty AND the workspace is absent or empty. Any entry in the
+    workspace, or a directory the hook cannot read, raises (the hook exits 1, the pod is kept)."""
+    state = probe_path(workdir)
+    if state == "dir":
+        if has_marker(workdir):
+            return False
+        if first_entry(workdir):
+            raise RuntimeError("%s holds files but no .git: not deleting the pod" % workdir)
+        return True
+    workspace = os.path.dirname(os.path.abspath(workdir))
+    if probe_path(workspace) == "absent":
+        return True
+    if first_entry(workspace):
+        raise RuntimeError("no repository at %s but the workspace %s is not empty: not deleting the pod" % (workdir, workspace))
+    return True
+
 
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
+    # Three answers: no checkout at all (see no_checkout: nothing was cloned, nothing can be lost; this answer carries
+    # no_repository), a checkout whose push fails (RuntimeError from git: the caller prints `error`, exit 1), and
+    # nothing unpushed or pushed (as before). A state the hook cannot read is an error, never "no repository".
+    if no_checkout(workdir):
+        return {"pushed": False, "wip_branch": None, "skipped": [], "no_repository": True, "note": NO_REPOSITORY_NOTE}
     url = HOST_URL + "%s.git" % repo if prestop else None
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout
     paths = [e[3:] for e in status.split("\0") if len(e) > 3]
@@ -309,9 +377,13 @@ def prestop_main():
     workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
     if not valid_worker(worker):
         return report(workdir, "the worker name is not valid", names=False)
-    if not os.path.exists(os.path.join(workdir, ".git")):
+    try:
+        gst = os.lstat(os.path.join(workdir, ".git"))
+    except (FileNotFoundError, NotADirectoryError):
         return report(workdir, "there is no git repository here", names=False)
-    if not os.path.isdir(os.path.join(workdir, ".git")):
+    except OSError as e:
+        return report(workdir, "cannot read %s/.git: %s" % (workdir, type(e).__name__), names=False)
+    if not stat.S_ISDIR(gst.st_mode):
         return report(workdir, ".git is a file: a linked worktree or a separate git directory is not supported", names=False)
     repo = os.environ.get("CW_REPO", "")
     if not REPO_RE.match(repo) or ".." in repo:

@@ -852,7 +852,7 @@ class LiveHead(Fixture):
             calls.append(pr)
             free.append(self.lock_free())   # the verdict: is the ledger lock free at the moment of THIS call
             (first_in if n == 0 else settled).set()
-            release[min(n, 1)].wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
+            release[min(n, 1)].wait()   # the test releases it (and addCleanup at the end): no timer
             return HEAD
         self.backend.live_head = slow
 
@@ -901,7 +901,7 @@ class LiveHead(Fixture):
         self.addCleanup(release.set)   # no thread of this test outlives it
 
         def blocked(pr):
-            release.wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; never what the test judges
+            release.wait()   # the test's release event ONLY, set after the join has observed the outcome: no timer competes with the join (t.join(10) bounds a hang)
             return HEAD
         self.backend.live_head = blocked
         answer, audits = [], len(self.backend.audits)
@@ -1556,16 +1556,23 @@ class OneWallClock(unittest.TestCase):
             return time.monotonic() - t0, err
         return time.monotonic() - t0, None
 
-    def slow_dns(self):
+    def slow_dns(self, mod):   # runs the fetch in a thread; returns its result and whether the lookup had returned when the test observed
         self.lookup_returned = threading.Event()   # #1521: what the tests observe: had the lookup returned when the fetch answered?
         self.addCleanup(self.lookup_release.set)
 
         def gai(*a, **k):
-            self.lookup_release.wait(10)   # guard, 5 times the slowest honest case (about 2 s): a broken mechanism fails instead of hanging; the test releases it at its end
+            self.lookup_release.wait()   # the TEST releases it, only after it observed whether the fetch answered
             self.lookup_returned.set()
             return self.real_gai(*a, **k)
         self.socket.getaddrinfo = gai
-        return "http://127.0.0.1:9"
+        out = []
+        t = threading.Thread(target=lambda: out.append(self.timed(mod, "http://127.0.0.1:9", 1.0)), daemon=True)
+        t.start()
+        t.join(10)   # hang guard, never a verdict: the real fetch has answered, the mutant one is still blocked on the lookup
+        returned, answered = self.lookup_returned.is_set(), bool(out)   # both taken BEFORE the release
+        self.lookup_release.set()
+        t.join(10)   # hang guard: the mutant fetch answers once the lookup returned
+        return out, returned, answered
 
     def full_backlog(self, n=4):
         """Deterministic n dead addresses: each attempt sleeps its whole timeout, then times out (no kernel backlog)."""
@@ -1583,16 +1590,14 @@ class OneWallClock(unittest.TestCase):
         return "http://localhost:9"
 
     def test_slow_dns_is_cut_at_the_deadline(self):
-        _, err = self.timed(relay, self.slow_dns(), 1.0)
-        returned = self.lookup_returned.is_set()   # the lookup is blocked on an Event the test controls
-        self.assertIsInstance(err, relay.PassCut)
+        out, returned, _ = self.slow_dns(relay)
+        self.assertIsInstance(out[0][1], relay.PassCut)
         self.assertFalse(returned, "the fetch was cut only after the name lookup had returned")
 
     def test_mutant_without_the_thread_cut_is_caught_by_dns(self):
         mod = load_backend_module("worker.join(READ_DEADLINE)", "worker.join()")
-        self.timed(mod, self.slow_dns(), 1.0)
-        # the mutant joins without the deadline: it waits for the lookup (the 10 s guard of slow_dns), so the lookup has returned
-        self.assertTrue(self.lookup_returned.is_set(), "the mutant fetch returned before the name lookup had returned")
+        out, _, answered = self.slow_dns(mod)   # the mutant joins without the deadline: silent until the release
+        self.assertFalse(answered, "the mutant fetch answered before the name lookup had returned"); self.assertTrue(out, "it never answered")
 
     def test_four_dead_addresses_share_one_deadline(self):
         _, err = self.timed(relay, self.full_backlog(), 2.0)
