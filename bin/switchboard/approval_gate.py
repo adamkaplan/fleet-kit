@@ -96,7 +96,7 @@ def approval_refusal(args, runner, now):
     if not ctx.problem and head and "G0c" in plan_ledger.valid_waivers(ctx.entries, ctx.pr, head, now()):
         try:
             AuditLog(ctx.state / "audit.jsonl").append("cli", "plan.approval.waived", ctx.pr, {"pr": ctx.pr, "head": head, "waived": "G0c: " + said})
-        except OSError:
-            pass
+        except Exception:
+            return "merge of %s refused: the waiver of G0c at head %s could not be recorded in the audit; an unaudited waiver is not honoured (the gate fails closed)" % (ctx.pr, head)
         return None
     return "merge of %s refused: %s; ask %s for the approval, or for a logged waiver (`%s waive %s --gates G0c --reason ...`)" % (ctx.pr, said, APPROVER, PROG, ctx.pr)

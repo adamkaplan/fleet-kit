@@ -98,6 +98,16 @@ def mutated_events(old, new):
     return space["approval_events"]
 
 
+def mutated_refusal(old, new):
+    """approval_refusal from the real part with `old` replaced by `new` (asserted applied)."""
+    text = PART.read_text()
+    if old not in text:
+        raise AssertionError("mutant not applied: %r" % old)
+    space = dict(vars(HOST.sb))
+    exec(compile(text.replace(old, new, 1), str(PART), "exec"), space)
+    return space["approval_refusal"]
+
+
 def many_files(total, at):
     """A state directory of `total` audit files (the live one, then rotated ones) read newest first; the ISSUE event at H_NEW sits only in the `at`th file read (1 = the live audit)."""
     folder = Path(tempfile.mkdtemp(prefix="approval-"))
@@ -270,4 +280,35 @@ class TestApprovalGateCommands(unittest.TestCase):
         self.h.fake.head = "c" * 40
         self.assertTrue(self.refusal())
 
+    def waive(self):
+        code, out, err = self.h.run_as("cos", "waive", self.h.PR, "--gates", "G0c", "--reason", "the owner decided to ship it before the approval is recorded")
+        self.assertEqual(code, 0, err)
 
+    def refusal_by(self, fn):
+        return fn(self.args, self.h.route, self.h.world.clock.now)
+
+    def unwritable_audit(self):
+        audit = self.h.world.state / "audit.jsonl"
+        if audit.exists():
+            audit.unlink()
+        audit.mkdir()   # an audit that cannot be appended to
+        self.addCleanup(lambda: audit.rmdir() if audit.is_dir() else None)
+
+    def test_a_waiver_whose_audit_write_fails_is_refused(self):
+        self.enforce()
+        self.waive()
+        self.assertEqual(len(self.h.audit_lines("plan.approval.waived")), 0)
+        self.assertIsNone(self.refusal(), "control: a writable audit passes")
+        self.assertEqual(len(self.h.audit_lines("plan.approval.waived")), 1, "control: one waived line")
+        self.unwritable_audit()
+        text = self.refusal()
+        self.assertRegex(text or "", r"^merge of acme/app#9 refused: the waiver of G0c at head %s could not be recorded in the audit" % HOST.MG_HEAD)
+
+    def test_mutant_the_swallowed_audit_failure_is_caught(self):
+        self.enforce()
+        self.waive()
+        self.unwritable_audit()
+        mutant = mutated_refusal("        except Exception:\n            return \"merge of %s refused: the waiver", "        except Exception:\n            pass\n            return None\n            return \"merge of %s refused: the waiver")
+        self.assertIsNone(self.refusal_by(mutant), "the mutant honours an unaudited waiver")
+        with self.assertRaisesRegex(AssertionError, r"^None is not true : the waiver must be refused$"):
+            self.assertTrue(self.refusal_by(mutant), "the waiver must be refused")
