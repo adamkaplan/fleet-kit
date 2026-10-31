@@ -204,3 +204,48 @@ class TestEpicRecordMove(unittest.TestCase):
                 result = unittest.TestResult()
                 suite.run(result)
             self.assertGreaterEqual(len(result.failures) + len(result.errors), 1, name)
+
+    # #1383: the carry reads the NEW names of a compare; the epic's stale rule adds the old names of a renamed file.
+    RENAMED = {"status": "ahead", "files": [{"filename": "src/new.py", "previous_filename": "src/old.py", "status": "renamed"}]}
+
+    def get(self, compare):
+        def get(path):
+            if "/compare/" in path:
+                return compare
+            if path.endswith("/check-runs"):
+                return {"check_runs": []}
+            return {"parents": []}
+        return get
+
+    def changed(self, compare):
+        return HOST.sb.epic_changed(self.get(compare), "o/r")("old", "new")
+
+    def check_rename(self):
+        sb = HOST.sb
+        get = self.get(self.RENAMED)
+        self.assertEqual(sb.compare_files(get, "o/r", "old", "new"), ["src/new.py"])
+        self.assertEqual(sb.carry_head_facts(get, "o/r", "old", "new")["files"], ["src/new.py"])
+        self.assertEqual(sorted(self.changed(self.RENAMED)), ["src/new.py", "src/old.py"])
+
+    def test_t1_the_carry_does_not_count_a_renamed_file_under_its_old_name_and_the_epic_does(self):
+        self.check_rename()
+
+    def test_t2_a_compare_that_is_not_a_dict_is_refused_by_the_carry_and_reads_as_stale_in_the_epic(self):
+        sb = HOST.sb
+        for bad in (None, [], "x"):
+            with self.assertRaises(sb.CarryRefused):
+                sb.compare_rows(self.get(bad), "o/r", "old", "new")
+            with self.assertRaises(sb.CarryRefused):
+                sb.carry_head_facts(self.get(bad), "o/r", "old", "new")
+            self.assertIsNone(self.changed(bad))
+
+    def test_t3_a_compare_files_that_returns_the_old_names_too_is_caught_by_t1(self):
+        sb = HOST.sb
+        real = sb.compare_rows
+        def mutant(get, repo, a, b):
+            return [f["filename"] for f in real(get, repo, a, b)] + [f["previous_filename"] for f in real(get, repo, a, b) if f.get("previous_filename")]
+        original = sb.compare_files
+        with mock.patch.object(sb, "compare_files", mutant):
+            self.assertIsNot(sb.compare_files, original, "the mutant is applied")
+            with self.assertRaises(AssertionError):
+                self.check_rename()
