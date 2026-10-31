@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """app-token: print a one-hour GitHub App installation token for ONE repository, to stdout, and nothing else.
 
-usage: app_token.py OWNER/REPO
+usage: app_token.py OWNER/REPO [--role worker|orchestrator]
 
 The App id and private key are read from the vault by commands (stdout of each, in memory only):
   CW_APP_ID_CMD, CW_APP_KEY_CMD
@@ -14,7 +14,7 @@ accepted, never run, ignored.
 The key goes to `openssl dgst -sha256 -sign /dev/fd/N` through a pipe: never a file, an argument or the environment.
 The 9-minute app JWT and the token are never printed except the token, once, on stdout. Errors go to stderr, never a value.
 Only https://api.github.com is used; CW_GITHUB_API_BASE may name a loopback http URL (tests).
-The request asks for, and the answer must carry EXACTLY, the permissions of EXPECTED_PERMISSIONS below (no extra key, no
+The request asks for, and the answer must carry EXACTLY, the permissions of the role's set in PERMISSIONS_BY_ROLE below (default worker) (no extra key, no
 higher level, none missing), else no token is printed. A missing key is the App not yet granted (or the installation not yet
 accepting) a permission: the refusal names it and the owner step.
 CW_OPENSSL names the openssl binary (default openssl).
@@ -40,17 +40,23 @@ MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output t
 # THE table of the cloud token's permissions: the request body, the exact check, the refusal text, the preflight's
 # "token permissions" line and the documents all derive from it. issues: read lets the worker read its ask and plan
 # (and their comments); nothing here is a write to an issue. shims/app_mint.py (the Mac shim) keeps its own, different set.
-EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
+# One table of sets BY ROLE. The orchestrator's set has no contents key at all: it reads issues, pull requests and check
+# results and writes to issues only.
+PERMISSIONS_BY_ROLE = {
+    "worker": {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"},
+    "orchestrator": {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"},
+}
+EXPECTED_PERMISSIONS = PERMISSIONS_BY_ROLE["worker"]  # the worker's set: the name every existing importer uses
 
 
-def render_permissions(perms=None):
-    """The table as text: `contents: write, pull_requests: write, issues: read, metadata: read`."""
-    return ", ".join("%s: %s" % kv for kv in (EXPECTED_PERMISSIONS if perms is None else perms).items())
+def render_permissions(perms=None, role="worker"):
+    """The set as text: for the worker `contents: write, pull_requests: write, issues: read, metadata: read`."""
+    return ", ".join("%s: %s" % kv for kv in (PERMISSIONS_BY_ROLE[role] if perms is None else perms).items())
 
 
-def owner_step():
-    """The one place that says what the owner does when the App lacks a permission of the table."""
-    return "the owner adds %s to the App's permissions and accepts them on each installation" % render_permissions()
+def owner_step(role="worker"):
+    """The one place that says what the owner does when the App lacks a permission of the role's set."""
+    return "the owner adds %s to the App's permissions and accepts them on each installation" % render_permissions(None, role)
 
 
 def open_url(req, timeout=30):
@@ -104,14 +110,31 @@ def revoke(token):
         return False
 
 
-def die(msg, code=1):
+LAST_FAILURE = {}  # the last die(): {'transient': bool, 'reason': text, 'retry_after': int or None}; a caller that retries reads it
+
+
+def _wait_seconds(value):
+    """A Retry-After header as whole seconds, or None when it is not a plain number."""
+    if not (isinstance(value, str) and value.isascii() and value.isdigit()):
+        return None   # an HTTP date, a sign, a float, a non-ASCII digit (int() would raise on it): not a number
+    return int(value) if len(value) <= 6 else 999999   # a huge wait is over the cap: the retries end at once
+
+
+EXIT_TEMPFAIL = 75   # sysexits "temporary failure": the process status of a passing failure (a launch retries on this status only)
+
+
+def die(msg, code=1, transient=False, retry_after=None):
+    """Print the reason and exit. transient=True marks a PASSING failure (the vault, the network, HTTP 5xx or 429, a 403 with Retry-After);
+    everything else is a refusal. LAST_FAILURE tells the caller which."""
     if MINTED:
         token = MINTED.pop()
         msg += (" The token was revoked." if revoke(token)
                 else " Revocation failed: the token expires within an hour and was never printed.")
         del token
+    LAST_FAILURE.clear()
+    LAST_FAILURE.update({"transient": bool(transient), "reason": msg, "retry_after": retry_after})
     print("app-token: " + msg, file=sys.stderr)
-    sys.exit(code)
+    sys.exit(EXIT_TEMPFAIL if transient and code == 1 else code)
 
 
 def b64(b):
@@ -133,10 +156,10 @@ def vault(env_name, secret):
         if len(p.stdout) > MAX_BYTES:
             die("the vault command for %s printed more than %d bytes" % (secret, MAX_BYTES))
     except (OSError, subprocess.TimeoutExpired):
-        die("could not run the command for %s" % secret)
+        die("could not run the command for %s" % secret, transient=True)
     val = p.stdout.strip() if secret != "cw-app-key" else p.stdout
     if p.returncode != 0 or not val.strip():
-        die("the vault command for %s failed or printed nothing" % secret)
+        die("the vault command for %s failed or printed nothing" % secret, transient=True)
     return val
 
 
@@ -175,8 +198,9 @@ def api_base():
     return base.rstrip("/")
 
 
-def check_permissions(perms):
-    """Refuse unless perms is exactly EXPECTED_PERMISSIONS. Names a key, never a value."""
+def check_permissions(perms, role="worker"):
+    """Refuse unless perms is exactly the role's set. Names a key, never a value."""
+    EXPECTED_PERMISSIONS = PERMISSIONS_BY_ROLE[role]  # local: the set of this role (the worker's by default)
     if not isinstance(perms, dict):
         die("refusing: the answer carries no permissions object")
     for k in sorted(perms):
@@ -184,12 +208,12 @@ def check_permissions(perms):
             die("refusing: the token carries an extra permission: %s" % str(k)[:40])
     for k, want in EXPECTED_PERMISSIONS.items():
         if k not in perms:
-            die("refusing: the token lacks the permission: %s (%s)" % (k, owner_step()))
+            die("refusing: the token lacks the permission: %s (%s)" % (k, owner_step(role)))
         if perms[k] != want:
             die("refusing: the token has a different level for the permission: %s" % k)
 
 
-def github_json(method, path, jwt, body=None, not_found=None):
+def github_json(method, path, jwt, body=None, not_found=None, role="worker"):
     """One GitHub call with the App JWT; the parsed JSON answer, or exit through die(). A 404 says not_found when given."""
     headers = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cw-app-token"}
@@ -209,14 +233,17 @@ def github_json(method, path, jwt, body=None, not_found=None):
             die(not_found)
         if e.code == 422 and method == "POST":
             die("the App's installation does not cover this repository: add it to the installation (HTTP 422); "
-                "if the App lacks a requested permission, %s" % owner_step())
+                "if the App lacks a requested permission, %s" % owner_step(role))
+        retry = e.headers.get("Retry-After") if e.headers else None
+        passing = e.code == 429 or 500 <= e.code <= 599 or (e.code == 403 and retry is not None)
+        flags = {"transient": passing, "retry_after": _wait_seconds(retry) if passing else None}
         if e.code == 403 and method == "POST":  # the App may not hold, or the installation not yet accept, a requested permission
-            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None), owner_step()))
-        die(http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None))
+            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, retry), owner_step(role)), **flags)
+        die(http_error_text(e.code, retry), **flags)
     except TimeoutError:
-        die("the GitHub request timed out: the launch is refused and nothing was minted")
+        die("the GitHub request timed out: the launch is refused and nothing was minted", transient=True)
     except Exception:  # OSError, ValueError, UnicodeDecodeError, RecursionError, MemoryError: any failure is a named refusal, never a crash
-        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted")
+        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted", transient=True)
 
 
 def is_id(x):
@@ -246,7 +273,7 @@ def find_installation(target, jwt):
     return inst, owner_id
 
 
-def mint(target):
+def mint(target, role="worker"):
     """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
     repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
@@ -261,7 +288,7 @@ def mint(target):
     del key
     inst, owner_id = find_installation(target, jwt)
     ans = github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt,
-                      {"repositories": [repo], "permissions": dict(EXPECTED_PERMISSIONS)})
+                      {"repositories": [repo], "permissions": dict(PERMISSIONS_BY_ROLE[role])}, role=role)
     token = ans.get("token") if isinstance(ans, dict) else None
     repos = ans.get("repositories") if isinstance(ans, dict) else None
     if not isinstance(token, str) or not token:
@@ -283,15 +310,20 @@ def mint(target):
         die("the answer has no readable expiry")
     if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
         die("refusing: the token lives longer than 61 minutes")
-    check_permissions(ans.get("permissions"))
+    check_permissions(ans.get("permissions"), role)
     MINTED.clear()
     return token
 
 
 def main(argv):
+    role = "worker"
+    if len(argv) == 3 and argv[1] == "--role":
+        role, argv = argv[2], argv[:1]
     if len(argv) != 1 or not valid_target(argv[0]):
-        die("usage: app_token.py OWNER/REPO", 2)
-    sys.stdout.write(mint(argv[0]))
+        die("usage: app_token.py OWNER/REPO [--role ROLE]", 2)
+    if role not in PERMISSIONS_BY_ROLE:
+        die("unknown role (one of: %s)" % ", ".join(PERMISSIONS_BY_ROLE), 2)
+    sys.stdout.write(mint(argv[0], role))
     sys.stdout.flush()
 
 

@@ -170,7 +170,7 @@ def _in_globs(path, globs):
 # The exact files CI runs as tests: the `bin/test-*` and `cloud/tests/test-cloud` steps of .github/workflows/test.yml, plus `bin/test-impact-brief` (collected by `bin/test-switchboard`). A test derives the workflow's steps from this list.
 TEST_RUNNERS = frozenset(("bin/test-app-mint", "bin/test-cloud-channel", "bin/test-cloud-channel-server", "bin/test-cloud-cli", "bin/test-cloud-client", "bin/test-cloud-hub", "bin/test-cloud-launcher",
                           "bin/test-cloud-hub-relay", "bin/test-cloud-neutral-names", "bin/test-cloud-relay", "bin/test-cloud-relay-daemon", "bin/test-cloud-way-back", "bin/test-cloud-worker", "bin/test-decisions-pull", "bin/test-fleet-doctor", "bin/test-fleet-doctor-config",
-                          "bin/test-fleet-doctor-heartbeat", "bin/test-gh-hold", "bin/test-health-records", "bin/test-heartbeat", "bin/test-impact-brief", "bin/test-switchboard",
+                          "bin/test-fleet-doctor-heartbeat", "bin/test-gh-hold", "bin/test-health-records", "bin/test-heartbeat", "bin/test-impact-brief", "bin/test-path-suites", "bin/test-switchboard",
                           "bin/test-workflow-split", "cloud/tests/test-cloud"))
 
 
