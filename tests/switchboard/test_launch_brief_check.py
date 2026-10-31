@@ -9,7 +9,7 @@ from support.installs_and_keys import ACME_WEB
 from support.scenario_roles import FAKE_GH
 
 
-def build(TwoRepoCase):
+def build(TwoRepoCase, RefusedCase):
     class TestLaunchBriefCheck(TwoRepoCase):
         """#1350: `launch --issue N` refuses a brief naming another issue or a stale PR head; nothing is started."""
         HEAD = "abc1234def5678abc1234def5678abc1234def56"
@@ -97,6 +97,20 @@ def build(TwoRepoCase):
             code, _, err = self.main("launch", "web-new", "--agent", "coder", "--dir", str(self.work), "--workspace", "w1", "--role", "coder",
                                      "--repo", ACME_WEB, "--brief-file", str(path))
             self.assertEqual((code, self.reads), (0, []), err)
+
+        def test_the_derived_exit_check_fails_without_the_mismatch_row(self):
+            ident = " > mismatch|return EXIT_USAGE"
+            case = RefusedCase("test_s6_every_refusal_exit_derived_from_the_source_has_a_row_and_sends_exactly_one_message")
+            case.setUp()
+            self.addCleanup(case.doCleanups)
+            derived = sorted(i for i, _ in case.derived_exits())
+            rows = case.rows()
+            self.assertEqual(derived, sorted(rows))
+            without = {k: v for k, v in rows.items() if k != ident}
+            self.assertNotEqual(derived, sorted(without))
+            argv, patches = rows[ident]
+            text, _ = case.check_refused(argv, patches, ident)
+            self.assertEqual(len(case.sent()), 1)
 
         def test_the_docs_say_it(self):
             text = (BIN.parent / "docs" / "switchboard.md").read_text()
