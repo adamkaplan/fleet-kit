@@ -19580,6 +19580,8 @@ def compare_rows(get, repo, old_head, new_head):
     """The rows (dicts with a str `filename`) of GitHub's compare from `old_head` to `new_head` through `get`: the one reading shared by the carry (#1129, through `compare_files`) and the epic's stale rule (#1383).
     A compare of 300 files or more, a truncated one and one whose new head is not a descendant raise CarryRefused. A failed read raises."""
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
+    if not isinstance(compared, dict):
+        raise CarryRefused("the compare could not be read")
     rows = [f for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
     if len(rows) >= CARRY_COMPARE_FILE_CAP or compared.get("truncated") or (compared.get("total_files") or 0) >= CARRY_COMPARE_FILE_CAP:
         raise CarryRefused(CARRY_TOO_LARGE)

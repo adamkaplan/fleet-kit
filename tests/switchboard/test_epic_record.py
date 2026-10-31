@@ -230,14 +230,12 @@ class TestEpicRecordMove(unittest.TestCase):
     def test_t1_the_carry_does_not_count_a_renamed_file_under_its_old_name_and_the_epic_does(self):
         self.check_rename()
 
-    def test_t2_a_compare_that_is_not_a_dict_raises_in_the_carry_as_on_integration_and_reads_as_stale_in_the_epic(self):
+    def test_t2_a_compare_that_is_not_a_dict_is_refused_by_the_carry_and_reads_as_stale_in_the_epic(self):
         sb = HOST.sb
         for bad in (None, [], "x"):
-            with self.assertRaises(AttributeError):
+            with self.assertRaises(sb.CarryRefused):
                 sb.compare_rows(self.get(bad), "o/r", "old", "new")
-            with self.assertRaises(AttributeError):
-                sb.compare_files(self.get(bad), "o/r", "old", "new")
-            with self.assertRaises(AttributeError):
+            with self.assertRaises(sb.CarryRefused):
                 sb.carry_head_facts(self.get(bad), "o/r", "old", "new")
             self.assertIsNone(self.changed(bad))
 
