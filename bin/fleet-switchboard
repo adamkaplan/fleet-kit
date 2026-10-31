@@ -18034,7 +18034,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     if record_problem:
         record = ("hold", None)   # an unreadable ledger is an unknown rating: it holds
     registrar = registrar_states(engine, repo, matrix, paths, raw.get("baseRefOid"), head)   # #964: the one reading of what a registrar edit does to the clear's closure (every consumer reads the report)
-    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record, registrar)
+    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record, registrar, impact_floor.entry_hold(engine.config, repo, matrix))
     if record_problem:
         owner = (owner[0], owner[1] + ["the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(record_problem), 120)])   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
     if engine.state_dir is not None and isinstance(head, str):

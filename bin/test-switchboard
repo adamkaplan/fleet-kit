@@ -67290,6 +67290,8 @@ TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJ
 _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
+# The per-repository owner hold tests of #1241.
+_t1241 = importlib.import_module("test_1241"); TestOwnerHoldFloorConfig, TestImpactHoldByEntry, TestOperatorHoldDocs = _t1241.TestOwnerHoldFloorConfig, _t1241.TestImpactHoldByEntry, _t1241.TestOperatorHoldDocs
 TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
