@@ -2901,6 +2901,9 @@ class Launcher:
         """The pods whose hard limit has not passed (a bad deadline is left to the pass's own report)."""
         out = []
         for pod in pods:
+            if PERSISTENT_ANNOTATION in ((pod.get("metadata") or {}).get("annotations") or {}):   # a persistent pod has no hard deadline: it is always before its limit
+                out.append(pod)
+                continue
             try:
                 if now < self.hard_deadline(pod):
                     out.append(pod)
@@ -2912,6 +2915,8 @@ class Launcher:
         """At minute 40 of a pod's life, ONE note asks its worker to push <worker>/wip (the text is wip_note). The pod's cw/wip-note annotation
         is set BEFORE the note goes, so a failed send is not repeated and a second pass never sends a second note. Never raises."""
         for pod in pods:
+            if PERSISTENT_ANNOTATION in ((pod.get("metadata") or {}).get("annotations") or {}):   # an always-on orchestrator is not asked to push at minute 40
+                continue
             try:
                 worker, name = ann(pod, "worker"), pod["metadata"]["name"]
                 if (pod.get("status") or {}).get("phase") != "Running" or not NAME_RE.match(worker or ""):
