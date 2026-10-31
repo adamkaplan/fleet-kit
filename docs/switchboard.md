@@ -5012,6 +5012,8 @@ Every path or condition the plan script decides from, and where it comes from:
 
 Each row is pinned through the real script, and each has a mutant that fails the pins.
 
+To add a path to the list, insert one line (with a one-line reason comment above it) into an existing group of `.github/macos-platform-paths.txt`, and, for a non-test file under `bin/`, `cloud/`, `plugins/` or `shims/` that runs an operating-system tool or branches on the platform and is deliberately not listed, add it with a written reason (at least 20 characters) to the `EXEMPT` table of `TestPlatformPaths` in `tests/switchboard/test_mac_legs.py`, which derives that set from the syntax tree and fails naming any such file that is neither listed nor exempt (it does not see a command whose first element is built at run time, nor a tool called only through a variable).
+
 A pull request retargeted from `integration` to `main` is not re-planned by the retarget itself (`edited` is not a trigger type, so that a title or body edit never starts a run): push to it or re-run it, and the plan then sees base `main`. Only the macOS result of a draft into `main`, or of an `integration` pull request that touches no listed path, is absent. Telling the daemon of a failed nightly is a later slice of ask #990. In short, a pull request is re-run with a re-run, never by closing and reopening it (a close and reopen cancels its run and queues a new macOS job; only the gate pass does it, on purpose, once, to get the merge-ref macOS run): `gh run rerun <id>`, or `gh workflow run test.yml --ref <branch>`.
 
 **The built-in `ci` recorder.** `fleet-switchboard gates ci-record <repo#N>` makes the switchboard itself record the `ci` verdict. It reads the PR's
