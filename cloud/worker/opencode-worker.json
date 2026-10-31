@@ -12,6 +12,8 @@
       "gh api*pulls/*/merge*": "deny",
       "gh*mergePullRequest*": "deny",
       "gh*enablePullRequestAutoMerge*": "deny",
+      "*CW_PR_RECORD*": "deny",
+      "*pr-record*": "deny",
       "git*push*--force*": "deny",
       "git*push* -f*": "deny",
       "git*push*+*": "deny",
@@ -2067,9 +2069,7 @@
       "*git*push*/master *": "deny",
       "*git*push*/master\t*": "deny",
       "*git*push*/master\r*": "deny",
-      "*git*push*/master\n*": "deny",
-      "*CW_PR_RECORD*": "deny",
-      "*pr-record*": "deny"
+      "*git*push*/master\n*": "deny"
     }
   },
   "agent": {
@@ -2087,6 +2087,8 @@
           "gh api*pulls/*/merge*": "deny",
           "gh*mergePullRequest*": "deny",
           "gh*enablePullRequestAutoMerge*": "deny",
+          "*CW_PR_RECORD*": "deny",
+          "*pr-record*": "deny",
           "git*push*--force*": "deny",
           "git*push* -f*": "deny",
           "git*push*+*": "deny",
@@ -4142,9 +4144,7 @@
           "*git*push*/master *": "deny",
           "*git*push*/master\t*": "deny",
           "*git*push*/master\r*": "deny",
-          "*git*push*/master\n*": "deny",
-          "*CW_PR_RECORD*": "deny",
-          "*pr-record*": "deny"
+          "*git*push*/master\n*": "deny"
         }
       }
     }
