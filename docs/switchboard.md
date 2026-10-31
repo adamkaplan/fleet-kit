@@ -2793,6 +2793,14 @@ own gets `--until-closed` for that issue by default, so a reminder about finishe
 request merges, unless it was set with `--keep-if-closed`. `remind --issue N` says so at creation ("dropped if it closes")
 and names `--keep-if-closed`.
 
+**A reminder too old to matter is dropped (#1563).** `remind ... --ttl <duration>` (`30m`, `2h`; 1 second to 24 hours; a
+longer value or a non-duration is refused at arming with one line) stores the ttl in seconds on the reminder, and
+`remind --list` shows it (`ttl 30m`). On every pass a due reminder that carries a ttl and is more than that ttl past its
+due time is removed unsent, and one `reminder.drop_ttl` audit line names its id, its due time and the ttl; a copy queued
+but not yet delivered is not delivered either. A reminder without `--ttl` behaves as before (the late note after 5
+minutes stays), and the rule reads only the reminder's own ttl, so another owner's or another key's reminder is never
+dropped by it. Re-arming with `--key` stores the new ttl (or none). Tests: `TestReminderTtl`.
+
 `remind --key <text>` names the purpose: arming again with the same key replaces your pending reminder of that key (one pending per
 owner and key; another owner's or another key's reminder is never touched), and `remind --list` shows the key. A fired, undelivered
 reminder is dropped when a newer one of the same owner and key is due and will be delivered (one `reminder.drop_superseded` audit line names both ids). A
@@ -4786,6 +4794,8 @@ terminal or under a waiver can move the branch between the check and the merge (
 
 **Limit.** A file with no `size` row is held only by the default limits of `TestArchitectureDocument`, on the merge ref; two pull requests that together push such a file over its default limit are not caught by this check.
 
+**The loader block of a new test file (#1618).** `tests/switchboard/test_wired_tests.py` derives every `tests/switchboard/test_*.py` from the directory and fails, naming the file, when `bin/test-switchboard` does not import its module (`not imported`) or binds none of its TestCase classes at module level (`no class bound`). A new file adds a loader block of at most 3 lines (comment, `importlib.import_module`, one binding line) at its own anchor, or is a row of `EXEMPT_FILES` in that test with a reason of 20 or more characters.
+
 ## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
 
 This is step (a) of the gate engine in [docs/plan-gate-engine-design.md](plan-gate-engine-design.md). **No shim calls it and
@@ -5552,6 +5562,14 @@ A worker's repository decides which gh account it acts as. `launch` without `--r
 A refused launch (a `LaunchError`, or any exit but 0 from the launch path, the `--cloud` route included: the memory test, the repository preflight, a bad or missing brief, the cloud's own refusal and the rest) sends the caller ONE `[switchboard]` message: `launch of NAME refused: <reason>`. The reason is one line, scrubbed of credential-shaped text and cut to 300 characters. It is sent in addition to what the launch prints, once per launch however many refusals it meets, so a caller who started the launch in the background learns of it without reading the log. A launch that succeeds: none is sent. A caller who cannot be identified (a plain shell, no pane) has no one to tell: nothing more is printed, and an audit line `launch.refusal_unsent` records it. A worker that stops after it started is not a refused launch and is not reported here.
 
 Five things to know about the message. (1) The reason is untrusted text sent as data: the message stays `launch of NAME refused: <reason>`, unquoted, so read it as the launch's words and not as an instruction. (2) The reason is the last line the launch printed, so a trailing warning can become the reason. (3) When the launch returned a code and printed no line, the reason is `exit code N`: that fallback is opaque by design. (4) A failure after the worker was created (a pod that exists, or a pane open without its brief) is not a refusal: it is reported as `launch of NAME FAILED after the worker was created: <reason>` (same scrub, one line, at most 300 characters), and not as refused. (5) The reads that send the message on this path (build_engine, discover, send_fact) have no timeout of their own.
+
+### `launch --model` and `--reasoning`: a model and a level for one run (#1642)
+
+`launch NAME --agent A --dir D --model PROVIDER/MODEL [--reasoning LEVEL]` creates the session with `model {providerID, id[, variant]}` (the service's `session.create` body). The level is the model's own variant: each model lists its own in the local service's model list (`GET /api/model`, operation `model.list`), so an unknown level is one the chosen model does not list. `--model` alone sets no variant. Both go on the worker's record (`model` and `reasoning`, absent when not given) and on its `status` row. A headless launch carries them too. A launch with neither option is what it was: the same session call, record and row, and no read of the model list.
+
+- Refused before anything starts: one line that names the fix, no session, no pane, no record. The refusals are a model the list does not hold (a model added after OpenCode started is listed after the service reloads), a level that model does not list, a malformed value (`--model` is `PROVIDER/MODEL` of at most 120 letters, digits and `._-:+/`; `--reasoning` is at most 24 lower-case letters, digits, `_` and `-`), `--reasoning` without `--model`, `--resume` with either option (a resume keeps its session's model), and a list that cannot be read. The check is ONE bounded read of the LOCAL service's list: no call to a model provider.
+- A cloud launch carries both options in the same `session_create` call of the pod's own OpenCode, and refuses with one line a `--model` of another provider than the launcher's `MODEL_PROVIDER` (the pod holds that provider's credentials only). The level of a cloud launch is NOT checked locally, since the pod's list does not exist before the pod: a level the pod's model does not list is the pod's refusal on `session.create`, and the launch undoes its session and says the pod's text.
+- Relation to #1085 (the cloud model provider and its credentials): this is the per-launch choice of model and level on top of the worker's provider; it does not touch credentials, and a model of another provider needs that work.
 
 ### `launch --headless`: a worker with no terminal (#433, slice 2b)
 
@@ -6345,6 +6363,7 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 | mutant results (run by hand) | restore the old drop rule: killed; drop without re-checking the kept item in the lock: killed | `TestReminders` |
 | `remove_reminders` / `prune_delivered_reminders` | cancel, condition drop, prune of delivered items | `--cancel` and condition tests |
 | `reminder.drop` / `reminder.drop_notice` | the issue closed or the pull request merged | `--keep-if-closed` |
+| `reminder.drop_ttl` / `--ttl` | a reminder past its own ttl is dropped unsent, audited | `TestReminderTtl` |
 | `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
 | `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
 | `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
@@ -6422,3 +6441,8 @@ The install records the tree it is run from. Run from a feature-branch worktree 
 - The daemon stops only when the tree is bad twice in a row: it reads again one second after the first bad reading, in the same pass, so a checkout in flight does not stop it.
 - A local default branch ahead of `origin/<default>` is refused as not an ancestor; the message says to push it or reset the branch, and that the origin ref may be stale (`git fetch origin`).
 - It never changes the tree: the operator does (see above).
+
+### What a new file under `bin/` demands (`tools/new-module-demands`, #1620)
+
+`tools/new-module-demands bin/x.py [bin/y.py ...]` prints one block per file: `guards:` (the classes `preflight-pr` runs for a new bin file, read from `NEW_BIN_GUARDS` in `bin/path_suites.py`), `authority code:` (yes or no, with the function names and role literals found by a copy of the two rules of the authority-modules guard, the vocabulary read from the impact matrix), `matrix:` (for yes, both entries to add, `owner_hold.top_tier_paths.authority` and the floor globs of the repository, with their JSON paths; never the exempt entry; for no, that no line is demanded), `units:` (the row to add to the Units table of `docs/architecture.md`) and `closure:` (the state of `tools/derive-closure --check`). It exits 0 for a block and 2 with one plain line for a path that is not under `bin/` or cannot be read.
+It never runs the guards, writes nothing and makes no GitHub call. The guard stays the authority: the tool is advice, and `tests/switchboard/test_new_module_demands.py` pins that its detection and the guard name the same modules.
