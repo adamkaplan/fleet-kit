@@ -62,7 +62,6 @@ def build(PR4Base):
 
         def test_s4_a_mutant_that_keeps_the_older_copies_fails_the_check_after_the_unmutated_control(self):
             self.check_s2()   # the control: the unmutated check passes
-            self.skip = len(self.drops())
             self.skip = len([e for e in self.world.audit() if e["event"] == "reminder.drop_superseded"])
             self.world.tick(1000)
             real = sb.ReminderFacts.drop_older_copies
