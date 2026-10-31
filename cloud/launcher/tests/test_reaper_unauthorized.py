@@ -156,6 +156,49 @@ class Scenarios(unittest.TestCase):
             self.assertEqual(w.attempts, 1)
 
 
+class S9Relogin(unittest.TestCase):
+    def test_s9_the_relogin_of_the_reaper_loop_honours_the_retry_gap(self):
+        w = World(self, vault_ok=False)
+        cw = w.cw
+        grabbed = []
+
+        class NoTicker:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                pass
+
+            def close(self):
+                pass
+
+        def reap(launcher):
+            grabbed.append(launcher.relogin)
+            launcher.reap_results = {}
+            return []
+        kube = mock.Mock()
+        env = {"CW_CLOUD_NAMESPACE": "cw-s9-%d" % os.getpid()}
+        with mock.patch.object(cw, "RenewalTicker", NoTicker), mock.patch.object(cw.Launcher, "reap", reap), \
+                mock.patch.object(cw, "reaper_lock", lambda *a, **k: None), mock.patch.object(cw.Launcher, "_catch_signals", staticmethod(lambda: {})):
+            cw._reap_main(env, mock.Mock(loop=False), lambda s: None, clock=w.clock, refresher=w.refresher, kube=kube)
+        relogin = grabbed[0]
+        w.reads = 0   # the pass's own refresh failed; count from here
+        w.clock.now += 301 * dt.timedelta(seconds=1)
+        first = relogin()
+        r1 = w.reads
+        w.clock.now += 60 * dt.timedelta(seconds=1)
+        w.reads = 0
+        second = relogin()
+        r2 = w.reads
+        w.clock.now += 301 * dt.timedelta(seconds=1)
+        w.reads = 0
+        relogin()
+        r3 = w.reads
+        print("S9: vault reads first call %d, second call inside the gap %d, call after the gap %d, inside-gap calls answering not written %d of 1"
+              % (r1, r2, r3, 1 if second is False else 0))
+        self.assertEqual((r1, r2, r3, first, second), (1, 0, 1, False, False))
+
+
 def mutate(directory, edits):
     with open(os.path.join(LAUNCHER, "cloud_worker.py")) as f:
         src = f.read()
@@ -196,6 +239,19 @@ class S7Mutants(unittest.TestCase):
                 print("S7: mutant survived: %s" % name)
         print("S7: mutants caught %d of 3, mutations applied %d of 3" % (caught, applied))
         self.assertEqual((caught, applied), (3, 3))
+
+
+class S9Mutant(unittest.TestCase):
+    def test_the_mutant_with_force_true_fails_s9(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = mutate(tmp, [("r = refresher.run(unauthorized=True)", "r = refresher.run(force=True)")])   # asserts it occurs once
+            applied = True
+            p = stub_support.start(self, [sys.executable, "-m", "unittest", "test_reaper_unauthorized.S9Relogin"], cwd=HERE,
+                                   env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out = p.communicate(timeout=90)[0]
+        failed = p.returncode == 1 and "FAIL: test_s9_" in out and "(1, 0, 1, False, False)" in out and "second call inside the gap 1" in out
+        print("S9 mutant: failed on the second vault read inside the gap %d of 1, mutation applied %s" % (1 if failed else 0, applied))
+        self.assertTrue(failed)
 
 
 class S8Docs(unittest.TestCase):
