@@ -501,6 +501,79 @@ class StopNoCheckout(base.Base):
         self.assertIn(ws, str(cm.exception))
         self.assert_pod_kept("coder6", os.path.join(ws, "repo"))
 
+    # ---- ask #1483: workspace states A2 and E, against the real hook and against a scratch mutant, each in a child ----
+    CHILD = ("import importlib.util, sys\n"
+             "spec = importlib.util.spec_from_file_location('eh_under_test', sys.argv[1])\n"
+             "m = importlib.util.module_from_spec(spec)\n"
+             "spec.loader.exec_module(m)\n"
+             "try:\n"
+             "    r = m.run(sys.argv[2], 'child')\n"
+             "    print('REPORTED' if r.get('no_repository') else 'OTHER')\n"
+             "except (RuntimeError, OSError):\n"
+             "    print('RAISED')\n")
+
+    def workspace_state(self, name):
+        """A2: the workspace is mode 600 and empty (listable, not enterable). E: the workspace's parent is mode 000. Returns the repo path."""
+        self.need_user()
+        if name == "A2":
+            ws = os.path.join(self.tmp.name, "a2ws")
+            os.makedirs(ws)
+            self.set_mode(ws, 0o600)
+            self.assertFalse(os.access(ws, os.X_OK))
+            self.assertEqual(os.listdir(ws), [])
+        else:
+            outer = os.path.join(self.tmp.name, "outer")
+            ws = os.path.join(outer, "ws")
+            os.makedirs(ws)
+            self.set_mode(outer, 0)
+            self.assertFalse(os.access(outer, os.X_OK))
+            with self.assertRaises(PermissionError):
+                os.listdir(outer)
+        return os.path.join(ws, "repo")
+
+    def in_child(self, hook_file, repo):
+        import subprocess
+        p = subprocess.run([sys.executable, "-c", self.CHILD, hook_file, repo], capture_output=True, text=True, timeout=60)
+        return p.stdout.strip()
+
+    def test_a_workspace_of_mode_600_that_is_empty_raises_and_keeps_the_pod(self):
+        d = self.workspace_state("A2")
+        import end_hook
+        with self.assertRaises((RuntimeError, OSError)):
+            end_hook.run(d, "coder4")
+        self.assertEqual(self.in_child(end_hook.__file__, d), "RAISED")
+        self.assert_pod_kept("coder4", d)
+
+    def test_a_workspace_whose_parent_is_mode_000_raises_and_keeps_the_pod(self):
+        d = self.workspace_state("E")
+        import end_hook
+        with self.assertRaises((RuntimeError, OSError)):
+            end_hook.run(d, "coder4")
+        self.assertEqual(self.in_child(end_hook.__file__, d), "RAISED")
+        self.assert_pod_kept("coder4", d)
+
+    def test_mutant_treating_any_oserror_of_the_probe_as_absent_fails_both_workspace_states(self):
+        # A third inserted test, same assertions as the two above, run on a scratch copy of end_hook.py outside the repository.
+        import end_hook
+        with open(end_hook.__file__, encoding="utf-8") as f:
+            src = f.read()
+        old = 'except (FileNotFoundError, NotADirectoryError):\n            return "absent"'
+        new = 'except OSError:\n            return "absent"'
+        applied = src.count(old) == 1
+        self.assertTrue(applied)
+        mut = os.path.join(self.tmp.name, "mutant_scratch", "end_hook.py")
+        os.makedirs(os.path.dirname(mut))
+        with open(mut, "w", encoding="utf-8") as f:
+            f.write(src.replace(old, new))
+        self.assertEqual(open(mut, encoding="utf-8").read().count(new), 1)
+        mut_fails = head_passes = 0
+        for name in ("A2", "E"):
+            d = self.workspace_state(name)
+            head_passes += self.in_child(end_hook.__file__, d) == "RAISED"
+            mut_fails += self.in_child(mut, d) != "RAISED"
+        print("A2/E: head passes %d of 2, mutant fails %d of 2, mutation applied %s" % (head_passes, mut_fails, applied))
+        self.assertEqual((head_passes, mut_fails), (2, 2))
+
     def test_the_deletion_path_source_has_no_exists_style_helper(self):
         import inspect
         import end_hook
