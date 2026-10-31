@@ -186,7 +186,7 @@ class TestGhShimSignInput(unittest.TestCase):
     def test_s10_completeness_and_count(self):
         self.assertEqual(forms_missing(self.source), [])
         self.assertEqual(count_forms(self.source), 21)
-        self.assertEqual(old_forms_without_an_example(self.source), [("api", "pr-review-comment"), ("api", "pr-review-reply")])
+        self.assertEqual(old_forms_without_an_example(self.source), [])
 
     def test_s11_a_planted_name_is_reported(self):
         planted = self.source + "\nGRAPHQL_BODY_MUTATIONS = {**GRAPHQL_BODY_MUTATIONS, 'addPlanted': 'x'}\n"
