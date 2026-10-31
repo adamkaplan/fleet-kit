@@ -17,7 +17,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 ## One plan comment
 
-A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash).
+A plan is one canonical comment, edited in place; every revision adds a new short receipt comment (what changed and why, two to four lines, with the new plan hash); a plan is never reposted as a second plan comment.
 
 Receipt format: `docs/plan-template.md`.
 
@@ -50,13 +50,13 @@ issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; forma
 
 ## The form
 
-Put it in the repo the work concerns. **a short issue body** (outcome, Done-when, link to the
+Put it in the repo the work concerns. **an issue body** (outcome, Done-when, link to the
 detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
 `scenarios:` yaml block. The latest such comment counts. One plan per ask; sections for work items.
 
 ## Challenge it
 
-A `plan review` command launches independent read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
+A `plan review` command launches read-only reviewers and records their verdicts (not built yet: ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
 chosen per item. Up to three rounds; a standing objection then goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
@@ -104,7 +104,7 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `comm
 
 ## After the plan
 
-Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
+The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
 open. The order does not matter: a coder's only extra step is `prove`. A push voids every proof and
 verdict. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.
