@@ -299,7 +299,7 @@ class Concurrent(unittest.TestCase):
         out0 = L0.reap()
         got0 = (out0, comparable(env0), c0.calls, L0.reap_results)
         want1 = ([("coder0", "hard limit", 0)],
-                 [{"action": "stop", "actor": got1[1][0]["actor"], "cost_estimate_usd": 0.0, "ok": True, "reason": "hard limit",
+                 [{"action": "stop", "cause": "hard", "actor": got1[1][0]["actor"], "cost_estimate_usd": 0.0, "ok": True, "reason": "hard limit",
                    "runtime_id": "pod/" + real.pod_name("coder0"), "worker": "coder0", "refresh": "none"}],
                  ["get_pod", "exec cw-end-hook"],
                  {"coder0": {"pushed": True, "wip_branch": real.pod_name("coder0") + "/wip", "skipped": [], "record": ""}})
