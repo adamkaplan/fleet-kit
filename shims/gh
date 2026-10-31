@@ -12,8 +12,13 @@ It signs the body of `gh issue comment`, `gh pr comment`, `gh pr review`,
 `gh issue create` and `gh pr create` when the body comes from --body/-b,
 --body-file/-F (a file, or - for stdin); the --comment/-c text of `gh issue close`
 and `gh pr close`; and the `body` field of a POST or PATCH made with `gh api` to
-a comment or review endpoint (SIGNED_API below). Everything else runs the real gh
-unchanged. A signed form whose text cannot be read is refused with one line and
+a comment or review endpoint (SIGNED_API below), whether the body comes from a field
+or from a JSON object read with --input (a file, or - for stdin; an object with no body
+passes unchanged; JSON that cannot be read, a body that is not a string or a missing
+file is refused). A `gh api graphql` call whose query names a body-writing mutation
+(GRAPHQL_BODY_MUTATIONS below: addComment, addPullRequestReview and the like) is refused
+with one line that names the REST or `gh pr comment` form to use: GraphQL text is not
+signed. Everything else runs the real gh unchanged. A signed form whose text cannot be read is refused with one line and
 nothing is posted: it is never posted unsigned.
 """
 import importlib.util
@@ -23,6 +28,7 @@ import posixpath
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,7 +41,18 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SIGNED_COMMANDS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"), ("issue", "create"), ("pr", "create")}
 CLOSE_COMMANDS = {("issue", "close"), ("pr", "close")}   # signed through their --comment/-c text
 SIGNED_API = (("issue-comments", r"issues/[0-9]+/comments"), ("issue-comment", r"issues/comments/[0-9]+"),
-              ("review-comments", r"pulls/[0-9]+/comments"), ("reviews", r"pulls/[0-9]+/reviews"))   # `gh api` endpoints (under repos/OWNER/REPO/) whose POST or PATCH body is signed
+              ("review-comments", r"pulls/[0-9]+/comments"), ("reviews", r"pulls/[0-9]+/reviews"),
+              ("pr-review-comment", r"pulls/comments/[0-9]+"), ("pr-review-reply", r"pulls/[0-9]+/comments/[0-9]+/replies"))   # `gh api` endpoints (under repos/OWNER/REPO/) whose POST or PATCH body is signed
+GRAPHQL_BODY_MUTATIONS = {   # GraphQL mutations that write a comment or review body: refused (not signed), with the form to use instead
+    "addComment": "gh pr comment, gh issue comment or POST repos/OWNER/REPO/issues/N/comments",
+    "addPullRequestReview": "gh pr review or POST repos/OWNER/REPO/pulls/N/reviews",
+    "addPullRequestReviewComment": "POST repos/OWNER/REPO/pulls/N/comments",
+    "addPullRequestReviewThread": "POST repos/OWNER/REPO/pulls/N/comments",
+    "addPullRequestReviewThreadReply": "POST repos/OWNER/REPO/pulls/N/comments/ID/replies",
+    "updateIssueComment": "PATCH repos/OWNER/REPO/issues/comments/ID",
+    "updatePullRequestReview": "PUT repos/OWNER/REPO/pulls/N/reviews/ID",
+    "updatePullRequestReviewComment": "PATCH repos/OWNER/REPO/pulls/comments/ID",
+}
 LOOKUP_SECONDS = 3.0
 WRITE_LOOKUP_SECONDS = 10.0   # a WRITE waits longer for the account lookup: a slow answer must not make it run as the wrong account
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -1157,8 +1174,8 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None, read
         return None
 
 
-def _clean_reason(text):
-    return "".join(c if 32 <= ord(c) < 127 else " " for c in text)[:120]
+def _clean_reason(text, limit=120):
+    return "".join(c if 32 <= ord(c) < 127 else " " for c in text)[:limit]
 
 
 def my_name(lookup=None):
@@ -1199,6 +1216,10 @@ def body_flag(args, specs=BODY_FLAGS):
 
 class Unsignable(Exception):
     """A signed form whose text cannot be signed: the call is refused, never posted unsigned."""
+
+
+class Refused(Unsignable):
+    """A call refused with its own one line (shown after "gh: refused: ")."""
 
 
 def read_text(path):
@@ -1301,16 +1322,158 @@ def api_parse(args):
     return positionals, method, fields
 
 
+_api_parse_raw = api_parse
+
+
+def api_parse(args):
+    positionals, method, fields = _api_parse_raw(args)
+    return [api_endpoint(p) for p in positionals], method, fields
+
+
+def input_value(args):
+    """(index, inline, value) of the LAST --input of a `gh api` call, or None."""
+    found = None
+    for i in range(1, len(args)):
+        if args[i] == "--":
+            break
+        if args[i] == "--input":
+            found = (i, None, args[i + 1] if i + 1 < len(args) else "")
+        elif args[i].startswith("--input="):
+            found = (i, args[i][8:], args[i][8:])
+    return found
+
+
+def read_input_json(value):
+    """(text, parsed object) of an --input value (a file, or - for stdin); Unsignable when it cannot be read or is not JSON."""
+    if value == "-":
+        try:
+            text = sys.stdin.read()
+        except (OSError, UnicodeError):
+            raise Unsignable("the --input text cannot be read")
+    else:
+        text = read_text(value)
+    try:
+        return text, json.loads(text)
+    except ValueError:
+        raise Unsignable("the --input JSON cannot be parsed")
+
+
+_read_input_json_text = read_input_json
+
+
+def read_input_json(value):
+    """A named --input file is opened without blocking, must be a regular file (a FIFO, directory or device is refused BEFORE any read), and is read
+    from that one open descriptor as exact bytes; stdin goes the old way."""
+    if value == "-":
+        return _read_input_json_text(value)
+    try:
+        fd = os.open(value, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as err:
+        raise Unsignable("the --input text cannot be read (%s)" % type(err).__name__)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Unsignable("the --input file %s is not a regular file" % value)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read()
+    except OSError as err:
+        raise Unsignable("the --input text cannot be read (%s)" % type(err).__name__)
+    finally:
+        os.close(fd)
+    try:
+        text = raw.decode("utf-8")
+        return text, json.loads(text)
+    except ValueError:
+        raise Unsignable("the --input JSON cannot be parsed")
+
+
+def passed_copy(args, index, inline, value, text):
+    """An --input object with no body passes on as a temporary copy of the exact bytes already read (the real gh never reads the original path again)."""
+    new = list(args)
+    if value == "-":
+        return new, text, None
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".json")
+    with os.fdopen(handle, "wb") as fh:
+        fh.write(text.encode("utf-8"))
+    if inline is None:
+        new[index + 1] = temp
+    else:
+        new[index] = "--input=" + temp
+    return new, None, temp
+
+
+def input_call(args, name, found):
+    index, inline, value = found
+    text, data = read_input_json(value)
+    if not isinstance(data, dict) or "body" not in data:
+        return passed_copy(args, index, inline, value, text)
+    if not isinstance(data["body"], str):
+        raise Unsignable("the --input body is not a string")
+    data["body"] = sign(data["body"], name)
+    out = json.dumps(data)
+    new = list(args)
+    if value == "-":
+        return new, out, None
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".json")
+    with os.fdopen(handle, "w") as fh:
+        fh.write(out)
+    if inline is None:
+        new[index + 1] = temp
+    else:
+        new[index] = "--input=" + temp
+    return new, None, temp
+
+
+def graphql_call(args):
+    """A `gh api graphql` call whose query names a body-writing mutation is refused (Refused); a query that cannot be read is refused. Else None
+    (when stdin was read for the query it is passed on)."""
+    positionals, _method, fields = api_parse(args)
+    if "graphql" not in positionals and UNKNOWN_ENDPOINT not in positionals:
+        return None
+    texts, stdin_text = [], None
+    for _i, flag, _inline, text in fields:
+        key, eq, value = text.partition("=")
+        if key != "query" or not eq:
+            continue
+        if flag in ("-F", "--field") and value.startswith("@"):
+            if value == "@-":
+                stdin_text = sys.stdin.read() if stdin_text is None else stdin_text
+                texts.append(stdin_text)
+            else:
+                texts.append(read_text(value[1:]))
+        else:
+            texts.append(value)
+    found = input_value(args)
+    if found is not None:
+        text, data = read_input_json(found[2])
+        if found[2] == "-":
+            stdin_text = text
+        if isinstance(data, dict) and isinstance(data.get("query"), str):
+            texts.append(data["query"])
+    if not texts:
+        raise Refused("the GraphQL request has no readable query text, so it is refused; only one query passes")
+    for text in texts:
+        verdict = graphql_verdict(text)
+        if verdict:
+            raise Refused(verdict)
+    return list(args), stdin_text, None
+
+
 def api_call(args, namer):
     """`gh api` POST or PATCH to a comment or review endpoint (SIGNED_API): every `body` field is signed (`-f`, `-F`, `--field`, `--raw-field`; `-F body=@file`
-    and `@-` are read, signed and passed as a temporary file or stdin). A read, another endpoint, a call with no body field and `--input` are not touched."""
+    and `@-` are read, signed and passed as a temporary file or stdin). `--input FILE` or `--input -` is read as JSON: a string `body` is signed, an object
+    with no body passes, anything else is refused. A `gh api graphql` call naming a body mutation is refused. A read and another endpoint are not touched."""
     if not args or args[0] != "api":
         return None
     positionals, method, fields = api_parse(args)
+    if "graphql" in positionals:
+        return graphql_call(args)
     if not any(API_ENDPOINT_RE.match(p) for p in positionals):
         return None
-    if any(a == "--input" or a.startswith("--input=") for a in args[1:]):
-        return None
+    found = input_value(args)
+    if found is not None:
+        if (method or "POST") not in ("POST", "PATCH"):
+            return None
+        return input_call(args, namer(), found)
     if (method or ("POST" if fields else "GET")) not in ("POST", "PATCH"):
         return None
     bodies = [f for f in fields if f[3].split("=", 1)[0] == "body" and "=" in f[3]]
@@ -1372,6 +1535,467 @@ def sign_plan(args, lookup):
     except Exception as err:
         raise Unsignable("signing failed (%s)" % type(err).__name__)
     return plan if plan is None or not lead else (args[:lead] + plan[0], plan[1], plan[2])
+
+
+class DeferredRefusal(tuple):
+    """What sign_plan returns for a graphql call it refused: the refusal is kept (.err) and written by run() AFTER the existing hold, plan-gate and merge-gate
+    decisions, so those refusals (exit 10) keep their text and exit code."""
+    err = None
+
+
+_sign_plan_now = sign_plan
+
+
+def sign_plan(args, lookup):
+    try:
+        return _sign_plan_now(args, lookup)
+    except Unsignable as err:
+        core = args[leading_repo_flags(args):]
+        if not core or core[0] != "api" or not (api_gated(core) or isinstance(err, Refused)):
+            raise
+        late = DeferredRefusal((list(args), None, None))
+        late.err = err
+        return late
+
+
+# ---- #1696 round 2 (H4, M1): wrappers over the defs above; new lines only.
+from urllib.parse import unquote, urlsplit
+
+UNKNOWN_ENDPOINT = "\x00unknown"
+REST_ROOTS = (API_TOP - {"graphql"}) | {"repos"}
+
+
+def api_clean(text):
+    """The endpoint positional with backslashes made slashes and percent escapes decoded repeatedly until stable (at most 5 rounds); None when the path part
+    holds a control character or whitespace, an undecodable or endless percent sequence."""
+    for _round in range(6):
+        text = text.replace("\\", "/")
+        head = re.split(r"[?#]", text, maxsplit=1)[0]
+        if any(ord(c) <= 0x20 or ord(c) == 0x7f for c in head):
+            return None
+        try:
+            decoded = unquote(text, errors="strict")
+        except UnicodeDecodeError:
+            return None
+        if decoded == text:
+            return None if "%" in head else text
+        text = decoded
+    return None
+
+
+def api_endpoint(text):
+    """DECIDE BY MEANING: one canonical form of an endpoint positional. An https or http URL (or //host) whose parsed host is exactly api.github.com (any case,
+    userinfo, port 443 and a trailing dot allowed) is reduced to its path. A positional of ANY other host is not GitHub's and is returned untouched (the call goes
+    to the user's own gh with that host: kept as it was, whatever the path says). Else the path (; params, ?query, #fragment dropped, dot segments resolved,
+    leading slashes stripped, lower case) is classified: graphql -> the bare word graphql; a known REST root -> that canonical path (the signed comment shapes
+    match it once); anything else, or text that cannot be cleaned -> UNKNOWN_ENDPOINT."""
+    clean = api_clean(text)
+    if clean is None:
+        return UNKNOWN_ENDPOINT
+    path = clean
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", clean) or clean.startswith("//"):
+        try:
+            parts = urlsplit(clean)
+            host, port = parts.hostname, parts.port
+        except ValueError:
+            return UNKNOWN_ENDPOINT
+        if parts.scheme.lower() not in ("", "https", "http") or not host or host.rstrip(".") != "api.github.com" or port not in (None, 443):
+            return text
+        path = parts.path
+    path = re.split(r"[?#]", path, maxsplit=1)[0]
+    path = "/".join(seg.split(";", 1)[0] for seg in path.split("/"))
+    path = posixpath.normpath("/" + path).lstrip("/").lower()
+    first = path.split("/", 1)[0]
+    if first == "graphql":
+        return "graphql"
+    return path if first in REST_ROOTS else UNKNOWN_ENDPOINT
+
+
+def api_gated(args):
+    """True when the endpoint is graphql or not classifiable (graphql_call decides by the request text)."""
+    positionals = api_parse(args)[0]
+    return "graphql" in positionals or UNKNOWN_ENDPOINT in positionals
+
+
+_api_call_now = api_call
+
+
+def api_call(args, namer):
+    """The classes of the endpoint: graphql and UNKNOWN go to graphql_call (the request text decides); a REST shape is checked for a mutation in an inline
+    query field, then handled as before (the signed comment shapes are signed). An endpoint of another host is left alone (the user's own gh)."""
+    if args and args[0] == "api":
+        if api_gated(args):
+            return graphql_call(args)
+    return _api_call_now(args, namer)
+
+
+_graphql_call_old = graphql_call
+
+
+def graphql_temp_copy(path, temps):
+    """H4: a named query file is opened without blocking, must be a regular file (refused BEFORE any read), and the exact bytes read from that one
+    descriptor go to a temp copy. The temp mode is the library default (mkstemp: 0600); the name is fleet-gh-*.gql, in the default temp dir."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as err:
+        raise Unsignable("the query text cannot be read (%s)" % type(err).__name__)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise Unsignable("the query file %s is not a regular file" % path)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read()
+    except OSError as err:
+        raise Unsignable("the query text cannot be read (%s)" % type(err).__name__)
+    finally:
+        os.close(fd)
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".gql")
+    temps.append(temp)
+    with os.fdopen(handle, "wb") as out:
+        out.write(raw)
+    return temp
+
+
+def graphql_call(args):
+    """H4: the query files (-F query=@file, --input FILE) are read once, as regular files, and the real gh gets temp copies of those bytes."""
+    positionals, _method, fields = api_parse(args)
+    if "graphql" not in positionals and UNKNOWN_ENDPOINT not in positionals:
+        return None
+    new, temps = list(args), []
+    try:
+        for index, flag, inline, text in fields:
+            key, eq, value = text.partition("=")
+            if key == "query" and eq and flag in ("-F", "--field") and value.startswith("@") and value != "@-":
+                replaced = "query=@" + graphql_temp_copy(value[1:], temps)
+                if inline is None:
+                    new[index + 1] = replaced
+                else:
+                    new[index] = args[index][:len(args[index]) - len(inline)] + replaced
+        found = input_value(args)
+        if found is not None and found[2] != "-":
+            copy = graphql_temp_copy(found[2], temps)
+            if found[1] is None:
+                new[found[0] + 1] = copy
+            else:
+                new[found[0]] = "--input=" + copy
+        plan = _graphql_call_old(new)
+    except BaseException:
+        for path in temps:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+    return plan[0], plan[1], temps or None
+
+
+# ---- #1696 round 4: DECIDE BY EFFECT. A `gh api` request with no body that uses GET passes on any path; a body or any other method passes only on an
+# allow-listed REST path (signed where it is a comment or review shape); graphql passes only when a real parser reads ONE operation of type query (or a
+# mutation whose every root field is on MUTATION_ALLOW). Everything the parser does not fully understand is refused.
+MUTATION_ALLOW = frozenset({"mergePullRequest"})   # the only mutation root field that passes: it cannot carry a comment or review body (U3)
+SIGNED_API_MORE = (("review-events", r"pulls/[0-9]+/reviews/[0-9]+/events"),)   # a review body written by POST .../reviews/ID/events: signed like the others
+API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API + SIGNED_API_MORE))
+REST_SIGNED_METHODS = {label: ("POST", "PATCH", "DELETE") for label, _p in SIGNED_API + SIGNED_API_MORE}   # every signed shape: the old tests use POST, PATCH and DELETE on all of them
+REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned REST write shapes lanes use (N, NAME: one path segment)
+    ("issue-create", r"issues", ("POST",)), ("issue-update", r"issues/[^/]+", ("PATCH", "POST")), ("issue-labels", r"issues/[^/]+/labels", ("POST", "PUT", "DELETE")),
+    ("issue-label", r"issues/[^/]+/labels/[^/]+", ("DELETE",)), ("sub-issues", r"issues/[^/]+/sub_issues", ("POST",)),
+    ("pull-update", r"pulls/[^/]+", ("PATCH", "POST")), ("pull-merge", r"pulls/[^/]+/merge", ("PUT",)), ("label-create", r"labels", ("POST",)))
+
+
+def api_scan(args):
+    """(method, has_input, field texts, positionals) of a `gh api` call read the way gh (cobra) reads flags: -X/--method any case and joined, bundled short
+    flags (-iXPUT, -ifa=b), `--flag=value`, repeated flags (the last method wins), `--` ends the flags. method is None when none is given, "" when its value is missing."""
+    method, has_input, fields, positionals, i = None, False, [], [], 1
+    longs = {"--method": "m", "--raw-field": "f", "--field": "f", "--input": "i", "--header": "x", "--jq": "x", "--template": "x", "--hostname": "x", "--cache": "x", "--preview": "x"}
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            positionals.extend(args[i:])
+            break
+        if arg.startswith("--"):
+            name, eq, value = arg.partition("=")
+            kind = longs.get(name)
+            if kind is None:
+                continue
+            if not eq:
+                value = args[i] if i < len(args) else None
+                i += 1
+            if kind == "m":
+                method = "" if value is None else value.upper()
+            elif kind == "f" and value is not None:
+                fields.append(value)
+            elif kind == "i":
+                has_input = True
+        elif arg.startswith("-") and len(arg) > 1:
+            for pos, ch in enumerate(arg[1:], 1):
+                if ch in "XHfFqtp":
+                    value = arg[pos + 1:] or None
+                    if value is None:
+                        value = args[i] if i < len(args) else None
+                        i += 1
+                    if ch == "X":
+                        method = "" if value is None else value.upper()
+                    elif ch in "fF" and value is not None:
+                        fields.append(value)
+                    break
+        else:
+            positionals.append(arg)
+    return method, has_input, fields, positionals
+
+
+class GqlError(Exception):
+    pass
+
+
+_GQL_PUNCT = "!$&():=@[]{|}"
+
+
+def gql_tokens(text):
+    """Tokens (kind, value) of a GraphQL document; raises GqlError on anything that is not comment, space, comma, name, punctuation, string, block string or number."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n,\ufeff":
+            i += 1
+        elif c == "#":
+            while i < n and text[i] not in "\r\n":
+                i += 1
+        elif text.startswith("...", i):
+            out.append(("spread", "..."))
+            i += 3
+        elif c in _GQL_PUNCT:
+            out.append(("p", c))
+            i += 1
+        elif c.isascii() and (c.isalpha() or c == "_"):
+            j = i + 1
+            while j < n and text[j].isascii() and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            out.append(("name", text[i:j]))
+            i = j
+        elif text.startswith('"""', i):
+            j = i + 3
+            while True:
+                if j >= n:
+                    raise GqlError("unterminated block string")
+                if text.startswith('\\"""', j):
+                    j += 4
+                elif text.startswith('"""', j):
+                    break
+                else:
+                    j += 1
+            out.append(("str", ""))
+            i = j + 3
+        elif c == '"':
+            j = i + 1
+            while True:
+                if j >= n or text[j] in "\r\n":
+                    raise GqlError("unterminated string")
+                if text[j] == "\\":
+                    if j + 1 >= n:
+                        raise GqlError("unterminated string")
+                    if text[j + 1] == "u":
+                        if not re.fullmatch(r"[0-9A-Fa-f]{4}", text[j + 2:j + 6]):
+                            raise GqlError("bad unicode escape")
+                        j += 6
+                    elif text[j + 1] in '"\\/bfnrt':
+                        j += 2
+                    else:
+                        raise GqlError("bad string escape")
+                elif text[j] == '"':
+                    break
+                else:
+                    j += 1
+            out.append(("str", ""))
+            i = j + 1
+        else:
+            m = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?").match(text, i)
+            if not m or not m.group():
+                raise GqlError("unexpected character %r" % c)
+            if m.end() < n and (text[m.end()] in "._" or text[m.end()].isalnum()):
+                raise GqlError("bad number")
+            out.append(("num", m.group()))
+            i = m.end()
+    return out
+
+
+def gql_operation(text):
+    """(operation type, [root field names]) of a document that holds exactly ONE operation and nothing else; GqlError for anything not fully understood
+    (fragments, directives, a second operation, unbalanced or trailing text, a bad token)."""
+    toks = gql_tokens(text)
+    pos = [0]
+
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else (None, None)
+
+    def take(kind=None, value=None):
+        tok = peek()
+        if tok[0] is None or (kind and tok[0] != kind) or (value and tok[1] != value):
+            raise GqlError("unexpected %s" % (tok[1] if tok[0] else "end of text"))
+        pos[0] += 1
+        return tok
+
+    def value():
+        kind, val = peek()
+        if (kind, val) == ("p", "$"):
+            take()
+            take("name")
+        elif kind in ("str", "num", "name"):
+            take()
+        elif (kind, val) == ("p", "["):
+            take()
+            while peek() != ("p", "]"):
+                value()
+            take()
+        elif (kind, val) == ("p", "{"):
+            take()
+            while peek() != ("p", "}"):
+                take("name")
+                take("p", ":")
+                value()
+            take()
+        else:
+            raise GqlError("unexpected %s" % (val if kind else "end of text"))
+
+    def typ():
+        if peek() == ("p", "["):
+            take()
+            typ()
+            take("p", "]")
+        else:
+            take("name")
+        if peek() == ("p", "!"):
+            take()
+
+    def selection_set():
+        roots = []
+        take("p", "{")
+        if peek() == ("p", "}"):
+            raise GqlError("empty selection set")
+        while peek() != ("p", "}"):
+            name = take("name")[1]
+            if peek() == ("p", ":"):
+                take()
+                name = take("name")[1]
+            roots.append(name)
+            if peek() == ("p", "("):
+                take()
+                if peek() == ("p", ")"):
+                    raise GqlError("empty arguments")
+                while peek() != ("p", ")"):
+                    take("name")
+                    take("p", ":")
+                    value()
+                take()
+            if peek() == ("p", "{"):
+                selection_set()
+        take()
+        return roots
+
+    kind, word = peek()
+    if (kind, word) == ("p", "{"):
+        op = "query"
+    elif kind == "name" and word in ("query", "mutation", "subscription"):
+        take()
+        op = word
+        if peek()[0] == "name":
+            take()
+        if peek() == ("p", "("):
+            take()
+            if peek() == ("p", ")"):
+                raise GqlError("empty variable definitions")
+            while peek() != ("p", ")"):
+                take("p", "$")
+                take("name")
+                take("p", ":")
+                typ()
+                if peek() == ("p", "="):
+                    take()
+                    value()
+            take()
+    elif kind is None:
+        raise GqlError("empty document")
+    else:
+        raise GqlError("unsupported %s" % word)
+    roots = selection_set()
+    if peek()[0] is not None:
+        raise GqlError("more than one operation or text after the operation")
+    return op, roots
+
+
+def graphql_verdict(text):
+    """None when the document may pass, else the refusal text."""
+    try:
+        op, roots = gql_operation(text)
+    except GqlError as err:
+        return "the GraphQL text cannot be fully read (%s), so it is refused; only one query passes" % err
+    except RecursionError:
+        return "the GraphQL text is nested too deeply to be read, so it is refused"
+    if op == "query":
+        return None
+    if op == "subscription":
+        return "a GraphQL subscription is refused; only one query passes"
+    for root in roots:
+        if root in GRAPHQL_BODY_MUTATIONS:
+            return "the GraphQL mutation %s writes a body that cannot be signed and nothing was posted; use %s" % (root, GRAPHQL_BODY_MUTATIONS[root])
+    bad = [r for r in roots if r not in MUTATION_ALLOW]
+    if bad:
+        return "the GraphQL mutation %s is refused: only %s may be sent as a mutation; add a root field to MUTATION_ALLOW in shims/gh to allow another" % (
+            ", ".join(bad), ", ".join(sorted(MUTATION_ALLOW)))
+    return None
+
+
+def api_refuse_unknown(method, shown):
+    raise Refused("a gh api %s with a body or a method other than GET is refused on %s: it is not on the REST_WRITES / SIGNED_API allow-list in shims/gh; "
+                  "add its path and method there to allow it" % (method, shown))
+
+
+def api_decide(args, namer, previous):
+    """The one decision, by effect. See the round 4 comment above."""
+    method, has_input, fields, raw_positionals = api_scan(args)
+    has_body = has_input or bool(fields)
+    effective = method if method is not None else ("POST" if has_body else "GET")
+    if effective == "GET" and not has_input:
+        return None
+    if not raw_positionals:
+        return None
+    positionals = [api_endpoint(p) for p in raw_positionals]
+    for raw, canon in zip(raw_positionals, positionals):
+        if canon == "graphql":
+            continue
+        shown = "an endpoint it cannot read" if canon == UNKNOWN_ENDPOINT else "the endpoint"
+        base = canon if canon != UNKNOWN_ENDPOINT else None
+        found = None
+        if base is not None:
+            for label, pattern in SIGNED_API + SIGNED_API_MORE:
+                if re.fullmatch(r"repos/[^/]+/[^/]+/" + pattern, base):
+                    found = (label, REST_SIGNED_METHODS.get(label, ()), True)
+            for label, pattern, methods in REST_WRITES:
+                if re.fullmatch(r"repos/[^/]+/[^/]+/" + pattern, base):
+                    found = (label, methods, False)
+        if found is None:
+            if True:   # an endpoint off the allow-list that carries a mutation in an inline query field: the refusal names the mutation (the same text as graphql)
+                for text in (f.partition("=")[2] for f in fields if f.partition("=")[0] == "query" and "=" in f):
+                    verdict = graphql_verdict(text)
+                    if verdict and "mutation" in verdict:
+                        raise Refused(verdict)
+            api_refuse_unknown(effective or "(no method)", "%s %s" % (shown, "(" + raw[:60] + ")"))
+        if effective not in found[1]:
+            api_refuse_unknown(effective or "(no method)", "the endpoint %s (%s allows %s)" % (raw[:60], found[0], "/".join(found[1])))
+        if found[2] and len(api_parse(args)[2]) != len(fields):
+            raise Refused("the flags of this gh api call to a comment or review endpoint cannot be read, so its body cannot be signed and nothing was posted")
+    if any(p == "graphql" for p in positionals):
+        return graphql_call(args)
+    return previous(args, namer)
+
+
+_api_call_round3 = api_call
+
+
+def api_call(args, namer):
+    if not args or args[0] != "api":
+        return _api_call_round3(args, namer)
+    return api_decide(args, namer, _api_call_round3)
 
 
 # ---- the gate probe (plan-driven development: enforcing in a repo whose mode is enforce). docs/plan-gate-engine-design.md, E1 and E3.
@@ -2274,7 +2898,8 @@ def run(args):
     try:
         plan = sign_plan(args, lookup)
     except Unsignable as err:
-        sys.stderr.write("gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(err)))
+        sys.stderr.write("gh: refused: %s\n" % _clean_reason(str(err), 400) if isinstance(err, Refused) else
+                         "gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(err)))
         audit_write(args, lookup, "refused", write, hold_repo, hold_number)
         return 1
     refusal = review_probe(args, over_found, over_reason, lookup, gh)
@@ -2297,6 +2922,11 @@ def run(args):
         return 10
     if merged is not None:
         args, release_ref = merged[1], merged[2]
+    if isinstance(plan, DeferredRefusal):   # the graphql refusal comes after every older refusal above
+        sys.stderr.write("gh: refused: %s\n" % _clean_reason(str(plan.err), 400) if isinstance(plan.err, Refused) else
+                         "gh: refused: %s, so it cannot be signed and nothing was posted\n" % _clean_reason(str(plan.err)))
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
     credential = is_git_credential(args)
     extra = {"credential": True} if credential else {}   # only the git credential route passes the keyword: every other call is exactly as it was
     if scope is not None:

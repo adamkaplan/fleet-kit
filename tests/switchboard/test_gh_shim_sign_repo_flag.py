@@ -47,7 +47,7 @@ class TestGhShimSignRepoFlag(unittest.TestCase):
 
     def test_every_form_with_every_flag_form_is_signed_and_the_flag_is_kept(self):
         listed = forms(self.source)
-        self.assertEqual(len(listed), 11)
+        self.assertEqual(len(listed), 13)
         for label, argv, at in listed:
             for flag_name, flag in FLAG_FORMS.items():
                 with self.subTest(form=label, flag=flag_name):
