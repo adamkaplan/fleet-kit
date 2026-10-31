@@ -339,7 +339,9 @@ def main():
         if not_run:
             print("\nRESULT: NOT RUN (budget)")
             return BUDGET_STATUS
-        print("\nRESULT: PASS")
+        print("\nRESULT: PASS" + (" (quick mode; left to CI: %d)" % len(left) if left else ""))
+        if left:
+            print(cloud_quick.left_line(left))
         return 0
     finally:
         kill_children()
