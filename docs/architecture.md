@@ -277,6 +277,10 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `delegated_clear.py` | `_registrar_unit:__import__(string)` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
 | `delegated_clear.py` | `_registrar_unit:builtins` | 2 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
 | `delegated_clear.py` | `_registrar_unit:import_module(string)` | 1 | the registrar lint only names this in order to refuse it in a registrar; it loads nothing |
+| `epic_record.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `epic_record.py` | `_plan_ledger:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `epic_record.py` | `_plan_ledger:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `epic_record.py` | `_plan_ledger:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `external_adapter.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `external_adapter.py` | `_load_core:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
@@ -318,9 +322,6 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `lanes.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `merged_labels.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `orders_copy.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
-| `plan_ledger.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
-| `plan_ledger.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
-| `plan_ledger.py` | `<module>:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `queue_ejections.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `reassign.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `registry.py` | `<module>:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
