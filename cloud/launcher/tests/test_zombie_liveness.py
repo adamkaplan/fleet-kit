@@ -4,8 +4,6 @@ Linux reads /proc/<pid>/stat; where it cannot be read (macOS) the test SKIPS lou
 reaped until the end. Nothing is written under the repository; every child is killed and reaped at the end."""
 import inspect
 import os
-import signal
-import subprocess
 import sys
 import time
 import unittest
@@ -43,15 +41,14 @@ class S7Zombie(unittest.TestCase):
             line = "SKIPPED: /proc not readable: a zombie cannot be observed here"
             print(line)
             self.skipTest(line)
-        z = live = None
-        try:
-            z = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        if True:
+            z = stub_support.start(self, [sys.executable, "-c", "pass"])
             end = time.time() + 20
             while state_of(z.pid) != "Z":
                 if time.time() > end:
                     raise AssertionError("the child %d never became a zombie (state %r)" % (z.pid, state_of(z.pid)))
                 time.sleep(0.02)
-            live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+            live = stub_support.start(self, [sys.executable, "-c", "import time; time.sleep(60)"])
             while state_of(live.pid) is None:
                 time.sleep(0.02)
             zg, zp = stub_support.group_alive(z.pid), test_stub_cleanup.pid_alive(z.pid)
@@ -70,15 +67,11 @@ class S7Zombie(unittest.TestCase):
             print("S7 mutants: old group_alive True %d of 1, old pid_alive True %d of 1, mutations applied %s" % (mg, mp, all(applied)))
             self.assertTrue(all(applied))
             self.assertEqual((mg, mp), (1, 1), "the old bodies must count the zombie as alive")
-        finally:
-            if live is not None:
-                try:
-                    os.killpg(live.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                live.wait()
-            if z is not None:
-                z.wait()
+            n_z = sum(1 for v in (zg, zp) if v is False)
+            n_l = sum(1 for v in (lg, lp) if v is True)
+            n_o = sum(1 for v in (og(z.pid), op(z.pid)) if v is True)
+            print("S7: zombie False %d of 2 (group_alive, pid_alive), live True %d of 2, old bodies True for the zombie %d of 2" % (n_z, n_l, n_o))
+            self.assertEqual((n_z, n_l, n_o), (2, 2, 2))
 
 
 if __name__ == "__main__":
