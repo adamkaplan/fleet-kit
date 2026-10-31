@@ -41,6 +41,7 @@ cloud/launcher/tests/test_m_cap.py
 cloud/launcher/tests/test_mint_retry.py
 cloud/launcher/tests/test_mint_roles.py
 cloud/launcher/tests/test_model_credential.py
+cloud/launcher/tests/test_needs_docker_hermetic.py
 cloud/launcher/tests/test_no_default_branch_push_fixture.py
 cloud/launcher/tests/test_orchestrator_agent.py
 cloud/launcher/tests/test_orchestrator_hub_session.py
