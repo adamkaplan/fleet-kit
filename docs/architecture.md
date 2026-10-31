@@ -15,7 +15,7 @@ A **unit** is a file: the entry `bin/fleet-switchboard`, a part under `bin/switc
 
 ## Where a new test goes
 
-A new file `tests/switchboard/test_<unit>.py` is preferred, named for the unit it is about, and it is picked up by `bin/test-switchboard` like `test_architecture.py`. Appending to `bin/test-switchboard` is allowed until the test split empties it, within the size row's headroom; when a change would go past the ceiling, the test names where the new tests go (a file under `tests/switchboard/`) or which row to lower.
+A new file `tests/switchboard/test_<unit>.py` is preferred, named for the unit it is about, and it is picked up by `bin/test-switchboard` like `test_architecture.py`. Every `tests/switchboard/test_*.py` must be imported and have a class bound at module level by `bin/test-switchboard`, or be listed with a reason of 20 or more characters in `tests/switchboard/test_wired_tests.py`. Appending to `bin/test-switchboard` is allowed until the test split empties it, within the size row's headroom; when a change would go past the ceiling, the test names where the new tests go (a file under `tests/switchboard/`) or which row to lower.
 
 ## Layers
 
@@ -56,6 +56,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `cloud_channel.py` | 1 | the receiving end of a message between two cloud agents | |
 | `cloud_relay.py` | 2 | the hub half of pod, hub and daemon calls for report, prove, verdict and gates: a bounded in-memory queue and the refusals | |
 | `cloud_client.py` | 1 | the sending end of a message or report through the cloud channel | |
+| `cloud_cluster.py` | 5 | the launcher process, the settings reader, the vault recovery, the cluster client and the tunnel of the cloud launch (#1647); a part of `cloud_worker.py` | |
 | `external_adapter.py` | 1 | a generic client for an outside system that holds decisions and work items | |
 | `agent_calls.py` | 2 | GitHub calls made from agents' shells, counted per account and per hour | |
 | `github_census.py` | 2 | the 5-minute sample line per account and the census of process kinds behind GitHub calls the records do not count (read only) | |
@@ -129,8 +130,13 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `switchboard/alert_labels.py` | 4 | an alert label on an open issue wakes that repository's orchestrator | |
 | `switchboard/handoff.py` | 5 | the handoff: a brief, not a fork | |
 | `switchboard/agents_verify.py` | 5 | `agents verify`: did the service register our agents as written | |
+| `switchboard/launch_model.py` | 5 | `launch --model` and `--reasoning`: the choice checked against the local service's model list before a session exists | |
 | `switchboard/secret_spans.py` | 5 | where the first secret-shaped match is: a fixed rule label and numbers, never the text | |
 | `switchboard/answer_delivery.py` | 5 | how an answer reaches the asker, behind the AnswerDelivery port | |
+| `switchboard/caches.py` | 5 | the bounded file cache and the audit tail a report reads | |
+| `switchboard/bootstrap.py` | 5 | the `bootstrap` command | |
+| `switchboard/profile_pieces.py` | 5 | the profile pieces shared by the install, the doctor and the commands that write a profile | |
+| `switchboard/installer.py` | 5 | the installer: the service, its units and the `install` command | |
 | `cloud_relay_daemon.py` | 5 | the daemon half of the cloud hub relay: pulls pod requests from the hub and runs them with the same rules as the local commands | |
 | `fleet-switchboard` | 6 | the entry: today also every section not yet moved to a part (the assembler, the engine, the commands) | |
 
@@ -147,7 +153,6 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `bin/test-switchboard` | `-` | size | 82,400 | the one test file; whole classes have moved to `tests/switchboard/test_cases_NN.py` (T1, T1b), and the lanes still add tests until the next split, so the row is the real count plus about 3,000 |
 | `switchboard/alert_labels.py switchboard/triage.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
 | `switchboard/answer_delivery.py switchboard/decisions_b.py` | `-` | cycle | 2 | moved together from the entry: each reads the other, one cycle to untangle |
-| `cloud_worker.py` | `-` | size | 2,000 | grew past the limit in a merged change; to be split |
 | `impact_hold.py` | `-` | size | 2,000 | the brief-bound clear (#1215) took it past the limit; to be split (ceiling = the test's own formula: 1510 lines, plus 500, rounded up to a multiple of 500) |
 | `delegated_clear.py` | `-` | size | 1,900 | the registrar lint lives with the clear it protects; a follow-up slice moves it to its own part and lowers the ceiling |
 | `switchboard/agents_verify.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -159,6 +164,14 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/answer_delivery.py` | `fleet-switchboard` | namespace | 33 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/audit.py` | `fleet-switchboard` | entry-import | 12 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/audit.py` | `fleet-switchboard` | namespace | 2 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/bootstrap.py` | `fleet-switchboard` | entry-import | 4 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/bootstrap.py` | `fleet-switchboard` | namespace | 15 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/caches.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/caches.py` | `fleet-switchboard` | namespace | 4 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/installer.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/installer.py` | `fleet-switchboard` | namespace | 58 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/profile_pieces.py` | `fleet-switchboard` | entry-import | 8 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/profile_pieces.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decision.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/decision.py` | `fleet-switchboard` | namespace | 8 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decision.py` | `switchboard/handoff.py` | namespace | 1 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
@@ -167,6 +180,8 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/facts.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/facts.py` | `fleet-switchboard` | namespace | 7 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/handoff.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/launch_model.py` | `fleet-switchboard` | entry-import | 1 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/launch_model.py` | `fleet-switchboard` | namespace | 1 | one namespace: the part reads the entry's `LaunchError` and `_one_line` |
 | `switchboard/secret_spans.py` | `fleet-switchboard` | namespace | 2 | one namespace: the finder reads the entry's `_SECRET_PATTERNS` and `redact_command_text` (it must see the very patterns the net applies) |
 | `switchboard/handoff.py` | `fleet-switchboard` | namespace | 48 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/jev.py` | `fleet-switchboard` | entry-import | 6 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -192,8 +207,8 @@ Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7):
 | `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 34 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decisions_b.py` | `fleet-switchboard` | namespace | 30 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 17 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/judge.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 26 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/judge.py` | `fleet-switchboard` | namespace | 12 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 24 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 25 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/plan_input.py` | `fleet-switchboard` | namespace | 13 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/review_laws_install.py` | `fleet-switchboard` | namespace | 5 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
@@ -225,15 +240,19 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `agent_reconcile.py` | `_load_registry:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `charter_check.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `closed_labels.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `cloud_cluster.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `cloud_cluster.py` | `_lib:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `cloud_cluster.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_cluster.py` | `_walk:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `cloud_cluster.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_way_back_check.py` | `check:imp` | 3 | uses the module object (a call, an attribute, an argument) |
 | `cloud_way_back_check.py` | `check_fixture_shape:imp` | 4 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
-| `cloud_worker.py` | `_lib:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
-| `cloud_worker.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `_load_cluster:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `cloud_worker.py` | `_load_cluster:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `_load_cluster:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_retired:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
-| `cloud_worker.py` | `_walk:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
-| `cloud_worker.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `bind:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `model_entry:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `model_entry:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
@@ -258,15 +277,15 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `external_adapter.py` | `_load_core:sys.modules` | 3 | uses `sys` beyond its plain attributes |
 | `fleet-switchboard` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
-| `fleet-switchboard` | `Installer.reaper_command_problem:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
-| `fleet-switchboard` | `Installer.reaper_command_problem:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
-| `fleet-switchboard` | `Installer.reaper_command_problem:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `installed_guard_module:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `installed_guard_module:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `fleet-switchboard` | `installed_guard_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `_brief_advisory:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `_brief_advisory:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `fleet-switchboard` | `_brief_advisory:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `switchboard/installer.py` | `Installer.reaper_command_problem:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `switchboard/installer.py` | `Installer.reaper_command_problem:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `switchboard/installer.py` | `Installer.reaper_command_problem:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `_declared_module:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `_declared_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `_declared_module:load_module(non-constant)` | 1 | a dynamic load |
