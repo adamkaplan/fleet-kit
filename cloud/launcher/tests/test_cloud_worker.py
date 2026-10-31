@@ -75,7 +75,7 @@ class Base(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def create(self, worker="coder7", *extra):
-        code, out, err = self.run_cli("create", worker, "--repo", "acme-org/widget-service", "--branch", "main", *extra)
+        code, out, err = self.run_cli("create", worker, "--repo", "acme-org/widget-service", "--branch", "main", "--idle", "10m", *extra)
         self.assertEqual(code, 0, err)
         return json.loads(out)
 

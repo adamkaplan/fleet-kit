@@ -12,7 +12,7 @@ One program, `cloud-worker <command>`; every command takes `--json` (one JSON ob
 
 | Command | Inputs | Output (stdout JSON) | Effect |
 |---|---|---|---|
-| `create <worker>` | `--repo OWNER/NAME`, `--branch B`, `--idle 10m` (default), `--hard 2h` (default), `--shape XS\|O\|S\|M` (default `XS`; `S` with `--stack`; `O` with `--agent orchestrator`, the orchestrator row: 250m CPU, 768 MiB; `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory; `XS` and `O` are refused with `--stack`), `--stack` | the endpoint record (section 3) plus `runtime_id` | starts one pod from the image with the environment of section 2; returns only once the worker answers |
+| `create <worker>` | `--repo OWNER/NAME`, `--branch B`, `--idle 30m` (default), `--hard 2h` (default), `--shape XS\|O\|S\|M` (default `XS`; `S` with `--stack`; `O` with `--agent orchestrator`, the orchestrator row: 250m CPU, 768 MiB; `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory; `XS` and `O` are refused with `--stack`), `--stack` | the endpoint record (section 3) plus `runtime_id` | starts one pod from the image with the environment of section 2; returns only once the worker answers |
 | `stop <worker>` | `--reason TEXT`; `--run-id NONCE`; `--record-dir DIR`; `--no-record` | `{worker, runtime_id, pushed, wip_branch, skipped, record}` | first writes the run record (below), then runs the end hook (section 5), then rewrites the record's `run.json` once with the hook's result (`end_hook`: `ran`, `pushed`, `wip_branch`, `skipped`, `note`, `error`), then deletes the pod and its scratch volume. `record` is the record directory, `""` when none could be made |
 | `extend <worker>` | `--hard +1h` or an ISO time; `--idle 30m` | the new deadlines | moves the deadlines; never past `--max-hard` (default 8h, **OPEN**: value); the pod itself carries a cluster-side floor at that cap (section 6) |
 | `delete <worker>` | `--force` | `{worker, runtime_id, deleted}` | removes the pod and its leftovers without the end hook; refused unless the hook ran or `--force` is given; used by the reaper after a kept pod is resolved |
@@ -128,6 +128,8 @@ A pod with no checkout: nothing was cloned and nothing can be lost, on this cond
 - **Idle** = no tool call and no model activity (a running session or step) for `CW_IDLE_SECONDS`. Inbound
   requests, health checks and event-stream reads do **not** count as activity: a worker that is only being watched is idle.
   A worker mid-task (a long build, a waiting model call) is not idle. The reaper reads this from the worker's own session state.
+  The default is 30m, read from the `--idle` default of the launcher's `create`; a pod with no `idle-seconds` annotation
+  (made before that default) is judged at 600 s. `launch --cloud` prints one stderr line with both limits and the stop time.
 - **Hard limit** = `CW_HARD_DEADLINE`, absolute. At the deadline the end hook runs and the pod is stopped,
   whatever the activity. `extend` is the only way to move it; the reaper re-reads the record at each pass.
 - **Cluster-side floor.** Every pod the launcher builds (shapes S and M alike) sets `spec.activeDeadlineSeconds` to the
