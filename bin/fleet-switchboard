@@ -17007,7 +17007,8 @@ def epic_contains(get, repo, merged, default=None):
 def epic_changed(get, repo):
     def changed(old, new):
         try:
-            return compare_files(get, repo, old, new)
+            rows = compare_rows(get, repo, old, new)
+            return [f["filename"] for f in rows] + [f["previous_filename"] for f in rows if isinstance(f.get("previous_filename"), str)]   # a renamed file changed under both names
         except Exception:   # a compare that cannot be judged (300 files or more, not a descendant, unreadable) counts as stale
             return None
     return changed
@@ -19575,19 +19576,23 @@ class _CarryDone(Exception):
     pass
 
 
-def compare_files(get, repo, old_head, new_head):
-    """The names of the files changed from `old_head` to `new_head` (GitHub's compare through `get`), the ONE reading of a compare that the carry (#1129) and the epic's stale rule (#1383) share.
-    A compare of 300 files or more, a truncated one and one whose new head is not a descendant raise CarryRefused: the diff cannot be judged. A failed read raises."""
+def compare_rows(get, repo, old_head, new_head):
+    """The rows (dicts with a str `filename`) of GitHub's compare from `old_head` to `new_head` through `get`: the one reading shared by the carry (#1129, through `compare_files`) and the epic's stale rule (#1383).
+    A compare of 300 files or more, a truncated one and one whose new head is not a descendant raise CarryRefused. A failed read raises."""
     compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
     if not isinstance(compared, dict):
         raise CarryRefused("the compare could not be read")
     rows = [f for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
-    files = [f["filename"] for f in rows]
-    if len(files) >= CARRY_COMPARE_FILE_CAP or compared.get("truncated") or (compared.get("total_files") or 0) >= CARRY_COMPARE_FILE_CAP:
+    if len(rows) >= CARRY_COMPARE_FILE_CAP or compared.get("truncated") or (compared.get("total_files") or 0) >= CARRY_COMPARE_FILE_CAP:
         raise CarryRefused(CARRY_TOO_LARGE)
     if compared.get("status") not in ("ahead", "identical"):
         raise CarryRefused(CARRY_NOT_DESCENDANT % compared.get("status"))
-    return files + [f["previous_filename"] for f in rows if isinstance(f.get("previous_filename"), str)]   # a renamed file changed under both names
+    return rows
+
+
+def compare_files(get, repo, old_head, new_head):
+    """The carry's compare (#1129): the NEW names of the files changed from `old_head` to `new_head`, as `compare_rows` reads them."""
+    return [f["filename"] for f in compare_rows(get, repo, old_head, new_head)]
 
 
 def carry_head_facts(get, repo, old_head, new_head, base=None):
