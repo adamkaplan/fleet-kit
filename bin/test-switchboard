@@ -67284,6 +67284,7 @@ TestLoadAlertCloudBusy = _load_cloud.TestLoadAlertCloudBusy
 # The CI test-file list tests of #1498.
 _ci_test_files = importlib.import_module("test_ci_test_files")
 TestCiTestFileList = _ci_test_files.TestCiTestFileList
+TestCiOutsideBin = importlib.import_module("test_ci_outside_bin").TestCiOutsideBin
 TestTempJanitorScratch = importlib.import_module("test_scratch").build(TestTempJanitor)
 
 # The delivery-lag tests of #1402.
