@@ -115,7 +115,7 @@ def suite(name, out="", timeout=None):
 OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
            suite("bin/test-heartbeat"), suite("bin/test-health-records"), suite("bin/test-fleet-doctor"),
            suite("bin/test-fleet-doctor-config"), suite("bin/test-fleet-doctor-heartbeat"), suite("bin/test-switchboard"),
-           suite("bin/test-workflow-split"), suite("bin/test-gh-hold", "-hold"), suite("bin/test-app-mint", "-app"),
+           suite("bin/test-workflow-split"), suite("bin/test-path-suites", "-paths", "15"), suite("bin/test-gh-hold", "-hold"), suite("bin/test-app-mint", "-app"),
            suite("bin/test-cloud-neutral-names"), suite("cloud/tests/test-cloud", "", "10"),
            ("bin/fleet-scenario validate", "bin/fleet-scenario validate", None),
            ("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4", None)]
@@ -128,8 +128,8 @@ LAUNCHER_TIMEOUT = "20"   # the cloud launcher step's timeout-minutes; the one p
 NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", LAUNCHER_TIMEOUT)] + [suite(n, "", t) for n, t in ADDED + RELAY]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
-CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
-               "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"}
+CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}${{ github.event.action == 'reopened' && '-reopened' || '' }}",
+               "cancel-in-progress": "${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}"}
 TRIGGERS = ["pull_request", "push", "schedule", "workflow_dispatch"]
 MATRIX = ["ubuntu-latest", "macos-latest"]
 
@@ -171,7 +171,10 @@ TEST_STEPS = [CHECKOUT, PYTHON,
               {"name": "bin/check-public-names", "env": {"FLEET_PRIVATE_NAMES": "${{ secrets.PRIVATE_NAMES }}"}, "run": "python3 bin/check-public-names"},
               step("bin/test-heartbeat", always=False), step("bin/test-health-records"), step("bin/test-fleet-doctor"),
               step("bin/test-fleet-doctor-config"), step("bin/test-fleet-doctor-heartbeat"), step("bin/test-switchboard"),
-              step("bin/test-workflow-split"), step("bin/test-gh-hold", "-hold"), step("bin/test-app-mint", "-app"),
+              step("bin/test-workflow-split"), step("bin/test-path-suites", "-paths", **{"timeout-minutes": "15"}), step("bin/test-gh-hold", "-hold"), step("bin/test-app-mint", "-app"),
+              {"name": "Size ceilings on the merge result", "if": "${{ github.event_name == 'pull_request' && github.base_ref == 'integration' && !cancelled() }}",
+               "env": {"BASE": "${{ github.base_ref }}", "HEAD_SHA": "${{ github.event.pull_request.head.sha }}"},
+               "run": "git fetch origin \"$BASE\"\npython3 bin/size_ceilings.py check --tip \"origin/$BASE\" --head \"$HEAD_SHA\""},
               step("bin/test-cloud-neutral-names"),
               step("cloud/tests/test-cloud", **{"timeout-minutes": "10", "env": {"CLOUD_TEST_SKIP_DOCKER": "1"}}),
               plain("node --test plugins/fleet-decisions-tui/health.test.mjs", "node --test plugins/fleet-decisions-tui/health.test.mjs"),
@@ -396,10 +399,10 @@ class Mutants(unittest.TestCase):
             self.assertTrue(result.failures or result.errors, t)
 
     def test_s6_concurrency_group_changed(self):
-        self.fails("github.event.pull_request.number || github.sha }}", "github.sha }}", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+        self.fails("github.event.pull_request.number || github.sha }}${{", "github.sha }}${{", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
 
     def test_s6_cancel_in_progress_always_true(self):
-        self.fails("${{ github.event_name == 'pull_request' }}", "true", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+        self.fails("${{ github.event_name == 'pull_request' && github.event.action != 'reopened' }}", "true", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
 
     def test_s6_a_job_level_concurrency_block(self):
         self.fails("  test-cloud:\n", "  test-cloud:\n    concurrency:\n      group: x\n", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")

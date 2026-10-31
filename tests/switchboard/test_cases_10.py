@@ -451,6 +451,7 @@ chat_clear.py:read_seen
 ci_runs.py:_read_run
 cloud_channel_server.py:do_POST
 cloud_cli.py:post
+cloud_cluster.py:run_launcher
 cloud_cost_report.py:read_lines
 cloud_hub.py:_read_json
 cloud_hub.py:_read_json_aged
@@ -458,7 +459,6 @@ cloud_hub.py:kube_http
 cloud_relay.py:loads_strict
 cloud_relay_daemon.py:_read
 cloud_way_back_check.py:main
-cloud_worker.py:run_launcher
 cpu_guard.py:load_episode
 decision_sync.py:_read_json
 decisions_pull.py:held_body
@@ -478,13 +478,13 @@ fleet-heartbeat:load_config
 fleet-scenario:read
 fleet-switchboard:__init__
 fleet-switchboard:_api
-fleet-switchboard:_audit_tail
+switchboard/caches.py:_audit_tail
 fleet-switchboard:_call
 fleet-switchboard:_docker_inspect
-fleet-switchboard:_fresh
+switchboard/caches.py:_fresh
 fleet-switchboard:_last
 fleet-switchboard:_load_markers
-fleet-switchboard:_read_json_object
+switchboard/profile_pieces.py:_read_json_object
 fleet-switchboard:_review_api
 fleet-switchboard:_write_gates_config
 fleet-switchboard:anonymous_volumes
@@ -607,6 +607,7 @@ switchboard/judge.py:looks_like_plugin_event
 switchboard/judge.py:parse_plugin_event
 switchboard/judge_request.py:_guess_configured
 switchboard/judge_request.py:parse_policy_request
+switchboard/sent_view.py:sent_deliveries
 switchboard/triage.py:triage_summary
 switchboard/v2_transport.py:_decode
 switchboard/v2_transport.py:_read_file
@@ -1302,7 +1303,7 @@ class TestCloudLoad(Base):
         fh = sb.load_fleet_health()
         src = (BIN / "fleet_health.py").read_text()
         self.assertIn("\\u2601 cloud", src)
-        self.assertIn('(" +%d\\u2601 cloud" % f["cloud"]) if f.get("cloud")', src)
+        self.assertIn('(" (%d\\u2601 cloud of the busy)" % f["cloud"]) if f.get("cloud")', src)
 
     def test_a_boss_with_control_characters_is_cleaned_at_the_source_and_a_non_string_is_no_boss(self):
         self.rec("e", reports_to="a\x1b[31mb\nc"); self.rec("l", reports_to="x" * 500); self.rec("n", reports_to=["orch"]); self.rec("i", reports_to=7)
