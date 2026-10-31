@@ -61,6 +61,8 @@ _NAMESPACE_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")   # a DNS-1
 # text only (never printed). Any other vault error (no permission, no such secret, not signed in, unreachable) matches neither.
 FIREWALL_MARKERS = ("client address is not authorized and caller is not a trusted service", "forbiddenbyfirewall")
 REAPER_RUNTIME_ID = "reaper"           # the reaper's own runtime id in the audit (it acts on no worker)
+UNAUTH_RETRY_VERBS = ("get", "patch", "delete", "label")   # the reads and idempotent calls: never exec, never create
+UNAUTH_REASON = "refreshed on unauthorized"   # the fixed audit reason of a refresh forced by an Unauthorized answer
 REFRESH_ACTION = "refresh-cluster-token"   # the audit action of the reaper's own login refresh
 SLOW_PASS_SECONDS = 600                 # a reaper pass that takes longer than this is named on the reaper's log and in the audit (a pass is normally seconds)
 SLOW_PASS_ACTION = "slow-reap-pass"     # the audit action of that note (its reason holds the seconds)
@@ -1241,14 +1243,15 @@ class ClusterTokenRefresher:
     def path(self):
         return (self.env.get("CW_CLOUD_TOKEN_FILE") or "").strip()
 
-    def run(self, force=False):
+    def run(self, force=False, unauthorized=False):
         """One attempt: make the file fresh when it is due (force: now, whatever the file's life and the retry gap say).
         Returns a TokenRefresh (never raises)."""
         if not self.enabled():
             return TokenRefresh("skipped")   # another login kind: nothing is read and nothing is written
         now = self.clock().timestamp()
         self.note_ignored(now)
-        if not force and self.last_failure is not None and 0 <= now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS:   # a negative gap (the clock went back) counts as expired
+        force = force or unauthorized   # unauthorized: due now, but the retry gap still holds
+        if not (force and not unauthorized) and self.last_failure is not None and 0 <= now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS:   # a negative gap (the clock went back) counts as expired
             return TokenRefresh("waiting", self.last_failure[1])   # the retry gap: no new attempt yet
         path = self.path()
         life = token_file_life_left(path, now)
@@ -1260,7 +1263,7 @@ class ClusterTokenRefresher:
         except ClusterLogin as e:
             reason = refresh_reason(e)
             self.last_failure = (now, reason)
-            self.audit(reason, False)
+            self.audit(UNAUTH_REASON if unauthorized else reason, False)
             return TokenRefresh("failed", reason)
         except OSError as e:
             reason = "the token file could not be written: %s" % (e.strerror or e)
@@ -1268,7 +1271,7 @@ class ClusterTokenRefresher:
             self.audit(reason, False)
             return TokenRefresh("failed", reason)
         self.last_failure = None
-        self.audit("", True)
+        self.audit(UNAUTH_REASON if unauthorized else "", True)
         return TokenRefresh("written", "", token)
 
     def audit(self, reason, ok):
@@ -1406,7 +1409,18 @@ class Kube:
             shutil.rmtree(self.dir, ignore_errors=True)
             self.dir = None
 
-    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
+    on_unauthorized = None   # the reaper's own: a function that refreshes its login through the retry gap; True when it did
+
+    def run(self, args, *a, retry=True, **kw):
+        """One kubectl call. A read or an idempotent call answered Unauthorized is retried ONCE after the login refresh (never the exec, never a create)."""
+        try:
+            return self._run(args, *a, **kw)
+        except CloudError as e:
+            if not (retry and self.on_unauthorized and args[0] in UNAUTH_RETRY_VERBS and "unauthorized" in str(e).lower() and self.on_unauthorized()):
+                raise
+        return self._run(args, *a, **kw)
+
+    def _run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
         if not self.context:  # never fall back to the active context
             raise CloudError("CW_KUBE_CONTEXT is not set; refusing to run kubectl against an unnamed context", EXIT_USAGE)
         cmd = [self.bin] + (["--kubeconfig", self.kubeconfig] if self.kubeconfig else []) + \
@@ -1593,7 +1607,7 @@ class Kube:
         self.run(["patch", "secret", secret, "--type=merge", "--patch-file=/dev/stdin"], stdin=json.dumps(body))
 
     def exec(self, name, *cmd, keep_stdout=False, timeout=120):
-        return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout)
+        return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout, retry=False)
 
 
 def _pod_env(pod, key):
@@ -3489,11 +3503,12 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                     note = note or ("cluster login failed: %s" % scrub(e, (), 120))
             if L is not None and ticker is None:
                 def relogin(refresher=refresher, L=L):
-                    r = refresher.run(force=True)
+                    r = refresher.run(unauthorized=True)
                     if r.token:
                         L.kube.add_secrets(r.token)
                     return r.state == "written"
                 L.relogin = relogin
+                L.kube.on_unauthorized = relogin
                 ticker = RenewalTicker(L, refresher, clock, ticker_wait)
                 ticker.start()
             began = clock()
