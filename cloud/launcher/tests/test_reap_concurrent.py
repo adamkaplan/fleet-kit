@@ -18,7 +18,10 @@ LAUNCHER = os.path.dirname(HERE)
 sys.path.insert(0, LAUNCHER)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(LAUNCHER)), "cloud", "worker", "tests"))
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(LAUNCHER)), "bin"))
 import cloud_worker as real  # noqa: E402
+import cloud_end_alert  # noqa: E402
+import record_json  # noqa: E402
 import stub_support  # noqa: E402
 
 T0 = dt.datetime(2026, 10, 30, 9, 0, 0, tzinfo=dt.timezone.utc)
@@ -327,8 +330,27 @@ class Concurrent(unittest.TestCase):
             cls.stop = old
         causes = [getattr(seen[w], "cause", None) for w in ("coder0", "coder1")]
         ok = (len(seen), causes) == (2, ["idle", "hard"])
-        print("S10: stops with the right cause %d of 2" % (2 if ok else 0))
+        lines = {l["worker"]: l.get("cause") for l in audit_lines(env) if l["action"] == "stop"}
+        audited = sum(lines.get(w) == c for w, c in (("coder0", "idle"), ("coder1", "hard")))
+        scratch = tempfile.mkdtemp()
+        audit, cursor, sent = os.path.join(scratch, "audit.jsonl"), os.path.join(scratch, "cursor.json"), []
+        open(audit, "w").close()
+        for w in ("coder0", "coder1"):
+            with open(os.path.join(scratch, w + ".json"), "w") as f:
+                json.dump({"worker": w, "reports_to": "coder-lead"}, f)   # the boss record, as test_cloud_end_alert's World writes it
+        scan = lambda: cloud_end_alert.scan_audit(audit, cursor, scratch, {}, lambda to, text: sent.append((to, text)), record_json.parse_bounded)
+        scan()   # the first pass over an empty file stores the cursor at its end
+        with open(env["CW_CLOUD_AUDIT"]) as src, open(audit, "a") as dst:
+            dst.write(src.read())
+        scan()
+        alerted = sum(len([t for to, t in sent if w in t and word in t]) == 2 for w, word in (("coder0", "idle limit"), ("coder1", "hard limit")))
+        runs = [getattr(seen[w], "run_id", None) for w in ("coder0", "coder1")]
+        pods = {real.ann(p, "worker"): real.ann(p, "run-id") for p in cluster.pods}
+        same_run = sum(runs[i] == pods.get(w) or runs[i] is None for i, w in enumerate(("coder0", "coder1")))
+        print("S10: stops with the right cause %d of 2, audit lines naming it %d of 2, end alerts naming it %d of 2" % (2 if ok else 0, audited, alerted))
+        print("S10: run id equals the pod annotation %d of 2" % same_run)
         self.assertEqual((len(seen), causes), (2, ["idle", "hard"]))
+        self.assertEqual((audited, alerted, same_run), (2, 2, 2))
 
     def test_S10_a_failed_pod_stops_through_the_pool_with_cause_pod_failed(self):
         mod = target_module()
@@ -338,7 +360,7 @@ class Concurrent(unittest.TestCase):
             setattr(cluster, name, lambda *a, **k: None)
         out = L.reap()
         causes = [l.get("cause") for l in audit_lines(env) if l["action"] == "stop"]
-        print("S10: a Failed pod through the pool ends with cause %s, reaped %d of 1, hook runs %d" % (causes, len(out), cluster.hooks))
+        print("S10b: a Failed pod through the pool ends with cause %s, reaped %d of 1, hook runs %d" % (causes, len(out), cluster.hooks))
         self.assertEqual((causes, out, cluster.hooks), (["pod_failed"], [("coder0", "hard limit", 0)], 0))
 
 
@@ -411,7 +433,7 @@ class Mutants(unittest.TestCase):
                                    env=dict(os.environ, **{MODULE_ENV: path}), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             out = p.communicate(timeout=90)[0]
         seen = "Set changed size during iteration" in out
-        print("S9 mutant: failed with the set-changed-size error %d of 1, mutation applied True" % (p.returncode == 1 and seen))
+        print("S9 mutant: failed with Set changed size during iteration %d of 1, mutation applied True" % (p.returncode == 1 and seen))
         self.assertEqual(p.returncode, 1, out)
         self.assertIn("Set changed size during iteration", out)
 
