@@ -19,6 +19,11 @@ import os
 import time
 from pathlib import Path
 
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("record_json", str(Path(__file__).resolve().parent / "record_json.py"))
+_record_json = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_record_json)   # the shared bounded-depth parse (#1314): registry.json and retired.json are record files another process can write
+
 VERSION = 1
 FILE = "registry.json"
 LOCK = "registry.lock"
@@ -84,7 +89,7 @@ def _parse(raw):
     if len(raw) > MAX_BYTES:
         return _empty(False, "%s is too large: nothing read" % FILE)
     try:
-        doc = json.loads(raw.decode("utf-8"))
+        doc = _record_json.parse_bounded(raw.decode("utf-8"))
     except (ValueError, UnicodeError):
         return _empty(False, "%s is not valid JSON: nothing read" % FILE)
     if not isinstance(doc, dict) or not _is_int(doc.get("version")):
@@ -130,7 +135,7 @@ def _old_retired(state_dir):
     except OSError as err:
         return {}, "%s cannot be read (%s)" % (RETIRED_DERIVED, getattr(err, "strerror", None) or type(err).__name__)
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = _record_json.parse_bounded(raw.decode("utf-8"))
     except (ValueError, UnicodeError):
         return {}, "%s is not valid JSON" % RETIRED_DERIVED
     if not isinstance(data, dict) or len(raw) > 1000000 or not all(isinstance(v, dict) for v in data.values()):

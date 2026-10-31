@@ -32,11 +32,17 @@ import zlib
 MARKER = ".fleet-review-checkout"
 MARKER_TOOL = "fleet-switchboard review checkout"
 PARENT = ".review"
+LAWS_MISSING_FILE = "laws-missing.txt"
 DIFFS_DIR = "diffs"            # #1047: `diffs/<path>.diff`, one per changed file
 MATRIX_FILE = "impact-matrix.txt"   # #1047: the impact matrix words, for a reviewer that cannot run a command
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 5000
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
+SPARSE_DIR_FILES = 200   # --sparse: at most this many files written for one directory (changed files first); past it the directory is listed as cut
+SPARSE_FILE = "sparse.txt"
+SPARSE_HINT = "; `review checkout --sparse` writes only the files the pull request changes and the other files of their directories"
+CHANGED_PAGES = 50       # pages of 100 of the pull request's file list; GitHub itself lists at most 3000 files
+CHANGED_MAX = 3000
 MAX_DIFF_BYTES = 5 * 1024 * 1024
 MAX_DIFF_LINES = 4000    # lines of one side: past it the line diff is skipped (difflib is quadratic: 4000 x 4000 fully different lines takes well under a second)
 DIFF_SECONDS = 30        # the time all line diffs together may take; past it each remaining file says the diff was skipped
@@ -92,7 +98,7 @@ def read_tree(api, repo, sha, limits):
     if not isinstance(got, dict) or not isinstance(got.get("tree"), list):
         raise Problem("GitHub answered no tree for %s" % sha[:12])
     if got.get("truncated"):
-        raise OverBound("the tree of %s is too large for GitHub to list in one answer (the file count limit is %d)" % (sha[:12], limits["files"]))
+        raise OverBound("the tree of %s is too large for GitHub to list in one answer (the file count limit is %d)%s" % (sha[:12], limits["files"], SPARSE_HINT))
     files, skipped, refused = {}, [], []
     for entry in got["tree"]:
         if not isinstance(entry, dict) or entry.get("type") == "tree":
@@ -110,9 +116,9 @@ def read_tree(api, repo, sha, limits):
     return files, skipped, refused
 
 
-def check_bounds(files, limits, what):
+def check_bounds(files, limits, what, sparse=False):
     if len(files) > limits["files"]:
-        raise OverBound("the %s tree has %d files, over the limit of %d files" % (what, len(files), limits["files"]))
+        raise OverBound("the %s tree has %d files, over the limit of %d files%s" % (what, len(files), limits["files"], "" if sparse or what != "head" else SPARSE_HINT))
     for path, (_, size, _x) in sorted(files.items()):
         if size > limits["file"]:
             raise OverBound("%s in the %s tree is %d bytes, over the limit of %d bytes for one file" % (_shown(path), what, size, limits["file"]))
@@ -202,12 +208,58 @@ class _Capped(io.RawIOBase):
         return got
 
 
-def read_archive(data, root, limits, started, expected):
+def changed_paths(api, repo, number):
+    """({path: status}, {previous paths of renames}) of the pull request's file list, EVERY page (a short page ends it). A failed page, a non-list page, more than
+    CHANGED_PAGES pages or a list GitHub caps at CHANGED_MAX files is refused: a selection from a cut list would miss a changed file."""
+    changed, previous = {}, set()
+    for page in range(1, CHANGED_PAGES + 1):
+        got = api("repos/%s/pulls/%d/files?per_page=100&page=%d" % (repo, number, page))
+        if not isinstance(got, list):
+            raise Problem("GitHub answered a file list page %d of the pull request that is not a list" % page)
+        for item in got:
+            name = item.get("filename") if isinstance(item, dict) else None
+            why = bad_path(name)
+            if why:
+                raise Unsafe("the pull request lists %s: %s" % (_shown(name if isinstance(name, str) else "?"), why))
+            changed[name] = str(item.get("status"))
+            if isinstance(item.get("previous_filename"), str):
+                if bad_path(item["previous_filename"]):
+                    raise Unsafe("the pull request lists a renamed file with a bad previous path %s" % _shown(item["previous_filename"]))
+                previous.add(item["previous_filename"])
+        if len(got) < 100:
+            if len(changed) >= CHANGED_MAX:
+                raise Problem("the pull request changes %d or more files: GitHub caps its file list, so a sparse checkout would miss files" % CHANGED_MAX)
+            return changed, previous
+    raise Problem("the pull request's file list is more than %d pages" % CHANGED_PAGES)
+
+
+def select_sparse(tree_files, changed, per_dir=None):
+    """(selected paths, cut directories): the changed files that are in the head tree, and the other files that sit DIRECTLY in the directory of a changed file
+    (not its subdirectories), at most `per_dir` files for one directory (the changed ones first, then by name); a directory with more is listed as cut.
+    Only names are looked at."""
+    per_dir = SPARSE_DIR_FILES if per_dir is None else per_dir
+    dirs = {p.rpartition("/")[0] for p in changed}
+    selected, cut = {p for p in changed if p in tree_files}, []
+    for d in sorted(dirs):
+        mine = sorted(p for p in tree_files if p.rpartition("/")[0] == d)
+        room = per_dir - sum(1 for p in mine if p in selected)
+        for p in mine:
+            if p not in selected and room > 0:
+                selected.add(p)
+                room -= 1
+        if any(p not in selected for p in mine):
+            cut.append(d or "(top directory)")
+    return selected, cut
+
+
+def read_archive(data, root, limits, started, expected, select=None):
     """Unpack the tarball `data` (bytes) into `root` with write_file, the only writer. Members are read in a stream, never extracted by tarfile.
     The archive's single top directory prefix is stripped; a member outside it is refused. `expected` is {path: (blob sha, size, exec)} of the git TREE, the authority: a file the tree does not list is refused, and a file whose content does not hash to the tree's blob sha (`export-subst`) is not written (the caller fetches it by blob). Returns ({path: (git blob sha, size)} of what was written, skipped, refused, altered).
-    Raises OverBound before a member's bytes are read when its header passes a bound."""
+    Raises OverBound before a member's bytes are read when its header passes a bound.
+    `select` (--sparse): the set of paths to write. Every member goes through the same name, link, special-file, duplicate and tree checks; a regular member not in `select`
+    is then skipped BY NAME, its bytes never read, and only the selected members count toward the file, size and total bounds (the archive's own cap and deadline cover all)."""
     files, skipped, refused, seen, altered = {}, [], [], set(), []
-    members, total, top = 0, 0, None
+    members, total, top, wrote = 0, 0, None, 0
     try:
         # unpacked here, under a byte cap that counts every byte (headers and skipped members too): total bound + room for headers and padding
         capped = io.BufferedReader(_Capped(gzip.GzipFile(fileobj=io.BytesIO(data)), limits["total"] + 1024 * (4 * limits["files"] + 16)))
@@ -247,7 +299,14 @@ def read_archive(data, root, limits, started, expected):
             if rel in seen:
                 raise Unsafe("%s appears twice in the archive (duplicate member)" % _shown(rel))
             seen.add(rel)
-            if len(seen) > limits["files"]:
+            if select is not None:
+                if rel not in expected:
+                    refused.append((rel, "a file the git tree of the head does not list"))
+                    continue
+                if rel not in select:
+                    continue
+                wrote += 1
+            if (wrote if select is not None else len(seen)) > limits["files"]:
                 raise OverBound("the head tree has more than %d files, over the limit of %d files" % (limits["files"], limits["files"]))
             if member.size > limits["file"]:
                 raise OverBound("%s in the head tree is %d bytes, over the limit of %d bytes for one file" % (_shown(rel), member.size, limits["file"]))
@@ -298,6 +357,63 @@ def _diff_text(path, old, new, late=False):
     return out
 
 
+NOT_WHOLE_MAX = 200     # the files the notice names; the rest are counted
+
+
+def _not_whole(old, new, late):
+    """(longest side in lines, why) of a changed file whose diff `_diff_text` does not hold whole, or None. The same tests, in the same order."""
+    counts = [len(d.splitlines()) for d in (old, new) if d is not None]
+    lines = max(counts) if counts else 0
+    if (old is not None and b"\x00" in old) or (new is not None and b"\x00" in new):
+        return lines, "binary"
+    if counts and max(counts) > MAX_DIFF_LINES:
+        return lines, "line bound %d" % MAX_DIFF_LINES
+    if late:
+        return lines, "time bound %d seconds" % DIFF_SECONDS
+    return None
+
+
+def _not_whole_line(path, lines, why):
+    return "%s: %d lines, %s: the diff is not whole\n" % (_shown(path), lines, why)
+
+
+def _not_whole_block(cut):
+    """The notice at the top of pr.diff: one line for each of the first NOT_WHOLE_MAX files, then how many more; empty when nothing is cut."""
+    if not cut:
+        return ""
+    out = ["review checkout: %d changed file(s) whose diff is not whole (the bounds are unchanged):\n" % len(cut)]
+    out += ["  " + _not_whole_line(*c) for c in cut[:NOT_WHOLE_MAX]]
+    if len(cut) > NOT_WHOLE_MAX:
+        out.append("  and %d more not whole, not named here (the marker field not_whole holds the count)\n" % (len(cut) - NOT_WHOLE_MAX))
+    return "".join(out)
+
+
+def _write_laws(root, laws, touched, used, limits, base_count):
+    """Write the base commit's law files under base/ (same guard and bounds as every base copy; a touched file's merge-base copy is never
+    overwritten). `laws` is ({name: bytes}, missing); `used` the bytes held so far, `base_count` the files in base/. Returns the missing list."""
+    files, missing = laws[0], list(laws[1])
+    for name in sorted(files):
+        data = files[name]
+        why = bad_path(name)
+        if why:
+            missing.append("%s (refused: %s)" % (_shown(name), why))
+        elif name in touched:
+            # the pull request changes it: base/ holds the merge base's copy when it has one, else the file is named missing
+            if not os.path.isfile(os.path.join(root, "base", name)):
+                missing.append("%s (changed by this pull request; base/ holds no merge-base copy)" % _shown(name))
+        elif len(data) > limits["file"] or used + len(data) > limits["total"] or base_count + 1 > limits["files"]:
+            missing.append("%s (over a size or count bound)" % _shown(name))
+        else:
+            try:
+                write_file(os.path.join(root, "base"), name, data)
+            except Unsafe as err:
+                missing.append("%s (%s)" % (_shown(name), err))
+                continue
+            used += len(data)
+            base_count += 1
+    return missing
+
+
 def make_readonly(root):
     """Bottom-up: files 0444 (the executable bit is not kept: a reviewer reads), directories 0555, the root last."""
     for current, dirs, names in os.walk(root, topdown=False, followlinks=False):
@@ -312,9 +428,9 @@ def make_readonly(root):
     os.chmod(root, 0o555)
 
 
-def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text: None, archive=None, extra_files=None):
+def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text: None, archive=None, extra_files=None, sparse=False, result=None, law_files=None):
     """Materialise PR `repo#number` at commit `head` (read ONCE by the caller; every fetch uses it) under `cwd`, diffed against merge base of
-    `base`. Returns the directory path. On any failure everything this call made is removed and the exception (Unsafe, OverBound, Problem) is raised."""
+    `base`. With `sparse` only the files the pull request changes and the files directly beside them are written (see select_sparse); `result`, a dict, then gets the counts. Returns the directory path. On any failure everything this call made is removed and the exception (Unsafe, OverBound, Problem) is raised."""
     limits = dict({"file": MAX_FILE_BYTES, "files": MAX_FILES, "total": MAX_TOTAL_BYTES}, **(limits or {}))
     if not isinstance(head, str) or not SHA_RE.fullmatch(head) or not isinstance(base, str) or not SHA_RE.fullmatch(base):
         raise Problem("the head and the base must each be a full 40-character commit sha")
@@ -357,14 +473,20 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
         if archive is None:
             raise Problem("no archive reader was given")
         tree_files, tree_skipped, tree_refused = read_tree(api, repo, head, limits)   # the AUTHORITY on which files the head has (a tarball honours export-ignore and export-subst)
-        check_bounds(tree_files, limits, "head")
-        archived, skipped, refused, altered = read_archive(archive(head), root, limits, started, tree_files)   # ONE call: the exact head sha
+        selected, cut, changed, previous = None, [], {}, set()
+        if sparse:
+            changed, previous = changed_paths(api, repo, number)
+            selected, cut = select_sparse(tree_files, set(changed))
+            check_bounds({p: tree_files[p] for p in selected}, limits, "head", sparse=True)   # the bounds count the files WRITTEN
+        else:
+            check_bounds(tree_files, limits, "head")
+        archived, skipped, refused, altered = read_archive(archive(head), root, limits, started, tree_files, select=selected)   # ONE call: the exact head sha
         skipped = tree_skipped + [s_ for s_ in skipped if s_[0] not in {p for p, _ in tree_skipped}]
         refused = tree_refused + refused + [(p + " (base)", w) for p, w in base_refused]
         if refused:
             raise Unsafe("refused, nothing kept: " + "; ".join("%s: %s" % (_shown(p), w) for p, w in refused[:20])
                          + ("; skipped (never followed): " + ", ".join(_shown(p) for p, _ in skipped[:20]) if skipped else ""))
-        head_files, from_blob = dict(archived), sorted(set(tree_files) - set(archived))   # the tree files the archive left out or altered: fetched by blob, never silently fewer
+        head_files, from_blob = dict(archived), sorted((set(tree_files) if selected is None else selected) - set(archived))   # the tree files the archive left out or altered: fetched by blob, never silently fewer
         fetched = [0]
         for path in from_blob:
             if time.monotonic() - started > DEADLINE_SECONDS:
@@ -380,7 +502,7 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
         if from_blob:
             notify("%d of %d files were not in the archive as the tree has them (export-ignore or export-subst) and came from the blob API: %s"
                    % (len(from_blob), len(tree_files), ", ".join(_shown(p) for p in from_blob[:20])))
-        touched = sorted(p for p in set(head_files) | set(base_files)
+        touched = sorted(p for p in (set(head_files) | set(base_files) if not sparse else (set(changed) | previous))
                          if (head_files.get(p) or (0,))[0] != (base_files.get(p) or (0,))[0])
         check_bounds({p: base_files[p] for p in touched if p in base_files}, limits, "base")
         total = sum(v[1] for v in head_files.values()) + sum(base_files[p][1] for p in touched if p in base_files)
@@ -402,6 +524,15 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
             with os.fdopen(fd, "rb") as handle:
                 return handle.read(limits["file"] + 1)
         diff, written, diff_started = [], 0, time.monotonic()
+        if sparse:
+            info = {"written": len(head_files), "not_written": len(tree_files) - len(head_files), "cut": cut}
+            if result is not None:
+                result.update(info)
+            head_line = "sparse checkout: %d files written, %d files of the head tree not written (the changed files and the files beside them; see %s)\n" % (
+                info["written"], info["not_written"], SPARSE_FILE)
+            diff.append(head_line)
+            written += len(head_line.encode())
+        cut_files = []   # (path, lines, why) of each changed file whose diff is not whole
         for path in touched:
             if time.monotonic() - started > DEADLINE_SECONDS:
                 raise OverBound("the checkout took more than %d seconds (the time limit)" % DEADLINE_SECONDS)
@@ -409,18 +540,41 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
             new = head_text(path) if path in head_files else None
             if old is not None:
                 write_file(os.path.join(root, "base"), path, old)
-            piece = _diff_text(path, old, new, late=time.monotonic() - diff_started > DIFF_SECONDS)
+            late = time.monotonic() - diff_started > DIFF_SECONDS
+            piece = _diff_text(path, old, new, late=late)
+            partial = _not_whole(old, new, late)
+            if partial:
+                cut_files.append((path,) + partial)
+                piece = "review checkout: " + _not_whole_line(path, *partial) + piece
             written += len(piece.encode())
             if written > MAX_DIFF_BYTES:
                 raise OverBound("the diff is over the limit of %d bytes" % MAX_DIFF_BYTES)
             diff.append(piece)
             write_file(root, DIFFS_DIR + "/" + path + ".diff", piece.encode())   # #1047: one diff per changed file, so a reader takes each whole, chunk by chunk
+        diff.insert(0, _not_whole_block(cut_files))   # added after the diff-byte check above: the 5 MiB bound is not exact for this block
         write_file(root, "pr.diff", "".join(diff).encode())
+        if sparse:
+            write_file(root, SPARSE_FILE, ("sparse checkout: %d files written, %d files of the head tree not written\n" % (info["written"], info["not_written"])
+                                           + "".join("written head/%s\n" % p for p in sorted(head_files))
+                                           + "".join("cut at %d files, others not included: %s\n" % (SPARSE_DIR_FILES, d) for d in cut)).encode())
         for name, text in sorted((extra_files or {}).items()):
             write_file(root, name, text.encode())
-        _rewrite_marker(root, _marker_bytes({"tool": MARKER_TOOL, "pr": "%s#%d" % (repo, number), "head": head, "base": base,
-                                             "merge_base": merge_base, "merge_base_fallback": fallback, "touched": len(touched),
-                                             "from_blob_api": from_blob, "altered_in_archive": sorted(altered)}))
+        fields = {"tool": MARKER_TOOL, "pr": "%s#%d" % (repo, number), "head": head, "base": base,
+                  "merge_base": merge_base, "merge_base_fallback": fallback, "touched": len(touched),
+                  "from_blob_api": from_blob, "altered_in_archive": sorted(altered), "not_whole": len(cut_files)}
+        if law_files is not None:
+            law_missing = _write_laws(root, law_files, set(touched), total, limits, sum(1 for p in touched if p in base_files))
+            fields["laws_missing"] = law_missing
+            if law_missing:
+                write_file(root, LAWS_MISSING_FILE, "".join("%s\n" % m for m in law_missing).encode())
+                notify("the review law files not provided in base/ (see %s): %s" % (LAWS_MISSING_FILE, ", ".join(law_missing)))
+        if sparse:
+            fields.update({"sparse": True, "sparse_written": info["written"], "sparse_not_written": info["not_written"], "sparse_cut_directories": cut})
+        _rewrite_marker(root, _marker_bytes(fields))
+        for c in cut_files[:NOT_WHOLE_MAX]:
+            notify(_not_whole_line(*c).rstrip("\n"))
+        if len(cut_files) > NOT_WHOLE_MAX:
+            notify("%d more changed files not whole, not named (the marker field not_whole holds the count)" % (len(cut_files) - NOT_WHOLE_MAX))
         for path, why in skipped:
             notify("skipped %s: %s (never followed or created)" % (_shown(path), why))
         make_readonly(root)

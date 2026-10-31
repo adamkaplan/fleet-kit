@@ -36,6 +36,8 @@ CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 
 A pull request for an ask, or for a work item with a live check, says `Refs #N`, never `Closes`, `Fixes` or `Resolves`; `Closes #N` only where the plan says so.
 
+A brief for a change that adds a file under `bin/` carries the output of `tools/new-module-demands bin/x.py` (the guard classes, the matrix entries, the units row, the closure state): the tool informs, the guards decide.
+
 Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
 
 ## Builder checklist
@@ -70,6 +72,8 @@ bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only
 **Name the suites that exercise your change.** Before offering a head, and in every brief you write for a coder, run `fleet-switchboard heavy --changed --list` and put its list (the header `suites that exercise your change`) in the brief; run those suites with `fleet-switchboard heavy --changed` (on a local merge of the current base) before offering the head. A change is never offered on the classes its diff happens to name while another suite runs the same code. A path the list says no suite exercises is said so in the pull request.
 
 **Local runs are focused by default.** Run the focused classes of what you changed through `heavy --short`; CI runs the whole suite. Run the whole suite only for a change to the CI workflow itself or to a test CI cannot run; say which in the pull request. The heavy wrapper refuses a second full-suite job in a worktree while one is queued or running.
+
+**A change that adds a committed file under `bin/` runs one command before the first push:** `fleet-switchboard preflight-pr` (with or without `--merged`) runs the one table of the classes that read the set of `bin/` files (`NEW_BIN_GUARDS` in `bin/path_suites.py`), one PASS or FAIL line each.
 
 A change that deletes something or raises an alert is checked against three lines before its first push:
 

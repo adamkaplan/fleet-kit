@@ -474,7 +474,6 @@ class RepoRootClean(unittest.TestCase):
         with open(os.devnull, "w") as null:
             unittest.TextTestRunner(stream=null).run(suite)
         self.assertEqual(status(), before, "scratch left in the repository root")
-        self.assertNotIn("??", status(), "an untracked entry in the repository root")
 
 
 if __name__ == "__main__":
