@@ -2157,7 +2157,6 @@ class TestCloudWatchBounds(unittest.TestCase):
 class TestArchTools(unittest.TestCase):
     """The two move tools (S0 of #1092): `arch-split-check` reads the surface of the daemon as its own entry assembles it, and `arch-part-cut` never overwrites a part."""
 
-    def tool(self, name, *args):
     # The warnings machinery adds __warningregistry__ to a module's globals when a warning is raised from code of that module, so dir(module) can hold a name the tool never reads.
     INTERPRETER_ADDED = frozenset({"__warningregistry__"})
 
@@ -2183,6 +2182,7 @@ class TestArchTools(unittest.TestCase):
         with mock.patch.object(type(self), "INTERPRETER_ADDED", frozenset()):
             self.assertNotEqual(self.daemon_names(self.scratch_module("__warningregistry__")), expected)
 
+    def tool(self, name, *args):
         return subprocess.run([sys.executable, "-B", str(REPO / "tools" / name)] + [str(a) for a in args], capture_output=True, text=True)
 
     def test_the_surface_of_the_daemon_is_read_as_its_entry_assembles_it_not_as_a_text_join(self):
