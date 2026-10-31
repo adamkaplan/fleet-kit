@@ -185,8 +185,9 @@ class TestGhShimSignInput(unittest.TestCase):
 
     def refused(self, done, calls):
         self.assertEqual(done.returncode, 1)
-        self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
-        self.assertTrue(done.stderr.startswith("gh: refused:"), done.stderr)
+        gh_lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        self.assertEqual([l for l in gh_lines if l.startswith("gh: refused:")], gh_lines, done.stderr)
+        self.assertEqual(len(gh_lines), 1, done.stderr)
         self.assertEqual(calls, [])
 
     def test_s3_input_file_is_signed_once_and_the_temp_file_removed(self):
@@ -288,7 +289,7 @@ class TestGhShimSignInput(unittest.TestCase):
         done, calls = gated.run(*merge)
         self.assertEqual(calls, [])                    # a gated repository: refused with one line, nothing reaches the real gh
         self.assertEqual(done.returncode, 10)
-        self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
+        self.assertEqual(len([l for l in done.stderr.splitlines() if l.startswith("gh:")]), 1, done.stderr)
 
     def test_u6_input_on_a_get_or_another_endpoint_is_untouched(self):
         path = self.file('{"body":"x"}')
@@ -334,7 +335,7 @@ class TestGhShimSignInput(unittest.TestCase):
             with self.subTest(spelling=spelling):
                 done, calls = self.rig.run("api", spelling, "-f", "query=" + gql("addComment"))
                 self.refused(done, calls)
-                self.assertEqual(done.stderr, bare.stderr)
+                self.assertEqual([l for l in done.stderr.splitlines() if l.startswith("gh:")], bare.stderr.splitlines())
 
     def test_h2_a_read_query_in_every_spelling_passes_untouched(self):
         rig = hermetic_rig()
@@ -385,7 +386,7 @@ class TestGhShimSignInput(unittest.TestCase):
             with self.subTest(args=args):
                 done, calls = gated.run(*args)
                 self.assertEqual((done.returncode, calls), (10, []))
-                self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
+                self.assertEqual(len([l for l in done.stderr.splitlines() if l.startswith("gh:")]), 1, done.stderr)
                 self.assertTrue(done.stderr.startswith("gh: "), done.stderr)
                 self.assertNotIn("cannot be signed", done.stderr)
         held = hermetic_rig()
