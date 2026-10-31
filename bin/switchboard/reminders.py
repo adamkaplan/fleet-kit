@@ -549,6 +549,10 @@ class ReminderFacts:
             self.engine.audit.append(self.engine.actor, "reminder.waiting", recipient,
                                      {"id": item_id, "late_min": max(0, int((now - due) // 60)), "reason": reason})
 
+    def ceiling(self, plan, now):
+        """#1728: the ceiling step of one plan (see `ceiling_wake`)."""
+        return ceiling_wake(self.engine, self, plan, now)
+
     def notify_drop(self, item, why):
         """#1132: a reminder dropped because its issue closed or its pull request merged tells its setter ONCE. Called only by the caller
         that removed the reminder from the file (`gone` was non-empty), so a second sweep finds nothing to drop and sends nothing."""
@@ -656,6 +660,52 @@ def waiting_reason(engine, plan, now):
     return "lane in a turn of %d minutes, queued" % (age // 60) if age is not None else "lane in a turn of unknown length, queued"
 
 
+def reminder_bound(config, item):
+    """#1728: the bound in SECONDS of a due reminder: `checkpoint_bound_minutes` (default 5) for one a launch checkpoint set (its condition names
+    the worker) or one marked `deadline`, else `reminder_bound_minutes` (default 10)."""
+    condition = item.get("condition") if isinstance(item.get("condition"), dict) else {}
+    checkpoint = bool(item.get("deadline")) or "while_running" in condition or "unless_report_from" in condition
+    key, default = ("checkpoint_bound_minutes", 5) if checkpoint else ("reminder_bound_minutes", 10)
+    minutes = config.get(key, default)
+    return (minutes if _is_number(minutes) and minutes >= 0 else default) * 60
+
+
+def ceiling_wake(engine, source, plan, now):
+    """#1728 ceiling: a due reminder of this lane past its bound that this pass would not admit (a batch window) turns the plan into a queued wake,
+    carrying every pending fact of the lane, with one `reminder.ceiling` audit line per reminder. A wake already planned (queued behind a turn) is
+    delivered by this very pass: only the line is written. A held lane is left alone. Returns the ids written."""
+    if plan.action not in ("wait", "wake"):
+        return []
+    items = {i["id"]: i for i in read_reminders(source.state_dir)}
+    late = [(f, items[f.key[len("reminder:"):]]) for f in plan.pending
+            if str(f.key).startswith("reminder:") and f.key[len("reminder:"):] in items]
+    over = [(f, i) for f, i in late if now - i["at"] > reminder_bound(engine.config, i)]
+    done = source.__dict__.setdefault("_ceiled", set())
+    over = [(f, i) for f, i in over if i["id"] not in done]
+    if not over:
+        return []
+    if plan.action == "wait":
+        for fact in plan.pending:
+            fact.batch = False
+        plan.action, plan.reason = "wake", "ceiling: a due reminder is past its bound"
+    for _, item in over:
+        if len(done) > 1000:
+            done.clear()
+        done.add(item["id"])
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "reminder.ceiling", plan.recipient,
+                                {"id": item["id"], "late_min": max(0, int((now - item["at"]) // 60)),
+                                 "bound_min": int(reminder_bound(engine.config, item) // 60), "delivery": "queued wake"})
+    return [i["id"] for _, i in over]
+
+
+def invariant_break(source, plan, now):
+    """#1728 invariant: the unconditional, unexpired due reminders of this lane that are not in its pending facts (an empty list: it holds)."""
+    have = {f.key for f in plan.pending}
+    return [i for i in source.due() if i["to"] == plan.recipient and not i.get("condition") and not i.get("key") and not i.get("ttl")
+            and "reminder:" + i["id"] not in have]
+
+
 def reminder_waiting(engine, plan, now):
     """#1728: the audit line for each due reminder in `plan` that is not delivered in this pass. Never raises: it must not stop a delivery."""
     try:
@@ -664,6 +714,10 @@ def reminder_waiting(engine, plan, now):
         reason = waiting_reason(engine, plan, now) if source is not None and mine else None
         for fact in mine if reason else ():
             source.waiting(fact.key[len("reminder:"):], plan.recipient, fact.created, reason)
+        if source is not None and plan.action != "hold":
+            for item in invariant_break(source, plan, now):
+                source.waiting(item["id"], plan.recipient, item["at"], "invariant broken: a due reminder of a lane neither held nor cancelled is not a pending fact")
+            source.ceiling(plan, now)
     except Exception:
         pass
 

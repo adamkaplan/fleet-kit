@@ -366,6 +366,8 @@ DEFAULTS = {
     "launch_default": "headless",   # #433: what a plain `launch` starts: "headless" (no terminal) or "terminal" (a herdr tab)
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "steer_after_minutes": 0,       # #1540: 0 = off; else a turn longer than this many minutes takes a peer `send` and a reminder as `steer` too
+    "reminder_bound_minutes": 10,     # #1728: a due reminder not admitted within this many minutes is delivered by the next pass (a queued wake)
+    "checkpoint_bound_minutes": 5,    # #1728: the same bound for a reminder a launch checkpoint set or one marked as a deadline
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
     "call_timeout_seconds": 20,

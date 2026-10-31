@@ -73,4 +73,47 @@ def build(PR4Base):
                 self.world.engine.run_pass()
                 with self.assertRaisesRegex(AssertionError, r"^10 != 5"):
                     self.assertEqual(len(self.lines()), 5)
+
+        def late_one(self, minutes, **kwargs):
+            now = self.world.clock.now()
+            return sb.add_reminder(self.world.state, "w-batch", now - minutes * 60, now - 3600, "ship the widget-api build", **kwargs)["id"]
+
+        def ceilings(self):
+            return [e for e in self.world.audit() if e["event"] == "reminder.ceiling"]
+
+        def test_s3_the_bounds_default_to_ten_and_five_and_a_launch_checkpoint_reminder_gets_five(self):
+            self.assertEqual((sb.DEFAULTS["reminder_bound_minutes"], sb.DEFAULTS["checkpoint_bound_minutes"]), (10, 5))
+            now = self.world.clock.now()
+            plain = sb.add_reminder(self.world.state, "w-batch", now, now, "look")
+            launch = sb.add_reminder(self.world.state, "w-batch", now, now, "report", condition={"while_running": "w-batch"})
+            deadline = dict(plain, deadline=True)
+            self.assertEqual([sb.reminder_bound(sb.DEFAULTS, i) for i in (plain, launch, deadline)], [600, 300, 300])
+
+        def test_s9_a_due_reminder_is_a_pending_fact_after_one_pass_and_a_delivery_carries_every_due_one(self):
+            self.world.add_agent("w-free", fleet={"role": "coder", "reports_to": "platform", "issue": 20})
+            first, second = self.remind("w-free"), self.remind("w-free")
+            facts, _ = self.world.engine.collect_facts()
+            self.assertEqual(len([f for f in facts if f.recipient == "w-free" and f.key.startswith("reminder:")]), 2)
+            del self.world.engine.deliver                       # the real delivery
+            self.world.engine.run_pass()
+            sent = [e for e in self.world.audit() if e["event"] == "v2.synthetic" and e.get("subject") == "w-free" and e["detail"].get("keys")]
+            carried = [k for e in sent for k in e["detail"].get("keys", [])]
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(len([k for k in carried if k in ("reminder:" + first, "reminder:" + second)]), 2)
+
+        def test_s10_a_reminder_past_its_bound_is_delivered_by_the_next_pass_by_a_queued_wake(self):
+            self.late_one(11)
+            del self.world.engine.deliver
+            self.world.engine.run_pass()
+            self.assertEqual(len(self.ceilings()), 1)           # control: the unmutated code
+            self.assertEqual(self.ceilings()[0]["detail"]["delivery"], "queued wake")
+            self.assertTrue([e for e in self.world.audit() if e["event"] == "v2.synthetic" and e.get("subject") == "w-batch"])
+
+        def test_s10_a_mutant_that_leaves_it_waiting_is_caught(self):
+            self.late_one(11)
+            del self.world.engine.deliver
+            with mock.patch.object(sb.ReminderFacts, "ceiling", lambda self, plan, now: []):
+                self.world.engine.run_pass()
+                with self.assertRaisesRegex(AssertionError, r"^0 != 1"):
+                    self.assertEqual(len(self.ceilings()), 1)
     return TestReminderWaiting

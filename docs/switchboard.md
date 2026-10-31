@@ -2829,6 +2829,8 @@ carry the rest); a changed action is audited as `recheck`. A reminders file that
 
 A due reminder that is not delivered in a pass writes one `reminder.waiting` audit line: the reminder id, the recipient, the minutes it is past due and a one-line reason (the plan action and its reason, a batch window, a hold or an engaged note; `condition unreadable`; or `lane in a turn of N minutes, queued`). It is written once per reminder and reason, again when the reason changes, and every 30 minutes while the reminder waits. The line only says why; it does not deliver the reminder sooner, and no bound on the wait is set by it.
 
+Two config keys set how long a due reminder may wait: `reminder_bound_minutes` (default `10`, an ordinary reminder) and `checkpoint_bound_minutes` (default `5`, a reminder a launch checkpoint set or one marked as a deadline). The invariant: a due reminder of a lane that is neither held nor cancelled is a pending fact within one pass, and every delivery to that lane carries every due reminder of it; when it is not, a `reminder.waiting` line says `invariant broken`. The ceiling: a due reminder not admitted within its bound is delivered by the very next pass as a queued wake, never dropped, with one `reminder.ceiling` audit line (id, minutes late, the bound).
+
 **Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
 ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
 still carried. A worker that failed, errored or was aborted is never folded: its line is shown in full. A stop after a
