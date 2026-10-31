@@ -6,6 +6,7 @@ import ast
 import json
 import os
 import re
+import stat
 import unittest
 
 from test_gh_shim_sign import (API_EXAMPLES, MARK, OLD_EXAMPLE, REPO, SHIM_DIR, Rig, forms_without_an_example as old_forms_without_an_example, pairs)
@@ -81,6 +82,15 @@ def battery(rig):
     done, calls = rig.run("api", ALL_API["reviews"], "--input", "-", stdin='{"body":"x"}')
     if len(calls) != 1 or calls[0]["stdin"].count(SIGNED) != 1:
         bad.append("--input stdin not signed")
+    path.write_text('{"event":"COMMENT"}')
+    done, calls = rig.run("api", ALL_API["reviews"], "--input", str(path))
+    if len(calls) != 1 or calls[0]["argv"][-1] == str(path) or calls[0]["files"].get(calls[0]["argv"][-1]) != '{"event":"COMMENT"}':
+        bad.append("no-body --input passed by path, not by temp copy")
+    fifo = rig.home / "fifo.json"
+    os.mkfifo(str(fifo))
+    done, calls = rig.run("api", ALL_API["reviews"], "--input", str(fifo))
+    if calls or "is not a regular file" not in done.stderr:
+        bad.append("a FIFO --input was not refused")
     for label, endpoint in NEW_API_EXAMPLES.items():
         done, calls = rig.run("api", endpoint, "-X", "PATCH", "-f", "body=x")
         if len(calls) != 1 or calls[0]["argv"][-1].count(SIGNED) != 1:
@@ -214,6 +224,38 @@ class TestGhShimSignInput(unittest.TestCase):
         done, calls = self.rig.run("api", "repos/o/r/issues/1/labels", "--input", path)
         self.assertEqual(calls[0]["argv"][-1], path)
 
+    def test_h1_fifo_input_is_refused_before_reading(self):
+        fifo = self.rig.home / "fifo.json"
+        os.mkfifo(str(fifo))
+        for spelling in (("--input", str(fifo)), ("--input=" + str(fifo),)):
+            with self.subTest(spelling=spelling):
+                done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", *spelling)
+                self.refused(done, calls)
+                self.assertEqual(done.stderr.strip(), "gh: refused: the --input file %s is not a regular file, so it cannot be signed and nothing was posted" % fifo)
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", str(self.rig.home))   # a directory
+        self.refused(done, calls)
+        self.assertIn("is not a regular file", done.stderr)
+        control = self.file('{"event":"COMMENT"}')   # control: a regular file of the same shape passes
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", control)
+        self.assertEqual(len(calls), 1, done.stderr)
+
+    def test_h1_no_body_input_is_passed_as_a_temp_copy_of_the_bytes_read(self):
+        text = '{"event":"COMMENT",\n "n": "\u00e9"}'
+        original = self.file(text)
+        for spelling in (lambda p: ("--input", p), lambda p: ("--input=" + p,)):
+            with self.subTest(spelling=spelling(original)):
+                done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", *spelling(original))
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(len(calls), 1)
+                last = calls[0]["argv"][-1]
+                temp = last[len("--input="):] if last.startswith("--input=") else last
+                self.assertNotEqual(temp, original)
+                if not last.startswith("--input="):   # the recorder reads only a bare path
+                    self.assertEqual(calls[0]["files"][temp], text)
+                self.assertFalse(os.path.exists(temp))
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "--input", "-", stdin='{"event":"COMMENT"}')   # stdin: read once, passed as that text
+        self.assertEqual(calls[0]["stdin"], '{"event":"COMMENT"}')
+
     def test_s10_completeness_and_count(self):
         self.assertEqual(forms_missing(self.source), [])
         self.assertEqual(count_forms(self.source), 21)
@@ -246,6 +288,12 @@ class TestGhShimSignInput(unittest.TestCase):
         self.assertIn("endpoint not signed: pr-review-reply", seen)
         seen = self.mutant('("pr-review-comment", r"pulls/comments/[0-9]+")', '("pr-review-comment", r"pulls/comments/[0-9]+X")')
         self.assertIn("endpoint not signed: pr-review-comment", seen)
+
+    def test_h1_mutants_are_seen(self):
+        seen = self.mutant("        return passed_copy(args, index, inline, value, text)", "        return list(args), (text if value == \"-\" else None), None")
+        self.assertEqual(seen, ["no-body --input passed by path, not by temp copy"])
+        seen = self.mutant("        if not stat.S_ISREG(os.fstat(fd).st_mode):", "        if False:")
+        self.assertEqual(seen, ["a FIFO --input was not refused"])
 
 
 if __name__ == "__main__":

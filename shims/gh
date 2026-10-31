@@ -28,6 +28,7 @@ import posixpath
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1349,11 +1350,54 @@ def read_input_json(value):
         raise Unsignable("the --input JSON cannot be parsed")
 
 
+_read_input_json_text = read_input_json
+
+
+def read_input_json(value):
+    """A named --input file is opened without blocking, must be a regular file (a FIFO, directory or device is refused BEFORE any read), and is read
+    from that one open descriptor as exact bytes; stdin goes the old way."""
+    if value == "-":
+        return _read_input_json_text(value)
+    try:
+        fd = os.open(value, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as err:
+        raise Unsignable("the --input text cannot be read (%s)" % type(err).__name__)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Unsignable("the --input file %s is not a regular file" % value)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read()
+    except OSError as err:
+        raise Unsignable("the --input text cannot be read (%s)" % type(err).__name__)
+    finally:
+        os.close(fd)
+    try:
+        text = raw.decode("utf-8")
+        return text, json.loads(text)
+    except ValueError:
+        raise Unsignable("the --input JSON cannot be parsed")
+
+
+def passed_copy(args, index, inline, value, text):
+    """An --input object with no body passes on as a temporary copy of the exact bytes already read (the real gh never reads the original path again)."""
+    new = list(args)
+    if value == "-":
+        return new, text, None
+    handle, temp = tempfile.mkstemp(prefix="fleet-gh-", suffix=".json")
+    with os.fdopen(handle, "wb") as fh:
+        fh.write(text.encode("utf-8"))
+    if inline is None:
+        new[index + 1] = temp
+    else:
+        new[index] = "--input=" + temp
+    return new, None, temp
+
+
 def input_call(args, name, found):
     index, inline, value = found
     text, data = read_input_json(value)
     if not isinstance(data, dict) or "body" not in data:
-        return list(args), (text if value == "-" else None), None
+        return passed_copy(args, index, inline, value, text)
     if not isinstance(data["body"], str):
         raise Unsignable("the --input body is not a string")
     data["body"] = sign(data["body"], name)
