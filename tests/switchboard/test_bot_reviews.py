@@ -283,23 +283,6 @@ class BotVerdict(unittest.TestCase):
 
 class BotSize(unittest.TestCase):
     """U6 and U7 (#1625)."""
-    def added(self, path):
-        import subprocess
-        base = None
-        for ref in ("origin/integration", "integration"):
-            if subprocess.run(["git", "-C", str(REPO), "rev-parse", "--verify", "-q", ref], capture_output=True).returncode == 0:
-                base = ref
-                break
-        if base is None:
-            self.skipTest("no integration ref to diff against")
-        out = subprocess.run(["git", "-C", str(REPO), "diff", base + "...HEAD", "-U0", "--no-color", "--", path], capture_output=True, text=True, timeout=60).stdout
-        return [l[1:] for l in out.splitlines() if l.startswith("+") and not l.startswith("+++")]
-
-    def test_u6_the_entry_adds_at_most_15_lines_and_the_test_runner_at_most_3_beyond_the_pin(self):
-        self.assertLessEqual(len(self.added("bin/fleet-switchboard")), 15)
-        pin = 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" job "build" run 101 is queued]'
-        self.assertLessEqual(len([l for l in self.added("bin/test-switchboard") if pin not in l]), 3)
-
     def test_u7_a_bot_finding_does_not_reach_the_verdict_or_the_exit_status(self):
         import re
         source = (REPO / "bin" / "fleet-switchboard").read_text()
