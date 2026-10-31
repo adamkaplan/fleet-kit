@@ -47,12 +47,21 @@ def wait_until(fn, seconds=8.0):
     return fn()
 
 
+def _is_zombie(pid):
+    """True when /proc says the process is a zombie; False when /proc cannot be read (the old behaviour)."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except (OSError, IndexError):
+        return False
+
+
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    return True
+    return not _is_zombie(pid)
 
 
 group_alive = stub_support.group_alive   # PermissionError (macOS: a group of only exited processes) counts as alive until it is reaped
