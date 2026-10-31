@@ -64,7 +64,8 @@ def _load(sb, path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = sb.parse_bounded(handle.read(READ_BYTES))
-        if isinstance(data, dict) and isinstance(data.get("offsets"), dict) and isinstance(data.get("alerted", {}), dict):
+        if isinstance(data, dict):
+            data.pop("_gap_ready", None)   # a working flag of one pass, never memory
             return data, "ok"
     except Exception:
         pass
@@ -139,7 +140,7 @@ def _fold(state, sb, lines, source):
                     stop[name] = max(ts, stop.get(name, 0))
                 elif action == "report":
                     report[name] = max(ts, report.get(name, 0))
-    for table in ("created", "stop", "report", "refused", "reaper"):
+    for table in ("created", "stop", "report", "refused"):
         data = state.get(table, {})
         while len(data) > SEEN_MAX:
             data.pop(min(data, key=lambda k: data[k]["at"] if isinstance(data[k], dict) else data[k]))
@@ -169,23 +170,83 @@ def _valid_record(rec, outage):
     return out
 
 
+def _table(valid):
+    """A cleaner for a table: every entry whose key is a string and whose value `valid` accepts is kept, the rest dropped; a non-table is dropped whole."""
+    def clean(value):
+        if not isinstance(value, dict):
+            return None
+        return {k: v for k, v in value.items() if isinstance(k, str) and valid(v)}
+    return clean
+
+
+def _is_text(value, limit=100000):
+    return isinstance(value, str) and len(value) <= limit
+
+
+def _c_offsets(value):
+    if not isinstance(value, dict):
+        return None
+    return {k: v for k, v in value.items() if k in ("switchboard", "launcher") and isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 1 << 62}
+
+
+def _c_new(value):
+    if not isinstance(value, list):
+        return None
+    return [e for e in value if isinstance(e, list) and len(e) == 3 and _num(e[0]) and isinstance(e[1], bool) and _is_text(e[2])] or None
+
+
+def _c_outage(value):
+    return _valid_record(value, True)
+
+
+def _c_gap(value):
+    return _valid_record(value, False)
+
+
+def _c_num(value):
+    return value if _num(value) else None
+
+
+def _c_flag(value):
+    return value if isinstance(value, bool) else None
+
+
+def _c_never(value):
+    return None   # a legacy key (the old per-failure `reaper` table): nothing reads it, so it is dropped
+
+
+# EVERY key of the memory the code reads or writes has its cleaner here, the one place a loaded memory is checked (a key not listed is dropped).
+# The test derives the keys the module reads from the code and fails for one that is not listed.
+_CLEANERS = {
+    "offsets": _c_offsets,
+    "alerted": _table(lambda v: isinstance(v, dict) and _num(v.get("at")) and _is_text(v.get("ask"))),
+    "created": _table(lambda v: isinstance(v, dict) and _num(v.get("at")) and (v.get("deadline") is None or _num(v.get("deadline"))) and _is_text(v.get("line"))),
+    "stop": _table(_num),
+    "report": _table(_num),
+    "refused": _table(lambda v: isinstance(v, dict) and _is_text(v.get("name")) and _num(v.get("at")) and _is_text(v.get("line"))),
+    "seen": _table(lambda v: isinstance(v, dict) and _num(v.get("at")) and _is_text(v.get("ask")) and (v.get("lane") is None or _is_text(v.get("lane")))),
+    "gone": _table(_num),
+    "reaper": _c_never,
+    "reaper_ok": _c_num,
+    "reaper_outage": _c_outage,
+    "reaper_gap": _c_gap,
+    "reaper_new": _c_new,
+    "catchup": _c_flag,
+}
+
+
 def _sanitize(state):
-    """Malformed memory fails closed: a bad record is dropped and the pass goes on (it never raises, so the detector is never wedged by one file)."""
-    for field, outage in (("reaper_outage", True), ("reaper_gap", False)):
-        if field in state:
-            rec = _valid_record(state[field], outage)
-            if rec is None:
-                state.pop(field)
-            else:
-                state[field] = rec
-    new = state.get("reaper_new", [])
-    state["reaper_new"] = [e for e in new if isinstance(e, list) and len(e) == 3 and _num(e[0]) and isinstance(e[1], bool)] if isinstance(new, list) else []
-    if not state["reaper_new"]:
-        state.pop("reaper_new")
-    alerted = state.get("alerted")
-    if isinstance(alerted, dict):
-        for key in [k for k, v in alerted.items() if not isinstance(v, dict) or not _num(v.get("at"))]:
-            alerted.pop(key)
+    """Malformed memory fails closed: every key is cleaned by its cleaner (a wrong type is dropped, a table is cleaned entry by entry) and the pass goes
+    on (it never raises, so the detector is never wedged by one file). An unknown key is dropped."""
+    for key in list(state):
+        if key == "_gap_ready":
+            continue
+        cleaner = _CLEANERS.get(key)
+        value = cleaner(state[key]) if cleaner else None
+        if value is None:
+            state.pop(key)
+        else:
+            state[key] = value
 
 
 def _reaper(state, now):
@@ -326,10 +387,13 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         else:
             engine.audit.append(engine.actor, "lost_worker.memory_corrupt", None, {"file": STATE_FILE, "action": "nothing alerted this pass; fresh memory next pass"})
             return []
+    before = json.dumps(state, sort_keys=True)   # before the cleaning: a cleaned memory is written back
+    raw_keys = set(state)
+    _sanitize(state)   # before the first fold: a record of the wrong type never reaches the code that adds to it
+    if status == "ok" and ("offsets" not in state or ("alerted" in raw_keys and "alerted" not in state)):
+        state, status = {}, "none"   # no usable positions or no usable list of what was alerted: no usable memory (recent losses only, the older marked)
     first = status in ("none", "memory_only")
     catchup = first or state.get("catchup") is True   # a catch-up: no usable memory, and every later pass until both audits are read to their end
-    _sanitize(state)   # before the first fold: a record of the wrong type never reaches the code that adds to it
-    before = json.dumps(state, sort_keys=True)
     _fold(state, sb, _read_new(sb, str(engine.audit.path), state, "switchboard"), "switchboard")
     _fold(state, sb, _read_new(sb, launcher_audit or launcher_audit_path(), state, "launcher"), "launcher")
     _reaper(state, now)

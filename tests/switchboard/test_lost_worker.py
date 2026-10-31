@@ -457,6 +457,70 @@ class TestLostWorkerReadRound(unittest.TestCase):
         r.created("w1")
         self.assertEqual([x["name"] for x in r.passes()], ["w1"])
 
+    BAD = [None, "x", 5, [1], {"a": 1}, True, 10 ** 30, {"a": {"b": [1]}}]
+    VALID = {"reaper_ok": [5], "catchup": [True], "stop": [{"a": 1}], "report": [{"a": 1}], "gone": [{"a": 1}]}   # the one bad value of the table that is a good value of that key
+    KEYS = ("offsets", "alerted", "created", "stop", "report", "refused", "seen", "gone", "reaper", "reaper_ok", "reaper_outage", "reaper_gap",
+            "reaper_new", "catchup")
+
+    def bad_table(self):
+        return {key: [b for b in self.BAD if not any(type(b) is type(v) and b == v for v in self.VALID.get(key, []))] for key in self.KEYS}
+
+    def keys_read(self):
+        """Every constant key the module reads or writes on the loaded memory (`state` or `data`), from the code."""
+        import ast
+        found = set()
+        for node in ast.walk(ast.parse((REPO / "bin" / "lost_worker.py").read_text())):
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in ("state", "data") and isinstance(node.slice, ast.Constant):
+                found.add(node.slice.value)
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id in ("state", "data")
+                    and node.func.attr in ("get", "setdefault", "pop") and node.args and isinstance(node.args[0], ast.Constant)):
+                found.add(node.args[0].value)
+            if isinstance(node, ast.Compare) and isinstance(node.left, ast.Constant) and any(isinstance(c, ast.Name) and c.id in ("state", "data") for c in node.comparators):
+                found.add(node.left.value)
+        return {k for k in found if isinstance(k, str)} - {"_gap_ready"}
+
+    def check_every_key(self, module):
+        """Raises when any bad value of any memory key makes a pass raise, is kept in the saved memory, or stops a recent failed reaper line alerting."""
+        global load
+        real, load = load, (lambda: module)
+        try:
+            table = self.bad_table()
+            unlisted = self.keys_read() - set(table)
+            self.assertEqual(unlisted, set(), "a memory key the code reads has no row in the bad-value table: %s" % sorted(unlisted))
+            self.assertEqual(set(module._CLEANERS), set(table))
+            for key, values in table.items():
+                for bad in values:
+                    probe = {key: json.loads(json.dumps(bad))}
+                    module._sanitize(probe)   # the one place the loaded memory is checked: the bad value does not come out of it
+                    self.assertNotEqual(probe.get(key, "<missing>"), bad, (key, bad))
+                    r = self.rig()
+                    with open(os.path.join(r.dir, "lost-workers.json"), "w") as handle:
+                        json.dump({"offsets": {}, "alerted": {}, key: bad}, handle)
+                    line(r.launcher, ts=stamp(NOW - 500), worker="", runtime_id="reaper", action="refresh-cluster-token", ok=True, reason="")
+                    self.failed(r, 60, "recent")
+                    r.created("w1", deadline=NOW + 600)
+                    r.alive["loc"] = {"lane": "boss", "ask": "ask-9"}
+                    for _ in range(2):   # the second pass reads what the first wrote
+                        r.passes()
+                    self.assertTrue(self.reaper_texts(r), (key, bad))
+                    saved = json.load(open(os.path.join(r.dir, "lost-workers.json")))
+                    self.assertNotEqual(saved.get(key, "<missing>"), bad, (key, bad))
+        finally:
+            load = real
+
+    def test_every_memory_key_is_cleaned_in_one_place_and_the_table_is_complete_by_construction(self):
+        self.check_every_key(load())
+
+    def test_skipping_the_check_of_any_one_memory_key_is_caught(self):
+        src = (REPO / "bin" / "lost_worker.py").read_text()
+        for key in self.KEYS:
+            old = '    "%s": ' % key
+            start = src.index(old, src.index("_CLEANERS = {"))
+            end = src.index(",\n", start)
+            mutant = self.mutant(src[start:end + 2], old + "(lambda v: v),\n")
+            with self.assertRaises(Exception, msg=key):
+                self.check_every_key(mutant)
+
     def test_the_catch_up_flag_is_set_only_with_no_usable_memory(self):
         r = self.rig()   # a valid memory, an audit more than one chunk behind
         self.pad(r.engine.audit.path, 3 << 19, "switchboard")
