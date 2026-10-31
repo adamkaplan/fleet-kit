@@ -1096,7 +1096,7 @@ class HubReadAndTransport(unittest.TestCase):
         ran_connect, entered = [], threading.Event()   # the threads that ran a held connect: the post's connection is made by the late thread itself
         def connect_hook(conn):
             if slow_for["post"] and slow_for.get("armed"):
-                if not gate.is_set(): ran_connect.append(threading.current_thread())
+                if not gate.is_set(): ran_connect.append(threading.current_thread()); entered.set()
                 gate.wait(20)
                 conn.timeout = 30   # once released the 0.4 s cut no longer binds: 30 s (product default, 75 times the cut) so a loaded runner cannot time out
             return real(conn)
