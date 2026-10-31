@@ -2827,6 +2827,8 @@ owner and key while it was on its way, is not delivered, and `reminder.drop_in_f
 When some facts of a plan are dropped this way the plan is decided again from the facts left (a wake planned for a dropped fact does not
 carry the rest); a changed action is audited as `recheck`. A reminders file that cannot be read at this step defers the delivery to the next pass: nothing is sent or lost. The audit line `source.error` for it names the file and the error class only, never reminder text.
 
+A due reminder that is not delivered in a pass writes one `reminder.waiting` audit line: the reminder id, the recipient, the minutes it is past due and a one-line reason (the plan action and its reason, a batch window, a hold or an engaged note; `condition unreadable`; or `lane in a turn of N minutes, queued`). It is written once per reminder and reason, again when the reason changes, and every 30 minutes while the reminder waits. The line only says why; it does not deliver the reminder sooner, and no bound on the wait is set by it.
+
 **Quiet wakes (Chief of Staff).** When other news is in the same wake, every `worker.idle` line of a worker that
 ended cleanly (`succeeded`) is folded into ONE line, `- quiet: N worker finishes with no change (names)`, whose keys are
 still carried. A worker that failed, errored or was aborted is never folded: its line is shown in full. A stop after a

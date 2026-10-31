@@ -529,6 +529,26 @@ class ReminderFacts:
             return "%s reported to %s since the launch" % (worker, item["to"])
         return "deliver"
 
+    def says_again(self, item_id, reason, now):
+        """#1728: True when `reminder.waiting` is to be written for this reminder now: the first time, a changed reason, or every WAITING_REPEAT seconds."""
+        said = self.__dict__.setdefault("_said", {})
+        before = said.get(item_id)
+        if before is not None and before[0] == reason and 0 <= now - before[1] < WAITING_REPEAT:
+            return False
+        if len(said) > 1000:
+            said.clear()
+        said[item_id] = (reason, now)
+        return True
+
+    def waiting(self, item_id, recipient, due, reason):
+        """#1728: one `reminder.waiting` audit line (id, recipient, minutes past due, a one-line reason) for a due reminder not delivered in this pass."""
+        if self.engine is None or self.engine.audit is None:
+            return
+        now, reason = self.engine.now(), _one_line(reason, 160)
+        if self.says_again(item_id, reason, now):
+            self.engine.audit.append(self.engine.actor, "reminder.waiting", recipient,
+                                     {"id": item_id, "late_min": max(0, int((now - due) // 60)), "reason": reason})
+
     def notify_drop(self, item, why):
         """#1132: a reminder dropped because its issue closed or its pull request merged tells its setter ONCE. Called only by the caller
         that removed the reminder from the file (`gone` was non-empty), so a second sweep finds nothing to drop and sends nothing."""
@@ -592,6 +612,7 @@ class ReminderFacts:
             if item.get("condition"):
                 found = self.verdict(item)
                 if found is None:
+                    self.waiting(item["id"], item["to"], item["at"], "condition unreadable")
                     continue
                 if found != "deliver":
                     gone = remove_reminders(self.state_dir, {item["id"]})
@@ -612,6 +633,39 @@ class ReminderFacts:
             if isinstance(item.get("wake_class"), str):
                 facts[-1].wake_class = item["wake_class"]
         return facts
+
+
+WAITING_REPEAT = 1800   # #1728: seconds between two `reminder.waiting` lines for the same reminder and reason
+
+
+def waiting_reason(engine, plan, now):
+    """#1728: why the reminders of this plan do not reach the lane now, or None (a wake that goes in at once, or a steer)."""
+    if plan.action != "wake":
+        return "%s: %s" % (plan.action, plan.reason)
+    observation = plan.observation
+    if observation is None or observation.status != "working":
+        return None
+    age = None
+    try:
+        if engine.config.get("steer_after_minutes") and engine.state_dir is not None:
+            age = load_module("turn_start").age(engine.state_dir, observation.session_id, now, load_module("record_json").parse_bounded)
+    except Exception:
+        age = None
+    if steers_into_turn(engine.config, observation, plan.pending, getattr(engine, "discovery", None), age):
+        return None
+    return "lane in a turn of %d minutes, queued" % (age // 60) if age is not None else "lane in a turn of unknown length, queued"
+
+
+def reminder_waiting(engine, plan, now):
+    """#1728: the audit line for each due reminder in `plan` that is not delivered in this pass. Never raises: it must not stop a delivery."""
+    try:
+        source = next((s for s in engine.sources if isinstance(s, ReminderFacts)), None)
+        mine = [f for f in plan.pending if str(f.key).startswith("reminder:")]
+        reason = waiting_reason(engine, plan, now) if source is not None and mine else None
+        for fact in mine if reason else ():
+            source.waiting(fact.key[len("reminder:"):], plan.recipient, fact.created, reason)
+    except Exception:
+        pass
 
 
 def prune_delivered_reminders(engine, discovery):

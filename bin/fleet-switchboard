@@ -3331,6 +3331,7 @@ class Switchboard:
                 plan = self.plan(recipient, by_recipient[recipient], discovery, now)
                 if plan is None:
                     continue
+                reminder_waiting(self, plan, now)   # #1728
                 if plan.action == "wait":
                     report["waiting"].append(recipient)
                 elif plan.action == "hold":
