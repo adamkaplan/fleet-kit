@@ -21,7 +21,7 @@ def load():
     return module
 
 
-RUNNER = ("import sys, runpy; sys.path.insert(0, %r); import heavy_slots as h; real = h.Watchdog.__init__; "
+RUNNER = ("import sys, runpy; sys.path.insert(0, %r); import heavy_slots as h; real = h.Watchdog.__init__; h.PROC_ROOT = __import__('os').environ.get('ACME_PROC_ROOT', h.PROC_ROOT); "
           "h.Watchdog.__init__ = lambda s, *a, **k: real(s, *a, **dict(k, every=0.2)); "
           "script = sys.argv[1]; sys.argv = [script] + sys.argv[2:]; runpy.run_path(script, run_name='__main__')")
 
@@ -199,7 +199,7 @@ class TestHeavyHolders(unittest.TestCase):
         with open(lock) as held:
             root = self.tmp / "proc3"
             (root / "401" / "fd").mkdir(parents=True)
-            os.symlink("/proc/self/fd/%d" % held.fileno(), root / "401" / "fd" / "7")
+            os.symlink(("/proc/self/fd/%d" if os.path.isdir("/proc/self/fd") else "/dev/fd/%d") % held.fileno(), root / "401" / "fd" / "7")
             self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), {401})   # present: found
             os.unlink(lock)
             # the fd link still stats the open inode, but the path stat fails, so nothing is compared: an empty set
@@ -218,7 +218,11 @@ class TestHeavyHolders(unittest.TestCase):
             self.addCleanup(held.kill)
             self.assertEqual(held.stdout.readline().strip(), b"up")
         env = {k: v for k, v in os.environ.items() if k not in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI")}
-        env.update(XDG_STATE_HOME=str(state), PATH=self.no_lsof_path(), FLEET_HEAVY_MEM_MB="100000", FLEET_HEAVY_REPORT_SECONDS="0.3")
+        fake = state / "proc"   # a fake process directory, so the proc route is taken on any platform (a Mac has no /proc)
+        (fake / "4242" / "fd").mkdir(parents=True)
+        if stranger:
+            os.symlink(str(lock), fake / "4242" / "fd" / "3")
+        env.update(ACME_PROC_ROOT=str(fake), XDG_STATE_HOME=str(state), PATH=self.no_lsof_path(), FLEET_HEAVY_MEM_MB="100000", FLEET_HEAVY_REPORT_SECONDS="0.3")
         argv = [sys.executable, "-c", RUNNER % str(BIN), str(BIN / "fleet-switchboard"), "heavy", "--slots", "1", "--name", "acme", "--",
                 "sh", "-c", "echo out-line; echo err-line >&2; sleep 1.5; echo done-line"]
         merged = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90, stdin=subprocess.DEVNULL)
