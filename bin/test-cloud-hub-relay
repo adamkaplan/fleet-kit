@@ -379,6 +379,9 @@ class TestBoundsAndCaps(unittest.TestCase):
                 handlers.append(threading.current_thread())
                 return orig_handler(*a, **kw)
             hub.server.process_request_thread = tracked_handler
+            def show_join():   # runs after release_all: the joins are in the log, printed only when the guard printed it
+                if shown[0]: sys.stderr.write("\n".join(elog[shown[0]:]) + "\n")
+            self.addCleanup(show_join)
             def release_all():   # no time bound on the held waits: every one is answered here, so a failure never hangs the run (the hub's server is already closed here: the answer goes to the relay itself)
                 end = time.monotonic() + 10
                 while hub.relay.pending and time.monotonic() < end:
@@ -387,13 +390,31 @@ class TestBoundsAndCaps(unittest.TestCase):
                     time.sleep(0.01)
                 for t in threads:
                     t.join(10)
+                note("join of the held call threads done")
                 stuck = [t for t in threads if t.is_alive()]
                 self.assertFalse(stuck, "%d held relay call threads did not end within 10 seconds" % len(stuck))
                 for h in list(handlers):   # the answers are delivered: the server's handler threads must end before the test ends
                     h.join(10)
+                note("join of the handler threads done")
                 live = [h.name for h in handlers if h.is_alive()]
                 self.assertFalse(live, "hub handler threads did not end within 10 seconds: %s" % live)
             self.addCleanup(release_all)
+            elog, shown, t0, elock = [], [0], [None], threading.Lock()   # the test's own event log, printed on failure only
+            def note(msg):
+                with elock:
+                    t0[0] = time.monotonic() if t0[0] is None else t0[0]
+                    elog.append("%8.4f %s" % (time.monotonic() - t0[0], msg))
+            real_held = hub.held_call
+            def logged_held(**kw):
+                note("start held call %s/%s" % (kw.get("who"), kw.get("call_id")))
+                try:
+                    res = real_held(**kw)
+                except BaseException as e:
+                    note("end held call %s/%s: %s: %s" % (kw.get("who"), kw.get("call_id"), type(e).__name__, e))
+                    raise
+                note("end held call %s/%s: %s %s" % (kw.get("who"), kw.get("call_id"), res[0], str(res[1])[:100]))
+                return res
+            hub.held_call = logged_held
             for i in range(4):          # 4 pods x 4 held waits = 16 held
                 for j in range(4):
                     t = threading.Thread(target=hub.held_call, kwargs={"who": "pod-%d" % i, "call_id": "c%d" % j, "pr": "acme-org/r%d#1" % i}); t.start(); threads.append(t)
@@ -401,6 +422,8 @@ class TestBoundsAndCaps(unittest.TestCase):
                 if registered.wait(0.02):
                     return True
                 if not registered.is_set() and not all(t.is_alive() for t in threads):
+                    note("guard fired: %d waits registered, %d of 16 calls alive" % (sum(hub.relay.waiting.values()), sum(t.is_alive() for t in threads)))
+                    sys.stderr.write("\n".join(elog[:]) + "\n"); shown[0] = len(elog)
                     raise AssertionError("a held relay call ended before all 16 were registered")
                 return False
             self.wait_for(all_registered)
