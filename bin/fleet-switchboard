@@ -7462,6 +7462,7 @@ def add_close_pane_parsers(sub):
 
 def add_retire_parsers(sub):
     retire = sub.add_parser("retire", help="Mark a finished worker RETIRED (not watched, not reattached); `--undo` reverses. Nothing is deleted or closed")
+    retire.epilog = "A cloud worker whose end hook could not push is kept: to save its tree, send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally."
     retire.add_argument("name", help="The agent's fleet name")
     retire.add_argument("--reason", help="Why (one line)")
     retire.add_argument("--undo", action="store_true", help="Watch it again")
@@ -23341,6 +23342,7 @@ def build_parser():
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
     launch = sub.add_parser("launch", help="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing", description="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5.")
+    launch.epilog = "A cloud worker kept by retire (its end hook could not push): send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally."
     launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
     launch.add_argument("--agent", help="The OpenCode agent definition, such as coder")
     launch.add_argument("--dir", help="The agent's working directory (absolute)")

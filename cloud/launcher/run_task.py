@@ -375,7 +375,7 @@ class Driver:
                 self.stopped = False
             self.stop_failed = not self.stopped
         if self.stop_failed:
-            self.say("the worker is kept (its end hook could not push, see above); delete it only after the work is saved: %s"
+            self.say("the worker is kept (its end hook could not push, see above); delete it only after the work is saved (to save it, send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally): %s"
                      % self.kube.delete_command("pod", self.name))
         if self.created:
             self.secret_line()

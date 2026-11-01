@@ -424,6 +424,7 @@ compaction and when the file changes.
 **Finished a worker? Retire it.** When a worker has made its final `done` or `failed` report and you close its tab, run
 `fleet-switchboard retire <name> [--reason "..."]` so the fleet does not report it dead or invite a reattach. (If you close the tab after its final
 report the switchboard retires it by itself; retire is for the cases it cannot tell.) `retire --undo <name>` reverses it; nothing is deleted.
+If a cloud worker is kept because its end hook could not push, send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally; the force-delete discards its work.
 
 ## Heavy runs
 
