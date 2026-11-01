@@ -1342,7 +1342,7 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
         result = {"archive": os.path.basename(archive), "lines": old.count(b"\n"), "bytes": len(old), "kept": len(data) - cut, "pruned": 0}
         if dry_run:
             return result
-        gz_temp = os.path.join(directory, ".audit.%d.gz.tmp" % os.getpid())
+        gz_temp = os.path.join(directory, ".audit.%d.%s.gz.tmp" % (os.getpid(), secrets.token_hex(4)))
         temps.append(gz_temp)
         with os.fdopen(os.open(gz_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as raw:
             with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0) as packed:
@@ -1361,9 +1361,9 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
         os.unlink(gz_temp)
         temps.remove(gz_temp)
         mine = os.path.basename(archive)
-        keep_temp = os.path.join(directory, ".audit.%d.tmp" % os.getpid())
-        temps.append(keep_temp)
+        keep_temp = os.path.join(directory, ".audit.%d.%s.tmp" % (os.getpid(), secrets.token_hex(4)))
         keep_fd = os.open(keep_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)   # created BEFORE pending: its identity is new_id
+        temps.append(keep_temp)
         kst = os.fstat(keep_fd)
         mine_pending = {"cut": cut, "old_size": len(data), "archive": mine, "ts": now.timestamp(), "new_id": [kst.st_dev, kst.st_ino]}
         wrote = []
