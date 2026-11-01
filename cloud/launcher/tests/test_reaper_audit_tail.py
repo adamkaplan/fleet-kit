@@ -601,5 +601,86 @@ class TestTotalWithGaps(unittest.TestCase):
         print("S11: copy that does not clear the dictionary fails: the steps of the pass before were shown")
 
 
+class DipClock(StepClock):
+    """The fake monotonic clock of S8 that returns a value `back` seconds SMALLER at its `at`-th read only (the 3rd read ends the pod list)."""
+    def __init__(self, at=3, back=5.0):
+        StepClock.__init__(self)
+        self.n, self.at, self.back = 0, at, back
+
+    def monotonic(self):
+        self.n += 1
+        return self.t - self.back if self.n == self.at else self.t
+
+
+def s12_numbers(test, mod):
+    clock = DipClock()
+    real = StepClock
+    try:
+        globals()["StepClock"] = lambda: clock   # the S8 world builds its clock through StepClock()
+        text = step_pass_text(test, mod)
+    finally:
+        globals()["StepClock"] = real
+    line = [x for x in text.splitlines() if "reaper pass line" in x]
+    assert len(line) == 1, line
+    import re
+    nums = [float(x) for x in re.findall(r"=(-?\d+\.\d)", line[0].split(" steps ", 1)[1])]
+    if any(n < 0 for n in nums):
+        raise AssertionError("a negative number was printed")
+    return line[0], nums
+
+
+class TestClockStepsBack(unittest.TestCase):
+    def test_s12_clock_steps_back(self):
+        line, nums = s12_numbers(self, build_module())   # the control first
+        self.assertEqual(len(nums), 8)
+        print("S12: control: a read 5 seconds smaller at the end of the pod list; %d seconds in the line, min %.1f: %s" % (len(nums), min(nums), line.split(" steps ", 1)[1]))
+        with self.assertRaisesRegex(AssertionError, "^a negative number was printed$"):
+            s12_numbers(self, build_module(("return max(0.0, float(v))", "return float(v)")))
+        print("S12: copy without the clamp fails: a negative number was printed")
+
+
+BAD_DICTS = (None, {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": 0, "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": None},
+             {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": "x", "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": 1.0, "start": 0.0})
+
+
+def s13_check(test, mod):
+    for d in BAD_DICTS:
+        try:
+            got = mod.step_text(d)
+        except Exception:
+            raise AssertionError("step_text raised inside the finally")
+        assert got == "", got
+    f, L, clock, state = s11_world(test, mod)
+
+    def reap():
+        L.step_seconds = BAD_DICTS[2]
+        raise RuntimeError("the pass's own error")
+    L.reap = reap
+    err = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        try:
+            mod._reap_main({"CW_CLOUD_NAMESPACE": "cw"}, types.SimpleNamespace(loop=0), lambda s: None, clock=lambda: T0,
+                           refresher=f.refresher, kube=L.kube)
+        except RuntimeError as e:
+            own = str(e)
+        except Exception:
+            raise AssertionError("step_text raised inside the finally")
+        else:
+            raise AssertionError("the pass did not end with its own error")
+    lines = [x for x in err.getvalue().splitlines() if "reaper pass line" in x]
+    assert len(lines) == 1 and " steps " not in lines[0], lines
+    return own, lines[0]
+
+
+class TestBadDictionaries(unittest.TestCase):
+    def test_s13_step_text_never_raises(self):
+        own, line = s13_check(self, build_module())   # the control first
+        self.assertEqual(own, "the pass's own error")
+        print("S13: control: 3 of 3 dictionaries (missing, no start with total None, activity_n 'x') give no step part, 0 raised; the pass ended with its own error %r; line: %s" % (own, line.split("audit_lines_parsed=", 1)[1].strip() or "(no step part)"))
+        with self.assertRaisesRegex(AssertionError, "^step_text raised inside the finally$"):
+            s13_check(self, build_module(("    except Exception:\n        return \"\"\n", "    except ZeroDivisionError:\n        return \"\"\n")))
+        print("S13: copy without the guard fails: step_text raised inside the finally")
+
+
 if __name__ == "__main__":
     unittest.main()
