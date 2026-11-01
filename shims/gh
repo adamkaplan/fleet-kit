@@ -1286,16 +1286,31 @@ API_FIELD_FLAGS = ("-f", "--raw-field", "-F", "--field")
 API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API))
 
 
-SHORT_EQ_RE = re.compile(r"^-[A-Za-z]=")
+SHORT_VALUE_LETTERS = "XfFHRqtp"   # the value-taking short flags of gh api (API_VALUE_FLAGS and -R); every other short letter (-i, -h) is a boolean
+
+
+def short_eq_token(arg):
+    """True when a single-dash argument, walked letter by letter as pflag does, meets an '=' where a flag letter or the joined value should start: boolean
+    letters continue the walk, the first value-taking letter ends it (what follows is its joined value: -fbody=x, -XPOST, -iXPOST are the legal joined forms),
+    and an '=' straight after a letter (-f=body=x, -iX=POST, -ii=) is the form pflag strips and this reader would misread."""
+    if not arg.startswith("-") or arg.startswith("--") or len(arg) < 2:
+        return False
+    for pos in range(1, len(arg)):
+        ch = arg[pos]
+        if ch == "=":
+            return pos > 1
+        if ch in SHORT_VALUE_LETTERS:
+            return arg[pos + 1:pos + 2] == "="
+    return False
 
 
 def refuse_short_eq(args):
-    """#1696 round 5: a short option written with an attached '=' (-f=body=x, -H=NAME:value, -X=POST, -i=...) is refused wherever argv is first read: the real
-    option parser and this reader do not agree on what it means, so the shim does not guess. Long options (--field=body=x) are not affected."""
+    """#1696 round 6: a short option written with an attached '=' (-f=body=x, -H=NAME:value, -X=POST, -iX=POST, -if=body=x) is refused wherever argv is first read: the
+    real option parser strips the '=' and this reader does not, so the shim does not guess. Long options (--field=body=x) are not affected."""
     for arg in args[1:]:
         if arg == "--":
             break
-        if SHORT_EQ_RE.match(arg):
+        if short_eq_token(arg):
             raise Refused("the short option %s is written with an attached '=': it is refused because the shim and gh read it differently; write the value as a separate word or use the long form (--field=..., --header=...)" % _clean_reason(arg[:40]))
 
 

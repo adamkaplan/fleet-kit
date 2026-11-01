@@ -1112,6 +1112,11 @@ SHORT_EQ_FORMS = {   # name -> argv after api
     "-p= (value-taking)": (COMMENTS, "-p=x"), "-q= (value-taking)": (COMMENTS, "-q=x"), "-t= (value-taking)": (COMMENTS, "-t=x"),
     "-i= (boolean)": ("repos/o/r/issues", "-i="), "-h= (boolean)": ("repos/o/r/issues", "-h="),
 }
+CLUSTER_FORMS = {
+    "-iX=POST": (COMMENTS, "-iX=POST", "-f", "body=x"), "-if=body=x": (COMMENTS, "-if=body=x"),
+    "-iiX=POST": (COMMENTS, "-iiX=POST", "-f", "body=x"), "-iF=body=@f": (COMMENTS, "-iF=body=@/dev/null"),
+    "-iH=override": ("repos/o/r/issues/1", "-X", "POST", "-iH=X-HTTP-Method-Override:PATCH", "-f", "title=x"),
+}
 QUERY_FORMS = {
     "mutation in url query, POST": ("graphql?query=mutation{x}", "-X", "POST", "-f", "query={viewer{login}}"),
     "mutation in url query, bare GET": ("graphql?query=mutation{x}",),
@@ -1167,7 +1172,7 @@ class TestGhShimRound5(unittest.TestCase):
         self.assertEqual(len(calls), 1, gh_err(done))
 
     def test_mutant_short_equals_refusal_removed_is_seen(self):
-        rig = self.mutant_rig('SHORT_EQ_RE = re.compile(r"^-[A-Za-z]=")', 'SHORT_EQ_RE = re.compile(r"^\\0$")')
+        rig = self.mutant_rig('        if short_eq_token(arg):', '        if False:')
         seen = self.failing(rig, SHORT_EQ_FORMS, EQ_ANCHOR)
         print("R5 mutant short '=' refusal removed: %d of %d forms fail: %s; control %d" % (len(seen), len(SHORT_EQ_FORMS), seen, len(self.failing(self.rig, SHORT_EQ_FORMS, EQ_ANCHOR))))
         self.assertEqual(seen, list(SHORT_EQ_FORMS))
@@ -1179,3 +1184,35 @@ class TestGhShimRound5(unittest.TestCase):
         print("R5 mutant graphql '?' refusal removed: %d of %d forms fail: %s" % (len(seen), len(QUERY_FORMS), seen))
         self.assertEqual(seen, list(QUERY_FORMS))
         self.assertEqual(self.failing(self.rig, QUERY_FORMS, Q_ANCHOR), [])
+
+
+    def test_cluster_forms_are_refused(self):
+        self.assertEqual(self.failing(self.rig, CLUSTER_FORMS, EQ_ANCHOR), [])
+        done, calls = self.rig.run("api", COMMENTS, "-H=X-HTTP-Method-Override:PATCH", "-f", "body=x")
+        self.assertEqual(calls, [])
+        self.assertTrue(gh_err(done).startswith(EQ_ANCHOR))
+
+    def test_joined_cluster_forms_still_work(self):
+        done, calls = self.rig.run("api", COMMENTS, "-ifbody=x")   # joined, no '=' after the flag letter: not the '=' rule's; the bundled field is not read by api_parse, so (as before) the call is refused as unreadable, never passed unsigned
+        self.assertEqual(calls, [])
+        self.assertTrue(gh_err(done).startswith("gh: refused: the flags of this gh api call") and not gh_err(done).startswith(EQ_ANCHOR), gh_err(done))
+        done, calls = self.rig.run("api", COMMENTS, "-fbody=x")   # the plain joined form signs once
+        self.assertEqual(len(calls), 1, gh_err(done))
+        self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
+        done, calls = self.rig.run("api", COMMENTS, "-iXPOST", "-f", "body=x")   # a POST on an allow-listed path: signed
+        self.assertEqual(len(calls), 1, gh_err(done))
+        self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
+        done, calls = self.rig.run("api", "repos/o/r/unknownthing", "-iXPOST")   # a write on an unknown path: refused
+        self.assertEqual(calls, [])
+        self.assertTrue(gh_err(done).startswith("gh: refused:") and not gh_err(done).startswith(EQ_ANCHOR), gh_err(done))
+        done, calls = self.rig.run("api", "repos/o/r/issues", "-i")
+        self.assertEqual(len(calls), 1, gh_err(done))
+        done, calls = self.rig.run("api", "repos/o/r/issues", "-ii")
+        self.assertEqual(len(calls), 1, gh_err(done))
+
+    def test_mutant_one_letter_rule_fails_the_cluster_forms(self):
+        rig = self.mutant_rig('        if short_eq_token(arg):', '        if re.match(r"^-[A-Za-z]=", arg):')
+        seen = self.failing(rig, CLUSTER_FORMS, EQ_ANCHOR)
+        print("R6 mutant one-letter rule: %d of %d cluster forms fail: %s; control %d" % (len(seen), len(CLUSTER_FORMS), seen, len(self.failing(self.rig, CLUSTER_FORMS, EQ_ANCHOR))))
+        self.assertEqual(seen, list(CLUSTER_FORMS))
+        self.assertEqual(self.failing(self.rig, CLUSTER_FORMS, EQ_ANCHOR), [])
