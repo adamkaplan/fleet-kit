@@ -1750,7 +1750,7 @@ class TestNeedsDocker(Base):   # #1488
 class TestKeptRetireNamesTheSave(Base):   # #1791
     SENTENCE = "send the pod one message to commit its tree on a NEW branch and push it there plainly, read the branch from origin, then retire normally"
     FORCE = "(only if there is nothing to save, `cloud-worker delete coder7 --force` is the explicit last resort: it discards the pod and its work)"
-    GUARD = 'sys.stderr.write(recover + "\n" + hint + "\n")'
+    GUARD = 'sys.stderr.write(recover + "\\n" + hint + "\\n")'
 
     def prompts(self):
         return [b for m, path, b in self.remote.bodies if m == "POST" and path.endswith("/prompt")]
@@ -1763,7 +1763,7 @@ class TestKeptRetireNamesTheSave(Base):   # #1791
         return res, len(self.prompts()) - before
 
     def check_order(self, err):
-        lines = [l for l in err.splitlines() if l.strip()]
+        lines = [l for l in err.splitlines() if l.startswith("fleet-switchboard:")]   # the launcher's own ResourceWarning noise is not an answer line
         self.assertEqual(len(lines), 2, err)   # both lines, no more
         self.assertIn("NEW branch", lines[0], "the recover line must come first: " + err)
         self.assertIn("--force", lines[1], "the force-delete line must come second, after the recover line: " + err)
@@ -1773,7 +1773,7 @@ class TestKeptRetireNamesTheSave(Base):   # #1791
         (code, out, err), _ = self.kept()
         self.assertEqual(code, 1)
         self.check_order(err)
-        first = err.splitlines()[0]
+        first = [l for l in err.splitlines() if l.startswith("fleet-switchboard:")][0]
         self.assertIn("send", first)
         self.assertIn('fleet-switchboard send coder7 "', first)
         self.assertIn("coder7-save", first)
