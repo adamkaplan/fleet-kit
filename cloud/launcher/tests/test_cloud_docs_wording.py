@@ -95,6 +95,14 @@ class TestClusterServerWording(unittest.TestCase):
     def test_window_sentence_present(self):
         self.assertTrue(has_window(read(QS)))
 
+    def test_no_commit_paragraph_present(self):   # #1771 S8
+        text = read(os.path.join(ROOT, "docs", "cloud-worker-interface.md"))
+        para = [p for p in text.split("\n") if p.startswith("- **A pod launched not to commit")]
+        self.assertEqual(len(para), 1)
+        for word in ("cw/no-commit", "no-commit-unreadable", "--role tester", "--role reviewer"):
+            self.assertIn(word, para[0])
+        self.assertNotIn("A pod launched not to commit", text.replace(para[0], ""))   # removed: the check fails
+
     # mutants: a copy of the text with the claim broken; the REAL check must then fail
     def test_mutants_are_caught(self):
         for name, get in PLACES.items():
