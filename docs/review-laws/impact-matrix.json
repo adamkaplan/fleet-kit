@@ -641,6 +641,7 @@
           "MessageTooLong",
           "Plan",
           "_line_of",
+          "clock_day",
           "clock_utc",
           "collapse_riders",
           "compose",
