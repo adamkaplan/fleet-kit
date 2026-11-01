@@ -2558,6 +2558,8 @@ class Switchboard:
         self.request_keys = None        # PR 18: "<session>:<request id>" of every request pending at the last derivation
         self.gh_runner = None           # PR notices: the runner for `gh pr view` (None: subprocess.run)
         self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
+        self.unconsumed_seen = collections.OrderedDict()    # #1844: inbox ids whose steer was tried (bounded): at most one try per item
+        self.reminder_memory = collections.OrderedDict()    # #1844: "reminder:<id>" -> (dedupe key, from, to) of a reminder delivered by THIS process (bounded; empty after a restart)
         self.stopped_news = {}          # #96: worker.stopped key -> judged clearly no news (decided once per note)
         self.awaiting_held_links = True        # #796: cleared by the first load tick whose held-PR links were all whole (it lapses after HELD_LINKS_WAIT_SECONDS)
         self.awaiting_first_full_pass = True   # #796: set False once a pass has published a non-provisional decisions file; the load tick judges nothing before
@@ -3169,6 +3171,7 @@ class Switchboard:
             else:
                 raise   # a 5xx, 408, timeout, bad_json, a dropped call: the fate is unknown, so the reservation STAYS (counts as delivered; status says how many)
         self.reads.forget(observation.session_id)   # we wrote to it: its inbox and times are not what was remembered
+        self.supersede_queued_reminders(observation, carried)   # #1844: after the new copy is in, an older delivered copy of its key is removed
         if self.light:
             self.sent.confirm(observation.session_id, keys, self.now())
         self._acknowledge(keys)
@@ -3278,6 +3281,85 @@ class Switchboard:
             converted.append(item.get("id"))
         return converted
 
+    UNCONSUMED_CAP = 500
+
+    def steer_unconsumed(self, observation, now):
+        """#1844: a message this daemon delivered as `queue` that the WORKING lane has not consumed within `unconsumed_steer_minutes` is
+        steered into the running turn, once per item (a refusal is audited once per item too). Held lanes are left alone. Returns the ids steered."""
+        minutes = self.config.get("unconsumed_steer_minutes")
+        if self.light or not minutes or hold_reason(observation) or observation.status != "working":
+            return []
+        bound = minutes * 60
+        def stale(inbox):
+            return [item for item in (inbox if isinstance(inbox, list) else [])
+                    if isinstance(item, dict) and item.get("id") not in self.unconsumed_seen and _fleet_meta(item) is not None
+                    and item.get("delivery") == "queue" and _created(item) is not None and now - _created(item) >= bound]
+        found = stale(self.reads.inbox(observation.session_id, now))
+        if found:   # what is remembered says one waits: read it afresh before the write
+            found = stale(self.reads.inbox(observation.session_id, now, fresh=True))
+        steered = []
+        for item in found:
+            self.unconsumed_seen[item.get("id")] = True
+            while len(self.unconsumed_seen) > self.UNCONSUMED_CAP:
+                self.unconsumed_seen.popitem(last=False)
+            detail = {"session": observation.session_id, "inbox_id": item.get("id"), "keys": _fleet_keys(item),
+                      "age_seconds": int(now - _created(item))}
+            try:
+                with self._external("v2.inbox.update", observation.name, dict(detail, delivery="steer", why="unconsumed")):
+                    self.v2.inbox_update(observation.session_id, item.get("id"), "steer")
+            except V2Error as err:
+                self.audit.append(self.actor, "unconsumed.refused", observation.name,
+                                  dict(detail, error=_one_line(str(err), 200)))
+                continue
+            self.audit.append(self.actor, "unconsumed.steer", observation.name, detail)
+            steered.append(item.get("id"))
+        if steered:
+            self.reads.forget(observation.session_id)
+        return steered
+
+    def supersede_queued_reminders(self, observation, carried):
+        """#1844: a keyed reminder was just delivered: an older delivered copy of the same key, sender and recipient that is still in the lane's
+        inbox is removed (`session.inbox.cancel`). Only what this process delivered is known (memory): after a restart the older copy stays.
+        Never raises: the delivery already happened."""
+        try:
+            source = next((s for s in self.sources if isinstance(s, ReminderFacts)), None)
+            if source is None or self.light or self.audit is None:
+                return []
+            items = {i["id"]: i for i in read_reminders(source.state_dir)}
+            mine = []
+            for fact in carried:
+                item = items.get(str(fact.key)[len("reminder:"):]) if str(fact.key).startswith("reminder:") else None
+                if item is None or not item.get("key") or not isinstance(item.get("from"), str) or not item["from"].strip():
+                    continue
+                mine.append((fact.key, (item["key"], item["from"], item.get("to"))))
+            older = {}
+            for new_key, ident in mine:
+                older.update({k: v for k, v in self.reminder_memory.items() if v == ident and k != new_key})
+            for new_key, ident in mine:
+                self.reminder_memory[new_key] = ident
+                self.reminder_memory.move_to_end(new_key)
+            while len(self.reminder_memory) > self.UNCONSUMED_CAP:
+                self.reminder_memory.popitem(last=False)
+            if not older:
+                return []
+            cancelled = []
+            for item in self.reads.inbox(observation.session_id, self.now(), fresh=True) or []:
+                keys = _fleet_keys(item) if isinstance(item, dict) else []
+                if keys and all(k in older for k in keys):
+                    with self._external("v2.inbox.cancel", observation.name, {
+                            "session": observation.session_id, "inbox_id": item.get("id"), "keys": keys,
+                            "why": "reminder re-armed"}):
+                        self.v2.inbox_cancel(observation.session_id, item.get("id"))
+                    for k in keys:
+                        self.reminder_memory.pop(k, None)
+                    cancelled.append(item.get("id"))
+            if cancelled:
+                self.reads.forget(observation.session_id)
+            return cancelled
+        except Exception as err:
+            self._note("reminder.cancel_queued.error", observation.name, {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+            return []
+
     # -- the pass
 
     def _failed(self, subject, step, err, report):
@@ -3312,6 +3394,10 @@ class Switchboard:
                 report["converted"].extend(self.convert_lapsed_notes(observation, now))
             except Exception as err:
                 self._failed(observation.name, "convert", err, report)
+            try:
+                self.steer_unconsumed(observation, now)
+            except Exception as err:
+                self._failed(observation.name, "unconsumed", err, report)
         run_shadow_classifier(self, discovery, now)  # PR 7: logs, acts on nothing
         facts, _ = self.collect_facts()
         try:
