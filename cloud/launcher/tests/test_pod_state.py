@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, os.environ.get("CW_PROBE_LAUNCHER") or os.path.dirname(HERE))   # a mutant's scratch copy, when probed
 import cloud_worker as cw  # noqa: E402
 import run_record  # noqa: E402
 
@@ -79,6 +79,8 @@ class FakeKube:
 
     def pod_events(self, name):
         self.log.append("pod_events")
+        if self.deleted:   # the cluster's events of a deleted pod are no longer read
+            return []
         if self.refuse:
             raise self.refuse
         return list(self.events)
@@ -137,7 +139,7 @@ class Stop(unittest.TestCase):
         say("S2 stop: %d of 2 stops hold phase, reason, exit code, node, 3 of 3 events, events read before the delete" % ok)
 
     def test_at_most_20_newest_events_each_cut_to_200(self):
-        kube = FakeKube(events=[ev(i, "x" * 500) for i in range(30)])
+        kube = FakeKube(events=[ev(i, "back off " * 56) for i in range(30)])
         ps = self.stop(kube)[1]["pod_state"]
         names = [e.split(":")[0] for e in ps["events"]]
         self.assertEqual(len(ps["events"]), 20)
@@ -195,5 +197,107 @@ class Stop(unittest.TestCase):
         say("U1 stop: a pod already gone writes 0 records")
 
 
+def probe():
+    """Every behaviour the plan names, checked against the launcher importable now; returns the list of what is wrong (empty: as asked)."""
+    bad = []
+    t = Stop("test_at_most_20_newest_events_each_cut_to_200")
+
+    def stopped(kube, cause=None):
+        try:
+            return t.stop(kube, cause)
+        except Exception as e:
+            bad.append("the stop raised %s" % type(e).__name__)
+            return None
+    try:
+        kube = FakeKube(events=[ev(1, "a " + TOKEN), ev(2, "b " + SECRET), ev(3, "c 10.20.30.40 registry.internal.example:5000")])
+        got = stopped(kube)
+        if got:
+            ps = got[1].get("pod_state") if isinstance(got[1].get("pod_state"), dict) else {}
+            if "pod_events" not in kube.log or "delete" not in kube.log or kube.log.index("pod_events") > kube.log.index("delete") or len(ps.get("events", [])) != 3:
+                bad.append("the pod state was read after the delete")
+            if (ps.get("containers") or [{}])[0].get("reason") != "OOMKilled" or ps.get("node") != "aks-pool-0007":
+                bad.append("the reason or the node is missing")
+            text = open(got[2]).read()
+            if any(v in text for v in PLANTED):
+                bad.append("a planted value reached the file")
+        kube = FakeKube(events=[ev(i, "back off " * 56) for i in range(30)])
+        got = stopped(kube)
+        if got:
+            events = (got[1].get("pod_state") or {}).get("events", [])
+            if len(events) != 20 or any(len(e) > 200 for e in events):
+                bad.append("the events are not 20 of at most 200 characters")
+        kube = FakeKube(phase="Running", events=[ev(1)])
+        if stopped(kube) and kube.log.count("pod_events"):
+            bad.append("the events of a running pod were read")
+        kube = FakeKube(refuse=cw.CloudError("Forbidden"))
+        got = stopped(kube)
+        ps = got[1].get("pod_state") if got else None
+        if got and (not isinstance(ps, dict) or ps.get("events_read") != "unreadable" or ps.get("phase") != "Failed"):
+            bad.append("an unreadable cluster lost the pod state")
+        if got and "delete" not in kube.log:
+            bad.append("the pod was not deleted")
+    finally:
+        t.doCleanups()
+    return bad
+
+
+LAUNCHER_DIR = os.path.dirname(HERE)
+CALL = '                self._record_pod_state(info["record"], pod, name)\n'
+AFTER_DELETE = '                self._remove(name, nonce, uid)\n                print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)\n'
+MUTANTS = [   # (name, [(old text, new text)], the anchored failure text)
+    ("read after the delete", [(CALL, "                pass\n"), (AFTER_DELETE, AFTER_DELETE + CALL)], "the pod state was read after the delete"),
+    ("events of a running pod", [('        if phase == "Running":\n            return state\n', '        if False:\n            return state\n')], "the events of a running pod were read"),
+    ("all events kept", [("items[-POD_EVENTS_MAX:]", "items")], "the events are not 20 of at most 200 characters"),
+    ("events uncut", [("self.kube.scrub(text, 1000))[:POD_EVENT_CHARS]", "self.kube.scrub(text, 1000))")], "the events are not 20 of at most 200 characters"),
+    ("a failed read raises", [("        except Exception:   # a Forbidden answer", "        except KeyError:   # a Forbidden answer")], "an unreadable cluster lost the pod state"),
+    ("events copied as given", [("mask_addresses(self.kube.scrub(text, 1000))", "text")], "a planted value reached the file"),
+]
+
+
+class Mutants(unittest.TestCase):
+    """A scratch copy of the launcher per mutant (never the file itself); the control (the unmutated copy) runs FIRST and passes."""
+    def child(self, directory):
+        import subprocess
+        env = dict(os.environ, CW_PROBE_LAUNCHER=directory, PYTHONPATH=os.path.join(os.path.dirname(LAUNCHER_DIR), "..", "bin"))   # path_walk lives in bin/
+        r = subprocess.run([sys.executable, "-B", os.path.join(HERE, "test_pod_state.py"), "--probe"], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        return [x for x in r.stdout.splitlines() if x]
+
+    def scratch(self, tmp, name):
+        import shutil
+        d = os.path.join(tmp, name)
+        os.mkdir(d)
+        for f in os.listdir(LAUNCHER_DIR):
+            if f.endswith(".py"):
+                shutil.copy(os.path.join(LAUNCHER_DIR, f), d)
+        return d
+
+    def test_the_control_passes_first_and_each_mutant_fails_with_its_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            control = self.child(self.scratch(tmp, "control"))
+            self.assertEqual(control, [])
+            say("S7 control: passes with 0 problems")
+            caught = 0
+            for i, (name, edits, anchor) in enumerate(MUTANTS):
+                d = self.scratch(tmp, "m%d" % i)
+                path = os.path.join(d, "cloud_worker.py")
+                with open(path) as f:
+                    src = f.read()
+                for old, new in edits:
+                    self.assertEqual(src.count(old), 1, "%s: the mutation text must occur once" % name)
+                    src = src.replace(old, new)
+                with open(path, "w") as f:
+                    f.write(src)
+                self.assertNotEqual(src, open(os.path.join(LAUNCHER_DIR, "cloud_worker.py")).read(), "%s: mutation not applied" % name)
+                got = self.child(d)
+                self.assertIn(anchor, got, "%s: not caught, problems %r" % (name, got))
+                caught += 1
+                say("S7 mutant %r: applied once, failed with %r" % (name, anchor))
+            self.assertEqual(caught, len(MUTANTS))
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--probe":   # the mutants' child process: prints the problems, one per line
+        print("\n".join(probe()))
+        sys.exit(0)
     unittest.main()
