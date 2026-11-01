@@ -1,6 +1,7 @@
 """The pure decision of bin/ci_fresh.py: a green run counts only on the current tip (ask #1755, S5)."""
 import json
 import os
+import subprocess
 import sys
 import types
 import unittest
@@ -287,11 +288,42 @@ class TestCiFreshReads(unittest.TestCase):
         judge(gh, reading=mod)
         self.assertEqual(gh.kinds().count("compare"), 1)
 
-    def test_s7_the_entrys_helper_reads_through_the_merge_gates_reader(self):
-        import inspect
-        src = inspect.getsource(_host().sb.ci_fresh_fact)
-        self.assertEqual(src.count("merge_gate_gh("), 1)
-        self.assertNotIn("pr view", src)
+    def test_s7_the_real_examination_reads_once_per_pair_through_the_merge_gates_reader(self):
+        sb = _host().sb
+        raw = {"state": "OPEN", "headRefOid": HEAD, "baseRefName": "main", "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]}
+        gh = CountingGh()
+        views, through_reader = [], []
+
+        def runner(argv, **kw):
+            if argv[1:3] == ["pr", "view"]:
+                views.append(argv)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
+            code, out, err = gh(argv[1:])
+            return subprocess.CompletedProcess(argv, code, out, err)
+
+        real = sb.merge_gate_gh
+
+        def counting(config, run, repo):
+            inner = real(config, run, repo)
+
+            def read(argv, own=True):
+                through_reader.append(argv)
+                return inner(argv, own)
+            return read
+        engine = types.SimpleNamespace(config=dict(sb.DEFAULTS, gh="gh"), gh_runner=runner, now=lambda: 0.0)
+        sb.load_module("pr_reading").read_behind.__defaults__[0].clear()
+        sb.merge_gate_gh = counting
+        try:
+            facts = sb.read_pr_facts(engine, "acme/app", 5)
+            first = list(gh.kinds())
+            sb.read_pr_facts(engine, "acme/app", 5)
+        finally:
+            sb.merge_gate_gh = real
+        self.assertEqual(facts["ci"], "stale: 3 behind")
+        self.assertEqual(first, ["runs", "tip", "compare"])
+        self.assertEqual(gh.kinds(), ["runs", "tip", "compare", "runs", "tip"])   # the pair is counted once per pass
+        self.assertEqual(len(views), 2)    # the examination's own view, one per examination, never a second one
+        self.assertEqual(len(through_reader), len(gh.calls))   # every GitHub read of the rule went through the merge gate's reader
 
 
 class TestCiFreshRefusalAndEvidence(unittest.TestCase):
