@@ -17,13 +17,17 @@ PINS_COMMON_WORDS = frozenset((
     "self", "args", "kwargs", "main", "name", "test", "tests", "data", "value", "values", "result", "results", "items", "item", "text", "line", "lines",
     "path", "file", "files", "list", "dict", "keys", "type", "kind", "none", "true", "false", "make", "read", "write", "load", "dump", "send", "print",
     "setup", "run", "get", "set", "init", "call", "help", "key", "now", "done", "open", "close", "check", "build", "parse", "state", "config", "error"))
-PINS_NAME_RES = (re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)"), re.compile(r"^\s*class\s+([A-Za-z_]\w*)"),
-                 re.compile(r"^\s*([A-Z][A-Z0-9_]{2,})\s*(?::[^=]+)?="))
-PINS_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
-PINS_STRING_RE = re.compile(r"\"((?:[^\"\\\n]|\\.){%d,})\"|'((?:[^'\\\n]|\\.){%d,})'" % (PINS_MIN_MESSAGE, PINS_MIN_MESSAGE))
-PINS_TEST_DEF_RE = re.compile(r"^(\s*)(?:async\s+)?def\s+(test\w*)")
-PINS_ANY_DEF_RE = re.compile(r"^(\s*)(?:async\s+)?def\s+\w+")
-PINS_CLASS_RE = re.compile(r"^(\s*)class\s+(\w+)")
+PINS_NAME_RES = (r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)", r"^\s*class\s+([A-Za-z_]\w*)", r"^\s*([A-Z][A-Z0-9_]{2,})\s*(?::[^=]+)?=")
+PINS_HUNK_RE = r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$"
+PINS_STRING_RE = r"\"((?:[^\"\\\n]|\\.){%d,})\"|'((?:[^'\\\n]|\\.){%d,})'" % (PINS_MIN_MESSAGE, PINS_MIN_MESSAGE)
+PINS_TEST_DEF_RE = r"^(\s*)(?:async\s+)?def\s+(test\w*)"
+PINS_ANY_DEF_RE = r"^(\s*)(?:async\s+)?def\s+\w+"
+PINS_CLASS_RE = r"^(\s*)class\s+(\w+)"
+
+
+def _pins_re(text):
+    import re
+    return re.compile(text)   # the re module caches compiled patterns
 
 
 class PinsError(Exception):
@@ -47,12 +51,12 @@ def _pins_name_ok(name):
 
 def pins_names_of(line):
     """The definition names a source line holds (def, class or constant assignment), the ones worth searching for."""
-    return [m.group(1) for r in PINS_NAME_RES for m in [r.match(line)] if m and _pins_name_ok(m.group(1))]
+    return [m.group(1) for r in PINS_NAME_RES for m in [_pins_re(r).match(line)] if m and _pins_name_ok(m.group(1))]
 
 
 def pins_messages_of(line):
     """The quoted strings of 12 or more characters on a line."""
-    return [a or b for a, b in PINS_STRING_RE.findall(line) if (a or b).strip()]   # a string of spaces only would match every indented line
+    return [a or b for a, b in _pins_re(PINS_STRING_RE).findall(line) if (a or b).strip()]   # a string of spaces only would match every indented line
 
 
 def pins_read_diff(base, runner):
@@ -103,7 +107,7 @@ def pins_read_diff(base, runner):
             continue
         if raw.startswith(('--- "', '+++ "')):
             raise PinsError("the diff headers were not understood (a quoted path): %s" % _pins_one_line(raw, 120))
-        hunk = PINS_HUNK_RE.match(raw)
+        hunk = _pins_re(PINS_HUNK_RE).match(raw)
         if hunk and path is not None:
             new_line = int(hunk.group(3))
             left_old = 1 if hunk.group(2) is None else int(hunk.group(2))
@@ -175,12 +179,12 @@ def pins_index(lines):
     whose indent is lower than every def after them, so no hit rescans the file)."""
     defs, answers, classes, stack = [], [], [], []   # defs: line numbers; answers: (test, test line, indent) per def; stack: (indent, test or None, line)
     for i, text in enumerate(lines):
-        m = PINS_ANY_DEF_RE.match(text)
+        m = _pins_re(PINS_ANY_DEF_RE).match(text)
         if m:
             indent = len(m.group(1))
             while stack and stack[-1][0] >= indent:
                 stack.pop()
-            t = PINS_TEST_DEF_RE.match(text)
+            t = _pins_re(PINS_TEST_DEF_RE).match(text)
             stack.append((indent, t.group(2) if t else None, i + 1))
             answer = (None, None, stack[0][0])
             for ind, name, line in reversed(stack):
@@ -190,7 +194,7 @@ def pins_index(lines):
             defs.append(i + 1)
             answers.append(answer)
             continue
-        c = PINS_CLASS_RE.match(text)
+        c = _pins_re(PINS_CLASS_RE).match(text)
         if c:
             classes.append((i + 1, len(c.group(1)), c.group(2)))
     return {"defs": defs, "answers": answers, "classes": classes, "size": len(lines), "class_cache": {}}
