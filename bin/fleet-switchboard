@@ -22449,7 +22449,9 @@ def preflight_changed(runner, root):
 def cmd_preflight_pr(args, runner, now):
     """`preflight-pr`: run each class of PREFLIGHT_CLASSES under `heavy`, print one PASS or FAIL line per class, exit 1 when any fails. Only runs tests."""
     if getattr(args, "body", None):   # off by default: only reads the description and the plan (bin/switchboard/body_check.py)
-        return cmd_body_check(args.body, runner, now)
+        return cmd_body_check(args.body, runner, now, dict(parse_pr_ref=parse_pr_ref, build_engine=build_engine, read_pr_json=read_pr_json, load_config=load_config,
+                              parse_plan_source=parse_plan_source, IntentReader=IntentReader, GhAccounts=GhAccounts, fetch_plan=fetch_plan,
+                              plan_ledger=plan_ledger, plan_check=plan_check, PLAN_LINE_RE=PLAN_LINE_RE))
     top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if top.returncode != 0:
         sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
