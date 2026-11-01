@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Ask #1730: the quick preflight leaves checks that cannot run in quick to CI and ends 0 when the checks that ran pass.
-Throwaway repositories under the system temporary directory only; every child is started by subprocess.run."""
+Throwaway repositories under the system temporary directory only; every child is started by the standard library's blocking run function and ends before the test goes on."""
 import os
 import re
 import shutil
