@@ -50,7 +50,7 @@ issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; forma
 
 **a short issue body** (outcome, Done-when, link to the
 detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
-`scenarios:` yaml block. The latest such comment counts. One plan per ask; sections for work items.
+`scenarios:` yaml block. One plan per ask; sections for work items.
 
 ## Challenge it
 
