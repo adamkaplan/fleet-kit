@@ -72,6 +72,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `size_ceilings.py` | 2 | the one reading of the `size` rows of Known violations and of a file's line count, and the check of a merge result against them (#1605) | |
 | `registry.py` | 2 | the one agent registry (interface frozen in `docs/agent-registry.md`) | |
 | `installed_guard.py` | 2 | is the installed tree the default branch, clean: the one reading of its git state, the entry check and the install of its hooks (#1380) | |
+| `issue_line.py` | 0 | change one line of an issue body (the next step, a parked date) from a fresh read, refusing a body without its Intent or Done-when; the last good copy (#1751) | |
 | `guard_alert.py` | 2 | the standalone alert of a bad installed tree, run from the state directory with nothing of the kit (#1380) | |
 | `guard_record_head_move.py` | 2 | the standalone recorder a git hook runs at each move of the installed tree's HEAD (#1380) | |
 | `decision_core.py` | 3 | the pure core of the Decision subsystem | |
