@@ -7,6 +7,7 @@ cloud/launcher/tests/test_orchestrator_row.py
 cloud/launcher/tests/test_orphan_secrets.py
 cloud/launcher/tests/test_probe_redirect.py
 cloud/launcher/tests/test_read_retired_last_message.py
+cloud/launcher/tests/test_reaper_audit_tail.py
 cloud/launcher/tests/test_reaper_renewal.py
 cloud/launcher/tests/test_reaper_restart.py
 cloud/launcher/tests/test_reaper_row.py
