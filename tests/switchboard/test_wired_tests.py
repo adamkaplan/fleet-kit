@@ -17,7 +17,7 @@ RUNNER = REPO / "bin" / "test-switchboard"
 TESTS = REPO / "tests" / "switchboard"
 MIN_REASON = 20
 
-# file name -> reason (at least 20 characters). Today empty: all files are wired.
+# file name or file.py::ClassName -> reason (at least 20 characters). Today empty: every class is bound or a base.
 EXEMPT_FILES = {}
 
 
