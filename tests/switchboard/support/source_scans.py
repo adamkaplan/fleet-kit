@@ -6,7 +6,7 @@ import importlib.util
 import os
 import re
 import importlib
-from support.paths import BIN, REPO
+from support.paths import BIN
 from support.fake_jev import SHIM
 from support.paths import BIN
 
