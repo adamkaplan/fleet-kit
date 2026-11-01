@@ -492,7 +492,7 @@ def review_respond(args, runner, now, socket_call=None):
     text, label, result = load_plan(ns, runner, now)
     if result["result"] != "pass":
         raise ReviewError("the new revision fails `plan check` (%d defect(s))" % len(result["defects"]))
-    if result["plan_hash"] == rnd["plan_hash"]:
+    if result["plan_hash"] == load_plan_check().canonical_hash(rnd["plan_hash"], result.get("plan_hashes")):
         raise ReviewError("the revision has the same plan hash: a new round needs a changed plan")
     plan_repo, plan_number, _ = parse_plan_source(args.plan_ref, config.get("intent_repo"))
     ask_repo, _, ask_number = rnd["lineage"].rpartition("#")
