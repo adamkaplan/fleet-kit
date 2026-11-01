@@ -15813,7 +15813,7 @@ def header_cache_action(name):
     return name if name in cache_allowed_commands() and name not in always_fresh_commands() else None
 
 
-HEADER_FRESH_EXTRA = ("plan", "gates", "gates-check", "merge-gate", "impact", "merge", "charter", "orders")   # approval and check, the gates, the impact floor and the merge shim; the charter set decides from the issue and its parent (#1249), the orders are read fresh
+HEADER_FRESH_EXTRA = ("plan", "gates", "gates-check", "merge-gate", "impact", "merge", "charter", "orders", "issue-line")   # approval and check, the gates, the impact floor and the merge shim; the charter set decides from the issue and its parent (#1249), the orders are read fresh
 
 
 class IntentReader:
