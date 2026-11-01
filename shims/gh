@@ -1286,8 +1286,22 @@ API_FIELD_FLAGS = ("-f", "--raw-field", "-F", "--field")
 API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API))
 
 
+SHORT_EQ_RE = re.compile(r"^-[A-Za-z]=")
+
+
+def refuse_short_eq(args):
+    """#1696 round 5: a short option written with an attached '=' (-f=body=x, -H=NAME:value, -X=POST, -i=...) is refused wherever argv is first read: the real
+    option parser and this reader do not agree on what it means, so the shim does not guess. Long options (--field=body=x) are not affected."""
+    for arg in args[1:]:
+        if arg == "--":
+            break
+        if SHORT_EQ_RE.match(arg):
+            raise Refused("the short option %s is written with an attached '=': it is refused because the shim and gh read it differently; write the value as a separate word or use the long form (--field=..., --header=...)" % _clean_reason(arg[:40]))
+
+
 def api_parse(args):
     """(positionals, method or None, fields) of a `gh api` call; fields are (index, flag, inline, text) of every field flag, in order."""
+    refuse_short_eq(args)
     positionals, method, fields, i = [], None, [], 1
     while i < len(args):
         arg = args[i]
@@ -1707,6 +1721,7 @@ REST_WRITES = (   # (label, path after repos/OWNER/REPO/, methods): the unsigned
 def api_scan(args, headers=None):
     """(method, has_input, field texts, positionals) of a `gh api` call read the way gh (cobra) reads flags: -X/--method any case and joined, bundled short
     flags (-iXPUT, -ifa=b), `--flag=value`, repeated flags (the last method wins), `--` ends the flags. method is None when none is given, "" when its value is missing."""
+    refuse_short_eq(args)
     method, has_input, fields, positionals, i = None, False, [], [], 1
     longs = {"--method": "m", "--raw-field": "f", "--field": "f", "--input": "i", "--header": "x", "--jq": "x", "--template": "x", "--hostname": "x", "--cache": "x", "--preview": "x"}
     while i < len(args):
@@ -1999,6 +2014,9 @@ def api_decide(args, namer, previous):
     for header in headers:
         if header.partition(":")[0].strip().lower() in OVERRIDE_HEADERS:
             raise Refused("a method-override header (X-HTTP-Method-Override, X-HTTP-Method, X-Method-Override) is refused: it can turn a read into a write, so the shim cannot tell the real method")
+    for raw in raw_positionals:
+        if "?" in raw and api_endpoint(raw) == "graphql":
+            raise Refused("a '?' (URL query string) on the graphql endpoint is refused: its query text would not be read; send the query as a plain POST with a query field")
     has_body = has_input or bool(fields)
     effective = method if method is not None else ("POST" if has_body else "GET")
     if effective == "GET":

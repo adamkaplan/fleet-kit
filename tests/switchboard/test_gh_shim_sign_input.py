@@ -425,7 +425,9 @@ class TestGhShimSignInput(unittest.TestCase):
             with self.subTest(spelling=spelling):
                 done, calls = self.rig.run("api", spelling, "-f", "query=" + gql("addComment"))
                 self.refused(done, calls)
-                if spelling in R5_RAW_OK_GRAPHQL + ("/graphql", "https://api.github.com/graphql", "graphql?x=1", "GraphQL"):
+                if spelling == "graphql?x=1":   # r5 round 5 (OLD: the mutation line): any '?' on graphql is refused first
+                    self.assertTrue(gh_err(done).startswith(Q_ANCHOR), gh_err(done))
+                elif spelling in R5_RAW_OK_GRAPHQL + ("/graphql", "https://api.github.com/graphql", "GraphQL"):
                     self.assertEqual([l for l in done.stderr.splitlines() if l.startswith("gh:")], bare.stderr.splitlines())
                 else:   # r5 (OLD: the same line as the bare word): graphql/ and the #x form change if cleaned
                     self.assertIn(RAW_LINE, gh_err(done))
@@ -437,6 +439,10 @@ class TestGhShimSignInput(unittest.TestCase):
             with self.subTest(spelling=spelling):
                 args = ("api", spelling, "-f", "query=query { viewer { login } }")
                 done, calls = rig.run(*args)
+                if spelling == "graphql?x=1":   # round 5 (OLD: passed): any '?' on graphql is refused
+                    self.assertEqual(calls, [])
+                    self.assertTrue(gh_err(done).startswith(Q_ANCHOR), gh_err(done))
+                    continue
                 if spelling in ("GraphQL", "graphql/"):   # r5 (OLD: passed): a write on a spelling that would change if cleaned
                     self.refused(done, calls)
                     continue
@@ -533,7 +539,7 @@ class TestGhShimSignInput(unittest.TestCase):
 
     def test_h2_h3_mutants_are_seen(self):
         seen = self.mutant("    return [api_endpoint(p) for p in positionals], method, fields", "    return positionals, method, fields")
-        self.assertEqual(sorted(seen), sorted(["graphql spelling let through: " + p for p in ("/graphql", "graphql?x=1", "https://api.github.com/graphql")] + ["URL form not signed: -f", "URL form not signed: -F", "URL form --input not signed"]))   # r5 (OLD: 5 spellings, now the 3 raw-valid ones: GraphQL and graphql/ are refused by the raw rule or the unknown rule first)
+        self.assertEqual(sorted(seen), sorted(["graphql spelling let through: " + p for p in ("/graphql", "https://api.github.com/graphql")] + ["URL form not signed: -f", "URL form not signed: -F", "URL form --input not signed"]))   # r5 (OLD: 5 spellings, now the 3 raw-valid ones: GraphQL and graphql/ are refused by the raw rule or the unknown rule first)
         seen = self.mutant('    if first == "graphql":\n        return "graphql"', '    if first == "graphql":\n        return text')
         self.assertEqual(sorted(seen), sorted(["graphql spelling let through: " + p for p in ("/graphql", "graphql?x=1", "https://api.github.com/graphql")]))   # r5 (OLD: []): the 3 raw-valid spellings now reach the canonical form
         seen = self.mutant('host.rstrip(".") != "api.github.com"', "True")
@@ -1094,3 +1100,82 @@ class TestGhShimRawPath(unittest.TestCase):
         self.assertEqual(len(calls), 1)   # the mutant lets it through; the real shim (test above) refuses
         done, calls = self.rig.run("api", "graphql", "-X", "GET", "-f", "query=query{a}")
         self.assertEqual(calls, [])
+
+
+EQ_ANCHOR = "gh: refused: the short option "
+Q_ANCHOR = "gh: refused: a '?' (URL query string) on the graphql endpoint is refused"
+COMMENTS = "repos/o/r/issues/1/comments"
+SHORT_EQ_FORMS = {   # name -> argv after api
+    "-f=": (COMMENTS, "-f=body=x"), "-F=": (COMMENTS, "-F=body=@/dev/null"), "-X=": (COMMENTS, "-X=POST", "-f", "body=x"),
+    "-H=": (COMMENTS, "-H=Accept:x", "-f", "body=x"), "-H= override": ("repos/o/r/issues/1", "-X", "POST", "-H=X-HTTP-Method-Override: PATCH", "-f", "title=x"),
+    "-i=": (COMMENTS, "-i=", "-f", "body=x"), "-R=": (COMMENTS, "-R=o/r", "-f", "body=x"),
+    "-p= (value-taking)": (COMMENTS, "-p=x"), "-q= (value-taking)": (COMMENTS, "-q=x"), "-t= (value-taking)": (COMMENTS, "-t=x"),
+    "-i= (boolean)": ("repos/o/r/issues", "-i="), "-h= (boolean)": ("repos/o/r/issues", "-h="),
+}
+QUERY_FORMS = {
+    "mutation in url query, POST": ("graphql?query=mutation{x}", "-X", "POST", "-f", "query={viewer{login}}"),
+    "mutation in url query, bare GET": ("graphql?query=mutation{x}",),
+    "any ? with a read query": ("graphql?x=1", "-f", "query=query{viewer{login}}"),
+}
+
+
+class TestGhShimRound5(unittest.TestCase):
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+
+    def mutant_rig(self, old, new):
+        rig = hermetic_rig()
+        self.addCleanup(rig.close)
+        shim = rig.shims / "gh"
+        text = shim.read_text()
+        self.assertEqual(text.count(old), 1, "the mutant's anchor is gone: " + old)
+        shim.write_text(text.replace(old, new, 1))
+        return rig
+
+    def failing(self, rig, forms, anchor):
+        bad = []
+        for name, argv in forms.items():
+            done, calls = rig.run("api", *argv)
+            if calls or not gh_err(done).startswith(anchor):
+                bad.append(name)
+        return bad
+
+    def test_short_options_with_an_attached_equals_are_refused(self):
+        self.assertEqual(self.failing(self.rig, SHORT_EQ_FORMS, EQ_ANCHOR), [])
+        done, calls = self.rig.run("api", COMMENTS, "-i=")
+        self.assertEqual(gh_err(done).count("\n"), 0)
+        self.assertIn("-i=", gh_err(done))
+
+    def test_the_long_forms_and_plain_forms_still_work(self):
+        done, calls = self.rig.run("api", COMMENTS, "--field=body=x")
+        self.assertEqual(len(calls), 1, gh_err(done))
+        self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
+        done, calls = self.rig.run("api", COMMENTS, "-f", "body=x")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["argv"][-1].count(SIGNED), 1)
+        done, calls = self.rig.run("api", COMMENTS, "--method=POST", "-f", "body=x")
+        self.assertEqual(len(calls), 1, gh_err(done))
+        done, calls = self.rig.run("api", "repos/o/r/issues", "--header=Accept:x")
+        self.assertEqual(len(calls), 1, gh_err(done))
+
+    def test_graphql_with_any_question_mark_is_refused(self):
+        self.assertEqual(self.failing(self.rig, QUERY_FORMS, Q_ANCHOR), [])
+
+    def test_plain_graphql_read_passes(self):
+        done, calls = self.rig.run("api", "graphql", "-f", "query=query{viewer{login}}")
+        self.assertEqual(len(calls), 1, gh_err(done))
+
+    def test_mutant_short_equals_refusal_removed_is_seen(self):
+        rig = self.mutant_rig('SHORT_EQ_RE = re.compile(r"^-[A-Za-z]=")', 'SHORT_EQ_RE = re.compile(r"^\\0$")')
+        seen = self.failing(rig, SHORT_EQ_FORMS, EQ_ANCHOR)
+        print("R5 mutant short '=' refusal removed: %d of %d forms fail: %s; control %d" % (len(seen), len(SHORT_EQ_FORMS), seen, len(self.failing(self.rig, SHORT_EQ_FORMS, EQ_ANCHOR))))
+        self.assertEqual(seen, list(SHORT_EQ_FORMS))
+        self.assertEqual(self.failing(self.rig, SHORT_EQ_FORMS, EQ_ANCHOR), [])
+
+    def test_mutant_graphql_question_mark_refusal_removed_is_seen(self):
+        rig = self.mutant_rig('if "?" in raw and api_endpoint(raw) == "graphql":', 'if False:')
+        seen = self.failing(rig, QUERY_FORMS, Q_ANCHOR)
+        print("R5 mutant graphql '?' refusal removed: %d of %d forms fail: %s" % (len(seen), len(QUERY_FORMS), seen))
+        self.assertEqual(seen, list(QUERY_FORMS))
+        self.assertEqual(self.failing(self.rig, QUERY_FORMS, Q_ANCHOR), [])
