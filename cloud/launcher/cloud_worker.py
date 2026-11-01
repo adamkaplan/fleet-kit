@@ -391,6 +391,22 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
+def _quantity(value, scale):
+    """A Kubernetes quantity ('4', '3920m', '8Gi', '16000Ki') as a whole number: `scale` 1000 gives millicores, 1 gives bytes. Unreadable is 0."""
+    text = str(value if value is not None else "0")
+    units = {"Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4, "k": 1000, "M": 1000 ** 2, "G": 1000 ** 3, "T": 1000 ** 4, "m": 0.001}
+    for suffix, mult in units.items():
+        if text.endswith(suffix):
+            text, factor = text[:-len(suffix)], mult
+            break
+    else:
+        factor = 1
+    try:
+        return int(float(text) * factor * scale)
+    except ValueError:
+        return 0
+
+
 def scrub(text, secrets_known=(), limit=300):
     """THE one place kubectl output (and anything built from it) is made safe to show, log or audit: the exact values
     of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
@@ -1459,6 +1475,10 @@ class Kube:
         login without that right is refused by the API server, and the caller falls back to the pod placement."""
         return json.loads(self.run(["get", "nodes", "-o", "json"]))["items"]
 
+    def list_events(self):
+        """The namespace's scheduler events (`FailedScheduling`): a `get`, a read only."""
+        return json.loads(self.run(["get", "events", "--field-selector", "reason=FailedScheduling", "-o", "json"]))["items"]
+
     def annotate(self, name, uid, **kv):
         """Annotate the pod that was READ (its `uid`), never one of the same name that replaced it: a merge patch whose body carries
         metadata.uid, which the API server refuses on a mismatch. Raises PodChanged when the pod is not that one (or is gone)."""
@@ -2473,6 +2493,46 @@ class Launcher:
             nodes, nodes_read, nodes_error = [], False, self.kube.scrub(e, 200)
         return {"pods": pods, "nodes": nodes, "nodes_read": nodes_read, "nodes_error": nodes_error}
 
+    def capacity(self, a):
+        """ONE read-only look at room: per node its name and allocatable cpu (millicores) and memory (bytes) ONLY (never its addresses), the requests of the
+        pods this login can list, per node, the Pending pods count and the last FailedScheduling line (scrubbed, 200 characters). Only `get` calls are made. A refused
+        read is said (`nodes_read`, `pods_read`, `events_read` false and a short scrubbed error), never a failure of the whole read."""
+        out = {"nodes": [], "requests": {}, "pending": None, "last_event": None,
+               "nodes_read": True, "nodes_error": None, "pods_read": True, "pods_error": None, "events_read": True, "events_error": None}
+        try:
+            for node in self.kube.list_nodes():
+                alloc = (node.get("status") or {}).get("allocatable") or {}
+                out["nodes"].append({"name": self.kube.scrub((node.get("metadata") or {}).get("name"), 100),
+                                     "cpu_m": _quantity(alloc.get("cpu"), 1000), "memory_b": _quantity(alloc.get("memory"), 1)})
+        except CloudError as e:
+            out["nodes"], out["nodes_read"], out["nodes_error"] = [], False, self.kube.scrub(e, 120)
+        try:
+            pending = 0
+            for pod in self.kube.list_pods_all():
+                phase = (pod.get("status") or {}).get("phase")
+                pending += phase == "Pending"
+                node = (pod.get("spec") or {}).get("nodeName")
+                if node and phase not in ("Succeeded", "Failed"):
+                    mine = out["requests"].setdefault(self.kube.scrub(node, 100), {"cpu_m": 0, "memory_b": 0})
+                    for c in (pod.get("spec") or {}).get("containers") or []:
+                        req = ((c.get("resources") or {}).get("requests")) or {}
+                        mine["cpu_m"] += _quantity(req.get("cpu"), 1000)
+                        mine["memory_b"] += _quantity(req.get("memory"), 1)
+            out["pending"] = pending
+        except CloudError as e:
+            out["requests"], out["pods_read"], out["pods_error"] = {}, False, self.kube.scrub(e, 120)
+        try:
+            events = [ev for ev in self.kube.list_events() if (ev or {}).get("reason") in (None, "FailedScheduling")]
+            if events:
+                def when(ev):
+                    return str(ev.get("lastTimestamp") or ev.get("eventTime") or (ev.get("metadata") or {}).get("creationTimestamp") or "")
+                last = max(events, key=when)
+                who = (last.get("involvedObject") or {}).get("name")
+                out["last_event"] = self.kube.scrub("FailedScheduling %s%s" % (who + ": " if who else "", last.get("message") or ""), 200)[:200]
+        except CloudError as e:
+            out["events_read"], out["events_error"] = False, self.kube.scrub(e, 120)
+        return out
+
     def hard_deadline(self, pod):
         """The pod's copy, unless the switchboard record (read only, --record-dir) names a later or earlier one."""
         hard = parse_iso(ann(pod, "hard-deadline"))
@@ -3316,6 +3376,7 @@ def build_parser():
     d.add_argument("--reason", default="")
     cmd("status")
     cmd("snapshot", worker=False)   # ONE read-only look at the cluster: the pods of the namespace and, when the login may list them, the nodes
+    cmd("capacity", worker=False)   # ONE read-only look at room: the nodes' allocatable, the pods' requests, the Pending count, the last FailedScheduling line
     cmd("report")
     pr = cmd("prune-records", worker=False)
     pr.add_argument("--days", type=int, help="remove run records older than this many days (default: $CW_RECORD_KEEP_DAYS, else 30)")
