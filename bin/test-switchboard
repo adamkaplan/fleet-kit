@@ -78327,6 +78327,11 @@ class TestCiRecordCarry(LedgerBase):
                 body = {"default_branch": "main"}
             elif "/compare/main..." in path:
                 body = {"status": "behind"}
+            elif "/actions/runs" in path:
+                body = {"workflow_runs": [{"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
+                                           "pull_requests": [{"number": 9, "base": {"sha": "t" * 40}}]}]}
+            elif "/git/ref/heads/" in path:
+                body = {"object": {"sha": "t" * 40}}
             else:
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
