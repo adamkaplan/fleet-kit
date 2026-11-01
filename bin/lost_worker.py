@@ -152,7 +152,10 @@ def _archive_stream(directory, name, cut):
     fd = _open_regular(os.path.join(directory, name))
     if fd is None:
         return None
-    return gzip.GzipFile(fileobj=os.fdopen(fd, "rb"), mode="rb")
+    raw = os.fdopen(fd, "rb")
+    stream = gzip.GzipFile(fileobj=raw, mode="rb")
+    stream.myfileobj = raw   # closing the stream closes the file
+    return stream
 
 
 def _archives_whole(directory, segs):
