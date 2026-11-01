@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""arch-count-movable: how many test classes of bin/test-switchboard can move whole (the fixpoint of the dry run of tools/arch-test-move).
+
+    tools/arch-count-movable [TREE]      (TREE defaults to `.`)
+
+Takes the top-level class names of TREE/bin/test-switchboard, runs the one-plan dry run of TREE/tools/arch-test-move (no --write), removes every class that
+has an `X uses Y, which stays ...` line, and repeats until a run prints none. Prints `classes N movable (fixpoint) M blocked K rounds R` and exits 0.
+Reads only; the one file it writes is a temporary plan."""
+import ast, json, os, subprocess, sys, tempfile
+
+tree = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
+entry = os.path.join(tree, "bin", "test-switchboard")
+names = [n.name for n in ast.parse(open(entry, encoding="utf-8").read()).body if isinstance(n, ast.ClassDef)]
+plan, rounds = list(names), 0
+with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, "plan.json")
+    while True:
+        rounds += 1
+        json.dump({"movable": plan}, open(path, "w"))
+        out = subprocess.run([sys.executable, os.path.join(tree, "tools", "arch-test-move"), "--source", "bin/test-switchboard", "--plan", path, "--out-dir", "tests/switchboard"], cwd=tree, capture_output=True, text=True).stdout
+        blocked = {l.split(" uses ")[0] for l in out.splitlines() if " uses " in l and ", which stays" in l}
+        plan = [c for c in plan if c not in blocked]
+        if not blocked:
+            break
+print("classes %d movable (fixpoint) %d blocked %d rounds %d" % (len(names), len(plan), len(names) - len(plan), rounds))
