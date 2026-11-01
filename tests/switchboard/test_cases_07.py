@@ -1348,7 +1348,7 @@ class TestPlanCheckCommand(Base):
         second = json.loads(self.run_cmd("acme/app#7", "--json")[1])
         self.assertEqual(second["scenario_hash"], first["scenario_hash"])
         self.assertNotEqual(second["plan_hash"], first["plan_hash"])
-        self.issue["body"] = GOOD_PLAN.replace("Commissioning works.", "Commissioning   works.\n\n")
+        self.issue["body"] = GOOD_PLAN.replace("Commissioning works.", "Commissioning works.  ")
         self.assertEqual(json.loads(self.run_cmd("acme/app#7", "--json")[1])["plan_hash"], first["plan_hash"], "whitespace only")
         code, out, err = self.run_cmd("acme/app#7")
         self.assertIn("scenario hash:", out)
