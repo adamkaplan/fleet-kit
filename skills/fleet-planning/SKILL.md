@@ -48,7 +48,7 @@ issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; forma
 
 ## The form
 
-Put it in the repo the work concerns. **a short issue body** (outcome, Done-when, link to the
+**a short issue body** (outcome, Done-when, link to the
 detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
 `scenarios:` yaml block. The latest such comment counts. One plan per ask; sections for work items.
 
