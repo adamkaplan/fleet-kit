@@ -55,5 +55,145 @@ class Writer(unittest.TestCase):
         say("S4 writer: a missing record raised 0 times")
 
 
+SECRET = "s3cr3t-value-of-the-pod-0123456789"
+TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+PLANTED = [TOKEN, SECRET, "10.20.30.40", "registry.internal.example:5000"]
+
+
+class FakeKube:
+    """A fake cluster: one pod, its events; a log of every call in order."""
+    def __init__(self, phase="Failed", events=(), refuse=None):
+        self.log, self.known, self.refuse, self.deleted = [], {SECRET}, refuse, False
+        self.events = list(events)
+        self.pod = {"metadata": {"name": "cw-w1", "uid": "u1", "annotations": {"cw/started": "2026-11-01T08:00:00Z", "cw/run-id": "r1"}},
+                    "spec": {"nodeName": "aks-pool-0007"},
+                    "status": {"phase": phase, "containerStatuses": [{"name": "worker", "state": {"terminated": {"reason": "OOMKilled", "exitCode": 137}}}]
+                               if phase == "Failed" else [{"name": "worker", "state": {"running": {}}}]}}
+
+    def scrub(self, text, limit=300):
+        return cw.scrub(text, self.known, limit)
+
+    def get_pod(self, name):
+        self.log.append("get_pod")
+        return None if self.deleted else self.pod
+
+    def pod_events(self, name):
+        self.log.append("pod_events")
+        if self.refuse:
+            raise self.refuse
+        return list(self.events)
+
+    def exec(self, *a, **k):
+        self.log.append("exec")
+        return json.dumps({"pushed": False, "wip_branch": None, "skipped": [], "note": "nothing"})
+
+    def annotate(self, *a, **k):
+        pass
+
+    def get_secret(self, name):
+        return None
+
+    delete_secret = delete_run_secret = get_secret
+
+    def delete(self, name, uid=None):
+        self.log.append("delete")
+        self.deleted = True
+
+
+def ev(i, message="m", when=None):
+    return {"type": "Warning", "reason": "R%d" % i, "message": message, "lastTimestamp": when or "2026-11-01T09:%02d:00Z" % i}
+
+
+class Stop(unittest.TestCase):
+    def stop(self, kube, cause=None, record=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = {"CW_CLOUD_AUDIT": os.path.join(tmp.name, "audit.jsonl")}
+        lau = cw.Launcher(kube, env, clock=lambda: cw.parse_iso("2026-11-01T09:10:00Z"))
+        lau.recorder.read_messages = lambda pod: (None, "no transcript in the fake")
+        lau.recorder.head_sha = lambda pod: None
+        rec = os.path.join(tmp.name, "rec")
+        import argparse
+        a = argparse.Namespace(worker="w1", reason="finished", run_id=None, record_dir=rec, cause=cause)
+        self.launcher = lau
+        res = lau.stop(a)
+        runs = os.listdir(rec)
+        with open(os.path.join(rec, runs[0], "run.json")) as f:
+            return res, json.load(f), f"{rec}/{runs[0]}/run.json"
+
+    def test_a_failed_pod_reaches_the_record_by_retire_and_by_the_reaper(self):
+        ok = 0
+        for cause in (None, "pod_failed"):
+            kube = FakeKube(events=[ev(1), ev(2), ev(3)])
+            _, rec, _ = self.stop(kube, cause)
+            ps = rec["pod_state"]
+            c = ps["containers"][0]
+            self.assertEqual((ps["phase"], c["reason"], c["exit_code"], ps["node"], len(ps["events"]), ps["events_read"]),
+                             ("Failed", "OOMKilled", 137, "aks-pool-0007", 3, "yes"))
+            self.assertLess(kube.log.index("pod_events"), kube.log.index("delete"))
+            self.assertEqual(kube.log.count("get_pod"), 1)
+            self.assertEqual(rec["end_hook"]["note"], "pod was Failed; end hook not run")
+            ok += 1
+        say("S2 stop: %d of 2 stops hold phase, reason, exit code, node, 3 of 3 events, events read before the delete" % ok)
+
+    def test_at_most_20_newest_events_each_cut_to_200(self):
+        kube = FakeKube(events=[ev(i, "x" * 500) for i in range(30)])
+        ps = self.stop(kube)[1]["pod_state"]
+        names = [e.split(":")[0] for e in ps["events"]]
+        self.assertEqual(len(ps["events"]), 20)
+        self.assertTrue(all(len(e) <= 200 for e in ps["events"]))
+        self.assertEqual(names, ["Warning R%d" % i for i in range(10, 30)])
+        say("S3 stop: %d events, longest %d characters, oldest 10 absent" % (len(ps["events"]), max(len(e) for e in ps["events"])))
+
+    def test_an_unreadable_cluster_is_one_word_and_the_pod_is_deleted(self):
+        n = 0
+        for err in (cw.CloudError("Forbidden: events is forbidden"), TimeoutError("timed out")):
+            kube = FakeKube(refuse=err)
+            res, rec, _ = self.stop(kube)
+            ps = rec["pod_state"]
+            self.assertEqual((ps["events_read"], ps["events"], ps["phase"], ps["node"]), ("unreadable", [], "Failed", "aks-pool-0007"))
+            self.assertIn("delete", kube.log)
+            self.assertEqual(rec["end_hook"]["note"], "pod was Failed; end hook not run")
+            self.assertEqual(res["note"], "pod was Failed; end hook not run")
+            n += 1
+        say("S4 stop: %d of 2 refused reads give unreadable with 0 events and the pod deleted" % n)
+
+    def test_no_planted_value_reaches_the_file(self):
+        msg = "pull %s failed, token %s, secret %s, dial 10.20.30.40:443 and registry.internal.example:5000" % ("img", TOKEN, SECRET)
+        kube = FakeKube(events=[ev(1, msg), ev(2, "back-off from registry.internal.example:5000")])
+        _, rec, path = self.stop(kube)
+        with open(path) as f:
+            text = f.read()
+        found = [i for i, v in enumerate(PLANTED) if v in text]
+        self.assertEqual(found, [])
+        self.assertIn("[address]", text)
+        self.assertIn("[redacted]", text)
+        say("S5 stop: %d of 4 planted values in run.json, %d address marks" % (len(found), text.count("[address]")))
+
+    def test_a_running_pod_reads_no_events(self):
+        kube = FakeKube(phase="Running", events=[ev(1)])
+        res, rec, _ = self.stop(kube)
+        ps = rec["pod_state"]
+        self.assertEqual((ps["phase"], ps["events_read"], ps["events"], ps["node"]), ("Running", "no", [], "aks-pool-0007"))
+        self.assertEqual(ps["containers"][0]["state"], "running")
+        self.assertEqual((kube.log.count("pod_events"), kube.log.count("get_pod")), (0, 1))
+        other = ("worker", "repository", "start", "end", "exit_reason", "head_sha", "transcript", "end_hook")
+        self.assertEqual([k for k in other if k not in rec], [])
+        say("S6 stop: phase Running, events_read no, %d reads of events, %d read of the pod, %d of 8 other fields" % (
+            kube.log.count("pod_events"), kube.log.count("get_pod"), len(other)))
+
+    def test_a_pod_that_is_gone_writes_no_pod_state(self):
+        kube = FakeKube()
+        kube.get_pod = lambda name: None
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        import argparse
+        lau = cw.Launcher(kube, {"CW_CLOUD_AUDIT": os.path.join(tmp.name, "a.jsonl")}, clock=lambda: cw.parse_iso("2026-11-01T09:10:00Z"))
+        res = lau.stop(argparse.Namespace(worker="w1", reason="x", run_id=None, record_dir=os.path.join(tmp.name, "r"), cause=None))
+        self.assertTrue(res["pod_gone"])
+        self.assertFalse(os.path.exists(os.path.join(tmp.name, "r")))
+        say("U1 stop: a pod already gone writes 0 records")
+
+
 if __name__ == "__main__":
     unittest.main()
