@@ -3283,6 +3283,21 @@ class Switchboard:
 
     UNCONSUMED_CAP = 500
 
+    def unconsumed_lines(self, observation):
+        """#1844: one line per message this daemon delivered as `queue` that the lane's inbox still holds, with its age and keys. Read only."""
+        if not observation or self.light:
+            return []
+        try:
+            inbox = self.v2.inbox_list(observation["session"])
+        except V2Error as err:
+            return ["  problem: the inbox could not be read (%s)" % _one_line(str(err), 100)]
+        now, lines = self.now(), []
+        for item in inbox if isinstance(inbox, list) else []:
+            if isinstance(item, dict) and _fleet_meta(item) is not None and item.get("delivery") == "queue" and _created(item) is not None:
+                lines.append("  - not consumed: %s queued %d min ago (delivered as queue, still in the lane's inbox)"
+                             % (", ".join(_fleet_keys(item)) or "no key", max(0, int((now - _created(item)) // 60))))
+        return lines
+
     def steer_unconsumed(self, observation, now):
         """#1844: a message this daemon delivered as `queue` that the WORKING lane has not consumed within `unconsumed_steer_minutes` is
         steered into the running turn, once per item (a refusal is audited once per item too). Held lanes are left alone. Returns the ids steered."""
@@ -15267,6 +15282,8 @@ def cmd_pending(args, runner, now):
                                                     _one_line(fact["summary"], 200)))
     for problem in entry["source_problems"]:
         print("  problem: %s" % problem)
+    for line in engine.unconsumed_lines(entry["observation"]):   # #1844: delivered as `queue`, still in the lane's inbox
+        print(line)
     return EXIT_OK
 
 
