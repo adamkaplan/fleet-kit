@@ -96,8 +96,7 @@ def edit(body, kind, value, now):
     """`body` with its one line changed: the LAST `Next step (...):` or `Next:` line (kind "next") or the `Parked until:` line (kind "parked") replaced,
     or the line appended after the last paragraph and before a trailing marker line. Every other byte is unchanged."""
     if kind == "next":
-        stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%-d %b %H:%MZ")
-        new, pattern = "Next step (%s): %s" % (stamp, value.strip()), NEXT_RE
+        new, pattern = "Next: %s" % value.strip(), NEXT_RE
     else:
         new, pattern = "Parked until: %s" % value, PARKED_RE
     lines = body.splitlines(keepends=True)
