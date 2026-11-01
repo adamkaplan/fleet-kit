@@ -2822,7 +2822,7 @@ class Launcher:
             role = ann(pod, "role", "worker")   # the role the pod was made under; a pod made before the annotation is a worker
             role = role if role in AGENTS else "worker"
             cmd = git_token_cmd(repo, self.env, role) if role != "worker" else git_token_cmd(repo, self.env)
-            token = run_git_token_cmd(cmd, repo, dict(os.environ, **self.env), register=self.kube.add_secrets)
+            token = run_git_token_cmd(cmd, repo, dict(os.environ, **self.env), register=lambda *v: self.kube.add_secrets(*v, life=secret_life_until(pod=(pod.get("metadata") or {}).get("name"))))
         except CloudError as e:
             raise _NotRenewed("the mint failed: %s" % e) from None
         self.kube.add_secrets(token)
