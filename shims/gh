@@ -883,7 +883,6 @@ def load_matcher():
     return MATCHER[0]
 
 
-API_VALUE_FLAGS = {"-H", "--header", "-X", "--method", "-q", "--jq", "-t", "--template", "-f", "-F", "--field", "--raw-field", "--input", "--hostname", "--cache", "-R", "--repo", "-p", "--preview"}
 
 
 UNNAMED_REPO_GROUPS = {"search", "gist", "status", "browse", "attestation", "extension", "ext", "alias", "org", "project", "codespace", "ssh-key", "gpg-key"}
@@ -1268,9 +1267,6 @@ def close_call(args, namer):
     return signed_call(args, namer(), COMMENT_FLAGS, CLOSE_COMMANDS)
 
 
-API_VALUE_FLAGS = ("-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header", "--input", "-q", "--jq", "-t", "--template",
-                   "--hostname", "--cache", "-p", "--preview")
-API_FIELD_FLAGS = ("-f", "--raw-field", "-F", "--field")
 API_ENDPOINT_RE = re.compile(r"^/?repos/[^/?#]+/[^/?#]+/(?:%s)/?(?:\?.*)?$" % "|".join(p for _label, p in SIGNED_API))
 
 
@@ -1693,15 +1689,6 @@ def api_gated(args):
 
 
 _api_call_now = api_call
-
-
-def api_call(args, namer):
-    """The classes of the endpoint: graphql and UNKNOWN go to graphql_call (the request text decides); a REST shape is checked for a mutation in an inline
-    query field, then handled as before (the signed comment shapes are signed). An endpoint of another host is left alone (the user's own gh)."""
-    if args and args[0] == "api":
-        if api_gated(args):
-            return graphql_call(args)
-    return _api_call_now(args, namer)
 
 
 _graphql_call_old = graphql_call
