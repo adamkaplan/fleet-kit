@@ -23,6 +23,52 @@ UPPER = "room is counted from the pods this login can see: an upper bound"
 MUTANT_TEXT = "a refused read stopped the launch"
 WRITE_VERBS = ("create", "patch", "apply", "delete", "annotate", "replace", "edit")
 
+CHECKER = r"""
+WRITE_VERBS = ("create", "patch", "apply", "delete", "annotate", "replace", "edit")
+import ast, importlib.util, re, sys
+root = sys.argv[1]
+spec = importlib.util.spec_from_file_location("launcher_copy", root + "/cloud/launcher/cloud_worker.py")
+lib = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lib)
+argvs = []
+kube = lib.Kube.__new__(lib.Kube)
+kube.run = lambda args, **kw: argvs.append(list(args)) or '{"items": []}'
+for read in (kube.list_nodes, kube.list_pods_all, kube.list_events):
+    read()
+if len(argvs) != 3 or [a[0] for a in argvs] != ["get"] * 3 or [a[1] for a in argvs] != ["nodes", "pods", "events"] \
+        or any(a[0] in WRITE_VERBS or any(w in a for w in WRITE_VERBS) for a in argvs):
+    sys.exit("a capacity read used a write verb: %r" % argvs)
+launch = open(root + "/bin/cloud_worker.py").read()
+found = re.search(r"^CAPACITY_SECONDS = (\d+)", launch, re.M)
+if not found or int(found.group(1)) != 5:
+    sys.exit("the capacity read bound is not 5 s")
+func = [n for n in ast.parse(launch).body if isinstance(n, ast.FunctionDef) and n.name == "_print_capacity"][0]
+seen = []
+class Refused(Exception):
+    pass
+class Lib:
+    SHAPES = {}
+    DEFAULT_ORCHESTRATOR_SHAPE = "O"
+    @staticmethod
+    def _quantity(v, d):
+        return d
+def refused(*a, **k):
+    raise Refused("refused")
+import io, contextlib
+ns = {"sys": sys, "_lib": lambda: Lib, "CloudError": Refused, "run_launcher": refused, "CAPACITY_SECONDS": 5,
+      "capacity_block": lambda body, *a, **k: ["  nodes: not read"]}
+exec(compile(ast.Module([func], []), "copy", "exec"), ns)
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err):
+        ns["_print_capacity"](None, None)
+except Exception:
+    sys.exit("a refused read stopped the launch")
+if "nodes: not read" not in err.getvalue():
+    sys.exit("a refused read stopped the launch")
+"""
+
+
 WRAPPER = """#!%(python)s
 import json, os, sys, time
 argv = sys.argv[1:]
@@ -301,5 +347,55 @@ def build():
             self.assertEqual((code, self.capacity_calls(), len(self.creates())), (0, 1, 1), err)
             self.assertIn("nodes: not read", err)
             self.assertIn("events: not read", err)
+
+        # -- U10: the real read verbs, the shipped bound and the refused read, each with a control and a mutant on a scratch copy
+        def scratch_check(self, mutate=None):
+            import shutil, subprocess, tempfile
+            root = Path(__file__).resolve().parents[2]
+            with tempfile.TemporaryDirectory(prefix="u10-") as tmp:
+                for src in sorted((root / "cloud" / "launcher").glob("*.py")) + [root / "bin" / "cloud_worker.py", root / "bin" / "path_walk.py"]:
+                    rel = src.relative_to(root)
+                    (Path(tmp) / rel).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(src, Path(tmp) / rel)
+                if mutate:
+                    rel, old, new = mutate
+                    text = (Path(tmp) / rel).read_text()
+                    self.assertEqual(text.count(old), 1, "the mutant's text is not in the copy: " + old)
+                    (Path(tmp) / rel).write_text(text.replace(old, new))
+                done = subprocess.run([sys.executable, "-c", CHECKER, tmp], capture_output=True, text=True, timeout=60,
+                                      env=dict(os.environ, PYTHONPATH=tmp + "/bin"))
+            return done.returncode, done.stderr
+
+        def test_u10_the_real_launcher_reads_are_three_gets_and_no_write_verb(self):
+            kube = LIB.Kube.__new__(LIB.Kube)
+            argvs = []
+            kube.run = lambda args, **kw: argvs.append(list(args)) or '{"items": []}'
+            kube.list_nodes(), kube.list_pods_all(), kube.list_events()
+            self.assertEqual(len(argvs), 3)
+            self.assertEqual(sum(1 for a in argvs if a[0] == "get"), 3, "a capacity read used a write verb: %r" % argvs)
+            self.assertEqual([a[1] for a in argvs], ["nodes", "pods", "events"])
+            self.assertEqual([a for a in argvs if a[0] in WRITE_VERBS], [], "a capacity read used a write verb")
+
+        def test_u10_the_shipped_bound_is_5(self):
+            self.assertEqual(self.cw.CAPACITY_SECONDS, 5, "the capacity read bound is not 5 s")
+
+        def test_u10_the_control_passes(self):
+            code, err = self.scratch_check()
+            self.assertEqual((code, err), (0, ""))
+
+        def test_u10_mutant_1_a_write_verb_in_list_events_fails_with_the_text(self):
+            code, err = self.scratch_check(("cloud/launcher/cloud_worker.py", 'json.loads(self.run(["get", "events"', 'json.loads(self.run(["delete", "events"'))
+            self.assertEqual(code, 1, err)
+            self.assertIn("a capacity read used a write verb", err)
+
+        def test_u10_mutant_2_a_bound_of_500_fails_with_the_text(self):
+            code, err = self.scratch_check(("bin/cloud_worker.py", "CAPACITY_SECONDS = 5 ", "CAPACITY_SECONDS = 500 "))
+            self.assertEqual(code, 1, err)
+            self.assertIn("the capacity read bound is not 5 s", err)
+
+        def test_u10_mutant_3_a_refused_read_raised_into_the_launch_fails_with_the_text(self):
+            code, err = self.scratch_check(("bin/cloud_worker.py", "except CloudError:\n            body = None", "except CloudError:\n            raise"))
+            self.assertEqual(code, 1, err)
+            self.assertIn("a refused read stopped the launch", err)
 
     return TestLaunchCapacity
