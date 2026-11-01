@@ -111,7 +111,7 @@ def scanned(path):
     """True for a file the scan judges: not a test, a fixture, a document, or the registry module itself."""
     name = os.path.basename(path)
     skip = (path == "bin/registry.py" or path.endswith((".md", ".json", ".txt", ".lock", ".png", ".svg"))
-            or name.startswith("test") or ".test." in name or "/tests/" in path or "/fixtures/" in path or path.startswith(("docs/", ".github/")))
+            or name.startswith("test") or ".test." in name or "/tests/" in path or path.startswith("tests/") or "/fixtures/" in path or path.startswith(("docs/", ".github/")))
     return not skip
 
 
