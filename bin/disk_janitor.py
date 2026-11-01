@@ -326,7 +326,6 @@ def judge(path, text, now, cfg, uid=None, clock=time.monotonic, busy=None):
         if using:
             row["why"] = using
             return row
-    row["action"], row["size"] = "remove", _size(path, deadline, clock)
     target = None
     if stat.S_ISLNK(info.st_mode):
         try:
@@ -334,6 +333,7 @@ def judge(path, text, now, cfg, uid=None, clock=time.monotonic, busy=None):
         except OSError as err:
             row["why"] = "cannot read the link (%s): kept" % err
             return row
+    row["action"], row["size"] = "remove", _size(path, deadline, clock)
     row["ident"] = (info.st_dev, info.st_ino, newest, stat.S_IFMT(info.st_mode), info.st_size, target)
     return row
 
