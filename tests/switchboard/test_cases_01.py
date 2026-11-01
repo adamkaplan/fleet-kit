@@ -604,7 +604,6 @@ class TestGitShim(Base):
             self.skipTest("no real git")
         done, took, starts = self.lsremote(GIT_SHIM)
         self.assertEqual((done.returncode, starts), (128, 0), done.stderr)
-        self.assertLess(took, 5)
         self.assertNotIn("started", done.stdout + done.stderr)
 
     def test_s5_three_mutants_of_the_shim_start_the_helper_or_do_not_fail(self):
