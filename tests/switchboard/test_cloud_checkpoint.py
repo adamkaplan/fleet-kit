@@ -76,7 +76,7 @@ def build(TwoRepoCase, sb, EPOCH, ACME_WEB):
         def test_s6_a_mutant_that_drops_the_default_fails_the_check(self):
             self.check_default()   # the control: the unmutated launch passes first
             sb.write_reminders(self.world.state, [])
-            with mock.patch.object(sb, "arm_cloud_checkpoints", lambda *a, **k: None):
+            with mock.patch.object(sb, "arm_cloud_checkpoints", lambda *a, **k: sb.EXIT_OK):
                 with self.assertRaises(AssertionError) as failed:
                     self.check_default()
             self.assertIn("default 25m/40m", str(failed.exception))
