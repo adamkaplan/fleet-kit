@@ -810,3 +810,17 @@ def cmd_plan_review(args, runner, now, socket_call=None):
         for key, value in done.items():
             print("%s: %s" % (key, value if not isinstance(value, (list, dict)) else json.dumps(value, sort_keys=True)))
     return EXIT_OK
+
+
+def cmd_plan_apply(args, runner, now):
+    """`plan apply`: the work is in the flat module bin/plan_apply.py (#1789); this passes it the caller and the engine's reader, and prints."""
+    engine, _, _ = build_engine(runner, now, "cli")
+    caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import plan_apply
+    code, text = plan_apply.run(args, caller, engine.intents._api, str(engine.state_dir), engine.audit)
+    if text:
+        (sys.stdout if code == 0 else sys.stderr).write(text.rstrip("\n") + "\n")
+    return code
