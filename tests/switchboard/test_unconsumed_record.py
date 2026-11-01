@@ -9,14 +9,14 @@ import unittest
 BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin")
 
 
-def _module_from_bin(name):
+def _load_record_module(name):
     spec = importlib.util.spec_from_file_location(name, os.path.join(BIN, name + ".py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-rec, record_json = _module_from_bin("unconsumed_record"), _module_from_bin("record_json")
+rec, record_json = _load_record_module("unconsumed_record"), _load_record_module("record_json")
 
 
 class TestUnconsumedRecord(unittest.TestCase):
