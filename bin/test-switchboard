@@ -67348,6 +67348,7 @@ _delivery_lag = importlib.import_module("test_delivery_lag")
 _delivery_lag.World = World
 PresentHub, TestDeliveryLag = _delivery_lag.PresentHub, _delivery_lag.TestDeliveryLag
 TestLaunchBriefCheck = importlib.import_module("test_launch_brief_check").build(TwoRepoCase, TestLaunchRefusedMessage)
+TestCloudLaunchArmsCheckpoint = importlib.import_module("test_cloud_checkpoint").build(TwoRepoCase, sb, EPOCH, ACME_WEB)
 TestEveryKindDelayedMark = importlib.import_module("test_every_kind_delayed_mark").TestEveryKindDelayedMark
 TestSignedLinkScrub = importlib.import_module("test_signed_link_scrub").build(Base, GithubRig)
 # The reminder-cancel tests of #1401.

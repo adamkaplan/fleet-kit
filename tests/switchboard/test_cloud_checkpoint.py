@@ -1,0 +1,98 @@
+"""#1790: a successful `launch --cloud` arms the checkpoint reminder and the overdue wake (a CHECKPOINT line or flags as a local launch, else the default 25m/40m).
+The cloud launcher is a fake (`run_cloud` patched): it keeps the brief text on args as the real one does and returns success."""
+import os
+from unittest import mock
+from pathlib import Path
+
+
+def build(TwoRepoCase, sb, EPOCH, ACME_WEB):
+    class TestCloudLaunchArmsCheckpoint(TwoRepoCase):
+        def fake_cloud(self, function, args, runner, now):
+            args.brief_text = Path(args.brief_file).read_text() if args.brief_file else ""
+            return sb.EXIT_OK
+
+        def launch(self, *extra, brief=None):
+            argv = ["launch", "web-new", "--cloud", "--repo", ACME_WEB, "--reports-to", "web-orch", "--issue", "acme/web#2", *extra]
+            if brief is not None:
+                (self.home / "brief.txt").write_text(brief)
+                argv += ["--brief-file", str(self.home / "brief.txt")]
+            with mock.patch.object(sb, "run_cloud", self.fake_cloud):
+                return self.main(*argv)
+
+        def reminders(self):
+            return {r["to"]: r for r in sb.read_reminders(self.world.state)}
+
+        def audit_for(self):
+            return sorted(e["data"]["for"] for e in self.world.audit() if e["event"] == "reminder.add")
+
+        def check_default(self, launch=None):
+            code, _, err = (launch or self.launch)()
+            self.assertEqual(code, 0, err)
+            found = self.reminders()
+            self.assertEqual(len(found), 2, "default 25m/40m: 2 reminders expected")
+            self.assertEqual((found["web-new"]["at"] - EPOCH, found["web-orch"]["at"] - EPOCH), (1500, 2400), "default 25m/40m: times")
+            self.assertIn("default 25m/40m", err, "the printed line says default 25m/40m")
+            self.assertEqual(self.audit_for(), ["checkpoint-overdue", "checkpoint-worker"])
+
+        def test_s2_neither_line_nor_flag_arms_the_default(self):
+            self.check_default()
+
+        def test_s3_the_line_then_the_flags(self):
+            code, _, err = self.launch(brief="CHECKPOINT: at 20 minutes, overdue at 45")
+            self.assertEqual(code, 0, err)
+            found = self.reminders()
+            self.assertEqual((len(found), found["web-new"]["at"] - EPOCH, found["web-orch"]["at"] - EPOCH), (2, 1200, 2700))
+            self.assertNotIn("default", err)
+
+        def test_s3_flags_win(self):
+            code, _, err = self.launch("--checkpoint", "10m", "--overdue", "30m", brief="CHECKPOINT: at 20 minutes, overdue at 45")
+            self.assertEqual(code, 0, err)
+            found = self.reminders()
+            self.assertEqual((len(found), found["web-new"]["at"] - EPOCH, found["web-orch"]["at"] - EPOCH), (2, 600, 1800))
+            self.assertNotIn("default", err)
+
+        def test_s4_an_unreadable_line_arms_the_default_and_says_so(self):
+            code, _, err = self.launch(brief="CHECKPOINT: when done")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(self.reminders()), 2)
+            self.assertIn("could not be read", err)
+            self.assertIn("default 25m/40m", err)
+
+        def test_s5_both_are_armed_with_their_conditions(self):
+            self.assertEqual(self.launch()[0], 0)
+            found = self.reminders()
+            self.assertEqual(found["web-new"]["condition"], {"while_running": "web-new"})
+            self.assertEqual(found["web-orch"]["condition"]["unless_report_from"], "web-new")
+
+        def test_s5_no_launcher_known_means_no_overdue(self):
+            os.environ.pop("HERDR_PANE_ID", None)
+            argv = ["launch", "web-new", "--cloud", "--repo", ACME_WEB, "--issue", "acme/web#2"]
+            with mock.patch.object(sb, "run_cloud", self.fake_cloud):
+                code, _, err = self.main(*argv)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(set(self.reminders()), {"web-new"})
+            self.assertIn("no overdue reminder", err)
+
+        def test_s6_a_mutant_that_drops_the_default_fails_the_check(self):
+            self.check_default()   # the control: the unmutated launch passes first
+            sb.write_reminders(self.world.state, [])
+            with mock.patch.object(sb, "arm_cloud_checkpoints", lambda *a, **k: None):
+                with self.assertRaises(AssertionError) as failed:
+                    self.check_default()
+            self.assertIn("default 25m/40m", str(failed.exception))
+
+        def test_u1_a_local_launch_is_unchanged(self):
+            os.environ.pop("HERDR_PANE_ID", None)
+            with mock.patch.object(sb, "arm_cloud_checkpoints", side_effect=AssertionError("a local launch never arms the cloud default")):
+                work = self.home / "checkout"
+                work.mkdir(exist_ok=True)
+                code, _, err = self.main("launch", "web-new", "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--role", "coder",
+                                         "--reports-to", "web-orch")
+            self.assertEqual((code, err, sb.read_reminders(self.world.state)), (0, "", []))
+
+        def test_u2_an_arming_that_fails_never_fails_the_launch(self):
+            with mock.patch.object(sb, "add_reminder", side_effect=OSError("read-only store")):
+                code, _, err = self.launch()
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len([l for l in err.splitlines() if "no checkpoint reminders" in l]), 1)
+    return TestCloudLaunchArmsCheckpoint
