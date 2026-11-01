@@ -1431,7 +1431,7 @@ class Kube:
     def scrub(self, text, limit=300):
         return scrub(text, self.known, limit)
 
-    def add_secrets(self, *values):
+    def add_secrets(self, *values, life=None):
         for v in values:
             if v:
                 self.known.update(secret_forms(v))
