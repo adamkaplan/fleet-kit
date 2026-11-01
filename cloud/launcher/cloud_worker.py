@@ -3537,8 +3537,10 @@ def step_text(st):
     """The seconds of the seven steps of a pass, for the pass line: numbers only, no name or value."""
     if not st:
         return ""
+    done = st["list"] + st["renew"] + st["vanished"] + st["activity"] + st["stops"] + st["orphans"] + st["notes"]
+    total = st["total"] or done   # a pass that raised never set its total: the seconds of the steps done
     return " steps list=%.1f renew=%.1f vanished=%.1f activity=%.1f (%d) stops=%.1f (%d) orphans=%.1f notes=%.1f total=%.1f" % (
-        st["list"], st["renew"], st["vanished"], st["activity"], st["activity_n"], st["stops"], st["stops_n"], st["orphans"], st["notes"], st["total"])
+        st["list"], st["renew"], st["vanished"], st["activity"], st["activity_n"], st["stops"], st["stops_n"], st["orphans"], st["notes"], total)
 
 
 def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, tree=None):

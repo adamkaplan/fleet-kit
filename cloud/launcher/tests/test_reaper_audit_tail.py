@@ -394,6 +394,9 @@ class TestStepSeconds(unittest.TestCase):
 S10_STEPS = (("list", "list=1.5"), ("renew", "renew=2.5"), ("vanished", "vanished=1.0"), ("activity", "activity=0.9 (2)"),
              ("orphans", "orphans=1.0"), ("notes", "notes=2.0"))
 
+# the total of the steps done, from the fake clock: list 1.5; 1.0+2.5; 1.0+2.0+1.0; 1.0+2.0+0.5+0.9; 3.5+0.6+4.0+1.0; 3.5+0.6+4.0+0.5+2.0
+S10_TOTALS = {"list": 1.5, "renew": 3.5, "vanished": 4.0, "activity": 4.4, "orphans": 9.1, "notes": 10.6}
+
 
 def raising_pass_text(test, mod, raising):
     """The fake world of S8 with ONE step raising after its fake seconds plus 0.5; returns the pass line (or fails with the anchored text)."""
@@ -440,7 +443,7 @@ def raising_pass_text(test, mod, raising):
             pass
     lines = [x for x in err.getvalue().splitlines() if "reaper pass line" in x]
     want = dict(S10_STEPS)[raising]
-    if len(lines) != 1 or (" " + want) not in lines[0]:
+    if len(lines) != 1 or (" " + want) not in lines[0] or (" total=%.1f" % S10_TOTALS[raising]) not in lines[0]:
         raise AssertionError("a raising step lost its seconds: %s" % raising)
     return lines[0]
 
@@ -452,6 +455,8 @@ class TestRaisingSteps(unittest.TestCase):
             line = raising_pass_text(self, build_module(), name)
             print("S10: %s raises: %s" % (name, line.split("audit_lines_parsed=", 1)[1]))
             self.assertIn(" " + want, line)
+            self.assertIn(" total=%.1f" % S10_TOTALS[name], line)
+            print("S10: %s run: total expected %.1f" % (name, S10_TOTALS[name]))
         for name, _ in S10_STEPS:
             old = 'steps["%s"] %s mono() - t0' % (name, "+=" if name == "activity" else "=")
             src = source()
