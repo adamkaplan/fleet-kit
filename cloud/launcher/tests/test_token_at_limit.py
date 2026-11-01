@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -295,8 +296,14 @@ class TestNote(tr.Harness):
 
 
 class TestHook(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = os.path.join(tmp.name, "repo")
+        os.makedirs(os.path.join(self.work, ".git"))
+
     def run_hook(self, says, verb="push"):
-        env = {"CW_WORKER": WORKER, "CW_WORKDIR": os.path.dirname(HERE), "FAKE_GIT_SAYS": says, "FAKE_GIT_VERB": verb}
+        env = {"CW_WORKER": WORKER, "CW_WORKDIR": self.work, "FAKE_GIT_SAYS": says, "FAKE_GIT_VERB": verb}
         out = io.StringIO()
         with mock.patch.object(end_hook, "GIT_BIN", FAKE_GIT), mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out):
             code = end_hook.main()

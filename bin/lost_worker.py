@@ -64,7 +64,8 @@ def _load(sb, path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = sb.parse_bounded(handle.read(READ_BYTES))
-        if isinstance(data, dict) and isinstance(data.get("offsets"), dict) and isinstance(data.get("alerted", {}), dict):
+        if isinstance(data, dict):
+            data.pop("_gap_ready", None)   # a working flag of one pass, never memory
             return data, "ok"
     except Exception:
         pass
@@ -132,17 +133,158 @@ def _fold(state, sb, lines, source):
                 state.setdefault("refused", {})["%s@%s" % (name, item["ts"])] = {"name": name, "at": ts, "line": raw}
         else:
             name, action, ok = item.get("worker"), item.get("action"), item.get("ok")
-            if item.get("runtime_id") == REAPER_ID and ok is False:
-                state.setdefault("reaper", {})["%s@%s" % (action, item["ts"])] = {"at": ts, "line": raw}
+            if item.get("runtime_id") == REAPER_ID and ok in (True, False):
+                state.setdefault("reaper_new", []).append([ts, ok, _clean(item.get("reason") or action or "", 120)])   # settled by `_reaper` in this pass
             elif isinstance(name, str) and name and ok is True:
                 if action == "stop":
                     stop[name] = max(ts, stop.get(name, 0))
                 elif action == "report":
                     report[name] = max(ts, report.get(name, 0))
-    for table in ("created", "stop", "report", "refused", "reaper"):
+    for table in ("created", "stop", "report", "refused"):
         data = state.get(table, {})
         while len(data) > SEEN_MAX:
             data.pop(min(data, key=lambda k: data[k]["at"] if isinstance(data[k], dict) else data[k]))
+
+
+EPOCH_MAX = 4102444800        # a time in a memory record is a finite number of seconds in 0..EPOCH_MAX
+COUNT_MAX = 1000000
+
+
+def _num(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and 0 <= value <= EPOCH_MAX
+
+
+def _valid_record(rec, outage):
+    """The cleaned `reaper_outage` / `reaper_gap` record, or None when it is malformed (the one place the record's fields are checked)."""
+    if not isinstance(rec, dict) or not _num(rec.get("first")) or not _num(rec.get("latest")):
+        return None
+    count = rec.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= COUNT_MAX or not isinstance(rec.get("reason"), str):
+        return None
+    out = {"first": rec["first"], "latest": rec["latest"], "count": count, "reason": _clean(rec["reason"], 120)}
+    if outage:
+        if not isinstance(rec.get("sent"), bool):
+            return None
+        out["sent"] = rec["sent"]
+        out["closed_by"] = rec.get("closed_by") if _num(rec.get("closed_by")) else None
+    return out
+
+
+def _table(valid):
+    """A cleaner for a table: every entry whose key is a string and whose value `valid` accepts is kept, the rest dropped; a non-table is dropped whole."""
+    def clean(value):
+        if not isinstance(value, dict):
+            return None
+        return {k: v for k, v in value.items() if isinstance(k, str) and valid(v)}
+    return clean
+
+
+def _is_text(value, limit=100000):
+    return isinstance(value, str) and len(value) <= limit
+
+
+def _c_offsets(value):
+    if not isinstance(value, dict):
+        return None
+    return {k: v for k, v in value.items() if k in ("switchboard", "launcher") and isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 1 << 62}
+
+
+def _c_new(value):
+    if not isinstance(value, list):
+        return None
+    return [e for e in value if isinstance(e, list) and len(e) == 3 and _num(e[0]) and isinstance(e[1], bool) and _is_text(e[2])] or None
+
+
+def _c_outage(value):
+    return _valid_record(value, True)
+
+
+def _c_gap(value):
+    return _valid_record(value, False)
+
+
+def _c_num(value):
+    return value if _num(value) else None
+
+
+def _c_flag(value):
+    return value if isinstance(value, bool) else None
+
+
+def _c_never(value):
+    return None   # a legacy key (the old per-failure `reaper` table): nothing reads it, so it is dropped
+
+
+# EVERY key of the memory the code reads or writes has its cleaner here, the one place a loaded memory is checked (a key not listed is dropped).
+# The test derives the keys the module reads from the code and fails for one that is not listed.
+_CLEANERS = {
+    "offsets": _c_offsets,
+    "alerted": _table(lambda v: isinstance(v, dict) and _num(v.get("at")) and _is_text(v.get("ask"))),
+    "created": _table(lambda v: isinstance(v, dict) and _num(v.get("at")) and (v.get("deadline") is None or _num(v.get("deadline"))) and _is_text(v.get("line"))),
+    "stop": _table(_num),
+    "report": _table(_num),
+    "refused": _table(lambda v: isinstance(v, dict) and _is_text(v.get("name")) and _num(v.get("at")) and _is_text(v.get("line"))),
+    "seen": _table(lambda v: isinstance(v, dict) and _num(v.get("at")) and _is_text(v.get("ask")) and (v.get("lane") is None or _is_text(v.get("lane")))),
+    "gone": _table(_num),
+    "reaper": _c_never,
+    "reaper_ok": _c_num,
+    "reaper_outage": _c_outage,
+    "reaper_gap": _c_gap,
+    "reaper_new": _c_new,
+    "catchup": _c_flag,
+}
+
+
+def _sanitize(state):
+    """Malformed memory fails closed: every key is cleaned by its cleaner (a wrong type is dropped, a table is cleaned entry by entry) and the pass goes
+    on (it never raises, so the detector is never wedged by one file). An unknown key is dropped."""
+    for key in list(state):
+        if key == "_gap_ready":
+            continue
+        cleaner = _CLEANERS.get(key)
+        value = cleaner(state[key]) if cleaner else None
+        if value is None:
+            state.pop(key)
+        else:
+            state[key] = value
+
+
+def _reaper(state, now):
+    """Settle the reaper lines read this pass (closed rule: a failed line younger than RECENT_SECONDS joins the outage; an older one joins the gap
+    summary and is never an alert of its own; an ok line closes the outage). Limits: a late line older than the window is summed, not alerted. A malformed
+    record is dropped (fails closed: no alert from it)."""
+    _sanitize(state)
+    events = sorted((e for e in state.pop("reaper_new", []) if isinstance(e, list) and len(e) == 3 and _num(e[0])), key=lambda e: e[0])
+    for ts, ok, reason in events:
+        outage = state.get("reaper_outage")
+        if ok:
+            state["reaper_ok"] = max(ts, state.get("reaper_ok", 0))
+            if isinstance(outage, dict) and outage.get("closed_by") is None and ts >= outage.get("latest", 0):
+                outage["closed_by"] = ts
+        elif ts < now - RECENT_SECONDS:
+            gap = state.get("reaper_gap")
+            if not isinstance(gap, dict):
+                gap = state["reaper_gap"] = {"count": 0, "first": ts, "latest": ts, "reason": reason}
+            gap["count"] += 1
+            gap["first"] = min(gap["first"], ts)
+            if ts >= gap["latest"]:
+                gap["latest"], gap["reason"] = ts, reason
+        elif isinstance(outage, dict) and (outage.get("closed_by") is None or ts <= outage["closed_by"]):
+            outage["count"] += 1
+            outage["first"] = min(outage["first"], ts)
+            if ts >= outage["latest"]:
+                outage["latest"], outage["reason"] = ts, reason
+        else:
+            state["reaper_outage"] = {"first": ts, "latest": ts, "count": 1, "reason": reason, "sent": False, "closed_by": None}
+
+
+def _at_end(state, path, key):
+    if not os.path.lexists(path):
+        return True   # a missing file has nothing to read
+    try:
+        return state.get("offsets", {}).get(key, 0) >= os.stat(path).st_size
+    except OSError:
+        return False   # a file that exists and cannot be read is not at its end
 
 
 def _ask_of(name, record):
@@ -153,6 +295,7 @@ def _ask_of(name, record):
 
 
 def _losses(state, sb, engine, alive, now, records):
+    _sanitize(state)
     out = []
     for name, c in sorted(state.get("created", {}).items()):
         deadline = c.get("deadline")
@@ -167,8 +310,17 @@ def _losses(state, sb, engine, alive, now, records):
         record = records.get(r["name"], {})
         out.append({"key": "refused_launch:" + key, "kind": "refused_launch", "name": r["name"], "ask": _ask_of(r["name"], record),
                     "at": r["at"], "lane": record.get("reports_to"), "line": r["line"]})
-    for key, r in sorted(state.get("reaper", {}).items()):
-        out.append({"key": "reaper_missed:" + key, "kind": "reaper_missed", "name": REAPER_ID, "ask": "-", "at": r["at"], "lane": None, "line": r["line"]})
+    outage = state.get("reaper_outage")
+    if isinstance(outage, dict) and not outage.get("sent"):
+        out.append({"key": "reaper_missed:outage@%s" % outage["first"], "kind": "reaper_missed", "name": REAPER_ID, "ask": "-", "at": outage["latest"],
+                    "lane": None, "outage": True,
+                    "line": "%d failed reaper line(s), first %s, latest %s, latest reason %s" % (outage["count"], _iso(outage["first"]), _iso(outage["latest"]), outage["reason"])})
+    gap = state.get("reaper_gap")
+    if isinstance(gap, dict) and gap.get("count") and state.get("_gap_ready"):
+        out.append({"key": "reaper_gap:%s:%s:%d" % (gap["first"], gap["latest"], gap["count"]), "kind": "reaper_missed", "name": REAPER_ID, "ask": "-",
+                    "at": gap["latest"], "lane": None, "gap": True,
+                    "text": "[lost worker] reaper: %d failed reaper line(s) while the detector was down or before this pass, first %s, latest %s, latest reason %s" % (
+                        gap["count"], _iso(gap["first"]), _iso(gap["latest"]), gap["reason"])})
     seen = state.setdefault("seen", {})
     if alive is not None:
         for name, info in alive.items():
@@ -235,10 +387,19 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
         else:
             engine.audit.append(engine.actor, "lost_worker.memory_corrupt", None, {"file": STATE_FILE, "action": "nothing alerted this pass; fresh memory next pass"})
             return []
+    before = json.dumps(state, sort_keys=True)   # before the cleaning: a cleaned memory is written back
+    raw_keys = set(state)
+    _sanitize(state)   # before the first fold: a record of the wrong type never reaches the code that adds to it
+    if status == "ok" and ("offsets" not in state or ("alerted" in raw_keys and "alerted" not in state)):
+        state, status = {}, "none"   # no usable positions or no usable list of what was alerted: no usable memory (recent losses only, the older marked)
     first = status in ("none", "memory_only")
-    before = json.dumps(state, sort_keys=True)
+    catchup = first or state.get("catchup") is True   # a catch-up: no usable memory, and every later pass until both audits are read to their end
     _fold(state, sb, _read_new(sb, str(engine.audit.path), state, "switchboard"), "switchboard")
     _fold(state, sb, _read_new(sb, launcher_audit or launcher_audit_path(), state, "launcher"), "launcher")
+    _reaper(state, now)
+    at_end = _at_end(state, str(engine.audit.path), "switchboard") and _at_end(state, launcher_audit or launcher_audit_path(), "launcher")
+    state["catchup"] = (first or state.get("catchup") is True) and not at_end   # set only on a pass with no usable memory; cleared only by a pass that reads both files to their end
+    state["_gap_ready"] = at_end
     records = {}
     for r in (getattr(engine, "cloud_watch", None) or {}).get("records", []):
         if isinstance(r, dict) and isinstance(r.get("worker"), str):
@@ -247,18 +408,23 @@ def run_pass(sb, engine, now, alive=None, launcher_audit=None):
     alerted.update({k: v for k, v in _PROC_ALERTED.get(path, {}).items() if k not in alerted})   # what this process already alerted is never skipped or repeated
     losses = [x for x in _losses(state, sb, engine, alive, now, records) if x["key"] not in alerted]
     losses.sort(key=lambda x: (x["at"], x["key"]))
-    if first:
-        # No usable memory: only workers created in the last hour are alerted; the older ones are marked, never sent (a valid memory alerts every loss since).
-        old = [x for x in losses if x["at"] < now - RECENT_SECONDS]
+    state.pop("_gap_ready", None)
+    if catchup:
+        # A catch-up: only losses of the last hour are alerted; the older ones are marked, never sent (a valid memory outside one alerts every loss since).
+        old = [x for x in losses if x["at"] < now - RECENT_SECONDS and x["kind"] != "reaper_missed"]
         for x in old:
             alerted[x["key"]] = {"ask": x["ask"], "at": now, "skipped": True}
-        losses = [x for x in losses if x["at"] >= now - RECENT_SECONDS]
+        losses = [x for x in losses if x["at"] >= now - RECENT_SECONDS or x["kind"] == "reaper_missed"]
     batch, rest = losses[:PASS_CAP], losses[PASS_CAP:]
     raised = []
     for loss in batch:
         earlier = sum(1 for a in alerted.values() if a.get("ask") == loss["ask"] and loss["ask"] != "-")
         alerted[loss["key"]] = {"ask": loss["ask"], "at": now}   # marked BEFORE the send: a send that fails is not tried again (once per loss)
-        text = text_of(loss, earlier)
+        text = loss.get("text") or text_of(loss, earlier)
+        if loss.get("gap"):
+            state.pop("reaper_gap", None)   # summed once per gap: cleared as it is sent
+        if loss.get("outage") and isinstance(state.get("reaper_outage"), dict):
+            state["reaper_outage"]["sent"] = True
         _deliver(engine, sb, loss, [loss.get("lane"), "chief-of-staff"], text)
         raised.append(dict(loss, text=text, earlier=earlier))
     if rest:

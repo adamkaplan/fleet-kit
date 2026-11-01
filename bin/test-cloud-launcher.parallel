@@ -19,3 +19,7 @@ cloud/worker/tests/test_guard_table.py
 cloud/worker/tests/test_cw_gh_comments.py
 cloud/worker/tests/test_cloud_prepush_hardening.py
 cloud/worker/tests/test_stack_pull.py
+cloud/launcher/tests/test_cloud_split.py
+cloud/launcher/tests/test_m_cap.py
+cloud/launcher/tests/test_mint_roles.py
+cloud/launcher/tests/test_git_token_retry.py
