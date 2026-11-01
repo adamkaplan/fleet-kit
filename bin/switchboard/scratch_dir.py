@@ -5,6 +5,7 @@
 # private-directory helper `job_ensure_root` (0700, ours, lstat, so a symlink is refused): this part makes no directory itself. The name is the caller's own,
 # found by `identify_caller`; the command takes no argument, so no path or name can point elsewhere. No fleet command removes or empties the directory
 # (`disk_janitor.holds_scratch` is the janitor's check; the others never reach the state directory). A size bound only warns, it never deletes or refuses.
+# The daemon's look is `ScratchBoundFacts`, one more source of `fact_sources` (the one registration point of the entry).
 
 SCRATCH_BOUND = 100 * 1024 * 1024   # bytes: 100 MB
 SCRATCH_WALK_MAX = 50000            # entries counted at most (a walk of more says "over" when the bytes seen are already over the bound, else stops)
@@ -106,10 +107,3 @@ class ScratchBoundFacts:
                 pass
         return []
 
-
-_fact_sources_before_scratch = fact_sources
-
-
-def fact_sources(state_dir):
-    """Every fact source of the entry, then the scratch bound's look (a part adds its source here: the entry's own list is not edited)."""
-    return _fact_sources_before_scratch(state_dir) + [ScratchBoundFacts()]
