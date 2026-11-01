@@ -257,6 +257,26 @@ class TestScratchGuard(ScratchWorld):
         self.assertIn("the temp janitor", str(caught.exception))
         self.assertIn("helper.sh", str(caught.exception))
 
+    def check_lookup_fails_closed(self, error):
+        scratch = self.plant()
+        real = os.path.realpath
+
+        def lookup(path, *a, **kw):
+            if str(path).endswith(os.sep + "scratch"):
+                raise error
+            return real(path, *a, **kw)
+        with mock.patch.object(os.path, "realpath", lookup):
+            lines = self.run_janitor()
+        self.assertEqual([l for l in lines if l.startswith("removed ")], [], "a removal happened with the real-path lookup failing: %s" % lines)
+        self.assertEqual(len([l for l in lines if "scratch directory" in l]), 1, "expected one 'scratch directory' line: %s" % lines)
+        self.assertTrue(scratch.exists(), "the scratch file was removed when the real-path lookup failed")
+
+    def test_s13_lookup_oserror_keeps_the_directory(self):
+        self.check_lookup_fails_closed(OSError("lookup failed"))
+
+    def test_s13_lookup_valueerror_keeps_the_directory(self):
+        self.check_lookup_fails_closed(ValueError("embedded null byte"))
+
 
 class TestScratchBound(ScratchWorld):
     """S11: the daemon records one audit line a day while a scratch directory stays over the bound, and removes nothing."""
