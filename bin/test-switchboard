@@ -67366,6 +67366,7 @@ TestWholeReadOfALargePullRequest = _changed_file_pages.load()
 
 _lm = importlib.import_module("test_launch_model"); _lm.HOST = sys.modules[__name__]; TestLaunchModel = _lm.build(); TestLaunchModelCloud = _lm.build_cloud()   # #1642
 TestPlanningDecision, TestConcurrencyGroup, TestGateLegs, TestGatePass, TestPlatformPaths, TestMacDocs = (_ml := importlib.import_module("test_mac_legs")).TestPlanningDecision, _ml.TestConcurrencyGroup, _ml.TestGateLegs, _ml.TestGatePass, _ml.TestPlatformPaths, _ml.TestDocs
+_ph = importlib.import_module("test_plan_hash_marker"); TestOneHashWithOrWithoutTheMarker, TestStoredBindingsReadAsBound, TestReviewRoundInBothForms, TestPlanHashMarkerMutants, TestPlanHashMarkerDocumentation, TestPlanHashMarkerNoSizeTest = _ph.TestOneHashWithOrWithoutTheMarker, _ph.TestStoredBindingsReadAsBound, _ph.TestReviewRoundInBothForms, _ph.TestMutants, _ph.TestTheDocumentation, _ph.TestNoSizeTestInThisFile   # #1713
 
 class TestTheArchitectureTestIsRun(unittest.TestCase):
     """CI runs this file and nothing else of the switchboard's tests: if the two lines above are removed, the architecture test would drop out of CI without a
