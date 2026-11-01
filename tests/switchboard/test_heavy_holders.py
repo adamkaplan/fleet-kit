@@ -196,14 +196,20 @@ class TestHeavyHolders(unittest.TestCase):
     def test_e_a_lock_deleted_while_held_is_not_found(self):
         lock = self.tmp / "lock"
         lock.write_text("")
-        with open(lock) as held:
-            root = self.tmp / "proc3"
-            (root / "401" / "fd").mkdir(parents=True)
-            os.symlink(("/proc/self/fd/%d" if os.path.isdir("/proc/self/fd") else "/dev/fd/%d") % held.fileno(), root / "401" / "fd" / "7")
-            self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), {401})   # present: found
-            os.unlink(lock)
-            # the fd link still stats the open inode, but the path stat fails, so nothing is compared: an empty set
-            self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), set())
+        root = self.tmp / "proc3"
+        (root / "401" / "fd").mkdir(parents=True)
+        # the fake fd link points directly at the lock: the stat follows it to the lock itself, on any platform
+        os.symlink(str(lock), root / "401" / "fd" / "7")
+        self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), {401})   # present: found
+        # the deleted-while-held half needs a real process directory: a symlink cannot model a deleted lock
+        # (on macOS /dev/fd/N has another st_dev), so it runs only where /proc/self/fd exists
+        if os.path.isdir("/proc/self/fd"):
+            os.unlink(root / "401" / "fd" / "7")
+            with open(lock) as held:
+                os.symlink("/proc/self/fd/%d" % held.fileno(), root / "401" / "fd" / "7")
+                os.unlink(lock)
+                # the fd link still stats the open inode, but the path stat fails, so nothing is compared: an empty set
+                self.assertEqual(self.hs._proc_lock_pids(str(lock), str(root)), set())
 
     def run_wrapper(self, name, stranger):
         """One wrapper run in a world without lsof; returns (merged text and status, stdout, stderr and status of a second, separate run's streams)."""
