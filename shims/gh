@@ -2082,8 +2082,9 @@ def api_decide(args, namer, previous):
             api_refuse_unknown(effective or "(no method)", "the endpoint %s (%s allows %s)" % (raw[:60], found[0], "/".join(found[1])))
         if found[2] and effective in ("POST", "PATCH"):
             query = raw.partition("#")[0].partition("?")[2]
-            for key in [part.partition("=")[0] for part in query.split("&") if part] + [f.partition("=")[0] for f in fields]:
-                if (key != "body" or key in [part.partition("=")[0] for part in query.split("&")]) and re.search(r"(?i)(^|\[)body\]?$", key):
+            query_keys = [urllib.parse.unquote(part.partition("=")[0]) for part in re.split(r"[&;]", query) if part]
+            for key in query_keys + [f.partition("=")[0] for f in fields]:
+                if (key != "body" or key in query_keys) and re.search(r"(?i)(^|\[)body\]?$", key):
                     raise Refused("a body written as %s (a nested key, another case, or the URL query string) on a comment or review endpoint cannot be signed: send it as -f body=... or --input with a JSON object" % key[:40])
         if found[2] and len(api_parse(args)[2]) != len(fields):
             raise Refused("the flags of this gh api call to a comment or review endpoint cannot be read, so its body cannot be signed and nothing was posted")
