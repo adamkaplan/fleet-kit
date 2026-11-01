@@ -1973,5 +1973,55 @@ class TestGhShimDeepBodiesAndInputForms(unittest.TestCase):
         self.assertEqual(sum(a.count(SIGNED) for a in calls[0]["argv"]), 2)
 
 
+def input_body_field_failures(rig):
+    """#1696 S33: the failures seen for a -f or -F body field beside --input (empty when the control passes and each form is refused)."""
+    bad = []
+    reviews = "repos/o/r/pulls/1/reviews"
+    path = rig.home / "beside.json"
+    path.write_text('{"event":"COMMENT"}')
+    other = rig.home / "control.json"
+    other.write_text('{"body":"x"}')
+    done, calls = rig.run("api", reviews, "-f", "event=COMMENT", "--input", str(other))
+    if len(calls) != 1 or json.loads(calls[0]["files"][calls[0]["argv"][-1]])["body"].count(SIGNED) != 1:
+        return ["the control of S33 did not pass"]
+    for form in (("-f", "body=a"), ("-F", "Body=a"), ("-f", "comments[][body]=a")):
+        done, calls = rig.run("api", reviews, *form, "--input", str(path))
+        lines = [l for l in done.stderr.splitlines() if l.startswith("gh:")]
+        if calls or done.returncode != 1 or len(lines) != 1 or not lines[0].startswith("gh: refused:"):
+            bad.append("a body field beside --input went out unsigned")
+    return bad
+
+
+class TestGhShimBodyFieldBesideInput(unittest.TestCase):
+    """#1696 PC-10: a -f or -F body field beside --input is refused (S33), and a mutant that skips that check is seen (S34)."""
+
+    def setUp(self):
+        self.rig = hermetic_rig()
+        self.addCleanup(self.rig.close)
+        self.source = (SHIM_DIR / "gh").read_text()
+
+    def test_s33_control_first_a_non_body_field_beside_input_is_signed_once(self):
+        path = self.rig.home / "c.json"
+        path.write_text('{"body":"x"}')
+        done, calls = self.rig.run("api", "repos/o/r/pulls/1/reviews", "-f", "event=COMMENT", "--input", str(path))
+        self.assertEqual(len(calls), 1, done.stderr)
+        self.assertEqual(json.loads(calls[0]["files"][calls[0]["argv"][-1]])["body"].count(SIGNED), 1)
+
+    def test_s33_the_label_delete_with_a_field_is_unchanged(self):
+        done, calls = self.rig.run("api", "-X", "DELETE", "repos/o/r/labels/n", "-f", "body=x")
+        self.assertEqual(len(calls), 1, done.stderr)
+
+    def test_s33_a_body_field_beside_input_is_refused(self):
+        self.assertEqual(input_body_field_failures(self.rig), [])
+
+    def test_s34_a_mutant_skipping_the_check_when_input_is_present_is_seen(self):
+        self.assertEqual(input_body_field_failures(self.rig), [])   # control first
+        old = "        if found[2] and has_input and any("
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone (the body field check of api_decide)")
+        rig = Rig(self.source.replace(old, "        if found[2] and has_input and not has_input and any(", 1))
+        self.addCleanup(rig.close)
+        self.assertIn("a body field beside --input went out unsigned", input_body_field_failures(rig))
+
+
 if __name__ == "__main__":
     unittest.main()
