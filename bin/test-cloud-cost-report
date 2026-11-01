@@ -472,6 +472,8 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
         names = sorted(derive_launcher_names(LAUNCHER_TEXT))
         print("launcher audit action names (%d): %s" % (len(names), ", ".join(names)))
         self.assertGreaterEqual(len(names), 10)
+        self.assertGreaterEqual(len(names), 14)
+        print("S2 derived actions: %d (names neither costed nor skipped: %d)" % (len(names), len(uncovered_names(LAUNCHER_TEXT, REAL))))
         self.assertEqual(uncovered_names(LAUNCHER_TEXT, REAL), [])
         self.assertEqual(stale_names(REAL, set(names)), [], "STALE: the report names an action the launcher no longer writes")
         sites = variable_action_sites(LAUNCHER_TEXT)
@@ -485,6 +487,8 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
         scratch = LAUNCHER_TEXT.replace(old, '"a-new-action", 0.0, True, "attempt %d: ready"')
         self.assertNotEqual(scratch, LAUNCHER_TEXT)
         self.assertEqual(uncovered_names(scratch, REAL), ["a-new-action"])
+        print("S2 mutant: the new action a-new-action is named by the derivation test %d of 1, mutation applied %s"
+              % (int(uncovered_names(scratch, REAL) == ["a-new-action"]), scratch != LAUNCHER_TEXT))
 
     def test_a_fixture_audit_of_the_real_shape_gives_a_report_and_counts_the_skipped_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -502,6 +506,7 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(len(err.getvalue().splitlines()), 1)
         self.assertIn("reboot", err.getvalue())
+        print("S3 report failure: exit %d, stderr lines %d, names reboot %d" % (code, len(err.getvalue().splitlines()), int("reboot" in err.getvalue())))
 
     def test_the_launcher_tail_reader_neither_raises_nor_takes_an_unknown_action_for_a_stop(self):
         launcher = load_launcher()
@@ -511,6 +516,31 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
             self.assertIsNone(launcher.last_audit_line(path, "stop"))
             self.assertIsNone(launcher.last_audit_line(path, "refresh-cluster-token", "reaper"))
             self.assertEqual(launcher.last_audit_line(path, "a-new-action"), (False, None))
+            print("S3 tail reader: stop %s, refresh %s, unknown %s" % (launcher.last_audit_line(path, "stop"),
+                  launcher.last_audit_line(path, "refresh-cluster-token", "reaper"), launcher.last_audit_line(path, "a-new-action")))
+
+    def test_s3_prints_its_counts(self):
+        launcher = load_launcher()
+        raises = stops = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = line("2026-10-14T06:00:00Z", "pod/cb-example-4", "a-new-action", 0, ok=False)
+            path = write(tmp, "audit.jsonl", [rec], raw=json.dumps(rec) + "\nnot json\n")
+            try:
+                stops += int(launcher.last_audit_line(path, "stop") is not None)
+                stops += int(launcher.last_audit_line(path, "refresh-cluster-token", "reaper") is not None)
+            except Exception:
+                raises += 1
+            bad = EVERY_LAUNCHER_ACTION + [line("2026-10-14T06:00:00Z", "pod/cb-example-4", "reboot", 0)]
+            err = io.StringIO()
+            try:
+                with mock_stderr(err):
+                    code, _ = run(REAL, write(tmp, "audit2.jsonl", bad))
+            except Exception:
+                raises += 1
+                code = None
+        failure_lines = len(err.getvalue().splitlines())
+        self.assertEqual((raises, stops, code, failure_lines), (0, 0, 2, 1))
+        print("S3 tolerant readers: %d of 2, raises %d, stops %d, report failure line %d" % (2 - raises, raises, stops, failure_lines))
 
 
 ROOT = BIN.parent
