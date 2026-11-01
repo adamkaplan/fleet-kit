@@ -78,6 +78,14 @@ export function urlOf(d) {
   return `https://github.com/${d.repo}/${isPrRow(d) ? "pull" : "issues"}/${n}`
 }
 
+// The short code of an item, `<repository-name>:#<number>` (owner dropped), or null. The ONE place a short code is built.
+export function shortCodeOf(d) {
+  const url = urlOf(d)
+  if (!url) return null
+  const m = url.match(/^https:\/\/github\.com\/[^/]+\/([^/]+)\/(?:issues|pull)\/([0-9]+)$/)
+  return m ? `${m[1]}:#${m[2]}` : null
+}
+
 // Text safe to put on a line the terminal draws: every control character except tab and line breaks (which wrap
 // collapses to a space) removed: C0, DEL, C1: ESC, BEL, the 8-bit CSI/OSC introducers and string terminators.
 export const stripControls = (text) => String(text ?? "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
@@ -257,6 +265,7 @@ export function entryOf(decision, nowMs, width = ROW_WIDTH) {
   const rows = Array.isArray(decision.rows) ? decision.rows.filter((r) => r && typeof r.text === "string") : []
   if (rows.length) entry.rows = rows.map((r) => wrapText(stripControls(r.text), width, ROW_LINES))
   const url = urlOf(decision)
+  if (url) entry.code = shortCodeOf(decision)
   if (url) entry.url = url  // only when there is one: an entry without a link is exactly what it was
   if (isNotice(decision)) entry.facts = wrapText(factsOf(decision), width, FACTS_LINES)  // a heads-up: facts between headline and id
   return entry
@@ -514,7 +523,7 @@ export const styledRows = (snapshot, nowMs, width = ROW_WIDTH, view = HUMAN_VIEW
       items.forEach((d, ei) => {
         const url = urlOf(d)
         const indent = "  ".repeat(depthOf(d))
-        const put = (l) => { const linked = url ? { ...l, url } : l; out.push(indent ? { ...linked, segs: [[indent, ""], ...linked.segs] } : linked) }
+        const put = (l) => { const linked = url ? { ...l, url, code: shortCodeOf(d) } : l; out.push(indent ? { ...linked, segs: [[indent, ""], ...linked.segs] } : linked) }
         const tidyWith = (t) => tidyRefs(stripControls(t), repo, known)
         const headline = tidyWith(typeof d.headline === "string" && d.headline ? d.headline : d.title)
         const age = ageSeg(d)

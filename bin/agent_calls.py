@@ -177,6 +177,15 @@ def _add_lane(lanes, lane, account, endpoint, n=1):
     cell[endpoint] = cell.get(endpoint, 0) + n
 
 
+def _add_accounts(pairs):
+    """{cleaned account: summed count}: accounts that clean to the same name ADD (only non-negative whole numbers), never overwrite."""
+    out = {}
+    for a, n in pairs:
+        if _number(n) and n >= 0:
+            out[_account(a)] = out.get(_account(a), 0) + int(n)
+    return out
+
+
 def load_hours(state_dir):
     raw = _read_json(os.path.join(state_dir, HOURS_FILE)) if state_dir else None
     hours = raw.get("hours") if raw else None
@@ -185,8 +194,7 @@ def load_hours(state_dir):
     if isinstance(hours, dict):
         for key, row in hours.items():
             if key.isdigit() and isinstance(row, dict):
-                clean[key] = {side: {_account(a): int(n) for a, n in (row.get(side) or {}).items() if _number(n) and n >= 0}
-                              for side in ("agent", "daemon") if isinstance(row.get(side), dict)}
+                clean[key] = {side: _add_accounts((row.get(side) or {}).items()) for side in ("agent", "daemon") if isinstance(row.get(side), dict)}
                 lanes = _clean_lanes(row.get("lanes"))
                 if lanes:
                     clean[key]["lanes"] = lanes
@@ -217,10 +225,12 @@ def fold(state_dir, now, daemon_delta=None):
                 if _number(c) and c > 0:
                     parts[_endpoint(e)] = parts.get(_endpoint(e), 0) + int(c)   # classes that reduce to one word ADD, never overwrite
             if parts:
-                detail[_account(a)] = parts
-                delta[_account(a)] = sum(parts.values())
+                cell = detail.setdefault(_account(a), {})
+                for e, c in parts.items():
+                    cell[e] = cell.get(e, 0) + c
+                delta[_account(a)] = delta.get(_account(a), 0) + sum(parts.values())
         elif _number(n) and n > 0:
-            delta[_account(a)] = int(n)
+            delta[_account(a)] = delta.get(_account(a), 0) + int(n)
     if not lines and not delta:
         return False
     hours, since = load_hours(state_dir)
@@ -322,8 +332,12 @@ def record_usage(state_dir, now, readings):
     """Keep {account: (used, remaining, limit, reset)} where `status` reads it. Never raises; returns True when written."""
     if not state_dir or not readings:
         return False
-    body = {"v": 1, "at": now, "accounts": {_account(a): {"used": u, "remaining": r, "limit": l, "reset": t}
-                                           for a, (u, r, l, t) in list(readings.items())[:USAGE_ACCOUNTS]}}
+    accounts = {}
+    for a, (u, r, l, t) in list(readings.items())[:USAGE_ACCOUNTS]:
+        old = accounts.get(_account(a))   # accounts that clean to one name ADD their figures (the later reset wins)
+        accounts[_account(a)] = {"used": u, "remaining": r, "limit": l, "reset": t} if old is None else {
+            "used": old["used"] + u, "remaining": old["remaining"] + r, "limit": old["limit"] + l, "reset": max(old["reset"], t)}
+    body = {"v": 1, "at": now, "accounts": accounts}
     return _write_json(os.path.join(state_dir, USAGE_FILE), body)
 
 
@@ -340,13 +354,8 @@ def recorded_in_window(hours, account, window_start, now):
     return int(round(total))
 
 
-def usage_lines(state_dir, now):
-    """The `status` lines for real usage: per account used, remaining and reset, the calls recorded in the same window and the difference
-    (spent outside the shim and the daemon). A reading older than 5 minutes says so; none says `not recorded`."""
-    body = _read_json(os.path.join(state_dir, USAGE_FILE)) if state_dir else None
-    accounts = body.get("accounts") if body else None
-    if not isinstance(accounts, dict) or not accounts or not _number(body.get("at")):
-        return ["      github     real usage: not recorded"]
+def merged_hours(state_dir):
+    """The hourly record with the agent shells' spool that is not folded yet added in: the one figure `status` and the census both read."""
     hours, _ = load_hours(state_dir)
     unfolded = {}
     for ts, account, _lane_name, _endpoint_name in _spool_lines(os.path.join(state_dir, SPOOL)) + _spool_lines(os.path.join(state_dir, SPOOL + ".fold")):
@@ -357,6 +366,23 @@ def usage_lines(state_dir, now):
         cell = merged.setdefault(str(start), {"agent": {}, "daemon": {}})["agent"]
         for account, n in row["agent"].items():
             cell[account] = cell.get(account, 0) + n
+    return merged
+
+
+def recorded_by_account(state_dir, readings, now):
+    """{account: calls recorded in the window of its real-usage reading}: the same computation as the `status` line (read only)."""
+    merged = merged_hours(state_dir)
+    return {a: recorded_in_window(merged, _account(a), r[3] - 3600, now) for a, r in readings.items()}
+
+
+def usage_lines(state_dir, now):
+    """The `status` lines for real usage: per account used, remaining and reset, the calls recorded in the same window and the difference
+    (spent outside the shim and the daemon). A reading older than 5 minutes says so; none says `not recorded`."""
+    body = _read_json(os.path.join(state_dir, USAGE_FILE)) if state_dir else None
+    accounts = body.get("accounts") if body else None
+    if not isinstance(accounts, dict) or not accounts or not _number(body.get("at")):
+        return ["      github     real usage: not recorded"]
+    merged = merged_hours(state_dir)
     age = now - body["at"]
     lines = []
     for account, row in sorted(accounts.items()):

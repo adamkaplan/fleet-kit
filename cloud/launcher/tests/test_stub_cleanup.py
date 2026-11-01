@@ -368,7 +368,7 @@ ENDERS = {"kill", "terminate", "send_signal", "stop_group", "killpg"}   # what E
 BACKGROUND = re.compile(r"(?<![&])&\s*($|[;\n)])|\bnohup\b|\bsetsid\b|\bdisown\b")   # a shell string that backgrounds something
 SERVER_WORDS = re.compile(r"stub_server|serve_forever|http\.server")   # a blocking call whose argument is a server never returns
 # a child that a string of code starts inside another process: allowed only with this reason (the scan finds the string; a new one fails)
-EMBEDDED_OK = {("bin/test-cloud-worker", "grandchild.pid"): "a bounded grandchild (sleep 60) of a stub tool; the test asserts it is gone",
+EMBEDDED_OK = {("cloud/launcher/tests/cw_cases_lookup.py", "grandchild.pid"): "a bounded grandchild (sleep 60) of a stub tool; the test asserts it is gone",
                ("bin/test-cloud-worker", "test_u3_a_signal_right_after_the_tunnel_spawn_still_stops_the_tunnel: subprocess.Popen"): "wraps the real Popen to raise a signal right after the tunnel spawn; the tunnel is started and stopped by the code under test, which the test asserts",
                ("bin/test-cloud-worker", "test_u3_a_signal_right_after_the_tunnel_spawn_still_stops_the_tunnel: subprocess"): "the module named only to patch its Popen with that wrapper",
                ("cloud/worker/tests/fixtures/prepush_spawner.py", "subprocess.Popen(['sleep', '77'])"): "a bounded grandchild (sleep 77) of a fixture script; the hardening test asserts the check's process-group kill ends it"}

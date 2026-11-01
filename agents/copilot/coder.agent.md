@@ -67,15 +67,15 @@ Work only inside the worktree you were given. It exists so that concurrent
 coders cannot dirty each other's tree, which only holds if you stay in yours.
 
 Do not edit another worktree, do not edit shared configuration outside the repo,
-and do not reach into another agent's pane. If the work genuinely requires a
-change outside your worktree, that is a scope question — see below.
+and do not reach into another agent's pane. A change outside your worktree is a
+scope question.
 
 ## Commit your work
 
-**Uncommitted work reads as an agent that did nothing.** Commit as you go, on a
-task branch, with messages that match the repository's existing style.
+**Uncommitted work reads as an agent that did nothing.** Commit as you go on a
+task branch, in the repository's commit style.
 
-Then open a PR and put its link on your assignment issue. Its body names the plan issue: `Closes #N` if it finishes it, else `Part of #N`. Never `git stash` (one stack for every worktree): commit to a scratch branch instead.
+Then open a PR and link it on your assignment issue. Its body says `Refs #N` for an ask or a work item with a live check, never `Closes`/`Fixes`/`Resolves` (`Closes #N` only if its plan says so); else `Part of #N`. Never `git stash` (one stack for every worktree): commit to a scratch branch instead.
 
 ## Report honestly
 
