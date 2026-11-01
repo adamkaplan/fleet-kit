@@ -332,6 +332,50 @@ class TestDocumentation(unittest.TestCase):
         self.assertIn("three states", str(caught.exception))
 
 
+class TestWholeFileMutants(Stopped):
+    """S10 and S11 (#1750): the decorator of cloud-clear and the Refusal of the cluster step of read, each pinned by a scratch copy of bin/cloud_worker.py."""
+
+    def scratch(self, old=None, new=None):
+        text = (BIN / "cloud_worker.py").read_text()
+        if old is not None:
+            self.assertEqual(text.count(old), 1, "the mutated text does not occur once")
+            mutated = text.replace(old, new)
+            self.assertNotEqual(mutated, text, "the mutation was not applied")
+            text = mutated
+        scope = dict(vars(self.cw))
+        exec(compile(text, "<scratch cloud_worker>", "exec"), scope)
+        scope["H"] = self.cw.H
+        return scope
+
+    def put(self, scope, name):
+        p = mock.patch.object(self.cw, name, scope[name])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def check_s10(self, scope):
+        def records(state):
+            raise scope["Refusal"]("the records were refused")
+        scope["list_records"] = records
+        self.put(scope, "cmd_cloud_clear")
+        self.assertEqual(self.launch("coder7")[0], 0)
+        try:
+            code, out, err = self.as_caller(rt.KIND_BOSS, "cloud-clear")
+        except Exception as raised:
+            raise AssertionError("cloud-clear no longer turns a Refusal into exit 2 (%s escaped)" % type(raised).__name__)
+        if code != 2 or len(err.strip().splitlines()) != 1:
+            raise AssertionError("cloud-clear no longer turns a Refusal into exit 2 (exit %s)" % code)
+
+    def test_s10_cloud_clear_still_turns_a_refusal_into_exit_2_with_one_line(self):
+        self.check_s10(self.scratch())
+        RESULTS["s10c"] = 1
+
+    def test_s10_a_copy_without_the_decorator_fails_with_the_anchored_text(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.check_s10(self.scratch("@refusals\ndef cmd_cloud_clear", "def cmd_cloud_clear"))
+        self.assertIn("cloud-clear no longer turns a Refusal into exit 2", str(caught.exception))
+        RESULTS["s10m"] = 1
+
+
 class TestDiff(unittest.TestCase):
     def test_s8_no_test_line_is_removed(self):
         base = subprocess.run(["git", "merge-base", "HEAD", "origin/integration"], cwd=str(BIN.parent), capture_output=True, text=True)
@@ -345,6 +389,8 @@ class TestDiff(unittest.TestCase):
 
 
 def tearDownModule():
+    print("S10: cloud-clear refusal exits 2 with 1 line, control passes %d of 1, mutant fails %d of 1 with the anchored text, mutation applied True"
+          % (RESULTS.get("s10c", 0), RESULTS.get("s10m", 0)), file=sys.stderr)
     print("S2: %d of 2; S3: reads %d of 4, control %d, mutant %d; S5: %d of 1; S6: allowed %d of 3, refused %d, mutant %d; S7: %d; S8: %d; S9: %d; S4: %d of 7"
           % tuple(RESULTS.get(k, 0) for k in ("s2", "s3", "s3c", "s3m", "s5", "s6", "s6r", "s6m", "s7", "s8", "s9", "s4")), file=sys.stderr)
 
