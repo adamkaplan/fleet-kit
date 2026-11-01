@@ -211,9 +211,11 @@ message. A `send` from another agent skips the batch.
   with its age in minutes and its key. When a keyed reminder is re-armed and the
   new copy is delivered, an older delivered copy of the same key, sender and
   recipient that the lane has still not consumed is removed with
-  `session.inbox.cancel`. That memory lives in the daemon process only: after a
-  daemon restart the older copy is not cancelled, and the steer above still
-  delivers it once it is old enough.
+  `session.inbox.cancel`. Which items were tried and which reminder ids were
+  delivered is kept in `unconsumed.json` in the state directory (bounded,
+  written before the action that depends on it), so a restart neither repeats a
+  steer nor forgets the older copy; a record that is missing or unreadable
+  reads as empty and is audited once as `unconsumed_record.error`.
 
 - **Explicit interrupt.** `fleet-switchboard send --interrupt <agent> "text"`
   is for stop and hold orders only, from a boss to its own worker, and is

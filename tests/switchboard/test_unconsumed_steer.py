@@ -10,6 +10,7 @@ from support.wire_fakes import EPOCH, FakeHTTP
 
 SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin", "fleet-switchboard")
 STEER_CALL = 'self.v2.inbox_update(observation.session_id, item.get("id"), "steer")'
+READ_CALL = 'record, reason = load_module("unconsumed_record").read(self.state_dir, load_module("record_json").parse_bounded)'
 CANCEL_CALL = 'self.v2.inbox_cancel(observation.session_id, item.get("id"))'
 
 
@@ -192,17 +193,54 @@ def build(Base, TestSteerToWorking):
             self.assertTrue(set(before["platform"]) <= {i["id"] for i in self.inbox("platform")})
             self.assertEqual(len(self.inbox("platform")), 3)
 
-        def test_a_restart_forgets_the_memory_so_the_older_copy_stays_and_the_steer_still_delivers_it(self):
+        def scenario_restart(self, restart):
             self.work(lasts=7200, steps=3)
+            plain = self.queue_message("plain")
             self.remind("platform", "check the build", key="K")
             (older,) = self.keyed()
-            self.world.engine = self.world.new_engine()   # a daemon restart: the memory of delivered reminders is empty
-            self.remind("platform", "check the build again", key="K")
-            self.assertEqual([i["id"] for i in self.inbox() if i["id"] == older["id"]], [older["id"]])   # the older copy remains: count 1
-            self.assertEqual(self.writes("session.inbox.cancel"), [])
             self.minutes(21)
             self.pass_()
-            self.assertIn(older["id"], [w["id"] for w in self.writes("session.inbox.update")])
+            self.assertEqual([w["id"] for w in self.writes("session.inbox.update")].count(plain["id"]), 1)
+            restart()   # a daemon restart: a new engine over the same state directory
+            self.remind("platform", "check the build again", key="K")
+            self.assertEqual([w["id"] for w in self.writes("session.inbox.cancel")], [older["id"]], "the older copy was not cancelled after the restart")
+            for _ in range(3):
+                self.minutes(1)
+                self.pass_()
+            self.assertEqual([w["id"] for w in self.writes("session.inbox.update")].count(plain["id"]), 1, "msg=the item was steered a second time")
+
+        def new_engine(self):
+            self.world.engine = self.world.new_engine()
+
+        def test_u4_a_restart_neither_steers_again_nor_forgets_the_older_copy(self):
+            self.scenario_restart(self.new_engine)
+            self.assertTrue(os.path.exists(os.path.join(str(self.world.state), "unconsumed.json")))
+
+        def test_u4_control_the_unmutated_loader_passes(self):
+            with mock.patch.object(sb.Switchboard, "_record_load", compiled("_record_load")):
+                self.scenario_restart(self.new_engine)
+
+        def test_u4_the_mutant_that_keeps_the_record_in_memory_only_fails_with_the_anchored_text(self):
+            mutant = compiled("_record_load", READ_CALL, 'record, reason = {"steered": [], "reminders": {}}, None')
+            with mock.patch.object(sb.Switchboard, "_record_load", mutant):
+                with self.assertRaises(AssertionError) as caught:
+                    self.scenario_restart(self.new_engine)
+            self.assertIn("the older copy was not cancelled after the restart", str(caught.exception))
+
+        def test_u4_an_unreadable_record_reads_as_empty_and_is_audited_once_after_five_passes(self):
+            self.work(lasts=7200, steps=3)
+            os.mkdir(os.path.join(str(self.world.state), "unconsumed.json"))
+            self.new_engine()
+            for _ in range(5):
+                self.pass_()
+                self.world.tick(5)
+            self.queue_message("needs the record")
+            self.minutes(21)
+            for _ in range(5):
+                self.pass_()
+                self.world.tick(5)
+            found = [e for e in self.lines("unconsumed_record.error") if e["detail"]["phase"] == "read"]
+            self.assertEqual([e["detail"]["reason"] for e in found], ["unreadable"])
 
         # -- S7
 

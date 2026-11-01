@@ -2560,6 +2560,7 @@ class Switchboard:
         self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
         self.unconsumed_seen = collections.OrderedDict()    # #1844: inbox ids whose steer was tried (bounded): at most one try per item
         self.reminder_memory = collections.OrderedDict()    # #1844: "reminder:<id>" -> (dedupe key, from, to) of a reminder delivered by THIS process (bounded; empty after a restart)
+        self.record_loaded, self.record_errors = False, set()   # #1844: the persisted record is read at first use; reasons already audited
         self.stopped_news = {}          # #96: worker.stopped key -> judged clearly no news (decided once per note)
         self.awaiting_held_links = True        # #796: cleared by the first load tick whose held-PR links were all whole (it lapses after HELD_LINKS_WAIT_SECONDS)
         self.awaiting_first_full_pass = True   # #796: set False once a pass has published a non-provisional decisions file; the load tick judges nothing before
@@ -3298,6 +3299,36 @@ class Switchboard:
                              % (", ".join(_fleet_keys(item)) or "no key", max(0, int((now - _created(item)) // 60))))
         return lines
 
+    def _record_load(self):
+        """#1844: the persisted record (unconsumed_record.py) is read when this engine starts and whenever memory holds nothing; a record
+        that is missing, corrupt, unreadable or of the wrong type reads as empty and is audited once per process and reason."""
+        if self.record_loaded and (self.unconsumed_seen or self.reminder_memory):
+            return
+        self.record_loaded = True
+        try:
+            record, reason = load_module("unconsumed_record").read(self.state_dir, load_module("record_json").parse_bounded)
+        except Exception as err:
+            record, reason = {"steered": [], "reminders": {}}, "unreadable: %s" % type(err).__name__
+        if reason is not None and reason not in self.record_errors:
+            self.record_errors.add(reason)
+            if self.audit is not None:
+                self.audit.append(self.actor, "unconsumed_record.error", None, {"reason": reason, "phase": "read"})
+        self.unconsumed_seen = collections.OrderedDict((i, True) for i in record["steered"])
+        self.reminder_memory = collections.OrderedDict((k, tuple(v)) for k, v in record["reminders"].items())
+
+    def _record_save(self):
+        """#1844: written BEFORE the action that depends on it; a failure is audited once and the daemon goes on."""
+        try:
+            load_module("unconsumed_record").write(self.state_dir, {"steered": list(self.unconsumed_seen),
+                                                                    "reminders": {k: list(v) for k, v in self.reminder_memory.items()}},
+                                                   load_module("record_json").parse_bounded)
+        except Exception as err:
+            if "write" not in self.record_errors:
+                self.record_errors.add("write")
+                if self.audit is not None:
+                    self.audit.append(self.actor, "unconsumed_record.error", None,
+                                      {"reason": _one_line("%s: %s" % (type(err).__name__, err), 200), "phase": "write"})
+
     def steer_unconsumed(self, observation, now):
         """#1844: a message this daemon delivered as `queue` that the WORKING lane has not consumed within `unconsumed_steer_minutes` is
         steered into the running turn, once per item (a refusal is audited once per item too). Held lanes are left alone. Returns the ids steered."""
@@ -3305,6 +3336,7 @@ class Switchboard:
         if self.light or not minutes or hold_reason(observation) or observation.status != "working":
             return []
         bound = minutes * 60
+        self._record_load()
         def stale(inbox):
             return [item for item in (inbox if isinstance(inbox, list) else [])
                     if isinstance(item, dict) and item.get("id") not in self.unconsumed_seen and _fleet_meta(item) is not None
@@ -3317,6 +3349,7 @@ class Switchboard:
             self.unconsumed_seen[item.get("id")] = True
             while len(self.unconsumed_seen) > self.UNCONSUMED_CAP:
                 self.unconsumed_seen.popitem(last=False)
+            self._record_save()   # before inbox_update: a restart never repeats the try
             detail = {"session": observation.session_id, "inbox_id": item.get("id"), "keys": _fleet_keys(item),
                       "age_seconds": int(now - _created(item))}
             try:
@@ -3347,6 +3380,7 @@ class Switchboard:
                 if item is None or not item.get("key") or not isinstance(item.get("from"), str) or not item["from"].strip():
                     continue
                 mine.append((fact.key, (item["key"], item["from"], item.get("to"))))
+            self._record_load()
             older = {}
             for new_key, ident in mine:
                 older.update({k: v for k, v in self.reminder_memory.items() if v == ident and k != new_key})
@@ -3355,6 +3389,7 @@ class Switchboard:
                 self.reminder_memory.move_to_end(new_key)
             while len(self.reminder_memory) > self.UNCONSUMED_CAP:
                 self.reminder_memory.popitem(last=False)
+            self._record_save()   # the new ids are recorded before the cancel call
             if not older:
                 return []
             cancelled = []
@@ -3367,6 +3402,7 @@ class Switchboard:
                         self.v2.inbox_cancel(observation.session_id, item.get("id"))
                     for k in keys:
                         self.reminder_memory.pop(k, None)
+                    self._record_save()
                     cancelled.append(item.get("id"))
             if cancelled:
                 self.reads.forget(observation.session_id)
