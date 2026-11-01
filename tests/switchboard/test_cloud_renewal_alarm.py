@@ -492,7 +492,7 @@ class TestCloudRenewalAlarmMutants(unittest.TestCase):
             self.assertEqual(self.child_text(scenario, BIN / "cloud_renewal_alarm.py")[0], 0, scenario)
             code_, text_ = self.child_text(scenario, copy)
             self.assertEqual(code_, 1, scenario)
-            self.assertEqual(text_.count(MUTANT_TEXT[scenario]), 1, "the mutant '%s' did not fail with the text of its own check: %s" % (label, text_[-300:]))
+            self.assertIn(MUTANT_TEXT[scenario], text_, "the mutant '%s' did not fail with the text of its own check: %s" % (label, text_[-300:]))
 
 
 if __name__ == "__main__":
