@@ -1781,7 +1781,7 @@ class TestKeptRetireNamesTheSave(Base):   # #1791
 
     def test_s3_u1_the_force_delete_sentence_and_the_stdout_line_are_unchanged(self):
         (code, out, err), _ = self.kept()
-        self.assertEqual(err.count(self.FORCE), 1, err)
+        self.assertEqual(err.count(self.FORCE), 1, "the force-delete hint is missing: " + err)
         self.assertEqual(out, "coder7: pod kept\n")
         self.assertEqual(code, 1)
 
@@ -1796,8 +1796,8 @@ class TestKeptRetireNamesTheSave(Base):   # #1791
         self.assertEqual(self.launch()[0], 0)
         code, out, err = self.main("retire", "coder7")
         self.assertEqual(code, 0, err)
-        self.assertEqual((err + out).count("NEW branch"), 0)
-        self.assertEqual((err + out).count("--force"), 0)
+        self.assertEqual((err + out).count("NEW branch"), 0, "a retire that pushed printed the recover line")
+        self.assertEqual((err + out).count("--force"), 0, "a retire that pushed printed the force-delete line")
 
     def test_s6_a_mutant_that_prints_the_force_hint_first_is_caught(self):
         src = (BIN / "cloud_worker.py").read_text()
@@ -1815,14 +1815,38 @@ class TestKeptRetireNamesTheSave(Base):   # #1791
         print("%d of 1 mutants failing" % failing)
         self.assertEqual(failing, 1, out)
 
-    def test_s7_the_recover_sentence_is_in_the_three_places(self):
-        root = BIN.parent
-        places = {"retire help (bin/fleet-switchboard)": root / "bin" / "fleet-switchboard", "coordination skill": root / "skills" / "fleet-coordination" / "SKILL.md",
-                  "cloud worker interface": root / "docs" / "cloud-worker-interface.md"}
-        lacking = [n for n, f in places.items() if self.SENTENCE not in " ".join(f.read_text().split())]
-        self.assertEqual(lacking, [], "the recover sentence is missing from: %s" % lacking)
-        text = " ".join((root / "cloud" / "launcher" / "run_task.py").read_text().split())   # the driver's line names the same step, or says nothing of deleting
-        self.assertTrue("delete it only after the work is saved" not in text or "commit its tree on a NEW branch" in text)
+    def five_places(self, root):
+        norm = lambda t: " ".join(t.split())
+        sw = (root / "bin" / "fleet-switchboard").read_text().splitlines()
+        line = lambda key: norm(" ".join(l for l in sw if key in l))
+        return {"launch epilog": line("launch.epilog ="), "retire epilog": line("retire.epilog ="),
+                "coordination skill": norm((root / "skills" / "fleet-coordination" / "SKILL.md").read_text()),
+                "cloud worker interface": norm((root / "docs" / "cloud-worker-interface.md").read_text()),
+                "run_task.py": norm((root / "cloud" / "launcher" / "run_task.py").read_text())}
+
+    def check_five(self, places, sentence):
+        for name in ("launch epilog", "retire epilog", "coordination skill", "cloud worker interface", "run_task.py"):
+            self.assertIn(sentence, places[name], "the %s lacks the recover sentence" % name)
+
+    def test_s7_the_recover_sentence_is_in_all_five_places(self):
+        sentence = sb.load_module("cloud_worker").RECOVER_SENTENCE
+        self.assertEqual(sentence, self.SENTENCE)
+        self.check_five(self.five_places(BIN.parent), sentence)
+
+    def test_s8_a_sentence_changed_in_one_place_fails_naming_that_place(self):
+        sentence = sb.load_module("cloud_worker").RECOVER_SENTENCE
+        places = self.five_places(BIN.parent)
+        self.check_five(places, sentence)   # control: the unmutated places pass
+        failing = 0
+        for name in places:
+            mutated = dict(places)
+            mutated[name] = places[name].replace("plainly", "quietly")
+            try:
+                self.check_five(mutated, sentence)
+            except AssertionError as e:
+                failing += int(("the %s lacks the recover sentence" % name) in str(e))
+                print("mutant in %s fails with: %s" % (name, str(e).rsplit(" : ", 1)[-1]))
+        self.assertEqual(failing, 5, "each of the five mutants must fail naming its own place")
 
 
 if __name__ == "__main__":
