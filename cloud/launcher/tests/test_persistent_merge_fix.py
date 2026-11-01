@@ -231,6 +231,67 @@ class S21RefusalsCreateNothing(po.PBase):
                 open(self.env["FAKE_KUBE_CALLS"], "w").close()
 
 
+RETRY_CALL = "                        res = self.run_hook(target)\n"
+NEEDS_REFRESH = {"pushed": False, "wip_branch": None, "error": "the git token had ended", "refresh": "needed"}
+
+
+class S22RetryTarget(po.PBase):
+    """S22: the stop's retry after a refreshed token runs the end hook on the same pod as the first call (the persistent pod NAME-0)."""
+    printed = {}
+
+    def hook_targets(self, worker, *, persistent, fresh=True):
+        import argparse
+        import contextlib
+        import io
+        if not fresh:
+            pass   # the same world again: the failed hook kept the pod and its workload
+        elif persistent:
+            self.launch()
+        else:
+            self.create(worker)
+        targets = []
+        L = self.mod.Launcher(self.mod.Kube(self.env), self.env, self.clock)
+
+        def hook(target):
+            targets.append(target)
+            return dict(NEEDS_REFRESH)
+        L.run_hook = hook
+        L.refresh_for_stop = lambda pod, now: self.mod.REFRESH_USED
+        a = argparse.Namespace(worker=worker, reason="done", run_id=None, no_record=True, record_dir=None)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                L.stop(a)
+            except self.mod.CloudError:
+                pass   # the scripted answer keeps the pod: the stop reports the hook failure; only the targets matter
+        return targets
+
+    def check_persistent(self, fresh=True):
+        targets = self.hook_targets(po.WORKER, persistent=True, fresh=fresh)
+        self.assertEqual(len(targets), 2, targets)
+        self.assertEqual(targets, [po.POD, po.POD], "the retry acted on a different pod than the first call: %r" % (targets,))
+        self.assertNotIn(po.NAME, targets)
+        return targets
+
+    def test_s22_the_retry_acts_on_the_persistent_pod_like_the_first_call(self):
+        S22RetryTarget.printed["p"] = self.check_persistent()
+
+    def test_s22_a_one_shot_stop_runs_both_hooks_on_its_own_pod_name(self):
+        targets = self.hook_targets("one1", persistent=False)
+        self.assertEqual(targets, [cw.pod_name("one1")] * 2)
+        S22RetryTarget.printed["o"] = targets
+
+    def test_s22_the_copy_whose_retry_acts_on_the_name_fails_with_the_anchored_text_and_the_control_passes(self):
+        control = self.check_persistent()   # CONTROL FIRST: the unmutated file passes the same check
+        self.assertEqual(control, [po.POD, po.POD])
+        self.mod = mutant(RETRY_CALL, "                        res = self.run_hook(name)\n")   # counted once and applied by mutant
+        with self.assertRaises(AssertionError) as caught:
+            self.check_persistent(fresh=False)
+        self.assertIn("the retry acted on a different pod than the first call", str(caught.exception))
+        p, o = S22RetryTarget.printed.get("p", control), S22RetryTarget.printed.get("o", [cw.pod_name("one1")] * 2)
+        print("S22: persistent retry hook targets %s and %s, one-shot targets %s, control passes 1 of 1, mutant fails 1 of 1 with the anchored text, "
+              "mutation applied True" % (p[:1], p[1:], o))
+
+
 def types_module(changed):
     import types
     mod = types.ModuleType("cloud_worker_moved")
