@@ -8,7 +8,7 @@ LOGIN = "eyJ" + "Qr7Zk9" * 20
 PW = "pw" + "Xy_-9" * 8
 MODEL = '{"provider":"p","key":"sk-' + "k" * 20 + '","base":"http://m.example"}'
 
-import json as _json, random as _random, string as _string
+import re, json as _json, random as _random, string as _string
 _R = _random.Random(1783)  # the fixed seed of the fixtures
 _AL = _string.ascii_letters + _string.digits + "-_"
 G34 = "ghs_" + "".join(_R.choice(_string.ascii_letters + _string.digits) for _ in range(36))
@@ -175,6 +175,82 @@ class S2Kinds(unittest.TestCase):
             failed += 1
         print("S2 mutants failed %d of %d with their anchored text" % (failed, len(cases)))
         self.assertEqual(failed, len(cases))
+
+
+def OLD_SCRUB(text, secrets_known=(), limit=300):
+    """The frozen copy of `scrub` as it stood at the integration tip ec5eabf1, kept verbatim as the reference (ask #1783)."""
+    text = str(text)[:cw.SCRUB_INPUT_MAX]
+    for sec in sorted({v for v in secrets_known if v and len(v.strip()) >= cw.MIN_FRAGMENT}, key=len, reverse=True):
+        for v in {sec, sec.strip()}:
+            text = text.replace(v, "[redacted]")
+        out, i = [], 0
+        while i < len(text):  # any run of 8+ characters that is a piece of the secret
+            head = text[i:i + cw.MIN_FRAGMENT]
+            if len(head) == cw.MIN_FRAGMENT and head in sec:
+                j = i + cw.MIN_FRAGMENT
+                while j < len(text) and text[i:j + 1] in sec:
+                    j += 1
+                out.append("[redacted]")
+                i = j
+            else:
+                out.append(text[i])
+                i += 1
+        text = "".join(out)
+    for pat, repl in cw.CREDENTIAL_SHAPES:
+        text = pat.sub(repl, text)
+    for pat in cw.TOKEN_SHAPES:
+        text = pat.sub("[redacted]", text)
+    return re.sub(r"[^\x20-\x7e]", "?", text)[:limit]
+
+
+class S4Same(unittest.TestCase):
+    SEED = 1783
+
+    def test_s4_two_thousand_texts(self):
+        extra = ["ghs_" + "".join(_random.Random(i).choice(_string.ascii_letters) for _ in range(36)) for i in range(5)]
+        k = cw.KnownForms()
+        for i, t in enumerate(extra):
+            k.add_forms(cw.secret_forms(t), ("until", 100.0 + i, None))
+        k.add_forms(cw.secret_forms(G34), ("until", 5000.0, "p1")); k.add_forms(cw.secret_forms(P34), ("pod", "p1"))
+        k.add_forms(cw.secret_forms(M34), None); k.add_forms(cw.secret_forms(H34), ("pod", "p9"))
+        k.sweep(1000.0, {"p1", "p9"})  # the five extra tokens are dropped, the rest is live
+        live = set(cw.secret_forms(G34)) | set(cw.secret_forms(P34)) | set(cw.secret_forms(M34)) | set(cw.secret_forms(H34))
+        self.assertEqual(set(k), live, "the live set differs from the expected one")
+        pool = sorted(live)
+        ordered = list(k)  # the live forms in the order the new scrub reads them (equal-length forms are tied in the sort, so the order is part of the output)
+        rnd = _random.Random(self.SEED); same = 0
+        for n in range(2000):
+            parts = []
+            for _ in range(rnd.randint(1, 5)):
+                parts.append("".join(rnd.choice(_string.ascii_letters + " :=/\n") for _ in range(rnd.randint(0, 20))))
+                if rnd.random() < 0.8:
+                    f = rnd.choice(pool)
+                    parts.append(f if rnd.random() < 0.7 else f[rnd.randint(0, len(f) // 2):])
+            text = "".join(parts)
+            same += cw.scrub(text, k, 100000) == OLD_SCRUB(text, ordered, 100000)
+        print("S4 seed %d: %d of 2000 outputs byte-identical" % (self.SEED, same))
+        self.assertEqual(same, 2000, "an output differs from the frozen old function's")
+
+    def test_s4_before_and_after_the_drop(self):
+        kinds = (("git", G34, ("until", 3660.0, None)), ("login", L34, ("until", 2400.0, None)), ("pw", P34, ("pod", "p1")), ("hub", H34, ("pod", "p2")))
+        k = cw.KnownForms(); nforms = shaped = before = after = 0
+        for _, v, life in kinds:
+            k.add_forms(cw.secret_forms(v), life)
+        k.add_forms(cw.secret_forms(M34), ("pod", "p1")); k.add_forms(cw.secret_forms(M34), None)
+        for _, v, _ in kinds:
+            before += v not in cw.scrub("x " + v + " y", k, 5000)
+        k.sweep(99999, set())
+        for name, v, _ in kinds:
+            after += v not in cw.scrub("x " + v + " y", k, 5000)
+            for f in cw.secret_forms(v):
+                if len(f) >= 8:
+                    nforms += 1
+                    shaped += f not in cw.scrub("x " + f + " y", (), 5000)
+        self.assertEqual(len(k), len(set(cw.secret_forms(M34))))
+        self.assertTrue(SHORT_KEY in cw.scrub("x " + SHORT_KEY, (), 300), "the shapes were expected not to catch a short key")
+        short = SHORT_KEY not in cw.scrub("x " + SHORT_KEY + " y", k, 5000)
+        print("S4 redacted before the drop %d of 4, after it by the shapes %d of 4 with %d of %d forms, short model key kept %d of 1" % (before, after, shaped, nforms, short))
+        self.assertEqual((before, after, shaped, nforms, short), (4, 4, 29, 29, 1))
 
 
 class Mutants(unittest.TestCase):
