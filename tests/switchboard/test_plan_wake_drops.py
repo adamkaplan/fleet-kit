@@ -92,10 +92,8 @@ def build():
             before = len(self.audit("plan_wake.dropped"))
             inbox = []
             self.offer(inbox)
-            if len(inbox) != 1:
-                self.fail("S2 delivered lines count must equal 1, got %d" % len(inbox))
-            if wake.dropped != 2:
-                self.fail("S2 dropped count must equal 2, got %d" % wake.dropped)
+            self.assertEqual(len(inbox), 1, msg="a held line for a replaced hash is delivered")
+            self.assertEqual(wake.dropped, 2, msg="a replaced hash is not counted as dropped")
             return len(self.audit("plan_wake.dropped")) - before, inbox
 
         def test_s2_s7_three_edits_deliver_the_current_hash_and_drop_two_each_with_an_audit_line(self):
@@ -119,21 +117,20 @@ def build():
             snap = self.snapshot()
             self.s2(snap, sb.PlanWakeFacts)   # the unmutated control first
             offers_all = self.mutant("if current is not None and now_key != own", "if False and now_key != own")
-            with self.assertRaisesRegex(AssertionError, r"^S2 delivered lines count must equal 1, got 3"):
+            with self.assertRaisesRegex(AssertionError, r"^3 != 1 : a held line for a replaced hash is delivered"):
                 self.s2(snap, offers_all)
             wake, _ = self.fresh(snap, sb.PlanWakeFacts)
             control = []
             self.offer(control)
             self.offer(control)
-            self.assertEqual(len(control), 1)   # the control: delivered once, never again
+            self.assertEqual(len(control), 1, msg="a delivered line is offered again")   # the control: delivered once, never again
             no_ack = self.mutant("def acknowledge(self, keys):", "def acknowledge_off(self, keys):")
             wake, _ = self.fresh(snap, no_ack)
             inbox = []
             self.offer(inbox)
             self.offer(inbox)
-            with self.assertRaisesRegex(AssertionError, r"^S8 no acknowledge: a delivered line was delivered again"):
-                if len(inbox) != 2 - 1:
-                    self.fail("S8 no acknowledge: a delivered line was delivered again, %d lines" % len(inbox))
+            with self.assertRaisesRegex(AssertionError, r"^2 != 1 : a delivered line is offered again"):
+                self.assertEqual(len(inbox), 1, msg="a delivered line is offered again")
 
         def test_s3_s4_a_delivered_key_offered_again_is_not_delivered_and_is_counted(self):
             self.post(3, self.plan())
@@ -143,12 +140,12 @@ def build():
             inbox = []
             self.offer(inbox)
             self.offer(inbox)   # a second pass over the held lines: delivered exactly once
-            self.assertEqual(len(inbox), 1)
+            self.assertEqual(len(inbox), 1, msg="a delivered line is offered again")
             held = dict(snap["facts"])
             for _ in range(3):
                 wake.facts.update(held)   # the same key offered again
                 self.offer(inbox)
-            self.assertEqual(len(inbox), 1)
+            self.assertEqual(len(inbox), 1, msg="a repeat of a delivered key is delivered")
             self.assertEqual(wake.repeats, 3)
             self.go()
             self.assertIn("repeats not delivered 3", "\n".join(sb.triage_status_lines(sb.triage_summary(self.world.state))))
@@ -173,7 +170,6 @@ def build():
             record["body"] += "\nreplaced"
             record["updated_at"] = sb.iso(self.world.clock.now())
             self.go()
-            self.engine.plan_wake.delivered.update(wake.delivered)
             self.offer(inbox)
             self.assertEqual(len(inbox), 2)
             self.assertEqual(self.engine.plan_wake.dropped, 0)
@@ -204,10 +200,9 @@ def build():
             self.offer(inbox)
             audited = len(self.audit("plan_wake.dropped")) - before
             if older:
-                if (len(inbox), wake.dropped) != (1, 0):
-                    self.fail("S12 stale-record world: delivered lines count must equal 1 and dropped 0, got %d and %d" % (len(inbox), wake.dropped))
-            elif (len(inbox), wake.dropped, audited) != (0, 1, 1):
-                self.fail("S12 newer-record world: delivered 0, dropped 1 and 1 audit line expected, got %d, %d, %d" % (len(inbox), wake.dropped, audited))
+                self.assertEqual((len(inbox), wake.dropped), (1, 0), msg="a line is dropped for a hash that is not newer")
+            else:
+                self.assertEqual((len(inbox), wake.dropped, audited), (0, 1, 1), msg="a held line for a replaced hash is delivered")
 
         def test_s12_a_drop_needs_a_current_hash_announced_after_the_line_and_a_differs_only_mutant_fails(self):
             self.edits(2)
@@ -215,7 +210,7 @@ def build():
             self.s12(snap, sb.PlanWakeFacts, True)
             self.s12(snap, sb.PlanWakeFacts, False)
             mutant = self.mutant(" and own in wake.announced and now_key in wake.announced and wake.announced[now_key] > wake.announced[own]", "")
-            with self.assertRaisesRegex(AssertionError, r"^S12 stale-record world: delivered lines count must equal 1 and dropped 0"):
+            with self.assertRaisesRegex(AssertionError, r"^Tuples differ: \(0, 1\) != \(1, 0\)(.|\n)*: a line is dropped for a hash that is not newer"):
                 self.s12(snap, mutant, True)
 
         def test_u1_a_current_unapproved_plan_is_announced_with_no_github_read(self):
