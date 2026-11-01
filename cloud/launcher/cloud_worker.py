@@ -3534,7 +3534,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                 def relogin(refresher=refresher, L=L):
                     r = refresher.run(force=True)
                     if r.token:
-                        L.kube.add_secrets(r.token)
+                        L.kube.add_secrets(r.token, life=secret_life_until())
                     return r.state == "written"
                 L.relogin = relogin
                 ticker = RenewalTicker(L, refresher, clock, ticker_wait)
