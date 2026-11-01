@@ -36,6 +36,12 @@ NEW_BIN_GUARDS = (
     ("TestAgentRegistryInventory", "bin/test-switchboard", "TestAgentRegistryInventory", None, "every module that reads or writes an agent record is in the registry inventory"),
     ("TestImpactHold module-name guard", "bin/test-switchboard", "TestImpactHold", "test_the_modules_the_clear_loads_or_runs_are_all_judged_and_the_list_is_derived_from_what_runs", "every module the clear runs is judged by name"),
     ("bin/check-public-names", "bin/check-public-names", None, None, "no private name in a tracked file"),
+    # #1457: the classes that read the set of files under bin/ (the failed classes of the three red rounds of #1429), run by `preflight-pr` with and without --merged
+    ("TestArchitectureDocument", "bin/test-switchboard", "TestArchitectureDocument", None, "every file under bin/ is a row of the Units table of docs/architecture.md"),
+    ("TestRecordJsonReaders", "bin/test-switchboard", "TestRecordJsonReaders", None, "every module under bin/ that reads a record's JSON is in the table of readers"),
+    ("TestTheReaperOnlyInstall", "bin/test-switchboard", "TestTheReaperOnlyInstall", None, "every function the installer calls is classified (Linux and macOS)"),
+    ("TestRecordingCommands", "bin/test-switchboard", "TestRecordingCommands", None, "every command that reaches a ledger append is a recording command or named exempt"),
+    ("TestDerivedClosure", "bin/test-switchboard", "TestDerivedClosure", None, "the closure of the delegated clear is derived over the entry and every part (tests/switchboard/test_closure.py)"),
 )
 
 
@@ -235,8 +241,15 @@ def guard_missing(root, guard):
     if not os.path.isfile(os.path.join(root, path)):
         return "%s is not in this tree" % path
     if cls is not None:
-        body = _read(root, path)
-        if not re.search(r"(?m)^class %s\b" % re.escape(cls), body):
+        try:   # #1457: the whole file, not READ_MAX of it: a class past the first 4 MiB of bin/test-switchboard is still there
+            with open(os.path.join(root, path), encoding="utf-8", errors="replace") as handle:
+                body = handle.read()
+        except OSError:
+            body = ""
+        imported = re.search(r"(?m)^(?:\w+\s*,\s*)*%s\w*(?:\s*,\s*\w+)*\s*=" % re.escape(cls), body)   # #1457: a class the file imports from tests/switchboard/ is in the file by name
+        if imported and not test:
+            return ""
+        if not re.search(r"(?m)^class %s\w*" % re.escape(cls), body):   # a prefix: `-k` matches a substring, so TestTheReaperOnlyInstall runs both TestTheReaperOnlyInstallOnLinux and ...OnMacOS
             return "class %s is not defined in %s" % (cls, path)
         # Known limits (a closed rule): the block runs from the class line to the next top-level `class` line, so a class nested at column 0 inside a string, or a `def NAME`
         # written inside a string or comment of the block, still counts; the guard table names real classes and tests, and a CI run of the guard is the proof.

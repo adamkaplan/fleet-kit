@@ -21,3 +21,4 @@ the tests and the change and judges them; it never runs them.
 ## This repository
 
 - **How the tests run.** `bin/test-switchboard` (stdlib only, no network); CI runs it on macOS and Ubuntu. A change to `bin/` carries a test in it that fails on the previous code.
+- **A measure of one pull request is not a test.** A measure of one pull request's own diff is a proof recorded on that pull request, never a test that runs for every later one.

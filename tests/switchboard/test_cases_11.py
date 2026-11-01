@@ -47,7 +47,7 @@ import urllib.parse
 from unittest import mock
 from support.core import Base
 from support.fake_hubs import tri_issue
-from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, copy_entry, sb, switchboard_source
+from support.loader import SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, captured, copy_entry, sb, switchboard_source
 from support.paths import BIN, REPO
 from support.wire_fakes import EPOCH, fact
 
@@ -612,7 +612,7 @@ class TestConfig(Base):
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
-            "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
+            "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "steer_after_minutes": 0, "launch_default": "headless",
             "rider_max_age_seconds": 3600, "undelivered_wake_minutes": 15, "undelivered_wake_tell_minutes": None, "undelivered_wake_per_pass": 2, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": sb.own_gh_path("gh"), "gh_by_name": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],   # #1216: the RESOLVED gh (a machine with a gh on PATH names it by path); `gh_by_name` is the gh as configured (PATH finds the shim), used by the one merge call of `merge-gate --pass --merge`
             "owner_logins": [], "github_bot_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
@@ -707,6 +707,179 @@ class TestConfig(Base):
                 with self.assertRaises(sb.ConfigError) as caught:
                     sb.load_config()
                 self.assertIn(needle, str(caught.exception))
+
+    def test_relay_holders_is_a_known_key_with_a_validated_shape(self):
+        """#1479. S1/S2/S6: a valid object (and {}) loads silently. S3/S4/S5: each bad shape is a ConfigError naming relay_holders. U1/U2: other loading unchanged."""
+        for good in ({"acme/app#12": "pod-a"}, {}):
+            with self.subTest(good=good):
+                sb._WARNED_CONFIG.clear()
+                err = io.StringIO()
+                self.write_config({"relay_holders": good})
+                with contextlib.redirect_stderr(err):
+                    config = sb.load_config()
+                self.assertNotIn("relay_holders", err.getvalue())
+                self.assertEqual(config["relay_holders"], good)
+        sb._WARNED_CONFIG.clear()
+        err = io.StringIO()
+        self.write_config({"no_such_key": 1})
+        with contextlib.redirect_stderr(err):
+            self.assertNotIn("relay_holders", sb.load_config())
+        self.assertEqual(err.getvalue().count("does not read: no_such_key"), 1)
+
+    def _refused(self, value, entry=None):
+        self.write_config({"relay_holders": value})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.load_config()
+        self.assertIn("'relay_holders'", str(caught.exception))
+        if entry:
+            self.assertIn(entry, str(caught.exception))
+
+    def test_relay_holders_that_is_not_an_object_is_refused(self):   # S3
+        for value in ([1], "x", None):
+            with self.subTest(value=value):
+                self._refused(value)
+
+    def test_a_relay_holders_key_without_a_hash_is_refused(self):   # S4
+        self._refused({"acme/app": "pod-a"}, "'acme/app'")
+
+    def test_a_relay_holders_pod_that_is_empty_is_refused(self):   # S5
+        self._refused({"a/b#1": ""}, "'a/b#1'")
+
+    def test_a_relay_holders_pod_that_is_whitespace_is_refused(self):
+        self._refused({"a/b#1": "  "}, "'a/b#1'")
+
+    def test_a_relay_holders_pod_that_is_not_a_string_is_refused(self):
+        for value in (7, None, ["p"]):
+            with self.subTest(value=value):
+                self._refused({"a/b#1": value}, "'a/b#1'")
+
+    def test_a_relay_holders_value_of_null_is_refused(self):
+        self._refused(None)
+
+    def test_the_relay_holders_key_must_be_owner_repo_hash_digits(self):
+        for good in ("a/b#1", "acme-org/widget-service#7", "o/r.x#120"):
+            with self.subTest(good=good):
+                sb.validate_config({"relay_holders": {good: "p"}})
+        for bad in ("#", "a#", "#5", "a#x", "a#5", "/b#5", "a/#5", "a/b/c#5", "a/b#", "a/b#5x", "a/b#-1", "a/b#1\n"):
+            with self.subTest(bad=bad):
+                self._refused({bad: "p"}, repr(bad))
+
+    def test_a_bad_relay_holders_fails_the_cli_like_every_other_config_error(self):
+        """The CLI maps a ConfigError to exit 1 (EXIT_ERROR) for every key, so this one does the same."""
+        self.write_config({"relay_holders": ["acme/app#1"]})
+        with captured() as (out, err):
+            code = sb.main(["status"])
+        self.assertEqual(code, 1)
+        self.assertIn("relay_holders", out.getvalue() + err.getvalue())
+
+    def _relay_load(self, raw):
+        sb._WARNED_CONFIG.clear()
+        err = io.StringIO()
+        self.write_config(raw)
+        with contextlib.redirect_stderr(err):
+            config = sb.load_config()
+        return config, err.getvalue()
+
+    def test_a_config_without_relay_holders_loads_as_on_the_base_commit(self):
+        """U1: same dict (the defaults plus what the file sets, no relay_holders key added) and exactly the same warning as before the change."""
+        sb._WARNED_CONFIG.clear()
+        self.assertFalse(self.config_file.exists())
+        defaults = sb.load_config()
+        config, warned = self._relay_load({"batch_seconds": 5, "no_such_key": 1})
+        self.assertEqual(config, {**defaults, "batch_seconds": 5, "no_such_key": 1})
+        self.assertNotIn("relay_holders", config)
+        self.assertEqual(warned.count("warning:"), 1)
+        self.assertIn("does not read: no_such_key", warned)
+        self.assertNotIn("relay_holders", warned)
+
+    def _holder_mutants(self):
+        """Each mutant is the real check with ONE rule changed; the key is the test that must catch it."""
+        real = sb.validate_relay_holders
+
+        def with_default(config, source):
+            real(config, source)
+            config.setdefault("relay_holders", {})
+
+        def accepts_list(config, source):
+            if isinstance(config.get("relay_holders"), list):
+                return
+            real(config, source)
+
+        def accepts_key_without_hash(config, source):
+            raw = config.get("relay_holders")
+            if isinstance(raw, dict):
+                config["relay_holders"] = {(k if "#" in k else k + "#0"): v for k, v in raw.items()}
+            real(config, source)
+            if isinstance(raw, dict):
+                config["relay_holders"] = raw
+
+        def accepts_empty_pod(config, source):
+            raw = config.get("relay_holders")
+            if isinstance(raw, dict):
+                config["relay_holders"] = {k: (v if v != "" else "x") for k, v in raw.items()}
+            real(config, source)
+            if isinstance(raw, dict):
+                config["relay_holders"] = raw
+
+        def pod_mutant(replace):
+            def mutant(config, source):
+                raw = config.get("relay_holders")
+                if isinstance(raw, dict):
+                    config["relay_holders"] = {k: replace(v) for k, v in raw.items()}
+                real(config, source)
+                if isinstance(raw, dict):
+                    config["relay_holders"] = raw
+            return mutant
+
+        def accepts_null(config, source):
+            if "relay_holders" in config and config["relay_holders"] is None:
+                return
+            real(config, source)
+
+        return {"test_a_config_without_relay_holders_loads_as_on_the_base_commit": with_default,
+                "test_relay_holders_that_is_not_an_object_is_refused": accepts_list,
+                "test_a_relay_holders_key_without_a_hash_is_refused": accepts_key_without_hash,
+                "test_a_relay_holders_pod_that_is_empty_is_refused": accepts_empty_pod,
+                "test_a_relay_holders_pod_that_is_whitespace_is_refused": pod_mutant(lambda v: "x" if isinstance(v, str) and v and not v.strip() else v),
+                "test_a_relay_holders_pod_that_is_not_a_string_is_refused": pod_mutant(lambda v: "x" if not isinstance(v, str) else v),
+                "test_a_relay_holders_value_of_null_is_refused": accepts_null}
+
+    def test_each_relay_holders_check_has_a_mutant_its_own_test_catches(self):
+        """S7/U1: every mutant fails its named test, and the real build passes every one."""
+        real = sb.validate_relay_holders
+        for name, mutant in self._holder_mutants().items():
+            with self.subTest(mutant=name):
+                ok = unittest.TestResult()
+                type(self)(name).run(ok)
+                self.assertEqual(len(ok.failures) + len(ok.errors), 0, "the real build passes " + name)
+                sb.validate_relay_holders = mutant
+                try:
+                    bad = unittest.TestResult()
+                    type(self)(name).run(bad)
+                finally:
+                    sb.validate_relay_holders = real
+                self.assertGreaterEqual(len(bad.failures) + len(bad.errors), 1, "the mutant survives " + name)
+        sb.validate_relay_holders = lambda config, source: None   # the whole validation removed: the bad-shape tests all fail
+        try:
+            res = unittest.TestResult()
+            for name in list(self._holder_mutants())[1:]:
+                type(self)(name).run(res)
+        finally:
+            sb.validate_relay_holders = real
+        self.assertGreaterEqual(len(res.failures), 3)
+
+    def test_the_relay_daemons_holder_of_reads_the_validated_shape_unchanged(self):
+        """U6/PC-3: a config with relay_holders, validated by this change, gives the relay daemon's holder_of the same pod for the fixed key, and a key
+        the config does not name stays None (fail closed). That the daemon file has 0 changed lines in this diff is checked by the diff itself."""
+        loader = importlib.machinery.SourceFileLoader("cloud_relay_daemon_u6", str(BIN / "cloud_relay_daemon.py"))
+        relay = importlib.util.module_from_spec(importlib.util.spec_from_loader("cloud_relay_daemon_u6", loader))
+        loader.exec_module(relay)
+        holders = {"acme-org/widget-service#7": "widget-pod"}
+        config = sb.validate_config({"relay_holders": dict(holders)})
+        backend = relay.SwitchboardBackend(None, (None, None, config), None, None)
+        self.assertEqual(backend.holder_of("acme-org/widget-service", 7), "widget-pod")
+        self.assertIsNone(backend.holder_of("acme-org/widget-service", 8))
+        self.assertIsNone(relay.SwitchboardBackend(None, (None, None, sb.validate_config({})), None, None).holder_of("acme-org/widget-service", 7))
 
     def test_malformed_files_are_refused(self):
         for text, needle in (("{not json", "not valid JSON"), ("[1, 2]", "JSON object"), ('"x"', "JSON object")):
@@ -1182,6 +1355,7 @@ class TestBuilderChecklist(unittest.TestCase):
     RULES = {
         "b": "(opens without blocking, refuses links, accepts only regular files, bounds the count, the size and the time)",
         "i": "and keep new strings and comments clear of the added-lines scans",
+        "cloud": "never runs the whole bin/test-switchboard",
         "e": "the pod's git token expires after about an hour and a late open fails",
     }
     BRIEF = "Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line."
