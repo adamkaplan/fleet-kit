@@ -877,7 +877,7 @@ def _registry_note(engine, what, state, name, *args, address=""):
         if got["problem"]:
             say(got["problem"])
     except Exception as err:
-        say(str(err))
+        say("the registry write failed (%s)" % type(err).__name__)
 
 
 def _record_from_create(name, body):
