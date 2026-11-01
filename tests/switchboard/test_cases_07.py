@@ -1501,7 +1501,7 @@ class TestHeavySlots(Base):
 
     def env(self, **more):
         env = dict(os.environ, XDG_STATE_HOME=str(self.dir), FLEET_HEAVY_REPORT_SECONDS="0.3", PATH=os.environ["PATH"])
-        for key in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI"):   # the suite may itself run in a slot, under FLEET_HEAVY=off, or in CI: these tests are about the slots
+        for key in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI", "CW_AUDIT_RUNTIME_ID"):   # the suite may itself run in a slot, under FLEET_HEAVY=off, or in CI: these tests are about the slots
             env.pop(key, None)
         env.update(more)
         return env
