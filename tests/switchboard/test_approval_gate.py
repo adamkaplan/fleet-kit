@@ -66,7 +66,8 @@ def scenario_rows(events_fn, state_fn):
     expect((H_NEW in old[1], H_OLD in old[1]), (True, True), "the older-hash detail names both hashes")
     expect(judge(events_fn, state_fn, audit_dir([]), ISSUE, H_NEW)[0], "missing", "no event at all")
     expect(judge(events_fn, state_fn, audit_dir([event(OTHER, H_NEW)]), ISSUE, H_NEW)[0], "missing", "an event of another issue")
-    expect(state_fn([], None, H_NEW)[0], "n/a", "no plan link")
+    nolink = state_fn([], None, H_NEW)
+    expect(nolink, ("missing", "no plan issue named: G0c cannot find an approval"), "no plan link")
     expect(judge(events_fn, state_fn, audit_dir([event(ISSUE, H_NEW, "subject")]), ISSUE, H_NEW)[0], "ok", "an event whose issue is only in its subject")
     expect(judge(events_fn, state_fn, audit_dir([], [event(ISSUE, H_NEW)]), ISSUE, H_NEW)[0], "ok", "an event only in a rotated compressed audit")
     expect(judge(events_fn, state_fn, audit_dir([event(ISSUE, H_OLD)], [event(ISSUE, H_NEW)]), ISSUE, H_NEW)[0], "ok", "an event at the current hash in a rotated audit")
@@ -389,3 +390,42 @@ class TestApprovalGateCommands(unittest.TestCase):
         self.assertIsNone(self.refusal_by(mutant), "the mutant reads the error as off")
         with self.assertRaisesRegex(AssertionError, r"^None is not true : a setting that cannot be read must hold the merge$"):
             self.assertTrue(self.refusal_by(mutant), "a setting that cannot be read must hold the merge")
+
+    NOPLAN = "no plan issue named: G0c cannot find an approval"
+
+    def set_body(self, body):
+        self.h.pr["body"] = body
+
+    def test_no_plan_link_or_a_link_naming_no_issue_is_refused_and_only_a_waiver_passes_with_one_audit_line(self):
+        self.enforce()
+        for body, base in (("canon: updated the docs", "integration"), ("PLAN: none for the batch itself: each change in the table cites its own plan", "main")):
+            self.doCleanups()
+            self.setUp()
+            self.enforce()
+            self.set_body(body)
+            self.h.fake.base = base
+            text = self.refusal() or ""
+            self.assertRegex(text, r"^merge of acme/app#9 refused: " + re.escape(self.NOPLAN) + r"; ask ", body)
+            self.waive()
+            self.assertIsNone(self.refusal(), "a valid waiver at the head passes: " + body)
+            self.assertEqual(len(self.h.audit_lines("plan.approval.waived")), 1, "one audited line: " + body)
+            self.assertIn("G0c", json.dumps(self.h.audit_lines("plan.approval.waived")[0]))
+
+    def test_the_g0c_row_for_no_plan_link_is_missing_and_no_row_is_not_applicable(self):
+        self.enforce()
+        self.set_body("canon: updated the docs")
+        report = self.h.gates()[1]
+        row = self.h.row(report, "G0c")
+        self.assertEqual((row["status"], row["detail"]), ("missing", self.NOPLAN))
+        self.assertEqual([r["gate"] for r in report["gates"] if r["status"] == "n/a" and r["gate"] == "G0c"], [])
+
+    def test_mutant_no_plan_link_read_as_not_applicable_is_caught(self):
+        old = '        return "missing", "no plan issue named: G0c cannot find an approval"'
+        self.enforce()
+        self.set_body("canon: updated the docs")
+        self.assertRegex(self.refusal() or "", re.escape(self.NOPLAN), "control: the unmutated rule refuses")
+        fn = mutated_state(old, '        return "n/a", "the pull request has no plan link"')
+        with mock.patch.object(plan_ledger, "approval_state", fn):
+            self.assertIsNone(self.refusal(), "the mutant passes a pull request with no plan link")
+            with self.assertRaisesRegex(AssertionError, r"^None is not true : no plan link must be refused$"):
+                self.assertTrue(self.refusal(), "no plan link must be refused")

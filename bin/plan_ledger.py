@@ -881,9 +881,9 @@ def review_records_at(entries, pr, head, expected=REVIEWERS_NOW):
 
 def approval_state(events, issue, current_hash):
     """#1735, G0c: (status, detail) from the plan.approved events of `issue`, newest first, each {"plan_hash": ...}; None = they could not be read. Pure: it reads no file.
-    ok when an event holds the current hash; missing when none does (the detail names the current hash and the newest approved one) or the events were unreadable; n/a with no plan link."""
+    ok when an event holds the current hash; missing when none does (the detail names the current hash and the newest approved one), the events were unreadable, or no plan issue is named (fail closed)."""
     if not issue:
-        return "n/a", "the pull request has no plan link (G0a is the gate for that)"
+        return "missing", "no plan issue named: G0c cannot find an approval"
     if events is None:
         return "missing", "the plan.approved events of %s could not be read in time: refused (fails closed)" % issue
     seen = [e["plan_hash"] for e in events if isinstance(e, dict) and isinstance(e.get("plan_hash"), str)]
