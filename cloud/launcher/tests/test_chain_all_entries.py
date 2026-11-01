@@ -297,6 +297,10 @@ def _child(kind, path):
     return 1 if bad else 0
 
 
+STARTER_LINE = ('CHAIN_SERIAL_ENTRY=$e python3 -c \'import os,signal,sys;signal.signal(signal.SIGINT,signal.SIG_DFL);'
+                'os.execv(sys.argv[1],sys.argv[1:])\' "$SELF" "$@" </dev/null & sp=$!')
+
+
 class SerialStatusAndStdin(Chain):
     def mutant_child(self, kind, old, new):
         src = base.slurp(base.SCRIPT)
@@ -322,7 +326,7 @@ class SerialStatusAndStdin(Chain):
     def test_stdin_reader_entry_reads_nothing_and_the_list_survives(self):
         self.assertEqual(s11_problems(self, base.slurp(base.SCRIPT)), [])
         rb, ran = self.s11_seen
-        rc, out = self.mutant_child("s11", 'run_entry "$e" "$@" & sp=$!', 'run_entry "$e" "$@"; sp=$!')
+        rc, out = self.mutant_child("s11", STARTER_LINE, 'run_entry "$e" "$@"; sp=$!')
         self.assertEqual(rc, 1, out)
         print("S11: stdin reader bytes %s, entries run %d of 4; mutant (stdin = the list) caught 1 of 1 (mutation applied True)"
               % (rb.split()[1], ran))
@@ -337,6 +341,56 @@ class SerialStatusAndStdin(Chain):
                     hits.append("%s:%d: %s" % (e, i, line.strip()))
         print("S11: chain entries reading standard input %d of %d" % (len(hits), len(ents)))
         self.assertEqual(hits, [])
+
+
+SIGINT_ENTRY = ("import signal\nprint('SIGINT-ACTION ' + ('ignored' if signal.getsignal(signal.SIGINT) == signal.SIG_IGN"
+                " else 'default'))\n")
+NO_STARTER = 'run_entry "$e" "$@" </dev/null & sp=$!'
+
+
+class SigintAndParallel(Chain):
+    def sigint_problems(self, script):
+        d = self.tree(["test_sig.py"])
+        self.entry(d, "test_sig.py", SIGINT_ENTRY)
+        p = _run(script, d, tempfile.mkdtemp(prefix="chain-log-"))
+        m = re.findall(r"^SIGINT-ACTION (\w+)$", p.stdout, re.M)
+        return ["the serial entry ran with SIGINT ignored"] if m == ["ignored"] else ([] if m == ["default"] else ["no action printed"])
+
+    def test_s13_serial_entry_has_the_default_action_of_sigint(self):
+        self.assertEqual(self.sigint_problems(base.slurp(base.SCRIPT)), [])   # the control first
+        src = base.slurp(base.SCRIPT)
+        self.assertEqual(src.count(STARTER_LINE), 1)
+        mut = src.replace(STARTER_LINE, NO_STARTER)
+        self.assertNotEqual(mut, src)
+        self.assertEqual(self.sigint_problems(mut), ["the serial entry ran with SIGINT ignored"])
+        print("S13: control entry printed the default action 1 of 1; copy without the starter printed ignored and failed "
+              "'the serial entry ran with SIGINT ignored' 1 of 1 (mutation applied True)")
+
+    def parallel_problems(self, script):
+        bad = []
+        d = self.tree(["test_ok.py", "test_bad_p.py"], par=["test_bad_p.py"])
+        p = _run(script, d, tempfile.mkdtemp(prefix="chain-log-"))
+        if re.findall(r"^failed entries: .*$", p.stdout, re.M) != ["failed entries: 1: cloud/launcher/tests/test_bad_p.py"]:
+            bad.append("a failing parallel entry was not counted")
+        if p.returncode != 1: bad.append("a failing parallel entry was not counted (exit %d)" % p.returncode)
+        return bad
+
+    def test_s12_failing_parallel_entry_is_counted(self):
+        self.assertEqual(self.parallel_problems(base.slurp(base.SCRIPT)), [])   # the control first
+        d = self.tree(["test_nores.py"], par=["test_nores.py"])
+        self.entry(d, "test_nores.py", "import os, signal\nos.kill(os.getppid(), signal.SIGKILL)\n")
+        p = _run(base.slurp(base.SCRIPT), d, tempfile.mkdtemp(prefix="chain-log-"))
+        self.assertIn("failed entries: 1: cloud/launcher/tests/test_nores.py", p.stdout)
+        self.assertEqual(p.returncode, 1)
+        src = base.slurp(base.SCRIPT)
+        old = '|| failed="$failed $e"\n  ran=$((ran + 1))\ndone < "$PAR"'
+        self.assertEqual(src.count(old), 1)
+        mut = src.replace(old, '|| true\n  ran=$((ran + 1))\ndone < "$PAR"')
+        self.assertNotEqual(mut, src)
+        got = self.parallel_problems(mut)
+        self.assertIn("a failing parallel entry was not counted", got[0])
+        print("S12: control named 1 failing parallel entry, failed entries count 1, exit 1; entry without a result file "
+              "named as failed 1 of 1; copy counting none exited 0 'a failing parallel entry was not counted' (mutation applied True)")
 
 
 class Docs(unittest.TestCase):
