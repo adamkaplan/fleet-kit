@@ -66,6 +66,7 @@ def _read(file):
     items, delivered = data.get("items"), data.get("delivered")
     if not isinstance(items, list) or not isinstance(delivered, list) or not all(isinstance(k, str) for k in delivered) or not all(
             isinstance(i, dict) and isinstance(i.get("key"), str) and isinstance(i.get("text"), str)
+            and not isinstance(i.get("at"), bool) and not isinstance(i.get("seq"), bool)
             and isinstance(i.get("at"), (int, float)) and isinstance(i.get("seq"), int) for i in items):
         return None, "a malformed item"
     seq = data.get("seq") if isinstance(data.get("seq"), int) else 0
