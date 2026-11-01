@@ -16,6 +16,23 @@ def say(line):
     print(line, file=sys.stderr)
 
 
+S10_KEPT = ["exit code:137 reason:5", "error:404 from the server", "pod default/x:8080 failed", "Reason:5",
+            "Warning FailedScheduling: 0/13 nodes are available: 13 Insufficient cpu.", "at 10:30 it ended", "image pulled in 4:12",
+            "node aks-pool-0001 not ready", "dial cw-hub:8080 failed", "started 10:30:45 and ended 11:02:09",
+            "at 12:00:01 UTC it failed", "ratio 3:2 and 5:1:2", "std::string failed"]
+S10_MASKED = {"get registry.example.org:5000 timeout": "get [address] timeout", "to 10.1.2.3:443 refused": "to [address] refused",
+              "dial tcp 10.0.0.5:443: i/o timeout": "dial tcp [address]: i/o timeout", "dial localhost:8080 failed": "dial [address] failed",
+              "an address 10.1.2.3 here": "an address [address] here", "dial fe80::1 failed": "dial [address] failed",
+              "peer 2001:db8::8a2e:370:7334 down": "peer [address] down", "loopback ::1 refused": "loopback [address] refused",
+              "dial tcp [2001:db8::1]:443: refused": "dial tcp [address]: refused", "addr 1:2:3:4:5:6:7:8 here": "addr [address] here"}
+
+
+def s10_problems(module):
+    """The kept texts must come back unchanged and the masked ones as stated; one line per difference."""
+    out = ["kept %r became %r" % (k, module.mask_addresses(k)) for k in S10_KEPT if module.mask_addresses(k) != k]
+    return out + ["masked %r became %r" % (k, module.mask_addresses(k)) for k, v in S10_MASKED.items() if module.mask_addresses(k) != v]
+
+
 class Mask(unittest.TestCase):
     def test_the_address_mask(self):
         cases = {"dial 10.1.2.3 failed": "dial [address] failed", "to 10.1.2.3:443 refused": "to [address] refused",
@@ -25,18 +42,42 @@ class Mask(unittest.TestCase):
         say("S5 mask: %d of %d cases masked as asked" % (len(cases) - len(bad), len(cases)))
         self.assertEqual(bad, [])
 
-    def test_a_word_glued_to_a_colon_and_digits_is_masked_as_a_stated_loss_of_text(self):
-        # The plan's mask over-masks a bare `word:digits` (not only host:port). No secret can
-        # leak through it; the loss is of the event's own words.
-        masked = {"exit code:137 reason:5": "exit [address] [address]", "Reason:5": "[address]",
-                  "pod default/x:8080 failed": "pod default/[address] failed"}
-        kept = ["Warning FailedScheduling: 0/13 nodes are available: 13 Insufficient cpu.",
-                "image pulled in 4:12", "at 10:30 it ended"]
-        n_masked = sum(cw.mask_addresses(k) == v for k, v in masked.items())
-        n_kept = sum(cw.mask_addresses(k) == k for k in kept)
-        say("S5 mask: %d of %d over-masked as stated, %d of %d kept" % (n_masked, len(masked), n_kept, len(kept)))
-        self.assertEqual(n_masked, len(masked))
-        self.assertEqual(n_kept, len(kept))
+    def test_the_mask_hides_hosts_and_addresses_never_the_exit_code(self):
+        problems = s10_problems(cw)
+        say("S10 mask: %d of %d kept, %d of %d masked" % (len(S10_KEPT) - sum(p.startswith("kept") for p in problems), len(S10_KEPT),
+                                                         len(S10_MASKED) - sum(p.startswith("masked") for p in problems), len(S10_MASKED)))
+        self.assertEqual(problems, [])
+
+    def test_a_mask_with_the_old_broad_host_alternative_masks_the_exit_code(self):
+        import shutil
+        import subprocess
+        src_path = os.path.join(os.path.dirname(HERE), "cloud_worker.py")
+        with open(src_path) as f:
+            src = f.read()
+        old = '(?<![\\w.-])(?:(?:[A-Za-z0-9-]+\\.)+[A-Za-z][A-Za-z0-9-]*|localhost):\\d{1,5}(?![\\w.-])'
+        new = '(?<![\\w.-])[A-Za-z][A-Za-z0-9.-]*:\\d{1,5}(?![\\w.-])'
+        self.assertEqual(src.count(old), 1, "the host alternative must occur once")
+        mutant = src.replace(old, new)
+        self.assertNotEqual(mutant, src, "the mutation was not applied")
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[2]); import cloud_worker as cw\n"
+                "from test_pod_state import s10_problems\n"
+                "p = s10_problems(cw); print('the exit code was masked' if any('exit code:137' in x for x in p) else 'ok')")
+        outs = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text in (("control", src), ("mutant", mutant)):
+                d = os.path.join(tmp, name)
+                os.mkdir(d)
+                for f in os.listdir(os.path.dirname(HERE)):
+                    if f.endswith(".py"):
+                        shutil.copy(os.path.join(os.path.dirname(HERE), f), d)
+                with open(os.path.join(d, "cloud_worker.py"), "w") as fh:
+                    fh.write(text)
+                env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(HERE), "..", "..", "bin"))
+                r = subprocess.run([sys.executable, "-B", "-c", code, d, HERE], env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 0, r.stderr[-300:])
+                outs.append(r.stdout.strip())
+        say("S10 control: %s; mutant: %s" % (outs[0], outs[1]))
+        self.assertEqual(outs, ["ok", "the exit code was masked"])
 
 
 class Writer(unittest.TestCase):
