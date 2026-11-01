@@ -444,7 +444,7 @@ EVERY_LAUNCHER_ACTION = [
     line("2026-10-14T02:44:00Z", "reaper", "orphan-secret-removed", 0, ok=False, worker=""),
     line("2026-10-14T02:45:00Z", "reaper", "reaper-restart", 0, worker=""),
     line("2026-10-14T03:00:00Z", "pod/cb-example-1", "extend", 0),
-    line("2026-10-14T04:00:00Z", "pod/cb-example-1", "stop", 0.25),
+    line("2026-10-14T04:00:00Z", "pod/cb-example-1", "stop", 0.5),
     line("2026-10-14T05:00:00Z", "pod/cb-example-4", "delete", 0, ok=False),
 ]
 
@@ -541,6 +541,78 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
         failure_lines = len(err.getvalue().splitlines())
         self.assertEqual((raises, stops, code, failure_lines), (0, 0, 2, 1))
         print("S3 tolerant readers: %d of 2, raises %d, stops %d, report failure line %d" % (2 - raises, raises, stops, failure_lines))
+
+    def test_a_stop_line_costs_at_least_the_wip_note_of_the_same_pod(self):
+        # the report prices the stop line; the wip-note is a snapshot of the cost so far
+        checked = 0
+        for note in [l for l in EVERY_LAUNCHER_ACTION if l["action"] == "wip-note"]:
+            stops = [l for l in EVERY_LAUNCHER_ACTION if l["action"] == "stop" and l["runtime_id"] == note["runtime_id"]]
+            self.assertEqual(len(stops), 1, note["runtime_id"])
+            self.assertGreaterEqual(stops[0]["cost_estimate_usd"], note["cost_estimate_usd"], note["runtime_id"])
+            checked += 1
+        self.assertGreaterEqual(checked, 1)
+        print("S wip-note claim: %d pod(s) checked, stop %s >= wip-note %s" % (checked, stops[0]["cost_estimate_usd"], note["cost_estimate_usd"]))
+
+    def tail_cases(self):
+        good = json.dumps(line("2026-10-14T06:00:00Z", "pod/cb-example-4", "stop", 1.0)) + "\n"
+        later = json.dumps(line("2026-10-14T07:00:00Z", "pod/cb-example-5", "create", 0)) + "\n"
+        nofield = json.loads(good)
+        del nofield["action"]
+        return {
+            "corrupt line in the middle": good + "{not json\n" + later,
+            "line with a missing field": good + json.dumps(nofield) + "\n" + later,
+            "truncated last line": good + later + good[:30],
+        }
+
+    def test_three_tail_shapes_for_the_launcher_tail_reader(self):
+        launcher = load_launcher()
+        for shape, raw in self.tail_cases().items():
+            raises = 0
+            with tempfile.TemporaryDirectory() as tmp:
+                path = write(tmp, "audit.jsonl", None, raw=raw)
+                try:
+                    stop = launcher.last_audit_line(path, "stop", "pod/cb-example-9")   # a pod with no stop line
+                    other = launcher.last_audit_line(path, "stop", "pod/cb-example-4")  # the one real stop line stays readable
+                except Exception:
+                    raises += 1
+            taken = int(stop is not None)
+            self.assertEqual((raises, taken), (0, 0), shape)
+            self.assertEqual(other, (True, None), shape)
+            print("S3 launcher tail reader, %s: raises %d, stops taken from it %d, real stop still read %s" % (shape, raises, taken, other is not None))
+
+    def run_report_on(self, module, raw):
+        err = io.StringIO()
+        raises = 0
+        code = None
+        with tempfile.TemporaryDirectory() as tmp, mock_stderr(err):
+            try:
+                code, text = run(module, write(tmp, "audit.jsonl", None, raw=raw))
+            except Exception:
+                raises += 1
+                text = ""
+        return raises, code, err.getvalue(), text
+
+    def test_three_tail_shapes_for_the_cost_report_reader(self):
+        reasons = {"corrupt line in the middle": "line 2: not JSON", "line with a missing field": "line 2: missing action",
+                   "truncated last line": "line 3: not JSON"}
+        for shape, raw in self.tail_cases().items():
+            raises, code, err, text = self.run_report_on(REAL, raw)
+            self.assertEqual((raises, code, len(err.splitlines()), text), (0, 2, 1, ""), shape)
+            self.assertIn(reasons[shape], err)
+            print("S3 report reader, %s: raises %d, exit %d, stderr lines %d, reason %r, priced lines %d" % (
+                shape, raises, code, len(err.splitlines()), reasons[shape], len(text.splitlines())))
+
+    def test_a_report_that_skips_a_corrupt_line_is_caught(self):
+        raw = self.tail_cases()["corrupt line in the middle"]
+        old = 'raise Malformed("%s: not JSON" % where)'
+        self.assertEqual(SOURCE.count(old), 1)
+        scratch = SOURCE.replace(old, "continue")
+        self.assertNotEqual(scratch, SOURCE)
+        self.assertEqual(self.run_report_on(REAL, raw)[1], 2)                      # control
+        raises, code, err, _ = self.run_report_on(load(scratch), raw)
+        self.assertEqual(err, "")
+        self.assertNotEqual(code, 2, "mutant: the corrupt line is skipped, the report no longer exits 2")
+        print("S3 mutant: skipping a corrupt line gives exit %s, stderr %r, caught %d of 1, mutation applied %s" % (code, err, int(code != 2), scratch != SOURCE))
 
 
 ROOT = BIN.parent
