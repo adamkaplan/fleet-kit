@@ -2479,6 +2479,8 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | `author` | absent: the proof writers and notice senders still exclude their own verdicts; the board is read as it is (the row tests only that the baseline stays ready; an exclusion of a proof by the author is not tested here) | the author is one more excluded name; it opens no gate on its own |
 | `legs` | `(applies, ok, said)`, set only when the PR's runs are all green: the macOS legs of the head, or of the gate pass's reopened run on the merge ref; an absent, skipped, cancelled or in-progress leg reads as not green and G4 is NOT READY (`rerun` when absent); not applying (no ubuntu legs by these names) asks nothing | a leg that did not report success is never read as green; pinned by `TestGateLegs`, mutant `test_s6_the_mutant_that_reads_an_absent_leg_as_green_is_caught` |
 | `ci` | NOT READY when None, none or unknown (G4 missing) | the PR view was whole: no green run is not green |
+| `ci_line` | the verdict line of the current-tip rule (#1755), set for a green rollup: `fresh: ...` names the tip and G4 stays as it was; `stale: ...` or `unknown: ...` makes G4 NOT READY with this line | a stale or unreadable run is never green; absent means not judged (not green, or the repo opted out) |
+| `base_ref` | the name of the pull request's base branch, from the view the examination already makes (#1755); not a gate input: the helper of the entry reads the base's tip with it, and a missing name reads the run as unknown | a missing name is never green |
 | `draft` | a draft is NOT READY | a draft is never ready; absent means not a draft |
 | `body` | NOT READY when empty (G5 missing); NOT CHECKED when it is not text | an empty body is a state, a body that is not text is a failed read |
 | `body_unreadable` | NOT CHECKED | the body is unread, not empty |
@@ -2488,7 +2490,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | `floor` | NOT CHECKED when None-decision (with or without a hold-all or re-hold), unreadable, re-hold unreadable or not a dict; absent with the label set: the label alone holds, the reading goes on; absent with no label: G6 not open, NOT READY | an unreadable floor would say G6 waiting, a false ready |
 | `held_check` | a raising check is NOT CHECKED (exception); a missing one on a held PR is G6b missing: NOT READY | the one `held_defects` check, local |
 
-S5 fact audit: 21 fact keys and arguments (computed from the source by the test, which fails when this number is stale) read by `evaluate_gates`, its helpers, `_ledger_context`, `pr_picture` and `sweep_gate_reading`, 4 external calls (PR view, plan fetch, floor view, `clear_who`): each has a row above and a test (`test_986_every_fact_the_gates_read_has_a_row_in_the_table`).
+S5 fact audit: 22 fact keys and arguments (computed from the source by the test, which fails when this number is stale) read by `evaluate_gates`, its helpers, `_ledger_context`, `pr_picture` and `sweep_gate_reading`, 4 external calls (PR view, plan fetch, floor view, `clear_who`): each has a row above and a test (`test_986_every_fact_the_gates_read_has_a_row_in_the_table`).
 
 Tests behind the S5 claims: wait from ready, new head, gate opens again, once per head, unreadable is not checked, mutants: the `test_986_*` tests and `EDGES`/`READING_CASES`; early/late/never: `edge_unread_drops`, `edge_roundtrip`, `edge_prune`, `edge_partial_list`, the clock test; bounds: `edge_cap`, `edge_real_calls`, the call counter; per-fact table: the two tests above.
 

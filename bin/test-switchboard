@@ -23058,6 +23058,8 @@ class TestSweep(Base):
         ("ci", "ci is None", {"ci": None}, {}, "not ready"),
         ("ci", "ci is absent", {"ci": KeyError}, {}, "not ready"),
         ("ci", "ci says none", {"ci": "none"}, {}, "not ready"),
+        ("ci_line", "the run is stale", {"ci_line": "stale: 3 commits behind", "ci": "stale: 3 behind"}, {}, "not ready"),
+        ("base_ref", "no base branch name: not a gate input", {"base_ref": None}, {}, "ready"),
         ("legs", "a macOS leg is not green (failed, absent, skipped, cancelled or in progress)", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test (macos-latest)": "failure"}, False)}, {}, "not ready"),
         ("legs", "a macOS leg is skipped", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success", "test (macos-latest)": "success", "test-cloud (macos-latest)": "skipped"}, False)}, {}, "not ready"),
         ("legs", "the macOS legs are absent", {"legs": sb.load_module("merge_gate").judge_legs({"test (ubuntu-latest)": "success", "test-cloud (ubuntu-latest)": "success"}, False)}, {}, "not ready"),
