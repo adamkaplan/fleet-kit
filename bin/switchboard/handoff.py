@@ -240,7 +240,9 @@ def add_foreground_parsers(sub):
                                        "(for the gh shim, which picks the account from it); empty when it has none")
     comment = sub.add_parser("comment", help="Comment on an issue as yourself, signed so it does not come back to "
                                              "you as an event")
-    comment.add_argument("--issue", type=issue_arg, required=True, help="The issue to comment on")
+    comment.add_argument("--issue", type=issue_arg, help="The issue to comment on (not with --edit)")
+    comment.add_argument("--edit", metavar="COMMENT_URL", help="Replace the body of your own comment at this url, signed once")
+    comment.add_argument("--approval", help="With --edit of an approved plan: the id of the approving comment or message")
     comment.add_argument("--body-file", dest="body_file", required=True, help="The comment: a file, or - for stdin")
     handoff = sub.add_parser("handoff", help="Hand your current work to a background subagent: post the brief on "
                                              "the ask and launch it, without typing")
