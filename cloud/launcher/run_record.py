@@ -416,7 +416,8 @@ def _word(w):
 
 def last_event_phrase(msgs, scrub):
     """ONE bounded phrase (at most PHRASE_MAX characters) naming the kind of the session's last event: `no session event`,
-    `last tool call refused: <command>` (its first two words, no path, address or value) or `last message`. Never raises."""
+    `last tool call refused: <word>` (the first word of the command, as its base name if a path, only if it is one of
+    gh, git, python3, cw-cloud, fleet-switchboard; else `another command`; no argument, path or value) or `last message`. Never raises."""
     try:
         if not msgs:
             return "no session event"
@@ -429,8 +430,9 @@ def last_event_phrase(msgs, scrub):
                 if state.get("status") == "error" or REFUSED_RE.search(said):
                     given = state.get("input") if isinstance(state.get("input"), dict) else (part.get("input") if isinstance(part.get("input"), dict) else {})
                     cmd = given.get("command") or given.get("cmd") or part.get("tool") or ""
-                    words = [_word(w) for w in str(cmd).split()[:2]]
-                    text = "last tool call refused: " + (" ".join(words) or "unknown")
+                    first = os.path.basename(str(cmd).split()[0]) if str(cmd).split() else ""
+                    word = first if first in ("gh", "git", "python3", "cw-cloud", "fleet-switchboard") else "another command"
+                    text = "last tool call refused: " + word
                     return scrub(text)[:PHRASE_MAX]
             break
         return "last message"
