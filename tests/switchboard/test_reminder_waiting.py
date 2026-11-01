@@ -227,12 +227,12 @@ def build(PR4Base):
         def test_s14_the_tail_window_drops_its_first_line_and_skips_non_dict_and_broken_lines(self):
             import tempfile
             directory, now = self.audit_window_fixture()
-            self.assertEqual(self.norm(sb.late_reminder_counts(directory, {}, now)), self.norm({"lane-a": 2}))
+            self.assertEqual(sb.late_reminder_counts(directory, {}, now), {"lane-a": 2})
             with tempfile.TemporaryDirectory() as empty:
-                self.assertEqual(self.norm(sb.late_reminder_counts(empty, {}, now)), self.norm({}))                       # a missing audit file
+                self.assertEqual(sb.late_reminder_counts(empty, {}, now), {})                       # a missing audit file
                 import os
                 os.mkdir(empty + "/audit.jsonl")
-                self.assertEqual(self.norm(sb.late_reminder_counts(empty, {}, now)), self.norm({}))                       # a directory in its place
+                self.assertEqual(sb.late_reminder_counts(empty, {}, now), {})                       # a directory in its place
 
         def mutant_counts(self, old, new):
             """`late_reminder_counts` with ONE textual replacement, exec'd into a copy of the module namespace (production is not edited)."""
