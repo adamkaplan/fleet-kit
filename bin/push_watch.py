@@ -63,10 +63,17 @@ def _load(sb, path):
 
 
 def _save(path, state):
+    text = json.dumps(state, sort_keys=True)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            if handle.read(len(text) + 1) == text:   # a per-pass file is written only when its content changes
+                return
+    except (OSError, ValueError):
+        pass
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(state, handle, sort_keys=True)
+        handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)

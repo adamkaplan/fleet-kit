@@ -539,6 +539,61 @@ class TestPushWatch(Case):
         self._fails(lambda: self._launcher_read([self._good("w-a", "stop")], reader=boom, module=mutant) and self.fail(
             "a RuntimeError of the launcher reader was swallowed as a corrupt line"),
             "a RuntimeError of the launcher reader was swallowed as a corrupt line")
+    def _replaces(self, module):
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}
+        real, calls = module.os.replace, []
+        def counted(src, dst):
+            calls.append(str(dst))
+            return real(src, dst)
+        module.os.replace = counted
+        try:
+            for i in range(40):
+                self.run_pass(NOW + i, module)
+        finally:
+            module.os.replace = real
+        return len([c for c in calls if c.endswith("push-watch.json")])
+
+    def test_fix2_idle_passes_write_the_state_file_at_most_twice(self):
+        self.assertLessEqual(self._replaces(self.pw), 2)
+
+    def test_fix2_the_unconditional_save_mutant_fails(self):
+        text = (REPO / "bin" / "push_watch.py").read_text()
+        guard = "            if handle.read(len(text) + 1) == text:"
+        self.assertIn(guard, text)
+        mutant = types.ModuleType("push_watch_mutant")
+        exec(compile(text.replace(guard, "            if False:"), "push_watch.py", "exec"), mutant.__dict__)
+        with self.assertRaises(AssertionError) as caught:
+            self.assertLessEqual(self._replaces(mutant), 2, "the state file was rewritten on idle passes")
+        self.assertIn("the state file was rewritten on idle passes", str(caught.exception))
+
+
+
+    def _tick(self, old=False):
+        import importlib.machinery
+        path = str(REPO / "bin" / "fleet-switchboard")
+        text = Path(path).read_text()
+        if old:
+            text = text.replace('(getattr(engine, "config", None) or {}).get("push_watch"))', 'engine.config.get("push_watch"))')
+            assert 'engine.config.get("push_watch"))' in text
+        module = types.ModuleType("sb_push_tick")
+        module.__file__ = path
+        exec(compile(text, path, "exec"), module.__dict__)
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+            lines = []
+            engine = types.SimpleNamespace(audit=audit, actor="daemon", now=lambda: NOW)
+            result = module.push_watch_tick(engine, None)
+            self.assertEqual((result, lines, list(Path(tmp).iterdir())), ([], [], []))
+
+    def test_fix1_an_engine_without_config_runs_the_pass_with_no_audit_line(self):
+        self._tick()
+
+    def test_fix1_the_old_expression_fails_the_check(self):
+        with self.assertRaises(AttributeError) as caught:
+            self._tick(old=True)
+        self.assertIn("has no attribute 'config'", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
