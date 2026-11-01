@@ -487,10 +487,11 @@ class TestRaisingSteps(unittest.TestCase):
 def s11_world(test, mod, gap=0.0, raise_second_read=False):
     """The fake world of S8; `gap` seconds are added by the fake clock at each boundary before a step; the 2nd activity read may raise."""
     clock = StepClock()
+    cls = mod.Launcher
     f = LineFixture(test, mod)
     mod.time = clock
     L = f.w.L
-    L.reap = types.MethodType(mod.Launcher.reap, L)
+    L.reap = types.MethodType(cls.reap, L)
     state = {"boundaries": 0, "steps": 0.0}
 
     def boundary():
