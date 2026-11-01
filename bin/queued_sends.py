@@ -36,24 +36,27 @@ def path(state_dir, name):
 
 
 def _read(file):
-    """{"seq", "items", "delivered"} from `file`; an empty queue when it is absent, not a regular file, too large or not ours."""
+    """{"seq", "items", "delivered"} from `file`: an empty queue ONLY when the file is absent; None when it is present but unreadable
+    (not a regular file, too large, too deep, not JSON, not a dict, any other OS error): the caller must never overwrite it."""
     empty = {"seq": 0, "items": [], "delivered": []}
     try:
         fd = os.open(str(file), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+    except FileNotFoundError:
         return empty
+    except OSError:
+        return None
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
-            return empty
+            return None
         with os.fdopen(fd, "r", closefd=False) as handle:
             data = _record_json.parse_bounded(handle.read())
     except (OSError, ValueError):
-        return empty
+        return None
     finally:
         os.close(fd)
     if not isinstance(data, dict):
-        return empty
+        return None
     items = [i for i in data.get("items") if isinstance(i, dict) and isinstance(i.get("key"), str) and isinstance(i.get("text"), str)
              and isinstance(i.get("at"), (int, float)) and isinstance(i.get("seq"), int)] if isinstance(data.get("items"), list) else []
     delivered = [k for k in data.get("delivered") if isinstance(k, str)] if isinstance(data.get("delivered"), list) else []
@@ -100,6 +103,8 @@ def enqueue(state_dir, recipient, key, sender, text, sent, issue=None, repo=None
     try:
         with _Lock(state_dir):
             queue = _read(file)
+            if queue is None:
+                return False, "the queue file of %s is present but not readable (not a regular, small, well-formed queue file): nothing was queued and the file is untouched" % (recipient,)
             if key in queue["delivered"] or any(i["key"] == key for i in queue["items"]):
                 return True, len(queue["items"])
             if len(queue["items"]) >= MAX_MESSAGES:
@@ -120,7 +125,8 @@ def waiting(state_dir, recipient):
     if file is None:
         return []
     with _Lock(state_dir):
-        return sorted(_read(file)["items"], key=lambda i: (i["at"], i["seq"]))
+        queue = _read(file)
+        return [] if queue is None else sorted(queue["items"], key=lambda i: (i["at"], i["seq"]))
 
 
 def recipients(state_dir):
@@ -140,6 +146,8 @@ def done(state_dir, recipient, key):
         return
     with _Lock(state_dir):
         queue = _read(file)
+        if queue is None:
+            return
         queue["items"] = [i for i in queue["items"] if i["key"] != key]
         if key not in queue["delivered"]:
             queue["delivered"] = (queue["delivered"] + [key])[-KEEP_DELIVERED:]

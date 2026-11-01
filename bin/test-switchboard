@@ -79941,12 +79941,12 @@ class TestHoldQueue(Base):
         self.assertEqual(self.queued("nobody") + self.queued("platform"), [])
         self.assertEqual(sb.load_module("queued_sends").recipients(self.world.state), [])
 
-    def test_a_queue_file_nested_deeper_than_the_bound_reads_as_empty(self):
+    def test_a_queue_file_nested_deeper_than_the_bound_is_unreadable_not_empty(self):
         hq = sb.load_module("queued_sends")
         file = Path(self.world.state) / "hold-queue-deep.json"
         depth = sb.load_module("record_json").RECORD_MAX_DEPTH + 5
         file.write_text('{"items": ' + "[" * depth + "]" * depth + "}")
-        self.assertEqual(hq._read(file), {"seq": 0, "items": [], "delivered": []})
+        self.assertIsNone(hq._read(file))
 
     def test_an_interrupt_send_to_a_held_pane_stays_refused_and_a_plain_send_is_queued(self):
         self.world.add_agent("helper", fleet={"role": "coder", "reports_to": "coder"})
@@ -80075,6 +80075,57 @@ class TestHoldQueue(Base):
                 with mock.patch.dict(globals(), {"sb": module}), rebound("sb", module):
                     result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestHoldQueue(test)]))
                 self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
+
+
+class TestHoldQueueUnreadableFile(Base):
+    """S12: an unreadable but present queue file is never overwritten: the next send is refused, nothing is lost."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state, True)
+        self.hq = sb.load_module("queued_sends")
+        self.file = self.hq.path(self.state, "platform")
+
+    def corruptions(self):
+        good = self.file.read_bytes()
+        return (("truncated", good[:len(good) // 2]), ("too deep", b'{"items": ' + b"[" * 5000 + b"]" * 5000 + b"}"),
+                ("too large", b" " * (self.hq.MAX_FILE + 1)))
+
+    def check(self, hq):
+        self.assertTrue(hq.enqueue(self.state, "platform", "k1", "coder", "one", 1.0)[0])
+        good = self.file.read_bytes()
+        for _label, bad in self.corruptions():
+            self.file.write_bytes(bad)
+            ok, why = hq.enqueue(self.state, "platform", "k2", "coder", "two", 2.0)
+            self.assertFalse(ok)
+            self.assertIn("present but not readable", why)
+            self.assertNotIn("\n", why)
+            self.assertEqual(self.file.read_bytes(), bad)
+            self.assertEqual(hq.waiting(self.state, "platform"), [])
+            hq.done(self.state, "platform", "k1")
+            self.assertEqual(self.file.read_bytes(), bad)
+            self.file.write_bytes(good)
+            self.assertEqual([i["key"] for i in hq.waiting(self.state, "platform")], ["k1"])
+
+    def test_an_unreadable_present_queue_file_is_refused_and_untouched(self):
+        self.check(self.hq)
+
+    def mutant(self):
+        src = (Path(sb.__file__).resolve().parent / "queued_sends.py").read_text()
+        old = "    except OSError:\n        return None\n    try:"
+        self.assertIn(old, src)
+        mutated = src.replace(old, "    except OSError:\n        return empty\n    try:").replace("            return None\n        with os.fdopen", "            return empty\n        with os.fdopen").replace("    except (OSError, ValueError):\n        return None", "    except (OSError, ValueError):\n        return empty")
+        self.assertNotEqual(mutated, src, "the mutation applied")
+        module = types.ModuleType("queued_sends_mutant")
+        module.__file__ = str(Path(sb.__file__).resolve().parent / "queued_sends.py")
+        exec(compile(mutated, module.__file__, "exec"), module.__dict__)
+        return module
+
+    def test_a_mutant_that_reads_an_unreadable_file_as_empty_is_caught(self):
+        self.check(self.hq)   # the control passes
+        with self.assertRaisesRegex(AssertionError, r"^True is not false"):
+            self.check(self.mutant())
 
 
 class TestHoldQueueIdleAfterProviderError(Base):
