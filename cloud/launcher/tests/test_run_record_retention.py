@@ -294,5 +294,69 @@ class S5Pass(unittest.TestCase):
             "the listing copy fails 1 of 1 with `the pass read the records` (50 listed with 50, 5000 with 5000)")
 
 
+def passes_1200(mod):
+    """Three passes of the reaper in one UTC day over 1,200 expired records and no running worker, then a fourth."""
+    with tempfile.TemporaryDirectory() as tmp:
+        lau, root = launcher(mod, tmp)
+        os.makedirs(root)
+        for i in range(1200):
+            make_record(root, run_id("w%d" % i, i), 45, 1)
+        removed, left = [], 1200
+        for _ in range(3):
+            with contextlib.redirect_stderr(io.StringIO()):
+                lau.reap()
+            now_left = len(os.listdir(root))
+            removed.append(left - now_left)
+            left = now_left
+        if left:
+            raise AssertionError("an expired record was left after three passes: %d left" % left)
+        with Counting(root) as c, contextlib.redirect_stderr(io.StringIO()):
+            lau.reap()
+        return removed, left, sum(c.listed), len(os.listdir(root))
+
+
+class S23Passes(unittest.TestCase):
+    def test_three_passes_remove_500_500_200_and_the_fourth_lists_nothing(self):
+        removed, left, listed, after = passes_1200(real)   # the control, first
+        self.assertEqual((removed, left, listed, after), ([500, 500, 200], 0, 0, 0))
+        mut = mutant(os.path.join(LAUNCHER, "cloud_worker.py"), "        if not dry_run and len(names) < run_record.MAINTENANCE_MAX_REMOVALS:\n",
+                     "        if not dry_run:\n", "cw_mut23")
+        with self.assertRaises(AssertionError) as cm:
+            passes_1200(mut)
+        self.assertIn("an expired record was left after three passes: 700 left", str(cm.exception))
+        say("S23 passes removed %s, %d left, pass 4 listed %d and removed 0; control passes 1 of 1; the day-done copy fails 1 of 1 with `%s`; mutation applied"
+            % (removed, left, listed, str(cm.exception)))
+
+
+def keep_days_run(mod, value):
+    with tempfile.TemporaryDirectory() as tmp:
+        lau, root = launcher(mod, tmp)
+        lau.env["CW_RECORD_KEEP_DAYS"] = value
+        os.makedirs(root)
+        d = make_record(root, run_id("ended", 3), 10)
+        with contextlib.redirect_stderr(io.StringIO()):
+            lau.daily_maintenance([], NOW)
+        return os.path.isdir(d)
+
+
+def check_keep_days(mod):
+    kept = {v: keep_days_run(mod, v) for v in ("0", "-5", "1")}
+    if not (kept["0"] and kept["-5"]):
+        raise AssertionError("a value below 1 drained the history: %s" % kept)
+    return kept
+
+
+class S24KeepDays(unittest.TestCase):
+    def test_a_value_below_1_falls_back_to_30_days(self):
+        kept = check_keep_days(real)   # the control, first
+        self.assertEqual(kept, {"0": True, "-5": True, "1": False})
+        mut = mutant(os.path.join(LAUNCHER, "cloud_worker.py"), "                days = run_record.KEEP_DAYS   #", "                days = 1   #", "cw_mut24")
+        with self.assertRaises(AssertionError) as cm:
+            check_keep_days(mut)
+        self.assertIn("a value below 1 drained the history", str(cm.exception))
+        say("S24 the 10-day record kept with 0 (%s) and -5 (%s), removed with 1 (kept %s); control passes 1 of 1; the max(days, 1) copy fails 1 of 1 with `a value below 1 drained the history`; mutation applied"
+            % (kept["0"], kept["-5"], kept["1"]))
+
+
 if __name__ == "__main__":
     unittest.main()

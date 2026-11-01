@@ -2544,8 +2544,10 @@ class Launcher:
             return None
         try:
             days = int(self.env.get("CW_RECORD_KEEP_DAYS") or run_record.KEEP_DAYS)
+            if days < 1:
+                days = run_record.KEEP_DAYS   # below 1 is not a number of days: a mistyped value never drains the history
             live = {ann(p, "worker") for p in pods if ann(p, "worker")}
-            names, size, kept = run_record.prune_limited(self.recorder.root(None), max(days, 1), now.timestamp(), live, dry_run=dry_run)
+            names, size, kept = run_record.prune_limited(self.recorder.root(None), days, now.timestamp(), live, dry_run=dry_run)
         except Exception as e:
             print("cloud-worker: the daily maintenance failed: %s" % scrub(e, (), 200), file=sys.stderr)
             if not dry_run:
@@ -2555,7 +2557,7 @@ class Launcher:
             print("cloud-worker: maintenance: %s run record %s" % ("would remove" if dry_run else "removed", name), file=sys.stderr)
         print("cloud-worker: maintenance%s: %d run records %s (%d bytes), %d kept for running workers" % (
             " (dry run)" if dry_run else "", len(names), "to remove" if dry_run else "removed", size, kept), file=sys.stderr)
-        if not dry_run and len(names) < MAINTENANCE_MAX_REMOVALS:
+        if not dry_run and len(names) < run_record.MAINTENANCE_MAX_REMOVALS:
             self.maintenance_day = today   # nothing expired is left beyond this run
         return {"removed": names, "bytes": size, "kept": kept}
 
