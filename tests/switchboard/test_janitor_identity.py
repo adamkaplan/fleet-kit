@@ -156,3 +156,108 @@ class JanitorIdentity(unittest.TestCase):
         self.assertIn("kept %s: it changed since the scan" % NAME, lines)
         self.assertEqual(removed, 0)
         self.assertTrue(f.exists())
+
+
+def _s6_methods(cls):
+    """Ask #1770 S6: the identity also holds size and link target. Added to JanitorIdentity (the loader wires only that class)."""
+    TYPE_ONLY = "(info.st_dev, info.st_ino, newest, stat.S_IFMT(info.st_mode))"
+    BASE = "(info.st_dev, info.st_ino, newest)"
+    FULL = "(info.st_dev, info.st_ino, newest, stat.S_IFMT(info.st_mode), info.st_size, target)"
+
+    def mutant(self, replacement):
+        src = (REPO / "bin" / "disk_janitor.py").read_text()
+        self.assertEqual(src.count(FULL), 1)
+        scratch = Path(tempfile.mkdtemp(prefix="jid-mut-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        path = scratch / "disk_janitor.py"
+        path.write_text(src.replace(FULL, replacement))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("disk_janitor_mutant_s6", str(path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def s6_run(self, jan, case):
+        """Scan one old entry, swap it (device, inode, newest time forged equal), run the removal. Returns (path, lines, removed)."""
+        self.s6_n = getattr(self, "s6_n", 0) + 1
+        base = self.root / ("s6-%s-%d" % (case, self.s6_n))
+        temp, state = base / "t", base / "s"
+        temp.mkdir(parents=True)
+        state.mkdir()
+        (state / "state-marker.json").write_text("{}")
+        cfg = jan.settings({})
+        f = temp / "entry"
+        if case == "file":
+            f.write_text("x")
+            os.utime(str(f), (1000.0, 1000.0))
+        else:
+            f.symlink_to("tgtA")
+            os.utime(str(f), (1000.0, 1000.0), follow_symlinks=False)
+        real_scan, real_lstat = jan.scan, os.lstat
+        real_readlink, real_realpath = os.readlink, os.path.realpath
+
+        def scan_then_swap(*a, **k):
+            rows = real_scan(*a, **k)
+            before = os.lstat(str(f))
+            if case == "file":
+                f.write_text("xxxx")        # same inode, another size
+                os.utime(str(f), (1000.0, 1000.0))
+            elif case == "link":
+                os.unlink(str(f))
+                f.symlink_to("tgtB")        # same length, another target
+                os.utime(str(f), (1000.0, 1000.0), follow_symlinks=False)
+            os.lstat = self.forge(f, before)
+            if case == "unreadable":
+                def no_readlink(p, *a, **k):
+                    if str(p) == str(f):
+                        raise OSError("unreadable")
+                    return real_readlink(p, *a, **k)
+                os.readlink = no_readlink
+                os.path.realpath = lambda p, *a, **k: p
+            return rows
+        real_judge = jan.judge
+        self.s6_whys = []
+
+        def judge_noting(*a, **k):
+            row = real_judge(*a, **k)
+            self.s6_whys.append(row["why"])
+            return row
+        try:
+            with mock.patch.object(jan, "scan", scan_then_swap), mock.patch.object(jan, "judge", judge_noting):
+                lines, removed, kept = jan.run(temp, state, self.now, cfg, True, lambda *a: None, busy=lambda p: None)
+        finally:
+            os.lstat, os.readlink, os.path.realpath = real_lstat, real_readlink, real_realpath
+        return f, lines, removed
+
+    def test_s6_the_new_identity_keeps_all_three(self):
+        for case, word in (("link", None), ("file", None), ("unreadable", "cannot read the link")):
+            with self.subTest(case=case):
+                f, lines, removed = self.s6_run(self.jan, case)
+                self.assertEqual(removed, 0, "it was removed though it changed since the scan: %s" % case)
+                self.assertIn("kept entry: it changed since the scan", lines)
+                if word:
+                    self.assertTrue(any(word in w for w in self.s6_whys), self.s6_whys)
+                self.assertTrue(f.is_symlink() or f.exists())
+
+    def test_s6_the_old_identities_remove_the_two_swaps(self):
+        for label, repl in (("base", BASE), ("type only", TYPE_ONLY)):
+            mod = self.mutant(repl)
+            removed = [c for c in ("link", "file") if self.s6_run(mod, c)[2] == 1]
+            self.assertEqual(removed, ["link", "file"], "%s identity removes the swaps: %s" % (label, removed))
+
+    def test_s6_mutant_without_size_and_target_fails(self):
+        for case in ("link", "file"):   # control first: the unmutated copy passes
+            f, lines, removed = self.s6_run(self.jan, case)
+            self.assertEqual(removed, 0, "control")
+        mod = self.mutant(TYPE_ONLY)
+        with self.assertRaises(AssertionError) as cm:
+            for case in ("link", "file"):
+                f, lines, removed = self.s6_run(mod, case)
+                self.assertEqual(removed, 0, "it was removed though it changed since the scan: %s" % case)
+        self.assertIn("it was removed though it changed since the scan", str(cm.exception))
+
+    for fn in (mutant, s6_run, test_s6_the_new_identity_keeps_all_three, test_s6_the_old_identities_remove_the_two_swaps, test_s6_mutant_without_size_and_target_fails):
+        setattr(cls, fn.__name__, fn)
+
+
+_s6_methods(JanitorIdentity)
