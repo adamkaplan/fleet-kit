@@ -391,6 +391,94 @@ class TestStepSeconds(unittest.TestCase):
         print("S8: 7 of 7 step seconds + 2 counts + total equal; 0 of 3 pod names, 0 planted; mutant fails 'no step seconds'; %d of 7 names in README" % len(found))
 
 
+S10_STEPS = (("list", "list=1.5"), ("renew", "renew=2.5"), ("vanished", "vanished=1.0"), ("activity", "activity=0.9 (2)"),
+             ("orphans", "orphans=1.0"), ("notes", "notes=2.0"))
+
+
+def raising_pass_text(test, mod, raising):
+    """The fake world of S8 with ONE step raising after its fake seconds plus 0.5; returns the pass line (or fails with the anchored text)."""
+    clock = StepClock()
+    cls = mod.Launcher
+    f = LineFixture(test, mod)
+    mod.time = clock
+    L = f.w.L
+    L.reap = types.MethodType(cls.reap, L)
+
+    def step(name, seconds, answer=None):
+        def call(*a, **k):
+            clock.t += seconds
+            if name == raising:
+                clock.t += 0.5
+                raise RuntimeError("fake step failure")
+            return answer
+        return call
+    L.kube.list_pods = step("list", 1.0, f.w.pods)
+    L.renew_git_tokens = step("renew", 2.0, [])
+    L._note_vanished_pods = step("vanished", 0.5)
+    L.hard_deadline = lambda pod: T0 + datetime.timedelta(days=1)
+    idle = f.w.pods[2]["metadata"]["name"]
+    reads = []
+
+    def activity(name):
+        reads.append(name)
+        clock.t += 0.2
+        if raising == "activity" and len(reads) == 2:
+            clock.t += 0.5
+            raise RuntimeError("fake step failure")
+        return (False, T0 - datetime.timedelta(days=1)) if name == idle else (True, T0)
+    L.activity = activity
+    L.stop = lambda ns, reason: (step("stops", 4.0)(), {})[1]
+    L.retire_row = lambda worker, reason: None
+    L.remove_orphan_secrets = step("orphans", 0.5)
+    L.send_wip_notes = step("notes", 1.5)
+    err = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        try:
+            mod._reap_main({"CW_CLOUD_NAMESPACE": "cw"}, types.SimpleNamespace(loop=0), lambda s: None, clock=lambda: T0,
+                           refresher=f.refresher, kube=L.kube)
+        except RuntimeError:
+            pass
+    lines = [x for x in err.getvalue().splitlines() if "reaper pass line" in x]
+    want = dict(S10_STEPS)[raising]
+    if len(lines) != 1 or (" " + want) not in lines[0]:
+        raise AssertionError("a raising step lost its seconds: %s" % raising)
+    return lines[0]
+
+
+class TestRaisingSteps(unittest.TestCase):
+    def test_s10_each_of_six_steps_raises(self):
+        raising_pass_text(self, build_module(), "list")   # the control first
+        for name, want in S10_STEPS:
+            line = raising_pass_text(self, build_module(), name)
+            print("S10: %s raises: %s" % (name, line.split("audit_lines_parsed=", 1)[1]))
+            self.assertIn(" " + want, line)
+        for name, _ in S10_STEPS:
+            old = 'steps["%s"] %s mono() - t0' % (name, "+=" if name == "activity" else "=")
+            src = source()
+            self.assertEqual(len([x for x in src.split("\n") if x.strip() == old]), 1, old)
+            # the timer is read after the call, outside the finally: the finally line is moved out one level, after the try block
+            lines = src.split("\n")
+            idx = [k for k, l in enumerate(lines) if l.strip() == old]
+            k = idx[0]
+            self.assertEqual(lines[k - 1].strip(), "finally:")
+            self.assertEqual(lines[k - 3].strip(), "try:")   # try / the call / finally / the timer
+            tail = 2 if name == "activity" else 1
+            body = [x[4:] for x in lines[k - 2:k - 1]] + [x[4:] for x in lines[k:k + tail]]
+            lines[k - 3:k + tail] = body   # the call, then the timer after it: no try, no finally
+            mutated = "\n".join(lines)
+            self.assertNotEqual(mutated, src)   # the mutation applied
+            tmp = tempfile.mkdtemp(prefix="s10-")   # the scratch copy lives under /tmp, never in the repository
+            with open(os.path.join(tmp, "cloud_worker.py"), "w") as f:
+                f.write(mutated)
+            mod = types.ModuleType("cloud_worker_s10_" + name)
+            mod.__file__ = SOURCE_PATH
+            exec(compile(mutated, SOURCE_PATH, "exec"), mod.__dict__)
+            mod.json = CountingJson()
+            with self.assertRaisesRegex(AssertionError, "^a raising step lost its seconds: %s$" % name):
+                raising_pass_text(self, mod, name)
+            print("S10: copy with the %s timer after the call fails: a raising step lost its seconds" % name)
+
+
 class TestPins(unittest.TestCase):
     OLD_LINES = ["            return self._renew_locked(pods, now)", '        return last_audit_line(self.audit_path, "renew-git-token", rid)']
 
