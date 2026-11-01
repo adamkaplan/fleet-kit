@@ -300,7 +300,7 @@ class TestWiredCheckPlanted(unittest.TestCase):
     def test_s2_the_real_directory_has_no_unbound_class(self):
         files = list(TESTS.glob("test_*.py"))
         classes = [c for f in files for c in test_classes(f)]
-        self.assertGreater(len(classes), len(files))
+        self.assertGreaterEqual(len(classes), 276)
         self.assertEqual(class_problems(TESTS, RUNNER.read_text(), EXEMPT_FILES), [])
 
 # Both lines are built from halves so that each appears once, in `problems`, never as one literal in this file.
