@@ -60,8 +60,6 @@ import uuid
 import urllib.parse
 from unittest import mock
 
-BIN = Path(__file__).resolve().parent
-REPO = BIN.parent
 os.environ["GIT_TERMINAL_PROMPT"] = "0"   # #1050: a test's git never opens a credential dialog
 os.environ["GCM_INTERACTIVE"] = "never"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests" / "switchboard"))   # support import
@@ -86,6 +84,7 @@ INSTALLER_FILE_MODES, INSTALLER_READERS, INSTALLER_STARTERS, INSTALLER_WRITERS, 
 _support_panel_harnesses = importlib.import_module("support.panel_harnesses")   # support import
 CAPTAIN_ROW_HARNESS, HARNESS_CASES, LAYOUT_HARNESS, LINK_HARNESS, NOTICE_HARNESS, ORDER_PANEL_HARNESS, STYLED_UNIT_HARNESS = (_support_panel_harnesses.CAPTAIN_ROW_HARNESS, _support_panel_harnesses.HARNESS_CASES, _support_panel_harnesses.LAYOUT_HARNESS, _support_panel_harnesses.LINK_HARNESS, _support_panel_harnesses.NOTICE_HARNESS, _support_panel_harnesses.ORDER_PANEL_HARNESS, _support_panel_harnesses.STYLED_UNIT_HARNESS)   # support import
 _support_paths = importlib.import_module("support.paths")   # support import
+BIN, REPO = (_support_paths.BIN, _support_paths.REPO)   # support import
 _support_policy_and_doc_tables = importlib.import_module("support.policy_and_doc_tables")   # support import
 CANARY, CHANGE_KINDS, COS_ONLY_MAXIMS, CRED_CRITERIA, CRED_DOC_PATH, CRED_TOKEN_PATTERNS, CUTOVER_DOC, DERIVED_VIEWS, DOC_EXAMPLE_LINE, FREE_KEYWORDS, HYGIENE_MAXIMS, IMPACT_TABLE, KEEP_OUT, LIVE_OBSERVERS, PINNED_G1_HASHES, POLICY_CASES, PR4_CATALOG, PRE_EXISTING_REDEFINITIONS, ROLE_LINE_LIMITS, RUBRIC, SHARED_MAXIMS, STOPPED_NEWS_RULES, STRUCTURAL_RULE, VERBS, cred_doc_sections, derived_forms, maxims_block, measured_table, per_agent_limits, structural_rule_homes, structural_rule_problems = (_support_policy_and_doc_tables.CANARY, _support_policy_and_doc_tables.CHANGE_KINDS, _support_policy_and_doc_tables.COS_ONLY_MAXIMS, _support_policy_and_doc_tables.CRED_CRITERIA, _support_policy_and_doc_tables.CRED_DOC_PATH, _support_policy_and_doc_tables.CRED_TOKEN_PATTERNS, _support_policy_and_doc_tables.CUTOVER_DOC, _support_policy_and_doc_tables.DERIVED_VIEWS, _support_policy_and_doc_tables.DOC_EXAMPLE_LINE, _support_policy_and_doc_tables.FREE_KEYWORDS, _support_policy_and_doc_tables.HYGIENE_MAXIMS, _support_policy_and_doc_tables.IMPACT_TABLE, _support_policy_and_doc_tables.KEEP_OUT, _support_policy_and_doc_tables.LIVE_OBSERVERS, _support_policy_and_doc_tables.PINNED_G1_HASHES, _support_policy_and_doc_tables.POLICY_CASES, _support_policy_and_doc_tables.PR4_CATALOG, _support_policy_and_doc_tables.PRE_EXISTING_REDEFINITIONS, _support_policy_and_doc_tables.ROLE_LINE_LIMITS, _support_policy_and_doc_tables.RUBRIC, _support_policy_and_doc_tables.SHARED_MAXIMS, _support_policy_and_doc_tables.STOPPED_NEWS_RULES, _support_policy_and_doc_tables.STRUCTURAL_RULE, _support_policy_and_doc_tables.VERBS, _support_policy_and_doc_tables.cred_doc_sections, _support_policy_and_doc_tables.derived_forms, _support_policy_and_doc_tables.maxims_block, _support_policy_and_doc_tables.measured_table, _support_policy_and_doc_tables.per_agent_limits, _support_policy_and_doc_tables.structural_rule_homes, _support_policy_and_doc_tables.structural_rule_problems)   # support import
 _support_process_and_ci = importlib.import_module("support.process_and_ci")   # support import
