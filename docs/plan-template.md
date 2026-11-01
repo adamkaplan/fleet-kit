@@ -64,7 +64,7 @@ scenarios:
 
 **Default scenario for every input a plan reads:** the input is missing, corrupt or unreadable: the output says so and the last good output is kept. `plan check` WARNS (`no-failure-mode`; never fails, the hash is unchanged) when the plan's text reads or produces something (read, reads, reader, feed, producer, guard, scan, derive, derived) and no scenario speaks of a missing, corrupt, unreadable or absent input.
 
-**Known looseness of the no-failure-mode warning:** (1) the all-clear is lexical: a scenario that says "missing" or "absent" about something else clears the warning, and the regex covers a scenario's text, pass rule and discriminates; (2) the trigger words (read, reads, guard, scan, derive) match anywhere in the plan, scenarios included. It is advice only (a warning) and must not be promoted to a defect without tightening both.
+**Known looseness of the no-failure-mode warning:** the check is lexical. The trigger words (read, reads, reader, feed, producer, guard, scan, derive, derived) are searched in the plan prose and in each scenario's `text` field only, and only a scenario's `text` field can clear the warning; so a text that says "missing" or "absent" about something else clears it, and a plan that reads an input in other words (load, parse, ingest, fetch) is not caught. It is advice only (a warning) and must not be promoted to a defect without tightening both.
 
 Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 
