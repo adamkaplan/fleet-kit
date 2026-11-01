@@ -932,10 +932,6 @@ class TestGhShimMutationRoots(unittest.TestCase):
         self.assertEqual([i for i, v in enumerate(got) if v != self.verdicts(self.source)[i]], [4, 6])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ---- #1696 round 5: the shim matches the RAW path for a write (it never normalises toward a path the server will not use).
 READER_FORMS = ("repos/o/r/contents/x\\..\\..\\pulls/1/merge", "repos/o/r/contents/x%5c..%5c..%5cpulls/1/merge", "repos/o/r/contents/x%252f..%252f..%252fpulls/1/merge")
 CLEANING_CLASSES = {"backslash": "repos/o/r/pulls/1/merge\\", "percent": "repos/o/r/pulls/1/%6derge", "dot": "repos/o/r/pulls/./1/merge", "dotdot": "repos/o/r/x/../pulls/1/merge",
@@ -1388,3 +1384,208 @@ class TestGhShimArgvParser(unittest.TestCase):
     def test_mutant_unknown_flags_passed_is_seen(self):
         old = '                _api_refuse(arg, "unknown flag --%s" % name)\n'
         self.check_mutant("unknown flags passed", self.mutant_space(old, "                i += 1\n                continue\n"), ["an unknown flag"])
+
+
+
+# ---- the older readers of gh api argv are views of parse_api_argv (#1696 round 7) ----
+
+MERGE = "repos/o/r/pulls/5/merge"
+ISSUE = "repos/o/r/issues/1"
+GRAPHQL_MERGE = "mutation{mergePullRequest(input:{pullRequestId:\"x\"}){clientMutationId}}"
+API_READER_FORMS = {
+    # label: (argv, accepted)
+    "-X PUT": (["api", "-X", "PUT", MERGE], True),
+    "-XPUT": (["api", "-XPUT", MERGE], True),
+    "--method=PUT": (["api", "--method=PUT", MERGE], True),
+    "--method put": (["api", "--method", "put", MERGE], True),
+    "-fsha=1": (["api", "-fsha=1", MERGE], True),
+    "-fa=b with -Xput": (["api", "-fa=b", "-Xput", MERGE], True),
+    "-i -XPUT": (["api", "-i", "-XPUT", MERGE], True),
+    "-ifoo -XPUT": (["api", "-ifoo", "-XPUT", MERGE], True),
+    "-pXPUT": (["api", "-pXPUT", MERGE], True),
+    "--cache 1h": (["api", "--cache", "1h", MERGE], True),
+    "--cache=1h --input=x": (["api", "--cache=1h", "--input=x", MERGE], True),
+    "-- then a positional": (["api", "--", MERGE], True),
+    "--silent --field": (["api", "--silent", "--field", "a=b", MERGE], True),
+    "-X GET -f a=b": (["api", "-X", "GET", "-f", "a=b", MERGE], True),
+    "-X PUT then -X GET": (["api", "-X", "PUT", "-X", "GET", MERGE], True),
+    "-X GET then -X PUT": (["api", "-X", "GET", "-X", "PUT", MERGE], True),
+    "plain read": (["api", MERGE], True),
+    "graphql -f": (["api", "graphql", "-f", "query=" + GRAPHQL_MERGE], True),
+    "graphql -F": (["api", "graphql", "-F", "query=" + GRAPHQL_MERGE], True),
+    "graphql --raw-field": (["api", "graphql", "--raw-field", "query=" + GRAPHQL_MERGE], True),
+    "graphql --input": (["api", "graphql", "--input", "q.json"], True),
+    "-R api api": (["-R", "api", "api", ISSUE], True),
+    "--repo api api": (["--repo", "api", "api", ISSUE], True),
+    "-R api/x api": (["-R", "api/x", "api", ISSUE], True),
+    "-R api/x api merge PUT": (["-R", "api/x", "api", MERGE, "-X", "PUT"], True),
+    "abbreviated --fiel": (["api", "--fiel", "a=b", MERGE], False),
+    "abbreviated --inp": (["api", "--inp", "x", MERGE], False),
+    "abbreviated --meth": (["api", "--meth", "PUT", MERGE], False),
+    "-- then two positionals": (["api", "--", MERGE, ISSUE], False),
+    "header override": (["api", "-H", "X-HTTP-Method-Override: PUT", MERGE], None),   # None: decided by the parser itself, whichever way
+}
+REFUSED_START = "the argv of that gh api call cannot be classified"
+
+
+class Lookup:
+    def identity(self):
+        return {"read_repo": "o/x", "repo": "o/r", "own": True, "name": "w"}
+
+
+def load_shim(source):
+    space = {"__name__": "ghshim_under_test", "__file__": str(SHIM_DIR / "gh")}
+    exec(compile(source, "shims/gh", "exec"), space)
+    return space
+
+
+def parser_verdict(space, argv):
+    """(None, parsed) when the parser accepts argv, else (message, None). argv is the whole command line."""
+    try:
+        return None, space["api_parsed"](argv)
+    except space["Refused"] as err:
+        return str(err), None
+
+
+def readers(space, argv):
+    """What each of the four readers decides for argv."""
+    os.environ.setdefault("XDG_CONFIG_HOME", "/nonexistent-xdg")
+    space["load_hold"] = lambda: None
+    guard = space["hold_probe"](argv, None, None, False)[0]
+    scope = space["read_scope"](argv, Lookup(), space["is_write"](argv))
+    return {"is_write": space["is_write"](argv), "merge_route": space["merge_route"](argv), "named_repos": space["named_repos"](argv),
+            "guard": guard, "scope": scope}
+
+
+def reader_failures(source):
+    """Every difference between a reader and the parser over API_READER_FORMS, as anchored one-line texts."""
+    space = load_shim(source)
+    failures = []
+    for label, (argv, _accepted) in API_READER_FORMS.items():
+        why, parsed = parser_verdict(space, argv)
+        got = readers(space, argv)
+        if why is not None and _accepted is True:
+            failures.append("%s: the parser refused an argv that is accepted: %s" % (label, why[:60]))
+        if why is not None:
+            if got["is_write"] is not True:
+                failures.append("%s: is_write read a refused argv as %r, not a write" % (label, got["is_write"]))
+            route = got["merge_route"]
+            if not (route and route[0] == "api-unknown" and route[1].startswith(REFUSED_START)):
+                failures.append("%s: merge_route did not refuse the argv: %r" % (label, route))
+            if got["named_repos"][1] is not True:
+                failures.append("%s: named_repos did not refuse the argv: %r" % (label, got["named_repos"]))
+            if got["guard"] != why:
+                failures.append("%s: the hold guard did not refuse the argv: %r" % (label, got["guard"]))
+            if not (got["scope"] and got["scope"][0] == "refuse" and got["scope"][1].startswith("gh: refused:")):
+                failures.append("%s: the read-scope gate did not refuse with 'gh: refused:': %r" % (label, got["scope"]))
+            continue
+        method, write = parsed.method or "GET", bool(parsed.fields or parsed.input)
+        if got["is_write"] != (parsed.effective_method != "GET"):
+            failures.append("%s: is_write %r differs from the parser's method %s" % (label, got["is_write"], parsed.effective_method))
+        route = got["merge_route"]
+        graphql = any(p == "graphql" for _i, p in parsed.positionals)
+        if graphql:
+            expected = ("graphql", None)
+        elif method == "GET" and not write:
+            expected = None
+        else:
+            expected = ("api", ("o/r", 5)) if parsed.positionals and parsed.positionals[0][1] == MERGE else None
+        if route != expected:
+            failures.append("%s: merge_route %r differs from the parser's %r" % (label, route, expected))
+        if got["guard"] is not None:
+            failures.append("%s: the hold guard refused an argv the parser accepts: %r" % (label, got["guard"]))
+        found, bad = got["named_repos"]
+        if parsed.positionals and parsed.positionals[0][1] in (MERGE, ISSUE):
+            if bad or "o/r" not in found:
+                failures.append("%s: named_repos read %r (bad %r), not o/r" % (label, found, bad))
+    return failures
+
+
+class TestApiReadersAreViews(unittest.TestCase):
+    source = (SHIM_DIR / "gh").read_text()
+
+    def test_every_reader_agrees_with_the_parser(self):
+        failures = reader_failures(self.source)
+        print("R7 readers: %d forms, %d differences" % (len(API_READER_FORMS), len(failures)))
+        self.assertEqual(failures, [])
+
+    def test_table_forms_are_accepted_or_refused_as_labelled(self):
+        space = load_shim(self.source)
+        for label, (argv, accepted) in API_READER_FORMS.items():
+            why, _parsed = parser_verdict(space, argv)
+            if accepted is not None:
+                self.assertEqual(why is None, accepted, label)
+        self.assertIsNotNone(parser_verdict(space, API_READER_FORMS["abbreviated --inp"][0])[0])
+
+    def test_option_value_named_api_is_not_the_verb(self):
+        space = load_shim(self.source)
+        for argv in (["-R", "api", "api", ISSUE], ["--repo", "api", "api", ISSUE], ["-R", "api/x", "api", ISSUE]):
+            got = readers(space, argv)
+            self.assertFalse(got["is_write"], argv)
+            self.assertIn("o/r", got["named_repos"][0], argv)
+            self.assertFalse(got["named_repos"][1], argv)
+            self.assertIsNone(got["guard"], argv)
+            _why, parsed = parser_verdict(space, argv)
+            self.assertEqual([p for _i, p in parsed.positionals], [ISSUE], argv)
+
+    def test_merge_put_behind_option_value_named_api_is_the_merge_route(self):
+        space = load_shim(self.source)
+        argv = ["-R", "api/x", "api", MERGE, "-X", "PUT"]
+        self.assertEqual(space["merge_route"](argv), ("api", ("o/r", 5)))
+        self.assertTrue(space["is_write"](argv))
+
+    def test_header_override_is_decided_as_the_parser_decides(self):
+        space = load_shim(self.source)
+        argv = API_READER_FORMS["header override"][0]
+        why, parsed = parser_verdict(space, argv)
+        got = readers(space, argv)
+        if why is not None:
+            self.assertTrue(got["is_write"])
+            self.assertEqual(got["guard"], why)
+        else:
+            self.assertEqual(got["is_write"], parsed.effective_method != "GET")
+
+    def mutant(self, old, new):
+        self.assertEqual(self.source.count(old), 1, "the mutant's anchor is gone: " + old[:60])
+        return self.source.replace(old, new)
+
+    def test_control_unmutated_passes(self):
+        self.assertEqual(reader_failures(self.source), [])
+
+    def test_mutant_old_is_write_branch_fails(self):
+        old = '''            try:
+                return api_parsed(args).effective_method != "GET"   # gh's own rule: an explicit last method, else POST with a field or --input
+            except Refused:
+                return True   # an argv the parser refuses is a write: fail closed
+'''
+        new = '''            method = None
+            for i, a in enumerate(args):
+                if a in ("-X", "--method") and i + 1 < len(args):
+                    method = args[i + 1].upper()
+                elif a.startswith("--method="):
+                    method = a.split("=", 1)[1].upper()
+                elif a.startswith("-X") and len(a) > 2:
+                    method = a[2:].upper()
+            if method is not None:
+                return method != "GET"
+            return any(a in ("-f", "-F", "--field", "--raw-field", "--input") or a.startswith(("--field=", "--raw-field=", "--input=", "-f", "-F"))
+                       for a in args[1:] if a.startswith("-") and not a.startswith("--jq") and not a.startswith("--paginate") and not a.startswith("--slurp"))
+'''
+        seen = reader_failures(self.mutant(old, new))
+        print("R7 mutant old is_write: %d failures" % len(seen))
+        self.assertTrue(any(s.startswith("abbreviated --inp: is_write read a refused argv as False") for s in seen), seen)
+
+    def test_mutant_args_index_api_fails(self):
+        old = '''    words = command_word_positions(args)
+    return words[0][0] if words and words[0][1] == "api" else None
+'''
+        new = '''    return args.index("api") if "api" in args else None
+'''
+        seen = reader_failures(self.mutant(old, new))
+        print("R7 mutant args.index: %d failures" % len(seen))
+        self.assertTrue(any(s.startswith("-R api api: the parser refused an argv that is accepted") for s in seen), seen)
+        self.assertTrue(any(s.startswith("--repo api api:") for s in seen), seen)
+
+
+if __name__ == "__main__":
+    unittest.main()
