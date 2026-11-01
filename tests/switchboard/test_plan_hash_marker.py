@@ -310,8 +310,8 @@ def build():
             with tempfile.TemporaryDirectory() as tmp:
                 msb = _entry_copy(tmp, "fleet-switchboard",
                                   "check_module.canonical_hash(plan_hash, hashes) in {check_module.canonical_hash(h, hashes) for h in consensus}", "plan_hash in consensus")
-                with self.assertRaisesRegex(AssertionError, "an approval at the old hash is not read as bound"):
-                    self.assertEqual(self.scenario(msb.triage_pass, "old"), [], "an approval at the old hash is not read as bound")
+                with self.assertRaisesRegex(AssertionError, r"sha256:[0-9a-f]{64}"):   # the announcement the mutated wake sends (its text names the plan hash)
+                    self.assertEqual(self.scenario(msb.triage_pass, "old"), [])
 
     only_own_tests(TestPlanHashMarkerWake)
 
@@ -424,8 +424,8 @@ def build():
                         mock.patch.object(sys, "stdin", io.StringIO(self.block(rnd["lanes"][-1], rnd["plan_hash"]))):
                     code = msb.main(["plan", "review", "verdict", review, "--lane", rnd["lanes"][-1], "--json"], runner=self.route, now=self.world.clock.now,
                                     wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
-                with self.assertRaisesRegex(AssertionError, "the tally counts the three verdicts together"):
-                    self.assertEqual(json.loads(out.getvalue())["tally"], "consensus", "the tally counts the three verdicts together")
+                with self.assertRaisesRegex(AssertionError, r"!= 'consensus'"):   # the assertion on the tally the mutated command printed
+                    self.assertEqual(json.loads(out.getvalue())["tally"], "consensus")
 
         # -- S9: the entry's decide and the two open-reading places, on a round that holds verdicts at both forms
 
@@ -491,8 +491,8 @@ def build():
                 with captured() as (out, err), mock.patch.object(msb, "owner_terminal_problem", lambda *a, **k: None), mock.patch.object(sys, "stdin", io.StringIO("")):
                     msb.main(["plan", "review", "decide", review, "--objection", "L2/O1", "--override", "--reason", "out of scope for this plan, accepted by the boss", "--json"],
                              runner=self.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
-                with self.assertRaisesRegex(AssertionError, "decide counts the old-hash consensus as the round's"):
-                    self.assertEqual(len(self.consensus_entries(review)), 1, "decide counts the old-hash consensus as the round's")
+                with self.assertRaisesRegex(AssertionError, r"2 != 1"):   # the mutated decide wrote a second consensus
+                    self.assertEqual(len(self.consensus_entries(review)), 1)
 
         def test_the_tick_and_the_lane_send_check_read_a_round_with_verdicts_at_both_forms_as_open(self):
             got = self.start_round()
@@ -600,8 +600,8 @@ def build():
                 except Exception as exc:
                     code, out, err = 2, "", repr(exc)
                 relaunched = json.loads(out)["relaunched"] if out.strip().startswith("{") else []
-                with self.assertRaisesRegex(AssertionError, "the round with its pair is handled"):
-                    self.assertEqual(sorted(relaunched), sorted(valid["lanes"]), "the round with its pair is handled")
+                with self.assertRaisesRegex(AssertionError, "boom"):   # the text the mutated tick raised, shown by the assertion on its stderr
+                    self.assertEqual(err.strip(), "")
                 self.assertEqual(len(self.ledger()), before)
 
         def test_the_control_a_round_started_after_the_change_is_accepted_by_the_commands_and_its_lane_send_check_answers_as_before(self):
@@ -619,8 +619,8 @@ def build():
                     os.environ["HERDR_PANE_ID"] = self.world.panes["orch"]
                     code = msb.main(["plan", "review", "status", got["review"]], runner=self.route, now=self.world.clock.now,
                                     wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
-                with self.assertRaisesRegex(AssertionError, "the round is refused with the line"):
-                    self.assertIn(self.PREDATES, err.getvalue(), "the round is refused with the line")
+                with self.assertRaisesRegex(AssertionError, "0 != 2"):   # the mutated status ran: exit 0 where the refusal exits 2
+                    self.assertEqual(code, 2)
 
     only_own_tests(TestPlanHashMarkerRounds)
     return TestPlanHashMarkerWake, TestPlanHashMarkerRounds
