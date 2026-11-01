@@ -64,13 +64,23 @@ def approval_on(config, repo):
     return bool(setting and setting.get("enabled") and setting.get("mode") == "enforce" and "G0c" in (setting.get("enforce_gates") or ()))
 
 
-def approval_facts(facts, config, state, pr, source, plan):
+def approval_facts(facts, config, state, pr, source, plan, runner=None):
     """`facts` with the approval facts when the gate is on for this repo, else `facts` as it is (G0c stays untracked). The current hash is the plan's own (plan_check.plan_hash)."""
     if not isinstance(facts, dict) or not approval_on(config, pr.rsplit("#", 1)[0]):
         return facts
     issue = approval_issue(source, config)
     events = approval_events(state, issue, (plan or {}).get("plan_hash")) if issue and plan else ([] if issue is None else None)
-    return dict(facts, approval={"issue": issue, "events": events})
+    approval = {"issue": issue, "events": events}
+    if runner is not None:   # the merge gate's own reads of the base and the default branch; unreadable: no flag, the row stays as approval_state gives it (fails closed)
+        try:
+            repo, number = parse_pr_ref(pr)
+            reading, gh = load_module("pr_reading"), merge_gate_gh(config, runner, repo)
+            base = reading.read_pr(gh, repo, number)["base"]
+            if base not in APPROVAL_BASES and base != reading.read_default_branch(gh, repo):
+                approval["gated"] = False
+        except Exception:
+            pass
+    return dict(facts, approval=approval)
 
 
 def approval_refusal(args, runner, now):

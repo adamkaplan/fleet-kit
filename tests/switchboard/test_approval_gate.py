@@ -429,3 +429,52 @@ class TestApprovalGateCommands(unittest.TestCase):
             self.assertIsNone(self.refusal(), "the mutant passes a pull request with no plan link")
             with self.assertRaisesRegex(AssertionError, r"^None is not true : no plan link must be refused$"):
                 self.assertTrue(self.refusal(), "no plan link must be refused")
+
+    NOT_GATED = "n/a: the base is not gated"
+
+    def nolink_row(self, base, default="main"):
+        self.enforce()
+        self.set_body("canon: updated the docs")
+        self.h.fake.base, self.h.fake.default = base, default
+        report = self.h.gates()[1]
+        return report, self.h.row(report, "G0c")
+
+    def test_a_pull_request_with_no_plan_link_on_a_feature_base_reads_not_applicable(self):
+        report, row = self.nolink_row("feature")
+        self.assertEqual((row["status"], row["detail"], row["missing"]), ("n/a", self.NOT_GATED, []))
+        self.assertNotIn("G0c", json.dumps(report.get("missing", [])))
+        self.assertIsNone(self.refusal(), "the merge gate lets it through: the row says the same")
+
+    def test_the_same_pull_request_on_the_integration_branch_or_the_default_branch_reads_missing(self):
+        for base in ("integration", "main"):
+            report, row = self.nolink_row(base)
+            self.assertEqual((row["status"], row["detail"]), ("missing", self.NOPLAN), base)
+            self.assertTrue(self.refusal(), base)
+            self.doCleanups()
+            self.setUp()
+
+    def test_a_base_that_cannot_be_read_leaves_the_row_missing_fail_closed(self):
+        self.enforce()
+        self.set_body("canon: updated the docs")
+        self.h.fake.base = "feature"
+        with mock.patch.object(HOST.sb.load_module("pr_reading"), "read_pr", side_effect=RuntimeError("no read")):
+            row = self.row()
+        self.assertEqual((row["status"], row["detail"]), ("missing", self.NOPLAN))
+
+    def test_mutant_not_applicable_for_every_base_is_caught(self):
+        self.enforce()
+        self.set_body("canon: updated the docs")
+        old = 'row.update(tracked=True, status="n/a", detail="n/a: the base is not gated")'
+        text = inspect.getsource(plan_ledger.evaluate_gates)
+        if old not in text or 'facts["approval"].get("gated") is False' not in text:
+            raise AssertionError("mutant not applied")
+        mutant = text.replace('facts["approval"].get("gated") is False', "True", 1)
+        space = dict(vars(plan_ledger))
+        exec(mutant, space)
+        def check():
+            self.h.fake.base = "integration"
+            self.assertEqual(self.row()["status"], "missing", "a gated base must read missing")
+        check()   # the unmutated control passes
+        with mock.patch.object(plan_ledger, "evaluate_gates", space["evaluate_gates"]):
+            with self.assertRaisesRegex(AssertionError, r"^'n/a' != 'missing'"):
+                check()

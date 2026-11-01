@@ -913,6 +913,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             row["detail"] = UNTRACKED_WHY.get(gid, "")
         elif not tracked and not (gid == "G0c" and isinstance((facts or {}).get("approval"), dict)):   # #1735: G0c is tracked only where the repo enforces it (facts["approval"] is then set)
             row["detail"] = UNTRACKED_WHY.get(gid, "not recorded yet")
+        elif gid == "G0c" and facts["approval"].get("gated") is False:   # #1735: the merge gate holds only the integration branch and the default branch
+            row.update(tracked=True, status="n/a", detail="n/a: the base is not gated")
         elif gid == "G0c":
             status, said = approval_state(facts["approval"].get("events"), facts["approval"].get("issue"), (plan or {}).get("plan_hash"))
             row.update(tracked=True, status=status, detail=said, missing=[said] if status == "missing" else [])
