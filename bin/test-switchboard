@@ -73584,6 +73584,11 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         self.assertIn("bin/fleet-switchboard", [p for p in tracked_files() if scanned(p)])
         self.assertTrue(any(p.startswith("plugins/") and scanned(p) for p in tracked_files()), "the scan reaches subdirectories")
 
+    def test_the_scan_skips_the_tests_tree_and_still_judges_the_code(self):
+        self.assertFalse(scanned("tests/switchboard/support/x.py"))
+        self.assertTrue(scanned("bin/fleet-switchboard"))
+        self.assertTrue(scanned("plugins/fleet-decisions-tui/health.mjs"))
+
     # Every function that reads the registry through the seam is a view; each has the test that retires an agent (or breaks the registry) and checks that view.
     # The table is checked against the code: a new caller of the seam with no row fails `test_every_view_that_reads_the_registry_has_its_retire_test`.
     VIEW_TESTS = {
