@@ -2528,10 +2528,18 @@ class Launcher:
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now, live = [], self.clock(), []
         self.reap_results, self.last_hook = {}, None
+        mono = time.monotonic
+        steps = self.step_seconds = {"list": 0.0, "renew": 0.0, "vanished": 0.0, "activity": 0.0, "activity_n": 0, "stops": 0.0, "stops_n": 0, "orphans": 0.0, "notes": 0.0, "total": 0.0}
+        t_pass = t0 = mono()
         pods = self.kube.list_pods()
+        steps["list"] = mono() - t0
+        t0 = mono()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
+        steps["renew"] = mono() - t0
+        t0 = mono()
         self._note_vanished_pods(pods, now)
+        steps["vanished"] = mono() - t0
         for pod in pods:
             worker = ann(pod, "worker")
             reason = None
@@ -2544,7 +2552,10 @@ class Launcher:
                 reason = "hard limit"
             else:
                 live.append(pod)   # before its hard limit and not stopped below: the git token renewal's candidates
+                t0 = mono()
                 act = self.activity(pod["metadata"]["name"])
+                steps["activity"] += mono() - t0
+                steps["activity_n"] += 1
                 if act is None:
                     # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
                     # its hard limit; it is reported so it is not silent.
@@ -2556,6 +2567,7 @@ class Launcher:
                 self.last_hook = None
                 if pod in live:
                     live.remove(pod)
+                t0 = mono()
                 try:
                     # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
                     res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None,
@@ -2566,9 +2578,17 @@ class Launcher:
                 except CloudError as e:
                     self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
+                finally:
+                    steps["stops"] += mono() - t0
+                    steps["stops_n"] += 1
         out.extend(renewed)
+        t0 = mono()
         self.remove_orphan_secrets(pods, now)
+        steps["orphans"] = mono() - t0
+        t0 = mono()
         self.send_wip_notes(live, now)
+        steps["notes"] = mono() - t0
+        steps["total"] = mono() - t_pass
         return out
 
     def _note_vanished_pods(self, pods, now):
@@ -3501,6 +3521,14 @@ class RenewalTicker:
             self.thread.join(5)   # a tick in flight ends first
 
 
+def step_text(st):
+    """The seconds of the seven steps of a pass, for the pass line: numbers only, no name or value."""
+    if not st:
+        return ""
+    return " steps list=%.1f renew=%.1f vanished=%.1f activity=%.1f (%d) stops=%.1f (%d) orphans=%.1f notes=%.1f total=%.1f" % (
+        st["list"], st["renew"], st["vanished"], st["activity"], st["activity_n"], st["stops"], st["stops_n"], st["orphans"], st["notes"], st["total"])
+
+
 def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait=None, tree=None):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop).
 
@@ -3547,7 +3575,7 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
             cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
             work = L.reap() if L is not None else []   # the pass's own work: the workers' results
             took = (clock() - began).total_seconds()
-            print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0), file=sys.stderr)
+            print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
             if L is not None:
                 L.note_slow_pass(took)
             res = work
