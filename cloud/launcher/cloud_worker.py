@@ -2717,7 +2717,11 @@ class Launcher:
         (worker, "git token renewed", 0) or (worker, "git token not renewed: WHY", 1). A pod that needs nothing (no per-run Secret, not due)
         adds nothing. One pod's trouble never stops the pass; the old token stays until a patch has landed."""
         with self.renew_lock:
-            return self._renew_locked(pods, now)
+            self._tail = AuditTail(self.audit_path)   # one lookup for this call; it reads nothing until a failure asks
+            try:
+                return self._renew_locked(pods, now)
+            finally:
+                self._tail = None
 
     def _renew_locked(self, pods, now):
         out, relogged = [], False
