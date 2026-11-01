@@ -366,6 +366,7 @@ DEFAULTS = {
     "launch_default": "headless",   # #433: what a plain `launch` starts: "headless" (no terminal) or "terminal" (a herdr tab)
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "steer_after_minutes": 0,       # #1540: 0 = off; else a turn longer than this many minutes takes a peer `send` and a reminder as `steer` too
+    "unconsumed_steer_minutes": 20,   # #1844: 0 = off; a delivered queue-mode message the lane has not consumed after this many minutes is steered into the running turn
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
     "call_timeout_seconds": 20,
@@ -8300,6 +8301,10 @@ def validate_decisions_config(config, source):
     if not _is_number(steer_after) or isinstance(steer_after, bool) or steer_after < 0:
         raise ConfigError("%s: 'steer_after_minutes' must be a number of minutes, 0 (off, the default) or more, got %r"
                           % (source, steer_after))
+    unconsumed_steer = config["unconsumed_steer_minutes"]
+    if not _is_number(unconsumed_steer) or isinstance(unconsumed_steer, bool) or unconsumed_steer < 0:
+        raise ConfigError("%s: 'unconsumed_steer_minutes' must be a number of minutes, 0 (off) or more (the default is 20), got %r"
+                          % (source, unconsumed_steer))
     hold = config["pr_notice_hold_minutes"]
     if not _is_number(hold) or hold < 0:
         raise ConfigError("%s: 'pr_notice_hold_minutes' must be a number of minutes, 0 (no hold, the default) or "
