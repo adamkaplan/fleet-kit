@@ -9683,7 +9683,7 @@ def push_watch_tick(engine, discovery):
     spec = importlib.util.spec_from_file_location("push_watch", os.path.join(os.path.dirname(os.path.realpath(__file__)), "push_watch.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line)
+    ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=_one_line, parse_bounded=load_module("record_json").parse_bounded)
     return module.run_pass(ns, engine, engine.now(), lambda path: engine.gh_api(path, paginate=False), engine.config.get("push_watch"))
 
 

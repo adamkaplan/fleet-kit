@@ -48,13 +48,13 @@ def _hms(epoch):
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%H:%M:%SZ")
 
 
-def _load(path):
+def _load(sb, path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            data = json.loads(handle.read(READ_BYTES))
+            data = sb.parse_bounded(handle.read(READ_BYTES))
         if isinstance(data, dict) and isinstance(data.get("workers"), dict):
             return data
-    except (OSError, ValueError):
+    except Exception:   # a missing or corrupt file: an empty state, one audit pass, never an error into the daemon
         pass
     return {"workers": {}, "offset": None, "stopped": {}, "reported": {}}
 
@@ -69,7 +69,7 @@ def _save(path, state):
     os.replace(tmp, path)
 
 
-def _read_launcher(path, state, parse_iso):
+def _read_launcher(sb, path, state, parse_iso):
     """New launcher audit lines since the stored byte position: stop and report times per worker."""
     try:
         size = os.stat(path).st_size
@@ -87,8 +87,8 @@ def _read_launcher(path, state, parse_iso):
     state["offset"] = start + end + 1
     for chunk in raw[:end + 1].split(b"\n"):
         try:
-            item = json.loads(chunk.decode("utf-8", "replace"))
-        except ValueError:
+            item = sb.parse_bounded(chunk.decode("utf-8", "replace"))
+        except Exception:
             continue
         if not isinstance(item, dict) or not isinstance(item.get("worker"), str) or item.get("ok") is not True:
             continue
@@ -134,14 +134,15 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
     if now - _LAST_RUN.get(path, -1e18) < cfg["interval"]:
         return []
     _LAST_RUN[path] = now
-    state = _load(path)
+    state = _load(sb, path)
     for key in ("stopped", "reported"):
         state.setdefault(key, {})
-    _read_launcher(launcher_audit or os.environ.get("CW_CLOUD_AUDIT") or os.path.join(
+    _read_launcher(sb, launcher_audit or os.environ.get("CW_CLOUD_AUDIT") or os.path.join(
         os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl"), state, sb.parse_iso)
     records = {r["worker"]: r for r in (getattr(engine, "cloud_watch", None) or {}).get("records", []) if isinstance(r, dict) and isinstance(r.get("worker"), str)}
     sent = []
     limited = []
+    cmpfail = []
     raw_gh = gh
 
     def gh(path_):   # a rate-limit stops the pass; a failed compare falls back to the tip alone (once audited)
@@ -155,14 +156,18 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 limited.append(1)
                 engine.audit.append(engine.actor, "push_watch.rate_limited", None, {"why": sb._one_line(str(err), 160)})
             elif "/compare/" in path_:
+                cmpfail.append(path_)
                 engine.audit.append(engine.actor, "push_watch.compare_failed", None, {"why": sb._one_line(str(err), 160)})
                 return raw_gh("repos/%s/commits/%s" % (path_.split("/compare/")[0].split("repos/", 1)[1], path_.rsplit("...", 1)[1]))
             raise
 
     live = sorted(n for n, r in records.items() if isinstance(r.get("repo"), str) and not state["stopped"].get(n, 0))
     start = state.get("cursor", 0) % len(live) if live else 0
-    chosen = set((live[start:] + live[:start])[:PASS_WORKERS_MAX])
+    order = (live[start:] + live[:start])[:PASS_WORKERS_MAX]
+    chosen = set(order)
+    current = None
     state["cursor"] = (start + PASS_WORKERS_MAX) % len(live) if live else 0
+    # (a rate-limit stop below moves the cursor to the first unreached worker)
     claimed = {}
     for n in live:
         b_ = records[n].get("branch")
@@ -177,11 +182,11 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
         except Exception as err:
             engine.audit.append(engine.actor, "push_watch.read_failed", worker, {"to": lane, "why": sb._one_line(str(err), 160)})
 
-    for name, record in sorted(records.items()):
+    for name in order:
+        record = records[name]
         if limited:
             break
-        if name not in chosen:
-            continue
+        current = name
         mem = state["workers"].setdefault(name, {})
         stopped = state["stopped"].get(name, 0)
         lane, repo = record.get("reports_to"), record.get("repo")
@@ -193,7 +198,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                 engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": "no reports_to: tells no lane"})
             continue
         task_ = record.get("branch")
-        if isinstance(task_, str) and task_ and (task_ in DENIED_BRANCHES or task_ == record.get("default_branch") or len(claimed.get(task_, ())) > 1):
+        if isinstance(task_, str) and task_ and (task_ in DENIED_BRANCHES or task_ == record.get("default_branch") or any(o != name and (task_ == o or task_.startswith(o + "/")) for o in records) or len(claimed.get(task_, ())) > 1):
             record = dict(record, branch=None)   # the default branch, or a branch two records name, is not this worker's
             if not mem.get("denied"):
                 mem["denied"] = True
@@ -226,6 +231,7 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
             if sha in b["told"]:
                 continue
             prev = b.get("sha")
+            del cmpfail[:]
             try:
                 if prev:   # every new commit since the last sha: ONE compare read, the newest COMMITS_MAX
                     data = (_dicts(gh("repos/%s/compare/%s...%s" % (repo, prev, sha))) or [{}])[0]
@@ -236,7 +242,11 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
                     commit = (_dicts(gh("repos/%s/commits/%s" % (repo, sha))) or [{}])[0]
                     batch, stats = [(sha, commit)], commit
             except Exception as err:
-                engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160)})
+                if cmpfail and not limited:   # the compare and the tip read both failed: the sha advances anyway (never retried), audited once as compare_failed
+                    b["told"] = (b["told"] + [sha])[-TOLD_MAX:]
+                    b["sha"], b["at"], b["quiet"] = sha, now, True
+                else:
+                    engine.audit.append(engine.actor, "push_watch.read_failed", name, {"why": sb._one_line(str(err), 160)})
                 continue
             unsent = False
             for csha, c in batch:
@@ -258,9 +268,14 @@ def run_pass(sb, engine, now, gh, config=None, launcher_audit=None):
         for branch, b in mem.get("branches", {}).items():
             minutes = (now - b.get("at", now)) / 60.0
             if b.get("sha") and not b.get("quiet") and state["reported"].get(name, 0) <= b.get("at", 0) and minutes >= cfg["quiet_minutes"]:
-                b["quiet"] = True   # marked before the send: once per sha
+                n_before = len(sent)
                 tell(lane, item_text(name, branch, b["sha"], {}, "quiet", int(minutes), b["at"]), name)
+                if len(sent) == n_before:   # a failed send leaves it unmarked: retried at the next pass
+                    continue
+                b["quiet"] = True   # marked only after a successful send: once per sha
                 engine.audit.append(engine.actor, "push_watch.quiet", name, {"to": lane, "sha": b["sha"][:8]})
+    if limited and current in live:
+        state["cursor"] = live.index(current)   # the worker the stop hit and those after it are read first at the next pass
     for name in list(state["workers"]):
         if name not in records:
             state["workers"].pop(name)

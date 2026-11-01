@@ -94,7 +94,7 @@ class Case(unittest.TestCase):
         self.world = PushWorld()
         self.world.commits = {SHA_A: commit(), SHA_B: commit("second"), SHA_C: commit("third")}
         self.engine = Engine(self.tmp.name, [record("w-a", "lane-a"), record("w-b", "lane-b")])
-        self.ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=lambda t, n=200: str(t)[:n])
+        self.ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=lambda t, n=200: str(t)[:n], parse_bounded=json.loads)
 
     def run_pass(self, now, module=None):
         return (module or self.pw).run_pass(self.ns, self.engine, now, self.world, self.config, self.launcher)
@@ -378,6 +378,105 @@ class TestPushWatch(Case):
         with self.assertRaises(AssertionError) as caught:
             self.assertEqual(len(self.to("lane-a")), 1, "a failed send was marked told")
         self.assertIn("a failed send was marked told", str(caught.exception))
+
+    def _fails(self, check, text):
+        with self.assertRaises(AssertionError) as caught:
+            check()
+        self.assertIn(text, str(caught.exception))
+
+    def test_fix3_a_corrupt_or_missing_state_starts_empty_and_audits_once(self):
+        self.world.refs = {"w-a/wip": SHA_A}
+        state = Path(self.tmp.name) / "push-watch.json"
+        state.write_text("{not json")
+        self.run_pass(NOW)
+        self.assertEqual(len(self.to("lane-a")), 1)
+        self.assertEqual(json.loads(state.read_text())["workers"]["w-a"]["branches"]["w-a/wip"]["sha"], SHA_A)
+        state.write_text("[" * 5000)   # too deep: refused, an empty state, no raise
+        self.run_pass(NOW + 1)
+        self.assertEqual(len(self.to("lane-a")), 2)
+
+    def test_fix3_pc8_a_branch_of_another_recorded_worker_is_denied_and_audited_once(self):
+        recs = [dict(record("cw-1", "lane-a"), branch="cw-2/wip"), record("cw-2", "lane-b")]
+        self._branch_case(recs, {"cw-2/wip": SHA_A})
+        self.assertEqual(self.to("lane-a"), [])
+        self.assertEqual(len(self.to("lane-b")), 1)   # cw-2 still gets its own push
+        self.run_pass(NOW + 1)
+        self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.branch_denied"]), 1)
+        self._branch_case([dict(record("cw-1", "lane-a"), branch="cw-2"), record("cw-2", "lane-b")], {"cw-2": SHA_A})
+        self.assertEqual(self.to("lane-a"), [])
+        self._branch_case(recs, {"cw-2/wip": SHA_A}, self.mutant('any(o != name and', 'False and any(o != name and'))
+        self._fails(lambda: self.assertEqual(self.to("lane-a"), [], "cw-1 received the pushes of cw-2"), "cw-1 received the pushes of cw-2")
+        self._branch_case([dict(record("cw-1", "lane-a"), branch="own/x"), record("cw-2", "lane-b")], {"own/x": SHA_A}, self.mutant('any(o != name and', 'False and any(o != name and'))
+        self.assertEqual(len(self.to("lane-a")), 1)   # control: the unmutated rule allows an own branch, as does the mutant
+
+    def _quiet_send(self, module=None):
+        self.setUp()
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW, module)
+        ok = self.engine.send
+        self.engine.send = lambda *a, **k: (_ for _ in ()).throw(OSError("down"))
+        self.run_pass(NOW + 700, module)
+        self.engine.send = ok
+        self.run_pass(NOW + 800, module)
+        return [t for t in self.to("lane-a") if "quiet" in t]
+
+    def test_fix3_pc4_a_failed_quiet_send_is_retried_at_the_next_pass(self):
+        self.assertEqual(len(self._quiet_send()), 1)
+        mutant = self.mutant('                n_before = len(sent)\n                tell(lane, item_text(name, branch, b["sha"], {}, "quiet"', '                b["quiet"] = True\n                n_before = len(sent)\n                tell(lane, item_text(name, branch, b["sha"], {}, "quiet"')
+        self._fails(lambda: self.assertEqual(len(self._quiet_send(mutant)), 1, "the quiet item was marked before a failed send"), "the quiet item was marked before a failed send")
+
+    def _both_fail(self, module=None):
+        self.setUp()
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW)
+        real = self.world.__call__
+        self.world.refs = {"w-a/wip": SHA_C}
+        log = []
+
+        def broken(path):
+            if "/compare/" in path or path.endswith("/commits/" + SHA_C):
+                log.append(path)
+                raise OSError("422 gone")
+            return real(path)
+        self.world = broken
+        for i in (1, 2, 3):
+            self.run_pass(NOW + 60 * i, module)
+        return log
+
+    def test_fix3_pc2_both_reads_failing_advances_the_sha_and_audits_once(self):
+        log = self._both_fail()
+        self.assertEqual(len(log), 2)   # the compare and the tip, in the first pass only
+        self.assertEqual(len(self.to("lane-a")), 1)   # the first sight only: no item for the failed sha
+        self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.compare_failed"]), 1)
+        self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.read_failed"]), 0)
+        mutant = self.mutant('if cmpfail and not limited:', 'if False:')
+        self._fails(lambda: self.assertEqual(len(self._both_fail(mutant)), 2, "the failed sha was read again at the next pass"), "the failed sha was read again at the next pass")
+
+    def _rotation(self, module=None):
+        self.setUp()
+        recs = [record("w%d" % i, "lane-a") for i in range(5)]
+        self.engine.cloud_watch = {"records": recs}
+        self.world.refs = {"w%d/wip" % i: SHA_A for i in range(5)}
+        real = self.world.__call__
+        self.seen, self.hit = [], False
+
+        def limited(path):
+            self.seen.append(path)
+            if path.endswith("heads/w2") and not self.hit:
+                self.hit = True
+                raise OSError("HTTP 403 rate limit exceeded")
+            return real(path)
+        self.world = limited
+        self.run_pass(NOW, module)
+        del self.seen[:]
+        self.run_pass(NOW + 1, module)
+        return [p.split("heads/")[1] for p in self.seen if "matching-refs" in p]
+
+    def test_fix3_the_rate_limit_stop_keeps_the_cursor_at_the_first_unreached_worker(self):
+        self.assertEqual(self._rotation()[:3], ["w2", "w3", "w4"])
+        mutant = self.mutant('state["cursor"] = live.index(current)', 'pass')
+        self._fails(lambda: self.assertEqual(self._rotation(mutant)[:3], ["w2", "w3", "w4"], "the workers after the stop were not read first"), "the workers after the stop were not read first")
 
 
 if __name__ == "__main__":
