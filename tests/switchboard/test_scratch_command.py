@@ -336,3 +336,18 @@ class TestScratchBound(ScratchWorld):
             clock[0] += 3600
             source()
         self.assertEqual(len(lines), 2, "the mutant must record two lines, or the one-line test pins nothing")
+
+    def test_s14_fact_sources_lists_the_scratch_source_once_and_a_pass_records_one_line(self):
+        sources = sb.fact_sources(self.world.state)
+        names = [s.__name__ for s in sources]
+        self.assertEqual(names.count("scratch_bound_facts"), 1, names)
+        self.fill(101)
+        clock = [1_800_000_000.0]
+        engine, lines = self.engine(clock)
+        for source in sources:
+            if getattr(source, "__name__", "") == "scratch_bound_facts":
+                source.bind(engine)
+                source()
+                clock[0] += 3600
+                source()
+        self.assertEqual([l[0] for l in lines], ["scratch.over_bound"], lines)
