@@ -1,10 +1,13 @@
 """The stage-event tests of #1575, moved out of bin/test-switchboard (its line ceiling). GithubRig and GH_REPO are set by bin/test-switchboard after the import."""
+import importlib
 import json
 from unittest import mock
 from support.core import Base
 from support.loader import sb
 
-GithubRig = GH_REPO = None
+GithubRig = None   # set by bin/test-switchboard after the import (its loader line for this file)
+_support_scenario_roles = importlib.import_module("support.scenario_roles")   # support import
+GH_REPO = _support_scenario_roles.GH_REPO   # support import
 
 
 
