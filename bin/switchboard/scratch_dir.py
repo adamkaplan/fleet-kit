@@ -4,7 +4,7 @@
 # swept by the system and by the temp janitor; the state directory is the fleet's own). The directory is made by `agent_scratch_dir`, which calls the one
 # private-directory helper `job_ensure_root` (0700, ours, lstat, so a symlink is refused): this part makes no directory itself. The name is the caller's own,
 # found by `identify_caller`; the command takes no argument, so no path or name can point elsewhere. No fleet command removes or empties the directory
-# (`disk_janitor.holds_scratch` is the janitor's check; the others never reach the state directory). A size bound only warns, it never deletes or refuses.
+# (`disk_janitor.covers_scratch` is the janitor's check; the others never reach the state directory). A size bound only warns, it never deletes or refuses.
 # The daemon's look is `ScratchBoundFacts`, one more source of `fact_sources` (the one registration point of the entry).
 
 SCRATCH_BOUND = 100 * 1024 * 1024   # bytes: 100 MB

@@ -245,13 +245,13 @@ class TestScratchGuard(ScratchWorld):
     def test_s5_control_the_janitor_does_sweep_what_it_may(self):
         """Without a scratch directory the same janitor run removes the old state tree: the guard, not a no-op janitor, is what keeps the file."""
         self.plant()
-        with mock.patch.object(sb.load_disk_janitor(), "holds_scratch", lambda *a: False):
+        with mock.patch.object(sb.load_disk_janitor(), "covers_scratch", lambda *a: False):
             lines = self.run_janitor()
         self.assertTrue(any(l.startswith("removed ") for l in lines), lines)
 
     def test_s5_mutant_a_sweep_of_the_scratch_directory_fails_the_check(self):
         jan = sb.load_disk_janitor()
-        with mock.patch.object(sb, "load_disk_janitor", lambda: jan), mock.patch.object(jan, "holds_scratch", lambda *a: False):
+        with mock.patch.object(sb, "load_disk_janitor", lambda: jan), mock.patch.object(jan, "covers_scratch", lambda *a: False):
             with self.assertRaises(AssertionError) as caught:
                 self.check_unchanged()
         self.assertIn("the temp janitor", str(caught.exception))

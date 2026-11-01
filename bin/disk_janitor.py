@@ -408,7 +408,7 @@ def remove_entry(path):
         os.unlink(path)
 
 
-def holds_scratch(path, state_dir):
+def covers_scratch(path, state_dir):
     """True when removing `path` would remove or empty a scratch directory (#1456): `path` is the state directory, one of its parents, or the scratch tree itself or
     anything inside it. A scratch directory is never swept; the check is by real path, so a link into it counts."""
     try:
@@ -452,7 +452,7 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
             lines.append("kept %s: it changed since the scan" % row["name"])
             kept += 1
             continue
-        if holds_scratch(row["path"], state_dir):   # #1456: a scratch directory is never removed or emptied
+        if covers_scratch(row["path"], state_dir):   # #1456: a scratch directory is never removed or emptied
             lines.append("kept %s: it holds a scratch directory" % row["name"])
             kept += 1
             continue
