@@ -105,3 +105,4 @@ Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `f
 open. The order does not matter: a coder's only extra step is `prove`. A push voids every proof and
 verdict. The Chief of Staff may waive a hotfix, logged; the plan is then due within a day.
 `CARRIES: #N`: see plan-template.
+A launch arms a checkpoint and an overdue wake: a cloud launch with no CHECKPOINT line or flags gets the default 25m/40m.
