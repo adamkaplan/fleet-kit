@@ -62959,6 +62959,34 @@ class TestReviewRefusalNamesRule(TestReviewPostAndDismiss):
                         failed += 1
                 self.assertEqual(failed, 1, name)
 
+    def test_every_redaction_pattern_has_its_own_rule_name(self):   # U9
+        dash = "-" * 5
+        whole = "x\n" + dash + "BEGIN " + "PRIVATE" + " KEY" + dash + "\n" + "Q" * 12 + "\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+        marker = "x\n" + dash + "END " + "PRIVATE" + " KEY" + dash + "\n"
+
+        def check(ns):
+            names, table = ns["SECRET_RULE_NAMES"], ns["_SECRET_PATTERNS"]
+            self.assertEqual(len(names), len(table), "a redaction pattern has no rule name")
+            self.assertEqual(len(set(names)), len(names))
+            self.assertEqual(ns["find_secret_span"](whole)[0], "private-key-block")
+            self.assertEqual(ns["find_secret_span"](marker)[0], "private-key-marker")
+            return len(names), len(table)
+
+        control = check(vars(sb))
+        print("S9 control: %d names for %d patterns, 2 of 2 texts named" % control)
+        self.assertEqual(control, (7, 7))
+        source = (Path(__file__).resolve().parent / "switchboard" / "secret_spans.py").read_text()
+        line = '"private-key-block", "private-key-marker", '
+        self.assertEqual(source.count(line), 1)
+        mutated = source.replace('"private-key-marker", ', "")
+        self.assertNotEqual(mutated, source)
+        ns = dict(vars(sb))
+        exec(compile(mutated, "scratch_secret_spans.py", "exec"), ns)
+        with self.assertRaises(AssertionError) as caught:
+            check(ns)
+        print("S9 mutant: applied, failed with: %s" % caught.exception)
+        self.assertIn("a redaction pattern has no rule name", str(caught.exception))
+
 
 for _name in dir(TestReviewPostAndDismiss):   # the parent's tests run in their own class
     if _name.startswith("test_") and _name not in TestReviewRefusalNamesRule.__dict__:
