@@ -1115,12 +1115,15 @@ def _child_cpu_seconds(pid):
         return None
 
 
+_progress_started = None   # tests: an Event the progress thread sets when it has started
 _progress_pause = None   # tests: a function (stop_event, seconds) that pauses in place of the real wait
 
 
 def _progress_loop(pid, program, interval, stop, out, clock, began):
     """One line every `interval` seconds until `stop` is set; a failure of its own ends it quietly. Never signals the child."""
     try:
+        if _progress_started is not None:
+            _progress_started.set()
         while True:
             if _progress_pause is not None:
                 _progress_pause(stop, interval)
@@ -1291,7 +1294,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             progress_every = float(environ.get("FLEET_HEAVY_PROGRESS_SECONDS") or PROGRESS_EVERY)
         except ValueError:
             progress_every = PROGRESS_EVERY
-        threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock()), daemon=True).start()
+        progress_thread = threading.Thread(target=_progress_loop, args=(child["p"].pid, os.path.basename(command[0]), progress_every, progress_stop, out, clock, clock()), daemon=True)
+        progress_thread.start()
         try:
             while True:
                 try:
@@ -1301,6 +1305,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                     continue
         finally:
             progress_stop.set()
+            if progress_thread.is_alive():
+                progress_thread.join(2)   # bounded: no progress line after run returns
             dog.finish()
         if dog.reason == "time" and on_stop is not None:   # after the stop; it never changes the exit status
             try:
