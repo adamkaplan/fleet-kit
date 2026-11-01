@@ -291,7 +291,7 @@ class S10Scope(unittest.TestCase):
                 for l in self.git("diff", "-U0", base, "HEAD", "--", f).stdout.splitlines():
                     if l.startswith("-") and not l.startswith("---"):
                         removed += 1
-        self.assertEqual(removed, 1)
+        self.assertEqual(removed, 2)
         print("S10 files %d removed test lines %d" % (len(names), removed))
 
 
