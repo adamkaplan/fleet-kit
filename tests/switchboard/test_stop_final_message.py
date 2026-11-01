@@ -23,7 +23,7 @@ ENDPOINT = "https://worker-cb-1788a-1f2e3d4c.example.internal:4096"
 CHECK_FILE = Path(__file__).resolve()
 
 
-class World:
+class StopWorld:
     """A temporary state directory, run records root, cloud records, an audit file and a send recorder."""
 
     def __init__(self, test):
@@ -71,7 +71,7 @@ class World:
 
 class TestStopFinalMessage(unittest.TestCase):
     def test_S2_five_thousand_characters_give_3000_in_the_message_and_2000_in_a_private_file(self):
-        w = World(self)
+        w = StopWorld(self)
         text = ("lorem ipsum dolor sit amet " * 400)[:5000]
         w.stop("cb-1788a", "hard", w.pod("cb-1788a", text))
         w.scan()
@@ -91,7 +91,7 @@ class TestStopFinalMessage(unittest.TestCase):
         self.assertEqual(path.name, "cb-1788a-20261101T120000Z-abc123.txt")
 
     def test_S3_three_stops_send_one_each_a_pod_that_reported_done_none_and_a_second_pass_repeats_nothing(self):
-        w = World(self)
+        w = StopWorld(self)
         for name, cause in (("cp-1788a", "hard"), ("cp-1788b", "idle"), ("cp-1788d", "idle")):
             w.stop(name, cause, w.pod(name, "final words of " + name))
         w.reports["cp-1788d"] = {"state": "done"}
@@ -109,7 +109,7 @@ class TestStopFinalMessage(unittest.TestCase):
         self.assertEqual(self.retire_run(code=0)[0], 1)
 
     def test_S4_a_planted_token_a_password_url_and_the_endpoint_never_reach_the_message_or_the_file(self):
-        w = World(self)
+        w = StopWorld(self)
         text = ("see %s and https://user:%s@host.example/x and %s ok " % (TOKEN, PASSWORD, ENDPOINT)) + "words " * 700
         w.stop("cb-1788a", "idle", w.pod("cb-1788a", text))
         w.scan()
@@ -120,7 +120,7 @@ class TestStopFinalMessage(unittest.TestCase):
         self.assertGreaterEqual(everything.count("[redacted]"), 1)
 
     def test_S5_no_record_and_no_text_give_one_line_and_the_pass_returns(self):
-        w = World(self)
+        w = StopWorld(self)
         (w.cloud / "cb-1788a.json").write_text(json.dumps({"worker": "cb-1788a", "reports_to": "boss-lane"}))
         w.stop("cb-1788a", "idle")
         w.scan()
@@ -136,7 +136,7 @@ class TestStopFinalMessage(unittest.TestCase):
         self.assertTrue(w.to("boss-lane")[-1].endswith("last text not read: RuntimeError"))
 
     def test_U1_the_chiefs_copy_is_as_at_the_base_and_a_causeless_stop_sends_nothing(self):
-        w = World(self)
+        w = StopWorld(self)
         w.stop("cb-1788a", "hard", w.pod("cb-1788a", "secret words"))
         with open(str(w.audit), "a") as handle:
             handle.write(json.dumps({"ts": "2026-11-01T12:31:00Z", "action": "stop", "worker": "cb-1788z", "ok": True, "reason": "idle for an hour"}) + "\n")
@@ -147,13 +147,13 @@ class TestStopFinalMessage(unittest.TestCase):
         self.assertNotIn("secret words", chief[0])
         self.assertEqual([to for to, t in w.sent if "cb-1788z" in t], [], "a causeless stop sent a message")
         # last_text left at its default: the boss's copy is the same bytes as the Chief's
-        w2 = World(self)
+        w2 = StopWorld(self)
         w2.stop("cb-1788a", "hard", w2.pod("cb-1788a", "secret words"))
         w2.scan(last_text=None)
         self.assertEqual(w2.to("boss-lane"), w2.to("chief-of-staff"))
 
     def test_U4_forty_thousand_characters_give_3000_20000_and_17000_left_out_and_old_files_go(self):
-        w = World(self)
+        w = StopWorld(self)
         text = ("lorem ipsum dolor sit amet " * 2000)[:40000]
         rec = w.pod("cb-1788a", text)
         base = w.state / "cloud-last"
@@ -175,7 +175,7 @@ class TestStopFinalMessage(unittest.TestCase):
     # ---- the retire command (PC-5) ----
     def retire_run(self, code, reports_to="boss-lane"):
         """(messages sent, exit) of cmd_retire for a fake pod whose stop answers `code`."""
-        w = World(self)
+        w = StopWorld(self)
         rec = w.pod("cp-1788r", "my final words", boss=reports_to)
         cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
         engine = mock.Mock()
@@ -259,7 +259,7 @@ class TestStopFinalMessageTwoRuns(unittest.TestCase):
     """S9, U7 (PC-7): the text read is the one of THIS stop's record, never the newest record of the name."""
 
     def two_runs(self, newer_has_record):
-        w = World(self)
+        w = StopWorld(self)
         older = make_record(w.runs, "cb-1788a", "20261101T100000Z", OLDER_TEXT)
         (w.cloud / "cb-1788a.json").write_text(json.dumps({"worker": "cb-1788a", "reports_to": "boss-lane"}))
         newer = make_record(w.runs, "cb-1788a", "20261101T120000Z", NEWER_TEXT) if newer_has_record else None
@@ -306,7 +306,7 @@ class TestStopFinalMessageTwoRuns(unittest.TestCase):
         self.assertIn("last text not read: no_run_record", got[0])
 
     def test_U7_a_directory_outside_the_root_or_of_another_pod_is_never_read(self):
-        w = World(self)
+        w = StopWorld(self)
         outside = make_record(w.root / "elsewhere", "cb-1788a", "20261101T120000Z", "PLANTED outside")
         other = make_record(w.runs, "cb-1788b", "20261101T120000Z", "PLANTED other pod")
         (w.cloud / "cb-1788a.json").write_text(json.dumps({"worker": "cb-1788a", "reports_to": "boss-lane"}))
