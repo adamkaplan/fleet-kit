@@ -583,13 +583,13 @@ class TestGitShim(Base):
                "XDG_CONFIG_HOME": str(self.home / "xdg-none"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": str(self.helper_path)}
         env.update(extra_env or {})   # (the sentinel test points the home variables at its scratch home)
         started = time.time()
-        done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], capture_output=True, text=True, env=env, timeout=self.HANG_GUARD_SECONDS)
+        done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], capture_output=True, text=True, env=env, timeout=30)
         took = time.time() - started
         server.close()
         thread.join(5)
         return done, took, starts.exists() and starts.read_text().count("started")
 
-    HANG_GUARD_SECONDS = 30   # the limit lsremote's subprocess.run uses
+    HANG_GUARD_SECONDS = 30   # mirrors the timeout=30 of lsremote (asserted below)
 
     def mutant(self, name, old, new):
         text = GIT_SHIM.read_text()
@@ -604,6 +604,7 @@ class TestGitShim(Base):
     def test_s5_a_local_port_url_fails_at_once_and_the_helper_never_starts(self):
         if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
             self.skipTest("no real git")
+        self.assertIn("timeout=%d" % self.HANG_GUARD_SECONDS, inspect.getsource(type(self).lsremote), "HANG_GUARD_SECONDS and the timeout of lsremote disagree")
         try:
             done, took, starts = self.lsremote(GIT_SHIM)
         except subprocess.TimeoutExpired:
