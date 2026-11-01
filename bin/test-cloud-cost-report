@@ -591,6 +591,26 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
             print("S3 report reader, %s: raises %d, exit %d, stderr lines %d, reason %r, priced lines %d" % (
                 shape, raises, code, len(err.splitlines()), reasons[shape], len(text.splitlines())))
 
+    def test_the_non_object_and_the_huge_audit_line_are_refused_with_one_named_line(self):
+        good = json.dumps(line("2026-10-14T06:00:00Z", "pod/cb-example-4", "stop", 1.0)) + "\n"
+        cases = {"non-object lines": good + "[1]\n5\n", "one line of 1 MiB": good + json.dumps({"note": "x" * (1024 * 1024)}) + "\n"}
+        reasons = {"non-object lines": "line 2: not an object", "one line of 1 MiB": "line 2: missing ts"}
+        for shape, raw in cases.items():
+            raises, code, err, text = self.run_report_on(REAL, raw)                  # control first
+            self.assertEqual((raises, code, len(err.splitlines()), text), (0, 2, 1, ""), shape)
+            self.assertIn(reasons[shape], err)
+            self.assertLess(len(err), 200, shape)
+            print("S10 %s: control exit %d, stderr lines %d, reason %r, raises %d, bytes in the file %d" % (
+                shape, code, len(err.splitlines()), reasons[shape], raises, len(raw)))
+        old = 'raise Malformed("%s: not an object" % where)'
+        self.assertEqual(SOURCE.count(old), 1, old)
+        scratch = SOURCE.replace(old, "continue")
+        self.assertNotEqual(scratch, SOURCE)
+        m_raises, m_code, m_err, _ = self.run_report_on(load(scratch), cases["non-object lines"])
+        self.assertEqual((m_raises, m_code), (0, 0), "a non-object line was not refused")
+        print("S10 mutant non-object check skipped: raises %d, exit %s (control 2), mutation applied %s" % (m_raises, m_code, scratch != SOURCE))
+        print("S10 huge line: control only, no mutant claim (the reader has no length limit; the 1 MiB line is refused for its missing fields)")
+
     def test_a_report_that_skips_a_corrupt_line_is_caught(self):
         raw = self.tail_cases()["corrupt line in the middle"]
         old = 'raise Malformed("%s: not JSON" % where)'
