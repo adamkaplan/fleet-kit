@@ -23,7 +23,7 @@ def build(TwoRepoCase, sb, EPOCH, ACME_WEB):
             return {r["to"]: r for r in sb.read_reminders(self.world.state)}
 
         def audit_for(self):
-            return sorted(e["data"]["for"] for e in self.world.audit() if e["event"] == "reminder.add")
+            return sorted(e["detail"]["for"] for e in self.world.audit() if e["event"] == "reminder.add")
 
         def check_default(self, launch=None):
             code, _, err = (launch or self.launch)()
@@ -87,7 +87,7 @@ def build(TwoRepoCase, sb, EPOCH, ACME_WEB):
                 work = self.home / "checkout"
                 work.mkdir(exist_ok=True)
                 code, _, err = self.main("launch", "web-new", "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--role", "coder",
-                                         "--reports-to", "web-orch")
+                                         "--reports-to", "web-orch", "--repo", ACME_WEB)
             self.assertEqual((code, err, sb.read_reminders(self.world.state)), (0, "", []))
 
         def test_u2_an_arming_that_fails_never_fails_the_launch(self):
