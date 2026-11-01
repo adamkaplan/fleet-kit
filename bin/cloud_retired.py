@@ -223,7 +223,8 @@ def read_run_record(name, retired, state, runner, now, record=None):
     cut = max(0, len(text) - READ_RETIRED_CHARS)
     text = scrub(text, (), 2000000)
     text = scrub(text[:READ_RETIRED_CHARS], (), READ_RETIRED_CHARS)
-    print("[%s: the text of the record of a retired run%s]" % (name, (" that ended " if own else " dated ") + stamp if stamp else ""))
+    what = _stopped_words(directory) if record is not None else "a retired run"
+    print("[%s: the text of the record of %s%s]" % (name, what, (" that ended " if own else " dated ") + stamp if stamp else ""))
     print(text)
     if cut:
         print("[%d characters cut]" % cut)
