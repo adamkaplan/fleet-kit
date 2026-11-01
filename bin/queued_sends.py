@@ -6,6 +6,7 @@ Nothing here decides who may be queued or delivers anything: the daemon asks, an
 
 Standard library only. Layer 2 (a record of the world), read and written by `bin/fleet-switchboard`.
 """
+import errno
 import fcntl
 import json
 import os
@@ -44,6 +45,8 @@ def _read(file):
     except FileNotFoundError:
         return empty, None
     except OSError as err:
+        if err.errno == errno.ELOOP:
+            return None, "a symbolic link"
         return None, "read error: " + type(err).__name__
     try:
         info = os.fstat(fd)
