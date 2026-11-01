@@ -2533,6 +2533,9 @@ class Launcher:
         out, now, live = [], self.clock(), []
         self.reap_results, self.last_hook = {}, None
         pods = self.kube.list_pods()
+        _sw = getattr(getattr(self.kube, "known", None), "sweep", None)
+        if _sw:
+            _sw(time.time(), {(p.get("metadata") or {}).get("name") for p in pods})   # forms whose every holder has left are dropped (ask #1783)
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
         self._note_vanished_pods(pods, now)
