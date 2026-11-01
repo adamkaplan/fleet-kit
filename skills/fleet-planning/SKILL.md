@@ -43,7 +43,7 @@ A plan is one canonical comment, edited in place; every revision adds a new shor
 ## Check it
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
-and the plan hash (editing anything changes it). Before sending a draft, run `plan check --file <plan> --done-when <the
+and the plan hash. Before sending a draft, run `plan check --file <plan> --done-when <the
 issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect.
 
 ## The form
