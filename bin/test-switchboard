@@ -80092,6 +80092,46 @@ class TestHoldQueueUnreadableFile(Base):
         return (("truncated", good[:len(good) // 2]), ("too deep", b'{"items": ' + b"[" * 5000 + b"]" * 5000 + b"}"),
                 ("too large", b" " * (self.hq.MAX_FILE + 1)))
 
+    def line(self, why):
+        return "the queue file of platform is present but not readable (%s): nothing was queued and the file is untouched" % why
+
+    def refused_with(self, why, readable=True):
+        before = self.file.read_bytes() if readable and self.file.is_file() else None
+        self.assertEqual(self.hq.enqueue(self.state, "platform", "k2", "coder", "two", 2.0), (False, self.line(why)))
+        if before is not None:
+            self.assertEqual(self.file.read_bytes(), before)
+
+    def test_truncated_says_so(self):
+        self.file.write_bytes(b'{"seq": 1, "items": [')
+        self.refused_with("truncated or not JSON")
+
+    def test_deep_says_so(self):
+        self.file.write_bytes(b'{"items": ' + b"[" * 5000 + b"]" * 5000 + b"}")
+        self.refused_with("nested too deep")
+
+    def test_too_large_says_so(self):
+        self.file.write_bytes(b" " * (self.hq.MAX_FILE + 1))
+        self.refused_with("larger than the size bound")
+
+    def test_a_directory_says_not_a_regular_file(self):
+        self.file.mkdir()
+        self.refused_with("not a regular file")
+        self.assertTrue(self.file.is_dir())
+
+    def test_not_a_dict_says_so(self):
+        self.file.write_bytes(b"[]")
+        self.refused_with("not a queue (not a dict)")
+
+    def test_a_read_error_names_only_its_class(self):
+        if os.geteuid() == 0:
+            self.skipTest("running as root: chmod 000 does not stop root from reading, so no read error can be provoked")
+        self.file.write_bytes(b"{}")
+        self.file.chmod(0)
+        self.addCleanup(self.file.chmod, 0o600)
+        self.refused_with("read error: PermissionError", readable=False)
+        self.file.chmod(0o600)
+        self.assertEqual(self.file.read_bytes(), b"{}")
+
     def check(self, hq):
         self.assertTrue(hq.enqueue(self.state, "platform", "k1", "coder", "one", 1.0)[0])
         good = self.file.read_bytes()
@@ -80113,9 +80153,10 @@ class TestHoldQueueUnreadableFile(Base):
 
     def mutant(self):
         src = (Path(sb.__file__).resolve().parent / "queued_sends.py").read_text()
-        old = "    except OSError:\n        return None\n    try:"
-        self.assertIn(old, src)
-        mutated = src.replace(old, "    except OSError:\n        return empty\n    try:").replace("            return None\n        with os.fdopen", "            return empty\n        with os.fdopen").replace("    except (OSError, ValueError):\n        return None", "    except (OSError, ValueError):\n        return empty")
+        head, tail = src.split("def _read(file):")
+        body, rest = tail.split("def _write(", 1)
+        self.assertIn("        return None", body)
+        mutated = head + "def _read(file):" + body.replace("return None", "return empty") + "def _write(" + rest
         self.assertNotEqual(mutated, src, "the mutation applied")
         module = types.ModuleType("queued_sends_mutant")
         module.__file__ = str(Path(sb.__file__).resolve().parent / "queued_sends.py")

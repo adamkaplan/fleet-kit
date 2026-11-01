@@ -43,19 +43,32 @@ def _read(file):
         fd = os.open(str(file), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return empty
-    except OSError:
+    except OSError as err:
+        _read.why = "read error: " + type(err).__name__   # why the last None: the refusal says it (no path, no message text)
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
+        if not stat.S_ISREG(info.st_mode):
+            _read.why = "not a regular file"
+            return None
+        if info.st_size > MAX_FILE:
+            _read.why = "larger than the size bound"
             return None
         with os.fdopen(fd, "r", closefd=False) as handle:
             data = _record_json.parse_bounded(handle.read())
-    except (OSError, ValueError):
+    except _record_json.TooDeep:
+        _read.why = "nested too deep"
+        return None
+    except ValueError:
+        _read.why = "truncated or not JSON"
+        return None
+    except OSError as err:
+        _read.why = "read error: " + type(err).__name__
         return None
     finally:
         os.close(fd)
     if not isinstance(data, dict):
+        _read.why = "not a queue (not a dict)"
         return None
     items = [i for i in data.get("items") if isinstance(i, dict) and isinstance(i.get("key"), str) and isinstance(i.get("text"), str)
              and isinstance(i.get("at"), (int, float)) and isinstance(i.get("seq"), int)] if isinstance(data.get("items"), list) else []
@@ -104,7 +117,7 @@ def enqueue(state_dir, recipient, key, sender, text, sent, issue=None, repo=None
         with _Lock(state_dir):
             queue = _read(file)
             if queue is None:
-                return False, "the queue file of %s is present but not readable (not a regular, small, well-formed queue file): nothing was queued and the file is untouched" % (recipient,)
+                return False, "the queue file of %s is present but not readable (%s): nothing was queued and the file is untouched" % (recipient, _read.why)
             if key in queue["delivered"] or any(i["key"] == key for i in queue["items"]):
                 return True, len(queue["items"])
             if len(queue["items"]) >= MAX_MESSAGES:
