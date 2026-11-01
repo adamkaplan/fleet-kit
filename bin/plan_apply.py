@@ -85,6 +85,16 @@ def parse_pairs(text):
     return [(old, new) for old, new in pairs], " ".join(why.split())
 
 
+def expect_live(have, want):
+    if have != want:
+        raise ApplyRefused("plan apply: refused: --expect-live: the live plan hash is %s and not %s" % (short(have), short(want)))
+
+
+def expect_file(have, want):
+    if have != want:
+        raise ApplyRefused("plan apply: refused: --expect-file: the file's sha256 is %s and not %s" % (have[:8], want[:8]))
+
+
 def apply_pairs(text, pairs):
     """The text after every pair, each OLD found exactly once in the text as the previous pairs left it. Raises ApplyRefused."""
     for number, (old, new) in enumerate(pairs, 1):
@@ -206,10 +216,8 @@ def run(args, caller, api, state_dir, audit):
         if comment_edit.marked_name(live) != caller:
             raise ApplyRefused("plan apply: refused: the plan comment is signed %s, you are %s" % (comment_edit.marked_name(live) or "by no lane", caller))
         old_hash = plan_check.plan_hash(live)
-        if old_hash != args.expect_live:
-            raise ApplyRefused("plan apply: refused: --expect-live: the live plan hash is %s and not %s" % (short(old_hash), short(args.expect_live)))
-        if file_sha != args.expect_file:
-            raise ApplyRefused("plan apply: refused: --expect-file: the file's sha256 is %s and not %s" % (file_sha[:8], args.expect_file[:8]))
+        expect_live(old_hash, args.expect_live)
+        expect_file(file_sha, args.expect_file)
         result = apply_pairs(live, pairs)
         result = comment_edit.MARKER.sub("", result).rstrip() + "\n\n" + mark_line(caller)
         new_hash = plan_check.plan_hash(result)

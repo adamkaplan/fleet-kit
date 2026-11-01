@@ -136,6 +136,19 @@ There is no yaml library and nothing is evaluated. The parser reads a flat list 
 deeper-indented lines, or a `|`/`>` block. Comments (`# ...`) are allowed: a `#` starts an inline comment only when a space (or the end of the value) follows it, so `see #348` and `issue #12` stay whole. Refused, naming the block line: tabs, nested
 lists or maps, flow lists `[a, b]`, anchors and tags, duplicate keys, a second document, over 100 KB or 200 scenarios.
 
+## Applying an approved plan edit
+
+A plan edit the Chief of Staff approved is applied by one command, never by hand: `fleet-switchboard plan apply <issue> --file F --expect-live <full hash> --expect-result <full hash> --expect-file <sha256 of the file>`. It refuses, with one line naming the expectation, unless the live plan hash, the file's sha256 and the result's plan hash are the ones named and each OLD text occurs once at its turn. The edit file has ONE standard form:
+
+Lines before the first header are a note and are read by nobody.
+Each pair is `===== OLD <n> (verbatim) =====` then the old text, then `===== NEW <n> (verbatim) =====` then the new text.
+The numbers run 1, 2, 3 in order.
+The text of each ends at the line before the next header; its final newline is not part of it.
+The paragraph that starts `Why:` after the last NEW is the receipt's reason.
+The file has no other header.
+
+It never edits the Intent or the Done-when, and it posts the receipt itself.
+
 ## A plan that adds a file under `bin/`
 
 A new file under `bin/` brings nine guard classes, and some of them demand lines in the impact matrix, the Units table and the closure that the plan must already name. Before the plan is posted run `tools/new-module-demands bin/x.py` (one path per new file) and put its output in the plan as constraints:
