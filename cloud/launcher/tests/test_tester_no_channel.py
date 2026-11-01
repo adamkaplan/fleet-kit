@@ -204,14 +204,19 @@ class Stop(tcw.Base):
         self.assertTrue(reason.endswith("; last tool call refused: gh"), reason)
         self.assertLessEqual(len(reason.rsplit("; ", 1)[1]), 160)
 
-    def test_s4_hostile_command_absent_from_the_stop_line_and_run_json(self):
-        for command, absent in (("pod-name-x1 10.0.0.5:80", ("pod-name-x1", "10.0.0.5")), ("gh run view 12345 --job x", ("12345", "--job"))):
-            reason = self.idle_stop( (refused_session(command), None))
+    def absent_from_stop_and_json(self, command, absent):
+        reason = self.idle_stop((refused_session(command), None))
+        texts = [reason] + [f.read_text() for f in Path(self.tmp.name).rglob("run.json")]
+        self.assertGreaterEqual(len(texts), 2, "no run.json was read")
+        for text in texts:
             for a in absent:
-                self.assertNotIn(a, reason)
-            for f in Path(self.home).rglob("run.json"):
-                for a in absent:
-                    self.assertNotIn(a, f.read_text())
+                self.assertNotIn(a, text)
+
+    def test_s4_hostile_name_and_address_absent_from_stop_line_and_run_json(self):
+        self.absent_from_stop_and_json("pod-name-x1 10.0.0.5:80", ("pod-name-x1", "10.0.0.5"))
+
+    def test_s4_listed_command_arguments_absent_from_stop_line_and_run_json(self):
+        self.absent_from_stop_and_json("gh run view 12345 --job x", ("12345", "--job"))
 
     def test_s6_an_unreadable_session_adds_those_words_and_the_stop_goes_on(self):
         reason = self.idle_stop((None, "the pod's server could not be reached"))
