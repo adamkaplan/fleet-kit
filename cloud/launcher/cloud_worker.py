@@ -1260,24 +1260,39 @@ def _err_text(e):
     return "%s errno=%s" % (type(e).__name__, getattr(e, "errno", None))
 
 
-def _complete_pending(path):
-    """A rotation that begun and whose record was not finished: under the exclusive lock, the replacement happened when the live file is smaller than old_size."""
+AUDIT_PENDING_STALE = 120   # seconds: a rotation holds the exclusive lock for one short step, so a rotator at work is far younger
+
+
+def _complete_pending(path, now_ts=None):
+    """A rotation that begun and whose record was not finished, completed under the exclusive lock by the rule: the swap happened when the live
+    file's (device, inode) equal new_id of pending (whatever its size); a finished one is recorded once, a stale one (ts older than 120 seconds)
+    is cleared and its orphan archive left, a young unswapped one is left untouched (a rotator is at work)."""
+    now_ts = time.time() if now_ts is None else now_ts
     if read_rotation_record(path)["pending"] is None:
         return
     lock = _audit_lock(path, fcntl.LOCK_EX)
     try:
         def complete(record):
             pend = record["pending"]
+            if pend is None:
+                return None
             if not isinstance(pend, dict):
-                return dict(record, pending=None) if pend is not None else None
+                return dict(record, pending=None)
             try:
-                swapped = os.path.getsize(path) < pend.get("old_size", 0)
-            except OSError:
+                st = os.stat(path)
+                swapped = list(pend.get("new_id") or []) == [st.st_dev, st.st_ino]
+            except (OSError, TypeError):
                 swapped = False
             if swapped:
+                name = pend.get("archive", "")
+                if any(isinstance(c, dict) and c.get("archive") == name for c in record["cuts"]):
+                    return dict(record, pending=None)
                 return {"done": record["done"] + 1, "pending": None,
-                        "cuts": record["cuts"] + [{"cut": pend.get("cut", 0), "archive": pend.get("archive", "")}]}
-            return dict(record, pending=None)
+                        "cuts": record["cuts"] + [{"cut": pend.get("cut", 0), "archive": name}]}
+            ts = pend.get("ts")
+            if not isinstance(ts, (int, float)) or now_ts - ts > AUDIT_PENDING_STALE:
+                return dict(record, pending=None)
+            return None
         _record_update(path, complete)
     finally:
         _audit_unlock(lock)
@@ -1299,7 +1314,7 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
         return None
     if not dry_run:
         try:
-            _complete_pending(path)
+            _complete_pending(path, now.timestamp())
         except Exception as e:
             print("cloud-worker: the audit rotation record could not be completed (%s)" % _err_text(e), file=sys.stderr)
     try:
@@ -1346,11 +1361,24 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
         os.unlink(gz_temp)
         temps.remove(gz_temp)
         mine = os.path.basename(archive)
-        _record_update(path, lambda record: dict(record, pending={"cut": cut, "old_size": len(data), "archive": mine}))   # the record lock is released before the audit lock is requested
+        keep_temp = os.path.join(directory, ".audit.%d.tmp" % os.getpid())
+        temps.append(keep_temp)
+        keep_fd = os.open(keep_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)   # created BEFORE pending: its identity is new_id
+        kst = os.fstat(keep_fd)
+        mine_pending = {"cut": cut, "old_size": len(data), "archive": mine, "ts": now.timestamp(), "new_id": [kst.st_dev, kst.st_ino]}
+        wrote = []
+
+        def put_pending(record):   # only when the record holds none
+            if record["pending"] is not None:
+                return None
+            wrote.append(1)
+            return dict(record, pending=mine_pending)
+        if not _record_update(path, put_pending) or not wrote:   # another rotator's pending is unfinished: not now, nothing written, nothing lost
+            os.close(keep_fd)
+            raise _GaveUp()
         pending = True
         if _before_lock:
             _before_lock()
-        keep_temp = os.path.join(directory, ".audit.%d.tmp" % os.getpid())
         lock = _audit_lock(path, fcntl.LOCK_EX)
         try:   # ONE short step: one read of the late bytes, one write, one rename of local files
             with open(path, "rb") as f:
@@ -1359,8 +1387,7 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
                     raise _GaveUp()
                 f.seek(len(data))
                 late = f.read()   # lines appended while the archive was written travel with the live part
-            temps.append(keep_temp)
-            with os.fdopen(os.open(keep_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as out:
+            with os.fdopen(keep_fd, "wb") as out:
                 out.write(data[cut:] + late)
             if _before_swap:
                 _before_swap()
@@ -1371,8 +1398,14 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=
         pending = False
         for attempt in range(3):   # done is incremented, the cut and its archive are appended, pending is cleared
             try:
-                if _record_update(path, lambda record: {"done": record["done"] + 1, "pending": None,
-                                                        "cuts": record["cuts"] + [{"cut": cut, "archive": mine}]}):
+                def final(record):   # idempotent: the cut is appended only when no cut holds this archive; pending is cleared only when it is ours
+                    own = isinstance(record["pending"], dict) and record["pending"].get("archive") == mine
+                    new = dict(record, pending=None if own else record["pending"])
+                    if not any(isinstance(c, dict) and c.get("archive") == mine for c in record["cuts"]):
+                        new["done"] = record["done"] + 1
+                        new["cuts"] = record["cuts"] + [{"cut": cut, "archive": mine}]
+                    return new
+                if _record_update(path, final):
                     break
             except Exception as e:
                 if attempt == 2:
