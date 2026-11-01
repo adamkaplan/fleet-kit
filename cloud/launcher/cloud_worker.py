@@ -2537,8 +2537,10 @@ class Launcher:
             steps["list"] = mono() - t0
         t0 = mono()
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
-        renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
-        steps["renew"] = mono() - t0
+        try:
+            renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
+        finally:
+            steps["renew"] = mono() - t0
         t0 = mono()
         self._note_vanished_pods(pods, now)
         steps["vanished"] = mono() - t0
