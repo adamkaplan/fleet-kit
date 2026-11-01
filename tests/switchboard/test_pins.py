@@ -276,15 +276,12 @@ class TestPinsReview(PinsRepo):
         self.assertEqual(len(hits), 2000)
         count = [0]
 
-        class Counting:
-            def __init__(self, real):
-                self.real = real
+        real = sb._pins_re
 
-            def match(self, text):
-                count[0] += 1
-                return self.real.match(text)
-        with mock.patch.object(sb, "PINS_ANY_DEF_RE", Counting(sb.PINS_ANY_DEF_RE)), mock.patch.object(sb, "PINS_CLASS_RE", Counting(sb.PINS_CLASS_RE)), \
-                mock.patch.object(sb, "PINS_TEST_DEF_RE", Counting(sb.PINS_TEST_DEF_RE)):
+        def counting(text):
+            count[0] += 1
+            return real(text)
+        with mock.patch.object(sb, "_pins_re", counting):
             listing = sb.pins_listing({}, hits, lambda path: lines)
         self.assertEqual(len(listing), 20)
         self.assertLessEqual(count[0], 4 * len(lines), count[0])
@@ -293,15 +290,23 @@ class TestPinsReview(PinsRepo):
         def rescan(lines, number, index=None):
             test, test_line, indent = None, None, None
             for i in range(min(number, len(lines)) - 1, -1, -1):
-                m = sb.PINS_ANY_DEF_RE.match(lines[i])
+                m = sb._pins_re(sb.PINS_ANY_DEF_RE).match(lines[i])
                 if m and (indent is None or len(m.group(1)) < indent):
-                    if sb.PINS_TEST_DEF_RE.match(lines[i]):
-                        return "TestBig", sb.PINS_TEST_DEF_RE.match(lines[i]).group(2), i + 1
+                    if sb._pins_re(sb.PINS_TEST_DEF_RE).match(lines[i]):
+                        return "TestBig", sb._pins_re(sb.PINS_TEST_DEF_RE).match(lines[i]).group(2), i + 1
                     indent = len(m.group(1))
             return "-", None, None
-        with mock.patch.object(sb, "pins_enclosing", rescan):
-            with self.assertRaises(AssertionError):
+        self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()   # control: the unmutated finder passes
+        applied = [0]
+
+        def mutated(*args, **kw):
+            applied[0] += 1
+            return rescan(*args, **kw)
+        with mock.patch.object(sb, "pins_enclosing", mutated):
+            with self.assertRaises(AssertionError) as caught:
                 self.test_a_scan_per_hit_is_bounded_by_the_file_not_the_hits()
+        self.assertEqual(applied[0], 2000)   # the mutation was reached once per hit (2000 hits), and only inside the one patch
+        self.assertRegex(str(caught.exception), r"^\d+ not less than or equal to 200004 : \d+$")
 
     def test_a_blank_quoted_message_is_no_term(self):   # L2
         self.assertEqual(sb.pins_messages_of('x = "            "'), [])
