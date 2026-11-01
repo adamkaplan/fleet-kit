@@ -112,7 +112,8 @@ class TestPlanHashMarkerStored(unittest.TestCase):
         for value in self.hashes:
             for entry in self.pl.as_current(self.entries(value), self.hashes):
                 bound += entry["plan_hash"] == self.hashes[0] and entry["head"] == self.pl.ask_head(self.hashes[0])
-        self.assertEqual(bound, 12)
+        self.assertEqual(bound, 6 * len(self.hashes))
+        self.assertEqual(len(self.hashes), 3)
         edited = self.pc.plan_hashes(self.signed.replace("size: S", "size: M"))
         stale = sum(e["plan_hash"] != self.hashes[0] for v in edited for e in self.pl.as_current(self.entries(v), self.hashes))
         self.assertEqual(stale, 6 * len(edited))
@@ -195,7 +196,7 @@ class TestPlanHashMarkerMutants(unittest.TestCase):
             self.check(pc, real("plan_approval"), real("plan_ledger"))
 
     def test_a_mutant_that_reads_the_ask_head_at_the_new_form_only_fails(self):
-        pl = _ph_mutate("plan_ledger", "        if entry.get(\"plan_hash\") == old or entry.get(\"head\") == old_head:", "        if False:")
+        pl = _ph_mutate("plan_ledger", "        if entry.get(\"plan_hash\") in olds or entry.get(\"head\") in old_heads:", "        if False:")
         with self.assertRaisesRegex(AssertionError, "an old-head record reads as stale"):
             self.check(real("plan_check"), real("plan_approval"), pl)
 
@@ -358,13 +359,15 @@ def build():
 
         def test_the_control_all_verdicts_at_the_old_hash_and_a_text_with_no_marker_reach_consensus(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
             self.assertEqual(self.tally(review, rnd, [old] * 5)["tally"], "consensus")
 
         def test_verdicts_at_the_old_and_at_the_new_hash_count_together_and_the_consensus_is_reached(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
-            self.assertEqual(len(rnd["plan_hashes"]), 2)
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
+            self.assertEqual(len(rnd["plan_hashes"]), 3)
             done = self.tally(review, rnd, [old, old, new, old, new])
             self.assertEqual(done["tally"], "consensus", done)
             (consensus,) = [e for e in self.ledger() if e["kind"] == "consensus"]
@@ -374,7 +377,8 @@ def build():
 
         def test_a_verdict_at_the_hash_of_an_edited_text_is_not_counted(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
             edited = sb.plan_check.plan_hash(self.FINAL + "\nan edit\n")
             done = self.tally(review, rnd, [old, old, new, old, edited])
             self.assertNotEqual(done["tally"], "consensus", done)
@@ -382,7 +386,8 @@ def build():
 
         def test_status_reads_a_consensus_recorded_at_the_old_hash_and_the_other_commands_accept_the_round(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
             self.inject({"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review, "plan_hash": old, "by": "plan-review"})
             self.assertTrue(json.loads(self.review("orch", "status", review, "--json")[1])["consensus"], "status: an old-hash consensus is not read as bound")
             before = len(self.ledger())
@@ -399,7 +404,8 @@ def build():
 
         def test_a_mutant_that_compares_the_raw_strings_of_a_round_fails_the_tally(self):
             review, rnd = self.closing_round()
-            new, old = rnd["plan_hashes"]
+            new, *older = rnd["plan_hashes"]
+            old = older[-1]
             with tempfile.TemporaryDirectory() as tmp:
                 msb = _entry_copy(tmp, "switchboard/plan_review.py", "    return plan_ledger.as_current(entries, pair), dict(rnd, plan_hash=load_plan_check().canonical_hash(rnd[\"plan_hash\"], pair))\n",
                                   "    return entries, rnd\n")
@@ -464,7 +470,7 @@ def build():
 
         def test_the_control_a_round_started_after_the_change_is_accepted_by_the_commands_and_its_lane_send_check_answers_as_before(self):
             got = self.start_round()
-            self.assertEqual(self.kinds("round")[-1]["plan_hashes"], [got["plan_hash"], sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER)])
+            self.assertEqual(self.kinds("round")[-1]["plan_hashes"], [got["plan_hash"], sb.plan_check.plan_hash_collapsed(host.LEDGER_PLAN + "\n" + MARKER), sb.plan_check.plan_hash_legacy(host.LEDGER_PLAN + "\n" + MARKER)])
             self.assertEqual(self.review("orch", "status", got["review"])[0], 0)
             self.assertEqual(self.review("orch", "tick")[0], 0)
             self.assertEqual(self.lane_verdict(got, "L1")[0], 0)
