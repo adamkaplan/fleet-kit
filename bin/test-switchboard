@@ -29226,6 +29226,12 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.comments if "&page=1" in path else []), "")
         if re.search(r"/issues/7$", path):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
+        if "/actions/runs" in path:
+            run = {"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
+                   "pull_requests": [{"number": 9, "base": {"sha": "t" * 40}}]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
+        if "/git/ref/heads/" in path:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
         return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
 
     terminal_problem = None   # what the owner-terminal check says in these tests (None: it is the owner's terminal)
