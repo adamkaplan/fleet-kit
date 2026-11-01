@@ -2842,6 +2842,7 @@ def load_hold():
             spec = importlib.util.spec_from_file_location("gh_hold", path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
+            module.API_PARSER[0] = api_parsed
             HOLD_MODULE[0] = module
         except Exception:
             HOLD_MODULE[0] = None

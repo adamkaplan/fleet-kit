@@ -487,55 +487,19 @@ def clean_endpoint(text):
     return segs
 
 
-API_VALUE_FLAGS = {"-H", "--header", "-q", "--jq", "-t", "--template", "--cache", "-p", "--preview", "--hostname"}
-API_FIELD_FLAGS = {"-f": "raw", "--raw-field": "raw", "-F": "field", "--field": "field"}
+API_PARSER = [None]   # the shim's api_parsed (parse_api_argv cut at the api word), handed over by the shim right after it loads this file: the ONE parser of gh api's argv; this file reads no api flag itself
 
 
 def parse_api(args):
-    """(endpoints, method, fields, input_unknown): every positional is an endpoint candidate; the LAST method wins; fields are (key, value or None when
-    the value is not known: `@file`, a typed placeholder, no `=`); `--input` makes the body unknown."""
-    endpoints, method, fields, inp, i, skipped_api = [], None, [], False, 0, False
-    while i < len(args):
-        a = args[i]
-        i += 1
-        if a == "--":
-            endpoints += args[i:]
-            break
-        if not a.startswith("-") or a == "-":
-            if not skipped_api and a == "api":
-                skipped_api = True
-            else:
-                endpoints.append(a)
-            continue
-        name, eq, inline = a.partition("=")
-        if a.startswith("--"):
-            if name in ("--method",):
-                method, i = (inline, i) if eq else ((args[i] if i < len(args) else ""), i + 1)
-            elif name == "--input":
-                inp = True
-                i += 0 if eq else 1
-            elif name in API_FIELD_FLAGS:
-                raw, i = (inline, i) if eq else ((args[i] if i < len(args) else ""), i + 1)
-                fields.append(split_field(raw, API_FIELD_FLAGS[name]))
-            elif name in API_VALUE_FLAGS and not eq:
-                i += 1
-            continue
-        letters, j = a[1:], 0
-        while j < len(letters):                       # a cluster as cobra reads it: bool letters, then the first value letter takes the rest or the next word
-            c = letters[j]
-            if c in "XfFHqtp":
-                rest = letters[j + 1:]
-                if rest:
-                    value = rest.lstrip("=") if rest.startswith("=") else rest
-                else:
-                    value, i = (args[i] if i < len(args) else ""), i + 1
-                if c == "X":
-                    method = value
-                elif c in "fF":
-                    fields.append(split_field(value, "raw" if c == "f" else "field"))
-                break
-            j += 1
-    return endpoints, (method.upper() if method is not None else None), fields, inp
+    """(endpoints, method, fields, input_unknown): a view of the shim's parser result, which the shim hands over cut at the api word api_parsed finds (file 1 BLOCK 0); this file never looks for the word itself. Every positional is an endpoint; the method is the last explicit one,
+    upper-cased, else None; fields are (key, value or None when the value is not known: `@file`, a typed placeholder, no `=`); `--input` makes the body unknown.
+    An argv the parser refuses raises (the shim's Refused), and check() turns that into the refusal of a write; the shim also refuses it before this file is asked."""
+    parser = API_PARSER[0]
+    if parser is None:
+        raise ValueError("no gh api parser was handed over")
+    parsed = parser(args)
+    fields = [split_field(text, "raw" if name == "raw-field" else "field") for _i, name, _j, text in parsed.fields]
+    return [p for _i, p in parsed.positionals], parsed.method, fields, parsed.input is not None
 
 
 def split_field(raw, kind):
