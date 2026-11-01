@@ -187,6 +187,19 @@ def _last_worker_text(directory):
     return found, None
 
 
+STOP_REASONS = ("idle", "hard limit")   # the exit reasons the reaper writes (#1750)
+
+
+def _stopped_words(directory):
+    """The words for the header of a run record read for a live cloud record (#1750): a run stopped by the reaper (with its reason) when `run.json`
+    says so, else the retired-run words. Read only, bounded."""
+    info, _ = D["read_record_file"](Path(directory) / "run.json", 65536)
+    reason = info.get("exit_reason") if isinstance(info, dict) else None
+    if reason in STOP_REASONS:
+        return "a run stopped by the reaper (reason: %s)" % reason
+    return "a retired run"
+
+
 def read_run_record(name, retired, state, runner, now):
     """The last text of a retired cloud worker, from its run record: only for the callers `retire` allows (the operator, the Chief of Staff, the boss kept
     at its removal, and only when the kept file is not older than the run it would speak for), scrubbed before and after the cap."""
