@@ -736,7 +736,11 @@ def _proc_lock_pids(path, root=None):
         names = os.listdir(root)
     except OSError:
         return None
-    want, me, found = str(path), os.getuid(), set()
+    try:
+        mark = os.stat(path)
+    except OSError:
+        return set()
+    want, me, found = (mark.st_dev, mark.st_ino), os.getuid(), set()
     for name in names:
         if not re.fullmatch(r"[0-9]{1,12}", name):
             continue
@@ -748,7 +752,8 @@ def _proc_lock_pids(path, root=None):
             continue
         for fd in fds:
             try:
-                if os.readlink(os.path.join(root, name, "fd", fd)) == want:
+                seen = os.stat(os.path.join(root, name, "fd", fd))   # follows the link: the open file itself
+                if (seen.st_dev, seen.st_ino) == want:
                     found.add(int(name))
                     break
             except OSError:
