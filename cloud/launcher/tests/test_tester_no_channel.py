@@ -123,7 +123,9 @@ class Phrase(unittest.TestCase):
 
     def check_names_command(self, module):
         text = phrase(refused_session(self.COMMAND), module)
-        self.assertIn("gh api", text, "the refused command is not named")
+        self.assertIn("refused: gh", text, "the refused command is not named")
+        self.assertNotIn("api", text, "a second word of the command was written")
+        self.assertNotIn("repos", text, "a second word of the command was written")
         return text
 
     def test_s3_no_event_and_last_message(self):
@@ -133,10 +135,26 @@ class Phrase(unittest.TestCase):
     def test_s4_the_refused_command_is_named_control_then_mutant(self):
         text = self.check_names_command(rr)   # the control: the unmutated module
         self.assertTrue(text.startswith("last tool call refused: "), text)
-        mod = mutant_record('(" ".join(words) or "unknown")', '"unknown"')
+        mod = mutant_record('text = "last tool call refused: " + word', 'text = "last tool call refused"')
         with self.assertRaises(AssertionError) as caught:
             self.check_names_command(mod)
         self.assertIn("the refused command is not named", str(caught.exception))
+
+    def test_s4_two_words_mutant_and_hostile_commands(self):
+        two = mutant_record('text = "last tool call refused: " + word', 'text = "last tool call refused: " + " ".join(str(cmd).split()[:2])')
+        self.check_names_command(rr)   # the control first
+        with self.assertRaises(AssertionError) as caught:
+            self.check_names_command(two)
+        self.assertIn("a second word of the command was written", str(caught.exception))
+        hostile = phrase(refused_session("pod-name-x1 10.0.0.5:80"))
+        self.assertEqual(hostile, "last tool call refused: another command")
+        listed = phrase(refused_session("gh run view 12345 --job x"))
+        self.assertEqual(listed, "last tool call refused: gh")
+        for bad in ("12345", "run", "--job"):
+            self.assertNotIn(bad, listed)
+        path = phrase(refused_session("/usr/bin/git status"))
+        self.assertEqual(path, "last tool call refused: git")   # the base name of a path first word, on the list
+        print("S4 lines: %r | %r | %r" % (hostile, listed, path))
 
     def test_s6_bounded_and_clean(self):
         long_cmd = "gh " + " ".join(PLANTED) + " " + "x" * 500
@@ -183,8 +201,17 @@ class Stop(tcw.Base):
 
     def test_s4_the_stop_line_names_the_refused_command(self):
         reason = self.idle_stop((refused_session(), None))
-        self.assertTrue(reason.endswith("; last tool call refused: gh api"), reason)
+        self.assertTrue(reason.endswith("; last tool call refused: gh"), reason)
         self.assertLessEqual(len(reason.rsplit("; ", 1)[1]), 160)
+
+    def test_s4_hostile_command_absent_from_the_stop_line_and_run_json(self):
+        for command, absent in (("pod-name-x1 10.0.0.5:80", ("pod-name-x1", "10.0.0.5")), ("gh run view 12345 --job x", ("12345", "--job"))):
+            reason = self.idle_stop( (refused_session(command), None))
+            for a in absent:
+                self.assertNotIn(a, reason)
+            for f in Path(self.home).rglob("run.json"):
+                for a in absent:
+                    self.assertNotIn(a, f.read_text())
 
     def test_s6_an_unreadable_session_adds_those_words_and_the_stop_goes_on(self):
         reason = self.idle_stop((None, "the pod's server could not be reached"))
