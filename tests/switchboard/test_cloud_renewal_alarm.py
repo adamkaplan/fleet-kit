@@ -448,6 +448,19 @@ class TestCloudRenewalAlarmWired(Base):
             self.assertEqual({r["to"] for r in sb.read_reminders(str(state))}, {"cos-1", "lane-a"})
 
 
+MUTANT_TEXT = {   # the failure text of the check each mutant breaks, anchored on what its scenario prints
+    "s16": "AssertionError: (0, 0)",
+    "s16b": "AssertionError: [5, 5]",
+    "s16d": "AssertionError: (1793368800.0",
+    "s16e": "TypeError: not serialisable",
+    "s17": "AssertionError: (3, 3)",
+    "s18": 'assert len(lane) == 1 and "9 pods" in lane[0][1]',
+    "s19": "AssertionError: 24",
+    "s21": "a line ahead of the clock moved the cursor",
+    "s22": "an alarm was lost: 0 messages in the new process",
+}
+
+
 class TestCloudRenewalAlarmMutants(unittest.TestCase):
     """Each mutant is a scratch copy OUTSIDE the repository with one applied change, run as a child process: its scenario exits 1; the real module exits 0."""
 
@@ -458,6 +471,12 @@ class TestCloudRenewalAlarmMutants(unittest.TestCase):
         proc = stub_support.start(self, [sys.executable, "-c", code], stdout=-1, stderr=-1)
         proc.communicate(timeout=60)
         return proc.returncode
+
+    def child_text(self, scenario, module_path):
+        code = "import sys; sys.path.insert(0, %r); import test_cloud_renewal_alarm as t; t.run(%r, %r)" % (str(TESTS_DIR), scenario, str(module_path))
+        import subprocess
+        proc = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=60)
+        return proc.returncode, proc.stdout + proc.stderr
 
     def test_the_real_module_passes_and_each_of_the_four_mutants_fails_its_scenario(self):
         scratch = Path(tempfile.mkdtemp(prefix="alarm-mutant-"))
@@ -470,6 +489,10 @@ class TestCloudRenewalAlarmMutants(unittest.TestCase):
             copy.write_text(source.replace(old, new, 1))
             self.assertNotEqual(copy.read_text(), source)
             self.assertEqual(self.child(scenario, copy), 1, "the mutant '%s' did not fail %s" % (label, scenario))
+            self.assertEqual(self.child_text(scenario, BIN / "cloud_renewal_alarm.py")[0], 0, scenario)
+            code_, text_ = self.child_text(scenario, copy)
+            self.assertEqual(code_, 1, scenario)
+            self.assertEqual(text_.count(MUTANT_TEXT[scenario]), 1, "the mutant '%s' did not fail with the text of its own check: %s" % (label, text_[-300:]))
 
 
 if __name__ == "__main__":
