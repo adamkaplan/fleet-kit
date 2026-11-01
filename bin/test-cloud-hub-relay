@@ -701,16 +701,22 @@ class TestEventWait(unittest.TestCase):
                 live = [h.name for h in handlers if h.is_alive()]
                 self.assertFalse(live, "hub handler threads did not end within 10 seconds: %s" % live)
             self.addCleanup(release_all)
+            ended = []   # (call index, kind, text) of every held call that ended
+            n_of = lambda i, j: i * 4 + j
             def call(i, j, wait):
                 time.sleep(wait)
-                hub.held_call(who="pod-%d" % i, call_id="c%d" % j, pr="acme-org/r%d#1" % i)
+                try:
+                    ended.append((n_of(i, j), "returned", "status %s" % (hub.held_call(who="pod-%d" % i, call_id="c%d" % j, pr="acme-org/r%d#1" % i)[0],)))
+                except BaseException as e:
+                    ended.append((n_of(i, j), type(e).__name__, str(e)[:120]))
             for n in range(16):
                 t = threading.Thread(target=call, args=(n // 4, n % 4, delay if n == 15 else 0)); t.start(); threads.append(t)
             def all_registered():
                 if registered.wait(0.02):
                     return True
                 if not all(t.is_alive() for t in threads):
-                    raise AssertionError("a held relay call ended before all 16 were registered")
+                    k = ended[0] if ended else None
+                    raise AssertionError("a held relay call ended before all 16 were registered" + (": call %d ended: %s: %s" % k if k else ""))
                 return False
             TestBoundsAndCaps.wait_for(all_registered, 30.0)
             self.assertEqual(sum(hub.relay.waiting.values()), 16)
