@@ -2747,12 +2747,22 @@ class Launcher:
                         reason = "unreadable setting"
                     else:
                         n = int(s)
+                bad_setting = False
+                if reason == "unreadable setting":
+                    reason, n, bad_setting = None, int(FINAL_NOTE_DEFAULT_MINUTES), True
+                    if str(raw_n).strip() == "":
+                        bad_setting = False
                 if reason is not None:
                     self.kube.annotate(name, uid, **{FINAL_NOTE_MARK: "unreadable"})
                     self.audit(worker, "pod/" + name, "final-note", self._cost_or_zero(pod), False, reason)
                     continue
                 left = (end - now).total_seconds() / 60
                 if left > n or (end - began).total_seconds() / 60 < 2 * n:
+                    continue
+                if bad_setting:
+                    self.kube.annotate(name, uid, **{FINAL_NOTE_MARK: "sent"})
+                    self.send_note(name, FINAL_NOTE_TEXT)
+                    self.audit(worker, "pod/" + name, "final-note", self._cost_or_zero(pod), True, "minutes left: %d; unreadable setting, %d used" % (max(0, int(left)), n))
                     continue
                 self.kube.annotate(name, uid, **{FINAL_NOTE_MARK: "sent"})
                 self.send_note(name, FINAL_NOTE_TEXT)
