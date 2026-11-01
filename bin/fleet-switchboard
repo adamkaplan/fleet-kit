@@ -25565,8 +25565,7 @@ def announce_order_change(engine, args, caller, repo, charter, detail):
 
 
 def cmd_issue_line(args, runner, now):
-    engine = build_engine(runner, now, "cli")[0]
-    return load_module("issue_line").run(types.SimpleNamespace(engine=engine, reader=engine.intents or _intent_reader(runner, now), fs=os, state=engine.state_dir, now=engine.now, parse_bounded=load_module("record_json").parse_bounded, write=write_issue_body, IntentError=IntentError, one_line=_one_line, sleep=_sleep, waits=ORDERS_READBACK_WAITS, PROG=PROG, EXIT_OK=EXIT_OK, EXIT_ERROR=EXIT_ERROR, err=sys.stderr.write, out=sys.stdout.write), args.issue.repo, int(args.issue), args.next_step, args.parked)
+    return load_module("issue_line").run(types.SimpleNamespace(build_engine=lambda: build_engine(runner, now, "cli")[0], make_reader=lambda: _intent_reader(runner, now), fs=os, parse_bounded=load_module("record_json").parse_bounded, write=write_issue_body, IntentError=IntentError, one_line=_one_line, sleep=_sleep, waits=ORDERS_READBACK_WAITS, PROG=PROG, EXIT_OK=EXIT_OK, EXIT_ERROR=EXIT_ERROR, err=sys.stderr.write, out=sys.stdout.write), args.issue.repo, int(args.issue), args.next_step, args.parked)
 
 
 def add_issue_line_parsers(sub):

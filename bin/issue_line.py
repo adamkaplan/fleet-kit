@@ -196,6 +196,10 @@ def _read(sb, repo, number):
 
 def run(sb, repo, number, next_step, parked):
     """Change the one line of `repo#number`: `next_step` or `parked`, exactly one. Exit code: 0 written; 1 refused, failed or restored (one plain line on stderr)."""
+    sb.engine = sb.build_engine()
+    sb.reader = sb.engine.intents or sb.make_reader()
+    sb.state = sb.engine.state_dir
+    sb.now = sb.engine.now
     kind, value = ("next", next_step) if parked is None else ("parked", parked)
     if (next_step is None) == (parked is None):
         bad = "give exactly one of --next-step and --parked"
