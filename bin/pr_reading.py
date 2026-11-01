@@ -116,7 +116,7 @@ def read_behind(gh, repo, run_base, tip, _seen={}):
 def read_fresh(gh, repo, number, head, base_ref):   # (run base of the earliest deciding run, tip, behind); None for what could not be read
     base = tip = behind = None
     try:
-        runs = read_pr_runs(gh, repo, number, head) if head else []
+        runs = read_pr_runs(gh, repo, number, head) if head and isinstance(base_ref, str) and base_ref else []
         base = min(runs, key=lambda r: r["created"] or 0)["base"] if runs and all(r["base"] for r in runs) else None
         tip = read_tip(gh, repo, base_ref) if isinstance(base_ref, str) and base_ref else None
         behind = read_behind(gh, repo, base, tip) if base and base != tip else None

@@ -82,7 +82,8 @@ def _host():
 class CountingGh:
     """A fake of the merge gate's reader: gh(argv) -> (code, out, err), counting each kind of read."""
 
-    def __init__(self, base=OLD, tip=TIP, behind=3, runs="ok", tip_ok=True, compare_ok=True, two_runs=False):
+    def __init__(self, base=OLD, tip=TIP, behind=3, runs="ok", tip_ok=True, compare_ok=True, two_runs=False, newest_first=False):
+        self.newest_first = newest_first
         self.base, self.tip, self.behind, self.runs, self.tip_ok, self.compare_ok, self.two_runs = base, tip, behind, runs, tip_ok, compare_ok, two_runs
         self.calls = []
 
@@ -99,7 +100,7 @@ class CountingGh:
             runs = [run(1, "2026-11-01T10:00:00Z", None if self.runs == "nobase" else self.base, 1)]
             if self.two_runs:
                 runs.append(run(2, "2026-11-01T11:00:00Z", self.tip, 2))
-            return 0, json.dumps({"workflow_runs": runs}), ""
+            return 0, json.dumps({"workflow_runs": runs[::-1] if self.newest_first else runs}), ""
         if "/git/ref/heads/" in path:
             return (0, json.dumps({"object": {"sha": self.tip}}), "") if self.tip_ok else (1, "", "boom")
         if "/compare/" in path:
@@ -110,34 +111,24 @@ class CountingGh:
         return [("runs" if "/actions/runs" in a[1] else "tip" if "/git/ref/heads/" in a[1] else "compare") for a in self.calls]
 
 
-def judge(gh, setting=None, ci="green", base_ref="main", repo="acme/app", number=5, reading=pr_reading, module=ci_fresh, made=None):
-    facts = {"ci": ci, "head": HEAD, "base_ref": base_ref}
+def judge(gh, setting=None, ci="green", base_ref="main", repo="acme/app", number=5, reading=pr_reading, module=ci_fresh, made=None, head=HEAD):
+    facts = {"ci": ci, "head": head, "base_ref": base_ref}
     def make_gh():
         if made is not None:
             made.append(1)
         return gh
-    return module.fresh_fact(facts, lambda: setting, make_gh, reading, repo, number)
+    return module.fresh_fact(facts, setting if callable(setting) else (lambda: setting), make_gh, reading, repo, number)
 
 
-def fresh_reading():
-    """pr_reading with a cleared memory of the compare, so every case reads its own pair."""
-    mod = types.ModuleType("pr_reading_case")
-    mod.__dict__.update(vars(pr_reading))
-    mod.read_behind = lambda gh, repo, a, b: pr_reading.read_behind.__wrapped__(gh, repo, a, b) if hasattr(pr_reading.read_behind, "__wrapped__") else pr_reading.read_behind(gh, repo, a, b, {})
-    mod.read_fresh = lambda gh, repo, number, head, base_ref: _read_fresh(mod, gh, repo, number, head, base_ref)
-    return mod
+def clear_cache():
+    """The memory of read_behind (`_seen`, module-global) is cleared, so a test that counts compare reads does not depend on the order of the tests."""
+    for mod in (pr_reading, _host().sb.load_module("pr_reading")):
+        mod.read_behind.__defaults__[0].clear()
 
 
-def _read_fresh(mod, gh, repo, number, head, base_ref):
-    base = tip = behind = None
-    try:
-        runs = mod.read_pr_runs(gh, repo, number, head) if head else []
-        base = min(runs, key=lambda r: r["created"] or 0)["base"] if runs and all(r["base"] for r in runs) else None
-        tip = mod.read_tip(gh, repo, base_ref) if isinstance(base_ref, str) and base_ref else None
-        behind = mod.read_behind(gh, repo, base, tip) if base and base != tip else None
-    except (mod.ReadError, AttributeError, TypeError):
-        pass
-    return base, tip, behind
+class FreshCase(unittest.TestCase):
+    def setUp(self):
+        clear_cache()
 
 
 def g4(facts):
@@ -153,41 +144,62 @@ def ci_record(facts):
 
 
 def pr_state_text(facts):
-    return "CI %s" % facts["ci"]   # the entry prints `CI %s` of the view's `ci`, which is this fact (the one line of the rule, not a private text)
+    """The REAL `pr-state` text: the entry's own enrich (what the daemon stores of an examination), view and line, from the facts the rule returned."""
+    sb = _host().sb
+    ref = "acme/app#5"
+    entry = {"state": "open", "head": HEAD, "labels": [], "at": 100.0, "listed_at": 100.0}
+    state = types.SimpleNamespace(pr_state={ref: entry})
+    ctx = types.SimpleNamespace(facts=dict(facts, state="open", checks=[], mergeable="MERGEABLE"), plan={"result": "pass", "scenarios_parsed": []}, entries=[], problem=None, pr=ref)
+    sb.pr_state_enrich(state, "acme/app", 5, ctx, 100.0)
+    view = sb.pr_state_view(ref, {"prs": state.pr_state, "written_at": 100}, [], 100.0)
+    return sb.pr_state_line(view)
 
 
-class TestCiFreshReaders(unittest.TestCase):
+def mutant(test, module, old, new, tag):
+    """A copy of the module with `old` replaced by `new`; the replaced text is asserted to occur exactly once (the mutation applied once)."""
+    src = open(module.__file__).read()
+    test.assertEqual(src.count(old), 1, "the mutation applies once: " + old)
+    mod = types.ModuleType(tag)
+    mod.__dict__["__file__"] = module.__file__
+    exec(compile(src.replace(old, new), tag, "exec"), mod.__dict__)
+    return mod
+
+
+class TestCiFreshReaders(FreshCase):
     """S2, S3: the three readers over a stale and a fresh green run (a repo with no `ci_current_tip` setting: the rule is on)."""
 
-    def test_s2_a_stale_run_is_missing_records_nothing_and_prints_stale(self):
-        facts = judge(CountingGh(behind=3), reading=fresh_reading())
+    STALE_RUN = '    if run_base == tip:\n        return "fresh"'
+
+    def check_stale(self, module):
+        facts = judge(CountingGh(behind=3), module=module)
         row = g4(facts)
-        self.assertEqual((row["status"], row["missing"][0][:23]), ("missing", "stale: 3 commits behind"))
+        self.assertEqual(row["status"], "missing", "G4 reads a stale run as missing")
+        self.assertEqual(row["missing"][0][:23], "stale: 3 commits behind", "G4 says the stale line")
         done = ci_record(facts)
-        self.assertEqual((done["status"], done["why"][:23]), ("not-green", "stale: 3 commits behind"))
-        self.assertEqual(pr_state_text(facts), "CI stale: 3 behind")
+        self.assertEqual(done["status"], "not-green", "ci-record records nothing for a stale run")
+        self.assertEqual(done["why"][:23], "stale: 3 commits behind", "ci-record says the stale line")
+        text = pr_state_text(facts)
+        self.assertIn("CI stale: 3 behind", text, "pr-state prints the stale count")
+        self.assertNotIn("CI green", text, "pr-state does not print CI green")
+
+    def test_s2_the_stale_run_is_missing_records_nothing_and_prints_stale(self):
+        self.check_stale(ci_fresh)
+
+    def test_s2_the_control_the_unmutated_copy_passes_the_same_check(self):
+        self.check_stale(mutant(self, ci_fresh, self.STALE_RUN, self.STALE_RUN, "ci_fresh_control2"))
 
     def test_s2_the_mutant_that_reads_the_heads_run_only_is_caught(self):
-        class Head(types.ModuleType):
-            pass
-        mut = types.ModuleType("ci_fresh_mut")
-        mut.__dict__.update(vars(ci_fresh))
-        src = open(ci_fresh.__file__).read()
-        old = '    if run_base == tip:\n        return "fresh"'
-        self.assertIn(old, src)   # the mutation applies
-        exec(compile(src.replace(old, '    if True:\n        return "fresh"'), "ci_fresh_mut", "exec"), mut.__dict__)
-        facts = judge(CountingGh(behind=3), reading=fresh_reading(), module=mut)
-        self.assertEqual(facts["ci"], "green")   # the mutant reads the stale run as green
-        with self.assertRaisesRegex(AssertionError, "stale: 3 commits behind"):
-            self.assertEqual(g4(facts)["status"], "missing", "expected stale: 3 commits behind")
+        mut = mutant(self, ci_fresh, self.STALE_RUN, '    if True:\n        return "fresh"', "ci_fresh_mut2")
+        with self.assertRaisesRegex(AssertionError, "G4 reads a stale run as missing"):
+            self.check_stale(mut)
 
     def test_s3_a_run_at_the_tip_is_ok_names_the_tip_and_reads_green(self):
-        facts = judge(CountingGh(base=TIP), reading=fresh_reading())
+        facts = judge(CountingGh(base=TIP))
         row = g4(facts)
         self.assertEqual(row["status"], "ok")
         self.assertIn(TIP[:12], row["detail"])
         self.assertNotEqual(ci_record(facts)["status"], "not-green")
-        self.assertEqual(pr_state_text(facts), "CI green")
+        self.assertIn("CI green", pr_state_text(facts))
 
 
 class TestCiFreshUnreadable(unittest.TestCase):
@@ -198,94 +210,153 @@ class TestCiFreshUnreadable(unittest.TestCase):
              ("tip", dict(tip_ok=False), "unknown", "unknown: the tip could not be read"),
              ("compare", dict(compare_ok=False), "stale: the commits", "stale: the commits behind were not counted"))
 
+    NOBASE = 'return "unknown", "unknown: the base of the last run is not recorded"'
+
+    def check_nobase(self, module):
+        facts = judge(CountingGh(runs="nobase"), module=module)
+        self.assertNotEqual(facts["ci"], "green", "a run with no recorded base is not green")
+        self.assertEqual(facts["ci"], "unknown", "a run with no recorded base is unknown")
+
     def test_s4_each_unreadable_state_is_not_green_with_its_line(self):
         for name, kw, ci, line in self.CASES:
-            facts = judge(CountingGh(**kw), reading=fresh_reading())
+            facts = judge(CountingGh(**kw))
             self.assertNotEqual(facts["ci"], "green", name)
             self.assertTrue(facts["ci_line"].startswith(line), (name, facts["ci_line"]))
             self.assertEqual(g4(facts)["status"], "missing", name)
 
+    def test_s4_the_control_the_unmutated_copy_reads_no_base_as_unknown(self):
+        self.check_nobase(mutant(self, ci_fresh, self.NOBASE, self.NOBASE, "ci_fresh_control4"))
+
     def test_s4_the_mutant_that_reads_an_unreadable_base_as_fresh_is_caught(self):
-        mut = types.ModuleType("ci_fresh_mut4")
-        src = open(ci_fresh.__file__).read()
-        old = 'return "unknown", "unknown: the base of the last run is not recorded"'
-        self.assertIn(old, src)   # the mutation applies
-        exec(compile(src.replace(old, 'return "fresh", "fresh: x"'), "ci_fresh_mut4", "exec"), mut.__dict__)
-        facts = judge(CountingGh(runs="nobase"), reading=fresh_reading(), module=mut)
-        with self.assertRaisesRegex(AssertionError, "not green: nobase"):
-            self.assertNotEqual(facts["ci"], "green", "not green: nobase")
+        mut = mutant(self, ci_fresh, self.NOBASE, 'return "fresh", "fresh: x"', "ci_fresh_mut4")
+        with self.assertRaisesRegex(AssertionError, "a run with no recorded base is not green"):
+            self.check_nobase(mut)
 
 
-class TestCiFreshOptOut(unittest.TestCase):
+class TestCiFreshOptOut(FreshCase):
     """S6: only an explicit `ci_current_tip: false` turns the rule off."""
+
+    OFF = '.get("ci_current_tip") is False'
+    WHOLE = 'try: off = (setting() or {}).get("ci_current_tip") is False\n    except Exception: off = False'
 
     def test_s6_the_opted_out_repo_reads_nothing_and_the_others_judge(self):
         gh = CountingGh()
-        facts = judge(gh, setting={"ci_current_tip": False}, reading=fresh_reading())
+        facts = judge(gh, setting={"ci_current_tip": False})
         self.assertEqual((facts["ci"], gh.calls, "ci_line" in facts), ("green", [], False))
         for setting in (None, {}, {"ci_current_tip": True}, {"ci_current_tip": "false"}, {"ci_current_tip": 0}):
-            self.assertEqual(judge(CountingGh(), setting=setting, reading=fresh_reading())["ci"], "stale: 3 behind", setting)
+            clear_cache()
+            self.assertEqual(judge(CountingGh(), setting=setting)["ci"], "stale: 3 behind", setting)
 
     def test_s6_an_unreadable_configuration_is_not_an_opt_out(self):
         def boom():
             raise ValueError("config")
         facts = {"ci": "green", "head": HEAD, "base_ref": "main"}
-        ci_fresh.fresh_fact(facts, boom, lambda: CountingGh(), fresh_reading(), "acme/app", 5)
+        ci_fresh.fresh_fact(facts, boom, lambda: CountingGh(), pr_reading, "acme/app", 5)
         self.assertEqual(facts["ci"], "stale: 3 behind")
 
-    def _mutant(self, old, new, tag):
-        src = open(ci_fresh.__file__).read()
-        self.assertIn(old, src)   # the mutation applies
-        mut = types.ModuleType(tag)
-        exec(compile(src.replace(old, new), tag, "exec"), mut.__dict__)
-        return mut
+    def check_opted_out(self, module):
+        gh = CountingGh()
+        judge(gh, setting={"ci_current_tip": False}, module=module)
+        self.assertEqual(gh.calls, [], "an opted-out repo makes no read")
+
+    def check_absent(self, module):
+        facts = judge(CountingGh(), setting=None, module=module)
+        self.assertEqual(facts["ci"], "stale: 3 behind", "an absent setting leaves the rule on")
+
+    def test_s6_the_control_the_unmutated_copy_honours_the_opt_out_and_an_absent_setting(self):
+        mod = mutant(self, ci_fresh, self.OFF, self.OFF, "ci_fresh_control6")
+        self.check_opted_out(mod)
+        self.check_absent(mod)
 
     def test_s6_the_mutant_that_ignores_the_opt_out_is_caught(self):
-        mut = self._mutant('.get("ci_current_tip") is False', '.get("ci_current_tip") is "never"', "ci_fresh_mut6a")
-        gh = CountingGh()
-        judge(gh, setting={"ci_current_tip": False}, reading=fresh_reading(), module=mut)
-        with self.assertRaisesRegex(AssertionError, "opted out: 0 reads"):
-            self.assertEqual(gh.calls, [], "opted out: 0 reads")
+        mut = mutant(self, ci_fresh, self.OFF, '.get("ci_current_tip") == "never"', "ci_fresh_mut6a")
+        with self.assertRaisesRegex(AssertionError, "an opted-out repo makes no read"):
+            self.check_opted_out(mut)
 
     def test_s6_the_mutant_that_reads_an_absent_setting_as_off_is_caught(self):
-        mut = self._mutant('.get("ci_current_tip") is False', '.get("ci_current_tip") is not True', "ci_fresh_mut6b")
-        facts = judge(CountingGh(), setting=None, reading=fresh_reading(), module=mut)
-        with self.assertRaisesRegex(AssertionError, "absent setting: stale"):
-            self.assertEqual(facts["ci"], "stale: 3 behind", "absent setting: stale")
+        mut = mutant(self, ci_fresh, self.OFF, '.get("ci_current_tip") is not True', "ci_fresh_mut6b")
+        with self.assertRaisesRegex(AssertionError, "an absent setting leaves the rule on"):
+            self.check_absent(mut)
+
+    def check_once(self, module):
+        asked = []
+        def setting():
+            asked.append(1)
+            return {}
+        judge(CountingGh(two_runs=True), setting=setting, module=module)
+        self.assertEqual(len(asked), 1, "the opt-out is checked once per examination")
+
+    def test_the_opt_out_control_it_is_checked_once_per_examination(self):
+        self.check_once(mutant(self, ci_fresh, self.WHOLE, self.WHOLE, "ci_fresh_control_once"))
+
+    def test_a_mutant_that_checks_the_opt_out_per_run_is_caught(self):
+        mut = mutant(self, ci_fresh, self.WHOLE, 'off = any((setting() or {}).get("ci_current_tip") is False for _ in range(2))', "ci_fresh_mut_per_run")
+        with self.assertRaisesRegex(AssertionError, "the opt-out is checked once per examination"):
+            self.check_once(mut)
+
+    def test_a_mutant_that_never_checks_the_opt_out_is_caught(self):
+        mut = mutant(self, ci_fresh, self.WHOLE, "off = False", "ci_fresh_mut_never")
+        with self.assertRaisesRegex(AssertionError, "the opt-out is checked once per examination"):
+            self.check_once(mut)
 
 
-class TestCiFreshReads(unittest.TestCase):
+class TestCiFreshReads(FreshCase):
     """S7: the reads of the helper, counted."""
 
     def test_s7_a_run_at_the_tip_reads_two_and_a_run_behind_three_in_order(self):
         made = []
         at_tip = CountingGh(base=TIP)
-        judge(at_tip, reading=fresh_reading(), made=made)
+        judge(at_tip, made=made)
         self.assertEqual(at_tip.kinds(), ["runs", "tip"])
         behind = CountingGh()
-        judge(behind, reading=fresh_reading(), made=made)
+        judge(behind, made=made)
         self.assertEqual(behind.kinds(), ["runs", "tip", "compare"])
         self.assertEqual(len(made), 2)   # every read went through the reader the merge gate's factory made, none through a view
 
     def test_s7_a_rollup_that_is_not_green_reads_nothing(self):
         for ci in ("failing", "pending", "none"):
             gh = CountingGh()
-            judge(gh, ci=ci, reading=fresh_reading())
+            judge(gh, ci=ci)
             self.assertEqual(gh.calls, [], ci)
 
     def test_s7_the_base_is_the_earliest_created_deciding_run(self):
-        gh = CountingGh(two_runs=True)   # run 1 (earlier) on OLD, run 2 (later) on the tip
-        facts = judge(gh, reading=fresh_reading())
+        gh = CountingGh(two_runs=True, newest_first=True)   # run 1 (earlier) on OLD, run 2 (later) on the tip, listed newest first
+        facts = judge(gh)
         self.assertEqual(facts["ci"], "stale: 3 behind")
         self.assertIn("bbbbbbbb", facts["ci_line"])
 
-    def test_s7_a_pair_is_read_once_per_pass(self):
-        mod = fresh_reading()
-        mod.read_behind = pr_reading.read_behind   # the real one keeps the pair in memory
-        pr_reading.read_behind.__defaults__[0].clear()
+    EARLIEST = 'min(runs, key=lambda r: r["created"] or 0)["base"]'
+
+    def check_earliest(self, mod):
+        facts = judge(CountingGh(two_runs=True, newest_first=True), reading=mod)
+        self.assertEqual(facts["ci"], "stale: 3 behind", "the earliest-created run decides the base")
+
+    def test_the_earliest_run_control_the_unmutated_copy_picks_the_earliest(self):
+        self.check_earliest(mutant(self, pr_reading, self.EARLIEST, self.EARLIEST, "pr_reading_control_earliest"))
+
+    def test_a_reader_that_picks_the_newest_run_is_caught(self):
+        mod = mutant(self, pr_reading, self.EARLIEST, 'max(runs, key=lambda r: r["created"] or 0)["base"]', "pr_reading_newest")
+        with self.assertRaisesRegex(AssertionError, "the earliest-created run decides the base"):
+            self.check_earliest(mod)
+
+    def test_a_reader_that_picks_the_first_listed_run_is_caught(self):
+        mod = mutant(self, pr_reading, self.EARLIEST, 'runs[0]["base"]', "pr_reading_first")
+        with self.assertRaisesRegex(AssertionError, "the earliest-created run decides the base"):
+            self.check_earliest(mod)
+
+    def test_a_pull_request_with_no_base_ref_or_no_head_reads_nothing_and_is_unknown(self):
+        for kw in (dict(base_ref=None), dict(base_ref="")):
+            gh = CountingGh()
+            facts = judge(gh, **kw)
+            self.assertEqual((gh.calls, facts["ci"]), ([], "unknown"), kw)
         gh = CountingGh()
-        judge(gh, reading=mod)
-        judge(gh, reading=mod)
+        facts = judge(gh, head=None)
+        self.assertEqual((facts["ci"], "runs" in gh.kinds(), "compare" in gh.kinds()), ("unknown", False, False))   # no head: no run list (the tip line is not this PR's one named line: it still reads the tip once)
+
+    def test_s7_a_pair_is_read_once_per_pass(self):
+        gh = CountingGh()
+        judge(gh)
+        judge(gh)
         self.assertEqual(gh.kinds().count("compare"), 1)
 
     def test_s7_the_real_examination_reads_once_per_pair_through_the_merge_gates_reader(self):
@@ -326,7 +397,7 @@ class TestCiFreshReads(unittest.TestCase):
         self.assertEqual(len(through_reader), len(gh.calls))   # every GitHub read of the rule went through the merge gate's reader
 
 
-class TestCiFreshRefusalAndEvidence(unittest.TestCase):
+class TestCiFreshRefusalAndEvidence(FreshCase):
     """S8: the merge gate's refusal holds the number; the evidence names the tip."""
 
     FACTS = dict(problems=[], state="OPEN", gated=True, branch="main", branch_result="green", branch_runs=[], pr_result="green", failing=[],
@@ -342,7 +413,7 @@ class TestCiFreshRefusalAndEvidence(unittest.TestCase):
     def test_s8_the_evidence_line_of_a_fresh_run_is_read_back_from_the_recorded_verdict(self):
         import tempfile
         with tempfile.TemporaryDirectory() as state:
-            facts = judge(CountingGh(base=TIP), reading=fresh_reading())
+            facts = judge(CountingGh(base=TIP))
             self.assertEqual(facts["ci_line"], "fresh: CI ran on the tip " + TIP[:12])
             ctx = types.SimpleNamespace(unreadable=None, facts=dict(facts, state="OPEN", body=""), plan_problem=None, engine=types.SimpleNamespace(audit=None), pr="acme/app#5", config={},
                                         repo="acme/app", state=state, source="plan.md", entries=[],
@@ -353,7 +424,7 @@ class TestCiFreshRefusalAndEvidence(unittest.TestCase):
             self.assertIsNone(problem)
             (verdict,) = [e for e in entries if e.get("kind") == "verdict"]
             self.assertEqual(verdict["evidence"], "CI green at %s on the tip %s: every check run complete and passing" % (HEAD[:12], TIP[:12]))
-            stale = judge(CountingGh(), reading=fresh_reading())
+            stale = judge(CountingGh())
             again = _host().sb.ci_record_core(types.SimpleNamespace(**dict(vars(ctx), facts=dict(stale, state="OPEN", body=""))), lambda: 0, quiet=True)
             self.assertEqual((again["status"], again["recorded"]), ("not-green", []))
             self.assertEqual(len([e for e in plan_ledger.read_ledger(state)[0] if e.get("kind") == "verdict"]), 1)   # nothing more was recorded
@@ -371,10 +442,10 @@ def _copy_of(module, old, new, tag):
     return mod
 
 
-class TestCiFreshReadMutants(unittest.TestCase):
+class TestCiFreshReadMutants(FreshCase):
     """Mutants of `pr_reading.read_fresh` (one per GitHub read it makes) and of the merge gate's `N commits behind` text; each has a control."""
 
-    RUNS = "runs = read_pr_runs(gh, repo, number, head) if head else []"
+    RUNS = "runs = read_pr_runs(gh, repo, number, head) if head and isinstance(base_ref, str) and base_ref else []"
     TIP = "tip = read_tip(gh, repo, base_ref) if isinstance(base_ref, str) and base_ref else None"
     COMPARE = "behind = read_behind(gh, repo, base, tip) if base and base != tip else None"
 
