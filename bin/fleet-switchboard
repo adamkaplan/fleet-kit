@@ -14311,7 +14311,8 @@ def _cmd_launch(args, runner, now, socket_call=None):
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
-        return run_cloud("cmd_launch", args, runner, now)
+        code = run_cloud("cmd_launch", args, runner, now)
+        return arm_cloud_checkpoints(args, runner, now) if code == EXIT_OK else code   # #1790
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     choice = launch_model_choice(args, engine)   # #1642: before any session or pane

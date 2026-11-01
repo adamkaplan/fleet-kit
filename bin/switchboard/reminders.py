@@ -758,6 +758,36 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
         return "no checkpoint reminders: %s" % _one_line(str(err), 200)
 
 
+CLOUD_DEFAULT_CHECKPOINT = ("25m", "40m")   # #1790: a cloud launch with no CHECKPOINT line and no flag arms this
+
+
+def arm_cloud_checkpoints(args, runner, now):
+    """#1790: after a cloud launch that succeeded, what a local launch arms (set_checkpoint_reminders), else the default 25m/40m.
+    One line on stderr; never raises and always returns EXIT_OK: the pod already exists."""
+    try:
+        engine, state, _ = build_engine(runner, now, "cli")
+        boss = args.reports_to
+        if boss is None:
+            try:
+                boss = identify_caller(engine.herdr, engine.v2, os.environ)
+            except Exception:
+                boss = None
+        brief, checkpoint, overdue = getattr(args, "brief_text", None), getattr(args, "checkpoint", None), getattr(args, "overdue", None)
+        why = None
+        if checkpoint is None and overdue is None and parse_checkpoint(brief) is None:
+            why = "the brief's CHECKPOINT line could not be read" if re.search(r"^\s*CHECKPOINT\s*:", brief or "", re.I | re.M) else "no CHECKPOINT line and no flag"
+            checkpoint, overdue = CLOUD_DEFAULT_CHECKPOINT
+        note = set_checkpoint_reminders(engine, state, args.name, boss, None if args.issue is None else int(args.issue), getattr(args, "repo", None),
+                                        brief, checkpoint, overdue, now(), now())
+        if why and note and note.startswith("checkpoint reminders"):
+            note = "default %s/%s (%s): %s" % (CLOUD_DEFAULT_CHECKPOINT + (why, note))
+    except Exception as err:
+        note = "no checkpoint reminders: %s" % _one_line(str(err), 200)
+    if note:
+        sys.stderr.write("%s: %s\n" % (PROG, note))
+    return EXIT_OK
+
+
 REMIND_LIST_MAX = 50   # reminders `remind --list` prints
 
 
