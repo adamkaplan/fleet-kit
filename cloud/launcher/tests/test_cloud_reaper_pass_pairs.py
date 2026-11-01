@@ -33,7 +33,7 @@ def pair_of(args):
         return ("create", "pods/exec")
     if verb == "delete" and rest[0] == "--raw":
         return ("delete", "pods")
-    res = {"pods": "pods", "pod": "pods", "secret": "secrets", "lease": "leases"}[rest[0]]
+    res = {"pods": "pods", "pod": "pods", "secret": "secrets", "secrets": "secrets", "lease": "leases"}[rest[0]]
     if verb == "get" and rest[0] == "pods":
         return ("list", "pods")
     return (verb, res)
