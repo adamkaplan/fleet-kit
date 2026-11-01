@@ -14933,7 +14933,7 @@ def check_approval(config, runner, now, text, repo, number, sender="cos"):
                 verdict = module.evaluate(value, comments, done_when, plan_check)
                 if verdict["ok"] and matched is None:
                     matched = dict(verdict, repo=cand[0], number=cand[1])
-                elif not verdict["ok"] and verdict.get("plan_hash") and "sha256:" + value.lower() == verdict["plan_hash"] and first is None:
+                elif not verdict["ok"] and verdict.get("plan_hash") and plan_check.canonical_hash("sha256:" + value.lower(), verdict.get("plan_hashes")) == verdict["plan_hash"] and first is None:
                     first = verdict                       # the plan is this hash, but the clauses differ (or no Done-when): refused with its reason
             if matched is not None:
                 verdicts.append(matched)
