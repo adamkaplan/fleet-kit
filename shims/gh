@@ -2098,6 +2098,8 @@ def api_decide(args, namer, previous):
             for key in query_keys + [f.partition("=")[0] for f in fields]:
                 if (key != "body" or key in query_keys) and re.search(r"(?i)(^|\[)body\]?$", key):
                     raise Refused("a body written as %s (a nested key, another case, or the URL query string) on a comment or review endpoint cannot be signed: send it as -f body=... or --input with a JSON object" % key[:40])
+        if found[2] and has_input and any(re.search(r"(?i)(^|\[)body\]?$", f.partition("=")[0]) for f in fields):
+            raise Refused("a -f or -F body field with --input on a comment or review endpoint is sent by gh as a URL query parameter and cannot be signed: put the body in the --input JSON object")
         if found[2] and len(api_parse(args)[2]) != len(fields):
             raise Refused("the flags of this gh api call to a comment or review endpoint cannot be read, so its body cannot be signed and nothing was posted")
     if any(api_raw_path(p) == "graphql" for p in raw_positionals):
