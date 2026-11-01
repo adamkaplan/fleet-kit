@@ -184,5 +184,60 @@ class S20Docs(unittest.TestCase):
             self.check(texts)
 
 
+REFUSAL_CALL = "                self._persistent_refusals(a, agent, run_values)\n                max_persistent(self.env)"
+FIRST_CREATE = "                if run_values:\n                    self._make(made, \"run\", self.kube.create_run_secret"
+
+
+class S21RefusalsCreateNothing(po.PBase):
+    """S21 part two: each of the two exempt raises happens before the first create. The mutant moves the refusal call behind the first create
+    (the password Secret's), where the launcher's own cleanup would hide the objects: the RECORDED calls show them."""
+    CASES = {"a worker with --persistent": (dict(agent=False), (), "--persistent is only for --agent orchestrator"),
+             "an orchestrator with --persistent --stack": (dict(), ("--stack", "--shape", "S"), "--persistent does not combine with --stack")}
+
+    def check_refusal(self, case):
+        kw, extra, text = self.CASES[case]
+        code, out, err = self.launch(po.WORKER, *extra, expect=2, **kw)
+        self.assertEqual(code, 2)
+        self.assertEqual(err.count(text), 1, err)   # the launcher's refusal line, the flag text exactly once
+        creates = [v for v in self.writes() if v[0] in ("create", "apply")]
+        self.assertEqual(creates, [], "something was created before the refusal: %r" % (creates,))   # 0 creates in the recorded calls
+        self.created_nothing()   # no StatefulSet, no Pod, no per-run Secret, no hub entry
+
+    def test_s21_each_exempt_refusal_exits_2_with_one_line_and_creates_nothing(self):
+        for case in self.CASES:
+            with self.subTest(case):
+                self.check_refusal(case)
+                self.patch_state(secrets={po.REGISTRY: 1, "cloud-hub-pw": 1})
+                open(self.env["FAKE_KUBE_CALLS"], "w").close()
+
+    def test_s21_the_launcher_with_the_refusal_behind_the_first_create_fails_each_with_the_anchored_text(self):
+        with open(po.SOURCE) as f:
+            src = f.read()
+        self.assertEqual(src.count(REFUSAL_CALL), 1)
+        self.assertEqual(src.count(FIRST_CREATE), 1)
+        moved = src.replace(REFUSAL_CALL, "                max_persistent(self.env)").replace(FIRST_CREATE, "                self._persistent_refusals(a, agent, run_values)\n" + FIRST_CREATE)
+        self.assertNotEqual(moved, src)   # the mutation applied: moved, not removed
+        self.assertEqual(moved.count("self._persistent_refusals(a, agent, run_values)"), 1)
+        guard = "    bad = workload_problems(workload)\n"   # the stack case is also stopped by the workload's own field guard before any create: the mutant relaxes it (counted) so the ORDER shows
+        self.assertEqual(moved.count(guard), 1)
+        moved = moved.replace(guard, "    bad = []\n")
+        self.mod = types_module(moved)
+        for case in self.CASES:
+            with self.subTest(case):
+                with self.assertRaises(AssertionError) as caught:
+                    self.check_refusal(case)
+                self.assertIn("something was created before the refusal", str(caught.exception))
+                self.patch_state(secrets={po.REGISTRY: 1, "cloud-hub-pw": 1})
+                open(self.env["FAKE_KUBE_CALLS"], "w").close()
+
+
+def types_module(changed):
+    import types
+    mod = types.ModuleType("cloud_worker_moved")
+    mod.__file__ = po.SOURCE
+    exec(compile(changed, po.SOURCE, "exec"), mod.__dict__)
+    return mod
+
+
 if __name__ == "__main__":
     unittest.main()
