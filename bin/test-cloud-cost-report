@@ -603,6 +603,35 @@ class TestLauncherNamesAreKnown(unittest.TestCase):
         self.assertNotEqual(code, 2, "mutant: the corrupt line is skipped, the report no longer exits 2")
         print("S3 mutant: skipping a corrupt line gives exit %s, stderr %r, caught %d of 1, mutation applied %s" % (code, err, int(code != 2), scratch != SOURCE))
 
+    def shape_cases(self):
+        good = json.dumps(line("2026-10-14T06:00:00Z", "pod/cb-example-4", "stop", 1.0)) + "\n"
+        return {
+            "non-object lines": (good + "[1]\n5\n", "line 2: not an object", "a non-object line was not refused"),
+            "one line of 1 MiB": (good + json.dumps({"note": "x" * (1024 * 1024)}) + "\n", "line 2: missing ts", "a huge line was not refused"),
+        }
+
+    def test_the_non_object_and_the_huge_audit_line_are_refused_with_one_named_line(self):
+        mutants = {
+            "non-object lines": 'if not isinstance(line, dict):',
+            "one line of 1 MiB": 'raise Malformed("%s: missing %s" % (where, key))',
+        }
+        replacements = {"non-object lines": "if False:", "one line of 1 MiB": "continue"}
+        for shape, (raw, reason, message) in self.shape_cases().items():
+            raises, code, err, text = self.run_report_on(REAL, raw)                  # control first
+            self.assertEqual((raises, code, len(err.splitlines()), text), (0, 2, 1, ""), shape)
+            self.assertIn(reason, err)
+            self.assertNotIn("Traceback", err)
+            self.assertLess(len(err), 200, shape)                                     # the huge value is not echoed
+            old = mutants[shape]
+            self.assertEqual(SOURCE.count(old), 1, shape)
+            scratch = SOURCE.replace(old, replacements[shape])
+            self.assertNotEqual(scratch, SOURCE)
+            m_raises, m_code, m_err, _ = self.run_report_on(load(scratch), raw)
+            refused = m_raises == 0 and m_code == 2 and reason in m_err
+            self.assertFalse(refused, message)
+            print("S3 report reader, %s: control exit %d, stderr lines %d, reason %r, raw bytes %d; mutant raises %d, exit %s, refused with the reason %s (%s), mutation applied %s" % (
+                shape, code, len(err.splitlines()), reason, len(raw), m_raises, m_code, refused, message, scratch != SOURCE))
+
 
 ROOT = BIN.parent
 WRITER_FILE = "cloud/launcher/cloud_worker.py"
