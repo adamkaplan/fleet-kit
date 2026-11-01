@@ -1,6 +1,6 @@
 """Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): installer_tables."""
 from pathlib import Path
-from support.paths import BIN, REPO
+from support.paths import REPO
 from support.delivery_measure import REPO
 from support.loader import sb
 
