@@ -969,6 +969,8 @@ def cmd_read(args, runner, now):
         try:
             with Cluster() as cluster, tunnel(cluster, record) as live:
                 messages = remote_v2(state, live, config["call_timeout_seconds"]).message_list(session, limit=limit, order="desc") or []
+        except Refusal:
+            raise
         except CloudError as err:
             return _read_stopped_run(args.name, record, err, state, runner, now)
         for message in reversed([m for m in messages if isinstance(m, dict)]):
