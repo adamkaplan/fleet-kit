@@ -2857,7 +2857,7 @@ def hold_probe(args, lookup, gh, write):
             try:
                 api_parsed(args)
             except Refused as err:
-                return str(err), None, None   # an argv the parser refuses is refused here too (read or write), one line
+                return "gh: refused: %s" % _clean_reason(str(err), 400), None, None   # an argv the parser refuses is refused here too (read or write), one line
         module = load_hold()
         if module is None:
             try:
