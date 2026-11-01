@@ -79,9 +79,10 @@ def approval_refusal(args, runner, now):
     try:
         repo, number = parse_pr_ref(args.pr)
         config = load_runnable_config()
-        if not approval_on(config, repo):
-            return None
-    except Exception:   # the gate is decided from the setting alone: whatever stops that read leaves the gate OFF, as before the change
+        on = approval_on(config, repo)
+    except Exception:   # a setting that cannot be read is not an absent setting: the merge is held (a broken config is fixed, not waived)
+        return "merge of %s refused: the approval gate setting could not be read: held" % args.pr
+    if not on:   # only a clean, absent setting (read, and G0c not named) means the gate is off
         return None
     try:
         reading, gh = load_module("pr_reading"), merge_gate_gh(config, runner, repo)

@@ -346,22 +346,46 @@ class TestApprovalGateCommands(unittest.TestCase):
         self.assertEqual((row["status"], "could not be read" in row["detail"]), ("missing", True))
         self.assertRegex(self.refusal() or "", r"^merge of acme/app#9 refused: ")
 
-    def test_an_unreadable_config_leaves_the_gate_off_and_a_gate_on_repo_fails_closed(self):
+    HELD = r"^merge of acme/app#9 refused: the approval gate setting could not be read: held$"
+
+    def broken_setting(self, how):
+        """Make the setting unreadable: `load` (the loader raises), `unreadable` (a directory where the file is), `corrupt` (not JSON)."""
+        cfg = self.h.config_file
+        if how == "unreadable":
+            cfg.unlink()
+            cfg.mkdir()
+            self.addCleanup(lambda: cfg.rmdir() if cfg.is_dir() else None)
+        elif how == "corrupt":
+            self.h.write_config("{ this is not json")
+        else:
+            patcher = mock.patch.object(HOST.sb, "load_runnable_config", side_effect=ValueError("config broken"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_clean_absent_setting_is_off_and_every_other_failure_to_read_it_holds_the_merge(self):
         before = self.h.run_as("coder", "merge-gate", self.h.PR, "--check", "--json")
-        with mock.patch.object(HOST.sb, "load_runnable_config", side_effect=ValueError("config broken")):
-            self.assertIsNone(self.refusal())
+        self.assertIsNone(self.refusal())   # absent: the config was read and does not name G0c
+        self.assertEqual(self.h.run_as("coder", "merge-gate", self.h.PR, "--check", "--json"), before, "the merge-gate output is unchanged (0 differing lines)")
+        self.enforce(("G0a", "G1"))
+        self.assertIsNone(self.refusal())
+        for how in ("load", "unreadable", "corrupt"):
+            self.doCleanups()   # undo the last break and the last world
+            self.setUp()   # a fresh world for each break
+            self.enforce()
+            self.waive()   # a valid head-bound waiver must NOT pass a broken setting
+            self.broken_setting(how)
+            self.assertRegex(self.refusal() or "", self.HELD, how)
         with mock.patch.object(HOST.sb, "approval_on", side_effect=RuntimeError("setting broken")):
-            self.assertIsNone(self.refusal())
-        self.assertEqual(self.h.run_as("coder", "merge-gate", self.h.PR, "--check", "--json"), before, "the merge-gate output is unchanged")
+            self.assertRegex(self.refusal() or "", self.HELD, "approval_on raising")
         self.enforce()
         with mock.patch.object(HOST.sb, "_ledger_context", side_effect=RuntimeError("ledger broken")):
             self.assertRegex(self.refusal() or "", r"^merge of acme/app#9 refused: the plan approval could not be judged \(ledger broken\)")
 
-    def test_mutant_the_config_load_inside_the_fail_closed_try_is_caught(self):
-        old = "    except Exception:   # the gate is decided from the setting alone: whatever stops that read leaves the gate OFF, as before the change\n        return None\n    try:\n"
-        self.assertIsNone(self.refusal(), "control: the unmutated refusal, gate off")
-        with mock.patch.object(HOST.sb, "load_runnable_config", side_effect=ValueError("config broken")):
-            self.assertIsNone(self.refusal(), "control: the unmutated refusal, config unreadable")
-            mutant = mutated_refusal(old, "")   # the config load back inside the fail-closed try
-            with self.assertRaisesRegex(AssertionError, r"^'merge of acme/app#9 refused: the plan approval could not be judged \(config broken\); the gate fails closed' is not None$"):
-                self.assertIsNone(self.refusal_by(mutant))
+    def test_mutant_any_error_reading_the_setting_is_off_is_caught(self):
+        old = "    except Exception:   # a setting that cannot be read is not an absent setting: the merge is held (a broken config is fixed, not waived)\n        return \"merge of %s refused: the approval gate setting could not be read: held\" % args.pr\n"
+        self.broken_setting("load")
+        self.assertRegex(self.refusal() or "", self.HELD, "control: the unmutated rule holds")
+        mutant = mutated_refusal(old, "    except Exception:\n        return None\n")   # round 2's 'any error = OFF'
+        self.assertIsNone(self.refusal_by(mutant), "the mutant reads the error as off")
+        with self.assertRaisesRegex(AssertionError, r"^None is not true : a setting that cannot be read must hold the merge$"):
+            self.assertTrue(self.refusal_by(mutant), "a setting that cannot be read must hold the merge")
