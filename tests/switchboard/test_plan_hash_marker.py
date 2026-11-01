@@ -429,7 +429,6 @@ def build():
             pane = [e["pane"] for e in self.ledger() if e["kind"] == "lane_session" and e["review"] == review and e["lane"] == lane][-1]
             rows.append(("verdict",) + self.review(pane, "verdict", review, "--lane", lane, stdin=self.block(lane, rnd["plan_hash"]))[::2])
             rows.append(("status",) + self.review("orch", "status", review)[::2])
-            rows.append(("tick",) + self.review("orch", "tick")[::2])
             rows.append(("decide",) + self.review("cos", "decide", review, "--objection", "L2/O1", "--accept", "--reason", "the objection is right, revise the plan")[::2])
             rows.append(("respond",) + self.review("orch", "respond", review, "--plan-ref", "acme/app#8", "--table", self.table("L2/O1: accept"))[::2])
             engine, state, _ = sb.build_engine(self.route, self.world.clock.now, "cli", writable=True, socket_call=self.world.herdr.socket)
@@ -449,13 +448,17 @@ def build():
                 self.inject(self.lane_entry(got["review"], rnd, lane, old if lane != rnd["lanes"][-1] else got["plan_hash"]))
             before = len(self.ledger())
             rows = self.six_commands(got["review"], rnd)
-            self.assertEqual([r[0] for r in rows], ["verdict", "status", "tick", "decide", "respond", "closing"])
+            self.assertEqual([r[0] for r in rows], ["verdict", "status", "decide", "respond", "closing"])
             for name, code, err in rows:
                 with self.subTest(command=name):
                     self.assertEqual(code, 2, err)
                     self.assertIn(self.PREDATES, err)
                     self.assertEqual(len(err.strip().splitlines()), 1, err)
             self.assertEqual(len(self.ledger()), before, "0 ledger lines added")
+            code, out, err = self.review("orch", "tick", "--json")
+            self.assertEqual(code, 0, err)
+            self.assertIn("skipped: %s: this round predates the hash pair" % got["review"], out)
+            self.assertEqual(len(self.ledger()), before)
             session = [e["session"] for e in self.ledger() if e["kind"] == "lane_session"][0]
             self.assertIn("is a reviewer lane", sb.review_lane_send_problem({"plan_review": {"enabled": True}}, session, "orch"))
 
