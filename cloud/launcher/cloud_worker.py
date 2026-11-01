@@ -2755,7 +2755,8 @@ class Launcher:
 
     def _last_renewal_audit(self, rid):
         """(ok, reason) of the newest renew-git-token audit line of this pod, or None (reads the file's tail only)."""
-        return last_audit_line(self.audit_path, "renew-git-token", rid)
+        tail = getattr(self, "_tail", None)
+        return tail.get("renew-git-token", rid) if tail is not None else last_audit_line(self.audit_path, "renew-git-token", rid)
 
     def _audit_renewal_failure(self, worker, pod, why):
         """One audit line per CHANGE of reason (a persistent failure is not written again every pass; the success line is the 'cleared' line)."""
