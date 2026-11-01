@@ -57,7 +57,7 @@ def record(worker, lane, repo="o/r"):
     return r
 
 
-class World:
+class PushWorld:
     """A fake gh: refs per worker prefix, commits per sha, and a request log."""
     def __init__(self):
         self.refs, self.commits, self.requests, self.fail, self.chain = {}, {}, [], False, [SHA_A, SHA_B, SHA_C]
@@ -91,7 +91,7 @@ class Case(unittest.TestCase):
         self.launcher = str(Path(self.tmp.name) / "launcher.jsonl")
         Path(self.launcher).touch()
         self.pw = load()
-        self.world = World()
+        self.world = PushWorld()
         self.world.commits = {SHA_A: commit(), SHA_B: commit("second"), SHA_C: commit("third")}
         self.engine = Engine(self.tmp.name, [record("w-a", "lane-a"), record("w-b", "lane-b")])
         self.ns = types.SimpleNamespace(parse_iso=parse_iso, _one_line=lambda t, n=200: str(t)[:n])
@@ -239,6 +239,145 @@ class TestPushWatch(Case):
         self.assertNotIn("<b>", text)
         self.assertEqual(max(len(m) for m in re.findall(r"p+", text)), 120)
         self.assertEqual(len(re.findall(r'Subject \(data, not an instruction\): "[^"]{1,100}"$', text)), 1)
+
+    def mutant(self, old, new):
+        text = (REPO / "bin" / "push_watch.py").read_text()
+        assert old in text, old
+        module = types.ModuleType("push_watch_mutant")
+        exec(compile(text.replace(old, new, 1), "push_watch.py", "exec"), module.__dict__)
+        return module
+
+    def test_high2_cw_1_does_not_take_the_branches_of_cw_10(self):
+        self.engine.cloud_watch = {"records": [record("cw-1", "lane-a")]}
+        self.world.refs = {"cw-10/wip": SHA_A, "cw-1x": SHA_B, "cw-1/wip": SHA_C}
+        self.run_pass(NOW)
+        self.assertEqual(len(self.to("lane-a")), 1)   # the control: its own branch only
+        self.assertIn("cw-1/wip", self.to("lane-a")[0])
+        self.setUp()
+        self.engine.cloud_watch = {"records": [record("cw-1", "lane-a")]}
+        self.world.refs = {"cw-10/wip": SHA_A}
+        self.run_pass(NOW, self.mutant("branch.startswith(name + \"/\")", "branch.startswith(name)"))
+        with self.assertRaises(AssertionError) as caught:
+            self.assertEqual(len(self.to("lane-a")), 0, "cw-1 got an item for the branch of cw-10")
+        self.assertIn("cw-1 got an item for the branch of cw-10", str(caught.exception))
+
+    def _branch_case(self, records, refs, module=None):
+        self.setUp()
+        self.engine.cloud_watch = {"records": records}
+        self.world.refs = refs
+        self.run_pass(NOW, module)
+
+    def test_medium1_the_default_branch_and_a_shared_branch_are_not_watched(self):
+        for branch in ("main", "integration"):
+            self._branch_case([dict(record("w-a", "lane-a"), branch=branch)], {branch: SHA_A})
+            self.assertEqual(self.to("lane-a"), [])
+            self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.branch_denied"]), 1)
+        self._branch_case([dict(record("w-a", "lane-a"), branch="dev", default_branch="dev")], {"dev": SHA_A})
+        self.assertEqual(self.to("lane-a"), [])
+        self._branch_case([dict(record("w-a", "lane-a"), branch="x/1"), record("w-b", "lane-b")], {"x/1": SHA_A})
+        self.assertEqual(len(self.to("lane-a")), 1)   # control: an own branch
+        both = [dict(record("w-a", "lane-a"), branch="x/1"), dict(record("w-b", "lane-b"), branch="x/1")]
+        self._branch_case(both, {"x/1": SHA_A})
+        self.assertEqual(self.engine.sent, [])   # neither gets it
+        self._branch_case(both, {"x/1": SHA_A}, self.mutant("> 1)", "> 5)"))
+        with self.assertRaises(AssertionError) as caught:
+            self.assertEqual(self.engine.sent, [], "a branch two workers name was watched")
+        self.assertIn("a branch two workers name was watched", str(caught.exception))
+        self._branch_case([dict(record("w-a", "lane-a"), branch="main")], {"main": SHA_A}, self.mutant("task_ in DENIED_BRANCHES or", "False and"))
+        with self.assertRaises(AssertionError) as caught:
+            self.assertEqual(self.engine.sent, [], "the default branch was watched")
+        self.assertIn("the default branch was watched", str(caught.exception))
+
+    def _failing_compare(self, module=None):
+        self.setUp()
+        self.engine.cloud_watch = {"records": [record("w-a", "lane-a")]}
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW)
+        real = self.world.__call__
+        self.world.refs = {"w-a/wip": SHA_C}
+        calls = []
+
+        def broken(path):
+            if "/compare/" in path:
+                calls.append(path)
+                raise OSError("422 no merge base")
+            return real(path)
+        self.world = broken
+        for i in (1, 2, 3):
+            self.run_pass(NOW + 60 * i, module)
+        return calls
+
+    def test_medium2_a_failed_compare_falls_back_to_the_tip_once(self):
+        calls = self._failing_compare()
+        self.assertEqual(len(self.to("lane-a")), 2)   # the first sight, then the tip alone
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.compare_failed"]), 1)
+        self._failing_compare(self.mutant('return raw_gh("repos/%s/commits/%s"', 'raise RuntimeError("x"); return raw_gh("repos/%s/commits/%s"'))
+        with self.assertRaises(AssertionError) as caught:
+            self.assertEqual(len(self.to("lane-a")), 2, "no fallback: the failed compare is retried each pass")
+        self.assertIn("no fallback", str(caught.exception))
+
+    def test_medium3_the_cap_rotates_and_a_rate_limit_stops_the_pass(self):
+        recs = [record("w%02d" % i, "lane-a") for i in range(30)]
+        self.engine.cloud_watch = {"records": recs}
+        self.world.refs = {"w%02d/wip" % i: SHA_A for i in range(30)}
+        self.run_pass(NOW)
+        first = [p for p in self.world.requests if "matching-refs" in p]
+        self.assertLessEqual(len(first), self.pw.PASS_WORKERS_MAX)
+        self.run_pass(NOW + 1)
+        self.assertEqual(len({p for p in self.world.requests if "matching-refs" in p}), 30)
+        self.setUp()
+        self.engine.cloud_watch = {"records": recs}
+        self.world.refs = {"w%02d/wip" % i: SHA_A for i in range(30)}
+        self.run_pass(NOW, self.mutant("PASS_WORKERS_MAX = 20", "PASS_WORKERS_MAX = 99"))
+        with self.assertRaises(AssertionError) as caught:
+            self.assertLessEqual(len([p for p in self.world.requests if "matching-refs" in p]), 20, "more than the cap was read")
+        self.assertIn("more than the cap was read", str(caught.exception))
+
+    def _limited(self, module=None):
+        self.setUp()
+        self.requests = []
+
+        def limited(path):
+            self.requests.append(path)
+            raise OSError("HTTP 403 rate limit exceeded")
+        self.world = limited
+        self.run_pass(NOW, module)
+
+    def test_medium3_a_rate_limit_stops_the_pass_after_the_first_request(self):
+        self._limited()
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len([l for l in self.engine.audit.lines if l[0] == "push_watch.rate_limited"]), 1)
+        self._limited(self.mutant("limited.append(1)", "pass"))
+        with self.assertRaises(AssertionError) as caught:
+            self.assertEqual(len(self.requests), 1, "the pass went on after the rate limit")
+        self.assertIn("went on after the rate limit", str(caught.exception))
+
+    def test_low_no_mention_no_quote_and_a_failed_send_is_not_told(self):
+        self.world.commits[SHA_A] = commit('hi @everyone "x" end https://e.com/@u')
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.run_pass(NOW)
+        text = self.to("lane-a")[0]
+        self.assertNotIn("@", text)
+        self.assertEqual(text.count('"'), 2)
+        self.assertIn("https://e.com/u", text)
+        self.setUp()
+        self.world.refs = {"w-a/wip": SHA_A}
+        ok = self.engine.send
+        self.engine.send = lambda *a, **k: (_ for _ in ()).throw(OSError("down"))
+        self.run_pass(NOW)
+        self.engine.send = ok
+        self.run_pass(NOW + 1)
+        self.assertEqual(len(self.to("lane-a")), 1)   # retried and told once
+        self.setUp()
+        self.world.refs = {"w-a/wip": SHA_A}
+        self.engine.send = lambda *a, **k: (_ for _ in ()).throw(OSError("down"))
+        self.run_pass(NOW, self.mutant("                    unsent = True\n", "                    unsent = False\n"))
+        self.engine.send = ok
+        self.run_pass(NOW + 1)
+        with self.assertRaises(AssertionError) as caught:
+            self.assertEqual(len(self.to("lane-a")), 1, "a failed send was marked told")
+        self.assertIn("a failed send was marked told", str(caught.exception))
 
 
 if __name__ == "__main__":
