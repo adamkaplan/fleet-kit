@@ -2,7 +2,6 @@
 
 APPROVAL_SECONDS = 2.0          # the bound of one read of the events
 APPROVAL_FILES = 60             # the bound in files (the live audit and the rotated ones)
-APPROVAL_BASES = ("integration",)   # a pull request whose base is this branch, or the repository's default branch, is held to the gate
 APPROVER = "the plan's approver (work item: its orchestrator; ask: the Chief of Staff; epic: the Chief of Staff, then the owner)"
 
 
@@ -64,27 +63,18 @@ def approval_on(config, repo):
     return bool(setting and setting.get("enabled") and setting.get("mode") == "enforce" and "G0c" in (setting.get("enforce_gates") or ()))
 
 
-def approval_facts(facts, config, state, pr, source, plan, runner=None):
+def approval_facts(facts, config, state, pr, source, plan):
     """`facts` with the approval facts when the gate is on for this repo, else `facts` as it is (G0c stays untracked). The current hash is the plan's own (plan_check.plan_hash)."""
     if not isinstance(facts, dict) or not approval_on(config, pr.rsplit("#", 1)[0]):
         return facts
     issue = approval_issue(source, config)
     events = approval_events(state, issue, (plan or {}).get("plan_hash")) if issue and plan else ([] if issue is None else None)
     approval = {"issue": issue, "events": events}
-    if runner is not None:   # the merge gate's own reads of the base and the default branch; unreadable: no flag, the row stays as approval_state gives it (fails closed)
-        try:
-            repo, number = parse_pr_ref(pr)
-            reading, gh = load_module("pr_reading"), merge_gate_gh(config, runner, repo)
-            base = reading.read_pr(gh, repo, number)["base"]
-            if base not in APPROVAL_BASES and base != reading.read_default_branch(gh, repo):
-                approval["gated"] = False
-        except Exception:
-            pass
     return dict(facts, approval=approval)
 
 
 def approval_refusal(args, runner, now):
-    """#1735: the merge gate's refusal line for a pull request into the integration branch or the default branch whose plan has no plan.approved event at its current hash, else None.
+    """#1735: the merge gate's refusal line for a pull request into any base whose plan has no plan.approved event at its current hash, else None.
     Only where the repo's enforce_gates names G0c; a head-bound `G0c` waiver passes it and is audited. Stands after the claim union and before the CI check."""
     try:
         repo, number = parse_pr_ref(args.pr)
@@ -95,10 +85,6 @@ def approval_refusal(args, runner, now):
     if not on:   # only a clean, absent setting (read, and G0c not named) means the gate is off
         return None
     try:
-        reading, gh = load_module("pr_reading"), merge_gate_gh(config, runner, repo)
-        base = reading.read_pr(gh, repo, number)["base"]
-        if base not in APPROVAL_BASES and base != reading.read_default_branch(gh, repo):
-            return None
         ctx = _ledger_context(types.SimpleNamespace(pr=args.pr, plan=None, ask=None), runner, now, False)
         facts = approval_facts(ctx.facts, ctx.config, ctx.state, ctx.pr, ctx.source, ctx.plan)
         status, said = plan_ledger.approval_state(facts["approval"]["events"], facts["approval"]["issue"], (ctx.plan or {}).get("plan_hash")) if facts.get("approval") else ("missing", "the plan could not be read")
