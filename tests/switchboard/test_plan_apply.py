@@ -201,6 +201,35 @@ def build(host):
             self.assertEqual(len(re.findall(r"""["']api["']""", source)), 0)
             self.assertNotIn("gh api", source.replace("`gh api` call", ""))
 
+        def check_failed_plan_check_is_in_the_receipt(self):
+            old, new = "    pass: count equals 1 pass\n", "    pass: it works\n"
+            body = self.gh.store[1]["body"]
+            result = re.sub(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]+\s*-->", "", body.replace(old, new)).rstrip() + "\n\n" + mark("cos")
+            code, out, err = self.run_apply(text=FORM % (1, old.rstrip("\n"), 1, new.rstrip("\n")), result=self.ph(result))
+            receipt = self.gh.store[2]["body"] if 2 in self.gh.store else ""
+            counts = (self.gh.writes.count(("PATCH", 1)), self.gh.writes.count(("POST", 7)), (out + err).count("plan check: FAIL"), receipt.splitlines().count("plan check: FAIL"), code)
+            if counts != (1, 1, 1, 1, 1):
+                raise AssertionError("plan check: FAIL line missing: patch, receipt, printed, in receipt, exit = %r\n%s%s" % (counts, out, err))
+
+        def test_u5_a_failing_plan_check_is_patched_receipted_with_the_line_and_exits_1(self):
+            self.check_failed_plan_check_is_in_the_receipt()
+            self.assertEqual(self.gh.store[1]["body"].count("pass: it works"), 1)
+
+        def test_u5_the_passing_run_has_no_fail_line(self):
+            code, out, err = self.run_apply()
+            self.assertEqual(code, 0, err)
+            self.assertEqual(out.count("plan check: FAIL"), 0)
+            self.assertEqual(self.gh.store[2]["body"].count("plan check: FAIL"), 0)
+
+        def test_u5_mutant_that_omits_the_line_fails_with_its_text(self):
+            import plan_apply
+            self.run_apply()
+            self.gh = FakeIssue(); self.gh.add(1, PLAN)
+            real = plan_apply.receipt_text
+            with mock.patch.object(plan_apply, "receipt_text", lambda *a: real(*a[:7])):
+                with self.assertRaisesRegex(AssertionError, r"plan check: FAIL line missing: patch, receipt, printed, in receipt, exit = \(1, 1, 1, 0, 1\)"):
+                    self.check_failed_plan_check_is_in_the_receipt()
+
         def check_live_was_checked(self):
             code, out, err = self.run_apply(live="sha256:" + "0" * 64)
             if code == 0 or self.gh.writes:

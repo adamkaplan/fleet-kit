@@ -175,12 +175,14 @@ def declared(text):
         raise ApplyRefused("plan apply: refused: the plan's clauses cannot be read: %s" % comment_edit.one_line(err, 150), 1) from None
 
 
-def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller):
+def receipt_text(name, file_sha, count, why, old_hash, new_hash, caller, checked="pass"):
     lines = [plan_check.RECEIPT_MARKER, "plan hash: %s" % new_hash,
              "file: %s (sha256 %s)" % (os.path.basename(name), file_sha[:8]),
              "pairs: %d; the old plan hash was %s" % (count, old_hash)]
     if why:
         lines.append(comment_edit.one_line(why.replace("`", "'"), REASON_LIMIT))
+    if checked != "pass":
+        lines.append("plan check: FAIL")
     return "\n".join(lines) + "\n\n" + mark_line(caller)
 
 
@@ -253,7 +255,7 @@ def run(args, caller, api, state_dir, audit):
     out.append("applied at %s; live plan hash %s" % (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), new_hash))
     try:
         comment_edit.gh_call(reader, repo, "repos/%s/issues/%d/comments" % (repo, number), "POST",
-                             {"body": receipt_text(args.file, file_sha, len(pairs), why, old_hash, new_hash, caller)})
+                             {"body": receipt_text(args.file, file_sha, len(pairs), why, old_hash, new_hash, caller, checked)})
     except comment_edit.CommentEditFailed as err:
         out.append("plan apply: the plan is changed and the receipt is not (%s): post the receipt by hand; live plan hash %s" % (comment_edit.one_line(err.detail, 200), new_hash))
         return 1, "\n".join(out)
