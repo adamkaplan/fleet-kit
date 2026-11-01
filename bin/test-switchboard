@@ -152,6 +152,7 @@ TestPlanCheckCommand, TestPlanExplain, TestHeavySlots, TestHeavySlotsSlowStart =
 TestWeeklyJobRewrite, TestSlice3Modules, TestModuleLoader, TestDeployFromMainSentence = (_support_test_cases_07.TestWeeklyJobRewrite, _support_test_cases_07.TestSlice3Modules, _support_test_cases_07.TestModuleLoader, _support_test_cases_07.TestDeployFromMainSentence)   # support import
 _support_test_cases_08 = importlib.import_module("test_cases_08")   # support import
 FakeActions, TestReds, TestTempJanitorResume, TestAgentRegistry = (_support_test_cases_08.FakeActions, _support_test_cases_08.TestReds, _support_test_cases_08.TestTempJanitorResume, _support_test_cases_08.TestAgentRegistry)   # support import
+JanitorIdentity = importlib.import_module("test_janitor_identity").JanitorIdentity   # ask #1770
 FakeQueueGh, TestClosingKeywordWarning, TestPreflightPr, TestFocusedLocalRuns = (_support_test_cases_08.FakeQueueGh, _support_test_cases_08.TestClosingKeywordWarning, _support_test_cases_08.TestPreflightPr, _support_test_cases_08.TestFocusedLocalRuns)   # support import
 TestBatchingDocs, FakePullFiles, TestCloudWatchBounds, TestArchTools = (_support_test_cases_08.TestBatchingDocs, _support_test_cases_08.FakePullFiles, _support_test_cases_08.TestCloudWatchBounds, _support_test_cases_08.TestArchTools)   # support import
 _support_test_cases_09 = importlib.import_module("test_cases_09")   # support import
