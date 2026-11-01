@@ -1209,7 +1209,7 @@ def _may_retire(kind, record):
     return kind[0] == "person" or (kind[0] == "agent" and ((len(kind) > 2 and kind[2] == "chief-of-staff") or kind[1] == record.get("reports_to")))
 
 
-_BOSS_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}", re.ASCII)
+_BOSS_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 
 
 def _final_message(engine, state, record, name, reason, body=None):

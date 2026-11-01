@@ -283,6 +283,9 @@ def last_message(directory, state, pod, clock=None):
             return None, "no run record"
         if os.path.dirname(os.path.abspath(str(directory))) != os.path.abspath(str(_runs_root())):
             return None, "no run record"
+        # PC-8: a link is refused, and the real path must be a child of the real path of the root
+        if os.path.islink(str(directory)) or os.path.dirname(os.path.realpath(str(directory))) != os.path.realpath(str(_runs_root())):
+            return None, "no run record"
         text, why = _last_worker_text(directory)
         if text is None:
             return None, why.replace("the transcript of the run record holds no text from the worker", "no text from the worker") \
