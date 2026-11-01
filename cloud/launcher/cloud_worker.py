@@ -2591,8 +2591,10 @@ class Launcher:
                     steps["stops_n"] += 1
         out.extend(renewed)
         t0 = mono()
-        self.remove_orphan_secrets(pods, now)
-        steps["orphans"] = mono() - t0
+        try:
+            self.remove_orphan_secrets(pods, now)
+        finally:
+            steps["orphans"] = mono() - t0
         t0 = mono()
         self.send_wip_notes(live, now)
         steps["notes"] = mono() - t0
