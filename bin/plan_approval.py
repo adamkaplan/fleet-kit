@@ -217,7 +217,8 @@ def evaluate(value, comments, done_when, plan_check):
         return refuse("the issue has %d plan comments, and an approval needs exactly 1" % len(plans))
     text = plans[0]["body"]
     current = plan_check.plan_hash(text)
-    if "sha256:" + value.lower() != current:
+    hashes = plan_check.plan_hashes(text)
+    if plan_check.canonical_hash("sha256:" + value.lower(), hashes) != hashes[0]:
         return refuse("the plan has changed (current %s)" % current, current)
     if not (done_when or "").strip():
         return refuse("there is no Done-when on the issue or its ask to check the plan against (current %s)" % current, current)
