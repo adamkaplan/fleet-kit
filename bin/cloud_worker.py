@@ -551,6 +551,8 @@ CLUSTER_NAMES = (
     "_lib", "_scrub_lib", "use_settings", "_OWNER_RE", "_NAME_RE", "_repo_key", "check_allowed", "_capture", "_jwt_lifetime", "_duration",
     "firewall_refused", "VaultRecovery", "_token_refusal", "cluster_token", "_cluster_token_bounded", "private_root", "_ps", "stop_recorded_tunnels",
     "sweep_stale", "Cluster", "tunnel",
+    "unknown_report_to",
+    "check_report_to",
 )
 cloud_cluster = _load_cluster()
 for _name in CLUSTER_NAMES:
@@ -657,47 +659,6 @@ def cmd_launch(args, runner, now):
     the same checks in between."""
     with contextlib.ExitStack() as stack:
         return _launch(args, runner, now, lambda state: stack.enter_context(reservation(state, args.name)))
-
-
-def unknown_report_to(state, name, agents, alias):
-    """(problem, warning) for a `--reports-to` name: `problem` is the text that stops a launch when no registry entry (running, recorded or retired), no
-    cloud record and not the role alias `alias` carries the name; `warning` is said when the registry could not be read (then nothing is refused:
-    a read that cannot be trusted never stops a launch)."""
-    if not name or name in agents or name == alias:
-        return None, None
-    registry = H["load_module"]("registry")
-    found = registry.read(state)
-    if not found.get("whole"):
-        return None, "the agent registry could not be read (%s); the name %s was not checked" % (_one(str(found.get("problem") or "unknown"), 100), _one(name, 60))
-    if name in found["agents"] or name in found["retired"]:
-        return None, None
-    try:
-        if load_record(state, name) is not None:
-            return None, None
-    except (CloudError, KeyError, OSError):
-        pass
-    import difflib
-    known = sorted(set(found["agents"]) | set(found["retired"]) | set(agents))
-    near = difflib.get_close_matches(name, known, n=5, cutoff=0.0) or known[:5]
-    first = ("" if known else " The registry holds no name yet: a first launch of a new installation may pass --boss-unregistered REASON (the reason is audited).")
-    return ("--reports-to %s is not a registered identity (no agent, retired agent, cloud worker or role alias has it); nothing was created. Use one of: %s, "
-            "or register the lane first, or pass --boss-unregistered REASON.%s" % (_one(name, 60), ", ".join(near[:5]) or "(no registered name yet)", first)), None
-
-
-def check_report_to(engine, state, args, local_agents):
-    """The report-to check of a launch, local or cloud: stops it (a LaunchError) before anything is created when `--reports-to` names no registered identity,
-    unless `--boss-unregistered REASON` is given (then one audit line). A registry that cannot be read warns and goes on."""
-    problem, warning = unknown_report_to(state, args.reports_to, local_agents, H["COS_ALIAS"])
-    if warning:
-        print("%s: launch: warning: %s" % (H["PROG"], warning), file=sys.stderr)
-    if not problem:
-        return
-    reason = getattr(args, "boss_unregistered", None)
-    if reason is None:
-        raise H["LaunchError"](problem)
-    if not reason.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", reason):
-        raise H["LaunchError"]("--boss-unregistered needs a reason: non-empty text on one line, no control characters; nothing was created")
-    _audit(engine, "launch.boss_unregistered", args.name, {"reports_to": H["scrubbed_flag_text"](args.reports_to, 60), "reason": H["scrubbed_flag_text"](reason)})
 
 
 def pod_shape(args):
