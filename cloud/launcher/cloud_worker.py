@@ -2542,8 +2542,10 @@ class Launcher:
         finally:
             steps["renew"] = mono() - t0
         t0 = mono()
-        self._note_vanished_pods(pods, now)
-        steps["vanished"] = mono() - t0
+        try:
+            self._note_vanished_pods(pods, now)
+        finally:
+            steps["vanished"] = mono() - t0
         for pod in pods:
             worker = ann(pod, "worker")
             reason = None
