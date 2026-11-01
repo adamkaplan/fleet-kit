@@ -2490,6 +2490,7 @@ class Launcher:
         out, now, live = [], self.clock(), []
         self.reap_results, self.last_hook = {}, None
         pods = self.kube.list_pods()
+        self.daily_maintenance(pods, now)
         # The renewal is the FIRST step: a slow activity read or stop below can no longer hold it back (the audit of 29 October).
         renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)
         self._note_vanished_pods(pods, now)
@@ -2531,6 +2532,28 @@ class Launcher:
         self.remove_orphan_secrets(pods, now)
         self.send_wip_notes(live, now)
         return out
+
+    def daily_maintenance(self, pods, now, dry_run=False, force=False):
+        """Once per UTC day, at the start of the first pass after midnight (the reaper's main thread only, never the renewal thread): remove the
+        run records older than the retention, never a worker's that has a pod in this pass's own list, at most MAINTENANCE_MAX_REMOVALS
+        a run. One line with the counts and one per removal (run ids only). Never raises.
+        Returns the summary dict, or None when it is not due."""
+        today = now.astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
+        if not force and getattr(self, "maintenance_day", None) == today:
+            return None
+        self.maintenance_day = today
+        try:
+            days = int(self.env.get("CW_RECORD_KEEP_DAYS") or run_record.KEEP_DAYS)
+            live = {ann(p, "worker") for p in pods if ann(p, "worker")}
+            names, size, kept = run_record.prune_limited(self.recorder.root(None), max(days, 1), now.timestamp(), live, dry_run=dry_run)
+        except Exception as e:
+            print("cloud-worker: the daily maintenance failed: %s" % scrub(e, (), 200), file=sys.stderr)
+            return None
+        for name in names:
+            print("cloud-worker: maintenance: %s run record %s" % ("would remove" if dry_run else "removed", name), file=sys.stderr)
+        print("cloud-worker: maintenance%s: %d run records %s (%d bytes), %d kept for running workers" % (
+            " (dry run)" if dry_run else "", len(names), "to remove" if dry_run else "removed", size, kept), file=sys.stderr)
+        return {"removed": names, "bytes": size, "kept": kept}
 
     def _note_vanished_pods(self, pods, now):
         """A worker this launcher created (a `create` line in the audit's last 24 hours, read from its last 2 MB) with no later stop or delete line,
