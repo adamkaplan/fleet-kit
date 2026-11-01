@@ -645,7 +645,7 @@ class M2CreateAndDeleteFailureSaysSo(K1Base):
         self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
 
     def delete_cmd(self, name):
-        return "%s --context acme-cw -n cw delete secret %s" % (self.env["CW_KUBECTL"], name)
+        return cw.scrub("%s --context acme-cw -n cw delete secret %s" % (self.env["CW_KUBECTL"], name), limit=1000)   # as the launcher prints it: its scrub redacts a long random path part (a macOS temp directory)
 
     def test_failed_create_with_cleanup_ok_says_cleaned_once_in_audit_and_output(self):
         self.patch_state(never_ready=True)
