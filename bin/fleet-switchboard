@@ -25564,6 +25564,18 @@ def announce_order_change(engine, args, caller, repo, charter, detail):
     return EXIT_OK
 
 
+def cmd_issue_line(args, runner, now):
+    engine = build_engine(runner, now, "cli")[0]
+    return load_module("issue_line").run(types.SimpleNamespace(engine=engine, reader=engine.intents or _intent_reader(runner, now), fs=os, state=engine.state_dir, now=engine.now, parse_bounded=load_module("record_json").parse_bounded, write=write_issue_body, IntentError=IntentError, one_line=_one_line, sleep=_sleep, waits=ORDERS_READBACK_WAITS, PROG=PROG, EXIT_OK=EXIT_OK, EXIT_ERROR=EXIT_ERROR, err=sys.stderr.write, out=sys.stdout.write), args.issue.repo, int(args.issue), args.next_step, args.parked)
+
+
+def add_issue_line_parsers(sub):
+    line = sub.add_parser("issue-line", help="Change ONE line of an issue body (the next step or a parked date) from a fresh read; the Intent and the Done-when are never changed")
+    line.add_argument("issue", type=issue_arg, help="owner/repo#N")
+    line.add_argument("--next-step", help="The next-step line: one line of at most 600 characters (give this or --parked)")
+    line.add_argument("--parked", help="The parked date: YYYY-MM-DD, a day ahead within 366 days (give this or --next-step)")
+
+
 CHARTER_HELP = "The charter issue: N (in your own repo) or owner/repo#N"
 
 

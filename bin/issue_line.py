@@ -191,16 +191,20 @@ def _stop(sb, repo, number, reason, text):
 
 
 def _read(sb, repo, number):
-    data = sb.engine.intents._api("repos/%s/issues/%d" % (repo, number), repo)
+    data = sb.reader._api("repos/%s/issues/%d" % (repo, number), repo)
     return data.get("body") if isinstance(data, dict) and isinstance(data.get("body"), str) else ""
 
 
-def run(sb, repo, number, kind, value):
-    """Change the one line of `repo#number`. Exit code: 0 written; 1 refused, failed or restored (one plain line on stderr)."""
-    bad = check_arguments(kind, value, sb.now()) if repo else "name the issue as owner/repo#N"
+def run(sb, repo, number, next_step, parked):
+    """Change the one line of `repo#number`: `next_step` or `parked`, exactly one. Exit code: 0 written; 1 refused, failed or restored (one plain line on stderr)."""
+    kind, value = ("next", next_step) if parked is None else ("parked", parked)
+    if (next_step is None) == (parked is None):
+        bad = "give exactly one of --next-step and --parked"
+    else:
+        bad = check_arguments(kind, value, sb.now()) if repo else "name the issue as owner/repo#N"
     if bad:
         return _stop(sb, repo, number, "arguments", bad)
-    reader = sb.engine.intents
+    reader = sb.reader
     try:
         body = _read(sb, repo, number)
     except sb.IntentError as err:
