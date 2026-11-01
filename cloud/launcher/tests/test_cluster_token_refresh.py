@@ -636,8 +636,10 @@ class TheServiceFile(Refresh):
 
     def test_the_launcher_reads_no_new_setting_name(self):
         """The names the launcher and the wiring read are a setting row or on the one list (the settings suite keeps that); this change adds none."""
-        with open(os.path.join(ROOT, "bin", "cloud_worker.py")) as f:
-            text = f.read()
+        text = ""
+        for name in ("cloud_worker.py", "cloud_cluster.py"):   # the wiring and the text moved out of it (ask #1647)
+            with open(os.path.join(ROOT, "bin", name)) as f:
+                text += f.read()
         self.assertNotIn("CW_CLUSTER_TOKEN_REFRESH", text)
         self.assertNotIn("CW_CLUSTER_TOKEN_RETRY", text)
 
@@ -977,8 +979,10 @@ class MintGuards(Refresh):
     def test_no_argument_or_variable_of_the_launch_path_reaches_strict(self):
         """Only the reaper's refresher sets strict: no CW_ name, flag or argument of the launch changes the launch path."""
         import inspect
-        with open(os.path.join(ROOT, "bin", "cloud_worker.py")) as f:
-            launch = f.read()
+        launch = ""   # the launch path: bin/cloud_worker.py and the moved text of bin/cloud_cluster.py (the split, ask #1647)
+        for name in ("cloud_worker.py", "cloud_cluster.py"):
+            with open(os.path.join(ROOT, "bin", name)) as f:
+                launch += f.read()
         self.assertEqual(list(inspect.signature(cw.cluster_token).parameters)[-1], "strict")
         self.assertIn("def cluster_token(env=None, now=None, recovery=None):", launch)   # the launch entry has no such argument
         self.assertEqual(re.findall(r"cluster_token\(([^)]*)\)", launch.split("def cluster_token(env=None")[1].split("\ndef ")[0]).count("strict"), 0)

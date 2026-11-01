@@ -1,6 +1,7 @@
 """Ask #1165: the image installs make (one new apt package) and carries ONE system-level git file written at build with a
 default identity (one named pair in the Dockerfile); the entrypoint exports no identity variable and writes nothing; a
 repository's own identity and a local `git config user.name` still win; the shell guard is unchanged. Offline; temp dirs only."""
+import hashlib
 import os
 import re
 import shutil
@@ -213,21 +214,8 @@ class Identity(unittest.TestCase):
         self.assertEqual(self.guard("git", "config", "push.default", "y"), 3)
 
     def test_s7_guard_is_unchanged_by_this_change(self):
-        def run(args):
-            return subprocess.run(["git", "-C", CLOUD] + args, capture_output=True, text=True)
-        ref = "origin/integration"
-        three_dot = True
-        if run(["rev-parse", "--verify", "-q", ref]).returncode != 0:
-            ref, three_dot = "origin/main", False   # no integration ref: the old compare against main
-        if run(["rev-parse", "--verify", "-q", ref]).returncode != 0:   # skip only when the base ref is truly absent, loudly
-            print("SKIPPED: test_s7_guard_is_unchanged_by_this_change: the base ref is absent, nothing to compare", flush=True)
-            self.skipTest("the base ref is absent")
-        if on_default_branch(run, "origin/main", ref):   # a squash merge to main: the merge-base is the old main
-            print("SKIPPED: test_s7_guard_is_unchanged_by_this_change: HEAD is the default branch", flush=True)
-            self.skipTest("HEAD is the default branch")
-        r = guard_diff(ref, run, three_dot)
-        self.assertEqual(r.returncode, 0, r.stderr)   # the base exists: a failing diff is a failure, never a skip
-        self.assertEqual(r.stdout.strip(), "")
+        digest = hashlib.sha256(open(GUARD, "rb").read()).hexdigest()   # the wrapper's content, not a diff against a branch (ask #1677)
+        self.assertEqual(digest, read(os.path.join(HERE, "guard.sha256")).strip())
 
     def make_repo(self, feature_edits_guard, base_moves_on):
         d = tempfile.mkdtemp()
