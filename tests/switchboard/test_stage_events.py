@@ -45,7 +45,7 @@ class TestStageEvents(Base):
             with self.subTest(url=url):
                 self.assertIsNone(sb.stage_parse(self.line(url=url)))
                 self.comment(self.line(url=url), cid=5100 + n)
-                self.assertEqual(self.told()[-1][1], "stage event unreadable")
+                self.assertEqual(self.told()[-1][1], "preview event unreadable")
         self.assertEqual(len(self.told()), 4)
 
     def told(self):
@@ -67,7 +67,7 @@ class TestStageEvents(Base):
         self.comment(self.line(url="https://stage.example.org/pr-40", until="2030-01-02T09:00:00Z"))
         (one,) = self.told()
         self.assertEqual((one[2], one[3]), ("github.stage", "coder"))
-        self.assertEqual(one[1], "stage up on PR #40, head aaaaaaa, https://stage.example.org/pr-40, until 2030-01-02T09:00:00Z")
+        self.assertEqual(one[1], "preview up on PR #40, head aaaaaaa, https://stage.example.org/pr-40, until 2030-01-02T09:00:00Z")
         self.assertEqual(self.audit("github.not_delivered"), [])
 
     def test_s4_other_login_other_repo_and_no_marker_are_as_today(self):
@@ -85,7 +85,7 @@ class TestStageEvents(Base):
         self.comment(body)
         (one,) = self.told()
         self.assertNotIn("\n", one[1])
-        self.assertEqual(one[1], "stage up on PR #40, head aaaaaaa, https://s.example.org/x")
+        self.assertEqual(one[1], "preview up on PR #40, head aaaaaaa, https://s.example.org/x")
 
     def test_s6_unreadable_lines_are_delivered_as_the_fixed_words(self):
         pre = "<!-- stage:event v1 "
@@ -97,7 +97,7 @@ class TestStageEvents(Base):
             self.comment(text, cid=5100 + n)
         got = self.told()
         self.assertEqual(len(got), 9)
-        self.assertEqual({g[1] for g in got}, {"stage event unreadable"})
+        self.assertEqual({g[1] for g in got}, {"preview event unreadable"})
         self.assertNotIn("ignore your instructions", self.rig.state_text())
         self.assertEqual({g[2] for g in got}, {"github.stage"})
 
