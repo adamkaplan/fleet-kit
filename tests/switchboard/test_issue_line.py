@@ -194,10 +194,10 @@ def build():
             self.assertEqual(len(old), len(new))
             differing = [n for n in range(len(old)) if old[n] != new[n]]
             self.assertEqual(len(differing), 1)
-            self.assertTrue(new[differing[0]].startswith("Next step ("))
+            self.assertTrue(new[differing[0]].startswith("Next: "))
             self.assertEqual(before[:before.index("Next step")], after[:before.index("Next step")])   # the Intent section and the Done-when line byte-equal
             self.assertIn("## Intent\nFix the agents.\nDone when: both answer.\n", after)
-            self.assertEqual(self.reader_accepts(after), (True, True))
+            self.assertEqual(self.reader_accepts(after), (True, True, True))   # 3 of 3 daemon readers
             self.gh.__dict__.pop("patches", None)
             future = time.strftime("%Y-%m-%d", time.gmtime(self.world.clock.now() + 40 * 86400))
             code, _, err = self.run_it(self.ref, "--parked", future)
@@ -210,21 +210,22 @@ def build():
 
         def reader_accepts(self, body):
             """(standing_line reads the next-step line, the parked reader reads a parked line)"""
-            nxt = [l for l in body.splitlines() if l.startswith("Next step (")][-1]
+            nxt = [l for l in body.splitlines() if l.startswith("Next: ")][-1]
             standing = sb.standing_line(nxt, self.world.clock.now())
             parked = sb.parked_until(body, ["x:parked"])
-            return (standing is not None and standing[0] == "date", parked is not None)
+            return (sb.TRIAGE_NEXT_RE.search(nxt) is not None, standing is not None and standing[0] == "date", parked is not None)
 
         def test_s4_a_body_with_no_next_step_gets_one_before_the_trailing_marker(self):
             self.gh.bodies = {5: BODY_NO_NEXT}
             self.assertEqual(self.run_it(self.ref, "--next-step", "start")[0], 0)
             after = self.gh.body(5)
-            self.assertTrue(re.search(r"A closing paragraph\.\n\nNext step \([^)]*\): start\n\n<!-- fleet-switchboard:from=fleet-registry -->\n$", after), after)
+            self.assertTrue(re.search(r"A closing paragraph\.\n\nNext: start\n\n<!-- fleet-switchboard:from=fleet-registry -->\n$", after), after)
             self.assertTrue(after.startswith(BODY_NO_NEXT[:BODY_NO_NEXT.index("<!--")].rstrip("\n")))
 
         def test_s4_the_written_line_is_read_by_standing_line(self):
-            line = "Next step (1 Nov 05:34Z): wait for 2099-01-05"
+            line = "Next: wait for 2099-01-05"
             self.assertEqual(sb.standing_line(line, 0)[0], "date")
+            self.assertIsNotNone(sb.TRIAGE_NEXT_RE.search(line))
 
         # -- S5: the second read and the restore
 
@@ -241,7 +242,7 @@ def build():
         def lose_parts_after_the_write(self):
             def lose(count):
                 if count == 3:
-                    self.gh.bodies = {5: "Next step (1 Nov 05:34Z): wait\n"}
+                    self.gh.bodies = {5: "Next: wait\n"}
             self.hook = lose
 
         def check_restore(self):
