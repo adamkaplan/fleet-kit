@@ -11,7 +11,7 @@ work starts, checked by a command, challenged by independent reviewers, and appr
 ## When a plan is required
 
 Every worker assignment links one: `PLAN: <link>` in the brief, to its own plan or to a section of an ask's, epic's or
-workspace's plan. No plan, no assignment.
+workspace's plan.
 Who approves: a work item's plan, its orchestrator (the Chief of Staff if it touches a held-PR area); an ask's, the Chief of
 Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
