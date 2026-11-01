@@ -3585,9 +3585,11 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None, ticker_wait
                 ticker.start()
             began = clock()
             cpu0, parsed0 = time.thread_time(), tail_lines_parsed()
-            work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            try:
+                work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            finally:
+                print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
             took = (clock() - began).total_seconds()
-            print("cloud-worker: reaper pass line: cpu_seconds=%.3f audit_lines_parsed=%d%s" % (time.thread_time() - cpu0, tail_lines_parsed() - parsed0, step_text(getattr(L, "step_seconds", None))), file=sys.stderr)
             if L is not None:
                 L.note_slow_pass(took)
             res = work
