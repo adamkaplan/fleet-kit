@@ -339,12 +339,24 @@ class TestCiFreshRefusalAndEvidence(unittest.TestCase):
         _, bare, _ = merge_gate.decide(dict(self.FACTS, behind=None))
         self.assertEqual(bare, "main moved after the last green run (tested on bbbbbbbb, tip now aaaaaaaa): its CI must run again on the current merge ref")
 
-    def test_s8_the_evidence_line_of_a_fresh_run_names_the_tip_with_12_characters(self):
-        facts = judge(CountingGh(base=TIP), reading=fresh_reading())
-        self.assertEqual(facts["ci_line"], "fresh: CI ran on the tip " + TIP[:12])
-        src = _host().SWITCHBOARD.read_text()
-        self.assertIn('"CI green at %s%s: every check run complete and passing"', src)
-
+    def test_s8_the_evidence_line_of_a_fresh_run_is_read_back_from_the_recorded_verdict(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as state:
+            facts = judge(CountingGh(base=TIP), reading=fresh_reading())
+            self.assertEqual(facts["ci_line"], "fresh: CI ran on the tip " + TIP[:12])
+            ctx = types.SimpleNamespace(unreadable=None, facts=dict(facts, state="OPEN", body=""), plan_problem=None, engine=types.SimpleNamespace(audit=None), pr="acme/app#5", config={},
+                                        repo="acme/app", state=state, source="plan.md", entries=[],
+                                        plan={"result": "pass", "plan_hash": "sha256:x", "scenarios_parsed": [{"id": "S1", "evaluator": "ci", "claim": "pr"}]})
+            done = _host().sb.ci_record_core(ctx, lambda: 0, quiet=True)
+            self.assertEqual((done["status"], done["recorded"]), ("recorded", ["S1"]))
+            entries, problem = plan_ledger.read_ledger(state)
+            self.assertIsNone(problem)
+            (verdict,) = [e for e in entries if e.get("kind") == "verdict"]
+            self.assertEqual(verdict["evidence"], "CI green at %s on the tip %s: every check run complete and passing" % (HEAD[:12], TIP[:12]))
+            stale = judge(CountingGh(), reading=fresh_reading())
+            again = _host().sb.ci_record_core(types.SimpleNamespace(**dict(vars(ctx), facts=dict(stale, state="OPEN", body=""))), lambda: 0, quiet=True)
+            self.assertEqual((again["status"], again["recorded"]), ("not-green", []))
+            self.assertEqual(len([e for e in plan_ledger.read_ledger(state)[0] if e.get("kind") == "verdict"]), 1)   # nothing more was recorded
 
 if __name__ == "__main__":
     unittest.main()
