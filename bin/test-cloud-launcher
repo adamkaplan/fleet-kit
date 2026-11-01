@@ -4,6 +4,7 @@
 # (It used to be ONE shell line of more than forty commands joined by &&; every member appended to it and every pair conflicted.)
 # Every entry runs even when one fails: each failure is named in a FAILED line and in the closing line `failed entries: N: <names>`, then RESULT: FAIL (exit 1). The completeness checks (NOT RUN) stop the run before any entry.
 # To add a test: add one line to bin/test-cloud-launcher.chain at its alphabetical place, ABOVE the fixed last line (even if it sorts after it).
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")   # absolute, for the serial entry starter
 cd "$(dirname "$0")/.." || exit 1
 LIST=bin/test-cloud-launcher.chain
 # Completeness check: every test_*.py must be listed in $LIST, or named here with a reason; every listed entry must exist.
@@ -68,6 +69,7 @@ run_entry() { # $1 = entry; runs it with the arguments it took in the old chain;
   esac || { echo "FAILED: $e"; return 1; }
   echo "TIME $e $(( $(date +%s) - t0 ))s"
 }
+[ -z "${CHAIN_SERIAL_ENTRY:-}" ] || { run_entry "$CHAIN_SERIAL_ENTRY" "$@"; exit $?; }   # the serial entry, started by the starter below with the default action of SIGINT
 is_parallel() { grep -qx "$1" "$PAR"; }
 while IFS= read -r e; do
   [ -n "$e" ] || continue
@@ -94,7 +96,8 @@ trap 'trap "" TERM INT; for p in $pids; do killtree "$p"; done; exit 143' TERM I
 while IFS= read -r e; do
   [ -n "$(printf %s "$e" | tr -d ' \t')" ] || continue
   is_parallel "$e" && continue
-  run_entry "$e" "$@" & sp=$!   # in the background so that the trap above acts at once while the entry runs
+  # a background job of a non-interactive shell inherits SIGINT as ignored: the one-line Python starter restores the default action and execs the script in entry mode (same process id)
+  CHAIN_SERIAL_ENTRY=$e python3 -c 'import os,signal,sys;signal.signal(signal.SIGINT,signal.SIG_DFL);os.execv(sys.argv[1],sys.argv[1:])' "$SELF" "$@" </dev/null & sp=$!   # in the background so that the trap above acts at once while the entry runs
   pids="$pids $sp"
   wait $sp || failed="$failed $e"
   ran=$((ran + 1))
