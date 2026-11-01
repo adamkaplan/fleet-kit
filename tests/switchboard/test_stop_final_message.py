@@ -242,3 +242,113 @@ class TestStopFinalMessageMutants(unittest.TestCase):
         code, out = self.run_child(done, "")
         self.assertEqual(code, 1)
         self.assertIn("sent for a pod that reported done", out)
+
+
+OLDER_TEXT = "words of the OLDER run of this name"
+NEWER_TEXT = "words of the NEWER run of this name"
+
+
+def make_record(parent, name, stamp, text):
+    rec = Path(parent) / ("%s-%s-abc123" % (name, stamp))
+    rec.mkdir(parents=True)
+    (rec / "transcript.jsonl").write_text(json.dumps({"type": "assistant", "content": [{"type": "text", "text": text}]}) + "\n")
+    return rec
+
+
+class TestStopFinalMessageTwoRuns(unittest.TestCase):
+    """S9, U7 (PC-7): the text read is the one of THIS stop's record, never the newest record of the name."""
+
+    def two_runs(self, newer_has_record):
+        w = World(self)
+        older = make_record(w.runs, "cb-1788a", "20261101T100000Z", OLDER_TEXT)
+        (w.cloud / "cb-1788a.json").write_text(json.dumps({"worker": "cb-1788a", "reports_to": "boss-lane"}))
+        newer = make_record(w.runs, "cb-1788a", "20261101T120000Z", NEWER_TEXT) if newer_has_record else None
+        return w, older, newer
+
+    def retire_path(self, w, record):
+        """The boss's messages of cmd_retire whose stop answer names `record` (None: no field)."""
+        cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
+        engine = mock.Mock()
+        engine.send = lambda sender, to, text: w.sent.append((to, text))
+        body = {"pushed": True}
+        if record is not None:
+            body["record"] = str(record)
+        args = argparse.Namespace(name="cb-1788a", undo=False, reason="finished")
+        with mock.patch.dict(cloud.H, {"build_engine": lambda *a, **k: (engine, w.state, None), "gates_caller_kind": lambda *a: ("person",)}), \
+                mock.patch.object(cloud, "run_launcher", lambda *a, **k: (0, body, "note")), \
+                mock.patch.object(cloud, "Cluster", lambda *a, **k: mock.MagicMock()), mock.patch.object(cloud, "_audit"), \
+                mock.patch.object(cloud, "_registry_note"), mock.patch.object(cloud, "_keep_boss"), mock.patch.object(cloud, "remove_record"):
+            cloud.cmd_retire(args, None, None, {"worker": "cb-1788a", "reports_to": "boss-lane"})
+        return w.to("boss-lane")
+
+    def test_S9_control_the_newer_run_with_its_own_record_sends_its_own_text(self):
+        w, older, newer = self.two_runs(True)
+        got = self.retire_path(w, newer)
+        self.assertEqual((len(got), got[0].count(NEWER_TEXT), got[0].count(OLDER_TEXT)), (1, 1, 0), got)
+        w2, older, newer = self.two_runs(True)
+        w2.stop("cb-1788a", "idle", newer)
+        w2.scan()
+        got = w2.to("boss-lane")
+        self.assertEqual((len(got), got[0].count(NEWER_TEXT), got[0].count(OLDER_TEXT)), (1, 1, 0), got)
+
+    def test_S9_the_newer_run_without_a_record_never_sends_the_older_runs_text(self):
+        w, older, _ = self.two_runs(False)
+        got = self.retire_path(w, None)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].count(OLDER_TEXT), 0, "the older run's text was sent as the last message")
+        self.assertTrue(got[0].endswith("\nlast text not read: no_run_record"), got[0])
+        w2, older, _ = self.two_runs(False)
+        w2.stop("cb-1788a", "idle")
+        w2.scan()
+        got = w2.to("boss-lane")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].count(OLDER_TEXT), 0, "the older run's text was sent as the last message")
+        self.assertIn("last text not read: no_run_record", got[0])
+
+    def test_U7_a_directory_outside_the_root_or_of_another_pod_is_never_read(self):
+        w = World(self)
+        outside = make_record(w.root / "elsewhere", "cb-1788a", "20261101T120000Z", "PLANTED outside")
+        other = make_record(w.runs, "cb-1788b", "20261101T120000Z", "PLANTED other pod")
+        (w.cloud / "cb-1788a.json").write_text(json.dumps({"worker": "cb-1788a", "reports_to": "boss-lane"}))
+        (w.cloud / "cb-1788c.json").write_text(json.dumps({"worker": "cb-1788c", "reports_to": "boss-lane"}))
+        w.stop("cb-1788a", "idle", outside)
+        w.stop("cb-1788c", "idle", other)
+        w.scan()
+        got = w.to("boss-lane")
+        self.assertEqual(len([t for t in got if "last text not read: no_run_record" in t]), 2, got)
+        self.assertEqual(len([t for t in got if "PLANTED" in t]), 0, got)
+        for rec in (outside, other):
+            self.assertEqual(w.last(str(rec), "cb-1788a"), (None, "no run record"))
+        before = len(w.to("boss-lane"))
+        self.retire_path(w, outside)
+        self.retire_path(w, other)
+        later = w.to("boss-lane")[before:]
+        self.assertEqual(len([t for t in later if "last text not read: no_run_record" in t]), 2, later)
+        self.assertEqual(len([t for to, t in w.sent if "PLANTED" in t]), 0)
+
+
+class TestStopFinalMessageTwoRunsMutant(unittest.TestCase):
+    """S10: the S9 check on the control and on a mutant that reads the newest record of the name, each in a fresh process."""
+    CHILD = (
+        "import sys,unittest\n"
+        "sys.path.insert(0, %r)\n"
+        "import test_stop_final_message as t\n"
+        "if %r:\n"
+        "    r = t.sb.load_module('cloud_worker').bind(t.sb.__dict__)._retired()\n"
+        "    real = r.last_message\n"
+        "    r.last_message = lambda d, s, p, clock=None: real((r.retired_run(p) or ['', ''])[0], s, p, clock)\n"
+        "suite = unittest.defaultTestLoader.loadTestsFromName('test_stop_final_message.TestStopFinalMessageTwoRuns.test_S9_the_newer_run_without_a_record_never_sends_the_older_runs_text')\n"
+        "res = unittest.TextTestRunner(verbosity=0).run(suite)\n"
+        "sys.exit(0 if res.wasSuccessful() else 1)\n")
+
+    def run_child(self, mutant):
+        done = subprocess.run([sys.executable, "-c", self.CHILD % (str(CHECK_FILE.parent), mutant)], cwd=str(CHECK_FILE.parent),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=90)
+        return done.returncode, done.stdout
+
+    def test_S10_the_control_passes_and_the_mutant_fails_with_the_text_of_the_check(self):
+        code, out = self.run_child(False)
+        self.assertEqual(code, 0, out)
+        code, out = self.run_child(True)
+        self.assertEqual(code, 1, out)
+        self.assertIn("the older run's text was sent as the last message", out)
