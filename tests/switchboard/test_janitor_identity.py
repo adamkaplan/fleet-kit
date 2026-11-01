@@ -105,7 +105,7 @@ class JanitorIdentity(unittest.TestCase):
 
     def test_s3_mutant_the_old_three_tuple_fails_it(self):
         src = (REPO / "bin" / "disk_janitor.py").read_text()
-        new = "(info.st_dev, info.st_ino, newest, stat.S_IFMT(info.st_mode))"
+        new = "(info.st_dev, info.st_ino, newest, stat.S_IFMT(info.st_mode), info.st_size, target)"
         self.assertEqual(src.count(new), 1)
         scratch = Path(tempfile.mkdtemp(prefix="jid-mut-"))
         self.addCleanup(shutil.rmtree, str(scratch), True)
