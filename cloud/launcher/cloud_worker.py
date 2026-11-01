@@ -391,6 +391,15 @@ SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: reda
 MIN_FRAGMENT = 8
 
 
+POD_EVENTS_MAX, POD_EVENT_CHARS = 20, 200
+_ADDRESS_RE = re.compile(r"(?<![\w.-])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?![\w.-])|(?<![\w.-])[A-Za-z][A-Za-z0-9.-]*:\d{1,5}(?![\w.-])")
+
+
+def mask_addresses(text):
+    """An IPv4 address (with a port, if any) and a host name followed by a port become `[address]`; a node name (no port) is kept."""
+    return _ADDRESS_RE.sub("[address]", str(text))
+
+
 def scrub(text, secrets_known=(), limit=300):
     """THE one place kubectl output (and anything built from it) is made safe to show, log or audit: the exact values
     of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
