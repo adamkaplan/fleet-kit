@@ -1209,13 +1209,77 @@ def write_rotation_record(path, rec):
         raise
 
 
-def rotate_audit(path, now=None, dry_run=False, _before_swap=None):
+class _GaveUp(Exception):
+    """The audit file is no longer the one the rotation read: another rotation or a replacement came first."""
+
+
+def _audit_lock(path, how):
+    """The lock file beside the audit file (0600, no link followed, created when missing), flock'ed; None when it cannot be had (the append goes ahead)."""
+    try:
+        fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, how)
+    except OSError:
+        os.close(fd)
+        return None
+    return os.fdopen(fd, "rb", buffering=0)
+
+
+def _audit_unlock(lock):
+    if lock is not None:
+        lock.close()
+
+
+def _err_text(e):
+    return "%s errno=%s" % (type(e).__name__, getattr(e, "errno", None))
+
+
+def _complete_pending(path):
+    """A rotation that begun and whose record was not finished: under the exclusive lock, the replacement happened when the live file is smaller than old_size."""
+    if read_rotation_record(path)["pending"] is None:
+        return
+    lock = _audit_lock(path, fcntl.LOCK_EX)
+    try:
+        record = read_rotation_record(path)
+        pend = record["pending"]
+        if not isinstance(pend, dict):
+            if pend is not None:
+                write_rotation_record(path, dict(record, pending=None))
+            return
+        try:
+            swapped = os.path.getsize(path) < pend.get("old_size", 0)
+        except OSError:
+            swapped = False
+        if swapped:
+            write_rotation_record(path, {"done": record["done"] + 1, "pending": None,
+                                         "cuts": record["cuts"] + [{"cut": pend.get("cut", 0), "archive": pend.get("archive", "")}]})
+        else:
+            write_rotation_record(path, dict(record, pending=None))
+    finally:
+        _audit_unlock(lock)
+
+
+_ARCHIVE_NAME = re.compile(r"^audit-(\d{4}-\d{2}-\d{2})(T\d{6})?\.jsonl\.gz$")
+
+
+def rotate_audit(path, now=None, dry_run=False, _before_swap=None, _before_lock=None):
     """Rotate the audit file when it is over AUDIT_ROTATE_BYTES: every line older than the newest AUDIT_KEEP_BYTES goes to
-    audit-<UTC date>.jsonl.gz (a temporary file and a rename, 0600) and the live file is replaced by its newest lines (a temporary file
-    and a rename); archives older than AUDIT_ARCHIVE_DAYS are deleted. Returns a dict (archive, lines, bytes, kept, pruned) or None when
-    nothing is due. A failure before the swap leaves the old file whole, removes the temporary files and says so once. dry_run writes nothing."""
+    audit-<UTC date>.jsonl.gz (published by a hard link, never replaced) and the live file is replaced by its newest lines under the exclusive
+    lock (one read of the late bytes, one write, one rename); archives whose NAME carries a date older than AUDIT_ARCHIVE_DAYS are deleted.
+    Returns a dict (archive, lines, bytes, kept, pruned) or None when nothing is due. A failure before the swap leaves the old file whole,
+    removes the temporary files and says so once. dry_run writes nothing. _before_lock and _before_swap are hooks for the tests."""
     import gzip
     now = now or dt.datetime.now(dt.timezone.utc)
+    if os.path.islink(path):
+        print("cloud-worker: the audit path is a symbolic link; it is not rotated", file=sys.stderr)
+        return None
+    if not dry_run:
+        try:
+            _complete_pending(path)
+        except Exception as e:
+            print("cloud-worker: the audit rotation record could not be completed (%s)" % _err_text(e), file=sys.stderr)
     try:
         if os.path.getsize(path) <= AUDIT_ROTATE_BYTES:
             return None
@@ -1226,6 +1290,7 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None):
     pending = False
     try:
         with open(path, "rb") as f:
+            seen = os.fstat(f.fileno())
             data = f.read()
         pos = max(0, len(data) - AUDIT_KEEP_BYTES)
         cut = pos if pos == 0 or data[pos - 1:pos] == b"\n" else data.find(b"\n", pos) + 1
@@ -1233,39 +1298,64 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None):
             return None
         old = data[:cut]
         stamp = now.astimezone(dt.timezone.utc)
-        archive = os.path.join(directory, "audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%d"))
+        names = ["audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%d"), "audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%dT%H%M%S")]
+        archive = os.path.join(directory, names[0])
         if os.path.exists(archive):
-            archive = os.path.join(directory, "audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%dT%H%M%S"))
+            archive = os.path.join(directory, names[1])
         result = {"archive": os.path.basename(archive), "lines": old.count(b"\n"), "bytes": len(old), "kept": len(data) - cut, "pruned": 0}
         if dry_run:
             return result
-        gz_temp = archive + ".%d.tmp" % os.getpid()
+        gz_temp = os.path.join(directory, ".audit.%d.gz.tmp" % os.getpid())
         temps.append(gz_temp)
         with os.fdopen(os.open(gz_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as raw:
             with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0) as packed:
                 packed.write(old)
-        keep_temp = os.path.join(directory, ".audit.%d.tmp" % os.getpid())
-        temps.append(keep_temp)
-        with open(path, "rb") as f:
-            f.seek(len(data))
-            late = f.read()   # lines appended while the archive was written travel with the live part
-        with os.fdopen(os.open(keep_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as out:
-            out.write(data[cut:] + late)
-        os.rename(gz_temp, archive)
+        for name in names:   # a hard link fails when the name exists: an archive is never replaced
+            archive = os.path.join(directory, name)
+            try:
+                os.link(gz_temp, archive)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(0, "no free archive name")
         temps.append(archive)
+        result["archive"] = os.path.basename(archive)
+        os.unlink(gz_temp)
+        temps.remove(gz_temp)
         record = read_rotation_record(path)
-        write_rotation_record(path, dict(record, pending={"cut": cut, "old_size": len(data)}))   # the archive is written; the replacement follows
+        write_rotation_record(path, dict(record, pending={"cut": cut, "old_size": len(data), "archive": os.path.basename(archive)}))
         pending = True
-        if _before_swap:
-            _before_swap()
-        os.replace(keep_temp, path)
+        if _before_lock:
+            _before_lock()
+        keep_temp = os.path.join(directory, ".audit.%d.tmp" % os.getpid())
+        lock = _audit_lock(path, fcntl.LOCK_EX)
+        try:   # ONE short step: one read of the late bytes, one write, one rename of local files
+            with open(path, "rb") as f:
+                now_seen = os.fstat(f.fileno())
+                if (now_seen.st_dev, now_seen.st_ino) != (seen.st_dev, seen.st_ino) or now_seen.st_size < len(data):
+                    raise _GaveUp()
+                f.seek(len(data))
+                late = f.read()   # lines appended while the archive was written travel with the live part
+            temps.append(keep_temp)
+            with os.fdopen(os.open(keep_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as out:
+                out.write(data[cut:] + late)
+            if _before_swap:
+                _before_swap()
+            os.replace(keep_temp, path)
+        finally:
+            _audit_unlock(lock)
         temps[:] = []
         pending = False
-        try:   # done is incremented, the cut and its archive are appended, pending is cleared
-            write_rotation_record(path, {"done": record["done"] + 1, "pending": None,
-                                         "cuts": record["cuts"] + [{"cut": cut, "archive": os.path.basename(archive)}]})
-        except Exception as e:
-            print("cloud-worker: the audit rotation record could not be written (%s)" % type(e).__name__, file=sys.stderr)
+        for attempt in range(3):   # done is incremented, the cut and its archive are appended, pending is cleared
+            try:
+                record = read_rotation_record(path)
+                write_rotation_record(path, {"done": record["done"] + 1, "pending": None,
+                                             "cuts": record["cuts"] + [{"cut": cut, "archive": os.path.basename(archive)}]})
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print("cloud-worker: the audit rotation record could not be written (%s)" % _err_text(e), file=sys.stderr)
     except Exception as e:
         if pending:   # a failure before the replacement clears pending
             try:
@@ -1277,21 +1367,24 @@ def rotate_audit(path, now=None, dry_run=False, _before_swap=None):
                 os.unlink(t)
             except OSError:
                 pass
-        text = "%s: %s" % (type(e).__name__, e)
+        if isinstance(e, _GaveUp):
+            return None
+        text = _err_text(e)
         if _ROTATE_SAID.get(path) != text:
             _ROTATE_SAID[path] = text
             print("cloud-worker: the audit file could not be rotated (%s); it is kept whole" % text, file=sys.stderr)
         return None
     print("cloud-worker: the audit was rotated: %d lines (%d bytes) to %s; the live file keeps %d bytes" % (result["lines"], result["bytes"], result["archive"], result["kept"]),
           file=sys.stderr)
-    cutoff = stamp.timestamp() - AUDIT_ARCHIVE_DAYS * 86400
+    limit = stamp.date() - dt.timedelta(days=AUDIT_ARCHIVE_DAYS)
     for name in sorted(os.listdir(directory)):
-        if name.startswith("audit-") and name.endswith(".jsonl.gz"):
+        m = _ARCHIVE_NAME.match(name)
+        if m:
             try:
-                if os.lstat(os.path.join(directory, name)).st_mtime < cutoff:
+                if dt.date.fromisoformat(m.group(1)) < limit:
                     os.unlink(os.path.join(directory, name))
                     result["pruned"] += 1
-            except OSError:
+            except (OSError, ValueError):
                 pass
     return result
 

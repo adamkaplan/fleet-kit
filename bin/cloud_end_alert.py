@@ -304,6 +304,14 @@ def _valid_chain(value):
 _IN_ARCHIVE_PASS = []   # set while scan_audit reads a chunk of an archive through itself
 
 
+def _write_count(count_file, value):
+    """The count file by a temporary file and a rename (a reader that polls it never sees it empty)."""
+    temp = "%s.%d.tmp" % (count_file, os.getpid())
+    with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "w") as handle:
+        handle.write(json.dumps(value) + "\n")
+    os.replace(temp, count_file)
+
+
 def _follow_rotation(audit_file, state_file, cloud_dir, last_reports, send, parse, audit):
     """The audit's rotation rule (ask #1743): the unread archive lines of this pass go through scan_audit itself from a private temporary file, before the live
     file. None when the live file is to be read as always (its offset is translated first). The reader's count of applied rotations and its place in the chain
@@ -320,8 +328,7 @@ def _follow_rotation(audit_file, state_file, cloud_dir, last_reports, send, pars
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or not isinstance(keys, list):
         first = _rotation_record(path, parse, size)   # first sight: the current count is taken and nothing moves
         if first is not None:
-            with os.fdopen(os.open(count_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
-                handle.write(json.dumps({"applied": first[0], "chain": None}) + "\n")
+            _write_count(count_file, {"applied": first[0], "chain": None})
         return None
     mine = read_small(count_file, parse) or {}
     applied, chain = mine.get("applied"), mine.get("chain")
@@ -329,10 +336,7 @@ def _follow_rotation(audit_file, state_file, cloud_dir, last_reports, send, pars
         applied, chain = None, None
     new_offset, new_applied, new_chain, data, failed = _rotation_step(path, parse, size, offset, applied, chain, READ_BYTES)
     if (new_offset, new_applied, new_chain) != (offset, applied, chain):
-        temp = "%s.%d.tmp" % (count_file, os.getpid())
-        with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
-            handle.write(json.dumps({"applied": new_applied, "chain": new_chain}) + "\n")
-        os.replace(temp, count_file)
+        _write_count(count_file, {"applied": new_applied, "chain": new_chain})
         if new_offset != offset:
             save_state(state_file, new_offset, [(str(k[0]), str(k[1])) for k in keys if isinstance(k, list) and len(k) == 2])
     if failed:
