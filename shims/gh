@@ -798,7 +798,7 @@ def is_write(args):
             return False   # `gh --version`, `gh --help`
         if words[0] == "api":
             try:
-                return parse_api_argv(args[args.index("api"):]).effective_method != "GET"   # gh's own rule: an explicit last method, else POST with a field or --input
+                return api_parsed(args).effective_method != "GET"   # gh's own rule: an explicit last method, else POST with a field or --input
             except Refused:
                 return True   # an argv the parser refuses is a write: fail closed
         if words[:2] == ["auth", "git-credential"]:
@@ -913,7 +913,7 @@ def named_repos(args):
                 found.add("%s/%s" % m.groups())
     if words[:1] == ["api"]:
         try:
-            rest = ["api"] + [p for _i, p in parse_api_argv(args[args.index("api"):]).positionals]
+            rest = ["api"] + [p for _i, p in api_parsed(args).positionals]
         except Refused:
             rest = []   # an argv the parser refuses: len(rest) != 2 below, so it is refused whole
         path = re.sub(r"^https://api\.github\.com/", "", (rest[1] if len(rest) > 1 else "").split("?")[0].split("#")[0]).lstrip("/")
@@ -1387,6 +1387,18 @@ def parse_api_argv(args):
     if len(out.positionals) > 1:
         _api_refuse(out.positionals[1][1], "a second positional (gh api takes one endpoint)")
     return out
+
+
+def api_start(args):
+    words = command_word_positions(args)
+    return words[0][0] if words and words[0][1] == "api" else None
+
+
+def api_parsed(args):
+    at = api_start(args)
+    if at is None:
+        raise Refused("not a gh api call")
+    return parse_api_argv(args[at:])
 
 
 def api_parse(args):
@@ -2697,7 +2709,7 @@ def merge_route(args):
         return None
     rest = [a for i, a in enumerate(args) if i != words[0][0]]
     try:
-        parsed = parse_api_argv(args[words[0][0]:])
+        parsed = api_parsed(args)
     except Refused as err:
         return ("api-unknown", "the argv of that gh api call cannot be classified: %s" % _clean_reason(str(err), 100))   # the existing exit-10 refusal path
     method, write = parsed.method or "GET", bool(parsed.fields or parsed.input)
@@ -2846,7 +2858,7 @@ def hold_probe(args, lookup, gh, write):
     try:
         if command_words(args)[:1] == ["api"]:
             try:
-                parse_api_argv(args[args.index("api"):])
+                api_parsed(args)
             except Refused as err:
                 return str(err), None, None   # an argv the parser refuses is refused here too (read or write), one line
         module = load_hold()
