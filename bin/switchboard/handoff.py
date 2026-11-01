@@ -168,6 +168,10 @@ def cmd_comment(args, runner, now):
     if body is None:
         raise IntentError("usage", "--body-file is required (a file, or - for stdin)")
     caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    if getattr(args, "edit", None):
+        return cmd_comment_edit(args, engine, caller, body)
+    if args.issue is None or getattr(args, "approval", None):
+        raise IntentError("usage", "--issue is required (or --edit URL; --approval goes with --edit)")
     try:
         repo, number = resolve_for_sender(engine, config, args.issue, caller)
     except IssueRefError as err:
@@ -180,6 +184,27 @@ def cmd_comment(args, runner, now):
 
 cmd_comment.ensure_on_use = True   # the daemon is alive when it runs
 cmd_comment.header_cache = True    # #1520
+
+
+def cmd_comment_edit(args, engine, caller, body):
+    """`comment --edit URL`: the work is in the flat module bin/comment_edit.py (#1714); this maps its answers."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import comment_edit
+    try:
+        url, lapse = comment_edit.edit_in_place(engine.intents, caller, args.edit, body, getattr(args, "approval", None),
+                                                lambda: _audit_tail(engine.state_dir), lambda subject, detail: engine._external("github.comment", subject, detail),
+                                                fleet_mark, engine.intents.repo)
+    except comment_edit.CommentEditRefused as err:
+        sys.stderr.write("%s: comment --edit refused: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    except comment_edit.CommentEditFailed as err:
+        raise IntentError(err.kind, err.detail) from None
+    if lapse:
+        sys.stderr.write(lapse + "\n")
+    print(json.dumps({"author": caller, "comment": url, "edited": True}, sort_keys=True))
+    return EXIT_OK
 
 
 def cmd_whoami(args, runner, now):
