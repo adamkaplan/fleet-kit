@@ -902,23 +902,29 @@ class TestEventWait(unittest.TestCase):
         return len(lines)
 
     def test_s13_the_saturation_test_copy_that_ends_a_call_fails_with_its_event_log(self):
-        text, err, lines = self.s13_run()   # the CONTROL: the real test, unmutated, runs first
-        self.assertEqual((text, lines), (None, []), "the control failed or printed log lines:\n" + err)
+        ctext, cerr, clines = self.s13_run()   # the CONTROL: the real test, unmutated, runs first
+        control_passed = int(ctext is None)
+        control_lines = len(clines)
+        self.assertEqual((ctext, clines), (None, []), "the control failed or printed log lines:\n" + cerr)
         text, err, lines = self.s13_run(end_one=True)
         n = self.s13_check(text, lines)
+        early = int("a held relay call ended before all 16 were registered" in (text or ""))
+        guard_n = len([l for l in lines if "guard fired: " in l and "waits registered" in l])
         first = [l for l in lines if "end held call" in l][0]
-        print("S13: copy that ends a call fails with the early-end text 1 of 1, %d ordered event lines (>= 17), guard line with registered waits %d of 1, real test passes %d of 1 with %d log lines, the ended call: %s" % (n, 1, 1, 0, first.strip()))
+        print("S13: copy that ends a call fails with the early-end text %d of 1, %d ordered event lines (>= 17), guard line with registered waits %d of 1, real test passes %d of 1 with %d log lines, the ended call: %s" % (early, n, guard_n, control_passed, control_lines, first.strip()))
+        self.assertEqual((early, guard_n, control_passed, control_lines), (1, 1, 1, 0))
         self.assertGreaterEqual(n, 17)
         import textwrap, inspect
         src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__["test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"]))
         drop = r'sys.stderr.write("\n".join(elog[:]) + "\n"); shown[0] = len(elog)'
         self.assertEqual(src.count(drop), 1)
-        text, err, lines = self.s13_run(lambda s: s.replace(drop, "pass"), end_one=True)
-        self.assertNotEqual(src.replace(drop, "pass"), src)
+        mtext, merr, mlines = self.s13_run(lambda s: s.replace(drop, "pass"), end_one=True)
+        applied = src.replace(drop, "pass") != src
         with self.assertRaises(AssertionError) as cm:
-            self.s13_check(text, lines)
-        print("S13 mutant: the copy without the log lines fails the check with %r, mutation applied True" % str(cm.exception))
-        self.assertEqual(str(cm.exception), "the event log was not printed")
+            self.s13_check(mtext, mlines)
+        nolog = int(str(cm.exception) == "the event log was not printed")
+        print("S13 mutant: the copy without the log lines fails %d of 1 with %r, mutation applied %s" % (nolog, str(cm.exception), applied))
+        self.assertEqual((nolog, applied), (1, True))
 
     def test_s5_control_passes_and_existing_cap_mutant_is_caught(self):
         name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
