@@ -63,14 +63,13 @@ def approval_on(config, repo):
     return bool(setting and setting.get("enabled") and setting.get("mode") == "enforce" and "G0c" in (setting.get("enforce_gates") or ()))
 
 
-def approval_facts(facts, config, state, pr, source, plan):
-    """`facts` with the approval facts when the gate is on for this repo, else `facts` as it is (G0c stays untracked). The current hash is the plan's own (plan_check.plan_hash)."""
-    if not isinstance(facts, dict) or not approval_on(config, pr.rsplit("#", 1)[0]):
-        return facts
+def approval_fact(config, state, pr, source, plan):
+    """The approval fact (a dict) when the gate is on for this repo, else None (G0c stays untracked). The current hash is the plan's own (plan_check.plan_hash)."""
+    if not approval_on(config, pr.rsplit("#", 1)[0]):
+        return None
     issue = approval_issue(source, config)
     events = approval_events(state, issue, (plan or {}).get("plan_hash")) if issue and plan else ([] if issue is None else None)
-    approval = {"issue": issue, "events": events}
-    return dict(facts, approval=approval)
+    return {"issue": issue, "events": events}
 
 
 def approval_refusal(args, runner, now):
@@ -86,7 +85,7 @@ def approval_refusal(args, runner, now):
         return None
     try:
         ctx = _ledger_context(types.SimpleNamespace(pr=args.pr, plan=None, ask=None), runner, now, False)
-        facts = approval_facts(ctx.facts, ctx.config, ctx.state, ctx.pr, ctx.source, ctx.plan)
+        facts = dict(ctx.facts or {}, approval=approval_fact(ctx.config, ctx.state, ctx.pr, ctx.source, ctx.plan))
         status, said = plan_ledger.approval_state(facts["approval"]["events"], facts["approval"]["issue"], (ctx.plan or {}).get("plan_hash")) if facts.get("approval") else ("missing", "the plan could not be read")
     except Exception as err:
         return "merge of %s refused: the plan approval could not be judged (%s); the gate fails closed" % (args.pr, _one_line(str(err), 100))

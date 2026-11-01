@@ -16782,7 +16782,8 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False, plan_r
             plan = checked_plan(config, source, args.ask, runner, now)
         except (PlanInputError, ValueError, ConfigError, IntentError) as err:
             plan_problem = _one_line(str(err), 200)
-    facts = approval_facts(facts, config, state, pr, source, plan) if floor else facts   # #1735: G0c is tracked where the repo enforces it
+    if floor and (approval := approval_fact(config, state, pr, source, plan)):
+        facts["approval"] = approval   # #1735: G0c is tracked where the repo enforces it
     carries = carries_context(engine, config, repo, number, facts, body, entries, runner, now) if not writable else None
     if carries:
         facts["carries"] = carries
