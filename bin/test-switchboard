@@ -29272,6 +29272,8 @@ class LedgerBase(Base):
             "reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]}
         self.write_config(raw)
 
+    run_base = "t" * 40   # #1755: the base the fake's run list records; a test sets another to make the run stale
+
     def route(self, argv, **kwargs):
         if argv[0] != FAKE_GH:
             return self.world.route(argv, **kwargs)
@@ -29288,10 +29290,12 @@ class LedgerBase(Base):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan_issue), "")
         if "/actions/runs" in path:
             run = {"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
-                   "pull_requests": [{"number": n, "base": {"sha": "t" * 40}} for n in (9, 11)]}
+                   "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}
             return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [run]}), "")
         if "/git/ref/heads/" in path:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"object": {"sha": "t" * 40}}), "")
+        if "/compare/" in path and path.endswith("..." + "t" * 40):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ahead_by": 3}), "")
         return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
 
     terminal_problem = None   # what the owner-terminal check says in these tests (None: it is the owner's terminal)
@@ -39158,6 +39162,14 @@ class TestCiRecordPass(LedgerBase):
         self.assertEqual(self.verdicts(), [("acme/app#9", "S1", "switchboard", LEDGER_HEAD), ("acme/app#9", "U1", "switchboard", LEDGER_HEAD)])
         (event,) = self.events("gate.ci_record")
         self.assertEqual((event["detail"]["ok"], event["detail"]["recorded"]), (True, ["S1", "U1"]))
+
+    def test_a_stale_run_records_no_verdict_and_says_the_stale_line(self):   # #1755; the control is the test above (the default run_base is the tip: it records)
+        self.run_base = "s" * 40
+        self.go()
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
+        code, out, err = self.run_as("coder", "gates", "ci-record", self.PR)
+        self.assertIn("stale: 3 commits behind (CI ran on ssssssss, the tip is tttttttt): close and reopen the pull request for a fresh run", out + err, "ci-record says the stale line")
+        self.assertEqual(self.verdicts(), [], "ci-record records no verdict for a stale run")
 
     def test_a_pr_whose_checks_are_running_is_recorded_within_five_minutes_of_going_green(self):
         self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
@@ -78395,9 +78407,11 @@ class TestCiRecordCarry(LedgerBase):
                 body = {"status": "behind"}
             elif "/actions/runs" in path:
                 body = {"workflow_runs": [{"id": 1, "head_sha": self.pr["headRefOid"], "status": "completed", "conclusion": "success",
-                                           "pull_requests": [{"number": n, "base": {"sha": "t" * 40}} for n in (9, 11)]}]}
+                                           "pull_requests": [{"number": n, "base": {"sha": self.run_base}} for n in (9, 11)]}]}
             elif "/git/ref/heads/" in path:
                 body = {"object": {"sha": "t" * 40}}
+            elif path.endswith("..." + "t" * 40):
+                body = {"ahead_by": 3}
             else:
                 return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
