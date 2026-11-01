@@ -69,6 +69,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests" / "switc
 import importlib
 _support_rebind = importlib.import_module("support.rebind")   # support import
 rebound = _support_rebind.rebound   # support import
+_support_helper_fakes = importlib.import_module("support.helper_fakes")   # support import
+FakeSweepHub, LabelGh, MutantSpliceError, ReaperOnlyFakes = (_support_helper_fakes.FakeSweepHub, _support_helper_fakes.LabelGh, _support_helper_fakes.MutantSpliceError, _support_helper_fakes.ReaperOnlyFakes)   # support import
+_support_helper_fakes2 = importlib.import_module("support.helper_fakes2")   # support import
+AlreadyDecidedRefusal, EjectionHub, FakeOwnerlessHub, FakePullFiles, FakeQueueGh, LightProbe, OrdersReachTheJudgeWhole, OwnedInputs, PolicyCountingJev, RecFacts, StubHub, StubIssueHub, Unavailable = (_support_helper_fakes2.AlreadyDecidedRefusal, _support_helper_fakes2.EjectionHub, _support_helper_fakes2.FakeOwnerlessHub, _support_helper_fakes2.FakePullFiles, _support_helper_fakes2.FakeQueueGh, _support_helper_fakes2.LightProbe, _support_helper_fakes2.OrdersReachTheJudgeWhole, _support_helper_fakes2.OwnedInputs, _support_helper_fakes2.PolicyCountingJev, _support_helper_fakes2.RecFacts, _support_helper_fakes2.StubHub, _support_helper_fakes2.StubIssueHub, _support_helper_fakes2.Unavailable)   # support import
 _support_offline_fakes = importlib.import_module("support.offline_fakes")   # support import
 ClosingRunner, FakeGH, FakeV1, OfflineRun, apply_worker_step, control_play, run_scenario = (_support_offline_fakes.ClosingRunner, _support_offline_fakes.FakeGH, _support_offline_fakes.FakeV1, _support_offline_fakes.OfflineRun, _support_offline_fakes.apply_worker_step, _support_offline_fakes.control_play, _support_offline_fakes.run_scenario)   # support import
 _support_baseline_adapters = importlib.import_module("support.baseline_adapters")   # support import

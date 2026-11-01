@@ -2026,23 +2026,3 @@ class TestClosedUnmergedLastPr(unittest.TestCase):
         self.assertIn("S3", text)
         self.assertIn("--gates CU", text)
 
-
-class StubIssueHub:
-    """The hub as the closed-issue pass sees it: the events it holds, and a fresh read per issue (`reads`: number -> dict, or an exception)."""
-
-    def __init__(self, entries, reads):
-        self.entries, self.reads, self.read_log = entries, reads, []
-
-    def closed_issue_snapshot(self):
-        return {ref: dict(entry) for ref, entry in self.entries.items()}
-
-    def forget_awaiting(self, repo, number):
-        self.forgotten = getattr(self, "forgotten", []) + [(repo, number)]
-
-    def _read_one(self, repo, path, now, fresh=False):
-        number = int(path.rsplit("/", 1)[1])
-        self.read_log.append((repo, number, fresh))
-        found = self.reads[number]
-        if isinstance(found, Exception):
-            raise found
-        return dict(found)
