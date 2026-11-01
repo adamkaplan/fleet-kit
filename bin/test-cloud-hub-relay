@@ -667,8 +667,17 @@ class TestEventWait(unittest.TestCase):
         self.assertTrue(control and applied)
         self.assertNotEqual(mutant, (1, 1))
 
+    @staticmethod
+    def control_report(tracebacks, events):
+        """The text of a failed control: its full tracebacks, then its event log in order."""
+        return "the inner failure of the control:\n" + "".join(tracebacks) + "\nevent log (seconds from the start of the scenario):\n" + "\n".join("%9.3f %s" % (t, text) for t, text in events)
+
     def saturation(self, delay, hub_wait):
         """The saturation scenario of the pinned test with the LAST of the 16 relay calls delayed by `delay` seconds."""
+        self.events = []   # the event log of this scenario: (monotonic offset from its start, text); the test prints it only on failure
+        t0 = time.monotonic()
+        log = lambda text: self.events.append((time.monotonic() - t0, text))
+        log("scenario start")
         import socket
         saved = dict(SECRETS)
         self.addCleanup(lambda: (SECRETS.clear(), SECRETS.update(saved)))
@@ -694,31 +703,39 @@ class TestEventWait(unittest.TestCase):
                     time.sleep(0.01)
                 for t in threads:
                     t.join(10)
+                log("join: the 16 held call threads were joined")
                 stuck = [t for t in threads if t.is_alive()]
                 self.assertFalse(stuck, "%d held relay call threads did not end within 10 seconds" % len(stuck))
                 for h in list(handlers):   # the answers are delivered: the server's handler threads must end before the test ends
                     h.join(10)
+                log("join: the hub handler threads were joined")
                 live = [h.name for h in handlers if h.is_alive()]
                 self.assertFalse(live, "hub handler threads did not end within 10 seconds: %s" % live)
             self.addCleanup(release_all)
             ended = []   # (call index, kind, text) of every held call that ended
             n_of = lambda i, j: i * 4 + j
             def call(i, j, wait):
+                log("call %d start (delay %s)" % (n_of(i, j), wait))
                 time.sleep(wait)
+                log("call %d sent" % n_of(i, j))
                 try:
                     ended.append((n_of(i, j), "returned", "status %s" % (hub.held_call(who="pod-%d" % i, call_id="c%d" % j, pr="acme-org/r%d#1" % i)[0],)))
                 except BaseException as e:
                     ended.append((n_of(i, j), type(e).__name__, str(e)[:120]))
+                log("call %d end: %s" % (n_of(i, j), ended[-1][1:]))
             for n in range(16):
                 t = threading.Thread(target=call, args=(n // 4, n % 4, delay if n == 15 else 0)); t.start(); threads.append(t)
             def all_registered():
+                if time.monotonic() - t0 > 29.9: log("guard: the 30 s limit of the wait is reached")
                 if registered.wait(0.02):
                     return True
                 if not all(t.is_alive() for t in threads):
+                    log("guard: a held call ended before all were registered, the wait raises")
                     k = ended[0] if ended else None
                     raise AssertionError("a held relay call ended before all 16 were registered" + (": call %d ended: %s: %s" % k if k else ""))
                 return False
             TestBoundsAndCaps.wait_for(all_registered, 30.0)
+            log("wait: the condition ended the wait, all 16 registered (the delayed call registered last)")
             self.assertEqual(sum(hub.relay.waiting.values()), 16)
             socks = []
             for _ in range(hub.server.max_handlers):
@@ -746,6 +763,7 @@ class TestEventWait(unittest.TestCase):
         control = TestEventWait("test_s3_last_call_delayed_three_seconds_still_registers_16")
         res = unittest.TestResult(); control.run(res)
         control_ok = res.wasSuccessful()
+        self.assertTrue(control_ok, self.control_report([tb for _, tb in res.failures + res.errors], getattr(control, "events", [])))
         mutant_case = TestEventWait("test_s3_last_call_delayed_three_seconds_still_registers_16")
         mutant_text = None
         try:
@@ -763,7 +781,26 @@ class TestEventWait(unittest.TestCase):
         import inspect, textwrap
         name = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
 
+        import traceback
+        events, failures, t0 = [], [], time.monotonic()   # the event log of the scenario run by `run`, kept by this test
+        log = lambda text: events.append((time.monotonic() - t0, text))
+
         def run(case, meth, remove_admit):
+            events.clear(); failures.clear(); log("scenario start (no delayed call in this scenario)")
+            real_held, real_wait = Hub.held_call, TestBoundsAndCaps.__dict__["wait_for"]
+            def held(self_, *a, **kw):
+                n = kw.get("who", "?") + "/" + kw.get("call_id", "?")
+                log("held call %s start" % n)
+                try:
+                    return real_held(self_, *a, **kw)
+                finally:
+                    log("held call %s end" % n)
+            def waited(cond, limit=10.0):
+                try:
+                    real_wait.__func__(cond, limit); log("wait: the condition ended the wait")
+                except AssertionError:
+                    log("guard: the wait limit of %s s ended the wait, it raised" % limit); raise
+            Hub.held_call = held; TestBoundsAndCaps.wait_for = staticmethod(waited)
             old = cloud_relay.Relay.admit
             if remove_admit:
                 cloud_relay.Relay.admit = lambda self: True
@@ -771,16 +808,20 @@ class TestEventWait(unittest.TestCase):
                 meth()
                 return None
             except BaseException as e:   # the kind and text of the failure
+                failures.append("".join(traceback.format_exception(type(e), e, e.__traceback__)))
                 return e
             finally:
                 cloud_relay.Relay.admit = old
                 case.doCleanups()
+                log("join: the cleanups of the case ran (the handler threads are joined)")
+                Hub.held_call = real_held; TestBoundsAndCaps.wait_for = real_wait
         case = TestBoundsAndCaps(name)
         e1 = run(case, getattr(case, name), True)
         m_over = int(isinstance(e1, AssertionError) and "over-admitted" in str(e1))
         m_timeout = int(isinstance(e1, TimeoutError) or (e1 is not None and "timed out" in str(e1)))
         case = TestBoundsAndCaps(name)
         control = int(run(case, getattr(case, name), False) is None)
+        self.assertEqual(control, 1, self.control_report(failures, events))
         src = textwrap.dedent(inspect.getsource(TestBoundsAndCaps.__dict__[name]))
         self.assertEqual(src.count("over.set()"), 1)
         self.assertEqual(src.count("30.0"), 1)
@@ -904,7 +945,73 @@ class TestHeldCallSource(unittest.TestCase):
         print("S10: the failing control is reported with its traceback %d of 1, the copy with the outer text only fails the check %d of 1 (the inner failure was not reported), mutation applied %s" % (reported, mut_caught, applied))
         self.assertEqual((reported, mut_caught, applied), (1, 1, True))
         res = unittest.TestResult(); TestEventWait(name).run(res)   # the real control passes
-        self.assertTrue(res.wasSuccessful(), "the inner failure was not reported" if False else "".join(tb for _, tb in res.failures + res.errors))
+        self.assertTrue(res.wasSuccessful(), "".join(tb for _, tb in res.failures + res.errors))
+
+    def test_s11_the_controls_of_s3_and_s7_report_their_inner_failure_and_an_event_log(self):
+        import contextlib, inspect, re, textwrap
+        marker = "INNERMARK-s11-by-construction"
+        ev_line = re.compile(r"^\s*\d+\.\d{3} \S", re.M)   # one event line: a monotonic offset, then its text
+        s3 = "test_s3_mutant_bound_held_wait_fails_with_the_early_end_text"
+        s7 = "test_s7_over_admission_is_seen_as_an_event_and_a_dead_observation_falls_to_the_guard"
+        sat = "test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive"
+        real_sat = TestBoundsAndCaps.__dict__[sat]
+        real_scen = TestEventWait.__dict__["saturation"]
+
+        def run(name, code, fail):
+            ns = dict(globals())
+            exec(compile(code, "<s11>", "exec"), ns)
+            case = TestEventWait(name)
+            if fail:   # a control that fails by construction: the real scenario runs, then raises the marker
+                def boom_sat(self_):
+                    real_sat(self_)
+                    raise AssertionError(marker)
+                def boom_scen(self_, delay, hub_wait):
+                    real_scen(self_, 0.2, None)
+                    raise AssertionError(marker)
+                TestBoundsAndCaps.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive = boom_sat
+                TestEventWait.saturation = boom_scen
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out):
+                    ns[name](case)
+                return None, out.getvalue()
+            except AssertionError as e:
+                return str(e), out.getvalue()
+            finally:
+                TestBoundsAndCaps.test_real_constants_held_plus_slow_bodies_daemon_and_channel_alive = real_sat
+                TestEventWait.saturation = real_scen
+                case.doCleanups()
+
+        def check(text):   # the check of this scenario: the report of a failing control holds the inner failure and the log
+            if text is None or marker not in text or "Traceback" not in text:
+                raise AssertionError("the inner failure was not reported")
+            if len(ev_line.findall(text)) < 3:
+                raise AssertionError("the event log was not printed")
+            return len(ev_line.findall(text))
+
+        def verdict(name, code):
+            try:
+                return check(run(name, code, True)[0]), None
+            except AssertionError as e:
+                return None, str(e)
+        results = []
+        for name, line, outer, drop_from, drop_to in (
+                (s3, "self.assertTrue(control_ok, self.control_report([tb for _, tb in res.failures + res.errors], getattr(control, \"events\", [])))", "self.assertTrue(control_ok)", "getattr(control, \"events\", [])", "[]"),
+                (s7, "self.assertEqual(control, 1, self.control_report(failures, events))", "self.assertEqual(control, 1)", "self.control_report(failures, events)", "self.control_report(failures, [])")):
+            src = textwrap.dedent(inspect.getsource(TestEventWait.__dict__[name]))
+            self.assertEqual(src.count(line), 1)
+            self.assertEqual(src.count(drop_from), 1)
+            m_outer, m_drop = src.replace(line, outer), src.replace(line, line.replace(drop_from, drop_to))
+            applied = m_outer != src and m_drop != src and m_outer != m_drop
+            n_events, control_err = verdict(name, src)   # the unmutated test is the CONTROL, first
+            passed_text, passed_out = run(name, src, False)
+            _, outer_err = verdict(name, m_outer)
+            _, drop_err = verdict(name, m_drop)
+            results.append((name[:7], n_events or 0, int(passed_text is None), len(ev_line.findall(passed_out)), int(outer_err == "the inner failure was not reported"), int(drop_err == "the event log was not printed"), applied))
+        for r in results:
+            print("S11 %s: failing control reported with its traceback and %d ordered event lines, real control passes %d of 1 and prints %d log lines, copy with the outer text only fails %d of 1 (the inner failure was not reported), copy without the log fails %d of 1 (the event log was not printed), mutations applied %s" % r)
+        self.assertEqual([(r[2], r[3], r[4], r[5], r[6]) for r in results], [(1, 0, 1, 1, True)] * 2)
+        self.assertTrue(all(r[1] >= 3 for r in results))
 
 
 class TestHostileBodies(unittest.TestCase):
