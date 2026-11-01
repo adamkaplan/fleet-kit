@@ -34,7 +34,7 @@ def stamp(seconds):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
 
 
-class World:
+class AlarmWorld:
     """A state directory, the launcher's audit file, a fake send and the clock."""
 
     def __init__(self, module, bosses=None, lane=None):
@@ -76,7 +76,7 @@ class World:
 
 
 def s16(module):
-    w = World(module, {"worker-1": "lane-a"})
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
     try:
         w.line(T0 - 5, "worker-1", False, "kubectl get: You must be logged in to the server (Unauthorized)")
         first = len(w.tick())
@@ -91,7 +91,7 @@ def s16(module):
 
 
 def s17(module):
-    w = World(module, {"worker-1": "lane-a"})
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
     try:
         for minute in (0, 10, 20):
             w.line(T0 + minute * 60, "worker-1", False, "kubectl get: Unauthorized")
@@ -113,7 +113,7 @@ def s17(module):
 
 def s18(module):
     workers = {"worker-%d" % i: "coder-%d" % i for i in range(1, 10)}
-    w = World(module, workers)
+    w = AlarmWorld(module, workers)
     try:
         for i, name in enumerate(sorted(workers)):
             w.line(T0 + i, name, False, "kubectl get: You must be logged in to the server (Unauthorized)")
@@ -129,7 +129,7 @@ def s18(module):
 
 
 def s19(module):
-    w = World(module, {"worker-1": "lane-a"})
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
     try:
         w.line(T0, "worker-1", False, "Unauthorized " + PLANT, detail=PLANT, note="token " + PLANT)
         saw = []
@@ -149,7 +149,7 @@ def s19(module):
 
 
 def s16b(module):
-    w = World(module, {"worker-1": "lane-a"})
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
     try:
         original = module._write_state
 
@@ -163,7 +163,7 @@ def s16b(module):
         print("S16b: passes 5, alarms per recipient with a failing state write %d" % max(counts))
         assert counts == [1, 1], counts
         # a send that raises for the second recipient: the first is not repeated on the next pass
-        w2 = World(module, {"worker-1": "lane-a"})
+        w2 = AlarmWorld(module, {"worker-1": "lane-a"})
         module._write_state = original
         try:
             w2.line(T0 - 60, "worker-1", False, "other")
@@ -183,7 +183,7 @@ def s16b(module):
         finally:
             w2.close()
         # a lane recipient on hold is skipped like the boss
-        w3 = World(module, {"worker-1": "lane-a"})
+        w3 = AlarmWorld(module, {"worker-1": "lane-a"})
         try:
             w3.line(T0 - 60, "worker-1", False, "held")
             module.tick(w3.engine, types.SimpleNamespace(agents=w3.agents), w3.send, lambda seen: "hold" if seen.name == "cos-1" else None, lambda worker: w3.bosses.get(worker), "cos-1", env=w3.env)
@@ -196,8 +196,8 @@ def s16b(module):
 
 
 def s16d(module):
-    w = World(module, {"worker-9": "lane-a", "worker-8": "lane-a"})
-    w2 = World(module, {"worker-7": "lane-a"})
+    w = AlarmWorld(module, {"worker-9": "lane-a", "worker-8": "lane-a"})
+    w2 = AlarmWorld(module, {"worker-7": "lane-a"})
     try:
         w.line(T0 + 7200, "worker-9", False, "clock jump")
         w.line(T0 - 10, "worker-8", False, "real failure")
@@ -217,7 +217,7 @@ def s16d(module):
 
 
 def s16e(module):
-    w = World(module, {"worker-1": "lane-a"})
+    w = AlarmWorld(module, {"worker-1": "lane-a"})
     try:
         def failing(path, state):
             raise TypeError("not serialisable")
@@ -285,7 +285,7 @@ class TestCloudRenewalAlarm(unittest.TestCase):
         self.assertLessEqual(len(m.scrub("word " * 100)), 160)
 
     def test_a_missing_audit_file_sends_nothing_and_raises_nothing(self):
-        w = World(self.module)
+        w = AlarmWorld(self.module)
         try:
             self.assertEqual(w.tick(), [])
             self.assertFalse(os.path.exists(os.path.join(w.dir, self.module.STATE_FILE)))
@@ -293,7 +293,7 @@ class TestCloudRenewalAlarm(unittest.TestCase):
             w.close()
 
     def test_a_bad_line_and_an_old_failure_are_skipped(self):
-        w = World(self.module)
+        w = AlarmWorld(self.module)
         try:
             with open(w.audit_file, "w") as handle:
                 handle.write("not json\n[1]\n")
@@ -315,7 +315,7 @@ class TestCloudRenewalAlarm(unittest.TestCase):
         for bad in ("lane-a", [1], ["a b"], ["a"] * 21, None):
             with self.assertRaises(ValueError):
                 m.validate(bad, "x")
-        w = World(self.module, {"worker-1": "lane-a"}, lane=["coder-1", "lane-a"])
+        w = AlarmWorld(self.module, {"worker-1": "lane-a"}, lane=["coder-1", "lane-a"])
         try:
             w.agents["coder-1"] = types.SimpleNamespace(name="coder-1", session_id="c", status="idle", fleet={"role": "coder"})
             w.line(T0, "worker-1", False, "r")
