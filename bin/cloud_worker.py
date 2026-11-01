@@ -1262,6 +1262,24 @@ def cmd_retire(args, runner, now, record):
 # ---------------------------------------------------------------- cloud-clear: the records whose pod is gone
 
 @refusals
+def _read_stopped_run(name, record, err, state, runner, now):
+    """`read NAME` after the tunnel failed (#1750): when the cluster snapshot proves the record's pod gone, the saved last text of the newest run record
+    (a run the reaper stopped); otherwise the original tunnel error, with one clause saying why the record was not used. ONE read-only cluster call."""
+    if not _pod_known(record):
+        raise CloudError("%s (the run record was not used: the pod of the record cannot be told)" % err) from None
+    try:
+        with Cluster(timeout=SNAPSHOT_SECONDS) as cluster:
+            snapshot = _cluster_snapshot(runner, cluster, SNAPSHOT_SECONDS)
+    except CloudError:
+        raise CloudError("%s (the run record was not used: the cluster could not be read)" % err) from None
+    if _pod_of(record, snapshot) is not None:
+        raise CloudError("%s (the run record was not used: the pod is still there)" % err) from None
+    retired = _retired().retired_run(name)
+    if retired is None:
+        raise H["LaunchError"]("no run record exists for %s: its pod is gone" % name)
+    return _retired().read_run_record(name, retired, state, runner, now, record=record)
+
+
 def cmd_cloud_clear(args, runner, now):
     """`cloud-clear [--dry-run]`: every cloud worker record whose pod is gone AND whose hard deadline has passed is removed (the record and its
     password file), and every one it removes is named. A record with a pod, or one not past its deadline, is never touched. It refuses when the
