@@ -32,9 +32,12 @@ STOP:       <holds and exclusions — what you must not touch>
 NEXT:       <the next deliverable and who owns it>
 AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
+NEEDS:      <only if the work needs docker: write the line `NEEDS: docker`; `launch --cloud` then refuses a pod without --stack>
 ```
 
 A pull request for an ask, or for a work item with a live check, says `Refs #N`, never `Closes`, `Fixes` or `Resolves`; `Closes #N` only where the plan says so.
+
+A brief for a change that adds a file under `bin/` carries the output of `tools/new-module-demands bin/x.py` (the guard classes, the matrix entries, the units row, the closure state): the tool informs, the guards decide.
 
 Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line.
 
@@ -53,7 +56,11 @@ The mistakes that cost the most review rounds and the most lost work. Meet them 
 - (i) Compare failure messages, not only test names, between the branch and a clean tree, and keep new strings and comments clear of the added-lines scans (`TestGitShim` in `bin/test-switchboard` and `TestEverySite` in `cloud/launcher/tests/test_stub_cleanup.py`): no literal ampersand, `nohup` or spawn text, no git-config variable names, no renamed import to pass a scan.
 - (j) Push the first version by minute 20, run slow suites afterwards in the background with a timeout, and say which git version the tests ran on: tests that depend on git behaviour are verified on a recent git.
 
+**A cloud builder never runs the whole bin/test-switchboard** or any suite over about 10 minutes in its pod: CI runs it on the merged head (45 to 55 minutes on a runner), and a pod is slower; in the briefs the fleet writes, the pod's hard limit is 50 minutes (the launcher's own default is longer). It runs the named classes singly, each under about 100 seconds, and keeps itself active with short foreground commands, because a long background run is not activity and an idle pod is stopped. It pushes its work branch after every commit, and sends its final message the minute the class list is done and stops. Item (j) and the paragraph on focused local runs are for a local worker and are not changed.
+
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
+
+A coder brief says: durable helper scripts go in the agent's own scratch directory (once #948 provides it), until then in a named directory under the switchboard's state area that no janitor lists (e.g. `~/.local/state/fleet-switchboard/scratch/<agent>`); the shared temporary directory is for one session's scratch only (the OS clears it at boot and files unread for 3 days).
 
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
 The pull request body answers each item of it in one line. A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of what changes, what it touches, what is irreversible and the risk.
@@ -68,6 +75,8 @@ bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only
 **Name the suites that exercise your change.** Before offering a head, and in every brief you write for a coder, run `fleet-switchboard heavy --changed --list` and put its list (the header `suites that exercise your change`) in the brief; run those suites with `fleet-switchboard heavy --changed` (on a local merge of the current base) before offering the head. A change is never offered on the classes its diff happens to name while another suite runs the same code. A path the list says no suite exercises is said so in the pull request.
 
 **Local runs are focused by default.** Run the focused classes of what you changed through `heavy --short`; CI runs the whole suite. Run the whole suite only for a change to the CI workflow itself or to a test CI cannot run; say which in the pull request. The heavy wrapper refuses a second full-suite job in a worktree while one is queued or running.
+
+**A change that adds a committed file under `bin/` runs one command before the first push:** `fleet-switchboard preflight-pr` (with or without `--merged`) runs the one table of the classes that read the set of `bin/` files (`NEW_BIN_GUARDS` in `bin/path_suites.py`), one PASS or FAIL line each.
 
 A change that deletes something or raises an alert is checked against three lines before its first push:
 

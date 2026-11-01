@@ -152,6 +152,8 @@ The child sees only:
 
 `CW_GITHUB_API_BASE`, `CW_PREFLIGHT_TOKEN_CMD`, `CW_GIT_TOKEN_CMD`, proxy variables, `GH_`/`GITHUB_` token variables, `HOME` and `PATH` set in your shell are ignored by `launch --cloud` and `run-task`: nothing in the environment can point the check at another host, and your `HOME`, `PATH` and `PYTHON*` cannot run code inside it. The token route's own settings (`CW_APP_*_CMD`, `CW_OPENSSL`, `AZURE_CONFIG_DIR`) are trusted operator configuration: they are run or read as given.
 
+**The cap on shape M per lane (ask #1640).** A lane may hold at most 4 shape-M cloud workers at once (`MAX_M_PER_LANE` in `bin/cloud_worker.py`), because a lane's batch of 4-CPU pods once filled the cluster and left every other lane's launches unplaceable. The refusal reads: `refused: lane LANE already holds 4 shape-M cloud workers (A, B, C, D): retire one (retire NAME) or launch a smaller shape (--shape S)`; it exits 2 before any token, launcher or cluster call. The count reads the record directory alone: a record counts while it exists, holds the shape M and its hard deadline has not passed (the lane is its `reports-to` boss, or `(no boss)`); a retire or a clear ends it. A launch of another shape, of a name that already has a record, or of a lane below the cap is unchanged. Limits: a launch still in flight has no record yet; two launches of one lane at the same moment can pass together; records written before this change hold no shape and are not counted.
+
 ## 2b. The vault access check
 
 The vault only answers machines on its firewall's list. When a vault read is **refused for that reason** (and only then), `launch --cloud`
@@ -196,7 +198,9 @@ fleet-switchboard retire coder7
 
 ### The light shape (`XS`) and the other shapes
 
-A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), the light shape and the default (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB) and `M` (4 CPU, 8 GiB) are chosen only by name: `--shape S`. A worker gets `XS` and an orchestrator (`--agent orchestrator`) gets `S` when `--shape` is not given.
+A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), the light shape and the default (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB) and `M` (4 CPU, 8 GiB) are chosen only by name: `--shape S`. A worker gets `XS` and an orchestrator (`--agent orchestrator`) gets `O` when `--shape` is not given.
+
+The orchestrator row is `O` (250m CPU, 768 MiB, 0.02 USD/hour), a list-price estimate (requests equal limits, no nested Docker). The one rule that chooses it: an orchestrator launch with no `--shape` takes `O`; an explicit `--shape S` (or `XS` or `M`) still wins; a worker launch and a stack launch are unchanged. `--shape O` is meant for an orchestrator: a worker on it has 250m and 768 MiB and is likely to be killed for memory. Cost per day of one always-on orchestrator: 24 x 0.02 = 0.48 USD a day (a list-price estimate, not a billed figure; the node's own price is not included).
 
 - Belongs in `XS`: a reader (code reading and review), a planner, a tester running short tests, a small edit and commit.
 - Does not belong in `XS`: a nested Docker stack (`--stack` refuses `XS`), an image build, a long full test suite or a build with a large memory peak: name `--shape S` or `M` for those.
@@ -281,11 +285,11 @@ Do not use plain `--uninstall` (or `--uninstall --no-service`) for that: on a fu
 
 The settings of the service: when your own settings file (`~/.config/fleet-switchboard/cloud.env`) exists, the service carries none of the keys that file holds — the file is then the only source of them, and a key set differently in the file and in the service makes every start of the reaper refuse. Without that file the service copies the non-secret `CW_*` settings of the shell that runs the install, as `--with-cloud-reaper` always did.
 
-## 4c. The cloud hub (cloud/k8s/cloud-hub.yaml)
+## 4c. The cloud hub (cloud/k8s/cloud-hub.yaml): the live hub, namespace `cw`
 
 Cause: the hub (the channel server) exists as code, but nothing started it in the cluster, and the launcher's per-pod registration writes to a registry Secret that did not exist. One file now defines, in the `cw` namespace only: Deployment `cloud-hub` (one replica), Service `cloud-hub` (ClusterIP, 8443), the headless Service `cw-agents` (selector `app=cw-worker`, port 4096, publishes not-ready addresses: pods register a name under this Service, `http://<pod name>.cw-agents.cw.svc.cluster.local:4096`, so the hub can reach them) and Secrets `cloud-hub-registry` (keys `secrets.json` and `agents.json`, each `{}`, mounted read-only at `/etc/hub`) and `cloud-hub-pw` (empty: the launcher adds one key per agent name later; mounted read-only at `/etc/hub/pw`, so an agent's `password_file` is `/etc/hub/pw/<name>`; nested under the Secret mount: this works on the cluster's runtime; if a runtime refuses it use `/etc/hub-pw` and `/etc/hub-pw/<name>`). The container command is `python3 /usr/local/bin/cloud_hub.py` (`cloud/worker/Dockerfile` copies the hub and its modules to `/usr/local/bin`; the manifest, these docs and the test use that real path). The environment is exactly `FLEET_CLOUD_CHANNEL_LISTEN`, `FLEET_CLOUD_HUB_AGENTS`, `FLEET_CLOUD_HUB_SECRETS` (its presence selects the secrets mode), `FLEET_CLOUD_HUB_DECISIONS` and `FLEET_CLOUD_AGENT_NAMESPACE` (value `cw`, the namespace of agent accounts; required, the hub stops at start without it). The container runs non-root (uid 1000, fsGroup 1000, seccomp RuntimeDefault, CPU limit 500m) with a read-only root filesystem; Secret volumes use defaultMode 0440 (JSON form 288: not world readable; 0400 would leave root-owned files unreadable to uid 1000, so group read plus fsGroup); only `/var/hub` and `/tmp` (emptyDirs) are writable. Every object carries the label `app.kubernetes.io/part-of=cloud-hub`. The names live in `cloud/launcher/hub_registry.py` and a test compares them with the manifest.
 
-Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_CLOUD_IMAGE` (a `name@sha256:...` reference; the file holds no real digest). The substituted value must carry `@sha256:` (a digest, never a floating tag). The pod runs only from an image built from the Dockerfile that holds the hub files.
+Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_CLOUD_IMAGE` (a `name@sha256:...` reference; the file holds no real digest). The substituted value must carry `@sha256:` (a digest, never a floating tag). The pod runs only from an image built from the Dockerfile that holds the hub files. This hand substitution is for the namespace `cw` only; the render of another namespace takes the hub's image from `CW_HUB_IMAGE` (Step 1 of the relay probe) and refuses without it.
 
 - Order in the file: Secrets, Services, Deployment.
 - Network boundary: the network boundary of the hub (which pods may reach it, which hosts it may reach) is enforced by the namespace's network policies, which are written in a separate manifest file under ask #1256 (cloud/k8s/cloud-hub-network.yaml); until that file is merged the policies exist only as applied in the cluster.
@@ -312,7 +316,7 @@ Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_
 
 State: the decisions file is on an emptyDir at `/var/hub`; it is lost when the pod restarts. Tests (offline, no cluster): `python3 cloud/launcher/tests/test_cloud_hub_manifest.py`.
 
-## 4d. The namespace's network policies
+## 4d. The namespace's network policies (the live hub, namespace `cw`)
 
 Cause: an independent read of the hub's manifest set found no network policy in the repository, while the cluster carried six applied by hand. None was in a file. They are now in `cloud/k8s/cloud-hub-network.yaml`, exactly as applied (a test fails when a rule is widened). The six policies:
 
@@ -326,6 +330,139 @@ Cause: an independent read of the hub's manifest set found no network policy in 
 Apply: run a server dry run first, `kubectl -n cw apply --dry-run=server -f cloud/k8s/cloud-hub-network.yaml` (all six should report unchanged), then apply the whole file in the order of its documents. Apply the allow policies before the default deny; a default deny applied first would cut every pod off. First check afterwards: a worker pod can still resolve names and the hub answers its health path.
 
 Roll back: `kubectl -n cw delete networkpolicy -l app.kubernetes.io/part-of=cloud-hub` removes the four hub policies; `kubectl -n cw delete networkpolicy allow-egress default-deny` removes the two namespace-wide ones. Deleting default-deny without allow-egress, or the reverse, changes the whole namespace's reachability.
+
+## A probe namespace
+
+Cause: the four manifest files `cloud/k8s/cloud-hub.yaml`, `cloud-hub-network.yaml`, `operator-rbac.yaml` and `cw-minter.yaml` name the namespace `cw` as a literal in 21 places (plus the hub's agent namespace value and four example commands in comments), and the hub's agent namespace (`FLEET_CLOUD_AGENT_NAMESPACE`) is one value of its environment. A second namespace, with its own hub, was therefore a hand edit. One script now renders the four files for another namespace:
+
+`cloud/k8s/render-namespace NAMESPACE_NAME` prints the documents on standard output with the namespace of every namespaced document and the hub's agent namespace value replaced. It reads only those four files, writes no file, makes no cluster call and opens no network connection. NAMESPACE_NAME must be a DNS label that is not `default` and does not start with `kube-` (the launcher's own rule); anything else gives one line on standard error, nothing on standard output and exit status 2. The names inside the namespace (`cw-operator`, `cw-worker`, `cw-minter`, `cw-agents`, `cloud-hub`, the pull secret `cw-pull`) are kept. The render for `cw` is byte-equal to the files after the 5-line header. The header of the output names the cluster-wide documents (kinds RuntimeClass, ClusterRole and ClusterRoleBinding: none are in these four files) and says that `runtimeclass.yaml` and `containerd-fix.yaml` are not rendered because they are already present, once per cluster.
+
+The steps, in order (the namespace `cwp` is the example):
+
+1. Step 1, render: `CW_HUB_IMAGE=REFERENCE cloud/k8s/render-namespace cwp > cwp.yaml`. Read the header and the file. REFERENCE is the settings' hub image reference, a `name@sha256:<64 hex>` value; the render refuses (exit status 2, nothing printed) without it, and the file to apply must not hold `IMAGE_DIGEST` as the image (the check chained in front of `kc create` in the apply block counts the image lines that still hold it and must print 0; the manifest's own comment line names the placeholder and stays).
+2. Step 2, the server-side dry run FIRST: `kc apply --dry-run=server -f cwp.yaml` (`kc`, defined in the first block below, adds `-n "${NS:?}"`, so kubectl refuses a document that names another namespace). Read the whole output: every object must say `created (server dry run)` and nothing may be an error. The namespace must exist for the dry run to pass, so the administrator creates the namespace first (the first command of the command list for the administrator apply below), then runs this dry run, then creates the objects (step 3).
+3. Step 3, the apply: the owner's step, done by the holder of the ADMINISTRATOR login. A pod, the launcher's own account and this change can never do it. The manifests do not create the namespace; the administrator creates it and then creates the objects (the hub file asks for `create`, never a second `apply`, because applying it again resets the registry Secret to empty objects). The command list for the administrator apply is below.
+4. Step 4, the secrets in the namespace: the owner's step. The pull secret named by `CW_PULL_SECRET` (the manifests use the name `cw-pull`), the hub's registry Secret `cloud-hub-registry` and its password Secret `cloud-hub-pw`. The apply of step 3 creates the last two as empty objects: check they exist and create them only when they are missing.
+5. Step 5, the private settings: a COPY of the settings file (never the live file), in its own directory, with four settings changed: `CW_CLOUD_NAMESPACE=cwp`, `CW_HUB_CHANNEL_URL=http://cloud-hub.cwp.svc:8443/message`, `CW_PULL_SECRET=cw-pull` (the name of the pull secret of step 4) and `CW_CLOUD_TOKEN_FILE`, the cluster token file of the namespace's OWN launcher account (`cw-operator` of the probe namespace; a token of the live namespace does not work there). The first three are lines of the copy; `CW_CLOUD_TOKEN_FILE` is set in the shell that runs the launch, as for the reaper. Point the launch at the copy with `XDG_CONFIG_HOME=PROBE_CONFIG_DIR`, where the copy is `PROBE_CONFIG_DIR/fleet-switchboard/cloud.env` (mode 0600).
+6. Step 6, the smoke launch: `launch --cloud` with the private copy, ONE worker, then retire it: `XDG_CONFIG_HOME=PROBE_CONFIG_DIR fleet-switchboard launch probe1 --cloud --agent coder --repo acme-org/widget-service --branch main --role coder --reports-to orch --brief-file BRIEF_FILE`, read it, then `XDG_CONFIG_HOME=PROBE_CONFIG_DIR fleet-switchboard retire probe1`.
+
+The blocks below are read as pasted, line by line, into an interactive shell by the holder of the administrator login. A failed check in such a shell stops only that one command, so the check is CHAINED on the command line itself. The first block defines two functions and sets the namespace ONCE (`NS=cwp`). `ns_ok` only REPORTS: it prints a line and returns non-zero when `NS` is empty, `cw` (the live namespace), `default`, `kube-*`, or not a DNS label (an allow-list beside the deny-list: lowercase letters, digits and `-` only, starting and ending with a letter or digit, so a space, an uppercase letter, a dot, a slash or a leading `-` is refused, and a value longer than 63 characters is refused by the length test at the end of the function), and never closes the shell. `kc() { ns_ok && kubectl -n "${NS:?}" "$@"; }` is the one way every namespaced `kubectl` call of this section is made: when `ns_ok` fails, `kubectl` is not started. The two cluster-scoped lines (`create namespace` and `delete namespace`) are written `ns_ok && kubectl ...`. So a refused `NS` (empty, `cw`, `default`, `kube-*`) runs NOTHING: every call is chained to the check. The only other `kubectl` words are `kubectl config current-context` (a read of your own login) and the read of the pull copy, which names `-n "${SRC:?}"` and only reads. The live namespace `cw` is never written on any command line below. Every block after the first one starts with the comment `needs the first block (NS, ns_ok, kc)`: a block pasted in a NEW terminal, where the functions are not defined, fails closed (`kc: command not found`): every call fails and nothing runs. Before the first apply, read `kubectl config current-context` and check it is the cluster you mean: no command here names a `--context`, so the current one is used. WORD_IN_CAPITALS names are placeholders to fill in, never values to paste into a PR.
+
+Paste the blocks into bash or zsh (not dash: there `[^...]` is not a negation).
+
+The command list for the administrator apply (the owner's steps 3 and 4):
+
+```text
+ns_ok() { case "$NS" in ""|cw|default|kube-*|*[^abcdefghijklmnopqrstuvwxyz0123456789-]*) echo "refused: NS is $NS" >&2; return 1;; esac; case "$NS" in [a-z0-9]|[a-z0-9]*[a-z0-9]) ;; *) echo "refused: NS is $NS" >&2; return 1;; esac; [ "${#NS}" -le 63 ] || { echo "refused: NS is longer than 63 characters" >&2; return 1; }; }
+kc() { ns_ok && kubectl -n "${NS:?}" "$@"; }
+NS=cwp
+kubectl config current-context
+ns_ok && kubectl create namespace "${NS:?}"
+kc apply --dry-run=server -f cwp.yaml
+[ "$(grep -c '"image": "IMAGE_DIGEST"' cwp.yaml)" = 0 ] && kc create -f cwp.yaml
+kc get secret cloud-hub-registry cloud-hub-pw
+( set -C; umask 077; kc create token cw-operator --duration=DURATION > TOKEN_FILE )
+```
+
+Only if `get` reports missing (the apply above makes both objects, so these two lines fail with AlreadyExists when pasted after it):
+
+```text
+# needs the first block (NS, ns_ok, kc)
+kc create secret generic cloud-hub-registry --from-literal=secrets.json={} --from-literal=agents.json={}
+kc create secret generic cloud-hub-pw
+```
+
+The pull secret copy (a lost `SRC` fails the read (`${SRC:?}`), so the write `kc create -f -` receives empty input and creates nothing; read only on the source side: SOURCE_NAMESPACE is read with `get` and nothing else, and `-n cw` is never written on any other line). The two namespaces are two variables, so the source and the target are never 30 characters apart in one line; `managedFields` and the identity fields are stripped:
+
+```text
+# needs the first block (NS, ns_ok, kc)
+SRC=SOURCE_NAMESPACE
+[ "$SRC" != "$NS" ] && ns_ok && kubectl -n "${SRC:?}" get secret PULL_SECRET_NAME -o json | python3 -c 'import json, sys; d = json.load(sys.stdin); [d["metadata"].pop(k, None) for k in ("namespace", "uid", "resourceVersion", "creationTimestamp", "ownerReferences", "managedFields")]; json.dump(d, sys.stdout)' | kc create -f -
+```
+
+The order after the apply: run the `get secret` line first. The apply creates the two registry Secrets (`cloud-hub-registry` and `cloud-hub-pw`) empty: they exist from the apply and are EDITED, not created; a `create secret generic` on them can fail with AlreadyExists. Run the `create secret generic` command ONLY for a Secret the `get` reports missing. The pull secret is never in the manifests: it is always created by hand.
+
+The two `create secret generic` lines (their own block, headed `Only if get reports missing`) are for a Secret the `get` reports missing. `create secret generic cloud-hub-pw` with no data is accepted by kubectl as far as its reference and source show (the generic create has no rule that asks for a `--from-*` option, and the manifest itself holds this Secret empty); it was not run here. The pull secret block copies the existing pull secret of the live namespace (`SOURCE_NAMESPACE`) by its own name into the probe namespace: the value goes through a pipe and is never printed and never on a command line (the shell history and the process list). Copying the live namespace's pull entry into the probe namespace gives the probe namespace the SAME registry pull value: an administrator step on the same registry, with no new access to the registry for anyone else (the probe namespace holds the same pull value; the registry itself is not widened). The alternative, when no such secret exists, is `kc create secret generic PULL_SECRET_NAME --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson=DOCKER_CONFIG_FILE`, with `DOCKER_CONFIG_FILE` made under `umask 077` by its holder. The token line of the first block writes the token of the namespace's launcher account straight to the token file of step 5 (mode 0600, made in a subshell with `umask 077` and noclobber), so the value never reaches the terminal; never paste it anywhere else. The token file is never overwritten (a second run needs the first removed). If the command was refused, remove the empty token file before running it again: `rm -f "${TOKEN_FILE:?}"` (the redirect makes the empty 0600 file before `kc` runs, and a rerun then fails under noclobber).
+
+Cost: a probe namespace adds one more hub pod and its Services (`cloud-hub` and the headless `cw-agents`) to the cluster while the namespace exists, plus the pods of the smoke launch while they run.
+
+Teardown (the owner's step; also the administrator's login):
+
+```text
+# needs the first block (NS, ns_ok, kc)
+NS=cwp
+echo "will delete: namespace $NS, context $(kubectl config current-context)"
+kc delete rolebinding cw-minter
+kc delete secret cw-minter-token
+ns_ok && kubectl delete namespace "${NS:?}"
+rm -f TOKEN_FILE
+PROBE_CONFIG_DIR=PROBE_CONFIG_DIR_PATH
+echo "will remove: $PROBE_CONFIG_DIR"
+case "$PROBE_CONFIG_DIR" in ""|/|"$HOME"|"$HOME"/) echo "refused: PROBE_CONFIG_DIR is $PROBE_CONFIG_DIR" >&2 ;; *) rm -rf "${PROBE_CONFIG_DIR:?}" ;; esac
+rm -f cwp.yaml
+rm -f PROBE_TOKEN_FILE
+rm -f PROBE_DIGEST_FILE
+```
+
+Set `NS` to the probe namespace again; in a new shell paste the first block first (it defines `ns_ok` and `kc`). A filled-in `cw`, `default`, `kube-*` or an empty `NS` is reported by `ns_ok` and every delete line is chained to it, so the live namespace is never deleted by this list. Read the line that prints the namespace and the context before the delete lines run. The settings directory is removed only when it is not empty text, `/` or `$HOME`; the path is printed first. `PROBE_CONFIG_DIR_PATH` is the probe's own settings directory, never a parent of it. Deleting the namespace removes everything inside it (the hub, its Services, the Secrets, the network policies and the accounts): the render makes no cluster-scoped objects, so deleting the namespace removes everything it created. The first two lines remove the minter binding and its token Secret before that; the token file and the private settings copy are removed from the machine last.
+
+### A relay probe
+
+A relay probe runs the hub's relay with a daemon of its own against the PROBE hub. The administrator's part takes about 20 minutes (the namespace, the apply, the secrets, R1 and the R2 edit). Three steps, in this order, each marked with who does it. `$NS` (set in the first block above) is the probe namespace; no value of a credential is ever written in a pull request or a log.
+
+R1. Who: the administrator. Set the hub's daemon name on the PROBE hub with one command:
+
+```text
+# needs the first block (NS, ns_ok, kc)
+kc set env deployment/cloud-hub FLEET_CLOUD_HUB_DAEMON=relay-probe
+```
+
+The name must not be a reserved name: the hub refuses to start (a ValueError, nothing bound) when `FLEET_CLOUD_HUB_DAEMON` names one. The hub's reserved names, as `RESERVED` in `bin/cloud_hub.py` holds them, are:
+
+Reserved names: `admin`, `captain`, `fleet-switchboard`, `hub`, `switchboard`.
+
+The command changes the Deployment, so the hub rolls its pod. Wait for it with `kc rollout status deployment/cloud-hub`. The render does NOT set the daemon name (the render of the namespace `cw` stays byte-equal to the manifests after the 5-line header): this command is the only place it is set.
+
+R2. Who: the holder of the probe credential (not the administrator, not a pod, not the launcher). The holder makes a NEW random token on the machine that will run the probe daemon, writing it straight to a new file with mode 0600, so it is never printed to a terminal or a log, then computes its SHA-256 digest into a second file and hands ONLY THE DIGEST to the administrator:
+
+```text
+( umask 077; set -C
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > PROBE_TOKEN_FILE
+python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1]).read().strip().encode()).hexdigest())' PROBE_TOKEN_FILE > PROBE_DIGEST_FILE )
+```
+
+The subshell leaves the holder's shell unchanged, and `set -C` (noclobber) makes a redirect onto an existing file fail: an existing probe file is never overwritten (a second run needs the first file removed by its holder). The same holds for the digest file.
+
+The administrator adds the digest as the one entry for `relay-probe` in the `secrets.json` key of the PROBE hub's registry Secret `cloud-hub-registry`, by an in-place edit that keeps every other entry. The hub reads `secrets.json` as one JSON object `{"AGENT_NAME": "sha256 hex of the secret"}` (the key `agents.json` is not touched: the daemon is not a pod). Read it, edit it, patch it back, with the working copy made in a subshell under `umask 077` (mode 0600 from the first byte); the read, edit and patch of the registry Secret is not atomic: one administrator at a time.
+
+```text
+# needs the first block (NS, ns_ok, kc)
+( umask 077 ; set -e ; trap 'rm -f secrets.json registry-patch.json' EXIT
+kc get secret cloud-hub-registry -o jsonpath='{.data.secrets\.json}' | base64 -d > secrets.json
+python3 -c 'import json; d = json.load(open("secrets.json")); d["relay-probe"] = open("PROBE_DIGEST_FILE").read().strip(); json.dump(d, open("secrets.json", "w"))'
+python3 -c 'import json; json.dump({"stringData": {"secrets.json": open("secrets.json").read()}}, open("registry-patch.json", "w"))'
+kc patch secret cloud-hub-registry --type merge --patch-file registry-patch.json
+)
+ls secrets.json registry-patch.json
+```
+
+The trap of the subshell removes both working files when the subshell ends, whether a step failed or not (`set -e` stops it at the first failure). The last line is the stated check: both names must answer `No such file`; if either is listed, remove it (`rm -f`) before anything else, because it holds registry digests.
+
+The patch is read from a file (`registry-patch.json`, built in the same subshell, mode 0600, removed by the trap), so the registry JSON (the digests) is never on a command line and never in the process list.
+
+With nothing else registered the file then reads:
+
+```text
+{"relay-probe": "DIGEST_VALUE"}
+```
+
+The token itself is never given to the administrator and never leaves its file; it is used against the probe hub only, and the teardown above removes the token file and the digest file.
+
+R3. Who: the launcher's caller, after the probe pods launch. Each pod's hub entry needs (a) the session and (b) the repository and issue.
+
+(a) The session: the launch writes it with the launcher's hub-session verb; by hand the command line is `cloud/launcher/cloud-worker hub-session WORKER_NAME --session SESSION_ID`.
+
+(b) The repository and issue: until the hub-entry repository and issue change (ask #1475, pull request #1491, branch cw/hub-entry-repo-issue) is in the tree the probe launcher runs from, either include that branch in the probe launcher tree (recommended), or make the entry edit by hand ONLY with the Chief of Staff's word.
 
 ## 5. Known gaps
 
@@ -412,3 +549,9 @@ Cause: in a cloud pod the full preflight of the pre-push command (`bin/cloud-pr-
 - quick mode (`bin/cloud-pr-preflight --quick`, and the default of `bin/cloud-prepush`): only the test files that read a changed file plus the named scans of `bin/cloud_quick.py` (each a file and one selector, run through the same test code CI runs). Same three sections and exit codes. Time measured (a builder's measurement in a pod, not a CI figure): 194 seconds on a six-file change for both sides. The match is on the basename, so a doc change can select many files; a change no check reads exits 1 with `NOT RUN: no check reads <files>`; a memory-heavy test is skipped and counts as could not run. The scan table is in `cloud/README.md`. A quick run that selects nothing for a non-empty change fails, never clean.
 - `CLOUD_PREPUSH_PREFLIGHT=full` asks `bin/cloud-prepush` for the full mode; `quick` (the default) is printed as `preflight mode: quick`; any other value is refused with exit 2. Continuous integration stays the full check.
 <!-- preflight-modes:end -->
+
+**Token roles.** The mint takes a role (`app_token.py OWNER/REPO --role ROLE`, default `worker`; an unknown role is refused before any network call) from one table of permission sets, `PERMISSIONS_BY_ROLE` in `cloud/launcher/app_token.py`. The worker role asks for, and accepts, exactly `contents: write, pull_requests: write, issues: read, metadata: read`. The orchestrator role asks for, and accepts, exactly `issues: write, pull_requests: read, checks: read, metadata: read` (no `contents` key at all). A launch with `--agent orchestrator` mints under the orchestrator role and records it on the pod as the annotation `cw/role: orchestrator` (a worker pod carries no annotation: its spec is unchanged); the reaper's renewal mints under the role the annotation names, and a pod made before the annotation renews as a worker. A custom mint command (`CW_GIT_TOKEN_CMD`) ignores the role, so the guarantee that an orchestrator never holds contents write holds only for the default mint command. An orchestrator pod made before this change has no role annotation and renews as a worker until it ends, so it is relaunched to take the narrower set. The orchestrator pod holds no App key, App id, vault setting or mint command.
+
+The App already holds checks: read (the owner confirmed it on 29 October), so the orchestrator set needs no App change today; if a later set needs a permission the App lacks, the owner adds it and accepts it on each installation, never this change.
+
+**What the orchestrator's token can and cannot do.** It can read issues, pull requests, check results and repository metadata, and it can write to issues only. It cannot push, create a branch, read a file, open, edit, approve or merge a pull request, change a workflow, a setting, a secret or a ruleset, or mint a token.
