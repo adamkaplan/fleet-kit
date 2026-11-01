@@ -2539,6 +2539,8 @@ class Launcher:
     def _note_vanished_pods(self, pods, now):
         """A worker this launcher created (a `create` line in the audit's last 24 hours, read from its last 2 MB) with no later stop or delete line,
         whose pod is absent from this pass's snapshot: ONE stop line, cause pod_gone. The next pass sees that line and writes nothing."""
+        if not self._beat():
+            return
         try:
             with open(self.audit_path, "rb") as f:
                 f.seek(0, os.SEEK_END)
@@ -2587,6 +2589,8 @@ class Launcher:
         exact name through the launcher's own delete, with ONE audit line. A kept Secret: its pod is listed (or that name plus `-0`, a persistent
         orchestrator's pod; this branch has no workload list, so that rule alone stands in for the workload), a Secret younger than the time, any
         Secret without the launcher's label (the hub's). An unreadable list deletes nothing and is said once. No value is ever read."""
+        if not self._beat():
+            return []
         if not hasattr(self.kube, "list_secrets"):
             return []   # a cluster object that cannot list Secrets (an earlier test's fake): the step does not run; the real Kube always can
         try:
