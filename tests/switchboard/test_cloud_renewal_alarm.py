@@ -209,8 +209,8 @@ def s16d(module):
         w2.line(T0 + 240, "worker-7", False, "slightly ahead")
         w2.tick()
         within = len(w2.to("cos-1"))
-        assert within == 1, w2.messages
-        print("S16d: future-dated lines ignored 1, real failures alarmed %d of 1, within-slack lines handled %d" % (alarmed, within))
+        assert within == 0, w2.messages
+        print("S16d: future-dated lines ignored 1, real failures alarmed %d of 1, a line ahead of the clock handled before its time %d" % (alarmed, within))
     finally:
         w.close()
         w2.close()
