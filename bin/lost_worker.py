@@ -140,7 +140,7 @@ def _rotation_record(path, parse, size):
         if not isinstance(pend, dict) or any(isinstance(pend.get(k), bool) or not isinstance(pend.get(k), int) or pend.get(k) < 0 for k in ("cut", "old_size")):
             return None
         if size < pend["old_size"]:   # the replacement has happened: one more rotation
-            return done + 1, entries + [(pend["cut"], None)]
+            return done + 1, entries + [(pend["cut"], pend.get("archive"))]
     return done, entries
 
 

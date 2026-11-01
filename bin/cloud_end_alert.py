@@ -187,7 +187,7 @@ def _rotation_record(path, parse, size):
         if not isinstance(pending, dict) or any(isinstance(pending.get(k), bool) or not isinstance(pending.get(k), int) or pending.get(k) < 0 for k in ("cut", "old_size")):
             return None
         if size < pending["old_size"]:   # the replacement has happened: one more rotation
-            return done + 1, entries + [(pending["cut"], None)]
+            return done + 1, entries + [(pending["cut"], pending.get("archive"))]
     return done, entries
 
 
