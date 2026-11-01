@@ -686,8 +686,8 @@ def reminder_bound(config, item):
 def late_reminder_counts(state_dir, config, now):
     """#1728: {lane: reminders delivered LATER than their bound in the last 24 hours}, from the audit lines. Each `reminder.add` (id, `at`, recipient)
     is paired with the FIRST `v2.synthetic` line whose keys hold `reminder:<id>`; delivery minus `at` is compared with `reminder_bound`."""
-    import json
     from datetime import datetime
+    parse = load_module("record_json").parse_bounded
     def epoch(text):
         try:
             return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
@@ -695,14 +695,22 @@ def late_reminder_counts(state_dir, config, now):
             return None
     added, delivered, counts = {}, {}, {}
     try:
-        with open(str(state_dir) + "/audit.jsonl", encoding="utf-8", errors="replace") as handle:
-            lines = handle.read().splitlines()
+        cap = 8 * 1024 * 1024   # only a bounded TAIL of the audit is ever read
+        with open(str(state_dir) + "/audit.jsonl", "rb") as handle:
+            size = handle.seek(0, 2)
+            handle.seek(max(0, size - cap))
+            data = handle.read(cap)
+            if size > cap:
+                data = data.partition(b"\n")[2]   # drop the first partial line
+        lines = data.decode("utf-8", errors="replace").splitlines()
     except OSError:
         return counts
     for line in lines:
         try:
-            entry = json.loads(line)
+            entry = parse(line)
         except ValueError:
+            continue
+        if not isinstance(entry, dict):
             continue
         detail = entry.get("detail") if isinstance(entry, dict) and isinstance(entry.get("detail"), dict) else {}
         if entry.get("event") == "reminder.add" and detail.get("id") is not None:

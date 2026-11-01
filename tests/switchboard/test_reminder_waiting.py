@@ -160,6 +160,17 @@ def build(PR4Base):
             holds = [e for e in self.lines() if e["detail"]["reason"].startswith("hold:") and "s-long" in e["detail"]["reason"]]
             self.assertEqual(len(holds), 1)
 
+        def test_s7b_a_line_past_the_parse_bound_is_skipped_not_a_crash(self):
+            import json, tempfile
+            base = 1_800_000_000
+            rows = [json.dumps({"ts": sb.iso(base), "event": "reminder.add", "subject": "lane-a", "detail": {"id": "r1", "at": sb.iso(base)}}),
+                    "[" * 5000 + "]" * 5000,
+                    json.dumps({"ts": sb.iso(base + 1500), "event": "v2.synthetic", "subject": "lane-a", "detail": {"keys": ["reminder:r1"]}})]
+            with tempfile.TemporaryDirectory() as tmp:
+                with open(tmp + "/audit.jsonl", "w") as handle:
+                    handle.write("\n".join(rows) + "\n")
+                self.assertEqual(sb.late_reminder_counts(tmp, {}, base + 3600), {"lane-a": 1})
+
         def test_s7_status_counts_per_lane_the_reminders_delivered_later_than_their_bound(self):
             import json, tempfile
             base = 1_800_000_000
