@@ -778,23 +778,6 @@ class TestFleetHooksSource(unittest.TestCase):
                 self.assertIsNone(pattern.search(line), "%s:%d %s" % (path.name, number, line))
 
 
-class FakeV1:
-    """The OpenCode v1 binary as the import sees it: it answers `export <id>` from
-    a table of exports and refuses to be asked anything else, so a test fails if
-    the command ever runs v1 for another purpose."""
-
-    def __init__(self, exports=None):
-        self.exports = {i: json.dumps(e) for i, e in (exports or {}).items()}
-        self.calls = []
-
-    def __call__(self, argv, **kwargs):
-        argv = list(argv)
-        self.calls.append(argv)
-        if len(argv) != 3 or argv[:2] != [FAKE_V1, "export"]:
-            raise AssertionError("v1 may only be asked `export <id>`; got %r" % argv)
-        if argv[2] not in self.exports:
-            return subprocess.CompletedProcess(argv, 1, "", "Session not found: %s\n" % argv[2])
-        return subprocess.CompletedProcess(argv, 0, self.exports[argv[2]], "")
 
 
 class TestImportOrder(unittest.TestCase):

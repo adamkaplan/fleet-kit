@@ -54,18 +54,6 @@ from support.scenario_roles import JEV_REPLAY
 from support.wire_fakes import FAKE_OPENCODE, SES, herdr_typing_violations
 
 
-class ClosingRunner:
-    """herdr's runner that closes a pane the moment the engine reads it with
-    `agent get`: the pane closes between the decision and the delivery."""
-
-    def __init__(self, herdr, pane):
-        self.herdr, self.pane, self.fired = herdr, pane, False
-
-    def __call__(self, argv, **kwargs):
-        if list(argv[1:3]) == ["agent", "get"] and argv[3:4] == [self.pane] and not self.fired:
-            self.fired = True
-            del self.herdr.panes[self.pane]
-        return self.herdr(argv, **kwargs)
 
 
 class TestV2ClientPR4(Base):
