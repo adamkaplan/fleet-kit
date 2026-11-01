@@ -284,8 +284,8 @@ class S5Pass(unittest.TestCase):
     def test_the_pass_reads_no_record_at_50_or_at_5000_and_the_listing_copy_fails(self):
         a, b = check_pass(real)   # the control, first
         self.assertEqual((a, b), ((0, 0), (0, 0)))
-        mut = mutant(os.path.join(LAUNCHER, "cloud_worker.py"), "        pods = self.kube.list_pods()\n        self.daily_maintenance(pods, now)\n",
-                     "        pods = self.kube.list_pods()\n        os.listdir(self.recorder.root(None))\n        self.daily_maintenance(pods, now)\n", "cw_mut5")
+        mut = mutant(os.path.join(LAUNCHER, "cloud_worker.py"), "        pods = self.kube.list_pods()\n        # The renewal is the FIRST step",
+                     "        pods = self.kube.list_pods()\n        os.listdir(self.recorder.root(None))\n        # The renewal is the FIRST step", "cw_mut5")
         with self.assertRaises(AssertionError) as cm:
             check_pass(mut)
         self.assertIn("the pass read the records", str(cm.exception))
@@ -356,6 +356,36 @@ class S24KeepDays(unittest.TestCase):
         self.assertIn("a value below 1 drained the history", str(cm.exception))
         say("S24 the 10-day record kept with 0 (%s) and -5 (%s), removed with 1 (kept %s); control passes 1 of 1; the max(days, 1) copy fails 1 of 1 with `a value below 1 drained the history`; mutation applied"
             % (kept["0"], kept["-5"], kept["1"]))
+
+
+def pass_order(mod):
+    """One pass of the fake world of S5 with the maintenance due; the names of the calls, in order."""
+    with tempfile.TemporaryDirectory() as tmp:
+        lau, root = launcher(mod, tmp)
+        os.makedirs(root)
+        make_record(root, run_id("w0", 0), 45, 1)
+        calls = []
+        r, m = lau.renew_git_tokens, lau.daily_maintenance
+        lau.renew_git_tokens = lambda *a, **k: (calls.append("renewal"), r(*a, **k))[1]
+        lau.daily_maintenance = lambda *a, **k: (calls.append("maintenance"), m(*a, **k))[1]
+        with contextlib.redirect_stderr(io.StringIO()):
+            lau.reap()
+    if calls != ["renewal", "maintenance"]:
+        raise AssertionError("the maintenance ran before the renewal: %s" % calls)
+    return calls
+
+
+class S27Order(unittest.TestCase):
+    def test_the_renewal_is_recorded_before_the_maintenance_and_the_copy_fails(self):
+        calls = pass_order(real)   # the control, first
+        self.assertEqual(calls, ["renewal", "maintenance"])
+        src = os.path.join(LAUNCHER, "cloud_worker.py")
+        mut = mutant(src, "        renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)\n        self.daily_maintenance(pods, now)\n",
+                     "        self.daily_maintenance(pods, now)\n        renewed = self.renew_git_tokens(self._before_hard_limit(pods, now), now)\n", "cw_mut27")
+        with self.assertRaises(AssertionError) as cm:
+            pass_order(mut)
+        self.assertIn("the maintenance ran before the renewal", str(cm.exception))
+        say("S27 recorded %s in 1 of 1 passes; control passes 1 of 1; the copy fails 1 of 1 with `%s`; mutation applied" % (calls, str(cm.exception)))
 
 
 if __name__ == "__main__":
