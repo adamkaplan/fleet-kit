@@ -8,8 +8,8 @@ import sys
 import tempfile
 import unittest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SUPPORT = os.path.join(HERE, "support")
+GUARD_DIR = os.path.dirname(os.path.abspath(__file__))
+SUPPORT = os.path.join(GUARD_DIR, "support")
 
 # Each entry: (file, name, reader). A re-exported name that another file reads. Empty now.
 EXCEPTIONS = []
