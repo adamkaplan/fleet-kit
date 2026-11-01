@@ -88,6 +88,8 @@ def read_tail(path):
     return found
 
 
+ALARMED_KEEP = 64   # the pod and time of the last 64 alarmed lines: a line read a second time (cursor clamped to the clock) is not alarmed again
+
 _MEMORY = {}   # state path -> state that could not be written: the fallback that keeps a failing write from repeating an alarm
 
 
@@ -100,10 +102,11 @@ def _read_state(path):
     except (OSError, ValueError):
         state = None
     if not isinstance(state, dict) or not isinstance(state.get("pods"), dict):
-        return {"cursor": None, "edge": [], "pods": {}}
+        return {"cursor": None, "edge": [], "alarmed": [], "pods": {}}
     cursor = state.get("cursor")
     return {"cursor": cursor if isinstance(cursor, (int, float)) and not isinstance(cursor, bool) else None,
             "edge": [e for e in state.get("edge", []) if isinstance(e, str)] if isinstance(state.get("edge"), list) else [],
+            "alarmed": [a for a in state.get("alarmed", []) if isinstance(a, list) and len(a) == 2 and isinstance(a[0], str) and isinstance(a[1], (int, float)) and not isinstance(a[1], bool)][-ALARMED_KEEP:] if isinstance(state.get("alarmed"), list) else [],
             "pods": {k: v for k, v in state["pods"].items() if isinstance(v, (int, float)) and not isinstance(v, bool)}}
 
 
@@ -153,10 +156,16 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
     now = engine.now()
     state_path = os.path.join(str(engine.state_dir), STATE_FILE)
     state = _read_state(state_path)
+    cursor, edge = state["cursor"], set(state["edge"])
+    clamped = cursor is not None and cursor > now
+    if clamped:   # a cursor later than the clock (the clock stepped back) is clamped to the clock at the start of every tick
+        cursor, edge = now, set()
+        state["cursor"], state["edge"] = now, []
     lines = [l for l in read_tail(audit_path(env)) if l[0] <= now + FUTURE_SLACK_SECONDS]
     if not lines:
+        if clamped:
+            _persist(state_path, state)
         return []
-    cursor, edge = state["cursor"], set(state["edge"])
     fresh = []
     for line in lines:
         sig = "%s|%s|%s" % (line[1], line[3], line[4])
@@ -164,16 +173,19 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
             continue
         fresh.append(line)
     if not fresh:
+        if clamped:
+            _persist(state_path, state)
         return []
     newest = max(l[0] for l in fresh)
     state["edge"] = sorted(({"%s|%s|%s" % (l[1], l[3], l[4]) for l in fresh if l[0] == newest}) | (edge if cursor == newest else set()))
     state["cursor"] = newest
+    alarmed = set((a[0], a[1]) for a in state["alarmed"])
     failed = {}   # pod -> (seconds, worker, reason) of its newest failure in this tick, after the last success
     for at, pod, worker, ok, reason in sorted(fresh, key=lambda l: l[0]):
         if ok:
             state["pods"].pop(pod, None)
             failed.pop(pod, None)
-        elif now - at <= MAX_AGE:
+        elif now - at <= MAX_AGE and (pod, at) not in alarmed:
             failed[pod] = (at, worker, reason)
     alarms = {}
     for pod, (at, worker, reason) in sorted(failed.items()):
@@ -181,18 +193,20 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
         if last is not None and 0 <= at - last < SERIES_SECONDS:
             continue
         state["pods"][pod] = at
+        state["alarmed"].append([pod, at])
         alarms[pod] = (worker, reason)
+    state["alarmed"] = state["alarmed"][-ALARMED_KEEP:]
     if len(state["pods"]) > POD_POOL:
         state["pods"] = dict(sorted(state["pods"].items(), key=lambda kv: kv[1])[-POD_POOL:])
     # AT LEAST ONCE: the sends come first and the state after them (in `finally`, so a send that raises still records the recipients told).
     # A crash between the send and the write repeats one round at the next start. A write that fails is kept in memory (_MEMORY).
+    by_reason = {}
+    told = {}
     sent = []
     try:
         lane = [n for n in _lane(engine.config, discovery, default_lane) if not hold_reason(discovery.agents[n])]
-        by_reason = {}
         for pod, (worker, reason) in alarms.items():
             by_reason.setdefault(reason, []).append(pod)
-        told = {}
 
         def tell(to, text, subject, reason):
             item = send(engine.state_dir, to, now, now, text, KIND, subject, reason, first=True)
@@ -217,9 +231,14 @@ def tick(engine, discovery, send, hold_reason, boss_of, default_lane, env=None):
                     len(names), reason or "no reason given", ", ".join(names[:NAMES_MAX]), ", and %d more" % (len(names) - NAMES_MAX) if len(names) > NAMES_MAX else "")
                 for to in lane:
                     tell(to, text, "group:" + names[0], reason)
+    except Exception:
+        pass   # nothing raises into the daemon pass; the entry and the state are still written below
     finally:
         _persist(state_path, state)
-    if engine.audit is not None:
-        for pod, (worker, reason) in sorted(alarms.items()):
-            engine.audit.append(engine.actor, EVENT, pod, {"told": sorted(set(told.get(pod, []))), "reason": reason, "group": len(by_reason[reason])})
+        try:   # the audit entry is in the same finally as the state, so a send that raises still leaves it
+            if engine.audit is not None:
+                for pod, (worker, reason) in sorted(alarms.items()):
+                    engine.audit.append(engine.actor, EVENT, pod, {"told": sorted(set(told.get(pod, []))), "reason": reason, "group": len(by_reason.get(reason, [pod]))})
+        except Exception:
+            pass
     return sent
