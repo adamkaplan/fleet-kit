@@ -484,29 +484,45 @@ class TestRaisingSteps(unittest.TestCase):
             print("S10: copy with the %s timer after the call fails: a raising step lost its seconds" % name)
 
 
+class GapClock(StepClock):
+    """The fake monotonic clock that adds `gap` seconds at each boundary: the read that starts a step right after the read that ended the step before."""
+    def __init__(self, gap):
+        StepClock.__init__(self)
+        self.gap, self.reads_since_exit, self.gaps = gap, 0, 0
+
+    def exited(self):
+        self.reads_since_exit = 1
+
+    def monotonic(self):
+        if self.reads_since_exit == 1:
+            self.reads_since_exit = 2   # the read that ends the step
+        elif self.reads_since_exit == 2:
+            self.reads_since_exit = 0   # the read that starts the next step: a boundary
+            self.t += self.gap
+            self.gaps += 1
+        return self.t
+
+
 def s11_world(test, mod, gap=0.0, raise_second_read=False):
-    """The fake world of S8; `gap` seconds are added by the fake clock at each boundary before a step; the 2nd activity read may raise."""
-    clock = StepClock()
+    """The fake world of S8; the fake clock adds `gap` seconds at each boundary of the steps; the 2nd activity read may raise."""
+    clock = GapClock(gap)
     cls = mod.Launcher
     f = LineFixture(test, mod)
     mod.time = clock
     L = f.w.L
     L.reap = types.MethodType(cls.reap, L)
-    state = {"boundaries": 0, "steps": 0.0}
+    state = {"steps": 0.0}
 
-    def boundary():
-        clock.t += gap
-        state["boundaries"] += 1
-
-    def step(seconds, answer=None, bound=True):
+    def step(seconds, answer=None):
         def call(*a, **k):
-            if bound:
-                boundary()
-            clock.t += seconds
-            state["steps"] += seconds
-            return answer
+            try:
+                clock.t += seconds
+                state["steps"] += seconds
+                return answer
+            finally:
+                clock.exited()
         return call
-    L.kube.list_pods = step(1.0, f.w.pods, bound=False)
+    L.kube.list_pods = step(1.0, f.w.pods)
     L.renew_git_tokens = step(2.0, [])
     L._note_vanished_pods = step(0.5)
     L.hard_deadline = lambda pod: T0 + datetime.timedelta(days=1)
@@ -515,20 +531,22 @@ def s11_world(test, mod, gap=0.0, raise_second_read=False):
 
     def activity(name):
         reads.append(name)
-        if len(reads) == 1:
-            boundary()
-        clock.t += 0.2
-        state["steps"] += 0.2
-        if raise_second_read and len(reads) == 2:
-            clock.t += 0.5
-            state["steps"] += 0.5
-            raise RuntimeError("fake step failure")
-        return (False, T0 - datetime.timedelta(days=1)) if name == idle else (True, T0)
+        try:
+            clock.t += 0.2
+            state["steps"] += 0.2
+            if raise_second_read and len(reads) == 2:
+                clock.t += 0.5
+                state["steps"] += 0.5
+                raise RuntimeError("fake step failure")
+            return (False, T0 - datetime.timedelta(days=1)) if name == idle else (True, T0)
+        finally:
+            clock.exited()
     L.activity = activity
     L.stop = lambda ns, reason: (step(4.0)(), {})[1]
     L.retire_row = lambda worker, reason: None
     L.remove_orphan_secrets = step(0.5)
     L.send_wip_notes = step(1.5)
+    state["clock"] = clock
     return f, L, clock, state
 
 
@@ -546,10 +564,10 @@ def s11_pass(test, f):
 def s11_total(test, mod):
     f, L, clock, state = s11_world(test, mod, gap=0.25, raise_second_read=True)
     lines = s11_pass(test, f)
-    want = state["steps"] + 0.25 * state["boundaries"]
+    want = state["steps"] + 0.25 * state["clock"].gaps
     if len(lines) != 1 or (" total=%.1f" % want) not in lines[0]:
         raise AssertionError("the total left out the seconds between steps")
-    return lines[0], want, state["boundaries"]
+    return lines[0], want, state["clock"].gaps
 
 
 def s11_early(test, mod):
