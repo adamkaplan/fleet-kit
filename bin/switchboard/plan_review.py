@@ -726,7 +726,8 @@ def review_tick(args, runner, now, socket_call=None):
     review_caller(runner, now, "run the plan review housekeeping")
     engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
     entries = review_entries(state)
-    done = {"relaunched": [], "unavailable": [], "reminded": [], "skipped": []}
+    done = {"relaunched": [], "unavailable": [], "reminded": []}
+    done["skipped"] = []   # #1713
     reviews = sorted({e["review"] for e in entries if e.get("kind") == "round"})
     for review in reviews:
         rnd = _round_of(entries, review)
