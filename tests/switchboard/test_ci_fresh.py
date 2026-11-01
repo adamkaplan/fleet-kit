@@ -45,6 +45,32 @@ class TestCiStateDecision(unittest.TestCase):
                              ("unknown", "unknown: the tip could not be read"))
 
 
+    def test_s5_the_decision_table_in_one_pass(self):
+        way = ": close and reopen the pull request for a fresh run"
+        table = [(("failing", OLD, TIP, 3), (None, "")), (("pending", OLD, TIP, 3), (None, "")), (("none", OLD, TIP, 3), (None, "")),
+                 (("green", TIP, TIP, None), ("fresh", "fresh: CI ran on the tip " + TIP[:12])),
+                 (("green", OLD, TIP, 3), ("stale", "stale: 3 commits behind (CI ran on bbbbbbbb, the tip is aaaaaaaa)" + way)),
+                 (("green", OLD, TIP, None), ("stale", "stale: the commits behind were not counted (%s, %s)%s" % (OLD, TIP, way))),
+                 (("green", None, TIP, None), ("unknown", "unknown: the base of the last run is not recorded")),
+                 (("green", OLD, None, None), ("unknown", "unknown: the tip could not be read"))]
+        for args, want in table:
+            self.assertEqual(ci_fresh.ci_state(*args), want, args)
+
+
+class TestCiFreshDocs(unittest.TestCase):
+    """S9: the documentation says what stale means and how a lane gets a fresh run."""
+
+    def test_s9_the_docs_say_what_stale_means_and_how_a_lane_gets_a_fresh_run(self):
+        docs = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "switchboard.md")).read()
+        start = docs.index("**A green run counts only on the current tip (#1755).**")
+        sec = docs[start:docs.index("\n\n", docs.index("**How a lane gets a fresh run (#1755).**"))]
+        for need in ("the last run was not made on the current tip", "commits behind", "gh pr close N", "gh pr reopen N",
+                     "one full CI run", "`gh run rerun`", "`workflow_dispatch`", "`update-branch`", "on for every repository", "ci_current_tip: false",
+                     "stale: N commits behind (CI ran on X, the tip is Y): close and reopen the pull request for a fresh run"):
+            self.assertIn(need, sec)
+
+
+
 HEAD = "c" * 40
 
 
